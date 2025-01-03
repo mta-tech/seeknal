@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.vscode
+.metals
+.idea
+lib
+.env
+config.toml
+
+.pytest_cache
+.DS_Store
+spark-engine/build
+spark-engine/.DS_Store
+spark-engine/derby.log
+spark-engine/out
+spark-engine/.gradle
+spark-engine/.idea 
+spark-engine/.bloop
+spark-engine/.metals

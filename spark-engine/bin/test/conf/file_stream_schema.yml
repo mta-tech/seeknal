@@ -1,0 +1,32 @@
+---
+pipeline:
+  kind: streaming
+  input:
+    source: file
+    params:
+      path : src/test/resources/databases/files
+      format: json
+      multiLine: true
+      schemaInference: false
+    schema:
+      - name: deptno
+        dataType: string
+      - name: designation
+        dataType: string
+      - name: empno
+        dataType: string
+      - name: ename
+        dataType: string
+      - name: hire_date
+        dataType: string
+      - name: manager
+        dataType: string
+      - name: sal
+        dataType: string
+  output:
+    source: file
+    params:
+      path: build/integ-test/outputStreamTwo
+      format: json
+    trigger:
+      mode: once

@@ -1,0 +1,3 @@
+za.co.absa:abris_2.12:6.3.0
+com.lihaoyi:os-lib_2.12:0.11.3
+org.apache.spark:spark-avro_2.12:3.3.0

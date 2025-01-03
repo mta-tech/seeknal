@@ -1,0 +1,1 @@
+{"schema":"{\"type\":\"record\",\"name\":\"_struct_id\",\"fields\":[{\"name\":\"msisdn\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"name\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"_row_number\",\"type\":[\"null\",\"int\"],\"default\":null},{\"name\":\"event_time\",\"type\":[\"null\",\"string\"],\"default\":null}]}"}

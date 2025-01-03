@@ -1,0 +1,14 @@
+---
+sources:
+  - id: file_connector
+    source: file
+    params:
+      path: src/test/resources/databases/db.csv
+
+pipeline:
+  input:
+    id: file_connector
+  output:
+    source: file
+    params:
+      path: build/integ-test/output/csv_output
