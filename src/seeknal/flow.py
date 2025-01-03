@@ -10,7 +10,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import typer
 import yaml
-from prefect import flow, task
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from tabulate import tabulate
@@ -425,7 +424,6 @@ class Flow:
         return FlowRequest.delete_by_id(self.flow_id)
 
 
-@flow
 def run_flow(
     flow_name: Optional[str] = None,
     flow: Optional[Flow] = None,

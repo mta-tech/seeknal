@@ -98,6 +98,28 @@ def test_write_feature_group_without_event_time(input_data_spark):
     my_fg.get_or_create()
     my_fg.write()
 
+def test_write_feature_group_to_path(input_data_spark, spark):
+    Project(name="my_project").get_or_create()
+    materialization = Materialization(event_time_col="day", 
+    offline_materialization=OfflineMaterialization(
+    store=OfflineStore(kind=OfflineStoreEnum.FILE, 
+                       name="test_offline_store",
+                       value=FeatureStoreFileOutput(path="file:///tmp/offline_store")), 
+                       mode="overwrite", ttl=None),
+    offline=True)
+    input_df = spark.read.table("comm_day")
+    my_fg = FeatureGroup(
+        name="test_write_fg",
+        entity=Entity(name="msisdn", join_keys=["msisdn"]).get_or_create(),
+        materialization=materialization,
+    ).set_dataframe(dataframe=input_df)
+
+    my_fg.set_features()
+    my_fg.get_or_create()
+    my_fg.set_dataframe(dataframe=input_df).write(
+        feature_start_time=datetime(2019, 3, 5)
+    )
+    my_fg.delete()
 
 def test_load_historical_features(input_data_spark):
     Project(name="my_project").get_or_create()
@@ -187,14 +209,6 @@ def test_feature_group_and_upsert(spark, input_data_spark):
     my_fg.write(
         feature_start_time=datetime(2019, 3, 6), feature_end_time=datetime(2019, 3, 10)
     )
-
-
-#def test_delete_fg_two(input_data_spark):
-#    Project(name="my_project").get_or_create()
-#    my_fg = FeatureGroup(name="comm_day_four").get_or_create()
-#    my_fg.delete()
-#
-#
 
 def test_load_offline_store():
     Project(name="my_project").get_or_create()
