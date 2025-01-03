@@ -13,7 +13,7 @@ USAGE=$(cat <<-EOF
 Usage: $0 command [ options ]
 
 Parameters:
-    command   command to execute, "run", "migrate-schema" or "pipeline"
+    command   command to execute, "run"
 
 Options:
     --master master, -m master

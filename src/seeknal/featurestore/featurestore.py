@@ -235,7 +235,10 @@ class OfflineStore:
                     table_name = "fg_{}__{}".format(kwds["project"], kwds["entity"])
                     path = os.path.join(base_path, "data", table_name)
                 else:
-                    base_path = self.value["path"]
+                    if isinstance(self.value, FeatureStoreFileOutput):
+                        base_path = self.value.path
+                    else:
+                        base_path = self.value["path"]
                     table_name = "fg_{}__{}".format(kwds["project"], kwds["entity"])
                     path = os.path.join(base_path, table_name)
                 start_date = kwds.get("start_date", None)
@@ -358,7 +361,10 @@ class OfflineStore:
                     table_name = "fg_{}__{}".format(kwds["project"], kwds["entity"])
                     path = os.path.join(base_path, "data", table_name)
                 else:
-                    base_path = self.value["path"]
+                    if isinstance(self.value, FeatureStoreFileOutput):
+                        base_path = self.value.path
+                    else:
+                        base_path = self.value["path"]
                     table_name = "fg_{}__{}".format(kwds["project"], kwds["entity"])
                     path = os.path.join(base_path, table_name)
                 try:
