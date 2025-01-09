@@ -1,0 +1,52 @@
+name: Pytest Pipeline
+
+on:
+  pull_request:
+    branches:
+      - "**" # Run on all branches when a PR is opened
+  push:
+    branches:
+      - main # Run when code is merged into the master branch
+
+jobs:
+  run-pytest:
+    runs-on: self-hosted
+    env:
+      CONFIG_FILE: ${{ vars.CONFIG_FILE }}
+
+    steps:
+      # Checkout the repository
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Set env for $SPARK_HOME
+      - name: Set SPARK_HOME environment variable
+        run: echo "SPARK_HOME=/usr/local/spark" >> $GITHUB_ENV
+
+      # Check if cache exist or not
+      - name: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+            
+      # Install dependencies
+      - name: Install dependencies
+        run: |
+          python3.11 -m pip install --upgrade pip
+          pip3.11 install -e .
+          
+      # Write the variable content to file
+      - name: Write config.toml from GitHub variable
+        run: echo "$CONFIG_FILE" > src/seeknal/config.toml  
+
+      - name: Verify config.toml file existence
+        run: |
+          ls -al src/seeknal/  # Check if the file exists
+          
+      # Run tests
+      - name: Run pytest
+        run: |
+          pytest -s src/tests
