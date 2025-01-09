@@ -17,6 +17,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      # Set env for $SPARK_HOME
+      - name: Set SPARK_HOME environment variable
+        run: echo "SPARK_HOME=/usr/local/spark" >> $GITHUB_ENV
+
+      # Check if cache exist or not
       - name: Cache pip dependencies
         uses: actions/cache@v3
         with:
