@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "seeknal"
 version = "1.0.0"
-description = "All-in-one data transformation and feature store engine"
+description = "All-in-one platform for data and AI/ML engineering"
 authors = [
     {name = "Fitra Kacamarga"}
 ]
@@ -47,7 +47,6 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/seeknal"]
-include = ["config.toml"]
 
 [tool.hatch.build]
 include-package-data = true

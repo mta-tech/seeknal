@@ -196,19 +196,27 @@ def test_feature_group_and_upsert(spark, input_data_spark):
             event_time_col="day",
             offline_materialization=OfflineMaterialization(
                 store=OfflineStore(kind=OfflineStoreEnum.FILE, name="default"),
-                mode="overwrite",
+                mode="merge",
                 ttl=None,
             ),
-            online=True,
+            online=False,
         ),
     ).set_flow(my_flow)
     my_fg.set_features()
-    # print(my_fg)
     my_fg.get_or_create()
 
     my_fg.write(
-        feature_start_time=datetime(2019, 3, 6), feature_end_time=datetime(2019, 3, 10)
+        feature_start_time=datetime(2019, 3, 6), feature_end_time=datetime(2019, 3, 7)
     )
+
+    my_fg.write(
+        feature_start_time=datetime(2019, 3, 7), feature_end_time=datetime(2019, 3, 9)
+    )
+    print(my_fg.get_or_create().offline_watermarks)
+    assert sorted(set(my_fg.get_or_create().offline_watermarks)) == [
+        '2019-03-06 00:00:00', '2019-03-07 00:00:00', '2019-03-08 00:00:00',
+        '2019-03-09 00:00:00'
+    ]
 
 def test_load_offline_store():
     Project(name="my_project").get_or_create()
