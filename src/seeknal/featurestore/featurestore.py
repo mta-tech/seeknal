@@ -179,15 +179,28 @@ class OfflineStore:
                         if not spark.catalog.tableExists(
                             "{}.{}".format(database, table_name)
                         ):
-                            raise ValueError(
-                                "cannot upsert because table is not exists"
+                            logger.info(
+                                "Table {} does not exist, creating table".format(
+                                    table_name
+                                ))
+                            (
+                                result.write.format("delta")
+                                .option(
+                                    "userMetadata",
+                                    "start_date={},end_date={},version={}".format(
+                                        start_date, end_date, version
+                                    ),
+                                )
+                                .saveAsTable("{}.{}".format(database, table_name))
                             )
-                        delta_table = DeltaTable.forName(
-                            spark, "{}.{}".format(database, table_name)
-                        )
-                        delta_table.alias("source").merge(
-                            result.alias("target"), "source.__pk__ = target.__pk__"
-                        ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+                        else:
+                            delta_table = DeltaTable.forName(
+                                spark, "{}.{}".format(database, table_name)
+                            )
+                            delta_table.alias("source").merge(
+                                result.alias("target"),
+                                "source.__pk__ = target.__pk__",
+                            ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
                     else:
                         raise ValueError("mode {} is not supported".format(mode))
 
@@ -286,13 +299,23 @@ class OfflineStore:
                         )
                     elif mode == "merge":
                         if not os.path.exists(path):
-                            raise ValueError(
-                                "cannot upsert because table is not exists"
+                            logger.info("Table is not exists, creating it now")
+                            (
+                                result.write.format("delta")
+                                .option(
+                                    "userMetadata",
+                                    "start_date={},end_date={},version={}".format(
+                                        start_date, end_date, version
+                                    ),
+                                )
+                                .save(path)
                             )
-                        delta_table = DeltaTable.forPath(spark, path)
-                        delta_table.alias("source").merge(
-                            result.alias("target"), "source.__pk__ = target.__pk__"
-                        ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+                        else:
+                            delta_table = DeltaTable.forPath(spark, path)
+                            delta_table.alias("source").merge(
+                                result.alias("target"),
+                                "source.__pk__ = target.__pk__",
+                            ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
                     else:
                         raise ValueError("mode {} is not supported".format(mode))
 

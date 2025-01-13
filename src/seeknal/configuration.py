@@ -23,7 +23,6 @@ from box import Box
 DictLike = Union[dict, "DotDict"]
 D = TypeVar("D", bound=Union[dict, MutableMapping])
 
-DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "config.toml")
 USER_CONFIG = os.getenv("__USER_CONFIG_PATH", "~/./config.toml")
 BACKEND_CONFIG = os.getenv("__BACKEND_CONFIG_PATH", "~/./backend.toml")
 ENV_VAR_PREFIX = ""
@@ -156,7 +155,6 @@ def as_nested_dict(
 
     Returns:
         - A `dict_class` representation of the object passed in
-    ```
     """
     if isinstance(obj, (list, tuple, set)):
         return type(obj)([as_nested_dict(d, dct_class) for d in obj])
@@ -284,7 +282,7 @@ def interpolate_env_vars(env_var: str) -> Optional[Union[bool, int, float, str]]
     return None
 
 
-def create_user_config(dest_path: str, source_path: str = DEFAULT_CONFIG) -> None:
+def create_user_config(dest_path: str, source_path: str = "") -> None:
     """
     Copies the default configuration to a user-customizable file at `dest_path`
     """
@@ -516,63 +514,74 @@ def interpolate_config(config: dict, env_var_prefix: Optional[str] = None) -> Co
 
 
 def load_configuration(
-    path: str,
+    path: str = "",
     user_config_path: Optional[str] = None,
     backend_config_path: Optional[str] = None,
     env_var_prefix: Optional[str] = None,
 ) -> Config:
     """
-    Loads a configuration from a known location.
+    Loads a configuration.
 
     Args:
-        - path (str): the path to the TOML configuration file
+        - path (str): DEPRECATED - no longer used
         - user_config_path (str): an optional path to a user config file. If a user config
             is provided, it will be used to update the main config prior to interpolation
+        - backend_config_path (str): an optional path to a backend config file
         - env_var_prefix (str): any env vars matching this prefix will be used to create
             configuration values
 
     Returns:
         - Config
     """
+    # Start with default config
+    config_dict = DEFAULT_CONFIG_DICT.copy()
 
-    # load default config
-    default_config = load_toml(path)
+    # update with user config
+    if user_config_path:
+        user_config_path = cast(str, interpolate_env_vars(user_config_path))
+        if os.path.exists(user_config_path):
+            user_config = load_toml(user_config_path)
+            config_dict.update(user_config)
 
-    # load user config
-    if user_config_path and os.path.isfile(str(interpolate_env_vars(user_config_path))):
-        user_config = load_toml(user_config_path)
-        # merge user config into default config
-        default_config = cast(dict, merge_dicts(default_config, user_config))
+    # update with backend config
+    if backend_config_path:
+        backend_config_path = cast(str, interpolate_env_vars(backend_config_path))
+        if os.path.exists(backend_config_path):
+            backend_config = load_toml(backend_config_path)
+            config_dict.update(backend_config)
 
-    # load backend config
-    if backend_config_path and os.path.isfile(
-        str(interpolate_env_vars(backend_config_path))
-    ):
-        backend_config = load_toml(backend_config_path)
-        # merge backend config into default config
-        default_config = cast(dict, merge_dicts(default_config, backend_config))
-
-    # interpolate after user config has already been merged
-    config = interpolate_config(default_config, env_var_prefix=env_var_prefix)
-
+    config_dict = interpolate_config(config_dict, env_var_prefix=env_var_prefix)
+    config = Config(config_dict)
     validate_config(config)
+    process_task_defaults(config)
+
     return config
 
 
-def load_default_config() -> "Config":
-    # load  configuration
-    config = load_configuration(
-        path=DEFAULT_CONFIG,
+# Default configuration as a Python dictionary instead of TOML file
+DEFAULT_CONFIG_DICT = {
+    # Add your default configuration here
+    # This replaces the contents that were previously in config.toml
+    "logging": {
+        "level": "INFO",
+        "format": "%(asctime)s - %(levelname)s - %(message)s",
+        "log_attributes": "[]",
+        "datefmt": "%Y-%m-%d %H:%M:%S",
+    },
+}
+
+def load_default_config() -> Config:
+    """
+    Load the default configuration.
+    
+    Returns:
+        - Config: A configuration object with default settings
+    """
+    return load_configuration(
         user_config_path=USER_CONFIG,
         backend_config_path=BACKEND_CONFIG,
-        env_var_prefix=ENV_VAR_PREFIX,
+        env_var_prefix=ENV_VAR_PREFIX
     )
-
-    # add task defaults
-    config = process_task_defaults(config)
-
-    return config
-
 
 # Define `.config` object
 config: "Config" = load_default_config()
