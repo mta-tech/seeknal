@@ -194,6 +194,10 @@ context = Context(
 session = load_session_config(CONFIG_BASE_URL)
 context.session = session
 context.logger = seeknal_logger = configure_logging()
+context.database = Context(
+    {"TURSO_DATABASE_URL": os.getenv("TURSO_DATABASE_URL"),
+    "TURSO_AUTH_TOKEN": os.getenv("TURSO_AUTH_TOKEN")
+    })
 
 logger = get_logger()
 logger.propagate = False
