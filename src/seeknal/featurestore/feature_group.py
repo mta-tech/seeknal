@@ -147,7 +147,10 @@ class FeatureGroup(FeatureStore):
     avro_schema: Optional[dict] = None
 
     def __post_init__(self):
-        self._jvm_gateway = SparkContext._active_spark_context._gateway.jvm
+        try:
+            self._jvm_gateway = SparkContext._active_spark_context._gateway.jvm
+        except AttributeError as e:
+            raise AttributeError("Failed to initialize SparkContext. Please ensure that SparkContext is properly configured.\nTips: You can load your Project and Workspace first.") from e
         if self.source is not None:
             if isinstance(self.source, Flow):
                 if self.source.output is not None:
@@ -423,15 +426,18 @@ class FeatureGroup(FeatureStore):
                 self.avro_schema = json.loads(version_obj.avro_schema)
 
             offline_watermarks = FeatureGroupRequest.select_watermarks_by_version_id(
-                feature_group.id, version_id
+            feature_group.id, version_id
             )
-            if offline_watermarks is not None:
+            if offline_watermarks is None or offline_watermarks == []:
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.offline_watermarks = [current_time]
+            else:
                 self.offline_watermarks = list(
                     map(
                         lambda x: pendulum.instance(x.date).format(
                             "YYYY-MM-DD HH:mm:SS"
                         ),
-                        offline_watermarks,
+                        offline_watermarks
                     )
                 )
             if feature_group.online_watermark is not None:
