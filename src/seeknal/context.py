@@ -198,8 +198,8 @@ context.database = Context(
     {"TURSO_DATABASE_URL": os.getenv("TURSO_DATABASE_URL"),
     "TURSO_AUTH_TOKEN": os.getenv("TURSO_AUTH_TOKEN")
     })
-context.secrets = Config({'SEEKNAL_USERNAME': os.getenv("SEEKNAL_USERNAME")}) 
 
+context.secrets = Config({'SEEKNAL_USERNAME': os.getenv("SEEKNAL_USERNAME")}) 
 
 logger = get_logger()
 logger.propagate = False
