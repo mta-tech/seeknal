@@ -25,3 +25,6 @@ spark-engine/.gradle
 spark-engine/.idea 
 spark-engine/.bloop
 spark-engine/.metals
+
+.ipynb_checkpoints
+*.ipynb
