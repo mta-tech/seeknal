@@ -428,16 +428,13 @@ class FeatureGroup(FeatureStore):
             offline_watermarks = FeatureGroupRequest.select_watermarks_by_version_id(
             feature_group.id, version_id
             )
-            if offline_watermarks is None or offline_watermarks == []:
-                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self.offline_watermarks = [current_time]
-            else:
+            if offline_watermarks is not None:
                 self.offline_watermarks = list(
                     map(
                         lambda x: pendulum.instance(x.date).format(
                             "YYYY-MM-DD HH:mm:SS"
                         ),
-                        offline_watermarks
+                        offline_watermarks,
                     )
                 )
             if feature_group.online_watermark is not None:

@@ -195,8 +195,6 @@ session = load_session_config(CONFIG_BASE_URL)
 context.session = session
 context.logger = seeknal_logger = configure_logging()
 
-context.secrets = Config({'SEEKNAL_USERNAME': os.getenv("SEEKNAL_USERNAME")}) 
-
 logger = get_logger()
 logger.propagate = False
 
