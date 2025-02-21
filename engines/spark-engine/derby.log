@@ -1,0 +1,13 @@
+----------------------------------------------------------------
+Mon Dec 30 15:03:39 WIB 2024:
+Booting Derby version The Apache Software Foundation - Apache Derby - 10.14.2.0 - (1828579): instance a816c00e-0194-1697-8f68-00000ca68a00 
+on database directory /private/var/folders/t0/0q17x1lx3qnfvkxx3b7r3z0r0000gn/T/spark-24fab768-97e3-41e8-88b7-53eec90cc234/metastore with class loader jdk.internal.loader.ClassLoaders$AppClassLoader@67424e82 
+Loaded from file:/Users/fitrakacamarga/.gradle/caches/modules-2/files-2.1/org.apache.derby/derby/10.14.2.0/7efad40ef52fbb1f08142f07a83b42d29e47d8ce/derby-10.14.2.0.jar
+java.vendor=Eclipse Adoptium
+java.runtime.version=11.0.21+9
+user.dir=/Users/fitrakacamarga/project/mta/signal/spark-engine
+os.name=Mac OS X
+os.arch=aarch64
+os.version=15.1
+derby.system.home=null
+Database Class Loader started - derby.database.classpath=''

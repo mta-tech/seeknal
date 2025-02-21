@@ -1,0 +1,30 @@
+{
+    "mappings" : {
+      "properties" : {
+        "booleanField" : {
+          "type" : "boolean"
+        },
+        "dateField" : {
+          "type" : "date"
+        },
+        "doubleField" : {
+          "type" : "double"
+        },
+        "floatField" : {
+          "type" : "float"
+        },
+        "intField" : {
+          "type" : "integer"
+        },
+        "keywordField" : {
+          "type" : "keyword"
+        },
+        "longField" : {
+          "type" : "long"
+        },
+        "shortField" : {
+          "type" : "short"
+        }
+      }
+    }
+}

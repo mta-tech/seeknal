@@ -1,0 +1,81 @@
+---
+sources:
+  - id: traffic_day
+    table: pipeline_integtest.db_traffic_daily
+
+transformations:
+  - id: rename_roaming_type
+    className: ai.eureka.featureengine.transformers.ColumnValueRenamed
+    params:
+      inputCol: roaming_position
+      outputCol: is_roaming
+      valueMappings:
+        - fromValue: OUTBOUND
+          toValue: ROAMING
+        - fromValue: INBOUND
+          toValue: NOT_ROAMING
+        - fromValue: LOCAL
+          toValue: NOT_ROAMING
+
+pipeline:
+  input:
+    id: traffic_day
+  output:
+    table: pipeline_test
+    partitions:
+      - month
+    db:
+      name: pipeline_integtest
+      path: build/pipelineintegtest-output
+  stages:
+    - className: org.apache.spark.ml.feature.SQLTransformer
+      params:
+        statement: SELECT date_id, CONCAT(msisdn, "-append") as id, roaming_position, hit,
+          b_party, direction_type FROM __THIS__
+    - id: rename_roaming_type
+    - className: ai.eureka.featureengine.transformers.AddDate
+      params:
+        inputCol: date_id
+        outputCol: month
+    - className: ai.eureka.featureengine.transformers.AddEntropy
+      params:
+        idCol: id
+        frequencyCol: month
+        groupByCols:
+          - b_party
+        entityCol: hit
+        entropyCol: entropy
+        filterExpression: direction_type = 'Outgoing'
+    - className: ai.eureka.featureengine.transformers.GroupByColumns
+      params:
+        inputCols:
+          - month
+          - id
+          - is_roaming
+      aggregators:
+        - className: ai.eureka.featureengine.aggregators.FunctionAggregator
+          params:
+            inputCol: hit
+            outputCol: hit_total
+            accumulatorFunction: sum
+            defaultAggregateValue: "0.0"
+            defaultAggregateValueType: double
+        - className: ai.eureka.featureengine.aggregators.FunctionAggregator
+          params:
+            inputCol: entropy
+            outputCol: entropy_max
+            accumulatorFunction: max
+            defaultAggregateValue: "0.0"
+            defaultAggregateValueType: double
+    - className: ai.eureka.featureengine.transformers.AddColumnByExpr
+      params:
+        expression: CASE WHEN hit_total > 10.0 THEN 'HIGH' ELSE 'LOW' END
+        outputCol: hit_group
+
+rules:
+  - id: inputPattern
+    rule:
+      value: yyyyMMdd
+  - id: outputPattern
+    rule:
+      value: yyyy-MM-01

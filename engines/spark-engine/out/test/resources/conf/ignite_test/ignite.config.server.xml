@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation=" http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd">
+    <bean id="grid.cfg" class="org.apache.ignite.configuration.IgniteConfiguration">
+        <property name="clientMode" value="false" />
+        <property name="cacheConfiguration">
+            <list>
+                <!--  Partitioned cache example configuration (Atomic mode).  -->
+                <bean class="org.apache.ignite.configuration.CacheConfiguration">
+                    <property name="name" value="default" />
+                    <property name="atomicityMode" value="ATOMIC" />
+                    <property name="backups" value="1" />
+                </bean>
+            </list>
+        </property>
+        <property name="systemWorkerBlockedTimeout" value="#{60 * 60 * 1000}"/>
+        <property name="failureDetectionTimeout" value="100000"/>
+    </bean>
+</beans>
+

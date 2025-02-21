@@ -1,0 +1,31 @@
+---
+connection:
+  - connId: CassandraConn
+    params:
+      spark.cassandra.connection.host: localhost
+
+pipeline:
+  input:
+    source: cassandra
+    connId: CassandraConn
+    params:
+      keyspace : test
+      table : eureka
+      spark.cassandra.connection.port: 9042
+
+  output:
+    source: cassandra
+    connId: CassandraConn
+    params:
+      mode: default
+      table: eurekanew
+      spark.cassandra.connection.port: 9042
+      keyspace: test
+      primaryKeys: id
+      clusteringKeys: job
+
+  stages:
+    - className: ai.eureka.featureengine.transformers.ColumnRenamed
+      params:
+        inputCol: role
+        outputCol: job

@@ -1,0 +1,29 @@
+---
+connection:
+  - connId: Neo4jConn
+    params:
+      authentication.basic.username: neo4j
+      authentication.basic.password: password
+
+  - connId: jdbcConfig
+    params:
+      url: jdbc:h2:~/test
+      driver: org.h2.Driver
+      user: sa
+      password: sa
+
+pipeline:
+  input:
+    source: jdbc
+    connId: jdbcConfig
+    params:
+      dbtable: sample_table
+  output:
+    connId: Neo4jConn
+    params:
+      url: {url}
+      mode: default
+      node.keys: ID
+      labels: Persons
+    source: neo4j
+

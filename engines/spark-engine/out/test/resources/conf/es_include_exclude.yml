@@ -1,0 +1,24 @@
+connection:
+  - connId : esConn
+    params:
+      es.nodes : localhost
+      es.port : 9200
+      es.nodes.wan.only: true
+      es.net.ssl: false
+
+pipeline:
+  input:
+    source: es
+    connId : esConn
+    params :
+      es.port : {port}
+      index : cities_{random}
+      es.read.metadata : false
+      es.read.field.exclude : continent
+  output:
+    source: es
+    connId : esConn
+    params :
+      es.port : {port}
+      index : exclude_test_{random}
+      mode : append

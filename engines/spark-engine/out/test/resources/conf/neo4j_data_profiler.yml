@@ -1,0 +1,115 @@
+---
+connection:
+  - connId: Neo4jConn
+    params:
+      authentication.basic.username: neo4j
+      authentication.basic.password: Eur3ka@
+
+sources:
+  - id: data_prof
+    table: feateng_test.data_prof
+
+pipeline:
+  input:
+    id: data_prof
+  output:
+    connId: Neo4jConn
+    source: neo4j
+    params:
+      url: neo4j://localhost:7687
+      mode: overwrite
+      script: >-
+        CREATE CONSTRAINT IF NOT EXISTS ON (table:TableTest) ASSERT table.urn IS UNIQUE;
+        CREATE CONSTRAINT IF NOT EXISTS ON (column:ColumnTest) ASSERT column.urn IS UNIQUE;
+        CREATE CONSTRAINT IF NOT EXISTS ON (stats:StatsTest) ASSERT stats.urn IS UNIQUE;
+        CREATE CONSTRAINT IF NOT EXISTS ON (tag:TagTest) ASSERT tag.value IS UNIQUE;
+        CREATE CONSTRAINT IF NOT EXISTS ON (description:DescriptionTest) ASSERT description.value IS UNIQUE;
+      query: >-
+        MERGE (table: TableTest {name: event.table_name, urn: "urn:eu:table:"+apoc.text.camelCase(apoc.convert.toString(event.table_name))})
+            ON CREATE SET
+                table.createdAt = apoc.date.currentTimestamp()
+            ON MATCH SET
+                table.updatedAt = apoc.date.currentTimestamp()
+
+        MERGE (column: ColumnTest {name: event.col_name, dataType: event.type, urn: "urn:eu:column:"+apoc.text.camelCase(apoc.convert.toString(event.table_name))+':'+apoc.text.camelCase(apoc.convert.toString(event.col_name))})
+            ON CREATE SET
+                column.createdAt = apoc.date.currentTimestamp()
+            ON MATCH SET
+                column.updatedAt = apoc.date.currentTimestamp()
+
+        MERGE (table)-[colRel:HAS_COLUMN_TEST]->(column)
+            ON CREATE SET
+                colRel.createdAt = apoc.date.currentTimestamp()
+            ON MATCH SET
+                colRel.updatedAt = apoc.date.currentTimestamp()
+
+        WITH event
+        OPTIONAL MATCH (stats: StatsTest {urn: 'urn:eu:stats:'+apoc.text.camelCase(apoc.convert.toString(event.table_name))+':'+apoc.text.camelCase(apoc.convert.toString(event.col_name))})
+        WITH event, stats
+
+        CALL apoc.do.when(
+            stats IS NOT NULL,
+            "
+            MERGE (stats)-[history: HAS_HISTORY_TEST {minProfiledDate: event.min_profiled_date, maxProfiledDate: event.max_profiled_date}]->(stats)
+                ON CREATE SET
+                    history = stats,
+                    history.createdAt = apoc.date.currentTimestamp()
+                ON MATCH SET
+                    history.updatedAt = apoc.date.currentTimestamp(),
+                    history.min = COALESCE(toFloat(event.min), null),
+                    history.max = COALESCE(toFloat(event.max), null),
+                    history.avg = COALESCE(toFloat(event.mean), null),
+                    history.cardinality = COALESCE(toInteger(event.cardinality), null),
+                    history.mode = COALESCE(event.mode, 'NULL'),
+                    history.sd = COALESCE(toFloat(event.stddev), null),
+                    history.nullCount = COALESCE(toInteger(event.is_null), null),
+                    history.minProfiledDate = COALESCE(event.min_profiled_date, 'NULL'),
+                    history.maxProfiledDate = COALESCE(event.max_profiled_date, 'NULL'),
+                    history.minDataDate = COALESCE(event.min_data_date, 'NULL'),
+                    history.maxDataDate = COALESCE(event.max_data_date, 'NULL')
+            RETURN event
+            ",
+            '',
+            {stats:stats, event:event}
+        ) yield value
+
+        WITH event
+        MERGE (stats: StatsTest {urn: 'urn:eu:stats:'+apoc.text.camelCase(apoc.convert.toString(event.table_name))+':'+apoc.text.camelCase(apoc.convert.toString(event.col_name))})
+            ON CREATE SET
+                stats.createdAt = apoc.date.currentTimestamp(),
+                stats.min = COALESCE(toFloat(event.min), null),
+                stats.max = COALESCE(toFloat(event.max), null),
+                stats.avg = COALESCE(toFloat(event.mean), null),
+                stats.cardinality = COALESCE(toInteger(event.cardinality), null),
+                stats.mode = COALESCE(event.mode, 'NULL'),
+                stats.sd = COALESCE(toFloat(event.stddev), null),
+                stats.nullCount = COALESCE(toInteger(event.is_null), null),
+                stats.minProfiledDate = COALESCE(event.min_profiled_date, 'NULL'),
+                stats.maxProfiledDate = COALESCE(event.max_profiled_date, 'NULL'),
+                stats.minDataDate = COALESCE(event.min_data_date, 'NULL'),
+                stats.maxDataDate = COALESCE(event.max_data_date, 'NULL')
+
+            ON MATCH SET
+                stats.updatedAt = apoc.date.currentTimestamp(),
+                stats.min = COALESCE(toFloat(event.min), null),
+                stats.max = COALESCE(toFloat(event.max), null),
+                stats.avg = COALESCE(toFloat(event.mean), null),
+                stats.cardinality = COALESCE(toInteger(event.cardinality), null),
+                stats.mode = COALESCE(event.mode, 'NULL'),
+                stats.sd = COALESCE(toFloat(event.stddev), null),
+                stats.nullCount = COALESCE(toInteger(event.is_null), null),
+                stats.minProfiledDate = COALESCE(event.min_profiled_date, 'NULL'),
+                stats.maxProfiledDate = COALESCE(event.max_profiled_date, 'NULL'),
+                stats.minDataDate = COALESCE(event.min_data_date, 'NULL'),
+                stats.maxDataDate = COALESCE(event.max_data_date, 'NULL')
+
+        WITH event
+
+        MATCH (column:ColumnTest{urn: "urn:eu:column:"+apoc.text.camelCase(apoc.convert.toString(event.table_name))+':'+apoc.text.camelCase(apoc.convert.toString(event.col_name))})
+        MATCH (stats: StatsTest {urn: 'urn:eu:stats:'+apoc.text.camelCase(apoc.convert.toString(event.table_name))+':'+apoc.text.camelCase(apoc.convert.toString(event.col_name))})
+
+        MERGE (column)-[statsRel:HAS_STATS_TEST]->(stats)
+            ON CREATE SET
+                statsRel.createdAt = apoc.date.currentTimestamp()
+            ON MATCH SET
+                statsRel.updatedAt = apoc.date.currentTimestamp()

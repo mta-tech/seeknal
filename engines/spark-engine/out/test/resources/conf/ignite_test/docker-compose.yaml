@@ -1,0 +1,28 @@
+version: "3.7"
+services:
+  ignite-01:
+    image: apacheignite/ignite:2.11.0
+    environment:
+      - CONFIG_URI=/config.xml
+      - IGNITE_WORK_DIR=/storage
+      - JVM_OPTS=-Xms512m -Xmx512m -server -XX:+AggressiveOpts -XX:+UseG1GC -XX:MaxPermSize=256m -XX:+DisableExplicitGC -DIGNITE_PERFORMANCE_SUGGESTIONS_DISABLED=true
+    expose:
+      - "47500-47509"
+    ports:
+      - "47500-47509:47500-47509"
+      - "47100:47100"
+      - "11211:11211"
+      - "49112:49112"
+      - "10800:10800"
+    volumes:
+      - "./ignite.config.server.xml:/config.xml"
+      - "./storage:/storage"
+
+  ignite-web:
+    image: nginx
+    volumes:
+      - ./:/usr/share/nginx/html
+    ports:
+      - "8000:80"
+    environment:
+      - NGINX_PORT=80
