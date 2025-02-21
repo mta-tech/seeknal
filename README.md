@@ -33,6 +33,8 @@ from seeknal.flow import (
     FlowInputEnum,
     FlowOutputEnum,
 )
+from spark_engine.task import SparkEngineTask, DuckDBTask
+
 project = Project(name="my_project", description="My project")
 project.get_or_create()
 
