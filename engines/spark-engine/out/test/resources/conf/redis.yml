@@ -1,0 +1,11 @@
+pipeline:
+  input:
+    source: file
+    params:
+      path: src/test/resources/databases/db.csv
+  output:
+    source: redis
+    params :
+      port : {port}
+      table : redis_output
+      mode : Overwrite

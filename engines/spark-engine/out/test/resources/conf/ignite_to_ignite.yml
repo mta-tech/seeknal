@@ -1,0 +1,17 @@
+pipeline:
+  input:
+    source: ignite
+    params:
+      table: risk_base_features
+      config: ignite.config.xml
+  output:
+    source: ignite
+    params:
+      table: test_six
+      mode: Overwrite
+      config: ignite.config.xml
+
+  stages:
+    - className: ai.eureka.featureengine.transformers.SQLTransformer
+      params:
+        statement: select *, '2021-07-23' as event_time from __THIS__

@@ -1,0 +1,8 @@
+{
+  "namespace": "all-types.test",
+  "type": "record",
+  "name": "record_name",
+    "fields":[
+    {"name": "int", "type":  ["int", "null"] }
+  ]
+ }

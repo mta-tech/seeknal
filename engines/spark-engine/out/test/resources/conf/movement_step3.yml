@@ -1,0 +1,95 @@
+---
+pipeline:
+  input:
+    table: pipeline_integtest.user_movement_dpi
+  output:
+    table: pipeline_integtest.user_movement_data
+    partitions:
+      - day
+    path: build/user_movement_data/user_movement_data
+  stages:
+    - className: ai.eureka.featureengine.transformers.FilterByExpr
+      params:
+        expression: day = "{date}"
+    - className: ai.eureka.featureengine.transformers.UnionTable
+      params:
+        tableName: pipeline_integtest.user_movement_cdr
+        filterExpression: day = "{date}"
+    - className: ai.eureka.featureengine.transformers.JoinById
+      params:
+        targetTable: pipeline_integtest.ref_ndb_mod
+        inputCols:
+          - site_id
+        joinType: inner
+    - className: ai.eureka.featureengine.transformers.JoinById
+      params:
+        targetTable: pipeline_integtest.ref_site_hexagon_map_mod
+        inputCols:
+          - site_id
+        joinType: left
+    - className: ai.eureka.featureengine.transformers.CastColumn
+      params:
+        inputCol: hour
+        outputCol: hour
+        dataType: int
+    - className: ai.eureka.featureengine.transformers.AddWindowFunction
+      params:
+        windowFunction: lag
+        partitionCols:
+          - msisdn
+        inputCol: long
+        offset: "1"
+        outputCol: prev_long
+        orderCols:
+          - hour
+    - className: ai.eureka.featureengine.transformers.AddWindowFunction
+      params:
+        windowFunction: lag
+        partitionCols:
+          - msisdn
+        inputCol: lat
+        offset: "1"
+        outputCol: prev_lat
+        orderCols:
+          - hour
+    - className: ai.eureka.featureengine.transformers.AddLatLongDistance
+      params:
+        sourcePoint: prev_lat,prev_long
+        targetPoint: lat,long
+        outputCol: radius_gyration
+    - className: ai.eureka.featureengine.transformers.CastColumn
+      params:
+        inputCol: long
+        outputCol: long
+        dataType: double
+    - className: ai.eureka.featureengine.transformers.CastColumn
+      params:
+        inputCol: lat
+        outputCol: lat
+        dataType: double
+    - className: ai.eureka.featureengine.transformers.CastColumn
+      params:
+        inputCol: prev_long
+        outputCol: prev_long
+        dataType: double
+    - className: ai.eureka.featureengine.transformers.CastColumn
+      params:
+        inputCol: prev_lat
+        outputCol: prev_lat
+        dataType: double
+    - className: ai.eureka.featureengine.transformers.SelectColumns
+      params:
+        inputCols:
+          - site_id
+          - hour
+          - msisdn
+          - duration
+          - site_type
+          - technology
+          - long
+          - lat
+          - hexagon_id
+          - prev_long
+          - prev_lat
+          - radius_gyration
+          - day

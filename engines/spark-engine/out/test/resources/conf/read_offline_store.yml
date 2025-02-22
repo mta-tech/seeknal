@@ -1,0 +1,26 @@
+---
+pipeline:
+  input:
+    source: offlineStore
+    params:
+      project: default
+      featureGroups:
+        - name: communication_day
+          entity: telco_subscriber
+          keys:
+            - msisdn
+      startEventTime: '2019-03-01'
+      schemaRegistryUrl: http://localhost:8081
+      database: feature_store
+  output:
+    source: offlineStore
+    params:
+      eventTimeCol: day
+      datePattern: yyyy-MM-dd
+      project: default
+      entity: subscriber
+      featureGroup: communication_day
+      keys: msisdn
+      schemaRegistryUrl: http://10.1.0.11:8082
+      database: feature_store
+      path: "/user/hive/warehouse/feature_store.db/"

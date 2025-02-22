@@ -572,6 +572,17 @@ class SparkEngineTask(Task):
         self.add_yaml(task_spec)
         return self
 
+    def to_yaml_file(self, yaml_path: str):
+        """
+        Save yaml string to a file
+
+        Args:
+            yaml_path (str): yaml file path
+        """
+        task_spec = self._create_spec_from_attributes()
+        with open(yaml_path, "w") as f:
+            f.write(yaml.dump(task_spec))
+
     def print_yaml(self):
         """
         Print yaml string

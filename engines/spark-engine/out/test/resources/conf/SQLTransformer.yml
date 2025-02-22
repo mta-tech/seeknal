@@ -1,0 +1,20 @@
+---
+pipeline:
+  input:
+    id: traffic_day
+    params:
+      dateCol: date_id
+  output:
+    id: test_1
+    partitions:
+      - day
+  stages:
+    - className: org.apache.spark.ml.feature.SQLTransformer
+      params:
+        statement: >-
+          CREATE OR REPLACE VIEW abc_1 as
+          SELECT msisdn as id, "dpi" as cat, date_id as day FROM feateng_integtest.db_dpi_hourly
+          where date_id = "{date}"
+    - className: org.apache.spark.ml.feature.SQLTransformer
+      params:
+        statement: SELECT * FROM abc_1

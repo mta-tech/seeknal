@@ -1,0 +1,18 @@
+{
+  "group" : "fans",
+  "user" : [
+    {
+      "first" : "John",
+      "last1" :  "Smith"
+    },
+    {
+      "first" : "Alice",
+      "last2" :  "White"
+    },
+    {
+      "first" : "Alice-John",
+      "last1" :  "Smith",
+      "last2" :  "White"
+    }
+  ]
+}

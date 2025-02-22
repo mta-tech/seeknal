@@ -1,0 +1,15 @@
+---
+pipeline:
+  input:
+    source: hive
+    table: feateng_integtest.nlp_data
+  output:
+    source: hive
+    table: feateng_integtest.nlp_data_output
+    path: build/integtest-output
+  stages:
+    - className: com.johnsnowlabs.nlp.DocumentAssembler
+      params:
+         inputCol: text
+         outputCol: document
+
