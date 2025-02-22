@@ -124,8 +124,8 @@ Your seeknal has been installed on your machine and ready to use in your project
 
     ```python
     from datetime import datetime
-    from src.seeknal.entity import Entity
-    from src.seeknal.featurestore.feature_group import (
+    from seeknal.entity import Entity
+    from seeknal.featurestore.feature_group import (
         FeatureGroup,
         Materialization,
         OfflineMaterialization,
