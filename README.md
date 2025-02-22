@@ -188,7 +188,7 @@ Your seeknal has been installed on your machine and ready to use in your project
 
     ```python
     latest_features = hist.using_latest.serve()
-    user_one = Entity(name="msisdn").get_or_create().set_key_values("05X5wBWKN3")
+    user_one = Entity(name="user_movement").get_or_create().set_key_values("05X5wBWKN3")
     user_one_features = latest_features.get_features(keys=[user_one])
     ```
 
