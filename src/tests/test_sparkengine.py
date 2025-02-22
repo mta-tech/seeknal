@@ -575,6 +575,18 @@ def test_insert_stage(spark, input_data_spark):
         res.select("id").distinct(), "id"
     )
 
+def test_save_yaml(spark, input_data_spark, tmpdir_spark):
+    df = spark.table(test_tables["df1"])
+    preprocess = (
+        SparkEngineTask()
+        .add_input(dataframe=df)
+        .add_stage(
+            transformer=T.SQL(
+                statement="SELECT day, CONCAT(id, '-append') as id, feature1, feature2 FROM __THIS__"
+            )
+        )
+    )
+    preprocess.to_yaml_file(f"{tmpdir_spark}/test.yaml")
 
 def test_run_with_date_range(spark, input_data_spark):
     df = spark.table(test_tables["df1"])
