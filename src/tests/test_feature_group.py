@@ -320,3 +320,173 @@ def test_delete_online_table(input_data_spark):
         lookup_key=Entity(name="msisdn").get_or_create(),
     )
     online_table.delete()
+
+
+class TestFeatureGroupValidation:
+    """Tests for input validation in feature group operations."""
+
+    # Test OnlineFeatures.get_features() column name validation
+    def test_get_features_valid_column_name(self, input_data_spark, spark):
+        """Test that valid column names are accepted in get_features()."""
+        Project(name="my_project").get_or_create()
+        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
+        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
+            feature_start_time=datetime(2019, 3, 5)
+        )
+        fs = FeatureLookup(source=my_fg)
+        online_table = OnlineFeatures(
+            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
+        )
+        # Valid column name - should not raise
+        result = online_table.get_features(keys=[{"msisdn": "05X5wBWKN3"}])
+        assert isinstance(result, list)
+
+    def test_get_features_invalid_column_name_with_hyphen(self, input_data_spark, spark):
+        """Test that column names with hyphens are rejected in get_features()."""
+        from seeknal.exceptions import InvalidIdentifierError
+
+        Project(name="my_project").get_or_create()
+        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
+        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
+            feature_start_time=datetime(2019, 3, 5)
+        )
+        fs = FeatureLookup(source=my_fg)
+        online_table = OnlineFeatures(
+            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
+        )
+        # Invalid column name with hyphen - should raise InvalidIdentifierError
+        with pytest.raises(InvalidIdentifierError) as exc_info:
+            online_table.get_features(keys=[{"invalid-column": "value"}])
+        assert "column name" in str(exc_info.value)
+        assert "invalid characters" in str(exc_info.value)
+
+    def test_get_features_invalid_column_name_with_space(self, input_data_spark, spark):
+        """Test that column names with spaces are rejected in get_features()."""
+        from seeknal.exceptions import InvalidIdentifierError
+
+        Project(name="my_project").get_or_create()
+        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
+        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
+            feature_start_time=datetime(2019, 3, 5)
+        )
+        fs = FeatureLookup(source=my_fg)
+        online_table = OnlineFeatures(
+            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
+        )
+        # Invalid column name with space - should raise InvalidIdentifierError
+        with pytest.raises(InvalidIdentifierError) as exc_info:
+            online_table.get_features(keys=[{"invalid column": "value"}])
+        assert "column name" in str(exc_info.value)
+
+    def test_get_features_sql_injection_in_column_name(self, input_data_spark, spark):
+        """Test that SQL injection attempts via column names are blocked."""
+        from seeknal.exceptions import InvalidIdentifierError
+
+        Project(name="my_project").get_or_create()
+        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
+        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
+            feature_start_time=datetime(2019, 3, 5)
+        )
+        fs = FeatureLookup(source=my_fg)
+        online_table = OnlineFeatures(
+            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
+        )
+        # SQL injection attempt via column name - should raise InvalidIdentifierError
+        with pytest.raises(InvalidIdentifierError):
+            online_table.get_features(keys=[{"msisdn'; DROP TABLE users; --": "value"}])
+
+    def test_get_features_sql_injection_in_value(self, input_data_spark, spark):
+        """Test that SQL injection attempts via values are blocked."""
+        from seeknal.exceptions import InvalidIdentifierError
+
+        Project(name="my_project").get_or_create()
+        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
+        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
+            feature_start_time=datetime(2019, 3, 5)
+        )
+        fs = FeatureLookup(source=my_fg)
+        online_table = OnlineFeatures(
+            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
+        )
+        # SQL injection attempt via value - should raise InvalidIdentifierError
+        with pytest.raises(InvalidIdentifierError) as exc_info:
+            online_table.get_features(keys=[{"msisdn": "value'; DROP TABLE users; --"}])
+        assert "forbidden pattern" in str(exc_info.value)
+
+    def test_get_features_union_injection_in_value(self, input_data_spark, spark):
+        """Test that UNION SQL injection via values is blocked."""
+        from seeknal.exceptions import InvalidIdentifierError
+
+        Project(name="my_project").get_or_create()
+        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
+        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
+            feature_start_time=datetime(2019, 3, 5)
+        )
+        fs = FeatureLookup(source=my_fg)
+        online_table = OnlineFeatures(
+            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
+        )
+        # UNION injection attempt - should raise InvalidIdentifierError
+        with pytest.raises(InvalidIdentifierError) as exc_info:
+            online_table.get_features(keys=[{"msisdn": "1 UNION SELECT * FROM secrets"}])
+        assert "UNION" in str(exc_info.value)
+
+    def test_get_features_delete_injection_in_value(self, input_data_spark, spark):
+        """Test that DELETE SQL injection via values is blocked."""
+        from seeknal.exceptions import InvalidIdentifierError
+
+        Project(name="my_project").get_or_create()
+        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
+        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
+            feature_start_time=datetime(2019, 3, 5)
+        )
+        fs = FeatureLookup(source=my_fg)
+        online_table = OnlineFeatures(
+            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
+        )
+        # DELETE injection attempt - should raise InvalidIdentifierError
+        with pytest.raises(InvalidIdentifierError) as exc_info:
+            online_table.get_features(keys=[{"msisdn": "value; DELETE FROM users"}])
+        assert "forbidden pattern" in str(exc_info.value)
+
+    def test_get_features_with_entity_key_validation(self, input_data_spark, spark):
+        """Test that Entity-based keys are also validated in get_features()."""
+        from seeknal.exceptions import InvalidIdentifierError
+
+        Project(name="my_project").get_or_create()
+        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
+        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
+            feature_start_time=datetime(2019, 3, 5)
+        )
+        fs = FeatureLookup(source=my_fg)
+        online_table = OnlineFeatures(
+            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
+        )
+
+        # Create entity with SQL injection value
+        entity = Entity(name="msisdn").get_or_create()
+        entity.key_values = {"msisdn": "value'; DROP TABLE users; --"}
+
+        # Should raise InvalidIdentifierError for the value
+        with pytest.raises(InvalidIdentifierError) as exc_info:
+            online_table.get_features(keys=[entity])
+        assert "forbidden pattern" in str(exc_info.value)
+
+    def test_get_features_comment_injection_in_value(self, input_data_spark, spark):
+        """Test that SQL comment injection via values is blocked."""
+        from seeknal.exceptions import InvalidIdentifierError
+
+        Project(name="my_project").get_or_create()
+        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
+        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
+            feature_start_time=datetime(2019, 3, 5)
+        )
+        fs = FeatureLookup(source=my_fg)
+        online_table = OnlineFeatures(
+            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
+        )
+        # SQL comment injection attempt - should raise InvalidIdentifierError
+        with pytest.raises(InvalidIdentifierError) as exc_info:
+            online_table.get_features(keys=[{"msisdn": "value--comment"}])
+        assert "forbidden pattern" in str(exc_info.value)
+        assert "--" in str(exc_info.value)

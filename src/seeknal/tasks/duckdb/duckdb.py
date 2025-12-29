@@ -5,6 +5,8 @@ import duckdb
 from pyarrow import Table
 import os
 
+from seeknal.validation import validate_file_path
+
 
 @dataclass
 class DuckDBTask(Task):
@@ -33,6 +35,8 @@ class DuckDBTask(Task):
         if dataframe is not None:
             self.input = {"dataframe": dataframe}
         elif path is not None:
+            # Validate path to prevent SQL injection
+            validate_file_path(path)
             self.input = {"path": path}
         return self
 

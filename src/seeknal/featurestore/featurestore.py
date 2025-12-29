@@ -19,6 +19,11 @@ from ..entity import Entity
 from ..request import FeatureGroupRequest
 from ..context import CONFIG_BASE_URL, logger
 from ..tasks.duckdb import DuckDBTask
+from ..validation import (
+    validate_database_name,
+    validate_table_name,
+    validate_sql_value,
+)
 
 
 class OfflineStoreEnum(str, Enum):
@@ -126,14 +131,23 @@ class OfflineStore:
                 if self.value is None:
                     # use default
                     database = "seeknal"
-                    table_name = "fg_{}__{}".format(kwds["project"], kwds["entity"])
                 else:
                     database = self.value.database
-                    table_name = "fg_{}__{}".format(kwds["project"], kwds["entity"])
+
+                # Validate database name and table components before use in SQL
+                validate_database_name(database)
+                project = kwds["project"]
+                entity = kwds["entity"]
+                validate_table_name(project)
+                validate_table_name(entity)
+                table_name = "fg_{}__{}".format(project, entity)
+
                 start_date = kwds.get("start_date", None)
                 end_date = kwds.get("end_date", None)
                 if write:
                     name = kwds.get("name")
+                    # Validate name used in WHERE clause / replaceWhere condition
+                    validate_sql_value(name, value_type="feature name")
                     mode = kwds.get("mode", "overwrite")
                     ttl = kwds.get("ttl", None)
                     if start_date is None:
@@ -242,22 +256,30 @@ class OfflineStore:
             case OfflineStoreEnum.FILE:
                 if spark is None:
                     spark = SparkSession.builder.getOrCreate()
+
+                # Validate project and entity parameters used in table name construction
+                project = kwds["project"]
+                entity = kwds["entity"]
+                validate_table_name(project)
+                validate_table_name(entity)
+                table_name = "fg_{}__{}".format(project, entity)
+
                 if self.value is None:
                     # use default
                     base_path = CONFIG_BASE_URL
-                    table_name = "fg_{}__{}".format(kwds["project"], kwds["entity"])
                     path = os.path.join(base_path, "data", table_name)
                 else:
                     if isinstance(self.value, FeatureStoreFileOutput):
                         base_path = self.value.path
                     else:
                         base_path = self.value["path"]
-                    table_name = "fg_{}__{}".format(kwds["project"], kwds["entity"])
                     path = os.path.join(base_path, table_name)
                 start_date = kwds.get("start_date", None)
                 end_date = kwds.get("end_date", None)
                 if write:
                     name = kwds.get("name")
+                    # Validate name used in WHERE clause / replaceWhere condition
+                    validate_sql_value(name, value_type="feature name")
                     mode = kwds.get("mode", "overwrite")
                     ttl = kwds.get("ttl", None)
                     if start_date is None:
@@ -362,14 +384,24 @@ class OfflineStore:
                 if spark is None:
                     spark = SparkSession.builder.getOrCreate()
                 name = kwds.get("name")
+                # Validate name used in WHERE clause
+                validate_sql_value(name, value_type="feature name")
                 if self.value is None:
                     database = "seeknal"
                 else:
                     database = self.value.database
+
+                # Validate database name and table components
+                validate_database_name(database)
+                project = kwds["project"]
+                entity = kwds["entity"]
+                validate_table_name(project)
+                validate_table_name(entity)
+
                 try:
                     delta_table = DeltaTable.forName(
                         spark,
-                        "{}.fg_{}_{}".format(database, kwds["project"], kwds["entity"]),
+                        "{}.fg_{}_{}".format(database, project, entity),
                     )
                     delta_table.delete(f"name = '{name}'")
                 except:
@@ -379,16 +411,24 @@ class OfflineStore:
                 if spark is None:
                     spark = SparkSession.builder.getOrCreate()
                 name = kwds.get("name")
+                # Validate name used in WHERE clause
+                validate_sql_value(name, value_type="feature name")
+
+                # Validate project and entity parameters used in table name construction
+                project = kwds["project"]
+                entity = kwds["entity"]
+                validate_table_name(project)
+                validate_table_name(entity)
+                table_name = "fg_{}__{}".format(project, entity)
+
                 if self.value == "null" or self.value is None:
                     base_path = CONFIG_BASE_URL
-                    table_name = "fg_{}__{}".format(kwds["project"], kwds["entity"])
                     path = os.path.join(base_path, "data", table_name)
                 else:
                     if isinstance(self.value, FeatureStoreFileOutput):
                         base_path = self.value.path
                     else:
                         base_path = self.value["path"]
-                    table_name = "fg_{}__{}".format(kwds["project"], kwds["entity"])
                     path = os.path.join(base_path, table_name)
                 try:
                     delta_table = DeltaTable.forPath(spark, path)
@@ -428,8 +468,12 @@ class OnlineStore:
                 if spark is None:
                     spark = SparkSession.builder.getOrCreate()
 
+                # Validate project and name parameters used in file name construction
                 name = kwargs.get("name")
-                file_name_complete = "fs_{}__{}".format(kwargs["project"], name)
+                project = kwargs["project"]
+                validate_table_name(project)
+                validate_table_name(name)
+                file_name_complete = "fs_{}__{}".format(project, name)
 
                 if self.value is None:
                     base_path = CONFIG_BASE_URL
@@ -454,8 +498,12 @@ class OnlineStore:
     def delete(self, *args, **kwargs):
         match self.kind:
             case OnlineStoreEnum.FILE:
+                # Validate project and name parameters used in file name construction
                 name = kwargs.get("name")
-                file_name_complete = "fs_{}__{}".format(kwargs["project"], name)
+                project = kwargs["project"]
+                validate_table_name(project)
+                validate_table_name(name)
+                file_name_complete = "fs_{}__{}".format(project, name)
 
                 if self.value == "null" or self.value is None:
                     base_path = CONFIG_BASE_URL

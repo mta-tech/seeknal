@@ -37,6 +37,7 @@ from ..tasks.sparkengine.transformers import (
     FilterByExpr,
 )
 from ..tasks.duckdb import DuckDBTask
+from ..validation import validate_column_name, validate_sql_value
 
 
 class Materialization(BaseModel):
@@ -1006,6 +1007,11 @@ class HistoricalFeatures:
             if i not in spine_columns:
                 raise ValueError("Spine DataFrame must contain all join keys")
         spine_df = self.spark.createDataFrame(spine)
+
+        # Validate join_keys before using them in SQL expressions
+        for join_key in self.lookup_key.join_keys:
+            validate_column_name(join_key)
+
         if date_col is not None:
             point_in_time = PointInTime(
                 spine=spine_df,
@@ -1377,11 +1383,17 @@ class OnlineFeatures:
         for i in keys:
             if isinstance(i, dict):
                 for k, v in i.items():
+                    # Validate column name and value to prevent SQL injection
+                    validate_column_name(k)
+                    validate_sql_value(str(v), value_type="key value")
                     keys_str.append(f"{k}='{v}'")
             elif isinstance(i, Entity):
                 if i.name != self.lookup_key.name:
                     raise ValueError("Provided entity is not correct.")
                 for k, v in i.key_values.items():
+                    # Validate column name and value to prevent SQL injection
+                    validate_column_name(k)
+                    validate_sql_value(str(v), value_type="key value")
                     keys_str.append(f"{k}='{v}'")
         keys_stm = " AND ".join(keys_str)
         if filter is not None:
