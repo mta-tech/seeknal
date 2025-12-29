@@ -33,6 +33,23 @@ def quiet():
     # numpy.warnings.filterwarnings('ignore')
 
 
+@pytest.fixture(autouse=True)
+def enable_seeknal_logger_propagation():
+    """
+    Enable log propagation for the seeknal logger during tests.
+
+    The seeknal logger has propagate=False by default (set in context.py),
+    which prevents pytest's caplog fixture from capturing log messages.
+    This fixture temporarily enables propagation for each test so that
+    caplog can capture warnings and other log messages.
+    """
+    seeknal_logger = logging.getLogger("seeknal")
+    original_propagate = seeknal_logger.propagate
+    seeknal_logger.propagate = True
+    yield
+    seeknal_logger.propagate = original_propagate
+
+
 @pytest.fixture(scope="session")
 def spark_temp_dirs(tmpdir_factory):
     return tmpdir_factory.mktemp("spark-warehouse"), tmpdir_factory.mktemp("meta_dir")

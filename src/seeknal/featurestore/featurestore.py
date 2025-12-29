@@ -1,7 +1,7 @@
 import shutil
 from dataclasses import dataclass, asdict, field
 from enum import Enum
-from typing import Any, Optional, Union
+from typing import Any, List, Optional, Union
 from abc import ABC, abstractmethod
 import pandas as pd
 from pydantic import BaseModel
@@ -98,9 +98,10 @@ class OfflineStore:
             self._validate_path_security()
 
         if self.value is not None:
-            self.value = (
-                self.value.to_dict() if not isinstance(self.value, str) else self.value
-            )
+            if hasattr(self.value, 'to_dict'):
+                self.value = self.value.to_dict()
+            elif not isinstance(self.value, (str, dict)):
+                self.value = str(self.value)
         self.kind = self.kind.value
 
     def _validate_path_security(self):
@@ -428,3 +429,202 @@ class OfflineStore:
                     elif end_date is not None:
                         df = df.filter(df.event_time <= end_date)
                     return df
+
+@dataclass
+class OnlineStore:
+    """Configuration for online feature store.
+
+    Attributes:
+        value: The storage configuration (file path or hive table).
+            A security warning will be logged if a file path is in an insecure
+            location (e.g., /tmp).
+        kind: Type of online store (FILE or HIVE_TABLE).
+        name: Optional name for the store.
+    """
+    value: Optional[
+        Union[str, FeatureStoreFileOutput, FeatureStoreHiveTableOutput]
+    ] = None
+    kind: OnlineStoreEnum = OnlineStoreEnum.FILE
+    name: Optional[str] = None
+
+    def __post_init__(self):
+        # Validate path security for file-based storage
+        if self.kind == OnlineStoreEnum.FILE:
+            self._validate_path_security()
+
+        if self.value is not None:
+            if hasattr(self.value, 'to_dict'):
+                self.value = self.value.to_dict()
+            elif not isinstance(self.value, (str, dict)):
+                self.value = str(self.value)
+        self.kind = self.kind.value
+
+    def _validate_path_security(self):
+        """Validate and warn if the storage path is insecure."""
+        if self.value is None:
+            return
+
+        # If value is FeatureStoreFileOutput, it validates in its own __post_init__
+        if isinstance(self.value, FeatureStoreFileOutput):
+            return
+
+        # Extract path from value
+        path = None
+        if isinstance(self.value, str):
+            # Try to parse as JSON
+            try:
+                value_dict = json.loads(self.value)
+                path = value_dict.get("path")
+            except (json.JSONDecodeError, TypeError):
+                # Not valid JSON, might be a direct path string
+                path = self.value
+        elif isinstance(self.value, dict):
+            path = self.value.get("path")
+
+        if path:
+            warn_if_insecure_path(path, context="online store", logger=logger)
+
+    def __call__(
+        self,
+        result: Optional[Union[DataFrame, pd.DataFrame]] = None,
+        spark: Optional[SparkSession] = None,
+        write=True,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        match self.kind:
+            case OnlineStoreEnum.FILE:
+                if spark is None:
+                    spark = SparkSession.builder.getOrCreate()
+
+                name = kwargs.get("name")
+                file_name_complete = "fs_{}__{}".format(kwargs["project"], name)
+
+                if self.value is None:
+                    base_path = CONFIG_BASE_URL
+                    path = os.path.join(base_path, "data", file_name_complete)
+                else:
+                    if type(self.value) == str:
+                        self.value = json.loads(self.value)
+                    base_path = self.value["path"]
+                    path = os.path.join(base_path, file_name_complete)
+                if write:
+                    if isinstance(result, DataFrame):
+                        result.write.mode("overwrite").parquet(path)
+                    elif isinstance(result, pd.DataFrame):
+                        os.mkdir(path)
+                        result.to_parquet(os.path.join(path, "file.parquet"))
+
+                sql_reader = DuckDBTask().add_input(
+                    path=os.path.join(path, "*.parquet")
+                )
+                return sql_reader
+
+    def delete(self, *args, **kwargs):
+        match self.kind:
+            case OnlineStoreEnum.FILE:
+                name = kwargs.get("name")
+                file_name_complete = "fs_{}__{}".format(kwargs["project"], name)
+
+                if self.value == "null" or self.value is None:
+                    base_path = CONFIG_BASE_URL
+                    path = os.path.join(base_path, "data", file_name_complete)
+                else:
+                    base_path = self.value["path"]
+                    path = os.path.join(base_path, file_name_complete)
+                if os.path.exists(path):
+                    shutil.rmtree(path)
+                return True
+
+
+class FillNull(BaseModel):
+    """Configuration for filling null values in columns.
+
+    Attributes:
+        value: Value to use for filling nulls.
+        dataType: Data type for the value (e.g., 'double', 'string').
+        columns: Optional list of columns to fill. If None, applies to all columns.
+    """
+    value: str
+    dataType: str
+    columns: Optional[List[str]] = None
+
+    def to_dict(self):
+        return {k: v for k, v in self.model_dump().items() if v is not None}
+
+
+class OfflineMaterialization(BaseModel):
+    """Configuration for offline materialization.
+
+    Attributes:
+        store: The offline store configuration.
+        mode: Write mode ('overwrite', 'append', 'merge').
+        ttl: Time-to-live in days for data retention.
+    """
+    store: Optional[OfflineStore] = None
+    mode: str = "overwrite"
+    ttl: Optional[int] = None
+
+
+class OnlineMaterialization(BaseModel):
+    """Configuration for online materialization.
+
+    Attributes:
+        store: The online store configuration.
+        ttl: Time-to-live in minutes for online store data.
+    """
+    store: Optional[OnlineStore] = None
+    ttl: Optional[int] = 1440
+
+    model_config = {
+        "use_enum_values": True
+    }
+
+
+class Feature(BaseModel):
+    """Define a Feature.
+
+    Attributes:
+        name: Feature name.
+        feature_id: Feature ID (assigned by seeknal).
+        description: Feature description.
+        data_type: Data type for the feature.
+        online_data_type: Data type when stored in online-store.
+        created_at: Creation timestamp.
+        updated_at: Last update timestamp.
+    """
+    name: str
+    feature_id: Optional[str] = None
+    description: Optional[str] = None
+    data_type: Optional[str] = None
+    online_data_type: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    def to_dict(self):
+        _dict = {
+            "metadata": {"name": self.name},
+            "datatype": self.data_type,
+            "onlineDatatype": self.online_data_type,
+        }
+        if self.description is not None:
+            _dict["metadata"]["description"] = self.description
+        return _dict
+
+
+@dataclass
+class FeatureStore(ABC):
+    """Abstract base class for feature stores.
+
+    Attributes:
+        name: Feature store name.
+        entity: Associated entity.
+        id: Feature store ID.
+    """
+    name: str
+    entity: Optional[Entity] = None
+    id: Optional[str] = None
+
+    @abstractmethod
+    def get_or_create(self):
+        pass
