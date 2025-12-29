@@ -207,15 +207,17 @@ class TestGetSecurePathRecommendation:
 class TestWarnIfInsecurePath:
     """Tests for warn_if_insecure_path function."""
 
-    def test_insecure_path_logs_warning(self, caplog):
+    def test_insecure_path_logs_warning(self):
         """Insecure paths should trigger a warning log."""
-        with caplog.at_level(logging.WARNING):
-            is_insecure, alt = warn_if_insecure_path("/tmp/data")
+        mock_logger = mock.Mock(spec=logging.Logger)
+        is_insecure, alt = warn_if_insecure_path("/tmp/data", logger=mock_logger)
 
         assert is_insecure is True
         assert alt is not None
-        assert "Security Warning" in caplog.text
-        assert "/tmp/data" in caplog.text
+        mock_logger.warning.assert_called_once()
+        warning_message = mock_logger.warning.call_args[0][0]
+        assert "Security Warning" in warning_message
+        assert "/tmp/data" in warning_message
 
     def test_secure_path_no_warning(self, caplog):
         """Secure paths should not trigger a warning."""
@@ -229,12 +231,14 @@ class TestWarnIfInsecurePath:
         assert alt is None
         assert "Security Warning" not in caplog.text
 
-    def test_context_included_in_warning(self, caplog):
+    def test_context_included_in_warning(self):
         """Context string should be included in the warning message."""
-        with caplog.at_level(logging.WARNING):
-            warn_if_insecure_path("/tmp/data", context="offline store")
+        mock_logger = mock.Mock(spec=logging.Logger)
+        warn_if_insecure_path("/tmp/data", context="offline store", logger=mock_logger)
 
-        assert "for offline store" in caplog.text
+        mock_logger.warning.assert_called_once()
+        warning_message = mock_logger.warning.call_args[0][0]
+        assert "for offline store" in warning_message
 
     def test_custom_logger(self):
         """Custom logger should be used when provided."""
