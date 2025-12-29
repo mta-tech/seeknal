@@ -468,8 +468,12 @@ class OnlineStore:
                 if spark is None:
                     spark = SparkSession.builder.getOrCreate()
 
+                # Validate project and name parameters used in file name construction
                 name = kwargs.get("name")
-                file_name_complete = "fs_{}__{}".format(kwargs["project"], name)
+                project = kwargs["project"]
+                validate_table_name(project)
+                validate_table_name(name)
+                file_name_complete = "fs_{}__{}".format(project, name)
 
                 if self.value is None:
                     base_path = CONFIG_BASE_URL
@@ -494,8 +498,12 @@ class OnlineStore:
     def delete(self, *args, **kwargs):
         match self.kind:
             case OnlineStoreEnum.FILE:
+                # Validate project and name parameters used in file name construction
                 name = kwargs.get("name")
-                file_name_complete = "fs_{}__{}".format(kwargs["project"], name)
+                project = kwargs["project"]
+                validate_table_name(project)
+                validate_table_name(name)
+                file_name_complete = "fs_{}__{}".format(project, name)
 
                 if self.value == "null" or self.value is None:
                     base_path = CONFIG_BASE_URL
