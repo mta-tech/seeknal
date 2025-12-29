@@ -203,5 +203,87 @@ TURSO_DATABASE_URL = "<your-turso-database-url>"
 TURSO_AUTH_TOKEN = "<your-turso-auth-token>"
 ```
 
+## Storage Security Best Practices
+
+Seeknal handles potentially sensitive feature data, so it's important to use secure storage paths. By default, Seeknal stores configuration and data in `~/.seeknal/`, which is a secure, user-specific directory.
+
+### Why Avoid `/tmp` and World-Writable Directories
+
+Using `/tmp` or other world-writable directories for data storage creates several security risks:
+
+| Risk | Description |
+|------|-------------|
+| **Data Exposure** | Other users on the system can read your feature data |
+| **Symlink Attacks** | Malicious users can create symlinks to redirect writes |
+| **Data Persistence** | Temporary directories may be cleared unexpectedly |
+| **Container Sharing** | In containerized environments, `/tmp` might be shared across containers |
+
+### Recommended Storage Paths
+
+We recommend using one of these secure storage locations:
+
+1. **Default Path** (`~/.seeknal/`): User-specific directory with restricted permissions
+2. **XDG-Compliant Path** (`~/.local/share/seeknal/`): If `XDG_DATA_HOME` is set
+3. **Custom Path**: Set via `SEEKNAL_BASE_CONFIG_PATH` environment variable
+
+Example secure path configurations:
+
+```python
+# Using secure default path
+from seeknal.featurestore.feature_group import OfflineStore, OfflineStoreEnum, FeatureStoreFileOutput
+
+# Recommended: Use ~/.seeknal/ paths
+offline_store = OfflineStore(
+    kind=OfflineStoreEnum.FILE,
+    name="secure_store",
+    value=FeatureStoreFileOutput(path="~/.seeknal/feature_store")
+)
+
+# For production: Use cloud storage
+offline_store = OfflineStore(
+    kind=OfflineStoreEnum.FILE,
+    name="cloud_store",
+    value=FeatureStoreFileOutput(path="s3a://my-bucket/feature_store")
+)
+```
+
+### Configuring Custom Storage Path
+
+You can configure a custom base storage path using the `SEEKNAL_BASE_CONFIG_PATH` environment variable. This is useful for:
+
+- Team environments with shared storage
+- Production deployments with specific storage requirements
+- Testing with isolated directories
+
+Set the environment variable in your `.env` file or shell:
+
+```bash
+# In .env file
+SEEKNAL_BASE_CONFIG_PATH="/path/to/secure/storage"
+
+# Or export in shell
+export SEEKNAL_BASE_CONFIG_PATH="/path/to/secure/storage"
+```
+
+When creating directories for Seeknal data, ensure they have secure permissions:
+
+```python
+import os
+
+# Create directory with secure permissions (owner read/write/execute only)
+os.makedirs(os.path.expanduser("~/.seeknal/feature_store"), mode=0o700, exist_ok=True)
+```
+
+### Automatic Security Warnings
+
+Seeknal automatically validates storage paths and logs warnings when insecure locations are detected. If you see a warning like:
+
+```
+Security Warning: Using insecure path '/tmp/feature_store' for offline store.
+Consider using a secure alternative like '/home/user/.seeknal/feature_store'.
+```
+
+This indicates you should update your configuration to use a secure path. The warning will include a recommended secure alternative based on your current path.
+
 ## Contributing
 Contributions are welcome! Please read our contributing guidelines before submitting pull requests.

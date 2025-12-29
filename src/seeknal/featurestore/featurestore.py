@@ -24,6 +24,7 @@ from ..validation import (
     validate_table_name,
     validate_sql_value,
 )
+from ..utils.path_security import warn_if_insecure_path
 
 
 class OfflineStoreEnum(str, Enum):
@@ -42,8 +43,23 @@ class FileKindEnum(str, Enum):
 
 @dataclass
 class FeatureStoreFileOutput:
+    """
+    Configuration for file-based feature store output.
+
+    Attributes:
+        path: The filesystem path for storing feature data. A security warning
+            will be logged if this path is in an insecure location (e.g., /tmp).
+        kind: The file format to use (default: DELTA).
+    """
+
     path: str
     kind: FileKindEnum = FileKindEnum.DELTA
+
+    def __post_init__(self):
+        """Validate the path and warn if it's in an insecure location."""
+        warn_if_insecure_path(
+            self.path, context="feature store file output", logger=logger
+        )
 
     def to_dict(self):
         return {"path": self.path, "kind": self.kind.value}
@@ -59,6 +75,17 @@ class FeatureStoreHiveTableOutput:
 
 @dataclass
 class OfflineStore:
+    """
+    Configuration for offline feature store storage.
+
+    Attributes:
+        value: The storage configuration (path for FILE, database for HIVE_TABLE).
+            A security warning will be logged if a file path is in an insecure
+            location (e.g., /tmp).
+        kind: The storage type (FILE or HIVE_TABLE).
+        name: Optional name for this offline store configuration.
+    """
+
     value: Optional[
         Union[str, FeatureStoreFileOutput, FeatureStoreHiveTableOutput]
     ] = None
@@ -66,11 +93,40 @@ class OfflineStore:
     name: Optional[str] = None
 
     def __post_init__(self):
+        # Validate path security for file-based storage
+        if self.kind == OfflineStoreEnum.FILE:
+            self._validate_path_security()
+
         if self.value is not None:
             self.value = (
                 self.value.to_dict() if not isinstance(self.value, str) else self.value
             )
         self.kind = self.kind.value
+
+    def _validate_path_security(self):
+        """Validate and warn if the storage path is insecure."""
+        if self.value is None:
+            return
+
+        # If value is FeatureStoreFileOutput, it validates in its own __post_init__
+        if isinstance(self.value, FeatureStoreFileOutput):
+            return
+
+        # Extract path from value
+        path = None
+        if isinstance(self.value, str):
+            # Try to parse as JSON
+            try:
+                value_dict = json.loads(self.value)
+                path = value_dict.get("path")
+            except (json.JSONDecodeError, TypeError):
+                # Not valid JSON, might be a direct path string
+                path = self.value
+        elif isinstance(self.value, dict):
+            path = self.value.get("path")
+
+        if path:
+            warn_if_insecure_path(path, context="offline store", logger=logger)
 
     def get_or_create(self):
         if self.name is None:
@@ -372,240 +428,3 @@ class OfflineStore:
                     elif end_date is not None:
                         df = df.filter(df.event_time <= end_date)
                     return df
-            case None:
-                return result
-        return None
-
-    def delete(
-        self, spark: Optional[SparkSession] = None, *args: Any, **kwds: Any
-    ) -> Any:
-        match self.kind:
-            case OfflineStoreEnum.HIVE_TABLE:
-                if spark is None:
-                    spark = SparkSession.builder.getOrCreate()
-                name = kwds.get("name")
-                # Validate name used in WHERE clause
-                validate_sql_value(name, value_type="feature name")
-                if self.value is None:
-                    database = "seeknal"
-                else:
-                    database = self.value.database
-
-                # Validate database name and table components
-                validate_database_name(database)
-                project = kwds["project"]
-                entity = kwds["entity"]
-                validate_table_name(project)
-                validate_table_name(entity)
-
-                try:
-                    delta_table = DeltaTable.forName(
-                        spark,
-                        "{}.fg_{}_{}".format(database, project, entity),
-                    )
-                    delta_table.delete(f"name = '{name}'")
-                except:
-                    logger.error("Table is not a delta table.")
-                return True
-            case OfflineStoreEnum.FILE:
-                if spark is None:
-                    spark = SparkSession.builder.getOrCreate()
-                name = kwds.get("name")
-                # Validate name used in WHERE clause
-                validate_sql_value(name, value_type="feature name")
-
-                # Validate project and entity parameters used in table name construction
-                project = kwds["project"]
-                entity = kwds["entity"]
-                validate_table_name(project)
-                validate_table_name(entity)
-                table_name = "fg_{}__{}".format(project, entity)
-
-                if self.value == "null" or self.value is None:
-                    base_path = CONFIG_BASE_URL
-                    path = os.path.join(base_path, "data", table_name)
-                else:
-                    if isinstance(self.value, FeatureStoreFileOutput):
-                        base_path = self.value.path
-                    else:
-                        base_path = self.value["path"]
-                    path = os.path.join(base_path, table_name)
-                try:
-                    delta_table = DeltaTable.forPath(spark, path)
-                    delta_table.delete(f"name = '{name}'")
-                except:
-                    logger.error("Table not found")
-            case None:
-                return False
-        return False
-
-
-@dataclass
-class OnlineStore:
-    value: Optional[
-        Union[str, FeatureStoreFileOutput, FeatureStoreHiveTableOutput]
-    ] = None
-    kind: OnlineStoreEnum = OnlineStoreEnum.FILE
-    name: Optional[str] = None
-
-    def __post_init__(self):
-        if self.value is not None:
-            self.value = (
-                self.value.to_dict() if not isinstance(self.value, str) else self.value
-            )
-        self.kind = self.kind.value
-
-    def __call__(
-        self,
-        result: Optional[Union[DataFrame, pd.DataFrame]] = None,
-        spark: Optional[SparkSession] = None,
-        write=True,
-        *args: Any,
-        **kwargs: Any,
-    ):
-        match self.kind:
-            case OnlineStoreEnum.FILE:
-                if spark is None:
-                    spark = SparkSession.builder.getOrCreate()
-
-                # Validate project and name parameters used in file name construction
-                name = kwargs.get("name")
-                project = kwargs["project"]
-                validate_table_name(project)
-                validate_table_name(name)
-                file_name_complete = "fs_{}__{}".format(project, name)
-
-                if self.value is None:
-                    base_path = CONFIG_BASE_URL
-                    path = os.path.join(base_path, "data", file_name_complete)
-                else:
-                    if type(self.value) == str:
-                        self.value = json.loads(self.value)
-                    base_path = self.value["path"]
-                    path = os.path.join(base_path, file_name_complete)
-                if write:
-                    if isinstance(result, DataFrame):
-                        result.write.mode("overwrite").parquet(path)
-                    elif isinstance(result, pd.DataFrame):
-                        os.mkdir(path)
-                        result.to_parquet(os.path.join(path, "file.parquet"))
-
-                sql_reader = DuckDBTask().add_input(
-                    path=os.path.join(path, "*.parquet")
-                )
-                return sql_reader
-
-    def delete(self, *args, **kwargs):
-        match self.kind:
-            case OnlineStoreEnum.FILE:
-                # Validate project and name parameters used in file name construction
-                name = kwargs.get("name")
-                project = kwargs["project"]
-                validate_table_name(project)
-                validate_table_name(name)
-                file_name_complete = "fs_{}__{}".format(project, name)
-
-                if self.value == "null" or self.value is None:
-                    base_path = CONFIG_BASE_URL
-                    path = os.path.join(base_path, "data", file_name_complete)
-                else:
-                    base_path = self.value["path"]
-                    path = os.path.join(base_path, file_name_complete)
-                if os.path.exists(path):
-                    shutil.rmtree(path)
-                return True
-
-
-class FillNull(BaseModel):
-    """
-    List columns that want the nulls to be filled
-    Attributes:
-        value (str): value for filling the nulls
-        dataType (str): data type for the correspond value to specific datatype
-        columns (List[str], optional): Determines which columns to be filled the nulls
-    """
-
-    value: str
-    dataType: str
-    columns: Optional[List[str]] = None
-
-    def to_dict(self):
-        return {k: v for k, v in asdict(self).items() if v is not None}
-
-
-class OfflineMaterialization(BaseModel):
-    store: Optional[OfflineStore] = None
-    mode: str = "overwrite"
-    ttl: Optional[int] = None
-
-
-class OnlineMaterialization(BaseModel):
-    """
-    Online materialization options
-
-    Attributes:
-        serving_ttl_days (int, optional): Look back window for features defined at the online-store.
-            This parameters determines how long features will live in the online store. The unit is in days.
-            Shorter TTLs improve performance and reduce computation. Default to 1.
-            For example, if we set TTLs as 1 then only one day data available in online-store
-        force_update (bool, optional): force to update the data in online-store without considering
-            the data that going materialized is newer than the data that already stored in online-store.
-            Default to False.
-    """
-
-    store: OnlineStore = OnlineStore()
-    ttl: Optional[int] = 1440
-
-    #class Config:
-    #    use_enum_values = True
-    model_config = {
-        "use_enum_values": True
-    }
-
-
-class Feature(BaseModel):
-    """
-    Define Feature
-
-    Attributes:
-        name (str): name of feature
-        feature_id (str, optional): feature id. Should not define by user but by seeknal.
-        description (str, optional): description of the feature
-        data_type (str, optional): data type for the feature. If None, then
-            it will expect `set_features()` method to run for getting the correct
-            data type.
-        online_data_type (str, optional): data type when stored in online-store. If None,
-            it will use data_type
-        created_at (str, optional): when the feature created
-        updated_at (str, optional): when the feature updated
-    """
-
-    name: str
-    feature_id: Optional[str] = None
-    description: Optional[str] = None
-    data_type: Optional[str] = None
-    online_data_type: Optional[str] = None
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
-
-    def to_dict(self):
-        _dict = {
-            "metadata": {"name": self.name},
-            "datatype": self.data_type,
-            "onlineDatatype": self.online_data_type,
-        }
-        if self.description is not None:
-            _dict["metadata"]["description"] = self.description
-        return _dict
-
-
-@dataclass
-class FeatureStore(ABC):
-
-    name: str
-    entity: Optional[Entity] = None
-    id: Optional[str] = None
-
-    @abstractmethod
-    def get_or_create(self):
-        pass

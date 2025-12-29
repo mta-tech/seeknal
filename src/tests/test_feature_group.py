@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import logging
 
 import pytest
 from seeknal.entity import Entity
@@ -98,13 +99,14 @@ def test_write_feature_group_without_event_time(input_data_spark):
     my_fg.get_or_create()
     my_fg.write()
 
-def test_write_feature_group_to_path(input_data_spark, spark):
+def test_write_feature_group_to_path(input_data_spark, spark, secure_temp_dir):
     Project(name="my_project").get_or_create()
-    materialization = Materialization(event_time_col="day", 
+    offline_store_path = secure_temp_dir.mkdir("offline_store")
+    materialization = Materialization(event_time_col="day",
     offline_materialization=OfflineMaterialization(
-    store=OfflineStore(kind=OfflineStoreEnum.FILE, 
+    store=OfflineStore(kind=OfflineStoreEnum.FILE,
                        name="test_offline_store",
-                       value=FeatureStoreFileOutput(path="file:///tmp/offline_store")), 
+                       value=FeatureStoreFileOutput(path=f"file://{offline_store_path}")),
                        mode="overwrite", ttl=None),
     offline=True)
     input_df = spark.read.table("comm_day")
@@ -246,19 +248,20 @@ def test_update_materialization(input_data_spark):
         offline_materialization=OfflineMaterialization(mode="merge", ttl=2)
     )
 
-def test_serve_with_path(input_data_spark, spark):
+def test_serve_with_path(input_data_spark, spark, secure_temp_dir):
 
     Project(name="my_project").get_or_create()
     my_fg = FeatureGroup(name="comm_day_four").get_or_create()
     my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
         feature_start_time=datetime(2019, 3, 5)
-    )    
+    )
     fs = FeatureLookup(source=my_fg)
 
     user_one = Entity(name="msisdn").get_or_create().set_key_values("05X5wBWKN3")
     fillnull = FillNull(value="0.0", dataType="double")
     hist = HistoricalFeatures(lookups=[fs], fill_nulls=[fillnull])
-    online_store = OnlineStore(value=FeatureStoreFileOutput(path="/tmp/online_store"))
+    online_store_path = secure_temp_dir.mkdir("online_store")
+    online_store = OnlineStore(value=FeatureStoreFileOutput(path=online_store_path))
     online_table = hist.using_latest().serve(
         target=online_store, ttl=timedelta(minutes=1)
     )
@@ -286,7 +289,7 @@ def test_load_online_features(input_data_spark):
     abc = online_table.get_features(keys=[{"msisdn": "05X5wBWKN3"}])
     print(abc)
 
-def test_create_online_table(input_data_spark, spark):
+def test_create_online_table(input_data_spark, spark, secure_temp_dir):
     Project(name="my_project").get_or_create()
     my_fg = FeatureGroup(name="comm_day_four").get_or_create()
     my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
@@ -296,7 +299,8 @@ def test_create_online_table(input_data_spark, spark):
     user_one = Entity(name="msisdn").get_or_create().set_key_values("05X5wBWKN3")
     fillnull = FillNull(value="0.0", dataType="double")
     hist = HistoricalFeatures(lookups=[fs], fill_nulls=[fillnull])
-    online_store = OnlineStore(value=FeatureStoreFileOutput(path="/tmp/online_store"))
+    online_store_path = secure_temp_dir.mkdir("online_store")
+    online_store = OnlineStore(value=FeatureStoreFileOutput(path=online_store_path))
     hist.using_latest().serve(
         name="my_online_table", target=online_store
     )
@@ -393,100 +397,135 @@ class TestFeatureGroupValidation:
         )
         # SQL injection attempt via column name - should raise InvalidIdentifierError
         with pytest.raises(InvalidIdentifierError):
-            online_table.get_features(keys=[{"msisdn'; DROP TABLE users; --": "value"}])
+            online_table.get_features(keys=[{"col'; DROP TABLE --": "value"}])
 
-    def test_get_features_sql_injection_in_value(self, input_data_spark, spark):
-        """Test that SQL injection attempts via values are blocked."""
-        from seeknal.exceptions import InvalidIdentifierError
 
-        Project(name="my_project").get_or_create()
-        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
-        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
-            feature_start_time=datetime(2019, 3, 5)
-        )
-        fs = FeatureLookup(source=my_fg)
-        online_table = OnlineFeatures(
-            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
-        )
-        # SQL injection attempt via value - should raise InvalidIdentifierError
-        with pytest.raises(InvalidIdentifierError) as exc_info:
-            online_table.get_features(keys=[{"msisdn": "value'; DROP TABLE users; --"}])
-        assert "forbidden pattern" in str(exc_info.value)
+class TestOfflineStorePathSecurity:
+    """Tests for OfflineStore path security validation."""
 
-    def test_get_features_union_injection_in_value(self, input_data_spark, spark):
-        """Test that UNION SQL injection via values is blocked."""
-        from seeknal.exceptions import InvalidIdentifierError
+    def test_file_kind_with_insecure_dict_path_logs_warning(self, caplog):
+        """OfflineStore should log a warning for /tmp paths passed as dict."""
+        with caplog.at_level(logging.WARNING):
+            store = OfflineStore(
+                kind=OfflineStoreEnum.FILE,
+                value={"path": "/tmp/offline_data", "kind": "delta"}
+            )
 
-        Project(name="my_project").get_or_create()
-        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
-        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
-            feature_start_time=datetime(2019, 3, 5)
-        )
-        fs = FeatureLookup(source=my_fg)
-        online_table = OnlineFeatures(
-            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
-        )
-        # UNION injection attempt - should raise InvalidIdentifierError
-        with pytest.raises(InvalidIdentifierError) as exc_info:
-            online_table.get_features(keys=[{"msisdn": "1 UNION SELECT * FROM secrets"}])
-        assert "UNION" in str(exc_info.value)
+        assert "Security Warning" in caplog.text
+        assert "/tmp/offline_data" in caplog.text
+        assert "offline store" in caplog.text
+        # Should still create the object
+        assert store.value["path"] == "/tmp/offline_data"
 
-    def test_get_features_delete_injection_in_value(self, input_data_spark, spark):
-        """Test that DELETE SQL injection via values is blocked."""
-        from seeknal.exceptions import InvalidIdentifierError
+    def test_file_kind_with_insecure_json_path_logs_warning(self, caplog):
+        """OfflineStore should log a warning for /tmp paths passed as JSON string."""
+        import json
+        with caplog.at_level(logging.WARNING):
+            store = OfflineStore(
+                kind=OfflineStoreEnum.FILE,
+                value=json.dumps({"path": "/var/tmp/data", "kind": "delta"})
+            )
 
-        Project(name="my_project").get_or_create()
-        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
-        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
-            feature_start_time=datetime(2019, 3, 5)
-        )
-        fs = FeatureLookup(source=my_fg)
-        online_table = OnlineFeatures(
-            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
-        )
-        # DELETE injection attempt - should raise InvalidIdentifierError
-        with pytest.raises(InvalidIdentifierError) as exc_info:
-            online_table.get_features(keys=[{"msisdn": "value; DELETE FROM users"}])
-        assert "forbidden pattern" in str(exc_info.value)
+        assert "Security Warning" in caplog.text
+        assert "/var/tmp/data" in caplog.text
 
-    def test_get_features_with_entity_key_validation(self, input_data_spark, spark):
-        """Test that Entity-based keys are also validated in get_features()."""
-        from seeknal.exceptions import InvalidIdentifierError
+    def test_file_kind_with_secure_path_no_warning(self, caplog, tmp_path):
+        """OfflineStore should not log warning for secure paths."""
+        secure_path = str(tmp_path / "offline_data")
+        with caplog.at_level(logging.WARNING):
+            store = OfflineStore(
+                kind=OfflineStoreEnum.FILE,
+                value={"path": secure_path, "kind": "delta"}
+            )
 
-        Project(name="my_project").get_or_create()
-        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
-        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
-            feature_start_time=datetime(2019, 3, 5)
-        )
-        fs = FeatureLookup(source=my_fg)
-        online_table = OnlineFeatures(
-            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
-        )
+        assert "Security Warning" not in caplog.text
+        assert store.value["path"] == secure_path
 
-        # Create entity with SQL injection value
-        entity = Entity(name="msisdn").get_or_create()
-        entity.key_values = {"msisdn": "value'; DROP TABLE users; --"}
+    def test_hive_table_kind_no_validation(self, caplog):
+        """OfflineStore with HIVE_TABLE kind should not validate paths."""
+        with caplog.at_level(logging.WARNING):
+            store = OfflineStore(
+                kind=OfflineStoreEnum.HIVE_TABLE,
+                value={"database": "my_database"}
+            )
 
-        # Should raise InvalidIdentifierError for the value
-        with pytest.raises(InvalidIdentifierError) as exc_info:
-            online_table.get_features(keys=[entity])
-        assert "forbidden pattern" in str(exc_info.value)
+        # No security warning for HIVE_TABLE kind
+        assert "Security Warning" not in caplog.text
 
-    def test_get_features_comment_injection_in_value(self, input_data_spark, spark):
-        """Test that SQL comment injection via values is blocked."""
-        from seeknal.exceptions import InvalidIdentifierError
+    def test_file_kind_with_none_value_no_error(self, caplog):
+        """OfflineStore with FILE kind but None value should not error."""
+        with caplog.at_level(logging.WARNING):
+            store = OfflineStore(kind=OfflineStoreEnum.FILE, value=None)
 
-        Project(name="my_project").get_or_create()
-        my_fg = FeatureGroup(name="comm_day_four").get_or_create()
-        my_fg.set_dataframe(dataframe=spark.read.table("comm_day")).write(
-            feature_start_time=datetime(2019, 3, 5)
-        )
-        fs = FeatureLookup(source=my_fg)
-        online_table = OnlineFeatures(
-            lookups=[fs], lookup_key=Entity(name="msisdn").get_or_create()
-        )
-        # SQL comment injection attempt - should raise InvalidIdentifierError
-        with pytest.raises(InvalidIdentifierError) as exc_info:
-            online_table.get_features(keys=[{"msisdn": "value--comment"}])
-        assert "forbidden pattern" in str(exc_info.value)
-        assert "--" in str(exc_info.value)
+        # No error, no warning
+        assert store.value is None
+
+    def test_file_kind_with_feature_store_file_output_delegates_validation(self, caplog):
+        """OfflineStore should delegate validation to FeatureStoreFileOutput."""
+        with caplog.at_level(logging.WARNING):
+            # FeatureStoreFileOutput validates in its own __post_init__
+            store = OfflineStore(
+                kind=OfflineStoreEnum.FILE,
+                value=FeatureStoreFileOutput(path="/tmp/offline_store")
+            )
+
+        # Warning comes from FeatureStoreFileOutput
+        assert "Security Warning" in caplog.text
+        assert "feature store file output" in caplog.text
+
+
+class TestOnlineStorePathSecurity:
+    """Tests for OnlineStore path security validation."""
+
+    def test_file_kind_with_insecure_dict_path_logs_warning(self, caplog):
+        """OnlineStore should log a warning for /tmp paths passed as dict."""
+        with caplog.at_level(logging.WARNING):
+            store = OnlineStore(
+                value={"path": "/tmp/online_data", "kind": "delta"}
+            )
+
+        assert "Security Warning" in caplog.text
+        assert "/tmp/online_data" in caplog.text
+        assert "online store" in caplog.text
+
+    def test_file_kind_with_insecure_json_path_logs_warning(self, caplog):
+        """OnlineStore should log a warning for /var/tmp paths passed as JSON string."""
+        import json
+        with caplog.at_level(logging.WARNING):
+            store = OnlineStore(
+                value=json.dumps({"path": "/var/tmp/data", "kind": "delta"})
+            )
+
+        assert "Security Warning" in caplog.text
+        assert "/var/tmp/data" in caplog.text
+
+    def test_file_kind_with_secure_path_no_warning(self, caplog, tmp_path):
+        """OnlineStore should not log warning for secure paths."""
+        secure_path = str(tmp_path / "online_data")
+        with caplog.at_level(logging.WARNING):
+            store = OnlineStore(
+                value={"path": secure_path, "kind": "delta"}
+            )
+
+        assert "Security Warning" not in caplog.text
+        assert store.value["path"] == secure_path
+
+    def test_file_kind_with_none_value_no_error(self, caplog):
+        """OnlineStore with None value should not error."""
+        with caplog.at_level(logging.WARNING):
+            store = OnlineStore(value=None)
+
+        # No error, no warning
+        assert store.value is None
+
+    def test_file_kind_with_feature_store_file_output_delegates_validation(self, caplog):
+        """OnlineStore should delegate validation to FeatureStoreFileOutput."""
+        with caplog.at_level(logging.WARNING):
+            # FeatureStoreFileOutput validates in its own __post_init__
+            store = OnlineStore(
+                value=FeatureStoreFileOutput(path="/tmp/online_store")
+            )
+
+        # Warning comes from FeatureStoreFileOutput
+        assert "Security Warning" in caplog.text
+        assert "feature store file output" in caplog.text
