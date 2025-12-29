@@ -11,62 +11,76 @@ from sqlalchemy.exc import OperationalError, TimeoutError
 
 from .context import context, DEFAULT_SEEKNAL_DB_PATH
 from .utils import check_is_dict_same
+from .db_utils import (
+    build_database_url,
+    sanitize_database_exceptions,
+    with_sanitized_exceptions,
+    DatabaseSecurityError,
+)
 import libsql_experimental as libsql
 from .models import *  # Import metadata first
 
+# Build secure database URL based on configuration
 if context.get("database"):
     if context.get("database").get("TURSO_DATABASE_URL") is not None:
         try:
-            TURSO_DATABASE_URL = context.database.TURSO_DATABASE_URL
-            TURSO_AUTH_TOKEN = context.database.TURSO_AUTH_TOKEN
-            db_url = f"sqlite+{TURSO_DATABASE_URL}/?authToken={TURSO_AUTH_TOKEN}&secure=true"
+            _turso_database_url = context.database.TURSO_DATABASE_URL
+            _turso_auth_token = context.database.TURSO_AUTH_TOKEN
+            secure_db_url = build_database_url(
+                turso_database_url=_turso_database_url,
+                turso_auth_token=_turso_auth_token,
+            )
         except BoxKeyError:
             raise ValueError("Config TURSO_DATABASE_URL and TURSO_AUTH_TOKEN is required.")
     else:
         try:
-            db_url = "sqlite:///{}".format(context.database.SEEKNAL_DB_PATH)
+            secure_db_url = build_database_url(
+                local_db_path=context.database.SEEKNAL_DB_PATH,
+            )
         except BoxKeyError:
             raise ValueError("Config SEEKNAL_DB_PATH is required.")
 else:
-    db_url = "sqlite:///{}".format(DEFAULT_SEEKNAL_DB_PATH)
+    secure_db_url = build_database_url(
+        default_db_path=DEFAULT_SEEKNAL_DB_PATH,
+    )
 
-engine = create_engine(
-    db_url,
-    connect_args={
-        'check_same_thread': False,
-        'timeout': 30  # Increase timeout to 30 seconds
-    },
-    pool_pre_ping=True,  # Add connection health check
-    pool_recycle=3600,  # Recycle connections after 1 hour
-    echo=False
-)
-engine = create_engine(
-    db_url,
-    connect_args={
-        'check_same_thread': False,
-        'timeout': 30  # Increase timeout to 30 seconds
-    },
-    pool_pre_ping=True,  # Add connection health check
-    pool_recycle=3600,  # Recycle connections after 1 hour
-    echo=False
-)
+# Wrap engine creation with sanitized exception handler to prevent credential leaks
+try:
+    with sanitize_database_exceptions():
+        engine = create_engine(
+            secure_db_url.get_connection_url(),
+            connect_args={
+                'check_same_thread': False,
+                'timeout': 30  # Increase timeout to 30 seconds
+            },
+            pool_pre_ping=True,  # Add connection health check
+            pool_recycle=3600,  # Recycle connections after 1 hour
+            echo=False
+        )
+except DatabaseSecurityError:
+    # Re-raise with sanitized message (credentials already masked)
+    raise
 
+@with_sanitized_exceptions()
 @retry(
     stop=stop_after_attempt(5),  # Increase attempts from 3 to 5
     wait=wait_exponential(multiplier=2, min=4, max=30),  # Increase wait times
     retry=retry_if_exception_type((OperationalError, TimeoutError))
 )
 def initialize_database():
+    """Initialize the database schema with sanitized error handling."""
     metadata.create_all(engine)
 
 initialize_database()
 
+@with_sanitized_exceptions()
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
     retry=retry_if_exception_type((OperationalError, TimeoutError))
 )
 def get_db_session():
+    """Get a database session with sanitized error handling."""
     return SQLSession(engine)
 
 @dataclass
