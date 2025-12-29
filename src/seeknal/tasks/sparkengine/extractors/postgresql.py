@@ -7,6 +7,8 @@ from sqlalchemy import create_engine
 import pandas as pd
 from pyspark.sql import SparkSession
 
+from seeknal.validation import validate_schema_name, validate_table_name
+
 class PostgreSQLConfig(BaseModel):
     """PostgreSQL connection configuration
 
@@ -112,6 +114,9 @@ class PostgreSQLExtractor:
         else:
             if not self.config.table:
                 raise ValueError("Either table or query must be specified")
+            # Validate schema and table names to prevent SQL injection
+            validate_schema_name(self.config.schema)
+            validate_table_name(self.config.table)
             query = f"SELECT * FROM {self.config.schema}.{self.config.table}"
 
         # Read data using pandas (more efficient for PostgreSQL)
