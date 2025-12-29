@@ -4,3 +4,4 @@ from ._featurestore_exceptions import (
     FeatureServingNotFoundError,
 )
 from ._project_exceptions import ProjectNotSetError, ProjectNotFoundError
+from ._validation_exceptions import InvalidIdentifierError, InvalidPathError
