@@ -1,0 +1,147 @@
+# Seeknal API Reference Documentation
+# https://www.mkdocs.org/user-guide/configuration/
+
+site_name: Seeknal API Reference
+site_description: Comprehensive API documentation for Seeknal - An all-in-one platform for data and AI/ML engineering
+site_url: https://mta-tech.github.io/seeknal/
+
+# Repository information
+repo_name: mta-tech/seeknal
+repo_url: https://github.com/mta-tech/seeknal
+
+# Theme configuration
+theme:
+  name: material
+  palette:
+    # Light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    # Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+  icon:
+    repo: fontawesome/brands/github
+
+# Plugins
+plugins:
+  - search:
+      separator: '[\s\-,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
+  - mkdocstrings:
+      handlers:
+        python:
+          paths:
+            - src
+          options:
+            # Display options
+            docstring_style: google
+            show_root_heading: true
+            show_root_full_path: false
+            show_source: true
+            show_bases: true
+            show_submodules: true
+            # Member options
+            members_order: source
+            group_by_category: true
+            show_category_heading: true
+            # Filtering
+            filters:
+              - "!^_"
+            inherited_members: true
+            # Signature options
+            show_signature: true
+            show_signature_annotations: true
+            separate_signature: false
+            # Docstring options
+            docstring_section_style: spacy
+            merge_init_into_class: true
+            show_if_no_docstring: false
+
+# Markdown extensions
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.betterem:
+      smart_enable: all
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.magiclink:
+      repo_url_shorthand: true
+      user: mta-tech
+      repo: seeknal
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+# Navigation
+nav:
+  - Home: index.md
+  - API Reference:
+      - Overview: api/index.md
+      - Core: api/core.md
+      - FeatureStore: api/featurestore.md
+      - Tasks: api/tasks.md
+  - Examples:
+      - Overview: examples/index.md
+      - Initialization: examples/initialization.md
+      - FeatureStore: examples/featurestore.md
+      - Flows: examples/flows.md
+      - Error Handling: examples/error_handling.md
+      - Configuration: examples/configuration.md
+
+# Extra configuration
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/mta-tech/seeknal
+  generator: false
+
+# Copyright
+copyright: Copyright &copy; 2024 MTA Tech
