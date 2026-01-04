@@ -476,6 +476,112 @@ def clean(
         raise typer.Exit(1)
 
 
+@app.command("delete-table")
+def delete_table(
+    table_name: str = typer.Argument(
+        ..., help="Name of the online table to delete"
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Force deletion without confirmation (bypass dependency warnings)"
+    ),
+):
+    """Delete an online table and all associated data files.
+
+    This command removes all data files from the online store and cleans up
+    metadata from the database. By default, it will show any dependent feature
+    groups and ask for confirmation before deleting.
+
+    Use --force to bypass confirmations and delete despite dependencies.
+    """
+    from seeknal.request import OnlineTableRequest, EntityRequest, get_db_session
+    from seeknal.models import FeatureGroupTable
+    from seeknal.featurestore.duckdbengine.feature_group import OnlineFeaturesDuckDB
+    from seeknal.featurestore.duckdbengine.featurestore import OnlineStoreDuckDB
+    from seeknal.entity import Entity
+    from sqlmodel import select
+
+    typer.echo(f"Looking up table: {table_name}")
+
+    try:
+        # Step 1: Validate table exists
+        online_table = OnlineTableRequest.select_by_name(table_name)
+        if online_table is None:
+            _echo_error(f"Table '{table_name}' not found")
+            raise typer.Exit(1)
+
+        # Step 2: Check dependencies (feature groups using this table)
+        fg_mappings = OnlineTableRequest.get_feature_group_from_online_table(online_table.id)
+        dependent_feature_groups = []
+
+        if fg_mappings:
+            with get_db_session() as session:
+                for mapping in fg_mappings:
+                    fg = session.exec(
+                        select(FeatureGroupTable).where(
+                            FeatureGroupTable.id == mapping.feature_group_id
+                        )
+                    ).first()
+                    if fg:
+                        dependent_feature_groups.append(fg.name)
+
+        # Step 3: Show warnings if dependencies exist
+        if dependent_feature_groups:
+            _echo_warning(f"Table '{table_name}' has {len(dependent_feature_groups)} dependent feature group(s):")
+            for fg_name in dependent_feature_groups:
+                typer.echo(f"  - {fg_name}")
+
+            if not force:
+                _echo_warning("Deleting this table may affect these feature groups.")
+                confirm = typer.confirm(
+                    "Are you sure you want to delete this table?",
+                    default=False
+                )
+                if not confirm:
+                    _echo_info("Deletion cancelled")
+                    raise typer.Exit(0)
+        else:
+            # No dependencies, but still confirm unless --force
+            if not force:
+                confirm = typer.confirm(
+                    f"Are you sure you want to delete table '{table_name}'?",
+                    default=False
+                )
+                if not confirm:
+                    _echo_info("Deletion cancelled")
+                    raise typer.Exit(0)
+
+        # Step 4: Get entity information for file deletion
+        entity = EntityRequest.select_by_id(online_table.entity_id)
+        entity_obj = None
+        if entity:
+            entity_obj = Entity(name=entity.name)
+
+        # Step 5: Perform deletion
+        typer.echo(f"Deleting table '{table_name}'...")
+
+        online_table_obj = OnlineFeaturesDuckDB(
+            name=table_name,
+            lookup_key=entity_obj,
+            online_store=OnlineStoreDuckDB(),
+            project="default",  # TODO: Get from online_table.project_id if needed
+            id=online_table.id
+        )
+
+        success = online_table_obj.delete()
+
+        if success:
+            _echo_success(f"Table '{table_name}' deleted successfully")
+        else:
+            _echo_warning(f"Table '{table_name}' deletion completed with warnings (check logs)")
+
+    except typer.Exit:
+        raise
+    except Exception as e:
+        _echo_error(f"Failed to delete table: {e}")
+        raise typer.Exit(1)
+
+
 def main():
     """Main entry point for the CLI."""
     app()
