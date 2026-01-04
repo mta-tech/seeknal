@@ -669,3 +669,170 @@ class RangeValidator(BaseValidator):
                 "non_null_count": non_null_count,
             },
         )
+
+
+class UniquenessValidator(BaseValidator):
+    """
+    Validator for detecting duplicate values in DataFrame columns.
+
+    This validator checks for duplicate records based on specified columns.
+    It can check uniqueness on a single column or a combination of columns
+    (composite key). The validator counts duplicate rows and can optionally
+    allow a certain percentage of duplicates.
+
+    Attributes:
+        columns (List[str]): List of column names to check for uniqueness.
+            If multiple columns are specified, the combination is checked.
+        max_duplicate_percentage (float): Maximum allowed percentage of duplicate
+            rows (between 0.0 and 1.0). Default is 0.0 (no duplicates allowed).
+
+    Example:
+        >>> # Check single column uniqueness
+        >>> validator = UniquenessValidator(columns=["user_id"])
+        >>> result = validator.validate(df)
+        >>> if not result.passed:
+        ...     print(f"Found {result.failure_count} duplicate rows")
+
+        >>> # Check composite key uniqueness
+        >>> validator = UniquenessValidator(
+        ...     columns=["user_id", "timestamp"],
+        ...     max_duplicate_percentage=0.01  # Allow up to 1% duplicates
+        ... )
+        >>> result = validator.validate(df)
+
+        >>> # Allow some duplicates (e.g., for slowly changing dimensions)
+        >>> validator = UniquenessValidator(
+        ...     columns=["product_id"],
+        ...     max_duplicate_percentage=0.05
+        ... )
+    """
+
+    def __init__(
+        self,
+        columns: List[str],
+        max_duplicate_percentage: float = 0.0,
+    ):
+        """
+        Initialize UniquenessValidator.
+
+        Args:
+            columns (List[str]): List of column names to check for uniqueness.
+                If multiple columns are provided, checks uniqueness of the
+                combination (composite key).
+            max_duplicate_percentage (float, optional): Maximum allowed percentage
+                of duplicate rows as a decimal (0.0 to 1.0). For example, 0.05
+                allows up to 5% duplicate rows. Default is 0.0 (no duplicates allowed).
+
+        Raises:
+            ValueError: If columns list is empty or max_duplicate_percentage is not
+                between 0.0 and 1.0.
+        """
+        if not columns:
+            raise ValueError("columns list cannot be empty")
+        if not 0.0 <= max_duplicate_percentage <= 1.0:
+            raise ValueError(
+                f"max_duplicate_percentage must be between 0.0 and 1.0, got {max_duplicate_percentage}"
+            )
+
+        self.columns = columns
+        self.max_duplicate_percentage = max_duplicate_percentage
+        self._name = "UniquenessValidator"
+
+    @property
+    def name(self) -> str:
+        """Return the name of this validator."""
+        return self._name
+
+    def validate(self, df: DataFrame) -> ValidationResult:
+        """
+        Validate the DataFrame for duplicate values in specified columns.
+
+        Counts duplicate rows based on the specified columns and compares
+        the percentage against the configured threshold. A row is considered
+        a duplicate if there are multiple rows with the same values for all
+        specified columns.
+
+        Args:
+            df (DataFrame): The PySpark DataFrame to validate.
+
+        Returns:
+            ValidationResult: The result containing pass/fail status,
+                duplicate count, total count, and detailed information about
+                the duplicates.
+
+        Raises:
+            ValueError: If any specified column is not found in the DataFrame.
+        """
+        # Check that all columns exist
+        self._check_columns_exist(df, self.columns)
+
+        # Get total row count
+        total_count = self._get_total_count(df)
+
+        # Handle empty DataFrame
+        if total_count == 0:
+            return ValidationResult(
+                validator_name=self.name,
+                passed=True,
+                failure_count=0,
+                total_count=0,
+                message="DataFrame is empty, no duplicates to check",
+                details={
+                    "columns": self.columns,
+                    "max_duplicate_percentage": self.max_duplicate_percentage,
+                },
+            )
+
+        # Count unique combinations of the specified columns
+        unique_count = df.select(self.columns).distinct().count()
+
+        # Calculate duplicate rows
+        # Duplicate rows = total rows - unique combinations
+        duplicate_row_count = total_count - unique_count
+
+        # Calculate duplicate percentage
+        duplicate_percentage = duplicate_row_count / total_count if total_count > 0 else 0.0
+
+        # Determine pass/fail based on threshold
+        passed = duplicate_percentage <= self.max_duplicate_percentage
+
+        # Build column description for messages
+        if len(self.columns) == 1:
+            col_desc = f"column '{self.columns[0]}'"
+        else:
+            col_desc = f"columns {self.columns}"
+
+        # Build message
+        if passed:
+            if duplicate_row_count == 0:
+                message = (
+                    f"Uniqueness check passed for {col_desc}. "
+                    f"All {total_count} rows are unique."
+                )
+            else:
+                message = (
+                    f"Uniqueness check passed for {col_desc}. "
+                    f"{duplicate_row_count} duplicate rows ({duplicate_percentage:.2%}) "
+                    f"within threshold of {self.max_duplicate_percentage:.2%}."
+                )
+        else:
+            message = (
+                f"Uniqueness check failed for {col_desc}. "
+                f"{duplicate_row_count} duplicate rows ({duplicate_percentage:.2%}) "
+                f"exceed threshold of {self.max_duplicate_percentage:.2%}."
+            )
+
+        return ValidationResult(
+            validator_name=self.name,
+            passed=passed,
+            failure_count=duplicate_row_count,
+            total_count=total_count,
+            message=message,
+            details={
+                "columns": self.columns,
+                "max_duplicate_percentage": self.max_duplicate_percentage,
+                "unique_count": unique_count,
+                "duplicate_row_count": duplicate_row_count,
+                "duplicate_percentage": duplicate_percentage,
+            },
+        )
