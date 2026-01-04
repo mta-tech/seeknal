@@ -39,7 +39,7 @@ from ..tasks.sparkengine.transformers import (
 from ..tasks.duckdb import DuckDBTask
 from ..validation import validate_column_name, validate_sql_value
 from ..feature_validation.validators import BaseValidator, ValidationRunner
-from ..feature_validation.models import ValidationMode, ValidationResult, ValidationSummary
+from ..feature_validation.models import ValidationConfig, ValidationMode, ValidationResult, ValidationSummary
 
 
 class Materialization(BaseModel):
@@ -132,6 +132,9 @@ class FeatureGroup(FeatureStore):
         features (List[Feature], optional): List of feature to be registered as features in this feature group.
             If set to None, then all columns except join_keys and event_time will
             register as features.
+        validation_config (ValidationConfig, optional): Configuration for data validation
+            including validators to run and validation mode (FAIL or WARN). When set,
+            enables declarative validation that can be used with the validate() method.
     """
 
     name: str
@@ -140,6 +143,7 @@ class FeatureGroup(FeatureStore):
     description: Optional[str] = None
     features: Optional[List[Feature]] = None
     tag: Optional[List[str]] = None
+    validation_config: Optional[ValidationConfig] = None
 
     feature_group_id: Optional[str] = None
     offline_watermarks: List[str] = field(default_factory=list)
@@ -184,6 +188,33 @@ class FeatureGroup(FeatureStore):
 
     def set_dataframe(self, dataframe: DataFrame):
         self.source = dataframe
+        return self
+
+    def set_validation_config(self, config: ValidationConfig):
+        """
+        Set validation configuration for this feature group.
+
+        Args:
+            config (ValidationConfig): Validation configuration containing
+                validators to run and validation mode (FAIL or WARN).
+
+        Returns:
+            self: Returns the FeatureGroup instance for method chaining.
+
+        Example:
+            >>> from seeknal.feature_validation.models import ValidationConfig, ValidatorConfig
+            >>>
+            >>> config = ValidationConfig(
+            ...     mode=ValidationMode.WARN,
+            ...     validators=[
+            ...         ValidatorConfig(validator_type="null", columns=["user_id"]),
+            ...         ValidatorConfig(validator_type="range", columns=["age"],
+            ...                         params={"min_val": 0, "max_val": 120})
+            ...     ]
+            ... )
+            >>> feature_group.set_validation_config(config)
+        """
+        self.validation_config = config
         return self
 
     @require_set_source
