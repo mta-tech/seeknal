@@ -1285,3 +1285,717 @@ def test_range_validator_detects_violations(spark):
     assert "RangeValidator" in result.validator_name
     assert result.details is not None
     assert "out_of_range_count" in result.details
+
+
+# =============================================================================
+# UniquenessValidator Tests
+# =============================================================================
+
+
+class TestUniquenessValidator:
+    """Comprehensive tests for the UniquenessValidator class."""
+
+    # -------------------------------------------------------------------------
+    # Basic Duplicate Detection Tests (Single Column)
+    # -------------------------------------------------------------------------
+
+    def test_detects_duplicates_in_single_column(self, spark):
+        """Test that UniquenessValidator correctly identifies duplicates in a single column."""
+        # Create DataFrame with duplicates
+        df = create_test_df_with_duplicates(spark, duplicate_count=2)
+
+        # Create validator for a single column (strict mode - no duplicates allowed)
+        validator = UniquenessValidator(columns=["user_id"], max_duplicate_percentage=0.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed due to duplicates
+        assert result.passed is False
+        assert result.failure_count > 0
+        assert result.validator_name == "UniquenessValidator"
+        assert result.details is not None
+        assert "duplicate_row_count" in result.details
+        assert result.details["duplicate_row_count"] > 0
+
+    def test_passes_when_no_duplicates_single_column(self, spark):
+        """Test that UniquenessValidator passes when there are no duplicates in a single column."""
+        # Create DataFrame without duplicates
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("name", StringType(), True),
+        ])
+        data = [(1, "alice"), (2, "bob"), (3, "charlie")]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator for single column (strict mode)
+        validator = UniquenessValidator(columns=["id"], max_duplicate_percentage=0.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed
+        assert result.passed is True
+        assert result.failure_count == 0
+        assert result.validator_name == "UniquenessValidator"
+        assert "passed" in result.message.lower()
+        assert result.details["duplicate_row_count"] == 0
+
+    def test_detects_all_duplicates_single_column(self, spark):
+        """Test that UniquenessValidator correctly counts all duplicate rows."""
+        # Create DataFrame where all rows have the same value
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("category", StringType(), True),
+        ])
+        data = [(1, "A"), (2, "A"), (3, "A"), (4, "A"), (5, "A")]  # 5 rows, 1 unique = 4 duplicates
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = UniquenessValidator(columns=["category"], max_duplicate_percentage=0.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed
+        assert result.passed is False
+        assert result.failure_count == 4  # 5 - 1 = 4 duplicate rows
+        assert result.details["unique_count"] == 1
+        assert result.details["duplicate_row_count"] == 4
+
+    # -------------------------------------------------------------------------
+    # Multi-Column (Composite Key) Tests
+    # -------------------------------------------------------------------------
+
+    def test_detects_duplicates_in_multiple_columns(self, spark):
+        """Test that UniquenessValidator correctly identifies duplicates in multiple columns."""
+        # Create DataFrame with duplicates on composite key
+        schema = StructType([
+            StructField("user_id", StringType(), True),
+            StructField("timestamp", StringType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [
+            ("user1", "2024-01-01", 100),
+            ("user1", "2024-01-02", 200),  # unique combination
+            ("user2", "2024-01-01", 300),
+            ("user1", "2024-01-01", 150),  # duplicate of first row (same user_id + timestamp)
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator for composite key (user_id + timestamp)
+        validator = UniquenessValidator(
+            columns=["user_id", "timestamp"],
+            max_duplicate_percentage=0.0
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed due to duplicates
+        assert result.passed is False
+        assert result.failure_count == 1  # 4 total rows, 3 unique combinations = 1 duplicate
+        assert result.details["columns"] == ["user_id", "timestamp"]
+        assert result.details["unique_count"] == 3
+        assert result.details["duplicate_row_count"] == 1
+
+    def test_passes_when_no_duplicates_multi_column(self, spark):
+        """Test that UniquenessValidator passes when composite key is unique."""
+        # Create DataFrame where composite key is unique
+        schema = StructType([
+            StructField("user_id", StringType(), True),
+            StructField("timestamp", StringType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [
+            ("user1", "2024-01-01", 100),
+            ("user1", "2024-01-02", 200),
+            ("user2", "2024-01-01", 300),
+            ("user2", "2024-01-02", 400),
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator for composite key
+        validator = UniquenessValidator(
+            columns=["user_id", "timestamp"],
+            max_duplicate_percentage=0.0
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed
+        assert result.passed is True
+        assert result.failure_count == 0
+        assert result.details["unique_count"] == 4
+        assert result.details["duplicate_row_count"] == 0
+        assert "columns" in result.message
+
+    def test_single_column_unique_but_composite_has_duplicates(self, spark):
+        """Test that single column can be unique while composite key has duplicates."""
+        # Create DataFrame where each column alone is unique, but combination isn't
+        schema = StructType([
+            StructField("col_a", StringType(), True),
+            StructField("col_b", StringType(), True),
+        ])
+        data = [
+            ("A", "1"),
+            ("B", "2"),
+            ("A", "1"),  # duplicate combination of first row
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Check single column - should fail
+        validator_single = UniquenessValidator(columns=["col_a"], max_duplicate_percentage=0.0)
+        result_single = validator_single.validate(df)
+        assert result_single.passed is False  # "A" appears twice
+
+        # Check composite - should also fail
+        validator_composite = UniquenessValidator(
+            columns=["col_a", "col_b"],
+            max_duplicate_percentage=0.0
+        )
+        result_composite = validator_composite.validate(df)
+        assert result_composite.passed is False
+
+    def test_composite_key_unique_but_single_columns_have_duplicates(self, spark):
+        """Test that composite key can be unique while individual columns have duplicates."""
+        # Create DataFrame where individual columns have duplicates but combination is unique
+        schema = StructType([
+            StructField("user_id", StringType(), True),
+            StructField("date", StringType(), True),
+        ])
+        data = [
+            ("user1", "2024-01-01"),
+            ("user1", "2024-01-02"),  # user1 appears twice but dates differ
+            ("user2", "2024-01-01"),  # date appears twice but users differ
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Single column check for user_id - should fail (duplicates)
+        validator_user = UniquenessValidator(columns=["user_id"], max_duplicate_percentage=0.0)
+        result_user = validator_user.validate(df)
+        assert result_user.passed is False
+
+        # Single column check for date - should fail (duplicates)
+        validator_date = UniquenessValidator(columns=["date"], max_duplicate_percentage=0.0)
+        result_date = validator_date.validate(df)
+        assert result_date.passed is False
+
+        # Composite key check - should pass (all combinations unique)
+        validator_composite = UniquenessValidator(
+            columns=["user_id", "date"],
+            max_duplicate_percentage=0.0
+        )
+        result_composite = validator_composite.validate(df)
+        assert result_composite.passed is True
+        assert result_composite.failure_count == 0
+
+    def test_three_column_composite_key(self, spark):
+        """Test UniquenessValidator with a three-column composite key."""
+        # Create DataFrame with three-column composite key
+        schema = StructType([
+            StructField("region", StringType(), True),
+            StructField("product", StringType(), True),
+            StructField("date", StringType(), True),
+            StructField("sales", IntegerType(), True),
+        ])
+        data = [
+            ("US", "A", "2024-01-01", 100),
+            ("US", "A", "2024-01-02", 150),
+            ("US", "B", "2024-01-01", 200),
+            ("EU", "A", "2024-01-01", 300),
+            ("US", "A", "2024-01-01", 120),  # duplicate of first row
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator for three-column composite key
+        validator = UniquenessValidator(
+            columns=["region", "product", "date"],
+            max_duplicate_percentage=0.0
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed
+        assert result.passed is False
+        assert result.failure_count == 1  # 5 total, 4 unique = 1 duplicate
+        assert len(result.details["columns"]) == 3
+
+    # -------------------------------------------------------------------------
+    # Threshold Tests
+    # -------------------------------------------------------------------------
+
+    def test_passes_with_duplicates_below_threshold(self, spark):
+        """Test that UniquenessValidator passes when duplicate percentage is below threshold."""
+        # Create DataFrame with 20% duplicates (1 out of 5)
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", StringType(), True),
+        ])
+        data = [
+            (1, "A"),
+            (2, "B"),
+            (3, "C"),
+            (4, "D"),
+            (1, "A"),  # duplicate (1 duplicate out of 5 = 20%)
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with threshold higher than actual duplicate percentage
+        validator = UniquenessValidator(columns=["id"], max_duplicate_percentage=0.3)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (20% duplicates is within 30% threshold)
+        assert result.passed is True
+        assert result.failure_count == 1
+        assert "passed" in result.message.lower()
+        assert "within threshold" in result.message.lower()
+
+    def test_fails_with_duplicates_above_threshold(self, spark):
+        """Test that UniquenessValidator fails when duplicate percentage exceeds threshold."""
+        # Create DataFrame with 40% duplicates (2 out of 5)
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", StringType(), True),
+        ])
+        data = [
+            (1, "A"),
+            (2, "B"),
+            (3, "C"),
+            (1, "A"),  # duplicate
+            (1, "A"),  # another duplicate (2 duplicates out of 5 = 40%)
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with threshold lower than actual duplicate percentage
+        validator = UniquenessValidator(columns=["id"], max_duplicate_percentage=0.2)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (40% duplicates exceeds 20% threshold)
+        assert result.passed is False
+        assert result.failure_count == 2
+        assert "failed" in result.message.lower()
+        assert "exceed" in result.message.lower()
+
+    def test_passes_with_duplicates_exactly_at_threshold(self, spark):
+        """Test that UniquenessValidator passes when duplicate percentage is exactly at threshold."""
+        # Create DataFrame with exactly 20% duplicates (1 out of 5)
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", StringType(), True),
+        ])
+        data = [
+            (1, "A"),
+            (2, "B"),
+            (3, "C"),
+            (4, "D"),
+            (1, "A"),  # duplicate (1/5 = 20%)
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with threshold exactly at duplicate percentage
+        validator = UniquenessValidator(columns=["id"], max_duplicate_percentage=0.2)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (exactly at threshold)
+        assert result.passed is True
+
+    def test_threshold_zero_is_strict_mode(self, spark):
+        """Test that a threshold of 0.0 enforces strict mode (no duplicates allowed)."""
+        # Create DataFrame with minimal duplicates (one duplicate)
+        df = create_test_df_with_duplicates(spark, duplicate_count=1)
+
+        # Create validator with strict mode (threshold = 0.0)
+        validator = UniquenessValidator(columns=["user_id"], max_duplicate_percentage=0.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (any duplicates fail strict mode)
+        assert result.passed is False
+
+    def test_threshold_100_percent_allows_all_duplicates(self, spark):
+        """Test that a threshold of 1.0 allows 100% duplicates."""
+        # Create DataFrame where all rows are duplicates
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", StringType(), True),
+        ])
+        data = [(1, "A"), (1, "A"), (1, "A"), (1, "A")]  # All same
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator allowing 100% duplicates
+        validator = UniquenessValidator(columns=["id"], max_duplicate_percentage=1.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed
+        assert result.passed is True
+
+    # -------------------------------------------------------------------------
+    # Null Value Handling Tests
+    # -------------------------------------------------------------------------
+
+    def test_null_values_counted_as_group(self, spark):
+        """Test that null values are treated as equal (grouped together)."""
+        # Create DataFrame with null values
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("category", StringType(), True),
+        ])
+        data = [
+            (1, "A"),
+            (2, None),
+            (3, None),  # Two nulls = 1 duplicate
+            (4, "B"),
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = UniquenessValidator(columns=["category"], max_duplicate_percentage=0.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (nulls are treated as equal, so there's a duplicate)
+        assert result.passed is False
+        assert result.failure_count == 1  # 4 rows, 3 unique (A, null, B) = 1 duplicate
+
+    def test_null_in_composite_key(self, spark):
+        """Test null values in composite key columns."""
+        # Create DataFrame with nulls in composite key
+        schema = StructType([
+            StructField("col_a", StringType(), True),
+            StructField("col_b", StringType(), True),
+        ])
+        data = [
+            ("A", "1"),
+            ("A", None),
+            ("A", None),  # duplicate of previous row
+            (None, "1"),
+            (None, "1"),  # duplicate of previous row
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator for composite key
+        validator = UniquenessValidator(
+            columns=["col_a", "col_b"],
+            max_duplicate_percentage=0.0
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed
+        assert result.passed is False
+        assert result.failure_count == 2  # 5 rows, 3 unique = 2 duplicates
+
+    # -------------------------------------------------------------------------
+    # Edge Cases
+    # -------------------------------------------------------------------------
+
+    def test_empty_dataframe(self, spark):
+        """Test that UniquenessValidator handles empty DataFrames gracefully."""
+        # Create empty DataFrame
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("name", StringType(), True),
+        ])
+        df = spark.createDataFrame([], schema)
+
+        # Create validator
+        validator = UniquenessValidator(columns=["id"], max_duplicate_percentage=0.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (empty DataFrame has no duplicates)
+        assert result.passed is True
+        assert result.total_count == 0
+        assert "empty" in result.message.lower()
+
+    def test_single_row_dataframe(self, spark):
+        """Test UniquenessValidator with a single row (always unique)."""
+        # Create single-row DataFrame
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("name", StringType(), True),
+        ])
+        df = spark.createDataFrame([(1, "alice")], schema)
+
+        # Create validator
+        validator = UniquenessValidator(columns=["id"], max_duplicate_percentage=0.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed
+        assert result.passed is True
+        assert result.failure_count == 0
+        assert result.total_count == 1
+        assert result.details["unique_count"] == 1
+
+    def test_two_rows_all_duplicates(self, spark):
+        """Test UniquenessValidator with two identical rows."""
+        # Create DataFrame with two identical rows
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("name", StringType(), True),
+        ])
+        df = spark.createDataFrame([(1, "alice"), (1, "alice")], schema)
+
+        # Create validator
+        validator = UniquenessValidator(columns=["id", "name"], max_duplicate_percentage=0.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed
+        assert result.passed is False
+        assert result.failure_count == 1  # 2 rows, 1 unique = 1 duplicate
+        assert result.details["duplicate_percentage"] == 0.5
+
+    def test_missing_column_raises_error(self, spark):
+        """Test that UniquenessValidator raises an error for missing columns."""
+        # Create DataFrame
+        df = create_test_df_with_duplicates(spark, duplicate_count=0)
+
+        # Create validator with a non-existent column
+        validator = UniquenessValidator(columns=["nonexistent_column"], max_duplicate_percentage=0.0)
+
+        # Assert that validation raises ValueError
+        with pytest.raises(ValueError) as exc_info:
+            validator.validate(df)
+
+        assert "not found" in str(exc_info.value).lower()
+
+    def test_partial_missing_columns(self, spark):
+        """Test that UniquenessValidator raises error when some columns are missing."""
+        # Create DataFrame
+        df = create_test_df_with_duplicates(spark, duplicate_count=0)
+
+        # Create validator with one valid and one invalid column
+        validator = UniquenessValidator(
+            columns=["user_id", "nonexistent"],
+            max_duplicate_percentage=0.0
+        )
+
+        # Assert that validation raises ValueError
+        with pytest.raises(ValueError) as exc_info:
+            validator.validate(df)
+
+        assert "nonexistent" in str(exc_info.value)
+
+    def test_large_dataset(self, spark):
+        """Test UniquenessValidator with a larger dataset."""
+        # Create DataFrame with many rows
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        # 100 rows, ids 1-90 are unique, ids 91-100 are duplicates of 1-10
+        data = [(i, i * 10) for i in range(1, 91)]  # 90 unique rows
+        data.extend([(i, i * 10) for i in range(1, 11)])  # 10 duplicate rows
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with 5% threshold
+        validator = UniquenessValidator(columns=["id"], max_duplicate_percentage=0.05)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (10/100 = 10% > 5%)
+        assert result.passed is False
+        assert result.failure_count == 10
+        assert result.total_count == 100
+
+    # -------------------------------------------------------------------------
+    # Input Validation Tests
+    # -------------------------------------------------------------------------
+
+    def test_empty_columns_list_raises_error(self, spark):
+        """Test that UniquenessValidator raises error when columns list is empty."""
+        with pytest.raises(ValueError) as exc_info:
+            UniquenessValidator(columns=[], max_duplicate_percentage=0.0)
+
+        assert "empty" in str(exc_info.value).lower()
+
+    def test_invalid_threshold_negative_raises_error(self, spark):
+        """Test that UniquenessValidator raises error for negative threshold."""
+        with pytest.raises(ValueError) as exc_info:
+            UniquenessValidator(columns=["col"], max_duplicate_percentage=-0.1)
+
+        assert "max_duplicate_percentage" in str(exc_info.value)
+
+    def test_invalid_threshold_above_one_raises_error(self, spark):
+        """Test that UniquenessValidator raises error for threshold above 1.0."""
+        with pytest.raises(ValueError) as exc_info:
+            UniquenessValidator(columns=["col"], max_duplicate_percentage=1.5)
+
+        assert "max_duplicate_percentage" in str(exc_info.value)
+
+    def test_boundary_threshold_values(self, spark):
+        """Test that UniquenessValidator accepts boundary threshold values (0.0 and 1.0)."""
+        # Should not raise
+        validator_zero = UniquenessValidator(columns=["col"], max_duplicate_percentage=0.0)
+        validator_one = UniquenessValidator(columns=["col"], max_duplicate_percentage=1.0)
+
+        assert validator_zero.max_duplicate_percentage == 0.0
+        assert validator_one.max_duplicate_percentage == 1.0
+
+    # -------------------------------------------------------------------------
+    # Result Details Tests
+    # -------------------------------------------------------------------------
+
+    def test_result_contains_all_expected_fields(self, spark):
+        """Test that the validation result contains all expected fields."""
+        # Create DataFrame with duplicates
+        df = create_test_df_with_duplicates(spark, duplicate_count=2)
+
+        # Create validator
+        validator = UniquenessValidator(columns=["user_id", "timestamp"], max_duplicate_percentage=0.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Check result has all expected fields
+        assert result.validator_name == "UniquenessValidator"
+        assert isinstance(result.passed, bool)
+        assert isinstance(result.failure_count, int)
+        assert isinstance(result.total_count, int)
+        assert isinstance(result.message, str)
+        assert isinstance(result.details, dict)
+
+        # Check details has all expected keys
+        assert "columns" in result.details
+        assert "max_duplicate_percentage" in result.details
+        assert "unique_count" in result.details
+        assert "duplicate_row_count" in result.details
+        assert "duplicate_percentage" in result.details
+
+    def test_result_message_clarity_on_pass_no_duplicates(self, spark):
+        """Test that the validation message is clear when passing with no duplicates."""
+        # Create DataFrame without duplicates
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("name", StringType(), True),
+        ])
+        data = [(1, "alice"), (2, "bob"), (3, "charlie")]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = UniquenessValidator(columns=["id"], max_duplicate_percentage=0.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Check message is clear
+        assert result.passed is True
+        assert "passed" in result.message.lower()
+        assert "unique" in result.message.lower()
+
+    def test_result_message_clarity_on_pass_within_threshold(self, spark):
+        """Test that the validation message is clear when passing within threshold."""
+        # Create DataFrame with some duplicates
+        df = create_test_df_with_duplicates(spark, duplicate_count=1)
+
+        # Create validator with high threshold
+        validator = UniquenessValidator(columns=["user_id"], max_duplicate_percentage=0.5)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Check message is clear
+        assert result.passed is True
+        assert "passed" in result.message.lower()
+        assert "within threshold" in result.message.lower()
+
+    def test_result_message_clarity_on_fail(self, spark):
+        """Test that the validation message is clear on failure."""
+        # Create DataFrame with duplicates
+        df = create_test_df_with_duplicates(spark, duplicate_count=2)
+
+        # Create validator
+        validator = UniquenessValidator(columns=["user_id"], max_duplicate_percentage=0.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Check message is clear
+        assert result.passed is False
+        assert "failed" in result.message.lower()
+
+    def test_validator_name_property(self, spark):
+        """Test that the validator name property works correctly."""
+        validator = UniquenessValidator(columns=["col"], max_duplicate_percentage=0.0)
+        assert validator.name == "UniquenessValidator"
+
+    def test_columns_property(self, spark):
+        """Test that the columns property is set correctly."""
+        validator = UniquenessValidator(columns=["col1", "col2"], max_duplicate_percentage=0.0)
+        assert validator.columns == ["col1", "col2"]
+
+    def test_max_duplicate_percentage_property(self, spark):
+        """Test that the max_duplicate_percentage property is set correctly."""
+        validator = UniquenessValidator(columns=["col"], max_duplicate_percentage=0.15)
+        assert validator.max_duplicate_percentage == 0.15
+
+    def test_message_shows_single_column_format(self, spark):
+        """Test that message uses singular format for single column."""
+        # Create DataFrame
+        df = create_test_df_with_duplicates(spark, duplicate_count=0)
+
+        # Create validator for single column
+        validator = UniquenessValidator(columns=["user_id"], max_duplicate_percentage=0.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Check message uses singular format
+        assert "column 'user_id'" in result.message
+
+    def test_message_shows_multiple_columns_format(self, spark):
+        """Test that message uses plural format for multiple columns."""
+        # Create DataFrame
+        df = create_test_df_with_duplicates(spark, duplicate_count=0)
+
+        # Create validator for multiple columns
+        validator = UniquenessValidator(
+            columns=["user_id", "timestamp"],
+            max_duplicate_percentage=0.0
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Check message uses plural format
+        assert "columns" in result.message
+
+
+# Legacy test for backward compatibility
+def test_uniqueness_validator_detects_duplicates(spark):
+    """Test that UniquenessValidator correctly identifies duplicate values."""
+    # Create DataFrame with duplicates
+    df = create_test_df_with_duplicates(spark, duplicate_count=2)
+
+    # Create validator for columns with duplicates (strict mode - no duplicates allowed)
+    validator = UniquenessValidator(columns=["user_id", "timestamp"], max_duplicate_percentage=0.0)
+
+    # Validate
+    result = validator.validate(df)
+
+    # Assert validation failed due to duplicates
+    assert result.passed is False
+    assert result.failure_count > 0
+    assert "UniquenessValidator" in result.validator_name
+    assert result.details is not None
+    assert "duplicate_row_count" in result.details
