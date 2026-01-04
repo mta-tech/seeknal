@@ -34,7 +34,7 @@ Usage:
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame, functions as F
 
 from ..context import logger
 from .models import ValidationMode, ValidationResult, ValidationSummary
@@ -333,4 +333,165 @@ class ValidationRunner:
         logger.info(
             f"{fg_prefix}Validation {status}: "
             f"{summary.passed_count}/{summary.total_validators} validators passed"
+        )
+
+
+class NullValidator(BaseValidator):
+    """
+    Validator for detecting null/missing values in DataFrame columns.
+
+    This validator checks specified columns for null values and compares
+    the null percentage against a configurable threshold. It can validate
+    multiple columns in a single pass.
+
+    Attributes:
+        columns (List[str]): List of column names to check for nulls.
+        max_null_percentage (float): Maximum allowed percentage of null values
+            (between 0.0 and 1.0). Default is 0.0 (no nulls allowed).
+
+    Example:
+        >>> # Check multiple columns, allow up to 5% nulls
+        >>> validator = NullValidator(
+        ...     columns=["age", "name", "email"],
+        ...     max_null_percentage=0.05
+        ... )
+        >>> result = validator.validate(df)
+        >>> if not result.passed:
+        ...     print(f"Found {result.failure_count} null values")
+
+        >>> # Strict mode: no nulls allowed (default)
+        >>> validator = NullValidator(columns=["user_id"])
+        >>> result = validator.validate(df)
+    """
+
+    def __init__(
+        self,
+        columns: List[str],
+        max_null_percentage: float = 0.0,
+    ):
+        """
+        Initialize NullValidator.
+
+        Args:
+            columns (List[str]): List of column names to check for null values.
+            max_null_percentage (float, optional): Maximum allowed percentage of
+                null values as a decimal (0.0 to 1.0). For example, 0.05 allows
+                up to 5% null values. Default is 0.0 (no nulls allowed).
+
+        Raises:
+            ValueError: If columns list is empty or max_null_percentage is not
+                between 0.0 and 1.0.
+        """
+        if not columns:
+            raise ValueError("columns list cannot be empty")
+        if not 0.0 <= max_null_percentage <= 1.0:
+            raise ValueError(
+                f"max_null_percentage must be between 0.0 and 1.0, got {max_null_percentage}"
+            )
+
+        self.columns = columns
+        self.max_null_percentage = max_null_percentage
+        self._name = "NullValidator"
+
+    @property
+    def name(self) -> str:
+        """Return the name of this validator."""
+        return self._name
+
+    def validate(self, df: DataFrame) -> ValidationResult:
+        """
+        Validate the DataFrame for null values in specified columns.
+
+        Counts null values across all specified columns and compares
+        the percentage against the configured threshold.
+
+        Args:
+            df (DataFrame): The PySpark DataFrame to validate.
+
+        Returns:
+            ValidationResult: The result containing pass/fail status,
+                null count, total count, and detailed information about
+                which columns have nulls.
+
+        Raises:
+            ValueError: If any specified column is not found in the DataFrame.
+        """
+        # Check that all columns exist
+        self._check_columns_exist(df, self.columns)
+
+        # Get total row count
+        total_count = self._get_total_count(df)
+
+        # Handle empty DataFrame
+        if total_count == 0:
+            return ValidationResult(
+                validator_name=self.name,
+                passed=True,
+                failure_count=0,
+                total_count=0,
+                message="DataFrame is empty, no null values to check",
+                details={
+                    "columns": self.columns,
+                    "max_null_percentage": self.max_null_percentage,
+                },
+            )
+
+        # Count nulls for each column
+        column_null_counts = {}
+        total_null_count = 0
+
+        for col_name in self.columns:
+            null_count = df.filter(F.col(col_name).isNull()).count()
+            column_null_counts[col_name] = null_count
+            total_null_count += null_count
+
+        # Calculate overall null percentage across all column checks
+        # Total possible = rows * columns being checked
+        total_checks = total_count * len(self.columns)
+        null_percentage = total_null_count / total_checks if total_checks > 0 else 0.0
+
+        # Calculate per-column percentages for details
+        column_null_percentages = {
+            col: count / total_count
+            for col, count in column_null_counts.items()
+        }
+
+        # Find columns that exceed threshold
+        columns_exceeding_threshold = [
+            col for col, pct in column_null_percentages.items()
+            if pct > self.max_null_percentage
+        ]
+
+        # Determine pass/fail
+        passed = len(columns_exceeding_threshold) == 0
+
+        # Build message
+        if passed:
+            message = (
+                f"Null check passed for columns {self.columns}. "
+                f"All columns within {self.max_null_percentage:.1%} threshold."
+            )
+        else:
+            failing_details = ", ".join(
+                f"{col}: {column_null_percentages[col]:.1%}"
+                for col in columns_exceeding_threshold
+            )
+            message = (
+                f"Null check failed. Columns exceeding {self.max_null_percentage:.1%} "
+                f"threshold: {failing_details}"
+            )
+
+        return ValidationResult(
+            validator_name=self.name,
+            passed=passed,
+            failure_count=total_null_count,
+            total_count=total_count,
+            message=message,
+            details={
+                "columns": self.columns,
+                "max_null_percentage": self.max_null_percentage,
+                "column_null_counts": column_null_counts,
+                "column_null_percentages": column_null_percentages,
+                "columns_exceeding_threshold": columns_exceeding_threshold,
+            },
         )
