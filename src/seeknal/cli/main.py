@@ -10,6 +10,7 @@ Usage:
     seeknal list <resource>         List resources
     seeknal show <resource> <name>  Show resource details
     seeknal validate                Validate configurations
+    seeknal validate-features <fg>  Validate feature group data quality
     seeknal version                 Show version information
 """
 
@@ -50,6 +51,12 @@ class ResourceType(str, Enum):
     FLOWS = "flows"
     FEATURE_GROUPS = "feature-groups"
     OFFLINE_STORES = "offline-stores"
+
+
+class ValidationModeChoice(str, Enum):
+    """Validation mode options for validate-features command."""
+    WARN = "warn"
+    FAIL = "fail"
 
 
 def _get_version() -> str:
@@ -382,6 +389,113 @@ def validate(
         raise typer.Exit(1)
 
     _echo_success("All validations passed")
+
+
+@app.command("validate-features")
+def validate_features(
+    feature_group: str = typer.Argument(
+        ..., help="Name of the feature group to validate"
+    ),
+    mode: ValidationModeChoice = typer.Option(
+        ValidationModeChoice.FAIL, "--mode", "-m",
+        help="Validation mode: 'warn' logs failures and continues, 'fail' stops on first failure"
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="Show detailed validation results"
+    ),
+):
+    """Validate feature group data quality.
+
+    Run configured validators against a feature group's data to check
+    for data quality issues like null values, out-of-range values,
+    duplicates, and stale data.
+
+    Examples:
+        seeknal validate-features user_features
+        seeknal validate-features user_features --mode warn
+        seeknal validate-features user_features --mode fail --verbose
+    """
+    from seeknal.featurestore.feature_group import FeatureGroup
+    from seeknal.feature_validation.models import ValidationMode
+    from seeknal.feature_validation.validators import ValidationRunner, ValidationException
+
+    typer.echo(f"Validating feature group: {feature_group}")
+    typer.echo(f"  Mode: {mode.value}")
+
+    try:
+        # Load the feature group
+        fg = FeatureGroup.load(name=feature_group)
+        if fg is None:
+            _echo_error(f"Feature group '{feature_group}' not found")
+            raise typer.Exit(1)
+
+        # Check if validation is configured
+        if not fg.validation_config or not fg.validation_config.validators:
+            _echo_warning(f"No validators configured for feature group '{feature_group}'")
+            typer.echo("  Configure validators using fg.set_validation_config()")
+            raise typer.Exit(0)
+
+        # Convert CLI mode to ValidationMode enum
+        validation_mode = ValidationMode.WARN if mode == ValidationModeChoice.WARN else ValidationMode.FAIL
+
+        # Run validation
+        _echo_info("Running validators...")
+        try:
+            summary = fg.validate(mode=validation_mode)
+        except ValidationException as e:
+            # In FAIL mode, validation stops on first failure
+            _echo_error(f"Validation failed: {e.message}")
+            if verbose and e.result:
+                typer.echo(f"  Validator: {e.result.validator_name}")
+                typer.echo(f"  Failures: {e.result.failure_count}")
+                if e.result.details:
+                    typer.echo(f"  Details: {e.result.details}")
+            raise typer.Exit(1)
+
+        # Display results summary
+        typer.echo("")
+        typer.echo("Validation Summary:")
+        typer.echo("-" * 40)
+        typer.echo(f"  Total validators: {summary.total_validators}")
+        typer.echo(f"  Passed: {summary.passed_count}")
+        typer.echo(f"  Failed: {summary.failed_count}")
+
+        # Display individual results if verbose
+        if verbose and summary.results:
+            typer.echo("")
+            typer.echo("Detailed Results:")
+            for result in summary.results:
+                if result.passed:
+                    _echo_success(f"{result.validator_name}: {result.message}")
+                else:
+                    _echo_warning(f"{result.validator_name}: {result.message}")
+                if result.details:
+                    typer.echo(f"    Details: {result.details}")
+
+        # Final status
+        typer.echo("")
+        if summary.passed:
+            _echo_success(f"All validations passed for '{feature_group}'")
+        else:
+            if mode == ValidationModeChoice.WARN:
+                _echo_warning(
+                    f"Validation completed with {summary.failed_count} warning(s) "
+                    f"for '{feature_group}'"
+                )
+            else:
+                _echo_error(
+                    f"Validation failed with {summary.failed_count} error(s) "
+                    f"for '{feature_group}'"
+                )
+                raise typer.Exit(1)
+
+    except typer.Exit:
+        # Re-raise typer.Exit as-is
+        raise
+    except Exception as e:
+        _echo_error(f"Validation failed: {e}")
+        raise typer.Exit(1)
 
 
 @app.command()
