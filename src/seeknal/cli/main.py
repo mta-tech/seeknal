@@ -1,19 +1,48 @@
 """
 Seeknal CLI - Main entry point
 
-A dbt-like CLI for managing feature stores.
+A dbt-like CLI for managing feature stores with comprehensive version management
+capabilities for ML teams.
 
 Usage:
-    seeknal init                    Initialize a new project
-    seeknal run <flow>              Execute a transformation flow
-    seeknal materialize <fg>        Materialize features to stores
-    seeknal list <resource>         List resources
-    seeknal show <resource> <name>  Show resource details
-    seeknal validate                Validate configurations
-    seeknal info                    Show version information
-    seeknal version list <fg>       List feature group versions
-    seeknal version show <fg>       Show feature group version details
-    seeknal version diff <fg>       Compare feature group versions
+    seeknal init                                Initialize a new project
+    seeknal run <flow>                          Execute a transformation flow
+    seeknal materialize <fg>                    Materialize features to stores
+    seeknal materialize <fg> --version <N>      Materialize a specific version
+    seeknal list <resource>                     List resources
+    seeknal show <resource> <name>              Show resource details
+    seeknal validate                            Validate configurations
+    seeknal info                                Show version information
+    seeknal debug <fg>                          Debug a feature group
+    seeknal clean <fg>                          Clean old feature data
+
+Version Management:
+    seeknal version list <fg>                   List all versions of a feature group
+    seeknal version list <fg> --limit 5         List last 5 versions
+    seeknal version show <fg>                   Show latest version details
+    seeknal version show <fg> --version <N>     Show specific version details
+    seeknal version diff <fg> --from 1 --to 2   Compare schemas between versions
+
+Examples:
+    # Initialize a new project
+    $ seeknal init --name my_project
+
+    # List all feature groups
+    $ seeknal list feature-groups
+
+    # Materialize the latest version of a feature group
+    $ seeknal materialize user_features --start-date 2024-01-01
+
+    # Materialize a specific version (useful for rollbacks)
+    $ seeknal materialize user_features --start-date 2024-01-01 --version 1
+
+    # View version history
+    $ seeknal version list user_features
+
+    # Compare schema changes between versions
+    $ seeknal version diff user_features --from 1 --to 2
+
+For more information, see: https://github.com/mta-tech/seeknal
 """
 
 import typer
@@ -33,7 +62,22 @@ app = typer.Typer(
 # Version command group for feature group version management
 version_app = typer.Typer(
     name="version",
-    help="Manage feature group versions",
+    help="""Manage feature group versions.
+
+Feature group versioning enables ML teams to track schema evolution,
+compare changes between versions, and safely roll back to previous
+versions when needed.
+
+Commands:
+  list   List all versions of a feature group with creation dates
+  show   Display detailed metadata and schema for a specific version
+  diff   Compare schemas between two versions to identify changes
+
+Examples:
+  seeknal version list user_features
+  seeknal version show user_features --version 2
+  seeknal version diff user_features --from 1 --to 2
+""",
 )
 app.add_typer(version_app, name="version")
 
@@ -190,30 +234,47 @@ def materialize(
     ),
     start_date: str = typer.Option(
         ..., "--start-date", "-s",
-        help="Start date (YYYY-MM-DD)"
+        help="Start date for feature data (YYYY-MM-DD format)"
     ),
     end_date: Optional[str] = typer.Option(
         None, "--end-date", "-e",
-        help="End date (YYYY-MM-DD)"
+        help="End date for feature data (YYYY-MM-DD format)"
     ),
     version: Optional[int] = typer.Option(
         None, "--version", "-v",
-        help="Version number to materialize (defaults to latest)"
+        help="Specific version number to materialize (defaults to latest). "
+             "Use 'seeknal version list' to see available versions."
     ),
     mode: WriteMode = typer.Option(
         WriteMode.OVERWRITE, "--mode", "-m",
-        help="Write mode"
+        help="Write mode: overwrite, append, or merge"
     ),
     offline_only: bool = typer.Option(
         False, "--offline-only",
-        help="Only materialize to offline store"
+        help="Only materialize to offline store (skip online store)"
     ),
     online_only: bool = typer.Option(
         False, "--online-only",
-        help="Only materialize to online store"
+        help="Only materialize to online store (skip offline store)"
     ),
 ):
-    """Materialize features to offline/online stores."""
+    """
+    Materialize features to offline/online stores.
+
+    Writes feature data to configured storage locations for the specified
+    date range. Supports version-specific materialization for rollbacks
+    or A/B testing scenarios.
+
+    Examples:
+        # Materialize latest version
+        seeknal materialize user_features --start-date 2024-01-01
+
+        # Materialize a specific version (rollback scenario)
+        seeknal materialize user_features --start-date 2024-01-01 --version 1
+
+        # Materialize with date range
+        seeknal materialize user_features -s 2024-01-01 -e 2024-01-31
+    """
     from seeknal.featurestore.feature_group import FeatureGroup
 
     # Parse dates
@@ -496,18 +557,29 @@ def clean(
 @version_app.command("list")
 def version_list(
     feature_group: str = typer.Argument(
-        ..., help="Name of the feature group"
+        ..., help="Name of the feature group to query versions for"
     ),
     format: OutputFormat = typer.Option(
         OutputFormat.TABLE, "--format", "-f",
-        help="Output format"
+        help="Output format: table (default), json, or yaml"
     ),
     limit: Optional[int] = typer.Option(
         None, "--limit", "-l",
-        help="Limit number of versions to display"
+        help="Maximum number of versions to display (most recent first)"
     ),
 ):
-    """List all versions of a feature group."""
+    """
+    List all versions of a feature group.
+
+    Displays version history with creation timestamps and feature counts,
+    sorted by version number (most recent first). Use this command to
+    review the evolution of a feature group over time.
+
+    Examples:
+        seeknal version list user_features
+        seeknal version list user_features --limit 5
+        seeknal version list user_features --format json
+    """
     from seeknal.featurestore.feature_group import FeatureGroup
     from tabulate import tabulate
     import json
@@ -551,18 +623,32 @@ def version_list(
 @version_app.command("show")
 def version_show(
     feature_group: str = typer.Argument(
-        ..., help="Name of the feature group"
+        ..., help="Name of the feature group to inspect"
     ),
     version: Optional[int] = typer.Option(
         None, "--version", "-v",
-        help="Version number to show (defaults to latest)"
+        help="Specific version number to show (defaults to latest version)"
     ),
     format: OutputFormat = typer.Option(
         OutputFormat.TABLE, "--format", "-f",
-        help="Output format"
+        help="Output format: table (default), json, or yaml"
     ),
 ):
-    """Show detailed information about a feature group version."""
+    """
+    Show detailed information about a feature group version.
+
+    Displays comprehensive metadata for a specific version including:
+    - Version number and timestamps (created, updated)
+    - Feature count
+    - Complete Avro schema with field names and types
+
+    If no version is specified, shows the latest version.
+
+    Examples:
+        seeknal version show user_features              # Show latest
+        seeknal version show user_features --version 2  # Show version 2
+        seeknal version show user_features --format json
+    """
     from seeknal.featurestore.feature_group import FeatureGroup
     import json
 
@@ -645,22 +731,36 @@ def version_show(
 @version_app.command("diff")
 def version_diff(
     feature_group: str = typer.Argument(
-        ..., help="Name of the feature group"
+        ..., help="Name of the feature group to compare versions for"
     ),
     from_version: int = typer.Option(
         ..., "--from", "-f",
-        help="Base version number to compare from"
+        help="Base version number to compare from (older version)"
     ),
     to_version: int = typer.Option(
         ..., "--to", "-t",
-        help="Target version number to compare to"
+        help="Target version number to compare to (newer version)"
     ),
     format: OutputFormat = typer.Option(
         OutputFormat.TABLE, "--format",
-        help="Output format"
+        help="Output format: table (default) or json"
     ),
 ):
-    """Compare two versions of a feature group to identify schema differences."""
+    """
+    Compare two versions of a feature group to identify schema differences.
+
+    Analyzes the Avro schemas of both versions and displays:
+    - Added features (+): New fields in the target version
+    - Removed features (-): Fields removed from the base version
+    - Modified features (~): Fields with type changes
+
+    This is useful for understanding schema evolution and identifying
+    potential breaking changes before rolling back or deploying a version.
+
+    Examples:
+        seeknal version diff user_features --from 1 --to 2
+        seeknal version diff user_features --from 1 --to 3 --format json
+    """
     from seeknal.featurestore.feature_group import FeatureGroup
     import json
 
