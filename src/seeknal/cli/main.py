@@ -9,6 +9,7 @@ Usage:
     seeknal materialize <fg>        Materialize features to stores
     seeknal list <resource>         List resources
     seeknal show <resource> <name>  Show resource details
+    seeknal delete <resource> <name> Delete a resource
     seeknal validate                Validate configurations
     seeknal version                 Show version information
 """
@@ -50,6 +51,11 @@ class ResourceType(str, Enum):
     FLOWS = "flows"
     FEATURE_GROUPS = "feature-groups"
     OFFLINE_STORES = "offline-stores"
+
+
+class DeleteResourceType(str, Enum):
+    """Resource types for deletion."""
+    FEATURE_GROUP = "feature-group"
 
 
 def _get_version() -> str:
@@ -474,6 +480,55 @@ def clean(
     except Exception as e:
         _echo_error(f"Cleanup failed: {e}")
         raise typer.Exit(1)
+
+
+@app.command()
+def delete(
+    resource_type: DeleteResourceType = typer.Argument(
+        ..., help="Type of resource to delete (feature-group)"
+    ),
+    name: str = typer.Argument(
+        ..., help="Name of the resource to delete"
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Skip confirmation prompt"
+    ),
+):
+    """Delete a resource (feature group) including storage and metadata."""
+    from seeknal.featurestore.feature_group import FeatureGroup
+
+    match resource_type:
+        case DeleteResourceType.FEATURE_GROUP:
+            typer.echo(f"Deleting feature group: {name}")
+
+            try:
+                fg = FeatureGroup.load(name=name)
+            except Exception as e:
+                _echo_error(f"Feature group '{name}' not found")
+                raise typer.Exit(1)
+
+            if not force:
+                confirm = typer.confirm(
+                    f"Are you sure you want to delete feature group '{name}'? "
+                    "This will remove all storage files and metadata."
+                )
+                if not confirm:
+                    _echo_warning("Deletion cancelled")
+                    raise typer.Exit(0)
+
+            try:
+                fg.delete()
+                _echo_success(
+                    f"Deleted feature group '{name}': "
+                    "removed storage files and metadata from database"
+                )
+            except Exception as e:
+                _echo_error(f"Failed to delete feature group '{name}': {e}")
+                raise typer.Exit(1)
+        case _:
+            _echo_error(f"Unknown resource type: {resource_type}")
+            raise typer.Exit(1)
 
 
 def main():
