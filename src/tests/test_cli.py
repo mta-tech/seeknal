@@ -370,6 +370,37 @@ class TestHelpCommand:
         assert "--mode" in result.stdout
 
 
+class TestValidateFeaturesCommand:
+    """Tests for the validate-features command."""
+
+    def test_validate_features_help(self):
+        """validate-features command help should display options."""
+        result = runner.invoke(app, ["validate-features", "--help"])
+        assert result.exit_code == 0
+        assert "--mode" in result.stdout
+        assert "--verbose" in result.stdout
+        assert "FEATURE_GROUP" in result.stdout
+
+    def test_validate_features_requires_feature_group(self):
+        """validate-features command should require feature group argument."""
+        result = runner.invoke(app, ["validate-features"])
+        assert result.exit_code != 0
+
+    def test_validate_features_mode_option(self):
+        """validate-features command should accept mode option."""
+        result = runner.invoke(app, ["validate-features", "--help"])
+        assert result.exit_code == 0
+        assert "warn" in result.stdout
+        assert "fail" in result.stdout
+
+    def test_validate_features_verbose_option(self):
+        """validate-features command should accept verbose option."""
+        result = runner.invoke(app, ["validate-features", "--help"])
+        assert result.exit_code == 0
+        assert "-v" in result.stdout
+        assert "--verbose" in result.stdout
+
+
 class TestDebugCommand:
     """Tests for the debug command."""
 
