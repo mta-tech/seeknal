@@ -1,0 +1,12 @@
+# Documentation dependencies for Seeknal API Reference
+# Install with: pip install -r requirements-docs.txt
+
+# MkDocs - Static site generator for documentation
+mkdocs>=1.6.0
+
+# Material theme - Modern UI with built-in search and navigation
+mkdocs-material>=9.5.0
+
+# mkdocstrings - Auto-generate API docs from Python docstrings
+mkdocstrings>=0.26.0
+mkdocstrings-python>=1.12.0
