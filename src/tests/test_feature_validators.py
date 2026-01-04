@@ -2811,14 +2811,23 @@ class TestFreshnessValidator:
         ])
         df = spark.createDataFrame([(1, reference_time - timedelta(hours=1))], schema)
 
-        # Test with hours
+        # Test with hours (less than 24 hours to trigger hours format)
         validator_hours = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=12),
+            reference_time=reference_time,
+        )
+        result_hours = validator_hours.validate(df)
+        assert "12 hours" in result_hours.message
+
+        # Test with 24 hours (displayed as "1 day")
+        validator_1day = FreshnessValidator(
             column="event_time",
             max_age=timedelta(hours=24),
             reference_time=reference_time,
         )
-        result_hours = validator_hours.validate(df)
-        assert "24 hours" in result_hours.message
+        result_1day = validator_1day.validate(df)
+        assert "1 day" in result_1day.message
 
         # Test with days
         validator_days = FreshnessValidator(

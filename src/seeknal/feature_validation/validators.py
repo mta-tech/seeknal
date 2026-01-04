@@ -977,6 +977,7 @@ class FreshnessValidator(BaseValidator):
                     "column": self.column,
                     "max_age_seconds": self.max_age.total_seconds(),
                     "null_count": null_count,
+                    "non_null_count": non_null_count,
                     "reference_time": ref_time.isoformat(),
                     "cutoff_time": cutoff_time.isoformat(),
                 },
