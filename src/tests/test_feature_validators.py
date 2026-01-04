@@ -2926,3 +2926,907 @@ def test_freshness_validator_detects_stale_data(spark):
     assert "FreshnessValidator" in result.validator_name
     assert result.details is not None
     assert "stale_count" in result.details
+
+
+# =============================================================================
+# CustomValidator and ValidationRunner Tests
+# =============================================================================
+
+
+class TestCustomValidatorAndRunner:
+    """Comprehensive tests for the CustomValidator and ValidationRunner classes."""
+
+    # -------------------------------------------------------------------------
+    # CustomValidator Initialization Tests
+    # -------------------------------------------------------------------------
+
+    def test_custom_validator_initialization_with_function(self, spark):
+        """Test that CustomValidator correctly initializes with a function."""
+        def my_validator(df):
+            return True
+
+        validator = CustomValidator(func=my_validator, name="my_validator")
+
+        assert validator.name == "my_validator"
+        assert validator.func is my_validator
+        assert validator.description is None
+
+    def test_custom_validator_initialization_with_lambda(self, spark):
+        """Test that CustomValidator correctly initializes with a lambda."""
+        validator = CustomValidator(
+            func=lambda df: df.count() > 0,
+            name="non_empty_check",
+        )
+
+        assert validator.name == "non_empty_check"
+        assert callable(validator.func)
+
+    def test_custom_validator_initialization_with_description(self, spark):
+        """Test that CustomValidator correctly stores description."""
+        validator = CustomValidator(
+            func=lambda df: True,
+            name="test_validator",
+            description="Checks that data meets requirements",
+        )
+
+        assert validator.description == "Checks that data meets requirements"
+
+    def test_custom_validator_initialization_default_name(self, spark):
+        """Test that CustomValidator uses default name if not provided."""
+        validator = CustomValidator(func=lambda df: True)
+
+        assert validator.name == "CustomValidator"
+
+    def test_custom_validator_rejects_non_callable(self, spark):
+        """Test that CustomValidator raises error for non-callable func."""
+        with pytest.raises(ValueError) as excinfo:
+            CustomValidator(func="not a function", name="test")
+
+        assert "callable" in str(excinfo.value).lower()
+
+    def test_custom_validator_rejects_none_func(self, spark):
+        """Test that CustomValidator raises error for None func."""
+        with pytest.raises(ValueError) as excinfo:
+            CustomValidator(func=None, name="test")
+
+        assert "callable" in str(excinfo.value).lower()
+
+    # -------------------------------------------------------------------------
+    # CustomValidator Boolean Return Tests
+    # -------------------------------------------------------------------------
+
+    def test_custom_validator_boolean_true_return(self, spark):
+        """Test that CustomValidator handles boolean True return correctly."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        validator = CustomValidator(
+            func=lambda df: True,
+            name="always_pass",
+        )
+
+        result = validator.validate(df)
+
+        assert result.passed is True
+        assert result.validator_name == "always_pass"
+        assert "passed" in result.message.lower()
+
+    def test_custom_validator_boolean_false_return(self, spark):
+        """Test that CustomValidator handles boolean False return correctly."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        validator = CustomValidator(
+            func=lambda df: False,
+            name="always_fail",
+        )
+
+        result = validator.validate(df)
+
+        assert result.passed is False
+        assert result.validator_name == "always_fail"
+        assert "failed" in result.message.lower()
+
+    def test_custom_validator_boolean_with_description_in_message(self, spark):
+        """Test that CustomValidator includes description in message."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        validator = CustomValidator(
+            func=lambda df: True,
+            name="test",
+            description="All values are positive",
+        )
+
+        result = validator.validate(df)
+
+        assert result.passed is True
+        assert "All values are positive" in result.message
+
+    def test_custom_validator_boolean_failure_count(self, spark):
+        """Test that CustomValidator sets correct failure_count for boolean return."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        # When True, failure_count should be 0
+        validator_pass = CustomValidator(func=lambda df: True, name="pass")
+        result_pass = validator_pass.validate(df)
+        assert result_pass.failure_count == 0
+
+        # When False, failure_count should be total_count
+        validator_fail = CustomValidator(func=lambda df: False, name="fail")
+        result_fail = validator_fail.validate(df)
+        assert result_fail.failure_count == result_fail.total_count
+
+    # -------------------------------------------------------------------------
+    # CustomValidator ValidationResult Return Tests
+    # -------------------------------------------------------------------------
+
+    def test_custom_validator_validation_result_return(self, spark):
+        """Test that CustomValidator handles ValidationResult return correctly."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        def custom_check(df):
+            count = df.count()
+            return ValidationResult(
+                validator_name="custom_check",
+                passed=count > 0,
+                failure_count=0,
+                total_count=count,
+                message=f"Found {count} rows",
+                details={"row_count": count},
+            )
+
+        validator = CustomValidator(func=custom_check, name="custom_check")
+
+        result = validator.validate(df)
+
+        assert result.passed is True
+        assert result.validator_name == "custom_check"
+        assert "Found" in result.message
+        assert "row_count" in result.details
+
+    def test_custom_validator_validation_result_preserves_details(self, spark):
+        """Test that CustomValidator preserves ValidationResult details."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        def custom_check(df):
+            return ValidationResult(
+                validator_name="detailed_check",
+                passed=True,
+                failure_count=0,
+                total_count=df.count(),
+                message="Custom message",
+                details={
+                    "custom_key": "custom_value",
+                    "nested": {"key": "value"},
+                },
+            )
+
+        validator = CustomValidator(func=custom_check, name="detailed_check")
+
+        result = validator.validate(df)
+
+        assert result.details["custom_key"] == "custom_value"
+        assert result.details["nested"]["key"] == "value"
+
+    def test_custom_validator_sets_validator_name_if_missing(self, spark):
+        """Test that CustomValidator sets validator_name if not in result."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        def custom_check(df):
+            return ValidationResult(
+                validator_name="",
+                passed=True,
+                failure_count=0,
+                total_count=df.count(),
+                message="Check passed",
+            )
+
+        validator = CustomValidator(func=custom_check, name="my_validator")
+
+        result = validator.validate(df)
+
+        assert result.validator_name == "my_validator"
+
+    # -------------------------------------------------------------------------
+    # CustomValidator Exception Handling Tests
+    # -------------------------------------------------------------------------
+
+    def test_custom_validator_handles_exception_gracefully(self, spark):
+        """Test that CustomValidator handles exceptions in user function."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        def failing_check(df):
+            raise RuntimeError("Something went wrong")
+
+        validator = CustomValidator(func=failing_check, name="failing_check")
+
+        result = validator.validate(df)
+
+        assert result.passed is False
+        assert "exception" in result.message.lower()
+        assert "Something went wrong" in result.message
+        assert "error" in result.details
+        assert result.details["error_type"] == "RuntimeError"
+
+    def test_custom_validator_handles_value_error(self, spark):
+        """Test that CustomValidator handles ValueError in user function."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        def failing_check(df):
+            raise ValueError("Invalid value")
+
+        validator = CustomValidator(func=failing_check, name="value_error_check")
+
+        result = validator.validate(df)
+
+        assert result.passed is False
+        assert result.details["error_type"] == "ValueError"
+        assert "Invalid value" in result.details["error"]
+
+    def test_custom_validator_raises_type_error_for_invalid_return(self, spark):
+        """Test that CustomValidator raises TypeError for invalid return type."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        def invalid_return_check(df):
+            return "invalid"  # Neither bool nor ValidationResult
+
+        validator = CustomValidator(func=invalid_return_check, name="invalid")
+
+        with pytest.raises(TypeError) as excinfo:
+            validator.validate(df)
+
+        assert "bool or ValidationResult" in str(excinfo.value)
+
+    # -------------------------------------------------------------------------
+    # CustomValidator with Real Validation Logic Tests
+    # -------------------------------------------------------------------------
+
+    def test_custom_validator_with_null_check_logic(self, spark):
+        """Test CustomValidator with custom null check logic."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.2)
+
+        def check_no_nulls(df):
+            from pyspark.sql import functions as F
+            null_count = df.filter(F.col("name").isNull()).count()
+            return null_count == 0
+
+        validator = CustomValidator(
+            func=check_no_nulls,
+            name="null_check",
+            description="Checks that name column has no nulls",
+        )
+
+        result = validator.validate(df)
+
+        # Should fail because there are nulls
+        assert result.passed is False
+
+    def test_custom_validator_with_row_count_logic(self, spark):
+        """Test CustomValidator with row count validation logic."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        def check_minimum_rows(df):
+            return df.count() >= 5
+
+        validator = CustomValidator(
+            func=check_minimum_rows,
+            name="min_rows_check",
+            description="Ensures at least 5 rows exist",
+        )
+
+        result = validator.validate(df)
+
+        assert result.passed is True
+
+    def test_custom_validator_with_empty_dataframe(self, spark):
+        """Test CustomValidator with empty DataFrame."""
+        df = create_empty_df(spark)
+
+        validator = CustomValidator(
+            func=lambda df: df.count() > 0,
+            name="non_empty_check",
+        )
+
+        result = validator.validate(df)
+
+        assert result.passed is False
+        assert result.total_count == 0
+
+    # -------------------------------------------------------------------------
+    # CustomValidator Details Tests
+    # -------------------------------------------------------------------------
+
+    def test_custom_validator_details_include_function_name(self, spark):
+        """Test that CustomValidator details include function name."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        def my_named_function(df):
+            return True
+
+        validator = CustomValidator(func=my_named_function, name="test")
+
+        result = validator.validate(df)
+
+        assert "function_name" in result.details
+        assert result.details["function_name"] == "my_named_function"
+
+    def test_custom_validator_details_include_lambda_marker(self, spark):
+        """Test that CustomValidator details indicate lambda for anonymous function."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        validator = CustomValidator(func=lambda df: True, name="test")
+
+        result = validator.validate(df)
+
+        assert "function_name" in result.details
+        assert result.details["function_name"] == "<lambda>"
+
+    def test_custom_validator_details_include_description(self, spark):
+        """Test that CustomValidator details include description when provided."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        validator = CustomValidator(
+            func=lambda df: True,
+            name="test",
+            description="My custom check",
+        )
+
+        result = validator.validate(df)
+
+        assert "description" in result.details
+        assert result.details["description"] == "My custom check"
+
+    # -------------------------------------------------------------------------
+    # ValidationRunner Initialization Tests
+    # -------------------------------------------------------------------------
+
+    def test_validation_runner_initialization_with_validators(self, spark):
+        """Test ValidationRunner initializes correctly with validators."""
+        validators = [
+            NullValidator(columns=["name"]),
+            RangeValidator(column="id", min_val=0),
+        ]
+
+        runner = ValidationRunner(validators=validators, mode=ValidationMode.WARN)
+
+        assert len(runner.validators) == 2
+        assert runner.mode == ValidationMode.WARN
+
+    def test_validation_runner_initialization_without_validators(self, spark):
+        """Test ValidationRunner initializes correctly without validators."""
+        runner = ValidationRunner()
+
+        assert len(runner.validators) == 0
+        assert runner.mode == ValidationMode.FAIL  # Default mode
+
+    def test_validation_runner_initialization_with_feature_group_name(self, spark):
+        """Test ValidationRunner stores feature group name."""
+        runner = ValidationRunner(
+            validators=[],
+            feature_group_name="my_feature_group",
+        )
+
+        assert runner.feature_group_name == "my_feature_group"
+
+    def test_validation_runner_mode_conversion_from_string(self, spark):
+        """Test ValidationRunner converts string mode to enum."""
+        runner = ValidationRunner(validators=[], mode="warn")
+
+        assert runner.mode == ValidationMode.WARN
+
+    # -------------------------------------------------------------------------
+    # ValidationRunner.add_validator Tests
+    # -------------------------------------------------------------------------
+
+    def test_validation_runner_add_validator(self, spark):
+        """Test ValidationRunner.add_validator adds validators."""
+        runner = ValidationRunner()
+
+        runner.add_validator(NullValidator(columns=["name"]))
+        runner.add_validator(RangeValidator(column="id", min_val=0))
+
+        assert len(runner.validators) == 2
+
+    def test_validation_runner_add_validator_chaining(self, spark):
+        """Test ValidationRunner.add_validator returns self for chaining."""
+        runner = ValidationRunner()
+
+        result = runner.add_validator(NullValidator(columns=["name"]))
+
+        assert result is runner
+
+    def test_validation_runner_add_validator_chain_multiple(self, spark):
+        """Test ValidationRunner.add_validator can be chained multiple times."""
+        runner = (
+            ValidationRunner()
+            .add_validator(NullValidator(columns=["name"]))
+            .add_validator(RangeValidator(column="id", min_val=0))
+        )
+
+        assert len(runner.validators) == 2
+
+    # -------------------------------------------------------------------------
+    # ValidationRunner.run with No Validators Tests
+    # -------------------------------------------------------------------------
+
+    def test_validation_runner_run_no_validators(self, spark, caplog):
+        """Test ValidationRunner.run with no validators logs warning."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+        runner = ValidationRunner(validators=[])
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            summary = runner.run(df)
+
+        assert summary.total_validators == 0
+        assert "No validators configured" in caplog.text
+
+    def test_validation_runner_run_no_validators_returns_empty_summary(self, spark):
+        """Test ValidationRunner.run with no validators returns empty summary."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+        runner = ValidationRunner(validators=[])
+
+        summary = runner.run(df)
+
+        assert summary.passed is True
+        assert summary.total_validators == 0
+        assert summary.passed_count == 0
+        assert summary.failed_count == 0
+
+    # -------------------------------------------------------------------------
+    # ValidationRunner.run with Passing Validators Tests
+    # -------------------------------------------------------------------------
+
+    def test_validation_runner_run_all_pass(self, spark):
+        """Test ValidationRunner.run when all validators pass."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        runner = ValidationRunner(
+            validators=[
+                NullValidator(columns=["name"]),
+                NullValidator(columns=["id"]),
+            ],
+            mode=ValidationMode.FAIL,
+        )
+
+        summary = runner.run(df)
+
+        assert summary.passed is True
+        assert summary.total_validators == 2
+        assert summary.passed_count == 2
+        assert summary.failed_count == 0
+
+    def test_validation_runner_run_returns_all_results(self, spark):
+        """Test ValidationRunner.run returns results from all validators."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        runner = ValidationRunner(
+            validators=[
+                NullValidator(columns=["name"]),
+                RangeValidator(column="id", min_val=0),
+            ],
+            mode=ValidationMode.WARN,
+        )
+
+        summary = runner.run(df)
+
+        assert len(summary.results) == 2
+        validator_names = [r.validator_name for r in summary.results]
+        assert "NullValidator" in validator_names
+        assert "RangeValidator" in validator_names
+
+    # -------------------------------------------------------------------------
+    # ValidationRunner.run with Failing Validators in WARN Mode Tests
+    # -------------------------------------------------------------------------
+
+    def test_validation_runner_run_warn_mode_continues_on_failure(self, spark):
+        """Test ValidationRunner continues to next validator in WARN mode."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.2)
+
+        runner = ValidationRunner(
+            validators=[
+                NullValidator(columns=["name"], max_null_percentage=0.0),  # Will fail
+                NullValidator(columns=["id"], max_null_percentage=0.0),  # Will pass
+            ],
+            mode=ValidationMode.WARN,
+        )
+
+        summary = runner.run(df)
+
+        # Both validators should run
+        assert summary.total_validators == 2
+        assert summary.passed_count == 1
+        assert summary.failed_count == 1
+        assert summary.passed is False  # Overall failed
+
+    def test_validation_runner_run_warn_mode_collects_all_failures(self, spark):
+        """Test ValidationRunner collects all failures in WARN mode."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.2)
+
+        runner = ValidationRunner(
+            validators=[
+                NullValidator(columns=["name"], max_null_percentage=0.0),  # Will fail
+                NullValidator(columns=["value"], max_null_percentage=0.0),  # Will fail
+            ],
+            mode=ValidationMode.WARN,
+        )
+
+        summary = runner.run(df)
+
+        assert summary.failed_count == 2
+        assert len(summary.results) == 2
+        assert all(not r.passed for r in summary.results)
+
+    # -------------------------------------------------------------------------
+    # ValidationRunner.run with Failing Validators in FAIL Mode Tests
+    # -------------------------------------------------------------------------
+
+    def test_validation_runner_run_fail_mode_raises_exception(self, spark):
+        """Test ValidationRunner raises exception on failure in FAIL mode."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.2)
+
+        runner = ValidationRunner(
+            validators=[
+                NullValidator(columns=["name"], max_null_percentage=0.0),
+            ],
+            mode=ValidationMode.FAIL,
+        )
+
+        with pytest.raises(ValidationException) as excinfo:
+            runner.run(df)
+
+        assert "Validation failed" in str(excinfo.value)
+        assert excinfo.value.result is not None
+        assert excinfo.value.result.passed is False
+
+    def test_validation_runner_run_fail_mode_stops_at_first_failure(self, spark):
+        """Test ValidationRunner stops at first failure in FAIL mode."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.2)
+
+        # Track which validators run
+        execution_log = []
+
+        def first_validator(df):
+            execution_log.append("first")
+            return False
+
+        def second_validator(df):
+            execution_log.append("second")
+            return True
+
+        runner = ValidationRunner(
+            validators=[
+                CustomValidator(func=first_validator, name="first"),
+                CustomValidator(func=second_validator, name="second"),
+            ],
+            mode=ValidationMode.FAIL,
+        )
+
+        with pytest.raises(ValidationException):
+            runner.run(df)
+
+        # Only first validator should have run
+        assert execution_log == ["first"]
+
+    def test_validation_runner_run_fail_mode_exception_contains_result(self, spark):
+        """Test ValidationRunner exception contains the failed result."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.2)
+
+        runner = ValidationRunner(
+            validators=[
+                NullValidator(columns=["name"], max_null_percentage=0.0),
+            ],
+            mode=ValidationMode.FAIL,
+        )
+
+        with pytest.raises(ValidationException) as excinfo:
+            runner.run(df)
+
+        assert excinfo.value.result.validator_name == "NullValidator"
+        assert excinfo.value.result.failure_count > 0
+
+    # -------------------------------------------------------------------------
+    # ValidationRunner.run with Empty DataFrame Tests
+    # -------------------------------------------------------------------------
+
+    def test_validation_runner_run_empty_dataframe(self, spark, caplog):
+        """Test ValidationRunner handles empty DataFrame."""
+        df = create_empty_df(spark)
+
+        runner = ValidationRunner(
+            validators=[NullValidator(columns=["name"])],
+            mode=ValidationMode.WARN,
+        )
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            summary = runner.run(df)
+
+        assert "empty" in caplog.text.lower()
+        assert summary.total_validators == 1
+
+    def test_validation_runner_run_empty_dataframe_validators_still_run(self, spark):
+        """Test ValidationRunner runs validators even on empty DataFrame."""
+        df = create_empty_df(spark)
+
+        runner = ValidationRunner(
+            validators=[
+                NullValidator(columns=["name"]),
+                RangeValidator(column="id", min_val=0),
+            ],
+            mode=ValidationMode.WARN,
+        )
+
+        summary = runner.run(df)
+
+        assert summary.total_validators == 2
+        assert len(summary.results) == 2
+
+    # -------------------------------------------------------------------------
+    # ValidationRunner.run Exception Handling Tests
+    # -------------------------------------------------------------------------
+
+    def test_validation_runner_handles_validator_exception_warn_mode(self, spark):
+        """Test ValidationRunner handles validator exceptions in WARN mode."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        def raising_validator(df):
+            raise RuntimeError("Unexpected error")
+
+        runner = ValidationRunner(
+            validators=[
+                CustomValidator(func=raising_validator, name="raising"),
+                NullValidator(columns=["name"]),  # This should still run
+            ],
+            mode=ValidationMode.WARN,
+        )
+
+        summary = runner.run(df)
+
+        # Both validators should be in results
+        assert summary.total_validators == 2
+        assert summary.failed_count == 1  # The raising one fails
+        assert summary.passed_count == 1  # NullValidator passes
+
+    def test_validation_runner_handles_validator_exception_fail_mode(self, spark):
+        """Test ValidationRunner raises for validator exceptions in FAIL mode."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        # Create a validator that will raise in validate method
+        class RaisingValidator(BaseValidator):
+            @property
+            def name(self):
+                return "RaisingValidator"
+
+            def validate(self, df):
+                raise RuntimeError("Validator error")
+
+        runner = ValidationRunner(
+            validators=[RaisingValidator()],
+            mode=ValidationMode.FAIL,
+        )
+
+        with pytest.raises(ValidationException) as excinfo:
+            runner.run(df)
+
+        assert "exception" in str(excinfo.value).lower()
+
+    # -------------------------------------------------------------------------
+    # ValidationRunner Summary Tests
+    # -------------------------------------------------------------------------
+
+    def test_validation_runner_summary_has_feature_group_name(self, spark):
+        """Test ValidationRunner summary includes feature group name."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        runner = ValidationRunner(
+            validators=[NullValidator(columns=["name"])],
+            feature_group_name="test_feature_group",
+            mode=ValidationMode.WARN,
+        )
+
+        summary = runner.run(df)
+
+        assert summary.feature_group_name == "test_feature_group"
+
+    def test_validation_runner_summary_passed_property(self, spark):
+        """Test ValidationRunner summary passed property is correct."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        runner = ValidationRunner(
+            validators=[
+                NullValidator(columns=["name"]),
+                NullValidator(columns=["id"]),
+            ],
+            mode=ValidationMode.WARN,
+        )
+
+        summary = runner.run(df)
+
+        assert summary.passed is True
+
+    def test_validation_runner_summary_failed_property(self, spark):
+        """Test ValidationRunner summary passed is False when any fails."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.2)
+
+        runner = ValidationRunner(
+            validators=[
+                NullValidator(columns=["name"], max_null_percentage=0.0),  # Fails
+                NullValidator(columns=["id"]),  # Passes
+            ],
+            mode=ValidationMode.WARN,
+        )
+
+        summary = runner.run(df)
+
+        assert summary.passed is False
+
+    # -------------------------------------------------------------------------
+    # ValidationRunner with Custom Validators Tests
+    # -------------------------------------------------------------------------
+
+    def test_validation_runner_with_custom_validator(self, spark):
+        """Test ValidationRunner works with CustomValidator."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        custom_v = CustomValidator(
+            func=lambda df: df.count() > 0,
+            name="non_empty_check",
+        )
+
+        runner = ValidationRunner(
+            validators=[custom_v],
+            mode=ValidationMode.WARN,
+        )
+
+        summary = runner.run(df)
+
+        assert summary.passed is True
+        assert summary.results[0].validator_name == "non_empty_check"
+
+    def test_validation_runner_with_mixed_validators(self, spark):
+        """Test ValidationRunner with mix of built-in and custom validators."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        runner = ValidationRunner(
+            validators=[
+                NullValidator(columns=["name"]),
+                CustomValidator(func=lambda df: True, name="custom"),
+                RangeValidator(column="id", min_val=0),
+            ],
+            mode=ValidationMode.WARN,
+        )
+
+        summary = runner.run(df)
+
+        assert summary.total_validators == 3
+        assert summary.passed_count == 3
+        validator_names = [r.validator_name for r in summary.results]
+        assert "NullValidator" in validator_names
+        assert "custom" in validator_names
+        assert "RangeValidator" in validator_names
+
+    # -------------------------------------------------------------------------
+    # ValidationRunner Logging Tests
+    # -------------------------------------------------------------------------
+
+    def test_validation_runner_logs_passed_validation(self, spark, caplog):
+        """Test ValidationRunner logs passed validations."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        runner = ValidationRunner(
+            validators=[NullValidator(columns=["name"])],
+            mode=ValidationMode.WARN,
+        )
+
+        import logging
+        with caplog.at_level(logging.INFO):
+            runner.run(df)
+
+        assert "PASSED" in caplog.text
+
+    def test_validation_runner_logs_failed_validation(self, spark, caplog):
+        """Test ValidationRunner logs failed validations."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.2)
+
+        runner = ValidationRunner(
+            validators=[NullValidator(columns=["name"], max_null_percentage=0.0)],
+            mode=ValidationMode.WARN,
+        )
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            runner.run(df)
+
+        assert "FAILED" in caplog.text
+
+    def test_validation_runner_logs_summary(self, spark, caplog):
+        """Test ValidationRunner logs summary at the end."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        runner = ValidationRunner(
+            validators=[
+                NullValidator(columns=["name"]),
+                NullValidator(columns=["id"]),
+            ],
+            mode=ValidationMode.WARN,
+        )
+
+        import logging
+        with caplog.at_level(logging.INFO):
+            runner.run(df)
+
+        # Should log "2/2 validators passed"
+        assert "2/2" in caplog.text or "validators passed" in caplog.text
+
+    def test_validation_runner_logs_with_feature_group_prefix(self, spark, caplog):
+        """Test ValidationRunner logs include feature group name prefix."""
+        df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+        runner = ValidationRunner(
+            validators=[NullValidator(columns=["name"])],
+            feature_group_name="my_feature_group",
+            mode=ValidationMode.WARN,
+        )
+
+        import logging
+        with caplog.at_level(logging.INFO):
+            runner.run(df)
+
+        assert "my_feature_group" in caplog.text
+
+    # -------------------------------------------------------------------------
+    # ValidationException Tests
+    # -------------------------------------------------------------------------
+
+    def test_validation_exception_initialization(self, spark):
+        """Test ValidationException initializes correctly."""
+        result = ValidationResult(
+            validator_name="test",
+            passed=False,
+            failure_count=5,
+            total_count=10,
+            message="Test failed",
+        )
+
+        exception = ValidationException("Validation failed", result=result)
+
+        assert exception.message == "Validation failed"
+        assert exception.result is result
+        assert str(exception) == "Validation failed"
+
+    def test_validation_exception_without_result(self, spark):
+        """Test ValidationException works without result."""
+        exception = ValidationException("Simple error")
+
+        assert exception.message == "Simple error"
+        assert exception.result is None
+
+
+# Legacy tests for backward compatibility
+def test_custom_validator_simple_usage(spark):
+    """Test basic CustomValidator usage pattern."""
+    df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+    validator = CustomValidator(
+        func=lambda df: df.count() > 0,
+        name="non_empty_check",
+    )
+
+    result = validator.validate(df)
+
+    assert result.passed is True
+    assert result.validator_name == "non_empty_check"
+
+
+def test_validation_runner_simple_usage(spark):
+    """Test basic ValidationRunner usage pattern."""
+    df = create_test_df_with_nulls(spark, null_percentage=0.0)
+
+    runner = ValidationRunner(
+        validators=[NullValidator(columns=["name"])],
+        mode=ValidationMode.WARN,
+    )
+
+    summary = runner.run(df)
+
+    assert summary.passed is True
+    assert summary.total_validators == 1
