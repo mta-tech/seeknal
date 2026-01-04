@@ -677,6 +677,76 @@ class FeatureGroup(FeatureStore):
         }
 
     @require_workspace
+    @require_project
+    def compare_versions(self, from_version: int, to_version: int) -> Optional[dict]:
+        """
+        Compare schemas between two versions of this feature group.
+
+        Identifies added, removed, and modified features between the two versions
+        by comparing their Avro schemas.
+
+        Args:
+            from_version (int): The base version number to compare from.
+            to_version (int): The target version number to compare to.
+
+        Returns:
+            Optional[dict]: A dictionary containing the comparison result if both
+                versions exist, None if either version doesn't exist or the feature
+                group has not been saved. The dictionary includes:
+                - from_version: The base version number
+                - to_version: The target version number
+                - added: List of field names added in to_version
+                - removed: List of field names removed in to_version
+                - modified: List of dicts with field name and type changes
+
+        Raises:
+            ValueError: If from_version equals to_version.
+
+        Example:
+            >>> fg = FeatureGroup(name="user_features").get_or_create()
+            >>> diff = fg.compare_versions(1, 2)
+            >>> if diff:
+            ...     print(f"Added features: {diff['added']}")
+            ...     print(f"Removed features: {diff['removed']}")
+            ...     print(f"Modified features: {diff['modified']}")
+        """
+        if from_version == to_version:
+            raise ValueError("from_version and to_version must be different")
+
+        if not hasattr(self, 'feature_group_id') or self.feature_group_id is None:
+            # Feature group not saved yet, return None
+            return None
+
+        # Fetch both versions
+        from_version_obj = FeatureGroupRequest.select_by_feature_group_id_and_version(
+            self.feature_group_id, from_version
+        )
+        to_version_obj = FeatureGroupRequest.select_by_feature_group_id_and_version(
+            self.feature_group_id, to_version
+        )
+
+        # Check if both versions exist
+        if from_version_obj is None:
+            raise ValueError(f"Version {from_version} not found for this feature group")
+        if to_version_obj is None:
+            raise ValueError(f"Version {to_version} not found for this feature group")
+
+        # Get avro_schema JSON strings
+        from_schema_json = from_version_obj.avro_schema if from_version_obj.avro_schema else "{}"
+        to_schema_json = to_version_obj.avro_schema if to_version_obj.avro_schema else "{}"
+
+        # Compare schemas using FeatureGroupRequest.compare_schemas()
+        schema_diff = FeatureGroupRequest.compare_schemas(from_schema_json, to_schema_json)
+
+        return {
+            "from_version": from_version,
+            "to_version": to_version,
+            "added": schema_diff.get("added", []),
+            "removed": schema_diff.get("removed", []),
+            "modified": schema_diff.get("modified", []),
+        }
+
+    @require_workspace
     @require_saved
     @require_project
     def delete(self):
