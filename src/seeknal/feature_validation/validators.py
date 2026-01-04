@@ -33,7 +33,7 @@ Usage:
 
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 from pyspark.sql import DataFrame, functions as F
 from pyspark.sql.types import TimestampType, DateType
@@ -1046,3 +1046,203 @@ class FreshnessValidator(BaseValidator):
         else:
             days = total_seconds // 86400
             return f"{days} day{'s' if days != 1 else ''}"
+
+
+class CustomValidator(BaseValidator):
+    """
+    Wrapper for user-defined validation functions.
+
+    This validator allows users to define custom validation logic via Python
+    functions. The user function can return either a boolean (True for pass,
+    False for fail) or a full ValidationResult object for more detailed control.
+
+    Attributes:
+        func (Callable): The user-defined validation function.
+        name (str): Name of this custom validator.
+        description (str, optional): Description of what the validator checks.
+
+    Example:
+        >>> # Simple boolean function
+        >>> def check_positive_values(df: DataFrame) -> bool:
+        ...     return df.filter(F.col("value") < 0).count() == 0
+        >>>
+        >>> validator = CustomValidator(
+        ...     func=check_positive_values,
+        ...     name="positive_values_check"
+        ... )
+        >>> result = validator.validate(df)
+        >>>
+        >>> # Lambda function
+        >>> validator = CustomValidator(
+        ...     func=lambda df: df.count() > 0,
+        ...     name="non_empty_check"
+        ... )
+        >>>
+        >>> # Function returning ValidationResult for detailed control
+        >>> def check_with_details(df: DataFrame) -> ValidationResult:
+        ...     count = df.filter(F.col("status") == "error").count()
+        ...     total = df.count()
+        ...     return ValidationResult(
+        ...         validator_name="error_check",
+        ...         passed=count == 0,
+        ...         failure_count=count,
+        ...         total_count=total,
+        ...         message=f"Found {count} error records"
+        ...     )
+        >>>
+        >>> validator = CustomValidator(
+        ...     func=check_with_details,
+        ...     name="error_check"
+        ... )
+    """
+
+    def __init__(
+        self,
+        func: Callable[[DataFrame], Union[bool, ValidationResult]],
+        name: str = "CustomValidator",
+        description: Optional[str] = None,
+    ):
+        """
+        Initialize CustomValidator.
+
+        Args:
+            func (Callable): A validation function that takes a PySpark DataFrame
+                and returns either:
+                - bool: True if validation passes, False if it fails
+                - ValidationResult: A complete validation result with details
+            name (str, optional): Name for this custom validator. Used in logging
+                and results. Defaults to "CustomValidator".
+            description (str, optional): Human-readable description of what this
+                validator checks. Included in validation results.
+
+        Raises:
+            ValueError: If func is not callable.
+        """
+        if not callable(func):
+            raise ValueError(
+                f"func must be a callable, got {type(func).__name__}"
+            )
+
+        self._func = func
+        self._name = name
+        self._description = description
+
+    @property
+    def name(self) -> str:
+        """Return the name of this validator."""
+        return self._name
+
+    @property
+    def func(self) -> Callable[[DataFrame], Union[bool, ValidationResult]]:
+        """Return the user-defined validation function."""
+        return self._func
+
+    @property
+    def description(self) -> Optional[str]:
+        """Return the description of this validator."""
+        return self._description
+
+    def validate(self, df: DataFrame) -> ValidationResult:
+        """
+        Execute the user-defined validation function on the DataFrame.
+
+        This method wraps the user function in exception handling to ensure
+        graceful error reporting. If the user function returns a boolean,
+        it is converted to a ValidationResult. If it returns a ValidationResult,
+        it is used directly.
+
+        Args:
+            df (DataFrame): The PySpark DataFrame to validate.
+
+        Returns:
+            ValidationResult: The result of the validation. If the user function
+                raises an exception, returns a failed result with error details.
+        """
+        total_count = 0
+
+        try:
+            # Get row count for result (only if needed)
+            total_count = self._get_total_count(df)
+
+            # Execute the user-defined function
+            result = self._func(df)
+
+            # Handle boolean return value
+            if isinstance(result, bool):
+                return ValidationResult(
+                    validator_name=self._name,
+                    passed=result,
+                    failure_count=0 if result else total_count,
+                    total_count=total_count,
+                    message=self._build_message(result),
+                    details=self._build_details(),
+                )
+
+            # Handle ValidationResult return value
+            if isinstance(result, ValidationResult):
+                # Use the user's result but ensure validator_name is set
+                if not result.validator_name:
+                    result.validator_name = self._name
+                return result
+
+            # Handle unexpected return type
+            raise TypeError(
+                f"Custom validation function must return bool or ValidationResult, "
+                f"got {type(result).__name__}"
+            )
+
+        except TypeError as e:
+            # Re-raise TypeError from type checking above
+            raise
+
+        except Exception as e:
+            # Handle exceptions in user function gracefully
+            error_message = f"Custom validation function raised exception: {str(e)}"
+            logger.error(f"[{self._name}] {error_message}")
+
+            return ValidationResult(
+                validator_name=self._name,
+                passed=False,
+                failure_count=0,
+                total_count=total_count,
+                message=error_message,
+                details={
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "description": self._description,
+                },
+            )
+
+    def _build_message(self, passed: bool) -> str:
+        """
+        Build a default message based on the validation result.
+
+        Args:
+            passed (bool): Whether the validation passed.
+
+        Returns:
+            str: A human-readable message describing the result.
+        """
+        if passed:
+            if self._description:
+                return f"Custom validation passed: {self._description}"
+            return f"Custom validation '{self._name}' passed"
+        else:
+            if self._description:
+                return f"Custom validation failed: {self._description}"
+            return f"Custom validation '{self._name}' failed"
+
+    def _build_details(self) -> dict:
+        """
+        Build details dictionary for the validation result.
+
+        Returns:
+            dict: Details about this custom validator.
+        """
+        details = {
+            "validator_type": "custom",
+            "function_name": getattr(self._func, "__name__", "lambda"),
+        }
+        if self._description:
+            details["description"] = self._description
+        return details
