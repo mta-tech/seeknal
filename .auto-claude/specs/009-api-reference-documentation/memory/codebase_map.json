@@ -4,7 +4,17 @@
       "description": "MkDocs configuration file with Material theme and mkdocstrings plugin. Uses Google-style docstrings. Source code path is set to 'src' directory. Navigation structure includes Home, API Reference (core, featurestore, tasks), and Examples sections.",
       "category": "configuration",
       "discovered_at": "2026-01-04T05:09:44.055153+00:00"
+    },
+    ".venv/": {
+      "description": "Virtual environment for documentation tooling with MkDocs 1.6.1, mkdocs-material 9.7.1, mkdocstrings 1.0.0. Use 'source .venv/bin/activate && python -m mkdocs build' to build docs.",
+      "category": "infrastructure",
+      "discovered_at": "2026-01-04T05:20:27.954207+00:00"
+    },
+    "docs/audit/docstring_coverage.md": {
+      "description": "Docstring coverage audit document analyzing 16 core modules. Key findings: 4 modules complete (validation.py, db_utils.py, context.py, configuration.py), 4 partial (core_utils.py, entity.py, account.py, exceptions/*), 8 missing (__init__.py, project.py, flow.py, workspace.py, common_artifact.py, request.py, models.py, utils/__init__.py). Priority enhancement order established for Phases 3-5.",
+      "category": "documentation",
+      "discovered_at": "2026-01-04T05:24:50.930141+00:00"
     }
   },
-  "last_updated": "2026-01-04T05:09:44.055163+00:00"
+  "last_updated": "2026-01-04T05:24:50.930151+00:00"
 }
