@@ -486,6 +486,62 @@ def clean(
         raise typer.Exit(1)
 
 
+# Version subcommands
+@version_app.command("list")
+def version_list(
+    feature_group: str = typer.Argument(
+        ..., help="Name of the feature group"
+    ),
+    format: OutputFormat = typer.Option(
+        OutputFormat.TABLE, "--format", "-f",
+        help="Output format"
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", "-l",
+        help="Limit number of versions to display"
+    ),
+):
+    """List all versions of a feature group."""
+    from seeknal.featurestore.feature_group import FeatureGroup
+    from tabulate import tabulate
+    import json
+
+    try:
+        fg = FeatureGroup(name=feature_group).get_or_create()
+        versions = fg.list_versions()
+
+        if not versions:
+            _echo_info(f"No versions found for feature group: {feature_group}")
+            return
+
+        # Apply limit if specified
+        if limit is not None:
+            versions = versions[:limit]
+
+        if format == OutputFormat.JSON:
+            typer.echo(json.dumps(versions, indent=2, default=str))
+        else:
+            # Table format
+            headers = ["Version", "Created At", "Features"]
+            data = []
+            for v in versions:
+                created_at = v.get("created_at", "N/A")
+                if created_at and created_at != "N/A":
+                    # Format datetime for display
+                    if hasattr(created_at, "strftime"):
+                        created_at = created_at.strftime("%Y-%m-%d %H:%M:%S")
+                feature_count = v.get("feature_count", 0)
+                data.append([v.get("version", "N/A"), created_at, feature_count])
+
+            typer.echo(f"\nVersions for feature group: {feature_group}")
+            typer.echo("-" * 50)
+            typer.echo(tabulate(data, headers=headers, tablefmt="simple"))
+
+    except Exception as e:
+        _echo_error(f"Error listing versions: {e}")
+        raise typer.Exit(1)
+
+
 def main():
     """Main entry point for the CLI."""
     app()
