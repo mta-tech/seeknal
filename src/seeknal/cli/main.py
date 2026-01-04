@@ -196,6 +196,10 @@ def materialize(
         None, "--end-date", "-e",
         help="End date (YYYY-MM-DD)"
     ),
+    version: Optional[int] = typer.Option(
+        None, "--version", "-v",
+        help="Version number to materialize (defaults to latest)"
+    ),
     mode: WriteMode = typer.Option(
         WriteMode.OVERWRITE, "--mode", "-m",
         help="Write mode"
@@ -221,13 +225,15 @@ def materialize(
         raise typer.Exit(1)
 
     typer.echo(f"Materializing feature group: {feature_group}")
+    if version is not None:
+        typer.echo(f"  Version: {version}")
     typer.echo(f"  Start date: {start_date}")
     if end_date:
         typer.echo(f"  End date: {end_date}")
     typer.echo(f"  Mode: {mode.value}")
 
     try:
-        fg = FeatureGroup.load(name=feature_group)
+        fg = FeatureGroup.load(name=feature_group, version=version)
         fg.write(
             feature_start_time=start_dt,
             feature_end_time=end_dt,
