@@ -24,6 +24,11 @@ from seeknal.cli.main import (
     _echo_info,
 )
 
+# Pre-populate sys.modules with mock to enable patching without triggering full import chain
+import sys
+if "seeknal.featurestore.feature_group" not in sys.modules:
+    sys.modules["seeknal.featurestore.feature_group"] = mock.MagicMock()
+
 
 runner = CliRunner()
 
@@ -411,7 +416,7 @@ class TestDeleteCommand:
 
     def test_delete_feature_group_success(self):
         """Delete command should successfully delete a feature group with --force."""
-        with mock.patch("seeknal.cli.main.FeatureGroup") as mock_fg_class:
+        with mock.patch("seeknal.featurestore.feature_group.FeatureGroup") as mock_fg_class:
             # Setup mock
             mock_fg_instance = mock.MagicMock()
             mock_fg_class.load.return_value = mock_fg_instance
@@ -429,7 +434,7 @@ class TestDeleteCommand:
 
     def test_delete_feature_group_not_found(self):
         """Delete command should return error for non-existent feature group."""
-        with mock.patch("seeknal.cli.main.FeatureGroup") as mock_fg_class:
+        with mock.patch("seeknal.featurestore.feature_group.FeatureGroup") as mock_fg_class:
             # Simulate feature group not found
             mock_fg_class.load.side_effect = Exception("Feature group not found")
 
@@ -443,7 +448,7 @@ class TestDeleteCommand:
 
     def test_delete_feature_group_confirmation_cancelled(self):
         """Delete command should exit gracefully when confirmation is cancelled."""
-        with mock.patch("seeknal.cli.main.FeatureGroup") as mock_fg_class:
+        with mock.patch("seeknal.featurestore.feature_group.FeatureGroup") as mock_fg_class:
             # Setup mock for load
             mock_fg_instance = mock.MagicMock()
             mock_fg_class.load.return_value = mock_fg_instance
@@ -460,7 +465,7 @@ class TestDeleteCommand:
 
     def test_delete_feature_group_confirmation_accepted(self):
         """Delete command should proceed when confirmation is accepted."""
-        with mock.patch("seeknal.cli.main.FeatureGroup") as mock_fg_class:
+        with mock.patch("seeknal.featurestore.feature_group.FeatureGroup") as mock_fg_class:
             # Setup mock
             mock_fg_instance = mock.MagicMock()
             mock_fg_class.load.return_value = mock_fg_instance
@@ -477,7 +482,7 @@ class TestDeleteCommand:
 
     def test_delete_feature_group_delete_failure(self):
         """Delete command should handle deletion failures gracefully."""
-        with mock.patch("seeknal.cli.main.FeatureGroup") as mock_fg_class:
+        with mock.patch("seeknal.featurestore.feature_group.FeatureGroup") as mock_fg_class:
             # Setup mock
             mock_fg_instance = mock.MagicMock()
             mock_fg_class.load.return_value = mock_fg_instance
