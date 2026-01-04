@@ -1161,6 +1161,80 @@ class FeatureGroupRequest(RequestFactory):
             }
 
     @staticmethod
+    def compare_schemas(schema1_json: str, schema2_json: str) -> dict:
+        """Compare two Avro schemas to detect added, removed, and modified fields.
+
+        Args:
+            schema1_json: JSON string of the first Avro schema (base version)
+            schema2_json: JSON string of the second Avro schema (new version)
+
+        Returns:
+            A dict containing:
+            - added: list of field names that are in schema2 but not in schema1
+            - removed: list of field names that are in schema1 but not in schema2
+            - modified: list of dicts with field name and type changes for fields
+                        that exist in both but have different types
+
+        Example:
+            >>> schema1 = '{"type":"record","fields":[{"name":"a","type":"int"}]}'
+            >>> schema2 = '{"type":"record","fields":[{"name":"a","type":"string"},{"name":"b","type":"int"}]}'
+            >>> diff = FeatureGroupRequest.compare_schemas(schema1, schema2)
+            >>> diff
+            {'added': ['b'], 'removed': [], 'modified': [{'name': 'a', 'old_type': 'int', 'new_type': 'string'}]}
+        """
+        result = {
+            "added": [],
+            "removed": [],
+            "modified": [],
+        }
+
+        try:
+            schema1 = json.loads(schema1_json) if isinstance(schema1_json, str) else schema1_json
+            schema2 = json.loads(schema2_json) if isinstance(schema2_json, str) else schema2_json
+        except (json.JSONDecodeError, TypeError):
+            return result
+
+        # Extract fields from schemas
+        fields1 = schema1.get("fields", []) if isinstance(schema1, dict) else []
+        fields2 = schema2.get("fields", []) if isinstance(schema2, dict) else []
+
+        # Build field maps {name: type}
+        fields1_map = {}
+        for field in fields1:
+            if isinstance(field, dict) and "name" in field:
+                fields1_map[field["name"]] = field.get("type")
+
+        fields2_map = {}
+        for field in fields2:
+            if isinstance(field, dict) and "name" in field:
+                fields2_map[field["name"]] = field.get("type")
+
+        # Find added fields (in schema2 but not in schema1)
+        for name in fields2_map:
+            if name not in fields1_map:
+                result["added"].append(name)
+
+        # Find removed fields (in schema1 but not in schema2)
+        for name in fields1_map:
+            if name not in fields2_map:
+                result["removed"].append(name)
+
+        # Find modified fields (same name but different type)
+        for name in fields1_map:
+            if name in fields2_map:
+                type1 = fields1_map[name]
+                type2 = fields2_map[name]
+                # Compare types - handle both simple types (strings) and complex types (dicts)
+                if type1 != type2:
+                    result["modified"].append({
+                        "name": name,
+                        "old_type": type1,
+                        "new_type": type2,
+                    })
+
+        return result
+
+    @staticmethod
     def delete_by_feature_group_id(id):
         with get_db_session() as session:
             try:
