@@ -542,6 +542,100 @@ def version_list(
         raise typer.Exit(1)
 
 
+@version_app.command("show")
+def version_show(
+    feature_group: str = typer.Argument(
+        ..., help="Name of the feature group"
+    ),
+    version: Optional[int] = typer.Option(
+        None, "--version", "-v",
+        help="Version number to show (defaults to latest)"
+    ),
+    format: OutputFormat = typer.Option(
+        OutputFormat.TABLE, "--format", "-f",
+        help="Output format"
+    ),
+):
+    """Show detailed information about a feature group version."""
+    from seeknal.featurestore.feature_group import FeatureGroup
+    import json
+
+    try:
+        fg = FeatureGroup(name=feature_group).get_or_create()
+
+        # Get specific version or latest
+        if version is not None:
+            version_data = fg.get_version(version)
+            if version_data is None:
+                _echo_error(f"Version {version} not found for feature group: {feature_group}")
+                raise typer.Exit(1)
+        else:
+            # Get latest version (first in list, sorted by version desc)
+            versions = fg.list_versions()
+            if not versions:
+                _echo_info(f"No versions found for feature group: {feature_group}")
+                return
+            version_data = versions[0]
+
+        if format == OutputFormat.JSON:
+            typer.echo(json.dumps(version_data, indent=2, default=str))
+        else:
+            # Table/readable format
+            version_num = version_data.get("version", "N/A")
+            created_at = version_data.get("created_at", "N/A")
+            updated_at = version_data.get("updated_at", "N/A")
+            feature_count = version_data.get("feature_count", 0)
+            avro_schema = version_data.get("avro_schema")
+
+            # Format datetime for display
+            if created_at and created_at != "N/A" and hasattr(created_at, "strftime"):
+                created_at = created_at.strftime("%Y-%m-%d %H:%M:%S")
+            if updated_at and updated_at != "N/A" and hasattr(updated_at, "strftime"):
+                updated_at = updated_at.strftime("%Y-%m-%d %H:%M:%S")
+
+            typer.echo(f"\nFeature Group: {feature_group}")
+            typer.echo(f"Version: {version_num}")
+            typer.echo("-" * 50)
+            typer.echo(f"  Created At:    {created_at}")
+            typer.echo(f"  Updated At:    {updated_at}")
+            typer.echo(f"  Feature Count: {feature_count}")
+
+            # Display schema
+            if avro_schema:
+                typer.echo("\nSchema:")
+                typer.echo("-" * 50)
+                try:
+                    # Parse and pretty-print the Avro schema
+                    if isinstance(avro_schema, str):
+                        schema_dict = json.loads(avro_schema)
+                    else:
+                        schema_dict = avro_schema
+
+                    # Display schema fields
+                    if "fields" in schema_dict:
+                        typer.echo("  Fields:")
+                        for field in schema_dict.get("fields", []):
+                            field_name = field.get("name", "unknown")
+                            field_type = field.get("type", "unknown")
+                            # Handle complex types
+                            if isinstance(field_type, dict):
+                                field_type = field_type.get("type", str(field_type))
+                            elif isinstance(field_type, list):
+                                # Union types like ["null", "string"]
+                                field_type = " | ".join(str(t) for t in field_type)
+                            typer.echo(f"    - {field_name}: {field_type}")
+                    else:
+                        # Fallback: print formatted JSON
+                        typer.echo(json.dumps(schema_dict, indent=2))
+                except (json.JSONDecodeError, TypeError):
+                    # If parsing fails, display raw schema
+                    typer.echo(f"  {avro_schema}")
+
+    except Exception as e:
+        _echo_error(f"Error showing version: {e}")
+        raise typer.Exit(1)
+
+
 def main():
     """Main entry point for the CLI."""
     app()
