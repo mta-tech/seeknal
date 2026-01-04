@@ -563,6 +563,65 @@ class FeatureGroup(FeatureStore):
         return self
 
     @require_workspace
+    @require_project
+    def list_versions(self):
+        """
+        List all versions of this feature group.
+
+        Returns a list of dictionaries containing version metadata including:
+        - version: The version number
+        - avro_schema: The Avro schema for this version (as dict)
+        - created_at: When the version was created
+        - updated_at: When the version was last updated
+        - feature_count: Number of features in this version
+
+        Returns:
+            List[dict]: A list of version metadata dictionaries, ordered by version
+                number descending (latest first). Returns an empty list if the
+                feature group has not been saved or has no versions.
+
+        Example:
+            >>> fg = FeatureGroup(name="user_features").get_or_create()
+            >>> versions = fg.list_versions()
+            >>> for v in versions:
+            ...     print(f"Version {v['version']}: {v['feature_count']} features")
+        """
+        if not hasattr(self, 'feature_group_id') or self.feature_group_id is None:
+            # Feature group not saved yet, return empty list
+            return []
+
+        versions = FeatureGroupRequest.select_version_by_feature_group_id(
+            self.feature_group_id
+        )
+
+        if versions is None:
+            return []
+
+        result = []
+        for v in versions:
+            # Parse avro_schema from JSON string
+            try:
+                avro_schema = json.loads(v.avro_schema) if v.avro_schema else None
+            except (json.JSONDecodeError, TypeError):
+                avro_schema = None
+
+            # Get feature count for this version
+            features = FeatureRequest.select_by_feature_group_id_and_version(
+                self.feature_group_id, v.version
+            )
+            feature_count = len(features) if features else 0
+
+            result.append({
+                "version": v.version,
+                "avro_schema": avro_schema,
+                "created_at": pendulum.instance(v.created_at).format("YYYY-MM-DD HH:mm:ss") if v.created_at else None,
+                "updated_at": pendulum.instance(v.updated_at).format("YYYY-MM-DD HH:mm:ss") if v.updated_at else None,
+                "feature_count": feature_count,
+            })
+
+        return result
+
+    @require_workspace
     @require_saved
     @require_project
     def delete(self):
