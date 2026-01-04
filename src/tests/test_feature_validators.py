@@ -643,3 +643,645 @@ def test_null_validator_detects_nulls(spark):
     assert "NullValidator" in result.validator_name
     assert result.details is not None
     assert "column_null_counts" in result.details
+
+
+# =============================================================================
+# RangeValidator Tests
+# =============================================================================
+
+
+class TestRangeValidator:
+    """Comprehensive tests for the RangeValidator class."""
+
+    # -------------------------------------------------------------------------
+    # Basic Range Detection Tests
+    # -------------------------------------------------------------------------
+
+    def test_detects_values_below_minimum(self, spark):
+        """Test that RangeValidator correctly identifies values below minimum."""
+        # Create DataFrame with out-of-range values (1 below min)
+        df = create_test_df_with_range_violations(spark, out_of_range_count=1)
+
+        # Create validator with range 0-100
+        validator = RangeValidator(column="age", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed due to values below minimum
+        assert result.passed is False
+        assert result.failure_count > 0
+        assert result.validator_name == "RangeValidator"
+        assert result.details is not None
+        assert "out_of_range_count" in result.details
+        assert result.details["out_of_range_count"] > 0
+
+    def test_detects_values_above_maximum(self, spark):
+        """Test that RangeValidator correctly identifies values above maximum."""
+        # Create DataFrame with out-of-range values (2 = 1 below + 1 above)
+        df = create_test_df_with_range_violations(spark, out_of_range_count=2)
+
+        # Create validator with range 0-100
+        validator = RangeValidator(column="age", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed due to values above maximum
+        assert result.passed is False
+        assert result.failure_count == 2
+        assert "failed" in result.message.lower()
+
+    def test_passes_when_all_values_in_range(self, spark):
+        """Test that RangeValidator passes when all values are within range."""
+        # Create DataFrame with no out-of-range values
+        df = create_test_df_with_range_violations(spark, out_of_range_count=0)
+
+        # Create validator with range 0-100
+        validator = RangeValidator(column="age", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed
+        assert result.passed is True
+        assert result.failure_count == 0
+        assert result.validator_name == "RangeValidator"
+        assert "passed" in result.message.lower()
+
+    def test_values_at_exact_minimum_boundary(self, spark):
+        """Test that values exactly at minimum are considered valid (inclusive)."""
+        # Create DataFrame with value exactly at minimum
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [(1, 0), (2, 50), (3, 100)]  # 0 is exactly at min boundary
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with range 0-100
+        validator = RangeValidator(column="value", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (boundary values are inclusive)
+        assert result.passed is True
+        assert result.failure_count == 0
+
+    def test_values_at_exact_maximum_boundary(self, spark):
+        """Test that values exactly at maximum are considered valid (inclusive)."""
+        # Create DataFrame with value exactly at maximum
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [(1, 0), (2, 50), (3, 100)]  # 100 is exactly at max boundary
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with range 0-100
+        validator = RangeValidator(column="value", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (boundary values are inclusive)
+        assert result.passed is True
+        assert result.failure_count == 0
+
+    def test_values_just_outside_minimum_boundary(self, spark):
+        """Test that values just below minimum are detected."""
+        # Create DataFrame with value just below minimum
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [(1, -1), (2, 50), (3, 100)]  # -1 is just below min of 0
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with range 0-100
+        validator = RangeValidator(column="value", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed
+        assert result.passed is False
+        assert result.failure_count == 1
+
+    def test_values_just_outside_maximum_boundary(self, spark):
+        """Test that values just above maximum are detected."""
+        # Create DataFrame with value just above maximum
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [(1, 0), (2, 50), (3, 101)]  # 101 is just above max of 100
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with range 0-100
+        validator = RangeValidator(column="value", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed
+        assert result.passed is False
+        assert result.failure_count == 1
+
+    # -------------------------------------------------------------------------
+    # Minimum-Only and Maximum-Only Bound Tests
+    # -------------------------------------------------------------------------
+
+    def test_only_min_val_specified_passes(self, spark):
+        """Test that validation passes when only min_val is specified and all values are valid."""
+        # Create DataFrame with all positive values
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [(1, 0), (2, 50), (3, 100), (4, 1000)]  # All >= 0
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with only min_val
+        validator = RangeValidator(column="value", min_val=0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed
+        assert result.passed is True
+        assert result.failure_count == 0
+        assert ">= 0" in result.message
+
+    def test_only_min_val_specified_fails(self, spark):
+        """Test that validation fails when only min_val is specified and some values are invalid."""
+        # Create DataFrame with some negative values
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [(1, -5), (2, 50), (3, 100)]  # -5 is below min of 0
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with only min_val
+        validator = RangeValidator(column="value", min_val=0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed
+        assert result.passed is False
+        assert result.failure_count == 1
+        assert result.details["min_val"] == 0
+        assert result.details["max_val"] is None
+
+    def test_only_max_val_specified_passes(self, spark):
+        """Test that validation passes when only max_val is specified and all values are valid."""
+        # Create DataFrame with all values <= 100
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [(1, -100), (2, 0), (3, 50), (4, 100)]  # All <= 100
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with only max_val
+        validator = RangeValidator(column="value", max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed
+        assert result.passed is True
+        assert result.failure_count == 0
+        assert "<= 100" in result.message
+
+    def test_only_max_val_specified_fails(self, spark):
+        """Test that validation fails when only max_val is specified and some values are invalid."""
+        # Create DataFrame with some values above max
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [(1, 0), (2, 50), (3, 150)]  # 150 is above max of 100
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with only max_val
+        validator = RangeValidator(column="value", max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed
+        assert result.passed is False
+        assert result.failure_count == 1
+        assert result.details["min_val"] is None
+        assert result.details["max_val"] == 100
+
+    # -------------------------------------------------------------------------
+    # Data Type Tests
+    # -------------------------------------------------------------------------
+
+    def test_with_float_values(self, spark):
+        """Test RangeValidator with float/double values."""
+        # Create DataFrame with float values
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("price", DoubleType(), True),
+        ])
+        data = [(1, 0.0), (2, 49.99), (3, 100.0), (4, 100.01)]  # 100.01 is above max
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with range 0.0-100.0
+        validator = RangeValidator(column="price", min_val=0.0, max_val=100.0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed due to 100.01
+        assert result.passed is False
+        assert result.failure_count == 1
+
+    def test_with_negative_range(self, spark):
+        """Test RangeValidator with negative range values."""
+        # Create DataFrame with values in negative range
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("temperature", IntegerType(), True),
+        ])
+        data = [(1, -50), (2, -25), (3, 0), (4, -100)]  # -100 is below min of -50
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with negative range
+        validator = RangeValidator(column="temperature", min_val=-50, max_val=0)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed
+        assert result.passed is False
+        assert result.failure_count == 1
+
+    def test_with_floating_point_precision(self, spark):
+        """Test RangeValidator handles floating point precision correctly."""
+        # Create DataFrame with precise float values
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", DoubleType(), True),
+        ])
+        data = [(1, 0.1 + 0.2), (2, 0.3)]  # Both should be ~0.3
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with range that includes 0.3
+        validator = RangeValidator(column="value", min_val=0.0, max_val=0.5)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (both values are within range)
+        assert result.passed is True
+
+    # -------------------------------------------------------------------------
+    # Null Value Handling Tests
+    # -------------------------------------------------------------------------
+
+    def test_null_values_excluded_from_check(self, spark):
+        """Test that null values are excluded from range check."""
+        # Create DataFrame with null values
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [(1, 50), (2, None), (3, 75)]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = RangeValidator(column="value", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (null values are excluded)
+        assert result.passed is True
+        assert result.details["null_count"] == 1
+        assert result.details["non_null_count"] == 2
+
+    def test_all_null_column_passes(self, spark):
+        """Test that column with all null values passes validation."""
+        # Create DataFrame with all null values
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [(1, None), (2, None), (3, None)]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = RangeValidator(column="value", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (no non-null values to check)
+        assert result.passed is True
+        assert result.details["null_count"] == 3
+        assert result.details["non_null_count"] == 0
+
+    def test_null_values_with_out_of_range(self, spark):
+        """Test that null values don't affect detection of out-of-range values."""
+        # Create DataFrame with nulls and out-of-range values
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [(1, None), (2, 150), (3, None), (4, 50)]  # 150 is out of range
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = RangeValidator(column="value", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (150 is out of range)
+        assert result.passed is False
+        assert result.failure_count == 1
+        assert result.details["null_count"] == 2
+        assert result.details["non_null_count"] == 2
+
+    # -------------------------------------------------------------------------
+    # Edge Cases
+    # -------------------------------------------------------------------------
+
+    def test_empty_dataframe(self, spark):
+        """Test that RangeValidator handles empty DataFrames gracefully."""
+        # Create empty DataFrame
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        df = spark.createDataFrame([], schema)
+
+        # Create validator
+        validator = RangeValidator(column="value", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (empty DataFrame)
+        assert result.passed is True
+        assert result.total_count == 0
+        assert "empty" in result.message.lower()
+
+    def test_missing_column_raises_error(self, spark):
+        """Test that RangeValidator raises an error for missing columns."""
+        # Create DataFrame
+        df = create_test_df_with_range_violations(spark, out_of_range_count=0)
+
+        # Create validator with a non-existent column
+        validator = RangeValidator(column="nonexistent_column", min_val=0, max_val=100)
+
+        # Assert that validation raises ValueError
+        with pytest.raises(ValueError) as exc_info:
+            validator.validate(df)
+
+        assert "not found" in str(exc_info.value).lower()
+
+    def test_single_row_in_range(self, spark):
+        """Test RangeValidator with a single row in range."""
+        # Create single-row DataFrame
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        df = spark.createDataFrame([(1, 50)], schema)
+
+        # Create validator
+        validator = RangeValidator(column="value", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed
+        assert result.passed is True
+        assert result.total_count == 1
+        assert result.failure_count == 0
+
+    def test_single_row_out_of_range(self, spark):
+        """Test RangeValidator with a single row out of range."""
+        # Create single-row DataFrame
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        df = spark.createDataFrame([(1, 150)], schema)
+
+        # Create validator
+        validator = RangeValidator(column="value", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed
+        assert result.passed is False
+        assert result.total_count == 1
+        assert result.failure_count == 1
+
+    def test_same_min_and_max_value(self, spark):
+        """Test RangeValidator when min equals max (only one valid value)."""
+        # Create DataFrame with exact match and non-match
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [(1, 50), (2, 50), (3, 51)]  # 51 is out of range
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with min == max
+        validator = RangeValidator(column="value", min_val=50, max_val=50)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (51 is not exactly 50)
+        assert result.passed is False
+        assert result.failure_count == 1
+
+    def test_same_min_and_max_value_all_match(self, spark):
+        """Test RangeValidator passes when all values equal the single allowed value."""
+        # Create DataFrame where all values match the single allowed value
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        data = [(1, 50), (2, 50), (3, 50)]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with min == max
+        validator = RangeValidator(column="value", min_val=50, max_val=50)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed
+        assert result.passed is True
+        assert result.failure_count == 0
+
+    def test_large_dataset(self, spark):
+        """Test RangeValidator with a larger dataset."""
+        # Create DataFrame with many rows
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("value", IntegerType(), True),
+        ])
+        # 100 rows, 10 out of range (values 91-100 are out of range for max=90)
+        data = [(i, i) for i in range(1, 101)]  # Values 1-100
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with range 1-90
+        validator = RangeValidator(column="value", min_val=1, max_val=90)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (10 values > 90)
+        assert result.passed is False
+        assert result.failure_count == 10
+        assert result.total_count == 100
+
+    # -------------------------------------------------------------------------
+    # Input Validation Tests
+    # -------------------------------------------------------------------------
+
+    def test_empty_column_raises_error(self, spark):
+        """Test that RangeValidator raises error when column is empty."""
+        with pytest.raises(ValueError) as exc_info:
+            RangeValidator(column="", min_val=0, max_val=100)
+
+        assert "empty" in str(exc_info.value).lower()
+
+    def test_both_bounds_none_raises_error(self, spark):
+        """Test that RangeValidator raises error when both min and max are None."""
+        with pytest.raises(ValueError) as exc_info:
+            RangeValidator(column="value", min_val=None, max_val=None)
+
+        assert "at least one" in str(exc_info.value).lower()
+
+    def test_min_greater_than_max_raises_error(self, spark):
+        """Test that RangeValidator raises error when min > max."""
+        with pytest.raises(ValueError) as exc_info:
+            RangeValidator(column="value", min_val=100, max_val=50)
+
+        assert "cannot be greater than" in str(exc_info.value).lower()
+
+    def test_min_equal_max_is_valid(self, spark):
+        """Test that RangeValidator accepts min == max."""
+        # Should not raise
+        validator = RangeValidator(column="value", min_val=50, max_val=50)
+        assert validator.min_val == 50
+        assert validator.max_val == 50
+
+    # -------------------------------------------------------------------------
+    # Result Details Tests
+    # -------------------------------------------------------------------------
+
+    def test_result_contains_all_expected_fields(self, spark):
+        """Test that the validation result contains all expected fields."""
+        # Create DataFrame with out-of-range values
+        df = create_test_df_with_range_violations(spark, out_of_range_count=2)
+
+        # Create validator
+        validator = RangeValidator(column="age", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Check result has all expected fields
+        assert result.validator_name == "RangeValidator"
+        assert isinstance(result.passed, bool)
+        assert isinstance(result.failure_count, int)
+        assert isinstance(result.total_count, int)
+        assert isinstance(result.message, str)
+        assert isinstance(result.details, dict)
+
+        # Check details has all expected keys
+        assert "column" in result.details
+        assert "min_val" in result.details
+        assert "max_val" in result.details
+        assert "out_of_range_count" in result.details
+        assert "null_count" in result.details
+        assert "non_null_count" in result.details
+
+    def test_result_message_clarity_on_pass(self, spark):
+        """Test that the validation message is clear on pass."""
+        # Create DataFrame without out-of-range values
+        df = create_test_df_with_range_violations(spark, out_of_range_count=0)
+
+        # Create validator
+        validator = RangeValidator(column="age", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Check message is clear
+        assert result.passed is True
+        assert "passed" in result.message.lower()
+        assert "age" in result.message
+        assert "[0, 100]" in result.message
+
+    def test_result_message_clarity_on_fail(self, spark):
+        """Test that the validation message is clear on failure."""
+        # Create DataFrame with out-of-range values
+        df = create_test_df_with_range_violations(spark, out_of_range_count=2)
+
+        # Create validator
+        validator = RangeValidator(column="age", min_val=0, max_val=100)
+
+        # Validate
+        result = validator.validate(df)
+
+        # Check message is clear
+        assert result.passed is False
+        assert "failed" in result.message.lower()
+        assert "age" in result.message
+
+    def test_validator_name_property(self, spark):
+        """Test that the validator name property works correctly."""
+        validator = RangeValidator(column="col", min_val=0, max_val=100)
+        assert validator.name == "RangeValidator"
+
+    def test_column_property(self, spark):
+        """Test that the column property is set correctly."""
+        validator = RangeValidator(column="test_col", min_val=0, max_val=100)
+        assert validator.column == "test_col"
+
+    def test_min_val_property(self, spark):
+        """Test that the min_val property is set correctly."""
+        validator = RangeValidator(column="col", min_val=10, max_val=100)
+        assert validator.min_val == 10
+
+    def test_max_val_property(self, spark):
+        """Test that the max_val property is set correctly."""
+        validator = RangeValidator(column="col", min_val=0, max_val=99)
+        assert validator.max_val == 99
+
+
+# Legacy test for backward compatibility
+def test_range_validator_detects_violations(spark):
+    """Test that RangeValidator correctly identifies out-of-range values."""
+    # Create DataFrame with out-of-range values
+    df = create_test_df_with_range_violations(spark, out_of_range_count=2)
+
+    # Create validator with range 0-100
+    validator = RangeValidator(column="age", min_val=0, max_val=100)
+
+    # Validate
+    result = validator.validate(df)
+
+    # Assert validation failed due to out-of-range values
+    assert result.passed is False
+    assert result.failure_count > 0
+    assert "RangeValidator" in result.validator_name
+    assert result.details is not None
+    assert "out_of_range_count" in result.details
