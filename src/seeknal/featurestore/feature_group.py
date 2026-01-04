@@ -622,6 +622,61 @@ class FeatureGroup(FeatureStore):
         return result
 
     @require_workspace
+    @require_project
+    def get_version(self, version: int) -> Optional[dict]:
+        """
+        Get metadata for a specific version of this feature group.
+
+        Args:
+            version (int): The version number to retrieve.
+
+        Returns:
+            Optional[dict]: A dictionary containing version metadata if found,
+                None if the version doesn't exist. The dictionary includes:
+                - version: The version number
+                - avro_schema: The Avro schema for this version (as dict)
+                - created_at: When the version was created
+                - updated_at: When the version was last updated
+                - feature_count: Number of features in this version
+
+        Example:
+            >>> fg = FeatureGroup(name="user_features").get_or_create()
+            >>> v1 = fg.get_version(1)
+            >>> if v1:
+            ...     print(f"Version 1 has {v1['feature_count']} features")
+        """
+        if not hasattr(self, 'feature_group_id') or self.feature_group_id is None:
+            # Feature group not saved yet, return None
+            return None
+
+        version_obj = FeatureGroupRequest.select_by_feature_group_id_and_version(
+            self.feature_group_id, version
+        )
+
+        if version_obj is None:
+            return None
+
+        # Parse avro_schema from JSON string
+        try:
+            avro_schema = json.loads(version_obj.avro_schema) if version_obj.avro_schema else None
+        except (json.JSONDecodeError, TypeError):
+            avro_schema = None
+
+        # Get feature count for this version
+        features = FeatureRequest.select_by_feature_group_id_and_version(
+            self.feature_group_id, version
+        )
+        feature_count = len(features) if features else 0
+
+        return {
+            "version": version_obj.version,
+            "avro_schema": avro_schema,
+            "created_at": pendulum.instance(version_obj.created_at).format("YYYY-MM-DD HH:mm:ss") if version_obj.created_at else None,
+            "updated_at": pendulum.instance(version_obj.updated_at).format("YYYY-MM-DD HH:mm:ss") if version_obj.updated_at else None,
+            "feature_count": feature_count,
+        }
+
+    @require_workspace
     @require_saved
     @require_project
     def delete(self):
