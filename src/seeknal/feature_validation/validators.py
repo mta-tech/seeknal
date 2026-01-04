@@ -495,3 +495,177 @@ class NullValidator(BaseValidator):
                 "columns_exceeding_threshold": columns_exceeding_threshold,
             },
         )
+
+
+class RangeValidator(BaseValidator):
+    """
+    Validator for checking numeric values are within specified bounds.
+
+    This validator checks that values in a specified column fall within
+    a minimum and maximum range (inclusive). At least one of min_val
+    or max_val must be provided.
+
+    Attributes:
+        column (str): Name of the column to validate.
+        min_val (float, optional): Minimum allowed value (inclusive).
+        max_val (float, optional): Maximum allowed value (inclusive).
+
+    Example:
+        >>> # Check age is between 0 and 120
+        >>> validator = RangeValidator(
+        ...     column="age",
+        ...     min_val=0,
+        ...     max_val=120
+        ... )
+        >>> result = validator.validate(df)
+        >>> if not result.passed:
+        ...     print(f"Found {result.failure_count} values out of range")
+
+        >>> # Check only minimum bound
+        >>> validator = RangeValidator(column="price", min_val=0)
+
+        >>> # Check only maximum bound
+        >>> validator = RangeValidator(column="percentage", max_val=100)
+    """
+
+    def __init__(
+        self,
+        column: str,
+        min_val: Optional[float] = None,
+        max_val: Optional[float] = None,
+    ):
+        """
+        Initialize RangeValidator.
+
+        Args:
+            column (str): Name of the column to validate.
+            min_val (float, optional): Minimum allowed value (inclusive).
+                If None, no lower bound is enforced.
+            max_val (float, optional): Maximum allowed value (inclusive).
+                If None, no upper bound is enforced.
+
+        Raises:
+            ValueError: If column is empty, both min_val and max_val are None,
+                or min_val is greater than max_val.
+        """
+        if not column:
+            raise ValueError("column cannot be empty")
+        if min_val is None and max_val is None:
+            raise ValueError("At least one of min_val or max_val must be provided")
+        if min_val is not None and max_val is not None and min_val > max_val:
+            raise ValueError(
+                f"min_val ({min_val}) cannot be greater than max_val ({max_val})"
+            )
+
+        self.column = column
+        self.min_val = min_val
+        self.max_val = max_val
+        self._name = "RangeValidator"
+
+    @property
+    def name(self) -> str:
+        """Return the name of this validator."""
+        return self._name
+
+    def validate(self, df: DataFrame) -> ValidationResult:
+        """
+        Validate the DataFrame for values within the specified range.
+
+        Checks that all non-null values in the specified column fall within
+        the configured min/max bounds (inclusive). Null values are excluded
+        from the range check but reported in details.
+
+        Args:
+            df (DataFrame): The PySpark DataFrame to validate.
+
+        Returns:
+            ValidationResult: The result containing pass/fail status,
+                count of out-of-range values, total count, and detailed
+                information about the violations.
+
+        Raises:
+            ValueError: If the specified column is not found in the DataFrame.
+        """
+        # Check that column exists
+        self._check_columns_exist(df, [self.column])
+
+        # Get total row count
+        total_count = self._get_total_count(df)
+
+        # Handle empty DataFrame
+        if total_count == 0:
+            return ValidationResult(
+                validator_name=self.name,
+                passed=True,
+                failure_count=0,
+                total_count=0,
+                message="DataFrame is empty, no values to check",
+                details={
+                    "column": self.column,
+                    "min_val": self.min_val,
+                    "max_val": self.max_val,
+                },
+            )
+
+        # Count null values (excluded from range check)
+        null_count = df.filter(F.col(self.column).isNull()).count()
+        non_null_count = total_count - null_count
+
+        # Build range violation condition
+        # Only check non-null values
+        conditions = []
+        if self.min_val is not None:
+            conditions.append(F.col(self.column) < self.min_val)
+        if self.max_val is not None:
+            conditions.append(F.col(self.column) > self.max_val)
+
+        # Combine conditions with OR (value is out of range if either condition is true)
+        if len(conditions) == 1:
+            out_of_range_condition = conditions[0]
+        else:
+            out_of_range_condition = conditions[0] | conditions[1]
+
+        # Count values outside the range (excluding nulls)
+        out_of_range_count = df.filter(
+            F.col(self.column).isNotNull() & out_of_range_condition
+        ).count()
+
+        # Determine pass/fail
+        passed = out_of_range_count == 0
+
+        # Build range description for messages
+        if self.min_val is not None and self.max_val is not None:
+            range_desc = f"[{self.min_val}, {self.max_val}]"
+        elif self.min_val is not None:
+            range_desc = f">= {self.min_val}"
+        else:
+            range_desc = f"<= {self.max_val}"
+
+        # Build message
+        if passed:
+            message = (
+                f"Range check passed for column '{self.column}'. "
+                f"All {non_null_count} non-null values within range {range_desc}."
+            )
+        else:
+            percentage = (out_of_range_count / non_null_count * 100) if non_null_count > 0 else 0
+            message = (
+                f"Range check failed for column '{self.column}'. "
+                f"{out_of_range_count} values ({percentage:.2f}%) outside range {range_desc}."
+            )
+
+        return ValidationResult(
+            validator_name=self.name,
+            passed=passed,
+            failure_count=out_of_range_count,
+            total_count=total_count,
+            message=message,
+            details={
+                "column": self.column,
+                "min_val": self.min_val,
+                "max_val": self.max_val,
+                "out_of_range_count": out_of_range_count,
+                "null_count": null_count,
+                "non_null_count": non_null_count,
+            },
+        )
