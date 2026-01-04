@@ -1088,6 +1088,79 @@ class FeatureGroupRequest(RequestFactory):
         return save_to_db()
 
     @staticmethod
+    def get_version_metadata(feature_group_id, version=None):
+        """Get version metadata for a specific feature group version.
+
+        Args:
+            feature_group_id: The ID of the feature group
+            version: Optional version number. If None, returns the latest version.
+
+        Returns:
+            A dict containing version metadata with keys:
+            - id: version record ID
+            - feature_group_id: feature group ID
+            - version: version number
+            - avro_schema: parsed Avro schema as dict
+            - created_at: creation timestamp
+            - updated_at: last update timestamp
+            - features: list of features for this version
+            Returns None if version not found.
+        """
+        with get_db_session() as session:
+            if version is None:
+                # Get the latest version
+                statement = (
+                    select(FeatureGroupVersionTable)
+                    .where(FeatureGroupVersionTable.feature_group_id == feature_group_id)
+                    .order_by(desc(FeatureGroupVersionTable.version))
+                )
+                version_record = session.exec(statement).first()
+            else:
+                # Get specific version
+                statement = (
+                    select(FeatureGroupVersionTable)
+                    .where(FeatureGroupVersionTable.feature_group_id == feature_group_id)
+                    .where(FeatureGroupVersionTable.version == version)
+                )
+                version_record = session.exec(statement).first()
+
+            if version_record is None:
+                return None
+
+            # Get features for this version
+            feature_statement = (
+                select(FeatureTable)
+                .where(FeatureTable.feature_group_id == feature_group_id)
+                .where(FeatureTable.feature_group_version_id == version_record.id)
+            )
+            features = session.exec(feature_statement).all()
+
+            # Parse Avro schema
+            try:
+                avro_schema = json.loads(version_record.avro_schema)
+            except (json.JSONDecodeError, TypeError):
+                avro_schema = None
+
+            return {
+                "id": version_record.id,
+                "feature_group_id": version_record.feature_group_id,
+                "version": version_record.version,
+                "avro_schema": avro_schema,
+                "created_at": version_record.created_at,
+                "updated_at": version_record.updated_at,
+                "features": [
+                    {
+                        "id": f.id,
+                        "name": f.name,
+                        "datatype": f.datatype,
+                        "online_datatype": f.online_datatype,
+                        "description": f.description,
+                    }
+                    for f in features
+                ],
+            }
+
+    @staticmethod
     def delete_by_feature_group_id(id):
         with get_db_session() as session:
             try:
@@ -1108,11 +1181,11 @@ class FeatureGroupRequest(RequestFactory):
                         )
                     )
                 ).all()
-                
+
                 for feature in features:
                     session.delete(feature)
                 session.flush()
-                
+
                 return True
             except Exception as e:
                 session.rollback()
