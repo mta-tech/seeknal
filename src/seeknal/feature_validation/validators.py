@@ -32,9 +32,11 @@ Usage:
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from datetime import datetime, timedelta
+from typing import List, Optional, Union
 
 from pyspark.sql import DataFrame, functions as F
+from pyspark.sql.types import TimestampType, DateType
 
 from ..context import logger
 from .models import ValidationMode, ValidationResult, ValidationSummary
@@ -836,3 +838,211 @@ class UniquenessValidator(BaseValidator):
                 "duplicate_percentage": duplicate_percentage,
             },
         )
+
+
+class FreshnessValidator(BaseValidator):
+    """
+    Validator for checking timestamp recency in DataFrame columns.
+
+    This validator checks that timestamp values in a specified column
+    are within a maximum age from the current time. It is useful for
+    ensuring that feature data is fresh and not stale.
+
+    Attributes:
+        column (str): Name of the timestamp column to validate.
+        max_age (timedelta): Maximum allowed age of timestamp values.
+        reference_time (datetime, optional): Reference time to compare against.
+            If None, the current time at validation is used.
+
+    Example:
+        >>> from datetime import timedelta
+        >>>
+        >>> # Check timestamps are within last 24 hours
+        >>> validator = FreshnessValidator(
+        ...     column="event_time",
+        ...     max_age=timedelta(hours=24)
+        ... )
+        >>> result = validator.validate(df)
+        >>> if not result.passed:
+        ...     print(f"Found {result.failure_count} stale records")
+        >>>
+        >>> # Check with custom reference time
+        >>> validator = FreshnessValidator(
+        ...     column="updated_at",
+        ...     max_age=timedelta(days=7),
+        ...     reference_time=datetime(2024, 1, 1, 12, 0, 0)
+        ... )
+        >>>
+        >>> # Check for very recent data (last hour)
+        >>> validator = FreshnessValidator(
+        ...     column="created_at",
+        ...     max_age=timedelta(hours=1)
+        ... )
+    """
+
+    def __init__(
+        self,
+        column: str,
+        max_age: timedelta,
+        reference_time: Optional[datetime] = None,
+    ):
+        """
+        Initialize FreshnessValidator.
+
+        Args:
+            column (str): Name of the timestamp column to validate.
+            max_age (timedelta): Maximum allowed age of timestamp values.
+                Values older than (reference_time - max_age) will fail validation.
+            reference_time (datetime, optional): Reference time to compare against.
+                If None, uses the current time when validate() is called.
+
+        Raises:
+            ValueError: If column is empty or max_age is not a positive timedelta.
+        """
+        if not column:
+            raise ValueError("column cannot be empty")
+        if not isinstance(max_age, timedelta):
+            raise ValueError(
+                f"max_age must be a timedelta instance, got {type(max_age).__name__}"
+            )
+        if max_age.total_seconds() <= 0:
+            raise ValueError("max_age must be a positive timedelta")
+
+        self.column = column
+        self.max_age = max_age
+        self.reference_time = reference_time
+        self._name = "FreshnessValidator"
+
+    @property
+    def name(self) -> str:
+        """Return the name of this validator."""
+        return self._name
+
+    def validate(self, df: DataFrame) -> ValidationResult:
+        """
+        Validate the DataFrame for timestamp freshness.
+
+        Checks that all timestamp values in the specified column are
+        within the configured max_age from the reference time. Null
+        values are counted separately and excluded from the freshness check.
+
+        Args:
+            df (DataFrame): The PySpark DataFrame to validate.
+
+        Returns:
+            ValidationResult: The result containing pass/fail status,
+                count of stale records, total count, and detailed information
+                about the freshness violations.
+
+        Raises:
+            ValueError: If the specified column is not found in the DataFrame.
+        """
+        # Check that column exists
+        self._check_columns_exist(df, [self.column])
+
+        # Get total row count
+        total_count = self._get_total_count(df)
+
+        # Handle empty DataFrame
+        if total_count == 0:
+            return ValidationResult(
+                validator_name=self.name,
+                passed=True,
+                failure_count=0,
+                total_count=0,
+                message="DataFrame is empty, no timestamps to check",
+                details={
+                    "column": self.column,
+                    "max_age_seconds": self.max_age.total_seconds(),
+                },
+            )
+
+        # Determine reference time
+        ref_time = self.reference_time if self.reference_time else datetime.now()
+        cutoff_time = ref_time - self.max_age
+
+        # Count null values (excluded from freshness check)
+        null_count = df.filter(F.col(self.column).isNull()).count()
+        non_null_count = total_count - null_count
+
+        # Handle case where all values are null
+        if non_null_count == 0:
+            return ValidationResult(
+                validator_name=self.name,
+                passed=True,
+                failure_count=0,
+                total_count=total_count,
+                message=f"All values in column '{self.column}' are null, no freshness check performed",
+                details={
+                    "column": self.column,
+                    "max_age_seconds": self.max_age.total_seconds(),
+                    "null_count": null_count,
+                    "reference_time": ref_time.isoformat(),
+                    "cutoff_time": cutoff_time.isoformat(),
+                },
+            )
+
+        # Count stale records (timestamps before cutoff)
+        stale_count = df.filter(
+            F.col(self.column).isNotNull() & (F.col(self.column) < F.lit(cutoff_time))
+        ).count()
+
+        # Determine pass/fail
+        passed = stale_count == 0
+
+        # Format max_age for human-readable message
+        max_age_str = self._format_timedelta(self.max_age)
+
+        # Build message
+        if passed:
+            message = (
+                f"Freshness check passed for column '{self.column}'. "
+                f"All {non_null_count} timestamps are within {max_age_str}."
+            )
+        else:
+            stale_percentage = (stale_count / non_null_count * 100) if non_null_count > 0 else 0
+            message = (
+                f"Freshness check failed for column '{self.column}'. "
+                f"{stale_count} records ({stale_percentage:.2f}%) are older than {max_age_str}."
+            )
+
+        return ValidationResult(
+            validator_name=self.name,
+            passed=passed,
+            failure_count=stale_count,
+            total_count=total_count,
+            message=message,
+            details={
+                "column": self.column,
+                "max_age_seconds": self.max_age.total_seconds(),
+                "stale_count": stale_count,
+                "null_count": null_count,
+                "non_null_count": non_null_count,
+                "reference_time": ref_time.isoformat(),
+                "cutoff_time": cutoff_time.isoformat(),
+            },
+        )
+
+    def _format_timedelta(self, td: timedelta) -> str:
+        """
+        Format a timedelta as a human-readable string.
+
+        Args:
+            td (timedelta): The timedelta to format.
+
+        Returns:
+            str: A human-readable representation (e.g., "2 days", "3 hours").
+        """
+        total_seconds = int(td.total_seconds())
+
+        if total_seconds < 60:
+            return f"{total_seconds} seconds"
+        elif total_seconds < 3600:
+            minutes = total_seconds // 60
+            return f"{minutes} minute{'s' if minutes != 1 else ''}"
+        elif total_seconds < 86400:
+            hours = total_seconds // 3600
+            return f"{hours} hour{'s' if hours != 1 else ''}"
+        else:
+            days = total_seconds // 86400
+            return f"{days} day{'s' if days != 1 else ''}"
