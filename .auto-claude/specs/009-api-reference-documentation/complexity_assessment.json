@@ -1,0 +1,71 @@
+{
+  "complexity": "standard",
+  "workflow_type": "feature",
+  "confidence": 0.85,
+  "reasoning": "Documentation generation requires tooling selection (Sphinx/MkDocs), deployment setup, and potentially improving docstrings across ~65 Python files. Single integration category (docs tooling) with moderate infrastructure (CI/CD pipeline). Research needed for tooling evaluation but scope is well-defined and contained to documentation concerns.",
+
+  "analysis": {
+    "scope": {
+      "estimated_files": 15,
+      "estimated_services": 1,
+      "is_cross_cutting": true,
+      "notes": "~65 Python source files need docstring audit. Estimated 10-15 files may need docstring improvements. Plus 3-5 new config files (docs tooling config, CI/CD pipeline). Existing docs/ directory has structure but no auto-generation setup."
+    },
+    "integrations": {
+      "external_services": ["Documentation hosting (GitHub Pages, Read the Docs, or similar)"],
+      "new_dependencies": ["sphinx or mkdocs", "documentation theme", "autodoc extensions"],
+      "research_needed": true,
+      "notes": "Need to evaluate Sphinx vs MkDocs vs pdoc for Python API documentation. Must choose deployment platform (GitHub Pages, Read the Docs, Netlify). Both are well-documented but require research for best fit."
+    },
+    "infrastructure": {
+      "docker_changes": false,
+      "database_changes": false,
+      "config_changes": true,
+      "notes": "Need documentation config file (conf.py or mkdocs.yml), CI/CD workflow for automated deployment (.github/workflows or similar). No Docker/database infrastructure needed."
+    },
+    "knowledge": {
+      "patterns_exist": false,
+      "research_required": true,
+      "unfamiliar_tech": ["Sphinx/MkDocs plugins", "Documentation deployment platforms"],
+      "notes": "Project has docs/ directory with guides but no auto-generation setup. Sample code shows mixed docstring quality (Entity has docstrings, Project doesn't). Need to research tooling options and establish docstring standards."
+    },
+    "risk": {
+      "level": "low",
+      "concerns": [
+        "Variable docstring quality may require significant improvements",
+        "Tooling choice affects long-term maintainability",
+        "Deployment pipeline must stay in sync with code updates",
+        "Documentation quality affects developer adoption"
+      ],
+      "notes": "Low risk since this is documentation-only work that won't break existing functionality. Main risk is time investment for docstring improvements and choosing sustainable tooling."
+    }
+  },
+
+  "recommended_phases": [
+    "discovery",
+    "requirements",
+    "research",
+    "context",
+    "spec_writing",
+    "planning",
+    "validation"
+  ],
+
+  "flags": {
+    "needs_research": true,
+    "needs_self_critique": false,
+    "needs_infrastructure_setup": true
+  },
+
+  "validation_recommendations": {
+    "risk_level": "low",
+    "skip_validation": false,
+    "minimal_mode": true,
+    "test_types_required": ["unit"],
+    "security_scan_required": false,
+    "staging_deployment_required": false,
+    "reasoning": "Documentation generation with CI/CD setup. Validation should verify docs build successfully, all public APIs are documented, and deployment works. Minimal mode since no functional code changes, just build verification."
+  },
+
+  "created_at": "2026-01-04T00:00:00Z"
+}

@@ -1,0 +1,781 @@
+{
+  "feature": "API Reference Documentation with MkDocs",
+  "workflow_type": "feature",
+  "workflow_rationale": "This is a new feature addition to the project infrastructure. We are creating a documentation system from scratch, including tooling setup (MkDocs), configuration files, documentation structure, and deployment pipeline. While it leverages existing docstrings, it introduces new build processes and developer workflows.",
+  "phases": [
+    {
+      "id": "phase-1-setup",
+      "name": "MkDocs Setup and Configuration",
+      "type": "setup",
+      "description": "Install MkDocs tooling (mkdocs, mkdocs-material, mkdocstrings) and create base configuration",
+      "depends_on": [],
+      "parallel_safe": true,
+      "subtasks": [
+        {
+          "id": "subtask-1-1",
+          "description": "Create documentation dependencies file",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "requirements-docs.txt"
+          ],
+          "patterns_from": [
+            "pyproject.toml"
+          ],
+          "verification": {
+            "type": "command",
+            "command": "test -f requirements-docs.txt && grep -q mkdocs requirements-docs.txt",
+            "expected": "File exists with mkdocs dependencies"
+          },
+          "status": "completed",
+          "notes": "Created requirements-docs.txt with mkdocs>=1.6.0, mkdocs-material>=9.5.0, mkdocstrings>=0.26.0, and mkdocstrings-python>=1.12.0. Verification passed. Committed as 3f773a6.",
+          "updated_at": "2026-01-04T05:07:50.248013+00:00"
+        },
+        {
+          "id": "subtask-1-2",
+          "description": "Create MkDocs configuration with Material theme and mkdocstrings",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "mkdocs.yml"
+          ],
+          "patterns_from": [],
+          "verification": {
+            "type": "command",
+            "command": "test -f mkdocs.yml && grep -q 'mkdocstrings' mkdocs.yml",
+            "expected": "mkdocs.yml exists with correct plugins"
+          },
+          "status": "completed",
+          "notes": "Created mkdocs.yml with Material theme and mkdocstrings plugin. Configuration includes: Material theme with light/dark mode, mkdocstrings-python handler pointing to src/ directory, Google-style docstring parsing, navigation structure for API Reference and Examples, search and code highlighting features, and GitHub repository integration. Verification passed. Committed as 16cb393.",
+          "updated_at": "2026-01-04T05:09:43.755024+00:00"
+        },
+        {
+          "id": "subtask-1-3",
+          "description": "Create documentation directory structure",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "docs/index.md",
+            "docs/api/index.md",
+            "docs/examples/index.md"
+          ],
+          "patterns_from": [
+            "README.md"
+          ],
+          "verification": {
+            "type": "command",
+            "command": "test -d docs && test -f docs/index.md && test -d docs/api && test -d docs/examples",
+            "expected": "Documentation directories and index files created"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-1-4",
+          "description": "Install documentation dependencies and test build",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [],
+          "patterns_from": [],
+          "verification": {
+            "type": "command",
+            "command": "pip install -r requirements-docs.txt && mkdocs build",
+            "expected": "MkDocs builds successfully without errors"
+          },
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "phase-2-docstring-audit",
+      "name": "Docstring Coverage Audit",
+      "type": "investigation",
+      "description": "Scan all Python files in src/seeknal/ to identify missing or incomplete docstrings",
+      "depends_on": [
+        "phase-1-setup"
+      ],
+      "parallel_safe": true,
+      "subtasks": [
+        {
+          "id": "subtask-2-1",
+          "description": "Audit core modules for docstring coverage",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "docs/audit/docstring_coverage.md"
+          ],
+          "patterns_from": [
+            "src/seeknal/project.py",
+            "src/seeknal/entity.py",
+            "src/seeknal/flow.py"
+          ],
+          "verification": {
+            "type": "manual",
+            "instructions": "Review docs/audit/docstring_coverage.md to identify modules requiring docstring enhancement"
+          },
+          "status": "pending",
+          "expected_output": "Markdown document listing: (1) Modules with complete docstrings, (2) Modules missing docstrings, (3) Priority list for enhancement"
+        },
+        {
+          "id": "subtask-2-2",
+          "description": "Audit featurestore module for docstring coverage",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "docs/audit/featurestore_audit.md"
+          ],
+          "patterns_from": [
+            "src/seeknal/featurestore/featurestore.py"
+          ],
+          "verification": {
+            "type": "manual",
+            "instructions": "Review docs/audit/featurestore_audit.md for completeness"
+          },
+          "status": "pending",
+          "expected_output": "List of featurestore classes/functions needing docstring enhancement"
+        },
+        {
+          "id": "subtask-2-3",
+          "description": "Audit tasks module for docstring coverage",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "docs/audit/tasks_audit.md"
+          ],
+          "patterns_from": [
+            "src/seeknal/tasks/base.py"
+          ],
+          "verification": {
+            "type": "manual",
+            "instructions": "Review docs/audit/tasks_audit.md for completeness"
+          },
+          "status": "pending",
+          "expected_output": "List of task-related classes/functions needing docstring enhancement"
+        }
+      ]
+    },
+    {
+      "id": "phase-3-core-docstrings",
+      "name": "Enhance Core Module Docstrings",
+      "type": "implementation",
+      "description": "Add/enhance docstrings for core public APIs (Project, Entity, Flow, Context)",
+      "depends_on": [
+        "phase-2-docstring-audit"
+      ],
+      "parallel_safe": true,
+      "subtasks": [
+        {
+          "id": "subtask-3-1",
+          "description": "Add module-level docstring to __init__.py",
+          "service": "main",
+          "files_to_modify": [
+            "src/seeknal/__init__.py"
+          ],
+          "files_to_create": [],
+          "patterns_from": [
+            "src/seeknal/featurestore/featurestore.py"
+          ],
+          "verification": {
+            "type": "command",
+            "command": "python -c \"import seeknal; print(seeknal.__doc__)\" | grep -q 'Seeknal'",
+            "expected": "Module docstring is present"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-3-2",
+          "description": "Enhance Project class docstrings",
+          "service": "main",
+          "files_to_modify": [
+            "src/seeknal/project.py"
+          ],
+          "files_to_create": [],
+          "patterns_from": [
+            "src/seeknal/entity.py"
+          ],
+          "verification": {
+            "type": "command",
+            "command": "python -c \"from seeknal.project import Project; assert Project.__doc__ is not None; assert Project.get_or_create.__doc__ is not None\"",
+            "expected": "Project class and methods have docstrings"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-3-3",
+          "description": "Enhance Entity class docstrings",
+          "service": "main",
+          "files_to_modify": [
+            "src/seeknal/entity.py"
+          ],
+          "files_to_create": [],
+          "patterns_from": [
+            "src/seeknal/featurestore/featurestore.py"
+          ],
+          "verification": {
+            "type": "command",
+            "command": "python -c \"from seeknal.entity import Entity; assert Entity.get_or_create.__doc__ is not None; assert Entity.update.__doc__ is not None\"",
+            "expected": "Entity methods have complete docstrings"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-3-4",
+          "description": "Enhance Flow class docstrings",
+          "service": "main",
+          "files_to_modify": [
+            "src/seeknal/flow.py"
+          ],
+          "files_to_create": [],
+          "patterns_from": [
+            "src/seeknal/featurestore/featurestore.py"
+          ],
+          "verification": {
+            "type": "command",
+            "command": "python -c \"from seeknal.flow import Flow; assert Flow.__doc__ is not None; assert Flow.run.__doc__ is not None\"",
+            "expected": "Flow class and key methods have docstrings"
+          },
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "phase-4-featurestore-docstrings",
+      "name": "Enhance FeatureStore Module Docstrings",
+      "type": "implementation",
+      "description": "Complete docstrings for FeatureStore classes (already partially documented)",
+      "depends_on": [
+        "phase-2-docstring-audit"
+      ],
+      "parallel_safe": true,
+      "subtasks": [
+        {
+          "id": "subtask-4-1",
+          "description": "Add module-level docstring to featurestore/__init__.py",
+          "service": "main",
+          "files_to_modify": [
+            "src/seeknal/featurestore/__init__.py"
+          ],
+          "files_to_create": [],
+          "patterns_from": [],
+          "verification": {
+            "type": "command",
+            "command": "python -c \"import seeknal.featurestore; print(seeknal.featurestore.__doc__)\" | grep -q 'feature'",
+            "expected": "FeatureStore module docstring present"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-4-2",
+          "description": "Enhance FeatureStore class method docstrings",
+          "service": "main",
+          "files_to_modify": [
+            "src/seeknal/featurestore/featurestore.py"
+          ],
+          "files_to_create": [],
+          "patterns_from": [
+            "src/seeknal/featurestore/featurestore.py"
+          ],
+          "verification": {
+            "type": "command",
+            "command": "grep -c '\"\"\"' src/seeknal/featurestore/featurestore.py | awk '{if ($1 > 10) print \"OK\"}'",
+            "expected": "Multiple docstrings present (>10)"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-4-3",
+          "description": "Enhance FeatureGroup class docstrings",
+          "service": "main",
+          "files_to_modify": [
+            "src/seeknal/featurestore/feature_group.py"
+          ],
+          "files_to_create": [],
+          "patterns_from": [
+            "src/seeknal/featurestore/featurestore.py"
+          ],
+          "verification": {
+            "type": "command",
+            "command": "python -c \"from seeknal.featurestore.feature_group import FeatureGroup; assert FeatureGroup.__doc__ is not None\"",
+            "expected": "FeatureGroup class has docstring"
+          },
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "phase-5-tasks-docstrings",
+      "name": "Enhance Tasks Module Docstrings",
+      "type": "implementation",
+      "description": "Add comprehensive docstrings to tasks module (base, sparkengine, duckdb)",
+      "depends_on": [
+        "phase-2-docstring-audit"
+      ],
+      "parallel_safe": true,
+      "subtasks": [
+        {
+          "id": "subtask-5-1",
+          "description": "Add module-level docstring to tasks/__init__.py",
+          "service": "main",
+          "files_to_modify": [
+            "src/seeknal/tasks/__init__.py"
+          ],
+          "files_to_create": [],
+          "patterns_from": [],
+          "verification": {
+            "type": "command",
+            "command": "python -c \"import seeknal.tasks; print(seeknal.tasks.__doc__)\" | grep -q 'task'",
+            "expected": "Tasks module docstring present"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-5-2",
+          "description": "Enhance Task base class docstrings",
+          "service": "main",
+          "files_to_modify": [
+            "src/seeknal/tasks/base.py"
+          ],
+          "files_to_create": [],
+          "patterns_from": [
+            "src/seeknal/featurestore/featurestore.py"
+          ],
+          "verification": {
+            "type": "command",
+            "command": "python -c \"from seeknal.tasks.base import Task; assert Task.__doc__ is not None\"",
+            "expected": "Task base class has comprehensive docstring"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-5-3",
+          "description": "Enhance SparkEngineTask docstrings",
+          "service": "main",
+          "files_to_modify": [
+            "src/seeknal/tasks/sparkengine/sparkengine.py"
+          ],
+          "files_to_create": [],
+          "patterns_from": [
+            "src/seeknal/featurestore/featurestore.py"
+          ],
+          "verification": {
+            "type": "command",
+            "command": "python -c \"from seeknal.tasks.sparkengine import SparkEngineTask; assert SparkEngineTask.__doc__ is not None\"",
+            "expected": "SparkEngineTask has docstring"
+          },
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "phase-6-api-pages",
+      "name": "Create API Reference Pages",
+      "type": "implementation",
+      "description": "Create MkDocs pages for auto-generated API documentation using mkdocstrings",
+      "depends_on": [
+        "phase-3-core-docstrings",
+        "phase-4-featurestore-docstrings",
+        "phase-5-tasks-docstrings"
+      ],
+      "parallel_safe": false,
+      "subtasks": [
+        {
+          "id": "subtask-6-1",
+          "description": "Create Core API reference page",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "docs/api/core.md"
+          ],
+          "patterns_from": [],
+          "verification": {
+            "type": "command",
+            "command": "test -f docs/api/core.md && grep -q ':::seeknal.project' docs/api/core.md",
+            "expected": "Core API page exists with mkdocstrings directives"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-6-2",
+          "description": "Create FeatureStore API reference page",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "docs/api/featurestore.md"
+          ],
+          "patterns_from": [],
+          "verification": {
+            "type": "command",
+            "command": "test -f docs/api/featurestore.md && grep -q ':::seeknal.featurestore' docs/api/featurestore.md",
+            "expected": "FeatureStore API page exists"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-6-3",
+          "description": "Create Tasks API reference page",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "docs/api/tasks.md"
+          ],
+          "patterns_from": [],
+          "verification": {
+            "type": "command",
+            "command": "test -f docs/api/tasks.md && grep -q ':::seeknal.tasks' docs/api/tasks.md",
+            "expected": "Tasks API page exists"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-6-4",
+          "description": "Update mkdocs.yml navigation with API pages",
+          "service": "main",
+          "files_to_modify": [
+            "mkdocs.yml"
+          ],
+          "files_to_create": [],
+          "patterns_from": [],
+          "verification": {
+            "type": "command",
+            "command": "grep -q 'api/core.md' mkdocs.yml && grep -q 'api/featurestore.md' mkdocs.yml",
+            "expected": "Navigation includes all API pages"
+          },
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "phase-7-examples",
+      "name": "Add Code Examples",
+      "type": "implementation",
+      "description": "Create code example pages demonstrating common Seeknal patterns",
+      "depends_on": [
+        "phase-6-api-pages"
+      ],
+      "parallel_safe": true,
+      "subtasks": [
+        {
+          "id": "subtask-7-1",
+          "description": "Create initialization example",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "docs/examples/initialization.md"
+          ],
+          "patterns_from": [
+            "README.md"
+          ],
+          "verification": {
+            "type": "manual",
+            "instructions": "Verify example code is syntactically correct and demonstrates Project/Entity setup"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-7-2",
+          "description": "Create FeatureStore usage example",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "docs/examples/featurestore.md"
+          ],
+          "patterns_from": [
+            "src/seeknal/featurestore/featurestore.py"
+          ],
+          "verification": {
+            "type": "manual",
+            "instructions": "Verify example shows FeatureGroup creation and materialization"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-7-3",
+          "description": "Create Flow pipeline example",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "docs/examples/flows.md"
+          ],
+          "patterns_from": [
+            "src/seeknal/flow.py"
+          ],
+          "verification": {
+            "type": "manual",
+            "instructions": "Verify example demonstrates Flow creation with inputs, tasks, and outputs"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-7-4",
+          "description": "Create error handling example",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "docs/examples/error_handling.md"
+          ],
+          "patterns_from": [
+            "src/seeknal/exceptions/__init__.py"
+          ],
+          "verification": {
+            "type": "manual",
+            "instructions": "Verify example shows common exceptions and how to handle them"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-7-5",
+          "description": "Create configuration example",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            "docs/examples/configuration.md"
+          ],
+          "patterns_from": [
+            "src/seeknal/configuration.py"
+          ],
+          "verification": {
+            "type": "manual",
+            "instructions": "Verify example shows config file usage and environment variables"
+          },
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "phase-8-deployment",
+      "name": "Documentation Deployment Setup",
+      "type": "implementation",
+      "description": "Create GitHub Actions workflow for building and deploying documentation to GitHub Pages",
+      "depends_on": [
+        "phase-7-examples"
+      ],
+      "parallel_safe": true,
+      "subtasks": [
+        {
+          "id": "subtask-8-1",
+          "description": "Create GitHub Actions workflow for docs deployment",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [
+            ".github/workflows/docs.yml"
+          ],
+          "patterns_from": [],
+          "verification": {
+            "type": "command",
+            "command": "test -f .github/workflows/docs.yml && grep -q 'mkdocs build' .github/workflows/docs.yml",
+            "expected": "Workflow file exists with mkdocs build command"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-8-2",
+          "description": "Update .gitignore for documentation build artifacts",
+          "service": "main",
+          "files_to_modify": [
+            ".gitignore"
+          ],
+          "files_to_create": [],
+          "patterns_from": [],
+          "verification": {
+            "type": "command",
+            "command": "grep -q 'site/' .gitignore && grep -q 'docs/audit/' .gitignore",
+            "expected": ".gitignore includes site/ and docs/audit/"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-8-3",
+          "description": "Test full documentation build locally",
+          "service": "main",
+          "files_to_modify": [],
+          "files_to_create": [],
+          "patterns_from": [],
+          "verification": {
+            "type": "command",
+            "command": "mkdocs build --strict",
+            "expected": "Build succeeds with --strict flag (no warnings)"
+          },
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "phase-9-verification",
+      "name": "Final Verification and Testing",
+      "type": "integration",
+      "description": "Verify all documentation builds correctly, search works, and meets acceptance criteria",
+      "depends_on": [
+        "phase-8-deployment"
+      ],
+      "parallel_safe": false,
+      "subtasks": [
+        {
+          "id": "subtask-9-1",
+          "description": "Verify all public APIs are documented",
+          "service": "main",
+          "all_services": false,
+          "files_to_modify": [],
+          "files_to_create": [],
+          "patterns_from": [],
+          "verification": {
+            "type": "manual",
+            "instructions": "Review built site in site/api/ - confirm all classes in Project, Entity, Flow, FeatureStore, Task modules appear with docstrings"
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-9-2",
+          "description": "Test local documentation preview with search",
+          "service": "main",
+          "all_services": false,
+          "files_to_modify": [],
+          "files_to_create": [],
+          "patterns_from": [],
+          "verification": {
+            "type": "browser",
+            "url": "http://localhost:8000",
+            "checks": [
+              "Documentation homepage loads",
+              "Navigation shows API Reference and Examples sections",
+              "Search bar is functional",
+              "Searching 'Project' returns relevant results",
+              "API pages show auto-generated docs from docstrings"
+            ]
+          },
+          "status": "pending"
+        },
+        {
+          "id": "subtask-9-3",
+          "description": "Run existing tests to ensure no regressions",
+          "service": "main",
+          "all_services": false,
+          "files_to_modify": [],
+          "files_to_create": [],
+          "patterns_from": [],
+          "verification": {
+            "type": "command",
+            "command": "pytest tests/",
+            "expected": "All existing tests pass (no regressions from docstring changes)"
+          },
+          "status": "pending"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "total_phases": 9,
+    "total_subtasks": 33,
+    "services_involved": [
+      "main"
+    ],
+    "parallelism": {
+      "max_parallel_phases": 3,
+      "parallel_groups": [
+        {
+          "phases": [
+            "phase-3-core-docstrings",
+            "phase-4-featurestore-docstrings",
+            "phase-5-tasks-docstrings"
+          ],
+          "reason": "All three depend only on phase-2 and modify different file sets"
+        }
+      ],
+      "recommended_workers": 1,
+      "speedup_estimate": "Minimal (docstring work is sequential, phases 3-5 could save ~30 mins if parallelized)"
+    },
+    "startup_command": "pip install -r requirements-docs.txt && mkdocs serve"
+  },
+  "verification_strategy": {
+    "risk_level": "medium",
+    "skip_validation": false,
+    "test_creation_phase": "post_implementation",
+    "test_types_required": [
+      "unit",
+      "integration"
+    ],
+    "security_scanning_required": false,
+    "staging_deployment_required": false,
+    "acceptance_criteria": [
+      "All public APIs documented with descriptions, parameters, return types",
+      "Module overviews present for each major module",
+      "At least 5 code examples for common patterns",
+      "mkdocs build runs without errors or warnings",
+      "Search functionality works in built documentation",
+      "All existing tests pass (no regressions)"
+    ],
+    "verification_steps": [
+      {
+        "name": "Documentation Build Test",
+        "command": "mkdocs build --strict",
+        "expected_outcome": "Build succeeds without errors or warnings",
+        "type": "test",
+        "required": true,
+        "blocking": true
+      },
+      {
+        "name": "Existing Tests Pass",
+        "command": "pytest tests/",
+        "expected_outcome": "All tests pass",
+        "type": "test",
+        "required": true,
+        "blocking": true
+      }
+    ],
+    "reasoning": "Medium risk - only adding/improving docstrings and documentation infrastructure. No functional code changes. Testing focuses on build success and no regressions."
+  },
+  "qa_acceptance": {
+    "unit_tests": {
+      "required": true,
+      "commands": [
+        "pytest tests/"
+      ],
+      "minimum_coverage": null
+    },
+    "integration_tests": {
+      "required": true,
+      "commands": [
+        "mkdocs build --strict"
+      ],
+      "services_to_test": [
+        "main"
+      ]
+    },
+    "e2e_tests": {
+      "required": false,
+      "commands": [],
+      "flows": []
+    },
+    "browser_verification": {
+      "required": true,
+      "pages": [
+        {
+          "url": "http://localhost:8000/",
+          "checks": [
+            "renders",
+            "navigation-present",
+            "search-functional"
+          ]
+        },
+        {
+          "url": "http://localhost:8000/api/core/",
+          "checks": [
+            "auto-generated-api-docs-present",
+            "docstrings-visible"
+          ]
+        },
+        {
+          "url": "http://localhost:8000/examples/initialization/",
+          "checks": [
+            "code-examples-formatted",
+            "syntax-highlighting-present"
+          ]
+        }
+      ]
+    },
+    "database_verification": {
+      "required": false,
+      "checks": []
+    }
+  },
+  "qa_signoff": null,
+  "last_updated": "2026-01-04T05:09:43.755032+00:00"
+}

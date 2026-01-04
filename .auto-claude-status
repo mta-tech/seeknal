@@ -1,0 +1,25 @@
+{
+  "active": true,
+  "spec": "009-api-reference-documentation",
+  "state": "building",
+  "subtasks": {
+    "completed": 2,
+    "total": 32,
+    "in_progress": 1,
+    "failed": 0
+  },
+  "phase": {
+    "current": "MkDocs Setup and Configuration",
+    "id": null,
+    "total": 4
+  },
+  "workers": {
+    "active": 0,
+    "max": 1
+  },
+  "session": {
+    "number": 3,
+    "started_at": "2026-01-04T12:06:52.141148"
+  },
+  "last_update": "2026-01-04T12:10:18.155596"
+}
