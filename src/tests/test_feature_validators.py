@@ -1999,3 +1999,930 @@ def test_uniqueness_validator_detects_duplicates(spark):
     assert "UniquenessValidator" in result.validator_name
     assert result.details is not None
     assert "duplicate_row_count" in result.details
+
+
+# =============================================================================
+# FreshnessValidator Tests
+# =============================================================================
+
+
+class TestFreshnessValidator:
+    """Comprehensive tests for the FreshnessValidator class."""
+
+    # -------------------------------------------------------------------------
+    # Basic Freshness Detection Tests
+    # -------------------------------------------------------------------------
+
+    def test_detects_stale_timestamps(self, spark):
+        """Test that FreshnessValidator correctly identifies stale timestamps."""
+        # Create reference time
+        reference_time = datetime.now()
+
+        # Create DataFrame with some stale timestamps
+        df = create_test_df_with_timestamps(
+            spark,
+            fresh_count=5,
+            stale_count=2,
+            reference_time=reference_time,
+            max_age_hours=24,
+        )
+
+        # Create validator with 24 hour max age
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed due to stale timestamps
+        assert result.passed is False
+        assert result.failure_count == 2
+        assert result.validator_name == "FreshnessValidator"
+        assert result.details is not None
+        assert "stale_count" in result.details
+        assert result.details["stale_count"] == 2
+
+    def test_passes_when_all_timestamps_fresh(self, spark):
+        """Test that FreshnessValidator passes when all timestamps are fresh."""
+        # Create reference time
+        reference_time = datetime.now()
+
+        # Create DataFrame with only fresh timestamps
+        df = create_test_df_with_timestamps(
+            spark,
+            fresh_count=10,
+            stale_count=0,
+            reference_time=reference_time,
+            max_age_hours=24,
+        )
+
+        # Create validator with 24 hour max age
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed
+        assert result.passed is True
+        assert result.failure_count == 0
+        assert result.validator_name == "FreshnessValidator"
+        assert "passed" in result.message.lower()
+        assert result.details["stale_count"] == 0
+
+    def test_detects_all_stale_timestamps(self, spark):
+        """Test that FreshnessValidator correctly counts all stale timestamps."""
+        # Create reference time
+        reference_time = datetime.now()
+
+        # Create DataFrame with all stale timestamps
+        df = create_test_df_with_timestamps(
+            spark,
+            fresh_count=0,
+            stale_count=5,
+            reference_time=reference_time,
+            max_age_hours=24,
+        )
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed
+        assert result.passed is False
+        assert result.failure_count == 5
+        assert result.details["stale_count"] == 5
+        assert result.details["non_null_count"] == 5
+
+    # -------------------------------------------------------------------------
+    # Boundary Tests
+    # -------------------------------------------------------------------------
+
+    def test_timestamp_exactly_at_cutoff(self, spark):
+        """Test that timestamp exactly at cutoff is considered fresh (boundary case)."""
+        # Create reference time
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+        max_age = timedelta(hours=24)
+        cutoff_time = reference_time - max_age  # June 1, 12:00 - 24h = May 31, 12:00
+
+        # Create DataFrame with timestamp exactly at cutoff
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        # Timestamp at cutoff is NOT stale (cutoff is exclusive for stale, inclusive for fresh)
+        data = [(1, cutoff_time)]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=max_age,
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (at cutoff is still fresh - it's not < cutoff)
+        # Based on implementation: stale = timestamp < cutoff
+        assert result.passed is True
+        assert result.failure_count == 0
+
+    def test_timestamp_just_before_cutoff(self, spark):
+        """Test that timestamp just before cutoff is considered stale."""
+        # Create reference time
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+        max_age = timedelta(hours=24)
+        cutoff_time = reference_time - max_age  # May 31, 12:00
+
+        # Create DataFrame with timestamp just before cutoff (1 second)
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        stale_time = cutoff_time - timedelta(seconds=1)
+        data = [(1, stale_time)]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=max_age,
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (just before cutoff is stale)
+        assert result.passed is False
+        assert result.failure_count == 1
+
+    def test_timestamp_just_after_cutoff(self, spark):
+        """Test that timestamp just after cutoff is considered fresh."""
+        # Create reference time
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+        max_age = timedelta(hours=24)
+        cutoff_time = reference_time - max_age  # May 31, 12:00
+
+        # Create DataFrame with timestamp just after cutoff (1 second)
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        fresh_time = cutoff_time + timedelta(seconds=1)
+        data = [(1, fresh_time)]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=max_age,
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (just after cutoff is fresh)
+        assert result.passed is True
+        assert result.failure_count == 0
+
+    # -------------------------------------------------------------------------
+    # Reference Time Tests
+    # -------------------------------------------------------------------------
+
+    def test_custom_reference_time(self, spark):
+        """Test that FreshnessValidator correctly uses custom reference time."""
+        # Create a specific reference time
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+        max_age = timedelta(days=7)
+
+        # Create DataFrame with known timestamps
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        data = [
+            (1, datetime(2024, 5, 30, 12, 0, 0)),  # 2 days old (fresh)
+            (2, datetime(2024, 5, 25, 12, 0, 0)),  # 7 days old (fresh, at boundary)
+            (3, datetime(2024, 5, 20, 12, 0, 0)),  # 12 days old (stale)
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with custom reference time
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=max_age,
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (1 stale record)
+        assert result.passed is False
+        assert result.failure_count == 1
+        assert result.details["reference_time"] == reference_time.isoformat()
+
+    def test_default_reference_time_uses_current_time(self, spark):
+        """Test that FreshnessValidator uses current time when reference_time is None."""
+        # Create DataFrame with recent timestamps
+        current_time = datetime.now()
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        data = [
+            (1, current_time - timedelta(hours=1)),  # 1 hour ago
+            (2, current_time - timedelta(hours=2)),  # 2 hours ago
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator without reference_time
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),  # 24 hours
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (all within 24 hours)
+        assert result.passed is True
+        assert result.failure_count == 0
+        assert "reference_time" in result.details
+
+    # -------------------------------------------------------------------------
+    # Max Age Unit Tests
+    # -------------------------------------------------------------------------
+
+    def test_max_age_in_seconds(self, spark):
+        """Test FreshnessValidator with max_age in seconds."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        data = [
+            (1, reference_time - timedelta(seconds=30)),  # 30 seconds old (fresh)
+            (2, reference_time - timedelta(seconds=90)),  # 90 seconds old (stale)
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with 60 second max age
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(seconds=60),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (1 stale)
+        assert result.passed is False
+        assert result.failure_count == 1
+
+    def test_max_age_in_minutes(self, spark):
+        """Test FreshnessValidator with max_age in minutes."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        data = [
+            (1, reference_time - timedelta(minutes=30)),  # 30 mins old (fresh)
+            (2, reference_time - timedelta(minutes=90)),  # 90 mins old (stale)
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with 60 minute max age
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(minutes=60),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (1 stale)
+        assert result.passed is False
+        assert result.failure_count == 1
+
+    def test_max_age_in_hours(self, spark):
+        """Test FreshnessValidator with max_age in hours."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        data = [
+            (1, reference_time - timedelta(hours=12)),  # 12 hours old (fresh)
+            (2, reference_time - timedelta(hours=48)),  # 48 hours old (stale)
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with 24 hour max age
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (1 stale)
+        assert result.passed is False
+        assert result.failure_count == 1
+
+    def test_max_age_in_days(self, spark):
+        """Test FreshnessValidator with max_age in days."""
+        reference_time = datetime(2024, 6, 15, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        data = [
+            (1, datetime(2024, 6, 10, 12, 0, 0)),  # 5 days old (fresh)
+            (2, datetime(2024, 6, 1, 12, 0, 0)),   # 14 days old (stale)
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with 7 day max age
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(days=7),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (1 stale)
+        assert result.passed is False
+        assert result.failure_count == 1
+
+    # -------------------------------------------------------------------------
+    # Null Value Handling Tests
+    # -------------------------------------------------------------------------
+
+    def test_null_values_excluded_from_check(self, spark):
+        """Test that null values are excluded from freshness check."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        data = [
+            (1, reference_time - timedelta(hours=1)),  # fresh
+            (2, None),  # null
+            (3, reference_time - timedelta(hours=2)),  # fresh
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (null excluded, other values are fresh)
+        assert result.passed is True
+        assert result.details["null_count"] == 1
+        assert result.details["non_null_count"] == 2
+
+    def test_all_null_column_passes(self, spark):
+        """Test that column with all null values passes validation."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        data = [(1, None), (2, None), (3, None)]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (no non-null values to check)
+        assert result.passed is True
+        assert result.details["null_count"] == 3
+        assert result.details["non_null_count"] == 0
+        assert "null" in result.message.lower()
+
+    def test_null_values_with_stale_records(self, spark):
+        """Test that null values don't affect detection of stale records."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        data = [
+            (1, None),
+            (2, reference_time - timedelta(days=30)),  # stale
+            (3, None),
+            (4, reference_time - timedelta(hours=1)),  # fresh
+        ]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (1 stale record)
+        assert result.passed is False
+        assert result.failure_count == 1
+        assert result.details["null_count"] == 2
+        assert result.details["non_null_count"] == 2
+        assert result.details["stale_count"] == 1
+
+    # -------------------------------------------------------------------------
+    # Edge Cases
+    # -------------------------------------------------------------------------
+
+    def test_empty_dataframe(self, spark):
+        """Test that FreshnessValidator handles empty DataFrames gracefully."""
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        df = spark.createDataFrame([], schema)
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (empty DataFrame)
+        assert result.passed is True
+        assert result.total_count == 0
+        assert "empty" in result.message.lower()
+
+    def test_single_fresh_row(self, spark):
+        """Test FreshnessValidator with a single fresh row."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        df = spark.createDataFrame([(1, reference_time - timedelta(hours=1))], schema)
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed
+        assert result.passed is True
+        assert result.total_count == 1
+        assert result.failure_count == 0
+
+    def test_single_stale_row(self, spark):
+        """Test FreshnessValidator with a single stale row."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        df = spark.createDataFrame([(1, reference_time - timedelta(days=7))], schema)
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed
+        assert result.passed is False
+        assert result.total_count == 1
+        assert result.failure_count == 1
+
+    def test_missing_column_raises_error(self, spark):
+        """Test that FreshnessValidator raises an error for missing columns."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        df = create_test_df_with_timestamps(
+            spark,
+            fresh_count=5,
+            stale_count=0,
+            reference_time=reference_time,
+        )
+
+        # Create validator with a non-existent column
+        validator = FreshnessValidator(
+            column="nonexistent_column",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Assert that validation raises ValueError
+        with pytest.raises(ValueError) as exc_info:
+            validator.validate(df)
+
+        assert "not found" in str(exc_info.value).lower()
+
+    def test_large_dataset(self, spark):
+        """Test FreshnessValidator with a larger dataset."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        # Create 100 rows: 80 fresh, 20 stale
+        data = []
+        for i in range(80):
+            data.append((i, reference_time - timedelta(hours=i % 24)))  # All within 24 hours
+        for i in range(20):
+            data.append((80 + i, reference_time - timedelta(days=2 + i)))  # All stale
+
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator with 24 hour max age
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed (20 stale records)
+        assert result.passed is False
+        assert result.failure_count == 20
+        assert result.total_count == 100
+
+    def test_very_old_timestamp(self, spark):
+        """Test FreshnessValidator with a very old timestamp."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        # Timestamp from year 2000
+        very_old = datetime(2000, 1, 1, 0, 0, 0)
+        data = [(1, very_old)]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(days=365),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation failed
+        assert result.passed is False
+        assert result.failure_count == 1
+
+    def test_future_timestamp(self, spark):
+        """Test FreshnessValidator with a future timestamp."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        # Timestamp in the future
+        future_time = reference_time + timedelta(days=1)
+        data = [(1, future_time)]
+        df = spark.createDataFrame(data, schema)
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Assert validation passed (future timestamps are fresh by definition)
+        assert result.passed is True
+        assert result.failure_count == 0
+
+    # -------------------------------------------------------------------------
+    # Input Validation Tests
+    # -------------------------------------------------------------------------
+
+    def test_empty_column_raises_error(self, spark):
+        """Test that FreshnessValidator raises error when column is empty."""
+        with pytest.raises(ValueError) as exc_info:
+            FreshnessValidator(column="", max_age=timedelta(hours=24))
+
+        assert "empty" in str(exc_info.value).lower()
+
+    def test_non_timedelta_max_age_raises_error(self, spark):
+        """Test that FreshnessValidator raises error when max_age is not timedelta."""
+        with pytest.raises(ValueError) as exc_info:
+            FreshnessValidator(column="event_time", max_age=24)  # Integer, not timedelta
+
+        assert "timedelta" in str(exc_info.value).lower()
+
+    def test_zero_max_age_raises_error(self, spark):
+        """Test that FreshnessValidator raises error for zero max_age."""
+        with pytest.raises(ValueError) as exc_info:
+            FreshnessValidator(column="event_time", max_age=timedelta(seconds=0))
+
+        assert "positive" in str(exc_info.value).lower()
+
+    def test_negative_max_age_raises_error(self, spark):
+        """Test that FreshnessValidator raises error for negative max_age."""
+        with pytest.raises(ValueError) as exc_info:
+            FreshnessValidator(column="event_time", max_age=timedelta(hours=-1))
+
+        assert "positive" in str(exc_info.value).lower()
+
+    def test_valid_small_max_age(self, spark):
+        """Test that FreshnessValidator accepts very small positive max_age."""
+        # Should not raise
+        validator = FreshnessValidator(column="event_time", max_age=timedelta(seconds=1))
+        assert validator.max_age.total_seconds() == 1
+
+    def test_valid_large_max_age(self, spark):
+        """Test that FreshnessValidator accepts large max_age values."""
+        # Should not raise
+        validator = FreshnessValidator(column="event_time", max_age=timedelta(days=365))
+        assert validator.max_age.total_seconds() == 365 * 24 * 60 * 60
+
+    # -------------------------------------------------------------------------
+    # Result Details Tests
+    # -------------------------------------------------------------------------
+
+    def test_result_contains_all_expected_fields(self, spark):
+        """Test that the validation result contains all expected fields."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        df = create_test_df_with_timestamps(
+            spark,
+            fresh_count=5,
+            stale_count=2,
+            reference_time=reference_time,
+        )
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Check result has all expected fields
+        assert result.validator_name == "FreshnessValidator"
+        assert isinstance(result.passed, bool)
+        assert isinstance(result.failure_count, int)
+        assert isinstance(result.total_count, int)
+        assert isinstance(result.message, str)
+        assert isinstance(result.details, dict)
+
+        # Check details has all expected keys
+        assert "column" in result.details
+        assert "max_age_seconds" in result.details
+        assert "stale_count" in result.details
+        assert "null_count" in result.details
+        assert "non_null_count" in result.details
+        assert "reference_time" in result.details
+        assert "cutoff_time" in result.details
+
+    def test_result_message_clarity_on_pass(self, spark):
+        """Test that the validation message is clear on pass."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        df = create_test_df_with_timestamps(
+            spark,
+            fresh_count=5,
+            stale_count=0,
+            reference_time=reference_time,
+        )
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Check message is clear
+        assert result.passed is True
+        assert "passed" in result.message.lower()
+        assert "event_time" in result.message
+
+    def test_result_message_clarity_on_fail(self, spark):
+        """Test that the validation message is clear on failure."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        df = create_test_df_with_timestamps(
+            spark,
+            fresh_count=3,
+            stale_count=2,
+            reference_time=reference_time,
+        )
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Check message is clear
+        assert result.passed is False
+        assert "failed" in result.message.lower()
+        assert "event_time" in result.message
+        assert "2" in result.message  # Should mention stale count
+
+    def test_result_message_includes_max_age_unit(self, spark):
+        """Test that the validation message includes the max_age in appropriate units."""
+        reference_time = datetime(2024, 6, 1, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        df = spark.createDataFrame([(1, reference_time - timedelta(hours=1))], schema)
+
+        # Test with hours
+        validator_hours = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(hours=24),
+            reference_time=reference_time,
+        )
+        result_hours = validator_hours.validate(df)
+        assert "24 hours" in result_hours.message
+
+        # Test with days
+        validator_days = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(days=7),
+            reference_time=reference_time,
+        )
+        result_days = validator_days.validate(df)
+        assert "7 days" in result_days.message
+
+        # Test with minutes
+        validator_mins = FreshnessValidator(
+            column="event_time",
+            max_age=timedelta(minutes=30),
+            reference_time=reference_time,
+        )
+        result_mins = validator_mins.validate(df)
+        assert "30 minutes" in result_mins.message
+
+    def test_validator_name_property(self, spark):
+        """Test that the validator name property works correctly."""
+        validator = FreshnessValidator(column="col", max_age=timedelta(hours=24))
+        assert validator.name == "FreshnessValidator"
+
+    def test_column_property(self, spark):
+        """Test that the column property is set correctly."""
+        validator = FreshnessValidator(column="test_col", max_age=timedelta(hours=24))
+        assert validator.column == "test_col"
+
+    def test_max_age_property(self, spark):
+        """Test that the max_age property is set correctly."""
+        max_age = timedelta(hours=48)
+        validator = FreshnessValidator(column="col", max_age=max_age)
+        assert validator.max_age == max_age
+
+    def test_reference_time_property(self, spark):
+        """Test that the reference_time property is set correctly."""
+        ref_time = datetime(2024, 6, 1, 12, 0, 0)
+        validator = FreshnessValidator(
+            column="col",
+            max_age=timedelta(hours=24),
+            reference_time=ref_time,
+        )
+        assert validator.reference_time == ref_time
+
+    def test_reference_time_none_by_default(self, spark):
+        """Test that reference_time is None by default."""
+        validator = FreshnessValidator(column="col", max_age=timedelta(hours=24))
+        assert validator.reference_time is None
+
+    def test_cutoff_time_calculation(self, spark):
+        """Test that cutoff time is correctly calculated."""
+        reference_time = datetime(2024, 6, 15, 12, 0, 0)
+        max_age = timedelta(days=7)
+        expected_cutoff = datetime(2024, 6, 8, 12, 0, 0)
+
+        schema = StructType([
+            StructField("id", IntegerType(), True),
+            StructField("event_time", TimestampType(), True),
+        ])
+        df = spark.createDataFrame([(1, reference_time - timedelta(hours=1))], schema)
+
+        # Create validator
+        validator = FreshnessValidator(
+            column="event_time",
+            max_age=max_age,
+            reference_time=reference_time,
+        )
+
+        # Validate
+        result = validator.validate(df)
+
+        # Check cutoff time in details
+        assert result.details["cutoff_time"] == expected_cutoff.isoformat()
+
+
+# Legacy test for backward compatibility
+def test_freshness_validator_detects_stale_data(spark):
+    """Test that FreshnessValidator correctly identifies stale timestamps."""
+    # Create reference time
+    reference_time = datetime.now()
+
+    # Create DataFrame with stale timestamps
+    df = create_test_df_with_timestamps(
+        spark,
+        fresh_count=3,
+        stale_count=2,
+        reference_time=reference_time,
+        max_age_hours=24,
+    )
+
+    # Create validator with 24 hour max age
+    validator = FreshnessValidator(
+        column="event_time",
+        max_age=timedelta(hours=24),
+        reference_time=reference_time,
+    )
+
+    # Validate
+    result = validator.validate(df)
+
+    # Assert validation failed due to stale timestamps
+    assert result.passed is False
+    assert result.failure_count == 2
+    assert "FreshnessValidator" in result.validator_name
+    assert result.details is not None
+    assert "stale_count" in result.details
