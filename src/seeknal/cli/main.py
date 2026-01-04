@@ -636,6 +636,120 @@ def version_show(
         raise typer.Exit(1)
 
 
+@version_app.command("diff")
+def version_diff(
+    feature_group: str = typer.Argument(
+        ..., help="Name of the feature group"
+    ),
+    from_version: int = typer.Option(
+        ..., "--from", "-f",
+        help="Base version number to compare from"
+    ),
+    to_version: int = typer.Option(
+        ..., "--to", "-t",
+        help="Target version number to compare to"
+    ),
+    format: OutputFormat = typer.Option(
+        OutputFormat.TABLE, "--format",
+        help="Output format"
+    ),
+):
+    """Compare two versions of a feature group to identify schema differences."""
+    from seeknal.featurestore.feature_group import FeatureGroup
+    import json
+
+    try:
+        fg = FeatureGroup(name=feature_group).get_or_create()
+
+        # Call compare_versions API
+        diff = fg.compare_versions(from_version, to_version)
+
+        if diff is None:
+            _echo_error(f"Could not compare versions {from_version} and {to_version}")
+            raise typer.Exit(1)
+
+        if format == OutputFormat.JSON:
+            typer.echo(json.dumps(diff, indent=2, default=str))
+        else:
+            # Table/readable format
+            typer.echo(f"\nFeature Group: {feature_group}")
+            typer.echo(f"Comparing version {from_version} → {to_version}")
+            typer.echo("=" * 60)
+
+            added = diff.get("added", [])
+            removed = diff.get("removed", [])
+            modified = diff.get("modified", [])
+
+            has_changes = added or removed or modified
+
+            if not has_changes:
+                _echo_info("No schema changes detected between versions.")
+            else:
+                # Display added features
+                if added:
+                    typer.echo("\n" + typer.style("Added (+):", fg=typer.colors.GREEN, bold=True))
+                    for field in added:
+                        if isinstance(field, dict):
+                            field_name = field.get("name", "unknown")
+                            field_type = field.get("type", "unknown")
+                            # Handle complex types
+                            if isinstance(field_type, dict):
+                                field_type = field_type.get("type", str(field_type))
+                            elif isinstance(field_type, list):
+                                field_type = " | ".join(str(t) for t in field_type)
+                            typer.echo(typer.style(f"  + {field_name}: {field_type}", fg=typer.colors.GREEN))
+                        else:
+                            typer.echo(typer.style(f"  + {field}", fg=typer.colors.GREEN))
+
+                # Display removed features
+                if removed:
+                    typer.echo("\n" + typer.style("Removed (-):", fg=typer.colors.RED, bold=True))
+                    for field in removed:
+                        if isinstance(field, dict):
+                            field_name = field.get("name", "unknown")
+                            field_type = field.get("type", "unknown")
+                            # Handle complex types
+                            if isinstance(field_type, dict):
+                                field_type = field_type.get("type", str(field_type))
+                            elif isinstance(field_type, list):
+                                field_type = " | ".join(str(t) for t in field_type)
+                            typer.echo(typer.style(f"  - {field_name}: {field_type}", fg=typer.colors.RED))
+                        else:
+                            typer.echo(typer.style(f"  - {field}", fg=typer.colors.RED))
+
+                # Display modified features
+                if modified:
+                    typer.echo("\n" + typer.style("Modified (~):", fg=typer.colors.YELLOW, bold=True))
+                    for change in modified:
+                        if isinstance(change, dict):
+                            field_name = change.get("field", "unknown")
+                            old_type = change.get("old_type", "unknown")
+                            new_type = change.get("new_type", "unknown")
+                            # Handle complex types
+                            if isinstance(old_type, dict):
+                                old_type = old_type.get("type", str(old_type))
+                            elif isinstance(old_type, list):
+                                old_type = " | ".join(str(t) for t in old_type)
+                            if isinstance(new_type, dict):
+                                new_type = new_type.get("type", str(new_type))
+                            elif isinstance(new_type, list):
+                                new_type = " | ".join(str(t) for t in new_type)
+                            typer.echo(typer.style(f"  ~ {field_name}: {old_type} → {new_type}", fg=typer.colors.YELLOW))
+                        else:
+                            typer.echo(typer.style(f"  ~ {change}", fg=typer.colors.YELLOW))
+
+                # Summary
+                typer.echo("\n" + "-" * 60)
+                typer.echo(f"Summary: {len(added)} added, {len(removed)} removed, {len(modified)} modified")
+
+    except ValueError as e:
+        _echo_error(str(e))
+        raise typer.Exit(1)
+    except Exception as e:
+        _echo_error(f"Error comparing versions: {e}")
+        raise typer.Exit(1)
+
+
 def main():
     """Main entry point for the CLI."""
     app()
