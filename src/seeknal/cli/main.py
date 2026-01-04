@@ -10,7 +10,10 @@ Usage:
     seeknal list <resource>         List resources
     seeknal show <resource> <name>  Show resource details
     seeknal validate                Validate configurations
-    seeknal version                 Show version information
+    seeknal info                    Show version information
+    seeknal version list <fg>       List feature group versions
+    seeknal version show <fg>       Show feature group version details
+    seeknal version diff <fg>       Compare feature group versions
 """
 
 import typer
@@ -26,6 +29,13 @@ app = typer.Typer(
     help="Feature store management CLI - similar to dbt",
     add_completion=False,
 )
+
+# Version command group for feature group version management
+version_app = typer.Typer(
+    name="version",
+    help="Manage feature group versions",
+)
+app.add_typer(version_app, name="version")
 
 
 class OutputFormat(str, Enum):
@@ -82,8 +92,8 @@ def _echo_info(message: str):
 
 
 @app.command()
-def version():
-    """Show version information."""
+def info():
+    """Show version information for Seeknal and its dependencies."""
     import pyspark
     import duckdb
 
