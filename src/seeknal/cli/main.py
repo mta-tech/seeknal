@@ -14,6 +14,7 @@ Usage:
     seeknal delete <resource> <name>            Delete a resource
     seeknal delete-table <name>                 Delete an online table
     seeknal validate                            Validate configurations
+    seeknal validate-features <fg>              Validate feature group data quality
     seeknal info                                Show version information
     seeknal debug <fg>                          Debug a feature group
     seeknal clean <fg>                          Clean old feature data
@@ -43,6 +44,9 @@ Examples:
 
     # Compare schema changes between versions
     $ seeknal version diff user_features --from 1 --to 2
+
+    # Validate feature data quality
+    $ seeknal validate-features user_features --mode fail
 
 For more information, see: https://github.com/mta-tech/seeknal
 """
@@ -111,6 +115,12 @@ class ResourceType(str, Enum):
 class DeleteResourceType(str, Enum):
     """Resource types for deletion."""
     FEATURE_GROUP = "feature-group"
+
+
+class ValidationModeChoice(str, Enum):
+    """Validation mode options for validate-features command."""
+    WARN = "warn"
+    FAIL = "fail"
 
 
 def _get_version() -> str:
@@ -466,6 +476,264 @@ def validate(
         raise typer.Exit(1)
 
     _echo_success("All validations passed")
+
+
+def _build_validators_from_config(validator_configs):
+    """Build validator instances from ValidatorConfig objects.
+
+    Args:
+        validator_configs: List of ValidatorConfig objects from validation_config.
+
+    Returns:
+        List of BaseValidator instances ready to execute.
+
+    Raises:
+        ValueError: If an unknown validator type is specified.
+    """
+    from datetime import timedelta
+    from seeknal.feature_validation.validators import (
+        NullValidator,
+        RangeValidator,
+        UniquenessValidator,
+        FreshnessValidator,
+        CustomValidator,
+    )
+
+    validators = []
+
+    for config in validator_configs:
+        validator_type = config.validator_type.lower()
+        columns = config.columns or []
+        params = config.params or {}
+
+        if validator_type == "null":
+            validator = NullValidator(
+                columns=columns,
+                max_null_percentage=params.get("max_null_percentage", 0.0),
+            )
+        elif validator_type == "range":
+            if not columns:
+                raise ValueError("RangeValidator requires at least one column")
+            # RangeValidator works on a single column
+            column = columns[0] if len(columns) == 1 else columns[0]
+            validator = RangeValidator(
+                column=column,
+                min_val=params.get("min_val"),
+                max_val=params.get("max_val"),
+            )
+        elif validator_type == "uniqueness":
+            validator = UniquenessValidator(
+                columns=columns,
+                max_duplicate_percentage=params.get("max_duplicate_percentage", 0.0),
+            )
+        elif validator_type == "freshness":
+            if not columns:
+                raise ValueError("FreshnessValidator requires a column")
+            column = columns[0]
+            max_age_seconds = params.get("max_age_seconds", 86400)  # Default 24 hours
+            max_age = timedelta(seconds=max_age_seconds)
+            validator = FreshnessValidator(
+                column=column,
+                max_age=max_age,
+            )
+        else:
+            raise ValueError(f"Unknown validator type: {validator_type}")
+
+        validators.append(validator)
+
+    return validators
+
+
+def _format_validation_table(results, verbose: bool = False):
+    """Format validation results as a colored table.
+
+    Args:
+        results: List of ValidationResult objects.
+        verbose: If True, show detailed information.
+
+    Returns:
+        Formatted table string.
+    """
+    if not results:
+        return "  No validation results."
+
+    # Calculate column widths
+    name_width = max(len(r.validator_name) for r in results)
+    name_width = max(name_width, 10)  # Minimum width
+
+    lines = []
+
+    # Header
+    header = f"  {'Validator':<{name_width}}  {'Status':^8}  {'Message'}"
+    lines.append(header)
+    lines.append("  " + "-" * (name_width + 2 + 8 + 2 + 40))
+
+    # Results
+    for result in results:
+        if result.passed:
+            status = typer.style("PASS", fg=typer.colors.GREEN, bold=True)
+        else:
+            status = typer.style("FAIL", fg=typer.colors.RED, bold=True)
+
+        # Truncate message if too long
+        message = result.message
+        if len(message) > 60 and not verbose:
+            message = message[:57] + "..."
+
+        line = f"  {result.validator_name:<{name_width}}  {status:^8}  {message}"
+        lines.append(line)
+
+        # Show details in verbose mode
+        if verbose and result.details:
+            for key, value in result.details.items():
+                if key not in ("columns", "validator_type"):  # Skip redundant fields
+                    detail_line = f"      {key}: {value}"
+                    lines.append(typer.style(detail_line, dim=True))
+
+    return "\n".join(lines)
+
+
+@app.command("validate-features")
+def validate_features(
+    feature_group: str = typer.Argument(
+        ..., help="Name of the feature group to validate"
+    ),
+    mode: ValidationModeChoice = typer.Option(
+        ValidationModeChoice.FAIL, "--mode", "-m",
+        help="Validation mode: 'warn' logs failures and continues, 'fail' stops on first failure"
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="Show detailed validation results"
+    ),
+):
+    """Validate feature group data quality.
+
+    Run configured validators against a feature group's data to check
+    for data quality issues like null values, out-of-range values,
+    duplicates, and stale data.
+
+    Exit codes:
+        0 - All validations passed (or passed with warnings in warn mode)
+        1 - Validation failed or feature group not found
+
+    Examples:
+        seeknal validate-features user_features
+        seeknal validate-features user_features --mode warn
+        seeknal validate-features user_features --mode fail --verbose
+    """
+    from seeknal.featurestore.feature_group import FeatureGroup
+    from seeknal.feature_validation.models import ValidationMode
+    from seeknal.feature_validation.validators import ValidationException
+
+    typer.echo("")
+    typer.echo(typer.style(f"Validating feature group: {feature_group}", bold=True))
+    typer.echo(f"  Mode: {mode.value}")
+    typer.echo("")
+
+    try:
+        # Load the feature group
+        _echo_info("Loading feature group...")
+        fg = FeatureGroup.load(name=feature_group)
+        if fg is None:
+            _echo_error(f"Feature group '{feature_group}' not found")
+            raise typer.Exit(1)
+
+        # Check if validation is configured
+        if not fg.validation_config or not fg.validation_config.validators:
+            _echo_warning(f"No validators configured for feature group '{feature_group}'")
+            typer.echo("  Configure validators using:")
+            typer.echo("    fg.set_validation_config(ValidationConfig(validators=[...]))")
+            typer.echo("")
+            raise typer.Exit(0)
+
+        # Build validators from configuration
+        try:
+            validators = _build_validators_from_config(fg.validation_config.validators)
+        except ValueError as e:
+            _echo_error(f"Invalid validator configuration: {e}")
+            raise typer.Exit(1)
+
+        # Convert CLI mode to ValidationMode enum
+        validation_mode = ValidationMode.WARN if mode == ValidationModeChoice.WARN else ValidationMode.FAIL
+
+        # Show validator count
+        typer.echo(f"  Validators to run: {len(validators)}")
+        if verbose:
+            for v in validators:
+                typer.echo(f"    - {v.name}")
+        typer.echo("")
+
+        # Run validation
+        _echo_info("Running validators...")
+        try:
+            summary = fg.validate(validators=validators, mode=validation_mode)
+        except ValidationException as e:
+            # In FAIL mode, validation stops on first failure
+            typer.echo("")
+            _echo_error(f"Validation stopped: {e.message}")
+            if e.result:
+                typer.echo("")
+                typer.echo(typer.style("Failed Validator Details:", bold=True))
+                typer.echo(f"  Validator: {e.result.validator_name}")
+                typer.echo(f"  Failures:  {e.result.failure_count:,}")
+                typer.echo(f"  Total:     {e.result.total_count:,}")
+                if verbose and e.result.details:
+                    typer.echo("  Details:")
+                    for key, value in e.result.details.items():
+                        typer.echo(f"    {key}: {value}")
+            typer.echo("")
+            raise typer.Exit(1)
+
+        # Display results summary
+        typer.echo("")
+        typer.echo(typer.style("Validation Summary", bold=True))
+        typer.echo("=" * 50)
+
+        # Summary statistics
+        passed_style = typer.style(str(summary.passed_count), fg=typer.colors.GREEN, bold=True)
+        failed_style = typer.style(str(summary.failed_count), fg=typer.colors.RED if summary.failed_count > 0 else typer.colors.GREEN, bold=True)
+
+        typer.echo(f"  Total validators: {summary.total_validators}")
+        typer.echo(f"  Passed:           {passed_style}")
+        typer.echo(f"  Failed:           {failed_style}")
+        typer.echo("")
+
+        # Display results table
+        if summary.results:
+            typer.echo(typer.style("Results:", bold=True))
+            typer.echo(_format_validation_table(summary.results, verbose=verbose))
+            typer.echo("")
+
+        # Final status message
+        typer.echo("-" * 50)
+        if summary.passed:
+            _echo_success(f"All validations passed for '{feature_group}'")
+        else:
+            if mode == ValidationModeChoice.WARN:
+                _echo_warning(
+                    f"Validation completed with {summary.failed_count} warning(s) "
+                    f"for '{feature_group}'"
+                )
+                typer.echo("  (Exit code 0 - warnings only)")
+            else:
+                _echo_error(
+                    f"Validation failed with {summary.failed_count} error(s) "
+                    f"for '{feature_group}'"
+                )
+                raise typer.Exit(1)
+        typer.echo("")
+
+    except typer.Exit:
+        # Re-raise typer.Exit as-is
+        raise
+    except Exception as e:
+        typer.echo("")
+        _echo_error(f"Validation failed: {e}")
+        if verbose:
+            import traceback
+            typer.echo(typer.style(traceback.format_exc(), dim=True))
+        raise typer.Exit(1)
 
 
 @app.command()

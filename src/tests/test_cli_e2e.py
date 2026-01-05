@@ -338,3 +338,35 @@ class TestCLIIntegration:
         # Validate should work regardless of previous commands
         result = runner.invoke(app, ["validate"])
         assert result.exit_code == 0
+
+
+class TestValidateFeaturesWorkflow:
+    """E2E tests for feature validation workflows."""
+
+    def test_validate_features_help_is_available(self):
+        """Test that validate-features command has help documentation."""
+        result = runner.invoke(app, ["validate-features", "--help"])
+        assert result.exit_code == 0
+        assert "Validate feature group data quality" in result.stdout
+        assert "--mode" in result.stdout
+        assert "--verbose" in result.stdout
+
+    def test_validate_features_mode_options(self):
+        """Test that validate-features accepts both mode options."""
+        result = runner.invoke(app, ["validate-features", "--help"])
+        assert result.exit_code == 0
+        assert "warn" in result.stdout
+        assert "fail" in result.stdout
+
+    def test_validate_features_requires_feature_group_argument(self):
+        """Test that validate-features requires a feature group argument."""
+        result = runner.invoke(app, ["validate-features"])
+        # Should fail due to missing argument
+        assert result.exit_code != 0
+        assert "Missing argument" in result.stdout or "FEATURE_GROUP" in result.stdout
+
+    def test_validate_features_appears_in_main_help(self):
+        """Test that validate-features command appears in main help."""
+        result = runner.invoke(app, ["--help"])
+        assert result.exit_code == 0
+        assert "validate-features" in result.stdout

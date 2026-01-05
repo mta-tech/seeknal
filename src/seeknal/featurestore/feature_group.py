@@ -38,6 +38,8 @@ from ..tasks.sparkengine.transformers import (
 )
 from ..tasks.duckdb import DuckDBTask
 from ..validation import validate_column_name, validate_sql_value
+from ..feature_validation.validators import BaseValidator, ValidationRunner
+from ..feature_validation.models import ValidationConfig, ValidationMode, ValidationResult, ValidationSummary
 
 
 class Materialization(BaseModel):
@@ -135,6 +137,9 @@ class FeatureGroup(FeatureStore):
         features: List of Feature objects to register. If None, all columns
             except join_keys and event_time will be registered as features.
         tag: Optional list of tags for categorizing and filtering feature groups.
+        validation_config: Configuration for data validation including validators
+            to run and validation mode (FAIL or WARN). When set, enables declarative
+            validation that can be used with the validate() method.
         feature_group_id: Unique identifier assigned by the system after creation.
         offline_watermarks: List of timestamps indicating when offline data was
             materialized. Used for tracking data freshness.
@@ -168,6 +173,7 @@ class FeatureGroup(FeatureStore):
     description: Optional[str] = None
     features: Optional[List[Feature]] = None
     tag: Optional[List[str]] = None
+    validation_config: Optional[ValidationConfig] = None
 
     feature_group_id: Optional[str] = None
     offline_watermarks: List[str] = field(default_factory=list)
@@ -247,6 +253,118 @@ class FeatureGroup(FeatureStore):
         """
         self.source = dataframe
         return self
+
+    def set_validation_config(self, config: ValidationConfig):
+        """
+        Set validation configuration for this feature group.
+
+        Args:
+            config (ValidationConfig): Validation configuration containing
+                validators to run and validation mode (FAIL or WARN).
+
+        Returns:
+            self: Returns the FeatureGroup instance for method chaining.
+
+        Example:
+            >>> from seeknal.feature_validation.models import ValidationConfig, ValidatorConfig
+            >>>
+            >>> config = ValidationConfig(
+            ...     mode=ValidationMode.WARN,
+            ...     validators=[
+            ...         ValidatorConfig(validator_type="null", columns=["user_id"]),
+            ...         ValidatorConfig(validator_type="range", columns=["age"],
+            ...                         params={"min_val": 0, "max_val": 120})
+            ...     ]
+            ... )
+            >>> feature_group.set_validation_config(config)
+        """
+        self.validation_config = config
+        return self
+
+    @require_set_source
+    def validate(
+        self,
+        validators: List[BaseValidator],
+        mode: Union[str, ValidationMode] = ValidationMode.FAIL,
+        reference_date: Optional[str] = None,
+    ) -> ValidationSummary:
+        """
+        Validate the feature group data using the provided validators.
+
+        This method runs a list of validators against the feature group's data
+        and returns a summary of the validation results. The validation can be
+        configured to either warn on failures (continue execution) or fail
+        immediately on the first validation failure.
+
+        Args:
+            validators (List[BaseValidator]): List of validators to run against
+                the feature group data. Each validator should be an instance of
+                a class that inherits from BaseValidator (e.g., NullValidator,
+                RangeValidator, UniquenessValidator, FreshnessValidator, or
+                CustomValidator).
+            mode (Union[str, ValidationMode], optional): Validation execution mode.
+                - ValidationMode.FAIL or "fail": Raise exception on first failure.
+                - ValidationMode.WARN or "warn": Log failures but continue execution.
+                Defaults to ValidationMode.FAIL.
+            reference_date (Optional[str], optional): Reference date for running
+                the source Flow. Only used when source is a Flow. Defaults to None.
+
+        Returns:
+            ValidationSummary: A summary containing all validation results,
+                pass/fail status, and counts.
+
+        Raises:
+            ValueError: If source is not set (use @require_set_source decorator).
+            ValidationException: If mode is FAIL and any validator fails.
+
+        Example:
+            >>> from seeknal.feature_validation.validators import NullValidator, RangeValidator
+            >>> from seeknal.feature_validation.models import ValidationMode
+            >>>
+            >>> # Create validators
+            >>> validators = [
+            ...     NullValidator(columns=["user_id", "email"]),
+            ...     RangeValidator(column="age", min_val=0, max_val=120)
+            ... ]
+            >>>
+            >>> # Run validation in warn mode (continues on failures)
+            >>> summary = feature_group.validate(validators, mode=ValidationMode.WARN)
+            >>> print(f"Passed: {summary.passed}, Failed: {summary.failed_count}")
+            >>>
+            >>> # Run validation in fail mode (stops on first failure)
+            >>> try:
+            ...     summary = feature_group.validate(validators, mode="fail")
+            ... except ValidationException as e:
+            ...     print(f"Validation failed: {e.message}")
+        """
+        # Convert string mode to ValidationMode enum if necessary
+        if isinstance(mode, str):
+            mode = ValidationMode(mode.lower())
+
+        # Get the DataFrame from source
+        if isinstance(self.source, Flow):
+            df = self.source.run(date=reference_date)
+        elif isinstance(self.source, DataFrame):
+            df = self.source
+        else:
+            raise ValueError("Source must be a Flow or DataFrame")
+
+        # Create validation runner and execute validators
+        runner = ValidationRunner(
+            validators=validators,
+            mode=mode,
+            feature_group_name=self.name,
+        )
+
+        # Run validation and return summary
+        summary = runner.run(df)
+
+        logger.info(
+            f"Feature group '{self.name}' validation complete: "
+            f"{summary.passed_count}/{summary.total_validators} validators passed"
+        )
+
+        return summary
 
     @staticmethod
     def _parse_avro_schema(schema: dict, exclude_cols: Optional[List[str]] = None):
