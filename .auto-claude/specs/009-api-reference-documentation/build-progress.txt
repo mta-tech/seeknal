@@ -80,3 +80,50 @@ Or use the init script:
   ./.auto-claude/specs/009-api-reference-documentation/init.sh
 
 === END SESSION 1 ===
+
+=== SESSION: Final Verification (2026-01-05) ===
+
+subtask-9-1: Verify all public APIs are documented
+Status: COMPLETED
+
+Verification Results:
+- Documentation build: SUCCESS (mkdocs build completed in 6.57 seconds)
+- API Pages Generated: 4 (index.md, core.md, featurestore.md, tasks.md)
+
+Documentation Coverage:
+- Core API (site/api/core/index.html): 68 doc-contents sections
+  - Project: ✅ documented with get_or_create, update, list, get_by_id
+  - Entity: ✅ documented with get_or_create, update, list, set_key_values
+  - Flow: ✅ documented with run, from_dict, get_or_create, list, update, delete
+  - FlowInput/FlowOutput: ✅ documented with enums
+  - Context: ✅ documented with copy, get, to_dict
+  - Configuration: ✅ documented with all helper functions
+  - Validation: ✅ documented with all validators
+  - Exceptions: ✅ documented
+
+- FeatureStore API (site/api/featurestore/index.html): 117 doc-contents sections
+  - FeatureGroup: ✅ documented with all methods
+  - FeatureLookup: ✅ documented
+  - HistoricalFeatures: ✅ documented
+  - OnlineFeatures: ✅ documented
+  - OfflineStore/OnlineStore: ✅ documented
+  - Feature/FillNull: ✅ documented
+  - Storage Enums: ✅ documented
+  - Output configs: ✅ documented
+
+- Tasks API (site/api/tasks/index.html): 173 doc-contents sections
+  - Task (base): ✅ documented with add_input, transform, add_common_yaml
+  - SparkEngineTask: ✅ documented with all 25+ methods
+  - DuckDBTask: ✅ documented
+  - Stage/Stages: ✅ documented
+  - Transformers: ✅ documented (SQL, AddColumnByExpr, FilterByExpr, etc.)
+  - Extractors: ✅ documented (PostgreSQLExtractor, etc.)
+  - Loaders: ✅ documented (PostgreSQLLoader, etc.)
+  - Aggregators: ✅ documented (Aggregator, LastNDaysAggregator, etc.)
+
+All public APIs in Project, Entity, Flow, FeatureStore, and Task modules
+have been verified to appear in the built documentation with docstrings visible.
+
+Note: griffe warnings about missing type annotations are expected - these are
+informational only and indicate the source code lacks Python type hints while
+docstrings document types. The build succeeds and generates correct documentation.
