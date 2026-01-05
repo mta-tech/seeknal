@@ -119,17 +119,47 @@ def require_set_entity(func):
 @dataclass
 class FeatureGroup(FeatureStore):
     """
-    Define Feature Group. Feature Group is a set of features created from a flow.
+    A feature group representing a set of features created from a data source.
 
-    Args:
-        name (str): Feature group name
-        entities (List[Entity]): List of entities associated
-        materialization (Materialization): Materialization setting for this feature group
-        flow (Flow, optional): Flow that used for create features for this feature group
-        description (str, optional): Description for this feature group
-        features (List[Feature], optional): List of feature to be registered as features in this feature group.
-            If set to None, then all columns except join_keys and event_time will
-            register as features.
+    A FeatureGroup is a logical grouping of related features that share the same
+    entity and are typically computed from the same data source (Flow or DataFrame).
+    It supports both offline and online materialization for feature storage and serving.
+
+    Attributes:
+        name: The unique name of the feature group within the project.
+        materialization: Configuration for how features are stored and served,
+            including offline/online storage settings and TTL configurations.
+        source: The data source for computing features. Can be a Flow pipeline
+            or a Spark DataFrame. If Flow, output will be set to SPARK_DATAFRAME.
+        description: Optional human-readable description of the feature group.
+        features: List of Feature objects to register. If None, all columns
+            except join_keys and event_time will be registered as features.
+        tag: Optional list of tags for categorizing and filtering feature groups.
+        feature_group_id: Unique identifier assigned by the system after creation.
+        offline_watermarks: List of timestamps indicating when offline data was
+            materialized. Used for tracking data freshness.
+        online_watermarks: List of timestamps indicating when online data was
+            materialized. Used for tracking data freshness.
+        version: Schema version number for the feature group.
+        created_at: Timestamp when the feature group was created.
+        updated_at: Timestamp when the feature group was last updated.
+        avro_schema: Avro schema definition for the feature data structure.
+
+    Example:
+        >>> from seeknal.featurestore import FeatureGroup, Materialization
+        >>> from seeknal.entity import Entity
+        >>>
+        >>> # Create a feature group from a flow
+        >>> fg = FeatureGroup(
+        ...     name="user_features",
+        ...     materialization=Materialization(event_time_col="event_date"),
+        ... )
+        >>> fg.entity = Entity(name="user", join_keys=["user_id"])
+        >>> fg.set_flow(my_flow).set_features().get_or_create()
+
+    Note:
+        A SparkContext must be active before creating a FeatureGroup instance.
+        Initialize your Project and Workspace first if you encounter SparkContext errors.
     """
 
     name: str
@@ -148,6 +178,14 @@ class FeatureGroup(FeatureStore):
     avro_schema: Optional[dict] = None
 
     def __post_init__(self):
+        """Initialize the feature group and validate dependencies.
+
+        Sets up the JVM gateway for Spark operations and ensures that the source
+        (Flow or DataFrame) and entity are properly initialized.
+
+        Raises:
+            AttributeError: If SparkContext is not active or properly configured.
+        """
         try:
             self._jvm_gateway = SparkContext._active_spark_context._gateway.jvm
         except AttributeError as e:
@@ -166,11 +204,21 @@ class FeatureGroup(FeatureStore):
                 self.entity.get_or_create()
 
     def set_flow(self, flow: Flow):
-        """
-        Set flow for this feature group
+        """Set the data flow pipeline as the source for this feature group.
+
+        Configures a Flow as the data source for computing features. The flow's
+        output will be automatically set to SPARK_DATAFRAME if not already
+        configured. If the flow hasn't been persisted, it will be created.
 
         Args:
-            flow (Flow): Flow that used for create features for this feature group
+            flow: The Flow pipeline to use for feature computation.
+
+        Returns:
+            FeatureGroup: The current instance for method chaining.
+
+        Example:
+            >>> fg = FeatureGroup(name="user_features")
+            >>> fg.set_flow(my_transformation_flow)
         """
         if flow.output is not None:
             if flow.output.kind != FlowOutputEnum.SPARK_DATAFRAME:
@@ -181,13 +229,46 @@ class FeatureGroup(FeatureStore):
         return self
 
     def set_dataframe(self, dataframe: DataFrame):
+        """Set a Spark DataFrame as the source for this feature group.
+
+        Configures a pre-computed Spark DataFrame as the data source for
+        features. This is useful when features have already been computed
+        or when using ad-hoc data that doesn't require a Flow pipeline.
+
+        Args:
+            dataframe: The Spark DataFrame containing the feature data.
+
+        Returns:
+            FeatureGroup: The current instance for method chaining.
+
+        Example:
+            >>> fg = FeatureGroup(name="user_features")
+            >>> fg.set_dataframe(my_spark_df)
+        """
         self.source = dataframe
         return self
 
     @staticmethod
     def _parse_avro_schema(schema: dict, exclude_cols: Optional[List[str]] = None):
-        """
-        Parse Avro Schema to Feature
+        """Parse an Avro schema and extract feature definitions.
+
+        Converts an Avro schema into a list of Feature objects by extracting
+        field names and data types. Handles various Avro type representations
+        including unions, arrays, and nested types.
+
+        Args:
+            schema: A dictionary representing the Avro schema with a 'fields' key
+                containing the list of field definitions.
+            exclude_cols: Optional list of column names to exclude from the
+                resulting features. Useful for filtering out entity keys or
+                timestamp columns.
+
+        Returns:
+            list[Feature]: A list of Feature objects with name, data_type, and
+                online_data_type populated from the schema.
+
+        Note:
+            Fields that cannot be parsed will be skipped with a warning logged.
         """
         features = []
         for idx, i in enumerate(schema["fields"]):
@@ -526,6 +607,29 @@ class FeatureGroup(FeatureStore):
         offline_materialization: Optional[OfflineMaterialization] = None,
         online_materialization: Optional[OnlineMaterialization] = None,
     ):
+        """Update the materialization settings for this feature group.
+
+        Modifies the materialization configuration and persists the changes
+        to the feature store backend. This allows changing storage settings,
+        TTL values, and enabling/disabling offline or online storage.
+
+        Args:
+            offline: Enable or disable offline storage. If None, keeps current setting.
+            online: Enable or disable online storage. If None, keeps current setting.
+            offline_materialization: New offline materialization configuration.
+                If None, keeps current setting.
+            online_materialization: New online materialization configuration.
+                If None, keeps current setting.
+
+        Returns:
+            FeatureGroup: The current instance for method chaining.
+
+        Example:
+            >>> fg.update_materialization(
+            ...     online=True,
+            ...     online_materialization=OnlineMaterialization(ttl=2880)
+            ... )
+        """
         if offline is not None:
             self.materialization.offline = offline
         if online is not None:
@@ -566,13 +670,20 @@ class FeatureGroup(FeatureStore):
     @require_saved
     @require_project
     def delete(self):
-        """
-        Deletes the feature group with the given feature_group_id.
+        """Delete this feature group and its associated data.
+
+        Removes the feature group from the feature store backend along with
+        any data stored in the offline store. This operation is irreversible.
 
         Returns:
-        -------
-        FeatureGroupRequest:
-            The FeatureGroupRequest object that was used to delete the feature group.
+            FeatureGroupRequest: The request object used to perform the deletion.
+
+        Raises:
+            ValueError: If the feature group has not been saved (no feature_group_id).
+
+        Note:
+            This requires an active workspace and project context. The feature
+            group must have been previously saved using get_or_create().
         """
         offline_store = self.materialization.offline_materialization.store
         offline_store.delete(
