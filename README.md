@@ -285,5 +285,130 @@ Consider using a secure alternative like '/home/user/.seeknal/feature_store'.
 
 This indicates you should update your configuration to use a secure path. The warning will include a recommended secure alternative based on your current path.
 
+## Feature Group Version Management
+
+Seeknal automatically versions feature groups whenever the schema changes. This enables ML teams to track schema evolution, compare changes between versions, and safely roll back to previous versions when needed.
+
+### Listing Versions
+
+View all versions of a feature group:
+
+```bash
+# List all versions
+seeknal version list user_features
+
+# List last 5 versions
+seeknal version list user_features --limit 5
+
+# Output as JSON
+seeknal version list user_features --format json
+```
+
+Example output:
+```
+Versions for feature group: user_features
+--------------------------------------------------
+Version    Created At             Features
+---------  -------------------    --------
+3          2024-01-15 10:30:00    12
+2          2024-01-10 08:15:00    10
+1          2024-01-05 14:20:00    8
+```
+
+### Viewing Version Details
+
+Inspect the schema and metadata for a specific version:
+
+```bash
+# Show latest version
+seeknal version show user_features
+
+# Show specific version
+seeknal version show user_features --version 2
+```
+
+### Comparing Versions
+
+Compare schemas between two versions to identify added, removed, or modified features:
+
+```bash
+seeknal version diff user_features --from 1 --to 2
+```
+
+Example output:
+```
+Feature Group: user_features
+Comparing version 1 → 2
+============================================================
+
+Added (+):
+  + age_bucket: string
+  + signup_source: string
+
+Removed (-):
+  - legacy_flag: boolean
+
+Modified (~):
+  ~ score: int → double
+
+------------------------------------------------------------
+Summary: 2 added, 1 removed, 1 modified
+```
+
+### Version-Specific Materialization
+
+Materialize a specific version instead of the latest (useful for rollbacks):
+
+```bash
+# Materialize version 1 instead of latest
+seeknal materialize user_features --start-date 2024-01-01 --version 1
+```
+
+### Python API
+
+You can also manage versions programmatically:
+
+```python
+from seeknal.featurestore.feature_group import FeatureGroup
+
+# Load feature group
+fg = FeatureGroup(name="user_features").get_or_create()
+
+# List all versions
+versions = fg.list_versions()
+for v in versions:
+    print(f"Version {v['version']}: {v['feature_count']} features, created {v['created_at']}")
+
+# Get specific version details
+v1 = fg.get_version(1)
+if v1:
+    print(f"Version 1 schema: {v1['avro_schema']}")
+
+# Compare versions
+diff = fg.compare_versions(from_version=1, to_version=2)
+print(f"Added features: {diff['added']}")
+print(f"Removed features: {diff['removed']}")
+print(f"Modified features: {diff['modified']}")
+```
+
+### Rollback Workflow
+
+When you need to roll back to a previous version:
+
+1. **Identify the target version:**
+   ```bash
+   seeknal version list user_features
+   ```
+
+2. **Compare schemas to understand the differences:**
+   ```bash
+   seeknal version diff user_features --from 2 --to 1
+   ```
+
+3. **Materialize the previous version:**
+   ```bash
+   seeknal materialize user_features --start-date 2024-01-01 --version 1
+   ```
+
 ## Contributing
 Contributions are welcome! Please read our contributing guidelines before submitting pull requests.

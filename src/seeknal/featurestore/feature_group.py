@@ -667,6 +667,190 @@ class FeatureGroup(FeatureStore):
         return self
 
     @require_workspace
+    @require_project
+    def list_versions(self):
+        """
+        List all versions of this feature group.
+
+        Returns a list of dictionaries containing version metadata including:
+        - version: The version number
+        - avro_schema: The Avro schema for this version (as dict)
+        - created_at: When the version was created
+        - updated_at: When the version was last updated
+        - feature_count: Number of features in this version
+
+        Returns:
+            List[dict]: A list of version metadata dictionaries, ordered by version
+                number descending (latest first). Returns an empty list if the
+                feature group has not been saved or has no versions.
+
+        Example:
+            >>> fg = FeatureGroup(name="user_features").get_or_create()
+            >>> versions = fg.list_versions()
+            >>> for v in versions:
+            ...     print(f"Version {v['version']}: {v['feature_count']} features")
+        """
+        if not hasattr(self, 'feature_group_id') or self.feature_group_id is None:
+            # Feature group not saved yet, return empty list
+            return []
+
+        versions = FeatureGroupRequest.select_version_by_feature_group_id(
+            self.feature_group_id
+        )
+
+        if versions is None:
+            return []
+
+        result = []
+        for v in versions:
+            # Parse avro_schema from JSON string
+            try:
+                avro_schema = json.loads(v.avro_schema) if v.avro_schema else None
+            except (json.JSONDecodeError, TypeError):
+                avro_schema = None
+
+            # Get feature count for this version
+            features = FeatureRequest.select_by_feature_group_id_and_version(
+                self.feature_group_id, v.version
+            )
+            feature_count = len(features) if features else 0
+
+            result.append({
+                "version": v.version,
+                "avro_schema": avro_schema,
+                "created_at": pendulum.instance(v.created_at).format("YYYY-MM-DD HH:mm:ss") if v.created_at else None,
+                "updated_at": pendulum.instance(v.updated_at).format("YYYY-MM-DD HH:mm:ss") if v.updated_at else None,
+                "feature_count": feature_count,
+            })
+
+        return result
+
+    @require_workspace
+    @require_project
+    def get_version(self, version: int) -> Optional[dict]:
+        """
+        Get metadata for a specific version of this feature group.
+
+        Args:
+            version (int): The version number to retrieve.
+
+        Returns:
+            Optional[dict]: A dictionary containing version metadata if found,
+                None if the version doesn't exist. The dictionary includes:
+                - version: The version number
+                - avro_schema: The Avro schema for this version (as dict)
+                - created_at: When the version was created
+                - updated_at: When the version was last updated
+                - feature_count: Number of features in this version
+
+        Example:
+            >>> fg = FeatureGroup(name="user_features").get_or_create()
+            >>> v1 = fg.get_version(1)
+            >>> if v1:
+            ...     print(f"Version 1 has {v1['feature_count']} features")
+        """
+        if not hasattr(self, 'feature_group_id') or self.feature_group_id is None:
+            # Feature group not saved yet, return None
+            return None
+
+        version_obj = FeatureGroupRequest.select_by_feature_group_id_and_version(
+            self.feature_group_id, version
+        )
+
+        if version_obj is None:
+            return None
+
+        # Parse avro_schema from JSON string
+        try:
+            avro_schema = json.loads(version_obj.avro_schema) if version_obj.avro_schema else None
+        except (json.JSONDecodeError, TypeError):
+            avro_schema = None
+
+        # Get feature count for this version
+        features = FeatureRequest.select_by_feature_group_id_and_version(
+            self.feature_group_id, version
+        )
+        feature_count = len(features) if features else 0
+
+        return {
+            "version": version_obj.version,
+            "avro_schema": avro_schema,
+            "created_at": pendulum.instance(version_obj.created_at).format("YYYY-MM-DD HH:mm:ss") if version_obj.created_at else None,
+            "updated_at": pendulum.instance(version_obj.updated_at).format("YYYY-MM-DD HH:mm:ss") if version_obj.updated_at else None,
+            "feature_count": feature_count,
+        }
+
+    @require_workspace
+    @require_project
+    def compare_versions(self, from_version: int, to_version: int) -> Optional[dict]:
+        """
+        Compare schemas between two versions of this feature group.
+
+        Identifies added, removed, and modified features between the two versions
+        by comparing their Avro schemas.
+
+        Args:
+            from_version (int): The base version number to compare from.
+            to_version (int): The target version number to compare to.
+
+        Returns:
+            Optional[dict]: A dictionary containing the comparison result if both
+                versions exist, None if either version doesn't exist or the feature
+                group has not been saved. The dictionary includes:
+                - from_version: The base version number
+                - to_version: The target version number
+                - added: List of field names added in to_version
+                - removed: List of field names removed in to_version
+                - modified: List of dicts with field name and type changes
+
+        Raises:
+            ValueError: If from_version equals to_version.
+
+        Example:
+            >>> fg = FeatureGroup(name="user_features").get_or_create()
+            >>> diff = fg.compare_versions(1, 2)
+            >>> if diff:
+            ...     print(f"Added features: {diff['added']}")
+            ...     print(f"Removed features: {diff['removed']}")
+            ...     print(f"Modified features: {diff['modified']}")
+        """
+        if from_version == to_version:
+            raise ValueError("from_version and to_version must be different")
+
+        if not hasattr(self, 'feature_group_id') or self.feature_group_id is None:
+            # Feature group not saved yet, return None
+            return None
+
+        # Fetch both versions
+        from_version_obj = FeatureGroupRequest.select_by_feature_group_id_and_version(
+            self.feature_group_id, from_version
+        )
+        to_version_obj = FeatureGroupRequest.select_by_feature_group_id_and_version(
+            self.feature_group_id, to_version
+        )
+
+        # Check if both versions exist
+        if from_version_obj is None:
+            raise ValueError(f"Version {from_version} not found for this feature group")
+        if to_version_obj is None:
+            raise ValueError(f"Version {to_version} not found for this feature group")
+
+        # Get avro_schema JSON strings
+        from_schema_json = from_version_obj.avro_schema if from_version_obj.avro_schema else "{}"
+        to_schema_json = to_version_obj.avro_schema if to_version_obj.avro_schema else "{}"
+
+        # Compare schemas using FeatureGroupRequest.compare_schemas()
+        schema_diff = FeatureGroupRequest.compare_schemas(from_schema_json, to_schema_json)
+
+        return {
+            "from_version": from_version,
+            "to_version": to_version,
+            "added": schema_diff.get("added", []),
+            "removed": schema_diff.get("removed", []),
+            "modified": schema_diff.get("modified", []),
+        }
+
+    @require_workspace
     @require_saved
     @require_project
     def delete(self):

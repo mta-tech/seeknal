@@ -1,17 +1,50 @@
 """
 Seeknal CLI - Main entry point
 
-A dbt-like CLI for managing feature stores.
+A dbt-like CLI for managing feature stores with comprehensive version management
+capabilities for ML teams.
 
 Usage:
-    seeknal init                    Initialize a new project
-    seeknal run <flow>              Execute a transformation flow
-    seeknal materialize <fg>        Materialize features to stores
-    seeknal list <resource>         List resources
-    seeknal show <resource> <name>  Show resource details
-    seeknal delete <resource> <name> Delete a resource
-    seeknal validate                Validate configurations
-    seeknal version                 Show version information
+    seeknal init                                Initialize a new project
+    seeknal run <flow>                          Execute a transformation flow
+    seeknal materialize <fg>                    Materialize features to stores
+    seeknal materialize <fg> --version <N>      Materialize a specific version
+    seeknal list <resource>                     List resources
+    seeknal show <resource> <name>              Show resource details
+    seeknal delete <resource> <name>            Delete a resource
+    seeknal delete-table <name>                 Delete an online table
+    seeknal validate                            Validate configurations
+    seeknal info                                Show version information
+    seeknal debug <fg>                          Debug a feature group
+    seeknal clean <fg>                          Clean old feature data
+
+Version Management:
+    seeknal version list <fg>                   List all versions of a feature group
+    seeknal version list <fg> --limit 5         List last 5 versions
+    seeknal version show <fg>                   Show latest version details
+    seeknal version show <fg> --version <N>     Show specific version details
+    seeknal version diff <fg> --from 1 --to 2   Compare schemas between versions
+
+Examples:
+    # Initialize a new project
+    $ seeknal init --name my_project
+
+    # List all feature groups
+    $ seeknal list feature-groups
+
+    # Materialize the latest version of a feature group
+    $ seeknal materialize user_features --start-date 2024-01-01
+
+    # Materialize a specific version (useful for rollbacks)
+    $ seeknal materialize user_features --start-date 2024-01-01 --version 1
+
+    # View version history
+    $ seeknal version list user_features
+
+    # Compare schema changes between versions
+    $ seeknal version diff user_features --from 1 --to 2
+
+For more information, see: https://github.com/mta-tech/seeknal
 """
 
 import typer
@@ -27,6 +60,28 @@ app = typer.Typer(
     help="Feature store management CLI - similar to dbt",
     add_completion=False,
 )
+
+# Version command group for feature group version management
+version_app = typer.Typer(
+    name="version",
+    help="""Manage feature group versions.
+
+Feature group versioning enables ML teams to track schema evolution,
+compare changes between versions, and safely roll back to previous
+versions when needed.
+
+Commands:
+  list   List all versions of a feature group with creation dates
+  show   Display detailed metadata and schema for a specific version
+  diff   Compare schemas between two versions to identify changes
+
+Examples:
+  seeknal version list user_features
+  seeknal version show user_features --version 2
+  seeknal version diff user_features --from 1 --to 2
+""",
+)
+app.add_typer(version_app, name="version")
 
 
 class OutputFormat(str, Enum):
@@ -88,8 +143,8 @@ def _echo_info(message: str):
 
 
 @app.command()
-def version():
-    """Show version information."""
+def info():
+    """Show version information for Seeknal and its dependencies."""
     import pyspark
     import duckdb
 
@@ -186,26 +241,47 @@ def materialize(
     ),
     start_date: str = typer.Option(
         ..., "--start-date", "-s",
-        help="Start date (YYYY-MM-DD)"
+        help="Start date for feature data (YYYY-MM-DD format)"
     ),
     end_date: Optional[str] = typer.Option(
         None, "--end-date", "-e",
-        help="End date (YYYY-MM-DD)"
+        help="End date for feature data (YYYY-MM-DD format)"
+    ),
+    version: Optional[int] = typer.Option(
+        None, "--version", "-v",
+        help="Specific version number to materialize (defaults to latest). "
+             "Use 'seeknal version list' to see available versions."
     ),
     mode: WriteMode = typer.Option(
         WriteMode.OVERWRITE, "--mode", "-m",
-        help="Write mode"
+        help="Write mode: overwrite, append, or merge"
     ),
     offline_only: bool = typer.Option(
         False, "--offline-only",
-        help="Only materialize to offline store"
+        help="Only materialize to offline store (skip online store)"
     ),
     online_only: bool = typer.Option(
         False, "--online-only",
-        help="Only materialize to online store"
+        help="Only materialize to online store (skip offline store)"
     ),
 ):
-    """Materialize features to offline/online stores."""
+    """
+    Materialize features to offline/online stores.
+
+    Writes feature data to configured storage locations for the specified
+    date range. Supports version-specific materialization for rollbacks
+    or A/B testing scenarios.
+
+    Examples:
+        # Materialize latest version
+        seeknal materialize user_features --start-date 2024-01-01
+
+        # Materialize a specific version (rollback scenario)
+        seeknal materialize user_features --start-date 2024-01-01 --version 1
+
+        # Materialize with date range
+        seeknal materialize user_features -s 2024-01-01 -e 2024-01-31
+    """
     from seeknal.featurestore.feature_group import FeatureGroup
 
     # Parse dates
@@ -217,13 +293,15 @@ def materialize(
         raise typer.Exit(1)
 
     typer.echo(f"Materializing feature group: {feature_group}")
+    if version is not None:
+        typer.echo(f"  Version: {version}")
     typer.echo(f"  Start date: {start_date}")
     if end_date:
         typer.echo(f"  End date: {end_date}")
     typer.echo(f"  Mode: {mode.value}")
 
     try:
-        fg = FeatureGroup.load(name=feature_group)
+        fg = FeatureGroup.load(name=feature_group, version=version)
         fg.write(
             feature_start_time=start_dt,
             feature_end_time=end_dt,
@@ -635,6 +713,309 @@ def delete_table(
     except Exception as e:
         _echo_error(f"Failed to delete table: {e}")
         raise typer.Exit(1)
+
+# Version subcommands
+@version_app.command("list")
+def version_list(
+    feature_group: str = typer.Argument(
+        ..., help="Name of the feature group to query versions for"
+    ),
+    format: OutputFormat = typer.Option(
+        OutputFormat.TABLE, "--format", "-f",
+        help="Output format: table (default), json, or yaml"
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", "-l",
+        help="Maximum number of versions to display (most recent first)"
+    ),
+):
+    """
+    List all versions of a feature group.
+
+    Displays version history with creation timestamps and feature counts,
+    sorted by version number (most recent first). Use this command to
+    review the evolution of a feature group over time.
+
+    Examples:
+        seeknal version list user_features
+        seeknal version list user_features --limit 5
+        seeknal version list user_features --format json
+    """
+    from seeknal.featurestore.feature_group import FeatureGroup
+    from tabulate import tabulate
+    import json
+
+    try:
+        fg = FeatureGroup(name=feature_group).get_or_create()
+        versions = fg.list_versions()
+
+        if not versions:
+            _echo_info(f"No versions found for feature group: {feature_group}")
+            return
+
+        # Apply limit if specified
+        if limit is not None:
+            versions = versions[:limit]
+
+        if format == OutputFormat.JSON:
+            typer.echo(json.dumps(versions, indent=2, default=str))
+        else:
+            # Table format
+            headers = ["Version", "Created At", "Features"]
+            data = []
+            for v in versions:
+                created_at = v.get("created_at", "N/A")
+                if created_at and created_at != "N/A":
+                    # Format datetime for display
+                    if hasattr(created_at, "strftime"):
+                        created_at = created_at.strftime("%Y-%m-%d %H:%M:%S")
+                feature_count = v.get("feature_count", 0)
+                data.append([v.get("version", "N/A"), created_at, feature_count])
+
+            typer.echo(f"\nVersions for feature group: {feature_group}")
+            typer.echo("-" * 50)
+            typer.echo(tabulate(data, headers=headers, tablefmt="simple"))
+
+    except Exception as e:
+        _echo_error(f"Error listing versions: {e}")
+        raise typer.Exit(1)
+
+
+@version_app.command("show")
+def version_show(
+    feature_group: str = typer.Argument(
+        ..., help="Name of the feature group to inspect"
+    ),
+    version: Optional[int] = typer.Option(
+        None, "--version", "-v",
+        help="Specific version number to show (defaults to latest version)"
+    ),
+    format: OutputFormat = typer.Option(
+        OutputFormat.TABLE, "--format", "-f",
+        help="Output format: table (default), json, or yaml"
+    ),
+):
+    """
+    Show detailed information about a feature group version.
+
+    Displays comprehensive metadata for a specific version including:
+    - Version number and timestamps (created, updated)
+    - Feature count
+    - Complete Avro schema with field names and types
+
+    If no version is specified, shows the latest version.
+
+    Examples:
+        seeknal version show user_features              # Show latest
+        seeknal version show user_features --version 2  # Show version 2
+        seeknal version show user_features --format json
+    """
+    from seeknal.featurestore.feature_group import FeatureGroup
+    import json
+
+    try:
+        fg = FeatureGroup(name=feature_group).get_or_create()
+
+        # Get specific version or latest
+        if version is not None:
+            version_data = fg.get_version(version)
+            if version_data is None:
+                _echo_error(f"Version {version} not found for feature group: {feature_group}")
+                raise typer.Exit(1)
+        else:
+            # Get latest version (first in list, sorted by version desc)
+            versions = fg.list_versions()
+            if not versions:
+                _echo_info(f"No versions found for feature group: {feature_group}")
+                return
+            version_data = versions[0]
+
+        if format == OutputFormat.JSON:
+            typer.echo(json.dumps(version_data, indent=2, default=str))
+        else:
+            # Table/readable format
+            version_num = version_data.get("version", "N/A")
+            created_at = version_data.get("created_at", "N/A")
+            updated_at = version_data.get("updated_at", "N/A")
+            feature_count = version_data.get("feature_count", 0)
+            avro_schema = version_data.get("avro_schema")
+
+            # Format datetime for display
+            if created_at and created_at != "N/A" and hasattr(created_at, "strftime"):
+                created_at = created_at.strftime("%Y-%m-%d %H:%M:%S")
+            if updated_at and updated_at != "N/A" and hasattr(updated_at, "strftime"):
+                updated_at = updated_at.strftime("%Y-%m-%d %H:%M:%S")
+
+            typer.echo(f"\nFeature Group: {feature_group}")
+            typer.echo(f"Version: {version_num}")
+            typer.echo("-" * 50)
+            typer.echo(f"  Created At:    {created_at}")
+            typer.echo(f"  Updated At:    {updated_at}")
+            typer.echo(f"  Feature Count: {feature_count}")
+
+            # Display schema
+            if avro_schema:
+                typer.echo("\nSchema:")
+                typer.echo("-" * 50)
+                try:
+                    # Parse and pretty-print the Avro schema
+                    if isinstance(avro_schema, str):
+                        schema_dict = json.loads(avro_schema)
+                    else:
+                        schema_dict = avro_schema
+
+                    # Display schema fields
+                    if "fields" in schema_dict:
+                        typer.echo("  Fields:")
+                        for field in schema_dict.get("fields", []):
+                            field_name = field.get("name", "unknown")
+                            field_type = field.get("type", "unknown")
+                            # Handle complex types
+                            if isinstance(field_type, dict):
+                                field_type = field_type.get("type", str(field_type))
+                            elif isinstance(field_type, list):
+                                # Union types like ["null", "string"]
+                                field_type = " | ".join(str(t) for t in field_type)
+                            typer.echo(f"    - {field_name}: {field_type}")
+                    else:
+                        # Fallback: print formatted JSON
+                        typer.echo(json.dumps(schema_dict, indent=2))
+                except (json.JSONDecodeError, TypeError):
+                    # If parsing fails, display raw schema
+                    typer.echo(f"  {avro_schema}")
+
+    except Exception as e:
+        _echo_error(f"Error showing version: {e}")
+        raise typer.Exit(1)
+
+
+@version_app.command("diff")
+def version_diff(
+    feature_group: str = typer.Argument(
+        ..., help="Name of the feature group to compare versions for"
+    ),
+    from_version: int = typer.Option(
+        ..., "--from", "-f",
+        help="Base version number to compare from (older version)"
+    ),
+    to_version: int = typer.Option(
+        ..., "--to", "-t",
+        help="Target version number to compare to (newer version)"
+    ),
+    format: OutputFormat = typer.Option(
+        OutputFormat.TABLE, "--format",
+        help="Output format: table (default) or json"
+    ),
+):
+    """
+    Compare two versions of a feature group to identify schema differences.
+
+    Analyzes the Avro schemas of both versions and displays:
+    - Added features (+): New fields in the target version
+    - Removed features (-): Fields removed from the base version
+    - Modified features (~): Fields with type changes
+
+    This is useful for understanding schema evolution and identifying
+    potential breaking changes before rolling back or deploying a version.
+
+    Examples:
+        seeknal version diff user_features --from 1 --to 2
+        seeknal version diff user_features --from 1 --to 3 --format json
+    """
+    from seeknal.featurestore.feature_group import FeatureGroup
+    import json
+
+    try:
+        fg = FeatureGroup(name=feature_group).get_or_create()
+
+        # Call compare_versions API
+        diff = fg.compare_versions(from_version, to_version)
+
+        if diff is None:
+            _echo_error(f"Could not compare versions {from_version} and {to_version}")
+            raise typer.Exit(1)
+
+        if format == OutputFormat.JSON:
+            typer.echo(json.dumps(diff, indent=2, default=str))
+        else:
+            # Table/readable format
+            typer.echo(f"\nFeature Group: {feature_group}")
+            typer.echo(f"Comparing version {from_version} → {to_version}")
+            typer.echo("=" * 60)
+
+            added = diff.get("added", [])
+            removed = diff.get("removed", [])
+            modified = diff.get("modified", [])
+
+            has_changes = added or removed or modified
+
+            if not has_changes:
+                _echo_info("No schema changes detected between versions.")
+            else:
+                # Display added features
+                if added:
+                    typer.echo("\n" + typer.style("Added (+):", fg=typer.colors.GREEN, bold=True))
+                    for field in added:
+                        if isinstance(field, dict):
+                            field_name = field.get("name", "unknown")
+                            field_type = field.get("type", "unknown")
+                            # Handle complex types
+                            if isinstance(field_type, dict):
+                                field_type = field_type.get("type", str(field_type))
+                            elif isinstance(field_type, list):
+                                field_type = " | ".join(str(t) for t in field_type)
+                            typer.echo(typer.style(f"  + {field_name}: {field_type}", fg=typer.colors.GREEN))
+                        else:
+                            typer.echo(typer.style(f"  + {field}", fg=typer.colors.GREEN))
+
+                # Display removed features
+                if removed:
+                    typer.echo("\n" + typer.style("Removed (-):", fg=typer.colors.RED, bold=True))
+                    for field in removed:
+                        if isinstance(field, dict):
+                            field_name = field.get("name", "unknown")
+                            field_type = field.get("type", "unknown")
+                            # Handle complex types
+                            if isinstance(field_type, dict):
+                                field_type = field_type.get("type", str(field_type))
+                            elif isinstance(field_type, list):
+                                field_type = " | ".join(str(t) for t in field_type)
+                            typer.echo(typer.style(f"  - {field_name}: {field_type}", fg=typer.colors.RED))
+                        else:
+                            typer.echo(typer.style(f"  - {field}", fg=typer.colors.RED))
+
+                # Display modified features
+                if modified:
+                    typer.echo("\n" + typer.style("Modified (~):", fg=typer.colors.YELLOW, bold=True))
+                    for change in modified:
+                        if isinstance(change, dict):
+                            field_name = change.get("field", "unknown")
+                            old_type = change.get("old_type", "unknown")
+                            new_type = change.get("new_type", "unknown")
+                            # Handle complex types
+                            if isinstance(old_type, dict):
+                                old_type = old_type.get("type", str(old_type))
+                            elif isinstance(old_type, list):
+                                old_type = " | ".join(str(t) for t in old_type)
+                            if isinstance(new_type, dict):
+                                new_type = new_type.get("type", str(new_type))
+                            elif isinstance(new_type, list):
+                                new_type = " | ".join(str(t) for t in new_type)
+                            typer.echo(typer.style(f"  ~ {field_name}: {old_type} → {new_type}", fg=typer.colors.YELLOW))
+                        else:
+                            typer.echo(typer.style(f"  ~ {change}", fg=typer.colors.YELLOW))
+
+                # Summary
+                typer.echo("\n" + "-" * 60)
+                typer.echo(f"Summary: {len(added)} added, {len(removed)} removed, {len(modified)} modified")
+
+    except ValueError as e:
+        _echo_error(str(e))
+        raise typer.Exit(1)
+    except Exception as e:
+        _echo_error(f"Error comparing versions: {e}")
+        raise typer.Exit(1)
+
 
 def main():
     """Main entry point for the CLI."""
