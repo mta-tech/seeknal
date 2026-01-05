@@ -1,389 +1,497 @@
-"""
-DuckDB-based Feature Group implementation.
+"""DuckDB-based Feature Group implementation.
 
-This module provides DuckDB-optimized versions of feature group management
-for use in environments where Spark is not available or needed.
+Provides feature group management, historical feature retrieval, and online serving
+using DuckDB instead of Spark.
 """
 
 import json
 import hashlib
-import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import List, Optional, Union
-
+from enum import Enum
+from typing import List, Optional, Union, Dict, Any
 import pandas as pd
-import pendulum
-import pyarrow as pa
+import duckdb
 
-from ...context import context, logger, require_project
+from ...context import context, logger
 from ...entity import Entity
-from ...request import FeatureGroupRequest, OnlineTableRequest
-from ...tasks.duckdb import DuckDBTask
-from ...workspace import require_workspace
-from ..featurestore import (
-    FeatureStore,
-    Feature,
-    OfflineMaterialization,
-    OnlineMaterialization,
-    OfflineStore,
-    OnlineStore,
+from ...request import OnlineTableRequest
+from .featurestore import (
+    OfflineStoreDuckDB,
+    OnlineStoreDuckDB,
+    FeatureStoreFileOutput,
+    OfflineStoreEnum,
     OnlineStoreEnum,
 )
 
 
-def require_saved(func):
-    """Decorator to ensure feature group is saved before method execution."""
-    def wrapper(self, *args, **kwargs):
-        if not hasattr(self, 'feature_group_id') or self.feature_group_id is None:
-            raise ValueError("Feature group is not loaded or saved")
-        return func(self, *args, **kwargs)
-    return wrapper
-
-
-def require_set_entity(func):
-    """Decorator to ensure entity is set before method execution."""
-    def wrapper(self, *args, **kwargs):
-        if self.entity is None:
-            raise ValueError("Entity is not set")
-        return func(self, *args, **kwargs)
-    return wrapper
-
-
-class MaterializationDuckDB:
-    """Materialization options for DuckDB feature groups."""
-
-    def __init__(
-        self,
-        event_time_col: Optional[str] = None,
-        date_pattern: Optional[str] = None,
-        offline: bool = True,
-        online: bool = False,
-        offline_materialization: Optional[OfflineMaterialization] = None,
-        online_materialization: Optional[OnlineMaterialization] = None,
-    ):
-        self.event_time_col = event_time_col
-        self.date_pattern = date_pattern
-        self.offline = offline
-        self.online = online
-        self.offline_materialization = offline_materialization or OfflineMaterialization()
-        self.online_materialization = online_materialization or OnlineMaterialization()
+class GetLatestTimeStrategy(str, Enum):
+    """Strategy for getting latest features."""
+    REQUIRE_ALL = "require_all"
+    REQUIRE_ANY = "require_any"
 
 
 @dataclass
-class FeatureGroupDuckDB(FeatureStore):
-    """
-    DuckDB-based Feature Group implementation.
+class FillNull:
+    """Configuration for filling null values."""
+    value: str
+    dataType: str
 
-    This class provides feature group functionality optimized for DuckDB,
-    suitable for environments where Spark is not available.
 
-    Args:
-        name: Feature group name
-        entity: Associated entity
-        materialization: Materialization settings for this feature group
-        source: Source dataframe or task
-        description: Description for this feature group
-        features: List of features to register
+@dataclass
+class FeatureLookup:
+    """Defines which features to retrieve from a feature group."""
+    source: 'FeatureGroupDuckDB'
+    features: Optional[List[str]] = None
+
+
+@dataclass
+class Materialization:
+    """Materialization configuration for a feature group."""
+    event_time_col: Optional[str] = None
+    offline: bool = True
+    online: bool = False
+    offline_store: Optional[OfflineStoreDuckDB] = None
+    online_store: Optional[OnlineStoreDuckDB] = None
+
+    def __post_init__(self):
+        if self.offline_store is None:
+            self.offline_store = OfflineStoreDuckDB()
+        if self.online_store is None:
+            self.online_store = OnlineStoreDuckDB()
+
+
+@dataclass
+class FeatureGroupDuckDB:
+    """DuckDB-based Feature Group.
+
+    A feature group is a collection of related features computed from source data.
     """
 
     name: str
-    materialization: MaterializationDuckDB = field(default_factory=MaterializationDuckDB)
-    source: Optional[Union[DuckDBTask, pd.DataFrame]] = None
+    entity: Entity
+    materialization: Materialization = field(default_factory=Materialization)
+    dataframe: Optional[pd.DataFrame] = None
     description: Optional[str] = None
-    features: Optional[List[Feature]] = None
-    tag: Optional[List[str]] = None
+    features: Optional[List[str]] = None
 
-    feature_group_id: Optional[str] = None
+    # Metadata
+    project: str = "default"
     offline_watermarks: List[str] = field(default_factory=list)
     online_watermarks: List[str] = field(default_factory=list)
     version: Optional[int] = None
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
 
-    def __post_init__(self):
-        if self.entity is not None:
-            if not hasattr(self.entity, 'entity_id') or self.entity.entity_id is None:
-                self.entity.get_or_create()
+    def set_dataframe(self, dataframe: pd.DataFrame) -> 'FeatureGroupDuckDB':
+        """Set the source dataframe for this feature group."""
+        self.dataframe = dataframe
+        return self
 
-    @require_workspace
-    @require_project
-    def get_or_create(self, version=None):
+    def set_features(self, features: Optional[List[str]] = None) -> 'FeatureGroupDuckDB':
+        """Set which features to include.
+
+        If features is None, all columns except entity keys and event_time are used.
         """
-        Get or create this feature group in the database.
+        if features is None and self.dataframe is not None:
+            # Auto-detect features
+            reserved_cols = self.entity.join_keys.copy()
+            if self.materialization.event_time_col:
+                reserved_cols.append(self.materialization.event_time_col)
 
-        Args:
-            version: Optional specific version to load.
-
-        Returns:
-            self: The feature group instance.
-        """
-        feature_group = FeatureGroupRequest.select_by_name(self.name)
-        if feature_group is None:
-            if self.entity is None:
-                raise ValueError("Entity is not set")
-            if self.features is None:
-                raise ValueError("Features are not set")
-
-            body = {
-                "name": self.name,
-                "project_id": context.project_id,
-                "description": self.description or "",
-                "offline": self.materialization.offline,
-                "online": self.materialization.online,
-                "materialization_params": {},
-                "entity_id": self.entity.entity_id,
-                "features": [f.to_dict() for f in self.features],
-                "flow_id": None,
-                "avro_schema": None,
-            }
-
-            req = FeatureGroupRequest(body=body)
-            (
-                self.feature_group_id,
-                features,
-                version_obj,
-                offline_store_id,
-                online_store_id,
-            ) = req.save()
-            self.version = version_obj.version
-            self.offline_store_id = offline_store_id
-            self.online_store_id = online_store_id
+            self.features = [col for col in self.dataframe.columns if col not in reserved_cols]
         else:
-            logger.warning("Feature group already exists. Loading the feature group.")
-            self.feature_group_id = feature_group.id
-            self.id = feature_group.id
-
-            if version is None:
-                versions = FeatureGroupRequest.select_version_by_feature_group_id(
-                    feature_group.id
-                )
-                self.version = versions[0].version
-            else:
-                version_obj = FeatureGroupRequest.select_by_feature_group_id_and_version(
-                    feature_group.id, version
-                )
-                if version_obj is None:
-                    raise ValueError(f"Version {version} not found.")
-                self.version = version
-
-            if feature_group.entity_id is not None:
-                from ...request import EntityRequest
-                entity = EntityRequest.select_by_id(feature_group.entity_id)
-                self.entity = Entity(name=entity.name).get_or_create()
-
-            self.offline_store_id = feature_group.offline_store
-            self.online_store_id = feature_group.online_store
-
-            # Load offline store
-            if self.offline_store_id:
-                _offline_store = FeatureGroupRequest.get_offline_store_by_id(
-                    self.offline_store_id
-                )
-                if _offline_store:
-                    from ..featurestore import OfflineStoreEnum, FeatureStoreFileOutput, FileKindEnum
-                    self.materialization.offline_materialization.store = OfflineStore(
-                        kind=OfflineStoreEnum(_offline_store.kind),
-                        name=_offline_store.name
-                    )
+            self.features = features
 
         return self
 
-    @require_workspace
-    @require_saved
-    @require_project
-    def delete(self):
+    def write(
+        self,
+        feature_start_time: Optional[datetime] = None,
+        feature_end_time: Optional[datetime] = None,
+        mode: str = "overwrite"
+    ) -> None:
+        """Materialize features to offline/online stores.
+
+        Args:
+            feature_start_time: Start time for this batch
+            feature_end_time: End time for this batch
+            mode: Write mode - 'overwrite', 'append', or 'merge'
         """
-        Delete this feature group including storage files and metadata.
+        if self.dataframe is None:
+            raise ValueError("Dataframe not set. Use set_dataframe() first.")
 
-        Deletes the feature group from both the storage backend (parquet/delta files)
-        and the metadata database.
+        # Prepare DataFrame for write
+        df = self.dataframe.copy()
 
-        Returns:
-            FeatureGroupRequest: The result of the metadata deletion.
+        # Add 'name' column for tracking feature group
+        df['name'] = self.name
 
-        Raises:
-            ValueError: If feature group is not saved or required context is missing.
-        """
-        offline_store = self.materialization.offline_materialization.store
-        if offline_store is not None:
-            offline_store.delete(
+        # Ensure event_time column exists
+        if self.materialization.event_time_col and self.materialization.event_time_col in df.columns:
+            # Rename to standard 'event_time' column
+            if self.materialization.event_time_col != 'event_time':
+                df = df.rename(columns={self.materialization.event_time_col: 'event_time'})
+
+        # Write to offline store
+        if self.materialization.offline:
+            self.materialization.offline_store.write(
+                df=df,
+                project=self.project,
+                entity=self.entity.name,
                 name=self.name,
-                project=context.project_id,
-                entity=self.entity.entity_id
+                mode=mode,
+                start_date=feature_start_time,
+                end_date=feature_end_time,
             )
 
-        return FeatureGroupRequest.delete_by_id(self.feature_group_id)
+            # Update watermarks
+            watermarks = self.materialization.offline_store.get_watermarks(
+                project=self.project,
+                entity=self.entity.name,
+                name=self.name
+            )
+            self.offline_watermarks = watermarks
+
+        logger.info(f"Wrote feature group '{self.name}' with {len(df)} rows")
+
+    def get_or_create(self) -> 'FeatureGroupDuckDB':
+        """Get or create this feature group (idempotent operation)."""
+        # For simplicity, just load watermarks if they exist
+        try:
+            watermarks = self.materialization.offline_store.get_watermarks(
+                project=self.project,
+                entity=self.entity.name,
+                name=self.name
+            )
+            self.offline_watermarks = watermarks
+        except FileNotFoundError:
+            # Feature group doesn't exist yet
+            pass
+
+        return self
+
+    def delete(self) -> bool:
+        """Delete this feature group.
+
+        Removes all data files from the offline store.
+
+        Returns:
+            True if deletion was successful
+        """
+        # Delete from offline store
+        result = self.materialization.offline_store.delete(
+            project=self.project,
+            entity=self.entity.name,
+            name=self.name
+        )
+        logger.info(f"Deleted feature group '{self.name}'")
+        return result
+
+
+@dataclass
+class HistoricalFeaturesDuckDB:
+    """Point-in-time historical feature retrieval using DuckDB.
+
+    Performs point-in-time correct joins to get features as they existed at
+    specific points in time.
+    """
+
+    lookups: List[FeatureLookup]
+    fill_nulls: Optional[List[FillNull]] = None
+    spine: Optional[pd.DataFrame] = None
+    date_col: Optional[str] = None
+    keep_cols: Optional[List[str]] = None
+    latest_strategy: Optional[GetLatestTimeStrategy] = None
+
+    def to_dataframe(
+        self,
+        feature_start_time: Optional[datetime] = None,
+        feature_end_time: Optional[datetime] = None
+    ) -> pd.DataFrame:
+        """Retrieve historical features as a DataFrame.
+
+        Args:
+            feature_start_time: Start time for features
+            feature_end_time: End time for features
+
+        Returns:
+            DataFrame with features
+        """
+        if not self.lookups:
+            raise ValueError("No feature lookups specified")
+
+        # Read all feature groups
+        dfs = []
+        for lookup in self.lookups:
+            fg = lookup.source
+            df = fg.materialization.offline_store.read(
+                project=fg.project,
+                entity=fg.entity.name,
+                name=fg.name,
+                start_date=feature_start_time,
+                end_date=feature_end_time
+            )
+            dfs.append(df)
+
+        # Merge all feature groups
+        if len(dfs) == 1:
+            result = dfs[0]
+        else:
+            # Join on entity keys + event_time
+            result = dfs[0]
+            for df in dfs[1:]:
+                join_keys = self.lookups[0].source.entity.join_keys + ['event_time']
+                result = result.merge(df, on=join_keys, how='outer')
+
+        return result
+
+    def using_spine(
+        self,
+        spine: pd.DataFrame,
+        date_col: str,
+        keep_cols: Optional[List[str]] = None
+    ) -> 'HistoricalFeaturesDuckDB':
+        """Use a spine (entity-date pairs) for point-in-time feature retrieval.
+
+        Args:
+            spine: DataFrame with entity keys and application dates
+            date_col: Name of the date column in spine
+            keep_cols: Columns from spine to keep in the result
+
+        Returns:
+            Self for chaining
+        """
+        self.spine = spine
+        self.date_col = date_col
+        self.keep_cols = keep_cols or []
+        return self
+
+    def using_latest(
+        self,
+        fetch_strategy: GetLatestTimeStrategy = GetLatestTimeStrategy.REQUIRE_ALL
+    ) -> 'HistoricalFeaturesDuckDB':
+        """Get the latest available features.
+
+        Args:
+            fetch_strategy: Strategy for handling missing features
+
+        Returns:
+            Self for chaining
+        """
+        self.latest_strategy = fetch_strategy
+        return self
+
+    def to_dataframe_with_spine(self) -> pd.DataFrame:
+        """Retrieve features using point-in-time join with spine.
+
+        For each row in the spine, gets features as they existed at or before
+        the application date.
+        """
+        if self.spine is None:
+            raise ValueError("Spine not set. Use using_spine() first.")
+
+        conn = duckdb.connect()
+
+        # Convert spine date column to datetime
+        spine = self.spine.copy()
+        if self.date_col in spine.columns:
+            spine[self.date_col] = pd.to_datetime(spine[self.date_col])
+
+        # Register spine
+        conn.register("spine", spine)
+
+        # Process each feature group
+        result_dfs = []
+        for lookup in self.lookups:
+            fg = lookup.source
+
+            # Read feature group
+            fg_df = fg.materialization.offline_store.read(
+                project=fg.project,
+                entity=fg.entity.name,
+                name=fg.name
+            )
+
+            # Ensure event_time is datetime
+            if 'event_time' in fg_df.columns:
+                fg_df['event_time'] = pd.to_datetime(fg_df['event_time'])
+
+            # Register feature group
+            conn.register("features", fg_df)
+
+            # Build point-in-time join query
+            entity_keys = fg.entity.join_keys
+            join_conditions = " AND ".join([f"spine.{k} = features.{k}" for k in entity_keys])
+
+            # Point-in-time join: get features where event_time <= app_date
+            query = f"""
+            SELECT
+                spine.*,
+                features.* EXCLUDE ({', '.join(entity_keys)}),
+                ROW_NUMBER() OVER (
+                    PARTITION BY {', '.join([f'spine.{k}' for k in entity_keys])}, spine.{self.date_col}
+                    ORDER BY features.event_time DESC
+                ) as rn
+            FROM spine
+            LEFT JOIN features
+                ON {join_conditions}
+                AND features.event_time <= spine.{self.date_col}
+            """
+
+            # Get most recent features
+            result_df = conn.execute(f"""
+                SELECT * EXCLUDE (rn)
+                FROM ({query})
+                WHERE rn = 1 OR rn IS NULL
+            """).df()
+
+            result_dfs.append(result_df)
+
+        # Merge all feature groups
+        if len(result_dfs) == 1:
+            result = result_dfs[0]
+        else:
+            result = result_dfs[0]
+            merge_keys = self.lookups[0].source.entity.join_keys + [self.date_col]
+            for df in result_dfs[1:]:
+                result = result.merge(df, on=merge_keys, how='outer')
+
+        # Keep only requested columns from spine
+        if self.keep_cols:
+            keep_cols_set = set(self.keep_cols + self.lookups[0].source.entity.join_keys + [self.date_col])
+            # Also keep feature columns
+            feature_cols = [col for col in result.columns if col not in spine.columns or col in keep_cols_set]
+            result = result[[col for col in result.columns if col in keep_cols_set or col in feature_cols]]
+
+        conn.close()
+        return result
+
+    def serve(
+        self,
+        name: Optional[str] = None,
+        target: Optional[OnlineStoreDuckDB] = None,
+        ttl: Optional[timedelta] = None
+    ) -> 'OnlineFeaturesDuckDB':
+        """Materialize features to online store for serving.
+
+        Args:
+            name: Name for the online table
+            target: Target online store
+            ttl: Time-to-live for features
+
+        Returns:
+            OnlineFeaturesDuckDB instance for serving
+        """
+        # Get latest features
+        df = self.to_dataframe()
+
+        # Generate table name if not provided
+        if name is None:
+            name = hashlib.md5(str(datetime.now().timestamp()).encode()).hexdigest()
+
+        # Use target store or default
+        if target is None:
+            target = OnlineStoreDuckDB()
+
+        # Write to online store
+        target.write(df=df, table_name=name)
+
+        # Create OnlineFeaturesDuckDB instance
+        return OnlineFeaturesDuckDB(
+            name=name,
+            lookup_key=self.lookups[0].source.entity,
+            online_store=target
+        )
 
 
 @dataclass
 class OnlineFeaturesDuckDB:
-    """
-    DuckDB-based online features implementation.
+    """Online feature serving using DuckDB.
 
-    This class provides online feature serving functionality using DuckDB
-    for environments where Spark is not available.
-
-    Args:
-        lookup_key: Entity to use as lookup key
-        dataframe: Source dataframe
-        name: Optional name for the online table
-        description: Description
-        ttl: Time-to-live for the features
-        online_store: Online store configuration
+    Provides low-latency feature lookups for real-time predictions.
+    Also known as OnlineTableDuckDB in some contexts.
     """
 
+    name: str
     lookup_key: Entity
-    dataframe: Optional[pd.DataFrame] = None
-    name: Optional[str] = None
-    description: str = ""
-    ttl: Optional[timedelta] = None
-    online_store: Optional[OnlineStore] = None
-    tag: Optional[List[str]] = None
-    online_watermarks: List[str] = field(default_factory=list)
-    online_table_id: Optional[str] = None
-    _online_reader: Optional[DuckDBTask] = None
+    online_store: Optional[OnlineStoreDuckDB] = None
+    lookups: Optional[List[FeatureLookup]] = None
+    project: str = "default"
+    id: Optional[str] = None
 
-    @require_project
-    @require_workspace
     def __post_init__(self):
-        if not hasattr(self.lookup_key, 'entity_id') or self.lookup_key.entity_id is None:
-            self.lookup_key.get_or_create()
+        if self.online_store is None:
+            self.online_store = OnlineStoreDuckDB()
 
-        if self.name is None:
-            if self.dataframe is not None:
-                column_names = ",".join(list(self.dataframe.columns))
-                name = hashlib.md5(column_names.encode()).hexdigest()
-            else:
-                name = hashlib.md5(str(datetime.now()).encode()).hexdigest()
-        else:
-            name = self.name
-
-        online_table = OnlineTableRequest.select_by_name(name)
-        if online_table is None:
-            if self.dataframe is None:
-                raise ValueError(
-                    "dataframe must be provided if online features have not been saved before."
-                )
-
-            if "__pk__" not in self.dataframe.columns:
-                self.dataframe["__pk__"] = range(len(self.dataframe))
-
-            if self.online_store is None:
-                self._online_reader = DuckDBTask().add_input(
-                    dataframe=pa.Table.from_pandas(self.dataframe)
-                )
-            else:
-                self._online_reader = self.online_store(
-                    spark=None,
-                    result=self.dataframe,
-                    write=True,
-                    name=name,
-                    project=context.project_id,
-                )
-
-                # Save online table metadata
-                req = OnlineTableRequest(
-                    body={
-                        "name": name,
-                        "description": self.description,
-                        "entity": self.lookup_key.entity_id,
-                        "online_store": self.online_store,
-                        "feature_lookups": None,
-                        "ttl": self.ttl,
-                        "watermarks": self.online_watermarks,
-                    }
-                )
-                self.online_table_id = req.save()
-            self.dataframe = None
-        else:
-            self.description = online_table.description
-            self.online_table_id = online_table.id
-
-            online_store_obj = OnlineTableRequest.get_online_store_by_id(
-                online_table.online_store_id
-            )
-            if online_store_obj:
-                self.online_store = OnlineStore(
-                    kind=OnlineStoreEnum(online_store_obj.kind),
-                    value=online_store_obj.params if online_store_obj.params != "null" else None,
-                    name=online_store_obj.name,
-                )
-                self._online_reader = self.online_store(
-                    spark=None,
-                    result=None,
-                    write=False,
-                    name=name,
-                    project=context.project_id,
-                )
-
-    def delete(self):
-        """
-        Delete this online feature table including storage files and metadata.
-
-        Deletes the online feature data from the storage backend and removes
-        all associated metadata from the database.
-
-        Returns:
-            bool: True if deletion was successful.
-
-        Raises:
-            ValueError: If online table is not initialized or required context is missing.
-        """
-        if self.online_store is not None:
-            try:
-                self.online_store.delete(name=self.name, project=context.project_id)
-            except Exception as e:
-                logger.error(f"Failed to delete online store files: {e}")
-
-        if self.online_table_id is not None:
-            OnlineTableRequest.delete_by_id(self.online_table_id)
-            OnlineTableRequest.delete_online_watermarks(self.online_table_id)
-            OnlineTableRequest.delete_feature_group_from_online_table(self.online_table_id)
-
-        return True
-
-    def get_features(
-        self,
-        keys: List[dict],
-        filter: Optional[str] = None,
-        drop_event_time: bool = True,
-    ):
-        """
-        Get features for the given entity keys.
+    def get_features(self, keys: List[Union[Entity, Dict[str, Any]]]) -> pd.DataFrame:
+        """Get features for specific entity keys.
 
         Args:
-            keys: List of dictionaries with entity key-value pairs.
-            filter: Optional SQL filter expression.
-            drop_event_time: Whether to drop the event_time column from results.
+            keys: List of entity instances or key dictionaries
 
         Returns:
-            list: List of feature records as dictionaries.
+            DataFrame with features for the requested keys
         """
-        if self._online_reader is None:
-            raise ValueError("Online reader not initialized. Must be served first.")
+        # Convert Entity instances to dicts
+        key_dicts = []
+        for key in keys:
+            if isinstance(key, Entity):
+                # Extract key values from Entity
+                key_dict = key.key_values if hasattr(key, 'key_values') else {}
+            elif isinstance(key, dict):
+                key_dict = key
+            else:
+                raise ValueError(f"Invalid key type: {type(key)}")
 
-        from ...validation import validate_column_name, validate_sql_value
+            key_dicts.append(key_dict)
 
-        keys_str = []
-        for key_dict in keys:
-            for k, v in key_dict.items():
-                validate_column_name(k)
-                validate_sql_value(str(v), value_type="key value")
-                keys_str.append(f"{k}='{v}'")
+        # Read from online store
+        df = self.online_store.read(table_name=self.name, keys=key_dicts)
 
-        keys_stm = " AND ".join(keys_str)
-        if filter is not None:
-            keys_stm = keys_stm + " AND " + filter
+        return df
 
-        query = f"SELECT * FROM __THIS__ WHERE {keys_stm}"
-        res = (
-            self._online_reader.add_sql(query)
-            .transform(params={"return_as_pandas": True})
-            .drop("__pk__", axis=1)
-        )
+    def delete(self) -> bool:
+        """Delete this online table.
 
-        if drop_event_time and "event_time" in res.columns:
-            res = res.drop("event_time", axis=1)
+        Removes all data files from the online store and cleans up metadata
+        from the database.
 
-        return json.loads(res.to_json(orient="records"))
+        Returns:
+            True if deletion was successful
+
+        Raises:
+            Exception: If file deletion fails (metadata cleanup still attempted)
+        """
+        deletion_success = True
+
+        # Step 1: Delete data files from online store
+        try:
+            entity_name = self.lookup_key.name if self.lookup_key else None
+            self.online_store.delete(
+                name=self.name,
+                project=self.project,
+                entity=entity_name
+            )
+            logger.info(f"Deleted online table data files for '{self.name}'")
+        except Exception as e:
+            logger.error(f"Failed to delete online table data files for '{self.name}': {e}")
+            deletion_success = False
+
+        # Step 2: Clean up metadata from database
+        try:
+            if self.id is not None:
+                OnlineTableRequest.delete_by_id(self.id)
+                logger.info(f"Deleted online table metadata for '{self.name}' (id={self.id})")
+        except Exception as e:
+            logger.error(f"Failed to delete online table metadata for '{self.name}': {e}")
+            deletion_success = False
+
+        if deletion_success:
+            logger.info(f"Successfully deleted online table '{self.name}'")
+        else:
+            logger.warning(f"Partial deletion of online table '{self.name}' - some cleanup may have failed")
+
+        return deletion_success
+
+
+# Alias for backward compatibility
+OnlineTableDuckDB = OnlineFeaturesDuckDB

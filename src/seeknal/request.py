@@ -1179,6 +1179,26 @@ class OnlineTableRequest(RequestFactory):
             return session.exec(stm).all()
 
     @staticmethod
+    def check_dependencies(table_id) -> List[str]:
+        """
+        Check if any feature groups depend on this online table.
+
+        Args:
+            table_id: The ID of the online table to check dependencies for.
+
+        Returns:
+            List of feature group names that depend on this table.
+        """
+        with get_db_session() as session:
+            stm = (
+                select(FeatureGroupTable.name)
+                .join(FeatureGroupOnlineTable, FeatureGroupOnlineTable.feature_group_id == FeatureGroupTable.id)
+                .where(FeatureGroupOnlineTable.online_table_id == table_id)
+            )
+            results = session.exec(stm).all()
+            return list(results)
+
+    @staticmethod
     def delete_feature_group_from_online_table(id):
         items = OnlineTableRequest.get_feature_group_from_online_table(id)
         with get_db_session() as session:
