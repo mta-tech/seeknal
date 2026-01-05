@@ -173,6 +173,87 @@ class OfflineStore:
         else:
             typer.echo("No offline stores found.")
 
+    def delete(
+        self,
+        spark: Optional[SparkSession] = None,
+        *args,
+        **kwargs,
+    ) -> bool:
+        """Delete storage for a feature group from the offline store.
+
+        For FILE type: Deletes the directory containing the delta table.
+        For HIVE_TABLE type: Drops the Hive table using Spark SQL.
+
+        Args:
+            spark: SparkSession instance (required for HIVE_TABLE, optional for FILE).
+            **kwargs: Must include 'project' and 'entity' to construct the table name.
+
+        Returns:
+            bool: True if deletion was successful or resource didn't exist.
+
+        Raises:
+            ValueError: If required kwargs (project, entity) are missing.
+        """
+        project = kwargs.get("project")
+        entity = kwargs.get("entity")
+
+        if project is None or entity is None:
+            raise ValueError("Both 'project' and 'entity' are required for deletion")
+
+        # Validate project and entity parameters
+        validate_table_name(project)
+        validate_table_name(entity)
+        table_name = "fg_{}__{}".format(project, entity)
+
+        match self.kind:
+            case OfflineStoreEnum.FILE:
+                if self.value is None:
+                    base_path = CONFIG_BASE_URL
+                    path = os.path.join(base_path, "data", table_name)
+                else:
+                    if isinstance(self.value, FeatureStoreFileOutput):
+                        base_path = self.value.path
+                    elif isinstance(self.value, dict):
+                        base_path = self.value.get("path", CONFIG_BASE_URL)
+                    else:
+                        base_path = self.value
+                    path = os.path.join(base_path, table_name)
+
+                if os.path.exists(path):
+                    shutil.rmtree(path)
+                    logger.info(f"Deleted offline store files at: {path}")
+                else:
+                    logger.info(f"Offline store path does not exist: {path}")
+                return True
+
+            case OfflineStoreEnum.HIVE_TABLE:
+                if spark is None:
+                    spark = SparkSession.builder.getOrCreate()
+
+                if self.value is None:
+                    database = "seeknal"
+                elif isinstance(self.value, FeatureStoreHiveTableOutput):
+                    database = self.value.database
+                elif isinstance(self.value, dict):
+                    database = self.value.get("database", "seeknal")
+                else:
+                    database = "seeknal"
+
+                # Validate database name before use in SQL
+                validate_database_name(database)
+
+                full_table_name = "{}.{}".format(database, table_name)
+                if spark.catalog.tableExists(full_table_name):
+                    spark.sql(f"DROP TABLE IF EXISTS {full_table_name}")
+                    logger.info(f"Dropped Hive table: {full_table_name}")
+                else:
+                    logger.info(f"Hive table does not exist: {full_table_name}")
+                return True
+
+            case _:
+                logger.warning(f"Unknown offline store kind: {self.kind}")
+                return False
+
     def __call__(
         self,
         result: Optional[DataFrame] = None,

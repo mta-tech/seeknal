@@ -16,12 +16,18 @@ from seeknal.cli.main import (
     OutputFormat,
     WriteMode,
     ResourceType,
+    DeleteResourceType,
     _get_version,
     _echo_success,
     _echo_error,
     _echo_warning,
     _echo_info,
 )
+
+# Pre-populate sys.modules with mock to enable patching without triggering full import chain
+import sys
+if "seeknal.featurestore.feature_group" not in sys.modules:
+    sys.modules["seeknal.featurestore.feature_group"] = mock.MagicMock()
 
 
 runner = CliRunner()
@@ -386,3 +392,119 @@ class TestDebugCommand:
         )
         # May fail for non-existent fg, but should not fail on argument parsing
         assert "test_fg" in result.stdout or result.exit_code in [0, 1]
+
+
+class TestDeleteCommand:
+    """Tests for the delete command."""
+
+    def test_delete_requires_resource_type(self):
+        """Delete command should require resource type argument."""
+        result = runner.invoke(app, ["delete"])
+        assert result.exit_code != 0
+
+    def test_delete_requires_name(self):
+        """Delete command should require name argument."""
+        result = runner.invoke(app, ["delete", "feature-group"])
+        assert result.exit_code != 0
+
+    def test_delete_help(self):
+        """Delete command help should display options."""
+        result = runner.invoke(app, ["delete", "--help"])
+        assert result.exit_code == 0
+        assert "feature-group" in result.stdout
+        assert "--force" in result.stdout
+
+    def test_delete_feature_group_success(self):
+        """Delete command should successfully delete a feature group with --force."""
+        with mock.patch("seeknal.featurestore.feature_group.FeatureGroup") as mock_fg_class:
+            # Setup mock
+            mock_fg_instance = mock.MagicMock()
+            mock_fg_class.load.return_value = mock_fg_instance
+            mock_fg_instance.delete.return_value = None
+
+            result = runner.invoke(
+                app, ["delete", "feature-group", "test_fg", "--force"]
+            )
+
+            assert result.exit_code == 0
+            assert "Deleted feature group 'test_fg'" in result.stdout
+            assert "removed storage files and metadata" in result.stdout
+            mock_fg_class.load.assert_called_once_with(name="test_fg")
+            mock_fg_instance.delete.assert_called_once()
+
+    def test_delete_feature_group_not_found(self):
+        """Delete command should return error for non-existent feature group."""
+        with mock.patch("seeknal.featurestore.feature_group.FeatureGroup") as mock_fg_class:
+            # Simulate feature group not found
+            mock_fg_class.load.side_effect = Exception("Feature group not found")
+
+            result = runner.invoke(
+                app, ["delete", "feature-group", "nonexistent_fg", "--force"]
+            )
+
+            assert result.exit_code == 1
+            assert "not found" in result.stdout
+            mock_fg_class.load.assert_called_once_with(name="nonexistent_fg")
+
+    def test_delete_feature_group_confirmation_cancelled(self):
+        """Delete command should exit gracefully when confirmation is cancelled."""
+        with mock.patch("seeknal.featurestore.feature_group.FeatureGroup") as mock_fg_class:
+            # Setup mock for load
+            mock_fg_instance = mock.MagicMock()
+            mock_fg_class.load.return_value = mock_fg_instance
+
+            # Simulate "n" input for confirmation
+            result = runner.invoke(
+                app, ["delete", "feature-group", "test_fg"], input="n\n"
+            )
+
+            assert result.exit_code == 0
+            assert "cancelled" in result.stdout.lower()
+            # delete() should NOT be called when cancelled
+            mock_fg_instance.delete.assert_not_called()
+
+    def test_delete_feature_group_confirmation_accepted(self):
+        """Delete command should proceed when confirmation is accepted."""
+        with mock.patch("seeknal.featurestore.feature_group.FeatureGroup") as mock_fg_class:
+            # Setup mock
+            mock_fg_instance = mock.MagicMock()
+            mock_fg_class.load.return_value = mock_fg_instance
+            mock_fg_instance.delete.return_value = None
+
+            # Simulate "y" input for confirmation
+            result = runner.invoke(
+                app, ["delete", "feature-group", "test_fg"], input="y\n"
+            )
+
+            assert result.exit_code == 0
+            assert "Deleted feature group 'test_fg'" in result.stdout
+            mock_fg_instance.delete.assert_called_once()
+
+    def test_delete_feature_group_delete_failure(self):
+        """Delete command should handle deletion failures gracefully."""
+        with mock.patch("seeknal.featurestore.feature_group.FeatureGroup") as mock_fg_class:
+            # Setup mock
+            mock_fg_instance = mock.MagicMock()
+            mock_fg_class.load.return_value = mock_fg_instance
+            mock_fg_instance.delete.side_effect = Exception("Storage deletion failed")
+
+            result = runner.invoke(
+                app, ["delete", "feature-group", "test_fg", "--force"]
+            )
+
+            assert result.exit_code == 1
+            assert "Failed to delete" in result.stdout
+            assert "test_fg" in result.stdout
+
+    def test_delete_invalid_resource_type(self):
+        """Delete command should fail for invalid resource type."""
+        result = runner.invoke(app, ["delete", "invalid-type", "test_name"])
+        assert result.exit_code != 0
+
+
+class TestDeleteResourceTypeEnum:
+    """Tests for DeleteResourceType enum."""
+
+    def test_feature_group_type(self):
+        """DeleteResourceType should have FEATURE_GROUP value."""
+        assert DeleteResourceType.FEATURE_GROUP.value == "feature-group"
