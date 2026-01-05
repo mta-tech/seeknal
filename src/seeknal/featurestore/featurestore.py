@@ -28,16 +28,36 @@ from ..utils.path_security import warn_if_insecure_path
 
 
 class OfflineStoreEnum(str, Enum):
+    """Enumeration of supported offline storage types.
+
+    Attributes:
+        HIVE_TABLE: Store features as a Hive table in a database.
+        FILE: Store features as files on the filesystem (e.g., Delta format).
+    """
+
     HIVE_TABLE = "hive_table"
     FILE = "file"
 
 
 class OnlineStoreEnum(str, Enum):
+    """Enumeration of supported online storage types.
+
+    Attributes:
+        HIVE_TABLE: Store features as a Hive table for online serving.
+        FILE: Store features as Parquet files for online serving.
+    """
+
     HIVE_TABLE = "hive_table"
     FILE = "file"
 
 
 class FileKindEnum(str, Enum):
+    """Enumeration of supported file formats for feature storage.
+
+    Attributes:
+        DELTA: Delta Lake format, providing ACID transactions and versioning.
+    """
+
     DELTA = "delta"
 
 
@@ -62,14 +82,30 @@ class FeatureStoreFileOutput:
         )
 
     def to_dict(self):
+        """Convert the configuration to a dictionary representation.
+
+        Returns:
+            dict: Dictionary with 'path' and 'kind' keys.
+        """
         return {"path": self.path, "kind": self.kind.value}
 
 
 @dataclass
 class FeatureStoreHiveTableOutput:
+    """Configuration for Hive table-based feature store output.
+
+    Attributes:
+        database: The Hive database name where features will be stored.
+    """
+
     database: str
 
     def to_dict(self):
+        """Convert the configuration to a dictionary representation.
+
+        Returns:
+            dict: Dictionary with 'database' key.
+        """
         return {"database": self.database}
 
 
@@ -130,6 +166,18 @@ class OfflineStore:
             warn_if_insecure_path(path, context="offline store", logger=logger)
 
     def get_or_create(self):
+        """Retrieve an existing offline store or create a new one.
+
+        If an offline store with the specified name exists, it is retrieved and
+        its configuration is loaded. Otherwise, a new offline store is created
+        with the current configuration.
+
+        Returns:
+            OfflineStore: The current instance with id populated.
+
+        Note:
+            The store name defaults to "default" if not specified.
+        """
         if self.name is None:
             name = "default"
         else:
@@ -159,6 +207,15 @@ class OfflineStore:
 
     @staticmethod
     def list():
+        """List all registered offline stores.
+
+        Displays a formatted table of all offline stores with their names,
+        kinds, and configuration values. If no stores are found, displays
+        an appropriate message.
+
+        Returns:
+            None: Output is printed to the console.
+        """
         offline_stores = FeatureGroupRequest.get_offline_stores()
         if offline_stores:
             offline_stores = [
@@ -181,6 +238,36 @@ class OfflineStore:
         *args: Any,
         **kwds: Any,
     ) -> Any:
+        """Write features to or read features from the offline store.
+
+        This method handles both writing and reading operations for the offline
+        store. When writing, it supports overwrite, append, and merge modes with
+        optional TTL-based data cleanup.
+
+        Args:
+            result: The DataFrame containing feature data to write.
+            spark: SparkSession instance. If None, a new session is created.
+            write: If True, write data to the store. If False, read from store.
+            *args: Additional positional arguments.
+            **kwds: Keyword arguments including:
+                - project (str): Project name for table naming.
+                - entity (str): Entity name for table naming.
+                - name (str): Feature name (required for write).
+                - start_date (str/datetime): Start date for data range.
+                - end_date (str/datetime): End date for data range.
+                - mode (str): Write mode ('overwrite', 'append', 'merge').
+                - ttl (int): Time-to-live in days for data retention.
+                - version (str): Version metadata.
+                - latest_watermark (datetime): Latest watermark for TTL cleanup.
+
+        Returns:
+            DataFrame: When reading (write=False), returns the filtered DataFrame.
+            None: When writing (write=True).
+
+        Raises:
+            ValueError: If start_date is missing for write operations or if
+                an unsupported mode is specified.
+        """
         match self.kind:
             case OfflineStoreEnum.HIVE_TABLE:
                 if spark is None:
@@ -492,6 +579,29 @@ class OnlineStore:
         *args: Any,
         **kwargs: Any,
     ):
+        """Write features to or prepare a reader from the online store.
+
+        This method handles writing feature data to the online store and
+        returns a DuckDB-based SQL reader for querying the stored data.
+
+        Args:
+            result: The DataFrame (Spark or Pandas) containing feature data.
+            spark: SparkSession instance. If None, a new session is created.
+            write: If True, write data before returning reader. If False,
+                only return the reader for existing data.
+            *args: Additional positional arguments.
+            **kwargs: Keyword arguments including:
+                - project (str): Project name for file naming.
+                - name (str): Feature name for file naming.
+
+        Returns:
+            DuckDBTask: A DuckDB reader configured to query the stored
+                Parquet files.
+
+        Note:
+            The data is stored in Parquet format under the configured path
+            with the naming convention: fs_{project}__{name}
+        """
         match self.kind:
             case OnlineStoreEnum.FILE:
                 if spark is None:
@@ -521,6 +631,21 @@ class OnlineStore:
                 return sql_reader
 
     def delete(self, *args, **kwargs):
+        """Delete feature data from the online store.
+
+        Removes the directory containing the feature data for the specified
+        project and feature name.
+
+        Args:
+            *args: Additional positional arguments (unused).
+            **kwargs: Keyword arguments including:
+                - project (str): Project name for file naming.
+                - name (str): Feature name for file naming.
+
+        Returns:
+            bool: True if the deletion was successful or if the path
+                did not exist.
+        """
         match self.kind:
             case OnlineStoreEnum.FILE:
                 name = kwargs.get("name")
@@ -550,6 +675,11 @@ class FillNull(BaseModel):
     columns: Optional[List[str]] = None
 
     def to_dict(self):
+        """Convert the configuration to a dictionary representation.
+
+        Returns:
+            dict: Dictionary containing non-None values from the model.
+        """
         return {k: v for k, v in self.model_dump().items() if v is not None}
 
 
@@ -602,6 +732,17 @@ class Feature(BaseModel):
     updated_at: Optional[str] = None
 
     def to_dict(self):
+        """Convert the feature definition to a dictionary representation.
+
+        Creates a dictionary suitable for API requests with metadata and
+        data type information.
+
+        Returns:
+            dict: Dictionary with structure:
+                - metadata: dict containing 'name' and optionally 'description'
+                - datatype: The feature's data type
+                - onlineDatatype: The feature's online store data type
+        """
         _dict = {
             "metadata": {"name": self.name},
             "datatype": self.data_type,
@@ -627,4 +768,12 @@ class FeatureStore(ABC):
 
     @abstractmethod
     def get_or_create(self):
+        """Retrieve an existing feature store or create a new one.
+
+        This abstract method must be implemented by subclasses to handle
+        the creation or retrieval of feature store instances.
+
+        Returns:
+            FeatureStore: The feature store instance.
+        """
         pass
