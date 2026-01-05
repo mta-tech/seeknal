@@ -30,3 +30,6 @@ spark-engine/.metals
 
 # MkDocs build output
 site/
+
+# Documentation audit artifacts
+docs/audit/
