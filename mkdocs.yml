@@ -43,6 +43,21 @@ theme:
   icon:
     repo: fontawesome/brands/github
 
+# Hooks for build configuration
+hooks:
+  - docs/hooks.py
+
+# Validation settings - downgrade certain warnings to info level
+validation:
+  nav:
+    omitted_files: info
+    absolute_links: warn
+  links:
+    not_found: warn
+    anchors: warn
+    absolute_links: warn
+    unrecognized_links: warn
+
 # Plugins
 plugins:
   - search:
@@ -76,6 +91,9 @@ plugins:
             docstring_section_style: spacy
             merge_init_into_class: true
             show_if_no_docstring: false
+            # Docstring parsing options - suppress warnings about unknown params
+            docstring_options:
+              warn_unknown_params: false
 
 # Markdown extensions
 markdown_extensions:
