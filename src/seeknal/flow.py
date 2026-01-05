@@ -26,6 +26,21 @@ from .workspace import require_workspace
 
 
 class FlowOutputEnum(str, Enum):
+    """Enumeration of supported flow output types.
+
+    Defines the possible output formats for Flow execution results.
+
+    Attributes:
+        SPARK_DATAFRAME: Output as a PySpark DataFrame.
+        ARROW_DATAFRAME: Output as a PyArrow Table.
+        PANDAS_DATAFRAME: Output as a Pandas DataFrame.
+        HIVE_TABLE: Write output to a Hive table.
+        PARQUET: Write output to Parquet files.
+        LOADER: Use a custom loader for output.
+        FEATURE_GROUP: Output to a feature group.
+        FEATURE_SERVING: Output for feature serving.
+    """
+
     SPARK_DATAFRAME = "spark_dataframe"
     ARROW_DATAFRAME = "arrow_dataframe"
     PANDAS_DATAFRAME = "pandas_dataframe"
@@ -37,6 +52,18 @@ class FlowOutputEnum(str, Enum):
 
 
 class FlowInputEnum(str, Enum):
+    """Enumeration of supported flow input types.
+
+    Defines the possible input sources for Flow data ingestion.
+
+    Attributes:
+        HIVE_TABLE: Read input from a Hive table.
+        PARQUET: Read input from Parquet files.
+        FEATURE_GROUP: Read input from a feature group.
+        EXTRACTOR: Use a custom extractor for input.
+        SOURCE: Read input from a defined Source.
+    """
+
     HIVE_TABLE = "hive_table"
     PARQUET = "parquet"
     FEATURE_GROUP = "feature_group"
@@ -46,10 +73,43 @@ class FlowInputEnum(str, Enum):
 
 @dataclass
 class FlowInput:
+    """Configuration for flow input data source.
+
+    Defines how data is loaded into a Flow for processing. Supports multiple
+    input types including Hive tables, Parquet files, extractors, and sources.
+
+    Attributes:
+        value: The input specification. Can be a table name (str), path (str),
+            configuration (dict), or Extractor instance depending on the kind.
+        kind: The type of input source (default: HIVE_TABLE).
+
+    Example:
+        >>> # Read from a Hive table
+        >>> flow_input = FlowInput(value="my_database.my_table", kind=FlowInputEnum.HIVE_TABLE)
+        >>> # Read from Parquet files
+        >>> flow_input = FlowInput(value="/path/to/data.parquet", kind=FlowInputEnum.PARQUET)
+    """
+
     value: Optional[Union[str, dict, Extractor]] = None
     kind: FlowInputEnum = FlowInputEnum.HIVE_TABLE
 
     def __call__(self, spark: Optional[SparkSession] = None):
+        """Load data from the configured input source.
+
+        Args:
+            spark: Optional SparkSession for Spark-based inputs. Required for
+                HIVE_TABLE input type.
+
+        Returns:
+            DataFrame or PyArrow Table containing the loaded data, depending
+            on the input type and available Spark session.
+
+        Raises:
+            ValueError: If the value type doesn't match the expected type for
+                the input kind.
+            NotImplementedError: If FEATURE_GROUP input type is used (not yet
+                implemented).
+        """
         match self.kind:
             case FlowInputEnum.HIVE_TABLE:
                 if not isinstance(self.value, str):
@@ -91,12 +151,43 @@ class FlowInput:
 
 @dataclass
 class FlowOutput:
+    """Configuration for flow output destination.
+
+    Defines how flow results are returned or persisted. Supports multiple
+    output formats including DataFrames, Hive tables, and Parquet files.
+
+    Attributes:
+        value: The output destination. For file-based outputs, this is the
+            path or table name. For DataFrame outputs, this is typically None.
+        kind: The type of output format (default: None, returns data as-is).
+
+    Example:
+        >>> # Return as Spark DataFrame
+        >>> output = FlowOutput(kind=FlowOutputEnum.SPARK_DATAFRAME)
+        >>> # Write to Hive table
+        >>> output = FlowOutput(value="my_db.output_table", kind=FlowOutputEnum.HIVE_TABLE)
+    """
+
     value: Optional[Any] = None
     kind: Optional[FlowOutputEnum] = None
 
     def __call__(
         self, result: Union[DataFrame, pa.Table], spark: Optional[SparkSession] = None
     ):
+        """Process and output the flow result.
+
+        Converts the result to the specified output format and optionally
+        persists it to the configured destination.
+
+        Args:
+            result: The data to output, either as a PySpark DataFrame or
+                PyArrow Table.
+            spark: Optional SparkSession for Spark-based outputs.
+
+        Returns:
+            The processed result in the specified format, or None if the
+            output was written to storage (HIVE_TABLE, PARQUET, LOADER).
+        """
         match self.kind:
             case FlowOutputEnum.SPARK_DATAFRAME:
                 if not isinstance(result, DataFrame):
@@ -158,6 +249,38 @@ VALID_SPARK_INPUT = [
 
 @dataclass
 class Flow:
+    """A data processing pipeline that chains inputs, tasks, and outputs.
+
+    Flow is the core abstraction for defining data pipelines in seeknal. It connects
+    a data source (input), a series of transformation tasks, and an output destination.
+    Flows can be saved to and loaded from the seeknal backend for reuse and scheduling.
+
+    Attributes:
+        name: Unique identifier for the flow (automatically converted to snake_case).
+        input: Configuration for the input data source.
+        input_date_col: Optional date column configuration for filtering input data.
+            Contains 'dateCol' (column name) and 'datePattern' (date format).
+        tasks: Optional list of Task instances to execute in sequence.
+        output: Configuration for the output destination.
+        description: Human-readable description of the flow's purpose.
+
+    Example:
+        >>> from seeknal.flow import Flow, FlowInput, FlowOutput, FlowInputEnum, FlowOutputEnum
+        >>> from seeknal.tasks.sparkengine import SparkEngineTask
+        >>>
+        >>> # Create a simple flow
+        >>> flow = Flow(
+        ...     name="my_etl_flow",
+        ...     input=FlowInput(value="source_table", kind=FlowInputEnum.HIVE_TABLE),
+        ...     tasks=[SparkEngineTask()],
+        ...     output=FlowOutput(kind=FlowOutputEnum.SPARK_DATAFRAME),
+        ...     description="ETL flow for processing source data"
+        ... )
+        >>>
+        >>> # Run the flow
+        >>> result = flow.run(start_date="2024-01-01", end_date="2024-01-31")
+    """
+
     name: str
     input: Optional[FlowInput] = None
     input_date_col: Optional[dict] = None
@@ -166,9 +289,22 @@ class Flow:
     description: str = ""
 
     def __post_init__(self):
+        """Initialize the flow and convert name to snake_case."""
         self.name = to_snake(self.name)
 
     def require_saved(func):
+        """Decorator that ensures the flow has been saved before method execution.
+
+        Args:
+            func: The method to wrap.
+
+        Returns:
+            Wrapped function that checks for flow_id before execution.
+
+        Raises:
+            ValueError: If the flow has not been saved (no flow_id).
+        """
+
         def wrapper(self, *args, **kwargs):
             if not "flow_id" in vars(self):
                 raise ValueError("flow not loaded or saved")
@@ -178,6 +314,21 @@ class Flow:
         return wrapper
 
     def set_input_date_col(self, date_col: str, date_pattern: str = "yyyyMMdd"):
+        """Configure the date column for input data filtering.
+
+        Sets up date-based filtering on the input data, allowing the flow
+        to process data within specific date ranges.
+
+        Args:
+            date_col: Name of the column containing date values.
+            date_pattern: Date format pattern (default: "yyyyMMdd").
+
+        Returns:
+            Self for method chaining.
+
+        Example:
+            >>> flow.set_input_date_col("event_date", "yyyy-MM-dd")
+        """
         self.input_date_col = {
             "dateCol": date_col,
             "datePattern": date_pattern,
@@ -185,6 +336,28 @@ class Flow:
         return self
 
     def run(self, params=None, filters=None, date=None, start_date=None, end_date=None):
+        """Execute the flow pipeline.
+
+        Runs the complete flow: loads input data, applies filters, executes
+        all tasks in sequence, and returns the output in the configured format.
+
+        Args:
+            params: Optional dictionary of parameters to pass to tasks.
+            filters: Optional filters to apply to the input data.
+            date: Optional single date for filtering (mutually exclusive with
+                start_date/end_date).
+            start_date: Optional start date for date range filtering.
+            end_date: Optional end date for date range filtering.
+
+        Returns:
+            The processed data in the format specified by the output configuration.
+
+        Example:
+            >>> # Run with date range
+            >>> result = flow.run(start_date="2024-01-01", end_date="2024-01-31")
+            >>> # Run with parameters
+            >>> result = flow.run(params={"threshold": 0.5})
+        """
         # check whether at least one task is a spark job
         has_spark_job = False
         if (self.tasks is not None) or (self.input.kind in VALID_SPARK_INPUT):
@@ -262,6 +435,15 @@ class Flow:
             return self.output(temp_data, spark)
 
     def as_dict(self):
+        """Convert the flow to a dictionary representation.
+
+        Serializes the flow configuration to a dictionary suitable for
+        storage or transmission. Removes Spark context references.
+
+        Returns:
+            Dictionary containing the flow's configuration including
+            name, input, output, tasks, and description.
+        """
         # removing any reference to spark context
         if self.tasks is not None:
             for task in self.tasks:
@@ -286,14 +468,39 @@ class Flow:
         return flow_dict
 
     def as_yaml(self):
+        """Convert the flow to a YAML string representation.
+
+        Returns:
+            YAML-formatted string of the flow configuration.
+        """
         flow_dict = self.as_dict()
         return yaml.dump(flow_dict)
 
     def __str__(self):
+        """Return string representation of the flow."""
         return str(self.as_dict())
 
     @staticmethod
     def from_dict(flow_dict: dict):
+        """Create a Flow instance from a dictionary.
+
+        Deserializes a flow configuration dictionary back into a Flow object.
+        Reconstructs input, output, and task configurations.
+
+        Args:
+            flow_dict: Dictionary containing flow configuration with keys
+                like 'name', 'input', 'output', 'tasks'.
+
+        Returns:
+            Flow instance with the configured settings.
+
+        Raises:
+            ValueError: If a task in the dictionary is missing 'class_name'.
+
+        Example:
+            >>> flow_config = {"name": "my_flow", "input": {...}, "output": {...}}
+            >>> flow = Flow.from_dict(flow_config)
+        """
         if "input" in flow_dict:
             flow_input = FlowInput(**flow_dict["input"])
             flow_input_enum = FlowInputEnum(flow_input.kind)
@@ -337,6 +544,17 @@ class Flow:
     @require_workspace
     @require_project
     def get_or_create(self):
+        """Save or retrieve the flow from the backend.
+
+        If a flow with the same name exists in the current project, loads
+        its configuration. Otherwise, saves this flow as a new entry.
+
+        Returns:
+            Self with flow_id populated.
+
+        Note:
+            Requires an active workspace and project context.
+        """
         req = FlowRequest(
             body={
                 "spec": self.as_dict(),
@@ -357,6 +575,15 @@ class Flow:
     @require_workspace
     @staticmethod
     def list():
+        """List all flows in the current project.
+
+        Displays a formatted table of flows including name, description,
+        specification, and timestamps.
+
+        Note:
+            Requires an active workspace and project context.
+            Outputs directly to the console using typer.echo.
+        """
         check_project_id()
         flows = FlowRequest.select_by_project_id(context.project_id)
         if flows:
@@ -390,6 +617,24 @@ class Flow:
         output: Optional[FlowOutput] = None,
         description: str = "",
     ):
+        """Update the flow configuration in the backend.
+
+        Updates the saved flow with new configuration values. Any parameter
+        not provided will retain its existing value.
+
+        Args:
+            name: New name for the flow.
+            input: New input configuration.
+            tasks: New list of tasks.
+            output: New output configuration.
+            description: New description.
+
+        Raises:
+            ValueError: If the flow has not been saved yet or not found.
+
+        Note:
+            Requires the flow to be saved first via get_or_create().
+        """
         if self.flow_id is None:
             raise ValueError("Flow not saved yet")
         flow = FlowRequest.select_by_id(self.flow_id)
@@ -419,6 +664,19 @@ class Flow:
     @require_saved
     @require_project
     def delete(self):
+        """Delete the flow from the backend.
+
+        Removes the saved flow from the seeknal backend permanently.
+
+        Returns:
+            Result of the delete operation.
+
+        Raises:
+            ValueError: If the flow has not been saved yet.
+
+        Note:
+            Requires the flow to be saved first via get_or_create().
+        """
         if self.flow_id is None:
             raise ValueError("Invalid. Make sure load flow with get_or_create()")
         return FlowRequest.delete_by_id(self.flow_id)
@@ -434,6 +692,31 @@ def run_flow(
     end_date=None,
     name="run_flow",
 ):
+    """Execute a flow by name or instance.
+
+    Convenience function to run a flow either by providing its name
+    (loads from backend) or a Flow instance directly.
+
+    Args:
+        flow_name: Name of a saved flow to load and run.
+        flow: Flow instance to run directly.
+        params: Optional dictionary of parameters to pass to tasks.
+        filters: Optional filters to apply to the input data.
+        date: Optional single date for filtering.
+        start_date: Optional start date for date range filtering.
+        end_date: Optional end date for date range filtering.
+        name: Internal name for the operation (default: "run_flow").
+
+    Returns:
+        The processed data from the flow execution.
+
+    Example:
+        >>> # Run by flow name
+        >>> result = run_flow(flow_name="my_saved_flow", start_date="2024-01-01")
+        >>> # Run by instance
+        >>> result = run_flow(flow=my_flow_instance, params={"key": "value"})
+    """
+
     def run_flow_by_instance(flow: Flow):
         return flow.run(params, filters, date, start_date, end_date)
 
