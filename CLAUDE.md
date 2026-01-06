@@ -1,0 +1,277 @@
+# Seeknal Project Guide for Claude Code
+
+## Project Overview
+
+**Seeknal** is an all-in-one platform for data and AI/ML engineering, providing feature store capabilities and data transformation pipelines. It abstracts away complexity in data transformation and ML feature engineering.
+
+- **Language**: Python 3.11+
+- **Main Dependencies**: DuckDB, PySpark, Typer (CLI), SQLModel, Pydantic
+- **Database**: SQLite (default) or Turso (production)
+- **Architecture**: Multi-engine data processing (DuckDB + Spark)
+
+## Project Structure
+
+```
+src/seeknal/
+├── cli/                    # Typer-based CLI commands
+│   └── main.py            # CLI entry point with all commands
+├── featurestore/          # Feature store core
+│   ├── feature_group.py   # FeatureGroup, Materialization models
+│   ├── featurestore.py    # Feature store operations
+│   └── duckdbengine/      # DuckDB-specific implementations
+├── tasks/                 # Data transformation tasks
+│   ├── base.py           # Base task interface
+│   ├── duckdb/           # DuckDB task implementations
+│   └── sparkengine/      # Spark task implementations
+├── feature_validation/    # Feature validation framework
+│   ├── validators.py     # Validation logic
+│   └── models.py         # Validation configuration models
+├── flow.py               # Data pipeline (Flow) orchestration
+├── entity.py             # Entity definitions (join keys)
+├── project.py            # Project management
+├── workspace.py          # Workspace context management
+├── context.py            # Global context and configuration
+├── request.py            # Database request layer
+├── validation.py         # SQL injection prevention
+└── utils/
+    └── path_security.py  # Secure path validation
+
+docs/                      # Comprehensive documentation
+├── api/                  # API reference docs
+├── examples/             # Usage examples
+└── getting-started-comprehensive.md
+
+tests/                     # pytest test suite
+├── cli/                  # CLI command tests
+├── e2e/                  # End-to-end tests
+└── featurestore/         # Feature store tests
+```
+
+## Key Concepts
+
+### 1. **Project & Workspace**
+- Every operation requires a project context
+- Use decorators: `@require_workspace`, `@require_project`
+- Projects are stored in SQLite/Turso database
+
+### 2. **Flow (Data Pipeline)**
+- Represents transformation pipelines
+- Can mix Spark and DuckDB tasks
+- Defined via: `Flow(name, input, tasks, output)`
+- Tasks are executed sequentially
+
+### 3. **Feature Groups**
+- Container for related features
+- Has entity (join keys), materialization config
+- Automatically versioned on schema changes
+- Supports offline and online stores
+
+### 4. **Materialization**
+- **Offline**: Batch processing for training data
+- **Online**: Low-latency serving for inference
+- Point-in-time joins prevent data leakage
+
+### 5. **Version Management**
+- Feature groups are automatically versioned
+- CLI commands: `version list`, `version show`, `version diff`
+- Can materialize specific versions (rollback capability)
+
+## Important Patterns & Conventions
+
+### Decorators
+```python
+@require_workspace  # Ensures workspace context exists
+@require_project    # Ensures project is selected
+@require_saved      # Ensures object is saved to database
+```
+
+### CLI Structure
+- Built with Typer
+- Main app in `cli/main.py`
+- Sub-commands use `app.add_typer()`
+- Version management is a separate Typer app group
+
+### Database Operations
+- Use `request.py` layer for all DB operations
+- Models defined with SQLModel
+- Context provides database connection: `context.con`
+
+### Security
+- **SQL Injection Prevention**: Always use `validate_sql_value()` and `validate_column_name()`
+- **Path Security**: Use `path_security.py` to validate file paths
+- Never use `/tmp` or world-writable directories
+- Default secure path: `~/.seeknal/`
+
+### Testing Patterns
+- Use pytest fixtures from `conftest.py`
+- Mock database operations
+- E2E tests in `tests/e2e/`
+- CLI tests use `typer.testing.CliRunner`
+
+## Recent Major Features (Jan 2026)
+
+1. **Feature Group Versioning** (#1405, #1407)
+   - `list_versions()`, `get_version()`, `compare_versions()` methods
+   - CLI: `seeknal version list/show/diff`
+   - Supports version-specific materialization
+
+2. **Feature Validation Framework** (#1395)
+   - Validators in `feature_validation/validators.py`
+   - CLI: `seeknal validate-features`
+   - Configurable validation modes (warn/fail)
+
+3. **Complete Table Deletion** (#1401, #1402, #1403)
+   - Delete feature groups with storage cleanup
+   - CLI: `seeknal delete feature-group <name>`
+   - Handles both offline and online stores
+
+4. **API Reference Documentation** (#1393)
+   - Comprehensive API docs in `docs/api/`
+   - Examples in `docs/examples/`
+
+5. **Comprehensive Getting Started Guide** (#1392, #1399)
+   - `docs/getting-started-comprehensive.md`
+   - DuckDB and Spark quickstarts
+
+## Common Tasks
+
+### Adding a New CLI Command
+1. Edit `src/seeknal/cli/main.py`
+2. Define command with Typer decorator: `@app.command()`
+3. Use helper functions: `_echo_success()`, `_echo_error()`, `_echo_info()`
+4. Add tests in `tests/cli/test_*.py`
+
+### Adding a New Feature Group Method
+1. Edit `src/seeknal/featurestore/feature_group.py`
+2. Add decorators if needed (`@require_workspace`, `@require_saved`)
+3. Use `context.project_id` for project context
+4. Update `request.py` for any new database operations
+5. Add tests in `tests/test_feature_group.py`
+
+### Adding a New Validation Rule
+1. Create validator in `feature_validation/validators.py`
+2. Inherit from `BaseValidator`
+3. Implement `validate()` method
+4. Register in validation config
+5. Add tests in `tests/test_feature_validators.py`
+
+### Modifying Database Schema
+1. Update models in `models.py`
+2. Update request layer in `request.py`
+3. Consider migration path for existing databases
+4. Update tests
+
+## Code Style & Quality
+
+- **Formatting**: Black (line length 100)
+- **Type Hints**: Use extensively
+- **Docstrings**: Google style for public APIs
+- **Testing**: Aim for high coverage on new features
+- **Error Handling**: Custom exceptions in `exceptions/`
+
+## Working with Engines
+
+### Spark Engine (`tasks/sparkengine/`)
+- Legacy Scala code in `engines/spark-engine/`
+- Python bindings in `src/seeknal/tasks/sparkengine/`
+- Transformers, aggregators, loaders, extractors
+
+### DuckDB Engine (`tasks/duckdb/`)
+- Native Python implementation
+- Preferred for new features
+- Faster for small-to-medium datasets
+
+## Configuration
+
+- Main config: `config.toml`
+- Environment vars: `.env` file
+- Key env vars:
+  - `SEEKNAL_BASE_CONFIG_PATH`: Base directory
+  - `SEEKNAL_USER_CONFIG_PATH`: User config file
+  - `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`: For Turso
+
+## Git Workflow
+
+- Main branch: `main`
+- Auto-claude worktrees: `.worktrees/` directory
+- Integration command: `seeknal integrate` (custom command)
+- Recent integrations tracked in git history
+
+## Documentation
+
+- **README.md**: Installation and quick start
+- **docs/getting-started-comprehensive.md**: Full tutorial
+- **docs/api/**: API reference
+- **docs/examples/**: Code examples
+- Always update docs when adding features
+
+## Known Issues & Gotchas
+
+1. **Spark Engine**: Legacy Scala code requires JVM
+2. **Path Security**: Always validate paths with `path_security.py`
+3. **SQL Injection**: Use validation functions from `validation.py`
+4. **Context Required**: Most operations need workspace/project context
+5. **Version Tracking**: Schema changes auto-create new versions
+
+## Testing Before Commit
+
+```bash
+# Run all tests
+pytest
+
+# Run specific test file
+pytest tests/test_feature_group.py
+
+# Run CLI tests
+pytest tests/cli/
+
+# Run E2E tests
+pytest tests/e2e/
+```
+
+## Useful Commands
+
+```bash
+# List all CLI commands
+seeknal --help
+
+# Initialize project
+seeknal init --name my_project
+
+# List feature groups
+seeknal list feature-groups
+
+# Materialize features
+seeknal materialize <fg_name> --start-date 2024-01-01
+
+# Version management
+seeknal version list <fg_name>
+seeknal version show <fg_name> --version 1
+seeknal version diff <fg_name> --from 1 --to 2
+
+# Validate features
+seeknal validate-features <fg_name> --mode fail
+
+# Delete feature group
+seeknal delete feature-group <fg_name>
+```
+
+## When Making Changes
+
+1. **Check Context**: Understand recent work from git history and session context
+2. **Read Tests**: Tests show expected behavior
+3. **Update Docs**: Keep documentation in sync
+4. **Follow Patterns**: Use existing decorators, error handling, CLI patterns
+5. **Security First**: Validate all inputs, use secure paths
+6. **Version Awareness**: Schema changes create new versions automatically
+
+## Resources
+
+- **Repository**: https://github.com/mta-tech/seeknal
+- **Releases**: https://github.com/mta-tech/seeknal/releases
+- **Documentation**: `docs/` directory
+- **Examples**: `docs/examples/` and demo notebooks
+
+---
+
+**Last Updated**: January 2026 based on recent development context
