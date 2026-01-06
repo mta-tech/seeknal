@@ -500,6 +500,11 @@ def sanitize_database_exceptions(
             sanitized_args = (sanitize_error_message(error_message),)
 
         # Re-raise as DatabaseSecurityError with sanitized message
+        # PRINT THE ORIGINAL ERROR FOR DEBUGGING
+        print(f"DEBUG: Database Error caught: {e}")
+        if hasattr(e, 'orig'):
+            print(f"DEBUG: Original DBAPI error: {e.orig}")
+            
         raise DatabaseSecurityError(
             sanitize_error_message(error_message),
             original_exception=e

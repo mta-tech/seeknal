@@ -71,7 +71,9 @@ def initialize_database():
     """Initialize the database schema with sanitized error handling."""
     metadata.create_all(engine)
 
-initialize_database()
+# initialize_database()  <-- Removed global call
+
+_db_initialized = False
 
 @with_sanitized_exceptions()
 @retry(
@@ -81,6 +83,18 @@ initialize_database()
 )
 def get_db_session():
     """Get a database session with sanitized error handling."""
+    global _db_initialized
+    if not _db_initialized:
+        try:
+             initialize_database()
+             _db_initialized = True
+        except Exception as e:
+             # If initialization fails, we try to proceed but log the error if possible
+             # or implicitly rely on the retry decorators. 
+             # However, initialize_database has its own retry.
+             # If it fails, we should probably let it raise.
+             raise e
+
     return SQLSession(engine)
 
 @dataclass

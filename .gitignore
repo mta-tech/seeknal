@@ -27,9 +27,12 @@ spark-engine/.bloop
 spark-engine/.metals
 
 .ipynb_checkpoints
+.worktrees/
 
 # MkDocs build output
 site/
 
 # Documentation audit artifacts
 docs/audit/
+
+.claude/auto-drive.local.md
