@@ -29,8 +29,31 @@ from .transformers import (
 
 @dataclass
 class Stage:
-    """
-    Define pipeline stage
+    """Configuration for a single pipeline stage in a SparkEngine transformation.
+
+    A Stage represents one step in a data transformation pipeline. It can contain
+    a reference to an existing transformation by ID, a custom class with parameters,
+    or one of several built-in transformation types (feature, aggregator, transformer).
+
+    Attributes:
+        id: Reference ID of a pre-defined transformation available in the project.
+        class_name: Fully qualified class name of a custom Spark transformation.
+        params: Parameters dictionary passed to the transformation class.
+        feature: A FeatureTransformer instance for feature engineering operations.
+        aggregator: An Aggregator instance for grouping and aggregation operations.
+        transformer: A Transformer instance for general data transformations.
+
+    Example:
+        Create a stage with a custom transformer::
+
+            stage = Stage(
+                class_name="tech.mta.seeknal.transformers.ColumnRenamed",
+                params={"inputCol": "old_name", "outputCol": "new_name"}
+            )
+
+        Create a stage referencing an existing transformation::
+
+            stage = Stage(id="my_predefined_transform")
     """
 
     id: Optional[str] = None
@@ -43,8 +66,25 @@ class Stage:
 
 @dataclass
 class Stages:
-    """
-    Define stages
+    """Container for multiple pipeline stages.
+
+    A Stages object holds a collection of Stage instances that can be added
+    to a SparkEngineTask pipeline as a batch. This is useful for grouping
+    related transformations together or reusing common transformation sequences.
+
+    Attributes:
+        stages: List of Stage instances to be executed in order.
+
+    Example:
+        Create a reusable set of stages::
+
+            common_stages = Stages(stages=[
+                Stage(transformer=ColumnRenamed(inputCol="id", outputCol="user_id")),
+                Stage(transformer=FilterByExpr(expression="status = 'active'"))
+            ])
+
+            task = SparkEngineTask(name="my_task")
+            task.add_stages(common_stages)
     """
 
     stages: List[Stage]
@@ -52,8 +92,78 @@ class Stages:
 
 @dataclass
 class SparkEngineTask(Task):
-    """
-    Define Spark Engine task
+    """A Spark-based data transformation task using the Spark Engine framework.
+
+    SparkEngineTask provides a fluent interface for building data transformation
+    pipelines that run on Apache Spark. It supports various input sources (Hive tables,
+    files, DataFrames), transformation stages (SQL, aggregations, custom transformers),
+    and output destinations.
+
+    The task follows a builder pattern where methods return `self` for chaining::
+
+        result = (
+            SparkEngineTask(name="my_pipeline")
+            .add_input(table="database.source_table")
+            .set_date_col(date_col="event_date", date_pattern="yyyyMMdd")
+            .add_sql("SELECT * FROM __THIS__ WHERE amount > 0")
+            .add_stage(transformer=ColumnRenamed(inputCol="id", outputCol="user_id"))
+            .transform()
+        )
+
+    Attributes:
+        name: Optional name identifier for the task.
+        description: Optional human-readable description of the task's purpose.
+        feature: Optional feature configuration dictionary for feature engineering.
+        default_input_db: Default database name for input sources (default: "base_input").
+        default_output_db: Default database name for output destinations (default: "base_output").
+        _materialize: Internal flag indicating if transformation results were materialized.
+        is_spark_job: Flag indicating this is a Spark-based job (always True).
+        stages: List of transformation stage configurations to be applied in order.
+        kind: Task type identifier (always "SparkEngineTask").
+
+    Example:
+        Basic transformation pipeline::
+
+            from seeknal.tasks.sparkengine import SparkEngineTask
+            from seeknal.tasks.sparkengine import transformers as T
+
+            task = SparkEngineTask(name="process_data", description="Process daily data")
+            result = (
+                task
+                .add_input(table="raw_db.events")
+                .set_date_col("event_date")
+                .add_filter_by_expr("status = 'completed'")
+                .add_new_column("amount * 1.1", "adjusted_amount")
+                .transform()
+            )
+            result.show()
+
+        Pipeline with aggregation::
+
+            from seeknal.tasks.sparkengine import aggregators as G
+
+            agg = G.Aggregator(
+                group_by_cols=["user_id", "date"],
+                aggregators=[
+                    G.AggregatorFunction(
+                        class_name="tech.mta.seeknal.aggregators.FunctionAggregator",
+                        params={"inputCol": "amount", "outputCol": "total", "accumulatorFunction": "sum"}
+                    )
+                ]
+            )
+
+            result = (
+                SparkEngineTask(name="aggregate_data")
+                .add_input(table="raw_db.transactions")
+                .add_stage(aggregator=agg)
+                .transform()
+            )
+
+    See Also:
+        - :class:`Stage`: Individual transformation step configuration.
+        - :class:`Stages`: Container for multiple stages.
+        - :mod:`seeknal.tasks.sparkengine.transformers`: Available transformers.
+        - :mod:`seeknal.tasks.sparkengine.aggregators`: Available aggregators.
     """
 
     name: Optional[str] = None
@@ -71,12 +181,25 @@ class SparkEngineTask(Task):
         self.kind = "SparkEngineTask"
 
     def set_date_col(self, date_col: str, date_pattern: str = "yyyyMMdd"):
-        """
-        set date column
+        """Set the date column for date-based filtering and partitioning.
+
+        Configures which column in the input dataset represents dates and
+        the format pattern used by that column. This is used for date-based
+        filtering and data selection operations.
 
         Args:
-            date_col (str): a column in source dataset that represent date
-            date_pattern (str): date pattern format are used by the date column
+            date_col: Name of the column containing date values.
+            date_pattern: Date format pattern (e.g., "yyyyMMdd", "yyyy-MM-dd").
+                Defaults to "yyyyMMdd".
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
+
+        Example:
+            ::
+
+                task = SparkEngineTask(name="my_task")
+                task.set_date_col(date_col="event_date", date_pattern="yyyy-MM-dd")
         """
         if self.input is None:
             self.input = {}
@@ -94,21 +217,31 @@ class SparkEngineTask(Task):
         return self
 
     def set_default_input_db(self, db_name: str):
-        """
-        set default input database
+        """Set the default input database for the pipeline.
+
+        Configures the default database name to use when resolving
+        input table references that don't specify a database.
 
         Args:
-            db_name (str): database name
+            db_name: Name of the default input database.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
         """
         self.default_input_db = db_name
         return self
 
     def set_default_output_db(self, db_name: str):
-        """
-        set default output database
+        """Set the default output database for the pipeline.
+
+        Configures the default database name to use when writing
+        output to tables that don't specify a database.
 
         Args:
-            db_name (str): database name
+            db_name: Name of the default output database.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
         """
         self.default_output_db = db_name
         return self
@@ -122,41 +255,48 @@ class SparkEngineTask(Task):
         extractor: Optional[Extractor] = None,
         dataframe: Optional[DataFrame] = None,
     ):
-        """
-        Add input to the transformation pipeline
+        """Add an input source to the transformation pipeline.
+
+        Configures where the pipeline reads its input data from. Supports
+        multiple input types including Hive tables, file-based sources,
+        custom extractors, and existing Spark DataFrames.
 
         Args:
-            id (str, optional): reference source id name
-            table (str, optional): table name
-            source (str, optional): source name which tell where the data comes from e.g., file, RDMS, etc
-            params (dict, optional): parameters for given source
-            extractor (Extractor, optional): define input using Extractor object
-            dataframe (DataFrame, optional): define input using Spark dataframe
+            id: Reference ID of a pre-defined source in the project configuration.
+            table: Fully qualified Hive table name (e.g., "database.table_name").
+            source: Source type identifier (e.g., "file", "jdbc", "hive").
+            params: Parameters dictionary for the source connector (required with source).
+            extractor: An Extractor object defining the input configuration.
+            dataframe: An existing Spark DataFrame to use as input.
 
-        Source and params accept Spark Engine supported connectors or Spark dataframe.
-        Example of a usage of `add_input()`:
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
 
-        1). Define table as input::
+        Raises:
+            ValueError: If none of id, table, source, extractor, or dataframe is provided.
+            ValueError: If source is provided without params.
 
-            SparkEngineTask(name="create_dataset")
-                .add_input(table="telco_sample.db_charging_hourly")
+        Example:
+            Define table as input::
 
-        2). Define connector as input::
+                SparkEngineTask(name="create_dataset")
+                    .add_input(table="telco_sample.db_charging_hourly")
 
-            SparkEngineTask(name="create_dataset")
-                .add_input(source="file", params={"format": "parquet", "path": "path/to/parquet"})
+            Define connector as input::
 
-        3). Define connector with Extractor object::
+                SparkEngineTask(name="create_dataset")
+                    .add_input(source="file", params={"format": "parquet", "path": "path/to/parquet"})
 
-            SparkEngineTask(name="create_dataset")
-                .add_input(extractor=Extractor(source="file", params={...}))
+            Define connector with Extractor object::
 
-        4). Define input using dataframe::
+                SparkEngineTask(name="create_dataset")
+                    .add_input(extractor=Extractor(source="file", params={...}))
 
-            df = spark.read.table("telco_sample.db_charging_hourly")
-            SparkEngineTask(name="create_dataset")
-                .add_input(dataframe=df)
+            Define input using dataframe::
 
+                df = spark.read.table("telco_sample.db_charging_hourly")
+                SparkEngineTask(name="create_dataset")
+                    .add_input(dataframe=df)
         """
         if (
             id is None
@@ -408,33 +548,60 @@ class SparkEngineTask(Task):
         return self
 
     def add_stages(self, stages: Stages):
-        """
-        Add stages to the pipeline
+        """Add multiple stages to the pipeline at once.
+
+        Appends all stages from a Stages container to this task's pipeline.
+        Stages are added in the order they appear in the container.
 
         Args:
-            stages (Stages): append stages into this task pipeline
+            stages: A Stages object containing the stages to append.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
         """
         for s in stages.stages:
             self.add_stage(stage=s)
         return self
 
     def add_sql(self, statement: str):
-        """
-        Add SQL transformation to the stage
+        """Add a SQL transformation stage to the pipeline.
+
+        Adds a stage that executes a SQL statement on the current dataset.
+        Use ``__THIS__`` as a placeholder for the current dataset in the SQL.
 
         Args:
-            statement (str): SQL statement
+            statement: SQL statement to execute. Use ``__THIS__`` to reference
+                the current dataset.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
+
+        Example:
+            ::
+
+                task.add_sql("SELECT id, name, amount * 2 as doubled FROM __THIS__ WHERE status = 'active'")
         """
         self.add_stage(transformer=SQL(statement=statement))
         return self
 
     def add_new_column(self, expression: str, output_col: str):
-        """
-        Add new column by expression
+        """Add a new column computed from an expression.
+
+        Creates a new column in the dataset based on a SQL expression.
+        The expression can reference existing columns.
 
         Args:
-            expression (str): expression to create new column
-            output_col (str): output column name
+            expression: SQL expression to compute the new column value.
+            output_col: Name of the new column to create.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
+
+        Example:
+            ::
+
+                task.add_new_column("price * quantity", "total_amount")
+                task.add_new_column("CONCAT(first_name, ' ', last_name)", "full_name")
         """
         self.add_stage(
             transformer=AddColumnByExpr(expression=expression, outputCol=output_col)
@@ -442,21 +609,41 @@ class SparkEngineTask(Task):
         return self
 
     def add_filter_by_expr(self, expression: str):
-        """
-        Filter by expression
+        """Add a filter stage using a SQL expression.
+
+        Filters the dataset to include only rows that satisfy the
+        given SQL expression condition.
 
         Args:
-            expression (str): expression to filter
+            expression: SQL boolean expression for filtering rows.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
+
+        Example:
+            ::
+
+                task.add_filter_by_expr("status = 'active' AND amount > 100")
         """
         self.add_stage(transformer=FilterByExpr(expression=expression))
         return self
 
     def select_columns(self, columns: List[str]):
-        """
-        Select columns
+        """Select specific columns from the dataset.
+
+        Reduces the dataset to only include the specified columns,
+        dropping all others.
 
         Args:
-            columns (List[str]): list of columns to be selected
+            columns: List of column names to retain in the dataset.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
+
+        Example:
+            ::
+
+                task.select_columns(["user_id", "name", "email"])
         """
         self.add_stage(
             transformer=Transformer(
@@ -466,11 +653,20 @@ class SparkEngineTask(Task):
         return self
 
     def drop_columns(self, columns: List[str]):
-        """
-        Drop columns
+        """Remove specific columns from the dataset.
+
+        Drops the specified columns from the dataset, keeping all others.
 
         Args:
-            columns (List[str]): list of columns to be dropped
+            columns: List of column names to remove from the dataset.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
+
+        Example:
+            ::
+
+                task.drop_columns(["temp_column", "debug_info"])
         """
         self.add_stage(
             transformer=Transformer(SparkEngineClassName.DROP_COLS, inputCols=columns)
@@ -478,8 +674,21 @@ class SparkEngineTask(Task):
         return self
 
     def update_stage(self, number: int, **kwargs):
-        """
-        Update stage
+        """Update an existing stage in the pipeline.
+
+        Replaces a stage at the specified index with a new stage
+        configuration. The new stage is built from the provided keyword
+        arguments using the same format as :meth:`add_stage`.
+
+        Args:
+            number: Zero-based index of the stage to update.
+            **kwargs: Stage configuration arguments (same as :meth:`add_stage`).
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
+
+        Raises:
+            Exception: If no stages are defined in the pipeline.
         """
         if self.stages is not None:
             _temp = SparkEngineTask().add_stage(**kwargs)
@@ -490,8 +699,19 @@ class SparkEngineTask(Task):
         return self
 
     def remove_stage(self, number: int):
-        """
-        Remove stage
+        """Remove a stage from the pipeline.
+
+        Removes the stage at the specified index from the pipeline.
+        Subsequent stages shift down to fill the gap.
+
+        Args:
+            number: Zero-based index of the stage to remove.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
+
+        Raises:
+            Exception: If no stages are defined in the pipeline.
         """
         if self.stages is not None:
             self.stages.pop(number)
@@ -501,8 +721,21 @@ class SparkEngineTask(Task):
         return self
 
     def insert_stage(self, number: int, **kwargs):
-        """
-        Insert stage
+        """Insert a new stage at a specific position in the pipeline.
+
+        Inserts a stage at the specified index, shifting subsequent stages
+        to make room. The new stage is built from the provided keyword
+        arguments using the same format as :meth:`add_stage`.
+
+        Args:
+            number: Zero-based index where the new stage will be inserted.
+            **kwargs: Stage configuration arguments (same as :meth:`add_stage`).
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
+
+        Raises:
+            Exception: If no stages are defined in the pipeline.
         """
         if self.stages is not None:
             _temp = SparkEngineTask().add_stage(**kwargs)
@@ -513,8 +746,10 @@ class SparkEngineTask(Task):
         return self
 
     def _create_spec_from_attributes(self):
-        """
-        Create a task spec from the attributes
+        """Create a task specification dictionary from current attributes.
+
+        Returns:
+            dict: Task specification containing pipeline configuration.
         """
         task_spec = {"pipeline": {}}
         if self.name is not None:
@@ -538,11 +773,17 @@ class SparkEngineTask(Task):
         return task_spec
 
     def add_yaml(self, yaml_string: str):
-        """
-        Add yaml string to the pipeline
+        """Configure the pipeline from a YAML string.
+
+        Parses a YAML string containing pipeline configuration and applies
+        it to this task. This allows defining pipelines in YAML format
+        for easier configuration management.
 
         Args:
-            yaml_string (str): yaml string
+            yaml_string: YAML-formatted string containing pipeline configuration.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
         """
         task_spec = yaml.load(yaml_string, Loader=yaml.FullLoader)
         if "pipeline" in task_spec:
@@ -561,11 +802,16 @@ class SparkEngineTask(Task):
         return self
 
     def add_yaml_file(self, yaml_path: str):
-        """
-        Add yaml file to the pipeline
+        """Configure the pipeline from a YAML file.
+
+        Reads a YAML file containing pipeline configuration and applies
+        it to this task.
 
         Args:
-            yaml_path (str): yaml file path
+            yaml_path: Path to the YAML configuration file.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
         """
         with open(yaml_path, "r") as f:
             task_spec = f.read()
@@ -573,40 +819,56 @@ class SparkEngineTask(Task):
         return self
 
     def to_yaml_file(self, yaml_path: str):
-        """
-        Save yaml string to a file
+        """Save the current pipeline configuration to a YAML file.
+
+        Exports the task's pipeline configuration to a YAML file,
+        which can be loaded later or used for documentation.
 
         Args:
-            yaml_path (str): yaml file path
+            yaml_path: Path where the YAML file will be saved.
         """
         task_spec = self._create_spec_from_attributes()
         with open(yaml_path, "w") as f:
             f.write(yaml.dump(task_spec))
 
     def print_yaml(self):
-        """
-        Print yaml string
+        """Print the current pipeline configuration as YAML to console.
+
+        Outputs the task's pipeline configuration in YAML format,
+        useful for debugging and documentation.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
         """
         task_spec = self._create_spec_from_attributes()
         typer.echo(yaml.dump(task_spec))
         return self
 
     def add_common_yaml(self, common_config: str):
-        """
-        Add common config to the pipeline
+        """Set common configuration from a YAML string.
+
+        Adds shared configuration (such as database connections, common
+        parameters) that can be referenced by the pipeline.
 
         Args:
-            common_config (str): common config
+            common_config: YAML-formatted string with common configuration.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
         """
         self.common = common_config
         return self
 
     def add_common_yaml_file(self, common_config_path: str):
-        """
-        Add common config file to the pipeline
+        """Load common configuration from a YAML file.
+
+        Reads shared configuration from a file and applies it to the task.
 
         Args:
-            common_config_path (str): common config file path
+            common_config_path: Path to the common configuration YAML file.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
         """
         with open(common_config_path, "r") as f:
             common_config = f.read()
@@ -614,8 +876,12 @@ class SparkEngineTask(Task):
         return self
 
     def print_common_yaml(self):
-        """
-        Print yaml string
+        """Print the common configuration YAML to console.
+
+        Outputs the task's common configuration in YAML format.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
         """
         typer.echo(self.common)
         return self
@@ -631,36 +897,44 @@ class SparkEngineTask(Task):
         repartition: Optional[int] = None,
         loader: Optional[Loader] = None,
     ):
-        """
-        Define output for the pipeline transformation
+        """Define the output destination for the pipeline transformation.
+
+        Configures where the pipeline writes its transformed data. Supports
+        multiple output types including Hive tables, file-based outputs,
+        and custom loaders.
 
         Args:
-            id (str, optional): reference source id name
-            table (str, optional): table name
-            partitions (List[str], optional): set which column(s) become partition(s)
-            path (str, optional): specify path location
-            source (str, optional): source name which tell where the data comes from e.g., file, RDMS, etc
-            params (dict, optional): parameters for given source
-            repatition (int, optional): repartition dataset before writing into a sink location
-            loader (Loader, optional): add Loader object
+            id: Reference ID of a pre-defined output in the project configuration.
+            table: Fully qualified Hive table name for output (e.g., "database.table").
+            partitions: List of column names to use for partitioning the output.
+            path: Filesystem path for the output data.
+            source: Output type identifier (e.g., "file", "jdbc").
+            params: Parameters dictionary for the output connector (required with source).
+            repartition: Number of partitions for the output DataFrame before writing.
+            loader: A Loader object defining the output configuration.
 
-        Source and params should follow Spark Engine supported connectors. Example of a usage of `add_output()`:
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
 
-        1). Define table as output::
+        Raises:
+            ValueError: If none of id, table, source, or loader is provided.
+            ValueError: If source is provided without params.
 
-            SparkEngineTask(name="create_dataset")
-                .add_output(table="telco_sample.db_charging_hourly", partitions=["date_id"], path="path/to/loc")
+        Example:
+            Define table as output::
 
-        2). Define connector as output::
+                SparkEngineTask(name="create_dataset")
+                    .add_output(table="db.output_table", partitions=["date_id"], path="path/to/loc")
 
-            SparkEngineTask(name="create_dataset")
-                .add_output(source="file", params={"format": "parquet", "path": "path/to/parquet"})
+            Define connector as output::
 
-        3). Define connector with Loader object::
+                SparkEngineTask(name="create_dataset")
+                    .add_output(source="file", params={"format": "parquet", "path": "path/to/parquet"})
 
-            SparkEngineTask(name="create_dataset")
-                .add_output(loader=Loader(source="file", params={...}))
+            Define connector with Loader object::
 
+                SparkEngineTask(name="create_dataset")
+                    .add_output(loader=Loader(source="file", params={...}))
         """
         if id is None and table is None and source is None and loader is None:
             raise ValueError("Must specify id or table or source")
@@ -883,15 +1157,37 @@ class SparkEngineTask(Task):
         start_date: Optional[Union[str, datetime]] = None,
         end_date: Optional[Union[str, datetime]] = None,
     ) -> Union[Task, DataFrame]:
-        """
-        Run transformation for given job spec
+        """Execute the transformation pipeline and return the result.
+
+        Runs all configured stages in the pipeline on the input data and
+        returns the transformed DataFrame. Optionally materializes (writes)
+        the results to the configured output destination.
+
         Args:
-            params: parameters for Spark Engine job
-            filters: filters for Spark Engine job
-            date: date selection for Spark Engine job
+            spark: Optional SparkSession instance. If None, uses the active session.
+            chain: If True, enables chaining behavior (reserved for future use).
+            materialize: If True, writes results to the output destination and
+                returns the task instance for further operations.
+            params: Dictionary of inline parameters passed to the Spark Engine job.
+            filters: Dictionary of filters to apply to the pipeline.
+            date: Single date or list of dates for date-based data selection.
+            start_date: Start date for date range filtering.
+            end_date: End date for date range filtering.
 
         Returns:
-            DataFrame: transformed dataframe
+            DataFrame: The transformed Spark DataFrame when materialize=False.
+            SparkEngineTask: The current instance when materialize=True.
+
+        Example:
+            Get transformed DataFrame::
+
+                df = task.transform()
+                df.show()
+
+            Materialize and retrieve output::
+
+                task.transform(materialize=True)
+                output_df = task.get_output_dataframe()
         """
         self._init_feature_engine_job(params, filters, date, start_date, end_date)
         self._params = params
@@ -932,15 +1228,30 @@ class SparkEngineTask(Task):
         filters=None,
         date=None,
     ):
-        """
-        Evaluate transformation for given job spec
+        """Evaluate and display transformation results for testing.
+
+        Runs the transformation pipeline and displays the results to the
+        console. Optionally applies an additional SQL statement before
+        displaying.
+
         Args:
-            statement: SQL statement to evaluate
-            maxResults: number of results to show
-            truncate: truncate results
-            params: parameters for Spark Engine job
-            filters: filters for Spark Engine job
-            date: date selection for Spark Engine job
+            statement: Optional SQL statement to apply to the transformed data
+                before display. Use ``__THIS__`` to reference the dataset.
+            maxResults: Maximum number of rows to display (default: 10).
+            truncate: If True, truncates long column values in display.
+            params: Dictionary of inline parameters for the Spark Engine job.
+            filters: Dictionary of filters to apply to the pipeline.
+            date: Date or date list for date-based data selection.
+
+        Returns:
+            SparkEngineTask: The current instance for method chaining.
+
+        Example:
+            ::
+
+                task.evaluate()  # Show first 10 rows
+                task.evaluate(maxResults=20)  # Show first 20 rows
+                task.evaluate(statement="SELECT COUNT(*) FROM __THIS__")  # Show count
         """
         res = self.transform(None, params=params, filters=filters, date=date)
         if isinstance(res, DataFrame):
@@ -961,8 +1272,19 @@ class SparkEngineTask(Task):
         return self
 
     def get_output_dataframe(self) -> Union[DataFrame, None]:
-        """
-        Get output dataframe
+        """Retrieve the output DataFrame after materialization.
+
+        Reads the materialized output data from the configured output
+        destination and returns it as a DataFrame. Only works after
+        calling :meth:`transform` with ``materialize=True``.
+
+        Returns:
+            DataFrame: The materialized output as a Spark DataFrame.
+            None: If the transformation was not materialized.
+
+        Note:
+            Call this method after :meth:`transform(materialize=True)`
+            to access the written data.
         """
         if self._materialize is True:
             feat_cls = SparkEngineTask()
@@ -988,19 +1310,24 @@ class SparkEngineTask(Task):
             return None
 
     def show_output_dataframe(self, max_results=10):
-        """
-        Show results after materialize the transformation.
+        """Display the materialized output DataFrame to console.
+
+        Shows the contents of the materialized output data. Only works
+        after calling :meth:`transform` with ``materialize=True``.
 
         Args:
-            max_results (int): number of results to show
+            max_results: Maximum number of rows to display (default: 10).
         """
         res = self.get_output_dataframe()
         if res is not None:
             res.show(max_results)
 
     def is_materialized(self) -> bool:
-        """
-        Check if the transformation is materialized
+        """Check if the transformation results have been materialized.
+
+        Returns:
+            bool: True if :meth:`transform` was called with ``materialize=True``
+                and the results were written to the output destination.
         """
         return self._materialize
 
@@ -1015,8 +1342,14 @@ class SparkEngineTask(Task):
         return newcopy
 
     def copy(self):
-        """
-        Create a copy of this object
+        """Create a deep copy of this SparkEngineTask.
+
+        Creates a new SparkEngineTask instance with the same configuration.
+        If the input contains a DataFrame, it is converted to a temporary
+        table reference to enable copying.
+
+        Returns:
+            SparkEngineTask: A new instance with copied configuration.
         """
         newcopy = SparkEngineTask._empty_copy(self)
         if self.input is not None:

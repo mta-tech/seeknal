@@ -1,16 +1,54 @@
 """
 Seeknal CLI - Main entry point
 
-A dbt-like CLI for managing feature stores.
+A dbt-like CLI for managing feature stores with comprehensive version management
+capabilities for ML teams.
 
 Usage:
-    seeknal init                    Initialize a new project
-    seeknal run <flow>              Execute a transformation flow
-    seeknal materialize <fg>        Materialize features to stores
-    seeknal list <resource>         List resources
-    seeknal show <resource> <name>  Show resource details
-    seeknal validate                Validate configurations
-    seeknal version                 Show version information
+    seeknal init                                Initialize a new project
+    seeknal run <flow>                          Execute a transformation flow
+    seeknal materialize <fg>                    Materialize features to stores
+    seeknal materialize <fg> --version <N>      Materialize a specific version
+    seeknal list <resource>                     List resources
+    seeknal show <resource> <name>              Show resource details
+    seeknal delete <resource> <name>            Delete a resource
+    seeknal delete-table <name>                 Delete an online table
+    seeknal validate                            Validate configurations
+    seeknal validate-features <fg>              Validate feature group data quality
+    seeknal info                                Show version information
+    seeknal debug <fg>                          Debug a feature group
+    seeknal clean <fg>                          Clean old feature data
+
+Version Management:
+    seeknal version list <fg>                   List all versions of a feature group
+    seeknal version list <fg> --limit 5         List last 5 versions
+    seeknal version show <fg>                   Show latest version details
+    seeknal version show <fg> --version <N>     Show specific version details
+    seeknal version diff <fg> --from 1 --to 2   Compare schemas between versions
+
+Examples:
+    # Initialize a new project
+    $ seeknal init --name my_project
+
+    # List all feature groups
+    $ seeknal list feature-groups
+
+    # Materialize the latest version of a feature group
+    $ seeknal materialize user_features --start-date 2024-01-01
+
+    # Materialize a specific version (useful for rollbacks)
+    $ seeknal materialize user_features --start-date 2024-01-01 --version 1
+
+    # View version history
+    $ seeknal version list user_features
+
+    # Compare schema changes between versions
+    $ seeknal version diff user_features --from 1 --to 2
+
+    # Validate feature data quality
+    $ seeknal validate-features user_features --mode fail
+
+For more information, see: https://github.com/mta-tech/seeknal
 """
 
 import typer
@@ -26,6 +64,28 @@ app = typer.Typer(
     help="Feature store management CLI - similar to dbt",
     add_completion=False,
 )
+
+# Version command group for feature group version management
+version_app = typer.Typer(
+    name="version",
+    help="""Manage feature group versions.
+
+Feature group versioning enables ML teams to track schema evolution,
+compare changes between versions, and safely roll back to previous
+versions when needed.
+
+Commands:
+  list   List all versions of a feature group with creation dates
+  show   Display detailed metadata and schema for a specific version
+  diff   Compare schemas between two versions to identify changes
+
+Examples:
+  seeknal version list user_features
+  seeknal version show user_features --version 2
+  seeknal version diff user_features --from 1 --to 2
+""",
+)
+app.add_typer(version_app, name="version")
 
 
 class OutputFormat(str, Enum):
@@ -50,6 +110,17 @@ class ResourceType(str, Enum):
     FLOWS = "flows"
     FEATURE_GROUPS = "feature-groups"
     OFFLINE_STORES = "offline-stores"
+
+
+class DeleteResourceType(str, Enum):
+    """Resource types for deletion."""
+    FEATURE_GROUP = "feature-group"
+
+
+class ValidationModeChoice(str, Enum):
+    """Validation mode options for validate-features command."""
+    WARN = "warn"
+    FAIL = "fail"
 
 
 def _get_version() -> str:
@@ -82,8 +153,8 @@ def _echo_info(message: str):
 
 
 @app.command()
-def version():
-    """Show version information."""
+def info():
+    """Show version information for Seeknal and its dependencies."""
     import pyspark
     import duckdb
 
@@ -180,26 +251,47 @@ def materialize(
     ),
     start_date: str = typer.Option(
         ..., "--start-date", "-s",
-        help="Start date (YYYY-MM-DD)"
+        help="Start date for feature data (YYYY-MM-DD format)"
     ),
     end_date: Optional[str] = typer.Option(
         None, "--end-date", "-e",
-        help="End date (YYYY-MM-DD)"
+        help="End date for feature data (YYYY-MM-DD format)"
+    ),
+    version: Optional[int] = typer.Option(
+        None, "--version", "-v",
+        help="Specific version number to materialize (defaults to latest). "
+             "Use 'seeknal version list' to see available versions."
     ),
     mode: WriteMode = typer.Option(
         WriteMode.OVERWRITE, "--mode", "-m",
-        help="Write mode"
+        help="Write mode: overwrite, append, or merge"
     ),
     offline_only: bool = typer.Option(
         False, "--offline-only",
-        help="Only materialize to offline store"
+        help="Only materialize to offline store (skip online store)"
     ),
     online_only: bool = typer.Option(
         False, "--online-only",
-        help="Only materialize to online store"
+        help="Only materialize to online store (skip offline store)"
     ),
 ):
-    """Materialize features to offline/online stores."""
+    """
+    Materialize features to offline/online stores.
+
+    Writes feature data to configured storage locations for the specified
+    date range. Supports version-specific materialization for rollbacks
+    or A/B testing scenarios.
+
+    Examples:
+        # Materialize latest version
+        seeknal materialize user_features --start-date 2024-01-01
+
+        # Materialize a specific version (rollback scenario)
+        seeknal materialize user_features --start-date 2024-01-01 --version 1
+
+        # Materialize with date range
+        seeknal materialize user_features -s 2024-01-01 -e 2024-01-31
+    """
     from seeknal.featurestore.feature_group import FeatureGroup
 
     # Parse dates
@@ -211,13 +303,15 @@ def materialize(
         raise typer.Exit(1)
 
     typer.echo(f"Materializing feature group: {feature_group}")
+    if version is not None:
+        typer.echo(f"  Version: {version}")
     typer.echo(f"  Start date: {start_date}")
     if end_date:
         typer.echo(f"  End date: {end_date}")
     typer.echo(f"  Mode: {mode.value}")
 
     try:
-        fg = FeatureGroup.load(name=feature_group)
+        fg = FeatureGroup.load(name=feature_group, version=version)
         fg.write(
             feature_start_time=start_dt,
             feature_end_time=end_dt,
@@ -384,6 +478,264 @@ def validate(
     _echo_success("All validations passed")
 
 
+def _build_validators_from_config(validator_configs):
+    """Build validator instances from ValidatorConfig objects.
+
+    Args:
+        validator_configs: List of ValidatorConfig objects from validation_config.
+
+    Returns:
+        List of BaseValidator instances ready to execute.
+
+    Raises:
+        ValueError: If an unknown validator type is specified.
+    """
+    from datetime import timedelta
+    from seeknal.feature_validation.validators import (
+        NullValidator,
+        RangeValidator,
+        UniquenessValidator,
+        FreshnessValidator,
+        CustomValidator,
+    )
+
+    validators = []
+
+    for config in validator_configs:
+        validator_type = config.validator_type.lower()
+        columns = config.columns or []
+        params = config.params or {}
+
+        if validator_type == "null":
+            validator = NullValidator(
+                columns=columns,
+                max_null_percentage=params.get("max_null_percentage", 0.0),
+            )
+        elif validator_type == "range":
+            if not columns:
+                raise ValueError("RangeValidator requires at least one column")
+            # RangeValidator works on a single column
+            column = columns[0] if len(columns) == 1 else columns[0]
+            validator = RangeValidator(
+                column=column,
+                min_val=params.get("min_val"),
+                max_val=params.get("max_val"),
+            )
+        elif validator_type == "uniqueness":
+            validator = UniquenessValidator(
+                columns=columns,
+                max_duplicate_percentage=params.get("max_duplicate_percentage", 0.0),
+            )
+        elif validator_type == "freshness":
+            if not columns:
+                raise ValueError("FreshnessValidator requires a column")
+            column = columns[0]
+            max_age_seconds = params.get("max_age_seconds", 86400)  # Default 24 hours
+            max_age = timedelta(seconds=max_age_seconds)
+            validator = FreshnessValidator(
+                column=column,
+                max_age=max_age,
+            )
+        else:
+            raise ValueError(f"Unknown validator type: {validator_type}")
+
+        validators.append(validator)
+
+    return validators
+
+
+def _format_validation_table(results, verbose: bool = False):
+    """Format validation results as a colored table.
+
+    Args:
+        results: List of ValidationResult objects.
+        verbose: If True, show detailed information.
+
+    Returns:
+        Formatted table string.
+    """
+    if not results:
+        return "  No validation results."
+
+    # Calculate column widths
+    name_width = max(len(r.validator_name) for r in results)
+    name_width = max(name_width, 10)  # Minimum width
+
+    lines = []
+
+    # Header
+    header = f"  {'Validator':<{name_width}}  {'Status':^8}  {'Message'}"
+    lines.append(header)
+    lines.append("  " + "-" * (name_width + 2 + 8 + 2 + 40))
+
+    # Results
+    for result in results:
+        if result.passed:
+            status = typer.style("PASS", fg=typer.colors.GREEN, bold=True)
+        else:
+            status = typer.style("FAIL", fg=typer.colors.RED, bold=True)
+
+        # Truncate message if too long
+        message = result.message
+        if len(message) > 60 and not verbose:
+            message = message[:57] + "..."
+
+        line = f"  {result.validator_name:<{name_width}}  {status:^8}  {message}"
+        lines.append(line)
+
+        # Show details in verbose mode
+        if verbose and result.details:
+            for key, value in result.details.items():
+                if key not in ("columns", "validator_type"):  # Skip redundant fields
+                    detail_line = f"      {key}: {value}"
+                    lines.append(typer.style(detail_line, dim=True))
+
+    return "\n".join(lines)
+
+
+@app.command("validate-features")
+def validate_features(
+    feature_group: str = typer.Argument(
+        ..., help="Name of the feature group to validate"
+    ),
+    mode: ValidationModeChoice = typer.Option(
+        ValidationModeChoice.FAIL, "--mode", "-m",
+        help="Validation mode: 'warn' logs failures and continues, 'fail' stops on first failure"
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="Show detailed validation results"
+    ),
+):
+    """Validate feature group data quality.
+
+    Run configured validators against a feature group's data to check
+    for data quality issues like null values, out-of-range values,
+    duplicates, and stale data.
+
+    Exit codes:
+        0 - All validations passed (or passed with warnings in warn mode)
+        1 - Validation failed or feature group not found
+
+    Examples:
+        seeknal validate-features user_features
+        seeknal validate-features user_features --mode warn
+        seeknal validate-features user_features --mode fail --verbose
+    """
+    from seeknal.featurestore.feature_group import FeatureGroup
+    from seeknal.feature_validation.models import ValidationMode
+    from seeknal.feature_validation.validators import ValidationException
+
+    typer.echo("")
+    typer.echo(typer.style(f"Validating feature group: {feature_group}", bold=True))
+    typer.echo(f"  Mode: {mode.value}")
+    typer.echo("")
+
+    try:
+        # Load the feature group
+        _echo_info("Loading feature group...")
+        fg = FeatureGroup.load(name=feature_group)
+        if fg is None:
+            _echo_error(f"Feature group '{feature_group}' not found")
+            raise typer.Exit(1)
+
+        # Check if validation is configured
+        if not fg.validation_config or not fg.validation_config.validators:
+            _echo_warning(f"No validators configured for feature group '{feature_group}'")
+            typer.echo("  Configure validators using:")
+            typer.echo("    fg.set_validation_config(ValidationConfig(validators=[...]))")
+            typer.echo("")
+            raise typer.Exit(0)
+
+        # Build validators from configuration
+        try:
+            validators = _build_validators_from_config(fg.validation_config.validators)
+        except ValueError as e:
+            _echo_error(f"Invalid validator configuration: {e}")
+            raise typer.Exit(1)
+
+        # Convert CLI mode to ValidationMode enum
+        validation_mode = ValidationMode.WARN if mode == ValidationModeChoice.WARN else ValidationMode.FAIL
+
+        # Show validator count
+        typer.echo(f"  Validators to run: {len(validators)}")
+        if verbose:
+            for v in validators:
+                typer.echo(f"    - {v.name}")
+        typer.echo("")
+
+        # Run validation
+        _echo_info("Running validators...")
+        try:
+            summary = fg.validate(validators=validators, mode=validation_mode)
+        except ValidationException as e:
+            # In FAIL mode, validation stops on first failure
+            typer.echo("")
+            _echo_error(f"Validation stopped: {e.message}")
+            if e.result:
+                typer.echo("")
+                typer.echo(typer.style("Failed Validator Details:", bold=True))
+                typer.echo(f"  Validator: {e.result.validator_name}")
+                typer.echo(f"  Failures:  {e.result.failure_count:,}")
+                typer.echo(f"  Total:     {e.result.total_count:,}")
+                if verbose and e.result.details:
+                    typer.echo("  Details:")
+                    for key, value in e.result.details.items():
+                        typer.echo(f"    {key}: {value}")
+            typer.echo("")
+            raise typer.Exit(1)
+
+        # Display results summary
+        typer.echo("")
+        typer.echo(typer.style("Validation Summary", bold=True))
+        typer.echo("=" * 50)
+
+        # Summary statistics
+        passed_style = typer.style(str(summary.passed_count), fg=typer.colors.GREEN, bold=True)
+        failed_style = typer.style(str(summary.failed_count), fg=typer.colors.RED if summary.failed_count > 0 else typer.colors.GREEN, bold=True)
+
+        typer.echo(f"  Total validators: {summary.total_validators}")
+        typer.echo(f"  Passed:           {passed_style}")
+        typer.echo(f"  Failed:           {failed_style}")
+        typer.echo("")
+
+        # Display results table
+        if summary.results:
+            typer.echo(typer.style("Results:", bold=True))
+            typer.echo(_format_validation_table(summary.results, verbose=verbose))
+            typer.echo("")
+
+        # Final status message
+        typer.echo("-" * 50)
+        if summary.passed:
+            _echo_success(f"All validations passed for '{feature_group}'")
+        else:
+            if mode == ValidationModeChoice.WARN:
+                _echo_warning(
+                    f"Validation completed with {summary.failed_count} warning(s) "
+                    f"for '{feature_group}'"
+                )
+                typer.echo("  (Exit code 0 - warnings only)")
+            else:
+                _echo_error(
+                    f"Validation failed with {summary.failed_count} error(s) "
+                    f"for '{feature_group}'"
+                )
+                raise typer.Exit(1)
+        typer.echo("")
+
+    except typer.Exit:
+        # Re-raise typer.Exit as-is
+        raise
+    except Exception as e:
+        typer.echo("")
+        _echo_error(f"Validation failed: {e}")
+        if verbose:
+            import traceback
+            typer.echo(typer.style(traceback.format_exc(), dim=True))
+        raise typer.Exit(1)
+
+
 @app.command()
 def debug(
     feature_group: str = typer.Argument(
@@ -473,6 +825,463 @@ def clean(
         _echo_success(f"Cleanup completed for: {feature_group}")
     except Exception as e:
         _echo_error(f"Cleanup failed: {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def delete(
+    resource_type: DeleteResourceType = typer.Argument(
+        ..., help="Type of resource to delete (feature-group)"
+    ),
+    name: str = typer.Argument(
+        ..., help="Name of the resource to delete"
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Skip confirmation prompt"
+    ),
+):
+    """Delete a resource (feature group) including storage and metadata."""
+    from seeknal.featurestore.feature_group import FeatureGroup
+
+    match resource_type:
+        case DeleteResourceType.FEATURE_GROUP:
+            typer.echo(f"Deleting feature group: {name}")
+
+            try:
+                fg = FeatureGroup.load(name=name)
+            except Exception as e:
+                _echo_error(f"Feature group '{name}' not found")
+                raise typer.Exit(1)
+
+            if not force:
+                confirm = typer.confirm(
+                    f"Are you sure you want to delete feature group '{name}'? "
+                    "This will remove all storage files and metadata."
+                )
+                if not confirm:
+                    _echo_warning("Deletion cancelled")
+                    raise typer.Exit(0)
+
+            try:
+                fg.delete()
+                _echo_success(
+                    f"Deleted feature group '{name}': "
+                    "removed storage files and metadata from database"
+                )
+            except Exception as e:
+                _echo_error(f"Failed to delete feature group '{name}': {e}")
+                raise typer.Exit(1)
+        case _:
+            _echo_error(f"Unknown resource type: {resource_type}")
+            raise typer.Exit(1)
+
+
+@app.command("delete-table")
+def delete_table(
+    table_name: str = typer.Argument(
+        ..., help="Name of the online table to delete"
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Force deletion without confirmation (bypass dependency warnings)"
+    ),
+):
+    """Delete an online table and all associated data files.
+
+    This command removes all data files from the online store and cleans up
+    metadata from the database. By default, it will show any dependent feature
+    groups and ask for confirmation before deleting.
+
+    Use --force to bypass confirmations and delete despite dependencies.
+    """
+    from seeknal.request import OnlineTableRequest, EntityRequest, get_db_session
+    from seeknal.models import FeatureGroupTable
+    from seeknal.featurestore.duckdbengine.feature_group import OnlineFeaturesDuckDB
+    from seeknal.featurestore.duckdbengine.featurestore import OnlineStoreDuckDB
+    from seeknal.entity import Entity
+    from sqlmodel import select
+
+    typer.echo(f"Looking up table: {table_name}")
+
+    try:
+        # Step 1: Validate table exists
+        online_table = OnlineTableRequest.select_by_name(table_name)
+        if online_table is None:
+            _echo_error(f"Table '{table_name}' not found")
+            raise typer.Exit(1)
+
+        # Step 2: Check dependencies (feature groups using this table)
+        fg_mappings = OnlineTableRequest.get_feature_group_from_online_table(online_table.id)
+        dependent_feature_groups = []
+
+        if fg_mappings:
+            with get_db_session() as session:
+                for mapping in fg_mappings:
+                    fg = session.exec(
+                        select(FeatureGroupTable).where(
+                            FeatureGroupTable.id == mapping.feature_group_id
+                        )
+                    ).first()
+                    if fg:
+                        dependent_feature_groups.append(fg.name)
+
+        # Step 3: Show warnings if dependencies exist
+        if dependent_feature_groups:
+            _echo_warning(f"Table '{table_name}' has {len(dependent_feature_groups)} dependent feature group(s):")
+            for fg_name in dependent_feature_groups:
+                typer.echo(f"  - {fg_name}")
+
+            if not force:
+                _echo_warning("Deleting this table may affect these feature groups.")
+                confirm = typer.confirm(
+                    "Are you sure you want to delete this table?",
+                    default=False
+                )
+                if not confirm:
+                    _echo_info("Deletion cancelled")
+                    raise typer.Exit(0)
+        else:
+            # No dependencies, but still confirm unless --force
+            if not force:
+                confirm = typer.confirm(
+                    f"Are you sure you want to delete table '{table_name}'?",
+                    default=False
+                )
+                if not confirm:
+                    _echo_info("Deletion cancelled")
+                    raise typer.Exit(0)
+
+        # Step 4: Get entity information for file deletion
+        entity = EntityRequest.select_by_id(online_table.entity_id)
+        entity_obj = None
+        if entity:
+            entity_obj = Entity(name=entity.name)
+
+        # Step 5: Perform deletion
+        typer.echo(f"Deleting table '{table_name}'...")
+
+        online_table_obj = OnlineFeaturesDuckDB(
+            name=table_name,
+            lookup_key=entity_obj,
+            online_store=OnlineStoreDuckDB(),
+            project="default",  # TODO: Get from online_table.project_id if needed
+            id=online_table.id
+        )
+
+        success = online_table_obj.delete()
+
+        if success:
+            _echo_success(f"Table '{table_name}' deleted successfully")
+        else:
+            _echo_warning(f"Table '{table_name}' deletion completed with warnings (check logs)")
+
+    except typer.Exit:
+        raise
+    except Exception as e:
+        _echo_error(f"Failed to delete table: {e}")
+        raise typer.Exit(1)
+
+# Version subcommands
+@version_app.command("list")
+def version_list(
+    feature_group: str = typer.Argument(
+        ..., help="Name of the feature group to query versions for"
+    ),
+    format: OutputFormat = typer.Option(
+        OutputFormat.TABLE, "--format", "-f",
+        help="Output format: table (default), json, or yaml"
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", "-l",
+        help="Maximum number of versions to display (most recent first)"
+    ),
+):
+    """
+    List all versions of a feature group.
+
+    Displays version history with creation timestamps and feature counts,
+    sorted by version number (most recent first). Use this command to
+    review the evolution of a feature group over time.
+
+    Examples:
+        seeknal version list user_features
+        seeknal version list user_features --limit 5
+        seeknal version list user_features --format json
+    """
+    from seeknal.featurestore.feature_group import FeatureGroup
+    from tabulate import tabulate
+    import json
+
+    try:
+        fg = FeatureGroup(name=feature_group).get_or_create()
+        versions = fg.list_versions()
+
+        if not versions:
+            _echo_info(f"No versions found for feature group: {feature_group}")
+            return
+
+        # Apply limit if specified
+        if limit is not None:
+            versions = versions[:limit]
+
+        if format == OutputFormat.JSON:
+            typer.echo(json.dumps(versions, indent=2, default=str))
+        else:
+            # Table format
+            headers = ["Version", "Created At", "Features"]
+            data = []
+            for v in versions:
+                created_at = v.get("created_at", "N/A")
+                if created_at and created_at != "N/A":
+                    # Format datetime for display
+                    if hasattr(created_at, "strftime"):
+                        created_at = created_at.strftime("%Y-%m-%d %H:%M:%S")
+                feature_count = v.get("feature_count", 0)
+                data.append([v.get("version", "N/A"), created_at, feature_count])
+
+            typer.echo(f"\nVersions for feature group: {feature_group}")
+            typer.echo("-" * 50)
+            typer.echo(tabulate(data, headers=headers, tablefmt="simple"))
+
+    except Exception as e:
+        _echo_error(f"Error listing versions: {e}")
+        raise typer.Exit(1)
+
+
+@version_app.command("show")
+def version_show(
+    feature_group: str = typer.Argument(
+        ..., help="Name of the feature group to inspect"
+    ),
+    version: Optional[int] = typer.Option(
+        None, "--version", "-v",
+        help="Specific version number to show (defaults to latest version)"
+    ),
+    format: OutputFormat = typer.Option(
+        OutputFormat.TABLE, "--format", "-f",
+        help="Output format: table (default), json, or yaml"
+    ),
+):
+    """
+    Show detailed information about a feature group version.
+
+    Displays comprehensive metadata for a specific version including:
+    - Version number and timestamps (created, updated)
+    - Feature count
+    - Complete Avro schema with field names and types
+
+    If no version is specified, shows the latest version.
+
+    Examples:
+        seeknal version show user_features              # Show latest
+        seeknal version show user_features --version 2  # Show version 2
+        seeknal version show user_features --format json
+    """
+    from seeknal.featurestore.feature_group import FeatureGroup
+    import json
+
+    try:
+        fg = FeatureGroup(name=feature_group).get_or_create()
+
+        # Get specific version or latest
+        if version is not None:
+            version_data = fg.get_version(version)
+            if version_data is None:
+                _echo_error(f"Version {version} not found for feature group: {feature_group}")
+                raise typer.Exit(1)
+        else:
+            # Get latest version (first in list, sorted by version desc)
+            versions = fg.list_versions()
+            if not versions:
+                _echo_info(f"No versions found for feature group: {feature_group}")
+                return
+            version_data = versions[0]
+
+        if format == OutputFormat.JSON:
+            typer.echo(json.dumps(version_data, indent=2, default=str))
+        else:
+            # Table/readable format
+            version_num = version_data.get("version", "N/A")
+            created_at = version_data.get("created_at", "N/A")
+            updated_at = version_data.get("updated_at", "N/A")
+            feature_count = version_data.get("feature_count", 0)
+            avro_schema = version_data.get("avro_schema")
+
+            # Format datetime for display
+            if created_at and created_at != "N/A" and hasattr(created_at, "strftime"):
+                created_at = created_at.strftime("%Y-%m-%d %H:%M:%S")
+            if updated_at and updated_at != "N/A" and hasattr(updated_at, "strftime"):
+                updated_at = updated_at.strftime("%Y-%m-%d %H:%M:%S")
+
+            typer.echo(f"\nFeature Group: {feature_group}")
+            typer.echo(f"Version: {version_num}")
+            typer.echo("-" * 50)
+            typer.echo(f"  Created At:    {created_at}")
+            typer.echo(f"  Updated At:    {updated_at}")
+            typer.echo(f"  Feature Count: {feature_count}")
+
+            # Display schema
+            if avro_schema:
+                typer.echo("\nSchema:")
+                typer.echo("-" * 50)
+                try:
+                    # Parse and pretty-print the Avro schema
+                    if isinstance(avro_schema, str):
+                        schema_dict = json.loads(avro_schema)
+                    else:
+                        schema_dict = avro_schema
+
+                    # Display schema fields
+                    if "fields" in schema_dict:
+                        typer.echo("  Fields:")
+                        for field in schema_dict.get("fields", []):
+                            field_name = field.get("name", "unknown")
+                            field_type = field.get("type", "unknown")
+                            # Handle complex types
+                            if isinstance(field_type, dict):
+                                field_type = field_type.get("type", str(field_type))
+                            elif isinstance(field_type, list):
+                                # Union types like ["null", "string"]
+                                field_type = " | ".join(str(t) for t in field_type)
+                            typer.echo(f"    - {field_name}: {field_type}")
+                    else:
+                        # Fallback: print formatted JSON
+                        typer.echo(json.dumps(schema_dict, indent=2))
+                except (json.JSONDecodeError, TypeError):
+                    # If parsing fails, display raw schema
+                    typer.echo(f"  {avro_schema}")
+
+    except Exception as e:
+        _echo_error(f"Error showing version: {e}")
+        raise typer.Exit(1)
+
+
+@version_app.command("diff")
+def version_diff(
+    feature_group: str = typer.Argument(
+        ..., help="Name of the feature group to compare versions for"
+    ),
+    from_version: int = typer.Option(
+        ..., "--from", "-f",
+        help="Base version number to compare from (older version)"
+    ),
+    to_version: int = typer.Option(
+        ..., "--to", "-t",
+        help="Target version number to compare to (newer version)"
+    ),
+    format: OutputFormat = typer.Option(
+        OutputFormat.TABLE, "--format",
+        help="Output format: table (default) or json"
+    ),
+):
+    """
+    Compare two versions of a feature group to identify schema differences.
+
+    Analyzes the Avro schemas of both versions and displays:
+    - Added features (+): New fields in the target version
+    - Removed features (-): Fields removed from the base version
+    - Modified features (~): Fields with type changes
+
+    This is useful for understanding schema evolution and identifying
+    potential breaking changes before rolling back or deploying a version.
+
+    Examples:
+        seeknal version diff user_features --from 1 --to 2
+        seeknal version diff user_features --from 1 --to 3 --format json
+    """
+    from seeknal.featurestore.feature_group import FeatureGroup
+    import json
+
+    try:
+        fg = FeatureGroup(name=feature_group).get_or_create()
+
+        # Call compare_versions API
+        diff = fg.compare_versions(from_version, to_version)
+
+        if diff is None:
+            _echo_error(f"Could not compare versions {from_version} and {to_version}")
+            raise typer.Exit(1)
+
+        if format == OutputFormat.JSON:
+            typer.echo(json.dumps(diff, indent=2, default=str))
+        else:
+            # Table/readable format
+            typer.echo(f"\nFeature Group: {feature_group}")
+            typer.echo(f"Comparing version {from_version} → {to_version}")
+            typer.echo("=" * 60)
+
+            added = diff.get("added", [])
+            removed = diff.get("removed", [])
+            modified = diff.get("modified", [])
+
+            has_changes = added or removed or modified
+
+            if not has_changes:
+                _echo_info("No schema changes detected between versions.")
+            else:
+                # Display added features
+                if added:
+                    typer.echo("\n" + typer.style("Added (+):", fg=typer.colors.GREEN, bold=True))
+                    for field in added:
+                        if isinstance(field, dict):
+                            field_name = field.get("name", "unknown")
+                            field_type = field.get("type", "unknown")
+                            # Handle complex types
+                            if isinstance(field_type, dict):
+                                field_type = field_type.get("type", str(field_type))
+                            elif isinstance(field_type, list):
+                                field_type = " | ".join(str(t) for t in field_type)
+                            typer.echo(typer.style(f"  + {field_name}: {field_type}", fg=typer.colors.GREEN))
+                        else:
+                            typer.echo(typer.style(f"  + {field}", fg=typer.colors.GREEN))
+
+                # Display removed features
+                if removed:
+                    typer.echo("\n" + typer.style("Removed (-):", fg=typer.colors.RED, bold=True))
+                    for field in removed:
+                        if isinstance(field, dict):
+                            field_name = field.get("name", "unknown")
+                            field_type = field.get("type", "unknown")
+                            # Handle complex types
+                            if isinstance(field_type, dict):
+                                field_type = field_type.get("type", str(field_type))
+                            elif isinstance(field_type, list):
+                                field_type = " | ".join(str(t) for t in field_type)
+                            typer.echo(typer.style(f"  - {field_name}: {field_type}", fg=typer.colors.RED))
+                        else:
+                            typer.echo(typer.style(f"  - {field}", fg=typer.colors.RED))
+
+                # Display modified features
+                if modified:
+                    typer.echo("\n" + typer.style("Modified (~):", fg=typer.colors.YELLOW, bold=True))
+                    for change in modified:
+                        if isinstance(change, dict):
+                            field_name = change.get("field", "unknown")
+                            old_type = change.get("old_type", "unknown")
+                            new_type = change.get("new_type", "unknown")
+                            # Handle complex types
+                            if isinstance(old_type, dict):
+                                old_type = old_type.get("type", str(old_type))
+                            elif isinstance(old_type, list):
+                                old_type = " | ".join(str(t) for t in old_type)
+                            if isinstance(new_type, dict):
+                                new_type = new_type.get("type", str(new_type))
+                            elif isinstance(new_type, list):
+                                new_type = " | ".join(str(t) for t in new_type)
+                            typer.echo(typer.style(f"  ~ {field_name}: {old_type} → {new_type}", fg=typer.colors.YELLOW))
+                        else:
+                            typer.echo(typer.style(f"  ~ {change}", fg=typer.colors.YELLOW))
+
+                # Summary
+                typer.echo("\n" + "-" * 60)
+                typer.echo(f"Summary: {len(added)} added, {len(removed)} removed, {len(modified)} modified")
+
+    except ValueError as e:
+        _echo_error(str(e))
+        raise typer.Exit(1)
+    except Exception as e:
+        _echo_error(f"Error comparing versions: {e}")
         raise typer.Exit(1)
 
 

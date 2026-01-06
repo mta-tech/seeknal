@@ -38,6 +38,8 @@ from ..tasks.sparkengine.transformers import (
 )
 from ..tasks.duckdb import DuckDBTask
 from ..validation import validate_column_name, validate_sql_value
+from ..feature_validation.validators import BaseValidator, ValidationRunner
+from ..feature_validation.models import ValidationConfig, ValidationMode, ValidationResult, ValidationSummary
 
 
 class Materialization(BaseModel):
@@ -119,17 +121,50 @@ def require_set_entity(func):
 @dataclass
 class FeatureGroup(FeatureStore):
     """
-    Define Feature Group. Feature Group is a set of features created from a flow.
+    A feature group representing a set of features created from a data source.
 
-    Args:
-        name (str): Feature group name
-        entities (List[Entity]): List of entities associated
-        materialization (Materialization): Materialization setting for this feature group
-        flow (Flow, optional): Flow that used for create features for this feature group
-        description (str, optional): Description for this feature group
-        features (List[Feature], optional): List of feature to be registered as features in this feature group.
-            If set to None, then all columns except join_keys and event_time will
-            register as features.
+    A FeatureGroup is a logical grouping of related features that share the same
+    entity and are typically computed from the same data source (Flow or DataFrame).
+    It supports both offline and online materialization for feature storage and serving.
+
+    Attributes:
+        name: The unique name of the feature group within the project.
+        materialization: Configuration for how features are stored and served,
+            including offline/online storage settings and TTL configurations.
+        source: The data source for computing features. Can be a Flow pipeline
+            or a Spark DataFrame. If Flow, output will be set to SPARK_DATAFRAME.
+        description: Optional human-readable description of the feature group.
+        features: List of Feature objects to register. If None, all columns
+            except join_keys and event_time will be registered as features.
+        tag: Optional list of tags for categorizing and filtering feature groups.
+        validation_config: Configuration for data validation including validators
+            to run and validation mode (FAIL or WARN). When set, enables declarative
+            validation that can be used with the validate() method.
+        feature_group_id: Unique identifier assigned by the system after creation.
+        offline_watermarks: List of timestamps indicating when offline data was
+            materialized. Used for tracking data freshness.
+        online_watermarks: List of timestamps indicating when online data was
+            materialized. Used for tracking data freshness.
+        version: Schema version number for the feature group.
+        created_at: Timestamp when the feature group was created.
+        updated_at: Timestamp when the feature group was last updated.
+        avro_schema: Avro schema definition for the feature data structure.
+
+    Example:
+        >>> from seeknal.featurestore import FeatureGroup, Materialization
+        >>> from seeknal.entity import Entity
+        >>>
+        >>> # Create a feature group from a flow
+        >>> fg = FeatureGroup(
+        ...     name="user_features",
+        ...     materialization=Materialization(event_time_col="event_date"),
+        ... )
+        >>> fg.entity = Entity(name="user", join_keys=["user_id"])
+        >>> fg.set_flow(my_flow).set_features().get_or_create()
+
+    Note:
+        A SparkContext must be active before creating a FeatureGroup instance.
+        Initialize your Project and Workspace first if you encounter SparkContext errors.
     """
 
     name: str
@@ -138,6 +173,7 @@ class FeatureGroup(FeatureStore):
     description: Optional[str] = None
     features: Optional[List[Feature]] = None
     tag: Optional[List[str]] = None
+    validation_config: Optional[ValidationConfig] = None
 
     feature_group_id: Optional[str] = None
     offline_watermarks: List[str] = field(default_factory=list)
@@ -148,6 +184,14 @@ class FeatureGroup(FeatureStore):
     avro_schema: Optional[dict] = None
 
     def __post_init__(self):
+        """Initialize the feature group and validate dependencies.
+
+        Sets up the JVM gateway for Spark operations and ensures that the source
+        (Flow or DataFrame) and entity are properly initialized.
+
+        Raises:
+            AttributeError: If SparkContext is not active or properly configured.
+        """
         try:
             self._jvm_gateway = SparkContext._active_spark_context._gateway.jvm
         except AttributeError as e:
@@ -166,11 +210,21 @@ class FeatureGroup(FeatureStore):
                 self.entity.get_or_create()
 
     def set_flow(self, flow: Flow):
-        """
-        Set flow for this feature group
+        """Set the data flow pipeline as the source for this feature group.
+
+        Configures a Flow as the data source for computing features. The flow's
+        output will be automatically set to SPARK_DATAFRAME if not already
+        configured. If the flow hasn't been persisted, it will be created.
 
         Args:
-            flow (Flow): Flow that used for create features for this feature group
+            flow: The Flow pipeline to use for feature computation.
+
+        Returns:
+            FeatureGroup: The current instance for method chaining.
+
+        Example:
+            >>> fg = FeatureGroup(name="user_features")
+            >>> fg.set_flow(my_transformation_flow)
         """
         if flow.output is not None:
             if flow.output.kind != FlowOutputEnum.SPARK_DATAFRAME:
@@ -181,13 +235,158 @@ class FeatureGroup(FeatureStore):
         return self
 
     def set_dataframe(self, dataframe: DataFrame):
+        """Set a Spark DataFrame as the source for this feature group.
+
+        Configures a pre-computed Spark DataFrame as the data source for
+        features. This is useful when features have already been computed
+        or when using ad-hoc data that doesn't require a Flow pipeline.
+
+        Args:
+            dataframe: The Spark DataFrame containing the feature data.
+
+        Returns:
+            FeatureGroup: The current instance for method chaining.
+
+        Example:
+            >>> fg = FeatureGroup(name="user_features")
+            >>> fg.set_dataframe(my_spark_df)
+        """
         self.source = dataframe
         return self
 
+    def set_validation_config(self, config: ValidationConfig):
+        """
+        Set validation configuration for this feature group.
+
+        Args:
+            config (ValidationConfig): Validation configuration containing
+                validators to run and validation mode (FAIL or WARN).
+
+        Returns:
+            self: Returns the FeatureGroup instance for method chaining.
+
+        Example:
+            >>> from seeknal.feature_validation.models import ValidationConfig, ValidatorConfig
+            >>>
+            >>> config = ValidationConfig(
+            ...     mode=ValidationMode.WARN,
+            ...     validators=[
+            ...         ValidatorConfig(validator_type="null", columns=["user_id"]),
+            ...         ValidatorConfig(validator_type="range", columns=["age"],
+            ...                         params={"min_val": 0, "max_val": 120})
+            ...     ]
+            ... )
+            >>> feature_group.set_validation_config(config)
+        """
+        self.validation_config = config
+        return self
+
+    @require_set_source
+    def validate(
+        self,
+        validators: List[BaseValidator],
+        mode: Union[str, ValidationMode] = ValidationMode.FAIL,
+        reference_date: Optional[str] = None,
+    ) -> ValidationSummary:
+        """
+        Validate the feature group data using the provided validators.
+
+        This method runs a list of validators against the feature group's data
+        and returns a summary of the validation results. The validation can be
+        configured to either warn on failures (continue execution) or fail
+        immediately on the first validation failure.
+
+        Args:
+            validators (List[BaseValidator]): List of validators to run against
+                the feature group data. Each validator should be an instance of
+                a class that inherits from BaseValidator (e.g., NullValidator,
+                RangeValidator, UniquenessValidator, FreshnessValidator, or
+                CustomValidator).
+            mode (Union[str, ValidationMode], optional): Validation execution mode.
+                - ValidationMode.FAIL or "fail": Raise exception on first failure.
+                - ValidationMode.WARN or "warn": Log failures but continue execution.
+                Defaults to ValidationMode.FAIL.
+            reference_date (Optional[str], optional): Reference date for running
+                the source Flow. Only used when source is a Flow. Defaults to None.
+
+        Returns:
+            ValidationSummary: A summary containing all validation results,
+                pass/fail status, and counts.
+
+        Raises:
+            ValueError: If source is not set (use @require_set_source decorator).
+            ValidationException: If mode is FAIL and any validator fails.
+
+        Example:
+            >>> from seeknal.feature_validation.validators import NullValidator, RangeValidator
+            >>> from seeknal.feature_validation.models import ValidationMode
+            >>>
+            >>> # Create validators
+            >>> validators = [
+            ...     NullValidator(columns=["user_id", "email"]),
+            ...     RangeValidator(column="age", min_val=0, max_val=120)
+            ... ]
+            >>>
+            >>> # Run validation in warn mode (continues on failures)
+            >>> summary = feature_group.validate(validators, mode=ValidationMode.WARN)
+            >>> print(f"Passed: {summary.passed}, Failed: {summary.failed_count}")
+            >>>
+            >>> # Run validation in fail mode (stops on first failure)
+            >>> try:
+            ...     summary = feature_group.validate(validators, mode="fail")
+            ... except ValidationException as e:
+            ...     print(f"Validation failed: {e.message}")
+        """
+        # Convert string mode to ValidationMode enum if necessary
+        if isinstance(mode, str):
+            mode = ValidationMode(mode.lower())
+
+        # Get the DataFrame from source
+        if isinstance(self.source, Flow):
+            df = self.source.run(date=reference_date)
+        elif isinstance(self.source, DataFrame):
+            df = self.source
+        else:
+            raise ValueError("Source must be a Flow or DataFrame")
+
+        # Create validation runner and execute validators
+        runner = ValidationRunner(
+            validators=validators,
+            mode=mode,
+            feature_group_name=self.name,
+        )
+
+        # Run validation and return summary
+        summary = runner.run(df)
+
+        logger.info(
+            f"Feature group '{self.name}' validation complete: "
+            f"{summary.passed_count}/{summary.total_validators} validators passed"
+        )
+
+        return summary
+
     @staticmethod
     def _parse_avro_schema(schema: dict, exclude_cols: Optional[List[str]] = None):
-        """
-        Parse Avro Schema to Feature
+        """Parse an Avro schema and extract feature definitions.
+
+        Converts an Avro schema into a list of Feature objects by extracting
+        field names and data types. Handles various Avro type representations
+        including unions, arrays, and nested types.
+
+        Args:
+            schema: A dictionary representing the Avro schema with a 'fields' key
+                containing the list of field definitions.
+            exclude_cols: Optional list of column names to exclude from the
+                resulting features. Useful for filtering out entity keys or
+                timestamp columns.
+
+        Returns:
+            list[Feature]: A list of Feature objects with name, data_type, and
+                online_data_type populated from the schema.
+
+        Note:
+            Fields that cannot be parsed will be skipped with a warning logged.
         """
         features = []
         for idx, i in enumerate(schema["fields"]):
@@ -526,6 +725,29 @@ class FeatureGroup(FeatureStore):
         offline_materialization: Optional[OfflineMaterialization] = None,
         online_materialization: Optional[OnlineMaterialization] = None,
     ):
+        """Update the materialization settings for this feature group.
+
+        Modifies the materialization configuration and persists the changes
+        to the feature store backend. This allows changing storage settings,
+        TTL values, and enabling/disabling offline or online storage.
+
+        Args:
+            offline: Enable or disable offline storage. If None, keeps current setting.
+            online: Enable or disable online storage. If None, keeps current setting.
+            offline_materialization: New offline materialization configuration.
+                If None, keeps current setting.
+            online_materialization: New online materialization configuration.
+                If None, keeps current setting.
+
+        Returns:
+            FeatureGroup: The current instance for method chaining.
+
+        Example:
+            >>> fg.update_materialization(
+            ...     online=True,
+            ...     online_materialization=OnlineMaterialization(ttl=2880)
+            ... )
+        """
         if offline is not None:
             self.materialization.offline = offline
         if online is not None:
@@ -563,16 +785,207 @@ class FeatureGroup(FeatureStore):
         return self
 
     @require_workspace
+    @require_project
+    def list_versions(self):
+        """
+        List all versions of this feature group.
+
+        Returns a list of dictionaries containing version metadata including:
+        - version: The version number
+        - avro_schema: The Avro schema for this version (as dict)
+        - created_at: When the version was created
+        - updated_at: When the version was last updated
+        - feature_count: Number of features in this version
+
+        Returns:
+            List[dict]: A list of version metadata dictionaries, ordered by version
+                number descending (latest first). Returns an empty list if the
+                feature group has not been saved or has no versions.
+
+        Example:
+            >>> fg = FeatureGroup(name="user_features").get_or_create()
+            >>> versions = fg.list_versions()
+            >>> for v in versions:
+            ...     print(f"Version {v['version']}: {v['feature_count']} features")
+        """
+        if not hasattr(self, 'feature_group_id') or self.feature_group_id is None:
+            # Feature group not saved yet, return empty list
+            return []
+
+        versions = FeatureGroupRequest.select_version_by_feature_group_id(
+            self.feature_group_id
+        )
+
+        if versions is None:
+            return []
+
+        result = []
+        for v in versions:
+            # Parse avro_schema from JSON string
+            try:
+                avro_schema = json.loads(v.avro_schema) if v.avro_schema else None
+            except (json.JSONDecodeError, TypeError):
+                avro_schema = None
+
+            # Get feature count for this version
+            features = FeatureRequest.select_by_feature_group_id_and_version(
+                self.feature_group_id, v.version
+            )
+            feature_count = len(features) if features else 0
+
+            result.append({
+                "version": v.version,
+                "avro_schema": avro_schema,
+                "created_at": pendulum.instance(v.created_at).format("YYYY-MM-DD HH:mm:ss") if v.created_at else None,
+                "updated_at": pendulum.instance(v.updated_at).format("YYYY-MM-DD HH:mm:ss") if v.updated_at else None,
+                "feature_count": feature_count,
+            })
+
+        return result
+
+    @require_workspace
+    @require_project
+    def get_version(self, version: int) -> Optional[dict]:
+        """
+        Get metadata for a specific version of this feature group.
+
+        Args:
+            version (int): The version number to retrieve.
+
+        Returns:
+            Optional[dict]: A dictionary containing version metadata if found,
+                None if the version doesn't exist. The dictionary includes:
+                - version: The version number
+                - avro_schema: The Avro schema for this version (as dict)
+                - created_at: When the version was created
+                - updated_at: When the version was last updated
+                - feature_count: Number of features in this version
+
+        Example:
+            >>> fg = FeatureGroup(name="user_features").get_or_create()
+            >>> v1 = fg.get_version(1)
+            >>> if v1:
+            ...     print(f"Version 1 has {v1['feature_count']} features")
+        """
+        if not hasattr(self, 'feature_group_id') or self.feature_group_id is None:
+            # Feature group not saved yet, return None
+            return None
+
+        version_obj = FeatureGroupRequest.select_by_feature_group_id_and_version(
+            self.feature_group_id, version
+        )
+
+        if version_obj is None:
+            return None
+
+        # Parse avro_schema from JSON string
+        try:
+            avro_schema = json.loads(version_obj.avro_schema) if version_obj.avro_schema else None
+        except (json.JSONDecodeError, TypeError):
+            avro_schema = None
+
+        # Get feature count for this version
+        features = FeatureRequest.select_by_feature_group_id_and_version(
+            self.feature_group_id, version
+        )
+        feature_count = len(features) if features else 0
+
+        return {
+            "version": version_obj.version,
+            "avro_schema": avro_schema,
+            "created_at": pendulum.instance(version_obj.created_at).format("YYYY-MM-DD HH:mm:ss") if version_obj.created_at else None,
+            "updated_at": pendulum.instance(version_obj.updated_at).format("YYYY-MM-DD HH:mm:ss") if version_obj.updated_at else None,
+            "feature_count": feature_count,
+        }
+
+    @require_workspace
+    @require_project
+    def compare_versions(self, from_version: int, to_version: int) -> Optional[dict]:
+        """
+        Compare schemas between two versions of this feature group.
+
+        Identifies added, removed, and modified features between the two versions
+        by comparing their Avro schemas.
+
+        Args:
+            from_version (int): The base version number to compare from.
+            to_version (int): The target version number to compare to.
+
+        Returns:
+            Optional[dict]: A dictionary containing the comparison result if both
+                versions exist, None if either version doesn't exist or the feature
+                group has not been saved. The dictionary includes:
+                - from_version: The base version number
+                - to_version: The target version number
+                - added: List of field names added in to_version
+                - removed: List of field names removed in to_version
+                - modified: List of dicts with field name and type changes
+
+        Raises:
+            ValueError: If from_version equals to_version.
+
+        Example:
+            >>> fg = FeatureGroup(name="user_features").get_or_create()
+            >>> diff = fg.compare_versions(1, 2)
+            >>> if diff:
+            ...     print(f"Added features: {diff['added']}")
+            ...     print(f"Removed features: {diff['removed']}")
+            ...     print(f"Modified features: {diff['modified']}")
+        """
+        if from_version == to_version:
+            raise ValueError("from_version and to_version must be different")
+
+        if not hasattr(self, 'feature_group_id') or self.feature_group_id is None:
+            # Feature group not saved yet, return None
+            return None
+
+        # Fetch both versions
+        from_version_obj = FeatureGroupRequest.select_by_feature_group_id_and_version(
+            self.feature_group_id, from_version
+        )
+        to_version_obj = FeatureGroupRequest.select_by_feature_group_id_and_version(
+            self.feature_group_id, to_version
+        )
+
+        # Check if both versions exist
+        if from_version_obj is None:
+            raise ValueError(f"Version {from_version} not found for this feature group")
+        if to_version_obj is None:
+            raise ValueError(f"Version {to_version} not found for this feature group")
+
+        # Get avro_schema JSON strings
+        from_schema_json = from_version_obj.avro_schema if from_version_obj.avro_schema else "{}"
+        to_schema_json = to_version_obj.avro_schema if to_version_obj.avro_schema else "{}"
+
+        # Compare schemas using FeatureGroupRequest.compare_schemas()
+        schema_diff = FeatureGroupRequest.compare_schemas(from_schema_json, to_schema_json)
+
+        return {
+            "from_version": from_version,
+            "to_version": to_version,
+            "added": schema_diff.get("added", []),
+            "removed": schema_diff.get("removed", []),
+            "modified": schema_diff.get("modified", []),
+        }
+
+    @require_workspace
     @require_saved
     @require_project
     def delete(self):
-        """
-        Deletes the feature group with the given feature_group_id.
+        """Delete this feature group and its associated data.
+
+        Removes the feature group from the feature store backend along with
+        any data stored in the offline store. This operation is irreversible.
 
         Returns:
-        -------
-        FeatureGroupRequest:
-            The FeatureGroupRequest object that was used to delete the feature group.
+            FeatureGroupRequest: The request object used to perform the deletion.
+
+        Raises:
+            ValueError: If the feature group has not been saved (no feature_group_id).
+
+        Note:
+            This requires an active workspace and project context. The feature
+            group must have been previously saved using get_or_create().
         """
         offline_store = self.materialization.offline_materialization.store
         offline_store.delete(

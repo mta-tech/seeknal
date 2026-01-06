@@ -1088,6 +1088,153 @@ class FeatureGroupRequest(RequestFactory):
         return save_to_db()
 
     @staticmethod
+    def get_version_metadata(feature_group_id, version=None):
+        """Get version metadata for a specific feature group version.
+
+        Args:
+            feature_group_id: The ID of the feature group
+            version: Optional version number. If None, returns the latest version.
+
+        Returns:
+            A dict containing version metadata with keys:
+            - id: version record ID
+            - feature_group_id: feature group ID
+            - version: version number
+            - avro_schema: parsed Avro schema as dict
+            - created_at: creation timestamp
+            - updated_at: last update timestamp
+            - features: list of features for this version
+            Returns None if version not found.
+        """
+        with get_db_session() as session:
+            if version is None:
+                # Get the latest version
+                statement = (
+                    select(FeatureGroupVersionTable)
+                    .where(FeatureGroupVersionTable.feature_group_id == feature_group_id)
+                    .order_by(desc(FeatureGroupVersionTable.version))
+                )
+                version_record = session.exec(statement).first()
+            else:
+                # Get specific version
+                statement = (
+                    select(FeatureGroupVersionTable)
+                    .where(FeatureGroupVersionTable.feature_group_id == feature_group_id)
+                    .where(FeatureGroupVersionTable.version == version)
+                )
+                version_record = session.exec(statement).first()
+
+            if version_record is None:
+                return None
+
+            # Get features for this version
+            feature_statement = (
+                select(FeatureTable)
+                .where(FeatureTable.feature_group_id == feature_group_id)
+                .where(FeatureTable.feature_group_version_id == version_record.id)
+            )
+            features = session.exec(feature_statement).all()
+
+            # Parse Avro schema
+            try:
+                avro_schema = json.loads(version_record.avro_schema)
+            except (json.JSONDecodeError, TypeError):
+                avro_schema = None
+
+            return {
+                "id": version_record.id,
+                "feature_group_id": version_record.feature_group_id,
+                "version": version_record.version,
+                "avro_schema": avro_schema,
+                "created_at": version_record.created_at,
+                "updated_at": version_record.updated_at,
+                "features": [
+                    {
+                        "id": f.id,
+                        "name": f.name,
+                        "datatype": f.datatype,
+                        "online_datatype": f.online_datatype,
+                        "description": f.description,
+                    }
+                    for f in features
+                ],
+            }
+
+    @staticmethod
+    def compare_schemas(schema1_json: str, schema2_json: str) -> dict:
+        """Compare two Avro schemas to detect added, removed, and modified fields.
+
+        Args:
+            schema1_json: JSON string of the first Avro schema (base version)
+            schema2_json: JSON string of the second Avro schema (new version)
+
+        Returns:
+            A dict containing:
+            - added: list of field names that are in schema2 but not in schema1
+            - removed: list of field names that are in schema1 but not in schema2
+            - modified: list of dicts with field name and type changes for fields
+                        that exist in both but have different types
+
+        Example:
+            >>> schema1 = '{"type":"record","fields":[{"name":"a","type":"int"}]}'
+            >>> schema2 = '{"type":"record","fields":[{"name":"a","type":"string"},{"name":"b","type":"int"}]}'
+            >>> diff = FeatureGroupRequest.compare_schemas(schema1, schema2)
+            >>> diff
+            {'added': ['b'], 'removed': [], 'modified': [{'name': 'a', 'old_type': 'int', 'new_type': 'string'}]}
+        """
+        result = {
+            "added": [],
+            "removed": [],
+            "modified": [],
+        }
+
+        try:
+            schema1 = json.loads(schema1_json) if isinstance(schema1_json, str) else schema1_json
+            schema2 = json.loads(schema2_json) if isinstance(schema2_json, str) else schema2_json
+        except (json.JSONDecodeError, TypeError):
+            return result
+
+        # Extract fields from schemas
+        fields1 = schema1.get("fields", []) if isinstance(schema1, dict) else []
+        fields2 = schema2.get("fields", []) if isinstance(schema2, dict) else []
+
+        # Build field maps {name: type}
+        fields1_map = {}
+        for field in fields1:
+            if isinstance(field, dict) and "name" in field:
+                fields1_map[field["name"]] = field.get("type")
+
+        fields2_map = {}
+        for field in fields2:
+            if isinstance(field, dict) and "name" in field:
+                fields2_map[field["name"]] = field.get("type")
+
+        # Find added fields (in schema2 but not in schema1)
+        for name in fields2_map:
+            if name not in fields1_map:
+                result["added"].append(name)
+
+        # Find removed fields (in schema1 but not in schema2)
+        for name in fields1_map:
+            if name not in fields2_map:
+                result["removed"].append(name)
+
+        # Find modified fields (same name but different type)
+        for name in fields1_map:
+            if name in fields2_map:
+                type1 = fields1_map[name]
+                type2 = fields2_map[name]
+                # Compare types - handle both simple types (strings) and complex types (dicts)
+                if type1 != type2:
+                    result["modified"].append({
+                        "name": name,
+                        "old_type": type1,
+                        "new_type": type2,
+                    })
+
+        return result
+
+    @staticmethod
     def delete_by_feature_group_id(id):
         with get_db_session() as session:
             try:
@@ -1108,11 +1255,11 @@ class FeatureGroupRequest(RequestFactory):
                         )
                     )
                 ).all()
-                
+
                 for feature in features:
                     session.delete(feature)
                 session.flush()
-                
+
                 return True
             except Exception as e:
                 session.rollback()
@@ -1177,6 +1324,26 @@ class OnlineTableRequest(RequestFactory):
                 FeatureGroupOnlineTable.online_table_id == id
             )
             return session.exec(stm).all()
+
+    @staticmethod
+    def check_dependencies(table_id) -> List[str]:
+        """
+        Check if any feature groups depend on this online table.
+
+        Args:
+            table_id: The ID of the online table to check dependencies for.
+
+        Returns:
+            List of feature group names that depend on this table.
+        """
+        with get_db_session() as session:
+            stm = (
+                select(FeatureGroupTable.name)
+                .join(FeatureGroupOnlineTable, FeatureGroupOnlineTable.feature_group_id == FeatureGroupTable.id)
+                .where(FeatureGroupOnlineTable.online_table_id == table_id)
+            )
+            results = session.exec(stm).all()
+            return list(results)
 
     @staticmethod
     def delete_feature_group_from_online_table(id):

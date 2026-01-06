@@ -27,3 +27,9 @@ spark-engine/.bloop
 spark-engine/.metals
 
 .ipynb_checkpoints
+
+# MkDocs build output
+site/
+
+# Documentation audit artifacts
+docs/audit/
