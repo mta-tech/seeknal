@@ -1303,6 +1303,10 @@ def parse(
         OutputFormat.TABLE, "--format", "-f",
         help="Output format: table (default) or json"
     ),
+    no_diff: bool = typer.Option(
+        False, "--no-diff",
+        help="Skip comparison with previous manifest"
+    ),
 ):
     """
     Parse project and generate manifest.json.
@@ -1310,6 +1314,9 @@ def parse(
     Scans the project directory for feature groups, models, and common config
     (sources, transforms, rules) to build the complete DAG manifest. The manifest
     is written to target/manifest.json.
+
+    If a previous manifest exists, shows what has changed (added, removed, modified).
+    Use --no-diff to skip this comparison.
 
     This command is similar to 'dbt parse' - it builds the dependency graph
     without executing any transformations.
@@ -1319,8 +1326,11 @@ def parse(
         seeknal parse --project my_project
         seeknal parse --path /path/to/project
         seeknal parse --format json
+        seeknal parse --no-diff
     """
     from seeknal.dag.parser import ProjectParser
+    from seeknal.dag.manifest import Manifest
+    from seeknal.dag.diff import ManifestDiff
     import json
 
     # Determine project name
@@ -1335,6 +1345,16 @@ def parse(
     typer.echo(f"  Path: {path.resolve()}")
 
     try:
+        # Check for existing manifest (for diff comparison)
+        manifest_file = target_path / "manifest.json"
+        old_manifest = None
+        if not no_diff and manifest_file.exists():
+            try:
+                old_manifest = Manifest.load(str(manifest_file))
+            except Exception:
+                # If we can't load the old manifest, just skip diff
+                old_manifest = None
+
         # Parse the project
         parser = ProjectParser(
             project_name=project,
@@ -1355,7 +1375,6 @@ def parse(
         target_path.mkdir(parents=True, exist_ok=True)
 
         # Write manifest
-        manifest_file = target_path / "manifest.json"
         manifest.save(str(manifest_file))
 
         # Display results
@@ -1380,6 +1399,49 @@ def parse(
                     type_counts[node_type] = type_counts.get(node_type, 0) + 1
                 for node_type, count in sorted(type_counts.items()):
                     typer.echo(f"  - {node_type}: {count}")
+
+            # Show diff if we have an old manifest
+            if old_manifest is not None:
+                diff = ManifestDiff.compare(old_manifest, manifest)
+                typer.echo("")
+                if diff.has_changes():
+                    typer.echo(typer.style("Changes detected:", bold=True))
+
+                    # Show added nodes
+                    if diff.added_nodes:
+                        typer.echo(typer.style(f"  Added ({len(diff.added_nodes)}):", fg=typer.colors.GREEN))
+                        for node_id in sorted(diff.added_nodes.keys()):
+                            typer.echo(typer.style(f"    + {node_id}", fg=typer.colors.GREEN))
+
+                    # Show removed nodes
+                    if diff.removed_nodes:
+                        typer.echo(typer.style(f"  Removed ({len(diff.removed_nodes)}):", fg=typer.colors.RED))
+                        for node_id in sorted(diff.removed_nodes.keys()):
+                            typer.echo(typer.style(f"    - {node_id}", fg=typer.colors.RED))
+
+                    # Show modified nodes
+                    if diff.modified_nodes:
+                        typer.echo(typer.style(f"  Modified ({len(diff.modified_nodes)}):", fg=typer.colors.YELLOW))
+                        for node_id in sorted(diff.modified_nodes.keys()):
+                            change = diff.modified_nodes[node_id]
+                            fields = ", ".join(change.changed_fields)
+                            typer.echo(typer.style(f"    ~ {node_id} ({fields})", fg=typer.colors.YELLOW))
+
+                    # Show edge changes
+                    if diff.added_edges:
+                        typer.echo(typer.style(f"  Added edges ({len(diff.added_edges)}):", fg=typer.colors.GREEN))
+                        for edge in diff.added_edges:
+                            typer.echo(typer.style(f"    + {edge.from_node} -> {edge.to_node}", fg=typer.colors.GREEN))
+
+                    if diff.removed_edges:
+                        typer.echo(typer.style(f"  Removed edges ({len(diff.removed_edges)}):", fg=typer.colors.RED))
+                        for edge in diff.removed_edges:
+                            typer.echo(typer.style(f"    - {edge.from_node} -> {edge.to_node}", fg=typer.colors.RED))
+
+                    typer.echo("")
+                    typer.echo(f"Summary: {diff.summary()}")
+                else:
+                    _echo_info("No changes detected since last parse")
 
     except Exception as e:
         _echo_error(f"Parse failed: {e}")
