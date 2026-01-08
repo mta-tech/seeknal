@@ -846,6 +846,8 @@ print(credit_features)
 
 ##### Using Builder Pattern (Fluent API)
 
+The improved developer experience uses a fluent builder pattern with `.feature()` as the starting point:
+
 ```python
 from seeknal.tasks.duckdb.aggregators.second_order_aggregator import FeatureBuilder
 
@@ -853,18 +855,101 @@ from seeknal.tasks.duckdb.aggregators.second_order_aggregator import FeatureBuil
 agg = (
     SecondOrderAggregator(
         idCol="user_id",
-        featureDateCol="date",
-        applicationDateCol="app_date"
+        featureDateCol="transaction_date",
+        applicationDateCol="application_date"
     )
     .builder()
-    .addBasic(features="amount", aggregations="sum")
-    .addBasicDays(features="amount", aggregations="sum", lower=1, upper=7)
-    .addRatio(features="amount", aggregations="sum", lower1=1, upper1=7, lower2=8, upper2=30)
-    .addSince(features="flag", aggregations="count", condition="flag == 1")
+    .feature("amount")
+        .basic(["sum", "count"])
+        .rolling(days=[(1, 7), (8, 30)], aggs=["sum", "mean"])
+        .ratio(numerator=(1, 7), denominator=(8, 30), aggs=["sum"])
+        .since(condition="amount > 100", aggs=["count"])
     .build()
 )
 
 result = agg.transform("transactions")
+```
+
+**Builder Pattern Methods:**
+
+1. **`.feature(name)`** - Set the feature column to aggregate
+2. **`.basic(aggs)`** - Add basic aggregations (all history)
+3. **`.rolling(days, aggs)`** - Add time-windowed aggregations
+4. **`.ratio(numerator, denominator, aggs)`** - Add ratio of two time windows
+5. **`.since(condition, aggs)`** - Add conditional aggregations
+6. **`.build()`** - Build and return the aggregator
+
+**Complete Example with Builder:**
+
+```python
+from seeknal.tasks.duckdb.aggregators.second_order_aggregator import (
+    SecondOrderAggregator,
+    FeatureBuilder
+)
+
+agg = (
+    SecondOrderAggregator(
+        idCol="customer_id",
+        featureDateCol="transaction_date",
+        applicationDateCol="application_date"
+    )
+    .builder()
+    
+    # Amount feature aggregations
+    .feature("amount")
+        .basic(["sum", "count", "mean"])              # All history
+        .rolling(days=[(1, 7), (8, 30)], aggs=["sum"]) # Recent vs historical
+        .ratio(
+            numerator=(1, 7),                         # Recent: 1-7 days
+            denominator=(8, 30),                      # Historical: 8-30 days
+            aggs=["sum"]
+        )
+        .since(condition="amount > 1000", aggs=["count"])  # Large transactions
+    
+    # Transaction count aggregations
+    .feature("transaction_count")
+        .basic(["count"])
+        .rolling(days=[(1, 7)], aggs=["sum"])
+    
+    .build()
+)
+
+# Validate and execute
+errors = agg.validate("transactions")
+if errors:
+    print("Errors:", errors)
+else:
+    result = agg.transform("transactions")
+    features_df = result.df()
+```
+
+**Why Builder Pattern is Better:**
+
+- ✅ **Type-safe:** Methods check for valid inputs
+- ✅ **Readable:** Clear structure with indentation
+- ✅ **Maintainable:** Easy to add/remove rules
+- ✅ **Feature-grouped:** All rules for a feature are together
+- ✅ **Less repetitive:** Don't repeat feature name in each rule
+
+**Comparison:**
+
+```python
+# OLD WAY (repetitive)
+rules = [
+    AggregationSpec("basic", "amount", "sum"),
+    AggregationSpec("basic", "amount", "count"),
+    AggregationSpec("basic_days", "amount", "sum", "", 1, 7),
+    AggregationSpec("basic_days", "amount", "count", "", 1, 7),
+    AggregationSpec("ratio", "amount", "sum", "", 1, 7, 8, 30),
+]
+
+# NEW WAY (builder pattern)
+agg.builder()
+    .feature("amount")
+        .basic(["sum", "count"])
+        .rolling(days=[(1, 7)], aggs=["sum", "count"])
+        .ratio(numerator=(1, 7), denominator=(8, 30), aggs=["sum"])
+    .build()
 ```
 
 ##### Best Practices for Second Order Aggregation
