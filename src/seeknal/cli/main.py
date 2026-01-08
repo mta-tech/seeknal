@@ -1285,6 +1285,107 @@ def version_diff(
         raise typer.Exit(1)
 
 
+@app.command()
+def parse(
+    project: str = typer.Option(
+        None, "--project", "-p",
+        help="Project name (defaults to current directory name)"
+    ),
+    path: Path = typer.Option(
+        Path("."), "--path",
+        help="Project path to parse"
+    ),
+    target_path: Optional[Path] = typer.Option(
+        None, "--target", "-t",
+        help="Target directory for manifest (defaults to <path>/target)"
+    ),
+    format: OutputFormat = typer.Option(
+        OutputFormat.TABLE, "--format", "-f",
+        help="Output format: table (default) or json"
+    ),
+):
+    """
+    Parse project and generate manifest.json.
+
+    Scans the project directory for feature groups, models, and common config
+    (sources, transforms, rules) to build the complete DAG manifest. The manifest
+    is written to target/manifest.json.
+
+    This command is similar to 'dbt parse' - it builds the dependency graph
+    without executing any transformations.
+
+    Examples:
+        seeknal parse
+        seeknal parse --project my_project
+        seeknal parse --path /path/to/project
+        seeknal parse --format json
+    """
+    from seeknal.dag.parser import ProjectParser
+    import json
+
+    # Determine project name
+    if project is None:
+        project = path.resolve().name
+
+    # Determine target path
+    if target_path is None:
+        target_path = path / "target"
+
+    typer.echo(f"Parsing project: {project}")
+    typer.echo(f"  Path: {path.resolve()}")
+
+    try:
+        # Parse the project
+        parser = ProjectParser(
+            project_name=project,
+            project_path=str(path),
+            seeknal_version=_get_version()
+        )
+
+        manifest = parser.parse()
+
+        # Validate
+        errors = parser.validate()
+        if errors:
+            _echo_warning(f"Validation warnings: {len(errors)}")
+            for error in errors:
+                typer.echo(f"  - {error}")
+
+        # Create target directory
+        target_path.mkdir(parents=True, exist_ok=True)
+
+        # Write manifest
+        manifest_file = target_path / "manifest.json"
+        manifest.save(str(manifest_file))
+
+        # Display results
+        node_count = len(manifest.nodes)
+        edge_count = len(manifest.edges)
+
+        if format == OutputFormat.JSON:
+            typer.echo(manifest.to_json())
+        else:
+            typer.echo("")
+            _echo_success(f"Manifest generated: {manifest_file}")
+            typer.echo(f"  Nodes: {node_count}")
+            typer.echo(f"  Edges: {edge_count}")
+
+            # Show node summary by type
+            if node_count > 0:
+                typer.echo("")
+                typer.echo("Node Summary:")
+                type_counts = {}
+                for node in manifest.nodes.values():
+                    node_type = node.node_type.value
+                    type_counts[node_type] = type_counts.get(node_type, 0) + 1
+                for node_type, count in sorted(type_counts.items()):
+                    typer.echo(f"  - {node_type}: {count}")
+
+    except Exception as e:
+        _echo_error(f"Parse failed: {e}")
+        raise typer.Exit(1)
+
+
 def main():
     """Main entry point for the CLI."""
     app()
