@@ -597,6 +597,326 @@ result = (
 )
 ```
 
+#### 5. SecondOrderAggregator
+
+Advanced feature engineering with multiple aggregation rules and time-based filtering.
+
+**What is Second Order Aggregation?**
+
+Second Order Aggregation allows you to create complex features by applying multiple aggregation rules with different time windows and conditions. It's particularly useful for:
+
+- **Customer Behavior Analysis:** Compare spending in different time periods
+- **Risk Scoring:** Calculate ratios of recent to historical activity
+- **Churn Prediction:** Track changes in behavior patterns over time
+- **Credit Scoring:** Compare recent vs. historical transaction patterns
+
+**Supported Rule Types:**
+
+1. **basic** - Simple aggregation over all history
+2. **basic_days** - Aggregation within a time window (days since application date)
+3. **ratio** - Ratio of two aggregations over different time windows
+4. **since** - Aggregation filtered by custom condition
+
+##### Basic Usage
+
+```python
+from seeknal.tasks.duckdb.aggregators.second_order_aggregator import (
+    SecondOrderAggregator,
+    AggregationSpec
+)
+import pandas as pd
+import pyarrow as pa
+
+# Prepare transaction data with dates
+df = pd.DataFrame({
+    "user_id": ["A", "A", "A", "A", "B", "B", "B", "B"],
+    "application_date": ["2024-01-15", "2024-01-15", "2024-01-15", "2024-01-15",
+                       "2024-01-15", "2024-01-15", "2024-01-15", "2024-01-15"],
+    "transaction_date": ["2024-01-01", "2024-01-05", "2024-01-10", "2024-01-14",
+                       "2024-01-02", "2024-01-06", "2024-01-11", "2024-01-13"],
+    "amount": [100, 150, 200, 250, 80, 120, 90, 110],
+    "category": ["food", "travel", "food", "entertainment", 
+                "food", "travel", "food", "entertainment"]
+})
+
+arrow_table = pa.Table.from_pandas(df)
+
+# Create aggregator
+agg = SecondOrderAggregator(
+    idCol="user_id",
+    featureDateCol="transaction_date",
+    featureDateFormat="yyyy-MM-dd",
+    applicationDateCol="application_date",
+    applicationDateFormat="yyyy-MM-dd"
+)
+
+# Define aggregation rules
+rules = [
+    # Rule 1: Basic aggregation - total amount over all history
+    AggregationSpec(
+        name="basic",
+        features="amount",
+        aggregations="sum"
+    ),
+    
+    # Rule 2: Time-windowed aggregation - amount in last 1-7 days
+    AggregationSpec(
+        name="basic_days",
+        features="amount",
+        aggregations="sum",
+        dayLimitLower1="1",
+        dayLimitUpper1="7"
+    ),
+    
+    # Rule 3: Ratio - compare recent (1-7 days) vs. historical (8-30 days)
+    AggregationSpec(
+        name="ratio",
+        features="amount",
+        aggregations="sum",
+        dayLimitLower1="1",
+        dayLimitUpper1="7",
+        dayLimitLower2="8",
+        dayLimitUpper2="30"
+    ),
+    
+    # Rule 4: Conditional aggregation - count since condition is met
+    AggregationSpec(
+        name="since",
+        features="amount",
+        aggregations="count",
+        filterCondition="amount > 100"
+    )
+]
+
+# Set rules and transform
+agg.setRules(rules)
+
+# Register table and execute
+import duckdb
+conn = duckdb.connect()
+conn.register("transactions", arrow_table)
+
+result = agg.transform("transactions")
+
+# Get result as pandas DataFrame
+features_df = result.df()
+print(features_df)
+```
+
+**Output:**
+```
+  user_id  amount_SUM  amount_SUM_1_7  amount_SUM1_7_amount_SUM8_30  SINCE_COUNT_amount_GEO_D
+0       A         700            450                       1.8                        3
+1       B         400            200                       1.0                        0
+```
+
+**Explanation:**
+- `amount_SUM`: Total amount for each user (all history)
+- `amount_SUM_1_7`: Sum of amounts in days 1-7 before application date
+- `amount_SUM1_7_amount_SUM8_30`: Ratio of recent (1-7 days) to historical (8-30 days) spending
+- `SINCE_COUNT_amount_GEO_D`: Count of transactions where amount > 100
+
+##### Multiple Features and Aggregations
+
+```python
+# Define complex rules with multiple features and aggregations
+rules = [
+    # Total spending and count for multiple categories
+    AggregationSpec(
+        name="basic_days",
+        features="amount, transaction_count",
+        aggregations="sum, count",
+        dayLimitLower1="1",
+        dayLimitUpper1="30"
+    ),
+    
+    # Ratio of spending in two time windows
+    AggregationSpec(
+        name="ratio",
+        features="amount",
+        aggregations="sum, mean",
+        dayLimitLower1="1",
+        dayLimitUpper1="7",
+        dayLimitLower2="8",
+        dayLimitUpper2="30"
+    )
+]
+
+agg.setRules(rules)
+result = agg.transform("transactions")
+features_df = result.df()
+
+# Output columns:
+# - amount_SUM_1_30
+# - amount_COUNT_1_30
+# - transaction_count_SUM_1_30
+# - transaction_count_COUNT_1_30
+# - amount_SUM1_7_amount_SUM8_30
+# - amount_MEAN1_7_amount_MEAN8_30
+```
+
+##### Real-World Example: Credit Scoring Features
+
+```python
+# Transaction data for credit scoring
+df = pd.DataFrame({
+    "customer_id": ["C001", "C001", "C001", "C001", "C001",
+                   "C002", "C002", "C002", "C002", "C002"],
+    "application_date": ["2024-01-15"] * 10,
+    "transaction_date": ["2024-01-01", "2024-01-05", "2024-01-10", "2024-01-12", "2024-01-14",
+                       "2024-01-02", "2024-01-06", "2024-01-09", "2024-01-11", "2024-01-13"],
+    "transaction_amount": [5000, 3000, 2000, 4000, 6000,
+                         1000, 1500, 1200, 1800, 2000],
+    "is_large_transaction": [1, 0, 0, 1, 1, 0, 0, 0, 0, 0]
+})
+
+arrow_table = pa.Table.from_pandas(df)
+
+# Create credit scoring features
+agg = SecondOrderAggregator(
+    idCol="customer_id",
+    featureDateCol="transaction_date",
+    featureDateFormat="yyyy-MM-dd",
+    applicationDateCol="application_date",
+    applicationDateFormat="yyyy-MM-dd"
+)
+
+# Credit scoring rules
+credit_rules = [
+    # Recent activity (last 7 days)
+    AggregationSpec(
+        name="basic_days",
+        features="transaction_amount",
+        aggregations="sum, count, mean",
+        dayLimitLower1="1",
+        dayLimitUpper1="7"
+    ),
+    
+    # Historical activity (8-30 days)
+    AggregationSpec(
+        name="basic_days",
+        features="transaction_amount",
+        aggregations="sum, count",
+        dayLimitLower1="8",
+        dayLimitUpper1="30"
+    ),
+    
+    # Ratio: Recent vs Historical (behavior change indicator)
+    AggregationSpec(
+        name="ratio",
+        features="transaction_amount",
+        aggregations="sum",
+        dayLimitLower1="1",
+        dayLimitUpper1="7",
+        dayLimitLower2="8",
+        dayLimitUpper2="30"
+    ),
+    
+    # Large transaction count (risk indicator)
+    AggregationSpec(
+        name="since",
+        features="is_large_transaction",
+        aggregations="sum",
+        filterCondition="is_large_transaction == 1"
+    )
+]
+
+agg.setRules(credit_rules)
+
+conn = duckdb.connect()
+conn.register("credit_transactions", arrow_table)
+
+result = agg.transform("credit_transactions")
+credit_features = result.df()
+
+print(credit_features)
+```
+
+**Output:**
+```
+  customer_id  transaction_amount_SUM_1_7  transaction_amount_COUNT_1_7  ...  SINCE_SUM_is_large_transaction_GEO_D
+0        C001                      15000                             3  ...                                     2
+1        C002                       5000                             2  ...                                     0
+```
+
+**Feature Interpretation:**
+- High recent transaction sum + high ratio = **Active customer** (good for credit limit increase)
+- Low ratio (recent/historical) = **Declining activity** (potential churn risk)
+- High large transaction count = **High-value customer** (or potential fraud risk)
+
+##### Using Builder Pattern (Fluent API)
+
+```python
+from seeknal.tasks.duckdb.aggregators.second_order_aggregator import FeatureBuilder
+
+# Use builder pattern for complex rule definitions
+agg = (
+    SecondOrderAggregator(
+        idCol="user_id",
+        featureDateCol="date",
+        applicationDateCol="app_date"
+    )
+    .builder()
+    .addBasic(features="amount", aggregations="sum")
+    .addBasicDays(features="amount", aggregations="sum", lower=1, upper=7)
+    .addRatio(features="amount", aggregations="sum", lower1=1, upper1=7, lower2=8, upper2=30)
+    .addSince(features="flag", aggregations="count", condition="flag == 1")
+    .build()
+)
+
+result = agg.transform("transactions")
+```
+
+##### Best Practices for Second Order Aggregation
+
+1. **Choose Appropriate Time Windows:**
+   - Short-term (1-7 days): Recent behavior patterns
+   - Medium-term (8-30 days): Medium-term trends
+   - Long-term (31-90 days): Historical baseline
+
+2. **Use Ratios for Trend Analysis:**
+   ```python
+   # Behavior change detection
+   AggregationSpec(
+       name="ratio",
+       features="amount",
+       aggregations="sum",
+       dayLimitLower1="1",   # Recent: 1-7 days
+       dayLimitUpper1="7",
+       dayLimitLower2="8",   # Historical: 8-30 days
+       dayLimitUpper2="30"
+   )
+   # Ratio > 1.0: Increasing activity (good)
+   # Ratio < 1.0: Decreasing activity (churn risk)
+   ```
+
+3. **Combine Multiple Rules:**
+   ```python
+   rules = [
+       # Volume metrics
+       AggregationSpec("basic_days", "amount", "sum", "", 1, 30),
+       
+       # Frequency metrics
+       AggregationSpec("basic_days", "transaction_id", "count", "", 1, 30),
+       
+       # Trend metrics
+       AggregationSpec("ratio", "amount", "sum", "", 1, 7, 8, 30),
+       
+       # Quality metrics
+       AggregationSpec("since", "large_amount", "count", "large_amount == 1")
+   ]
+   ```
+
+4. **Validate Input Data:**
+   ```python
+   # Always validate before processing
+   errors = agg.validate("transactions")
+   if errors:
+       print("Validation errors:", errors)
+   else:
+       result = agg.transform("transactions")
+   ```
+
 ---
 
 ## Feature Store with DuckDB
