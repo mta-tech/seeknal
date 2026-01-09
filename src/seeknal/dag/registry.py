@@ -7,7 +7,7 @@ or use_rule() are called, they register their dependencies here.
 """
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Optional
 from threading import Lock
 
 
@@ -20,13 +20,13 @@ class DependencyType(Enum):
     AGGREGATION = "aggregation"
 
 
-@dataclass
+@dataclass(slots=True)
 class Dependency:
     """A single dependency relationship."""
     node_id: str
     dependency_id: str
     dependency_type: DependencyType
-    params: Dict = field(default_factory=dict)
+    params: dict[str, Any] = field(default_factory=dict)
 
 
 class DependencyRegistry:
@@ -43,10 +43,10 @@ class DependencyRegistry:
     _instance: Optional["DependencyRegistry"] = None
     _lock: Lock = Lock()
 
-    def __init__(self):
-        self._dependencies: List[Dependency] = []
+    def __init__(self) -> None:
+        self._dependencies: list[Dependency] = []
         self._current_node: Optional[str] = None
-        self._node_dependencies: Dict[str, List[Dependency]] = {}
+        self._node_dependencies: dict[str, list[Dependency]] = {}
 
     @classmethod
     def get_instance(cls) -> "DependencyRegistry":
@@ -66,24 +66,27 @@ class DependencyRegistry:
 
     def set_current_node(self, node_id: str) -> None:
         """Set the current node context for dependency registration."""
-        self._current_node = node_id
-        if node_id not in self._node_dependencies:
-            self._node_dependencies[node_id] = []
+        with self._lock:
+            self._current_node = node_id
+            if node_id not in self._node_dependencies:
+                self._node_dependencies[node_id] = []
 
     def get_current_node(self) -> Optional[str]:
         """Get the current node context."""
-        return self._current_node
+        with self._lock:
+            return self._current_node
 
     def clear_current_node(self) -> None:
         """Clear the current node context."""
-        self._current_node = None
+        with self._lock:
+            self._current_node = None
 
     def register_dependency(
         self,
         node_id: str,
         dependency_id: str,
         dependency_type: DependencyType,
-        params: Optional[Dict] = None
+        params: Optional[dict[str, Any]] = None
     ) -> Dependency:
         """
         Register a dependency.
@@ -112,22 +115,13 @@ class DependencyRegistry:
 
         return dep
 
-    def get_dependencies_for_node(self, node_id: str) -> List[Dependency]:
+    def get_dependencies_for_node(self, node_id: str) -> list[Dependency]:
         """Get all dependencies for a specific node."""
-        return self._node_dependencies.get(node_id, [])
+        with self._lock:
+            deps = self._node_dependencies.get(node_id, [])
+            return deps.copy()
 
-    def get_all_dependencies(self) -> List[Dependency]:
+    def get_all_dependencies(self) -> list[Dependency]:
         """Get all registered dependencies."""
-        return self._dependencies.copy()
-
-    def get_dependency_graph(self) -> Dict[str, List[str]]:
-        """
-        Get the dependency graph as adjacency list.
-
-        Returns:
-            Dict mapping node_id to list of dependency_ids
-        """
-        graph = {}
-        for node_id, deps in self._node_dependencies.items():
-            graph[node_id] = [d.dependency_id for d in deps]
-        return graph
+        with self._lock:
+            return self._dependencies.copy()

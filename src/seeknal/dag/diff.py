@@ -10,11 +10,12 @@ Compares two manifests to detect what has changed:
 
 This enables incremental rebuilds - only re-process what changed.
 """
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any
 
-from seeknal.dag.manifest import Manifest, Node, Edge
+from seeknal.dag.manifest import Manifest, Node
 
 
 class DiffType(Enum):
@@ -24,17 +25,17 @@ class DiffType(Enum):
     MODIFIED = "modified"
 
 
-@dataclass
+@dataclass(slots=True)
 class NodeChange:
     """Represents a change to a node."""
     node_id: str
     change_type: DiffType
     old_value: Any = None
     new_value: Any = None
-    changed_fields: List[str] = field(default_factory=list)
+    changed_fields: list[str] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(slots=True)
 class EdgeChange:
     """Represents a change to an edge."""
     from_node: str
@@ -49,11 +50,11 @@ class ManifestDiff:
 
     Contains lists of all changes detected between the old and new manifests.
     """
-    added_nodes: Dict[str, Node] = field(default_factory=dict)
-    removed_nodes: Dict[str, Node] = field(default_factory=dict)
-    modified_nodes: Dict[str, NodeChange] = field(default_factory=dict)
-    added_edges: List[EdgeChange] = field(default_factory=list)
-    removed_edges: List[EdgeChange] = field(default_factory=list)
+    added_nodes: dict[str, Node] = field(default_factory=dict)
+    removed_nodes: dict[str, Node] = field(default_factory=dict)
+    modified_nodes: dict[str, NodeChange] = field(default_factory=dict)
+    added_edges: list[EdgeChange] = field(default_factory=list)
+    removed_edges: list[EdgeChange] = field(default_factory=list)
 
     @classmethod
     def compare(cls, old: Manifest, new: Manifest) -> "ManifestDiff":
@@ -118,7 +119,7 @@ class ManifestDiff:
         return diff
 
     @staticmethod
-    def _compare_nodes(old: Node, new: Node) -> List[str]:
+    def _compare_nodes(old: Node, new: Node) -> list[str]:
         """
         Compare two nodes and return list of changed fields.
 
@@ -136,11 +137,11 @@ class ManifestDiff:
             "name", "node_type", "description", "owner", "tags", "config"
         ]
 
-        for field in fields_to_compare:
-            old_val = getattr(old, field, None)
-            new_val = getattr(new, field, None)
+        for field_name in fields_to_compare:
+            old_val = getattr(old, field_name, None)
+            new_val = getattr(new, field_name, None)
             if old_val != new_val:
-                changed.append(field)
+                changed.append(field_name)
 
         # Compare columns separately (dict comparison)
         if old.columns != new.columns:
@@ -158,7 +159,7 @@ class ManifestDiff:
             self.removed_edges
         )
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
             "added_nodes": list(self.added_nodes.keys()),
@@ -194,19 +195,20 @@ class ManifestDiff:
 
         return ", ".join(parts)
 
-    def get_affected_nodes(self) -> Set[str]:
+    def get_affected_nodes(self) -> set[str]:
         """Get all node IDs affected by changes (added, removed, or modified)."""
-        affected = set()
+        affected: set[str] = set()
         affected.update(self.added_nodes.keys())
         affected.update(self.removed_nodes.keys())
         affected.update(self.modified_nodes.keys())
         return affected
 
-    def get_nodes_to_rebuild(self, manifest: Manifest) -> Set[str]:
+    def get_nodes_to_rebuild(self, manifest: Manifest) -> set[str]:
         """
         Get nodes that need to be rebuilt based on changes.
 
         This includes directly changed nodes and their downstream dependents.
+        Uses iterative BFS to avoid Python recursion limit issues.
 
         Args:
             manifest: The new manifest to use for dependency analysis
@@ -214,27 +216,20 @@ class ManifestDiff:
         Returns:
             Set of node IDs that need rebuilding
         """
-        to_rebuild = set()
+        to_rebuild: set[str] = set()
 
         # Start with directly affected nodes
         affected = self.get_affected_nodes()
         to_rebuild.update(affected)
 
-        # Add downstream dependents
-        for node_id in affected:
-            self._add_downstream_recursive(node_id, manifest, to_rebuild)
+        # Add downstream dependents using iterative BFS
+        queue: deque[str] = deque(affected)
+        while queue:
+            node_id = queue.popleft()
+            downstream = manifest.get_downstream_nodes(node_id)
+            for downstream_id in downstream:
+                if downstream_id not in to_rebuild:
+                    to_rebuild.add(downstream_id)
+                    queue.append(downstream_id)
 
         return to_rebuild
-
-    def _add_downstream_recursive(
-        self,
-        node_id: str,
-        manifest: Manifest,
-        to_rebuild: Set[str]
-    ) -> None:
-        """Recursively add downstream nodes to the rebuild set."""
-        downstream = manifest.get_downstream_nodes(node_id)
-        for downstream_id in downstream:
-            if downstream_id not in to_rebuild:
-                to_rebuild.add(downstream_id)
-                self._add_downstream_recursive(downstream_id, manifest, to_rebuild)

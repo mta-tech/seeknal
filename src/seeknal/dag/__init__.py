@@ -5,9 +5,11 @@ from seeknal.dag.functions import (
     ref,
     use_transform,
     use_rule,
+    use_aggregation,
     SourceReference,
     NodeReference,
     RuleExpression,
+    AggregationReference,
 )
 from seeknal.dag.manifest import (
     Manifest,
@@ -16,6 +18,8 @@ from seeknal.dag.manifest import (
     NodeType,
     Edge,
 )
+from seeknal.dag.parser import ProjectParser
+from seeknal.dag.diff import ManifestDiff, DiffType, NodeChange, EdgeChange
 
 __all__ = [
     # Registry
@@ -27,13 +31,22 @@ __all__ = [
     "ref",
     "use_transform",
     "use_rule",
+    "use_aggregation",
     "SourceReference",
     "NodeReference",
     "RuleExpression",
+    "AggregationReference",
     # Manifest
     "Manifest",
     "ManifestMetadata",
     "Node",
     "NodeType",
     "Edge",
+    # Parser
+    "ProjectParser",
+    # Diff
+    "ManifestDiff",
+    "DiffType",
+    "NodeChange",
+    "EdgeChange",
 ]

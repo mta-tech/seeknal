@@ -4,12 +4,11 @@ Project parser for Seeknal 2.0.
 Parses the project structure, common config, and Python files
 to build the complete DAG manifest.
 """
-import os
 import yaml
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
-from seeknal.dag.manifest import Manifest, Node, NodeType, Edge
+from seeknal.dag.manifest import Manifest, Node, NodeType
 
 
 class ProjectParser:
@@ -29,16 +28,35 @@ class ProjectParser:
         project_path: Optional[str] = None,
         seeknal_version: str = "2.0.0"
     ):
+        """Initialize the parser.
+
+        Args:
+            project_name: Name of the project.
+            project_path: Path to the project directory.
+            seeknal_version: Version of Seeknal.
+
+        Raises:
+            ValueError: If the project path contains path traversal sequences.
+        """
         self.project_name = project_name
-        self.project_path = Path(project_path) if project_path else Path.cwd()
+
+        # Validate and resolve project path
+        if project_path:
+            path = Path(project_path)
+            if ".." in path.parts:
+                raise ValueError("Invalid project path: path traversal not allowed")
+            self.project_path = path.resolve()
+        else:
+            self.project_path = Path.cwd()
+
         self.seeknal_version = seeknal_version
         self.manifest = Manifest(
             project=project_name,
             seeknal_version=seeknal_version
         )
-        self._pending_references: List[Tuple[str, str, str]] = []
-        self._errors: List[str] = []
-        self._warnings: List[str] = []
+        self._pending_references: list[tuple[str, str, str]] = []
+        self._errors: list[str] = []
+        self._warnings: list[str] = []
 
     def parse(self) -> Manifest:
         """
@@ -64,14 +82,18 @@ class ProjectParser:
         if not common_path.exists():
             return
 
-        with open(common_path, "r") as f:
+        with open(common_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
 
         # Parse sources
-        for source_config in config.get("sources", []):
+        for idx, source_config in enumerate(config.get("sources", [])):
+            source_id = source_config.get("id")
+            if not source_id:
+                self._errors.append(f"Source at index {idx} is missing required 'id' field")
+                continue
             node = Node(
-                id=f"source.{source_config['id']}",
-                name=source_config["id"],
+                id=f"source.{source_id}",
+                name=source_id,
                 node_type=NodeType.SOURCE,
                 description=source_config.get("description"),
                 config={
@@ -83,10 +105,14 @@ class ProjectParser:
             self.manifest.add_node(node)
 
         # Parse transformations
-        for transform_config in config.get("transformations", []):
+        for idx, transform_config in enumerate(config.get("transformations", [])):
+            transform_id = transform_config.get("id")
+            if not transform_id:
+                self._errors.append(f"Transform at index {idx} is missing required 'id' field")
+                continue
             node = Node(
-                id=f"transform.{transform_config['id']}",
-                name=transform_config["id"],
+                id=f"transform.{transform_id}",
+                name=transform_id,
                 node_type=NodeType.TRANSFORM,
                 description=transform_config.get("description"),
                 config={
@@ -97,10 +123,14 @@ class ProjectParser:
             self.manifest.add_node(node)
 
         # Parse rules
-        for rule_config in config.get("rules", []):
+        for idx, rule_config in enumerate(config.get("rules", [])):
+            rule_id = rule_config.get("id")
+            if not rule_id:
+                self._errors.append(f"Rule at index {idx} is missing required 'id' field")
+                continue
             node = Node(
-                id=f"rule.{rule_config['id']}",
-                name=rule_config["id"],
+                id=f"rule.{rule_id}",
+                name=rule_id,
                 node_type=NodeType.RULE,
                 description=rule_config.get("description"),
                 config={
@@ -110,24 +140,28 @@ class ProjectParser:
             self.manifest.add_node(node)
 
         # Parse aggregations (if present)
-        for agg_config in config.get("aggregations", []):
+        for idx, agg_config in enumerate(config.get("aggregations", [])):
+            agg_id = agg_config.get("id")
+            if not agg_id:
+                self._errors.append(f"Aggregation at index {idx} is missing required 'id' field")
+                continue
             node = Node(
-                id=f"aggregation.{agg_config['id']}",
-                name=agg_config["id"],
+                id=f"aggregation.{agg_id}",
+                name=agg_id,
                 node_type=NodeType.AGGREGATION,
                 description=agg_config.get("description"),
                 config=agg_config,
             )
             self.manifest.add_node(node)
 
-    def validate(self) -> List[str]:
+    def validate(self) -> list[str]:
         """
         Validate the parsed manifest.
 
         Returns:
             List of validation errors
         """
-        errors = []
+        errors: list[str] = []
 
         # Check for missing references
         for node_id, ref_id, ref_type in self._pending_references:
@@ -143,10 +177,10 @@ class ProjectParser:
 
         return errors
 
-    def get_warnings(self) -> List[str]:
+    def get_warnings(self) -> list[str]:
         """Get parsing warnings."""
         return self._warnings.copy()
 
-    def get_errors(self) -> List[str]:
+    def get_errors(self) -> list[str]:
         """Get parsing errors."""
         return self._errors.copy()

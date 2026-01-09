@@ -218,7 +218,7 @@ def test_phase_5_complex_aggregators():
 
 def test_phase_6_window_functions():
     """Test Phase 6: Window functions."""
-    print("\n" " + "=" * 60)
+    print("\n" + "=" * 60)
     print("TESTING PHASE 6: WINDOW FUNCTIONS")
     print("=" * 60)
 
