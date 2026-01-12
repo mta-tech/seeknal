@@ -171,6 +171,44 @@ class FlowOutput:
     value: Optional[Any] = None
     kind: Optional[FlowOutputEnum] = None
 
+    def _to_spark_dataframe(self, result: Union[DataFrame, pa.Table], spark: SparkSession) -> DataFrame:
+        """Convert result to Spark DataFrame."""
+        if isinstance(result, DataFrame):
+            return result
+        return spark.createDataFrame(result.to_pandas())
+
+    def _to_arrow_table(self, result: Union[DataFrame, pa.Table]) -> pa.Table:
+        """Convert result to PyArrow Table."""
+        if isinstance(result, pa.Table):
+            return result
+        if isinstance(result, DataFrame):
+            return pa.Table.from_pandas(result.toPandas())
+        return result
+
+    def _to_pandas_dataframe(self, result: Union[DataFrame, pa.Table]):
+        """Convert result to Pandas DataFrame."""
+        if isinstance(result, pa.Table):
+            return result.to_pandas()
+        if isinstance(result, DataFrame):
+            return result.toPandas()
+        return result
+
+    def _write_to_hive(self, result: Union[DataFrame, pa.Table], spark: SparkSession, table_name: str) -> None:
+        """Write result to a Hive table."""
+        df = self._to_spark_dataframe(result, spark) if spark else result
+        df.write.saveAsTable(table_name)
+
+    def _write_parquet(self, result: Union[DataFrame, pa.Table], spark: SparkSession, path: str) -> None:
+        """Write result to Parquet files."""
+        df = self._to_spark_dataframe(result, spark) if spark else result
+        df.write.parquet(path)
+
+    def _write_with_loader(self, result: Union[DataFrame, pa.Table], spark: SparkSession, loader) -> None:
+        """Write result using a custom loader."""
+        from .tasks.sparkengine import SparkEngineTask
+        df = self._to_spark_dataframe(result, spark) if spark else result
+        SparkEngineTask().add_input(dataframe=df).add_output(loader=loader).transform(materialize=True)
+
     def __call__(
         self, result: Union[DataFrame, pa.Table], spark: Optional[SparkSession] = None
     ):
@@ -188,54 +226,21 @@ class FlowOutput:
             The processed result in the specified format, or None if the
             output was written to storage (HIVE_TABLE, PARQUET, LOADER).
         """
-        match self.kind:
-            case FlowOutputEnum.SPARK_DATAFRAME:
-                if not isinstance(result, DataFrame):
-                    # try convert to spark dataframe
-                    return spark.createDataFrame(result.to_pandas())
-                return result
-            case FlowOutputEnum.ARROW_DATAFRAME:
-                if not isinstance(result, pa.Table):
-                    # try convert to arrow dataframe
-                    if isinstance(self, DataFrame):
-                        _temp_data = result.toPandas()
-                        return pa.Table.from_pandas(_temp_data)
-                return result
-            case FlowOutputEnum.PANDAS_DATAFRAME:
-                if not isinstance(result, pa.Table):
-                    # try convert to pandas dataframe
-                    if isinstance(self, DataFrame):
-                        return result.toPandas()
-                else:
-                    return result.to_pandas()
-            case FlowOutputEnum.HIVE_TABLE:
-                if not isinstance(result, DataFrame):
-                    # try convert to spark dataframe
-                    _temp_data = spark.createDataFrame(result)
-                    _temp_data.write.saveAsTable(self.value)
-                else:
-                    result.write.saveAsTable(self.value)
-                return None
-            case FlowOutputEnum.PARQUET:
-                if not isinstance(result, DataFrame):
-                    # try convert to spark dataframe
-                    _temp_data = spark.createDataFrame(result)
-                    _temp_data.write.parquet(self.value)
-                else:
-                    result.write.parquet(self.value)
-                return None
-            case FlowOutputEnum.LOADER:
-                _temp_data = result
-                if not isinstance(result, DataFrame):
-                    # try convert to spark dataframe
-                    _temp_data = spark.createDataFrame(result)
+        if self.kind is None:
+            return result
 
-                SparkEngineTask().add_input(dataframe=_temp_data).add_output(
-                    loader=self.value
-                ).transform(materialize=True)
-                return None
-            case None:
-                return result
+        converters = {
+            FlowOutputEnum.SPARK_DATAFRAME: lambda r: self._to_spark_dataframe(r, spark) if spark else r,
+            FlowOutputEnum.ARROW_DATAFRAME: self._to_arrow_table,
+            FlowOutputEnum.PANDAS_DATAFRAME: self._to_pandas_dataframe,
+            FlowOutputEnum.HIVE_TABLE: lambda r: self._write_to_hive(r, spark, self.value),
+            FlowOutputEnum.PARQUET: lambda r: self._write_parquet(r, spark, self.value),
+            FlowOutputEnum.LOADER: lambda r: self._write_with_loader(r, spark, self.value),
+        }
+
+        converter = converters.get(self.kind)
+        if converter:
+            return converter(result)
         return None
 
 
@@ -335,6 +340,21 @@ class Flow:
         }
         return self
 
+    def _requires_spark(self) -> bool:
+        """Check if the flow requires Spark session.
+
+        Determines whether a Spark session is needed based on the input type
+        and whether any tasks are Spark jobs.
+
+        Returns:
+            True if Spark is required, False otherwise.
+        """
+        if self.input.kind in VALID_SPARK_INPUT:
+            return True
+        if self.tasks:
+            return any(task.is_spark_job for task in self.tasks)
+        return False
+
     def run(self, params=None, filters=None, date=None, start_date=None, end_date=None):
         """Execute the flow pipeline.
 
@@ -358,22 +378,7 @@ class Flow:
             >>> # Run with parameters
             >>> result = flow.run(params={"threshold": 0.5})
         """
-        # check whether at least one task is a spark job
-        has_spark_job = False
-        if (self.tasks is not None) or (self.input.kind in VALID_SPARK_INPUT):
-            if self.tasks is not None:
-                for task in self.tasks:
-                    if task.is_spark_job:
-                        has_spark_job = True
-                        break
-            if self.input.kind in VALID_SPARK_INPUT:
-                has_spark_job = True
-            if has_spark_job:
-                spark = SparkSession.builder.getOrCreate()
-            else:
-                spark = None
-        else:
-            spark = None
+        spark = SparkSession.builder.getOrCreate() if self._requires_spark() else None
         # taking care the input
         # load data and applying filters
         flow_input = self.input(spark)

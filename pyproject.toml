@@ -11,6 +11,7 @@ authors = [
 ]
 readme = "README.md"
 requires-python = ">=3.11"
+scripts = { seeknal = "seeknal.cli.main:main" }
 dependencies = [
     "delta-spark==3.2.0",
     "duckdb>=1.1.3",
@@ -53,3 +54,24 @@ packages = ["src/seeknal"]
 [tool.hatch.build]
 include-package-data = true
 packages = ["src/seeknal"]
+
+# Pytest configuration
+[tool.pytest.ini_options]
+# Test paths and discovery
+testpaths = ["src/tests"]
+pythonpath = ["src"]
+
+# Test output options
+addopts = [
+    "-v",                    # verbose output
+    "--tb=short",            # shorter traceback format
+    "--strict-markers",       # error on unknown markers
+    "--disable-warnings",    # disable warnings during test runs
+]
+
+# Ignore slow tests by default
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "e2e: marks tests as end-to-end tests",
+]

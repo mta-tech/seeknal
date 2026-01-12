@@ -158,11 +158,23 @@ class Manifest:
         return self.nodes.get(node_id)
 
     def _invalidate_node_cache(self, node_id: str) -> None:
-        """Invalidate cache for a specific node (and its neighbors)."""
-        # For simplicity, clear all caches when graph structure changes
-        # A more sophisticated approach would track specific invalidations
-        self._upstream_cache.clear()
-        self._downstream_cache.clear()
+        """Invalidate cache for nodes affected by a change to node_id.
+
+        Clears caches for the node and all its upstream and downstream neighbors,
+        providing more efficient cache management than clearing all caches.
+
+        Args:
+            node_id: The ID of the node that changed.
+        """
+        # Collect all affected nodes: the node itself and all its neighbors
+        affected_nodes = {node_id}
+        affected_nodes.update(self.get_upstream_nodes(node_id))
+        affected_nodes.update(self.get_downstream_nodes(node_id))
+
+        # Clear caches only for affected nodes
+        for node in affected_nodes:
+            self._upstream_cache.pop(node, None)
+            self._downstream_cache.pop(node, None)
 
     def _build_adjacency_lists(self) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
         """Build upstream and downstream adjacency lists."""

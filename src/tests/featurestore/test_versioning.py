@@ -7,6 +7,7 @@ Tests cover:
 - compare_schemas(): Correctly parses and compares Avro schemas
 """
 import json
+import os
 from datetime import datetime
 
 import pytest
@@ -23,7 +24,11 @@ from seeknal.request import FeatureGroupRequest
 @pytest.fixture(scope="module")
 def input_data_spark(spark):
     """Load test data into Spark and create a Hive table."""
-    comm_day = spark.read.format("parquet").load("tests/data/feateng_comm_day")
+    # Get path relative to this test file
+    # __file__ is src/tests/featurestore/test_versioning.py, go up two levels to src/tests
+    tests_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_path = os.path.join(tests_dir, "data", "feateng_comm_day")
+    comm_day = spark.read.format("parquet").load(data_path)
     comm_day.write.mode("overwrite").saveAsTable("comm_day_versioning")
 
 

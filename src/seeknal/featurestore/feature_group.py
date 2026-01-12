@@ -78,44 +78,41 @@ class Materialization(BaseModel):
     }
 
 
-def require_saved(func):
-    def wrapper(self, *args, **kwargs):
-        if not "feature_group_id" in vars(self):
-            raise ValueError("Feature group is not loaded or saved")
-        else:
-            func(self, *args, **kwargs)
+def _require_attribute(attr_name: str, error_msg: str):
+    """Factory for creating requirement-checking decorators.
 
-    return wrapper
+    This factory creates decorators that verify a specific attribute
+    is set (not None) before allowing the decorated method to execute.
+    This provides consistent validation across the codebase.
+
+    Args:
+        attr_name: The name of the attribute to check.
+        error_msg: The error message to raise if the attribute is None.
+
+    Returns:
+        A decorator function that can be applied to methods.
+
+    Example:
+        >>> # Create a specific requirement decorator
+        >>> require_saved = _require_attribute("feature_group_id", "Not saved")
+    """
+    from functools import wraps
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            if getattr(self, attr_name, None) is None:
+                raise ValueError(error_msg)
+            return func(self, *args, **kwargs)
+        return wrapper
+    return decorator
 
 
-def require_set_source(func):
-    def wrapper(self, *args, **kwargs):
-        if self.source is None:
-            raise ValueError("Source is not set")
-        else:
-            func(self, *args, **kwargs)
-
-    return wrapper
-
-
-def require_set_features(func):
-    def wrapper(self, *args, **kwargs):
-        if self.features is None:
-            raise ValueError("Features are not set")
-        else:
-            func(self, *args, **kwargs)
-
-    return wrapper
-
-
-def require_set_entity(func):
-    def wrapper(self, *args, **kwargs):
-        if self.entity is None:
-            raise ValueError("Entity is not set")
-        else:
-            func(self, *args, **kwargs)
-
-    return wrapper
+# Specific requirement decorators using the factory pattern
+require_saved = _require_attribute("feature_group_id", "Feature group is not loaded or saved")
+require_set_source = _require_attribute("source", "Source is not set")
+require_set_features = _require_attribute("features", "Features are not set")
+require_set_entity = _require_attribute("entity", "Entity is not set")
 
 
 @dataclass
@@ -546,8 +543,10 @@ class FeatureGroup(FeatureStore):
             if self.materialization.offline_materialization.store is not None
             else None
         )
-        materialization_params["online_materialization"]["store"] = asdict(
-            self.materialization.online_materialization.store
+        materialization_params["online_materialization"]["store"] = (
+            asdict(self.materialization.online_materialization.store)
+            if self.materialization.online_materialization.store is not None
+            else None
         )
 
         body = {
@@ -679,11 +678,14 @@ class FeatureGroup(FeatureStore):
                 elif key == "online_materialization":
                     for k, v in value.items():
                         if k == "store":
-                            self.materialization.online_materialization.store = (
-                                OnlineStore(
-                                    kind=OnlineStoreEnum(v["kind"]), value=v["value"]
+                            if v is not None:
+                                self.materialization.online_materialization.store = (
+                                    OnlineStore(
+                                        kind=OnlineStoreEnum(v["kind"]), value=v["value"]
+                                    )
                                 )
-                            )
+                            else:
+                                self.materialization.online_materialization.store = None
                         else:
                             setattr(self.materialization.online_materialization, k, v)
                 else:
@@ -763,8 +765,10 @@ class FeatureGroup(FeatureStore):
             if self.materialization.offline_materialization.store is not None
             else None
         )
-        materialization_params["online_materialization"]["store"] = asdict(
-            self.materialization.online_materialization.store
+        materialization_params["online_materialization"]["store"] = (
+            asdict(self.materialization.online_materialization.store)
+            if self.materialization.online_materialization.store is not None
+            else None
         )
 
         body = {

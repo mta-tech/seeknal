@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 import logging
+import os
 
 import pytest
 from seeknal.entity import Entity
@@ -32,7 +33,11 @@ from .conftest import are_equal, file_from_string
 
 @pytest.fixture(scope="module")
 def input_data_spark(spark):
-    comm_day = spark.read.format("parquet").load("tests/data/feateng_comm_day")
+    # Get path relative to this test file
+    # __file__ is src/tests/test_feature_group.py, go up one level to src/tests
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    data_path = os.path.join(tests_dir, "data", "feateng_comm_day")
+    comm_day = spark.read.format("parquet").load(data_path)
     comm_day.write.saveAsTable("comm_day")
 
 

@@ -6,6 +6,7 @@ connection URLs, ensuring that sensitive credentials (such as authToken)
 are not exposed in logs, error messages, or debugging output.
 """
 
+import os
 import re
 from contextlib import contextmanager
 from functools import wraps
@@ -344,9 +345,17 @@ def build_database_url(
         db_url = f"sqlite+{turso_database_url}/?authToken={turso_auth_token}&secure=true"
     elif local_db_path is not None:
         # Local SQLite database configuration
+        local_db_path = os.path.expanduser(local_db_path)
+        local_dir = os.path.dirname(local_db_path)
+        if local_dir:
+            os.makedirs(local_dir, exist_ok=True)
         db_url = f"sqlite:///{local_db_path}"
     elif default_db_path is not None:
         # Default fallback SQLite database
+        default_db_path = os.path.expanduser(default_db_path)
+        default_dir = os.path.dirname(default_db_path)
+        if default_dir:
+            os.makedirs(default_dir, exist_ok=True)
         db_url = f"sqlite:///{default_db_path}"
     else:
         raise ValueError(
@@ -500,11 +509,11 @@ def sanitize_database_exceptions(
             sanitized_args = (sanitize_error_message(error_message),)
 
         # Re-raise as DatabaseSecurityError with sanitized message
-        # PRINT THE ORIGINAL ERROR FOR DEBUGGING
-        print(f"DEBUG: Database Error caught: {e}")
+        # Log the original error for debugging
+        logger.debug(f"Database Error caught: {e}")
         if hasattr(e, 'orig'):
-            print(f"DEBUG: Original DBAPI error: {e.orig}")
-            
+            logger.debug(f"Original DBAPI error: {e.orig}")
+
         raise DatabaseSecurityError(
             sanitize_error_message(error_message),
             original_exception=e

@@ -34,7 +34,7 @@ class TestVersionListCommand:
         assert "--format" in result.stdout
         assert "--limit" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_table_format(self, mock_fg_class):
         """Version list command should display versions in table format."""
         # Setup mock
@@ -54,7 +54,7 @@ class TestVersionListCommand:
         assert "Created At" in result.stdout
         assert "Features" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_json_format(self, mock_fg_class):
         """Version list command should display versions in JSON format."""
         # Setup mock
@@ -74,7 +74,7 @@ class TestVersionListCommand:
         assert len(output) == 2
         assert output[0]["version"] == 2
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_with_limit(self, mock_fg_class):
         """Version list command should respect limit option."""
         # Setup mock with 5 versions
@@ -98,7 +98,7 @@ class TestVersionListCommand:
         assert output[0]["version"] == 5
         assert output[1]["version"] == 4
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_empty_versions(self, mock_fg_class):
         """Version list command should handle feature group with no versions."""
         mock_fg = mock.MagicMock()
@@ -110,7 +110,7 @@ class TestVersionListCommand:
         assert result.exit_code == 0
         assert "No versions found" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_handles_error(self, mock_fg_class):
         """Version list command should handle errors gracefully."""
         mock_fg_class.return_value.get_or_create.side_effect = Exception(
@@ -139,7 +139,7 @@ class TestVersionShowCommand:
         assert "--version" in result.stdout
         assert "--format" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_show_displays_version_details(self, mock_fg_class):
         """Version show command should display version details."""
         mock_fg = mock.MagicMock()
@@ -167,7 +167,7 @@ class TestVersionShowCommand:
         assert "Created At:" in result.stdout
         assert "Feature Count:" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_show_displays_schema_fields(self, mock_fg_class):
         """Version show command should display schema fields."""
         mock_fg = mock.MagicMock()
@@ -194,7 +194,7 @@ class TestVersionShowCommand:
         assert "field_a" in result.stdout
         assert "field_b" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_show_json_format(self, mock_fg_class):
         """Version show command should support JSON output format."""
         mock_fg = mock.MagicMock()
@@ -216,7 +216,7 @@ class TestVersionShowCommand:
         assert output["version"] == 1
         assert "created_at" in output
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_show_defaults_to_latest(self, mock_fg_class):
         """Version show command should default to latest version."""
         mock_fg = mock.MagicMock()
@@ -233,7 +233,7 @@ class TestVersionShowCommand:
         # Should show version 3 (latest)
         assert "Version: 3" in result.stdout or "3" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_show_nonexistent_version(self, mock_fg_class):
         """Version show command should handle non-existent version."""
         mock_fg = mock.MagicMock()
@@ -245,7 +245,7 @@ class TestVersionShowCommand:
         assert result.exit_code == 1
         assert "not found" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_show_no_versions_exist(self, mock_fg_class):
         """Version show command should handle feature group with no versions."""
         mock_fg = mock.MagicMock()
@@ -257,7 +257,7 @@ class TestVersionShowCommand:
         assert result.exit_code == 0
         assert "No versions found" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_show_handles_nullable_types(self, mock_fg_class):
         """Version show command should handle nullable union types in schema."""
         mock_fg = mock.MagicMock()
@@ -311,7 +311,7 @@ class TestVersionDiffCommand:
         assert "--to" in result.stdout
         assert "--format" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_shows_no_changes(self, mock_fg_class):
         """Version diff command should show no changes for identical schemas."""
         mock_fg = mock.MagicMock()
@@ -329,7 +329,7 @@ class TestVersionDiffCommand:
         assert result.exit_code == 0
         assert "No schema changes" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_shows_added_fields(self, mock_fg_class):
         """Version diff command should show added fields."""
         mock_fg = mock.MagicMock()
@@ -348,7 +348,7 @@ class TestVersionDiffCommand:
         assert "Added" in result.stdout
         assert "new_field" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_shows_removed_fields(self, mock_fg_class):
         """Version diff command should show removed fields."""
         mock_fg = mock.MagicMock()
@@ -367,7 +367,7 @@ class TestVersionDiffCommand:
         assert "Removed" in result.stdout
         assert "old_field" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_shows_modified_fields(self, mock_fg_class):
         """Version diff command should show modified fields."""
         mock_fg = mock.MagicMock()
@@ -390,7 +390,7 @@ class TestVersionDiffCommand:
         assert "int" in result.stdout
         assert "string" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_shows_summary(self, mock_fg_class):
         """Version diff command should show summary of changes."""
         mock_fg = mock.MagicMock()
@@ -411,7 +411,7 @@ class TestVersionDiffCommand:
         assert "1 removed" in result.stdout
         assert "1 modified" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_json_format(self, mock_fg_class):
         """Version diff command should support JSON output format."""
         mock_fg = mock.MagicMock()
@@ -433,7 +433,7 @@ class TestVersionDiffCommand:
         assert "modified" in output
         assert len(output["added"]) == 1
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_same_version_error(self, mock_fg_class):
         """Version diff command should fail when comparing same version."""
         mock_fg = mock.MagicMock()
@@ -449,7 +449,7 @@ class TestVersionDiffCommand:
         assert result.exit_code == 1
         assert "must be different" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_nonexistent_version(self, mock_fg_class):
         """Version diff command should fail for non-existent version."""
         mock_fg = mock.MagicMock()
@@ -463,7 +463,7 @@ class TestVersionDiffCommand:
         assert result.exit_code == 1
         assert "Version 999 not found" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_handles_error(self, mock_fg_class):
         """Version diff command should handle errors gracefully."""
         mock_fg_class.return_value.get_or_create.side_effect = Exception(
@@ -500,7 +500,7 @@ class TestVersionSubcommandHelp:
 class TestVersionOutputFormats:
     """Tests for output format handling in version commands."""
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_invalid_format_rejected(self, mock_fg_class):
         """Version list command should reject invalid format."""
         result = runner.invoke(
@@ -508,7 +508,7 @@ class TestVersionOutputFormats:
         )
         assert result.exit_code != 0
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_show_invalid_format_rejected(self, mock_fg_class):
         """Version show command should reject invalid format."""
         result = runner.invoke(
@@ -516,7 +516,7 @@ class TestVersionOutputFormats:
         )
         assert result.exit_code != 0
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_invalid_format_rejected(self, mock_fg_class):
         """Version diff command should reject invalid format."""
         result = runner.invoke(

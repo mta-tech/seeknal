@@ -52,9 +52,10 @@ For more information, see: https://github.com/mta-tech/seeknal
 """
 
 import typer
-from typing import Optional
+from typing import Optional, Callable
 from datetime import datetime
 from enum import Enum
+from functools import wraps
 import os
 import sys
 from pathlib import Path
@@ -150,6 +151,37 @@ def _echo_warning(message: str):
 def _echo_info(message: str):
     """Print info message in blue."""
     typer.echo(typer.style(f"ℹ {message}", fg=typer.colors.BLUE))
+
+
+def handle_cli_error(error_message: str = "Operation failed"):
+    """Decorator to standardize CLI error handling.
+
+    This decorator wraps CLI commands to provide consistent error handling
+    across all commands. It catches exceptions, displays an error message,
+    and exits with a non-zero status code.
+
+    Args:
+        error_message: The base error message to display. The actual exception
+            message will be appended to this.
+
+    Example:
+        @app.command()
+        @handle_cli_error("Failed to initialize project")
+        def init(name: str):
+            # Command logic here
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except typer.Exit:
+                raise
+            except Exception as e:
+                _echo_error(f"{error_message}: {e}")
+                raise typer.Exit(1)
+        return wrapper
+    return decorator
 
 
 @app.command()
@@ -478,6 +510,64 @@ def validate(
     _echo_success("All validations passed")
 
 
+def _build_range_validator(config):
+    """Build a RangeValidator from config."""
+    if not config.columns:
+        raise ValueError("RangeValidator requires at least one column")
+    params = config.params or {}
+    column = config.columns[0] if len(config.columns) == 1 else config.columns[0]
+    from seeknal.feature_validation.validators import RangeValidator
+    return RangeValidator(
+        column=column,
+        min_val=params.get("min_val"),
+        max_val=params.get("max_val"),
+    )
+
+
+def _build_freshness_validator(config):
+    """Build a FreshnessValidator from config."""
+    if not config.columns:
+        raise ValueError("FreshnessValidator requires a column")
+    from datetime import timedelta
+    from seeknal.feature_validation.validators import FreshnessValidator
+    
+    params = config.params or {}
+    max_age_seconds = params.get("max_age_seconds", 86400)  # Default 24 hours
+    return FreshnessValidator(
+        column=config.columns[0],
+        max_age=timedelta(seconds=max_age_seconds),
+    )
+
+
+# Validator registry for cleaner instantiation
+_VALIDATOR_REGISTRY = {
+    "null": lambda c: _build_null_validator(c),
+    "range": lambda c: _build_range_validator(c),
+    "uniqueness": lambda c: _build_uniqueness_validator(c),
+    "freshness": lambda c: _build_freshness_validator(c),
+}
+
+
+def _build_null_validator(config):
+    """Build a NullValidator from config."""
+    from seeknal.feature_validation.validators import NullValidator
+    params = config.params or {}
+    return NullValidator(
+        columns=config.columns or [],
+        max_null_percentage=params.get("max_null_percentage", 0.0),
+    )
+
+
+def _build_uniqueness_validator(config):
+    """Build a UniquenessValidator from config."""
+    from seeknal.feature_validation.validators import UniquenessValidator
+    params = config.params or {}
+    return UniquenessValidator(
+        columns=config.columns or [],
+        max_duplicate_percentage=params.get("max_duplicate_percentage", 0.0),
+    )
+
+
 def _build_validators_from_config(validator_configs):
     """Build validator instances from ValidatorConfig objects.
 
@@ -490,57 +580,13 @@ def _build_validators_from_config(validator_configs):
     Raises:
         ValueError: If an unknown validator type is specified.
     """
-    from datetime import timedelta
-    from seeknal.feature_validation.validators import (
-        NullValidator,
-        RangeValidator,
-        UniquenessValidator,
-        FreshnessValidator,
-        CustomValidator,
-    )
-
     validators = []
-
     for config in validator_configs:
         validator_type = config.validator_type.lower()
-        columns = config.columns or []
-        params = config.params or {}
-
-        if validator_type == "null":
-            validator = NullValidator(
-                columns=columns,
-                max_null_percentage=params.get("max_null_percentage", 0.0),
-            )
-        elif validator_type == "range":
-            if not columns:
-                raise ValueError("RangeValidator requires at least one column")
-            # RangeValidator works on a single column
-            column = columns[0] if len(columns) == 1 else columns[0]
-            validator = RangeValidator(
-                column=column,
-                min_val=params.get("min_val"),
-                max_val=params.get("max_val"),
-            )
-        elif validator_type == "uniqueness":
-            validator = UniquenessValidator(
-                columns=columns,
-                max_duplicate_percentage=params.get("max_duplicate_percentage", 0.0),
-            )
-        elif validator_type == "freshness":
-            if not columns:
-                raise ValueError("FreshnessValidator requires a column")
-            column = columns[0]
-            max_age_seconds = params.get("max_age_seconds", 86400)  # Default 24 hours
-            max_age = timedelta(seconds=max_age_seconds)
-            validator = FreshnessValidator(
-                column=column,
-                max_age=max_age,
-            )
-        else:
+        builder = _VALIDATOR_REGISTRY.get(validator_type)
+        if not builder:
             raise ValueError(f"Unknown validator type: {validator_type}")
-
-        validators.append(validator)
-
+        validators.append(builder(config))
     return validators
 
 
@@ -591,6 +637,45 @@ def _format_validation_table(results, verbose: bool = False):
                     lines.append(typer.style(detail_line, dim=True))
 
     return "\n".join(lines)
+
+
+def _format_field_type(field_type) -> str:
+    """Normalize field type to string representation.
+
+    Handles Avro schema field types which can be strings, dicts, or lists.
+    Normalizes them to a human-readable string format.
+
+    Args:
+        field_type: The field type from Avro schema (str, dict, or list).
+
+    Returns:
+        A normalized string representation of the field type.
+    """
+    if isinstance(field_type, dict):
+        return str(field_type.get("type", field_type))
+    if isinstance(field_type, list):
+        return " | ".join(str(t) for t in field_type)
+    return str(field_type)
+
+
+def _format_field(field, symbol: str = "") -> str:
+    """Format a schema field for display.
+
+    Formats a field from an Avro schema for display in the CLI,
+    including the field name, type, and an optional symbol prefix.
+
+    Args:
+        field: The field to format (can be a dict or string).
+        symbol: Optional symbol to prefix (e.g., "+", "-", "~").
+
+    Returns:
+        A formatted string representation of the field.
+    """
+    if isinstance(field, dict):
+        name = field.get("name", "unknown")
+        type_str = _format_field_type(field.get("type", "unknown"))
+        return f"  {symbol} {name}: {type_str}"
+    return f"  {symbol} {field}"
 
 
 @app.command("validate-features")
@@ -1224,33 +1309,13 @@ def version_diff(
                 if added:
                     typer.echo("\n" + typer.style("Added (+):", fg=typer.colors.GREEN, bold=True))
                     for field in added:
-                        if isinstance(field, dict):
-                            field_name = field.get("name", "unknown")
-                            field_type = field.get("type", "unknown")
-                            # Handle complex types
-                            if isinstance(field_type, dict):
-                                field_type = field_type.get("type", str(field_type))
-                            elif isinstance(field_type, list):
-                                field_type = " | ".join(str(t) for t in field_type)
-                            typer.echo(typer.style(f"  + {field_name}: {field_type}", fg=typer.colors.GREEN))
-                        else:
-                            typer.echo(typer.style(f"  + {field}", fg=typer.colors.GREEN))
+                        typer.echo(typer.style(_format_field(field, "+"), fg=typer.colors.GREEN))
 
                 # Display removed features
                 if removed:
                     typer.echo("\n" + typer.style("Removed (-):", fg=typer.colors.RED, bold=True))
                     for field in removed:
-                        if isinstance(field, dict):
-                            field_name = field.get("name", "unknown")
-                            field_type = field.get("type", "unknown")
-                            # Handle complex types
-                            if isinstance(field_type, dict):
-                                field_type = field_type.get("type", str(field_type))
-                            elif isinstance(field_type, list):
-                                field_type = " | ".join(str(t) for t in field_type)
-                            typer.echo(typer.style(f"  - {field_name}: {field_type}", fg=typer.colors.RED))
-                        else:
-                            typer.echo(typer.style(f"  - {field}", fg=typer.colors.RED))
+                        typer.echo(typer.style(_format_field(field, "-"), fg=typer.colors.RED))
 
                 # Display modified features
                 if modified:
@@ -1258,17 +1323,8 @@ def version_diff(
                     for change in modified:
                         if isinstance(change, dict):
                             field_name = change.get("field", "unknown")
-                            old_type = change.get("old_type", "unknown")
-                            new_type = change.get("new_type", "unknown")
-                            # Handle complex types
-                            if isinstance(old_type, dict):
-                                old_type = old_type.get("type", str(old_type))
-                            elif isinstance(old_type, list):
-                                old_type = " | ".join(str(t) for t in old_type)
-                            if isinstance(new_type, dict):
-                                new_type = new_type.get("type", str(new_type))
-                            elif isinstance(new_type, list):
-                                new_type = " | ".join(str(t) for t in new_type)
+                            old_type = _format_field_type(change.get("old_type", "unknown"))
+                            new_type = _format_field_type(change.get("new_type", "unknown"))
                             typer.echo(typer.style(f"  ~ {field_name}: {old_type} → {new_type}", fg=typer.colors.YELLOW))
                         else:
                             typer.echo(typer.style(f"  ~ {change}", fg=typer.colors.YELLOW))

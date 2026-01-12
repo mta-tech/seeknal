@@ -59,50 +59,69 @@ See Also:
     seeknal.tasks: Task definitions for data processing pipelines.
 """
 
-from .feature_group import (
-    FeatureGroup,
-    FeatureLookup,
-    HistoricalFeatures,
-    OnlineFeatures,
-    Materialization,
-    GetLatestTimeStrategy,
-)
-from .featurestore import (
-    FeatureStore,
-    Feature,
-    FillNull,
-    OfflineStore,
-    OnlineStore,
-    OfflineMaterialization,
-    OnlineMaterialization,
-    OfflineStoreEnum,
-    OnlineStoreEnum,
-    FileKindEnum,
-    FeatureStoreFileOutput,
-    FeatureStoreHiveTableOutput,
-)
+from importlib import import_module
+from typing import TYPE_CHECKING
 
-__all__ = [
+_EXPORTS = {
     # Feature Group classes
-    "FeatureGroup",
-    "FeatureLookup",
-    "HistoricalFeatures",
-    "OnlineFeatures",
-    "Materialization",
-    "GetLatestTimeStrategy",
+    "FeatureGroup": "seeknal.featurestore.feature_group",
+    "FeatureLookup": "seeknal.featurestore.feature_group",
+    "HistoricalFeatures": "seeknal.featurestore.feature_group",
+    "OnlineFeatures": "seeknal.featurestore.feature_group",
+    "Materialization": "seeknal.featurestore.feature_group",
+    "GetLatestTimeStrategy": "seeknal.featurestore.feature_group",
     # Feature Store classes
-    "FeatureStore",
-    "Feature",
-    "FillNull",
-    "OfflineStore",
-    "OnlineStore",
-    "OfflineMaterialization",
-    "OnlineMaterialization",
+    "FeatureStore": "seeknal.featurestore.featurestore",
+    "Feature": "seeknal.featurestore.featurestore",
+    "FillNull": "seeknal.featurestore.featurestore",
+    "OfflineStore": "seeknal.featurestore.featurestore",
+    "OnlineStore": "seeknal.featurestore.featurestore",
+    "OfflineMaterialization": "seeknal.featurestore.featurestore",
+    "OnlineMaterialization": "seeknal.featurestore.featurestore",
     # Enums
-    "OfflineStoreEnum",
-    "OnlineStoreEnum",
-    "FileKindEnum",
+    "OfflineStoreEnum": "seeknal.featurestore.featurestore",
+    "OnlineStoreEnum": "seeknal.featurestore.featurestore",
+    "FileKindEnum": "seeknal.featurestore.featurestore",
     # Output configurations
-    "FeatureStoreFileOutput",
-    "FeatureStoreHiveTableOutput",
-]
+    "FeatureStoreFileOutput": "seeknal.featurestore.featurestore",
+    "FeatureStoreHiveTableOutput": "seeknal.featurestore.featurestore",
+}
+
+__all__ = list(_EXPORTS.keys())
+
+
+def __getattr__(name: str):
+    module_path = _EXPORTS.get(name)
+    if module_path is None:
+        raise AttributeError(f"module 'seeknal.featurestore' has no attribute '{name}'")
+    module = import_module(module_path)
+    return getattr(module, name)
+
+
+def __dir__():
+    return sorted(__all__)
+
+
+if TYPE_CHECKING:
+    from .feature_group import (
+        FeatureGroup,
+        FeatureLookup,
+        HistoricalFeatures,
+        OnlineFeatures,
+        Materialization,
+        GetLatestTimeStrategy,
+    )
+    from .featurestore import (
+        FeatureStore,
+        Feature,
+        FillNull,
+        OfflineStore,
+        OnlineStore,
+        OfflineMaterialization,
+        OnlineMaterialization,
+        OfflineStoreEnum,
+        OnlineStoreEnum,
+        FileKindEnum,
+        FeatureStoreFileOutput,
+        FeatureStoreHiveTableOutput,
+    )

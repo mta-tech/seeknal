@@ -31,3 +31,7 @@ __all__ = [
     "get_df_schema",
     "check_is_dict_same",
 ]
+
+# Formatters module is available as seeknal.utils.formatters
+# It contains reusable formatting functions for CLI output
+
