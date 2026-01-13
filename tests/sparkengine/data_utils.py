@@ -1,5 +1,10 @@
 """Test data utilities for Spark engine tests."""
 
+import os
+import shutil
+import stat
+import tempfile
+
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.types import (
     StructType, StructField, IntegerType, StringType,
@@ -11,13 +16,23 @@ import pytest
 @pytest.fixture(scope="module")
 def spark_session():
     """Create a local Spark session for testing."""
+    # Create secure temp directory with restricted permissions (owner only)
+    warehouse_dir = tempfile.mkdtemp(prefix="spark-warehouse-test_")
+    os.chmod(warehouse_dir, stat.S_IRWXU)  # 0o700 - owner read/write/execute only
+
     spark = SparkSession.builder \
         .master("local[1]") \
         .appName("test") \
-        .config("spark.sql.warehouse.dir", "/tmp/spark-warehouse") \
+        .config("spark.sql.warehouse.dir", warehouse_dir) \
         .getOrCreate()
+
     yield spark
     spark.stop()
+    spark._jvm.System.clearProperty("spark.driver.port")
+
+    # Cleanup temp directory
+    if os.path.exists(warehouse_dir):
+        shutil.rmtree(warehouse_dir, ignore_errors=True)
 
 
 def create_sample_dataframe(spark: SparkSession, rows: int = 100) -> DataFrame:
