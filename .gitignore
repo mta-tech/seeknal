@@ -14,6 +14,8 @@ wheels/
 lib
 .env
 config.toml
+.claude_settings.json
+seeknal.db
 
 .pytest_cache
 .DS_Store
@@ -21,13 +23,24 @@ spark-engine/build
 spark-engine/.DS_Store
 spark-engine/derby.log
 spark-engine/out
-spark-engine/.gradle
-spark-engine/.idea 
+spark-engine/.gradle/
+spark-engine/.idea
 spark-engine/.bloop
 spark-engine/.metals
 
+# Engines directory
+engines/spark-engine/.gradle/
+engines/spark-engine/.idea/
+engines/spark-engine/.bloop/
+engines/spark-engine/.metals/
+
 .ipynb_checkpoints
 .worktrees/
+
+# Tool directories
+.code/
+.factory/
+.serena/
 
 # MkDocs build output
 site/
