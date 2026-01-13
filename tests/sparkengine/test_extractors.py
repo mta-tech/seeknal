@@ -8,7 +8,7 @@ import os
 
 def test_file_source_parquet(spark_session: SparkSession, tmp_path):
     """Test FileSource with Parquet."""
-    from seeknal.tasks.sparkengine.pyspark.extractors.file_source import FileSource
+    from seeknal.tasks.sparkengine.py_impl.extractors.file_source import FileSource
 
     # Create test file
     from tests.sparkengine.data_utils import create_sample_dataframe
@@ -25,7 +25,7 @@ def test_file_source_parquet(spark_session: SparkSession, tmp_path):
 
 def test_generic_source(spark_session: SparkSession, tmp_path):
     """Test GenericSource."""
-    from seeknal.tasks.sparkengine.pyspark.extractors.file_source import GenericSource
+    from seeknal.tasks.sparkengine.py_impl.extractors.file_source import GenericSource
 
     test_df = spark_session.createDataFrame([(1, "a"), (2, "b")], ["id", "name"])
     test_path = os.path.join(tmp_path, "test.json")

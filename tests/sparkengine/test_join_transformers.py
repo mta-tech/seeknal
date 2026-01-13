@@ -11,7 +11,7 @@ from tests.sparkengine.data_utils import (
 
 def test_join_by_id(spark_session: SparkSession):
     """Test JoinById transformer."""
-    from seeknal.tasks.sparkengine.pyspark.transformers.joins import JoinById
+    from seeknal.tasks.sparkengine.py_impl.transformers.joins import JoinById
 
     left = create_join_left_dataframe(spark_session)
     right = create_join_right_dataframe(spark_session)
@@ -33,7 +33,7 @@ def test_join_by_id(spark_session: SparkSession):
 
 def test_join_by_expr(spark_session: SparkSession):
     """Test JoinByExpr transformer."""
-    from seeknal.tasks.sparkengine.pyspark.transformers.joins import JoinByExpr
+    from seeknal.tasks.sparkengine.py_impl.transformers.joins import JoinByExpr
 
     left = create_join_left_dataframe(spark_session)
     right = create_join_right_dataframe(spark_session)
@@ -51,7 +51,7 @@ def test_join_by_expr(spark_session: SparkSession):
 
 def test_join_by_id_left(spark_session: SparkSession):
     """Test JoinById with left join."""
-    from seeknal.tasks.sparkengine.pyspark.transformers.joins import JoinById
+    from seeknal.tasks.sparkengine.py_impl.transformers.joins import JoinById
 
     left = create_join_left_dataframe(spark_session)
     right = create_join_right_dataframe(spark_session)

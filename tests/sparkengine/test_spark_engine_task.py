@@ -9,7 +9,7 @@ from tests.sparkengine.data_utils import create_sample_dataframe
 
 def test_spark_engine_task_simple_pipeline(spark_session: SparkSession, tmp_path):
     """Test SparkEngineTask with simple pipeline."""
-    from seeknal.tasks.sparkengine.pyspark.spark_engine_task import SparkEngineTask
+    from seeknal.tasks.sparkengine.py_impl.spark_engine_task import SparkEngineTask
 
     # Create test data
     df = create_sample_dataframe(spark_session, 100)
@@ -38,7 +38,7 @@ def test_spark_engine_task_simple_pipeline(spark_session: SparkSession, tmp_path
 
 def test_spark_engine_task_with_output(spark_session: SparkSession, tmp_path):
     """Test SparkEngineTask with output."""
-    from seeknal.tasks.sparkengine.pyspark.spark_engine_task import SparkEngineTask
+    from seeknal.tasks.sparkengine.py_impl.spark_engine_task import SparkEngineTask
 
     # Create test data
     df = create_sample_dataframe(spark_session, 100)

@@ -2,7 +2,7 @@
 
 import pytest
 from pyspark.sql import SparkSession
-from seeknal.tasks.sparkengine.pyspark.transformers.column_operations import ColumnRenamed
+from seeknal.tasks.sparkengine.py_impl.transformers.column_operations import ColumnRenamed
 from tests.sparkengine.assertions import assert_dataframes_equal
 from tests.sparkengine.data_utils import create_sample_dataframe
 
@@ -55,7 +55,7 @@ def test_column_renamed_config(spark_session: SparkSession):
 
 def test_filter_by_expr(spark_session: SparkSession):
     """Test FilterByExpr transformer."""
-    from seeknal.tasks.sparkengine.pyspark.transformers.column_operations import FilterByExpr
+    from seeknal.tasks.sparkengine.py_impl.transformers.column_operations import FilterByExpr
 
     df = create_sample_dataframe(spark_session, 10)
 
@@ -69,7 +69,7 @@ def test_filter_by_expr(spark_session: SparkSession):
 
 def test_add_column_by_expr(spark_session: SparkSession):
     """Test AddColumnByExpr transformer."""
-    from seeknal.tasks.sparkengine.pyspark.transformers.column_operations import AddColumnByExpr
+    from seeknal.tasks.sparkengine.py_impl.transformers.column_operations import AddColumnByExpr
 
     df = create_sample_dataframe(spark_session, 10)
 

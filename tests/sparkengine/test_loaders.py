@@ -8,7 +8,7 @@ import os
 
 def test_parquet_writer(spark_session: SparkSession, tmp_path):
     """Test ParquetWriter."""
-    from seeknal.tasks.sparkengine.pyspark.loaders.parquet_writer import ParquetWriter
+    from seeknal.tasks.sparkengine.py_impl.loaders.parquet_writer import ParquetWriter
     from tests.sparkengine.data_utils import create_sample_dataframe
 
     df = create_sample_dataframe(spark_session, 10)

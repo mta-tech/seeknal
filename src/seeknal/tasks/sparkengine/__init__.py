@@ -4,8 +4,8 @@ This module now provides pure PySpark implementation.
 """
 
 # Import from new PySpark implementation
-from .pyspark.spark_engine_task import SparkEngineTask, Stage
-from .pyspark.transformers import (
+from .py_impl.spark_engine_task import SparkEngineTask, Stage
+from .py_impl.transformers import (
     FilterByExpr,
     AddColumnByExpr,
     ColumnRenamed,
@@ -15,7 +15,7 @@ from .pyspark.transformers import (
     AddEntropy,
     AddLatLongDistance,
 )
-from .pyspark.aggregators import FunctionAggregator, AggregationFunction
+from .py_impl.aggregators import FunctionAggregator, AggregationFunction
 
 __all__ = [
     "SparkEngineTask",

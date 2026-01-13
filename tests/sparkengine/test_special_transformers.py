@@ -7,7 +7,7 @@ from tests.sparkengine.data_utils import create_sample_dataframe
 
 def test_add_entropy(spark_session: SparkSession):
     """Test AddEntropy transformer."""
-    from seeknal.tasks.sparkengine.pyspark.transformers.special import AddEntropy
+    from seeknal.tasks.sparkengine.py_impl.transformers.special import AddEntropy
 
     # Create data with values (probability distributions)
     data = [(1, [0.1, 0.2, 0.7]), (2, [0.5, 0.5, 0.0])]
@@ -32,7 +32,7 @@ def test_add_entropy(spark_session: SparkSession):
 
 def test_add_latlong_distance(spark_session: SparkSession):
     """Test AddLatLongDistance transformer."""
-    from seeknal.tasks.sparkengine.pyspark.transformers.special import AddLatLongDistance
+    from seeknal.tasks.sparkengine.py_impl.transformers.special import AddLatLongDistance
 
     data = [
         (1, 40.7128, -74.0060, 34.0522, -118.2437),  # NYC to LA

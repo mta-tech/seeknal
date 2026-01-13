@@ -7,7 +7,7 @@ This module provides PySpark-based implementations of:
 - Loaders: Load data to destinations (files, databases, etc.)
 """
 
-from seeknal.tasks.sparkengine.pyspark.base import (
+from .base import (
     BaseAggregatorPySpark,
     BaseExtractorPySpark,
     BaseLoaderPySpark,

@@ -7,7 +7,7 @@ from tests.sparkengine.data_utils import create_sample_dataframe
 
 def test_function_aggregator_sum(spark_session: SparkSession):
     """Test FunctionAggregator with sum."""
-    from seeknal.tasks.sparkengine.pyspark.aggregators.function_aggregator import (
+    from seeknal.tasks.sparkengine.py_impl.aggregators.function_aggregator import (
         FunctionAggregator,
         AggregationFunction,
     )
@@ -28,7 +28,7 @@ def test_function_aggregator_sum(spark_session: SparkSession):
 
 def test_function_aggregator_count(spark_session: SparkSession):
     """Test FunctionAggregator with count."""
-    from seeknal.tasks.sparkengine.pyspark.aggregators.function_aggregator import (
+    from seeknal.tasks.sparkengine.py_impl.aggregators.function_aggregator import (
         FunctionAggregator,
         AggregationFunction,
     )
@@ -49,7 +49,7 @@ def test_function_aggregator_count(spark_session: SparkSession):
 
 def test_function_aggregator_group_by(spark_session: SparkSession):
     """Test FunctionAggregator with group by."""
-    from seeknal.tasks.sparkengine.pyspark.aggregators.function_aggregator import (
+    from seeknal.tasks.sparkengine.py_impl.aggregators.function_aggregator import (
         FunctionAggregator,
         AggregationFunction,
     )
