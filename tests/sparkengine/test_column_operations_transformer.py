@@ -51,3 +51,17 @@ def test_column_renamed_config(spark_session: SparkSession):
     assert config["old_name"] == "old"
     assert config["new_name"] == "new"
     assert config["extra_param"] == "value"
+
+
+def test_filter_by_expr(spark_session: SparkSession):
+    """Test FilterByExpr transformer."""
+    from seeknal.tasks.sparkengine.pyspark.transformers.column_operations import FilterByExpr
+
+    df = create_sample_dataframe(spark_session, 10)
+
+    transformer = FilterByExpr(expression="id > 5")
+    result = transformer.transform(df)
+
+    # Should have 4 rows (id 6-9, since data has rows 0-9)
+    assert result.count() == 4
+    assert result.filter("id <= 5").count() == 0

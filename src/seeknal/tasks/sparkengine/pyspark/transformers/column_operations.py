@@ -27,3 +27,26 @@ class ColumnRenamed(BaseTransformerPySpark):
             DataFrame with renamed column
         """
         return df.withColumnRenamed(self.old_name, self.new_name)
+
+
+class FilterByExpr(BaseTransformerPySpark):
+    """Filter rows by expression.
+
+    Args:
+        expression: SQL expression for filtering
+    """
+
+    def __init__(self, expression: str, **kwargs):
+        super().__init__(**kwargs, expression=expression)
+        self.expression = expression
+
+    def transform(self, df: DataFrame) -> DataFrame:
+        """Filter DataFrame by expression.
+
+        Args:
+            df: Input DataFrame
+
+        Returns:
+            Filtered DataFrame
+        """
+        return df.filter(self.expression)
