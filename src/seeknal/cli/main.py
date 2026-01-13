@@ -26,6 +26,16 @@ Version Management:
     seeknal version show <fg> --version <N>     Show specific version details
     seeknal version diff <fg> --from 1 --to 2   Compare schemas between versions
 
+Atlas Data Platform Integration (requires: pip install seeknal[atlas]):
+    seeknal atlas info                          Show Atlas integration info
+    seeknal atlas api start                     Start the Atlas API server
+    seeknal atlas api status                    Check API server status
+    seeknal atlas governance stats              Get governance statistics
+    seeknal atlas governance policies           List governance policies
+    seeknal atlas governance violations         List policy violations
+    seeknal atlas lineage show <name>           Show lineage for a resource
+    seeknal atlas lineage publish <pipeline>    Publish lineage to DataHub
+
 Examples:
     # Initialize a new project
     $ seeknal init --name my_project
@@ -47,6 +57,12 @@ Examples:
 
     # Validate feature data quality
     $ seeknal validate-features user_features --mode fail
+
+    # Start Atlas API (requires: pip install seeknal[atlas])
+    $ seeknal atlas api start --port 8000
+
+    # View governance statistics
+    $ seeknal atlas governance stats
 
 For more information, see: https://github.com/mta-tech/seeknal
 """
@@ -87,6 +103,39 @@ Examples:
 """,
 )
 app.add_typer(version_app, name="version")
+
+
+# =============================================================================
+# Atlas Integration (Optional)
+# =============================================================================
+# The Atlas command group is loaded dynamically if atlas-data-platform is installed.
+# This allows Seeknal to work standalone while providing Atlas features when available.
+
+def _register_atlas_commands():
+    """Register Atlas commands if atlas-data-platform is available."""
+    try:
+        from seeknal.cli.atlas import atlas_app
+        app.add_typer(atlas_app, name="atlas")
+    except ImportError:
+        # Atlas not installed, add a placeholder command
+        @app.command("atlas", hidden=True)
+        def atlas_not_installed():
+            """Atlas Data Platform integration (not installed).
+
+            Install with: pip install seeknal[atlas]
+            """
+            typer.echo(typer.style("✗ Atlas Data Platform is not installed.", fg=typer.colors.RED))
+            typer.echo("")
+            typer.echo("Install Atlas integration with:")
+            typer.echo(typer.style("  pip install seeknal[atlas]", fg=typer.colors.CYAN))
+            typer.echo("")
+            typer.echo("Or install Atlas directly:")
+            typer.echo(typer.style("  pip install atlas-data-platform", fg=typer.colors.CYAN))
+            raise typer.Exit(1)
+
+
+# Register Atlas commands
+_register_atlas_commands()
 
 
 class OutputFormat(str, Enum):
