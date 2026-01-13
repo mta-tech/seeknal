@@ -45,6 +45,9 @@ def assert_dataframes_equal(
             if isinstance(val1, float) and isinstance(val2, float):
                 if math.isnan(val1) and math.isnan(val2):
                     continue
+                if math.isinf(val1) or math.isinf(val2):
+                    assert val1 == val2, \
+                        f"Row {i}, col {j}: {val1} != {val2}"
                 assert abs(val1 - val2) <= tolerance, \
                     f"Row {i}, col {j}: {val1} != {val2} (tolerance: {tolerance})"
             else:
