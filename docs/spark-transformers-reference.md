@@ -168,6 +168,8 @@ df.groupBy(cols).agg(*aggregators)
 
 **Complexity:** Medium
 
+**Note:** The full Scala implementation includes pivot functionality with `pivotKeyCol` and `pivotValueCols` parameters for pivoting grouped data. This simplified PySpark mapping shows only the basic group-by aggregation without pivot support.
+
 ---
 
 ### 9. JoinByExpr
@@ -205,6 +207,8 @@ df.join(other, join_cols, join_type)
 ```
 
 **Complexity:** Low
+
+**Note:** The full Scala implementation includes `filterExpression` and `targetTable` parameters for advanced join filtering and table targeting. This simplified PySpark mapping shows only the basic join-by-ID functionality.
 
 ---
 
@@ -441,7 +445,7 @@ def truncate_decimal(input, offset, round_up):
     rounding = ROUND_UP if round_up else ROUND_DOWN
     return float(Decimal(str(input)).quantize(
         Decimal('0.' + '0' * (offset - 1) + '1'),
-        rounding=routing
+        rounding=rounding
     ))
 df.withColumn(output_col, truncate_decimal(F.col(input_col), F.lit(offset), F.lit(round_up)))
 ```
