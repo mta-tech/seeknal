@@ -65,3 +65,23 @@ def test_filter_by_expr(spark_session: SparkSession):
     # Should have 4 rows (id 6-9, since data has rows 0-9)
     assert result.count() == 4
     assert result.filter("id <= 5").count() == 0
+
+
+def test_add_column_by_expr(spark_session: SparkSession):
+    """Test AddColumnByExpr transformer."""
+    from seeknal.tasks.sparkengine.pyspark.transformers.column_operations import AddColumnByExpr
+
+    df = create_sample_dataframe(spark_session, 10)
+
+    transformer = AddColumnByExpr(
+        column_name="doubled_value",
+        expression="value * 2"
+    )
+    result = transformer.transform(df)
+
+    # Verify new column exists
+    assert "doubled_value" in result.columns
+
+    # Verify values
+    row = result.filter("id = 1").first()
+    assert row["doubled_value"] == row["value"] * 2
