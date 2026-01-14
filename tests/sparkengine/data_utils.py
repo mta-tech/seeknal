@@ -20,11 +20,26 @@ def spark_session():
     warehouse_dir = tempfile.mkdtemp(prefix="spark-warehouse-test_")
     os.chmod(warehouse_dir, stat.S_IRWXU)  # 0o700 - owner read/write/execute only
 
+    # Get the project root directory (src/seeknal parent)
+    from pathlib import Path
+    project_root = Path(__file__).parent.parent.parent.resolve()
+    src_dir = str(project_root / "src")
+
+    # Set PYTHONPATH so Spark workers can find seeknal module
+    old_pythonpath = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = f"{src_dir}:{old_pythonpath}"
+
     spark = SparkSession.builder \
         .master("local[1]") \
         .appName("test") \
         .config("spark.sql.warehouse.dir", warehouse_dir) \
+        .config("spark.python.worker.reuse", "false") \
         .getOrCreate()
+
+    # Also add to sys.path for the driver process
+    import sys
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
 
     yield spark
     spark.stop()
