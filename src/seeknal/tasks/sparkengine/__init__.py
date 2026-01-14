@@ -14,8 +14,12 @@ from .py_impl.transformers import (
     SQL,
     AddEntropy,
     AddLatLongDistance,
+    PointInTime,
+    TableJoinDef,
+    JoinType,
+    JoinTablesByExpr,
 )
-from .py_impl.aggregators import FunctionAggregator, AggregationFunction
+from .py_impl.aggregators import FunctionAggregator, AggregationFunction, SecondOrderAggregator, AggregationSpec
 
 __all__ = [
     "SparkEngineTask",
@@ -28,6 +32,12 @@ __all__ = [
     "SQL",
     "AddEntropy",
     "AddLatLongDistance",
+    "PointInTime",
+    "TableJoinDef",
+    "JoinType",
+    "JoinTablesByExpr",
     "FunctionAggregator",
     "AggregationFunction",
+    "SecondOrderAggregator",
+    "AggregationSpec",
 ]

@@ -29,7 +29,7 @@ from ..tasks.sparkengine import SparkEngineTask
 from ..workspace import require_workspace
 from .featurestore import *
 from .featurestore import FeatureStore, Feature, FillNull
-from ..tasks.sparkengine.transformers import (
+from ..tasks.sparkengine import (
     PointInTime,
     TableJoinDef,
     JoinTablesByExpr,
