@@ -79,20 +79,67 @@ last_val_udf = F.udf(last_val, StringType())
 most_frequent_udf = F.udf(most_frequent, StringType())
 
 
-# Type definitions - use namedtuple like DuckDB version
-AggregationSpec = namedtuple(
-    "AggregationSpec",
-    [
-        "name",
-        "features",
-        "aggregations",
-        "filterCondition",
-        "dayLimitLower1",
-        "dayLimitUpper1",
-        "dayLimitLower2",
-        "dayLimitUpper2",
-    ],
-)
+# Type definitions - use namedtuple with defaults like DuckDB version
+def _aggregation_spec(
+    name,
+    features,
+    aggregations,
+    filterCondition="",
+    dayLimitLower1="",
+    dayLimitUpper1="",
+    dayLimitLower2="",
+    dayLimitUpper2="",
+):
+    """Create AggregationSpec with default values."""
+    return namedtuple(
+        "AggregationSpec",
+        [
+            "name",
+            "features",
+            "aggregations",
+            "filterCondition",
+            "dayLimitLower1",
+            "dayLimitUpper1",
+            "dayLimitLower2",
+            "dayLimitUpper2",
+        ],
+    )(
+        name,
+        features,
+        aggregations,
+        filterCondition,
+        dayLimitLower1,
+        dayLimitUpper1,
+        dayLimitLower2,
+        dayLimitUpper2,
+    )
+
+
+# Create AggregationSpec class with factory function
+class AggregationSpec:
+    """Specification for an aggregation rule with defaults."""
+
+    def __new__(
+        cls,
+        name,
+        features,
+        aggregations,
+        filterCondition="",
+        dayLimitLower1="",
+        dayLimitUpper1="",
+        dayLimitLower2="",
+        dayLimitUpper2="",
+    ):
+        return _aggregation_spec(
+            name,
+            features,
+            aggregations,
+            filterCondition,
+            dayLimitLower1,
+            dayLimitUpper1,
+            dayLimitLower2,
+            dayLimitUpper2,
+        )
 
 
 class SecondOrderAggregator:
@@ -283,6 +330,7 @@ class SecondOrderAggregator:
     def _since_aggregations(self, features: List[str], aggs: List[str], conds: List[Optional[str]]) -> List[Column]:
         """Generate days-since aggregations."""
         result = []
+        methods = self._get_methods()
 
         for feat, cond in zip(features, conds):
             for agg in aggs:
@@ -292,8 +340,19 @@ class SecondOrderAggregator:
                 else:
                     filter_expr = F.col(feat).isNotNull()
 
-                # For "since", return the days_between value
-                result.append(F.when(filter_expr, F.col("_days_between")).alias(f"SINCE_{agg.upper()}_{feat}"))
+                # For "since", get the min days_between value for filtered records
+                # This gives the earliest days_since that meets the condition
+                if agg == "count":
+                    # Count returns count of matching records
+                    filtered_col = F.when(filter_expr, F.lit(1))
+                    result.append(F.sum(filtered_col).alias(f"SINCE_{agg.upper()}_{feat}"))
+                elif agg in ["sum", "mean", "min", "max"]:
+                    filtered_col = F.when(filter_expr, F.col("_days_between"))
+                    result.append(methods[agg](filtered_col).alias(f"SINCE_{agg.upper()}_{feat}"))
+                else:
+                    # For other aggregations, use the aggregated value
+                    filtered_col = F.when(filter_expr, F.col(feat))
+                    result.append(methods[agg](filtered_col).alias(f"SINCE_{agg.upper()}_{feat}"))
 
         return result
 
