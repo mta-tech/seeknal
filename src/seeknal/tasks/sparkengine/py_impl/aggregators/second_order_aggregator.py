@@ -1,16 +1,16 @@
-"""Second-order aggregator for time-windowed aggregations."""
+"""Second-order aggregator for time-windowed aggregations.
+
+This matches the API of the DuckDB SecondOrderAggregator for consistency.
+"""
 
 import math
 from collections import namedtuple
-from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Union
 
 import pyspark.sql.functions as F
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql.types import FloatType, StringType
-
-from ..base import BaseAggregatorPySpark
 
 
 # Native Spark aggregations
@@ -79,75 +79,107 @@ last_val_udf = F.udf(last_val, StringType())
 most_frequent_udf = F.udf(most_frequent, StringType())
 
 
-# Type definitions
-@dataclass
-class AggregationSpec:
-    """Specification for an aggregation rule."""
+# Type definitions - use namedtuple like DuckDB version
+AggregationSpec = namedtuple(
+    "AggregationSpec",
+    [
+        "name",
+        "features",
+        "aggregations",
+        "filterCondition",
+        "dayLimitLower1",
+        "dayLimitUpper1",
+        "dayLimitLower2",
+        "dayLimitUpper2",
+    ],
+)
 
-    name: str
-    features: str
-    aggregations: str
-    filterCondition: str = ""
-    dayLimitLower1: str = ""
-    dayLimitUpper1: str = ""
-    dayLimitLower2: str = ""
-    dayLimitUpper2: str = ""
 
+class SecondOrderAggregator:
+    """Perform second-order aggregations with time windows using PySpark.
 
-class SecondOrderAggregator(BaseAggregatorPySpark):
-    """Perform second-order aggregations with time windows.
+    This class enables feature engineering by creating second-order features from
+    transaction-level or event-level data. It supports various aggregation strategies
+    that can be combined to generate a rich feature set.
 
-    Supports multiple aggregation types:
-    - basic: Simple aggregations per ID
-    - basic_days: Aggregations with day windows
-    - since: Days-since aggregations
-    - ratio: Ratio of two time-window aggregations
+    Supported Aggregation Types:
+        1. **basic**: Simple aggregation over the entire history per ID.
+           - Format: `AggregationSpec("basic", "feature_col", "agg_func")`
+           - Example: `AggregationSpec("basic", "amount", "sum")` -> Sum of amount for each user.
+
+        2. **basic_days**: Aggregation over a specific time window defined by `days_between`.
+           - Format: `AggregationSpec("basic_days", "feature_col", "agg_func", "", lower, upper)`
+           - Example: `AggregationSpec("basic_days", "amount", "mean", "", 1, 30)` -> Mean amount in the last 1-30 days.
+
+        3. **ratio**: Ratio of two aggregations over different time windows.
+           - Format: `AggregationSpec("ratio", "feature_col", "agg_func", "", lower1, upper1, lower2, upper2)`
+           - Example: `AggregationSpec("ratio", "amount", "sum", "", 1, 30, 31, 60)` -> (Sum 1-30 days) / (Sum 31-60 days).
+
+        4. **since**: Aggregation filtered by a custom condition.
+           - Format: `AggregationSpec("since", "feature_col", "agg_func", "condition")`
+           - Example: `AggregationSpec("since", "flag", "count", "flag == 1")` -> Count of flag=1 events.
 
     Args:
-        spark: SparkSession
-        rules: List of aggregation specifications
-        idCol: ID column name
-        applicationDateCol: Application date column name
-        featureDateCol: Feature date column name
-        applicationDateFormat: Application date format (default: "yyyy-MM-dd")
-        featureDateFormat: Feature date format (default: "yyyy-MM-dd")
+        spark: SparkSession for executing queries
+        idCol: Column name representing the entity ID (e.g., 'user_id', 'msisdn')
+        featureDateCol: Column name representing the date of the event/transaction
+        featureDateFormat: Format of the feature date column (default: "yyyy-MM-dd")
+        applicationDateCol: Column name representing the reference date (e.g., application date)
+        applicationDateFormat: Format of the application date column (default: "yyyy-MM-dd")
+
+    The `transform` method applies the aggregation rules to a table and returns a DataFrame.
     """
 
     def __init__(
         self,
         spark: SparkSession,
-        rules: List[AggregationSpec],
         idCol: str,
-        applicationDateCol: str,
         featureDateCol: str = "day",
-        applicationDateFormat: str = "yyyy-MM-dd",
         featureDateFormat: str = "yyyy-MM-dd",
-        **kwargs
+        applicationDateCol: str = "application_date",
+        applicationDateFormat: str = "yyyy-MM-dd",
     ):
-        super().__init__(**kwargs, spark=spark)
         self.spark = spark
-        self.rules = rules
         self.idCol = idCol
-        self.applicationDateCol = applicationDateCol
         self.featureDateCol = featureDateCol
-        self.applicationDateFormat = applicationDateFormat
         self.featureDateFormat = featureDateFormat
+        self.applicationDateCol = applicationDateCol
+        self.applicationDateFormat = applicationDateFormat
+        self.rules = []
 
-    def transform(self, df: DataFrame) -> DataFrame:
-        """Apply second-order aggregations.
+    def setRules(self, rules: List[AggregationSpec]) -> "SecondOrderAggregator":
+        """Set aggregation rules.
 
         Args:
-            df: Input DataFrame
+            rules: List of AggregationSpec objects
 
         Returns:
-            Aggregated DataFrame
+            self for method chaining
         """
+        self.rules = rules
+        return self
+
+    def transform(self, table_name: str) -> DataFrame:
+        """Transform the input table using the defined aggregation rules.
+
+        Args:
+            table_name: Name of the table or view to aggregate
+
+        Returns:
+            DataFrame with aggregated features
+        """
+        if not self.rules:
+            raise ValueError("No rules defined for aggregation.")
+
+        # Load the table and add days_between column
+        df = self.spark.table(table_name)
+
         # Add days_between column
         df = df.withColumn(
-            "days_between",
+            "_days_between",
             F.datediff(
-                F.to_date(F.col(self.applicationDateCol), self.applicationDateFormat),
                 F.to_date(F.col(self.featureDateCol), self.featureDateFormat),
+                F.to_date(F.col(self.applicationDateCol), self.applicationDateFormat),
             ),
         )
 
@@ -161,19 +193,18 @@ class SecondOrderAggregator(BaseAggregatorPySpark):
             conds = [c.strip() for c in rule.filterCondition.split(",")] if rule.filterCondition else [None] * len(features)
 
             if rule.name == "basic":
-                all_aggs.extend(self._basic_aggregations(df, features, aggs))
+                all_aggs.extend(self._basic_aggregations(features, aggs))
             elif rule.name == "basic_days":
                 all_aggs.extend(
                     self._basic_days_aggregations(
-                        df, features, aggs, int(rule.dayLimitLower1), int(rule.dayLimitUpper1), conds
+                        features, aggs, int(rule.dayLimitLower1), int(rule.dayLimitUpper1), conds
                     )
                 )
             elif rule.name == "since":
-                all_aggs.extend(self._since_aggregations(df, features, aggs, conds))
+                all_aggs.extend(self._since_aggregations(features, aggs, conds))
             elif rule.name == "ratio":
                 all_aggs.extend(
                     self._ratio_aggregations(
-                        df,
                         features,
                         aggs,
                         int(rule.dayLimitLower1),
@@ -187,15 +218,16 @@ class SecondOrderAggregator(BaseAggregatorPySpark):
         # Perform aggregation
         result = df.groupBy(*group_cols).agg(*all_aggs)
 
-        # Flatten column names
+        # Flatten column names (Spark agg creates nested column names)
         for col in result.columns:
             if col != self.idCol:
-                # Extract aggregation name from nested structure
-                result = result.withColumnRenamed(col, col.replace("(", "_").replace(")", "").replace(",", ""))
+                # Clean up column name from aggregation nesting
+                new_name = col.replace("(", "_").replace(")", "").replace(",", "")
+                result = result.withColumnRenamed(col, new_name)
 
         return result
 
-    def _basic_aggregations(self, df: DataFrame, features: List[str], aggs: List[str]) -> List[Column]:
+    def _basic_aggregations(self, features: List[str], aggs: List[str]) -> List[Column]:
         """Generate basic aggregations (no time window)."""
         result = []
         methods = self._get_methods()
@@ -207,7 +239,6 @@ class SecondOrderAggregator(BaseAggregatorPySpark):
 
     def _basic_days_aggregations(
         self,
-        df: DataFrame,
         features: List[str],
         aggs: List[str],
         day_lower: int,
@@ -223,9 +254,16 @@ class SecondOrderAggregator(BaseAggregatorPySpark):
             for agg in aggs:
                 # Build filter condition
                 if cond:
-                    filter_expr = (F.col("days_between") >= day_lower) & (F.col("days_between") <= day_upper) & F.expr(cond)
+                    filter_expr = (
+                        (F.col("_days_between") >= day_lower)
+                        & (F.col("_days_between") <= day_upper)
+                        & F.expr(cond)
+                    )
                 else:
-                    filter_expr = (F.col("days_between") >= day_lower) & (F.col("days_between") <= day_upper)
+                    filter_expr = (
+                        (F.col("_days_between") >= day_lower)
+                        & (F.col("_days_between") <= day_upper)
+                    )
 
                 # Get filtered column
                 filtered_col = F.when(filter_expr & F.col(feat).isNotNull(), F.col(feat))
@@ -242,29 +280,25 @@ class SecondOrderAggregator(BaseAggregatorPySpark):
 
         return result
 
-    def _since_aggregations(self, df: DataFrame, features: List[str], aggs: List[str], conds: List[Optional[str]]) -> List[Column]:
+    def _since_aggregations(self, features: List[str], aggs: List[str], conds: List[Optional[str]]) -> List[Column]:
         """Generate days-since aggregations."""
         result = []
-        methods = self._get_methods()
 
         for feat, cond in zip(features, conds):
             for agg in aggs:
+                # Build filter condition
                 if cond:
                     filter_expr = F.col(feat).isNotNull() & F.expr(cond)
                 else:
                     filter_expr = F.col(feat).isNotNull()
 
                 # For "since", return the days_between value
-                result.append(
-                    F.when(filter_expr, F.col("days_between"))
-                    .alias(f"{feat}_SINCE")
-                )
+                result.append(F.when(filter_expr, F.col("_days_between")).alias(f"SINCE_{agg.upper()}_{feat}"))
 
         return result
 
     def _ratio_aggregations(
         self,
-        df: DataFrame,
         features: List[str],
         aggs: List[str],
         day_lower1: int,
@@ -285,15 +319,15 @@ class SecondOrderAggregator(BaseAggregatorPySpark):
                 # Numerator (window 1)
                 if cond:
                     filter_expr1 = (
-                        (F.col("days_between") >= day_lower1)
-                        & (F.col("days_between") <= day_upper1)
+                        (F.col("_days_between") >= day_lower1)
+                        & (F.col("_days_between") <= day_upper1)
                         & F.col(feat).isNotNull()
                         & F.expr(cond)
                     )
                 else:
                     filter_expr1 = (
-                        (F.col("days_between") >= day_lower1)
-                        & (F.col("days_between") <= day_upper1)
+                        (F.col("_days_between") >= day_lower1)
+                        & (F.col("_days_between") <= day_upper1)
                         & F.col(feat).isNotNull()
                     )
 
@@ -302,15 +336,15 @@ class SecondOrderAggregator(BaseAggregatorPySpark):
                 # Denominator (window 2)
                 if cond:
                     filter_expr2 = (
-                        (F.col("days_between") >= day_lower2)
-                        & (F.col("days_between") <= day_upper2)
+                        (F.col("_days_between") >= day_lower2)
+                        & (F.col("_days_between") <= day_upper2)
                         & F.col(feat).isNotNull()
                         & F.expr(cond)
                     )
                 else:
                     filter_expr2 = (
-                        (F.col("days_between") >= day_lower2)
-                        & (F.col("days_between") <= day_upper2)
+                        (F.col("_days_between") >= day_lower2)
+                        & (F.col("_days_between") <= day_upper2)
                         & F.col(feat).isNotNull()
                     )
 
@@ -324,6 +358,52 @@ class SecondOrderAggregator(BaseAggregatorPySpark):
                 )
 
         return result
+
+    def validate(self, table_name: str) -> List[str]:
+        """Validate that the input table has the required columns.
+
+        Args:
+            table_name: Name of the table to validate
+
+        Returns:
+            List of error messages (empty if validation passes)
+        """
+        errors = []
+        try:
+            df = self.spark.table(table_name)
+            columns = set(df.columns)
+        except Exception as e:
+            return [f"Could not access table '{table_name}': {str(e)}"]
+
+        # Check required columns
+        if self.idCol not in columns:
+            errors.append(f"Missing ID column: '{self.idCol}'")
+
+        if self.featureDateCol not in columns:
+            errors.append(f"Missing feature date column: '{self.featureDateCol}'")
+
+        if self.applicationDateCol not in columns:
+            errors.append(f"Missing application date column: '{self.applicationDateCol}'")
+
+        # Check feature columns from rules
+        used_features = set()
+        for rule in self.rules:
+            for f in rule.features.split(","):
+                used_features.add(f.strip())
+
+        missing = used_features - columns
+        if missing:
+            errors.append(f"Missing feature columns: {missing}")
+
+        return errors
+
+    def builder(self) -> "FeatureBuilder":
+        """Returns a FeatureBuilder instance for fluent API.
+
+        Returns:
+            FeatureBuilder for chaining aggregation rules
+        """
+        return FeatureBuilder(self)
 
     def _get_methods(self) -> Dict[str, Callable]:
         """Get native Spark aggregation methods."""
@@ -346,3 +426,141 @@ class SecondOrderAggregator(BaseAggregatorPySpark):
             "last_value": last_val_udf,
             "most_frequent": most_frequent_udf,
         }
+
+    def _map_agg_func(self, agg: str) -> str:
+        """Map aggregation function name to Spark equivalent."""
+        mapping = {
+            "count": "count",
+            "sum": "sum",
+            "mean": "avg",
+            "avg": "avg",
+            "min": "min",
+            "max": "max",
+            "std": "stddev",
+            "stddev": "stddev",
+        }
+        return mapping.get(agg.lower(), agg)
+
+
+class FeatureBuilder:
+    """Fluent builder for SecondOrderAggregator rules.
+
+    Provides a fluent API for defining aggregation rules:
+
+    ```python
+    aggregator = SecondOrderAggregator(spark, "user_id", "day", "application_date")
+    aggregator.builder() \\
+        .feature("amount") \\
+        .basic(["sum", "mean"]) \\
+        .rolling([(1, 30), (31, 60)], ["sum"]) \\
+        .ratio((1, 30), (31, 60), ["sum"]) \\
+        .since("flag == 1", ["count"]) \\
+        .build()
+    ```
+    """
+
+    def __init__(self, aggregator: SecondOrderAggregator):
+        self.aggregator = aggregator
+        self.current_feature = None
+
+    def feature(self, name: str) -> "FeatureBuilder":
+        """Set the current feature for aggregation rules.
+
+        Args:
+            name: Feature column name
+
+        Returns:
+            self for method chaining
+        """
+        self.current_feature = name
+        return self
+
+    def basic(self, aggs: List[str]) -> "FeatureBuilder":
+        """Add basic aggregations for the current feature.
+
+        Args:
+            aggs: List of aggregation function names (e.g., ["sum", "mean"])
+
+        Returns:
+            self for method chaining
+        """
+        if not self.current_feature:
+            raise ValueError("Call .feature() before defining aggregations.")
+        for agg in aggs:
+            self.aggregator.rules.append(AggregationSpec("basic", self.current_feature, agg))
+        return self
+
+    def rolling(self, days: List[tuple], aggs: List[str]) -> "FeatureBuilder":
+        """Add rolling window aggregations for the current feature.
+
+        Args:
+            days: List of (lower, upper) day window tuples
+            aggs: List of aggregation function names
+
+        Returns:
+            self for method chaining
+
+        Example:
+            .rolling([(1, 30), (31, 60)], ["sum"])  # 1-30 days and 31-60 days
+        """
+        if not self.current_feature:
+            raise ValueError("Call .feature() before defining aggregations.")
+        for lower, upper in days:
+            for agg in aggs:
+                self.aggregator.rules.append(
+                    AggregationSpec("basic_days", self.current_feature, agg, "", str(lower), str(upper))
+                )
+        return self
+
+    def ratio(self, numerator: tuple, denominator: tuple, aggs: List[str]) -> "FeatureBuilder":
+        """Add ratio aggregations for the current feature.
+
+        Args:
+            numerator: (lower, upper) day window for numerator
+            denominator: (lower, upper) day window for denominator
+            aggs: List of aggregation function names
+
+        Returns:
+            self for method chaining
+
+        Example:
+            .ratio((1, 30), (31, 60), ["sum"])  # sum(1-30) / sum(31-60)
+        """
+        if not self.current_feature:
+            raise ValueError("Call .feature() before defining aggregations.")
+        l1, u1 = numerator
+        l2, u2 = denominator
+        for agg in aggs:
+            self.aggregator.rules.append(
+                AggregationSpec("ratio", self.current_feature, agg, "", str(l1), str(u1), str(l2), str(u2))
+            )
+        return self
+
+    def since(self, condition: str, aggs: List[str]) -> "FeatureBuilder":
+        """Add conditional aggregations for the current feature.
+
+        Args:
+            condition: SQL expression for filtering (e.g., "flag == 1")
+            aggs: List of aggregation function names
+
+        Returns:
+            self for method chaining
+
+        Example:
+            .since("flag == 1", ["count"])  # count where flag == 1
+        """
+        if not self.current_feature:
+            raise ValueError("Call .feature() before defining aggregations.")
+        for agg in aggs:
+            self.aggregator.rules.append(
+                AggregationSpec("since", self.current_feature, agg, condition)
+            )
+        return self
+
+    def build(self) -> SecondOrderAggregator:
+        """Return the aggregator with all rules applied.
+
+        Returns:
+            The SecondOrderAggregator instance
+        """
+        return self.aggregator

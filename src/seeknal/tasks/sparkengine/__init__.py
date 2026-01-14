@@ -19,7 +19,7 @@ from .py_impl.transformers import (
     JoinType,
     JoinTablesByExpr,
 )
-from .py_impl.aggregators import FunctionAggregator, AggregationFunction, SecondOrderAggregator, AggregationSpec
+from .py_impl.aggregators import FunctionAggregator, AggregationFunction, SecondOrderAggregator, AggregationSpec, FeatureBuilder
 
 __all__ = [
     "SparkEngineTask",
@@ -40,4 +40,5 @@ __all__ = [
     "AggregationFunction",
     "SecondOrderAggregator",
     "AggregationSpec",
+    "FeatureBuilder",
 ]
