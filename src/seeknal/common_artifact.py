@@ -9,10 +9,10 @@ from tabulate import tabulate
 
 from .context import context as seeknal_context, require_project, check_project_id
 from .context import logger
-from .tasks.sparkengine.transformers import Transformer
+from .tasks.sparkengine.py_impl.base import BaseTransformerPySpark as Transformer
 from .project import Project
 from .utils import to_snake
-from .tasks.sparkengine.loaders import Loader
+from .tasks.sparkengine.py_impl.base import BaseLoaderPySpark as Loader
 from .request import SourceRequest, RuleRequest, EntityRequest
 from .entity import Entity
 from .workspace import require_workspace

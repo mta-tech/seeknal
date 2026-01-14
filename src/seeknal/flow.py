@@ -20,7 +20,7 @@ from .request import FlowRequest
 from .tasks.base import Task
 from .tasks.duckdb import DuckDBTask
 from .tasks.sparkengine import SparkEngineTask
-from .tasks.sparkengine.extractors import Extractor
+from .tasks.sparkengine.py_impl.base import BaseExtractorPySpark as Extractor
 from .utils import to_snake
 from .workspace import require_workspace
 

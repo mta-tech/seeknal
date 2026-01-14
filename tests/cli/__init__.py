@@ -1,1 +1,1 @@
-"""CLI tests for Seeknal."""
+"""CLI integration tests package."""

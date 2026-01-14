@@ -70,6 +70,8 @@ _EXPORTS = {
     "OnlineFeatures": "seeknal.featurestore.feature_group",
     "Materialization": "seeknal.featurestore.feature_group",
     "GetLatestTimeStrategy": "seeknal.featurestore.feature_group",
+    # Feature Group submodule (for tests/mocking)
+    "feature_group": "seeknal.featurestore.feature_group",
     # Feature Store classes
     "FeatureStore": "seeknal.featurestore.featurestore",
     "Feature": "seeknal.featurestore.featurestore",
