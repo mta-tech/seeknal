@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "seeknal"
-version = "1.0.0"
+version = "2.0.0"
 description = "All-in-one platform for data and AI/ML engineering"
 authors = [
     {name = "Fitra Kacamarga"}
@@ -15,7 +15,6 @@ scripts = { seeknal = "seeknal.cli.main:main" }
 dependencies = [
     "delta-spark==3.2.0",
     "duckdb>=1.1.3",
-    "findspark>=2.0.1",
     "httpx>=0.28.1",
     "ipykernel>=6.29.5",
     "libsql-experimental>=0.0.41",
