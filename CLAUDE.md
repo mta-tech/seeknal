@@ -172,9 +172,9 @@ tests/                     # pytest test suite
 ## Working with Engines
 
 ### Spark Engine (`tasks/sparkengine/`)
-- Legacy Scala code in `engines/spark-engine/`
-- Python bindings in `src/seeknal/tasks/sparkengine/`
+- Pure PySpark implementation (no JVM required)
 - Transformers, aggregators, loaders, extractors
+- Uses `delta-spark` and `pyspark` packages
 
 ### DuckDB Engine (`tasks/duckdb/`)
 - Native Python implementation
@@ -207,7 +207,7 @@ tests/                     # pytest test suite
 
 ## Known Issues & Gotchas
 
-1. **Spark Engine**: Legacy Scala code requires JVM
+1. **Spark Engine**: Pure PySpark implementation (no JVM required for transformers)
 2. **Path Security**: Always validate paths with `path_security.py`
 3. **SQL Injection**: Use validation functions from `validation.py`
 4. **Context Required**: Most operations need workspace/project context
