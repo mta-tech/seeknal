@@ -1,7 +1,0 @@
-{
-  "group" : "fans",
-  "user" : {
-      "first" : "John",
-      "last" :  "Smith"
-    }
-}
