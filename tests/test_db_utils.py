@@ -270,14 +270,18 @@ class TestBuildDatabaseUrl:
 
     def test_build_local_sqlite_url(self):
         """Test building local SQLite URL."""
-        result = build_database_url(local_db_path="/path/to/db.sqlite")
+        from unittest import mock
+        with mock.patch("os.makedirs"):
+            result = build_database_url(local_db_path="/path/to/db.sqlite")
 
         assert isinstance(result, SecureDatabaseURL)
         assert str(result) == "sqlite:////path/to/db.sqlite"
 
     def test_build_default_sqlite_url(self):
         """Test building default SQLite URL."""
-        result = build_database_url(default_db_path="/default/path/db.sqlite")
+        from unittest import mock
+        with mock.patch("os.makedirs"):
+            result = build_database_url(default_db_path="/default/path/db.sqlite")
 
         assert isinstance(result, SecureDatabaseURL)
         assert str(result) == "sqlite:////default/path/db.sqlite"

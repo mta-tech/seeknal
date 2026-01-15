@@ -23,7 +23,7 @@ def test_duckdb_task_with_path():
 
     my_duckdb = (
         DuckDBTask()
-        .add_input(path="tests/data/poi_sample.parquet/part-0.parquet")
+        .add_input(path="tests/data/poi_sample.parquet/part-00000-9590699e-c6c2-4709-b2e4-9b37e7d544d6-c000.parquet")
         .add_sql("SELECT poi_name, lat, long FROM __THIS__")
         .add_sql("SELECT poi_name, lat FROM __THIS__")
     )
