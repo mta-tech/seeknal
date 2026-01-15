@@ -94,7 +94,7 @@ class TestDuckDBTaskBasics:
         task = DuckDBTask()
         task.add_input(dataframe=sample_data_arrow)
         task.add_sql("SELECT * FROM __THIS__ LIMIT 10")
-        assert len(task.sqls) > 0
+        assert len(task.stages) > 0
 
 
 class TestDuckDBTransformation:
@@ -270,12 +270,19 @@ class TestQuickstartScriptExecution:
         """Verify the quickstart script runs without errors."""
         script_path = os.path.join(temp_quickstart_dir, "quickstart_duckdb.py")
 
+        # Add src directory to PYTHONPATH so the script can import seeknal
+        import sys
+        src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+        env = os.environ.copy()
+        env["PYTHONPATH"] = env.get("PYTHONPATH", "") + ":" + src_dir
+
         result = subprocess.run(
             [sys.executable, script_path],
             capture_output=True,
             text=True,
             cwd=temp_quickstart_dir,
             timeout=120,
+            env=env,
         )
 
         assert result.returncode == 0, (

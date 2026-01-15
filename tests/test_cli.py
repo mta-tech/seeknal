@@ -34,29 +34,29 @@ runner = CliRunner()
 
 
 class TestVersionCommand:
-    """Tests for the version command."""
+    """Tests for the info command (displays version information)."""
 
     def test_version_displays_seeknal_version(self):
-        """Version command should display Seeknal version."""
-        result = runner.invoke(app, ["version"])
+        """Info command should display Seeknal version."""
+        result = runner.invoke(app, ["info"])
         assert result.exit_code == 0
         assert "Seeknal version:" in result.stdout
 
     def test_version_displays_python_version(self):
-        """Version command should display Python version."""
-        result = runner.invoke(app, ["version"])
+        """Info command should display Python version."""
+        result = runner.invoke(app, ["info"])
         assert result.exit_code == 0
         assert "Python version:" in result.stdout
 
     def test_version_displays_pyspark_version(self):
-        """Version command should display PySpark version."""
-        result = runner.invoke(app, ["version"])
+        """Info command should display PySpark version."""
+        result = runner.invoke(app, ["info"])
         assert result.exit_code == 0
         assert "PySpark version:" in result.stdout
 
     def test_version_displays_duckdb_version(self):
-        """Version command should display DuckDB version."""
-        result = runner.invoke(app, ["version"])
+        """Info command should display DuckDB version."""
+        result = runner.invoke(app, ["info"])
         assert result.exit_code == 0
         assert "DuckDB version:" in result.stdout
 

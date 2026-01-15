@@ -100,7 +100,7 @@ class TestVersionMaterializationWorkflow:
 class TestVersionQueryingWorkflow:
     """E2E tests for version querying workflows."""
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_workflow(self, mock_fg_class, clean_test_env):
         """Test the full version listing workflow."""
         # Setup mock to simulate a feature group with multiple versions
@@ -123,7 +123,7 @@ class TestVersionQueryingWorkflow:
         assert "Created At" in result.stdout
         assert "Features" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_show_workflow(self, mock_fg_class, clean_test_env):
         """Test the version show workflow with specific version."""
         mock_fg = mock.MagicMock()
@@ -158,7 +158,7 @@ class TestVersionQueryingWorkflow:
         assert "Schema:" in result.stdout
         assert "Fields:" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_workflow(self, mock_fg_class, clean_test_env):
         """Test the schema comparison workflow between versions."""
         mock_fg = mock.MagicMock()
@@ -208,7 +208,7 @@ class TestVersionRollbackWorkflow:
         assert "Version: 1" in result.stdout
         assert "Mode: overwrite" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_shows_multiple_versions_after_rollback(
         self, mock_fg_class, clean_test_env
     ):
@@ -233,7 +233,7 @@ class TestVersionRollbackWorkflow:
 class TestSchemaComparisonWorkflow:
     """E2E tests for schema comparison workflows."""
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_schema_comparison_detects_added_features(self, mock_fg_class, clean_test_env):
         """Test that schema comparison correctly detects added features."""
         mock_fg = mock.MagicMock()
@@ -259,7 +259,7 @@ class TestSchemaComparisonWorkflow:
         assert "new_feature_2" in result.stdout
         assert "2 added" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_schema_comparison_detects_removed_features(self, mock_fg_class, clean_test_env):
         """Test that schema comparison correctly detects removed features."""
         mock_fg = mock.MagicMock()
@@ -281,7 +281,7 @@ class TestSchemaComparisonWorkflow:
         assert "deprecated_feature" in result.stdout
         assert "1 removed" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_schema_comparison_detects_modified_features(self, mock_fg_class, clean_test_env):
         """Test that schema comparison correctly detects type changes."""
         mock_fg = mock.MagicMock()
@@ -307,7 +307,7 @@ class TestSchemaComparisonWorkflow:
         assert "double" in result.stdout
         assert "1 modified" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_schema_comparison_no_changes(self, mock_fg_class, clean_test_env):
         """Test schema comparison when versions have identical schemas."""
         mock_fg = mock.MagicMock()
@@ -331,7 +331,7 @@ class TestSchemaComparisonWorkflow:
 class TestVersionErrorHandling:
     """E2E tests for error handling in version workflows."""
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_empty_feature_group(self, mock_fg_class, clean_test_env):
         """Test version list with feature group that has no versions."""
         mock_fg = mock.MagicMock()
@@ -345,7 +345,7 @@ class TestVersionErrorHandling:
         assert result.exit_code == 0
         assert "No versions found" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_show_nonexistent_version(self, mock_fg_class, clean_test_env):
         """Test version show with non-existent version number."""
         mock_fg = mock.MagicMock()
@@ -361,7 +361,7 @@ class TestVersionErrorHandling:
         assert result.exit_code == 1
         assert "not found" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_same_version_error(self, mock_fg_class, clean_test_env):
         """Test that comparing same version with itself fails with clear error."""
         mock_fg = mock.MagicMock()
@@ -379,7 +379,7 @@ class TestVersionErrorHandling:
         assert result.exit_code == 1
         assert "must be different" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_nonexistent_version(self, mock_fg_class, clean_test_env):
         """Test diff with non-existent version."""
         mock_fg = mock.MagicMock()
@@ -416,7 +416,7 @@ class TestVersionCLIIntegration:
         assert result.exit_code == 0
         assert "--version" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_json_output(self, mock_fg_class, clean_test_env):
         """Test version list with JSON output format."""
         mock_fg = mock.MagicMock()
@@ -438,7 +438,7 @@ class TestVersionCLIIntegration:
         assert len(output) == 2
         assert output[0]["version"] == 2
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_full_version_workflow(self, mock_fg_class, clean_test_env):
         """Test complete version management workflow: list -> show -> diff."""
         mock_fg = mock.MagicMock()

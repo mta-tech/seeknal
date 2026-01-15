@@ -155,7 +155,7 @@ class TestVersionWorkflow:
 
     def test_version_shows_all_components(self):
         """Test that version shows all component versions."""
-        result = runner.invoke(app, ["version"])
+        result = runner.invoke(app, ["info"])
         assert result.exit_code == 0
 
         # Should show all version components
@@ -166,7 +166,7 @@ class TestVersionWorkflow:
 
     def test_version_format(self):
         """Test that versions are in expected format."""
-        result = runner.invoke(app, ["version"])
+        result = runner.invoke(app, ["info"])
         assert result.exit_code == 0
 
         # Each line should have a version number pattern
@@ -332,7 +332,7 @@ class TestCLIIntegration:
     def test_version_then_validate(self):
         """Test version and validate commands work independently."""
         # Version should always work
-        result = runner.invoke(app, ["version"])
+        result = runner.invoke(app, ["info"])
         assert result.exit_code == 0
 
         # Validate should work regardless of previous commands

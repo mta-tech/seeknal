@@ -38,12 +38,12 @@ class DuckDBTask(Task):
     _materialize: bool = False
     is_spark_job: bool = False
     stages: List[dict] = field(default_factory=list)
-    kind: str = "DuckDBTask"
+    kind: str = "duckdb"
     conn: Optional[duckdb.DuckDBPyConnection] = None
 
     def __post_init__(self):
         self.is_spark_job = False
-        self.kind = "DuckDBTask"
+        self.kind = "duckdb"
         self.conn = duckdb.connect(database=":memory:")
 
         # Install and load extensions

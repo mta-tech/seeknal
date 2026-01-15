@@ -242,7 +242,7 @@ class TestValidateFeaturesHelp:
 class TestValidateFeaturesModeFailE2E:
     """E2E tests for validate-features command with --mode fail."""
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_fail_mode_returns_exit_code_1_on_validation_failure(self, mock_fg_class):
         """Test that fail mode returns exit code 1 when validation fails."""
         # Setup mock
@@ -271,7 +271,7 @@ class TestValidateFeaturesModeFailE2E:
         # Should fail with exit code 1
         assert result.exit_code == 1
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_fail_mode_shows_clear_error_message(self, mock_fg_class):
         """Test that fail mode displays clear error messages."""
         # Setup mock
@@ -300,7 +300,7 @@ class TestValidateFeaturesModeFailE2E:
         # Should show error message
         assert "Validation stopped" in result.stdout or "failed" in result.stdout.lower()
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_fail_mode_shows_failure_details(self, mock_fg_class):
         """Test that fail mode shows details about the failure."""
         # Setup mock
@@ -332,7 +332,7 @@ class TestValidateFeaturesModeFailE2E:
         # Should show validator name in output
         assert "NullValidator" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_fail_mode_returns_exit_code_0_when_all_pass(self, mock_fg_class):
         """Test that fail mode returns exit code 0 when all validations pass."""
         # Setup mock with passing validators
@@ -349,7 +349,7 @@ class TestValidateFeaturesModeFailE2E:
         assert result.exit_code == 0
         assert "passed" in result.stdout.lower() or "PASS" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_fail_mode_displays_validation_summary(self, mock_fg_class):
         """Test that fail mode displays validation summary."""
         # Setup mock
@@ -374,7 +374,7 @@ class TestValidateFeaturesModeFailE2E:
 class TestValidateFeaturesModeWarnE2E:
     """E2E tests for validate-features command with --mode warn."""
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_warn_mode_returns_exit_code_0_even_on_failure(self, mock_fg_class):
         """Test that warn mode returns exit code 0 even when validators fail."""
         # Setup mock with failing validators
@@ -390,7 +390,7 @@ class TestValidateFeaturesModeWarnE2E:
         # Should pass with exit code 0 in warn mode
         assert result.exit_code == 0
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_warn_mode_shows_warnings(self, mock_fg_class):
         """Test that warn mode displays warnings for failed validators."""
         # Setup mock with failing validators
@@ -406,7 +406,7 @@ class TestValidateFeaturesModeWarnE2E:
         # Should show warnings
         assert "warning" in result.stdout.lower() or "FAIL" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_warn_mode_continues_after_failure(self, mock_fg_class):
         """Test that warn mode continues and shows all validation results."""
         # Setup mock with multiple validators (some failing)
@@ -426,7 +426,7 @@ class TestValidateFeaturesModeWarnE2E:
             or "Passed" in result.stdout
         )
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_warn_mode_shows_exit_code_message(self, mock_fg_class):
         """Test that warn mode shows exit code message for warnings."""
         # Setup mock with failing validators
@@ -456,7 +456,7 @@ class TestValidateFeaturesModeWarnE2E:
 class TestValidateFeaturesErrorHandling:
     """E2E tests for validate-features error handling."""
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_nonexistent_feature_group_returns_exit_code_1(self, mock_fg_class):
         """Test that non-existent feature group returns exit code 1."""
         # Setup mock to return None (feature group not found)
@@ -469,7 +469,7 @@ class TestValidateFeaturesErrorHandling:
         # Should fail with exit code 1
         assert result.exit_code == 1
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_nonexistent_feature_group_shows_error_message(self, mock_fg_class):
         """Test that non-existent feature group shows clear error message."""
         # Setup mock to return None
@@ -483,7 +483,7 @@ class TestValidateFeaturesErrorHandling:
         assert "not found" in result.stdout.lower()
         assert "nonexistent_fg" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_no_validators_configured_exits_cleanly(self, mock_fg_class):
         """Test that feature group with no validators exits cleanly."""
         # Setup mock with no validators
@@ -503,7 +503,7 @@ class TestValidateFeaturesErrorHandling:
             or "configure" in result.stdout.lower()
         )
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_load_exception_shows_error(self, mock_fg_class):
         """Test that exception during load shows error message."""
         # Setup mock to raise exception
@@ -533,7 +533,7 @@ class TestValidateFeaturesErrorHandling:
 class TestValidateFeaturesOutputFormat:
     """E2E tests for validate-features output formatting."""
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_output_shows_feature_group_name(self, mock_fg_class):
         """Test that output shows the feature group name."""
         mock_fg = create_mock_feature_group(
@@ -549,7 +549,7 @@ class TestValidateFeaturesOutputFormat:
 
         assert "my_feature_group" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_output_shows_mode(self, mock_fg_class):
         """Test that output shows the validation mode."""
         mock_fg = create_mock_feature_group(
@@ -563,7 +563,7 @@ class TestValidateFeaturesOutputFormat:
 
         assert "warn" in result.stdout.lower()
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_output_shows_validator_count(self, mock_fg_class):
         """Test that output shows the number of validators."""
         mock_fg = create_mock_feature_group(
@@ -578,7 +578,7 @@ class TestValidateFeaturesOutputFormat:
         # Should show validator count (2 default validators)
         assert "2" in result.stdout or "validators" in result.stdout.lower()
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_verbose_mode_shows_additional_details(self, mock_fg_class):
         """Test that verbose mode shows additional details."""
         mock_fg = create_mock_feature_group(
@@ -605,7 +605,7 @@ class TestValidateFeaturesOutputFormat:
 class TestValidateFeaturesWorkflowIntegration:
     """Integration tests for complete validation workflows."""
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_complete_passing_workflow(self, mock_fg_class):
         """Test complete workflow with all validations passing."""
         mock_fg = create_mock_feature_group(
@@ -624,7 +624,7 @@ class TestValidateFeaturesWorkflowIntegration:
         assert "user_features" in result.stdout
         assert "passed" in result.stdout.lower() or "PASS" in result.stdout
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_complete_failing_workflow_fail_mode(self, mock_fg_class):
         """Test complete workflow with failures in fail mode."""
         mock_fg = create_mock_feature_group(
@@ -654,7 +654,7 @@ class TestValidateFeaturesWorkflowIntegration:
         assert result.exit_code == 1
         assert "failed" in result.stdout.lower() or "stopped" in result.stdout.lower()
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_complete_failing_workflow_warn_mode(self, mock_fg_class):
         """Test complete workflow with failures in warn mode."""
         mock_fg = create_mock_feature_group(
@@ -681,7 +681,7 @@ class TestValidateFeaturesWorkflowIntegration:
 class TestValidateFeaturesDefaults:
     """Tests for validate-features default behavior."""
 
-    @mock.patch("seeknal.cli.main.FeatureGroup")
+    @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_default_mode_is_fail(self, mock_fg_class):
         """Test that default mode is 'fail' when not specified."""
         mock_fg = create_mock_feature_group(

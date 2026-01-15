@@ -13,6 +13,8 @@ from functools import wraps
 from typing import Callable, Dict, Optional, Tuple, Type, TypeVar, Union
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
+from .context import logger
+
 
 class SecureDatabaseURL:
     """
