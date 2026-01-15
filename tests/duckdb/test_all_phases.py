@@ -296,7 +296,7 @@ def test_complete_pipeline():
     import duckdb
 
     # Load existing project data
-    parquet_path = "src/tests/data/poi_sample.parquet/part-00000-9590699e-c6c2-4709-b2e4-9b37e7d544d6-c000.parquet"
+    parquet_path = "tests/data/poi_sample.parquet/part-00000-9590699e-c6c2-4709-b2e4-9b37e7d544d6-c000.parquet"
 
     if not Path(parquet_path).exists():
         print("⚠  Skipping real data test (file not found)")

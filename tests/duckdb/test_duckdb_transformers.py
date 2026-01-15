@@ -235,7 +235,7 @@ class TestRealParquetData:
     @pytest.fixture
     def parquet_path(self):
         """Path to real parquet file."""
-        return "src/tests/data/poi_sample.parquet/part-00000-9590699e-c6c2-4709-b2e4-9b37e7d544d6-c000.parquet"
+        return "tests/data/poi_sample.parquet/part-00000-9590699e-c6c2-4709-b2e4-9b37e7d544d6-c000.parquet"
 
     def test_read_parquet(self, parquet_path):
         """Test reading parquet file."""
@@ -392,7 +392,7 @@ def run_all_tests():
     print("\n✓ All aggregator tests passed!\n")
 
     # Run real data tests
-    parquet_path = "src/tests/data/poi_sample.parquet/part-00000-9590699e-c6c2-4709-b2e4-9b37e7d544d6-c000.parquet"
+    parquet_path = "tests/data/poi_sample.parquet/part-00000-9590699e-c6c2-4709-b2e4-9b37e7d544d6-c000.parquet"
     if Path(parquet_path).exists():
         print("Testing with Real Parquet Data...")
         test_real.test_read_parquet(parquet_path)

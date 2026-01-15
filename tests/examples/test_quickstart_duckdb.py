@@ -249,6 +249,61 @@ class TestFeatureOutputQuality:
         )
 
 
+# Phase 5: Secure environment fixture for subprocess tests
+# Security: Allow only safe environment variables
+ALLOWED_ENV_VARS = {"PATH", "HOME", "USER", "SHELL", "PYTHONPATH"}
+
+# Security: Block dangerous environment variable patterns
+FORBIDDEN_ENV_PATTERNS = {"API_KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIALS"}
+
+
+@pytest.fixture
+def secure_quickstart_env():
+    """
+    Set up SECURE environment for quickstart subprocess tests.
+
+    SECURITY FIXES:
+    - Validates src_dir path is within project
+    - Creates clean environment (doesn't copy all env vars)
+    - Filters out dangerous variables
+    - Cross-platform path handling
+
+    Returns:
+        dict: Clean environment variables for subprocess execution
+    """
+    # Validate and resolve src directory
+    project_root = Path(__file__).parent.parent.parent
+    src_dir = (project_root / "src").resolve()
+
+    # SECURITY: Validate src_dir is within project
+    if not str(src_dir).startswith(str(project_root.resolve())):
+        raise ValueError(f"Security: src directory outside project root: {src_dir}")
+
+    # SECURITY: Validate src_dir exists
+    if not src_dir.exists():
+        raise FileNotFoundError(f"Source directory not found: {src_dir}")
+
+    # Create clean environment (don't copy potentially malicious env)
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "USER": os.environ.get("USER", ""),
+        "PYTHONPATH": str(src_dir),  # Use validated path only
+    }
+
+    # SECURITY: Remove dangerous variables
+    for key in list(env.keys()):
+        key_upper = key.upper()
+        if any(forbidden in key_upper for forbidden in FORBIDDEN_ENV_PATTERNS):
+            del env[key]
+
+    # SECURITY: Remove system-level dangerous variables
+    for key in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "IFS"]:
+        env.pop(key, None)
+
+    return env
+
+
 class TestQuickstartScriptExecution:
     """Tests for running the quickstart script end-to-end."""
 
@@ -266,30 +321,24 @@ class TestQuickstartScriptExecution:
         # Cleanup
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def test_quickstart_script_runs_successfully(self, temp_quickstart_dir):
+    def test_quickstart_script_runs_successfully(self, temp_quickstart_dir, secure_quickstart_env):
         """Verify the quickstart script runs without errors."""
         script_path = os.path.join(temp_quickstart_dir, "quickstart_duckdb.py")
-
-        # Add src directory to PYTHONPATH so the script can import seeknal
-        import sys
-        src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
-        env = os.environ.copy()
-        env["PYTHONPATH"] = env.get("PYTHONPATH", "") + ":" + src_dir
 
         result = subprocess.run(
             [sys.executable, script_path],
             capture_output=True,
             text=True,
             cwd=temp_quickstart_dir,
-            timeout=120,
-            env=env,
+            timeout=90,  # 90s balances speed vs system load variations
+            env=secure_quickstart_env,  # Use SECURE environment
         )
 
         assert result.returncode == 0, (
             f"Quickstart script failed with error:\n{result.stderr}"
         )
 
-    def test_quickstart_creates_output_directory(self, temp_quickstart_dir):
+    def test_quickstart_creates_output_directory(self, temp_quickstart_dir, secure_quickstart_env):
         """Verify the quickstart script creates output directory."""
         script_path = os.path.join(temp_quickstart_dir, "quickstart_duckdb.py")
         output_dir = os.path.join(temp_quickstart_dir, "output")
@@ -298,14 +347,15 @@ class TestQuickstartScriptExecution:
             [sys.executable, script_path],
             capture_output=True,
             cwd=temp_quickstart_dir,
-            timeout=120,
+            timeout=90,  # 90s balances speed vs system load variations
+            env=secure_quickstart_env,  # Use SECURE environment
         )
 
         assert os.path.exists(output_dir), (
             "Output directory was not created"
         )
 
-    def test_quickstart_creates_parquet_output(self, temp_quickstart_dir):
+    def test_quickstart_creates_parquet_output(self, temp_quickstart_dir, secure_quickstart_env):
         """Verify the quickstart script creates Parquet output."""
         script_path = os.path.join(temp_quickstart_dir, "quickstart_duckdb.py")
         parquet_path = os.path.join(temp_quickstart_dir, "output", "user_features.parquet")
@@ -314,7 +364,8 @@ class TestQuickstartScriptExecution:
             [sys.executable, script_path],
             capture_output=True,
             cwd=temp_quickstart_dir,
-            timeout=120,
+            timeout=90,  # 90s balances speed vs system load variations
+            env=secure_quickstart_env,  # Use SECURE environment
         )
 
         assert os.path.exists(parquet_path), (
@@ -325,7 +376,7 @@ class TestQuickstartScriptExecution:
         df = pd.read_parquet(parquet_path)
         assert len(df) > 0, "Parquet file is empty"
 
-    def test_quickstart_creates_csv_output(self, temp_quickstart_dir):
+    def test_quickstart_creates_csv_output(self, temp_quickstart_dir, secure_quickstart_env):
         """Verify the quickstart script creates CSV output."""
         script_path = os.path.join(temp_quickstart_dir, "quickstart_duckdb.py")
         csv_path = os.path.join(temp_quickstart_dir, "output", "user_features.csv")
@@ -334,7 +385,8 @@ class TestQuickstartScriptExecution:
             [sys.executable, script_path],
             capture_output=True,
             cwd=temp_quickstart_dir,
-            timeout=120,
+            timeout=90,  # 90s balances speed vs system load variations
+            env=secure_quickstart_env,  # Use SECURE environment
         )
 
         assert os.path.exists(csv_path), (
@@ -345,7 +397,7 @@ class TestQuickstartScriptExecution:
         df = pd.read_csv(csv_path)
         assert len(df) > 0, "CSV file is empty"
 
-    def test_quickstart_output_has_expected_columns(self, temp_quickstart_dir):
+    def test_quickstart_output_has_expected_columns(self, temp_quickstart_dir, secure_quickstart_env):
         """Verify the output files have expected feature columns."""
         script_path = os.path.join(temp_quickstart_dir, "quickstart_duckdb.py")
         parquet_path = os.path.join(temp_quickstart_dir, "output", "user_features.parquet")
@@ -354,7 +406,8 @@ class TestQuickstartScriptExecution:
             [sys.executable, script_path],
             capture_output=True,
             cwd=temp_quickstart_dir,
-            timeout=120,
+            timeout=90,  # 90s balances speed vs system load variations
+            env=secure_quickstart_env,  # Use SECURE environment
         )
 
         df = pd.read_parquet(parquet_path)
@@ -367,7 +420,7 @@ class TestQuickstartScriptExecution:
         for col in expected_columns:
             assert col in df.columns, f"Missing expected column: {col}"
 
-    def test_quickstart_output_contains_users(self, temp_quickstart_dir):
+    def test_quickstart_output_contains_users(self, temp_quickstart_dir, secure_quickstart_env):
         """Verify the output contains user-level aggregations."""
         script_path = os.path.join(temp_quickstart_dir, "quickstart_duckdb.py")
         parquet_path = os.path.join(temp_quickstart_dir, "output", "user_features.parquet")
@@ -376,7 +429,8 @@ class TestQuickstartScriptExecution:
             [sys.executable, script_path],
             capture_output=True,
             cwd=temp_quickstart_dir,
-            timeout=120,
+            timeout=90,  # 90s balances speed vs system load variations
+            env=secure_quickstart_env,  # Use SECURE environment
         )
 
         df = pd.read_parquet(parquet_path)

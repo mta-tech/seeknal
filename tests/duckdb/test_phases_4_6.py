@@ -207,7 +207,7 @@ def test_complete_pipeline():
     print("TESTING COMPLETE PIPELINE (ALL PHASES)")
     print("=" * 60)
 
-    parquet_path = "src/tests/data/poi_sample.parquet/part-00000-9590699e-c6c2-4709-b2e4-9b37e7d544d6-c000.parquet"
+    parquet_path = "tests/data/poi_sample.parquet/part-00000-9590699e-c6c2-4709-b2e4-9b37e7d544d6-c000.parquet"
 
     print(f"\nTesting with real data: {parquet_path}")
     import os
