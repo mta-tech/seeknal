@@ -60,8 +60,8 @@ def spark(request, spark_temp_dirs):
     spark_warehouse_dir, meta_dir = spark_temp_dirs
     # current is ./tests
     cur_dir = os.path.dirname(os.path.realpath(__file__))
-    # in ./lib/external
-    external_libs_dir = os.path.join(cur_dir, os.pardir, os.pardir, "lib", "external")
+    # in ./lib/external (at project root)
+    external_libs_dir = os.path.join(cur_dir, os.pardir, "lib", "external")
     external_libs_jars = [
         os.path.join(external_libs_dir, f) for f in os.listdir(external_libs_dir)
     ]

@@ -21,7 +21,7 @@ import pytest
 
 # Path to the source code for static analysis
 SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLI_FILE = os.path.join(SRC_DIR, 'seeknal', 'cli', 'main.py')
+CLI_FILE = os.path.join(SRC_DIR, 'src', 'seeknal', 'cli', 'main.py')
 
 
 def read_cli_source():

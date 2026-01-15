@@ -32,8 +32,8 @@ except ImportError:
 
 # Path to the source code for static analysis
 SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FEATURESTORE_FILE = os.path.join(SRC_DIR, 'seeknal', 'featurestore', 'duckdbengine', 'featurestore.py')
-FEATURE_GROUP_FILE = os.path.join(SRC_DIR, 'seeknal', 'featurestore', 'duckdbengine', 'feature_group.py')
+FEATURESTORE_FILE = os.path.join(SRC_DIR, 'src', 'seeknal', 'featurestore', 'duckdbengine', 'featurestore.py')
+FEATURE_GROUP_FILE = os.path.join(SRC_DIR, 'src', 'seeknal', 'featurestore', 'duckdbengine', 'feature_group.py')
 
 
 def read_featurestore_source():

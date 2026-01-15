@@ -18,7 +18,7 @@ from unittest.mock import patch, MagicMock
 
 # Path to the source code for static analysis
 SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-REQUEST_FILE = os.path.join(SRC_DIR, 'seeknal', 'request.py')
+REQUEST_FILE = os.path.join(SRC_DIR, 'src', 'seeknal', 'request.py')
 
 
 def read_request_source():
