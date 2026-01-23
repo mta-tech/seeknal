@@ -104,6 +104,11 @@ Examples:
 )
 app.add_typer(version_app, name="version")
 
+# Source management for REPL
+from seeknal.cli.source import app as source_app
+
+app.add_typer(source_app, name="source")
+
 
 # =============================================================================
 # Atlas Integration (Optional)
@@ -1551,6 +1556,33 @@ def parse(
     except Exception as e:
         _echo_error(f"Parse failed: {e}")
         raise typer.Exit(1)
+
+
+@app.command()
+def repl():
+    """Start interactive SQL REPL.
+
+    The SQL REPL allows you to explore data across multiple sources using DuckDB
+    as a unified query engine. Connect to PostgreSQL, MySQL, SQLite databases,
+    or query local parquet/csv files.
+
+    Examples:
+        seeknal repl
+        seeknal> .connect mydb                   (saved source)
+        seeknal> .connect postgres://user:pass@host/db
+        seeknal> .connect /path/to/data.parquet
+        seeknal> SELECT * FROM db0.users LIMIT 10
+        seeknal> .tables
+        seeknal> .quit
+
+    Manage sources:
+        seeknal source add mydb --url postgres://user:pass@host/db
+        seeknal source list
+        seeknal source remove mydb
+    """
+    from seeknal.cli.repl import run_repl
+
+    run_repl()
 
 
 def main():

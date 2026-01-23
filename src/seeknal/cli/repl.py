@@ -1,0 +1,375 @@
+"""Minimal SQL REPL for seeknal using DuckDB.
+
+Uses DuckDB scanner extensions to query postgres, mysql, sqlite databases
+and native DuckDB for parquet/csv files.
+"""
+from __future__ import annotations
+
+import os
+import readline
+from pathlib import Path
+from typing import Optional
+
+import duckdb
+from tabulate import tabulate
+
+from seeknal.utils.path_security import is_insecure_path
+from seeknal.db_utils import sanitize_error_message
+
+
+# Scanner extensions to load
+EXTENSIONS = ["postgres", "mysql", "sqlite"]
+
+
+class REPL:
+    """Simple SQL REPL using DuckDB as the single query engine."""
+
+    def __init__(self) -> None:
+        self.conn = duckdb.connect(":memory:")
+        self.attached: set[str] = set()
+        self._load_extensions()
+        self._setup_history()
+
+    def _load_extensions(self) -> None:
+        """Install and load DuckDB scanner extensions."""
+        for ext in EXTENSIONS:
+            try:
+                self.conn.execute(f"INSTALL {ext}")
+                self.conn.execute(f"LOAD {ext}")
+            except Exception:
+                pass  # Extension may already be installed or unavailable
+
+    def _setup_history(self) -> None:
+        """Configure readline history."""
+        history_dir = Path.home() / ".seeknal"
+        history_dir.mkdir(parents=True, exist_ok=True)
+        self._history_path = history_dir / ".repl_history"
+
+        try:
+            if self._history_path.exists():
+                readline.read_history_file(str(self._history_path))
+            readline.set_history_length(1000)
+        except Exception:
+            pass
+
+    def _save_history(self) -> None:
+        """Save readline history."""
+        try:
+            readline.write_history_file(str(self._history_path))
+        except Exception:
+            pass
+
+    def run(self) -> None:
+        """Main REPL loop."""
+        print("Seeknal SQL REPL (DuckDB)")
+        print("Commands: .connect <url>, .tables, .schema <table>, .quit")
+        print("Example: .connect postgres://user:pass@host/db")
+        print()
+
+        try:
+            while True:
+                try:
+                    line = input("seeknal> ").strip()
+                    if not line:
+                        continue
+
+                    if line == ".quit" or line == ".exit":
+                        break
+                    elif line == ".help":
+                        self._show_help()
+                    elif line == ".sources":
+                        self._show_sources()
+                    elif line.startswith(".connect "):
+                        self._connect(line[9:].strip())
+                    elif line == ".tables":
+                        self._show_tables()
+                    elif line.startswith(".schema "):
+                        self._show_schema(line[8:].strip())
+                    elif line.startswith("."):
+                        print(f"Unknown command: {line.split()[0]}. Type .help")
+                    else:
+                        self._execute(line)
+
+                except KeyboardInterrupt:
+                    print()  # Newline after ^C
+                    continue
+
+        except EOFError:
+            pass
+        finally:
+            self._save_history()
+            print("Goodbye!")
+
+    def _show_help(self) -> None:
+        """Show available commands."""
+        print(
+            """
+Commands:
+  .sources          List saved data sources
+  .connect <name>   Connect to a saved source by name
+  .connect <url>    Connect to a database URL directly
+  .tables           List tables in connected databases
+  .schema <table>   Show table schema
+  .quit             Exit the REPL
+
+Connection examples:
+  .connect mydb                                    (saved source)
+  .connect postgres://user:pass@localhost/mydb    (direct URL)
+  .connect $DATABASE_URL                          (env variable)
+  .connect /path/to/data.parquet                  (file)
+
+Manage sources:
+  seeknal source add <name> --url <connection_url>
+  seeknal source list
+  seeknal source remove <name>
+"""
+        )
+
+    def _show_sources(self) -> None:
+        """List saved data sources."""
+        try:
+            from seeknal.request import ReplSourceRequest
+
+            sources = ReplSourceRequest.select_all()
+
+            if not sources:
+                print("No saved sources. Add with: seeknal source add <name> --url <url>")
+                return
+
+            print(f"{'NAME':<20} {'TYPE':<12} {'URL'}")
+            print("-" * 60)
+            for s in sources:
+                print(f"{s.name:<20} {s.source_type:<12} {s.masked_url}")
+        except Exception as e:
+            print(f"Error listing sources: {sanitize_error_message(str(e))}")
+
+    def _resolve_source(self, name_or_url: str) -> str:
+        """Resolve a source name or URL to a connection URL.
+
+        If name_or_url looks like a saved source name (no :// or file extension),
+        look it up and decrypt credentials. Otherwise return as-is.
+        """
+        # Check if it's a URL or file path
+        if "://" in name_or_url or name_or_url.endswith((".parquet", ".csv")):
+            return os.path.expandvars(name_or_url)
+
+        # Try to load as saved source
+        try:
+            from seeknal.request import ReplSourceRequest
+            from seeknal.utils.encryption import decrypt_value
+
+            source = ReplSourceRequest.select_by_name(name_or_url)
+            if source:
+                return self._reconstruct_url(source)
+        except Exception:
+            pass
+
+        # Not found - maybe it's an env var or typo
+        return os.path.expandvars(name_or_url)
+
+    def _reconstruct_url(self, source) -> str:
+        """Reconstruct full URL from source record with decrypted password."""
+        from seeknal.utils.encryption import decrypt_value
+
+        if source.source_type in ("parquet", "csv"):
+            return source.masked_url
+
+        password = ""
+        if source.encrypted_credentials:
+            password = decrypt_value(source.encrypted_credentials)
+
+        # Rebuild URL
+        scheme_map = {"postgres": "postgresql", "mysql": "mysql", "sqlite": "sqlite"}
+        scheme = scheme_map.get(source.source_type, source.source_type)
+
+        if source.source_type == "sqlite":
+            return f"sqlite:///{source.database}"
+
+        netloc = ""
+        if source.username:
+            netloc = source.username
+            if password:
+                netloc += f":{password}"
+            netloc += "@"
+        if source.host:
+            netloc += source.host
+            if source.port:
+                netloc += f":{source.port}"
+
+        path = f"/{source.database}" if source.database else ""
+
+        return f"{scheme}://{netloc}{path}"
+
+    def _connect(self, name_or_url: str) -> None:
+        """Connect to a data source by name or URL."""
+        # Resolve saved source name to URL
+        url = self._resolve_source(name_or_url)
+
+        # Generate alias - use source name if available, else db0, db1...
+        if "://" not in name_or_url and not name_or_url.endswith((".parquet", ".csv")):
+            alias = name_or_url  # Use source name as alias
+        else:
+            alias = f"db{len(self.attached)}"
+
+        try:
+            if url.startswith(("postgres://", "postgresql://")):
+                self._attach_postgres(alias, url)
+            elif url.startswith("mysql://"):
+                self._attach_mysql(alias, url)
+            elif url.startswith("sqlite://"):
+                self._attach_sqlite(alias, url)
+            elif url.endswith(".parquet"):
+                self._attach_parquet(alias, url)
+            elif url.endswith(".csv"):
+                self._attach_csv(alias, url)
+            else:
+                print(f"Unknown source or URL format: {name_or_url}")
+                print("Use a saved source name, URL (postgres://...), or file path")
+                return
+
+            self.attached.add(alias)
+            print(f"Connected as '{alias}'. Query with: SELECT * FROM {alias}.<table>")
+
+        except Exception as e:
+            # Sanitize to avoid credential leakage
+            print(f"Connection failed: {sanitize_error_message(str(e))}")
+
+    def _attach_postgres(self, alias: str, url: str) -> None:
+        """Attach PostgreSQL database."""
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+
+        conn_str = (
+            f"host={parsed.hostname or 'localhost'} "
+            f"port={parsed.port or 5432} "
+            f"dbname={parsed.path.lstrip('/')} "
+            f"user={parsed.username or ''} "
+            f"password={parsed.password or ''}"
+        )
+        self.conn.execute(f"ATTACH '{conn_str}' AS {alias} (TYPE postgres)")
+
+    def _attach_mysql(self, alias: str, url: str) -> None:
+        """Attach MySQL database."""
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+
+        conn_str = (
+            f"host={parsed.hostname or 'localhost'} "
+            f"port={parsed.port or 3306} "
+            f"database={parsed.path.lstrip('/')} "
+            f"user={parsed.username or ''} "
+            f"password={parsed.password or ''}"
+        )
+        self.conn.execute(f"ATTACH '{conn_str}' AS {alias} (TYPE mysql)")
+
+    def _attach_sqlite(self, alias: str, url: str) -> None:
+        """Attach SQLite database."""
+        # sqlite:///path/to/file.db -> /path/to/file.db
+        path = url.replace("sqlite://", "")
+        if path and not path.startswith(":memory:"):
+            if is_insecure_path(path):
+                raise RuntimeError(f"Insecure path: {path}")
+        self.conn.execute(f"ATTACH '{path}' AS {alias} (TYPE sqlite)")
+
+    def _attach_parquet(self, alias: str, path: str) -> None:
+        """Attach parquet file as a view."""
+        if is_insecure_path(path):
+            raise RuntimeError(f"Insecure path: {path}")
+        if not Path(path).exists():
+            raise RuntimeError(f"File not found: {path}")
+
+        # Escape single quotes in path
+        safe_path = str(path).replace("'", "''")
+        self.conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}")
+        self.conn.execute(
+            f"CREATE VIEW {alias}.data AS SELECT * FROM read_parquet('{safe_path}')"
+        )
+
+    def _attach_csv(self, alias: str, path: str) -> None:
+        """Attach CSV file as a view."""
+        if is_insecure_path(path):
+            raise RuntimeError(f"Insecure path: {path}")
+        if not Path(path).exists():
+            raise RuntimeError(f"File not found: {path}")
+
+        # Escape single quotes in path
+        safe_path = str(path).replace("'", "''")
+        self.conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}")
+        self.conn.execute(
+            f"CREATE VIEW {alias}.data AS SELECT * FROM read_csv_auto('{safe_path}')"
+        )
+
+    def _show_tables(self) -> None:
+        """List tables in all attached databases."""
+        if not self.attached:
+            print("No databases connected. Use .connect <url> first.")
+            return
+
+        for alias in sorted(self.attached):
+            try:
+                result = self.conn.execute(
+                    f"SELECT table_schema, table_name FROM information_schema.tables "
+                    f"WHERE table_catalog = '{alias}'"
+                ).fetchall()
+                for schema, table in result:
+                    print(f"{alias}.{schema}.{table}")
+            except Exception:
+                # For file-based sources
+                try:
+                    result = self.conn.execute(f"SHOW TABLES FROM {alias}").fetchall()
+                    for row in result:
+                        print(f"{alias}.{row[0]}")
+                except Exception:
+                    pass
+
+    def _show_schema(self, table: str) -> None:
+        """Show schema for a table."""
+        if not table:
+            print("Usage: .schema <table_name>")
+            return
+
+        try:
+            result = self.conn.execute(f"DESCRIBE {table}").fetchall()
+            print(
+                tabulate(
+                    result, headers=["Column", "Type", "Null", "Key", "Default", "Extra"]
+                )
+            )
+        except Exception as e:
+            print(f"Error: {sanitize_error_message(str(e))}")
+
+    def _execute(self, sql: str) -> None:
+        """Execute SQL query and display results."""
+        try:
+            result = self.conn.execute(sql)
+
+            if not result.description:
+                print("Query executed successfully.")
+                return
+
+            columns = [desc[0] for desc in result.description]
+            rows = result.fetchall()
+
+            # Limit display
+            MAX_ROWS = 100
+            display_rows = rows[:MAX_ROWS]
+
+            print(tabulate(display_rows, headers=columns, tablefmt="simple"))
+
+            if len(rows) > MAX_ROWS:
+                print(
+                    f"\n({MAX_ROWS} of {len(rows)} rows displayed. Use LIMIT for more control.)"
+                )
+            else:
+                print(f"\n({len(rows)} rows)")
+
+        except Exception as e:
+            print(f"Error: {sanitize_error_message(str(e))}")
+
+
+def run_repl() -> None:
+    """Entry point for REPL."""
+    repl = REPL()
+    repl.run()

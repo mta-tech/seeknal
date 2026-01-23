@@ -49,3 +49,6 @@ site/
 docs/audit/
 
 .claude/auto-drive.local.md
+
+# Auto Claude data directory
+.auto-claude/
