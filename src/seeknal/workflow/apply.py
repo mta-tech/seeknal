@@ -83,28 +83,165 @@ def get_target_path(node_type: str, name: str) -> Path:
     return target_file
 
 
-def check_conflict(target_path: Path, force: bool) -> bool:
+def check_conflict(target_path: Path, force: bool, new_data: dict) -> tuple[bool, Optional[dict]]:
     """Check if target file exists and handle conflict.
 
     Args:
         target_path: Target file path
         force: Skip confirmation
+        new_data: New YAML data for comparison
 
     Returns:
-        True if safe to proceed, False otherwise
+        Tuple of (should_proceed, existing_yaml_data)
 
     Raises:
         typer.Exit: If user cancels
     """
     if not target_path.exists():
-        return True
+        return True, None
+
+    # Load existing YAML for comparison
+    try:
+        with open(target_path, "r") as f:
+            existing_data = yaml.safe_load(f)
+    except Exception:
+        existing_data = None
 
     if not force:
         _echo_warning(f"Node already exists: {target_path}")
-        _echo_info("Use --force to overwrite")
+
+        # Show diff if we have both versions
+        if existing_data:
+            show_yaml_diff(existing_data, new_data, target_path)
+
+            _echo_info("")
+            _echo_info("Use --force to apply these changes")
+
         raise typer.Exit(1)
 
-    return True
+    return True, existing_data
+
+
+def show_yaml_diff(old_data: dict, new_data: Optional[dict], target_path: Path) -> None:
+    """Show differences between old and new YAML.
+
+    Args:
+        old_data: Existing YAML data
+        new_data: New YAML data (None if showing prompt)
+        target_path: Target file path
+    """
+    _echo_info("")
+    _echo_info("Changes:")
+
+    changes_found = False
+
+    # Compare description
+    old_desc = old_data.get("description", "")
+    new_desc = new_data.get("description", "") if new_data else ""
+
+    if old_desc != new_desc:
+        if old_desc:
+            _echo_info(f"  - description: \"{old_desc}\"")
+        if new_desc:
+            _echo_info(f"  + description: \"{new_desc}\"")
+        changes_found = True
+
+    # Compare owner
+    old_owner = old_data.get("owner", "")
+    new_owner = new_data.get("owner", "") if new_data else ""
+
+    if old_owner != new_owner:
+        if old_owner:
+            _echo_info(f"  - owner: {old_owner}")
+        if new_owner:
+            _echo_info(f"  + owner: {new_owner}")
+        changes_found = True
+
+    # Compare columns (for sources)
+    old_cols = old_data.get("columns", {})
+    new_cols = new_data.get("columns", {}) if new_data else {}
+
+    if old_cols != new_cols:
+        # Removed columns
+        for col in set(old_cols.keys()) - set(new_cols.keys()):
+            _echo_info(f"  - column: {col}")
+            changes_found = True
+
+        # Added columns
+        for col in set(new_cols.keys()) - set(old_cols.keys()):
+            desc = new_cols.get(col, "")
+            _echo_info(f"  + column: {col} ({desc})")
+            changes_found = True
+
+        # Modified columns
+        for col in set(old_cols.keys()) & set(new_cols.keys()):
+            if old_cols[col] != new_cols[col]:
+                _echo_info(f"  ~ column: {col}")
+                _echo_info(f"      - \"{old_cols[col]}\"")
+                _echo_info(f"      + \"{new_cols[col]}\"")
+                changes_found = True
+
+    # Compare features (for feature_groups)
+    old_feats = old_data.get("features", {})
+    new_feats = new_data.get("features", {}) if new_data else {}
+
+    if old_feats != new_feats:
+        # Removed features
+        for feat in set(old_feats.keys()) - set(new_feats.keys()):
+            _echo_info(f"  - feature: {feat}")
+            changes_found = True
+
+        # Added features
+        for feat in set(new_feats.keys()) - set(old_feats.keys()):
+            dtype = new_feats[feat].get("dtype", "unknown") if isinstance(new_feats[feat], dict) else "unknown"
+            _echo_info(f"  + feature: {feat} ({dtype})")
+            changes_found = True
+
+        # Modified features
+        for feat in set(old_feats.keys()) & set(new_feats.keys()):
+            if old_feats[feat] != new_feats[feat]:
+                _echo_info(f"  ~ feature: {feat}")
+                changes_found = True
+
+    # Compare transform SQL (for transforms/feature_groups)
+    old_transform = old_data.get("transform", "")
+    new_transform = new_data.get("transform", "") if new_data else ""
+
+    if old_transform != new_transform:
+        if old_transform:
+            _echo_info(f"  - transform: [SQL changed]")
+        if new_transform:
+            _echo_info(f"  + transform: [SQL changed]")
+        changes_found = True
+
+    # Compare table/source
+    old_table = old_data.get("table", "")
+    new_table = new_data.get("table", "") if new_data else ""
+
+    if old_table != new_table:
+        if old_table:
+            _echo_info(f"  - table: {old_table}")
+        if new_table:
+            _echo_info(f"  + table: {new_table}")
+        changes_found = True
+
+    # Compare inputs/dependencies
+    old_inputs = old_data.get("inputs", [])
+    new_inputs = new_data.get("inputs", []) if new_data else []
+
+    if old_inputs != new_inputs:
+        old_refs = [inp.get("ref", "") for inp in old_inputs]
+        new_refs = [inp.get("ref", "") for inp in new_inputs]
+
+        if set(old_refs) != set(new_refs):
+            if old_refs:
+                _echo_info(f"  - depends_on: {', '.join(old_refs)}")
+            if new_refs:
+                _echo_info(f"  + depends_on: {', '.join(new_refs)}")
+            changes_found = True
+
+    if not changes_found:
+        _echo_info("  (no changes detected)")
 
 
 def move_draft_file(source_path: Path, target_path: Path) -> None:
@@ -160,36 +297,6 @@ def update_manifest(target_path: Path) -> bool:
         return True
 
 
-def show_diff(yaml_data: dict) -> None:
-    """Show diff of changes.
-
-    Args:
-        yaml_data: Parsed YAML data
-    """
-    kind = yaml_data.get("kind")
-    name = yaml_data.get("name")
-
-    _echo_info(f"Diff:")
-    _echo_info(f"  + {kind}.{name}")
-
-    # Show columns if present
-    if "columns" in yaml_data:
-        for col, desc in yaml_data["columns"].items():
-            _echo_info(f"    - {col} ({desc})")
-
-    # Show features if present
-    if "features" in yaml_data:
-        for feat, config in yaml_data["features"].items():
-            dtype = config.get("dtype", "unknown")
-            _echo_info(f"    - {feat} ({dtype})")
-
-    # Show depends_on if present
-    if "inputs" in yaml_data:
-        deps = [inp.get("ref", "") for inp in yaml_data["inputs"]]
-        if deps:
-            _echo_info(f"    - depends_on: {', '.join(deps)}")
-
-
 def apply_command(
     file_path: str = typer.Argument(..., help="Path to draft YAML file"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing file without prompt"),
@@ -243,11 +350,14 @@ def apply_command(
         _echo_warning(f"Using secure alternative: {secure_alt}")
         target_path = Path(secure_alt)
 
-    # Check for conflicts
+    # Check for conflicts and get existing data
     try:
-        check_conflict(target_path, force)
+        should_proceed, existing_data = check_conflict(target_path, force, yaml_data)
     except typer.Exit:
         raise
+
+    if not should_proceed:
+        return
 
     _echo_success("All checks passed")
 
@@ -271,8 +381,32 @@ def apply_command(
         else:
             _echo_warning("Manifest update failed, but file was moved")
 
-    # Show diff
-    show_diff(yaml_data)
+    # Show diff if this was an update
+    if existing_data:
+        _echo_info("")
+        show_yaml_diff(existing_data, yaml_data, target_path)
+    else:
+        # Show summary for new node
+        _echo_info("")
+        _echo_info("Added:")
+        _echo_info(f"  + {node_type}.{name}")
+
+        # Show columns if present
+        if "columns" in yaml_data:
+            for col, desc in yaml_data["columns"].items():
+                _echo_info(f"    - {col} ({desc})")
+
+        # Show features if present
+        if "features" in yaml_data:
+            for feat, config in yaml_data["features"].items():
+                dtype = config.get("dtype", "unknown")
+                _echo_info(f"    - {feat} ({dtype})")
+
+        # Show depends_on if present
+        if "inputs" in yaml_data:
+            deps = [inp.get("ref", "") for inp in yaml_data["inputs"]]
+            if deps:
+                _echo_info(f"    - depends_on: {', '.join(deps)}")
 
     _echo_success("Applied successfully")
 
