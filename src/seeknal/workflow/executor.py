@@ -13,7 +13,7 @@ import time
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from seeknal.cli.main import _echo_info, _echo_error
+from seeknal.cli.main import _echo_info, _echo_error, _echo_warning
 from tabulate import tabulate
 import typer
 
@@ -65,24 +65,66 @@ def execute_source(
     limit: int,
     timeout: int,
 ) -> Dict[str, Any]:
-    """Execute source node for preview.
+    """Execute source node for preview with actual data.
 
-    For sources, we show the schema information rather than actual data
-    since we may not have access to the actual database.
+    For CSV sources, reads and displays sample data rows.
+    For other sources, shows schema information.
 
     Args:
         yaml_data: Parsed YAML data
-        limit: Row limit (unused for sources)
-        timeout: Timeout (unused for sources)
+        limit: Row limit
+        timeout: Query timeout
 
     Returns:
-        Result dict with schema information
+        Result dict with execution info
     """
     name = yaml_data.get("name", "unknown")
     source_type = yaml_data.get("source", "unknown")
     table = yaml_data.get("table", "unknown")
 
-    # Show schema info
+    import time
+    start_time = time.time()
+
+    # Handle CSV sources with actual data preview
+    if source_type == "csv" and table.endswith(".csv"):
+        try:
+            # Use DuckDB to read CSV and display data
+            con = duckdb.connect(":memory:")
+
+            # Convert to absolute path for DuckDB
+            from pathlib import Path
+            table_path = Path(table)
+            if not table_path.is_absolute():
+                # Get absolute path relative to current working directory
+                table_path = Path.cwd() / table
+            abs_path = str(table_path)
+
+            # Build query - DuckDB can auto-detect CSV format
+            query = f"SELECT * FROM '{abs_path}' LIMIT {limit}"
+
+            # Execute query
+            result = con.execute(query)
+            rows = result.fetchall()
+            columns = [desc[0] for desc in result.description]
+
+            # Display data as table
+            if rows:
+                print(tabulate(rows, headers=columns, tablefmt="psql"))
+            else:
+                _echo_info(f"No data found in source: {name}")
+
+            duration = time.time() - start_time
+            return {
+                "duration": duration,
+                "row_count": len(rows),
+                "schema_only": False,
+            }
+
+        except Exception as e:
+            _echo_warning(f"Could not preview data: {e}")
+            _echo_info("Showing schema instead:")
+
+    # Fallback to schema display
     columns = yaml_data.get("columns", {})
 
     if columns:
@@ -93,7 +135,7 @@ def execute_source(
         _echo_info(f"No columns defined for source: {name}")
 
     return {
-        "duration": 0.1,
+        "duration": time.time() - start_time,
         "row_count": 0,
         "schema_only": True,
     }
