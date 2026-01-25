@@ -39,14 +39,18 @@ dependencies = [
     "tabulate>=0.9.0",
     "tenacity>=9.0.0",
     "typer>=0.13.1",
+    "jinja2>=3.1.0",
+    "pyyaml>=6.0.0",
 ]
 
 [project.optional-dependencies]
 # Atlas Data Platform integration for governance, lineage, and API features
-atlas = [
-    "atlas-data-platform>=0.1.0",
-    "uvicorn[standard]>=0.27.0",
-]
+# NOTE: Temporarily disabled - atlas-data-platform is not available in PyPI
+# To enable when the package is available:
+# atlas = [
+#     "atlas-data-platform>=0.1.0",
+#     "uvicorn[standard]>=0.27.0",
+# ]
 
 # Development dependencies
 dev = [
@@ -57,7 +61,9 @@ dev = [
 
 # All optional dependencies
 all = [
-    "seeknal[atlas,dev]",
+    "seeknal[dev]",
+    # Note: atlas requires internal package atlas-data-platform, install separately with:
+    # uv pip install -e ".[atlas]" when the package is available
 ]
 
 [dependency-groups]

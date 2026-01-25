@@ -1,0 +1,23 @@
+kind: aggregation
+name: {{ name }}
+description: "{{ description | default('Reusable aggregation pattern') }}"
+owner: "{{ owner | default('ml-team@example.com') }}"
+id_col: {{ id_col | default('id') }}
+feature_date_col: {{ feature_date_col | default('event_date') }}
+application_date_col: {{ application_date_col | default('prediction_date') }}
+features:
+  - name: amount
+    basic: [sum, mean, max, std]
+    rolling:
+      - window: [1, 7]
+        aggs: [sum, mean]
+      - window: [8, 30]
+        aggs: [sum, mean]
+    ratio:
+      - numerator: [1, 30]
+        denominator: [31, 90]
+        aggs: [sum]
+  - name: is_active
+    since:
+      - condition: "is_active == 1"
+        aggs: [count, sum]

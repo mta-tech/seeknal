@@ -1585,6 +1585,100 @@ def repl():
     run_repl()
 
 
+@app.command()
+def draft(
+    node_type: str = typer.Argument(..., help="Node type (source, transform, feature-group, model, aggregation, rule, exposure)"),
+    name: str = typer.Argument(..., help="Node name"),
+    description: Optional[str] = typer.Option(None, "--description", "-d", help="Node description"),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing draft file"),
+):
+    """Generate YAML template from Jinja2 template.
+
+    Creates a draft YAML file for a new node using Jinja2 templates.
+    The draft file can be edited and then applied using 'seeknal apply'.
+
+    Template discovery order:
+    1. project/seeknal/templates/*.j2 (project override)
+    2. Package templates (default)
+
+    Examples:
+        # Create a feature group draft
+        $ seeknal draft feature-group user_behavior
+
+        # Create a source with description
+        $ seeknal draft source postgres_users --description "PostgreSQL users table"
+
+        # Overwrite existing draft
+        $ seeknal draft transform clean_data --force
+    """
+    from seeknal.workflow.draft import draft_command
+
+    draft_command(node_type, name, description, force)
+
+
+@app.command()
+def dry_run(
+    file_path: str = typer.Argument(..., help="Path to draft YAML file"),
+    limit: int = typer.Option(10, "--limit", "-l", help="Row limit for preview (default: 10)"),
+    timeout: int = typer.Option(30, "--timeout", "-t", help="Query timeout in seconds (default: 30)"),
+    schema_only: bool = typer.Option(False, "--schema-only", "-s", help="Validate schema only, skip execution"),
+):
+    """Validate YAML and preview execution.
+
+    Performs comprehensive validation:
+    1. YAML syntax validation with line numbers
+    2. Schema validation (required fields)
+    3. Dependency validation (refs to upstream nodes)
+    4. Preview execution with sample data
+
+    Examples:
+        # Validate and preview
+        $ seeknal dry-run draft_feature_group_user_behavior.yml
+
+        # Preview with 5 rows
+        $ seeknal dry-run draft_feature_group_user_behavior.yml --limit 5
+
+        # Schema validation only (no execution)
+        $ seeknal dry-run draft_source_postgres.yml --schema-only
+
+        # Longer timeout for slow queries
+        $ seeknal dry-run draft_transform.yml --timeout 60
+    """
+    from seeknal.workflow.dry_run import dry_run_command
+
+    dry_run_command(file_path, limit, timeout, schema_only)
+
+
+@app.command()
+def apply(
+    file_path: str = typer.Argument(..., help="Path to draft YAML file"),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing file without prompt"),
+    no_parse: bool = typer.Option(False, "--no-parse", help="Skip manifest regeneration"),
+):
+    """Apply draft file to production and update manifest.
+
+    Workflow:
+    1. Validate file exists and YAML is valid
+    2. Check if target exists (prompt or require --force)
+    3. Move file to seeknal/<type>s/<name>.yml
+    4. Run seeknal parse to regenerate manifest
+    5. Show diff of changes
+
+    Examples:
+        # Apply draft file
+        $ seeknal apply draft_feature_group_user_behavior.yml
+
+        # Apply with overwrite
+        $ seeknal apply draft_feature_group_user_behavior.yml --force
+
+        # Apply without updating manifest
+        $ seeknal apply draft_source_postgres.yml --no-parse
+    """
+    from seeknal.workflow.apply import apply_command
+
+    apply_command(file_path, force, no_parse)
+
+
 def main():
     """Main entry point for the CLI."""
     app()

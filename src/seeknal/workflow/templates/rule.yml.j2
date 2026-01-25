@@ -1,0 +1,8 @@
+kind: rule
+name: {{ name }}
+description: "{{ description | default('Business rule definition') }}"
+owner: "{{ owner | default('business-team@example.com') }}"
+params:
+  threshold: {{ threshold | default(100) }}
+rule:
+  value: "value > {{ threshold | default(100) }}"

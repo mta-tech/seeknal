@@ -1,0 +1,16 @@
+kind: source
+name: {{ name }}
+description: "{{ description | default('External data source') }}"
+owner: "{{ owner | default('team@example.com') }}"
+tags: {{ tags | default(['source']) | tojson }}
+source: {{ source_type | default('hive') }}
+table: "{{ table_name }}"
+params:
+  dateCol: "{{ date_col | default('date_id') }}"
+  idCol: "{{ id_col | default('id') }}"
+columns:
+  id: "Unique identifier"
+  event_timestamp: "Event timestamp"
+freshness:
+  warn_after: {{ warn_after | default('24h') }}
+  error_after: {{ error_after | default('48h') }}
