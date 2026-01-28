@@ -85,7 +85,7 @@ Based on: docs/plans/2026-01-27-feat-seeknal-init-python-pipelines-plan.md
 - [x] M5-E1-S3: Add --deps flag for PEP 723 dependencies
 - [x] M5-E1-S4: Generate Python scaffolds with PEP 723 headers
 
-**Commit**: (pending)
+**Commit**: 5ef4139 "feat(workflow): Add Python templates to draft command"
 
 ## All Phases Complete ✅
 
