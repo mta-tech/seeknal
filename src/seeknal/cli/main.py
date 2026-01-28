@@ -36,6 +36,13 @@ Atlas Data Platform Integration (requires: pip install seeknal[atlas]):
     seeknal atlas lineage show <name>           Show lineage for a resource
     seeknal atlas lineage publish <pipeline>    Publish lineage to DataHub
 
+Iceberg Materialization (requires: DuckDB + Iceberg extension):
+    seeknal iceberg validate-materialization    Validate Iceberg materialization config
+    seeknal iceberg snapshot-list <table>       List snapshots for a table
+    seeknal iceberg snapshot-show <table> <id>  Show snapshot details
+    seeknal iceberg setup                       Interactive credential setup
+    seeknal iceberg profile-show                Show current materialization profile
+
 Examples:
     # Initialize a new project
     $ seeknal init --name my_project
@@ -68,7 +75,7 @@ For more information, see: https://github.com/mta-tech/seeknal
 """
 
 import typer
-from typing import Optional, Callable
+from typing import Optional, Callable, List
 from datetime import datetime
 from enum import Enum
 from functools import wraps
@@ -108,6 +115,11 @@ app.add_typer(version_app, name="version")
 from seeknal.cli.source import app as source_app
 
 app.add_typer(source_app, name="source")
+
+# Iceberg materialization commands
+from seeknal.cli.materialization_cli import app as iceberg_app
+
+app.add_typer(iceberg_app, name="iceberg")
 
 
 # =============================================================================
@@ -264,26 +276,138 @@ def init(
         Path("."), "--path", "-p",
         help="Project path"
     ),
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Overwrite existing project configuration"
+    ),
 ):
-    """Initialize a new Seeknal project in the current directory."""
-    from seeknal.project import Project
+    """Initialize a new Seeknal project with dbt-style structure.
 
+    Creates a complete project structure with:
+    - seeknal_project.yml: Project configuration (name, version, profile)
+    - profiles.yml: Credentials and engine config (gitignored)
+    - .gitignore: Auto-generated with profiles.yml and target/
+    - seeknal/: Directory for YAML and Python pipeline definitions
+    - target/: Output directory for compiled artifacts
+
+    Directory structure:
+        seeknal/
+        ├── sources/         # YAML source definitions
+        ├── transforms/      # YAML transforms
+        ├── feature_groups/  # YAML feature groups
+        ├── models/          # YAML models
+        ├── pipelines/       # Python pipeline scripts (*.py)
+        └── templates/       # Custom Jinja templates (optional)
+        target/
+        └── intermediate/    # Node output storage for cross-references
+
+    Examples:
+        # Initialize in current directory
+        $ seeknal init
+
+        # Initialize with custom name
+        $ seeknal init --name my_project
+
+        # Initialize at specific path
+        $ seeknal init --path /path/to/project
+
+        # Reinitialize existing project
+        $ seeknal init --force
+    """
+    import yaml
+
+    project_path = path.resolve()
+    project_file = project_path / "seeknal_project.yml"
+
+    # Check for existing project
+    if project_file.exists() and not force:
+        _echo_error(f"Project already exists at {project_path}")
+        _echo_info("Use --force to reinitialize")
+        raise typer.Exit(1)
+
+    # Default name from directory
     if name is None:
-        name = path.resolve().name
+        name = project_path.name
 
     typer.echo(f"Initializing Seeknal project: {name}")
 
     try:
-        project = Project(name=name, description=description)
-        project.get_or_create()
-        _echo_success(f"Project '{name}' initialized successfully!")
+        # Create dbt-style directory structure
+        directories = [
+            "seeknal/sources",
+            "seeknal/transforms",
+            "seeknal/feature_groups",
+            "seeknal/models",
+            "seeknal/pipelines",
+            "seeknal/templates",
+            "target/intermediate",
+        ]
 
-        # Create basic directory structure
-        dirs = ["flows", "entities", "feature_groups"]
-        for d in dirs:
-            dir_path = path / d
-            dir_path.mkdir(exist_ok=True)
-            typer.echo(f"  Created directory: {d}/")
+        for dir_name in directories:
+            dir_path = project_path / dir_name
+            dir_path.mkdir(parents=True, exist_ok=True)
+            typer.echo(f"  Created directory: {dir_name}/")
+
+        # Generate seeknal_project.yml
+        project_config = {
+            "name": name,
+            "version": "1.0.0",
+            "profile": "default",
+            "config-version": 1,
+        }
+        # Only add description if it's a non-empty string
+        if description and isinstance(description, str):
+            project_config["description"] = description
+
+        project_file.write_text(yaml.dump(project_config, sort_keys=False))
+        typer.echo(f"  Created: seeknal_project.yml")
+
+        # Generate profiles.yml
+        profiles_config = {
+            "default": {
+                "target": "dev",
+                "outputs": {
+                    "dev": {
+                        "type": "duckdb",
+                        "path": "target/dev.duckdb",
+                    }
+                }
+            }
+        }
+        (project_path / "profiles.yml").write_text(yaml.dump(profiles_config, sort_keys=False))
+        typer.echo(f"  Created: profiles.yml (gitignored)")
+
+        # Generate .gitignore
+        gitignore_content = """# Seeknal
+profiles.yml
+target/
+*.duckdb
+*.duckdb.wal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+"""
+        (project_path / ".gitignore").write_text(gitignore_content)
+        typer.echo(f"  Created: .gitignore")
+
+        # Also create the legacy Project for database compatibility
+        from seeknal.project import Project
+        if description and isinstance(description, str):
+            project = Project(name=name, description=description)
+        else:
+            project = Project(name=name)
+        project.get_or_create()
+
+        _echo_success(f"Project '{name}' initialized successfully!")
+        typer.echo("")
+        _echo_info("Next steps:")
+        typer.echo("  1. Edit profiles.yml to configure your data sources")
+        typer.echo("  2. Create sources: seeknal draft source <name>")
+        typer.echo("  3. Create transforms: seeknal draft transform <name>")
+        typer.echo("  4. Run pipeline: seeknal run")
 
     except Exception as e:
         _echo_error(f"Failed to initialize project: {e}")
@@ -292,7 +416,10 @@ def init(
 
 @app.command()
 def run(
-    flow_name: str = typer.Argument(..., help="Name of the flow to run"),
+    flow_name: Optional[str] = typer.Argument(
+        None,
+        help="Name of the flow to run (legacy). If omitted, executes YAML pipeline from seeknal/ directory."
+    ),
     start_date: Optional[str] = typer.Option(
         None, "--start-date", "-s",
         help="Start date for the flow (YYYY-MM-DD)"
@@ -305,28 +432,483 @@ def run(
         False, "--dry-run",
         help="Show what would be executed without running"
     ),
+    # YAML pipeline execution flags
+    full: bool = typer.Option(
+        False, "--full", "-f",
+        help="Run all nodes regardless of state (ignore incremental run cache)"
+    ),
+    nodes: Optional[List[str]] = typer.Option(
+        None, "--nodes", "-n",
+        help="Run specific nodes only (e.g., --nodes transform.clean_data)"
+    ),
+    types: Optional[List[str]] = typer.Option(
+        None, "--types", "-t",
+        help="Filter by node types (e.g., --types transform,feature_group)"
+    ),
+    exclude_tags: Optional[List[str]] = typer.Option(
+        None, "--exclude-tags",
+        help="Skip nodes with these tags"
+    ),
+    continue_on_error: bool = typer.Option(
+        False, "--continue-on-error",
+        help="Continue execution after failures"
+    ),
+    retry: int = typer.Option(
+        0, "--retry", "-r",
+        help="Number of retries for failed nodes"
+    ),
+    show_plan: bool = typer.Option(
+        False, "--show-plan", "-p",
+        help="Show execution plan without running"
+    ),
+    # Materialization flags
+    materialize: Optional[bool] = typer.Option(
+        None, "--materialize/--no-materialize",
+        help="Enable/disable Iceberg materialization (overrides node config)"
+    ),
 ):
-    """Execute a feature transformation flow."""
-    from seeknal.flow import Flow
+    """Execute a feature transformation flow or YAML pipeline.
 
-    typer.echo(f"Running flow: {flow_name}")
-    if start_date:
-        typer.echo(f"  Start date: {start_date}")
-    if end_date:
-        typer.echo(f"  End date: {end_date}")
+    **Legacy Mode (with flow_name):**
+    Run a legacy Flow object by name.
 
-    if dry_run:
-        _echo_warning("Dry run mode - no changes will be made")
-        return
+    **YAML Pipeline Mode (without flow_name):**
+    Execute the DAG defined by YAML files in the seeknal/ directory.
+    Supports incremental runs with change detection, parallel execution,
+    and configurable error handling.
+
+    **YAML Pipeline Examples:**
+        # Run changed nodes only (incremental)
+        seeknal run
+
+        # Run all nodes (full refresh)
+        seeknal run --full
+
+        # Dry run to see what would execute
+        seeknal run --dry-run
+
+        # Show execution plan
+        seeknal run --show-plan
+
+        # Run specific nodes
+        seeknal run --nodes transform.clean_data feature_group.user_features
+
+        # Run only transforms and feature_groups
+        seeknal run --types transform,feature_group
+
+        # Continue on error (don't stop at first failure)
+        seeknal run --continue-on-error
+
+        # Retry failed nodes
+        seeknal run --retry 2
+
+    **Legacy Flow Examples:**
+        seeknal run my_flow --start-date 2024-01-01
+    """
+    # Determine mode: legacy Flow vs YAML pipeline
+    if flow_name is not None:
+        # Legacy mode: run Flow object
+        from seeknal.flow import Flow
+
+        typer.echo(f"Running flow: {flow_name}")
+        if start_date:
+            typer.echo(f"  Start date: {start_date}")
+        if end_date:
+            typer.echo(f"  End date: {end_date}")
+
+        if dry_run:
+            _echo_warning("Dry run mode - no changes will be made")
+            return
+
+        try:
+            flow = Flow(name=flow_name).get_or_create()
+            result = flow.run()
+            _echo_success(f"Flow '{flow_name}' completed successfully!")
+            if result is not None:
+                typer.echo(f"  Result rows: {result.count()}")
+        except Exception as e:
+            _echo_error(f"Flow execution failed: {e}")
+            raise typer.Exit(1)
+    else:
+        # YAML pipeline mode: execute DAG from seeknal/ directory
+        _run_yaml_pipeline(
+            dry_run=dry_run,
+            full=full,
+            nodes=nodes,
+            types=types,
+            exclude_tags=exclude_tags,
+            continue_on_error=continue_on_error,
+            retry=retry,
+            show_plan=show_plan,
+            materialize=materialize,
+        )
+
+
+def _run_yaml_pipeline(
+    dry_run: bool = False,
+    full: bool = False,
+    nodes: Optional[List[str]] = None,
+    types: Optional[List[str]] = None,
+    exclude_tags: Optional[List[str]] = None,
+    continue_on_error: bool = False,
+    retry: int = 0,
+    show_plan: bool = False,
+    materialize: Optional[bool] = None,
+) -> None:
+    """
+    Execute YAML-based pipeline using DAGBuilder, state tracking, and executors.
+
+    This function orchestrates the complete pipeline execution workflow:
+    1. Build DAG from YAML files using DAGBuilder
+    2. Load previous state for incremental runs
+    3. Detect changes and determine nodes to run
+    4. Execute in topological order using executors
+    5. Update state and report results
+
+    Args:
+        dry_run: Show plan without executing
+        full: Run all nodes regardless of state
+        nodes: Run specific nodes only
+        types: Filter by node types
+        exclude_tags: Skip nodes with these tags
+        continue_on_error: Continue after failures
+        retry: Number of retries for failed nodes
+        show_plan: Show execution plan and exit
+        materialize: Enable/disable Iceberg materialization (None=use node config)
+    """
+    from pathlib import Path
+    from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
+    from seeknal.workflow.state import (
+        RunState, load_state, save_state,
+        calculate_node_hash, get_nodes_to_run,
+        update_node_state, NodeStatus,
+        include_upstream_sources,
+    )
+    from seeknal.workflow.executors import get_executor, ExecutionContext
+    from seeknal.context import context
+
+    project_path = Path.cwd()
+    target_path = project_path / "target"
+    state_path = target_path / "run_state.json"
+
+    typer.echo("")
+    typer.echo(typer.style("Seeknal Pipeline Execution", bold=True))
+    typer.echo("=" * 60)
+    typer.echo(f"  Project: {project_path.name}")
+    typer.echo(f"  Mode: {'Full' if full else 'Incremental'}")
+
+    # Step 1: Build DAG from YAML files
+    _echo_info("Building DAG from seeknal/ directory...")
 
     try:
-        flow = Flow(name=flow_name).get_or_create()
-        result = flow.run()
-        _echo_success(f"Flow '{flow_name}' completed successfully!")
-        if result is not None:
-            typer.echo(f"  Result rows: {result.count()}")
-    except Exception as e:
-        _echo_error(f"Flow execution failed: {e}")
+        dag_builder = DAGBuilder(project_path=project_path)
+        dag_builder.build()
+    except ValueError as e:
+        _echo_error(f"DAG build failed: {e}")
+        raise typer.Exit(1)
+    except CycleDetectedError as e:
+        _echo_error(f"Cycle detected in DAG: {e.message}")
+        raise typer.Exit(1)
+    except MissingDependencyError as e:
+        _echo_error(f"Missing dependency: {e.message}")
+        raise typer.Exit(1)
+
+    node_count = dag_builder.get_node_count()
+    edge_count = dag_builder.get_edge_count()
+
+    _echo_success(f"DAG built: {node_count} nodes, {edge_count} edges")
+
+    # Get topological order
+    try:
+        execution_order = dag_builder.topological_sort()
+    except CycleDetectedError as e:
+        _echo_error(f"Cycle detected: {e.message}")
+        raise typer.Exit(1)
+
+    # Step 2: Load previous state
+    old_state = load_state(state_path)
+
+    if old_state:
+        _echo_info(f"Loaded previous state from run: {old_state.run_id}")
+    else:
+        _echo_info("No previous state found (first run)")
+
+    # Step 3: Calculate current hashes and detect changes
+    _echo_info("Detecting changes...")
+
+    current_hashes = {}
+    for node_id, node in dag_builder.nodes.items():
+        try:
+            node_hash = calculate_node_hash(node.yaml_data, Path(node.file_path))
+            current_hashes[node_id] = node_hash
+        except Exception as e:
+            _echo_warning(f"Failed to calculate hash for {node_id}: {e}")
+
+    # Build DAG adjacency for downstream propagation
+    dag_adjacency = {}
+    dag_upstream = {}
+    for node_id in dag_builder.nodes:
+        dag_adjacency[node_id] = dag_builder.get_downstream(node_id)
+        dag_upstream[node_id] = dag_builder.get_upstream(node_id)
+
+    # Determine nodes to run
+    nodes_to_run = get_nodes_to_run(current_hashes, old_state, dag_adjacency)
+
+    # Apply filters
+    if full:
+        # Override: run all nodes
+        nodes_to_run = set(dag_builder.nodes.keys())
+    elif nodes:
+        # Run specific nodes and their downstream
+        specified = set()
+        for node_name in nodes:
+            # Find matching node
+            for node_id, node in dag_builder.nodes.items():
+                if node.name == node_name or node_id == node_name:
+                    specified.add(node_id)
+                    # Add downstream
+                    specified.update(dag_builder.get_all_downstream(node_id))
+                    break
+        nodes_to_run = specified
+    elif types:
+        # Filter by type
+        type_set = set(types)
+        nodes_to_run = {
+            node_id for node_id in nodes_to_run
+            if dag_builder.nodes[node_id].kind.value in type_set
+        }
+
+    if exclude_tags:
+        # Filter out nodes with excluded tags
+        exclude_set = set(exclude_tags)
+        nodes_to_run = {
+            node_id for node_id in nodes_to_run
+            if not any(tag in exclude_set for tag in dag_builder.nodes[node_id].tags)
+        }
+
+    # Include upstream source dependencies for transforms
+    # This ensures DuckDB views/tables are available for transform SQL
+    if not full:
+        nodes_to_run = include_upstream_sources(nodes_to_run, dag_upstream)
+
+    if show_plan:
+        # Show execution plan and exit
+        _echo_info("")
+        _echo_info("Execution Plan:")
+        _echo_info("-" * 60)
+
+        for idx, node_id in enumerate(execution_order, 1):
+            node = dag_builder.nodes[node_id]
+            if node_id in nodes_to_run:
+                status = "RUN"
+                status_msg = typer.style(status, fg=typer.colors.GREEN, bold=True)
+            elif old_state and node_id in old_state.nodes and old_state.nodes[node_id].is_success():
+                status = "CACHED"
+                status_msg = typer.style(status, fg=typer.colors.BLUE)
+            else:
+                status = "SKIP"
+                status_msg = typer.style(status, fg=typer.colors.RESET)
+
+            tags_str = f" [{', '.join(node.tags)}]" if node.tags else ""
+            typer.echo(f"  {idx:2d}. {status_msg} {node.name}{tags_str}")
+
+        typer.echo("")
+        _echo_info(f"Total: {len(execution_order)} nodes, {len(nodes_to_run)} to run")
+        return
+
+    if not nodes_to_run:
+        _echo_success("No changes detected. Nothing to run.")
+        return
+
+    _echo_info(f"Nodes to run: {len(nodes_to_run)}")
+
+    # Step 4: Create execution context
+    exec_context = ExecutionContext(
+        project_name=project_path.name,
+        workspace_path=project_path,
+        target_path=target_path,
+        dry_run=dry_run,
+        verbose=True,
+        materialize_enabled=materialize,
+    )
+
+    # Step 5: Execute nodes in topological order
+    import time
+    start_time = time.time()
+
+    # Initialize run state
+    run_state = RunState(
+        config={"full": full, "nodes": nodes, "types": types},
+    )
+
+    # Copy previous successful states
+    if old_state:
+        for node_id, node_state in old_state.nodes.items():
+            if node_state.is_success() and node_id not in nodes_to_run:
+                run_state.nodes[node_id] = node_state
+
+    typer.echo("")
+    typer.echo(typer.style("Execution", bold=True))
+    typer.echo("=" * 60)
+
+    successful = 0
+    failed = 0
+    cached = 0
+
+    for idx, node_id in enumerate(execution_order, 1):
+        node = dag_builder.nodes[node_id]
+
+        # Check if we should run this node
+        if node_id not in nodes_to_run:
+            if node_id in run_state.nodes and run_state.nodes[node_id].is_success():
+                typer.echo(f"{idx}/{len(execution_order)}: {node.name} [{typer.style('CACHED', fg=typer.colors.BLUE)}]")
+                cached += 1
+            continue
+
+        # Check if node has changed hash (skip for SOURCE nodes as they're needed for downstream transforms)
+        # SOURCE nodes are relatively cheap to execute and create DuckDB views needed by transforms
+        current_hash = current_hashes.get(node_id, "")
+        if old_state and node_id in old_state.nodes and node.kind.value != "source":
+            old_hash = old_state.nodes[node_id].hash
+            if old_hash == current_hash and old_state.nodes[node_id].is_success():
+                typer.echo(f"{idx}/{len(execution_order)}: {node.name} [{typer.style('CACHED', fg=typer.colors.BLUE)}]")
+                run_state.nodes[node_id] = old_state.nodes[node_id]
+                cached += 1
+                continue
+
+        # Execute the node
+        typer.echo(f"{idx}/{len(execution_order)}: {node.name} [{typer.style('RUNNING', fg=typer.colors.YELLOW)}]")
+
+        if dry_run:
+            # Dry run - just show what would happen
+            typer.echo(f"  Would execute: {node.kind.value}.{node.name}")
+            update_node_state(run_state, node_id, NodeStatus.CACHED.value)
+            successful += 1
+            continue
+
+        # Actual execution using executors
+        node_start = time.time()
+
+        try:
+            # Get executor for node type
+            executor = get_executor(node, exec_context)
+
+            # Execute
+            result = executor.run()
+
+            duration = time.time() - node_start
+
+            if result.is_success():
+                status_msg = typer.style("SUCCESS", fg=typer.colors.GREEN, bold=True)
+                typer.echo(f"  {status_msg} in {duration:.2f}s")
+
+                if result.row_count > 0:
+                    typer.echo(f"  Rows: {result.row_count:,}")
+
+                # Update state with hash
+                current_hash = current_hashes.get(node_id, "")
+                update_node_state(
+                    run_state,
+                    node_id,
+                    NodeStatus.SUCCESS.value,
+                    duration_ms=int(duration * 1000),
+                    row_count=result.row_count,
+                    metadata=result.metadata,
+                    hash=current_hash,
+                )
+                successful += 1
+
+            elif result.is_failed() or result.status.value == "failed":
+                status_msg = typer.style("FAILED", fg=typer.colors.RED, bold=True)
+                typer.echo(f"  {status_msg}: {result.error_message}")
+
+                update_node_state(
+                    run_state,
+                    node_id,
+                    NodeStatus.FAILED.value,
+                    duration_ms=int(duration * 1000),
+                    metadata={"error": result.error_message},
+                )
+                failed += 1
+
+                if not continue_on_error:
+                    typer.echo("")
+                    _echo_error("Stopping execution due to failure")
+                    break
+
+                # Retry logic
+                if retry > 0:
+                    for attempt in range(1, retry + 1):
+                        typer.echo(f"  Retry {attempt}/{retry}...")
+
+                        try:
+                            executor = get_executor(node, exec_context)
+                            result = executor.run()
+
+                            if result.is_success():
+                                duration = time.time() - node_start
+                                status_msg = typer.style("SUCCESS", fg=typer.colors.GREEN)
+                                typer.echo(f"  {status_msg} on retry {attempt} in {duration:.2f}s")
+
+                                current_hash = current_hashes.get(node_id, "")
+                                update_node_state(
+                                    run_state,
+                                    node_id,
+                                    NodeStatus.SUCCESS.value,
+                                    duration_ms=int(duration * 1000),
+                                    row_count=result.row_count,
+                                    hash=current_hash,
+                                )
+                                failed -= 1
+                                successful += 1
+                                break
+                        except Exception as e:
+                            typer.echo(f"  Retry {attempt} failed: {e}")
+
+        except Exception as e:
+            duration = time.time() - node_start
+            status_msg = typer.style("FAILED", fg=typer.colors.RED, bold=True)
+            typer.echo(f"  {status_msg}: {e}")
+
+            update_node_state(
+                run_state,
+                node_id,
+                NodeStatus.FAILED.value,
+                duration_ms=int(duration * 1000),
+                metadata={"error": str(e)},
+            )
+            failed += 1
+
+            if not continue_on_error:
+                typer.echo("")
+                _echo_error("Stopping execution due to failure")
+                break
+
+    # Step 6: Save state
+    if not dry_run:
+        try:
+            save_state(run_state, state_path)
+            _echo_success("State saved")
+        except Exception as e:
+            _echo_warning(f"Failed to save state: {e}")
+
+    # Step 7: Print summary
+    total_duration = time.time() - start_time
+
+    typer.echo("")
+    typer.echo(typer.style("Execution Summary", bold=True))
+    typer.echo("=" * 60)
+    typer.echo(f"  Total nodes:    {node_count}")
+    typer.echo(f"  Executed:       {successful}")
+    if cached > 0:
+        typer.echo(f"  Cached:         {cached}")
+    if failed > 0:
+        failed_msg = typer.style(str(failed), fg=typer.colors.RED, bold=True)
+        typer.echo(f"  Failed:         {failed_msg}")
+    typer.echo(f"  Duration:       {total_duration:.2f}s")
+    typer.echo("=" * 60)
+
+    if failed > 0:
         raise typer.Exit(1)
 
 
@@ -1438,8 +2020,8 @@ def parse(
         seeknal parse --format json
         seeknal parse --no-diff
     """
-    from seeknal.dag.parser import ProjectParser
-    from seeknal.dag.manifest import Manifest
+    from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
+    from seeknal.dag.manifest import Manifest, Node, NodeType as ManifestNodeType
     from seeknal.dag.diff import ManifestDiff
     import json
 
@@ -1465,17 +2047,55 @@ def parse(
                 # If we can't load the old manifest, just skip diff
                 old_manifest = None
 
-        # Parse the project
-        parser = ProjectParser(
-            project_name=project,
-            project_path=str(path),
+        # Build DAG from YAML files in seeknal/ directory
+        try:
+            dag_builder = DAGBuilder(project_path=path)
+            dag_builder.build()
+        except ValueError as e:
+            _echo_error(f"DAG build failed: {e}")
+            raise typer.Exit(1)
+        except CycleDetectedError as e:
+            _echo_error(f"Cycle detected in DAG: {e.message}")
+            raise typer.Exit(1)
+        except MissingDependencyError as e:
+            _echo_error(f"Missing dependency: {e.message}")
+            raise typer.Exit(1)
+
+        # Convert DAGBuilder results to Manifest format
+        manifest = Manifest(
+            project=project,
             seeknal_version=_get_version()
         )
 
-        manifest = parser.parse()
+        # Map workflow NodeType to manifest NodeType
+        node_type_map = {
+            "source": ManifestNodeType.SOURCE,
+            "transform": ManifestNodeType.TRANSFORM,
+            "feature_group": ManifestNodeType.FEATURE_GROUP,
+            "model": ManifestNodeType.MODEL,
+            "aggregation": ManifestNodeType.AGGREGATION,
+            "rule": ManifestNodeType.RULE,
+            "exposure": ManifestNodeType.EXPOSURE,
+        }
 
-        # Validate
-        errors = parser.validate()
+        # Add nodes to manifest
+        for node_id, dag_node in dag_builder.nodes.items():
+            kind_str = dag_node.kind.value if hasattr(dag_node.kind, 'value') else str(dag_node.kind)
+            manifest_node = Node(
+                id=node_id,
+                name=dag_node.name,
+                node_type=node_type_map.get(kind_str, ManifestNodeType.SOURCE),
+                description=dag_node.yaml_data.get("description"),
+                config=dag_node.yaml_data,
+            )
+            manifest.add_node(manifest_node)
+
+        # Add edges to manifest
+        for edge in dag_builder.edges:
+            manifest.add_edge(from_node=edge.from_node, to_node=edge.to_node)
+
+        # Report any parse errors as warnings
+        errors = dag_builder._parse_errors
         if errors:
             _echo_warning(f"Validation warnings: {len(errors)}")
             for error in errors:
@@ -1505,8 +2125,8 @@ def parse(
                 typer.echo("Node Summary:")
                 type_counts = {}
                 for node in manifest.nodes.values():
-                    node_type = node.node_type.value
-                    type_counts[node_type] = type_counts.get(node_type, 0) + 1
+                    node_type_str = node.node_type.value
+                    type_counts[node_type_str] = type_counts.get(node_type_str, 0) + 1
                 for node_type, count in sorted(type_counts.items()):
                     typer.echo(f"  - {node_type}: {count}")
 
