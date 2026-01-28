@@ -51,4 +51,14 @@ Based on: docs/plans/2026-01-27-feat-seeknal-init-python-pipelines-plan.md
 
 **Commit**: ab260c4 "feat(cli): Enhance init command with dbt-style project structure"
 
+### Phase 2: Python Pipeline Module & Decorators ✅
+- [x] M2-E1-S1: Create materialization dataclasses (OfflineConfig, OnlineConfig, IcebergTable, Materialization)
+- [x] M2-E1-S2: Create PipelineContext with ref(), duckdb, config
+- [x] M2-E1-S3: Implement @source decorator
+- [x] M2-E1-S4: Implement @transform decorator
+- [x] M2-E1-S5: Implement @feature_group decorator
+- [x] M2-E1-S6: Create public API exports in __init__.py
+
+**Commit**: e1fae7f "feat(pipeline): Add Python Pipeline API with decorators"
+
 ## Next Session Notes
