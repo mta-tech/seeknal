@@ -225,6 +225,96 @@ class DAGBuilder:
         # Errors collected during parsing
         self._parse_errors: list[str] = []
 
+        # Profile config (for default materialization settings)
+        self.profile: dict[str, Any] = {}
+
+    def _merge_materialization_config(
+        self,
+        decorator_config: Optional[dict],
+        yaml_config: Optional[dict],
+        profile_config: Optional[dict] = None,
+    ) -> dict:
+        """
+        Merge materialization configuration with priority:
+        decorator > yaml > profile > defaults
+
+        Args:
+            decorator_config: Materialization config from Python decorator
+            yaml_config: Materialization config from YAML override file
+            profile_config: Materialization config from profile defaults
+
+        Returns:
+            Merged materialization configuration dict
+
+        Note:
+            Only non-None decorator values override lower-priority configs.
+            This allows selective override (e.g., decorator sets table, inherits mode).
+        """
+        # Start with system defaults
+        result = {
+            "enabled": False,  # Default: opt-in
+            "mode": "append",
+            "create_table": True,
+        }
+
+        # Merge profile config (if exists)
+        if profile_config:
+            result.update(profile_config)
+
+        # Merge YAML config (overrides profile)
+        if yaml_config:
+            result.update(yaml_config)
+
+        # Merge decorator config (highest priority)
+        if decorator_config:
+            # CRITICAL: Only override non-None values
+            for key, value in decorator_config.items():
+                if value is not None:
+                    result[key] = value
+
+        return result
+
+    def _load_yaml_override_for_node(self, qualified_name: str) -> Optional[dict]:
+        """
+        Load YAML override file for a specific node.
+
+        Checks for a YAML file matching the node name in seeknal/ subdirectories.
+        For example: 'transform.sales_forecast' -> seeknal/transforms/sales_forecast.yml
+
+        Args:
+            qualified_name: Fully qualified node name (e.g., "transform.sales_forecast")
+
+        Returns:
+            Parsed YAML data dict, or None if no override file exists
+        """
+        # Parse qualified name: "kind.name" -> kind, name
+        parts = qualified_name.split(".", 1)
+        if len(parts) != 2:
+            return None
+
+        kind, name = parts
+        kind_dir = kind + "s"  # "transform" -> "transforms"
+
+        # Look for YAML file in seeknal/{kind_dir}/{name}.yml
+        yaml_path = self.seeknal_dir / kind_dir / f"{name}.yml"
+
+        if not yaml_path.exists():
+            return None
+
+        try:
+            import yaml
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+
+            if isinstance(data, dict) and "materialization" in data:
+                return data.get("materialization")
+
+            return None
+
+        except Exception:
+            # If loading fails, just return None (don't fail on override)
+            return None
+
     def build(self) -> None:
         """
         Build the DAG by scanning and parsing all YAML and Python files.
@@ -442,8 +532,19 @@ class DAGBuilder:
                 if kind_str == "feature_group":
                     yaml_data["entity"] = node_meta.get("entity")
                     yaml_data["features"] = node_meta.get("features", {})
-                    if node_meta.get("materialization"):
-                        yaml_data["materialization"] = node_meta["materialization"]
+
+                # Handle materialization for all node types (source, transform, feature_group)
+                decorator_mat = node_meta.get("materialization")
+                if decorator_mat is not None:
+                    # Load YAML override for this node
+                    yaml_mat = self._load_yaml_override_for_node(qualified_name)
+                    # Get profile defaults
+                    profile_mat = self.profile.get("materialization", {})
+                    # Merge configs: decorator > yaml > profile > defaults
+                    merged_mat = self._merge_materialization_config(
+                        decorator_mat, yaml_mat, profile_mat
+                    )
+                    yaml_data["materialization"] = merged_mat
 
                 # Create node
                 node = DAGNode(

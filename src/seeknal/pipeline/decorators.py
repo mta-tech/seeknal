@@ -5,11 +5,69 @@ Provides @source, @transform, and @feature_group decorators that register
 pipeline nodes in a global registry for later discovery and execution.
 """
 
+import re
 from functools import wraps
-from typing import Callable, Optional, Any
+from typing import Callable, Optional, Any, Union
+
+from seeknal.pipeline.materialization_config import MaterializationConfig
 
 # Global registry for discovered nodes
 _PIPELINE_REGISTRY: dict[str, dict] = {}
+
+
+def _validate_materialization_config(
+    materialization: Optional[Union[dict, MaterializationConfig]]
+) -> None:
+    """
+    Validate materialization configuration parameters.
+
+    Args:
+        materialization: Dict or MaterializationConfig to validate
+
+    Raises:
+        ValueError: If configuration is invalid
+        TypeError: If materialization is not dict or MaterializationConfig
+    """
+    if materialization is None:
+        return
+
+    # Convert to dict for validation
+    if isinstance(materialization, MaterializationConfig):
+        config = materialization.to_dict()
+    elif isinstance(materialization, dict):
+        config = materialization
+    else:
+        raise TypeError(
+            f"materialization must be dict or MaterializationConfig, "
+            f"got {type(materialization).__name__}"
+        )
+
+    enabled = config.get("enabled")
+    table = config.get("table")
+    mode = config.get("mode")
+
+    # If enabled, table is required
+    if enabled is True and not table:
+        raise ValueError(
+            "materialization.table is required when materialization.enabled=True"
+        )
+
+    # Validate table name format (catalog.namespace.table)
+    if table:
+        pattern = r'^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*){2}$'
+        if not re.match(pattern, table):
+            raise ValueError(
+                f"Invalid table name '{table}'. "
+                "Expected format: catalog.namespace.table "
+                "(e.g., 'warehouse.prod.sales_forecast')"
+            )
+
+    # Validate mode
+    if mode and mode not in ("append", "overwrite"):
+        raise ValueError(
+            f"Invalid materialization.mode '{mode}'. "
+            "Must be 'append' or 'overwrite'"
+        )
 
 
 def source(
@@ -18,6 +76,7 @@ def source(
     table: str = "",
     columns: Optional[dict] = None,
     tags: Optional[list[str]] = None,
+    materialization: Optional[Union[dict, MaterializationConfig]] = None,
     **params,
 ):
     """Decorator to define a data source node.
@@ -32,6 +91,7 @@ def source(
         table: Table or file path
         columns: Optional column schema definitions
         tags: Optional tags for organization
+        materialization: Optional Iceberg materialization config (dict or MaterializationConfig)
         **params: Additional source-specific parameters
 
     Example:
@@ -44,11 +104,19 @@ def source(
             source="postgres",
             table="public.events",
             columns={"event_id": "int", "user_id": "int"},
-            tags=["production"]
+            tags=["production"],
+            materialization=MaterializationConfig(
+                enabled=True,
+                table="warehouse.raw.events",
+                mode="append",
+            )
         )
         def events():
             pass
     """
+    # Validate materialization config
+    _validate_materialization_config(materialization)
+
     def decorator(func: Callable) -> Callable:
         node_id = f"source.{name}"
 
@@ -61,6 +129,14 @@ def source(
                 ctx._store_output(node_id, result)
             return result
 
+        # Normalize materialization to dict
+        mat_dict = None
+        if materialization is not None:
+            if isinstance(materialization, dict):
+                mat_dict = materialization
+            elif isinstance(materialization, MaterializationConfig):
+                mat_dict = materialization.to_dict()
+
         # Register node metadata
         wrapper._seeknal_node = {
             "kind": "source",
@@ -71,6 +147,7 @@ def source(
             "columns": columns or {},
             "tags": tags or [],
             "params": params,
+            "materialization": mat_dict,
             "func": func,
         }
         _PIPELINE_REGISTRY[node_id] = wrapper._seeknal_node
@@ -83,6 +160,7 @@ def transform(
     sql: Optional[str] = None,
     inputs: Optional[list[str]] = None,
     tags: Optional[list[str]] = None,
+    materialization: Optional[Union[dict, MaterializationConfig]] = None,
     **params,
 ):
     """Decorator to define a transformation node.
@@ -95,6 +173,7 @@ def transform(
         sql: Optional SQL transform (alternative to Python function)
         inputs: List of upstream node IDs this transform depends on
         tags: Optional tags for organization
+        materialization: Optional Iceberg materialization config (dict or MaterializationConfig)
         **params: Additional transform-specific parameters
 
     Example:
@@ -104,18 +183,22 @@ def transform(
             return ctx.duckdb.sql("SELECT * FROM df WHERE active = true").df()
 
         @transform(
-            name="user_features",
-            inputs=["source.users", "source.events"],
-            tags=["feature-engineering"]
+            name="sales_forecast",
+            inputs=["source.orders"],
+            tags=["ml"],
+            materialization=MaterializationConfig(
+                enabled=True,
+                table="warehouse.prod.sales_forecast",
+                mode="overwrite",
+            )
         )
-        def user_features(ctx):
-            users = ctx.ref("source.users")
-            events = ctx.ref("source.events")
-            sql = "SELECT u.user_id, COUNT(e.event_id) as event_count " \
-                  "FROM users u LEFT JOIN events e ON u.user_id = e.user_id " \
-                  "GROUP BY u.user_id"
-            return ctx.duckdb.sql(sql).df()
+        def sales_forecast(ctx):
+            df = ctx.ref("source.orders")
+            return ctx.duckdb.sql("SELECT * FROM df").df()
     """
+    # Validate materialization config
+    _validate_materialization_config(materialization)
+
     def decorator(func: Callable) -> Callable:
         node_name = name or func.__name__
         node_id = f"transform.{node_name}"
@@ -130,6 +213,14 @@ def transform(
         # Extract dependencies from inputs or analyze function
         deps = inputs or []
 
+        # Normalize materialization to dict
+        mat_dict = None
+        if materialization is not None:
+            if isinstance(materialization, dict):
+                mat_dict = materialization
+            elif isinstance(materialization, MaterializationConfig):
+                mat_dict = materialization.to_dict()
+
         wrapper._seeknal_node = {
             "kind": "transform",
             "name": node_name,
@@ -138,6 +229,7 @@ def transform(
             "inputs": [{"ref": d} for d in deps],
             "tags": tags or [],
             "params": params,
+            "materialization": mat_dict,
             "func": func,
         }
         _PIPELINE_REGISTRY[node_id] = wrapper._seeknal_node
@@ -165,12 +257,15 @@ def feature_group(
         features: Optional feature schema definitions
         inputs: List of upstream node IDs this feature group depends on
         materialization: Optional Materialization config for offline/online stores
+            (Can be Materialization, MaterializationConfig, or dict)
         tags: Optional tags for organization
         **params: Additional feature group-specific parameters
 
     Example:
         from seeknal.pipeline.materialization import Materialization, OfflineConfig
+        from seeknal.pipeline.materialization_config import MaterializationConfig
 
+        # With Materialization (offline/online stores)
         @feature_group(
             name="user_features",
             entity="user",
@@ -178,10 +273,20 @@ def feature_group(
         )
         def user_features(ctx):
             df = ctx.ref("transform.clean_users")
-            sql = "SELECT user_id, COUNT(*) as total_events, " \
-                  "AVG(session_duration) as avg_session_duration " \
-                  "FROM df GROUP BY user_id"
-            return ctx.duckdb.sql(sql).df()
+            return ctx.duckdb.sql("SELECT * FROM df").df()
+
+        # With MaterializationConfig (Iceberg inline)
+        @feature_group(
+            name="user_features_v2",
+            entity="user",
+            materialization=MaterializationConfig(
+                enabled=True,
+                table="warehouse.online.user_features_v2",
+                mode="append",
+            ),
+        )
+        def user_features_v2(ctx):
+            return ctx.duckdb.sql("SELECT * FROM df").df()
     """
     def decorator(func: Callable) -> Callable:
         node_name = name or func.__name__
@@ -196,10 +301,17 @@ def feature_group(
 
         deps = inputs or []
 
-        # Convert Materialization to dict if provided
+        # Convert materialization to dict if provided
         mat_dict = None
         if materialization is not None:
-            mat_dict = materialization.to_dict()
+            # Handle both old Materialization and new MaterializationConfig
+            if isinstance(materialization, dict):
+                mat_dict = materialization
+            elif isinstance(materialization, MaterializationConfig):
+                mat_dict = materialization.to_dict()
+            elif hasattr(materialization, 'to_dict'):
+                # Old Materialization object
+                mat_dict = materialization.to_dict()
 
         wrapper._seeknal_node = {
             "kind": "feature_group",
