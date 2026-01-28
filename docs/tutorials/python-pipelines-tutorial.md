@@ -59,25 +59,31 @@ retail_analytics/
 
 ---
 
-## Step 2: Download Sample Data
+## Step 2: Generate Sample Data
 
-For this tutorial, we'll use a pre-processed sample. Create `data/` directory and download:
+Generate a sample retail dataset locally:
 
 ```bash
+# Run the download script (generates synthetic retail data)
+python scripts/download_tutorial_data.py
+
+# Or copy pre-built examples directly
 mkdir -p data
-cd data
-
-# Download sample dataset (first 10K rows for faster processing)
-curl -O https://raw.githubusercontent.com/seeknal-ai/datasets/main/online_retail_sample.csv
-
-cd ..
+cp docs/tutorials/examples/*.py seeknal/pipelines/
 ```
+
+**This creates `data/online_retail_sample.csv` with:**
+- 10,000 transactions
+- 500 unique customers
+- 500 unique products
+- 7 countries
+- Realistic product descriptions
 
 **Preview of the data:**
 ```csv
 InvoiceNo,StockCode,Description,Quantity,InvoiceDate,UnitPrice,CustomerID,Country
-536365,85123A,WHITE HANGING HEART T-LIGHT HOLDER,6,2010-12-01 08:26:00,3.39,17850,United Kingdom
-536366,22752,SET 7 BABUSHKA NESTING BOXES,2,2010-12-01 08:26:00,7.65,17850,United Kingdom
+508154,P00281,FOURTY SIX PIECE CUTLERY SET,16,2011-09-02 00:00:00,32.85,C00186,Netherlands
+496219,P00210,GLASS STOKE TEA TUMBLERS,19,2011-09-02 00:00:00,10.63,C00310,Belgium
 ...
 ```
 
