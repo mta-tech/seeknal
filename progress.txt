@@ -35,10 +35,10 @@ Based on: docs/plans/2026-01-27-feat-seeknal-init-python-pipelines-plan.md
 - [ ] M4-E1-S5: Register PythonExecutor in get_executor()
 
 ### Phase 5: Enhanced Draft Command
-- [ ] M5-E1-S1: Create Python Jinja2 templates
-- [ ] M5-E1-S2: Add --python flag to draft command
-- [ ] M5-E1-S3: Add --deps flag for PEP 723 dependencies
-- [ ] M5-E1-S4: Generate Python scaffolds with PEP 723 headers
+- [x] M5-E1-S1: Create Python Jinja2 templates
+- [x] M5-E1-S2: Add --python flag to draft command
+- [x] M5-E1-S3: Add --deps flag for PEP 723 dependencies
+- [x] M5-E1-S4: Generate Python scaffolds with PEP 723 headers
 
 ## Completed Work
 
@@ -69,5 +69,26 @@ Based on: docs/plans/2026-01-27-feat-seeknal-init-python-pipelines-plan.md
 - [x] M3-E1-S5: Handle duplicate node detection
 
 **Commit**: 2b52b9b "feat(dag): Add Python file discovery and manifest integration"
+
+### Phase 4: Python Executor & uv Integration ✅
+- [x] M4-E1-S1: Create PythonExecutor class
+- [x] M4-E1-S2: Add uv presence check
+- [x] M4-E1-S3: Implement uv run execution with PEP 723 support
+- [x] M4-E1-S4: Add PYTHON node type to NodeType enum
+- [x] M4-E1-S5: Register PythonExecutor in get_executor()
+
+**Commit**: 8431424 "feat(executor): Add Python executor with uv integration"
+
+### Phase 5: Enhanced Draft Command ✅
+- [x] M5-E1-S1: Create Python Jinja2 templates
+- [x] M5-E1-S2: Add --python flag to draft command
+- [x] M5-E1-S3: Add --deps flag for PEP 723 dependencies
+- [x] M5-E1-S4: Generate Python scaffolds with PEP 723 headers
+
+**Commit**: (pending)
+
+## All Phases Complete ✅
+
+All 5 phases have been implemented successfully!
 
 ## Next Session Notes

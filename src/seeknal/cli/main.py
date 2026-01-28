@@ -2211,21 +2211,31 @@ def draft(
     name: str = typer.Argument(..., help="Node name"),
     description: Optional[str] = typer.Option(None, "--description", "-d", help="Node description"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing draft file"),
+    python: bool = typer.Option(False, "--python", "-py", help="Generate Python file instead of YAML"),
+    deps: str = typer.Option("", "--deps", help="Comma-separated Python dependencies for PEP 723 header"),
 ):
-    """Generate YAML template from Jinja2 template.
+    """Generate template from Jinja2 template.
 
-    Creates a draft YAML file for a new node using Jinja2 templates.
+    Creates a draft file for a new node using Jinja2 templates.
     The draft file can be edited and then applied using 'seeknal apply'.
+
+    Supports both YAML (--default) and Python (--python) output formats.
 
     Template discovery order:
     1. project/seeknal/templates/*.j2 (project override)
     2. Package templates (default)
 
     Examples:
-        # Create a feature group draft
+        # Create a YAML feature group draft
         $ seeknal draft feature-group user_behavior
 
-        # Create a source with description
+        # Create a Python transform draft
+        $ seeknal draft transform clean_data --python
+
+        # Create Python source with dependencies
+        $ seeknal draft source raw_users --python --deps pandas,requests
+
+        # Create with description
         $ seeknal draft source postgres_users --description "PostgreSQL users table"
 
         # Overwrite existing draft
@@ -2233,7 +2243,7 @@ def draft(
     """
     from seeknal.workflow.draft import draft_command
 
-    draft_command(node_type, name, description, force)
+    draft_command(node_type, name, description, force, python, deps)
 
 
 @app.command()

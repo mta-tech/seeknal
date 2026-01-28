@@ -39,6 +39,17 @@ TEMPLATE_FILES = {
     "exposure": "exposure.yml.j2",
 }
 
+# Python template file mapping
+PYTHON_TEMPLATE_FILES = {
+    "source": "source.py.j2",
+    "transform": "transform.py.j2",
+    "feature_group": "feature_group.py.j2",
+    "model": "model.py.j2",
+    "aggregation": "aggregation.py.j2",
+    "rule": "rule.py.j2",
+    "exposure": "exposure.py.j2",
+}
+
 
 def get_template_env() -> Environment:
     """Get Jinja2 environment with template discovery order.
@@ -122,20 +133,22 @@ def validate_name(name: str) -> str:
     return name
 
 
-def generate_filename(node_type: str, name: str) -> str:
+def generate_filename(node_type: str, name: str, python: bool = False) -> str:
     """Generate draft filename.
 
     Args:
         node_type: Normalized node type
         name: Validated node name
+        python: Whether to generate Python file (True) or YAML file (False)
 
     Returns:
         Draft filename
     """
-    return f"draft_{node_type}_{name}.yml"
+    ext = "py" if python else "yml"
+    return f"draft_{node_type}_{name}.{ext}"
 
 
-def render_template(template_env: Environment, node_type: str, name: str, description: Optional[str]) -> str:
+def render_template(template_env: Environment, node_type: str, name: str, description: Optional[str], python: bool = False, deps: Optional[list[str]] = None) -> str:
     """Render Jinja2 template.
 
     Args:
@@ -143,11 +156,17 @@ def render_template(template_env: Environment, node_type: str, name: str, descri
         node_type: Normalized node type
         name: Node name
         description: Optional description
+        python: Whether to generate Python file (True) or YAML file (False)
+        deps: Optional list of PEP 723 dependencies for Python files
 
     Returns:
-        Rendered YAML content
+        Rendered content
     """
-    template_file = TEMPLATE_FILES.get(node_type)
+    if python:
+        template_file = PYTHON_TEMPLATE_FILES.get(node_type)
+    else:
+        template_file = TEMPLATE_FILES.get(node_type)
+
     if not template_file:
         raise ValueError(f"No template found for node type: {node_type}")
 
@@ -157,6 +176,7 @@ def render_template(template_env: Environment, node_type: str, name: str, descri
     context = {
         "name": name,
         "description": description or f"{node_type.replace('_', ' ')} node",
+        "deps": deps or [],
     }
 
     return template.render(**context)
@@ -193,21 +213,31 @@ def draft_command(
     name: str = typer.Argument(..., help="Node name"),
     description: Optional[str] = typer.Option(None, "--description", "-d", help="Node description"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing draft file"),
+    python: bool = typer.Option(False, "--python", "-py", help="Generate Python file instead of YAML"),
+    deps: str = typer.Option("", "--deps", help="Comma-separated Python dependencies for PEP 723 header"),
 ):
-    """Generate YAML template from Jinja2 template.
+    """Generate template from Jinja2 template.
 
-    Creates a draft YAML file for a new node using Jinja2 templates.
+    Creates a draft file for a new node using Jinja2 templates.
     The draft file can be edited and then applied using 'seeknal apply'.
+
+    Supports both YAML (--default) and Python (--python) output formats.
 
     Template discovery order:
     1. project/seeknal/templates/*.j2 (project override)
     2. Package templates (default)
 
     Examples:
-        # Create a feature group draft
+        # Create a YAML feature group draft
         $ seeknal draft feature-group user_behavior
 
-        # Create a source with description
+        # Create a Python transform draft
+        $ seeknal draft transform clean_data --python
+
+        # Create Python source with dependencies
+        $ seeknal draft source raw_users --python --deps pandas,requests
+
+        # Create with description
         $ seeknal draft source postgres_users --description "PostgreSQL users table"
 
         # Overwrite existing draft
@@ -217,8 +247,18 @@ def draft_command(
     normalized_type = validate_node_type(node_type)
     validated_name = validate_name(name)
 
+    # Parse dependencies if provided
+    dep_list = ["seeknal"]  # Always include seeknal as default
+    if deps:
+        user_deps = [d.strip() for d in deps.split(",") if d.strip()]
+        # Add seeknal as default dependency if not present
+        if "seeknal" not in user_deps:
+            dep_list.extend(user_deps)
+        else:
+            dep_list = user_deps
+
     # Generate filename
-    filename = generate_filename(normalized_type, validated_name)
+    filename = generate_filename(normalized_type, validated_name, python)
 
     # Get template environment
     try:
@@ -229,7 +269,7 @@ def draft_command(
 
     # Render template
     try:
-        content = render_template(template_env, normalized_type, validated_name, description)
+        content = render_template(template_env, normalized_type, validated_name, description, python, dep_list)
     except Exception as e:
         _echo_error(f"Failed to render template: {e}")
         raise typer.Exit(1)
@@ -244,7 +284,11 @@ def draft_command(
         raise typer.Exit(1)
 
     _echo_success(f"Created: {filename}")
-    _echo_info(f"Edit the file, then run: seeknal dry-run {filename}")
+
+    if python:
+        _echo_info(f"Edit the file, then run: seeknal apply {filename}")
+    else:
+        _echo_info(f"Edit the file, then run: seeknal dry-run {filename}")
 
 
 if __name__ == "__main__":
