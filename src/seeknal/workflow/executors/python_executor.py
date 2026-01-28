@@ -161,15 +161,23 @@ class PythonExecutor(BaseExecutor):
         Returns:
             Python script content as string
         """
+        import seeknal
+        seeknal_path = Path(seeknal.__file__).parent.parent
+
         file_path = Path(self.node.file_path)
         func_name = self.node.name
 
-        # Read original file to preserve PEP 723 header
+        # Read original file to preserve PEP 723 header, but remove seeknal from deps
+        # since we're adding sys.path and seeknal is a local package
         original_content = file_path.read_text()
         pep723_header = self._extract_pep723_header(original_content)
+        # Remove seeknal from PEP 723 deps as it's a local package
+        pep723_header = pep723_header.replace('#     "seeknal",\n', '')
+        pep723_header = pep723_header.replace('#     "seeknal"', '')
 
         return f'''{pep723_header}
 import sys
+sys.path.insert(0, "{seeknal_path}")
 sys.path.insert(0, "{self.context.workspace_path}")
 
 from pathlib import Path

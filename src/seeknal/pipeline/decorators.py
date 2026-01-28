@@ -54,8 +54,12 @@ def source(
 
         @wraps(func)
         def wrapper(ctx=None):
-            # Sources typically don't have logic - data loaded by executor
-            return func() if ctx is None else func(ctx)
+            # Sources return data (loaded by function or executor)
+            result = func() if ctx is None else func(ctx)
+            # Store output if context is provided
+            if ctx is not None and result is not None:
+                ctx._store_output(node_id, result)
+            return result
 
         # Register node metadata
         wrapper._seeknal_node = {

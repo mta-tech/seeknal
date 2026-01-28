@@ -12,12 +12,14 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 from pathlib import Path
 
+# Import duckdb eagerly as it's needed for the connection
 try:
     import duckdb
-    import pandas as pd
 except ImportError:
     duckdb = None
-    pd = None
+
+# Import pandas lazily when needed (in _store_output and ref methods)
+# to avoid top-level import errors when seeknal is imported from system path
 
 
 @dataclass
@@ -81,10 +83,12 @@ class PipelineContext:
             ValueError: If node output is not found
             ImportError: If pandas is not installed
         """
-        if pd is None:
+        try:
+            import pandas as pd
+        except ImportError:
             raise ImportError(
                 "pandas is required for Python pipelines. "
-                "Install with: pip install pandas"
+                "Ensure it is in the PEP 723 dependencies."
             )
 
         # Check in-memory cache first
@@ -116,10 +120,12 @@ class PipelineContext:
         Returns:
             Path where the output was stored
         """
-        if pd is None:
+        try:
+            import pandas as pd
+        except ImportError:
             raise ImportError(
                 "pandas is required for Python pipelines. "
-                "Install with: pip install pandas"
+                "Ensure it is in the PEP 723 dependencies."
             )
 
         # Store in memory
