@@ -6,33 +6,33 @@ Based on: docs/plans/2026-01-27-feat-seeknal-init-python-pipelines-plan.md
 ## Status Tracking
 
 ### Phase 1: Enhanced `seeknal init` Command
-- [ ] M1-E1-S1: Enhance init command with dbt-style structure
-- [ ] M1-E1-S2: Create seeknal_project.yml with name, version, profile
-- [ ] M1-E1-S3: Create profiles.yml with default DuckDB profile
-- [ ] M1-E1-S4: Generate .gitignore with profiles.yml and target/
-- [ ] M1-E1-S5: Add force flag to override existing projects
+- [x] M1-E1-S1: Enhance init command with dbt-style structure
+- [x] M1-E1-S2: Create seeknal_project.yml with name, version, profile
+- [x] M1-E1-S3: Create profiles.yml with default DuckDB profile
+- [x] M1-E1-S4: Generate .gitignore with profiles.yml and target/
+- [x] M1-E1-S5: Add force flag to override existing projects
 
 ### Phase 2: Python Pipeline Module & Decorators
-- [ ] M2-E1-S1: Create materialization dataclasses (OfflineConfig, OnlineConfig, IcebergTable, Materialization)
-- [ ] M2-E1-S2: Create PipelineContext with ref(), duckdb, config
-- [ ] M2-E1-S3: Implement @source decorator
-- [ ] M2-E1-S4: Implement @transform decorator
-- [ ] M2-E1-S5: Implement @feature_group decorator
-- [ ] M2-E1-S6: Create public API exports in __init__.py
+- [x] M2-E1-S1: Create materialization dataclasses (OfflineConfig, OnlineConfig, IcebergTable, Materialization)
+- [x] M2-E1-S2: Create PipelineContext with ref(), duckdb, config
+- [x] M2-E1-S3: Implement @source decorator
+- [x] M2-E1-S4: Implement @transform decorator
+- [x] M2-E1-S5: Implement @feature_group decorator
+- [x] M2-E1-S6: Create public API exports in __init__.py
 
 ### Phase 3: Python File Discovery & Manifest Integration
-- [ ] M3-E1-S1: Create PythonPipelineDiscoverer class
-- [ ] M3-E1-S2: Implement parse_file to extract decorated nodes
-- [ ] M3-E1-S3: Implement extract_dependencies_ast for ctx.ref() parsing
-- [ ] M3-E1-S4: Integrate Python discovery into DAGBuilder
-- [ ] M3-E1-S5: Handle duplicate node detection
+- [x] M3-E1-S1: Create PythonPipelineDiscoverer class
+- [x] M3-E1-S2: Implement parse_file to extract decorated nodes
+- [x] M3-E1-S3: Implement extract_dependencies_ast for ctx.ref() parsing
+- [x] M3-E1-S4: Integrate Python discovery into DAGBuilder
+- [x] M3-E1-S5: Handle duplicate node detection
 
 ### Phase 4: Python Executor & uv Integration
-- [ ] M4-E1-S1: Create PythonExecutor class
-- [ ] M4-E1-S2: Add uv presence check
-- [ ] M4-E1-S3: Implement uv run execution with PEP 723 support
-- [ ] M4-E1-S4: Add PYTHON node type to NodeType enum
-- [ ] M4-E1-S5: Register PythonExecutor in get_executor()
+- [x] M4-E1-S1: Create PythonExecutor class
+- [x] M4-E1-S2: Add uv presence check
+- [x] M4-E1-S3: Implement uv run execution with PEP 723 support
+- [x] M4-E1-S4: Add PYTHON node type to NodeType enum
+- [x] M4-E1-S5: Register PythonExecutor in get_executor()
 
 ### Phase 5: Enhanced Draft Command
 - [x] M5-E1-S1: Create Python Jinja2 templates
