@@ -1,0 +1,18 @@
+name: manager_dashboard
+kind: exposure
+description: Export for regional management dashboard
+inputs:
+  - ref: transform.sales_forecast
+sql: |
+  SELECT
+    region,
+    product_category,
+    forecast_margin,
+    trend,
+    RANK() OVER (ORDER BY forecast_margin DESC) as margin_rank
+  FROM __THIS__
+  WHERE trend IN ('UP', 'STABLE')
+materialization:
+  offline:
+    format: csv
+    path: exports/manager_dashboard.csv

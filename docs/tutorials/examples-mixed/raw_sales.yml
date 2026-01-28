@@ -1,0 +1,15 @@
+name: raw_sales
+kind: source
+source: csv
+table: data/sales.csv
+description: Raw sales transactions
+tags:
+  - sales
+  - raw
+columns:
+  transaction_id: int
+  date: date
+  product_id: str
+  quantity: int
+  unit_price: float
+  region: str
