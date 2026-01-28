@@ -61,4 +61,13 @@ Based on: docs/plans/2026-01-27-feat-seeknal-init-python-pipelines-plan.md
 
 **Commit**: e1fae7f "feat(pipeline): Add Python Pipeline API with decorators"
 
+### Phase 3: Python File Discovery & Manifest Integration ✅
+- [x] M3-E1-S1: Create PythonPipelineDiscoverer class
+- [x] M3-E1-S2: Implement parse_file to extract decorated nodes
+- [x] M3-E1-S3: Implement extract_dependencies_ast for ctx.ref() parsing
+- [x] M3-E1-S4: Integrate Python discovery into DAGBuilder
+- [x] M3-E1-S5: Handle duplicate node detection
+
+**Commit**: 2b52b9b "feat(dag): Add Python file discovery and manifest integration"
+
 ## Next Session Notes

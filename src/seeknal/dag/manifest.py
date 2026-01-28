@@ -24,6 +24,7 @@ class NodeType(Enum):
     RULE = "rule"
     AGGREGATION = "aggregation"
     EXPOSURE = "exposure"
+    PYTHON = "python"  # For nodes that need special Python execution
 
 
 @dataclass(slots=True)
