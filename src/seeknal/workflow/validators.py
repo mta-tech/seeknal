@@ -38,6 +38,10 @@ SCHEMAS = {
         "required": ["kind", "name", "id_col", "feature_date_col"],
         "optional": ["description", "owner", "application_date_col", "features"],
     },
+    "second_order_aggregation": {
+        "required": ["kind", "name", "id_col", "feature_date_col", "source", "features"],
+        "optional": ["description", "owner", "application_date_col", "inputs", "tags", "materialization"],
+    },
     "rule": {
         "required": ["kind", "name", "rule"],
         "optional": ["description", "owner", "params"],

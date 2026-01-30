@@ -45,6 +45,7 @@ from seeknal.workflow.executors.base import (
 from seeknal.workflow.executors.source_executor import SourceExecutor
 from seeknal.workflow.executors.transform_executor import TransformExecutor
 from seeknal.workflow.executors.aggregation_executor import AggregationExecutor
+from seeknal.workflow.executors.second_order_aggregation_executor import SecondOrderAggregationExecutor
 from seeknal.workflow.executors.feature_group_executor import FeatureGroupExecutor
 from seeknal.workflow.executors.model_executor import ModelExecutor
 from seeknal.workflow.executors.rule_executor import RuleExecutor
@@ -115,6 +116,7 @@ __all__ = [
     "SourceExecutor",
     "TransformExecutor",
     "AggregationExecutor",
+    "SecondOrderAggregationExecutor",
     "FeatureGroupExecutor",
     "ModelExecutor",
     "RuleExecutor",
