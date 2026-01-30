@@ -18,6 +18,7 @@ Learn Seeknal's dbt-inspired YAML workflow to define, validate, and execute data
 - [Part 6: Apply and Run](#part-6-apply-and-run)
 - [Part 7: Incremental Runs](#part-7-incremental-runs)
 - [Part 8: Advanced Features](#part-8-advanced-features)
+  - [8.8 Second-Order Aggregations](#88-second-order-aggregations)
 - [Part 9: Production Tips](#part-9-production-tips)
 - [Part 10: Iceberg Materialization](#part-10-iceberg-materialization)
 - [Troubleshooting](#troubleshooting)
@@ -41,6 +42,8 @@ Seeknal's YAML pipeline workflow provides a **dbt-like experience** for defining
 | **Source** | Raw data input (CSV, Parquet, database, etc.) |
 | **Transform** | SQL transformation logic |
 | **Feature Group** | ML feature definitions with entity keys |
+| **Aggregation** | First-level aggregations (e.g., user-level metrics) |
+| **Second-Order Aggregation** | Aggregations of aggregations (e.g., region-level from user-level) |
 | **Node** | A single unit in the pipeline (source/transform/etc.) |
 | **DAG** | Directed Acyclic Graph of node dependencies |
 | **State** | Execution history with hashes for change detection |
@@ -847,6 +850,216 @@ seeknal run --show-plan --types source --full
 
 # Dry run with specific nodes
 seeknal run --dry-run --nodes active_customers
+```
+
+### 8.8 Second-Order Aggregations
+
+Second-order aggregations enable **aggregations of aggregations** - a powerful pattern for multi-level feature engineering. For example, you can aggregate user-level features to region-level, or product-level features to category-level metrics.
+
+#### What are Second-Order Aggregations?
+
+```
+Raw Data → First-Level Aggregation → Second-Order Aggregation
+           (user metrics)             (region metrics)
+```
+
+**Example use cases:**
+- User-level metrics → Region-level averages
+- Store-level sales → Country-level totals
+- Product-level features → Category-level aggregations
+- Daily metrics → Weekly/monthly patterns
+
+#### Creating a Second-Order Aggregation
+
+First, let's create an aggregation node (first level), then aggregate it again (second order).
+
+**Step 1: Create an aggregation directory**
+```bash
+mkdir -p seeknal/aggregations
+```
+
+**Step 2: Create first-level aggregation (user daily features)**
+
+Create `seeknal/aggregations/user_daily_features.yml`:
+
+```bash
+cat > seeknal/aggregations/user_daily_features.yml << 'EOF'
+kind: aggregation
+name: user_daily_features
+description: "Daily features per user"
+owner: "ml-team"
+id_col: customer_id
+feature_date_col: order_date
+application_date_col: order_date
+features:
+  - name: spend_metrics
+    basic:
+      - sum
+      - count
+    column: amount
+  - name: volume_metrics
+    basic:
+      - sum
+    column: amount
+inputs:
+  - ref: transform.customer_orders
+tags:
+  - aggregation
+  - daily-features
+EOF
+```
+
+> **Note:** First-level aggregations use a **list** format for features, where each item has a name, basic aggregations, and column.
+
+**Step 3: Create second-order aggregation (region user metrics)**
+
+Create `seeknal/aggregations/region_user_metrics.yml`:
+
+```bash
+cat > seeknal/aggregations/region_user_metrics.yml << 'EOF'
+kind: second_order_aggregation
+name: region_user_metrics
+description: "Aggregate user-level features to region level"
+owner: "analytics"
+id_col: country
+feature_date_col: order_date
+application_date_col: order_date
+source: aggregation.user_daily_features
+features:
+  # Count users per region
+  total_users:
+    basic: [count]
+
+  # Average spending across users in region
+  avg_user_spend:
+    basic: [mean]
+    source_feature: spend_metrics_sum
+
+  # Maximum spending by users in region
+  max_user_spend:
+    basic: [max]
+    source_feature: spend_metrics_sum
+
+  # Total volume across users in region
+  total_volume:
+    basic: [sum]
+    source_feature: volume_metrics_sum
+
+inputs:
+  - ref: aggregation.user_daily_features
+tags:
+  - second-order
+  - feature-engineering
+  - analytics
+EOF
+```
+
+> **Note:** Second-order aggregations use a **dictionary** format for features, where the key is the output feature name and the value contains the aggregation specification.
+
+**Key fields for second-order aggregations:**
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `kind` | Node type | `second_order_aggregation` |
+| `id_col` | Entity ID for second-level grouping | `country`, `region` |
+| `feature_date_col` | Date column for features | `date` |
+| `source` | Upstream aggregation reference | `aggregation.user_daily_features` |
+| `features` | Feature specifications (dict format) | See below |
+
+**Feature aggregation types:**
+
+1. **Basic aggregations** - Simple statistical functions:
+   ```yaml
+   total_users:
+     basic: [count]  # count, sum, mean, stddev, min, max
+   ```
+
+2. **Aggregating specific source features**:
+   ```yaml
+   avg_user_spend:
+     basic: [mean]
+     source_feature: spend_metrics_sum  # Aggregate this upstream feature
+   ```
+
+3. **Window aggregations** - Time-based windows:
+   ```yaml
+   weekly_total:
+     window: [7, 7]  # [lower_bound, upper_bound] in days
+     basic: [sum]
+     source_feature: daily_volume
+   ```
+
+4. **Ratio aggregations** - Numerator/denominator comparisons:
+   ```yaml
+   recent_vs_historical:
+     ratio:
+       numerator: [1, 7]    # Days 1-7
+       denominator: [8, 30]  # Days 8-30
+       aggs: [sum]
+     source_feature: total_spend
+   ```
+
+> **Important:** When using `source_feature`, reference the upstream feature name. First-level aggregations produce features with names like `spend_metrics_sum`, `spend_metrics_count`, etc. (feature name + aggregation function).
+       aggs: [sum]
+     source_feature: amount
+   ```
+
+#### Verify and Run
+
+```bash
+# Show execution plan with new nodes
+seeknal run --show-plan
+```
+
+Expected output:
+```
+ℹ Execution Plan:
+   1. RUN customers
+   2. RUN orders
+   3. RUN active_customers
+   4. RUN customer_orders
+   5. RUN user_daily_features [aggregation, daily-features]
+   6. RUN region_user_metrics [second-order, feature-engineering, analytics]
+```
+
+```bash
+# Run the pipeline
+seeknal run
+```
+
+#### Using the Draft Command
+
+You can also generate second-order aggregation templates using the CLI:
+
+```bash
+# Generate YAML template
+seeknal draft second-order-aggregation region_metrics
+
+# Generate Python template
+seeknal draft second-order-aggregation region_metrics --python
+```
+
+This creates a draft file that you can customize:
+
+```yaml
+# draft_second_order_aggregation_region_metrics.yml
+kind: second_order_aggregation
+name: region_metrics
+description: "second order aggregation node"
+id_col: region_id
+feature_date_col: date
+application_date_col: application_date
+source: aggregation.upstream_aggregation
+features:
+  total_entities:
+    basic: [count]
+  avg_feature_value:
+    basic: [mean, stddev]
+    source_feature: feature_value
+  weekly_total:
+    window: [7, 7]
+    basic: [sum]
+    source_feature: daily_amount
 ```
 
 ---

@@ -184,6 +184,7 @@ class DAGBuilder:
         "feature_group": NodeType.FEATURE_GROUP,
         "model": NodeType.MODEL,
         "aggregation": NodeType.AGGREGATION,
+        "second_order_aggregation": NodeType.SECOND_ORDER_AGGREGATION,
         "rule": NodeType.RULE,
         "exposure": NodeType.EXPOSURE,
     }
