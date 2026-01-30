@@ -1,0 +1,43 @@
+kind: second_order_aggregation
+name: region_user_metrics
+description: "Aggregate user-level features to region level"
+owner: "data-science"
+id_col: region_id
+feature_date_col: date
+application_date_col: application_date
+source: aggregation.user_daily_features
+features:
+  # Count users per region
+  total_users:
+    basic: [count]
+
+  # Average and std dev of user spending in region
+  avg_user_spend_30d:
+    basic: [mean, stddev]
+    source_feature: total_spend_30d
+
+  # Maximum transaction count by users in region
+  max_user_transactions_30d:
+    basic: [max]
+    source_feature: transaction_count_30d
+
+  # Weekly total volume (aggregate 7-day windows into weekly blocks)
+  weekly_total_volume:
+    window: [7, 7]
+    basic: [sum]
+    source_feature: daily_volume
+
+  # Ratio of recent to historical spending
+  recent_vs_historical_ratio:
+    ratio:
+      numerator: [1, 7]
+      denominator: [8, 30]
+      aggs: [sum]
+    source_feature: transaction_amount
+
+inputs:
+  - ref: aggregation.user_daily_features
+tags:
+  - second-order
+  - feature-engineering
+  - analytics

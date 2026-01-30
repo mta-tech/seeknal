@@ -24,6 +24,7 @@ NODE_TYPES = {
     "feature_group": "feature_group",
     "model": "model",
     "aggregation": "aggregation",
+    "second-order-aggregation": "second_order_aggregation",
     "rule": "rule",
     "exposure": "exposure",
 }
@@ -35,6 +36,7 @@ TEMPLATE_FILES = {
     "feature_group": "feature_group.yml.j2",
     "model": "model.yml.j2",
     "aggregation": "aggregation.yml.j2",
+    "second_order_aggregation": "second_order_aggregation.yml.j2",
     "rule": "rule.yml.j2",
     "exposure": "exposure.yml.j2",
 }
@@ -46,6 +48,7 @@ PYTHON_TEMPLATE_FILES = {
     "feature_group": "feature_group.py.j2",
     "model": "model.py.j2",
     "aggregation": "aggregation.py.j2",
+    "second_order_aggregation": "second_order_aggregation.py.j2",
     "rule": "rule.py.j2",
     "exposure": "exposure.py.j2",
 }
@@ -209,7 +212,7 @@ def write_draft_file(filename: str, content: str, force: bool = False) -> Path:
 
 
 def draft_command(
-    node_type: str = typer.Argument(..., help="Node type (source, transform, feature-group, model, aggregation, rule, exposure)"),
+    node_type: str = typer.Argument(..., help="Node type (source, transform, feature-group, model, aggregation, second-order-aggregation, rule, exposure)"),
     name: str = typer.Argument(..., help="Node name"),
     description: Optional[str] = typer.Option(None, "--description", "-d", help="Node description"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing draft file"),

@@ -330,6 +330,111 @@ def feature_group(
     return decorator
 
 
+def second_order_aggregation(
+    name: str,
+    source: str,
+    id_col: str,
+    feature_date_col: str,
+    application_date_col: Optional[str] = None,
+    description: Optional[str] = None,
+    owner: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+    materialization: Optional[Union[dict, Any]] = None,
+    **params,
+):
+    """Decorator to define a second-order aggregation node.
+
+    Second-order aggregations perform aggregations on already-aggregated data,
+    enabling multi-level feature engineering (e.g., user → store → region).
+
+    The decorated function receives a PipelineContext (ctx) and a pre-aggregated
+    DataFrame (df), and must return the second-aggregated DataFrame.
+
+    Args:
+        name: Second-order aggregation name (e.g., "region_user_metrics")
+        source: Upstream aggregation reference (e.g., "aggregation.user_daily_features")
+        id_col: Entity ID column for grouping (e.g., "region_id")
+        feature_date_col: Date column for time-based operations
+        application_date_col: Optional reference date column for window calculations
+        description: Optional human-readable description
+        owner: Optional team/person responsible
+        tags: Optional tags for organization
+        materialization: Optional Iceberg materialization config (dict or MaterializationConfig)
+        **params: Additional parameters
+
+    Example:
+        @second_order_aggregation(
+            name="region_metrics",
+            source="aggregation.user_metrics",
+            id_col="region_id",
+            feature_date_col="date"
+        )
+        def region_metrics(ctx, df: pd.DataFrame) -> pd.DataFrame:
+            return df.groupby("region_id").agg({
+                "total_spend_30d": ["mean", "std"],
+                "transaction_count": "sum"
+            })
+
+        @second_order_aggregation(
+            name="weekly_patterns",
+            source="aggregation.daily_volume",
+            id_col="merchant_id",
+            feature_date_col="date",
+            materialization=MaterializationConfig(
+                enabled=True,
+                table="warehouse.analytics.weekly_patterns",
+                mode="append"
+            )
+        )
+        def weekly_patterns(ctx, df: pd.DataFrame) -> pd.DataFrame:
+            # Weekly aggregation logic
+            pass
+    """
+    # Validate materialization config
+    _validate_materialization_config(materialization)
+
+    def decorator(func: Callable) -> Callable:
+        node_id = f"second_order_aggregation.{name}"
+
+        @wraps(func)
+        def wrapper(ctx, df=None):
+            result = func(ctx, df)
+            if result is not None and ctx is not None:
+                ctx._store_output(node_id, result)
+            return result
+
+        # Build inputs list from source
+        inputs = [{"ref": source}] if source else []
+
+        # Normalize materialization to dict
+        mat_dict = None
+        if materialization is not None:
+            if isinstance(materialization, dict):
+                mat_dict = materialization
+            elif hasattr(materialization, 'to_dict'):
+                mat_dict = materialization.to_dict()
+
+        wrapper._seeknal_node = {
+            "kind": "second_order_aggregation",
+            "name": name,
+            "id": node_id,
+            "description": description,
+            "owner": owner,
+            "id_col": id_col,
+            "feature_date_col": feature_date_col,
+            "application_date_col": application_date_col,
+            "source": source,
+            "inputs": inputs,
+            "tags": tags or [],
+            "materialization": mat_dict,
+            "params": params,
+            "func": func,
+        }
+        _PIPELINE_REGISTRY[node_id] = wrapper._seeknal_node
+        return wrapper
+    return decorator
+
+
 def get_registered_nodes() -> dict[str, dict]:
     """Get all registered pipeline nodes.
 
