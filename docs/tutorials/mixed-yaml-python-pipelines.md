@@ -28,7 +28,7 @@ We'll build a sales analytics pipeline that:
 1. **YAML Source**: Load sales data (simple)
 2. **Python Transform**: Enrich with external data (complex)
 3. **YAML Transform**: Aggregate by region (simple SQL)
-4. **Python Model**: Forecast sales (ML)
+4. **Python ML Forecast**: Predict sales using scikit-learn RandomForest
 5. **YAML Exposure**: Export results (static)
 
 ---
@@ -42,9 +42,60 @@ cd sales_analytics
 
 ---
 
-## Step 2: Create YAML Source
+## Step 2: Generate Sample Data
 
-Create `seeknal/sources/sales_data.yml`:
+Create a sample sales dataset using Python:
+
+```bash
+# Create data directory
+mkdir -p data
+
+# Generate sample sales data
+python3 << 'EOF'
+import pandas as pd
+import random
+from datetime import datetime, timedelta
+
+# Set random seed for reproducibility
+random.seed(42)
+
+# Generate 1000 sample transactions
+regions = ['USA', 'UK', 'Germany', 'France', 'Japan']
+product_ids = [f'ELE-{i:04d}' for i in range(100)] + \
+               [f'CLO-{i:04d}' for i in range(100)] + \
+               [f'FOO-{i:04d}' for i in range(100)]
+
+data = []
+for i in range(1000):
+    data.append({
+        'transaction_id': f'TXN-{i:06d}',
+        'date': (datetime(2024, 1, 1) + timedelta(days=random.randint(0, 90))).strftime('%Y-%m-%d'),
+        'product_id': random.choice(product_ids),
+        'quantity': random.randint(1, 10),
+        'unit_price': round(random.uniform(10, 500), 2),
+        'region': random.choice(regions)
+    })
+
+df = pd.DataFrame(data)
+df.to_csv('data/sales.csv', index=False)
+print(f"✓ Generated {len(df)} sample sales transactions")
+print(f"  Columns: {list(df.columns)}")
+print(f"  File: data/sales.csv")
+EOF
+```
+
+**Expected output:**
+```
+✓ Generated 1000 sample sales transactions
+  Columns: ['transaction_id', 'date', 'product_id', 'quantity', 'unit_price', 'region']
+  File: data/sales.csv
+```
+
+---
+
+## Step 3: Create YAML Source
+
+Create `seeknal/sources/raw_sales.yml`:
 
 ```yaml
 name: raw_sales
@@ -66,7 +117,7 @@ columns:
 
 ---
 
-## Step 3: Create Python Transform (References YAML)
+## Step 4: Create Python Transform (References YAML)
 
 Create `seeknal/pipelines/enrich_sales.py`:
 
@@ -120,9 +171,9 @@ def enriched_sales(ctx):
 
 ---
 
-## Step 4: Create YAML Transform (References Python)
+## Step 5: Create YAML Transform (References Python)
 
-Create `seeknal/transforms/region_totals.yml`:
+Create `seeknal/transforms/regional_totals.yml`:
 
 ```yaml
 name: regional_totals
@@ -130,7 +181,7 @@ kind: transform
 description: Aggregate sales by region
 inputs:
   - ref: transform.enriched_sales
-sql: |
+transform: |
   SELECT
     region,
     product_category,
@@ -146,7 +197,7 @@ sql: |
 
 ---
 
-## Step 5: Create Python Model Node
+## Step 6: Create ML Forecast Node
 
 Create `seeknal/pipelines/sales_forecast.py`:
 
@@ -158,93 +209,335 @@ Create `seeknal/pipelines/sales_forecast.py`:
 #     "pyarrow",
 #     "duckdb",
 #     "scikit-learn",
+#     "numpy",
 # ]
 # ///
 
 """
-Model: Simple sales forecast using moving average.
+Transform: ML-based sales forecast using scikit-learn.
 
-This demonstrates Python nodes referencing mixed upstream sources.
+This demonstrates Python nodes with ML models.
+Uses RandomForestRegressor to predict future margins based on
+historical performance metrics.
 """
 
 from seeknal.pipeline import transform
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
 
 
 @transform(
     name="sales_forecast",
-    description="Forecast next month sales by region",
+    description="Forecast next period sales using ML regression",
 )
 def sales_forecast(ctx):
-    """Generate sales forecast using moving average."""
+    """Generate ML-based sales forecast."""
     # Reference YAML transform output
     aggregated = ctx.ref("transform.regional_totals")
 
-    return ctx.duckdb.sql("""
-        WITH time_series AS (
-            SELECT
-                region,
-                product_category,
-                SUM(total_margin) as monthly_margin,
-                ROW_NUMBER() OVER (PARTITION BY region ORDER BY region) as rn
-            FROM aggregated
-        ),
-        moving_avg AS (
-            SELECT
-                region,
-                product_category,
-                monthly_margin,
-                AVG(monthly_margin) OVER (
-                    PARTITION BY region
-                    ORDER BY region
-                    ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
-                ) as forecast_margin
-            FROM time_series
-            WHERE rn <= 12  -- Use first 12 periods for training
-        )
-        SELECT
-            region,
-            product_category,
-            forecast_margin,
-            CASE
-                WHEN forecast_margin > monthly_margin * 1.1 THEN 'UP'
-                WHEN forecast_margin < monthly_margin * 0.9 THEN 'DOWN'
-                ELSE 'STABLE'
-            END as trend
-        FROM moving_avg
+    # Convert to DataFrame
+    if not isinstance(aggregated, pd.DataFrame):
+        aggregated = aggregated.df()
+
+    # Prepare features for ML
+    df = aggregated.copy()
+
+    # Feature engineering
+    df['margin_per_unit'] = df.apply(
+        lambda row: row['total_margin'] / row['total_quantity'] if row['total_quantity'] > 0 else 0,
+        axis=1
+    )
+    df['avg_transaction_size'] = df.apply(
+        lambda row: row['total_quantity'] / row['transaction_count'] if row['transaction_count'] > 0 else 0,
+        axis=1
+    )
+
+    # Encode categorical variables
+    df['region_encoded'] = df['region'].astype('category').cat.codes
+    df['category_encoded'] = df['product_category'].astype('category').cat.codes
+
+    # Prepare feature matrix
+    feature_cols = ['total_quantity', 'transaction_count', 'margin_per_unit',
+                    'avg_transaction_size', 'region_encoded', 'category_encoded']
+
+    X = df[feature_cols].values
+    y = df['total_margin'].values
+
+    # Train RandomForest model
+    model = RandomForestRegressor(
+        n_estimators=100,
+        max_depth=10,
+        random_state=42,
+        n_jobs=-1
+    )
+    model.fit(X, y)
+
+    # Make predictions with growth factor (simulating future period)
+    X_forecast = X.copy()
+    # Use numpy slicing for column assignment
+    X_forecast[:, 0:1] = X[:, 0:1] * 1.10  # Increase total_quantity by 10%
+    X_forecast[:, 1:2] = X[:, 1:2] * 1.08  # Increase transaction_count by 8%
+
+    forecast_margin = model.predict(X_forecast)
+
+    # Add predictions to dataframe
+    df['forecast_margin'] = forecast_margin
+    df['projected_growth'] = df['forecast_margin'] - df['total_margin']
+    df['growth_percentage'] = (df['projected_growth'] / df['total_margin'] * 100).round(2)
+
+    # Determine trend based on ML prediction
+    df['trend'] = pd.cut(
+        df['growth_percentage'],
+        bins=[-np.inf, -2, 2, np.inf],
+        labels=['DOWN', 'STABLE', 'UP']
+    )
+
+    # Calculate confidence score (R²)
+    df['forecast_confidence'] = model.score(X, y)
+
+    # Select output columns
+    result = df[[
+        'region', 'product_category', 'total_margin', 'forecast_margin',
+        'projected_growth', 'growth_percentage', 'trend', 'forecast_confidence'
+    ]].rename(columns={'total_margin': 'current_margin'})
+
+    return result.sort_values('forecast_margin', ascending=False)
+```
+
+**Key ML Features:**
+- **RandomForestRegressor** with 100 trees for robust predictions
+- **Feature engineering**: margin_per_unit, avg_transaction_size
+- **Categorical encoding**: region and product_category
+- **Forecast simulation**: 10% quantity growth, 8% transaction growth
+- **Confidence score**: R² score indicates model reliability
+
+---
+
+## Step 7: Enable Iceberg Materialization (Optional)
+
+**Both YAML and Python transforms support Iceberg materialization!**
+
+When enabled, transform outputs are automatically written to Iceberg tables via:
+- **Lakekeeper**: Iceberg REST Catalog (catalog management)
+- **MinIO**: S3-compatible object storage (data storage)
+
+This gives you:
+- Long-term storage in your data lakehouse
+- Cross-query with other tools (Spark, Trino, etc.)
+- Data versioning and time travel
+- Production data serving
+
+### Environment Configuration
+
+**Seeknal automatically loads `.env` files from your project directory!**
+
+Create a `.env` file in your project root with your Lakekeeper/MinIO credentials:
+
+```bash
+# .env file in project root
+# Lakekeeper (Iceberg REST Catalog)
+LAKEKEEPER_URI=http://172.19.0.9:8181
+LAKEKEEPER_WAREHOUSE_ID=c008ea5c-fb89-11f0-aa64-c32ca2f52144
+
+# MinIO (S3-compatible Object Storage)
+AWS_ENDPOINT_URL=http://172.19.0.9:9000
+AWS_ACCESS_KEY_ID=minioadmin
+AWS_SECRET_ACCESS_KEY=minioadmin_change_in_production
+AWS_REGION=us-east-1
+
+# Keycloak (OAuth2 Authentication)
+KEYCLOAK_TOKEN_URL=http://172.19.0.9:8080/realms/atlas/protocol/openid-connect/token
+KEYCLOAK_CLIENT_ID=duckdb
+KEYCLOAK_CLIENT_SECRET=duckdb-secret-change-in-production
+```
+
+**How it works:**
+
+- When you run any `seeknal` command, it automatically searches for `.env` files:
+  1. Current directory
+  2. Parent directories (up to 3 levels up)
+  3. Falls back to default `.env` loading behavior
+
+- **No need to manually source the file** - just create it and run commands!
+
+**Verify environment variables are loaded:**
+
+```bash
+# Check if credentials are loaded
+seeknal run --help  # This will trigger .env loading
+
+# Or check a specific variable
+echo $LAKEKEEPER_URI
+```
+
+### Materialization for Python Transforms
+
+**seeknal/pipelines/sales_forecast.py** (already created in Step 6):
+
+The Python transform code remains the same. Materialization is configured separately via YAML.
+
+**Create the materialization config:**
+
+```bash
+# Create the transforms directory
+mkdir -p seeknal/transforms
+
+# Create materialization config
+cat > seeknal/transforms/sales_forecast.yml << 'EOF'
+name: sales_forecast
+kind: transform
+file: seeknal/pipelines/sales_forecast.py
+description: ML-based sales forecast with Iceberg materialization
+materialization:
+  enabled: true
+  table: "warehouse.prod.sales_forecast"
+  mode: overwrite
+  create_table: true
+EOF
+```
+
+**Configuration options:**
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `enabled` | boolean | Enable/disable materialization |
+| `table` | string | Fully qualified table name (database.schema.table) |
+| `mode` | string | `append` or `overwrite` |
+| `create_table` | boolean | Auto-create table if it doesn't exist |
+
+### How Python Materialization Works
+
+When `materialization.enabled: true`:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Python Transform Execution                                  │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  1. Python Function Executes                                 │
+│     sales_forecast(ctx) → DataFrame                          │
+│                          │                                    │
+│                          ▼                                    │
+│  2. Intermediate Storage                                      │
+│     target/intermediate/transform_sales_forecast.parquet     │
+│                          │                                    │
+│                          ▼                                    │
+│  3. DuckDB View Created                                      │
+│     CREATE VIEW transform.sales_forecast AS                  │
+│       SELECT * FROM read_parquet('...parquet')               │
+│                          │                                    │
+│                          ▼                                    │
+│  4. Iceberg Materialization                                  │
+│     ├─ Get OAuth2 token from Keycloak                        │
+│     ├─ Attach to Lakekeeper catalog                          │
+│     ├─ CREATE TABLE atlas.prod.sales_forecast AS             │
+│     │   SELECT * FROM transform.sales_forecast                │
+│     └─ Data written to MinIO S3 as Iceberg                   │
+│                          │                                    │
+│                          ▼                                    │
+│  5. Verification                                             │
+│     ✓ Table exists in Lakekeeper catalog                     │
+│     ✓ Data stored in MinIO S3                                │
+│     ✓ Queryable from any tool                                │
+│                                                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Materialization Modes
+
+| Mode | Behavior | SQL | Use Case |
+|------|----------|-----|----------|
+| `overwrite` | `DROP TABLE + CREATE TABLE` | Replaces all data | Full refresh, daily snapshots |
+| `append` | `INSERT INTO` | Adds to existing table | Incremental updates, time-series |
+
+**Example - Incremental forecasts:**
+```yaml
+materialization:
+  enabled: true
+  table: "warehouse.prod.sales_forecast_history"
+  mode: append  # Keep historical forecasts
+```
+
+**Example - Latest snapshot:**
+```yaml
+materialization:
+  enabled: true
+  table: "warehouse.prod.sales_forecast_latest"
+  mode: overwrite  # Only keep latest forecast
+```
+
+### Querying Materialized Data
+
+After materialization, query from any tool:
+
+**From DuckDB (same connection):**
+```python
+import duckdb
+
+# Query the materialized Iceberg table
+df = duckdb.sql("""
+    SELECT region, product_category, forecast_margin, trend
+    FROM atlas.prod.sales_forecast
+    WHERE trend = 'UP'
+    ORDER BY forecast_margin DESC
+""").df()
+```
+
+**From a fresh DuckDB connection:**
+```python
+from seeknal.workflow.materialization.yaml_integration import IcebergMaterializationHelper
+
+with IcebergMaterializationHelper.get_duckdb_connection() as con:
+    df = con.execute("""
+        SELECT * FROM atlas.prod.sales_forecast
         ORDER BY forecast_margin DESC
     """).df()
 ```
 
----
+**From Trino/Presto:**
+```sql
+-- Cross-query from Trino
+SELECT region, AVG(forecast_confidence) as avg_confidence
+FROM warehouse.prod.sales_forecast
+GROUP BY region;
+```
 
-## Step 6: Create YAML Exposure
-
-Create `seeknal/exposures/manager_dashboard.yml`:
-
-```yaml
-name: manager_dashboard
-kind: exposure
-description: Export for regional management dashboard
-inputs:
-  - ref: transform.sales_forecast
-sql: |
-  SELECT
-    region,
-    product_category,
-    forecast_margin,
-    trend,
-    RANK() OVER (ORDER BY forecast_margin DESC) as margin_rank
-  FROM __THIS__
-  WHERE trend IN ('UP', 'STABLE')
-materialization:
-  offline:
-    format: csv
-    path: exports/manager_dashboard.csv
+**From Spark:**
+```scala
+// Read Iceberg table in Spark
+val df = spark.read.format("iceberg").load("warehouse.prod.sales_forecast")
+df.show()
 ```
 
 ---
 
-## Step 7: Build and Run Pipeline
+## Step 8: Create YAML Exposure
+
+First create the exposures directory:
+```bash
+mkdir -p seeknal/exposures
+```
+
+Then create `seeknal/exposures/manager_dashboard.yml`:
+
+```yaml
+name: manager_dashboard
+kind: exposure
+type: file
+description: Export for regional management dashboard
+depends_on:
+  - ref: transform.sales_forecast
+params:
+  path: exports/manager_dashboard.csv
+  format: csv
+```
+
+**Note:** Exposures export data as-is from the input ref. They don't support SQL filtering. If you need to filter or transform data before export, create a separate transform node first.
+
+---
+
+## Step 9: Build and Run Pipeline
 
 ```bash
 # Show execution plan
@@ -261,10 +554,11 @@ Execution Plan:
    1. RUN raw_sales [sales, raw]
    2. RUN enriched_sales
    3. RUN regional_totals
-   4. RUN sales_forecast
+   4. RUN sales_forecast (ML: RandomForestRegressor)
    5. RUN manager_dashboard
 
-Note: Mix of YAML (1, 2, 5) and Python (3, 4) nodes
+Note: Mix of YAML (1, 3, 5) and Python (2, 4) nodes
+Step 4 uses scikit-learn's RandomForestRegressor for ML-based forecasting.
 ```
 
 ---
@@ -277,7 +571,7 @@ Note: Mix of YAML (1, 2, 5) and Python (3, 4) nodes
 ├─────────────────────────────────────────────────────────────┤
 │                                                                   │
 │  ┌──────────────┐          ctx.ref()          ┌──────────┐  │
-│  │ sales_data    │  ───────────────────────▶  │enriched  │  │
+│  │  raw_sales    │  ───────────────────────▶  │enriched  │  │
 │  │   (YAML)      │                            │  sales    │  │
 │  └──────────────┘                            └──────────┘  │
 │         │                                            │         │
@@ -287,13 +581,14 @@ Note: Mix of YAML (1, 2, 5) and Python (3, 4) nodes
 │  │   totals      │     inputs:            │ forecast │  │
 │  │   (YAML)      │     transform.          │(Python)  │  │
 │  └──────────────┘     enriched_sales      └──────────┘  │
-│         │                                            │         │
-│         ▼                                            ▼         │
-│  ┌──────────────┐                            ┌──────────┐  │
-│  │   manager     │ ◀─────────────────────────│ dashboard│  │
-│  │   dashboard   │     inputs:            │ export   │  │
-│  │   (YAML)      │     transform.sales_    │ (YAML)   │  │
-│  └──────────────┘     forecast                └──────────┘  │
+│         │              [ML Forecast:            │         │
+│         │               RandomForest]           ▼         │
+│         ▼                                      ┌──────────┐  │
+│  ┌──────────────┐                            │ dashboard│  │
+│  │   manager     │ ◀─────────────────────────│ export   │  │
+│  │   dashboard   │     inputs:            │ (YAML)   │  │
+│  │   (YAML)      │     transform.sales_    └──────────┘  │
+│  └──────────────┘     forecast                
 │                                                                   │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -434,13 +729,13 @@ kind: transform
 description: Summarize customer segments
 inputs:
   - ref: transform.customer_ltv
-sql: |
+transform: |
   SELECT
     value_segment,
     ltv_decile,
     COUNT(*) as customer_count,
     AVG(avg_order_value) as segment_aov,
-    SUM(predicted_ltv) as_total_ltv,
+    SUM(predicted_ltv) as total_ltv,
     AVG(days_since_first_order) as avg_recency
   FROM __THIS__
   GROUP BY value_segment, ltv_decile
@@ -525,7 +820,68 @@ def validated_sales(ctx):
 
 ## Best Practices for Mixed Pipelines
 
-### 1. Clear Naming Conventions
+### 1. Exposure Node Format
+
+Exposures don't support SQL queries - they export data as-is. Use the correct format:
+
+```yaml
+# File export
+kind: exposure
+type: file
+depends_on:
+  - ref: transform.my_data
+params:
+  path: exports/data.csv
+  format: csv  # csv, parquet, json, jsonl
+
+# API POST
+kind: exposure
+type: api
+depends_on:
+  - ref: transform.results
+params:
+  url: https://api.example.com/data
+  method: POST
+
+# Database write
+kind: exposure
+type: database
+depends_on:
+  - ref: transform.processed
+params:
+  table: production.results
+```
+
+**Note:** Use `depends_on` (not `inputs`) for exposure nodes.
+
+**If you need SQL filtering**, create a transform node before the exposure:
+```yaml
+# Transform: Filter and format data
+kind: transform
+name: manager_dashboard_filtered
+inputs:
+  - ref: transform.sales_forecast
+transform: |
+  SELECT
+    region,
+    product_category,
+    forecast_margin,
+    trend,
+    RANK() OVER (ORDER BY forecast_margin DESC) as margin_rank
+  FROM __THIS__
+  WHERE trend IN ('UP', 'STABLE')
+
+# Exposure: Export the filtered data
+kind: exposure
+type: file
+depends_on:
+  - ref: transform.manager_dashboard_filtered
+params:
+  path: exports/manager_dashboard.csv
+  format: csv
+```
+
+### 2. Clear Naming Conventions
 
 ```python
 # Good: Clear indication of what type of node it is
@@ -613,7 +969,7 @@ name: daily_metrics
 kind: transform
 inputs:
   - ref: transform.computed_metrics
-sql: |
+transform: |
   SELECT DATE(event_time) as date, SUM(value) as total
   FROM __THIS__
   GROUP BY DATE(event_time)

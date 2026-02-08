@@ -3,7 +3,7 @@ kind: transform
 description: Aggregate sales by region
 inputs:
   - ref: transform.enriched_sales
-sql: |
+transform: |
   SELECT
     region,
     product_category,

@@ -6,6 +6,7 @@ and native DuckDB for parquet/csv files.
 from __future__ import annotations
 
 import os
+import re
 import readline
 from pathlib import Path
 from typing import Optional
@@ -15,6 +16,65 @@ from tabulate import tabulate
 
 from seeknal.utils.path_security import is_insecure_path
 from seeknal.db_utils import sanitize_error_message
+
+
+# SQL operation allowlist for security
+ALLOWED_SQL_PATTERNS = [
+    r'^\s*SELECT\s+',           # SELECT queries
+    r'^\s*WITH\s+',             # CTEs (Common Table Expressions)
+    r'^\s*EXPLAIN\s+',          # Query explain plans
+    r'^\s*DESCRIBE\s+',         # Table descriptions
+    r'^\s*SHOW\s+',             # Show commands
+    r'^\s*PRAGMA\s+',           # SQLite/DuckDB pragma commands
+    r'^\s*DESC\s+',             # Short for DESCRIBE
+]
+
+# Dangerous SQL keywords that are NOT allowed in REPL
+DANGEROUS_SQL_KEYWORDS = [
+    'DROP', 'DELETE', 'UPDATE', 'INSERT', 'CREATE',
+    'ALTER', 'TRUNCATE', 'GRANT', 'REVOKE', 'EXECUTE',
+    'CALL', 'COPY', 'IMPORT', 'EXPORT'
+]
+
+
+def validate_sql(sql: str) -> tuple[bool, str]:
+    """Validate SQL query against security rules.
+
+    Args:
+        sql: The SQL query to validate
+
+    Returns:
+        Tuple of (is_valid, error_message)
+        - is_valid: True if query passes validation
+        - error_message: Empty string if valid, error description if invalid
+    """
+    # Remove leading/trailing whitespace for checking
+    sql_stripped = sql.strip()
+
+    # Check for empty query
+    if not sql_stripped:
+        return True, ""
+
+    # Check for dangerous keywords (case-insensitive)
+    sql_upper = sql_stripped.upper()
+    for keyword in DANGEROUS_SQL_KEYWORDS:
+        # Use word boundary to avoid false positives (e.g., "column_name" shouldn't match "UPDATE")
+        pattern = r'\b' + keyword + r'\b'
+        if re.search(pattern, sql_upper):
+            return False, (
+                f"Dangerous keyword '{keyword}' not allowed in REPL. "
+                f"REPL is read-only for data exploration."
+            )
+
+    # Check against allowlist - query must start with allowed pattern
+    is_allowed = any(re.match(pattern, sql_stripped, re.IGNORECASE) for pattern in ALLOWED_SQL_PATTERNS)
+    if not is_allowed:
+        return False, (
+            "Only SELECT and read-only queries are allowed in REPL. "
+            "Allowed: SELECT, WITH, EXPLAIN, DESCRIBE, SHOW, PRAGMA."
+        )
+
+    return True, ""
 
 
 # Scanner extensions to load
@@ -111,6 +171,11 @@ Commands:
   .tables           List tables in connected databases
   .schema <table>   Show table schema
   .quit             Exit the REPL
+
+Query Security:
+  REPL is READ-ONLY for data exploration.
+  Allowed: SELECT, WITH, EXPLAIN, DESCRIBE, SHOW, PRAGMA
+  Blocked: DROP, DELETE, UPDATE, INSERT, CREATE, ALTER, etc.
 
 Connection examples:
   .connect mydb                                    (saved source)
@@ -269,19 +334,33 @@ Manage sources:
         # sqlite:///path/to/file.db -> /path/to/file.db
         path = url.replace("sqlite://", "")
         if path and not path.startswith(":memory:"):
-            if is_insecure_path(path):
-                raise RuntimeError(f"Insecure path: {path}")
+            # Resolve symlinks FIRST to prevent symlink-based attacks
+            resolved_path = Path(path).resolve(strict=True)
+
+            # Check the RESOLVED path for security (not the original path)
+            if is_insecure_path(str(resolved_path)):
+                raise RuntimeError(f"Insecure path: {resolved_path}")
+
+            # Use resolved path
+            path = str(resolved_path)
+
         self.conn.execute(f"ATTACH '{path}' AS {alias} (TYPE sqlite)")
 
     def _attach_parquet(self, alias: str, path: str) -> None:
         """Attach parquet file as a view."""
-        if is_insecure_path(path):
-            raise RuntimeError(f"Insecure path: {path}")
-        if not Path(path).exists():
-            raise RuntimeError(f"File not found: {path}")
+        # Resolve symlinks FIRST to prevent symlink-based attacks
+        resolved_path = Path(path).resolve(strict=True)
+
+        # Check the RESOLVED path for security (not the original path)
+        if is_insecure_path(str(resolved_path)):
+            raise RuntimeError(f"Insecure path: {resolved_path}")
+
+        # Verify it's actually a parquet file
+        if resolved_path.suffix.lower() != '.parquet':
+            raise RuntimeError(f"Invalid file type: {resolved_path.suffix}. Expected .parquet")
 
         # Escape single quotes in path
-        safe_path = str(path).replace("'", "''")
+        safe_path = str(resolved_path).replace("'", "''")
         self.conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}")
         self.conn.execute(
             f"CREATE VIEW {alias}.data AS SELECT * FROM read_parquet('{safe_path}')"
@@ -289,13 +368,19 @@ Manage sources:
 
     def _attach_csv(self, alias: str, path: str) -> None:
         """Attach CSV file as a view."""
-        if is_insecure_path(path):
-            raise RuntimeError(f"Insecure path: {path}")
-        if not Path(path).exists():
-            raise RuntimeError(f"File not found: {path}")
+        # Resolve symlinks FIRST to prevent symlink-based attacks
+        resolved_path = Path(path).resolve(strict=True)
+
+        # Check the RESOLVED path for security (not the original path)
+        if is_insecure_path(str(resolved_path)):
+            raise RuntimeError(f"Insecure path: {resolved_path}")
+
+        # Verify it's actually a CSV file
+        if resolved_path.suffix.lower() != '.csv':
+            raise RuntimeError(f"Invalid file type: {resolved_path.suffix}. Expected .csv")
 
         # Escape single quotes in path
-        safe_path = str(path).replace("'", "''")
+        safe_path = str(resolved_path).replace("'", "''")
         self.conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}")
         self.conn.execute(
             f"CREATE VIEW {alias}.data AS SELECT * FROM read_csv_auto('{safe_path}')"
@@ -342,6 +427,12 @@ Manage sources:
 
     def _execute(self, sql: str) -> None:
         """Execute SQL query and display results."""
+        # Security validation: prevent SQL injection and dangerous operations
+        is_valid, error_msg = validate_sql(sql)
+        if not is_valid:
+            print(f"Query rejected: {error_msg}")
+            return
+
         try:
             result = self.conn.execute(sql)
 

@@ -197,6 +197,77 @@ Based on a real-world dataset (73,194 rows × 35 columns):
 
 For a complete demo, see `duckdb_feature_store_demo.ipynb`.
 
+## Apache Iceberg Materialization
+
+Seeknal supports Apache Iceberg table format for materializing pipeline outputs with ACID transactions, time travel, and incremental updates.
+
+### Why Iceberg?
+
+- **ACID Transactions**: Atomic commits with automatic rollback
+- **Time Travel**: Query data as it was at any point in time
+- **Schema Evolution**: Add/modify columns without rewriting data
+- **Hidden Partitioning**: Partition evolution without data migration
+- **Compatibility**: Works with DuckDB, Spark, Trino, and more
+
+### Quick Start
+
+1. **Configure Iceberg** in `~/.seeknal/profiles.yml`:
+
+```yaml
+materialization:
+  enabled: true
+  catalog:
+    type: rest
+    uri: ${LAKEKEEPER_URI}
+    warehouse: s3://my-bucket/warehouse
+  default_mode: append
+```
+
+2. **Set credentials** as environment variables:
+
+```bash
+export LAKEKEEPER_URI=https://lakekeeper.example.com
+export LAKEKEEPER_WAREHOUSE=s3://my-bucket/warehouse
+```
+
+3. **Enable materialization** in your YAML nodes:
+
+```yaml
+kind: source
+name: orders
+materialization:
+  enabled: true
+  mode: append
+  partition_by:
+    - order_date
+```
+
+4. **Run your pipeline**:
+
+```bash
+seeknal run
+```
+
+### CLI Commands
+
+```bash
+# Validate configuration
+seeknal iceberg validate-materialization
+
+# Show current profile
+seeknal iceberg profile-show
+
+# List snapshots
+seeknal iceberg snapshot-list warehouse.prod.orders
+
+# Interactive setup
+seeknal iceberg setup
+```
+
+### Documentation
+
+For comprehensive documentation, see [Iceberg Materialization Guide](docs/iceberg-materialization.md).
+
 ## Seeknal in action (Spark Engine)
 
 1. Create a data pipeline

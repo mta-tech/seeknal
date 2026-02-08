@@ -426,16 +426,28 @@ class SecondOrderAggregationExecutor(BaseExecutor):
         from seeknal.dag.manifest import Node
 
         # This is a simplified version - in production, resolve from manifest
+        # Map kind string to NodeType enum
+        kind_map = {
+            "source": NodeType.SOURCE,
+            "transform": NodeType.TRANSFORM,
+            "feature_group": NodeType.FEATURE_GROUP,
+            "model": NodeType.MODEL,
+            "aggregation": NodeType.AGGREGATION,
+            "second_order_aggregation": NodeType.SECOND_ORDER_AGGREGATION,
+            "rule": NodeType.RULE,
+            "exposure": NodeType.EXPOSURE,
+        }
+
         return Node(
             id=source_ref,
             name=name,
-            node_type=NodeType(kind.upper()),
+            node_type=kind_map.get(kind.lower(), NodeType.SOURCE),
             config={}
         )
 
     def _load_source_data(self, con, source_node: Node) -> str:
         """
-        Load source aggregation data from intermediate storage.
+        Load source aggregation data from intermediate storage or upstream views.
 
         Args:
             con: DuckDB connection
@@ -447,24 +459,58 @@ class SecondOrderAggregationExecutor(BaseExecutor):
         Raises:
             ExecutorExecutionError: If source data not found
         """
-        # In production, load from intermediate storage path
-        # For now, create a view that references the upstream node's output
+        from pathlib import Path
+
+        # Try multiple sources in order:
+        # 1. Check for aggregation view (schema.name)
+        # 2. Check for aggregation intermediate storage
+        # 3. Check for transform intermediate storage
+        # 4. Create view from transform output
+
+        intermediate_path = Path(self.context.target_path) / "intermediate"
+
+        # Try aggregation view first (created by upstream aggregation executor)
         source_view_name = f"aggregation.{source_node.name}"
+        try:
+            # Try to query the view - if it exists, this will work
+            test_query = con.execute(f"SELECT * FROM {source_view_name} LIMIT 1")
+            return source_view_name
+        except Exception:
+            pass
 
-        # Check if view exists
-        view_exists = con.execute(
-            f"SELECT EXISTS (SELECT * FROM information_schema.views "
-            f"WHERE table_schema = 'aggregation' AND table_name = '{source_node.name}')"
-        ).fetchone()[0]
+        # Try aggregation intermediate storage (result.parquet from aggregation output)
+        agg_output_path = Path(self.context.target_path) / "aggregation" / source_node.name
+        agg_parquet = agg_output_path / "result.parquet"
+        if agg_parquet.exists():
+            view_name = f"source_data_{source_node.name}"
+            con.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM '{agg_parquet}'")
+            return view_name
 
-        if not view_exists:
-            raise ExecutorExecutionError(
-                self.node.id,
-                f"Source aggregation 'aggregation.{source_node.name}' not found. "
-                f"Ensure the upstream aggregation node has been executed."
-            )
+        # Try transform intermediate storage
+        transform_parquet = intermediate_path / f"transform_{source_node.name}.parquet"
+        if transform_parquet.exists():
+            # Create a view for the aggregation
+            view_name = f"source_data_{source_node.name}"
+            con.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM '{transform_parquet}'")
+            return view_name
 
-        return source_view_name
+        # Create view from transform output if it exists
+        transform_view = f"transform.{source_node.name}"
+        try:
+            test_query = con.execute(f"SELECT * FROM {transform_view} LIMIT 1")
+            # Create aggregation source view
+            view_name = f"source_data_{source_node.name}"
+            con.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM {transform_view}")
+            return view_name
+        except Exception:
+            pass
+
+        raise ExecutorExecutionError(
+            self.node.id,
+            f"Source aggregation '{source_node.id}' not found. "
+            f"Ensure the upstream aggregation node has been executed and stored output. "
+            f"Tried: {source_view_name}, {agg_parquet}, {transform_parquet}, {transform_view}"
+        )
 
     def _load_source_data_spark(self, spark, source_node: Node) -> Any:
         """

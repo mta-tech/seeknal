@@ -1,0 +1,18 @@
+kind: transform
+name: clean_users
+description: Clean and standardize user data
+transform: |
+  SELECT
+    user_id,
+    TRIM(name) as name,
+    LOWER(email) as email,
+    created_at,
+    UPPER(country) as country
+  FROM source.users
+  WHERE email IS NOT NULL
+    AND email LIKE '%@%'
+inputs:
+  - ref: source.users
+tags:
+  - data-cleaning
+  - transformation

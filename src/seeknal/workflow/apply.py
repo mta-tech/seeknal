@@ -4,6 +4,9 @@ Apply command for Seeknal workflow.
 Moves file to production and updates manifest.
 """
 
+import difflib
+import ast
+
 import typer
 from pathlib import Path
 from typing import Optional
@@ -83,22 +86,28 @@ def get_target_path(node_type: str, name: str) -> Path:
     return target_file
 
 
-def check_conflict(target_path: Path, force: bool, new_data: dict) -> tuple[bool, Optional[dict]]:
+def check_conflict(
+    source_path: Path, target_path: Path, force: bool, new_data: dict
+) -> tuple[bool, Optional[dict], bool]:
     """Check if target file exists and handle conflict.
 
     Args:
+        source_path: Source file path (the file being applied)
         target_path: Target file path
         force: Skip confirmation
         new_data: New YAML data for comparison
 
     Returns:
-        Tuple of (should_proceed, existing_yaml_data)
+        Tuple of (should_proceed, existing_yaml_data, is_same_file)
 
     Raises:
         typer.Exit: If user cancels
     """
+    # Check if source and target are the same file
+    is_same_file = source_path.resolve() == target_path.resolve()
+
     if not target_path.exists():
-        return True, None
+        return True, None, is_same_file
 
     # Load existing YAML for comparison
     try:
@@ -107,28 +116,46 @@ def check_conflict(target_path: Path, force: bool, new_data: dict) -> tuple[bool
     except Exception:
         existing_data = None
 
-    if not force:
-        _echo_warning(f"Node already exists: {target_path}")
+    # If source == target, the file is already in place
+    # Just need to run parse to update manifest
+    if is_same_file:
+        return True, existing_data, is_same_file
 
-        # Show diff if we have both versions
-        if existing_data:
-            show_yaml_diff(existing_data, new_data, target_path)
+    _echo_warning(f"Node already exists: {target_path}")
 
-            _echo_info("")
-            _echo_info("Use --force to apply these changes")
+    # Show diff if we have both versions
+    if existing_data:
+        has_changes = show_yaml_diff(existing_data, new_data, target_path)
 
-        raise typer.Exit(1)
+        _echo_info("")
 
-    return True, existing_data
+        if not has_changes:
+            _echo_info("Files are identical. No action needed.")
+            raise typer.Exit(0)
+
+        # If --force flag provided, skip confirmation
+        if force:
+            return True, existing_data, is_same_file
+
+        # Prompt for confirmation
+        confirm = typer.confirm("Apply these changes?")
+        if not confirm:
+            _echo_info("Cancelled.")
+            raise typer.Exit(0)
+
+    return True, existing_data, is_same_file
 
 
-def show_yaml_diff(old_data: dict, new_data: Optional[dict], target_path: Path) -> None:
+def show_yaml_diff(old_data: dict, new_data: Optional[dict], target_path: Path) -> bool:
     """Show differences between old and new YAML.
 
     Args:
         old_data: Existing YAML data
         new_data: New YAML data (None if showing prompt)
         target_path: Target file path
+
+    Returns:
+        True if changes were found, False otherwise
     """
     _echo_info("")
     _echo_info("Changes:")
@@ -240,8 +267,257 @@ def show_yaml_diff(old_data: dict, new_data: Optional[dict], target_path: Path) 
                 _echo_info(f"  + depends_on: {', '.join(new_refs)}")
             changes_found = True
 
+    # Compare schema (for sources)
+    old_schema = old_data.get("schema", [])
+    new_schema = new_data.get("schema", []) if new_data else []
+
+    if old_schema != new_schema:
+        old_cols = {s.get("name"): s.get("data_type") for s in old_schema if isinstance(s, dict)}
+        new_cols = {s.get("name"): s.get("data_type") for s in new_schema if isinstance(s, dict)}
+
+        # Removed schema columns
+        for col in set(old_cols.keys()) - set(new_cols.keys()):
+            _echo_info(f"  - schema: {col} ({old_cols[col]})")
+            changes_found = True
+
+        # Added schema columns
+        for col in set(new_cols.keys()) - set(old_cols.keys()):
+            _echo_info(f"  + schema: {col} ({new_cols[col]})")
+            changes_found = True
+
+        # Modified schema columns
+        for col in set(old_cols.keys()) & set(new_cols.keys()):
+            if old_cols[col] != new_cols[col]:
+                _echo_info(f"  ~ schema: {col}: {old_cols[col]} → {new_cols[col]}")
+                changes_found = True
+
+    # Compare tags
+    old_tags = set(old_data.get("tags", []))
+    new_tags = set(new_data.get("tags", [])) if new_data else set()
+
+    if old_tags != new_tags:
+        removed_tags = old_tags - new_tags
+        added_tags = new_tags - old_tags
+
+        for tag in removed_tags:
+            _echo_info(f"  - tag: {tag}")
+            changes_found = True
+
+        for tag in added_tags:
+            _echo_info(f"  + tag: {tag}")
+            changes_found = True
+
+    # Compare params
+    old_params = old_data.get("params", {})
+    new_params = new_data.get("params", {}) if new_data else {}
+
+    if old_params != new_params:
+        all_keys = set(old_params.keys()) | set(new_params.keys())
+        for key in all_keys:
+            old_val = old_params.get(key)
+            new_val = new_params.get(key)
+            if old_val != new_val:
+                if old_val is not None and new_val is None:
+                    _echo_info(f"  - param: {key}={old_val}")
+                elif old_val is None and new_val is not None:
+                    _echo_info(f"  + param: {key}={new_val}")
+                else:
+                    _echo_info(f"  ~ param: {key}: {old_val} → {new_val}")
+                changes_found = True
+
+    # Compare materialization
+    old_mat = old_data.get("materialization", {})
+    new_mat = new_data.get("materialization", {}) if new_data else {}
+
+    if old_mat != new_mat:
+        if not old_mat and new_mat:
+            _echo_info("  + materialization: [added]")
+            changes_found = True
+        elif old_mat and not new_mat:
+            _echo_info("  - materialization: [removed]")
+            changes_found = True
+        else:
+            _echo_info("  ~ materialization: [changed]")
+            changes_found = True
+
+    # Compare entity
+    old_entity = old_data.get("entity", {})
+    new_entity = new_data.get("entity", {}) if new_data else {}
+
+    if old_entity != new_entity:
+        _echo_info("  ~ entity: [changed]")
+        changes_found = True
+
     if not changes_found:
         _echo_info("  (no changes detected)")
+
+    return changes_found
+
+
+def show_python_diff(old_path: Path, new_path: Path) -> bool:
+    """Show differences between old and new Python files.
+
+    Args:
+        old_path: Path to existing Python file
+        new_path: Path to new Python file
+
+    Returns:
+        True if changes were found, False otherwise
+    """
+    _echo_info("")
+    _echo_info("Changes:")
+
+    # Read both files
+    old_content = old_path.read_text()
+    new_content = new_path.read_text()
+
+    # Check if files are identical
+    if old_content == new_content:
+        _echo_info("  (no changes detected)")
+        return False
+
+    changes_found = False
+
+    # Try AST-level comparison for meaningful diffs
+    try:
+        old_tree = ast.parse(old_content, filename=str(old_path))
+        new_tree = ast.parse(new_content, filename=str(new_path))
+
+        # Compare decorators
+        old_decorators = extract_decorators_from_tree(old_tree)
+        new_decorators = extract_decorators_from_tree(new_tree)
+
+        # Compare decorator metadata
+        for key in ["name", "kind", "description"]:
+            old_val = old_decorators.get(key, "")
+            new_val = new_decorators.get(key, "")
+
+            if old_val != new_val:
+                if old_val:
+                    _echo_info(f"  - {key}: \"{old_val}\"")
+                if new_val:
+                    _echo_info(f"  + {key}: \"{new_val}\"")
+                changes_found = True
+
+        # Compare PEP 723 metadata
+        from seeknal.workflow.dry_run import extract_pep723_metadata
+        old_pep = extract_pep723_metadata(old_content)
+        new_pep = extract_pep723_metadata(new_content)
+
+        # Compare dependencies
+        old_deps = set(old_pep.get("dependencies", []))
+        new_deps = set(new_pep.get("dependencies", []))
+
+        if old_deps != new_deps:
+            removed = old_deps - new_deps
+            added = new_deps - old_deps
+            for dep in removed:
+                _echo_info(f"  - dependency: {dep}")
+                changes_found = True
+            for dep in added:
+                _echo_info(f"  + dependency: {dep}")
+                changes_found = True
+
+        # Compare Python version
+        old_py = old_pep.get("requires_python", "")
+        new_py = new_pep.get("requires_python", "")
+        if old_py != new_py:
+            if old_py:
+                _echo_info(f"  - requires_python: {old_py}")
+            if new_py:
+                _echo_info(f"  + requires_python: {new_py}")
+            changes_found = True
+
+    except SyntaxError:
+        # Fall back to line diff if AST parsing fails
+        pass
+
+    # Show line diff for function body changes
+    old_lines = old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+
+    # Find actual code changes (exclude whitespace-only)
+    line_diff = list(difflib.unified_diff(
+        old_lines,
+        new_lines,
+        fromfile=str(old_path),
+        tofile=str(new_path),
+        lineterm=""
+    ))
+
+    # Filter to only show meaningful changes
+    meaningful_lines = []
+    for line in line_diff:
+        # Skip diff headers
+        if line.startswith("---") or line.startswith("+++") or line.startswith("@@"):
+            continue
+        # Skip empty line changes
+        if line.strip() in ["", "+", "-"]:
+            continue
+        meaningful_lines.append(line)
+
+    if meaningful_lines:
+        # Show summary of line changes
+        added_count = sum(1 for l in meaningful_lines if l.startswith("+") and not l.startswith("+++"))
+        removed_count = sum(1 for l in meaningful_lines if l.startswith("-") and not l.startswith("---"))
+
+        if added_count > 0 or removed_count > 0:
+            _echo_info(f"  ~ code: {removed_count} removals, {added_count} additions")
+            changes_found = True
+
+            # Show first few meaningful changes
+            shown = 0
+            max_show = 10
+            for line in meaningful_lines:
+                if shown >= max_show:
+                    remaining = len(meaningful_lines) - max_show
+                    if remaining > 0:
+                        _echo_info(f"    ... and {remaining} more changes")
+                    break
+                _echo_info(f"    {line}")
+                shown += 1
+
+    if not changes_found:
+        _echo_info("  (no semantic changes detected)")
+
+    return changes_found
+
+
+def extract_decorators_from_tree(tree: ast.AST) -> dict:
+    """Extract pipeline decorator information from AST tree.
+
+    Args:
+        tree: AST tree
+
+    Returns:
+        Dictionary with decorator info (name, kind, description)
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            # Check decorators
+            for decorator in node.decorator_list:
+                decorator_name = None
+                decorator_args = {}
+
+                if isinstance(decorator, ast.Call):
+                    if isinstance(decorator.func, ast.Name):
+                        decorator_name = decorator.func.id
+                        for keyword in decorator.keywords:
+                            if isinstance(keyword.value, ast.Constant):
+                                decorator_args[keyword.arg] = keyword.value.value
+                elif isinstance(decorator, ast.Name):
+                    decorator_name = decorator.id
+
+                if decorator_name in ["source", "transform", "feature_group"]:
+                    docstring = ast.get_docstring(node)
+                    return {
+                        "kind": decorator_name,
+                        "name": decorator_args.get("name", node.name),
+                        "description": decorator_args.get("description", docstring or ""),
+                        "function_name": node.name
+                    }
+
+    return {}
 
 
 def move_draft_file(source_path: Path, target_path: Path) -> None:
@@ -352,7 +628,9 @@ def apply_command(
 
     # Check for conflicts and get existing data
     try:
-        should_proceed, existing_data = check_conflict(target_path, force, yaml_data)
+        should_proceed, existing_data, is_same_file = check_conflict(
+            draft_path, target_path, force, yaml_data
+        )
     except typer.Exit:
         raise
 
@@ -361,16 +639,19 @@ def apply_command(
 
     _echo_success("All checks passed")
 
-    # Move file
-    _echo_info("Moving file...")
-    _echo_info(f"  FROM: {draft_path}")
-    _echo_info(f"  TO:   {target_path}")
+    # Move file (skip if source == target)
+    if is_same_file:
+        _echo_info("File already in correct location")
+    else:
+        _echo_info("Moving file...")
+        _echo_info(f"  FROM: {draft_path}")
+        _echo_info(f"  TO:   {target_path}")
 
-    try:
-        move_draft_file(draft_path, target_path)
-    except OSError as e:
-        _echo_error(f"Failed to move file: {e}")
-        raise typer.Exit(1)
+        try:
+            move_draft_file(draft_path, target_path)
+        except OSError as e:
+            _echo_error(f"Failed to move file: {e}")
+            raise typer.Exit(1)
 
     # Update manifest
     if not no_parse:

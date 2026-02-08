@@ -39,6 +39,14 @@ Seeknal is useful in multiple scenarios:
 
     [:octicons-arrow-right-24: Examples](examples/index.md)
 
+-   :material-database: **Iceberg Materialization**
+
+    ---
+
+    Persist pipeline outputs to Apache Iceberg tables with ACID transactions and time travel.
+
+    [:octicons-arrow-right-24: Iceberg Materialization](iceberg-materialization.md)
+
 </div>
 
 ## Getting Started

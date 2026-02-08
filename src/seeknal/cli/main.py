@@ -83,6 +83,24 @@ import os
 import sys
 from pathlib import Path
 
+# Load .env file if present (for local development)
+# This makes environment variables available for all CLI commands
+try:
+    from dotenv import load_dotenv
+    
+    # Try to find .env in current directory or up to 3 parent directories
+    cwd = Path.cwd()
+    for path in [cwd] + list(cwd.parents)[:3]:
+        env_file = path / ".env"
+        if env_file.exists():
+            load_dotenv(env_file)
+            break
+    else:
+        # Fallback to default behavior (search in current directory only)
+        load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed, skip
+
 app = typer.Typer(
     name="seeknal",
     help="Feature store management CLI - similar to dbt",
@@ -2248,12 +2266,12 @@ def draft(
 
 @app.command()
 def dry_run(
-    file_path: str = typer.Argument(..., help="Path to draft YAML file"),
+    file_path: str = typer.Argument(..., help="Path to YAML or Python pipeline file"),
     limit: int = typer.Option(10, "--limit", "-l", help="Row limit for preview (default: 10)"),
     timeout: int = typer.Option(30, "--timeout", "-t", help="Query timeout in seconds (default: 30)"),
     schema_only: bool = typer.Option(False, "--schema-only", "-s", help="Validate schema only, skip execution"),
 ):
-    """Validate YAML and preview execution.
+    """Validate YAML/Python and preview execution.
 
     Performs comprehensive validation:
     1. YAML syntax validation with line numbers
@@ -2281,32 +2299,86 @@ def dry_run(
 
 @app.command()
 def apply(
-    file_path: str = typer.Argument(..., help="Path to draft YAML file"),
+    file_path: str = typer.Argument(..., help="Path to YAML or Python pipeline file"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing file without prompt"),
     no_parse: bool = typer.Option(False, "--no-parse", help="Skip manifest regeneration"),
 ):
-    """Apply draft file to production and update manifest.
+    """Apply file to production.
 
-    Workflow:
-    1. Validate file exists and YAML is valid
-    2. Check if target exists (prompt or require --force)
-    3. Move file to seeknal/<type>s/<name>.yml
-    4. Run seeknal parse to regenerate manifest
-    5. Show diff of changes
+    YAML files: Moves to seeknal/<type>s/<name>.yml and updates manifest
+    Python files: Copies to seeknal/pipelines/<name>.py and validates
 
     Examples:
-        # Apply draft file
+        # Apply YAML draft
         $ seeknal apply draft_feature_group_user_behavior.yml
 
+        # Apply Python file
+        $ seeknal apply seeknal/pipelines/enriched_sales.py
+
         # Apply with overwrite
-        $ seeknal apply draft_feature_group_user_behavior.yml --force
-
-        # Apply without updating manifest
-        $ seeknal apply draft_source_postgres.yml --no-parse
+        $ seeknal apply draft_transform.yml --force
     """
+    from pathlib import Path
     from seeknal.workflow.apply import apply_command
+    from seeknal.workflow.apply import show_python_diff
 
-    apply_command(file_path, force, no_parse)
+    # Check if it's a Python file
+    path = Path(file_path)
+    if path.suffix == ".py":
+        # Python files - validate with optional diff
+        # Extract node name from decorator for target path
+        from seeknal.workflow.dry_run import extract_decorators, validate_python_syntax
+
+        try:
+            metadata = validate_python_syntax(path)
+            node_name = metadata.get("name", path.stem)
+        except Exception:
+            # Fallback to filename stem if validation fails
+            node_name = path.stem
+
+        target_path = Path.cwd() / "seeknal" / "pipelines" / f"{node_name}.py"
+
+        # Check if file exists and show diff
+        if target_path.exists() and target_path.resolve() != path.resolve():
+            _echo_warning(f"Node already exists: {target_path}")
+
+            # Show diff
+            if not force:
+                has_changes = show_python_diff(target_path, path)
+                _echo_info("")
+
+                if not has_changes:
+                    _echo_info("Files are identical. No action needed.")
+                    raise typer.Exit(0)
+
+                # Prompt for confirmation
+                confirm = typer.confirm("Apply these changes?")
+                if not confirm:
+                    _echo_info("Cancelled.")
+                    raise typer.Exit(0)
+
+        # Move file to target location (like YAML apply)
+        if target_path.resolve() != path.resolve():
+            _echo_info(f"Moving file to {target_path}...")
+            import shutil
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(target_path))
+
+        # Run validation
+        _echo_info("Running validation...")
+        from seeknal.workflow.dry_run import dry_run_command
+
+        # Convert to list format for dry_run_command
+        import sys
+        sys.argv = ["seeknal", "dry-run", str(target_path)]
+
+        # Run dry-run with schema-only mode
+        dry_run_command(str(target_path), 10, 30, True)
+
+        _echo_success(f"Python file applied: {target_path}")
+    else:
+        # YAML files - use normal apply workflow
+        apply_command(file_path, force, no_parse)
 
 
 def main():

@@ -1,0 +1,16 @@
+kind: exposure
+name: user_features_api
+description: Expose user features via REST API
+type: api
+url: https://api.example.com/v1/user-features
+params:
+  method: POST
+  headers:
+    Authorization: "Bearer {API_TOKEN}"
+    Content-Type: "application/json"
+  refresh_interval: 3600
+inputs:
+  - ref: feature_group.user_features
+tags:
+  - api
+  - production

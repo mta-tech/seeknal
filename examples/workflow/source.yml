@@ -1,0 +1,13 @@
+kind: source
+name: raw_users
+description: Raw user data from CSV
+source: csv
+params:
+  path: data/users.csv
+schema:
+  - name: user_id
+    data_type: integer
+  - name: name
+    data_type: string
+  - name: email
+    data_type: string

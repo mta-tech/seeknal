@@ -28,14 +28,14 @@ def enriched_sales(ctx):
     return ctx.duckdb.sql("""
         SELECT
             s.*,
-            -- Add product categories
+            -- Add product categories based on product_id
             CASE
-                WHEN s.product_id LIKE 'ELE%' THEN 'Electronics'
-                WHEN s.product_id LIKE 'CLO%' THEN 'Clothing'
-                WHEN s.product_id LIKE 'FOO%' THEN 'Food'
+                WHEN s.product_id LIKE 'ELE-%' THEN 'Electronics'
+                WHEN s.product_id LIKE 'CLO-%' THEN 'Clothing'
+                WHEN s.product_id LIKE 'FOO-%' THEN 'Food'
                 ELSE 'Other'
             END as product_category,
-            -- Calculate margin
+            -- Calculate margin (30% profit margin)
             (s.unit_price * 0.7) as unit_cost,
             (s.unit_price - (s.unit_price * 0.7)) as margin
         FROM sales s

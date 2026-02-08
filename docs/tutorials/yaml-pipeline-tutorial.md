@@ -311,7 +311,8 @@ transform: |
     c.country,
     o.order_id,
     o.order_date,
-    o.amount
+    o.amount,
+    o.order_date AS prediction_date
   FROM source.customers c
   INNER JOIN source.orders o
     ON c.customer_id = o.customer_id
@@ -330,6 +331,7 @@ EOF
 - Reference sources as `kind.name` (e.g., `source.customers`)
 - Supports all DuckDB SQL syntax
 - Can use CTEs, subqueries, etc.
+- For second-order aggregations, include `prediction_date` (or other application date column) in the transform output. This allows the aggregation to use it for time-based calculations.
 
 ### 3.4 Verify Directory Structure
 
@@ -891,6 +893,8 @@ owner: "ml-team"
 id_col: customer_id
 feature_date_col: order_date
 application_date_col: order_date
+group_by:
+  - country
 features:
   - name: spend_metrics
     basic:
@@ -909,6 +913,11 @@ tags:
 EOF
 ```
 
+> **Important:** For second-order aggregations to work:
+> - The first-level aggregation must include the `group_by` field with columns that will be used for second-level grouping (e.g., `country`)
+> - Include `prediction_date` in the transform output if the second-order aggregation uses it as `application_date_col`
+> - All `group_by` columns must exist in the upstream transform output
+
 > **Note:** First-level aggregations use a **list** format for features, where each item has a name, basic aggregations, and column.
 
 **Step 3: Create second-order aggregation (region user metrics)**
@@ -923,12 +932,13 @@ description: "Aggregate user-level features to region level"
 owner: "analytics"
 id_col: country
 feature_date_col: order_date
-application_date_col: order_date
+application_date_col: prediction_date
 source: aggregation.user_daily_features
 features:
-  # Count users per region
+  # Count users per region (use customer_id to count rows)
   total_users:
     basic: [count]
+    source_feature: customer_id
 
   # Average spending across users in region
   avg_user_spend:
@@ -953,6 +963,12 @@ tags:
   - analytics
 EOF
 ```
+
+> **Important:**
+> - Always specify `source_feature` for each feature - it tells the executor which upstream column to aggregate
+> - For counting rows, use a unique ID column (e.g., `customer_id`) as the source_feature
+> - The `source_feature` must exist in the upstream aggregation's output (e.g., `spend_metrics_sum`)
+> - If `application_date_col` is used, ensure the upstream aggregation includes this column in its `group_by`
 
 > **Note:** Second-order aggregations use a **dictionary** format for features, where the key is the output feature name and the value contains the aggregation specification.
 

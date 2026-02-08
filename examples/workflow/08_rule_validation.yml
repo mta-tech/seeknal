@@ -1,0 +1,14 @@
+kind: rule
+name: data_quality_rules
+description: Validate data quality in user features
+rule:
+  value: "transaction_count >= 0 AND total_amount >= 0"
+params:
+  severity: error
+  error_message: "Negative values detected in transaction metrics"
+columns:
+  - transaction_count
+  - total_amount
+tags:
+  - validation
+  - data-quality

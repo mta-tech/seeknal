@@ -1,0 +1,23 @@
+kind: source
+name: users
+source: csv
+table: data/users.csv
+columns:
+  user_id:
+    description: Unique user identifier
+    dtype: string
+  name:
+    description: User's full name
+    dtype: string
+  email:
+    description: User's email address
+    dtype: string
+  created_at:
+    description: Account creation timestamp
+    dtype: datetime
+  country:
+    description: User's country
+    dtype: string
+tags:
+  - raw-data
+  - pii
