@@ -685,8 +685,8 @@ task.add_sql("SELECT user_id, SUM(amount) FROM __THIS__ GROUP BY user_id")
 
 ### Learn More
 
-- **[Spark Quickstart](../examples/quickstart/quickstart_spark.py)** - Production-scale feature engineering
-- **[Feature Store Demo](../feature-store-demo.ipynb)** - Complete feature store workflow
+- **[Spark Transformers Reference](./spark-transformers-reference.md)** - Production-scale feature engineering
+- **[Feature Store Examples](./examples/featurestore.md)** - Complete feature store workflow
 - **[API Reference](https://github.com/mta-tech/seeknal)** - Full documentation
 
 ### Try These Exercises

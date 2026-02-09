@@ -171,6 +171,10 @@ user_features.set_features([
 ])
 ```
 
+### Advanced Feature Engineering
+
+For complex feature engineering scenarios like multi-level aggregations (e.g., computing regional totals from user-level metrics), see [Second-Order Aggregations](../concepts/second-order-aggregations.md). This technique enables hierarchical rollups and is particularly useful for building features at different granularities.
+
 ## Step 2: Write Feature Data
 
 Materialize features to the offline store for training.

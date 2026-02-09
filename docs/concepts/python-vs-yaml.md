@@ -15,6 +15,7 @@ Seeknal offers two complementary approaches to define data pipelines. Choose bas
 | **Parallel execution** | Manual | Built-in (`--parallel`) |
 | **Audit/validation** | Manual | Built-in (`seeknal audit`) |
 | **State management** | Manual | Automatic (incremental runs) |
+| **Second-order aggregations** | Manual rollup logic | Built-in YAML support |
 | **IDE support** | Full Python tooling | Limited YAML validation |
 | **Type safety** | Python type hints | Schema validation |
 | **Debugging** | Python debugger | CLI logs + dry-run |
@@ -186,6 +187,49 @@ output:
   table: analytics.clean_orders
 inputs:
   - ref: transform.clean_orders
+```
+
+**Multi-Level Aggregations**
+```yaml
+# First-level: User-level aggregation
+kind: aggregation
+name: user_sales_totals
+description: Per-user sales metrics
+entity:
+  name: user
+  join_keys: [user_id]
+aggregations:
+  total_revenue:
+    expression: SUM(order_amount)
+    data_type: float
+  order_count:
+    expression: COUNT(*)
+    data_type: integer
+inputs:
+  - ref: source.raw_orders
+group_by:
+  - user_id
+  - region
+
+---
+# Second-level: Regional rollup
+kind: second_order_aggregation
+name: regional_totals
+description: Regional sales totals from user-level data
+entity:
+  name: region
+  join_keys: [region]
+aggregations:
+  region_revenue:
+    expression: SUM(total_revenue)
+    data_type: float
+  region_orders:
+    expression: SUM(order_count)
+    data_type: integer
+inputs:
+  - ref: aggregation.user_sales_totals
+group_by:
+  - region
 ```
 
 **Team Collaboration**
@@ -724,6 +768,6 @@ seeknal run --select transform.clean_orders
 
 ## See Also
 
-- **Tutorials**: [YAML Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md), [Python Pipelines Tutorial](../tutorials/python-pipelines-tutorial.md), [Mixed YAML + Python](../tutorials/mixed-yaml-python-pipelines.md)
-- **Concepts**: [Virtual Environments](virtual-environments.md) (YAML only), [Change Categorization](change-categorization.md) (YAML only)
+- **Tutorials**: [YAML Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md), [Python Pipelines Guide](../guides/python-pipelines.md), [Mixed YAML + Python](../tutorials/mixed-yaml-python-pipelines.md)
+- **Concepts**: [Virtual Environments](virtual-environments.md) (YAML only), [Change Categorization](change-categorization.md) (YAML only), [Second-Order Aggregations](second-order-aggregations.md)
 - **Reference**: [CLI Commands](../reference/cli.md), [YAML Schema](../reference/yaml-schema.md), [Configuration](../reference/configuration.md)

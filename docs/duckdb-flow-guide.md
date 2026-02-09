@@ -919,7 +919,7 @@ flow = Flow(
 
 ## Examples
 
-See [Examples](./examples/duckdb-flow-examples.md) for complete, runnable examples.
+See [Examples](./examples/flows.md) for complete, runnable examples.
 
 ---
 

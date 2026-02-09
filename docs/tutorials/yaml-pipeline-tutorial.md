@@ -2050,11 +2050,11 @@ Congratulations! You've learned:
 - Set up scheduled runs with cron/Airflow
 - Integrate with your data warehouse (Snowflake, BigQuery)
 - Set up Lakekeeper and MinIO for Iceberg materialization
-- Read [API Reference](../api/yaml-schema.md) for full YAML schema
+- Read [YAML Schema Reference](../reference/yaml-schema.md) for full YAML schema
 
 ### Getting Help
 
-- Check [Documentation](../README.md)
+- Check [Documentation](../index.md)
 - Review [Examples](../examples/)
 - Report issues at [GitHub](https://github.com/mta-tech/seeknal/issues)
 

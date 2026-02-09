@@ -17,6 +17,7 @@ Learn the mental model behind Seeknal.
 
 - [Glossary](concepts/glossary.md) — Definitions of all key terms
 - [Point-in-Time Joins](concepts/point-in-time-joins.md) — Prevent data leakage in ML features
+- [Second-Order Aggregations](concepts/second-order-aggregations.md) — Hierarchical rollups and multi-level analytics
 - [Virtual Environments](concepts/virtual-environments.md) — Isolated workspaces for safe development
 - [Change Categorization](concepts/change-categorization.md) — BREAKING, NON_BREAKING, and METADATA changes
 - [Python API vs YAML Workflows](concepts/python-vs-yaml.md) — Choose the right paradigm
@@ -25,6 +26,7 @@ Learn the mental model behind Seeknal.
 
 Task-oriented walkthroughs for specific workflows.
 
+- [Python Pipelines](guides/python-pipelines.md) — Write Python feature transforms and custom logic
 - [Testing & Audits](guides/testing-and-audits.md) — Data quality validation with `seeknal audit`
 - [Semantic Layer & Metrics](guides/semantic-layer.md) — Define and query metrics with `seeknal query`
 - [Training to Serving](guides/training-to-serving.md) — End-to-end ML feature workflow
@@ -44,7 +46,6 @@ Lookup documentation for commands, schemas, and configuration.
 Step-by-step learning paths with copy-pasteable code.
 
 - [YAML Pipeline Tutorial](tutorials/yaml-pipeline-tutorial.md) — Build a complete pipeline from scratch (75 min)
-- [Python Pipelines](tutorials/python-pipelines-tutorial.md) — Write Python feature transforms (45 min)
 - [Mixed YAML + Python](tutorials/mixed-yaml-python-pipelines.md) — Combine both paradigms (60 min)
 - [Virtual Environments](tutorials/phase2-data-eng-environments.md) — Safe development with environments (45 min)
 - [Parallel Execution](tutorials/phase2-ml-eng-parallel.md) — Speed up large pipelines (45 min)
@@ -59,32 +60,3 @@ Step-by-step learning paths with copy-pasteable code.
 - [Iceberg Materialization](iceberg-materialization.md) — Apache Iceberg integration
 - [DAGRunner Documentation](workflows/runner.md) — Workflow runner internals
 
-## Quick Links
-
-<div class="grid cards" markdown>
-
--   :material-code-braces: **API Reference**
-
-    ---
-
-    Explore the complete API documentation for all Seeknal modules.
-
-    [:octicons-arrow-right-24: API Reference](api/index.md)
-
--   :material-book-open-variant: **Examples**
-
-    ---
-
-    Learn through practical code examples demonstrating common patterns.
-
-    [:octicons-arrow-right-24: Examples](examples/index.md)
-
--   :material-database: **Iceberg Materialization**
-
-    ---
-
-    Persist pipeline outputs to Apache Iceberg tables with ACID transactions and time travel.
-
-    [:octicons-arrow-right-24: Iceberg Materialization](iceberg-materialization.md)
-
-</div>

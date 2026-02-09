@@ -822,7 +822,7 @@ You now know how to:
 - Explore [YAML Pipeline Tutorial](yaml-pipeline-tutorial.md) for basics
 - Learn about [Iceberg Materialization](../iceberg-materialization.md)
 - Set up CI/CD with environment promotion
-- Read [API Reference](../api/yaml-schema.md)
+- Read [YAML Schema Reference](../reference/yaml-schema.md)
 
 ---
 

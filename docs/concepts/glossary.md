@@ -279,6 +279,15 @@ A temporal join that ensures features are computed only from data available at t
 
 ---
 
+## Python Pipeline
+
+A data transformation pipeline defined in Python using the Flow API or as standalone Python scripts with inline transformations. Python pipelines support custom business logic, ML model training, and external API integration that cannot be expressed in SQL alone.
+
+**File location:** `seeknal/pipelines/*.py`
+**See also:** [Python Pipelines Guide](../guides/python-pipelines.md), [Python API vs YAML Workflows](python-vs-yaml.md), [Flow](#flow)
+
+---
+
 ## Promote
 
 The act of moving a validated pipeline from one environment to another (e.g., dev to staging to prod). Promotion copies environment-specific configurations and validates compatibility before deployment.
@@ -299,11 +308,11 @@ A validation or business rule node that checks data quality constraints. Rules c
 
 ## Second-Order Aggregation
 
-An aggregation that computes summary statistics over first-order aggregations. For example, computing regional totals from user-level metrics. Second-order aggregations support hierarchical rollups and multi-level analytics.
+An aggregation that computes summary statistics over first-order aggregations. For example, computing regional totals from user-level metrics. Second-order aggregations support hierarchical rollups and multi-level analytics, enabling you to build features at different levels of granularity without duplicating aggregation logic.
 
 **YAML kind:** `second_order_aggregation`
-**Example use case:** Region-level totals from user-level metrics
-**See also:** [Aggregation](#aggregation), [YAML Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md)
+**Example use case:** Region-level totals from user-level metrics, department rollups from team metrics
+**See also:** [Second-Order Aggregations Guide](second-order-aggregations.md), [Aggregation](#aggregation), [YAML Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md)
 
 ---
 

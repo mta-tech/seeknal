@@ -209,7 +209,7 @@ seeknal run [FLOW_NAME] [OPTIONS]
 | `--dry-run` | FLAG | False | Show what would be executed without running |
 | `--full`, `-f` | FLAG | False | Run all nodes regardless of state (ignore incremental run cache) |
 | `--nodes`, `-n` | TEXT (multiple) | None | Run specific nodes only (e.g., --nodes transform.clean_data) |
-| `--types`, `-t` | TEXT (multiple) | None | Filter by node types (e.g., --types transform,feature_group) |
+| `--types`, `-t` | TEXT (multiple) | None | Filter by node types (e.g., --types transform,feature_group,second_order_aggregation) |
 | `--exclude-tags` | TEXT (multiple) | None | Skip nodes with these tags |
 | `--continue-on-error` | FLAG | False | Continue execution after failures |
 | `--retry`, `-r` | INTEGER | 0 | Number of retries for failed nodes |
@@ -238,6 +238,9 @@ seeknal run --nodes transform.clean_data feature_group.user_features
 
 # Run only transforms and feature_groups
 seeknal run --types transform,feature_group
+
+# Run only aggregations and second-order aggregations
+seeknal run --types aggregation,second_order_aggregation
 
 # Continue on error (don't stop at first failure)
 seeknal run --continue-on-error
@@ -752,7 +755,7 @@ seeknal draft NODE_TYPE NAME [OPTIONS]
 **Arguments:**
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `node_type` | TEXT | Yes | Node type (source, transform, feature-group, model, aggregation, rule, exposure) |
+| `node_type` | TEXT | Yes | Node type (source, transform, feature-group, model, aggregation, second-order-aggregation, rule, exposure) |
 | `name` | TEXT | Yes | Node name |
 
 **Options:**
@@ -767,6 +770,9 @@ seeknal draft NODE_TYPE NAME [OPTIONS]
 ```bash
 # Create a YAML feature group draft
 seeknal draft feature-group user_behavior
+
+# Create a second-order aggregation draft
+seeknal draft second-order-aggregation regional_totals
 
 # Create a Python transform draft
 seeknal draft transform clean_data --python
@@ -1604,5 +1610,5 @@ seeknal atlas lineage publish my_pipeline
 - [YAML Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md)
 - [Configuration Reference](configuration.md)
 - [YAML Schema Reference](yaml-schema.md)
-- [API Reference](../api/)
+- [API Reference](../api/index.md)
 - [GitHub Repository](https://github.com/mta-tech/seeknal)

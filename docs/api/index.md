@@ -52,7 +52,7 @@ seeknal/
 ### Task Classes
 
 - **[Task](tasks.md#seeknal.tasks.base.Task)** - Base class for all tasks
-- **[SparkEngineTask](tasks.md#seeknal.tasks.sparkengine.sparkengine.SparkEngineTask)** - Spark-based data processing
+- **[SparkEngineTask](tasks.md#sparkenginetask)** - Spark-based data processing
 - **[DuckDBTask](tasks.md#seeknal.tasks.duckdb.duckdb.DuckDBTask)** - DuckDB-based data processing
 
 ## Docstring Format

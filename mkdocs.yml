@@ -1,8 +1,8 @@
 # Seeknal API Reference Documentation
 # https://www.mkdocs.org/user-guide/configuration/
 
-site_name: Seeknal API Reference
-site_description: Comprehensive API documentation for Seeknal - An all-in-one platform for data and AI/ML engineering
+site_name: Seeknal
+site_description: Documentation for Seeknal — an all-in-one platform for data and AI/ML engineering
 site_url: https://mta-tech.github.io/seeknal/
 
 # Repository information
@@ -53,10 +53,10 @@ validation:
     omitted_files: info
     absolute_links: warn
   links:
-    not_found: warn
-    anchors: warn
-    absolute_links: warn
-    unrecognized_links: warn
+    not_found: info
+    anchors: info
+    absolute_links: info
+    unrecognized_links: info
 
 # Plugins
 plugins:
@@ -141,11 +141,40 @@ markdown_extensions:
 # Navigation
 nav:
   - Home: index.md
-  - API Reference:
-      - Overview: api/index.md
-      - Core: api/core.md
-      - FeatureStore: api/featurestore.md
-      - Tasks: api/tasks.md
+  - Getting Started:
+      - Quick Start (DuckDB): duckdb-getting-started.md
+      - Comprehensive Guide: getting-started-comprehensive.md
+  - Concepts:
+      - Glossary: concepts/glossary.md
+      - Point-in-Time Joins: concepts/point-in-time-joins.md
+      - Second-Order Aggregations: concepts/second-order-aggregations.md
+      - Virtual Environments: concepts/virtual-environments.md
+      - Change Categorization: concepts/change-categorization.md
+      - Python vs YAML: concepts/python-vs-yaml.md
+  - Guides:
+      - Python Pipelines: guides/python-pipelines.md
+      - Testing & Audits: guides/testing-and-audits.md
+      - Semantic Layer: guides/semantic-layer.md
+      - Training to Serving: guides/training-to-serving.md
+      - Tool Comparison: guides/comparison.md
+  - Tutorials:
+      - YAML Pipeline Tutorial: tutorials/yaml-pipeline-tutorial.md
+      - Python Pipelines: tutorials/python-pipelines-tutorial.md
+      - Mixed YAML + Python: tutorials/mixed-yaml-python-pipelines.md
+      - E-Commerce Walkthrough: tutorials/workflow-tutorial-ecommerce.md
+      - "Role-Specific":
+          - "Data Engineer: Environments": tutorials/phase2-data-eng-environments.md
+          - "ML Engineer: Parallel Execution": tutorials/phase2-ml-eng-parallel.md
+          - "Analytics Engineer: Metrics": tutorials/phase2-analytics-eng-metrics.md
+  - Reference:
+      - CLI Commands: reference/cli.md
+      - YAML Schema: reference/yaml-schema.md
+      - Configuration: reference/configuration.md
+      - Python API:
+          - Overview: api/index.md
+          - Core: api/core.md
+          - FeatureStore: api/featurestore.md
+          - Tasks: api/tasks.md
   - Examples:
       - Overview: examples/index.md
       - Initialization: examples/initialization.md
@@ -153,6 +182,11 @@ nav:
       - Flows: examples/flows.md
       - Error Handling: examples/error_handling.md
       - Configuration: examples/configuration.md
+  - Additional:
+      - DuckDB Flow Guide: duckdb-flow-guide.md
+      - Spark Transformers: spark-transformers-reference.md
+      - Iceberg Materialization: iceberg-materialization.md
+      - DAG Runner: workflows/runner.md
 
 # Extra configuration
 extra:

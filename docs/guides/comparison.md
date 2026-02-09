@@ -299,6 +299,7 @@ Most code remains similar due to shared concepts (entities, features, PIT joins)
 | **Feature Registry** | Project-based | No | No | Centralized |
 | **Training Dataset Creation** | Yes | No | No | Yes |
 | **Training-Serving Parity** | Yes | No | No | Yes |
+| **Second-Order Aggregations** | Yes (unique) | No | No | No |
 
 ### Deployment & Environments
 
