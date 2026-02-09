@@ -1,15 +1,116 @@
-# Seeknal Documentation
+# Welcome to Seeknal
 
-Seeknal is an all-in-one platform for data and AI/ML engineering — combine feature store capabilities, YAML-defined data pipelines, and multi-engine processing (DuckDB + Spark) in a single CLI tool.
+> **Build data pipelines and ML features in minutes, not days.**
 
-## Choose Your Path
+Seeknal is an all-in-one platform for data and AI/ML engineering. Define transformations in YAML or Python, run them with DuckDB or Spark, and deploy features to production with a single CLI.
 
-| I am a... | Start here | Then explore |
-|-----------|-----------|--------------|
-| **New user** | [Installation & Quick Start](getting-started-comprehensive.md) | [DuckDB Quick Start](duckdb-getting-started.md) |
-| **Data Engineer** | [YAML Pipeline Tutorial](tutorials/yaml-pipeline-tutorial.md) | [Virtual Environments](tutorials/phase2-data-eng-environments.md) |
-| **Analytics Engineer** | [YAML Pipeline Tutorial](tutorials/yaml-pipeline-tutorial.md) | [Change Categorization](tutorials/phase2-analytics-eng-metrics.md) · [Semantic Layer](guides/semantic-layer.md) |
-| **ML Engineer** | [Getting Started](getting-started-comprehensive.md) | [Python Pipelines](tutorials/python-pipelines-tutorial.md) · [Parallel Execution](tutorials/phase2-ml-eng-parallel.md) |
+---
+
+## What Can You Build With Seeknal?
+
+| For ML Engineers | For Data Engineers | For Analytics Engineers |
+|------------------|-------------------|-------------------------|
+| **Feature stores** with point-in-time correctness | **ELT pipelines** with incremental execution | **Semantic layers** with consistent metrics |
+| **Training datasets** from raw events | **Data transformations** with SQL | **Business metrics** with change tracking |
+| **Online serving** for real-time inference | **Multi-engine workflows** (DuckDB + Spark) | **Self-serve analytics** for stakeholders |
+
+**Common use cases:** Recommendation systems, churn prediction, customer segmentation, real-time dashboards, A/B test analysis, fraud detection.
+
+---
+
+## Get Started in 10 Minutes
+
+**[→ Quick Start Guide](getting-started-comprehensive.md)**
+
+1. Install Seeknal (download from [GitHub Releases](https://github.com/mta-tech/seeknal/releases))
+2. Load your data (CSV, Parquet, database)
+3. Transform with SQL
+4. Run your first pipeline
+
+No infrastructure required. Works on your laptop.
+
+---
+
+## How Seeknal Works: The Pipeline Builder
+
+Seeknal's workflow is inspired by modern infrastructure tools like `terraform` and `kubectl`:
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│     init        │ →   │     draft       │ →   │     apply       │ →   │   run --env     │
+│  (setup project)│     │  (write YAML)   │     │  (save changes) │     │  (execute)      │
+└─────────────────┘     └─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+### Step-by-Step
+
+1. **`seeknal init`** - Create a new project
+2. **`seeknal draft`** - Generate YAML templates for sources, transforms, feature groups
+3. **`seeknal apply`** - Save your pipeline definition (like `git commit`)
+4. **`seeknal run --env prod`** - Execute in production with safety checks
+
+**Key benefits:** Dry-run validation, change detection, rollback support, and multi-environment support.
+
+---
+
+## Choose Your Learning Path
+
+Seeknal supports different workflows depending on your role and goals.
+
+### 🆕 New to Seeknal?
+
+Start here if you're evaluating or just getting started:
+
+**[→ Quick Start Guide (10 min)](getting-started-comprehensive.md)**
+
+Install, load data, create features, and run your first pipeline.
+
+---
+
+### 🏗️ Data Engineer Path
+
+**Goal:** Build reliable ELT pipelines with incremental execution and production safety.
+
+**Start with:** [YAML Pipeline Tutorial (75 min)](tutorials/yaml-pipeline-tutorial.md)
+
+**Then learn:**
+- [Virtual Environments](tutorials/phase2-data-eng-environments.md) - Safe development with isolated environments
+- [Incremental Models](concepts/second-order-aggregations.md) - Efficient incremental processing
+- [Change Categorization](concepts/change-categorization.md) - Understand breaking vs. non-breaking changes
+
+**Typical use case:** "I need to transform raw data into analytics-ready tables, incrementally, with production safety."
+
+---
+
+### 📊 Analytics Engineer Path
+
+**Goal:** Define metrics and build a semantic layer for self-serve analytics.
+
+**Start with:** [YAML Pipeline Tutorial (75 min)](tutorials/yaml-pipeline-tutorial.md)
+
+**Then learn:**
+- [Semantic Layer & Metrics](guides/semantic-layer.md) - Define and query consistent metrics
+- [Change Categorization](tutorials/phase2-analytics-eng-metrics.md) - Track metric changes over time
+- [Testing & Audits](guides/testing-and-audits.md) - Validate data quality
+
+**Typical use case:** "I need consistent metrics across dashboards and tools, with change tracking."
+
+---
+
+### 🤖 ML Engineer Path
+
+**Goal:** Build feature stores with point-in-time joins for ML models.
+
+**Start with:** [Getting Started (30 min)](getting-started-comprehensive.md)
+
+**Then learn:**
+- [Python Pipelines](tutorials/python-pipelines-tutorial.md) - Feature engineering with Python
+- [Training to Serving](guides/training-to-serving.md) - End-to-end ML workflow
+- [Parallel Execution](tutorials/phase2-ml-eng-parallel.md) - Speed up large pipelines
+
+**Typical use case:** "I need features for training that prevent data leakage, with online serving."
+
+---
 
 ## Concepts
 
@@ -59,4 +160,3 @@ Step-by-step learning paths with copy-pasteable code.
 - [Spark Transformers Reference](spark-transformers-reference.md) — Spark-specific reference
 - [Iceberg Materialization](iceberg-materialization.md) — Apache Iceberg integration
 - [DAGRunner Documentation](workflows/runner.md) — Workflow runner internals
-
