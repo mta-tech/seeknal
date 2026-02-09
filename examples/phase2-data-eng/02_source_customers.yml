@@ -1,0 +1,27 @@
+kind: source
+name: customers
+description: Customer profile information
+owner: data-team
+source: csv
+table: data/customers.csv
+params:
+  delimiter: ","
+  header: true
+schema:
+  - name: customer_id
+    data_type: integer
+  - name: email
+    data_type: string
+  - name: first_name
+    data_type: string
+  - name: last_name
+    data_type: string
+  - name: country
+    data_type: string
+  - name: signup_date
+    data_type: date
+  - name: customer_segment
+    data_type: string
+tags:
+  - raw-data
+  - customer

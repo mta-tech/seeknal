@@ -43,6 +43,18 @@ Iceberg Materialization (requires: DuckDB + Iceberg extension):
     seeknal iceberg setup                       Interactive credential setup
     seeknal iceberg profile-show                Show current materialization profile
 
+Virtual Environments (plan/apply/promote workflow):
+    seeknal env plan <name>                    Preview changes in a virtual environment
+    seeknal env apply <name>                   Execute a plan in a virtual environment
+    seeknal env apply <name> --parallel        Execute with parallel node processing
+    seeknal env promote <from> [to]            Promote environment to production
+    seeknal env list                           List all virtual environments
+    seeknal env delete <name>                  Delete a virtual environment
+
+Parallel Execution:
+    seeknal run --parallel                     Execute independent nodes in parallel
+    seeknal run --parallel --max-workers 8     Set maximum parallel workers
+
 Examples:
     # Initialize a new project
     $ seeknal init --name my_project
@@ -138,6 +150,10 @@ app.add_typer(source_app, name="source")
 from seeknal.cli.materialization_cli import app as iceberg_app
 
 app.add_typer(iceberg_app, name="iceberg")
+
+# Virtual environment management
+env_app = typer.Typer(help="Virtual environments for safe pipeline development (plan/apply/promote)")
+app.add_typer(env_app, name="env")
 
 
 # =============================================================================
@@ -479,6 +495,15 @@ def run(
         False, "--show-plan", "-p",
         help="Show execution plan without running"
     ),
+    # Parallel execution flags
+    parallel: bool = typer.Option(
+        False, "--parallel",
+        help="Execute independent nodes in parallel (layer-based concurrency)"
+    ),
+    max_workers: int = typer.Option(
+        4, "--max-workers",
+        help="Maximum parallel workers (default: 4, max recommended: CPU count)"
+    ),
     # Materialization flags
     materialize: Optional[bool] = typer.Option(
         None, "--materialize/--no-materialize",
@@ -520,6 +545,12 @@ def run(
         # Retry failed nodes
         seeknal run --retry 2
 
+        # Run independent nodes in parallel (uses up to 8 workers)
+        seeknal run --parallel
+
+        # Run in parallel with custom worker count
+        seeknal run --parallel --max-workers 8
+
     **Legacy Flow Examples:**
         seeknal run my_flow --start-date 2024-01-01
     """
@@ -558,6 +589,8 @@ def run(
             continue_on_error=continue_on_error,
             retry=retry,
             show_plan=show_plan,
+            parallel=parallel,
+            max_workers=max_workers,
             materialize=materialize,
         )
 
@@ -571,6 +604,8 @@ def _run_yaml_pipeline(
     continue_on_error: bool = False,
     retry: int = 0,
     show_plan: bool = False,
+    parallel: bool = False,
+    max_workers: int = 4,
     materialize: Optional[bool] = None,
 ) -> None:
     """
@@ -592,6 +627,8 @@ def _run_yaml_pipeline(
         continue_on_error: Continue after failures
         retry: Number of retries for failed nodes
         show_plan: Show execution plan and exit
+        parallel: Execute independent nodes in parallel
+        max_workers: Maximum number of parallel workers
         materialize: Enable/disable Iceberg materialization (None=use node config)
     """
     from pathlib import Path
@@ -739,6 +776,33 @@ def _run_yaml_pipeline(
         return
 
     _echo_info(f"Nodes to run: {len(nodes_to_run)}")
+
+    # Parallel execution mode
+    if parallel:
+        from seeknal.workflow.runner import DAGRunner as _DAGRunner
+        from seeknal.workflow.parallel import ParallelDAGRunner, print_parallel_summary
+        from seeknal.dag.manifest import Manifest as _Manifest, Node as _Node, NodeType as _NodeType
+
+        # Build a Manifest from dag_builder for the DAGRunner
+        _manifest = _Manifest(project=project_path.name)
+        for node_id, node in dag_builder.nodes.items():
+            _manifest.add_node(_Node(
+                id=node_id,
+                name=node.name,
+                node_type=_NodeType(node.kind.value),
+                tags=list(node.tags) if node.tags else [],
+                config=node.yaml_data,
+                file_path=node.file_path,
+            ))
+        for node_id in dag_builder.nodes:
+            for downstream_id in dag_builder.get_downstream(node_id):
+                _manifest.add_edge(node_id, downstream_id)
+
+        _runner = _DAGRunner(_manifest, target_path=target_path)
+        parallel_runner = ParallelDAGRunner(_runner, max_workers, continue_on_error)
+        parallel_summary = parallel_runner.run(nodes_to_run, dry_run=dry_run)
+        print_parallel_summary(parallel_summary)
+        return
 
     # Step 4: Create execution context
     exec_context = ExecutionContext(
@@ -2379,6 +2443,722 @@ def apply(
     else:
         # YAML files - use normal apply workflow
         apply_command(file_path, force, no_parse)
+
+
+@app.command("starrocks-setup-catalog")
+def starrocks_setup_catalog(
+    catalog_name: str = typer.Option("iceberg_catalog", help="Catalog name"),
+    catalog_type: str = typer.Option("iceberg", help="Catalog type (iceberg)"),
+    warehouse: str = typer.Option("s3://warehouse/", help="Warehouse path"),
+    uri: str = typer.Option("", help="Catalog URI (e.g., thrift://host:9083)"),
+):
+    """Generate StarRocks Iceberg catalog setup SQL.
+
+    Outputs CREATE EXTERNAL CATALOG DDL for connecting StarRocks to an Iceberg catalog.
+
+    Examples:
+        seeknal starrocks-setup-catalog --catalog-name my_catalog --uri thrift://hive:9083
+        seeknal starrocks-setup-catalog --warehouse s3://my-bucket/warehouse
+    """
+    ddl = (
+        f"CREATE EXTERNAL CATALOG IF NOT EXISTS {catalog_name}\n"
+        f"PROPERTIES (\n"
+        f'    "type" = "{catalog_type}",\n'
+    )
+
+    if uri:
+        ddl += f'    "iceberg.catalog.type" = "hive",\n'
+        ddl += f'    "hive.metastore.uris" = "{uri}",\n'
+    else:
+        ddl += f'    "iceberg.catalog.type" = "rest",\n'
+
+    ddl += f'    "warehouse" = "{warehouse}"\n'
+    ddl += ");"
+
+    _echo_info("StarRocks Iceberg Catalog Setup SQL:")
+    typer.echo("")
+    typer.echo(ddl)
+    typer.echo("")
+    _echo_info("Execute this SQL in your StarRocks client to create the catalog.")
+
+
+@app.command("connection-test")
+def connection_test(
+    name: str = typer.Argument(..., help="Connection profile name or starrocks:// URL"),
+    profile: str = typer.Option("default", "--profile", "-p", help="Profile name in profiles.yml"),
+):
+    """Test connectivity to a StarRocks database.
+
+    Tests connection using profiles.yml config or a direct URL.
+
+    Examples:
+        seeknal connection-test default
+        seeknal connection-test starrocks://user:pass@host:9030/db
+    """
+    if name.startswith("starrocks://"):
+        from seeknal.connections.starrocks import parse_starrocks_url, check_starrocks_connection
+
+        sr_config = parse_starrocks_url(name)
+        success, message = check_starrocks_connection(sr_config.to_pymysql_kwargs())
+    else:
+        from seeknal.connections.starrocks import check_starrocks_connection
+        from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+        try:
+            loader = ProfileLoader()
+            config = loader.load_starrocks_profile(name)
+        except Exception as e:
+            _echo_error(f"Profile error: {e}")
+            raise typer.Exit(code=1)
+
+        success, message = check_starrocks_connection(config)
+
+    if success:
+        _echo_success(message)
+    else:
+        _echo_error(message)
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def audit(
+    node: Optional[str] = typer.Argument(None, help="Specific node to audit (e.g., source.users)"),
+    target_path: str = typer.Option("target", help="Path to target directory"),
+):
+    """
+    Run data quality audits on cached node outputs.
+
+    Executes all audit rules defined in node YAML configs against
+    the last execution's cached outputs. No re-execution needed.
+    """
+    from pathlib import Path as P
+    import duckdb
+
+    target = P(target_path)
+    cache_dir = target / "cache"
+
+    if not cache_dir.exists():
+        _echo_error("No cached data found. Run 'seeknal run' first.")
+        raise typer.Exit(code=1)
+
+    # Find cached parquet files
+    parquet_files = list(cache_dir.glob("**/*.parquet"))
+    if not parquet_files:
+        _echo_error("No cached parquet files found.")
+        raise typer.Exit(code=1)
+
+    conn = duckdb.connect(":memory:")
+
+    # Load all cached files as views
+    for pf in parquet_files:
+        kind = pf.parent.name
+        name = pf.stem
+        view_name = f"{kind}.{name}"
+        if node and view_name != node:
+            continue
+        try:
+            conn.execute(f'CREATE VIEW "{view_name}" AS SELECT * FROM read_parquet(\'{pf}\')')
+        except Exception as e:
+            _echo_warning(f"Could not load {view_name}: {e}")
+
+    # Load manifest to get audit configs
+    manifest_path = target / "manifest.json"
+    if not manifest_path.exists():
+        _echo_error("No manifest found. Run 'seeknal parse' first.")
+        raise typer.Exit(code=1)
+
+    from seeknal.dag.manifest import Manifest
+    manifest = Manifest.load(str(manifest_path))
+
+    from seeknal.workflow.audits import parse_audits, AuditRunner
+    runner = AuditRunner(conn)
+    total_passed = 0
+    total_failed = 0
+
+    for node_id, node_obj in manifest.nodes.items():
+        if node and node_id != node:
+            continue
+
+        audits = parse_audits(node_obj.config)
+        if not audits:
+            continue
+
+        view_name = f"{node_obj.node_type.value}.{node_obj.name}"
+        _echo_info(f"\nAuditing {view_name}:")
+
+        results = runner.run_audits(audits, view_name)
+        for r in results:
+            status = "PASS" if r.passed else "FAIL"
+            cols = f" [{', '.join(r.columns)}]" if r.columns else ""
+            severity_str = f" ({r.severity})" if not r.passed else ""
+            msg = f"  {status} {r.audit_type}{cols}{severity_str}: {r.message} ({r.duration_ms}ms)"
+            if r.passed:
+                _echo_success(msg)
+                total_passed += 1
+            else:
+                _echo_error(msg)
+                total_failed += 1
+
+    _echo_info(f"\nAudit Summary: {total_passed} passed, {total_failed} failed")
+    if total_failed > 0:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def query(
+    metrics: str = typer.Option(..., help="Comma-separated metric names"),
+    dimensions: Optional[str] = typer.Option(None, help="Comma-separated dimensions (e.g. region,ordered_at__month)"),
+    filter: Optional[str] = typer.Option(None, "--filter", help="SQL filter expression"),
+    order_by: Optional[str] = typer.Option(None, "--order-by", help="Order by columns (prefix - for DESC)"),
+    limit: int = typer.Option(100, help="Maximum rows to return"),
+    compile_only: bool = typer.Option(False, "--compile", help="Show generated SQL without executing"),
+    format: str = typer.Option("table", help="Output format: table, json, csv"),
+    project_path: str = typer.Option(".", help="Path to project directory"),
+):
+    """
+    Query metrics from the semantic layer.
+
+    Compiles metric definitions into SQL, executes against DuckDB, and
+    returns formatted results.
+
+    Example:
+        seeknal query --metrics total_revenue,order_count --dimensions region
+    """
+    import json as json_mod
+    import yaml
+    from pathlib import Path as P
+
+    from seeknal.workflow.semantic.models import (
+        Metric as MetricModel,
+        MetricQuery,
+        SemanticModel,
+    )
+    from seeknal.workflow.semantic.compiler import MetricCompiler
+
+    project = P(project_path)
+
+    # Load semantic models
+    sm_dir = project / "seeknal" / "semantic_models"
+    semantic_models = []
+    if sm_dir.exists():
+        for yml_path in sorted(sm_dir.glob("*.yml")):
+            with open(yml_path, "r") as f:
+                data = yaml.safe_load(f) or {}
+            if data.get("kind") == "semantic_model":
+                semantic_models.append(SemanticModel.from_dict(data))
+
+    if not semantic_models:
+        _echo_error("No semantic models found. Create YAML files in seeknal/semantic_models/")
+        raise typer.Exit(code=1)
+
+    # Load metrics
+    metrics_dir = project / "seeknal" / "metrics"
+    metric_list = []
+    if metrics_dir.exists():
+        for yml_path in sorted(metrics_dir.glob("*.yml")):
+            with open(yml_path, "r") as f:
+                for doc in yaml.safe_load_all(f):
+                    if doc and doc.get("kind") == "metric":
+                        metric_list.append(MetricModel.from_dict(doc))
+
+    if not metric_list:
+        _echo_error("No metrics found. Create YAML files in seeknal/metrics/")
+        raise typer.Exit(code=1)
+
+    # Build compiler
+    compiler = MetricCompiler(semantic_models, metric_list)
+
+    # Build query
+    metric_names = [m.strip() for m in metrics.split(",")]
+    dim_list = [d.strip() for d in dimensions.split(",")] if dimensions else []
+    filter_list = [filter] if filter else []
+    order_list = [o.strip() for o in order_by.split(",")] if order_by else []
+
+    mq = MetricQuery(
+        metrics=metric_names,
+        dimensions=dim_list,
+        filters=filter_list,
+        order_by=order_list,
+        limit=limit,
+    )
+
+    try:
+        sql = compiler.compile(mq)
+    except ValueError as e:
+        _echo_error(f"Compilation error: {e}")
+        raise typer.Exit(code=1)
+
+    if compile_only:
+        typer.echo(sql)
+        return
+
+    # Execute on DuckDB
+    import duckdb
+    conn = duckdb.connect(":memory:")
+
+    # Register semantic model tables from cached parquet files
+    target = P(project_path) / "target" / "cache"
+    if target.exists():
+        for pf in target.glob("**/*.parquet"):
+            table_name = f"{pf.parent.name}.{pf.stem}"
+            try:
+                conn.execute(f"CREATE VIEW \"{table_name}\" AS SELECT * FROM read_parquet('{pf}')")
+            except Exception:
+                pass
+
+    try:
+        result = conn.execute(sql)
+        columns = [desc[0] for desc in result.description]
+        rows = result.fetchall()
+    except Exception as e:
+        _echo_error(f"Query execution error: {e}")
+        raise typer.Exit(code=1)
+
+    # Format output
+    if format == "json":
+        data = [dict(zip(columns, row)) for row in rows]
+        typer.echo(json_mod.dumps(data, indent=2, default=str))
+    elif format == "csv":
+        import csv
+        import io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(columns)
+        writer.writerows(rows)
+        typer.echo(output.getvalue())
+    else:
+        try:
+            from tabulate import tabulate as tabfmt
+            typer.echo(tabfmt(rows, headers=columns, tablefmt="simple"))
+        except ImportError:
+            # Fallback to simple formatting
+            typer.echo("  ".join(columns))
+            for row in rows:
+                typer.echo("  ".join(str(v) for v in row))
+
+    _echo_info(f"\n{len(rows)} rows returned")
+
+
+@app.command("deploy-metrics")
+def deploy_metrics(
+    connection: str = typer.Option(..., help="StarRocks connection name or URL"),
+    dimensions: Optional[str] = typer.Option(None, help="Comma-separated dimensions to include in MVs"),
+    refresh_interval: str = typer.Option("1 DAY", help="MV refresh interval (e.g. '1 HOUR', '1 DAY')"),
+    drop_existing: bool = typer.Option(False, "--drop-existing", help="Drop and recreate existing MVs"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show DDL without executing"),
+    project_path: str = typer.Option(".", help="Path to project directory"),
+):
+    """
+    Deploy semantic layer metrics as StarRocks materialized views.
+
+    Generates CREATE MATERIALIZED VIEW DDL for each metric definition
+    and executes on the specified StarRocks connection.
+
+    Example:
+        seeknal deploy-metrics --connection starrocks://root@localhost:9030/analytics --dry-run
+    """
+    import yaml
+    from pathlib import Path as P
+
+    from seeknal.workflow.semantic.models import (
+        Metric as MetricModel,
+        SemanticModel,
+    )
+    from seeknal.workflow.semantic.compiler import MetricCompiler
+    from seeknal.workflow.semantic.deploy import MetricDeployer, DeployConfig
+
+    project = P(project_path)
+
+    # Load semantic models
+    sm_dir = project / "seeknal" / "semantic_models"
+    semantic_models = []
+    if sm_dir.exists():
+        for yml_path in sorted(sm_dir.glob("*.yml")):
+            with open(yml_path, "r") as f:
+                data = yaml.safe_load(f) or {}
+            if data.get("kind") == "semantic_model":
+                semantic_models.append(SemanticModel.from_dict(data))
+
+    if not semantic_models:
+        _echo_error("No semantic models found.")
+        raise typer.Exit(code=1)
+
+    # Load metrics
+    metrics_dir = project / "seeknal" / "metrics"
+    metric_list = []
+    if metrics_dir.exists():
+        for yml_path in sorted(metrics_dir.glob("*.yml")):
+            with open(yml_path, "r") as f:
+                for doc in yaml.safe_load_all(f):
+                    if doc and doc.get("kind") == "metric":
+                        metric_list.append(MetricModel.from_dict(doc))
+
+    if not metric_list:
+        _echo_error("No metrics found.")
+        raise typer.Exit(code=1)
+
+    # Resolve connection config
+    if connection.startswith("starrocks://"):
+        from seeknal.connections.starrocks import parse_starrocks_url
+        sr_config = parse_starrocks_url(connection)
+        conn_config = sr_config.to_pymysql_kwargs()
+    else:
+        # Try loading from profiles
+        try:
+            from seeknal.workflow.materialization.profile_loader import ProfileLoader
+            loader = ProfileLoader()
+            conn_config = loader.load_starrocks_profile(connection)
+        except Exception as e:
+            _echo_error(f"Could not load connection '{connection}': {e}")
+            raise typer.Exit(code=1)
+
+    # Build compiler and deployer
+    compiler = MetricCompiler(semantic_models, metric_list)
+    config = DeployConfig(
+        refresh_interval=refresh_interval,
+        drop_existing=drop_existing,
+    )
+
+    dim_list = [d.strip() for d in dimensions.split(",")] if dimensions else None
+
+    deployer = MetricDeployer(compiler, conn_config)
+    results = deployer.deploy(metric_list, config, dim_list, dry_run=dry_run)
+
+    # Display results
+    for r in results:
+        if dry_run:
+            _echo_info(f"\n-- Metric: {r.metric_name} -> {r.mv_name}")
+            typer.echo(r.ddl)
+        elif r.success:
+            _echo_success(f"Deployed {r.metric_name} -> {r.mv_name}")
+        else:
+            _echo_error(f"Failed {r.metric_name}: {r.error}")
+
+    succeeded = sum(1 for r in results if r.success)
+    failed = sum(1 for r in results if not r.success)
+
+    if dry_run:
+        _echo_info(f"\nDry run: {len(results)} MVs would be created")
+    else:
+        _echo_info(f"\nDeployed: {succeeded} succeeded, {failed} failed")
+
+    if failed > 0:
+        raise typer.Exit(code=1)
+
+
+# =============================================================================
+# Environment Management Commands
+# =============================================================================
+
+
+@env_app.command("plan")
+@handle_cli_error("Environment plan failed")
+def env_plan(
+    env_name: str = typer.Argument(..., help="Environment name (e.g., dev, staging)"),
+    project_path: Path = typer.Option(".", help="Project directory"),
+):
+    """Preview changes in a virtual environment."""
+    from seeknal.workflow.environment import EnvironmentManager
+    from seeknal.workflow.dag import DAGBuilder
+    from seeknal.dag.manifest import Manifest, Node, NodeType as ManifestNodeType
+    from seeknal.dag.diff import ChangeCategory
+
+    project_path = Path(project_path).resolve()
+    target_path = project_path / "target"
+
+    _echo_info(f"Planning environment '{env_name}'...")
+
+    # Build current manifest from YAML files
+    dag_builder = DAGBuilder(project_path=project_path)
+    dag_builder.build()
+
+    # Map workflow NodeType to manifest NodeType
+    node_type_map = {
+        "source": ManifestNodeType.SOURCE,
+        "transform": ManifestNodeType.TRANSFORM,
+        "feature_group": ManifestNodeType.FEATURE_GROUP,
+        "model": ManifestNodeType.MODEL,
+        "rule": ManifestNodeType.RULE,
+        "aggregation": ManifestNodeType.AGGREGATION,
+        "second_order_aggregation": ManifestNodeType.SECOND_ORDER_AGGREGATION,
+        "exposure": ManifestNodeType.EXPOSURE,
+        "python": ManifestNodeType.PYTHON,
+        "semantic_model": ManifestNodeType.SEMANTIC_MODEL,
+        "metric": ManifestNodeType.METRIC,
+    }
+
+    # Convert to Manifest
+    manifest = Manifest(project=project_path.name)
+    for node_id, node in dag_builder.nodes.items():
+        manifest_node_type = node_type_map.get(node.kind.value, ManifestNodeType.SOURCE)
+        manifest.add_node(Node(
+            id=node_id,
+            name=node.name,
+            node_type=manifest_node_type,
+            tags=list(node.tags) if node.tags else [],
+            config=node.yaml_data,
+            file_path=node.file_path,
+        ))
+    for node_id in dag_builder.nodes:
+        for downstream_id in dag_builder.get_downstream(node_id):
+            manifest.add_edge(node_id, downstream_id)
+
+    manager = EnvironmentManager(target_path)
+    plan = manager.plan(env_name, manifest)
+
+    # Display plan
+    _echo_info("")
+    _echo_info(f"Environment Plan: {env_name}")
+    _echo_info("=" * 60)
+
+    if not plan.categorized_changes:
+        _echo_success("No changes detected.")
+        return
+
+    breaking = sum(1 for v in plan.categorized_changes.values() if v == "breaking")
+    non_breaking = sum(1 for v in plan.categorized_changes.values() if v == "non_breaking")
+    metadata = sum(1 for v in plan.categorized_changes.values() if v == "metadata")
+
+    if breaking > 0:
+        _echo_warning(f"  BREAKING changes: {breaking}")
+    if non_breaking > 0:
+        _echo_info(f"  Non-breaking changes: {non_breaking}")
+    if metadata > 0:
+        _echo_info(f"  Metadata-only changes: {metadata}")
+    if plan.added_nodes:
+        _echo_info(f"  New nodes: {len(plan.added_nodes)}")
+    if plan.removed_nodes:
+        _echo_info(f"  Removed nodes: {len(plan.removed_nodes)}")
+
+    _echo_info(f"\n  Total nodes to execute: {plan.total_nodes_to_execute}")
+
+    env_dir = target_path / "environments" / env_name
+    _echo_success(f"Plan saved to {env_dir / 'plan.json'}")
+
+
+@env_app.command("apply")
+@handle_cli_error("Environment apply failed")
+def env_apply(
+    env_name: str = typer.Argument(..., help="Environment name"),
+    force: bool = typer.Option(False, help="Apply even if plan is stale"),
+    parallel: bool = typer.Option(False, "--parallel", help="Run nodes in parallel"),
+    max_workers: int = typer.Option(4, "--max-workers", help="Max parallel workers"),
+    continue_on_error: bool = typer.Option(False, "--continue-on-error", help="Continue past failures"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would execute without running"),
+    project_path: Path = typer.Option(".", help="Project directory"),
+):
+    """Execute a plan in a virtual environment.
+
+    Validates the saved plan, then executes changed nodes using the
+    environment-specific cache directory. Unchanged nodes reference
+    production outputs (zero-copy).
+    """
+    from seeknal.workflow.environment import EnvironmentManager
+
+    project_path = Path(project_path).resolve()
+    target_path = project_path / "target"
+
+    manager = EnvironmentManager(target_path)
+
+    _echo_info(f"Applying plan for environment '{env_name}'...")
+
+    apply_info = manager.apply(env_name, force=force)
+
+    nodes_to_execute = apply_info["nodes_to_execute"]
+    env_dir = apply_info["env_dir"]
+    manifest = apply_info["manifest"]
+
+    if not nodes_to_execute:
+        _echo_success("No nodes to execute (metadata-only changes).")
+        return
+
+    _echo_info(f"Executing {len(nodes_to_execute)} node(s) in environment '{env_name}'...")
+
+    # Set up env cache directory
+    env_cache = env_dir / "cache"
+    env_cache.mkdir(parents=True, exist_ok=True)
+
+    # Copy production refs for unchanged nodes (zero-copy references)
+    refs_data = manager._load_json(env_dir / "refs.json")
+    if refs_data:
+        import shutil
+        for ref in refs_data.get("refs", []):
+            src_path = Path(ref["output_path"])
+            if src_path.exists():
+                # Determine destination in env cache
+                dest = env_cache / src_path.relative_to(target_path / "cache")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if not dest.exists():
+                    shutil.copy2(src_path, dest)
+
+    # Execute nodes using DAGRunner with env-specific target path
+    from seeknal.workflow.runner import DAGRunner
+
+    runner = DAGRunner(manifest, target_path=env_dir)
+
+    if parallel:
+        from seeknal.workflow.parallel import ParallelDAGRunner, print_parallel_summary
+
+        parallel_runner = ParallelDAGRunner(runner, max_workers, continue_on_error)
+        summary = parallel_runner.run(nodes_to_execute, dry_run=dry_run)
+        print_parallel_summary(summary)
+        failed = summary.failed_nodes
+    else:
+        # Sequential execution
+        import time as _time
+        successful = 0
+        failed = 0
+        order = runner._get_topological_order()
+
+        for node_id in order:
+            if node_id not in nodes_to_execute:
+                continue
+
+            node = manifest.get_node(node_id)
+            node_name = node.name if node else node_id
+
+            if dry_run:
+                _echo_info(f"  Would execute: {node_name}")
+                successful += 1
+                continue
+
+            _echo_info(f"  Executing: {node_name}...")
+            result = runner._execute_node(node_id)
+
+            if result.status.value == "success":
+                _echo_success(f"  {node_name} completed in {result.duration:.2f}s")
+                successful += 1
+            else:
+                _echo_error(f"  {node_name} failed: {result.error_message}")
+                failed += 1
+                if not continue_on_error:
+                    break
+
+        _echo_info(f"\n  Results: {successful} succeeded, {failed} failed")
+
+    # Create run_state.json marker for promote validation
+    env_state_path = env_dir / "run_state.json"
+    if not env_state_path.exists():
+        import json
+        with open(env_state_path, "w") as f:
+            json.dump({"applied": True, "env_name": env_name}, f)
+
+    if failed > 0:
+        _echo_warning(
+            f"Environment '{env_name}' applied with {failed} failure(s)."
+        )
+    else:
+        _echo_success(
+            f"Environment '{env_name}' applied successfully."
+        )
+
+
+@env_app.command("promote")
+@handle_cli_error("Environment promote failed")
+def env_promote(
+    from_env: str = typer.Argument(..., help="Source environment"),
+    to_env: str = typer.Argument("prod", help="Target (default: prod)"),
+    project_path: Path = typer.Option(".", help="Project directory"),
+):
+    """Promote environment to production."""
+    from seeknal.workflow.environment import EnvironmentManager
+
+    project_path = Path(project_path).resolve()
+    target_path = project_path / "target"
+
+    manager = EnvironmentManager(target_path)
+    target_label = "production" if to_env == "prod" else f"environment '{to_env}'"
+
+    # Show promotion preview
+    env_dir = target_path / "environments" / from_env
+    plan_data = manager._load_json(env_dir / "plan.json")
+    if plan_data:
+        changes = plan_data.get("categorized_changes", {})
+        added = plan_data.get("added_nodes", [])
+        removed = plan_data.get("removed_nodes", [])
+        _echo_info(f"Promotion preview for '{from_env}' -> {target_label}:")
+        if changes:
+            _echo_info(f"  Changed nodes: {len(changes)}")
+        if added:
+            _echo_info(f"  New nodes: {len(added)}")
+        if removed:
+            _echo_info(f"  Removed nodes: {len(removed)}")
+        _echo_info("")
+
+    typer.confirm(
+        f"Promote environment '{from_env}' to {target_label}?",
+        abort=True,
+    )
+
+    manager.promote(from_env, to_env)
+
+    _echo_success(f"Environment '{from_env}' promoted to {target_label}.")
+
+
+@env_app.command("list")
+@handle_cli_error("Failed to list environments")
+def env_list(
+    project_path: Path = typer.Option(".", help="Project directory"),
+):
+    """List all virtual environments."""
+    from seeknal.workflow.environment import EnvironmentManager
+
+    project_path = Path(project_path).resolve()
+    target_path = project_path / "target"
+
+    manager = EnvironmentManager(target_path)
+    envs = manager.list_environments()
+
+    if not envs:
+        _echo_info("No environments found.")
+        return
+
+    _echo_info("Virtual Environments:")
+    _echo_info("-" * 60)
+
+    for env in envs:
+        expired_str = " (EXPIRED)" if env.is_expired() else ""
+        plan_exists = (target_path / "environments" / env.name / "plan.json").exists()
+        applied = (target_path / "environments" / env.name / "run_state.json").exists()
+
+        status = "applied" if applied else ("planned" if plan_exists else "created")
+        status_color = (
+            typer.colors.GREEN if applied
+            else (typer.colors.BLUE if plan_exists else typer.colors.YELLOW)
+        )
+
+        typer.echo(
+            f"  {env.name:20s} "
+            f"{typer.style(status, fg=status_color):12s} "
+            f"created: {env.created_at}  "
+            f"last accessed: {env.last_accessed}"
+            f"{expired_str}"
+        )
+
+    _echo_info(f"\n  Total: {len(envs)} environment(s)")
+
+
+@env_app.command("delete")
+@handle_cli_error("Failed to delete environment")
+def env_delete(
+    env_name: str = typer.Argument(..., help="Environment to delete"),
+    project_path: Path = typer.Option(".", help="Project directory"),
+):
+    """Delete a virtual environment."""
+    from seeknal.workflow.environment import EnvironmentManager
+
+    project_path = Path(project_path).resolve()
+    target_path = project_path / "target"
+
+    typer.confirm(
+        f"Delete environment '{env_name}'? This cannot be undone.",
+        abort=True,
+    )
+
+    manager = EnvironmentManager(target_path)
+    manager.delete_environment(env_name)
+
+    _echo_success(f"Environment '{env_name}' deleted.")
 
 
 def main():

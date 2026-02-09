@@ -1,0 +1,53 @@
+kind: transform
+name: txn_enriched
+description: "Enrich transactions with user, device, and IP data"
+owner: "ml-team"
+transform: |
+  SELECT
+    t.txn_id,
+    t.customer_id,
+    t.merchant_id,
+    t.card_id,
+    t.amount,
+    t.currency,
+    t.timestamp AS txn_timestamp,
+
+    -- User profile features
+    u.account_age_days,
+    u.kyc_verified,
+    u.country AS user_country,
+
+    -- Device features
+    d.device_type,
+    d.browser,
+    d.os,
+    d.is_emulator,
+    d.is_rooted,
+    d.risk_score AS device_risk_score,
+
+    -- IP features
+    i.country_code AS ip_country,
+    i.is_vpn,
+    i.is_proxy,
+    i.is_tor,
+    i.reputation_score AS ip_reputation_score,
+
+    -- Cross-feature flags
+    CASE WHEN u.country != i.country_code THEN 1 ELSE 0 END AS country_mismatch
+
+  FROM source.transactions t
+  LEFT JOIN source.user_profiles u
+    ON t.customer_id = u.customer_id
+  LEFT JOIN source.device_fingerprints d
+    ON t.device_id = d.device_id
+  LEFT JOIN source.ip_geolocation i
+    ON t.ip_address = i.ip_address
+inputs:
+  - ref: source.transactions
+  - ref: source.user_profiles
+  - ref: source.device_fingerprints
+  - ref: source.ip_geolocation
+tags:
+  - transformation
+  - enrichment
+  - layer-1

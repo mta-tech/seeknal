@@ -1,0 +1,16 @@
+kind: exposure
+name: warehouse_export
+description: Export enriched customer data to data warehouse
+owner: data-team
+type: file
+path: output/customer_warehouse.parquet
+format: parquet
+params:
+  compression: snappy
+  partition_by:
+    - country
+inputs:
+  - ref: transform.customer_enriched
+tags:
+  - exposure
+  - warehouse

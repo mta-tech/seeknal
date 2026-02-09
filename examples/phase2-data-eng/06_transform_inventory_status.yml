@@ -1,0 +1,25 @@
+kind: transform
+name: inventory_status
+description: Calculate inventory availability status
+owner: operations-team
+transform: |
+  SELECT
+    product_id,
+    product_name,
+    category,
+    stock_quantity,
+    reorder_level,
+    last_updated,
+    CASE
+      WHEN stock_quantity = 0 THEN 'out_of_stock'
+      WHEN stock_quantity <= reorder_level THEN 'low_stock'
+      WHEN stock_quantity > reorder_level * 2 THEN 'overstocked'
+      ELSE 'in_stock'
+    END as availability_status,
+    stock_quantity - reorder_level as safety_margin
+  FROM source.inventory
+inputs:
+  - ref: source.inventory
+tags:
+  - transformation
+  - inventory

@@ -1,0 +1,31 @@
+kind: source
+name: transactions
+description: "Transaction records from payment gateway"
+owner: "data-eng"
+source: csv
+table: "data/transactions.csv"
+params:
+  delimiter: ","
+  header: true
+schema:
+  - name: txn_id
+    data_type: string
+  - name: customer_id
+    data_type: integer
+  - name: merchant_id
+    data_type: integer
+  - name: card_id
+    data_type: integer
+  - name: amount
+    data_type: float
+  - name: currency
+    data_type: string
+  - name: timestamp
+    data_type: timestamp
+  - name: device_id
+    data_type: string
+  - name: ip_address
+    data_type: string
+tags:
+  - raw
+  - layer-0

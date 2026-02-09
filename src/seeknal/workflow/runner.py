@@ -19,6 +19,12 @@ from typing import Any, Dict, List, Optional, Set
 from seeknal.cli.main import _echo_success, _echo_error, _echo_info, _echo_warning
 from seeknal.dag.manifest import Manifest, Node, NodeType
 from seeknal.dag.diff import ManifestDiff
+from seeknal.workflow.state import (
+    RunState, NodeStatus, NodeFingerprint,
+    load_state, save_state, update_node_state,
+    compute_node_fingerprint, compute_dag_fingerprints,
+    calculate_node_hash, find_downstream_nodes,
+)
 
 
 class ExecutionStatus(Enum):
@@ -95,52 +101,29 @@ class DAGRunner:
         self,
         manifest: Manifest,
         old_manifest: Optional[Manifest] = None,
-        state_dir: Optional[Path] = None,
+        target_path: Optional[Path] = None,
     ):
         """Initialize the runner.
 
         Args:
             manifest: The current manifest to execute
             old_manifest: Previous manifest for change detection
-            state_dir: Directory for state storage
+            target_path: Path to target directory (default: target/)
         """
         self.manifest = manifest
         self.old_manifest = old_manifest
-        self.state_dir = state_dir or Path("target/state")
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.target_path = target_path or Path("target")
+        self.target_path.mkdir(parents=True, exist_ok=True)
+        self.state_path = self.target_path / "run_state.json"
 
-        # Load or initialize state
-        self.node_state = self._load_state()
+        # Load or initialize unified state
+        self.run_state: RunState = load_state(self.state_path) or RunState()
 
         # Determine what changed
         if old_manifest:
             self.diff = ManifestDiff.compare(old_manifest, manifest)
         else:
             self.diff = None
-
-    def _load_state(self) -> Dict[str, Dict[str, Any]]:
-        """Load execution state from disk.
-
-        Returns:
-            Dictionary mapping node_id to state info
-        """
-        state_file = self.state_dir / "execution_state.json"
-        if not state_file.exists():
-            return {}
-
-        import json
-        try:
-            with open(state_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-
-    def _save_state(self) -> None:
-        """Save execution state to disk."""
-        import json
-        state_file = self.state_dir / "execution_state.json"
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(self.node_state, f, indent=2, default=str)
 
     def _get_topological_order(self) -> List[str]:
         """
@@ -182,13 +165,52 @@ class DAGRunner:
 
         return result
 
+    def _get_topological_layers(self) -> List[List[str]]:
+        """Get nodes grouped into topological layers for parallel execution.
+
+        Each layer contains nodes whose dependencies are all in previous layers.
+        Nodes within a layer can safely execute in parallel.
+
+        Returns:
+            List of layers, each layer is a list of node IDs
+
+        Raises:
+            ValueError: If the DAG contains cycles
+        """
+        # Build adjacency directly from edges to avoid stale cache issues
+        in_degree: Dict[str, int] = {node_id: 0 for node_id in self.manifest.nodes}
+        downstream_adj: Dict[str, Set[str]] = {node_id: set() for node_id in self.manifest.nodes}
+        for edge in self.manifest.edges:
+            if edge.to_node in in_degree:
+                in_degree[edge.to_node] += 1
+            if edge.from_node in downstream_adj:
+                downstream_adj[edge.from_node].add(edge.to_node)
+
+        layers: List[List[str]] = []
+        remaining = set(self.manifest.nodes.keys())
+
+        while remaining:
+            # Current layer = nodes with in_degree 0 among remaining
+            layer = [nid for nid in remaining if in_degree[nid] == 0]
+            if not layer:
+                raise ValueError("DAG contains cycles")
+            layers.append(sorted(layer))  # Sort for deterministic ordering
+            remaining -= set(layer)
+            # Reduce in_degree for downstream
+            for nid in layer:
+                for ds in downstream_adj.get(nid, set()):
+                    if ds in in_degree:
+                        in_degree[ds] -= 1
+
+        return layers
+
     def _get_nodes_to_run(
         self,
         full: bool = False,
         node_types: Optional[List[str]] = None,
         nodes: Optional[List[str]] = None,
         exclude_tags: Optional[List[str]] = None,
-    ) -> Set[str]:
+    ) -> tuple[Set[str], Dict[str, str]]:
         """
         Determine which nodes need to run.
 
@@ -199,30 +221,35 @@ class DAGRunner:
             exclude_tags: Skip nodes with these tags
 
         Returns:
-            Set of node IDs to execute
+            Tuple of (set of node IDs to execute, dict of node_id -> skip reason)
         """
         to_run: Set[str] = set()
+        skip_reasons: Dict[str, str] = {}
 
         if full:
             # Run all nodes
             to_run.update(self.manifest.nodes.keys())
+            for nid in to_run:
+                skip_reasons[nid] = "full refresh"
         elif nodes:
             # Run specific nodes
             for node_name in nodes:
-                # Find node by name
                 for node_id, node in self.manifest.nodes.items():
                     if node.name == node_name or node_id == node_name:
                         to_run.add(node_id)
-                        # Also add downstream dependencies
+                        skip_reasons[node_id] = "explicitly selected"
                         downstream = self._get_all_downstream(node_id)
                         to_run.update(downstream)
+                        for d in downstream:
+                            skip_reasons[d] = f"downstream of {node_name}"
                         break
         elif self.diff:
             # Run changed nodes and downstream
-            to_run.update(self.diff.get_nodes_to_rebuild(self.manifest))
+            rebuild_map = self.diff.get_nodes_to_rebuild(self.manifest)
+            to_run.update(rebuild_map.keys())
         else:
-            # No changes detected, run nothing
-            pass
+            # Fingerprint-based change detection
+            to_run, skip_reasons = self._fingerprint_based_detection()
 
         # Apply type filter
         if node_types:
@@ -241,7 +268,63 @@ class DAGRunner:
                 )
             }
 
-        return to_run
+        return to_run, skip_reasons
+
+    def _fingerprint_based_detection(self) -> tuple[Set[str], Dict[str, str]]:
+        """Use fingerprint comparison to detect changed nodes."""
+        # Build upstream map from manifest
+        upstream_map: Dict[str, Set[str]] = {}
+        for nid in self.manifest.nodes:
+            upstream_map[nid] = self.manifest.get_upstream_nodes(nid)
+
+        # Build node data for fingerprint computation
+        manifest_nodes = {}
+        for nid, node in self.manifest.nodes.items():
+            manifest_nodes[nid] = {
+                "kind": node.node_type.value,
+                "config": node.config,
+                "file_path": node.file_path or "unknown.yml",
+                "columns": node.columns,
+            }
+
+        current_fps = compute_dag_fingerprints(manifest_nodes, upstream_map)
+
+        # Compare with stored fingerprints
+        changed: Set[str] = set()
+        skip_reasons: Dict[str, str] = {}
+        for nid, fp in current_fps.items():
+            stored_node = self.run_state.nodes.get(nid)
+            if stored_node is None or stored_node.fingerprint is None:
+                changed.add(nid)
+                skip_reasons[nid] = "new node" if stored_node is None else "no stored fingerprint"
+            elif stored_node.fingerprint.combined != fp.combined:
+                changed.add(nid)
+                skip_reasons[nid] = "content changed"
+            # Also check if cache file exists for nodes that should be cached
+            else:
+                node = self.manifest.nodes[nid]
+                cache_path = self.target_path / "cache" / node.node_type.value / f"{node.name}.parquet"
+                if not cache_path.exists() and stored_node.status == NodeStatus.SUCCESS.value:
+                    changed.add(nid)
+                    skip_reasons[nid] = "cache missing"
+
+        # Store current fingerprints for later saving
+        self._current_fingerprints = current_fps
+
+        if not changed:
+            return set(), skip_reasons
+
+        # Build downstream adjacency for propagation
+        downstream_adj: Dict[str, Set[str]] = {}
+        for nid in self.manifest.nodes:
+            downstream_adj[nid] = self.manifest.get_downstream_nodes(nid)
+
+        to_run = find_downstream_nodes(downstream_adj, changed)
+        for nid in to_run:
+            if nid not in skip_reasons:
+                skip_reasons[nid] = "downstream of changed node"
+
+        return to_run, skip_reasons
 
     def _get_all_downstream(self, node_id: str) -> Set[str]:
         """Get all downstream nodes recursively."""
@@ -263,11 +346,9 @@ class DAGRunner:
 
     def _is_cached(self, node_id: str) -> bool:
         """Check if a node has a valid cached result."""
-        if node_id not in self.node_state:
+        if node_id not in self.run_state.nodes:
             return False
-
-        state = self.node_state[node_id]
-        return state.get("status") == ExecutionStatus.SUCCESS.value
+        return self.run_state.nodes[node_id].status == NodeStatus.SUCCESS.value
 
     def _execute_node(
         self,
@@ -400,7 +481,7 @@ class DAGRunner:
         start_time = time.time()
 
         # Determine nodes to run
-        to_run = self._get_nodes_to_run(
+        to_run, skip_reasons = self._get_nodes_to_run(
             full=full,
             node_types=node_types,
             nodes=nodes,
@@ -432,14 +513,14 @@ class DAGRunner:
             # Check if we should skip this node
             if self._should_skip_node(node_id, to_run):
                 if self._is_cached(node_id):
-                    _echo_info(f"{idx}/{len(execution_order)}: {node.name} [CACHED]")
+                    _echo_info(f"{idx}/{len(execution_order)}: Skipping {node.name} (cached)")
                     summary.cached_nodes += 1
                     result = NodeResult(
                         node_id=node_id,
                         status=ExecutionStatus.CACHED,
                     )
                 else:
-                    _echo_info(f"{idx}/{len(execution_order)}: {node.name} [SKIPPED]")
+                    _echo_info(f"{idx}/{len(execution_order)}: Skipping {node.name} (no changes)")
                     summary.skipped_nodes += 1
                     result = NodeResult(
                         node_id=node_id,
@@ -449,7 +530,9 @@ class DAGRunner:
                 continue
 
             # Execute the node
-            _echo_info(f"{idx}/{len(execution_order)}: {node.name} [RUNNING]")
+            reason = skip_reasons.get(node_id, "")
+            reason_str = f" ({reason})" if reason else ""
+            _echo_info(f"{idx}/{len(execution_order)}: Executing {node.name}{reason_str}")
             result = self._execute_node(node_id, dry_run=dry_run)
 
             # Update summary
@@ -459,12 +542,16 @@ class DAGRunner:
 
                 # Update state on success
                 if not dry_run:
-                    self.node_state[node_id] = {
-                        "status": ExecutionStatus.SUCCESS.value,
-                        "duration": result.duration,
-                        "row_count": result.row_count,
-                        "last_run": time.time(),
-                    }
+                    update_node_state(
+                        self.run_state,
+                        node_id,
+                        status=NodeStatus.SUCCESS.value,
+                        duration_ms=int(result.duration * 1000),
+                        row_count=result.row_count,
+                    )
+                    # Store fingerprint if computed
+                    if hasattr(self, '_current_fingerprints') and node_id in self._current_fingerprints:
+                        self.run_state.nodes[node_id].fingerprint = self._current_fingerprints[node_id]
 
             elif result.status == ExecutionStatus.FAILED:
                 _echo_error(f"{node.name} failed: {result.error_message}")
@@ -492,7 +579,7 @@ class DAGRunner:
 
         # Save state if not dry run
         if not dry_run:
-            self._save_state()
+            save_state(self.run_state, self.state_path)
 
         summary.total_duration = time.time() - start_time
         return summary
@@ -512,7 +599,7 @@ class DAGRunner:
             nodes: Show specific nodes only
             exclude_tags: Exclude nodes with these tags
         """
-        to_run = self._get_nodes_to_run(
+        to_run, skip_reasons = self._get_nodes_to_run(
             full=full,
             node_types=node_types,
             nodes=nodes,
@@ -529,6 +616,9 @@ class DAGRunner:
             if not node:
                 continue
 
+            reason = skip_reasons.get(node_id, "")
+            reason_str = f" ({reason})" if reason else ""
+
             if node_id in to_run:
                 status = "RUN"
                 status_msg = typer.style(status, fg=typer.colors.GREEN)
@@ -537,10 +627,10 @@ class DAGRunner:
                 status_msg = typer.style(status, fg=typer.colors.BLUE)
             else:
                 status = "SKIP"
-                status_msg = typer.style(status, fg=typer.colors.DIM)
+                status_msg = typer.style(status, fg=typer.colors.YELLOW)
 
             tags_str = f" [{', '.join(node.tags)}]" if node.tags else ""
-            print(f"  {idx:2d}. {status_msg} {node.name}{tags_str}")
+            print(f"  {idx:2d}. {status_msg} {node.name}{tags_str}{reason_str}")
 
         _echo_info("=" * 60)
         _echo_info(f"Total: {len(execution_order)} nodes, {len(to_run)} to run")

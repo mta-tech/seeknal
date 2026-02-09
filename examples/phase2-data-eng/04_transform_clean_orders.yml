@@ -1,0 +1,28 @@
+kind: transform
+name: clean_orders
+description: Clean and validate order data
+owner: analytics-team
+transform: |
+  SELECT
+    order_id,
+    customer_id,
+    product_id,
+    order_date,
+    quantity,
+    unit_price,
+    total_amount,
+    UPPER(TRIM(status)) as status,
+    CASE
+      WHEN total_amount != (quantity * unit_price) THEN 'invalid'
+      WHEN total_amount <= 0 THEN 'invalid'
+      ELSE 'valid'
+    END as validation_status
+  FROM source.orders
+  WHERE order_date IS NOT NULL
+    AND customer_id IS NOT NULL
+    AND total_amount > 0
+inputs:
+  - ref: source.orders
+tags:
+  - transformation
+  - data-quality

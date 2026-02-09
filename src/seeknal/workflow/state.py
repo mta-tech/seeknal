@@ -20,7 +20,6 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional, Set, Dict, List
-import yaml
 
 
 class NodeStatus(Enum):
@@ -31,6 +30,51 @@ class NodeStatus(Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     CACHED = "cached"
+
+
+@dataclass
+class NodeFingerprint:
+    """
+    Content-based fingerprint for a node.
+
+    Used for smart change detection: if the fingerprint matches stored state,
+    the node can be skipped. Changes propagate downstream via upstream_hash.
+
+    Attributes:
+        content_hash: SHA256 of normalized functional YAML content
+        schema_hash: SHA256 of output column names + types (if available)
+        upstream_hash: SHA256 of sorted upstream fingerprints
+        config_hash: SHA256 of non-functional config (e.g. materialization settings)
+    """
+    content_hash: str = ""
+    schema_hash: str = ""
+    upstream_hash: str = ""
+    config_hash: str = ""
+
+    @property
+    def combined(self) -> str:
+        """Combined fingerprint hash for comparison."""
+        combined_str = f"{self.content_hash}:{self.schema_hash}:{self.upstream_hash}:{self.config_hash}"
+        return hashlib.sha256(combined_str.encode("utf-8")).hexdigest()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "content_hash": self.content_hash,
+            "schema_hash": self.schema_hash,
+            "upstream_hash": self.upstream_hash,
+            "config_hash": self.config_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "NodeFingerprint":
+        if data is None:
+            return cls()
+        return cls(
+            content_hash=data.get("content_hash", ""),
+            schema_hash=data.get("schema_hash", ""),
+            upstream_hash=data.get("upstream_hash", ""),
+            config_hash=data.get("config_hash", ""),
+        )
 
 
 @dataclass
@@ -63,6 +107,7 @@ class NodeState:
     row_count: int = 0
     version: int = 1
     metadata: Dict[str, Any] = field(default_factory=dict)
+    fingerprint: Optional[NodeFingerprint] = None
 
     # Iceberg materialization fields
     iceberg_snapshot_id: Optional[str] = None
@@ -72,19 +117,27 @@ class NodeState:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
-        return asdict(self)
+        d = asdict(self)
+        # Replace fingerprint with its dict form (asdict already handles this,
+        # but we want None -> omitted for cleaner JSON)
+        if self.fingerprint is None:
+            d.pop("fingerprint", None)
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "NodeState":
         """Create from dictionary for JSON deserialization."""
+        fp_data = data.get("fingerprint")
+        fingerprint = NodeFingerprint.from_dict(fp_data) if fp_data else None
         return cls(
-            hash=data["hash"],
-            last_run=data["last_run"],
-            status=data["status"],
+            hash=data.get("hash", ""),
+            last_run=data.get("last_run", ""),
+            status=data.get("status", "pending"),
             duration_ms=data.get("duration_ms", 0),
             row_count=data.get("row_count", 0),
             version=data.get("version", 1),
             metadata=data.get("metadata", {}),
+            fingerprint=fingerprint,
             # Iceberg fields (with backward compatibility)
             iceberg_snapshot_id=data.get("iceberg_snapshot_id"),
             iceberg_snapshot_timestamp=data.get("iceberg_snapshot_timestamp"),
@@ -114,14 +167,14 @@ class RunState:
     Persists to target/run_state.json.
 
     Attributes:
-        version: State schema version
+        schema_version: State schema version for migration support
         seeknal_version: Seeknal CLI version
         last_run: ISO timestamp of last workflow run
         run_id: Unique identifier for this run
         config: Workflow configuration snapshot
         nodes: Mapping of node_id -> NodeState
     """
-    version: str = "1.0.0"
+    schema_version: str = "2.0"
     seeknal_version: str = "2.0.0"
     last_run: str = field(default_factory=lambda: datetime.now().isoformat())
     run_id: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -131,7 +184,7 @@ class RunState:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
-            "version": self.version,
+            "schema_version": self.schema_version,
             "seeknal_version": self.seeknal_version,
             "last_run": self.last_run,
             "run_id": self.run_id,
@@ -144,13 +197,39 @@ class RunState:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RunState":
-        """Create from dictionary for JSON deserialization."""
+        """Create from dictionary for JSON deserialization.
+
+        Handles backward compatibility:
+        - Old v1.0 format (runner.py style): plain dict {node_id: {status, duration, ...}}
+        - Old v1.0 format (state.py style): {version: "1.0.0", nodes: {node_id: NodeState}}
+        - New v2.0 format: {schema_version: "2.0", nodes: {node_id: NodeState}}
+        """
+        schema_version = data.get("schema_version", data.get("version", "1.0.0"))
+
+        # Detect old runner.py format: no "nodes" key, values are dicts with "status"
+        if "nodes" not in data and "schema_version" not in data and "version" not in data:
+            # Old runner.py execution_state.json format: {node_id: {status, duration, ...}}
+            nodes = {}
+            for node_id, node_data in data.items():
+                if isinstance(node_data, dict) and "status" in node_data:
+                    nodes[node_id] = NodeState(
+                        hash="",
+                        last_run=str(node_data.get("last_run", "")),
+                        status=node_data.get("status", "pending"),
+                        duration_ms=int(node_data.get("duration", 0) * 1000),
+                        row_count=node_data.get("row_count", 0),
+                    )
+            return cls(
+                schema_version="2.0",
+                nodes=nodes,
+            )
+
         nodes = {
             node_id: NodeState.from_dict(node_data)
             for node_id, node_data in data.get("nodes", {}).items()
         }
         return cls(
-            version=data.get("version", "1.0.0"),
+            schema_version="2.0",
             seeknal_version=data.get("seeknal_version", "2.0.0"),
             last_run=data.get("last_run", datetime.now().isoformat()),
             run_id=data.get("run_id", datetime.now().strftime("%Y%m%d_%H%M%S")),
@@ -361,7 +440,11 @@ def save_state(state: RunState, target_path: Path) -> None:
 
 def load_state(state_path: Path) -> Optional[RunState]:
     """
-    Load state from file.
+    Load state from file with automatic migration from old formats.
+
+    Checks both the new unified path (target/run_state.json) and the
+    old runner.py path (target/state/execution_state.json). If only the
+    old path exists, migrates it to the new format.
 
     Args:
         state_path: Path to state file (typically target/run_state.json)
@@ -371,20 +454,24 @@ def load_state(state_path: Path) -> Optional[RunState]:
 
     Raises:
         StatePersistenceError: If file exists but is invalid
-
-    Examples:
-        >>> state = load_state(Path("target/run_state.json"))
-        >>> if state:
-        ...     print(f"Last run: {state.last_run}")
     """
     try:
-        if not state_path.exists():
-            return None
+        if state_path.exists():
+            with open(state_path, "r", encoding="utf-8") as f:
+                json_str = f.read()
+            return RunState.from_json(json_str)
 
-        with open(state_path, "r", encoding="utf-8") as f:
-            json_str = f.read()
+        # Check for old runner.py state file and migrate
+        old_state_path = state_path.parent / "state" / "execution_state.json"
+        if old_state_path.exists():
+            with open(old_state_path, "r", encoding="utf-8") as f:
+                json_str = f.read()
+            state = RunState.from_json(json_str)
+            # Save in new format for next time
+            save_state(state, state_path)
+            return state
 
-        return RunState.from_json(json_str)
+        return None
 
     except json.JSONDecodeError as e:
         raise StatePersistenceError(f"Invalid state file {state_path}: {e}") from e
@@ -725,3 +812,116 @@ def get_nodes_to_run(
     nodes_to_run = find_downstream_nodes(dag, affected_nodes)
 
     return nodes_to_run
+
+
+def compute_node_fingerprint(
+    yaml_data: Dict[str, Any],
+    yaml_path: Path,
+    upstream_fingerprints: Optional[Dict[str, NodeFingerprint]] = None,
+) -> NodeFingerprint:
+    """
+    Compute a NodeFingerprint for a node.
+
+    Args:
+        yaml_data: Parsed YAML data for the node
+        yaml_path: Path to the YAML file
+        upstream_fingerprints: Map of upstream node_id -> NodeFingerprint
+
+    Returns:
+        NodeFingerprint with all hash fields computed
+    """
+    # Content hash: reuse existing calculate_node_hash
+    content_hash = calculate_node_hash(yaml_data, yaml_path)
+
+    # Schema hash: from output columns if defined
+    columns = yaml_data.get("columns", {})
+    if columns:
+        schema_str = json.dumps(dict(sorted(columns.items())), sort_keys=True)
+    else:
+        schema_str = ""
+    schema_hash = hashlib.sha256(schema_str.encode("utf-8")).hexdigest()
+
+    # Upstream hash: combined hash of sorted upstream fingerprints
+    if upstream_fingerprints:
+        upstream_parts = sorted(
+            f"{nid}:{fp.combined}" for nid, fp in upstream_fingerprints.items()
+        )
+        upstream_str = "|".join(upstream_parts)
+    else:
+        upstream_str = ""
+    upstream_hash = hashlib.sha256(upstream_str.encode("utf-8")).hexdigest()
+
+    # Config hash: non-functional config like materialization, tags, owner
+    config_fields = {}
+    for key in ("materialization", "freshness", "schedule"):
+        if key in yaml_data:
+            config_fields[key] = yaml_data[key]
+    config_str = json.dumps(config_fields, sort_keys=True) if config_fields else ""
+    config_hash = hashlib.sha256(config_str.encode("utf-8")).hexdigest()
+
+    return NodeFingerprint(
+        content_hash=content_hash,
+        schema_hash=schema_hash,
+        upstream_hash=upstream_hash,
+        config_hash=config_hash,
+    )
+
+
+def compute_dag_fingerprints(
+    manifest_nodes: Dict[str, Any],
+    dag_upstream: Dict[str, Set[str]],
+) -> Dict[str, NodeFingerprint]:
+    """
+    Compute fingerprints for all nodes in topological order.
+
+    Traverses the DAG bottom-up (sources first) so that upstream hashes
+    are available when computing downstream fingerprints.
+
+    Args:
+        manifest_nodes: Map of node_id -> node data (with config, file_path, etc.)
+        dag_upstream: Map of node_id -> set of upstream node IDs
+
+    Returns:
+        Map of node_id -> NodeFingerprint
+    """
+    from collections import deque
+
+    # Build in-degree map for topological sort
+    all_nodes = set(manifest_nodes.keys())
+    in_degree: Dict[str, int] = {nid: 0 for nid in all_nodes}
+    downstream: Dict[str, Set[str]] = {nid: set() for nid in all_nodes}
+
+    for nid, upstreams in dag_upstream.items():
+        for up in upstreams:
+            if up in all_nodes:
+                in_degree[nid] = in_degree.get(nid, 0) + 1
+                downstream.setdefault(up, set()).add(nid)
+
+    # Kahn's algorithm for topological order
+    queue = deque([nid for nid, deg in in_degree.items() if deg == 0])
+    topo_order: List[str] = []
+    while queue:
+        nid = queue.popleft()
+        topo_order.append(nid)
+        for child in downstream.get(nid, set()):
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                queue.append(child)
+
+    # Compute fingerprints in topological order
+    fingerprints: Dict[str, NodeFingerprint] = {}
+    for nid in topo_order:
+        node_data = manifest_nodes[nid]
+        yaml_data = node_data.get("config", {})
+        yaml_data["kind"] = node_data.get("kind", "")
+        yaml_path = Path(node_data.get("file_path", "unknown.yml"))
+
+        # Gather upstream fingerprints
+        upstream_fps = {}
+        for up_id in dag_upstream.get(nid, set()):
+            if up_id in fingerprints:
+                upstream_fps[up_id] = fingerprints[up_id]
+
+        fingerprints[nid] = compute_node_fingerprint(yaml_data, yaml_path, upstream_fps)
+
+    return fingerprints

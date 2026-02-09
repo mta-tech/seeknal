@@ -1,0 +1,42 @@
+kind: aggregation
+name: monthly_revenue_metrics
+description: Monthly recurring revenue and payment metrics
+id_col: customer_id
+feature_date_col: payment_date
+application_date_col: report_date
+features:
+  - name: mrr_metrics
+    basic:
+      - sum
+      - avg
+      - count
+    column: mrr
+    rolling:
+      - window: 30d
+        functions:
+          - sum
+          - avg
+      - window: 90d
+        functions:
+          - sum
+          - avg
+  - name: payment_metrics
+    basic:
+      - sum
+      - count
+    column: payment_amount
+    rolling:
+      - window: 30d
+        functions:
+          - sum
+          - count
+      - window: 90d
+        functions:
+          - sum
+          - count
+inputs:
+  - ref: transform.revenue_base
+tags:
+  - aggregation
+  - revenue
+  - metrics

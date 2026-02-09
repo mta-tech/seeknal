@@ -1,0 +1,30 @@
+kind: source
+name: device_fingerprints
+description: "Device fingerprint data for fraud detection"
+owner: "security-team"
+source: csv
+table: "data/device_fingerprints.csv"
+params:
+  delimiter: ","
+  header: true
+schema:
+  - name: device_id
+    data_type: string
+  - name: device_type
+    data_type: string
+  - name: browser
+    data_type: string
+  - name: os
+    data_type: string
+  - name: is_emulator
+    data_type: boolean
+  - name: is_rooted
+    data_type: boolean
+  - name: risk_score
+    data_type: float
+  - name: first_seen
+    data_type: timestamp
+tags:
+  - raw
+  - security
+  - layer-0

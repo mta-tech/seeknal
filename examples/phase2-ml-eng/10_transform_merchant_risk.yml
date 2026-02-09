@@ -1,0 +1,51 @@
+kind: transform
+name: merchant_risk
+description: "Calculate merchant risk scores from historical fraud"
+owner: "ml-team"
+transform: |
+  SELECT
+    m.merchant_id,
+    m.merchant_name,
+    m.category,
+    m.chargeback_rate,
+    m.is_verified,
+
+    -- Fraud statistics
+    COUNT(CASE WHEN f.is_fraud THEN 1 END) AS total_fraud_count,
+    COUNT(f.txn_id) AS total_txns,
+
+    -- Merchant risk score
+    COALESCE(
+      COUNT(CASE WHEN f.is_fraud THEN 1 END)::FLOAT / NULLIF(COUNT(f.txn_id), 0),
+      0.0
+    ) AS merchant_fraud_rate,
+
+    -- Risk tier
+    CASE
+      WHEN COALESCE(
+        COUNT(CASE WHEN f.is_fraud THEN 1 END)::FLOAT / NULLIF(COUNT(f.txn_id), 0),
+        0.0
+      ) > 0.10 THEN 'HIGH'
+      WHEN COALESCE(
+        COUNT(CASE WHEN f.is_fraud THEN 1 END)::FLOAT / NULLIF(COUNT(f.txn_id), 0),
+        0.0
+      ) > 0.05 THEN 'MEDIUM'
+      ELSE 'LOW'
+    END AS risk_tier
+
+  FROM source.merchant_data m
+  LEFT JOIN source.fraud_labels f
+    ON m.merchant_id::STRING = f.txn_id  -- Simplified join for demo
+  GROUP BY
+    m.merchant_id,
+    m.merchant_name,
+    m.category,
+    m.chargeback_rate,
+    m.is_verified
+inputs:
+  - ref: source.merchant_data
+  - ref: source.fraud_labels
+tags:
+  - transformation
+  - risk-scoring
+  - layer-1

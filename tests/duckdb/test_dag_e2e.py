@@ -335,9 +335,24 @@ class TestDAGE2E:
         manifest.add_edge("source.data", "feature_group.features")
         manifest.add_edge("feature_group.features", "model.prediction")
 
-        # Create diff with source modified
+        # Create diff with source modified (different config triggers NON_BREAKING)
+        from seeknal.dag.diff import NodeChange, DiffType
+        old_source = Node(
+            id="source.data", name="data", node_type=NodeType.SOURCE,
+            config={"sql": "SELECT 1"},
+        )
+        new_source = Node(
+            id="source.data", name="data", node_type=NodeType.SOURCE,
+            config={"sql": "SELECT 2"},
+        )
         diff = ManifestDiff()
-        diff.modified_nodes["source.data"] = None  # Simplified for test
+        diff.modified_nodes["source.data"] = NodeChange(
+            node_id="source.data",
+            change_type=DiffType.MODIFIED,
+            old_value=old_source,
+            new_value=new_source,
+            changed_fields=["config"],
+        )
 
         # Get nodes to rebuild
         to_rebuild = diff.get_nodes_to_rebuild(manifest)

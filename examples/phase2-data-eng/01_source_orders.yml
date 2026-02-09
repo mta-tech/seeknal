@@ -1,0 +1,29 @@
+kind: source
+name: orders
+description: E-commerce order transactions
+owner: data-team
+source: csv
+table: data/orders.csv
+params:
+  delimiter: ","
+  header: true
+schema:
+  - name: order_id
+    data_type: integer
+  - name: customer_id
+    data_type: integer
+  - name: product_id
+    data_type: integer
+  - name: order_date
+    data_type: date
+  - name: quantity
+    data_type: integer
+  - name: unit_price
+    data_type: float
+  - name: total_amount
+    data_type: float
+  - name: status
+    data_type: string
+tags:
+  - raw-data
+  - sales

@@ -1,0 +1,27 @@
+kind: aggregation
+name: daily_sales
+description: Daily sales metrics by product and customer
+owner: analytics-team
+id_col: product_id
+feature_date_col: order_date
+application_date_col: order_date
+group_by:
+  - customer_id
+  - country
+features:
+  - name: revenue_metrics
+    basic:
+      - sum
+      - count
+      - avg
+    column: total_amount
+  - name: quantity_metrics
+    basic:
+      - sum
+      - avg
+    column: quantity
+inputs:
+  - ref: transform.clean_orders
+tags:
+  - aggregation
+  - sales-metrics

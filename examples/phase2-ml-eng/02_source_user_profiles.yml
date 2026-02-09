@@ -1,0 +1,27 @@
+kind: source
+name: user_profiles
+description: "Customer profile information"
+owner: "data-eng"
+source: csv
+table: "data/user_profiles.csv"
+params:
+  delimiter: ","
+  header: true
+schema:
+  - name: customer_id
+    data_type: integer
+  - name: email
+    data_type: string
+  - name: phone
+    data_type: string
+  - name: country
+    data_type: string
+  - name: account_age_days
+    data_type: integer
+  - name: kyc_verified
+    data_type: boolean
+  - name: created_at
+    data_type: timestamp
+tags:
+  - raw
+  - layer-0

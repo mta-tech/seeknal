@@ -1,0 +1,25 @@
+kind: source
+name: inventory
+description: Product inventory levels
+owner: data-team
+source: csv
+table: data/inventory.csv
+params:
+  delimiter: ","
+  header: true
+schema:
+  - name: product_id
+    data_type: integer
+  - name: product_name
+    data_type: string
+  - name: category
+    data_type: string
+  - name: stock_quantity
+    data_type: integer
+  - name: reorder_level
+    data_type: integer
+  - name: last_updated
+    data_type: date
+tags:
+  - raw-data
+  - inventory

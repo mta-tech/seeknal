@@ -1,0 +1,13 @@
+kind: exposure
+name: training_data
+description: "Final training dataset for fraud detection model"
+owner: "ml-team"
+type: file
+path: "output/fraud_training_data.parquet"
+inputs:
+  - ref: feature_group.txn_features
+  - ref: feature_group.user_risk
+tags:
+  - exposure
+  - training
+  - layer-3

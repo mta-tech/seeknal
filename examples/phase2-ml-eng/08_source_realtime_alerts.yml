@@ -1,0 +1,24 @@
+kind: source
+name: realtime_alerts
+description: "Real-time fraud alert feeds from monitoring systems"
+owner: "fraud-ops"
+source: csv
+table: "data/realtime_alerts.csv"
+params:
+  delimiter: ","
+  header: true
+schema:
+  - name: alert_id
+    data_type: string
+  - name: txn_id
+    data_type: string
+  - name: alert_type
+    data_type: string
+  - name: severity
+    data_type: string
+  - name: triggered_at
+    data_type: timestamp
+tags:
+  - raw
+  - alerts
+  - layer-0

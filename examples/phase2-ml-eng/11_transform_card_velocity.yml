@@ -1,0 +1,68 @@
+kind: transform
+name: card_velocity
+description: "Card usage velocity features"
+owner: "ml-team"
+transform: |
+  WITH card_txns AS (
+    SELECT
+      t.card_id,
+      t.amount,
+      t.timestamp,
+      c.card_type,
+      c.is_prepaid,
+      c.card_country,
+
+      -- Window functions for velocity
+      COUNT(*) OVER (
+        PARTITION BY t.card_id
+        ORDER BY t.timestamp
+        RANGE BETWEEN INTERVAL 1 HOUR PRECEDING AND CURRENT ROW
+      ) AS txns_last_hour,
+
+      COUNT(*) OVER (
+        PARTITION BY t.card_id
+        ORDER BY t.timestamp
+        RANGE BETWEEN INTERVAL 24 HOUR PRECEDING AND CURRENT ROW
+      ) AS txns_last_day,
+
+      SUM(t.amount) OVER (
+        PARTITION BY t.card_id
+        ORDER BY t.timestamp
+        RANGE BETWEEN INTERVAL 1 HOUR PRECEDING AND CURRENT ROW
+      ) AS amount_last_hour,
+
+      SUM(t.amount) OVER (
+        PARTITION BY t.card_id
+        ORDER BY t.timestamp
+        RANGE BETWEEN INTERVAL 24 HOUR PRECEDING AND CURRENT ROW
+      ) AS amount_last_day
+
+    FROM source.transactions t
+    INNER JOIN source.card_data c
+      ON t.card_id = c.card_id
+  )
+  SELECT
+    card_id,
+    card_type,
+    is_prepaid,
+    card_country,
+    MAX(txns_last_hour) AS max_txns_per_hour,
+    MAX(txns_last_day) AS max_txns_per_day,
+    MAX(amount_last_hour) AS max_amount_per_hour,
+    MAX(amount_last_day) AS max_amount_per_day,
+
+    -- Velocity flags
+    CASE WHEN MAX(txns_last_hour) > 5 THEN 1 ELSE 0 END AS high_velocity_flag
+  FROM card_txns
+  GROUP BY
+    card_id,
+    card_type,
+    is_prepaid,
+    card_country
+inputs:
+  - ref: source.transactions
+  - ref: source.card_data
+tags:
+  - transformation
+  - velocity
+  - layer-1
