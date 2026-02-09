@@ -199,8 +199,13 @@ class ExecutionContext:
         return self.target_path / node.node_type.value / node.name
 
     def get_cache_path(self, node: Node) -> Path:
-        """Get cache path for a node's results."""
-        return self.state_dir / f"{node.id}.parquet"
+        """Get cache path for a node's results.
+
+        Uses target/cache/{kind}/{node_name}.parquet structure.
+        """
+        cache_dir = self.target_path / "cache" / node.node_type.value
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / f"{node.name}.parquet"
 
 
 class ExecutorError(Exception):
@@ -392,28 +397,48 @@ class BaseExecutor(ABC):
 
     def post_execute(self, result: ExecutorResult) -> ExecutorResult:
         """
-        Perform cleanup after node execution.
+        Perform cleanup after node execution, including audit execution.
 
-        Implementations can use this to:
-        - Close database connections
-        - Clean up temporary files
-        - Update result metadata
-
-        This method is called after execute() and the result can be
-        modified before returning to the runner.
+        Runs any audits defined in the node's config `audits:` section.
+        On error-severity failure: sets result.status = FAILED.
+        On warn-severity failure: adds warning to result.metadata.
 
         Args:
             result: The result from execute()
 
         Returns:
             Possibly modified ExecutorResult
-
-        Example:
-            >>> def post_execute(self, result: ExecutorResult) -> ExecutorResult:
-            ...     # Add additional metadata
-            ...     result.metadata["executor_version"] = "1.0"
-            ...     return result
         """
+        # Run audits if defined
+        audit_configs = self.node.config.get("audits", [])
+        if audit_configs and result.is_success():
+            try:
+                from seeknal.workflow.audits import parse_audits, AuditRunner
+                audits = parse_audits(self.node.config)
+                if audits:
+                    conn = self.context.get_duckdb_connection()
+                    table_name = f"{self.node.node_type.value}.{self.node.name}"
+                    runner = AuditRunner(conn)
+                    audit_results = runner.run_audits(audits, table_name)
+
+                    # Store results in metadata
+                    result.metadata["audits"] = [r.to_dict() for r in audit_results]
+
+                    # Check for failures
+                    for ar in audit_results:
+                        if not ar.passed:
+                            if ar.severity == "error":
+                                result.status = ExecutionStatus.FAILED
+                                result.error_message = f"Audit failed: {ar.audit_type} - {ar.message}"
+                                break
+                            elif ar.severity == "warn":
+                                warnings = result.metadata.setdefault("warnings", [])
+                                warnings.append(f"Audit warning: {ar.audit_type} - {ar.message}")
+            except Exception as e:
+                if self.context.verbose:
+                    import warnings
+                    warnings.warn(f"Audit execution failed: {e}")
+
         return result
 
     def run(self) -> ExecutorResult:

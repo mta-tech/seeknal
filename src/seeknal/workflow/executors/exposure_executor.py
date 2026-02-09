@@ -49,6 +49,7 @@ class ExposureType(Enum):
     API = "api"
     DATABASE = "database"
     NOTIFICATION = "notification"
+    STARROCKS_MV = "starrocks_materialized_view"
 
 
 class FileFormat(Enum):
@@ -166,6 +167,8 @@ class ExposureExecutor(BaseExecutor):
             self._validate_database_exposure(config)
         elif exposure_type.lower() == ExposureType.NOTIFICATION.value:
             self._validate_notification_exposure(config)
+        elif exposure_type.lower() == ExposureType.STARROCKS_MV.value:
+            self._validate_starrocks_mv_exposure(config)
 
     def _validate_file_exposure(self, config: Dict[str, Any]) -> None:
         """Validate file export configuration."""
@@ -306,6 +309,8 @@ class ExposureExecutor(BaseExecutor):
                 result = self._execute_database_exposure(data)
             elif exposure_type == ExposureType.NOTIFICATION.value:
                 result = self._execute_notification_exposure(data)
+            elif exposure_type == ExposureType.STARROCKS_MV.value:
+                result = self._execute_starrocks_mv_exposure(data)
             else:
                 raise ExecutorExecutionError(
                     self.node.id,
@@ -780,6 +785,108 @@ class ExposureExecutor(BaseExecutor):
             success=False,
             error_message="Email notifications not yet implemented. Use webhook or Slack instead."
         )
+
+    def _validate_starrocks_mv_exposure(self, config: Dict[str, Any]) -> None:
+        """Validate StarRocks materialized view exposure configuration."""
+        params = config.get("params", {})
+        if not isinstance(params, dict):
+            raise ExecutorValidationError(
+                self.node.id,
+                "'params' must be a dictionary for StarRocks MV exposures"
+            )
+
+        if "mv_name" not in params:
+            raise ExecutorValidationError(
+                self.node.id,
+                "StarRocks MV exposures require 'params.mv_name' field"
+            )
+
+        if "query" not in params and not config.get("depends_on"):
+            raise ExecutorValidationError(
+                self.node.id,
+                "StarRocks MV exposures require 'params.query' or 'depends_on'"
+            )
+
+    def _execute_starrocks_mv_exposure(self, data: Any) -> DeliveryResult:
+        """
+        Execute StarRocks materialized view creation.
+
+        Generates and executes CREATE MATERIALIZED VIEW DDL on StarRocks.
+
+        Args:
+            data: Not used directly; query comes from config
+
+        Returns:
+            DeliveryResult with MV creation status
+        """
+        start = time.time()
+        config = self.node.config
+        params = config.get("params", {})
+        mv_name = params.get("mv_name", self.node.name)
+        query = params.get("query", "")
+        refresh = params.get("refresh", "MANUAL")
+        properties = params.get("properties", {})
+
+        if not query:
+            return DeliveryResult(
+                success=False,
+                error_message="Missing 'query' in StarRocks MV exposure params"
+            )
+
+        try:
+            from seeknal.connections.starrocks import create_starrocks_connection
+        except ImportError:
+            return DeliveryResult(
+                success=False,
+                error_message="pymysql required for StarRocks. Install with: pip install pymysql"
+            )
+
+        # Build DDL
+        props_str = ""
+        if properties:
+            props_items = ", ".join(f'"{k}" = "{v}"' for k, v in properties.items())
+            props_str = f"\nPROPERTIES ({props_items})"
+
+        ddl = (
+            f"CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_name}\n"
+            f"REFRESH {refresh}{props_str}\n"
+            f"AS\n{query}"
+        )
+
+        # Get connection config
+        conn_config = {
+            "host": params.get("host", "localhost"),
+            "port": params.get("port", 9030),
+            "user": params.get("user", "root"),
+            "password": params.get("password", ""),
+            "database": params.get("database", ""),
+        }
+
+        try:
+            sr_conn = create_starrocks_connection(conn_config)
+            cursor = sr_conn.cursor()
+            cursor.execute(ddl)
+            cursor.close()
+            sr_conn.close()
+
+            return DeliveryResult(
+                success=True,
+                records_sent=0,
+                url=f"starrocks://{conn_config['host']}:{conn_config['port']}/{mv_name}",
+                duration_seconds=time.time() - start,
+                metadata={
+                    "mv_name": mv_name,
+                    "refresh": refresh,
+                    "ddl": ddl,
+                }
+            )
+
+        except Exception as e:
+            return DeliveryResult(
+                success=False,
+                error_message=f"Failed to create StarRocks MV '{mv_name}': {str(e)}",
+                metadata={"ddl": ddl}
+            )
 
     def _create_sample_data(self) -> List[Dict[str, Any]]:
         """Create sample data for demonstration."""

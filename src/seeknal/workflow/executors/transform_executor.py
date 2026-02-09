@@ -168,14 +168,93 @@ class TransformExecutor(BaseExecutor):
         """
         Setup before transform execution.
 
-        Creates output directory and prepares DuckDB connection.
+        Creates output directory, prepares DuckDB connection, and loads
+        cached upstream views that may have been lost from in-memory DuckDB.
         """
-        # Ensure DuckDB connection is available
-        _ = self.context.get_duckdb_connection()
+        conn = self.context.get_duckdb_connection()
 
         # Create output directory for this node
         output_path = self.context.get_output_path(self.node)
         output_path.mkdir(parents=True, exist_ok=True)
+
+        # Load cached upstream source/transform views into DuckDB
+        # This fixes the "Table does not exist" bug when source nodes are skipped
+        self._load_cached_upstream_views(conn)
+
+    def _load_cached_upstream_views(self, conn) -> None:
+        """Load cached Parquet files as DuckDB views for upstream dependencies."""
+        if not hasattr(self.context, '_manifest') or self.context._manifest is None:
+            # No manifest available - try to load from input refs
+            self._load_views_from_inputs(conn)
+            return
+
+        manifest = self.context._manifest
+        upstream_ids = manifest.get_upstream_nodes(self.node.id)
+        for up_id in upstream_ids:
+            up_node = manifest.get_node(up_id)
+            if up_node is None:
+                continue
+            self._ensure_view_loaded(conn, up_node)
+
+    def _load_views_from_inputs(self, conn) -> None:
+        """Load cached views based on input refs in the node config."""
+        inputs = self.node.config.get("inputs", [])
+        if not inputs:
+            return
+
+        for inp in inputs:
+            if isinstance(inp, dict):
+                ref = inp.get("ref", "")
+            elif isinstance(inp, str):
+                ref = inp
+            else:
+                continue
+
+            if not ref:
+                continue
+
+            # Check if view exists in DuckDB
+            try:
+                conn.execute(f"SELECT 1 FROM {ref} LIMIT 0")
+            except Exception:
+                # View doesn't exist - try to load from cache
+                parts = ref.split(".")
+                if len(parts) == 2:
+                    kind, name = parts
+                    cache_path = self.context.target_path / "cache" / kind / f"{name}.parquet"
+                    if cache_path.exists():
+                        try:
+                            conn.execute(
+                                f"CREATE OR REPLACE VIEW \"{ref}\" AS "
+                                f"SELECT * FROM read_parquet('{cache_path}')"
+                            )
+                            logger.info(f"Loaded cached view: {ref} from {cache_path}")
+                        except Exception as e:
+                            logger.warning(f"Failed to load cache for {ref}: {e}")
+
+    def _ensure_view_loaded(self, conn, node: Node) -> None:
+        """Ensure a node's view is loaded in DuckDB, from cache if needed."""
+        view_name = f"{node.node_type.value}.{node.name}"
+        try:
+            conn.execute(f"SELECT 1 FROM \"{view_name}\" LIMIT 0")
+        except Exception:
+            # View missing - load from cache
+            cache_path = self.context.get_cache_path(node)
+            if cache_path.exists():
+                try:
+                    conn.execute(
+                        f"CREATE OR REPLACE VIEW \"{view_name}\" AS "
+                        f"SELECT * FROM read_parquet('{cache_path}')"
+                    )
+                    logger.info(f"Loaded cached view: {view_name} from {cache_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to load cache for {view_name}: {e}")
+                    # Cache corrupted — delete it so the node re-executes
+                    try:
+                        cache_path.unlink()
+                        logger.info(f"Deleted corrupted cache: {cache_path}")
+                    except Exception:
+                        pass
 
     def execute(self) -> ExecutorResult:
         """

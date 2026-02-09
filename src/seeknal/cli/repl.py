@@ -87,6 +87,8 @@ class REPL:
     def __init__(self) -> None:
         self.conn = duckdb.connect(":memory:")
         self.attached: set[str] = set()
+        self._starrocks_connections: dict = {}
+        self._active_starrocks: Optional[str] = None
         self._load_extensions()
         self._setup_history()
 
@@ -121,15 +123,17 @@ class REPL:
 
     def run(self) -> None:
         """Main REPL loop."""
-        print("Seeknal SQL REPL (DuckDB)")
+        print("Seeknal SQL REPL (DuckDB + StarRocks)")
         print("Commands: .connect <url>, .tables, .schema <table>, .quit")
         print("Example: .connect postgres://user:pass@host/db")
+        print("         .connect starrocks://user:pass@host:9030/db")
         print()
 
         try:
             while True:
                 try:
-                    line = input("seeknal> ").strip()
+                    prompt = f"seeknal[{self._active_starrocks}]> " if self._active_starrocks else "seeknal> "
+                    line = input(prompt).strip()
                     if not line:
                         continue
 
@@ -145,6 +149,9 @@ class REPL:
                         self._show_tables()
                     elif line.startswith(".schema "):
                         self._show_schema(line[8:].strip())
+                    elif line == ".duckdb":
+                        self._active_starrocks = None
+                        print("Switched to DuckDB mode.")
                     elif line.startswith("."):
                         print(f"Unknown command: {line.split()[0]}. Type .help")
                     else:
@@ -170,6 +177,7 @@ Commands:
   .connect <url>    Connect to a database URL directly
   .tables           List tables in connected databases
   .schema <table>   Show table schema
+  .duckdb           Switch back to DuckDB query mode
   .quit             Exit the REPL
 
 Query Security:
@@ -180,6 +188,7 @@ Query Security:
 Connection examples:
   .connect mydb                                    (saved source)
   .connect postgres://user:pass@localhost/mydb    (direct URL)
+  .connect starrocks://user:pass@host:9030/db     (StarRocks)
   .connect $DATABASE_URL                          (env variable)
   .connect /path/to/data.parquet                  (file)
 
@@ -283,6 +292,9 @@ Manage sources:
                 self._attach_mysql(alias, url)
             elif url.startswith("sqlite://"):
                 self._attach_sqlite(alias, url)
+            elif url.startswith("starrocks://"):
+                self._attach_starrocks(alias, url)
+                return  # StarRocks has its own success message
             elif url.endswith(".parquet"):
                 self._attach_parquet(alias, url)
             elif url.endswith(".csv"):
@@ -386,6 +398,30 @@ Manage sources:
             f"CREATE VIEW {alias}.data AS SELECT * FROM read_csv_auto('{safe_path}')"
         )
 
+    def _attach_starrocks(self, alias: str, url: str) -> None:
+        """Connect to StarRocks via pymysql."""
+        try:
+            from seeknal.connections.starrocks import create_starrocks_connection_from_url
+        except ImportError:
+            print("pymysql is required for StarRocks. Install with: pip install pymysql")
+            return
+
+        try:
+            conn = create_starrocks_connection_from_url(url)
+            self._starrocks_connections[alias] = conn
+            self._active_starrocks = alias
+            self.attached.add(alias)
+
+            # Get version for confirmation
+            cursor = conn.cursor()
+            cursor.execute("SELECT VERSION()")
+            version = cursor.fetchone()[0]
+            cursor.close()
+            print(f"Connected to StarRocks ({version}) as '{alias}'.")
+            print("Queries will route to StarRocks. Use .duckdb to switch back.")
+        except Exception as e:
+            print(f"StarRocks connection failed: {sanitize_error_message(str(e))}")
+
     def _show_tables(self) -> None:
         """List tables in all attached databases."""
         if not self.attached:
@@ -393,6 +429,20 @@ Manage sources:
             return
 
         for alias in sorted(self.attached):
+            # StarRocks connections
+            if alias in self._starrocks_connections:
+                try:
+                    sr_conn = self._starrocks_connections[alias]
+                    cursor = sr_conn.cursor()
+                    cursor.execute("SHOW TABLES")
+                    for row in cursor.fetchall():
+                        print(f"{alias}.{row[0]}")
+                    cursor.close()
+                except Exception as e:
+                    print(f"Error listing StarRocks tables for {alias}: {sanitize_error_message(str(e))}")
+                continue
+
+            # DuckDB-attached databases
             try:
                 result = self.conn.execute(
                     f"SELECT table_schema, table_name FROM information_schema.tables "
@@ -415,6 +465,42 @@ Manage sources:
             print("Usage: .schema <table_name>")
             return
 
+        # Check if table belongs to a StarRocks alias
+        parts = table.split(".", 1)
+        if len(parts) == 2 and parts[0] in self._starrocks_connections:
+            alias, tbl = parts
+            try:
+                sr_conn = self._starrocks_connections[alias]
+                cursor = sr_conn.cursor()
+                cursor.execute(f"DESCRIBE {tbl}")
+                result = cursor.fetchall()
+                cursor.close()
+                print(
+                    tabulate(
+                        result, headers=["Field", "Type", "Null", "Key", "Default", "Extra"]
+                    )
+                )
+            except Exception as e:
+                print(f"Error: {sanitize_error_message(str(e))}")
+            return
+
+        # If active StarRocks and no alias prefix, try StarRocks first
+        if self._active_starrocks and self._active_starrocks in self._starrocks_connections:
+            try:
+                sr_conn = self._starrocks_connections[self._active_starrocks]
+                cursor = sr_conn.cursor()
+                cursor.execute(f"DESCRIBE {table}")
+                result = cursor.fetchall()
+                cursor.close()
+                print(
+                    tabulate(
+                        result, headers=["Field", "Type", "Null", "Key", "Default", "Extra"]
+                    )
+                )
+                return
+            except Exception:
+                pass  # Fall through to DuckDB
+
         try:
             result = self.conn.execute(f"DESCRIBE {table}").fetchall()
             print(
@@ -431,6 +517,11 @@ Manage sources:
         is_valid, error_msg = validate_sql(sql)
         if not is_valid:
             print(f"Query rejected: {error_msg}")
+            return
+
+        # Route to StarRocks if active
+        if self._active_starrocks and self._active_starrocks in self._starrocks_connections:
+            self._execute_starrocks(sql)
             return
 
         try:
@@ -458,6 +549,37 @@ Manage sources:
 
         except Exception as e:
             print(f"Error: {sanitize_error_message(str(e))}")
+
+    def _execute_starrocks(self, sql: str) -> None:
+        """Execute SQL on the active StarRocks connection."""
+        sr_conn = self._starrocks_connections[self._active_starrocks]
+        try:
+            cursor = sr_conn.cursor()
+            cursor.execute(sql)
+
+            if not cursor.description:
+                print("Query executed successfully.")
+                cursor.close()
+                return
+
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            cursor.close()
+
+            MAX_ROWS = 100
+            display_rows = rows[:MAX_ROWS]
+
+            print(tabulate(display_rows, headers=columns, tablefmt="simple"))
+
+            if len(rows) > MAX_ROWS:
+                print(
+                    f"\n({MAX_ROWS} of {len(rows)} rows displayed. Use LIMIT for more control.)"
+                )
+            else:
+                print(f"\n({len(rows)} rows)")
+
+        except Exception as e:
+            print(f"StarRocks error: {sanitize_error_message(str(e))}")
 
 
 def run_repl() -> None:

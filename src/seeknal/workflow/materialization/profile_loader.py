@@ -426,6 +426,58 @@ class ProfileLoader:
             memory_limit=duckdb_data.get("memory_limit", "1GB"),
         )
 
+    def load_starrocks_profile(self, name: str = "default") -> Dict[str, Any]:
+        """
+        Load a StarRocks connection profile from profiles.yml.
+
+        Profile structure (in ~/.seeknal/profiles.yml):
+
+            starrocks:
+              default:
+                host: ${STARROCKS_HOST}
+                port: 9030
+                user: ${STARROCKS_USER}
+                password: ${STARROCKS_PASSWORD}
+                database: my_db
+
+        Args:
+            name: Profile name (default: "default")
+
+        Returns:
+            Dict with StarRocks connection config
+
+        Raises:
+            ConfigurationError: If profile is invalid or not found
+        """
+        if not self.profile_path.exists():
+            raise ConfigurationError(
+                f"Profile file not found: {self.profile_path}. "
+                f"Create it with StarRocks connection details."
+            )
+
+        try:
+            with open(self.profile_path, "r") as f:
+                profile_data = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            raise ConfigurationError(f"Failed to parse profile: {e}") from e
+
+        starrocks_section = profile_data.get("starrocks", {})
+        if not starrocks_section:
+            raise ConfigurationError(
+                "No 'starrocks' section in profiles.yml. "
+                "Add one with: host, port, user, password, database"
+            )
+
+        profile = starrocks_section.get(name)
+        if not profile:
+            available = list(starrocks_section.keys())
+            raise ConfigurationError(
+                f"StarRocks profile '{name}' not found. "
+                f"Available profiles: {available}"
+            )
+
+        return profile
+
     def validate_materialization(self) -> bool:
         """
         Validate materialization configuration without loading.

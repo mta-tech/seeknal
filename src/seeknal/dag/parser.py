@@ -68,6 +68,10 @@ class ProjectParser:
         # Parse common config
         self._parse_common_config()
 
+        # Parse semantic models and metrics
+        self._parse_semantic_models()
+        self._parse_metrics()
+
         # TODO: Parse Python files for feature groups, models
         # self._parse_python_files()
 
@@ -184,3 +188,78 @@ class ProjectParser:
     def get_errors(self) -> list[str]:
         """Get parsing errors."""
         return self._errors.copy()
+
+    def _parse_semantic_models(self) -> None:
+        """Parse semantic_models/*.yml files."""
+        sm_dir = self.project_path / "seeknal" / "semantic_models"
+        if not sm_dir.exists():
+            return
+
+        for yml_path in sorted(sm_dir.glob("*.yml")):
+            try:
+                with open(yml_path, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f) or {}
+            except yaml.YAMLError as e:
+                self._errors.append(f"Invalid YAML in {yml_path.name}: {e}")
+                continue
+
+            if data.get("kind") != "semantic_model":
+                continue
+
+            name = data.get("name")
+            if not name:
+                self._errors.append(f"Semantic model in {yml_path.name} missing 'name'")
+                continue
+
+            node = Node(
+                id=f"semantic_model.{name}",
+                name=name,
+                node_type=NodeType.SEMANTIC_MODEL,
+                description=data.get("description"),
+                config=data,
+                file_path=str(yml_path),
+            )
+            self.manifest.add_node(node)
+
+            # Add edge from referenced model
+            model_ref = data.get("model", "")
+            if model_ref.startswith("ref("):
+                ref_id = model_ref.strip("ref('\")")
+                self._pending_references.append(
+                    (node.id, ref_id, "semantic_model_ref")
+                )
+
+    def _parse_metrics(self) -> None:
+        """Parse metrics/*.yml files (supports multi-document YAML)."""
+        metrics_dir = self.project_path / "seeknal" / "metrics"
+        if not metrics_dir.exists():
+            return
+
+        for yml_path in sorted(metrics_dir.glob("*.yml")):
+            try:
+                with open(yml_path, "r", encoding="utf-8") as f:
+                    docs = list(yaml.safe_load_all(f))
+            except yaml.YAMLError as e:
+                self._errors.append(f"Invalid YAML in {yml_path.name}: {e}")
+                continue
+
+            for doc in docs:
+                if not doc or doc.get("kind") != "metric":
+                    continue
+
+                name = doc.get("name")
+                if not name:
+                    self._errors.append(
+                        f"Metric in {yml_path.name} missing 'name'"
+                    )
+                    continue
+
+                node = Node(
+                    id=f"metric.{name}",
+                    name=name,
+                    node_type=NodeType.METRIC,
+                    description=doc.get("description"),
+                    config=doc,
+                    file_path=str(yml_path),
+                )
+                self.manifest.add_node(node)

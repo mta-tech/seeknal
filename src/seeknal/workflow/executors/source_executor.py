@@ -116,6 +116,7 @@ class SourceExecutor(BaseExecutor):
         supported_sources = [
             "csv", "parquet", "json", "jsonl",
             "sqlite", "postgresql", "postgres", "hive",
+            "starrocks",
             "bigquery", "snowflake", "redshift"
         ]
 
@@ -137,7 +138,7 @@ class SourceExecutor(BaseExecutor):
                 ) from e
 
         # Validate database configuration for database sources
-        if source_type in ["postgresql", "postgres"]:
+        if source_type in ["postgresql", "postgres", "starrocks"]:
             params = config.get("params", {})
 
             if not isinstance(params, dict):
@@ -148,7 +149,7 @@ class SourceExecutor(BaseExecutor):
 
             # Check for required database parameters
             # (host, port, database, user, password can be in params or env vars)
-            if not any(k in params for k in ["host", "database"]):
+            if not any(k in params for k in ["host", "database", "profile"]):
                 # Will be loaded from environment or default
                 pass
 
@@ -216,6 +217,8 @@ class SourceExecutor(BaseExecutor):
                 row_count = self._load_json(con, table, params)
             elif source_type in ["sqlite", "postgresql", "postgres"]:
                 row_count = self._load_database(con, source_type, table, params)
+            elif source_type == "starrocks":
+                row_count = self._load_starrocks(con, table, params)
             elif source_type == "hive":
                 row_count = self._load_hive(con, table, params)
             else:
@@ -680,6 +683,92 @@ class SourceExecutor(BaseExecutor):
             raise ExecutorExecutionError(
                 self.node.id,
                 f"Failed to load from PostgreSQL database '{database}', table '{table}': {str(e)}",
+                e
+            ) from e
+
+    def _load_starrocks(
+        self,
+        con: Any,
+        table: str,
+        params: Dict[str, Any]
+    ) -> int:
+        """
+        Load data from StarRocks into DuckDB view via pymysql.
+
+        Queries StarRocks via MySQL protocol, fetches results,
+        and creates a DuckDB view from the data.
+
+        Args:
+            con: DuckDB connection
+            table: Table name in StarRocks
+            params: Connection parameters (host, port, user, password, database, profile, query)
+
+        Returns:
+            Number of rows loaded
+        """
+        try:
+            from seeknal.connections.starrocks import create_starrocks_connection
+        except ImportError:
+            raise ExecutorExecutionError(
+                self.node.id,
+                "pymysql is required for StarRocks sources. Install with: pip install pymysql"
+            )
+
+        # Build connection config from params
+        conn_config = {
+            "host": params.get("host", "localhost"),
+            "port": params.get("port", 9030),
+            "user": params.get("user", "root"),
+            "password": params.get("password", ""),
+            "database": params.get("database", ""),
+        }
+
+        # Create schema and view names from node qualified name
+        node_id = self.node.id
+        if "." in node_id:
+            schema, view_name = node_id.split(".", 1)
+        else:
+            schema, view_name = "source", node_id
+
+        try:
+            sr_conn = create_starrocks_connection(conn_config)
+            cursor = sr_conn.cursor()
+
+            # Use custom query or default SELECT *
+            query = params.get("query", f"SELECT * FROM {table}")
+            cursor.execute(query)
+
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            cursor.close()
+            sr_conn.close()
+
+            if not rows:
+                # Create empty view with correct schema
+                col_defs = ", ".join(f'NULL AS "{col}"' for col in columns)
+                con.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+                con.execute(
+                    f"CREATE OR REPLACE VIEW {schema}.{view_name} AS SELECT {col_defs} WHERE FALSE"
+                )
+                return 0
+
+            # Create DuckDB view from fetched data
+            import pandas as pd
+            df = pd.DataFrame(rows, columns=columns)
+
+            # Register as DuckDB table then create view
+            con.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+            con.register(f"_sr_temp_{view_name}", df)
+            con.execute(
+                f"CREATE OR REPLACE VIEW {schema}.{view_name} AS SELECT * FROM _sr_temp_{view_name}"
+            )
+
+            return len(rows)
+
+        except Exception as e:
+            raise ExecutorExecutionError(
+                self.node.id,
+                f"Failed to load from StarRocks table '{table}': {str(e)}",
                 e
             ) from e
 
