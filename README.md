@@ -27,6 +27,16 @@ Seeknal is useful in multiple use cases including:
 
 Seeknal is designed as a comprehensive data processing tool that enables you to create an end-to-end pipeline by allowing you to utilize one or more data processing engines (such as Apache Spark combined with DuckDB). To facilitate execution across various engines, Seeknal defines the pipeline in JSON format, which the respective engine processes. In this context, the engines need to support JSON input for the pipeline to function correctly. Since some data processors do not naturally handle YAML input, we enhance these data processors to incorporate this feature, which we refer to as engines. These engines are located in the`engines` folder.
 
+## Documentation
+
+- **[Documentation Homepage](docs/index.md)** — Start here
+- **[CLI Reference](docs/reference/cli.md)** — All commands and flags
+- **[YAML Schema](docs/reference/yaml-schema.md)** — Pipeline YAML reference
+- **[Glossary](docs/concepts/glossary.md)** — Key term definitions
+- **Tutorials**: [YAML Pipelines](docs/tutorials/yaml-pipeline-tutorial.md) · [Python Pipelines](docs/tutorials/python-pipelines-tutorial.md) · [Mixed YAML + Python](docs/tutorials/mixed-yaml-python-pipelines.md)
+- **Guides**: [Testing & Audits](docs/guides/testing-and-audits.md) · [Semantic Layer](docs/guides/semantic-layer.md) · [Training to Serving](docs/guides/training-to-serving.md)
+- **Concepts**: [Point-in-Time Joins](docs/concepts/point-in-time-joins.md) · [Virtual Environments](docs/concepts/virtual-environments.md) · [Change Categorization](docs/concepts/change-categorization.md)
+
 ## Getting started
 We recommend to use uv for installing Seeknal. The following steps are expecting you to have [UV](https://docs.astral.sh/uv/guides/install-python/) installed.
 
