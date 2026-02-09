@@ -82,7 +82,7 @@ Expected output includes commands:
 - `draft` - Create YAML templates
 - `dry-run` - Validate and preview
 - `apply` - Apply changes to production
-- `parse` - Generate manifest
+- `plan` - Generate manifest (also: `parse`)
 - `run` - Execute the pipeline
 
 ---
@@ -450,8 +450,10 @@ Before running, validate all your YAML files.
 
 ### 5.1 Parse and Generate Manifest
 
+The `seeknal plan` command (or `seeknal parse` for backward compatibility) validates your YAML files and generates a manifest showing your pipeline structure:
+
 ```bash
-seeknal parse
+seeknal plan
 ```
 
 Expected output:
@@ -470,6 +472,8 @@ The manifest (`target/manifest.json`) contains:
 - Dependencies between nodes
 - Topological sort order
 - Metadata for each node
+
+> **Note:** `seeknal parse` also works as a backward-compatible alias for `seeknal plan`.
 
 ### 5.2 Show Execution Plan
 
@@ -1087,7 +1091,7 @@ features:
 **DO:**
 - ✅ Use `dry-run` before `apply` (if using draft workflow)
 - ✅ Use `--show-plan` before `run`
-- ✅ Run `parse` after applying changes
+- ✅ Run `plan` after applying changes
 - ✅ Commit `target/manifest.json` to version control
 - ✅ Use descriptive names and tags
 - ✅ Document complex transforms with comments in SQL
@@ -1212,7 +1216,7 @@ stages:
 validate-pipeline:
   stage: validate
   script:
-    - seeknal parse
+    - seeknal plan
     - seeknal run --show-plan
   only:
     - merge_requests
@@ -1220,7 +1224,7 @@ validate-pipeline:
 run-pipeline:
   stage: run
   script:
-    - seeknal parse
+    - seeknal plan
     - seeknal run
   only:
     - main
@@ -1249,12 +1253,12 @@ jobs:
 
       - name: Validate Pipeline
         run: |
-          seeknal parse
+          seeknal plan
           seeknal run --show-plan
 
       - name: Run Pipeline
         run: |
-          seeknal parse
+          seeknal plan
           seeknal run
 ```
 
@@ -1294,7 +1298,7 @@ For datasets larger than ~100M rows:
 cat target/manifest.json | python -m json.tool
 
 # Look for cycles or missing dependencies
-seeknal parse
+seeknal plan
 ```
 
 **Inspect execution state:**
@@ -2029,7 +2033,7 @@ Congratulations! You've learned:
 
 | Command | Purpose |
 |---------|---------|
-| `seeknal parse` | Generate manifest from YAML files |
+| `seeknal plan` | Generate manifest from YAML files |
 | `seeknal run --show-plan` | Show execution plan without running |
 | `seeknal run` | Execute pipeline (incremental) |
 | `seeknal run --full` | Run all nodes (ignore state) |

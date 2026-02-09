@@ -90,8 +90,10 @@ cd phase2-ml-eng/
 
 ### 2. Generate Manifest
 
+Validate the pipeline structure:
+
 ```bash
-seeknal parse
+seeknal plan
 ```
 
 Expected output:
@@ -102,6 +104,8 @@ Parsing project: phase2-ml-eng
   Nodes: 15
   Edges: 22
 ```
+
+> **Note:** `seeknal parse` also works as a backward-compatible alias.
 
 ### 3. Run Sequential Execution
 
@@ -322,9 +326,13 @@ Environments provide isolated workspaces to test feature changes without affecti
 
 ### 1. Create Experiment Environment
 
+Plan a new experimental environment:
+
 ```bash
-seeknal env plan experiment
+seeknal plan experiment
 ```
+
+> **Note:** `seeknal env plan experiment` also works as a backward-compatible alias.
 
 Output:
 ```
@@ -362,8 +370,10 @@ features:
 ### 3. Re-Plan
 
 ```bash
-seeknal env plan experiment
+seeknal plan experiment
 ```
+
+> **Note:** `seeknal env plan experiment` also works as a backward-compatible alias.
 
 Output:
 ```
@@ -392,9 +402,13 @@ Environment Plan:
 
 ### 4. Apply Experiment
 
+Execute the experiment with parallel processing:
+
 ```bash
-seeknal env apply experiment --parallel
+seeknal run --env experiment --parallel
 ```
+
+> **Note:** `seeknal env apply experiment --parallel` also works as a backward-compatible alias.
 
 Output:
 ```
@@ -447,8 +461,10 @@ features:
 ### 2. Plan Shows BREAKING
 
 ```bash
-seeknal env plan breaking-test
+seeknal plan breaking-test
 ```
+
+> **Note:** `seeknal env plan breaking-test` also works as a backward-compatible alias.
 
 Output:
 ```
@@ -528,18 +544,22 @@ Complete ML experiment lifecycle:
 ### 1. Plan (Preview Changes)
 
 ```bash
-seeknal env plan dev-model-v2
+seeknal plan dev-model-v2
 ```
 
 Analyzes changes, creates execution plan.
 
+> **Note:** `seeknal env plan dev-model-v2` also works as a backward-compatible alias.
+
 ### 2. Apply (Execute)
 
 ```bash
-seeknal env apply dev-model-v2 --parallel
+seeknal run --env dev-model-v2 --parallel
 ```
 
 Executes changed nodes, references production for unchanged nodes.
+
+> **Note:** `seeknal env apply dev-model-v2 --parallel` also works as a backward-compatible alias.
 
 ### 3. Validate Results
 
@@ -559,10 +579,12 @@ print(df)
 ### 4. Promote to Production
 
 ```bash
-seeknal env promote dev-model-v2 prod
+seeknal promote dev-model-v2
 ```
 
 Atomically copies environment outputs to production cache.
+
+> **Note:** `seeknal env promote dev-model-v2 prod` also works as a backward-compatible alias.
 
 ### 5. List Environments
 
@@ -595,20 +617,20 @@ git checkout -b feature/new-fraud-signal
 vim seeknal/feature_groups/13_feature_group_txn_features.yml
 
 # Plan in dev environment
-seeknal env plan dev
+seeknal plan dev
 
 # Apply and test
-seeknal env apply dev --parallel
+seeknal run --env dev --parallel
 ```
 
 ### 2. Staging
 
 ```bash
 # Promote to staging
-seeknal env promote dev staging
+seeknal promote dev staging
 
 # Run full pipeline in staging
-seeknal env apply staging --parallel --full
+seeknal run --env staging --parallel --full
 ```
 
 ### 3. Production
@@ -619,7 +641,7 @@ git checkout main
 git merge feature/new-fraud-signal
 
 # Promote to production
-seeknal env promote staging prod
+seeknal promote staging
 
 # Run production pipeline
 seeknal run --parallel
@@ -645,9 +667,9 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install seeknal
-      - run: seeknal parse
-      - run: seeknal env plan ci-test
-      - run: seeknal env apply ci-test --parallel --dry-run
+      - run: seeknal plan
+      - run: seeknal plan ci-test
+      - run: seeknal run --env ci-test --parallel --dry-run
 
   deploy:
     if: github.ref == 'refs/heads/main'
@@ -678,10 +700,15 @@ You've learned:
 |---------|---------|
 | `seeknal run --parallel` | Execute with parallel engine |
 | `seeknal run --parallel --max-workers N` | Limit parallelism |
-| `seeknal env plan <name>` | Create environment plan |
-| `seeknal env apply <name> --parallel` | Execute environment |
-| `seeknal env promote <from> <to>` | Promote environment |
+| `seeknal plan <name>` | Create environment plan |
+| `seeknal run --env <name> --parallel` | Execute environment |
+| `seeknal promote <from>` | Promote environment |
 | `seeknal env list` | Show all environments |
+
+**Backward-compatible aliases:**
+- `seeknal env plan <name>` → `seeknal plan <name>`
+- `seeknal env apply <name>` → `seeknal run --env <name>`
+- `seeknal env promote <from> <to>` → `seeknal promote <from>`
 
 ### Performance Guidelines
 

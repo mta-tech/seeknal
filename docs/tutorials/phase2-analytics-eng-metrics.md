@@ -18,8 +18,10 @@ Copy source YAMLs from `examples/phase2-analytics-eng/` to `workflows/`:
 - `03_source_customers.yml` — customer profiles
 
 ```bash
-seeknal parse workflows/  # ✓ Parsed 3 sources, generated manifest.json
+seeknal plan workflows/  # ✓ Parsed 3 sources, generated manifest.json
 ```
+
+> **Note:** `seeknal parse` also works as a backward-compatible alias.
 
 ## 2. Define Transforms
 
@@ -53,7 +55,7 @@ Copy aggregation YAMLs from `examples/phase2-analytics-eng/`:
 - `07_aggregation_churn_analysis.yml` — subscription stability metrics
 
 ```bash
-seeknal parse workflows/  # ✓ 3 sources, 2 transforms, 2 aggregations, 7 nodes
+seeknal plan workflows/  # ✓ 3 sources, 2 transforms, 2 aggregations, 7 nodes
 ```
 
 ## 4. Make a Schema Change (Non-Breaking)
@@ -86,25 +88,30 @@ seeknal diff workflows/
 
 ## 6. Environment Safety
 
+Plan the change in a staging environment:
+
 ```bash
-seeknal env create staging
-seeknal env plan staging --path workflows/
+seeknal plan staging --path workflows/
 # Environment: staging, Current state: 7 nodes
 # [BREAKING] transform.customer_metrics
 #     Downstream: aggregation.churn_rate_analysis
 # Action required: Update downstream consumers first
 ```
 
+> **Note:** `seeknal env plan staging` also works as a backward-compatible alias.
+
 ## 7. Apply and Promote
 
 Update `churn_analysis.yml` feature column to `total_monthly_recurring_revenue`.
 
 ```bash
-seeknal env apply staging --path workflows/
+seeknal run --env staging --path workflows/
 seeknal run --env staging --select +churn_rate_analysis
-seeknal env promote staging production
+seeknal promote staging
 # ✓ Rebuilt transform + aggregation, promoted staging → production
 ```
+
+> **Note:** `seeknal env apply staging` and `seeknal env promote staging production` also work as backward-compatible aliases.
 
 ## 8. Change Categorization Reference
 

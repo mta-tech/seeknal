@@ -284,6 +284,56 @@ def handle_cli_error(error_message: str = "Operation failed"):
     return decorator
 
 
+def _build_manifest_from_dag(dag_builder, project_name: str):
+    """Build a Manifest from a DAGBuilder result.
+
+    Shared by plan, parse, and env_plan commands to avoid duplicating
+    the node_type_map and conversion logic.
+
+    Args:
+        dag_builder: A built DAGBuilder instance with nodes and edges.
+        project_name: Project name for the manifest metadata.
+
+    Returns:
+        A Manifest instance populated from the DAGBuilder.
+    """
+    from seeknal.dag.manifest import Manifest, Node, NodeType as ManifestNodeType
+
+    node_type_map = {
+        "source": ManifestNodeType.SOURCE,
+        "transform": ManifestNodeType.TRANSFORM,
+        "feature_group": ManifestNodeType.FEATURE_GROUP,
+        "model": ManifestNodeType.MODEL,
+        "rule": ManifestNodeType.RULE,
+        "aggregation": ManifestNodeType.AGGREGATION,
+        "second_order_aggregation": ManifestNodeType.SECOND_ORDER_AGGREGATION,
+        "exposure": ManifestNodeType.EXPOSURE,
+        "python": ManifestNodeType.PYTHON,
+        "semantic_model": ManifestNodeType.SEMANTIC_MODEL,
+        "metric": ManifestNodeType.METRIC,
+    }
+
+    manifest = Manifest(project=project_name)
+    for node_id, node in dag_builder.nodes.items():
+        kind_str = node.kind.value if hasattr(node.kind, 'value') else str(node.kind)
+        manifest_node_type = node_type_map.get(kind_str, ManifestNodeType.SOURCE)
+        manifest.add_node(Node(
+            id=node_id,
+            name=node.name,
+            node_type=manifest_node_type,
+            description=node.yaml_data.get("description") if hasattr(node, 'yaml_data') else None,
+            tags=list(node.tags) if hasattr(node, 'tags') and node.tags else [],
+            config=node.yaml_data if hasattr(node, 'yaml_data') else {},
+            file_path=node.file_path if hasattr(node, 'file_path') else None,
+        ))
+
+    for node_id in dag_builder.nodes:
+        for downstream_id in dag_builder.get_downstream(node_id):
+            manifest.add_edge(node_id, downstream_id)
+
+    return manifest
+
+
 @app.command()
 def info():
     """Show version information for Seeknal and its dependencies."""
@@ -439,9 +489,16 @@ __pycache__/
         typer.echo("")
         _echo_info("Next steps:")
         typer.echo("  1. Edit profiles.yml to configure your data sources")
-        typer.echo("  2. Create sources: seeknal draft source <name>")
-        typer.echo("  3. Create transforms: seeknal draft transform <name>")
-        typer.echo("  4. Run pipeline: seeknal run")
+        typer.echo("  2. Create sources:     seeknal draft source <name>")
+        typer.echo("  3. Validate drafts:    seeknal dry-run draft_source_<name>.yml")
+        typer.echo("  4. Apply to project:   seeknal apply draft_source_<name>.yml")
+        typer.echo("  5. Plan execution:     seeknal plan")
+        typer.echo("  6. Run pipeline:       seeknal run")
+        typer.echo("")
+        _echo_info("Advanced:")
+        typer.echo("  - Test in isolation:   seeknal plan dev && seeknal run --env dev")
+        typer.echo("  - Promote to prod:     seeknal promote dev")
+        typer.echo("  - Parallel execution:  seeknal run --parallel")
 
     except Exception as e:
         _echo_error(f"Failed to initialize project: {e}")
@@ -509,6 +566,11 @@ def run(
         None, "--materialize/--no-materialize",
         help="Enable/disable Iceberg materialization (overrides node config)"
     ),
+    # Environment flag
+    env: Optional[str] = typer.Option(
+        None, "--env",
+        help="Run in isolated virtual environment (requires a plan: seeknal env plan <name>)"
+    ),
 ):
     """Execute a feature transformation flow or YAML pipeline.
 
@@ -551,9 +613,31 @@ def run(
         # Run in parallel with custom worker count
         seeknal run --parallel --max-workers 8
 
+        # Run in an isolated environment
+        seeknal run --env dev
+
+        # Run in environment with parallel execution
+        seeknal run --env dev --parallel
+
     **Legacy Flow Examples:**
         seeknal run my_flow --start-date 2024-01-01
     """
+    # Environment mode: delegate to shared helper
+    if env is not None:
+        from pathlib import Path
+        project_path = Path.cwd().resolve()
+        _run_in_environment(
+            env_name=env,
+            project_path=project_path,
+            force=False,
+            parallel=parallel,
+            max_workers=max_workers,
+            continue_on_error=continue_on_error,
+            dry_run=dry_run,
+            show_plan=show_plan,
+        )
+        return
+
     # Determine mode: legacy Flow vs YAML pipeline
     if flow_name is not None:
         # Legacy mode: run Flow object
@@ -776,6 +860,31 @@ def _run_yaml_pipeline(
         return
 
     _echo_info(f"Nodes to run: {len(nodes_to_run)}")
+
+    # Auto-parallel suggestion
+    if not parallel:
+        layers: dict[int, list[str]] = {}
+        depth: dict[str, int] = {}
+        for node_id in execution_order:
+            deps = dag_upstream.get(node_id, set())
+            if not deps:
+                depth[node_id] = 0
+            else:
+                depth[node_id] = max(depth.get(d, 0) for d in deps) + 1
+            layer = depth[node_id]
+            if layer not in layers:
+                layers[layer] = []
+            layers[layer].append(node_id)
+
+        if layers:
+            widest_layer_num, widest_layer_nodes = max(
+                layers.items(), key=lambda x: len(x[1])
+            )
+            if len(widest_layer_nodes) > 3:
+                _echo_info(
+                    f"Tip: This pipeline has {len(widest_layer_nodes)} independent nodes "
+                    f"in layer {widest_layer_num}. Use --parallel for faster execution."
+                )
 
     # Parallel execution mode
     if parallel:
@@ -2103,9 +2212,8 @@ def parse(
         seeknal parse --no-diff
     """
     from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
-    from seeknal.dag.manifest import Manifest, Node, NodeType as ManifestNodeType
+    from seeknal.dag.manifest import Manifest
     from seeknal.dag.diff import ManifestDiff
-    import json
 
     # Determine project name
     if project is None:
@@ -2144,37 +2252,7 @@ def parse(
             raise typer.Exit(1)
 
         # Convert DAGBuilder results to Manifest format
-        manifest = Manifest(
-            project=project,
-            seeknal_version=_get_version()
-        )
-
-        # Map workflow NodeType to manifest NodeType
-        node_type_map = {
-            "source": ManifestNodeType.SOURCE,
-            "transform": ManifestNodeType.TRANSFORM,
-            "feature_group": ManifestNodeType.FEATURE_GROUP,
-            "model": ManifestNodeType.MODEL,
-            "aggregation": ManifestNodeType.AGGREGATION,
-            "rule": ManifestNodeType.RULE,
-            "exposure": ManifestNodeType.EXPOSURE,
-        }
-
-        # Add nodes to manifest
-        for node_id, dag_node in dag_builder.nodes.items():
-            kind_str = dag_node.kind.value if hasattr(dag_node.kind, 'value') else str(dag_node.kind)
-            manifest_node = Node(
-                id=node_id,
-                name=dag_node.name,
-                node_type=node_type_map.get(kind_str, ManifestNodeType.SOURCE),
-                description=dag_node.yaml_data.get("description"),
-                config=dag_node.yaml_data,
-            )
-            manifest.add_node(manifest_node)
-
-        # Add edges to manifest
-        for edge in dag_builder.edges:
-            manifest.add_edge(from_node=edge.from_node, to_node=edge.to_node)
+        manifest = _build_manifest_from_dag(dag_builder, project)
 
         # Report any parse errors as warnings
         errors = dag_builder._parse_errors
@@ -2258,6 +2336,254 @@ def parse(
     except Exception as e:
         _echo_error(f"Parse failed: {e}")
         raise typer.Exit(1)
+
+
+@app.command()
+@handle_cli_error("Plan failed")
+def plan(
+    env_name: Optional[str] = typer.Argument(
+        None,
+        help="Environment name (optional). Without: show changes vs last run. With: create environment plan."
+    ),
+    project_path: Path = typer.Option(".", help="Project directory"),
+):
+    """Analyze changes and show execution plan.
+
+    Without environment: shows changes since last run and saves manifest.
+    With environment: creates an isolated environment plan with change categorization.
+
+    Examples:
+        seeknal plan              # What changed since last run?
+        seeknal plan dev          # Plan changes in dev environment
+        seeknal plan staging      # Plan changes in staging
+    """
+    from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
+
+    project_path = Path(project_path).resolve()
+    target_path = project_path / "target"
+
+    # Step 1: Build DAG
+    _echo_info("Building DAG from seeknal/ directory...")
+
+    try:
+        dag_builder = DAGBuilder(project_path=project_path)
+        dag_builder.build()
+    except ValueError as e:
+        _echo_error(f"DAG build failed: {e}")
+        raise typer.Exit(1)
+    except CycleDetectedError as e:
+        _echo_error(f"Cycle detected in DAG: {e.message}")
+        raise typer.Exit(1)
+    except MissingDependencyError as e:
+        _echo_error(f"Missing dependency: {e.message}")
+        raise typer.Exit(1)
+
+    # Report parse warnings
+    errors = dag_builder.get_parse_errors()
+    if errors:
+        _echo_warning(f"Parse warnings: {len(errors)}")
+        for error in errors:
+            typer.echo(f"  - {error}")
+
+    # Step 2: Convert to Manifest
+    manifest = _build_manifest_from_dag(dag_builder, project_path.name)
+
+    _echo_success(f"DAG built: {len(manifest.nodes)} nodes, {len(manifest.edges)} edges")
+
+    # Show node summary by type
+    if manifest.nodes:
+        typer.echo("")
+        typer.echo("Node Summary:")
+        type_counts: dict[str, int] = {}
+        for node in manifest.nodes.values():
+            node_type_str = node.node_type.value
+            type_counts[node_type_str] = type_counts.get(node_type_str, 0) + 1
+        for node_type, count in sorted(type_counts.items()):
+            typer.echo(f"  - {node_type}: {count}")
+
+    if env_name is not None:
+        # ---- Environment mode ----
+        from seeknal.workflow.environment import EnvironmentManager
+
+        _echo_info(f"\nPlanning environment '{env_name}'...")
+
+        manager = EnvironmentManager(target_path)
+        env_plan_result = manager.plan(env_name, manifest)
+
+        # Display categorized changes
+        typer.echo("")
+        _echo_info(f"Environment Plan: {env_name}")
+        _echo_info("=" * 60)
+
+        if not env_plan_result.categorized_changes:
+            _echo_success("No changes detected.")
+            return
+
+        breaking = sum(1 for v in env_plan_result.categorized_changes.values() if v == "breaking")
+        non_breaking = sum(
+            1 for v in env_plan_result.categorized_changes.values() if v == "non_breaking"
+        )
+        metadata_count = sum(
+            1 for v in env_plan_result.categorized_changes.values() if v == "metadata"
+        )
+
+        if breaking > 0:
+            _echo_warning(f"  BREAKING changes: {breaking}")
+        if non_breaking > 0:
+            _echo_info(f"  Non-breaking changes: {non_breaking}")
+        if metadata_count > 0:
+            _echo_info(f"  Metadata-only changes: {metadata_count}")
+        if env_plan_result.added_nodes:
+            _echo_info(f"  New nodes: {len(env_plan_result.added_nodes)}")
+        if env_plan_result.removed_nodes:
+            _echo_info(f"  Removed nodes: {len(env_plan_result.removed_nodes)}")
+
+        _echo_info(f"\n  Total nodes to execute: {env_plan_result.total_nodes_to_execute}")
+
+        env_dir = target_path / "environments" / env_name
+        _echo_success(f"Plan saved to {env_dir / 'plan.json'}")
+
+    else:
+        # ---- Production mode (no environment) ----
+        from seeknal.dag.manifest import Manifest
+        from seeknal.dag.diff import ManifestDiff
+        from seeknal.workflow.state import load_state, calculate_node_hash, get_nodes_to_run
+
+        # Load existing manifest for diff
+        manifest_file = target_path / "manifest.json"
+        old_manifest = None
+        if manifest_file.exists():
+            try:
+                old_manifest = Manifest.load(str(manifest_file))
+            except Exception:
+                old_manifest = None
+
+        # Show diff if we have an old manifest
+        if old_manifest is not None:
+            diff = ManifestDiff.compare(old_manifest, manifest)
+            typer.echo("")
+            if diff.has_changes():
+                typer.echo(typer.style("Changes detected:", bold=True))
+
+                if diff.added_nodes:
+                    typer.echo(typer.style(
+                        f"  Added ({len(diff.added_nodes)}):", fg=typer.colors.GREEN
+                    ))
+                    for node_id in sorted(diff.added_nodes.keys()):
+                        typer.echo(typer.style(f"    + {node_id}", fg=typer.colors.GREEN))
+
+                if diff.removed_nodes:
+                    typer.echo(typer.style(
+                        f"  Removed ({len(diff.removed_nodes)}):", fg=typer.colors.RED
+                    ))
+                    for node_id in sorted(diff.removed_nodes.keys()):
+                        typer.echo(typer.style(f"    - {node_id}", fg=typer.colors.RED))
+
+                if diff.modified_nodes:
+                    typer.echo(typer.style(
+                        f"  Modified ({len(diff.modified_nodes)}):", fg=typer.colors.YELLOW
+                    ))
+                    for node_id in sorted(diff.modified_nodes.keys()):
+                        change = diff.modified_nodes[node_id]
+                        fields = ", ".join(change.changed_fields)
+                        typer.echo(typer.style(
+                            f"    ~ {node_id} ({fields})", fg=typer.colors.YELLOW
+                        ))
+
+                if diff.added_edges:
+                    typer.echo(typer.style(
+                        f"  Added edges ({len(diff.added_edges)}):", fg=typer.colors.GREEN
+                    ))
+                    for edge in diff.added_edges:
+                        typer.echo(typer.style(
+                            f"    + {edge.from_node} -> {edge.to_node}", fg=typer.colors.GREEN
+                        ))
+
+                if diff.removed_edges:
+                    typer.echo(typer.style(
+                        f"  Removed edges ({len(diff.removed_edges)}):", fg=typer.colors.RED
+                    ))
+                    for edge in diff.removed_edges:
+                        typer.echo(typer.style(
+                            f"    - {edge.from_node} -> {edge.to_node}", fg=typer.colors.RED
+                        ))
+
+                typer.echo("")
+                typer.echo(f"Summary: {diff.summary()}")
+            else:
+                _echo_info("No changes detected since last parse")
+        else:
+            _echo_info("No previous manifest found (first run)")
+
+        # Save updated manifest
+        target_path.mkdir(parents=True, exist_ok=True)
+        manifest.save(str(manifest_file))
+        _echo_success(f"Manifest saved to {manifest_file}")
+
+        # Load run state and show execution plan
+        state_path = target_path / "run_state.json"
+        old_state = load_state(state_path)
+
+        # Calculate current hashes
+        current_hashes: dict[str, str] = {}
+        for node_id, node in dag_builder.nodes.items():
+            try:
+                node_hash = calculate_node_hash(node.yaml_data, Path(node.file_path))
+                current_hashes[node_id] = node_hash
+            except Exception:
+                pass
+
+        # Build DAG adjacency for downstream propagation
+        dag_adjacency: dict[str, set[str]] = {}
+        for node_id in dag_builder.nodes:
+            dag_adjacency[node_id] = dag_builder.get_downstream(node_id)
+
+        nodes_to_run = get_nodes_to_run(current_hashes, old_state, dag_adjacency)
+
+        # Show execution plan
+        try:
+            execution_order = dag_builder.topological_sort()
+        except CycleDetectedError as e:
+            _echo_error(f"Cycle detected: {e.message}")
+            raise typer.Exit(1)
+
+        typer.echo("")
+        typer.echo(typer.style("Execution Plan:", bold=True))
+        typer.echo("-" * 60)
+
+        for idx, node_id in enumerate(execution_order, 1):
+            node = dag_builder.nodes[node_id]
+            if node_id in nodes_to_run:
+                status = "RUN"
+                status_msg = typer.style(status, fg=typer.colors.GREEN, bold=True)
+            elif old_state and node_id in old_state.nodes and old_state.nodes[node_id].is_success():
+                status = "CACHED"
+                status_msg = typer.style(status, fg=typer.colors.BLUE)
+            else:
+                status = "SKIP"
+                status_msg = typer.style(status, fg=typer.colors.RESET)
+
+            tags_str = f" [{', '.join(node.tags)}]" if node.tags else ""
+            typer.echo(f"  {idx:2d}. {status_msg} {node.name}{tags_str}")
+
+        typer.echo("")
+        _echo_info(f"Total: {len(execution_order)} nodes, {len(nodes_to_run)} to run")
+
+
+@app.command()
+@handle_cli_error("Promote failed")
+def promote(
+    env_name: str = typer.Argument(..., help="Environment to promote"),
+    target: str = typer.Argument("prod", help="Target (default: prod)"),
+    project_path: Path = typer.Option(".", help="Project directory"),
+):
+    """Promote environment changes to production.
+
+    Examples:
+        seeknal promote dev           # Promote dev to production
+        seeknal promote staging prod  # Promote staging to prod
+    """
+    _promote_environment(env_name, target, project_path)
 
 
 @app.command()
@@ -2860,8 +3186,6 @@ def env_plan(
     """Preview changes in a virtual environment."""
     from seeknal.workflow.environment import EnvironmentManager
     from seeknal.workflow.dag import DAGBuilder
-    from seeknal.dag.manifest import Manifest, Node, NodeType as ManifestNodeType
-    from seeknal.dag.diff import ChangeCategory
 
     project_path = Path(project_path).resolve()
     target_path = project_path / "target"
@@ -2872,36 +3196,8 @@ def env_plan(
     dag_builder = DAGBuilder(project_path=project_path)
     dag_builder.build()
 
-    # Map workflow NodeType to manifest NodeType
-    node_type_map = {
-        "source": ManifestNodeType.SOURCE,
-        "transform": ManifestNodeType.TRANSFORM,
-        "feature_group": ManifestNodeType.FEATURE_GROUP,
-        "model": ManifestNodeType.MODEL,
-        "rule": ManifestNodeType.RULE,
-        "aggregation": ManifestNodeType.AGGREGATION,
-        "second_order_aggregation": ManifestNodeType.SECOND_ORDER_AGGREGATION,
-        "exposure": ManifestNodeType.EXPOSURE,
-        "python": ManifestNodeType.PYTHON,
-        "semantic_model": ManifestNodeType.SEMANTIC_MODEL,
-        "metric": ManifestNodeType.METRIC,
-    }
-
-    # Convert to Manifest
-    manifest = Manifest(project=project_path.name)
-    for node_id, node in dag_builder.nodes.items():
-        manifest_node_type = node_type_map.get(node.kind.value, ManifestNodeType.SOURCE)
-        manifest.add_node(Node(
-            id=node_id,
-            name=node.name,
-            node_type=manifest_node_type,
-            tags=list(node.tags) if node.tags else [],
-            config=node.yaml_data,
-            file_path=node.file_path,
-        ))
-    for node_id in dag_builder.nodes:
-        for downstream_id in dag_builder.get_downstream(node_id):
-            manifest.add_edge(node_id, downstream_id)
+    # Convert to Manifest using shared helper
+    manifest = _build_manifest_from_dag(dag_builder, project_path.name)
 
     manager = EnvironmentManager(target_path)
     plan = manager.plan(env_name, manifest)
@@ -2936,26 +3232,36 @@ def env_plan(
     _echo_success(f"Plan saved to {env_dir / 'plan.json'}")
 
 
-@env_app.command("apply")
-@handle_cli_error("Environment apply failed")
-def env_apply(
-    env_name: str = typer.Argument(..., help="Environment name"),
-    force: bool = typer.Option(False, help="Apply even if plan is stale"),
-    parallel: bool = typer.Option(False, "--parallel", help="Run nodes in parallel"),
-    max_workers: int = typer.Option(4, "--max-workers", help="Max parallel workers"),
-    continue_on_error: bool = typer.Option(False, "--continue-on-error", help="Continue past failures"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would execute without running"),
-    project_path: Path = typer.Option(".", help="Project directory"),
-):
+def _run_in_environment(
+    env_name: str,
+    project_path: Path,
+    force: bool = False,
+    parallel: bool = False,
+    max_workers: int = 4,
+    continue_on_error: bool = False,
+    dry_run: bool = False,
+    show_plan: bool = False,
+) -> None:
     """Execute a plan in a virtual environment.
 
-    Validates the saved plan, then executes changed nodes using the
-    environment-specific cache directory. Unchanged nodes reference
-    production outputs (zero-copy).
+    Shared helper used by both `seeknal run --env` and `seeknal env apply`.
+
+    Validates the saved plan, sets up the env cache directory, copies
+    production refs for unchanged nodes, and executes changed nodes
+    using DAGRunner with the env-specific target path.
+
+    Args:
+        env_name: Name of the environment to apply.
+        project_path: Resolved project root directory.
+        force: Apply even if the plan is stale.
+        parallel: Execute independent nodes in parallel.
+        max_workers: Maximum number of parallel workers.
+        continue_on_error: Continue execution after failures.
+        dry_run: Show what would execute without running.
+        show_plan: Show execution plan and exit (no execution).
     """
     from seeknal.workflow.environment import EnvironmentManager
 
-    project_path = Path(project_path).resolve()
     target_path = project_path / "target"
 
     manager = EnvironmentManager(target_path)
@@ -2970,6 +3276,15 @@ def env_apply(
 
     if not nodes_to_execute:
         _echo_success("No nodes to execute (metadata-only changes).")
+        return
+
+    if show_plan:
+        _echo_info(f"Environment '{env_name}' execution plan:")
+        _echo_info(f"  {len(nodes_to_execute)} node(s) to execute:")
+        for node_id in sorted(nodes_to_execute):
+            node = manifest.get_node(node_id)
+            node_name = node.name if node else node_id
+            _echo_info(f"    - {node_name}")
         return
 
     _echo_info(f"Executing {len(nodes_to_execute)} node(s) in environment '{env_name}'...")
@@ -3053,14 +3368,40 @@ def env_apply(
         )
 
 
-@env_app.command("promote")
-@handle_cli_error("Environment promote failed")
-def env_promote(
-    from_env: str = typer.Argument(..., help="Source environment"),
-    to_env: str = typer.Argument("prod", help="Target (default: prod)"),
+@env_app.command("apply")
+@handle_cli_error("Environment apply failed")
+def env_apply(
+    env_name: str = typer.Argument(..., help="Environment name"),
+    force: bool = typer.Option(False, help="Apply even if plan is stale"),
+    parallel: bool = typer.Option(False, "--parallel", help="Run nodes in parallel"),
+    max_workers: int = typer.Option(4, "--max-workers", help="Max parallel workers"),
+    continue_on_error: bool = typer.Option(False, "--continue-on-error", help="Continue past failures"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would execute without running"),
     project_path: Path = typer.Option(".", help="Project directory"),
 ):
-    """Promote environment to production."""
+    """Execute a plan in a virtual environment.
+
+    Validates the saved plan, then executes changed nodes using the
+    environment-specific cache directory. Unchanged nodes reference
+    production outputs (zero-copy).
+    """
+    project_path = Path(project_path).resolve()
+    _run_in_environment(
+        env_name=env_name,
+        project_path=project_path,
+        force=force,
+        parallel=parallel,
+        max_workers=max_workers,
+        continue_on_error=continue_on_error,
+        dry_run=dry_run,
+    )
+
+
+def _promote_environment(from_env: str, to_env: str, project_path: Path):
+    """Shared logic for promoting an environment.
+
+    Used by both `seeknal promote` and `seeknal env promote`.
+    """
     from seeknal.workflow.environment import EnvironmentManager
 
     project_path = Path(project_path).resolve()
@@ -3093,6 +3434,17 @@ def env_promote(
     manager.promote(from_env, to_env)
 
     _echo_success(f"Environment '{from_env}' promoted to {target_label}.")
+
+
+@env_app.command("promote")
+@handle_cli_error("Environment promote failed")
+def env_promote(
+    from_env: str = typer.Argument(..., help="Source environment"),
+    to_env: str = typer.Argument("prod", help="Target (default: prod)"),
+    project_path: Path = typer.Option(".", help="Project directory"),
+):
+    """Promote environment to production."""
+    _promote_environment(from_env, to_env, project_path)
 
 
 @env_app.command("list")

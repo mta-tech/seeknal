@@ -175,8 +175,10 @@ Expected output:
 
 ### 2.1 Parse the Pipeline
 
+Validate the pipeline structure using the unified `plan` command:
+
 ```bash
-seeknal parse
+seeknal plan
 ```
 
 Expected output:
@@ -187,6 +189,8 @@ Parsing project: seeknal-phase2-tutorial
   Nodes: 8
   Edges: 7
 ```
+
+> **Note:** `seeknal parse` also works as a backward-compatible alias.
 
 ### 2.2 Run the Full Pipeline
 
@@ -303,9 +307,13 @@ EOF
 
 ### 4.1 Create a Plan
 
+Use the unified `plan` command with an environment:
+
 ```bash
-seeknal env plan dev
+seeknal plan dev
 ```
+
+> **Note:** `seeknal env plan dev` also works as a backward-compatible alias.
 
 Expected output:
 ```
@@ -369,9 +377,13 @@ The plan shows:
 
 ### 5.1 Execute the Plan
 
+Use the unified `run` command with an environment:
+
 ```bash
-seeknal env apply dev
+seeknal run --env dev
 ```
+
+> **Note:** `seeknal env apply dev` also works as a backward-compatible alias.
 
 Expected output:
 ```
@@ -417,8 +429,10 @@ Execution Summary
 For faster execution, use the `--parallel` flag:
 
 ```bash
-seeknal env apply dev --parallel
+seeknal run --env dev --parallel
 ```
+
+> **Note:** `seeknal env apply dev --parallel` also works as a backward-compatible alias.
 
 Expected output:
 ```
@@ -498,11 +512,13 @@ This shows execution history and node hashes for the dev environment.
 
 ### 7.1 Promote Changes
 
-Once you've verified the dev environment, promote to production:
+Once you've verified the dev environment, promote to production using the unified command:
 
 ```bash
-seeknal env promote dev prod
+seeknal promote dev
 ```
+
+> **Note:** `seeknal env promote dev prod` also works as a backward-compatible alias.
 
 Expected output:
 ```
@@ -599,8 +615,10 @@ EOF
 ### 8.2 Plan the Breaking Change
 
 ```bash
-seeknal env plan staging
+seeknal plan staging
 ```
+
+> **Note:** `seeknal env plan staging` also works as a backward-compatible alias.
 
 Expected output:
 ```
@@ -763,14 +781,19 @@ You now know how to:
 
 | Command | Purpose |
 |---------|---------|
-| `seeknal env plan <name>` | Preview changes in a virtual environment |
-| `seeknal env apply <name>` | Execute plan in environment |
-| `seeknal env apply <name> --parallel` | Execute with parallel processing |
-| `seeknal env promote <from> <to>` | Promote environment changes |
+| `seeknal plan <name>` | Preview changes in a virtual environment |
+| `seeknal run --env <name>` | Execute plan in environment |
+| `seeknal run --env <name> --parallel` | Execute with parallel processing |
+| `seeknal promote <from>` | Promote environment changes |
 | `seeknal env list` | List all environments |
 | `seeknal env delete <name>` | Delete an environment |
 | `seeknal run --parallel` | Run pipeline with parallel execution |
 | `seeknal run --parallel --max-workers N` | Set max parallel workers |
+
+**Backward-compatible aliases:**
+- `seeknal env plan <name>` → `seeknal plan <name>`
+- `seeknal env apply <name>` → `seeknal run --env <name>`
+- `seeknal env promote <from> <to>` → `seeknal promote <from>`
 
 ### Change Categories
 
