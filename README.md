@@ -87,9 +87,14 @@ To install Seeknal, follow these steps:
     ```
 
 Congratulation!
-Your seeknal has been installed on your machine and ready to use in your projects. To see it in action, check out:
-- `feature-store-demo.ipynb` - Spark-based feature store demo
-- `duckdb_feature_store_demo.ipynb` - DuckDB-based feature store demo (73K real data rows)
+Your seeknal has been installed on your machine and ready to use in your projects.
+
+**Next Steps:**
+
+- **For the CLI workflow (recommended for teams)**: Try the [Workflow Tutorial](docs/tutorials/workflow-tutorial-ecommerce.md) to learn the `draft → dry-run → apply` pattern for creating production-grade pipelines
+- **For Python API users**: Check out the demo notebooks:
+  - `feature-store-demo.ipynb` - Spark-based feature store demo
+  - `duckdb_feature_store_demo.ipynb` - DuckDB-based feature store demo (73K real data rows)
 
 ## DuckDB Integration
 

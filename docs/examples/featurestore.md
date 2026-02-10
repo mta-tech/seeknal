@@ -2,6 +2,8 @@
 
 This guide demonstrates how to create and manage feature groups in Seeknal's Feature Store. Feature groups are the primary way to organize, store, and serve features for machine learning models.
 
+> **Note:** This guide demonstrates Seeknal's **Python API** for programmatic feature group creation and management. For a **CLI-based workflow** using the `draft → dry-run → apply` pattern with YAML definitions, see the [Workflow Tutorial](../tutorials/workflow-tutorial-ecommerce.md). Both approaches are valid - choose based on your workflow preference.
+
 ## Prerequisites
 
 Before running these examples, ensure you have:

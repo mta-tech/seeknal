@@ -12,6 +12,7 @@ This comprehensive guide takes you from installation to your first materialized 
 - [What You'll Learn](#what-youll-learn)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
+- [Development Approaches](#development-approaches)
 - [Quick Start Tutorial](#quick-start-tutorial)
   - [Part 1: Load and Explore Data](#part-1-load-and-explore-data-5-minutes)
   - [Part 2: Feature Engineering](#part-2-feature-engineering-10-minutes)
@@ -47,6 +48,75 @@ Unlike other feature stores that require complex infrastructure setup, Seeknal:
 
 ---
 
+## Development Approaches
+
+Seeknal supports two development workflows. Choose based on your preference:
+
+### Approach 1: CLI-Based Workflow (Recommended for Teams)
+
+The **draft workflow** provides a structured, team-friendly approach:
+
+```bash
+# 1. Create a draft with scaffolding
+seeknal draft source raw_data --description "Raw customer data"
+
+# 2. Edit the generated template
+# Edit draft_source_raw_data.yml
+
+# 3. Preview what will happen
+seeknal dry-run draft_source_raw_data.yml
+
+# 4. Apply to create the actual source
+seeknal apply draft_source_raw_data.yml
+```
+
+**Benefits:**
+- Validated templates prevent errors
+- Preview changes before applying
+- Git-friendly YAML files
+- Works with CI/CD pipelines
+- **If you're coming from dbt, this will feel familiar!**
+
+**When to use:** Team collaboration, production pipelines, GitOps workflows
+
+**Learn more:** [Workflow Tutorial](./tutorials/workflow-tutorial-ecommerce.md)
+
+### Approach 2: Python API (This Tutorial)
+
+The **Python API** provides programmatic control:
+
+```python
+from seeknal.tasks.duckdb import DuckDBTask
+
+# Create task and define transformation
+task = DuckDBTask()
+task.add_input(dataframe=arrow_table)
+task.add_sql("SELECT user_id, SUM(amount) FROM __THIS__ GROUP BY user_id")
+result = task.transform()
+```
+
+**Benefits:**
+- Full Python flexibility
+- Jupyter Notebook compatible
+- Interactive development
+- Direct debugging
+
+**When to use:** Exploratory analysis, notebooks, data science workflows
+
+**Learn more:** Continue with this tutorial
+
+### Choosing Your Approach
+
+| Factor | CLI Workflow | Python API |
+|--------|--------------|------------|
+| **Team size** | Multiple developers | Individual or small team |
+| **Deployment** | Production pipelines | Notebooks & scripts |
+| **Version control** | Git-friendly YAML | Standard Python |
+| **Learning curve** | Moderate | Low (if you know Python) |
+| **Use case** | Production features | Exploratory analysis |
+
+---
+
 ## What You'll Learn
 
 By completing this guide, you will:
@@ -57,6 +127,8 @@ By completing this guide, you will:
 4. **Aggregate user behavior** into ML-ready features
 5. **Save features** in efficient formats (Parquet, CSV)
 6. **Understand** when to use DuckDB vs Spark
+
+> **Note:** This tutorial teaches Seeknal's **Python API** for programmatic feature engineering. If you prefer a **CLI-based workflow** with YAML definitions and the `draft → dry-run → apply` pattern, see the [Workflow Tutorial](./tutorials/workflow-tutorial-ecommerce.md). Both approaches are valid - choose based on your workflow preference.
 
 ---
 
@@ -683,10 +755,18 @@ task.add_sql("SELECT user_id, SUM(amount) FROM __THIS__ GROUP BY user_id")
 
 ## Next Steps
 
-### Learn More
+### Choose Your Path
 
+**For production-ready, team-based development:**
+- **[Workflow Tutorial: E-commerce Analytics Pipeline](./tutorials/workflow-tutorial-ecommerce.md)** - Learn the `draft → dry-run → apply` CLI workflow for creating production-grade pipelines with YAML definitions.
+
+**For continued Python API learning:**
 - **[Spark Transformers Reference](./spark-transformers-reference.md)** - Production-scale feature engineering
 - **[Feature Store Examples](./examples/featurestore.md)** - Complete feature store workflow
+- **[Python Pipelines Tutorial](./tutorials/python-pipelines-tutorial.md)** - Advanced Python pipeline patterns
+
+### Learn More
+
 - **[API Reference](https://github.com/mta-tech/seeknal)** - Full documentation
 
 ### Try These Exercises

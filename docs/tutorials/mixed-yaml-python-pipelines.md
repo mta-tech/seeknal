@@ -2,6 +2,8 @@
 
 Learn how to combine YAML and Python pipeline nodes in a single Seeknal project for maximum flexibility.
 
+> **Note:** This tutorial shows the complete file contents for learning purposes. In production, you can use the **draft workflow** to generate templates: `seeknal draft <type> <name>` for YAML files, or `seeknal draft <type> <name> --python` for Python decorator templates. See the [Workflow Tutorial](./workflow-tutorial-ecommerce.md) for the complete draft→dry-run→apply pattern.
+
 ## Overview
 
 Seeknal supports **mixed pipelines** where you can:
@@ -115,6 +117,24 @@ columns:
   region: str
 ```
 
+> **Alternative: Using Draft Workflow**
+>
+> Instead of creating the file manually, use the draft command:
+>
+> ```bash
+> # Generate a YAML source template
+> seeknal draft source raw_sales --description "Raw sales transactions"
+>
+> # Edit the generated template
+> # Edit draft_source_raw_sales.yml
+>
+> # Preview what will happen
+> seeknal dry-run draft_source_raw_sales.yml
+>
+> # Apply to create the actual source
+> seeknal apply draft_source_raw_sales.yml
+> ```
+
 ---
 
 ## Step 4: Create Python Transform (References YAML)
@@ -169,6 +189,22 @@ def enriched_sales(ctx):
 
 **Key Point:** `ctx.ref("source.raw_sales")` references the YAML source node!
 
+> **Alternative: Using Draft Workflow for Python**
+>
+> You can also generate Python decorator templates:
+>
+> ```bash
+> # Generate a Python transform template
+> seeknal draft transform enriched_sales --python --description "Enrich sales data"
+>
+> # Edit the generated template
+> # Edit draft_transform_enriched_sales.py
+>
+> # Preview and apply
+> seeknal dry-run draft_transform_enriched_sales.py
+> seeknal apply draft_transform_enriched_sales.py
+> ```
+
 ---
 
 ## Step 5: Create YAML Transform (References Python)
@@ -194,6 +230,20 @@ transform: |
 ```
 
 **Key Point:** `ref: transform.enriched_sales` references the Python node!
+
+> **Alternative: Using Draft Workflow**
+>
+> ```bash
+> # Generate a YAML transform template
+> seeknal draft transform regional_totals --description "Aggregate sales by region"
+>
+> # Edit the generated template
+> # Edit draft_transform_regional_totals.yml
+>
+> # Preview and apply
+> seeknal dry-run draft_transform_regional_totals.yml
+> seeknal apply draft_transform_regional_totals.yml
+> ```
 
 ---
 
@@ -311,6 +361,20 @@ def sales_forecast(ctx):
 - **Categorical encoding**: region and product_category
 - **Forecast simulation**: 10% quantity growth, 8% transaction growth
 - **Confidence score**: R² score indicates model reliability
+
+> **Alternative: Using Draft Workflow for Python ML**
+>
+> ```bash
+> # Generate a Python transform template
+> seeknal draft transform sales_forecast --python --description "ML sales forecast"
+>
+> # The template will include the decorator structure
+> # Edit draft_transform_sales_forecast.py to add ML logic
+>
+> # Preview and apply
+> seeknal dry-run draft_transform_sales_forecast.py
+> seeknal apply draft_transform_sales_forecast.py
+> ```
 
 ---
 

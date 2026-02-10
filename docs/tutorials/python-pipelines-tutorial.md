@@ -2,6 +2,8 @@
 
 Learn how to use Seeknal's Python pipeline API to build data transformation workflows using real Python code instead of YAML.
 
+> **Note:** This tutorial teaches Seeknal's **Python decorator API** for programmatic pipeline definitions. If you prefer a **CLI-based workflow** with the `draft → dry-run → apply` pattern for YAML files, see the [Workflow Tutorial](./workflow-tutorial-ecommerce.md). You can also use `seeknal draft --python` to generate Python decorator templates as a starting point.
+
 ## Prerequisites
 
 - Python 3.11+
@@ -86,6 +88,30 @@ InvoiceNo,StockCode,Description,Quantity,InvoiceDate,UnitPrice,CustomerID,Countr
 496219,P00210,GLASS STOKE TEA TUMBLERS,19,2011-09-02 00:00:00,10.63,C00310,Belgium
 ...
 ```
+
+---
+
+## Alternative: Using the Draft Workflow
+
+> **Optional:** If you prefer using the CLI workflow, you can generate Python pipeline templates with `seeknal draft --python`:
+
+```bash
+# Generate a source template
+seeknal draft source raw_transactions --python --description "Raw transaction data"
+
+# Edit the generated file
+# draft_source_raw_transactions.py
+
+# Preview what will happen
+seeknal dry-run draft_source_raw_transactions.py
+
+# Apply to create the actual pipeline file
+seeknal apply draft_source_raw_transactions.py
+```
+
+The generated template will include the decorator structure and PEP 723 header. You can then customize the implementation.
+
+**Why use this tutorial instead?** This tutorial shows complete, working implementations with explanations of each step—ideal for learning the decorator API. The draft workflow is better for quickly scaffolding new nodes once you understand the patterns.
 
 ---
 
