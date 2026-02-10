@@ -1145,3 +1145,16 @@ my-project/
 ---
 
 **Last Updated:** February 2026
+
+
+---
+
+## Additional Resources
+
+- [CLI Reference](cli.md) - Complete command documentation
+- [Configuration Reference](configuration.md) - Project and profile configuration
+- [Migration Guides](migration.md) - Migrate from other platforms
+- [Troubleshooting Guide](troubleshooting.md) - Debug common issues
+- [Getting Started Guide](../getting-started-comprehensive.md) - Tutorial
+- [API Reference](../api/index.md) - Python API docs
+

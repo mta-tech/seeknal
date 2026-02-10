@@ -3513,6 +3513,113 @@ def env_delete(
     _echo_success(f"Environment '{env_name}' deleted.")
 
 
+@app.command("download-sample-data")
+def download_sample_data(
+    output_dir: Path = typer.Option(
+        Path("data/sample"), "--output-dir", "-o",
+        help="Output directory for sample data files"
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Overwrite existing sample data files"
+    ),
+):
+    """Download sample e-commerce datasets for tutorials and testing.
+
+    Downloads four normalized CSV files that demonstrate a realistic
+    e-commerce data model:
+
+    - customers.csv: Customer information (20 customers)
+    - products.csv: Product catalog (20 products)
+    - orders.csv: Order headers (40 orders)
+    - sales.csv: Order line items (100 sales)
+
+    These datasets are designed for:
+    - Learning Seeknal pipeline building
+    - Testing ELT workflows
+    - Demonstrating feature store concepts
+    - Trying YAML and Python pipeline examples
+
+    Examples:
+        # Download to default location (data/sample/)
+        seeknal download-sample-data
+
+        # Download to custom directory
+        seeknal download-sample-data --output-dir ./my_data
+
+        # Overwrite existing files
+        seeknal download-sample-data --force
+    """
+    import shutil
+    from pathlib import Path
+
+    # Get the package data directory
+    from importlib.resources import files
+    try:
+        # Try Python 3.9+ style first
+        sample_data_dir = files('seeknal.docs.data.sample')
+    except (TypeError, AttributeError):
+        # Fallback for older Python versions
+        import os
+        package_dir = Path(__file__).parent.parent
+        sample_data_dir = package_dir / 'docs' / 'data' / 'sample'
+
+    # Check if source sample data exists
+    source_files = ['customers.csv', 'products.csv', 'orders.csv', 'sales.csv']
+    missing_files = [f for f in source_files if not (sample_data_dir / f).exists()]
+
+    if missing_files:
+        _echo_error(f"Sample data files not found in package: {missing_files}")
+        _echo_info("This may indicate Seeknal is not installed correctly.")
+        raise typer.Exit(1)
+
+    # Create output directory
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check for existing files
+    existing_files = [f for f in source_files if (output_dir / f).exists()]
+    if existing_files and not force:
+        _echo_warning(f"Sample data files already exist in {output_dir}:")
+        for f in existing_files:
+            typer.echo(f"  - {f}")
+        _echo_info("Use --force to overwrite existing files.")
+        raise typer.Exit(0)
+
+    # Copy files
+    _echo_info(f"Downloading sample data to {output_dir}...")
+
+    copied = 0
+    for filename in source_files:
+        src_path = sample_data_dir / filename
+        dst_path = output_dir / filename
+
+        if src_path.exists():
+            shutil.copy2(src_path, dst_path)
+            copied += 1
+            typer.echo(f"  ✓ {filename}")
+        else:
+            _echo_warning(f"  ✗ {filename} not found")
+
+    if copied == len(source_files):
+        _echo_success(f"Downloaded {copied} sample data files successfully!")
+        typer.echo("")
+        _echo_info("Sample datasets:")
+        typer.echo("  customers.csv - 20 customers with demographic info")
+        typer.echo("  products.csv  - 20 products with pricing")
+        typer.echo("  orders.csv    - 40 orders with shipping info")
+        typer.echo("  sales.csv     - 100 line items with quantities")
+        typer.echo("")
+        _echo_info("Next steps:")
+        typer.echo("  1. Explore the data: head data/sample/customers.csv")
+        typer.echo("  2. Create a source: seeknal draft source customers")
+        typer.echo("  3. Build a pipeline: seeknal plan")
+        typer.echo("  4. Run it: seeknal run")
+    else:
+        _echo_error(f"Only downloaded {copied}/{len(source_files)} files.")
+        raise typer.Exit(1)
+
+
 def main():
     """Main entry point for the CLI."""
     app()

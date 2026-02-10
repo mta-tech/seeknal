@@ -1610,5 +1610,7 @@ seeknal atlas lineage publish my_pipeline
 - [YAML Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md)
 - [Configuration Reference](configuration.md)
 - [YAML Schema Reference](yaml-schema.md)
+- [Migration Guides](migration.md) - Migrate from Spark, dbt, Feast, or Featuretools
+- [Troubleshooting Guide](troubleshooting.md) - Debug common issues
 - [API Reference](../api/index.md)
 - [GitHub Repository](https://github.com/mta-tech/seeknal)

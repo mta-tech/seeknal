@@ -594,3 +594,15 @@ Error: Permission denied: /mnt/data/seeknal
 ```
 
 **Solution**: Ensure the application has write permissions to the configured directories, or update the path in your configuration.
+
+
+---
+
+## Additional Resources
+
+- [CLI Reference](cli.md) - Complete command documentation
+- [YAML Schema Reference](yaml-schema.md) - Pipeline node definitions
+- [Migration Guides](migration.md) - Migrate from other platforms
+- [Troubleshooting Guide](troubleshooting.md) - Debug common issues
+- [Getting Started Guide](../getting-started-comprehensive.md) - Tutorial
+

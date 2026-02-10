@@ -829,6 +829,7 @@ If you're still stuck:
 2. **Search GitHub Issues** - Someone may have solved your problem
 3. **Open a new issue** - Include your Python version, OS, and error message
 4. **Join discussions** - Ask the community for help
+5. **See the [Troubleshooting Guide](reference/troubleshooting.md)** - Comprehensive issue diagnosis
 
 ---
 
