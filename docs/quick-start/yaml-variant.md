@@ -80,7 +80,7 @@ seeknal --version
 
 ```bash
 # Create a new project
-seeknal init quickstart-yaml
+seeknal init --name quickstart-yaml
 cd quickstart-yaml
 ```
 

@@ -116,7 +116,7 @@ Seeknal is distributed as a wheel file via GitHub releases.
 
 ```bash
 # Create a new project
-seeknal init quickstart-demo
+seeknal init --name quickstart-demo
 cd quickstart-demo
 ```
 
