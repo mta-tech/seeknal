@@ -1177,7 +1177,7 @@ class FeatureGroup(FeatureStore):
                 if feature_end_time is None
                 else pendulum.instance(feature_end_time).format(date_pattern.upper())
             )
-            offline_store(
+            offline_mat_result = offline_store(
                 result=res_df,
                 name=self.name,
                 project=context.project_id,
@@ -1189,6 +1189,20 @@ class FeatureGroup(FeatureStore):
                 latest_watermark=max(offline_watermarks),
                 ttl=self.materialization.offline_materialization.ttl,
             )
+
+            # Capture Iceberg snapshot metadata
+            if offline_mat_result and offline_mat_result.get("storage_type") == "iceberg":
+                req.add_iceberg_watermark(
+                    snapshot_id=offline_mat_result.get("snapshot_id"),
+                    table=offline_mat_result.get("table"),
+                    namespace=offline_mat_result.get("namespace"),
+                    row_count=offline_mat_result.get("num_rows"),
+                )
+                logger.info(
+                    f"Iceberg snapshot created: {offline_mat_result.get('snapshot_id')[:8]} "
+                    f"for table {offline_mat_result.get('namespace')}.{offline_mat_result.get('table')}"
+                )
+
         if self.materialization.online:
             logger.info("Writing to online-store.")
             if self.materialization.offline:

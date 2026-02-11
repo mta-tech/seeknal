@@ -753,6 +753,164 @@ task.add_sql("SELECT user_id, SUM(amount) FROM __THIS__ GROUP BY user_id")
 
 ---
 
+## Using Iceberg Storage
+
+**Apache Iceberg** provides ACID transactions, time travel, and cloud-native storage for feature groups. With Iceberg, you can store features in S3, GCS, or Azure Blob storage while maintaining full version history and rollback capabilities.
+
+### Prerequisites
+
+For Iceberg storage, you need:
+- **DuckDB** with Iceberg extension (included with Seeknal)
+- **REST Catalog** (e.g., Lakekeeper, Hive Metastore)
+- **Cloud storage** (S3, GCS, Azure) or local filesystem
+
+### Configure Catalog
+
+Create or update `~/.seeknal/profiles.yml`:
+
+```yaml
+materialization:
+  catalog:
+    uri: http://localhost:8181  # Lakekeeper REST catalog
+    warehouse: s3://my-bucket/warehouse
+    bearer_token: optional_token  # If auth required
+```
+
+Or use environment variables:
+```bash
+export LAKEKEEPER_URI=http://localhost:8181
+export LAKEKEEPER_WAREHOUSE=s3://my-bucket/warehouse
+```
+
+### Create Feature Group with Iceberg
+
+```python
+from seeknal.featurestore import (
+    FeatureGroup,
+    Materialization,
+    OfflineMaterialization,
+    OfflineStore,
+    OfflineStoreEnum,
+    IcebergStoreOutput,
+)
+from seeknal.entity import Entity
+from datetime import datetime
+import pandas as pd
+
+# Create sample data
+df = pd.DataFrame({
+    "customer_id": ["A001", "A002", "A003"],
+    "event_date": [datetime(2024, 1, 1)] * 3,
+    "total_orders": [5, 10, 3],
+    "total_spend": [100.0, 250.0, 75.0],
+})
+
+# Create entity
+customer_entity = Entity(name="customer", join_keys=["customer_id"])
+
+# Create feature group with Iceberg storage
+fg = FeatureGroup(
+    name="customer_features",
+    entity=customer_entity,
+    materialization=Materialization(
+        event_time_col="event_date",
+        offline=True,
+        offline_materialization=OfflineMaterialization(
+            store=OfflineStore(
+                kind=OfflineStoreEnum.ICEBERG,  # Use Iceberg!
+                value=IcebergStoreOutput(
+                    catalog="lakekeeper",        # Catalog name from profiles.yml
+                    namespace="prod",            # Iceberg namespace (database)
+                    table="customer_features",   # Table name
+                    mode="append"               # "append" or "overwrite"
+                )
+            ),
+            mode="append"
+        )
+    )
+)
+
+# Write features to Iceberg
+fg.set_dataframe(df).set_features()
+fg.write(feature_start_time=datetime(2024, 1, 1))
+
+# Features are now in Iceberg table: lakekeeper.prod.customer_features
+```
+
+### Query Iceberg Tables
+
+After writing, query features with DuckDB or Spark:
+
+```python
+import duckdb
+
+# Query Iceberg table directly
+con = duckdb.connect(":memory:")
+
+# Load Iceberg extension
+con.install_extension("iceberg")
+con.load_extension("iceberg")
+
+# Attach REST catalog
+con.execute(f"""
+    ATTACH 'http://localhost:8181' AS iceberg_catalog (
+        TYPE iceberg,
+        WAREHOUSE 's3://my-bucket/warehouse'
+    )
+""")
+
+# Query features
+result = con.execute("""
+    SELECT customer_id, total_orders, total_spend
+    FROM iceberg_catalog.prod.customer_features
+""").fetchall()
+
+print(result)  # [('A001', 5, 100.0), ('A002', 10, 250.0), ...]
+```
+
+### Time Travel with Iceberg
+
+Iceberg supports time travel - query features as of any snapshot:
+
+```python
+# Get snapshot ID from write result
+result = fg.write(feature_start_time=datetime(2024, 1, 1))
+snapshot_id = result["snapshot_id"]
+
+# Query as of specific snapshot
+con.execute(f"USE SNAPSHOT '{snapshot_id}'")
+historical_features = con.execute("""
+    SELECT * FROM iceberg_catalog.prod.customer_features
+""").fetchall()
+```
+
+### Write Modes
+
+**Append Mode** (default):
+```python
+IcebergStoreOutput(table="features", mode="append")
+# Adds new rows to existing table
+```
+
+**Overwrite Mode**:
+```python
+IcebergStoreOutput(table="features", mode="overwrite")
+# Replaces table data (keeps schema history)
+```
+
+### Benefits of Iceberg Storage
+
+| Feature | Benefit |
+|---------|---------|
+| **ACID Transactions** | Atomic writes, no partial data |
+| **Time Travel** | Query features as of any point in time |
+| **Schema Evolution** | Add/modify features without rewrites |
+| **Cloud Storage** | S3, GCS, Azure Blob support |
+| **Compatibility** | Works with DuckDB, Spark, Trino, and more |
+| **Partitioning** | Efficient data pruning for large datasets |
+
+---
+
 ## Next Steps
 
 ### Choose Your Path

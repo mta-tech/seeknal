@@ -891,6 +891,51 @@ class FeatureGroupRequest(RequestFactory):
 
         save_to_db()
 
+    def add_iceberg_watermark(
+        self,
+        snapshot_id: str,
+        table: str,
+        namespace: str,
+        row_count: int,
+    ):
+        """Add Iceberg snapshot watermark for a feature group.
+
+        Args:
+            snapshot_id: Iceberg snapshot ID
+            table: Table name
+            namespace: Iceberg namespace
+            row_count: Number of rows in snapshot
+        """
+        def save_to_db():
+            feature_group_id = self.body.get("feature_group_id")
+            feature_group_version_id = self.body.get("feature_group_version_id")
+
+            with get_db_session() as session:
+                watermark = OfflineWatermarkTable(
+                    feature_group_id=feature_group_id,
+                    feature_group_version_id=feature_group_version_id,
+                    date=datetime.now(),
+                )
+                session.add(watermark)
+                session.commit()
+                session.refresh(watermark)
+
+                # Store Iceberg metadata as JSON in additional_info
+                # Note: The schema may need to be extended to properly support
+                # Iceberg-specific fields like snapshot_id, table, namespace
+                import json
+                watermark.additional_info = json.dumps({
+                    "snapshot_id": snapshot_id,
+                    "table": table,
+                    "namespace": namespace,
+                    "row_count": row_count,
+                    "storage_type": "iceberg",
+                })
+                session.commit()
+                session.refresh(watermark)
+
+        save_to_db()
+
     def update_materialization(self):
         def save_to_db():
             feature_group_id = self.body.get("feature_group_id")
