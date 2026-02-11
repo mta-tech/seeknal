@@ -160,6 +160,7 @@ class ExecutionContext:
         config: Additional configuration dictionary
         dry_run: Whether running in dry-run mode
         verbose: Whether to enable verbose output
+        params: Resolved parameters from YAML (with {{ }} expressions)
 
     Example:
         >>> context = ExecutionContext(
@@ -179,6 +180,7 @@ class ExecutionContext:
     dry_run: bool = False
     verbose: bool = False
     materialize_enabled: Optional[bool] = None  # None=use node config
+    params: Dict[str, Any] = field(default_factory=dict)  # Resolved parameters
 
     def get_duckdb_connection(self):
         """Get or create DuckDB connection."""

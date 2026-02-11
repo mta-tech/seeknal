@@ -41,6 +41,9 @@ from seeknal.workflow.executors.base import (
     ExecutorValidationError,
 )
 
+# Import parameter helper
+from seeknal.workflow.parameters.helpers import get_param, list_params, has_param
+
 # Import executors to trigger registration via @register_executor decorator
 from seeknal.workflow.executors.source_executor import SourceExecutor
 from seeknal.workflow.executors.transform_executor import TransformExecutor
@@ -124,6 +127,11 @@ __all__ = [
     "PythonExecutor",
     "ExposureType",
     "FileFormat",
+
+    # Parameter helpers
+    "get_param",
+    "list_params",
+    "has_param",
 ]
 
 # Version info

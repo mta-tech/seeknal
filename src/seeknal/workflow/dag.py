@@ -189,13 +189,20 @@ class DAGBuilder:
         "exposure": NodeType.EXPOSURE,
     }
 
-    def __init__(self, project_path: str | Path = ".") -> None:
+    def __init__(
+    self,
+    project_path: str | Path = ".",
+    cli_overrides: dict[str, Any] | None = None,
+    run_id: str | None = None,
+) -> None:
         """
         Initialize the DAG builder.
 
         Args:
-            project_path: Path to the project root directory.
-                         The seeknal/ directory will be searched relative to this path.
+            project_path: Path to the project root directory. The seeknal/
+                         directory will be searched relative to this path.
+            cli_overrides: Parameter values from CLI flags (takes precedence).
+            run_id: Custom run ID for parameterization.
 
         Raises:
             ValueError: If the project path contains path traversal sequences
@@ -228,6 +235,10 @@ class DAGBuilder:
 
         # Profile config (for default materialization settings)
         self.profile: dict[str, Any] = {}
+
+        # Parameter resolution support
+        self.cli_overrides: dict[str, Any] = cli_overrides or {}
+        self.run_id: str | None = run_id
 
     def _merge_materialization_config(
         self,
@@ -435,6 +446,15 @@ class DAGBuilder:
                     f"(already defined in {self.nodes[qualified_name].file_path})"
                 )
                 return
+
+            # Resolve parameters if present
+            if "params" in data and (self.cli_overrides or self.run_id):
+                from seeknal.workflow.parameters.resolver import ParameterResolver
+                resolver = ParameterResolver(
+                    cli_overrides=self.cli_overrides,
+                    run_id=self.run_id,
+                )
+                data["params"] = resolver.resolve(data["params"])
 
             # Create node
             node = DAGNode(

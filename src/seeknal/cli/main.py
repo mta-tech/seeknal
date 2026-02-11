@@ -571,6 +571,15 @@ def run(
         None, "--env",
         help="Run in isolated virtual environment (requires a plan: seeknal env plan <name>)"
     ),
+    # Parameterization flags
+    param_date: Optional[str] = typer.Option(
+        None, "--date",
+        help="Override date parameter (YYYY-MM-DD format)"
+    ),
+    param_run_id: Optional[str] = typer.Option(
+        None, "--run-id",
+        help="Custom run ID for parameterization"
+    ),
 ):
     """Execute a feature transformation flow or YAML pipeline.
 
@@ -621,6 +630,19 @@ def run(
 
     **Legacy Flow Examples:**
         seeknal run my_flow --start-date 2024-01-01
+
+    **Parameterization Examples:**
+        # Use default (today's date)
+        seeknal run
+
+        # Override date for backfill
+        seeknal run --date 2025-01-15
+
+        # Custom run ID
+        seeknal run --run-id daily-batch-123
+
+        # Combine with other flags
+        seeknal run --date 2025-01-15 --full
     """
     # Environment mode: delegate to shared helper
     if env is not None:
@@ -663,8 +685,19 @@ def run(
             _echo_error(f"Flow execution failed: {e}")
             raise typer.Exit(1)
     else:
+        # Build CLI overrides for parameter resolution
+        cli_overrides: dict[str, Any] = {}
+        if param_date:
+            cli_overrides["date"] = param_date
+            cli_overrides["run_date"] = param_date
+            cli_overrides["today"] = param_date
+        if param_run_id:
+            cli_overrides["run_id"] = param_run_id
+
         # YAML pipeline mode: execute DAG from seeknal/ directory
         _run_yaml_pipeline(
+            cli_overrides=cli_overrides,
+            run_id=param_run_id,
             dry_run=dry_run,
             full=full,
             nodes=nodes,
@@ -680,6 +713,8 @@ def run(
 
 
 def _run_yaml_pipeline(
+    cli_overrides: dict[str, Any] | None = None,
+    run_id: str | None = None,
     dry_run: bool = False,
     full: bool = False,
     nodes: Optional[List[str]] = None,
@@ -740,7 +775,11 @@ def _run_yaml_pipeline(
     _echo_info("Building DAG from seeknal/ directory...")
 
     try:
-        dag_builder = DAGBuilder(project_path=project_path)
+        dag_builder = DAGBuilder(
+            project_path=project_path,
+            cli_overrides=cli_overrides,
+            run_id=run_id,
+        )
         dag_builder.build()
     except ValueError as e:
         _echo_error(f"DAG build failed: {e}")
@@ -921,6 +960,7 @@ def _run_yaml_pipeline(
         dry_run=dry_run,
         verbose=True,
         materialize_enabled=materialize,
+        params={},  # Will be populated per-node from yaml_data
     )
 
     # Step 5: Execute nodes in topological order
