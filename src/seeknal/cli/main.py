@@ -157,6 +157,36 @@ app.add_typer(env_app, name="env")
 
 
 # =============================================================================
+# Interval Management
+# =============================================================================
+# Interval tracking for incremental materialization and backfill operations
+
+intervals_app = typer.Typer(
+    name="intervals",
+    help="""Manage execution intervals for incremental materialization.
+
+Interval tracking enables efficient incremental processing by tracking which
+time intervals have been completed and which need to be executed or restated.
+
+Commands:
+  list              List completed intervals for a node
+  pending           Show pending intervals (not yet executed)
+  restatement-add   Mark interval for restatement
+  restatement-list  List restatement intervals
+  restatement-clear Clear restatement intervals
+  backfill          Execute backfill for missing intervals
+
+Examples:
+  seeknal intervals list transform.clean_data
+  seeknal intervals pending feature_group.user_features --start 2024-01-01
+  seeknal intervals restatement-add feature_group.user_features --start 2024-01-01 --end 2024-01-31
+  seeknal intervals backfill feature_group.user_features --start 2024-01-01 --end 2024-01-31
+"""
+)
+app.add_typer(intervals_app, name="intervals")
+
+
+# =============================================================================
 # Atlas Integration (Optional)
 # =============================================================================
 # The Atlas command group is loaded dynamically if atlas-data-platform is installed.
@@ -438,6 +468,7 @@ def init(
             "version": "1.0.0",
             "profile": "default",
             "config-version": 1,
+            "state_backend": "file",  # Options: file, database
         }
         # Only add description if it's a non-empty string
         if description and isinstance(description, str):
@@ -571,6 +602,23 @@ def run(
         None, "--env",
         help="Run in isolated virtual environment (requires a plan: seeknal env plan <name>)"
     ),
+    # Interval tracking flags
+    start: Optional[str] = typer.Option(
+        None, "--start",
+        help="Start timestamp for interval execution (ISO format or YYYY-MM-DD)"
+    ),
+    end: Optional[str] = typer.Option(
+        None, "--end",
+        help="End timestamp for interval execution (ISO format or YYYY-MM-DD)"
+    ),
+    backfill: bool = typer.Option(
+        False, "--backfill",
+        help="Execute backfill for all missing intervals in the date range"
+    ),
+    restate: bool = typer.Option(
+        False, "--restate",
+        help="Process restatement intervals marked for reprocessing"
+    ),
 ):
     """Execute a feature transformation flow or YAML pipeline.
 
@@ -618,6 +666,16 @@ def run(
 
         # Run in environment with parallel execution
         seeknal run --env dev --parallel
+
+    **Interval Tracking Examples:**
+        # Run with specific interval
+        seeknal run --start 2024-01-01 --end 2024-01-31
+
+        # Backfill missing intervals
+        seeknal run --backfill --start 2024-01-01 --end 2024-01-31
+
+        # Process restatement intervals
+        seeknal run --restate
 
     **Legacy Flow Examples:**
         seeknal run my_flow --start-date 2024-01-01
@@ -2465,31 +2523,29 @@ def plan(
             if diff.has_changes():
                 typer.echo(typer.style("Changes detected:", bold=True))
 
-                if diff.added_nodes:
-                    typer.echo(typer.style(
-                        f"  Added ({len(diff.added_nodes)}):", fg=typer.colors.GREEN
-                    ))
-                    for node_id in sorted(diff.added_nodes.keys()):
-                        typer.echo(typer.style(f"    + {node_id}", fg=typer.colors.GREEN))
+                # Use enhanced plan output with SQL diffs and downstream impact
+                formatted_output = diff.format_plan_output(manifest)
+                for line in formatted_output.split("\n"):
+                    if line.strip():
+                        # Colorize based on content
+                        if "[BREAKING" in line:
+                            typer.echo(typer.style(line, fg=typer.colors.RED, bold=True))
+                        elif "[CHANGED" in line or "[NEW]" in line:
+                            typer.echo(typer.style(line, fg=typer.colors.YELLOW))
+                        elif "[METADATA" in line:
+                            typer.echo(typer.style(line, fg=typer.colors.BLUE))
+                        elif "[REMOVED]" in line:
+                            typer.echo(typer.style(line, fg=typer.colors.RED))
+                        elif "-> REBUILD" in line:
+                            typer.echo(typer.style(line, fg=typer.colors.RED))
+                        elif "Downstream impact" in line:
+                            typer.echo(typer.style(line, fg=typer.colors.YELLOW, bold=True))
+                        elif line.strip().startswith("Summary:"):
+                            typer.echo(typer.style(line, bold=True))
+                        else:
+                            typer.echo(line)
 
-                if diff.removed_nodes:
-                    typer.echo(typer.style(
-                        f"  Removed ({len(diff.removed_nodes)}):", fg=typer.colors.RED
-                    ))
-                    for node_id in sorted(diff.removed_nodes.keys()):
-                        typer.echo(typer.style(f"    - {node_id}", fg=typer.colors.RED))
-
-                if diff.modified_nodes:
-                    typer.echo(typer.style(
-                        f"  Modified ({len(diff.modified_nodes)}):", fg=typer.colors.YELLOW
-                    ))
-                    for node_id in sorted(diff.modified_nodes.keys()):
-                        change = diff.modified_nodes[node_id]
-                        fields = ", ".join(change.changed_fields)
-                        typer.echo(typer.style(
-                            f"    ~ {node_id} ({fields})", fg=typer.colors.YELLOW
-                        ))
-
+                # Show edge changes
                 if diff.added_edges:
                     typer.echo(typer.style(
                         f"  Added edges ({len(diff.added_edges)}):", fg=typer.colors.GREEN
@@ -2507,9 +2563,6 @@ def plan(
                         typer.echo(typer.style(
                             f"    - {edge.from_node} -> {edge.to_node}", fg=typer.colors.RED
                         ))
-
-                typer.echo("")
-                typer.echo(f"Summary: {diff.summary()}")
             else:
                 _echo_info("No changes detected since last parse")
         else:
@@ -3617,6 +3670,522 @@ def download_sample_data(
         typer.echo("  4. Run it: seeknal run")
     else:
         _echo_error(f"Only downloaded {copied}/{len(source_files)} files.")
+        raise typer.Exit(1)
+
+
+# =============================================================================
+# Interval Management Commands
+# =============================================================================
+
+@intervals_app.command("list")
+def intervals_list(
+    node_id: str = typer.Argument(
+        ...,
+        help="Node identifier (e.g., transform.clean_data, feature_group.user_features)"
+    ),
+    output_format: OutputFormat = typer.Option(
+        OutputFormat.TABLE,
+        "--output", "-o",
+        help="Output format"
+    ),
+):
+    """List completed intervals for a node.
+
+    Shows all time intervals that have been successfully executed for the
+    specified node, along with execution metadata.
+
+    Examples:
+        seeknal intervals list transform.clean_data
+        seeknal intervals list feature_group.user_features --output json
+    """
+    from pathlib import Path
+    from seeknal.workflow.state import load_state
+
+    project_path = Path.cwd()
+    state_path = project_path / "target" / "run_state.json"
+
+    if not state_path.exists():
+        _echo_error("No run state found. Run 'seeknal run' first.")
+        raise typer.Exit(1)
+
+    state = load_state(state_path)
+    if not state or node_id not in state.nodes:
+        _echo_error(f"No state found for node: {node_id}")
+        raise typer.Exit(1)
+
+    node_state = state.nodes[node_id]
+
+    if output_format == OutputFormat.TABLE:
+        typer.echo(f"\nCompleted intervals for {node_id}:")
+        typer.echo("-" * 60)
+
+        if node_state.completed_intervals:
+            for i, (start, end) in enumerate(node_state.completed_intervals, 1):
+                typer.echo(f"  {i}. {start} to {end}")
+        else:
+            typer.echo("  No completed intervals")
+
+        typer.echo("-" * 60)
+
+        if node_state.completed_partitions:
+            typer.echo(f"\nCompleted partitions: {', '.join(node_state.completed_partitions)}")
+
+    elif output_format == OutputFormat.JSON:
+        import json
+        data = {
+            "node_id": node_id,
+            "completed_intervals": node_state.completed_intervals,
+            "completed_partitions": node_state.completed_partitions,
+        }
+        typer.echo(json.dumps(data, indent=2))
+
+
+@intervals_app.command("pending")
+def intervals_pending(
+    node_id: str = typer.Argument(
+        ...,
+        help="Node identifier (e.g., transform.clean_data, feature_group.user_features)"
+    ),
+    start: str = typer.Option(
+        ...,
+        "--start", "-s",
+        help="Start date (YYYY-MM-DD or ISO timestamp)",
+    ),
+    end: Optional[str] = typer.Option(
+        None,
+        "--end", "-e",
+        help="End date (YYYY-MM-DD or ISO timestamp). Defaults to next scheduled run.",
+    ),
+    schedule: str = typer.Option(
+        "daily",
+        "--schedule",
+        help="Cron schedule or preset (daily, hourly, weekly, monthly, yearly)",
+    ),
+):
+    """Show pending intervals for a node.
+
+    Calculates which intervals need to be executed based on the schedule
+    and compares against completed intervals to find gaps.
+
+    Examples:
+        seeknal intervals pending feature_group.user_features --start 2024-01-01
+        seeknal intervals pending transform.clean_data --start 2024-01-01 --end 2024-01-31
+        seeknal intervals pending feature_group.user_features --start 2024-01-01 --schedule hourly
+    """
+    from pathlib import Path
+    from datetime import datetime
+    from seeknal.workflow.state import load_state
+    from seeknal.workflow.intervals import IntervalCalculator, create_interval_calculator
+
+    project_path = Path.cwd()
+    state_path = project_path / "target" / "run_state.json"
+
+    # Parse dates
+    try:
+        if "T" in start:
+            start_dt = datetime.fromisoformat(start)
+        else:
+            start_dt = datetime.fromisoformat(f"{start}T00:00:00")
+    except ValueError:
+        _echo_error(f"Invalid start date format: {start}. Use YYYY-MM-DD or ISO timestamp.")
+        raise typer.Exit(1)
+
+    end_dt = None
+    if end:
+        try:
+            if "T" in end:
+                end_dt = datetime.fromisoformat(end)
+            else:
+                end_dt = datetime.fromisoformat(f"{end}T23:59:59")
+        except ValueError:
+            _echo_error(f"Invalid end date format: {end}. Use YYYY-MM-DD or ISO timestamp.")
+            raise typer.Exit(1)
+
+    # Create interval calculator
+    calc = create_interval_calculator(schedule)
+
+    # Get completed intervals from state
+    completed_intervals = []
+    if state_path.exists():
+        state = load_state(state_path)
+        if state and node_id in state.nodes:
+            completed_intervals = state.nodes[node_id].completed_intervals
+
+    # Calculate pending intervals
+    pending = calc.get_pending_intervals(completed_intervals, start_dt, end_dt)
+
+    # Display results
+    typer.echo(f"\nPending intervals for {node_id}:")
+    typer.echo(f"Schedule: {schedule}")
+    typer.echo(f"Range: {start} to {end or 'next run'}")
+    typer.echo("-" * 60)
+
+    if pending:
+        for i, interval in enumerate(pending, 1):
+            typer.echo(f"  {i}. {interval.start} to {interval.end}")
+        typer.echo(f"\nTotal: {len(pending)} pending interval(s)")
+    else:
+        typer.echo("  No pending intervals - all up to date!")
+
+
+# Restatement subcommands - use add subcommand pattern
+@intervals_app.command("restatement-add")
+def restatement_add(
+    node_id: str = typer.Argument(
+        ...,
+        help="Node identifier"
+    ),
+    start: str = typer.Option(
+        ...,
+        "--start", "-s",
+        help="Start date (YYYY-MM-DD or ISO timestamp)",
+    ),
+    end: str = typer.Option(
+        ...,
+        "--end", "-e",
+        help="End date (YYYY-MM-DD or ISO timestamp)",
+    ),
+):
+    """Mark an interval for restatement.
+
+    Adds the specified time range to the node's restatement intervals list.
+    The next run will re-process data for this interval.
+
+    Examples:
+        seeknal intervals restatement-add feature_group.user_features --start 2024-01-01 --end 2024-01-31
+    """
+    from pathlib import Path
+    from seeknal.workflow.state import load_state, save_state, RunState
+
+    project_path = Path.cwd()
+    state_path = project_path / "target" / "run_state.json"
+
+    # Load or create state
+    if state_path.exists():
+        state = load_state(state_path)
+    else:
+        state = RunState()
+
+    # Ensure node exists
+    if node_id not in state.nodes:
+        _echo_error(f"No state found for node: {node_id}")
+        _echo_info("Run the node first with 'seeknal run'")
+        raise typer.Exit(1)
+
+    # Add restatement interval
+    node_state = state.nodes[node_id]
+    node_state.restatement_intervals.append((start, end))
+
+    # Save state
+    save_state(state, state_path)
+
+    _echo_success(f"Added restatement interval: {start} to {end}")
+    typer.echo(f"Total restatement intervals: {len(node_state.restatement_intervals)}")
+
+
+@intervals_app.command("restatement-list")
+def restatement_list(
+    node_id: str = typer.Argument(
+        ...,
+        help="Node identifier"
+    ),
+):
+    """List restatement intervals for a node.
+
+    Shows all intervals marked for restatement.
+
+    Examples:
+        seeknal intervals restatement-list feature_group.user_features
+    """
+    from pathlib import Path
+    from seeknal.workflow.state import load_state
+
+    project_path = Path.cwd()
+    state_path = project_path / "target" / "run_state.json"
+
+    if not state_path.exists():
+        _echo_error("No run state found. Run 'seeknal run' first.")
+        raise typer.Exit(1)
+
+    state = load_state(state_path)
+    if not state or node_id not in state.nodes:
+        _echo_error(f"No state found for node: {node_id}")
+        raise typer.Exit(1)
+
+    node_state = state.nodes[node_id]
+
+    typer.echo(f"\nRestatement intervals for {node_id}:")
+    typer.echo("-" * 60)
+
+    if node_state.restatement_intervals:
+        for i, (start, end) in enumerate(node_state.restatement_intervals, 1):
+            typer.echo(f"  {i}. {start} to {end}")
+    else:
+        typer.echo("  No restatement intervals")
+
+    typer.echo("-" * 60)
+
+
+@intervals_app.command("restatement-clear")
+def restatement_clear(
+    node_id: str = typer.Argument(
+        ...,
+        help="Node identifier"
+    ),
+):
+    """Clear all restatement intervals for a node.
+
+    Removes all intervals marked for restatement.
+
+    Examples:
+        seeknal intervals restatement-clear feature_group.user_features
+    """
+    from pathlib import Path
+    from seeknal.workflow.state import load_state, save_state
+
+    project_path = Path.cwd()
+    state_path = project_path / "target" / "run_state.json"
+
+    if not state_path.exists():
+        _echo_error("No run state found. Run 'seeknal run' first.")
+        raise typer.Exit(1)
+
+    state = load_state(state_path)
+    if not state or node_id not in state.nodes:
+        _echo_error(f"No state found for node: {node_id}")
+        raise typer.Exit(1)
+
+    count = len(state.nodes[node_id].restatement_intervals)
+    state.nodes[node_id].restatement_intervals = []
+
+    save_state(state, state_path)
+
+    _echo_success(f"Cleared {count} restatement interval(s)")
+
+
+@intervals_app.command("backfill")
+def intervals_backfill(
+    node_id: str = typer.Argument(
+        ...,
+        help="Node identifier to backfill"
+    ),
+    start: str = typer.Option(
+        ...,
+        "--start", "-s",
+        help="Start date (YYYY-MM-DD or ISO timestamp)",
+    ),
+    end: str = typer.Option(
+        ...,
+        "--end", "-e",
+        help="End date (YYYY-MM-DD or ISO timestamp)",
+    ),
+    schedule: str = typer.Option(
+        "daily",
+        "--schedule",
+        help="Cron schedule or preset (daily, hourly, weekly, monthly, yearly)",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show what would be executed without running",
+    ),
+):
+    """Execute backfill for missing intervals.
+
+    Calculates pending intervals for the specified date range and
+    executes the node for each missing interval.
+
+    Examples:
+        seeknal intervals backfill feature_group.user_features --start 2024-01-01 --end 2024-01-31
+        seeknal intervals backfill transform.clean_data --start 2024-01-01 --end 2024-01-31 --schedule hourly
+        seeknal intervals backfill feature_group.user_features --start 2024-01-01 --end 2024-01-31 --dry-run
+    """
+    from pathlib import Path
+    from datetime import datetime
+    from seeknal.workflow.state import load_state
+    from seeknal.workflow.intervals import IntervalCalculator, create_interval_calculator
+
+    project_path = Path.cwd()
+    state_path = project_path / "target" / "run_state.json"
+
+    # Parse dates
+    try:
+        if "T" in start:
+            start_dt = datetime.fromisoformat(start)
+        else:
+            start_dt = datetime.fromisoformat(f"{start}T00:00:00")
+
+        if "T" in end:
+            end_dt = datetime.fromisoformat(end)
+        else:
+            end_dt = datetime.fromisoformat(f"{end}T23:59:59")
+    except ValueError as e:
+        _echo_error(f"Invalid date format: {e}")
+        raise typer.Exit(1)
+
+    # Create interval calculator
+    calc = create_interval_calculator(schedule)
+
+    # Get completed intervals from state
+    completed_intervals = []
+    if state_path.exists():
+        state = load_state(state_path)
+        if state and node_id in state.nodes:
+            completed_intervals = state.nodes[node_id].completed_intervals
+
+    # Calculate pending intervals
+    pending = calc.get_pending_intervals(completed_intervals, start_dt, end_dt)
+
+    # Display results
+    typer.echo(f"\nBackfill plan for {node_id}:")
+    typer.echo(f"Schedule: {schedule}")
+    typer.echo(f"Range: {start} to {end}")
+    typer.echo("-" * 60)
+
+    if pending:
+        typer.echo(f"Intervals to process: {len(pending)}")
+        for i, interval in enumerate(pending, 1):
+            typer.echo(f"  {i}. {interval.start} to {interval.end}")
+
+        if dry_run:
+            typer.echo("\n[Dry run] Use --no-dry-run to execute.")
+        else:
+            typer.echo("\nExecuting backfill...")
+            # TODO: Implement actual backfill execution
+            _echo_warning("Backfill execution not yet implemented.")
+            _echo_info("This will execute the node for each pending interval.")
+    else:
+        typer.echo("No pending intervals - all up to date!")
+
+
+@app.command()
+def migrate_state(
+    backend: str = typer.Option(..., "--backend", "-b", help="Target backend type (file, database)"),
+    project_path: Path = typer.Option(".", help="Project directory"),
+    dry_run: bool = typer.Option(True, help="Preview changes without executing"),
+):
+    """Migrate state from one backend to another.
+
+    Preserves all existing state including:
+    - Node execution history
+    - Completed intervals
+    - Fingerprints
+    - Row counts
+
+    Examples:
+        seeknal migrate-state --backend database    # Preview migration to database
+        seeknal migrate-state --backend database --no-dry-run  # Execute migration
+        seeknal migrate-state --backend file       # Migrate back to file
+    """
+    from seeknal.workflow.state import load_state, save_state, RunState
+    from seeknal.state.backend import StateBackendFactory, create_state_backend
+    from seeknal.state.file_backend import FileStateBackend
+    from seeknal.state.database_backend import DatabaseStateBackend
+    from pathlib import Path
+    import shutil
+
+    project_path = Path(project_path).resolve()
+    target_path = project_path / "target"
+
+    # Current state file (file backend)
+    state_path = target_path / "run_state.json"
+
+    if not state_path.exists():
+        _echo_error(f"No state file found at {state_path}")
+        _echo_info("Run 'seeknal run' first to create state.")
+        raise typer.Exit(1)
+
+    _echo_info("Loading current state...")
+    old_state = load_state(state_path)
+
+    # Get node counts
+    node_count = len(old_state.nodes)
+    run_count = len(old_state.runs)
+    total_rows = sum(ns.row_count or 0 for ns in old_state.nodes.values())
+
+    typer.echo(f"  Nodes: {node_count}")
+    typer.echo(f"  Runs: {run_count}")
+    typer.echo(f"  Total rows processed: {total_rows:,}")
+
+    if backend == "database":
+        # Check for database config
+        db_path = target_path / "state.db"
+
+        if dry_run:
+            typer.echo("")
+            typer.echo("Preview: Migration to database backend")
+            typer.echo(f"  Source: {state_path}")
+            typer.echo(f"  Target: {db_path}")
+            typer.echo("")
+            typer.echo("[Dry run] Use --no-dry-run to execute migration.")
+            return
+
+        _echo_info("Migrating to database backend...")
+
+        # Create database backend
+        db_backend = DatabaseStateBackend(db_path=str(db_path))
+        db_backend.initialize()
+
+        # Migrate all runs
+        _echo_info(f"Migrating {run_count} runs...")
+        for run_id, run_info in old_state.runs.items():
+            db_backend.create_run(
+                run_id=run_id,
+                status=run_info.status,
+                started_at=run_info.started_at,
+                finished_at=run_info.finished_at,
+                metadata=run_info.metadata or {}
+            )
+
+        # Migrate all node states
+        _echo_info(f"Migrating {node_count} node states...")
+        for node_id, node_state in old_state.nodes.items():
+            db_backend.set_node_state(
+                run_id=node_state.run_id,
+                node_id=node_id,
+                status=node_state.status,
+                started_at=node_state.started_at,
+                finished_at=node_state.finished_at,
+                duration_ms=node_state.duration_ms,
+                row_count=node_state.row_count,
+                error_message=node_state.error_message,
+                fingerprint=node_state.fingerprint,
+            )
+
+            # Migrate intervals if present
+            for interval_start, interval_end in node_state.completed_intervals:
+                db_backend.add_completed_interval(
+                    run_id=node_state.run_id,
+                    node_id=node_id,
+                    interval_start=interval_start,
+                    interval_end=interval_end,
+                )
+
+        # Backup old state file
+        backup_path = state_path.with_suffix(".json.bak")
+        shutil.copy(state_path, backup_path)
+        _echo_info(f"Backup saved to {backup_path}")
+
+        # Update project config
+        project_file = project_path / "seeknal_project.yml"
+        if project_file.exists():
+            import yaml
+            with open(project_file) as f:
+                config = yaml.safe_load(f)
+            config["state_backend"] = "database"
+            with open(project_file, "w") as f:
+                yaml.dump(config, f, sort_keys=False)
+            _echo_success(f"Updated {project_file} with state_backend: database")
+
+        _echo_success(f"Migration complete! State now in {db_path}")
+        _echo_info(f"Old state backed up to {backup_path}")
+
+    elif backend == "file":
+        typer.echo("Already using file backend (default).")
+        typer.echo("No migration needed.")
+    else:
+        _echo_error(f"Unknown backend type: {backend}")
+        _echo_info(f"Available backends: {', '.join(StateBackendFactory.list_backends())}")
         raise typer.Exit(1)
 
 

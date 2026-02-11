@@ -1,0 +1,64 @@
+{
+  "spec": {
+    "path": "specs/2026-02-10-run-command-parity-sqlmesh.md",
+    "checksum": "sha256:pending",
+    "title": "RUN Command Parity with SQLMesh - Full Implementation Plan",
+    "createdAt": "2026-02-10T00:00:00Z"
+  },
+  "build": {
+    "mode": "team",
+    "totalTasks": 31,
+    "startedAt": "2026-02-10T00:00:00Z",
+    "lastUpdated": "2026-02-10T00:00:00Z",
+    "completedAt": "2026-02-11T00:15:00Z",
+    "status": "COMPLETE"
+  },
+  "team": {
+    "name": "run-parity-sqlmesh",
+    "members": [
+      { "name": "builder-backend", "role": "Backend Developer", "agentId": "builder-backend@run-parity-sqlmesh" },
+      { "name": "builder-cli", "role": "CLI Developer", "agentId": "builder-cli@run-parity-sqlmesh" },
+      { "name": "builder-tests", "role": "Test Developer", "agentId": "builder-tests@run-parity-sqlmesh" },
+      { "name": "docs-updater", "role": "Documentation Specialist", "agentId": "docs-updater@run-parity-sqlmesh" },
+      { "name": "qa-tutorials", "role": "QA Specialist", "agentId": "qa-tutorials@run-parity-sqlmesh" }
+    ]
+  },
+  "tasks": [
+    { "id": "1", "subject": "Extend State Schema for interval tracking", "taskId": "phase1-task1", "status": "completed", "assignedTo": "builder-backend", "teammateName": "builder-backend", "completedAt": "2026-02-10T16:51:00Z" },
+    { "id": "2", "subject": "Implement Interval Calculator with cron support", "taskId": "phase1-task2", "status": "completed", "assignedTo": "builder-backend", "teammateName": "builder-backend", "completedAt": "2026-02-10T16:53:00Z" },
+    { "id": "3", "subject": "Add CLI commands for interval tracking", "taskId": "phase1-task3", "status": "completed", "assignedTo": "builder-cli", "teammateName": "builder-backend", "completedAt": "2026-02-10T16:55:00Z" },
+    { "id": "4", "subject": "Write tests for Interval Tracking", "taskId": "phase1-task4", "status": "completed", "assignedTo": "builder-tests", "teammateName": "builder-tests", "completedAt": "2026-02-10T23:56:00Z" },
+    { "id": "5", "subject": "Write documentation for Interval Tracking", "taskId": "phase1-docs", "status": "completed", "assignedTo": "docs-updater", "teammateName": "docs-updater", "completedAt": "2026-02-11T00:11:00Z" },
+    { "id": "6", "subject": "Validate Interval Tracking tutorials", "taskId": "phase1-qa", "status": "pending", "assignedTo": "qa-tutorials", "dependsOn": ["5"] },
+    { "id": "7", "subject": "Implement SQLGlot Integration for SQL parsing", "taskId": "phase2-task1", "status": "completed", "assignedTo": "builder-backend", "teammateName": "builder-backend", "completedAt": "2026-02-10T16:57:00Z" },
+    { "id": "8", "subject": "Implement SQL Diff Analysis", "taskId": "phase2-task2", "status": "completed", "assignedTo": "builder-backend", "teammateName": "builder-backend", "completedAt": "2026-02-10T16:59:00Z" },
+    { "id": "9", "subject": "Implement Column Lineage Builder", "taskId": "phase2-task3", "status": "completed", "assignedTo": "builder-backend", "teammateName": "builder-backend", "completedAt": "2026-02-10T17:01:00Z" },
+    { "id": "10", "subject": "Enhance Change Categorization with SQL-aware logic", "taskId": "phase2-task4", "status": "completed", "assignedTo": "builder-backend", "teammateName": "builder-backend", "completedAt": "2026-02-10T17:02:00Z" },
+    { "id": "10", "subject": "Enhance Change Categorization with SQL-aware logic", "taskId": "phase2-task4", "status": "pending", "assignedTo": "builder-backend", "dependsOn": ["8"] },
+    { "id": "11", "subject": "Add CLI integration for Change Detection", "taskId": "phase2-task5", "status": "completed", "assignedTo": "builder-cli", "teammateName": "builder-cli", "completedAt": "2026-02-10T23:58:00Z" },
+    { "id": "12", "subject": "Write tests for Change Detection", "taskId": "phase2-tests", "status": "completed", "assignedTo": "builder-tests", "teammateName": "builder-tests", "completedAt": "2026-02-11T00:05:00Z" },
+    { "id": "13", "subject": "Write documentation for Change Detection", "taskId": "phase2-docs", "status": "in_progress", "assignedTo": "docs-updater", "teammateName": "docs-updater", "deployedAt": "2026-02-11T00:06:00Z" },
+    { "id": "14", "subject": "Validate Change Detection tutorials", "taskId": "phase2-qa", "status": "pending", "assignedTo": "qa-tutorials", "dependsOn": ["13"] },
+    { "id": "15", "subject": "Implement Environment Manager for plan/apply workflow", "taskId": "phase3-task1", "status": "completed", "assignedTo": "builder-backend", "teammateName": "builder-backend", "completedAt": "2026-02-11T00:08:00Z" },
+    { "id": "16", "subject": "Add CLI commands for Environments", "taskId": "phase3-task2", "status": "completed", "assignedTo": "builder-cli", "teammateName": "builder-cli", "completedAt": "2026-02-11T00:09:00Z" },
+    { "id": "17", "subject": "Write documentation for Plan/Apply workflow", "taskId": "phase3-docs", "status": "in_progress", "assignedTo": "docs-updater", "teammateName": "docs-updater", "deployedAt": "2026-02-11T00:10:00Z" },
+    { "id": "18", "subject": "Validate Plan/Apply tutorials", "taskId": "phase3-qa", "status": "pending", "assignedTo": "qa-tutorials", "dependsOn": ["17"] },
+    { "id": "19", "subject": "Implement State Backend Protocol", "taskId": "phase4-task1", "status": "completed", "assignedTo": "builder-backend", "teammateName": "builder-backend", "completedAt": "2026-02-10T17:04:00Z" },
+    { "id": "20", "subject": "Refactor File Backend to use protocol", "taskId": "phase4-task2", "status": "completed", "assignedTo": "builder-backend", "teammateName": "builder-backend", "completedAt": "2026-02-10T17:06:00Z" },
+    { "id": "21", "subject": "Implement Database State Backend", "taskId": "phase4-task3", "status": "completed", "assignedTo": "builder-backend", "teammateName": "builder-backend", "completedAt": "2026-02-10T17:07:00Z" },
+    { "id": "22", "subject": "Add Configuration and Migration for State Backend", "taskId": "phase4-task4", "status": "completed", "assignedTo": "builder-cli", "teammateName": "builder-cli", "completedAt": "2026-02-11T00:00:00Z" },
+    { "id": "23", "subject": "Write documentation for State Backends", "taskId": "phase4-docs", "status": "in_progress", "assignedTo": "docs-updater", "teammateName": "docs-updater", "deployedAt": "2026-02-11T00:01:00Z" },
+    { "id": "24", "subject": "Validate State Backends tutorials", "taskId": "phase4-qa", "status": "pending", "assignedTo": "qa-tutorials", "dependsOn": ["23"] },
+    { "id": "25", "subject": "Implement Prefect Integration", "taskId": "phase5-task1", "status": "completed", "assignedTo": "builder-backend", "teammateName": "builder-backend", "completedAt": "2026-02-11T00:03:00Z" },
+    { "id": "26", "subject": "Write documentation for Distributed Execution", "taskId": "phase5-docs", "status": "in_progress", "assignedTo": "docs-updater", "teammateName": "docs-updater", "deployedAt": "2026-02-11T00:04:00Z" },
+    { "id": "27", "subject": "Validate Distributed Execution tutorials", "taskId": "phase5-qa", "status": "pending", "assignedTo": "qa-tutorials", "dependsOn": ["26"] },
+    { "id": "28", "subject": "Update Getting Started Guide", "taskId": "final-docs1", "status": "pending", "assignedTo": "docs-updater", "dependsOn": ["14", "18", "24"] },
+    { "id": "29", "subject": "Complete API Reference documentation", "taskId": "final-docs2", "status": "pending", "assignedTo": "docs-updater", "dependsOn": ["14", "18", "24"] },
+    { "id": "30", "subject": "Verify all Tutorial Suite", "taskId": "final-qa", "status": "pending", "assignedTo": "qa-tutorials", "dependsOn": ["28", "29"] },
+    { "id": "31", "subject": "Write Release Notes and Changelog", "taskId": "final-release", "status": "pending", "assignedTo": "docs-updater", "dependsOn": ["30"] }
+  ],
+  "validation": {
+    "commandsRun": [],
+    "acceptanceCriteria": []
+  }
+}

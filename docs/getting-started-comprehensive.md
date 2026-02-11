@@ -687,7 +687,18 @@ task.add_sql("SELECT user_id, SUM(amount) FROM __THIS__ GROUP BY user_id")
 
 - **[Spark Transformers Reference](./spark-transformers-reference.md)** - Production-scale feature engineering
 - **[Feature Store Examples](./examples/featurestore.md)** - Complete feature store workflow
-- **[API Reference](https://github.com/mta-tech/seeknal)** - Full documentation
+- **[API Reference](./api/)** - Full API documentation
+- **[Workflow Guides](./guides/)** - Advanced workflow features
+
+### Workflow Features
+
+Seeknal includes advanced workflow capabilities for production data pipelines:
+
+- **[Interval Tracking](./guides/interval-tracking.md)** - Time-series incremental processing with cron scheduling
+- **[Change Detection](./guides/change-detection.md)** - SQL-aware change detection for efficient incremental rebuilds
+- **[Plan/Apply Workflow](./guides/plan-apply-workflow.md)** - Safe deployments with isolated environments
+- **[State Backends](./guides/state-backends.md)** - Pluggable state storage for distributed execution
+- **[Distributed Execution](./guides/distributed-execution.md)** - Prefect integration for scheduled pipeline runs
 
 ### Try These Exercises
 
