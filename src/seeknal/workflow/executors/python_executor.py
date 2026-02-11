@@ -237,4 +237,11 @@ finally:
         env = os.environ.copy()
         # Add seeknal-specific env vars
         env["SEEKNAL_PROJECT_PATH"] = str(self.context.workspace_path)
+
+        # Add resolved parameters for get_param() helper
+        if self.context.params:
+            for key, value in self.context.params.items():
+                env_key = f"SEEKNAL_PARAM_{key.upper()}"
+                env[env_key] = str(value)
+
         return env

@@ -925,7 +925,12 @@ IcebergStoreOutput(table="features", mode="overwrite")
 
 ### Learn More
 
-- **[API Reference](https://github.com/mta-tech/seeknal)** - Full documentation
+-- **[API Reference](https://github.com/mta-tech/seeknal)** - Full documentation
+-- **[Spark Transformers Reference](./spark-transformers-reference.md)** - Production-scale feature engineering
+-- **[Feature Store Examples](./examples/featurestore.md)** - Complete feature store workflow
+-- **[API Reference](./api/)** - Full API documentation
+-- **[Workflow Guides](./guides/)** - Advanced workflow features
+
 
 ### Try These Exercises
 

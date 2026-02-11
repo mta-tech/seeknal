@@ -9,13 +9,23 @@ Compares two manifests to detect what has changed:
 - Removed edges
 
 This enables incremental rebuilds - only re-process what changed.
+
+SQL-aware change detection uses semantic SQL comparison via sqlglot
+to distinguish between breaking and non-breaking SQL changes.
 """
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 
 from seeknal.dag.manifest import Manifest, Node
+
+# Try to import SQL diff module for SQL-aware change detection
+try:
+    from seeknal.dag.sql_diff import SQLDiffer, SQLDialect, SQLDiffResult
+    SQL_DIFF_AVAILABLE = True
+except ImportError:
+    SQL_DIFF_AVAILABLE = False
 
 
 class DiffType(Enum):
@@ -35,6 +45,7 @@ class ChangeCategory(Enum):
 METADATA_FIELDS = {"description", "owner", "tags"}
 BREAKING_CONFIG_KEYS = {"entity", "source_type"}
 METADATA_CONFIG_KEYS = {"audits"}
+SQL_CONFIG_KEYS = {"sql"}  # Config keys that contain SQL to diff semantically
 
 
 def _severity(cat: ChangeCategory) -> int:
@@ -73,6 +84,65 @@ def _classify_column_change(old_node: Node, new_node: Node) -> ChangeCategory:
     return ChangeCategory.METADATA
 
 
+def _classify_sql_change(old_sql: Optional[str], new_sql: Optional[str]) -> ChangeCategory:
+    """Classify SQL changes using semantic comparison.
+
+    Uses SQL diff module to detect breaking vs non-breaking SQL changes:
+    - Column/table removed: BREAKING
+    - Column/table added: NON_BREAKING
+    - Whitespace/formatting only: METADATA
+
+    Args:
+        old_sql: The old SQL string
+        new_sql: The new SQL string
+
+    Returns:
+        ChangeCategory indicating the impact level
+    """
+    # Fast path: if SQL is identical, no change
+    if old_sql == new_sql:
+        return ChangeCategory.METADATA
+
+    # Fast path: if one is None/empty and other isn't, treat as breaking
+    if not old_sql and new_sql:
+        return ChangeCategory.NON_BREAKING  # New SQL added
+    if old_sql and not new_sql:
+        return ChangeCategory.BREAKING  # SQL removed
+
+    # If SQL diff module is available, use semantic comparison
+    if SQL_DIFF_AVAILABLE:
+        try:
+            differ = SQLDiffer()
+            diff_result = differ.diff(old_sql, new_sql)
+
+            if not diff_result.has_changes:
+                # Semantically identical (whitespace/comments only)
+                return ChangeCategory.METADATA
+
+            # Check if there are breaking changes
+            if diff_result.is_breaking:
+                return ChangeCategory.BREAKING
+
+            # Has changes but none are breaking
+            if diff_result.edits:
+                return ChangeCategory.NON_BREAKING
+
+            # No semantic changes detected
+            return ChangeCategory.METADATA
+
+        except Exception:
+            # Fallback to string comparison if SQL diff fails
+            pass
+
+    # Fallback: string comparison (conservative)
+    if old_sql != new_sql:
+        # Any SQL change is treated as non-breaking by default
+        # (column removal would be detected in column changes)
+        return ChangeCategory.NON_BREAKING
+
+    return ChangeCategory.METADATA
+
+
 def _classify_config_change(old_node: Node, new_node: Node) -> ChangeCategory:
     """Classify config-level changes."""
     old_config = old_node.config or {}
@@ -86,6 +156,12 @@ def _classify_config_change(old_node: Node, new_node: Node) -> ChangeCategory:
     for key in changed_keys:
         if key in METADATA_CONFIG_KEYS:
             pass  # stays METADATA
+        elif key in SQL_CONFIG_KEYS:
+            # SQL-aware change detection
+            old_sql = old_config.get(key)
+            new_sql = new_config.get(key)
+            sql_cat = _classify_sql_change(old_sql, new_sql)
+            category = max(category, sql_cat, key=_severity)
         elif key in BREAKING_CONFIG_KEYS:
             category = max(category, ChangeCategory.BREAKING, key=_severity)
         elif key == "features":
