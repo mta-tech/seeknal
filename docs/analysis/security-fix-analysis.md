@@ -1,0 +1,296 @@
+---
+title: Security Fix Analysis - Integration Security Issues
+spec: specs/fix-integration-security-issues.md
+spec_title: Fix Integration Security and Functionality Issues
+completed_tasks: 12
+extraction_date: 2026-02-11T10:00:00Z
+analysis_type: task_analysis
+---
+
+```json
+{
+  "spec": "specs/fix-integration-security-issues.md",
+  "spec_title": "Fix Integration Security and Functionality Issues",
+  "completed_tasks": 12,
+  "extraction_date": "2026-02-11T10:00:00Z",
+
+  "decisions": [
+    {
+      "type": "security",
+      "title": "Defense in depth: path sanitization AND validation",
+      "context": "Critical path traversal vulnerability in FileStateBackend where run_id and node_id were used directly in path construction",
+      "rationale": "Using both sanitization (removing dangerous sequences) and validation (checking path security) provides multiple layers of protection against path traversal attacks",
+      "consequences": [
+        "Path traversal sequences (../, ..\\, /, \\) are removed from user input",
+        "Insecure base paths (/tmp, /var/tmp, /dev/shm) are rejected at initialization",
+        "All file operations remain contained within the base directory",
+        "Minor breaking change: FileStateBackend initialization may raise ValueError for insecure paths"
+      ],
+      "alternatives": [
+        "Sanitization only (less robust - edge cases could slip through)",
+        "Validation only (insufficient - user input needs cleaning)",
+        "Path.resolve() with strict checking (alternative approach but less explicit)"
+      ],
+      "evidence": ["src/seeknal/state/file_backend.py", "tests/state/test_file_backend.py"]
+    },
+    {
+      "type": "architecture",
+      "title": "Warning-based parameter collision handling",
+      "context": "User parameters could silently override reserved system values (run_id, run_date, project_id, workspace_path)",
+      "rationale": "Emitting warnings instead of errors maintains backward compatibility with existing workflows while alerting users to potential issues",
+      "consequences": [
+        "System values always take precedence over user parameters",
+        "Warnings are emitted when collisions are detected",
+        "Existing workflows with colliding names continue to work but with warnings",
+        "Users can identify and fix parameter naming issues incrementally"
+      ],
+      "alternatives": [
+        "Error on collision (breaking change for existing workflows)",
+        "Silent override (confusing behavior, difficult to debug)",
+        "Rename system parameters (large API change)"
+      ],
+      "evidence": ["src/seeknal/workflow/parameters/resolver.py"]
+    },
+    {
+      "type": "code_quality",
+      "title": "Centralized type conversion in shared module",
+      "context": "Type conversion logic was duplicated between resolver.py and helpers.py with inconsistent behavior",
+      "rationale": "Single source of truth for type conversion ensures consistent behavior across codebase and simplifies testing",
+      "consequences": [
+        "Consistent boolean conversion across all parameter handling",
+        "Easier to add new type conversion rules",
+        "Simplified testing (test one module instead of multiple)",
+        "Reduced code duplication"
+      ],
+      "alternatives": [
+        "Keep duplicated code (maintenance burden, inconsistent behavior)",
+        "Use third-party conversion library (external dependency)"
+      ],
+      "evidence": ["src/seeknal/workflow/parameters/type_conversion.py"]
+    },
+    {
+      "type": "api_design",
+      "title": "Parameter name validation with regex pattern",
+      "context": "Parameter names were not validated, allowing potential access to system environment variables",
+      "rationale": "Restricting parameter names to Python identifier syntax (alphanumeric + underscores, starting with letter/underscore) prevents confusion and potential security issues",
+      "consequences": [
+        "Invalid parameter names raise ValueError with clear error messages",
+        "Parameter names must follow Python identifier conventions",
+        "Hyphens, special characters, and leading digits are rejected",
+        "Breaking change: previously accepted invalid names will now fail"
+      ],
+      "alternatives": [
+        "Allow any parameter name (security risk, confusing)",
+        "Whitelist approach (list allowed names - not scalable)",
+        "Blacklist approach (list disallowed names - cat-and-mouse game)"
+      ],
+      "evidence": ["src/seeknal/workflow/parameters/helpers.py"]
+    }
+  ],
+
+  "errors": [
+    {
+      "type": "code_quality",
+      "category": "python_builtin_shadowing",
+      "symptom": "Parameter named 'type' in get_param() function shadows Python built-in type()",
+      "investigation_steps": [
+        "Identified shadowing issue during code review",
+        "Checked all call sites using grep",
+        "Found type parameter used in helpers.py"
+      ],
+      "root_cause": "Using 'type' as a parameter name shadows the Python built-in type() function, which is a code quality anti-pattern and can cause confusion",
+      "solution": "Renamed 'type' parameter to 'param_type' in get_param() function signature and all internal references",
+      "result": "No Python built-in shadowing, clearer intent",
+      "prevention_strategies": [
+        "Code review checklist: check for shadowing of Python built-ins",
+        "Use linters (pylint, flake8) with builtin-shadowing detection enabled",
+        "Avoid common built-in names as variables: list, dict, type, id, input"
+      ],
+      "evidence": ["src/seeknal/workflow/parameters/helpers.py"]
+    },
+    {
+      "type": "security",
+      "category": "path_traversal",
+      "symptom": "FileStateBackend._get_run_state_path() and _get_node_state_path() construct paths directly from user input without validation",
+      "investigation_steps": [
+        "Code review identified direct string concatenation of user input into paths",
+        "Tested with ../ sequences - confirmed paths could escape base directory",
+        "Reviewed existing path_security.py module for integration patterns"
+      ],
+      "root_cause": "run_id and node_id parameters from user input were used directly in path construction without sanitization, allowing attackers to use '../' to escape the base directory",
+      "solution": "1. Added is_insecure_path() check in __init__ to reject insecure base paths\n2. Created _sanitize_run_id() and _sanitize_node_id() methods to remove dangerous sequences\n3. Updated _get_run_state_path() and _get_node_state_path() to use sanitized IDs\n4. Applied sanitization in delete_run(), list_nodes(), and other methods",
+      "result": "Path traversal attempts blocked, all file operations contained within base directory",
+      "prevention_strategies": [
+        "Always sanitize user input used in file paths",
+        "Use path_security.is_insecure_path() for path validation",
+        "Security code review checklist for all file operations",
+        "Test with malicious inputs (../, ..\\, absolute paths)"
+      ],
+      "test_cases": [
+        "test_sanitize_run_id_parent_traversal()",
+        "test_sanitize_node_id_parent_traversal()",
+        "test_insecure_base_path_rejects_tmp()",
+        "test_path_traversal_cannot_read_files_outside_base()"
+      ],
+      "evidence": ["src/seeknal/state/file_backend.py", "tests/state/test_file_backend.py"]
+    },
+    {
+      "type": "data_validation",
+      "category": "date_parsing",
+      "symptom": "datetime.fromisoformat() accepts invalid dates like '2024-13-45' or dates with unreasonable years",
+      "investigation_steps": [
+        "Tested fromisoformat with edge cases like '2024-13-45'",
+        "Found that some invalid dates are accepted or produce unexpected results",
+        "Reviewed CLI date handling in materialize and backfill commands"
+      ],
+      "root_cause": "datetime.fromisoformat() has limited validation and will accept dates that may be technically valid but unreasonable for data engineering use cases (e.g., year 1900, year 2150)",
+      "solution": "Created parse_date_safely() function with:\n1. Year range validation (2000-2100)\n2. Future date limit (max 1 year ahead)\n3. Clear error messages with parameter name context\n4. Support for both YYYY-MM-DD and ISO timestamp formats",
+      "result": "Invalid dates rejected with clear error messages, reasonable date range enforced",
+      "prevention_strategies": [
+        "Always validate dates from user input",
+        "Set reasonable bounds for dates in your domain",
+        "Provide clear error messages that include the parameter name",
+        "Test edge cases (leap years, month boundaries, invalid dates)"
+      ],
+      "test_cases": [
+        "test_year_before_2000_is_rejected()",
+        "test_year_2101_is_rejected()",
+        "test_one_year_and_one_day_ahead_is_rejected()",
+        "test_invalid_month_is_rejected()",
+        "test_invalid_day_for_february_is_rejected()"
+      ],
+      "evidence": ["src/seeknal/cli/main.py", "tests/cli/test_date_validation.py"]
+    }
+  ],
+
+  "deployment": {
+    "environment": "development",
+    "platform": "cross-platform (Linux, macOS, Windows)",
+    "changes": [
+      {
+        "type": "security",
+        "description": "Path security validation in FileStateBackend initialization",
+        "config_file": "src/seeknal/state/file_backend.py",
+        "details": "FileStateBackend.__init__() now raises ValueError if base_path is in insecure directory (/tmp, /var/tmp, /dev/shm)"
+      },
+      {
+        "type": "validation",
+        "description": "Parameter name validation enforced at runtime",
+        "details": "get_param() and has_param() now validate parameter names against regex pattern, rejecting invalid names"
+      },
+      {
+        "type": "cli",
+        "description": "Date validation in CLI commands",
+        "details": "materialize, cleanup, backfill, and pending-intervals commands now use parse_date_safely() for robust date validation"
+      },
+      {
+        "type": "breaking_change",
+        "description": "FileStateBackend initialization may raise ValueError for insecure paths",
+        "migration_guide": "Set SEEKNAL_BASE_CONFIG_PATH to a secure directory like ~/.seeknal/state instead of /tmp"
+      },
+      {
+        "type": "breaking_change",
+        "description": "Parameter names with special characters now raise ValueError",
+        "migration_guide": "Rename parameters to use only alphanumeric characters and underscores, starting with a letter or underscore"
+      }
+    ]
+  },
+
+  "patterns": [
+    {
+      "name": "Path sanitization for user input",
+      "pattern": "Always sanitize user input used in file paths to prevent path traversal attacks",
+      "correct": "def _sanitize_run_id(self, run_id: str) -> str:\n    sanitized = re.sub(r'\\.\\.[/\\\\]', '', run_id)  # Remove ../ or ..\\\n    sanitized = re.sub(r'[/\\\\]', '', sanitized)   # Remove remaining slashes\n    sanitized = re.sub(r'\\.\\.', '', sanitized)     # Remove any remaining ..\n    return sanitized",
+      "incorrect": "def _get_run_state_path(self, run_id: str) -> Path:\n    return self.base_path / run_id  # VULNERABLE to path traversal",
+      "rationale": "Prevents attackers from escaping the base directory using ../ sequences",
+      "category": "security"
+    },
+    {
+      "name": "Security validation at initialization",
+      "pattern": "Validate security-critical configuration at object initialization, fail fast with clear error messages",
+      "correct": "def __init__(self, base_path: Path):\n    if is_insecure_path(str(base_path)):\n        raise ValueError(\n            f\"Insecure base path detected: '{base_path}'. \"\n            \"Use a secure location such as ~/.seeknal/state\"\n        )",
+      "incorrect": "def __init__(self, base_path: Path):\n    self.base_path = base_path  # No validation - insecure paths accepted",
+      "rationale": "Prevents silent security issues, provides clear guidance for fixing the problem",
+      "category": "security"
+    },
+    {
+      "name": "Reserved parameter name handling with warnings",
+      "pattern": "When user-provided names could collide with system names, emit warnings and ensure system values take precedence",
+      "correct": "RESERVED_PARAM_NAMES = {\"run_id\", \"run_date\", \"project_id\"}\nif key in RESERVED_PARAM_NAMES:\n    warnings.warn(\n        f\"Parameter '{key}' collides with reserved system name. \"\n        f\"System value will take precedence. Use a different name.\"\n    )",
+      "incorrect": "# No validation - silent override\nresolved[key] = cli_params[key]",
+      "rationale": "Maintains backward compatibility while alerting users to potential issues",
+      "category": "api_design"
+    },
+    {
+      "name": "Parameter name validation with regex",
+      "pattern": "Validate parameter names using regex to ensure they follow safe naming conventions",
+      "correct": "PARAM_NAME_PATTERN = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')\nif not PARAM_NAME_PATTERN.match(name):\n    raise ValueError(\n        f\"Invalid parameter name '{name}'. \"\n        f\"Parameter names must be alphanumeric with underscores only.\"\n    )",
+      "incorrect": "# No validation - any name accepted\nvalue = os.environ.get(env_name)",
+      "rationale": "Prevents confusion and potential security issues from invalid parameter names",
+      "category": "validation"
+    },
+    {
+      "name": "Consistent boolean string conversion",
+      "pattern": "Accept multiple string representations for boolean values for user-friendliness",
+      "correct": "def convert_to_bool(value: Any) -> bool:\n    if isinstance(value, str):\n        normalized = value.lower().strip()\n        if normalized in ('true', '1', 'yes', 'on'):\n            return True\n        if normalized in ('false', '0', 'no', 'off'):\n            return False\n    return bool(value)",
+      "incorrect": "# Only 'true'/'false' accepted\nif value == 'true':\n    return True\nelif value == 'false':\n    return False\nelse:\n    raise ValueError(f\"Invalid boolean: {value}\")",
+      "rationale": "Users may expect different boolean representations - accepting common variants improves UX",
+      "category": "user_experience"
+    },
+    {
+      "name": "Safe date parsing with range validation",
+      "pattern": "Parse dates with comprehensive validation including year range and future date limits",
+      "correct": "def parse_date_safely(date_str: str, param_name: str = \"date\") -> datetime:\n    dt = datetime.fromisoformat(date_str)\n    if dt.year < 2000 or dt.year > 2100:\n        raise ValueError(f\"Year out of valid range: {dt.year}\")\n    if dt > datetime.now() + timedelta(days=365):\n        raise ValueError(f\"Date too far in future: {dt}\")\n    return dt",
+      "incorrect": "dt = datetime.fromisoformat(date_str)  # No validation",
+      "rationale": "Prevents errors from unreasonable dates and provides clear error messages",
+      "category": "validation"
+    },
+    {
+      "name": "Shared type conversion module",
+      "pattern": "Centralize type conversion logic in a dedicated module to ensure consistency across codebase",
+      "correct": "# type_conversion.py\ndef convert_to_type(value: Any, target_type: Type) -> Any:\n    if target_type == bool:\n        return convert_to_bool(value)\n    # ... other types\n\n# Used in both resolver and helpers\nfrom .type_conversion import convert_to_type",
+      "incorrect": "# Duplicated in resolver.py\ndef _type_convert(self, value: str) -> Any:\n    if value.lower() in ('true', 'false'):\n        return value == 'true'\n\n# Duplicated differently in helpers.py\ndef get_param(name, type=None):\n    if type == bool:\n        return bool(value)  # Different logic!",
+      "rationale": "Single source of truth ensures consistent behavior and easier maintenance",
+      "category": "code_quality"
+    },
+    {
+      "name": "Avoid Python built-in shadowing",
+      "pattern": "Never use Python built-in names (type, list, dict, id, input) as variable or parameter names",
+      "correct": "def get_param(name: str, param_type: Optional[Type[T]] = None) -> Any:\n    if param_type is not None:\n        return convert_to_type(value, param_type)",
+      "incorrect": "def get_param(name: str, type: Optional[Type[T]] = None) -> Any:\n    if type is not None:\n        return convert_to_type(value, type)  # 'type' shadows built-in",
+      "rationale": "Shadowing built-ins causes confusion and can hide bugs",
+      "category": "code_quality"
+    }
+  ]
+}
+```
+
+## Summary
+
+### Task Analysis Complete
+
+**Spec:** `specs/fix-integration-security-issues.md`
+**Tasks Analyzed:** 12 (all completed)
+
+**Extracted:**
+- Architecture Decisions: 4
+- Errors/Solutions: 3 (1 critical security issue, 1 code quality issue, 1 validation issue)
+- Deployment Changes: 5 configuration changes
+- Reusable Patterns: 8 security and code quality patterns
+
+**Key Security Fixes:**
+1. **Critical:** Path traversal vulnerability closed - FileStateBackend now sanitizes user input
+2. **Important:** Parameter name collision detection - warnings emitted for reserved names
+3. **Important:** Parameter name validation - invalid names rejected
+
+**Code Quality Improvements:**
+1. Type shadowing fixed - `type` renamed to `param_type`
+2. Type conversion consolidated - single `type_conversion.py` module
+3. Date validation added - robust date parsing with range checks
+
+**Output:** This analysis will be consumed by:
+- `architecture-writer-agent` (uses decisions array)
+- `deployment-writer-agent` (uses deployment object)
+- `mistake-extractor-agent` (uses errors array)
+- `claude-updater-agent` (uses patterns array)
+- `doc-assembler-agent` (uses all metadata)

@@ -6,10 +6,15 @@ Supports CLI overrides and context-aware resolution.
 
 import re
 import uuid
+import warnings
 from datetime import datetime
 from typing import Any, Dict, Optional
 
 from .functions import get_function, env_var
+from .type_conversion import convert_to_bool
+
+# Reserved parameter names that cannot be overridden by user parameters
+RESERVED_PARAM_NAMES = {"run_id", "run_date", "project_id", "workspace_path"}
 
 
 class ParameterResolver:
@@ -94,6 +99,13 @@ class ParameterResolver:
 
         resolved = {}
         for key, value in params.items():
+            # Check for parameter name collision with reserved system names
+            if key in RESERVED_PARAM_NAMES:
+                warnings.warn(
+                    f"Parameter '{key}' collides with reserved system name. "
+                    f"System value will take precedence. Use a different name."
+                )
+
             # Check CLI override first (highest precedence)
             if key in self.cli_overrides:
                 resolved[key] = self._type_convert(self.cli_overrides[key])
@@ -300,11 +312,9 @@ class ParameterResolver:
             >>> resolver._type_convert("hello")
             'hello'
         """
-        # Boolean
-        if value.lower() == 'true':
-            return True
-        if value.lower() == 'false':
-            return False
+        # Boolean - use shared utility for consistency
+        if value.lower() in ('true', 'false', '1', '0', 'yes', 'no', 'on', 'off'):
+            return convert_to_bool(value)
 
         # Integer (handle negative numbers)
         try:

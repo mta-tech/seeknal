@@ -3,6 +3,117 @@ Python executor for running Python pipeline nodes via uv.
 
 This module provides the PythonExecutor class that executes Python pipeline
 files using Astral's uv tool with PEP 723 inline script metadata support.
+
+Environment Variable Type Handling Limitations
+----------------------------------------------
+
+All parameter values passed to Python scripts are converted to environment
+variables. Due to environment variable limitations in all major operating systems,
+**all parameter values are converted to strings** before being passed to the
+Python execution context.
+
+This means that if you pass parameters like:
+```python
+context.params = {
+    "count": 100,           # int
+    "ratio": 0.95,          # float
+    "active": True,         # bool
+    "tags": ["a", "b"]     # list
+}
+```
+
+They will arrive in your Python script as strings:
+```python
+count = "100"           # String, not int
+ratio = "0.95"          # String, not float
+active = "True"         # String, not bool
+tags = "['a', 'b']"     # String representation of list
+```
+
+Type Preservation Alternatives
+-----------------------------
+
+To work around this limitation, you have several options:
+
+1. **JSON-Encoded Values (Recommended)**
+   When setting parameters, encode them as JSON strings:
+   ```python
+   import json
+
+   context.params = {
+       "count": json.dumps(100),
+       "ratio": json.dumps(0.95),
+       "active": json.dumps(True),
+       "tags": json.dumps(["a", "b"])
+   }
+   ```
+
+   In your Python script, decode them:
+   ```python
+   import json
+   import os
+
+   def my_function(ctx):
+       count = json.loads(os.environ.get("SEEKNAL_PARAM_COUNT"))
+       ratio = float(os.environ.get("SEEKNAL_PARAM_RATIO"))
+       active = json.loads(os.environ.get("SEEKNAL_PARAM_ACTIVE"))
+       tags = json.loads(os.environ.get("SEEKNAL_PARAM_TAGS"))
+   ```
+
+2. **Type-Prefixed Variables**
+   Use environment variable names that indicate their type:
+   ```python
+   context.params = {
+       "count__type=int": 100,
+       "ratio__type=float": 0.95,
+       "active__type=bool": True,
+       "tags__type=json": ["a", "b"]
+   }
+   ```
+
+   In your Python script, parse them accordingly:
+   ```python
+   import os
+
+   def my_function(ctx):
+       def parse_value(value, type_hint):
+           if type_hint == "int":
+               return int(value)
+           elif type_hint == "float":
+               return float(value)
+           elif type_hint == "bool":
+               return value.lower() in ("true", "1", "yes")
+           elif type_hint == "json":
+               import json
+               return json.loads(value)
+           return value
+
+       # Extract all environment variables
+       for key, value in os.environ.items():
+           if key.startswith("SEEKNAL_PARAM_"):
+               param_name = key.replace("SEEKNAL_PARAM_", "")
+               if "__type=" in param_name:
+                   name, type_info = param_name.split("__type=")
+                   parsed_value = parse_value(value, type_info)
+   ```
+
+3. **Use Context Parameters Directly**
+   If you need the original parameter types, access them directly from the context
+   before they're converted to environment variables:
+   ```python
+   def my_function(ctx):
+       # Access parameters directly without using get_param()
+       count = ctx.params.get("count")  # This will be the original int value
+       ratio = ctx.params.get("ratio")  # This will be the original float value
+   ```
+
+Best Practices
+-------------
+
+- Document parameter types in your pipeline definitions
+- Use JSON encoding for complex data structures
+- Provide default values in case environment variables are missing
+- Create helper functions for common type conversions
 """
 
 import os

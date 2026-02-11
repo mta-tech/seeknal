@@ -87,8 +87,8 @@ For more information, see: https://github.com/mta-tech/seeknal
 """
 
 import typer
-from typing import Optional, Callable, List
-from datetime import datetime
+from typing import Optional, Callable, List, Any
+from datetime import datetime, timedelta
 from enum import Enum
 from functools import wraps
 import os
@@ -281,6 +281,62 @@ def _echo_warning(message: str):
 def _echo_info(message: str):
     """Print info message in blue."""
     typer.echo(typer.style(f"ℹ {message}", fg=typer.colors.BLUE))
+
+
+def parse_date_safely(date_str: str, param_name: str = "date") -> datetime:
+    """Parse and validate a date string with robust validation.
+
+    This function handles both ISO format with time (YYYY-MM-DDTHH:MM:SS)
+    and date-only format (YYYY-MM-DD). It performs comprehensive validation
+    including year range checks and future date limits.
+
+    Args:
+        date_str: The date string to parse (YYYY-MM-DD or ISO timestamp)
+        param_name: The parameter name for error messages (default: "date")
+
+    Returns:
+        datetime: The parsed datetime object
+
+    Raises:
+        typer.Exit: If the date is invalid or fails validation
+    """
+    try:
+        # Parse the date - handle both ISO format with time and date-only format
+        if "T" in date_str:
+            dt = datetime.fromisoformat(date_str)
+        else:
+            dt = datetime.fromisoformat(f"{date_str}T00:00:00")
+
+        # Validate year range (2000-2100)
+        if dt.year < 2000:
+            _echo_error(f"Invalid {param_name}: Year {dt.year} is before minimum year 2000")
+            raise typer.Exit(1)
+        if dt.year > 2100:
+            _echo_error(f"Invalid {param_name}: Year {dt.year} is after maximum year 2100")
+            raise typer.Exit(1)
+
+        # Validate future dates (max 1 year ahead from today)
+        max_future_date = datetime.now() + timedelta(days=365)
+        if dt > max_future_date:
+            _echo_error(f"Invalid {param_name}: Date {dt.strftime('%Y-%m-%d')} is more than 1 year in the future")
+            raise typer.Exit(1)
+
+        return dt
+
+    except ValueError as e:
+        # Catch parsing errors from fromisoformat
+        if "invalid" in str(e).lower() or "out of range" in str(e).lower():
+            _echo_error(f"Invalid {param_name}: {date_str}. Use YYYY-MM-DD or ISO timestamp (YYYY-MM-DDTHH:MM:SS)")
+        else:
+            _echo_error(f"Invalid {param_name}: {e}")
+        raise typer.Exit(1)
+    except typer.Exit:
+        # Re-raise typer.Exit from our validation checks
+        raise
+    except Exception as e:
+        # Catch any unexpected errors
+        _echo_error(f"Invalid {param_name}: {e}")
+        raise typer.Exit(1)
 
 
 def handle_cli_error(error_message: str = "Operation failed"):
@@ -627,7 +683,6 @@ def run(
     restate: bool = typer.Option(
         False, "--restate",
         help="Process restatement intervals marked for reprocessing"
-    ),
     ),
 ):
     """Execute a feature transformation flow or YAML pipeline.
@@ -1252,13 +1307,9 @@ def materialize(
     """
     from seeknal.featurestore.feature_group import FeatureGroup
 
-    # Parse dates
-    try:
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d") if end_date else None
-    except ValueError as e:
-        _echo_error(f"Invalid date format: {e}")
-        raise typer.Exit(1)
+    # Parse dates with validation
+    start_dt = parse_date_safely(start_date, "start date")
+    end_dt = parse_date_safely(end_date, "end date") if end_date else None
 
     typer.echo(f"Materializing feature group: {feature_group}")
     if version is not None:
@@ -1814,11 +1865,7 @@ def clean(
         raise typer.Exit(1)
 
     if before_date:
-        try:
-            cutoff = datetime.strptime(before_date, "%Y-%m-%d")
-        except ValueError:
-            _echo_error("Invalid date format. Use YYYY-MM-DD")
-            raise typer.Exit(1)
+        cutoff = parse_date_safely(before_date, "before date")
     else:
         from datetime import timedelta
         cutoff = datetime.now() - timedelta(days=ttl_days)
@@ -3814,33 +3861,18 @@ def intervals_pending(
         seeknal intervals pending feature_group.user_features --start 2024-01-01 --schedule hourly
     """
     from pathlib import Path
-    from datetime import datetime
     from seeknal.workflow.state import load_state
     from seeknal.workflow.intervals import IntervalCalculator, create_interval_calculator
 
     project_path = Path.cwd()
     state_path = project_path / "target" / "run_state.json"
 
-    # Parse dates
-    try:
-        if "T" in start:
-            start_dt = datetime.fromisoformat(start)
-        else:
-            start_dt = datetime.fromisoformat(f"{start}T00:00:00")
-    except ValueError:
-        _echo_error(f"Invalid start date format: {start}. Use YYYY-MM-DD or ISO timestamp.")
-        raise typer.Exit(1)
+    # Parse dates with validation
+    start_dt = parse_date_safely(start, "start date")
 
     end_dt = None
     if end:
-        try:
-            if "T" in end:
-                end_dt = datetime.fromisoformat(end)
-            else:
-                end_dt = datetime.fromisoformat(f"{end}T23:59:59")
-        except ValueError:
-            _echo_error(f"Invalid end date format: {end}. Use YYYY-MM-DD or ISO timestamp.")
-            raise typer.Exit(1)
+        end_dt = parse_date_safely(end, "end date")
 
     # Create interval calculator
     calc = create_interval_calculator(schedule)
@@ -4042,27 +4074,15 @@ def intervals_backfill(
         seeknal intervals backfill feature_group.user_features --start 2024-01-01 --end 2024-01-31 --dry-run
     """
     from pathlib import Path
-    from datetime import datetime
     from seeknal.workflow.state import load_state
     from seeknal.workflow.intervals import IntervalCalculator, create_interval_calculator
 
     project_path = Path.cwd()
     state_path = project_path / "target" / "run_state.json"
 
-    # Parse dates
-    try:
-        if "T" in start:
-            start_dt = datetime.fromisoformat(start)
-        else:
-            start_dt = datetime.fromisoformat(f"{start}T00:00:00")
-
-        if "T" in end:
-            end_dt = datetime.fromisoformat(end)
-        else:
-            end_dt = datetime.fromisoformat(f"{end}T23:59:59")
-    except ValueError as e:
-        _echo_error(f"Invalid date format: {e}")
-        raise typer.Exit(1)
+    # Parse dates with validation
+    start_dt = parse_date_safely(start, "start date")
+    end_dt = parse_date_safely(end, "end date")
 
     # Create interval calculator
     calc = create_interval_calculator(schedule)

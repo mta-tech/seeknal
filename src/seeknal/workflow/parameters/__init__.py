@@ -17,6 +17,7 @@ Basic Usage (YAML):
 from .resolver import ParameterResolver
 from .helpers import get_param, list_params, has_param
 from .functions import today, yesterday, month_start, year_start, env_var
+from .type_conversion import convert_to_bool, convert_to_type
 
 __all__ = [
     "ParameterResolver",
@@ -28,4 +29,6 @@ __all__ = [
     "month_start",
     "year_start",
     "env_var",
+    "convert_to_bool",
+    "convert_to_type",
 ]

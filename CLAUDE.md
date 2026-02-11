@@ -97,10 +97,198 @@ tests/                     # pytest test suite
 - Context provides database connection: `context.con`
 
 ### Security
-- **SQL Injection Prevention**: Always use `validate_sql_value()` and `validate_column_name()`
-- **Path Security**: Use `path_security.py` to validate file paths
-- Never use `/tmp` or world-writable directories
+
+#### SQL Injection Prevention
+- Always use `validate_sql_value()` and `validate_column_name()` from `validation.py`
+- Never concatenate user input into SQL queries
+
+#### Path Security
+- Use `path_security.is_insecure_path()` to validate file paths
+- Never use `/tmp`, `/var/tmp`, or world-writable directories
 - Default secure path: `~/.seeknal/`
+
+#### Path Sanitization
+- Always sanitize user input used in file paths to prevent path traversal attacks
+- Remove dangerous sequences (`../`, `..\\`, `/`, `\\`) before path construction
+- Validate base paths at initialization time
+
+**Correct:**
+```python
+def _sanitize_run_id(self, run_id: str) -> str:
+    sanitized = re.sub(r'\.\.[/\\]', '', run_id)  # Remove ../ or ..\
+    sanitized = re.sub(r'[/\\]', '', sanitized)   # Remove remaining slashes
+    sanitized = re.sub(r'\.\.', '', sanitized)     # Remove any remaining ..
+    return sanitized
+
+def __init__(self, base_path: Path):
+    if is_insecure_path(str(base_path)):
+        raise ValueError(
+            f"Insecure base path detected: '{base_path}'. "
+            "Use a secure location such as ~/.seeknal/state"
+        )
+```
+
+**Incorrect:**
+```python
+def _get_run_state_path(self, run_id: str) -> Path:
+    return self.base_path / run_id  # VULNERABLE to path traversal
+```
+
+**Rationale:** Prevents attackers from escaping the base directory using `../` sequences.
+
+### Validation Patterns
+
+#### Parameter Name Validation
+- Validate parameter names using regex to ensure they follow safe naming conventions
+- Parameter names must be valid Python identifiers (alphanumeric + underscores, starting with letter/underscore)
+
+**Correct:**
+```python
+PARAM_NAME_PATTERN = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+if not PARAM_NAME_PATTERN.match(name):
+    raise ValueError(
+        f"Invalid parameter name '{name}'. "
+        f"Parameter names must be alphanumeric with underscores only."
+    )
+```
+
+**Incorrect:**
+```python
+# No validation - any name accepted
+value = os.environ.get(env_name)
+```
+
+**Rationale:** Prevents confusion and potential security issues from invalid parameter names.
+
+#### Date Parsing with Range Validation
+- Always validate dates from user input with reasonable bounds
+- Set year range limits (e.g., 2000-2100 for data engineering)
+- Provide clear error messages that include the parameter name
+
+**Correct:**
+```python
+def parse_date_safely(date_str: str, param_name: str = "date") -> datetime:
+    dt = datetime.fromisoformat(date_str)
+    if dt.year < 2000 or dt.year > 2100:
+        raise ValueError(f"{param_name}: Year {dt.year} is out of valid range (2000-2100)")
+    if dt > datetime.now() + timedelta(days=365):
+        raise ValueError(f"{param_name}: Date too far in future")
+    return dt
+```
+
+**Incorrect:**
+```python
+dt = datetime.fromisoformat(date_str)  # No validation - accepts invalid dates
+```
+
+**Rationale:** Prevents errors from unreasonable dates and provides clear error messages.
+
+#### Consistent Type Conversion
+- Accept multiple string representations for boolean values for user-friendliness
+- Centralize type conversion logic in a dedicated module
+
+**Correct:**
+```python
+def convert_to_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        normalized = value.lower().strip()
+        if normalized in ('true', '1', 'yes', 'on'):
+            return True
+        if normalized in ('false', '0', 'no', 'off'):
+            return False
+    return bool(value)
+```
+
+**Incorrect:**
+```python
+# Only 'true'/'false' accepted
+if value == 'true':
+    return True
+elif value == 'false':
+    return False
+else:
+    raise ValueError(f"Invalid boolean: {value}")
+```
+
+**Rationale:** Users may expect different boolean representations - accepting common variants improves UX.
+
+### API Design Patterns
+
+#### Reserved Parameter Name Handling
+- When user-provided names could collide with system names, emit warnings
+- Ensure system values always take precedence over user parameters
+
+**Correct:**
+```python
+RESERVED_PARAM_NAMES = {"run_id", "run_date", "project_id", "workspace_path"}
+
+if key in RESERVED_PARAM_NAMES:
+    warnings.warn(
+        f"Parameter '{key}' collides with reserved system name. "
+        f"System value will take precedence. Use a different name."
+    )
+```
+
+**Incorrect:**
+```python
+# No validation - silent override
+resolved[key] = cli_params[key]
+```
+
+**Rationale:** Maintains backward compatibility while alerting users to potential issues.
+
+### Code Quality Patterns
+
+#### Avoid Python Built-in Shadowing
+- Never use Python built-in names (type, list, dict, id, input) as variable or parameter names
+
+**Correct:**
+```python
+def get_param(name: str, param_type: Optional[Type[T]] = None) -> Any:
+    if param_type is not None:
+        return convert_to_type(value, param_type)
+```
+
+**Incorrect:**
+```python
+def get_param(name: str, type: Optional[Type[T]] = None) -> Any:
+    if type is not None:
+        return convert_to_type(value, type)  # 'type' shadows built-in
+```
+
+**Rationale:** Shadowing built-ins causes confusion and can hide bugs.
+
+#### Shared Type Conversion Module
+- Centralize type conversion logic in a dedicated module to ensure consistency
+- Avoid duplicating conversion logic across multiple files
+
+**Correct:**
+```python
+# type_conversion.py
+def convert_to_type(value: Any, target_type: Type) -> Any:
+    if target_type == bool:
+        return convert_to_bool(value)
+    # ... other types
+
+# Used in both resolver and helpers
+from .type_conversion import convert_to_type
+```
+
+**Incorrect:**
+```python
+# Duplicated in resolver.py
+def _type_convert(self, value: str) -> Any:
+    if value.lower() in ('true', 'false'):
+        return value == 'true'
+
+# Duplicated differently in helpers.py
+def get_param(name, type=None):
+    if type == bool:
+        return bool(value)  # Different logic!
+```
+
+**Rationale:** Single source of truth ensures consistent behavior and easier maintenance.
 
 ### Testing Patterns
 - Use pytest fixtures from `conftest.py`
@@ -154,6 +342,13 @@ tests/                     # pytest test suite
 3. Implement `validate()` method
 4. Register in validation config
 5. Add tests in `tests/test_feature_validators.py`
+
+### Adding Security Validation
+1. Use `path_security.is_insecure_path()` for path validation
+2. Sanitize user input with regex before using in file paths
+3. Use `parse_date_safely()` for date validation from CLI/user input
+4. Validate parameter names with `PARAM_NAME_PATTERN` regex
+5. Use `convert_to_type()` from `type_conversion.py` for type conversion
 
 ### Modifying Database Schema
 1. Update models in `models.py`
@@ -304,10 +499,13 @@ Based on real dataset (73,194 rows × 35 columns):
 ## Known Issues & Gotchas
 
 1. **Spark Engine**: Pure PySpark implementation (no JVM required for transformers)
-2. **Path Security**: Always validate paths with `path_security.py`
+2. **Path Security**: Always validate paths with `path_security.py` and sanitize user input
 3. **SQL Injection**: Use validation functions from `validation.py`
 4. **Context Required**: Most operations need workspace/project context
 5. **Version Tracking**: Schema changes auto-create new versions
+6. **Date Validation**: Always use `parse_date_safely()` for user-provided dates
+7. **Parameter Names**: Must follow Python identifier syntax (no hyphens or special chars)
+8. **Reserved Names**: Avoid using `run_id`, `run_date`, `project_id`, `workspace_path` as parameter names
 
 ## Testing Before Commit
 
@@ -358,7 +556,11 @@ seeknal delete feature-group <fg_name>
 2. **Read Tests**: Tests show expected behavior
 3. **Update Docs**: Keep documentation in sync
 4. **Follow Patterns**: Use existing decorators, error handling, CLI patterns
-5. **Security First**: Validate all inputs, use secure paths
+5. **Security First**:
+   - Validate all inputs at initialization (fail fast with clear errors)
+   - Sanitize user input used in file paths
+   - Use shared validation modules (type_conversion.py, validation.py, path_security.py)
+   - Test with malicious inputs (path traversal, invalid dates, special characters)
 6. **Version Awareness**: Schema changes create new versions automatically
 
 ## Resources
@@ -370,7 +572,7 @@ seeknal delete feature-group <fg_name>
 
 ---
 
-**Last Updated**: January 2026 based on recent development context
+**Last Updated**: February 2026 based on recent development context (Security and Validation patterns)
 
 # Instructions MUST FOLLOW when work
 

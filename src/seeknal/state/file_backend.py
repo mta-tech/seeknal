@@ -13,6 +13,7 @@ Key features:
 
 import json
 import logging
+import re
 import shutil
 import threading
 from contextlib import contextmanager
@@ -29,6 +30,7 @@ from .backend import (
     StateBackendFactory,
 )
 from ..workflow.state import NodeState, RunState
+from ..utils.path_security import is_insecure_path
 
 logger = logging.getLogger(__name__)
 
@@ -51,24 +53,128 @@ class FileStateBackend(StateBackend):
 
         Args:
             base_path: Base directory for storing state files
+
+        Raises:
+            ValueError: If the base_path is in an insecure location.
         """
+        # Validate base_path is not in an insecure location
+        base_path_str = str(base_path)
+        if is_insecure_path(base_path_str):
+            raise ValueError(
+                f"Insecure base path detected: '{base_path_str}'. "
+                "State files contain sensitive workflow data and should not be "
+                "stored in world-writable directories like /tmp. "
+                "Use a secure location such as ~/.seeknal/state or set "
+                "SEEKNAL_BASE_CONFIG_PATH environment variable."
+            )
+
         self.base_path = Path(base_path)
         self.lock = threading.Lock()
         self._locks: Dict[str, threading.Lock] = {}
         self._transaction_state: Optional[TransactionState] = None
 
+    def _sanitize_run_id(self, run_id: str) -> str:
+        """
+        Sanitize a run_id to prevent path traversal attacks.
+
+        Removes dangerous path traversal sequences (.., /, \) from the input
+        to prevent escaping the base directory.
+
+        Args:
+            run_id: The raw run identifier from user input.
+
+        Returns:
+            A sanitized run_id safe for use in file paths.
+
+        Examples:
+            >>> backend._sanitize_run_id("normal_run")
+            'normal_run'
+            >>> backend._sanitize_run_id("../escape")
+            'escape'
+            >>> backend._sanitize_run_id("run/with/slashes")
+            'runwithslashes'
+        """
+        if not run_id:
+            return run_id
+
+        # Remove path traversal sequences and directory separators
+        # This handles: "../", "..\\", "/", "\\", and standalone ".."
+        sanitized = re.sub(r'\.\.[/\\]', '', run_id)  # Remove ../ or ..\
+        sanitized = re.sub(r'[/\\]', '', sanitized)   # Remove remaining slashes
+        sanitized = re.sub(r'\.\.', '', sanitized)     # Remove any remaining ..
+
+        return sanitized
+
+    def _sanitize_node_id(self, node_id: str) -> str:
+        """
+        Sanitize a node_id to prevent path traversal attacks.
+
+        Removes dangerous path traversal sequences (.., /, \) from the input
+        to prevent escaping the base directory.
+
+        Args:
+            node_id: The raw node identifier from user input.
+
+        Returns:
+            A sanitized node_id safe for use in file paths.
+
+        Examples:
+            >>> backend._sanitize_node_id("normal_node")
+            'normal_node'
+            >>> backend._sanitize_node_id("../escape")
+            'escape'
+            >>> backend._sanitize_node_id("node/with/slashes")
+            'nodewithslashes'
+        """
+        if not node_id:
+            return node_id
+
+        # Remove path traversal sequences and directory separators
+        # This handles: "../", "..\\", "/", "\\", and standalone ".."
+        sanitized = re.sub(r'\.\.[/\\]', '', node_id)  # Remove ../ or ..\
+        sanitized = re.sub(r'[/\\]', '', sanitized)    # Remove remaining slashes
+        sanitized = re.sub(r'\.\.', '', sanitized)      # Remove any remaining ..
+
+        return sanitized
+
     def _get_run_state_path(self, run_id: str) -> Path:
-        """Get the file path for a run's state."""
-        # Use run_id as the directory name, with run_state.json inside
-        run_dir = self.base_path / run_id
+        """
+        Get the file path for a run's state.
+
+        Sanitizes the run_id to prevent path traversal attacks.
+
+        Args:
+            run_id: The run identifier (will be sanitized).
+
+        Returns:
+            Path to the run's state file.
+        """
+        # Sanitize run_id to prevent path traversal
+        safe_run_id = self._sanitize_run_id(run_id)
+        # Use sanitized run_id as the directory name, with run_state.json inside
+        run_dir = self.base_path / safe_run_id
         return run_dir / "run_state.json"
 
     def _get_node_state_path(self, run_id: str, node_id: str) -> Path:
-        """Get the file path for a node's state."""
+        """
+        Get the file path for a node's state.
+
+        Sanitizes both run_id and node_id to prevent path traversal attacks.
+
+        Args:
+            run_id: The run identifier (will be sanitized).
+            node_id: The node identifier (will be sanitized).
+
+        Returns:
+            Path to the node's state file.
+        """
+        # Sanitize inputs to prevent path traversal
+        safe_run_id = self._sanitize_run_id(run_id)
+        safe_node_id = self._sanitize_node_id(node_id)
         # Store node states in run-specific subdirectory
-        run_dir = self.base_path / run_id
+        run_dir = self.base_path / safe_run_id
         nodes_dir = run_dir / "nodes"
-        return nodes_dir / f"{node_id}.json"
+        return nodes_dir / f"{safe_node_id}.json"
 
     def get_node_state(self, run_id: str, node_id: str) -> Optional[NodeState]:
         """Get the state for a specific node in a run."""
@@ -185,7 +291,9 @@ class FileStateBackend(StateBackend):
 
     def delete_run(self, run_id: str) -> None:
         """Delete all state for a run."""
-        run_dir = self.base_path / run_id
+        # Sanitize run_id to prevent path traversal
+        safe_run_id = self._sanitize_run_id(run_id)
+        run_dir = self.base_path / safe_run_id
 
         if not run_dir.exists():
             return
@@ -198,7 +306,9 @@ class FileStateBackend(StateBackend):
 
     def list_nodes(self, run_id: str) -> List[str]:
         """List all node IDs for a run."""
-        nodes_dir = self.base_path / run_id / "nodes"
+        # Sanitize run_id to prevent path traversal
+        safe_run_id = self._sanitize_run_id(run_id)
+        nodes_dir = self.base_path / safe_run_id / "nodes"
 
         if not nodes_dir.exists():
             return []
