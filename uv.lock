@@ -602,6 +602,19 @@ wheels = [
 ]
 
 [[package]]
+name = "croniter"
+version = "6.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "python-dateutil" },
+    { name = "pytz" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ad/2f/44d1ae153a0e27be56be43465e5cb39b9650c781e001e7864389deb25090/croniter-6.0.0.tar.gz", hash = "sha256:37c504b313956114a983ece2c2b07790b1f1094fe9d81cc94739214748255577", size = 64481, upload-time = "2024-12-17T17:17:47.32Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/4b/290b4c3efd6417a8b0c284896de19b1d5855e6dbdb97d2a35e68fa42de85/croniter-6.0.0-py2.py3-none-any.whl", hash = "sha256:2f878c3856f17896979b2a4379ba1f09c83e374931ea15cc835c5dd2eee9b368", size = 25468, upload-time = "2024-12-17T17:17:45.359Z" },
+]
+
+[[package]]
 name = "cryptography"
 version = "46.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -3411,6 +3424,7 @@ name = "seeknal"
 version = "2.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "croniter" },
     { name = "cryptography" },
     { name = "delta-spark" },
     { name = "duckdb" },
@@ -3436,6 +3450,7 @@ dependencies = [
     { name = "s3fs" },
     { name = "sqlalchemy" },
     { name = "sqlalchemy-libsql" },
+    { name = "sqlglot" },
     { name = "sqlmodel" },
     { name = "tabulate" },
     { name = "tenacity" },
@@ -3464,6 +3479,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=24.10.0" },
+    { name = "croniter", specifier = ">=3.0.0" },
     { name = "cryptography", specifier = ">=43.0.0" },
     { name = "delta-spark", specifier = "==3.2.0" },
     { name = "duckdb", specifier = ">=1.1.3" },
@@ -3492,6 +3508,7 @@ requires-dist = [
     { name = "seeknal", extras = ["dev"], marker = "extra == 'all'" },
     { name = "sqlalchemy", specifier = ">=1.4.0" },
     { name = "sqlalchemy-libsql", specifier = ">=0.1.0" },
+    { name = "sqlglot", specifier = "~=25.0.0" },
     { name = "sqlmodel", specifier = ">=0.0.22" },
     { name = "tabulate", specifier = ">=0.9.0" },
     { name = "tenacity", specifier = ">=9.0.0" },
@@ -3617,6 +3634,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/9c/3e/a628dad23a5310e00db674a5ddf92300acb4199a06ea82385cc48f6e9289/sqlalchemy_libsql-0.2.0.tar.gz", hash = "sha256:f6349c89ea10b941a9cd87ebb65330c660aff996c12d3da7e1696572c360edd1", size = 6405, upload-time = "2025-05-30T17:59:14.812Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a2/b9/7a3b645766a9f0f2ba27580d1ec6eb1ade754b30f0c88fcc6bee4cc2cb20/sqlalchemy_libsql-0.2.0-py3-none-any.whl", hash = "sha256:852a731c64f318581942c81a5e18c9752a553af25608abbff04cd54ae1f3d451", size = 5929, upload-time = "2025-05-30T17:59:13.913Z" },
+]
+
+[[package]]
+name = "sqlglot"
+version = "25.0.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/da/4a/af84df2e0554b082282281e32903f7f502d3f708aca24dab7b6c48c90c78/sqlglot-25.0.3.tar.gz", hash = "sha256:84bddaf24e28d761ea5d3857de2bbb9515f1482799189de54f1c1e8b1bc6147c", size = 18736092, upload-time = "2024-06-06T17:37:46.885Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/65/14/188ad4217a2f925aaa657037a21911571548ddacb9e435f757cfd72a5739/sqlglot-25.0.3-py3-none-any.whl", hash = "sha256:810dedc451e2d4e947effe50eeb6a5e85a6f624053086bb77d0228a45b78e0b7", size = 381044, upload-time = "2024-06-06T17:37:39.967Z" },
 ]
 
 [[package]]

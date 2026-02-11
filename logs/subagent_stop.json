@@ -1,0 +1,24 @@
+[
+  {
+    "session_id": "8af8835b-aaca-4696-b914-9d26fae517a5",
+    "transcript_path": "/Users/fitrakacamarga/.cc-mirror/zai/config/projects/-Users-fitrakacamarga-project-mta-signal-trees-feat-iceberg-source-1/8af8835b-aaca-4696-b914-9d26fae517a5.jsonl",
+    "cwd": "/Users/fitrakacamarga/project/mta/signal/trees/feat/iceberg-source-1",
+    "permission_mode": "bypassPermissions",
+    "hook_event_name": "SubagentStop",
+    "stop_hook_active": false,
+    "agent_id": "afafec1",
+    "agent_transcript_path": "/Users/fitrakacamarga/.cc-mirror/zai/config/projects/-Users-fitrakacamarga-project-mta-signal-trees-feat-iceberg-source-1/8af8835b-aaca-4696-b914-9d26fae517a5/subagents/agent-afafec1.jsonl",
+    "agent_type": ""
+  },
+  {
+    "session_id": "8af8835b-aaca-4696-b914-9d26fae517a5",
+    "transcript_path": "/Users/fitrakacamarga/.cc-mirror/zai/config/projects/-Users-fitrakacamarga-project-mta-signal-trees-feat-iceberg-source-1/8af8835b-aaca-4696-b914-9d26fae517a5.jsonl",
+    "cwd": "/Users/fitrakacamarga/project/mta/signal/trees/feat/iceberg-source-1",
+    "permission_mode": "bypassPermissions",
+    "hook_event_name": "SubagentStop",
+    "stop_hook_active": false,
+    "agent_id": "a2deb60",
+    "agent_transcript_path": "/Users/fitrakacamarga/.cc-mirror/zai/config/projects/-Users-fitrakacamarga-project-mta-signal-trees-feat-iceberg-source-1/8af8835b-aaca-4696-b914-9d26fae517a5/subagents/agent-a2deb60.jsonl",
+    "agent_type": ""
+  }
+]

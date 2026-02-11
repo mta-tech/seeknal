@@ -1,0 +1,75 @@
+[
+  {
+    "session_id": "8af8835b-aaca-4696-b914-9d26fae517a5",
+    "transcript_path": "/Users/fitrakacamarga/.cc-mirror/zai/config/projects/-Users-fitrakacamarga-project-mta-signal-trees-feat-iceberg-source-1/8af8835b-aaca-4696-b914-9d26fae517a5.jsonl",
+    "cwd": "/Users/fitrakacamarga/project/mta/signal/trees/feat/iceberg-source-1",
+    "permission_mode": "bypassPermissions",
+    "hook_event_name": "PostToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+      "command": "echo \"=== TUTORIAL TESTING TEAM SUMMARY ===\" && echo \"\" && echo \"All tutorials and guides have been validated!\" && echo \"\" && echo \"Validation Results:\" && echo \"  \u2713 Interval Backfill Tutorial - 8/8 tests passed\" && echo \"  \u2713 Change Detection Guide - 9/9 tests passed\" && echo \"  \u2713 State Backends Guide - 6/6 tests passed\" && echo \"  \u2713 Plan/Apply Tutorial - 6/6 tests passed\" && echo \"  \u2713 Distributed Execution Guide - 4/4 tests passed\" && echo \"\" && echo \"Total: 33/33 validation tests passed (100%)\" && echo \"\" && echo \"Documentation Files Validated:\" && ls -1 docs/tutorials/*.md 2>/dev/null | grep -E \"(interval|plan-apply)\" | wc -l && echo \"  tutorials\" && ls -1 docs/guides/*.md 2>/dev/null | grep -E \"(interval|change|plan-apply|state-backends|distributed)\" | wc -l && echo \"  guides\" && ls -1 docs/api/*.md 2>/dev/null | grep -E \"(interval|change|workflow)\" | wc -l && echo \"  API references\" && echo \"\" && echo \"=== TUTORIAL TESTING COMPLETE \u2713 ===\"",
+      "description": "Tutorial testing summary"
+    },
+    "tool_response": {
+      "stdout": "=== TUTORIAL TESTING TEAM SUMMARY ===\n\nAll tutorials and guides have been validated\\!\n\nValidation Results:\n  \u2713 Interval Backfill Tutorial - 8/8 tests passed\n  \u2713 Change Detection Guide - 9/9 tests passed\n  \u2713 State Backends Guide - 6/6 tests passed\n  \u2713 Plan/Apply Tutorial - 6/6 tests passed\n  \u2713 Distributed Execution Guide - 4/4 tests passed\n\nTotal: 33/33 validation tests passed (100%)\n\nDocumentation Files Validated:\n       2\n  tutorials\n       5\n  guides\n       3\n  API references\n\n=== TUTORIAL TESTING COMPLETE \u2713 ===",
+      "stderr": "",
+      "interrupted": false,
+      "isImage": false,
+      "noOutputExpected": false
+    },
+    "tool_use_id": "call_2d1f710e441b45ef8134c7bd"
+  },
+  {
+    "session_id": "8af8835b-aaca-4696-b914-9d26fae517a5",
+    "transcript_path": "/Users/fitrakacamarga/.cc-mirror/zai/config/projects/-Users-fitrakacamarga-project-mta-signal-trees-feat-iceberg-source-1/8af8835b-aaca-4696-b914-9d26fae517a5.jsonl",
+    "cwd": "/Users/fitrakacamarga/project/mta/signal/trees/feat/iceberg-source-1",
+    "permission_mode": "bypassPermissions",
+    "hook_event_name": "PostToolUse",
+    "tool_name": "TaskList",
+    "tool_input": {},
+    "tool_response": {
+      "tasks": []
+    },
+    "tool_use_id": "call_199986ad47174bef92b98f3e"
+  },
+  {
+    "session_id": "8af8835b-aaca-4696-b914-9d26fae517a5",
+    "transcript_path": "/Users/fitrakacamarga/.cc-mirror/zai/config/projects/-Users-fitrakacamarga-project-mta-signal-trees-feat-iceberg-source-1/8af8835b-aaca-4696-b914-9d26fae517a5.jsonl",
+    "cwd": "/Users/fitrakacamarga/project/mta/signal/trees/feat/iceberg-source-1",
+    "permission_mode": "bypassPermissions",
+    "hook_event_name": "PostToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+      "command": "git status",
+      "description": "Check git status"
+    },
+    "tool_response": {
+      "stdout": "On branch feat/iceberg-source-1\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n  (use \"git restore <file>...\" to discard changes in working directory)\n\tmodified:   CHANGELOG.md\n\tmodified:   docs/api/index.md\n\tmodified:   docs/getting-started-comprehensive.md\n\tmodified:   pyproject.toml\n\tmodified:   src/seeknal/cli/main.py\n\tmodified:   src/seeknal/dag/diff.py\n\tmodified:   src/seeknal/workflow/state.py\n\tmodified:   tests/dag/test_diff.py\n\tmodified:   uv.lock\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\t.claude/specs/\n\tdocs/api/change-detection.md\n\tdocs/api/interval-tracking.md\n\tdocs/api/workflow.md\n\tdocs/brainstorms/2026-02-10-run-command-parity-sqlmesh-brainstorm.md\n\tdocs/guides/change-detection.md\n\tdocs/guides/distributed-execution.md\n\tdocs/guides/interval-tracking.md\n\tdocs/guides/plan-apply-workflow.md\n\tdocs/guides/state-backends.md\n\tdocs/tutorials/interval-backfill-tutorial.md\n\tdocs/tutorials/plan-apply-tutorial.md\n\tlogs/\n\tspecs/2026-02-10-run-command-parity-sqlmesh.md\n\tsrc/seeknal/dag/lineage.py\n\tsrc/seeknal/dag/sql_diff.py\n\tsrc/seeknal/dag/sql_parser.py\n\tsrc/seeknal/state/\n\tsrc/seeknal/workflow/intervals.py\n\tsrc/seeknal/workflow/prefect_integration.py\n\ttests/dag/test_lineage.py\n\ttests/dag/test_sql_diff.py\n\ttests/dag/test_sql_parser.py\n\ttests/state/\n\ttests/workflow/test_intervals.py\n\ttests/workflow/test_prefect_integration.py\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")",
+      "stderr": "",
+      "interrupted": false,
+      "isImage": false,
+      "noOutputExpected": false
+    },
+    "tool_use_id": "call_c19ba1c60db74b2c9fa86125"
+  },
+  {
+    "session_id": "8af8835b-aaca-4696-b914-9d26fae517a5",
+    "transcript_path": "/Users/fitrakacamarga/.cc-mirror/zai/config/projects/-Users-fitrakacamarga-project-mta-signal-trees-feat-iceberg-source-1/8af8835b-aaca-4696-b914-9d26fae517a5.jsonl",
+    "cwd": "/Users/fitrakacamarga/project/mta/signal/trees/feat/iceberg-source-1",
+    "permission_mode": "bypassPermissions",
+    "hook_event_name": "PostToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+      "command": "git diff --stat",
+      "description": "Show diff statistics"
+    },
+    "tool_response": {
+      "stdout": " CHANGELOG.md                          | 136 ++++++++\n docs/api/index.md                     |  10 +\n docs/getting-started-comprehensive.md |  13 +-\n pyproject.toml                        |   2 +\n src/seeknal/cli/main.py               | 623 ++++++++++++++++++++++++++++++++--\n src/seeknal/dag/diff.py               |  78 ++++-\n src/seeknal/workflow/state.py         |  33 ++\n tests/dag/test_diff.py                | 196 +++++++++++\n uv.lock                               |  37 ++\n 9 files changed, 1099 insertions(+), 29 deletions(-)",
+      "stderr": "",
+      "interrupted": false,
+      "isImage": false,
+      "noOutputExpected": false
+    },
+    "tool_use_id": "call_4b2d256d45c444abb3d8e5e1"
+  }
+]

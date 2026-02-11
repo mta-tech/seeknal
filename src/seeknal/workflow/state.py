@@ -99,6 +99,11 @@ class NodeState:
         iceberg_snapshot_timestamp: Optional ISO timestamp of snapshot creation
         iceberg_table_ref: Optional fully qualified Iceberg table name
         iceberg_schema_version: Optional Iceberg schema version
+
+        # Interval tracking fields
+        completed_intervals: List of (start, end) datetime tuples for completed intervals
+        completed_partitions: List of partition identifiers that have been completed
+        restatement_intervals: List of (start, end) datetime tuples for intervals that require restatement
     """
     hash: str
     last_run: str
@@ -115,6 +120,11 @@ class NodeState:
     iceberg_table_ref: Optional[str] = None
     iceberg_schema_version: Optional[int] = None
 
+    # Interval tracking fields
+    completed_intervals: List[tuple[str, str]] = field(default_factory=list)
+    completed_partitions: List[str] = field(default_factory=list)
+    restatement_intervals: List[tuple[str, str]] = field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         d = asdict(self)
@@ -129,6 +139,25 @@ class NodeState:
         """Create from dictionary for JSON deserialization."""
         fp_data = data.get("fingerprint")
         fingerprint = NodeFingerprint.from_dict(fp_data) if fp_data else None
+
+        # Handle interval fields with backward compatibility
+        completed_intervals = data.get("completed_intervals", [])
+        # Convert list of lists to list of tuples for consistency
+        if isinstance(completed_intervals, list):
+            completed_intervals = [
+                tuple(interval) if isinstance(interval, list) else interval
+                for interval in completed_intervals
+            ]
+
+        completed_partitions = data.get("completed_partitions", [])
+
+        restatement_intervals = data.get("restatement_intervals", [])
+        if isinstance(restatement_intervals, list):
+            restatement_intervals = [
+                tuple(interval) if isinstance(interval, list) else interval
+                for interval in restatement_intervals
+            ]
+
         return cls(
             hash=data.get("hash", ""),
             last_run=data.get("last_run", ""),
@@ -143,6 +172,10 @@ class NodeState:
             iceberg_snapshot_timestamp=data.get("iceberg_snapshot_timestamp"),
             iceberg_table_ref=data.get("iceberg_table_ref"),
             iceberg_schema_version=data.get("iceberg_schema_version"),
+            # Interval tracking fields (with backward compatibility)
+            completed_intervals=completed_intervals,
+            completed_partitions=completed_partitions,
+            restatement_intervals=restatement_intervals,
         )
 
     def is_success(self) -> bool:
