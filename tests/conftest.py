@@ -7,7 +7,6 @@ import stat
 import shutil
 from builtins import str
 
-import findspark
 import numpy
 import pytest
 
@@ -16,14 +15,6 @@ cur_dir = os.path.dirname(os.path.realpath(__file__))
 # workaround to use locally downloaded spark
 default_spark_home = os.path.join(cur_dir, os.pardir, os.pardir, os.pardir, "spark")
 default_mlflow_tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///{}")
-findspark.init(
-    os.getenv("SPARK_HOME", "/Users/fitrakacamarga/.sdkman/candidates/spark/current")
-)
-import pyspark  # noqa
-from pyspark.sql import SparkSession  # noqa
-
-os.environ.pop("SPARK_REMOTE", None)
-os.environ["PYDEVD_WARN_EVALUATION_TIMEOUT"] = "60"
 
 
 def quiet():
@@ -57,6 +48,29 @@ def spark_temp_dirs(tmpdir_factory):
 
 @pytest.fixture(scope="session")
 def spark(request, spark_temp_dirs):
+    """PySpark session fixture with lazy initialization.
+
+    Only initializes Spark when the fixture is actually used.
+    Skips tests if Spark/findspark is not available.
+    """
+    # Lazy initialization of findspark and pyspark
+    try:
+        import findspark
+        spark_home = os.getenv("SPARK_HOME")
+        if spark_home:
+            findspark.init(spark_home)
+        else:
+            findspark.init()
+    except ImportError:
+        pytest.skip("findspark not installed - skipping Spark tests")
+        return None
+    except Exception as e:
+        pytest.skip(f"Spark not available: {e}")
+        return None
+
+    # Import SparkSession only after findspark is initialized
+    from pyspark.sql import SparkSession
+
     spark_warehouse_dir, meta_dir = spark_temp_dirs
     # current is ./tests
     cur_dir = os.path.dirname(os.path.realpath(__file__))

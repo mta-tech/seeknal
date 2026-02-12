@@ -1,0 +1,12 @@
+# Seeknal User Configuration
+# Copy this file to your SEEKNAL_BASE_CONFIG_PATH directory
+
+[context]
+
+[context.secrets]
+# Your username for Seeknal
+SEEKNAL_USERNAME = "your_username"
+
+[context.database]
+# SQLite database file (relative to SEEKNAL_BASE_CONFIG_PATH)
+SEEKNAL_DB_PATH = "seeknal.db"

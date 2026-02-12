@@ -38,56 +38,61 @@ Seeknal is designed as a comprehensive data processing tool that enables you to 
 - **Concepts**: [Point-in-Time Joins](docs/concepts/point-in-time-joins.md) · [Virtual Environments](docs/concepts/virtual-environments.md) · [Change Categorization](docs/concepts/change-categorization.md)
 
 ## Getting started
-We recommend to use uv for installing Seeknal. The following steps are expecting you to have [UV](https://docs.astral.sh/uv/guides/install-python/) installed.
 
+### Option 1: Install from Source (Recommended)
 
-To install Seeknal, follow these steps:
+```bash
+# Clone the repository
+git clone https://github.com/mta-tech/seeknal.git
+cd seeknal
 
-1. Download the Seeknal package:
-    
-    - Visit the [releases](https://github.com/mta-tech/seeknal/releases) page and download the latest package.
+# Create virtual environment and install (using uv - faster)
+uv venv --python 3.11
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+uv pip install -e ".[all]"
 
-2. Extract the Downloaded File:
-    - Unzip the downloaded zip file to your working directory.
+# Or using standard pip
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+pip install -e ".[all]"
 
-3. Initialize the environment using uv:
-    - Open your terminal and navigate to the directory where you extracted the files. Then, run the following command to initialize the environment:
+# Verify installation
+seeknal --help
+```
 
-    ```
-    $ cd seeknal_build
-    $ uv venv --python 3.11
-    ```
+### Option 2: Install from GitHub Releases
 
-    - Activate the environment:
+Visit the [releases page](https://github.com/mta-tech/seeknal/releases) and download the latest wheel file.
 
-    ```
-    source .venv/bin/activate  
-    ```
+```bash
+pip install seeknal-<version>-py3-none-any.whl
+```
 
-4. Install Seeknal using `uv pip`:
-    ```
-    uv pip install seeknal-<version>-py3-none-any.whl
-    ```
-    Replace <version> with the actual version number of the wheel file you downloaded.
+### Configuration
 
-5. Verify the Installation:
+1. Copy example configuration files:
+   ```bash
+   cp .env.example .env
+   mkdir -p ~/.seeknal
+   cp config.toml.example ~/.seeknal/config.toml
+   ```
 
-    To ensure that Seeknal has been installed correctly, you can run:
-    
-    ```
-    uv pip show seeknal
-    ```
-    This command will display information about the installed package, confirming that the installation was successful.
+2. Edit the files with your settings:
+   ```bash
+   # .env - Set your paths
+   SEEKNAL_BASE_CONFIG_PATH="${HOME}/.seeknal"
+   SEEKNAL_USER_CONFIG_PATH="${HOME}/.seeknal/config.toml"
+   ```
 
-6. Edit `.env` variable `SEEKNAL_BASE_CONFIG_PATH` and `SEEKNAL_USER_CONFIG_PATH` to point to the directory where you have `config.toml` file. For getting started, we have an example config.toml which you can find inside the `seeknal_build` directory. This case necessary update to the .env to point to the directory.
+3. (Optional) For production with Turso:
+   ```toml
+   # ~/.seeknal/config.toml
+   [context.database]
+   TURSO_DATABASE_URL = "your-turso-database-url"
+   TURSO_AUTH_TOKEN = "your-turso-auth-token"
+   ```
 
-    ```
-    SEEKNAL_BASE_CONFIG_PATH="path/to/seeknal_build"
-    SEEKNAL_USER_CONFIG_PATH="path/to/seeknal_build/config.toml"
-    ```
-
-Congratulation!
-Your seeknal has been installed on your machine and ready to use in your projects.
+**Congratulations!** Seeknal is now installed and ready to use.
 
 **Next Steps:**
 
