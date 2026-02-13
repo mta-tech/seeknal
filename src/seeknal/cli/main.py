@@ -4250,6 +4250,73 @@ def migrate_state(
         raise typer.Exit(1)
 
 
+@app.command()
+def lineage(
+    node_id: Optional[str] = typer.Argument(
+        None, help="Node to focus on (e.g., transform.clean_orders)"
+    ),
+    column: Optional[str] = typer.Option(
+        None, "--column", "-c",
+        help="Column to trace lineage for (requires node argument)"
+    ),
+    project: str = typer.Option(
+        None, "--project", "-p", help="Project name"
+    ),
+    path: Path = typer.Option(
+        Path("."), "--path", help="Project path"
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o",
+        help="Output HTML file path (default: target/lineage.html)"
+    ),
+    no_open: bool = typer.Option(
+        False, "--no-open", help="Don't auto-open browser"
+    ),
+):
+    """Generate interactive lineage visualization.
+
+    Examples:
+        seeknal lineage                              # Full DAG
+        seeknal lineage transform.clean_orders       # Focus on node
+        seeknal lineage transform.X --column total   # Trace column
+        seeknal lineage --output dag.html            # Custom path
+    """
+    from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
+    from seeknal.dag.visualize import generate_lineage_html, LineageVisualizationError
+
+    if project is None:
+        project = path.resolve().name
+
+    try:
+        try:
+            dag_builder = DAGBuilder(project_path=path)
+            dag_builder.build()
+        except (ValueError, CycleDetectedError, MissingDependencyError) as e:
+            _echo_error(f"DAG build failed: {e}")
+            raise typer.Exit(code=1)
+
+        manifest = _build_manifest_from_dag(dag_builder, project)
+
+        if not manifest.nodes:
+            _echo_warning("No nodes found. Add pipeline files to your project.")
+            raise typer.Exit(code=1)
+
+        if output is None:
+            output = path / "target" / "lineage.html"
+
+        result_path = generate_lineage_html(
+            manifest=manifest,
+            output_path=output,
+            focus_node=node_id,
+            focus_column=column,
+            open_browser=not no_open,
+        )
+        _echo_success(f"Lineage visualization generated: {result_path}")
+    except LineageVisualizationError as e:
+        _echo_error(str(e))
+        raise typer.Exit(code=1)
+
+
 def main():
     """Main entry point for the CLI."""
     app()

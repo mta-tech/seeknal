@@ -1,0 +1,1165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src https://unpkg.com 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:;">
+<title>Seeknal Lineage Visualization</title>
+<script src="https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js"
+        integrity="sha384-H3uzGzTfGHUAumB8+s4GEdfFwzAceN9wCCndN8AXubWKFIPuBSWKKtWDx7RhSf/z"
+        crossorigin="anonymous"></script>
+<script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"
+        integrity="sha384-2IH3T69EIKYC4c+RXZifZRvaH5SRUdacJW7j6HtE5rQbvLhKKdawxq6vpIzJ7j9M"
+        crossorigin="anonymous"></script>
+<script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"
+        integrity="sha384-u69h9ebXeSjlg6q/rb1zKTRAGu/h8deCl0409xpS/QJctMKnc4M9Fzkm01VOQdeF"
+        crossorigin="anonymous"></script>
+<style>
+/* ===== Reset & Base ===== */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  display: flex; flex-direction: column; height: 100vh; background: #f8fafc;
+  color: #1e293b; overflow: hidden;
+}
+
+/* ===== Top Header ===== */
+#top-header {
+  display: flex; align-items: center; padding: 0 16px;
+  background: #fff; border-bottom: 1px solid #e2e8f0;
+  height: 48px; flex-shrink: 0; z-index: 30;
+}
+#top-header .logo {
+  display: flex; align-items: center; gap: 8px;
+  font-weight: 700; font-size: 15px; color: #1e293b;
+  padding-right: 16px; border-right: 1px solid #e2e8f0; margin-right: 16px;
+}
+#top-header .logo-icon {
+  width: 22px; height: 22px; border-radius: 4px;
+  background: #3b82f6; color: #fff; display: flex;
+  align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 800;
+}
+#top-header .nav-breadcrumb {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: #64748b;
+}
+#top-header .nav-breadcrumb .sep { color: #cbd5e1; }
+#top-header .nav-breadcrumb .current { color: #1e293b; font-weight: 500; }
+#top-header .header-right {
+  margin-left: auto; display: flex; align-items: center; gap: 16px;
+}
+.header-stat {
+  font-size: 12px; color: #64748b; display: flex; align-items: center; gap: 4px;
+}
+.header-stat b { color: #1e293b; font-weight: 600; }
+.header-dot {
+  width: 6px; height: 6px; border-radius: 50%; display: inline-block;
+}
+
+/* ===== Main Layout ===== */
+#main-area { display: flex; flex: 1; overflow: hidden; }
+
+/* ===== Left Sidebar ===== */
+#sidebar {
+  width: 280px; background: #fff; border-right: 1px solid #e2e8f0;
+  display: flex; flex-direction: column; flex-shrink: 0; z-index: 20;
+}
+#sidebar-header {
+  padding: 12px 14px; border-bottom: 1px solid #e2e8f0;
+  display: flex; align-items: center; gap: 8px;
+}
+#sidebar-filter {
+  flex: 1; border: 1px solid #e2e8f0; border-radius: 6px;
+  padding: 7px 10px; font-size: 13px; outline: none;
+  color: #334155; background: #f8fafc;
+  transition: border-color 0.15s, background 0.15s;
+}
+#sidebar-filter:focus { border-color: #93c5fd; background: #fff; }
+#sidebar-filter::placeholder { color: #94a3b8; }
+#sidebar-count {
+  font-size: 12px; font-weight: 600; color: #3b82f6;
+  background: #eff6ff; border-radius: 10px;
+  padding: 2px 8px; flex-shrink: 0;
+}
+#sidebar-list {
+  flex: 1; overflow-y: auto; padding: 4px 0;
+}
+#sidebar-list::-webkit-scrollbar { width: 6px; }
+#sidebar-list::-webkit-scrollbar-track { background: transparent; }
+#sidebar-list::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+.sidebar-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; cursor: pointer;
+  transition: background 0.1s;
+  border-left: 3px solid transparent;
+}
+.sidebar-item:hover { background: #f1f5f9; }
+.sidebar-item.active {
+  background: #eff6ff; border-left-color: #3b82f6;
+}
+.sidebar-item .item-name {
+  font-size: 13px; color: #334155; font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; min-width: 0;
+}
+.sidebar-item.active .item-name { color: #1e293b; font-weight: 600; }
+.sidebar-item .item-badge {
+  font-size: 9px; font-weight: 700; letter-spacing: 0.5px;
+  padding: 2px 6px; border-radius: 3px; flex-shrink: 0;
+  text-transform: uppercase;
+}
+.sidebar-item.hidden-by-filter { display: none; }
+
+/* ===== Graph Area ===== */
+#graph-area {
+  flex: 1; display: flex; flex-direction: column; overflow: hidden;
+  position: relative;
+}
+
+/* ===== Stats Bar ===== */
+#stats-bar {
+  display: flex; align-items: center; gap: 12px; padding: 8px 16px;
+  background: #fff; border-bottom: 1px solid #e2e8f0;
+  flex-shrink: 0; min-height: 42px;
+}
+#stats-bar .focused-name {
+  font-weight: 600; font-size: 14px; color: #1e293b;
+  max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.stat-pill {
+  font-size: 12px; color: #64748b; padding: 3px 0;
+}
+.stat-pill b { color: #334155; font-weight: 600; }
+.stat-divider { color: #e2e8f0; font-size: 12px; }
+#stats-bar .search-box {
+  margin-left: auto; display: flex; align-items: center;
+  border: 1px solid #e2e8f0; border-radius: 6px; padding: 0 10px;
+  background: #f8fafc; transition: border-color 0.15s, background 0.15s;
+}
+#stats-bar .search-box:focus-within { border-color: #93c5fd; background: #fff; }
+#stats-bar .search-box .search-icon { color: #94a3b8; font-size: 13px; }
+#stats-bar .search-box input {
+  border: none; outline: none; font-size: 13px; padding: 6px 8px;
+  width: 140px; background: transparent; color: #334155;
+}
+#stats-bar .search-box input::placeholder { color: #94a3b8; }
+.show-btn {
+  display: flex; align-items: center; gap: 5px;
+  padding: 5px 12px; border: 1px solid #e2e8f0; border-radius: 6px;
+  background: #fff; cursor: pointer; font-size: 12px; color: #f97316;
+  font-weight: 600; transition: all 0.15s;
+}
+.show-btn:hover { background: #fff7ed; border-color: #fdba74; }
+
+/* ===== Graph Container ===== */
+#graph-container {
+  flex: 1; position: relative; overflow: hidden;
+  background: #f8fafc;
+  background-image: radial-gradient(circle, #e2e8f0 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+#cy { position: absolute; inset: 0; z-index: 1; }
+#node-overlay {
+  position: absolute; inset: 0; z-index: 2;
+  pointer-events: none; overflow: hidden;
+}
+#node-transform { transform-origin: 0 0; position: absolute; top: 0; left: 0; }
+
+/* ===== Floating Zoom Controls ===== */
+#zoom-controls {
+  position: absolute; bottom: 16px; left: 16px; z-index: 10;
+  display: flex; flex-direction: column; gap: 0;
+  background: #fff; border-radius: 10px; border: 1px solid #e2e8f0;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  overflow: hidden;
+}
+#zoom-controls button {
+  width: 36px; height: 36px; border: none; background: #fff;
+  cursor: pointer; font-size: 16px; color: #64748b;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.12s;
+}
+#zoom-controls button:hover { background: #f1f5f9; color: #1e293b; }
+#zoom-controls button.active { color: #3b82f6; background: #eff6ff; }
+#zoom-controls .ctrl-sep { height: 1px; background: #e2e8f0; }
+
+/* ===== Node Cards ===== */
+.node-card {
+  position: absolute; pointer-events: auto; cursor: pointer;
+  border-radius: 8px; border: 2px solid #cbd5e1;
+  background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  transition: border-color 0.15s, box-shadow 0.15s, opacity 0.2s;
+  overflow: hidden; user-select: none;
+}
+.node-card:hover {
+  box-shadow: 0 4px 16px rgba(0,0,0,0.1);
+}
+.node-card.selected {
+  border-color: #f97316; border-width: 3px;
+  box-shadow: 0 0 0 4px rgba(249,115,22,0.12), 0 4px 16px rgba(0,0,0,0.08);
+}
+.node-card.upstream {
+  border-color: #3b82f6; border-width: 3px;
+  box-shadow: 0 0 0 4px rgba(59,130,246,0.1), 0 4px 16px rgba(0,0,0,0.06);
+}
+.node-card.downstream {
+  border-color: #22c55e; border-width: 2px;
+  box-shadow: 0 0 0 3px rgba(34,197,94,0.1);
+}
+.node-card.dimmed { opacity: 0.18; pointer-events: none; }
+.node-card.search-match {
+  border-color: #8b5cf6; border-width: 3px;
+  box-shadow: 0 0 0 4px rgba(139,92,246,0.12);
+}
+
+/* Card Header */
+.card-header {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 10px; border-bottom: 1px solid #e2e8f0;
+  min-height: 36px;
+}
+.type-badge {
+  font-size: 9px; font-weight: 700; letter-spacing: 0.5px;
+  padding: 2px 6px; border-radius: 3px; flex-shrink: 0;
+}
+.card-name {
+  font-size: 12px; font-weight: 600; color: #1e293b;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; min-width: 0;
+}
+.col-count {
+  font-size: 10px; font-weight: 700; color: #fff;
+  background: #94a3b8; border-radius: 8px;
+  padding: 1px 6px; flex-shrink: 0;
+  min-width: 18px; text-align: center;
+}
+
+/* Card Body (Columns) */
+.card-body { padding: 0; }
+.col-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 4px 10px; font-size: 11px; border-bottom: 1px solid #f1f5f9;
+  gap: 8px; transition: background 0.1s;
+}
+.col-row:last-child { border-bottom: none; }
+.col-row:hover { background: #f8fafc; }
+.col-row .col-name {
+  font-family: 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+  color: #334155; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.col-row .col-type {
+  font-family: 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+  color: #94a3b8; font-size: 10px; flex-shrink: 0; text-transform: lowercase;
+}
+.col-row.highlighted { background: #fef3c7; }
+.col-more {
+  padding: 4px 10px; font-size: 10px; color: #94a3b8;
+  text-align: center; border-top: 1px solid #f1f5f9;
+}
+
+/* Connection handles */
+.handle {
+  position: absolute; width: 10px; height: 10px;
+  border-radius: 50%; border: 2px solid; background: #fff;
+  top: 50%; transform: translateY(-50%); z-index: 3;
+}
+.handle-left { left: -6px; }
+.handle-right { right: -6px; }
+
+/* ===== Details Panel ===== */
+#details-panel {
+  width: 0; overflow-y: auto; background: #fff; border-left: 1px solid #e2e8f0;
+  transition: width 0.2s ease; flex-shrink: 0; z-index: 10;
+}
+#details-panel.visible { width: 340px; padding: 20px; }
+#details-panel h2 {
+  font-size: 15px; color: #1e293b; margin-bottom: 6px;
+  word-break: break-all; font-weight: 600;
+}
+#details-panel .detail-id {
+  font-size: 11px; color: #94a3b8;
+  font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+  margin-bottom: 10px; word-break: break-all;
+}
+#details-panel .detail-badge {
+  display: inline-block; padding: 3px 10px; border-radius: 4px;
+  font-size: 10px; font-weight: 700; color: #fff;
+  margin-bottom: 14px; letter-spacing: 0.3px;
+}
+#details-panel .detail-desc {
+  font-size: 13px; color: #64748b; margin-bottom: 14px; line-height: 1.5;
+}
+#details-panel .detail-path {
+  font-size: 11px; color: #94a3b8;
+  font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+  margin-bottom: 14px; word-break: break-all;
+  padding: 8px 10px; background: #f8fafc; border-radius: 6px;
+  border: 1px solid #e2e8f0;
+}
+#details-panel h3 {
+  font-size: 12px; color: #475569; margin: 16px 0 8px;
+  font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+}
+#details-panel .detail-columns {
+  list-style: none; font-size: 12px;
+  font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+}
+#details-panel .detail-columns li {
+  display: flex; justify-content: space-between;
+  padding: 5px 0; border-bottom: 1px solid #f1f5f9; color: #334155;
+}
+#details-panel .detail-columns .dt-col-type { color: #94a3b8; font-size: 11px; }
+#details-panel .detail-more { font-size: 11px; color: #94a3b8; font-style: italic; margin-top: 6px; }
+#details-panel .sql-block {
+  font-size: 11px; font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+  background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px;
+  padding: 12px; overflow-x: auto; max-height: 200px;
+  white-space: pre-wrap; word-break: break-all; color: #334155; line-height: 1.6;
+}
+#details-panel .close-btn {
+  float: right; width: 28px; height: 28px; border: none; background: #f1f5f9;
+  border-radius: 6px; cursor: pointer; font-size: 16px; color: #64748b;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.12s;
+}
+#details-panel .close-btn:hover { background: #e2e8f0; color: #1e293b; }
+
+/* ===== Empty State ===== */
+#empty-state {
+  display: none; position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%, -50%); text-align: center; z-index: 5;
+}
+#empty-state h2 { font-size: 18px; color: #475569; margin-bottom: 8px; font-weight: 600; }
+#empty-state p { font-size: 14px; color: #94a3b8; }
+
+/* ===== Column Trace Bar ===== */
+#column-trace {
+  display: none; padding: 10px 16px; background: #fff;
+  border-top: 1px solid #e2e8f0; font-size: 13px;
+  overflow-x: auto; white-space: nowrap; flex-shrink: 0;
+}
+#column-trace .trace-label { font-weight: 600; color: #475569; margin-right: 8px; }
+#column-trace .trace-step {
+  display: inline-block; padding: 3px 10px; background: #eff6ff;
+  border: 1px solid #bfdbfe; border-radius: 4px; margin-right: 4px;
+  color: #1e40af; font-family: monospace; font-size: 12px;
+}
+#column-trace .trace-arrow { color: #94a3b8; margin-right: 4px; }
+
+/* ===== Footer ===== */
+#footer {
+  padding: 6px 16px; background: #fff; border-top: 1px solid #e2e8f0;
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 11px; color: #94a3b8; flex-shrink: 0;
+}
+
+/* ===== Tooltip ===== */
+#tooltip {
+  display: none; position: fixed; background: #1e293b; color: #f8fafc;
+  padding: 6px 10px; border-radius: 6px; font-size: 11px;
+  font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+  max-width: 300px; word-break: break-all; pointer-events: none;
+  z-index: 100; white-space: pre-wrap; box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+}
+
+/* ===== Zoom Indicator ===== */
+#zoom-pct {
+  position: absolute; top: 12px; right: 12px; z-index: 10;
+  font-size: 11px; color: #94a3b8; background: rgba(255,255,255,0.9);
+  padding: 4px 10px; border-radius: 4px; border: 1px solid #e2e8f0;
+}
+</style>
+</head>
+<body>
+
+<!-- Top Header -->
+<div id="top-header">
+  <div class="logo">
+    <span class="logo-icon">S</span>
+    <span>Seeknal</span>
+  </div>
+  <div class="nav-breadcrumb">
+    <span>Lineage</span>
+    <span class="sep">/</span>
+    <span class="current" id="nav-focus">All Models</span>
+  </div>
+  <div class="header-right">
+    <div class="header-stat">
+      <span class="header-dot" style="background:#22c55e"></span>
+      <span id="h-nodes"></span>
+    </div>
+    <div class="header-stat">
+      <span class="header-dot" style="background:#3b82f6"></span>
+      <span id="h-edges"></span>
+    </div>
+  </div>
+</div>
+
+<!-- Main Area -->
+<div id="main-area">
+  <!-- Left Sidebar -->
+  <div id="sidebar">
+    <div id="sidebar-header">
+      <input type="text" id="sidebar-filter" placeholder="Filter items">
+      <span id="sidebar-count">0</span>
+    </div>
+    <div id="sidebar-list"></div>
+  </div>
+
+  <!-- Graph + Stats + Details -->
+  <div id="graph-area">
+    <!-- Stats Bar -->
+    <div id="stats-bar">
+      <span class="focused-name" id="focused-label">Seeknal Lineage</span>
+      <span class="stat-divider">|</span>
+      <span class="stat-pill" id="stat-all"></span>
+      <span class="stat-pill" id="stat-hidden"></span>
+      <span class="stat-pill" id="stat-sources"></span>
+      <span class="stat-pill" id="stat-lineage"></span>
+      <div class="search-box">
+        <span class="search-icon">&#128269;</span>
+        <input type="text" id="search-input" placeholder="Find">
+      </div>
+      <button class="show-btn" id="btn-show">
+        <span>&#9660;</span> Show
+      </button>
+    </div>
+
+    <!-- Graph Container -->
+    <div id="graph-container">
+      <div id="cy"></div>
+      <div id="node-overlay">
+        <div id="node-transform"></div>
+      </div>
+
+      <!-- Floating Zoom Controls -->
+      <div id="zoom-controls">
+        <button id="btn-zoom-in" title="Zoom in">+</button>
+        <div class="ctrl-sep"></div>
+        <button id="btn-zoom-out" title="Zoom out">&minus;</button>
+        <div class="ctrl-sep"></div>
+        <button id="btn-fit" title="Fit to view">&#x2922;</button>
+        <div class="ctrl-sep"></div>
+        <button id="btn-lock" title="Lock layout">&#x1f512;</button>
+      </div>
+
+      <!-- Zoom Level Indicator -->
+      <div id="zoom-pct"></div>
+
+      <!-- Empty State -->
+      <div id="empty-state">
+        <h2>No nodes found</h2>
+        <p>Add pipeline files to your project.</p>
+      </div>
+    </div>
+
+    <!-- Details Panel -->
+    <div id="details-panel"></div>
+  </div>
+</div>
+
+<!-- Column Trace -->
+<div id="column-trace"></div>
+
+<!-- Footer -->
+<div id="footer">
+  <span>Seeknal &mdash; Lineage Visualization</span>
+  <span id="footer-engine"></span>
+</div>
+
+<!-- Tooltip -->
+<div id="tooltip"></div>
+
+<script>
+(function() {
+  'use strict';
+
+  var LINEAGE_DATA = {{ lineage_data_json | safe }};
+
+  /* ===== Helper: set stat text with bold value ===== */
+  function setStatText(el, label, value) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+    el.appendChild(document.createTextNode(label + ': '));
+    var b = document.createElement('b');
+    b.textContent = value;
+    el.appendChild(b);
+  }
+
+  function setHeaderStat(el, value, suffix) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+    var b = document.createElement('b');
+    b.textContent = value;
+    el.appendChild(b);
+    el.appendChild(document.createTextNode(' ' + suffix));
+  }
+
+  /* ===== Constants ===== */
+  var CARD_WIDTH = 260;
+  var MAX_VISIBLE_COLS = 8;
+  var HEADER_HEIGHT = 36;
+  var COL_ROW_HEIGHT = 23;
+  var MORE_ROW_HEIGHT = 24;
+
+  var NODE_COLORS = {
+    source:                   { border: '#3B82F6', bg: '#EFF6FF', text: '#1E40AF', badge: '#DBEAFE', badgeText: '#1E40AF' },
+    transform:                { border: '#10B981', bg: '#ECFDF5', text: '#065F46', badge: '#D1FAE5', badgeText: '#065F46' },
+    feature_group:            { border: '#8B5CF6', bg: '#F5F3FF', text: '#5B21B6', badge: '#EDE9FE', badgeText: '#5B21B6' },
+    aggregation:              { border: '#F59E0B', bg: '#FFFBEB', text: '#92400E', badge: '#FEF3C7', badgeText: '#92400E' },
+    second_order_aggregation: { border: '#D97706', bg: '#FEF3C7', text: '#78350F', badge: '#FDE68A', badgeText: '#78350F' },
+    exposure:                 { border: '#EF4444', bg: '#FEF2F2', text: '#991B1B', badge: '#FEE2E2', badgeText: '#991B1B' },
+    rule:                     { border: '#6B7280', bg: '#F9FAFB', text: '#374151', badge: '#F3F4F6', badgeText: '#374151' },
+    python:                   { border: '#14B8A6', bg: '#F0FDFA', text: '#134E4A', badge: '#CCFBF1', badgeText: '#134E4A' },
+    semantic_model:           { border: '#6366F1', bg: '#EEF2FF', text: '#3730A3', badge: '#E0E7FF', badgeText: '#3730A3' },
+    metric:                   { border: '#EC4899', bg: '#FDF2F8', text: '#9D174D', badge: '#FCE7F3', badgeText: '#9D174D' },
+    model:                    { border: '#0EA5E9', bg: '#F0F9FF', text: '#075985', badge: '#E0F2FE', badgeText: '#075985' }
+  };
+  var DEFAULT_COLOR = { border: '#94A3B8', bg: '#F8FAFC', text: '#475569', badge: '#F1F5F9', badgeText: '#475569' };
+
+  var TYPE_LABELS = {
+    source: 'SOURCE', transform: 'SQL', feature_group: 'FG', aggregation: 'AGG',
+    second_order_aggregation: '2ND AGG', exposure: 'EXPOSURE', rule: 'RULE',
+    python: 'PYTHON', semantic_model: 'SEMANTIC', metric: 'METRIC', model: 'MODEL'
+  };
+
+  var TYPE_SHORT = {
+    source: 'SRC', transform: 'SQL', feature_group: 'FG', aggregation: 'AGG',
+    second_order_aggregation: '2ND', exposure: 'EXP', rule: 'RULE',
+    python: 'PY', semantic_model: 'SEM', metric: 'MET', model: 'MOD'
+  };
+
+  /* ===== Helpers ===== */
+  function getNodeColumns(nodeData) {
+    var cols = [];
+    var colLineage = LINEAGE_DATA.column_lineage[nodeData.id];
+
+    if (nodeData.columns && Object.keys(nodeData.columns).length > 0) {
+      Object.entries(nodeData.columns).forEach(function(entry) {
+        cols.push({ name: entry[0], type: entry[1] || '' });
+      });
+    } else if (colLineage && colLineage.output_columns) {
+      colLineage.output_columns.forEach(function(colName) {
+        var colType = '';
+        if (colLineage.dependencies) {
+          for (var i = 0; i < colLineage.dependencies.length; i++) {
+            if (colLineage.dependencies[i].output === colName) {
+              colType = colLineage.dependencies[i].transformation_type || '';
+              break;
+            }
+          }
+        }
+        cols.push({ name: colName, type: colType });
+      });
+    }
+    return cols;
+  }
+
+  function computeCardHeight(cols) {
+    var visibleCount = Math.min(cols.length, MAX_VISIBLE_COLS);
+    var bodyHeight = visibleCount * COL_ROW_HEIGHT;
+    if (cols.length > MAX_VISIBLE_COLS) bodyHeight += MORE_ROW_HEIGHT;
+    return HEADER_HEIGHT + (visibleCount > 0 ? bodyHeight : 0);
+  }
+
+  /* ===== Empty State ===== */
+  if (!LINEAGE_DATA.nodes || LINEAGE_DATA.nodes.length === 0) {
+    document.getElementById('empty-state').style.display = 'block';
+    document.getElementById('cy').style.display = 'none';
+    document.getElementById('node-overlay').style.display = 'none';
+    return;
+  }
+
+  /* ===== Precompute Node Data ===== */
+  var nodeColumnsMap = {};
+  var nodeDimensionsMap = {};
+
+  LINEAGE_DATA.nodes.forEach(function(n) {
+    var cols = getNodeColumns(n.data);
+    nodeColumnsMap[n.data.id] = cols;
+    var h = computeCardHeight(cols);
+    nodeDimensionsMap[n.data.id] = { width: CARD_WIDTH, height: h };
+    n.data._width = CARD_WIDTH;
+    n.data._height = h;
+  });
+
+  /* ===== Build Sidebar ===== */
+  var sidebarList = document.getElementById('sidebar-list');
+  var sidebarItems = {};
+
+  // Sort nodes alphabetically
+  var sortedNodes = LINEAGE_DATA.nodes.slice().sort(function(a, b) {
+    return a.data.label.localeCompare(b.data.label);
+  });
+
+  sortedNodes.forEach(function(n) {
+    var colors = NODE_COLORS[n.data.node_type] || DEFAULT_COLOR;
+    var item = document.createElement('div');
+    item.className = 'sidebar-item';
+    item.setAttribute('data-node-id', n.data.id);
+    item.setAttribute('data-label', n.data.label.toLowerCase());
+    item.setAttribute('data-type', n.data.node_type);
+
+    var nameSpan = document.createElement('span');
+    nameSpan.className = 'item-name';
+    nameSpan.textContent = n.data.label;
+    nameSpan.title = n.data.id;
+    item.appendChild(nameSpan);
+
+    var badge = document.createElement('span');
+    badge.className = 'item-badge';
+    badge.style.background = colors.badge;
+    badge.style.color = colors.badgeText;
+    badge.textContent = TYPE_LABELS[n.data.node_type] || n.data.node_type.toUpperCase();
+    item.appendChild(badge);
+
+    item.addEventListener('click', function() {
+      selectNode(n.data.id, true);
+    });
+
+    sidebarList.appendChild(item);
+    sidebarItems[n.data.id] = item;
+  });
+
+  document.getElementById('sidebar-count').textContent = String(LINEAGE_DATA.nodes.length);
+
+  /* ===== Sidebar Filter ===== */
+  var sidebarFilter = document.getElementById('sidebar-filter');
+  sidebarFilter.addEventListener('input', function() {
+    var query = this.value.toLowerCase().trim();
+    var visible = 0;
+    Object.keys(sidebarItems).forEach(function(id) {
+      var item = sidebarItems[id];
+      var label = item.getAttribute('data-label');
+      var nodeType = item.getAttribute('data-type');
+      var match = !query || label.indexOf(query) !== -1 || nodeType.indexOf(query) !== -1;
+      item.classList.toggle('hidden-by-filter', !match);
+      if (match) visible++;
+    });
+    document.getElementById('sidebar-count').textContent = String(visible);
+  });
+
+  /* ===== Stats ===== */
+  var totalNodes = LINEAGE_DATA.nodes.length;
+  var sourceCount = 0;
+  LINEAGE_DATA.nodes.forEach(function(n) {
+    if (n.data.node_type === 'source') sourceCount++;
+  });
+  var upDownCount = totalNodes - sourceCount;
+
+  setStatText(document.getElementById('stat-all'), 'All', totalNodes);
+  setStatText(document.getElementById('stat-hidden'), 'Hidden', 0);
+  setStatText(document.getElementById('stat-sources'), 'Sources', sourceCount);
+  setStatText(document.getElementById('stat-lineage'), 'Upstream/Downstream', upDownCount);
+  setHeaderStat(document.getElementById('h-nodes'), totalNodes, 'Nodes');
+  setHeaderStat(document.getElementById('h-edges'), LINEAGE_DATA.edges.length, 'Edges');
+
+  if (LINEAGE_DATA.focus_node) {
+    document.getElementById('focused-label').textContent = LINEAGE_DATA.focus_node;
+    document.getElementById('nav-focus').textContent = LINEAGE_DATA.focus_node;
+  }
+
+  /* ===== Initialize Cytoscape ===== */
+  var cy = cytoscape({
+    container: document.getElementById('cy'),
+    elements: [].concat(LINEAGE_DATA.nodes, LINEAGE_DATA.edges),
+    layout: { name: 'preset' },
+    style: [
+      {
+        selector: 'node',
+        style: {
+          'width': 'data(_width)',
+          'height': 'data(_height)',
+          'shape': 'round-rectangle',
+          'background-opacity': 0,
+          'border-opacity': 0,
+          'label': '',
+          'overlay-opacity': 0
+        }
+      },
+      {
+        selector: 'edge',
+        style: {
+          'width': 1.5,
+          'line-color': '#93c5fd',
+          'target-arrow-color': '#93c5fd',
+          'target-arrow-shape': 'triangle',
+          'arrow-scale': 0.7,
+          'curve-style': 'bezier',
+          'source-endpoint': '50% 0',
+          'target-endpoint': '-50% 0',
+          'edge-distances': 'node-position',
+          'line-opacity': 0.7
+        }
+      },
+      {
+        selector: 'edge.upstream',
+        style: {
+          'line-color': '#3b82f6',
+          'target-arrow-color': '#3b82f6',
+          'width': 2,
+          'line-opacity': 1
+        }
+      },
+      {
+        selector: 'edge.downstream',
+        style: {
+          'line-color': '#22c55e',
+          'target-arrow-color': '#22c55e',
+          'width': 2,
+          'line-opacity': 1
+        }
+      },
+      {
+        selector: 'edge.dimmed',
+        style: { 'opacity': 0.1 }
+      }
+    ],
+    minZoom: 0.1,
+    maxZoom: 4,
+    wheelSensitivity: 0.3,
+    boxSelectionEnabled: false
+  });
+
+  /* ===== Run Dagre Layout ===== */
+  var layout = cy.layout({
+    name: 'dagre',
+    rankDir: 'LR',
+    nodeSep: 60,
+    rankSep: 120,
+    padding: 40,
+    animate: false
+  });
+  layout.run();
+
+  /* ===== Create HTML Node Cards ===== */
+  var cardElements = {};
+  var nodeTransform = document.getElementById('node-transform');
+  var selectedNodeId = null;
+
+  function createCard(nodeData) {
+    var cols = nodeColumnsMap[nodeData.id] || [];
+    var colors = NODE_COLORS[nodeData.node_type] || DEFAULT_COLOR;
+    var dims = nodeDimensionsMap[nodeData.id];
+
+    var card = document.createElement('div');
+    card.className = 'node-card';
+    card.id = 'card-' + nodeData.id;
+    card.setAttribute('data-node-id', nodeData.id);
+    card.style.width = dims.width + 'px';
+    card.style.height = dims.height + 'px';
+    card.style.borderColor = colors.border;
+
+    // Connection handles
+    var handleL = document.createElement('div');
+    handleL.className = 'handle handle-left';
+    handleL.style.borderColor = colors.border;
+    card.appendChild(handleL);
+
+    var handleR = document.createElement('div');
+    handleR.className = 'handle handle-right';
+    handleR.style.borderColor = colors.border;
+    card.appendChild(handleR);
+
+    // Header
+    var header = document.createElement('div');
+    header.className = 'card-header';
+    header.style.background = colors.bg;
+
+    var badge = document.createElement('span');
+    badge.className = 'type-badge';
+    badge.style.background = colors.badge;
+    badge.style.color = colors.badgeText;
+    badge.textContent = TYPE_SHORT[nodeData.node_type] || nodeData.node_type.slice(0, 4).toUpperCase();
+    header.appendChild(badge);
+
+    var name = document.createElement('span');
+    name.className = 'card-name';
+    name.textContent = nodeData.label;
+    name.title = nodeData.id;
+    header.appendChild(name);
+
+    if (cols.length > 0) {
+      var count = document.createElement('span');
+      count.className = 'col-count';
+      count.textContent = String(cols.length);
+      header.appendChild(count);
+    }
+
+    card.appendChild(header);
+
+    // Column body
+    if (cols.length > 0) {
+      var body = document.createElement('div');
+      body.className = 'card-body';
+
+      var visibleCols = cols.slice(0, MAX_VISIBLE_COLS);
+      visibleCols.forEach(function(col) {
+        var row = document.createElement('div');
+        row.className = 'col-row';
+        row.setAttribute('data-col-name', col.name);
+
+        var colName = document.createElement('span');
+        colName.className = 'col-name';
+        colName.textContent = col.name;
+        row.appendChild(colName);
+
+        if (col.type) {
+          var colType = document.createElement('span');
+          colType.className = 'col-type';
+          colType.textContent = col.type;
+          row.appendChild(colType);
+        }
+
+        body.appendChild(row);
+      });
+
+      if (cols.length > MAX_VISIBLE_COLS) {
+        var moreRow = document.createElement('div');
+        moreRow.className = 'col-more';
+        moreRow.textContent = '+ ' + (cols.length - MAX_VISIBLE_COLS) + ' more columns';
+        body.appendChild(moreRow);
+      }
+
+      card.appendChild(body);
+    }
+
+    return card;
+  }
+
+  // Create and position all cards
+  cy.nodes().forEach(function(cyNode) {
+    var nodeData = cyNode.data();
+    var card = createCard(nodeData);
+    var pos = cyNode.position();
+    var dims = nodeDimensionsMap[nodeData.id];
+
+    card.style.left = (pos.x - dims.width / 2) + 'px';
+    card.style.top = (pos.y - dims.height / 2) + 'px';
+
+    nodeTransform.appendChild(card);
+    cardElements[nodeData.id] = card;
+  });
+
+  /* ===== Sync Overlay with Cytoscape Viewport ===== */
+  function syncOverlay() {
+    var zoom = cy.zoom();
+    var pan = cy.pan();
+    nodeTransform.style.transform = 'translate(' + pan.x + 'px, ' + pan.y + 'px) scale(' + zoom + ')';
+    document.getElementById('zoom-pct').textContent = Math.round(zoom * 100) + '%';
+  }
+
+  cy.on('viewport', syncOverlay);
+  syncOverlay();
+
+  /* ===== Details Panel ===== */
+  function showDetailsPanel(nodeData) {
+    var panel = document.getElementById('details-panel');
+    while (panel.firstChild) panel.removeChild(panel.firstChild);
+
+    var colors = NODE_COLORS[nodeData.node_type] || DEFAULT_COLOR;
+
+    // Close button
+    var closeBtn = document.createElement('button');
+    closeBtn.className = 'close-btn';
+    closeBtn.textContent = '\u2715';
+    closeBtn.addEventListener('click', function() {
+      resetHighlight();
+      hideDetailsPanel();
+    });
+    panel.appendChild(closeBtn);
+
+    var h2 = document.createElement('h2');
+    h2.textContent = nodeData.label;
+    panel.appendChild(h2);
+
+    var idText = document.createElement('p');
+    idText.className = 'detail-id';
+    idText.textContent = nodeData.id;
+    panel.appendChild(idText);
+
+    var badge = document.createElement('span');
+    badge.className = 'detail-badge';
+    badge.style.background = colors.border;
+    badge.textContent = TYPE_LABELS[nodeData.node_type] || nodeData.node_type;
+    panel.appendChild(badge);
+
+    if (nodeData.description) {
+      var desc = document.createElement('p');
+      desc.className = 'detail-desc';
+      desc.textContent = nodeData.description;
+      panel.appendChild(desc);
+    }
+
+    if (nodeData.file_path) {
+      var fp = document.createElement('p');
+      fp.className = 'detail-path';
+      fp.textContent = nodeData.file_path;
+      panel.appendChild(fp);
+    }
+
+    // Columns
+    var cols = nodeColumnsMap[nodeData.id] || [];
+    if (cols.length > 0) {
+      var h3 = document.createElement('h3');
+      h3.textContent = 'Columns (' + cols.length + ')';
+      panel.appendChild(h3);
+
+      var ul = document.createElement('ul');
+      ul.className = 'detail-columns';
+      var visible = cols.slice(0, 25);
+      visible.forEach(function(col) {
+        var li = document.createElement('li');
+        var cn = document.createElement('span');
+        cn.textContent = col.name;
+        li.appendChild(cn);
+        if (col.type) {
+          var ct = document.createElement('span');
+          ct.className = 'dt-col-type';
+          ct.textContent = col.type;
+          li.appendChild(ct);
+        }
+        ul.appendChild(li);
+      });
+      panel.appendChild(ul);
+
+      if (cols.length > 25) {
+        var more = document.createElement('p');
+        more.className = 'detail-more';
+        more.textContent = '+ ' + (cols.length - 25) + ' more columns';
+        panel.appendChild(more);
+      }
+    }
+
+    // SQL
+    if (nodeData.sql) {
+      var sqlH3 = document.createElement('h3');
+      sqlH3.textContent = 'SQL';
+      panel.appendChild(sqlH3);
+
+      var sqlPre = document.createElement('pre');
+      sqlPre.className = 'sql-block';
+      sqlPre.textContent = nodeData.sql;
+      panel.appendChild(sqlPre);
+    }
+
+    panel.classList.add('visible');
+  }
+
+  function hideDetailsPanel() {
+    document.getElementById('details-panel').classList.remove('visible');
+  }
+
+  /* ===== Lineage Highlighting ===== */
+  function highlightLineage(nodeId) {
+    var cyNode = cy.getElementById(nodeId);
+    if (!cyNode.length) return;
+
+    var upNodes = cyNode.predecessors('node');
+    var upEdges = cyNode.predecessors('edge');
+    var downNodes = cyNode.successors('node');
+    var downEdges = cyNode.successors('edge');
+
+    // Dim all edges first
+    cy.edges().addClass('dimmed');
+    upEdges.removeClass('dimmed').addClass('upstream');
+    downEdges.removeClass('dimmed').addClass('downstream');
+
+    // Dim/highlight cards
+    Object.keys(cardElements).forEach(function(id) {
+      var card = cardElements[id];
+      card.classList.remove('selected', 'upstream', 'downstream', 'dimmed');
+      if (id === nodeId) {
+        card.classList.add('selected');
+      } else if (upNodes.filter('[id="' + id + '"]').length) {
+        card.classList.add('upstream');
+      } else if (downNodes.filter('[id="' + id + '"]').length) {
+        card.classList.add('downstream');
+      } else {
+        card.classList.add('dimmed');
+      }
+    });
+
+    // Highlight sidebar
+    Object.keys(sidebarItems).forEach(function(id) {
+      sidebarItems[id].classList.toggle('active', id === nodeId);
+    });
+  }
+
+  function resetHighlight() {
+    cy.edges().removeClass('upstream downstream dimmed');
+    Object.keys(cardElements).forEach(function(id) {
+      cardElements[id].classList.remove('selected', 'upstream', 'downstream', 'dimmed', 'search-match');
+    });
+    Object.keys(sidebarItems).forEach(function(id) {
+      sidebarItems[id].classList.remove('active');
+    });
+    selectedNodeId = null;
+    document.getElementById('focused-label').textContent = 'Seeknal Lineage';
+    document.getElementById('nav-focus').textContent = 'All Models';
+  }
+
+  /* ===== Select Node (from card or sidebar) ===== */
+  function selectNode(nodeId, centerOnNode) {
+    var cyNode = cy.getElementById(nodeId);
+    if (!cyNode.length) return;
+
+    resetHighlight();
+    selectedNodeId = nodeId;
+    highlightLineage(nodeId);
+    showDetailsPanel(cyNode.data());
+
+    document.getElementById('focused-label').textContent = cyNode.data().label;
+    document.getElementById('nav-focus').textContent = cyNode.data().label;
+
+    // Scroll sidebar item into view
+    if (sidebarItems[nodeId]) {
+      sidebarItems[nodeId].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+
+    if (centerOnNode) {
+      cy.animate({ center: { eles: cyNode }, duration: 250 });
+    }
+  }
+
+  /* ===== Card Click Handlers ===== */
+  nodeTransform.addEventListener('click', function(evt) {
+    var card = evt.target.closest('.node-card');
+    if (!card) return;
+
+    var nodeId = card.getAttribute('data-node-id');
+    selectNode(nodeId, false);
+    evt.stopPropagation();
+  });
+
+  // Click background to reset
+  document.getElementById('graph-container').addEventListener('click', function(evt) {
+    if (evt.target.closest('.node-card')) return;
+    if (evt.target.closest('#zoom-controls')) return;
+    resetHighlight();
+    hideDetailsPanel();
+  });
+
+  /* ===== Zoom Controls ===== */
+  document.getElementById('btn-fit').addEventListener('click', function() {
+    cy.fit(null, 40);
+    syncOverlay();
+  });
+  document.getElementById('btn-zoom-in').addEventListener('click', function() {
+    cy.zoom({ level: cy.zoom() * 1.3, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } });
+    syncOverlay();
+  });
+  document.getElementById('btn-zoom-out').addEventListener('click', function() {
+    cy.zoom({ level: cy.zoom() / 1.3, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } });
+    syncOverlay();
+  });
+
+  var layoutLocked = false;
+  document.getElementById('btn-lock').addEventListener('click', function() {
+    layoutLocked = !layoutLocked;
+    cy.autoungrabify(layoutLocked);
+    this.classList.toggle('active', layoutLocked);
+    this.textContent = layoutLocked ? '\u{1f510}' : '\u{1f512}';
+  });
+
+  /* ===== Search ===== */
+  var searchInput = document.getElementById('search-input');
+  searchInput.addEventListener('input', function() {
+    var query = this.value.toLowerCase().trim();
+    Object.keys(cardElements).forEach(function(id) {
+      var card = cardElements[id];
+      card.classList.remove('search-match', 'dimmed');
+      if (query && (id.toLowerCase().indexOf(query) !== -1)) {
+        card.classList.add('search-match');
+      } else if (query) {
+        card.classList.add('dimmed');
+      }
+    });
+    if (query) {
+      cy.edges().addClass('dimmed');
+    } else {
+      cy.edges().removeClass('dimmed');
+    }
+  });
+
+  searchInput.addEventListener('keydown', function(evt) {
+    if (evt.key === 'Escape') {
+      this.value = '';
+      this.dispatchEvent(new Event('input'));
+    }
+  });
+
+  /* ===== Column Trace Breadcrumb ===== */
+  function renderColumnTrace() {
+    var traceData = LINEAGE_DATA.metadata && LINEAGE_DATA.metadata.column_trace;
+    if (!traceData || traceData.length === 0) return;
+
+    var bar = document.getElementById('column-trace');
+    while (bar.firstChild) bar.removeChild(bar.firstChild);
+
+    var label = document.createElement('span');
+    label.className = 'trace-label';
+    label.textContent = 'Column Trace:';
+    bar.appendChild(label);
+
+    traceData.forEach(function(step, idx) {
+      if (idx > 0) {
+        var arrow = document.createElement('span');
+        arrow.className = 'trace-arrow';
+        arrow.textContent = '\u2190';
+        bar.appendChild(arrow);
+      }
+      var stepEl = document.createElement('span');
+      stepEl.className = 'trace-step';
+      stepEl.textContent = step.node + '.' + step.column;
+      if (step.transformation_type && step.transformation_type !== 'source') {
+        stepEl.textContent += ' (' + step.transformation_type + ')';
+      }
+      bar.appendChild(stepEl);
+
+      // Highlight column in card
+      var card = cardElements[step.node];
+      if (card) {
+        var colRows = card.querySelectorAll('.col-row');
+        colRows.forEach(function(row) {
+          if (row.getAttribute('data-col-name') === step.column) {
+            row.classList.add('highlighted');
+          }
+        });
+      }
+    });
+
+    bar.style.display = 'block';
+  }
+
+  /* ===== Initial State ===== */
+
+  // Focus node highlight
+  if (LINEAGE_DATA.focus_node) {
+    selectedNodeId = LINEAGE_DATA.focus_node;
+    highlightLineage(LINEAGE_DATA.focus_node);
+
+    var focusNode = cy.getElementById(LINEAGE_DATA.focus_node);
+    if (focusNode.length) {
+      showDetailsPanel(focusNode.data());
+      document.getElementById('focused-label').textContent = focusNode.data().label;
+      document.getElementById('nav-focus').textContent = focusNode.data().label;
+      cy.animate({ center: { eles: focusNode }, duration: 300 });
+    }
+  }
+
+  // Column trace
+  if (LINEAGE_DATA.focus_column) {
+    renderColumnTrace();
+  }
+
+  // Fit on load
+  cy.fit(null, 40);
+  syncOverlay();
+
+  // Footer engine info
+  document.getElementById('footer-engine').textContent = 'Cytoscape.js + Dagre';
+
+})();
+</script>
+</body>
+</html>
