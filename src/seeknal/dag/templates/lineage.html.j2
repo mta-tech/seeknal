@@ -116,6 +116,9 @@ body {
   flex: 1; display: flex; flex-direction: column; overflow: hidden;
   position: relative;
 }
+#graph-content {
+  flex: 1; display: flex; flex-direction: row; overflow: hidden;
+}
 
 /* ===== Stats Bar ===== */
 #stats-bar {
@@ -426,36 +429,38 @@ body {
       </button>
     </div>
 
-    <!-- Graph Container -->
-    <div id="graph-container">
-      <div id="cy"></div>
-      <div id="node-overlay">
-        <div id="node-transform"></div>
+    <!-- Graph Content (row: graph + details panel) -->
+    <div id="graph-content">
+      <div id="graph-container">
+        <div id="cy"></div>
+        <div id="node-overlay">
+          <div id="node-transform"></div>
+        </div>
+
+        <!-- Floating Zoom Controls -->
+        <div id="zoom-controls">
+          <button id="btn-zoom-in" title="Zoom in">+</button>
+          <div class="ctrl-sep"></div>
+          <button id="btn-zoom-out" title="Zoom out">&minus;</button>
+          <div class="ctrl-sep"></div>
+          <button id="btn-fit" title="Fit to view">&#x2922;</button>
+          <div class="ctrl-sep"></div>
+          <button id="btn-lock" title="Lock layout">&#x1f512;</button>
+        </div>
+
+        <!-- Zoom Level Indicator -->
+        <div id="zoom-pct"></div>
+
+        <!-- Empty State -->
+        <div id="empty-state">
+          <h2>No nodes found</h2>
+          <p>Add pipeline files to your project.</p>
+        </div>
       </div>
 
-      <!-- Floating Zoom Controls -->
-      <div id="zoom-controls">
-        <button id="btn-zoom-in" title="Zoom in">+</button>
-        <div class="ctrl-sep"></div>
-        <button id="btn-zoom-out" title="Zoom out">&minus;</button>
-        <div class="ctrl-sep"></div>
-        <button id="btn-fit" title="Fit to view">&#x2922;</button>
-        <div class="ctrl-sep"></div>
-        <button id="btn-lock" title="Lock layout">&#x1f512;</button>
-      </div>
-
-      <!-- Zoom Level Indicator -->
-      <div id="zoom-pct"></div>
-
-      <!-- Empty State -->
-      <div id="empty-state">
-        <h2>No nodes found</h2>
-        <p>Add pipeline files to your project.</p>
-      </div>
+      <!-- Details Panel -->
+      <div id="details-panel"></div>
     </div>
-
-    <!-- Details Panel -->
-    <div id="details-panel"></div>
   </div>
 </div>
 
@@ -946,7 +951,10 @@ body {
   }
 
   function hideDetailsPanel() {
-    document.getElementById('details-panel').classList.remove('visible');
+    var panel = document.getElementById('details-panel');
+    panel.classList.remove('visible');
+    // Clear content so hidden panel has no intrinsic height
+    while (panel.firstChild) panel.removeChild(panel.firstChild);
   }
 
   /* ===== Lineage Highlighting ===== */
