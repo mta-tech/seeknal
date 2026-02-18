@@ -214,7 +214,12 @@ class EnvironmentManager:
         """
         env_dir = self._get_env_dir(env_name)
         if not env_dir.exists():
-            raise ValueError(f"Environment '{env_name}' not found")
+            available = [e.name for e in self.list_environments()]
+            hint = f" Available: {', '.join(available)}" if available else ""
+            raise ValueError(
+                f"Environment '{env_name}' not found.{hint} "
+                f"Run 'seeknal env plan {env_name}' to create it."
+            )
 
         plan_data = self._load_json(env_dir / "plan.json")
         if plan_data is None:
@@ -225,7 +230,10 @@ class EnvironmentManager:
 
         manifest_data = self._load_json(env_dir / "manifest.json")
         if manifest_data is None:
-            raise ValueError(f"No manifest found for environment '{env_name}'")
+            raise ValueError(
+                f"No manifest found for environment '{env_name}'. "
+                f"Run 'seeknal env plan {env_name}' to regenerate."
+            )
 
         # Check staleness
         new_manifest = Manifest.from_dict(manifest_data)
@@ -267,7 +275,12 @@ class EnvironmentManager:
         """
         from_dir = self._get_env_dir(from_env)
         if not from_dir.exists():
-            raise ValueError(f"Environment '{from_env}' not found")
+            available = [e.name for e in self.list_environments()]
+            hint = f" Available: {', '.join(available)}" if available else ""
+            raise ValueError(
+                f"Environment '{from_env}' not found.{hint} "
+                f"Run 'seeknal env plan {from_env}' to create it."
+            )
 
         # Check that env has been applied (has run_state.json)
         env_state = from_dir / "run_state.json"
@@ -352,7 +365,9 @@ class EnvironmentManager:
         """Delete an environment directory."""
         env_dir = self._get_env_dir(env_name)
         if not env_dir.exists():
-            raise ValueError(f"Environment '{env_name}' not found")
+            available = [e.name for e in self.list_environments()]
+            hint = f" Available: {', '.join(available)}" if available else ""
+            raise ValueError(f"Environment '{env_name}' not found.{hint}")
         shutil.rmtree(env_dir)
 
     def cleanup_expired(self) -> List[str]:

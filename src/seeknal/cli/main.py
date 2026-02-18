@@ -3578,7 +3578,11 @@ def _run_in_environment(
 
     _echo_info(f"Applying plan for environment '{env_name}'...")
 
-    apply_info = manager.apply(env_name, force=force)
+    try:
+        apply_info = manager.apply(env_name, force=force)
+    except ValueError as e:
+        _echo_error(str(e))
+        raise typer.Exit(1)
 
     nodes_to_execute = apply_info["nodes_to_execute"]
     env_dir = apply_info["env_dir"]
