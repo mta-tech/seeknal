@@ -2651,6 +2651,14 @@ def plan(
                         typer.echo(typer.style(
                             f"    - {edge.from_node} -> {edge.to_node}", fg=typer.colors.RED
                         ))
+
+                # Hint for detailed diff
+                if diff.modified_nodes:
+                    typer.echo("")
+                    typer.echo(typer.style(
+                        "  Tip: Run 'seeknal diff <type>/<name>' for detailed YAML diff",
+                        fg=typer.colors.RESET,
+                    ))
             else:
                 _echo_info("No changes detected since last parse")
         else:
@@ -2709,6 +2717,167 @@ def plan(
 
         typer.echo("")
         _echo_info(f"Total: {len(execution_order)} nodes, {len(nodes_to_run)} to run")
+
+
+@app.command(name="diff")
+@handle_cli_error("Diff failed")
+def diff_command(
+    node: Optional[str] = typer.Argument(None, help="Node to diff (e.g., 'sources/orders')"),
+    node_type: Optional[str] = typer.Option(None, "--type", "-t", help="Filter by node type"),
+    stat: bool = typer.Option(False, "--stat", help="Show summary statistics only"),
+    project_path: Path = typer.Option(".", "--project-path", "-p", help="Project directory"),
+):
+    """Show changes in pipeline files since last apply.
+
+    Like 'git diff' for your Seeknal pipelines. Shows unified YAML diffs
+    with semantic annotations (BREAKING/NON_BREAKING/METADATA).
+
+    Examples:
+        seeknal diff                    # Show all changes
+        seeknal diff sources/orders     # Diff a specific node
+        seeknal diff --type transforms  # Filter by node type
+        seeknal diff --stat             # Show summary statistics only
+    """
+    from seeknal.workflow.diff_engine import DiffEngine
+    from seeknal.dag.diff import ChangeCategory
+
+    project_path = Path(project_path).resolve()
+    engine = DiffEngine(project_path)
+
+    if node:
+        # Single-node diff mode
+        try:
+            result = engine.diff_node(node)
+        except ValueError as e:
+            _echo_error(str(e))
+            raise typer.Exit(1)
+
+        if result.status == "unchanged":
+            _echo_success("No changes detected since last apply.")
+            return
+
+        if result.status == "new":
+            _echo_info(f"New file (not yet applied): {result.file_path}")
+            return
+
+        if result.status == "deleted":
+            _echo_warning(f"Deleted: {result.node_id}")
+            return
+
+        # Show unified diff
+        if result.unified_diff:
+            for line in result.unified_diff.splitlines():
+                if line.startswith("---") or line.startswith("+++"):
+                    typer.echo(typer.style(line, bold=True))
+                elif line.startswith("-"):
+                    typer.echo(typer.style(line, fg=typer.colors.RED))
+                elif line.startswith("+"):
+                    typer.echo(typer.style(line, fg=typer.colors.GREEN))
+                elif line.startswith("@@"):
+                    typer.echo(typer.style(line, fg=typer.colors.CYAN))
+                else:
+                    typer.echo(line)
+
+        # Show semantic annotations
+        typer.echo("")
+        if result.category:
+            cat_labels = {
+                ChangeCategory.BREAKING: ("BREAKING (downstream rebuild required)", typer.colors.RED),
+                ChangeCategory.NON_BREAKING: ("NON_BREAKING (rebuild this node)", typer.colors.YELLOW),
+                ChangeCategory.METADATA: ("METADATA (no rebuild needed)", typer.colors.BLUE),
+            }
+            label, color = cat_labels.get(
+                result.category, ("UNKNOWN", typer.colors.RESET)
+            )
+            typer.echo(typer.style(f"  Category: {label}", fg=color, bold=True))
+
+        if result.downstream_count > 0 and result.category == ChangeCategory.BREAKING:
+            typer.echo(typer.style(
+                f"  Impact: {result.downstream_count} downstream node(s) affected",
+                fg=typer.colors.YELLOW, bold=True,
+            ))
+            downstream = engine.get_downstream_nodes(result.node_id)
+            for ds_id in downstream[:5]:
+                typer.echo(typer.style(f"    -> {ds_id}", fg=typer.colors.RED))
+            if len(downstream) > 5:
+                typer.echo(f"    ... and {len(downstream) - 5} more")
+
+    else:
+        # All-files diff mode
+        results = engine.diff_all(node_type=node_type)
+
+        if not results:
+            _echo_success("No changes detected since last apply.")
+            return
+
+        modified = [r for r in results if r.status == "modified"]
+        new = [r for r in results if r.status == "new"]
+        deleted = [r for r in results if r.status == "deleted"]
+
+        if stat:
+            # Git-style stat output
+            for r in modified:
+                bar = "+" * min(r.insertions, 20) + "-" * min(r.deletions, 20)
+                changes = r.insertions + r.deletions
+                typer.echo(f"  {r.file_path:<45} | {changes} {bar}")
+            for r in new:
+                typer.echo(typer.style(f"  {r.file_path:<45} | new file", fg=typer.colors.GREEN))
+            for r in deleted:
+                typer.echo(typer.style(f"  {r.file_path:<45} | deleted", fg=typer.colors.RED))
+
+            total_files = len(modified) + len(new) + len(deleted)
+            total_ins = sum(r.insertions for r in modified)
+            total_del = sum(r.deletions for r in modified)
+            typer.echo(f"  {total_files} file(s) changed, {total_ins} insertion(s), {total_del} deletion(s)")
+        else:
+            # Summary mode
+            typer.echo(typer.style("Changes since last apply:", bold=True))
+            typer.echo("")
+
+            if modified:
+                typer.echo("  Modified:")
+                for r in modified:
+                    cat_label = ""
+                    if r.category:
+                        cat_labels = {
+                            ChangeCategory.BREAKING: "[BREAKING]",
+                            ChangeCategory.NON_BREAKING: "[NON_BREAKING]",
+                            ChangeCategory.METADATA: "[METADATA]",
+                        }
+                        cat_label = cat_labels.get(r.category, "")
+
+                    change_desc = f"+{r.insertions} -{r.deletions}"
+                    line = f"    {r.file_path:<40} {cat_label} {change_desc}"
+
+                    if r.category == ChangeCategory.BREAKING:
+                        typer.echo(typer.style(line, fg=typer.colors.RED))
+                    elif r.category == ChangeCategory.NON_BREAKING:
+                        typer.echo(typer.style(line, fg=typer.colors.YELLOW))
+                    else:
+                        typer.echo(typer.style(line, fg=typer.colors.BLUE))
+
+            if new:
+                typer.echo("")
+                typer.echo("  New (not yet applied):")
+                for r in new:
+                    typer.echo(typer.style(f"    {r.file_path}", fg=typer.colors.GREEN))
+
+            if deleted:
+                typer.echo("")
+                typer.echo("  Deleted:")
+                for r in deleted:
+                    typer.echo(typer.style(f"    {r.file_path}", fg=typer.colors.RED))
+
+            typer.echo("")
+            typer.echo(f"  {len(modified)} modified, {len(new)} new, {len(deleted)} deleted")
+
+        # Check for Python files
+        py_dir = project_path / "seeknal" / "pipelines"
+        if py_dir.exists():
+            py_files = list(py_dir.glob("*.py"))
+            if py_files:
+                typer.echo("")
+                _echo_info(f"Note: {len(py_files)} Python pipeline file(s) found. Diff not yet supported for .py files.")
 
 
 @app.command()

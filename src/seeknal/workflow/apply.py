@@ -662,6 +662,18 @@ def apply_command(
         else:
             _echo_warning("Manifest update failed, but file was moved")
 
+    # Save applied state snapshot for diff baseline
+    try:
+        from seeknal.workflow.diff_engine import write_applied_state_entry
+
+        project_path = Path.cwd()
+        node_id = f"{node_type}.{name}"
+        yaml_content = target_path.read_text(encoding="utf-8")
+        rel_path = str(target_path.relative_to(project_path))
+        write_applied_state_entry(project_path, node_id, rel_path, yaml_content)
+    except Exception:
+        pass  # Non-critical: don't fail apply if snapshot fails
+
     # Show diff if this was an update
     if existing_data:
         _echo_info("")
