@@ -19,6 +19,8 @@ Learn Seeknal's dbt-inspired YAML workflow to define, validate, and execute data
 - [Part 7: Incremental Runs](#part-7-incremental-runs)
 - [Part 8: Advanced Features](#part-8-advanced-features)
   - [8.8 Second-Order Aggregations](#88-second-order-aggregations)
+  - [8.9 Named ref() Syntax](#89-named-ref-syntax)
+  - [8.10 Common Config](#810-common-config-reusable-rules)
 - [Part 9: Production Tips](#part-9-production-tips)
 - [Part 10: Iceberg Materialization](#part-10-iceberg-materialization)
 - [Troubleshooting](#troubleshooting)
@@ -1082,6 +1084,56 @@ features:
     source_feature: daily_amount
 ```
 
+### 8.9 Named ref() Syntax
+
+Instead of positional `input_0`, `input_1`, use `ref('source.name')` for readable multi-input transforms:
+
+```yaml
+name: enriched_sales
+kind: transform
+inputs:
+  - ref: source.sales
+  - ref: source.products
+  - ref: source.regions
+transform: |
+  SELECT s.*, p.category, r.region_name
+  FROM ref('source.sales') s
+  JOIN ref('source.products') p ON s.product_id = p.product_id
+  JOIN ref('source.regions') r ON s.region = r.region
+```
+
+Named refs resolve to `input_0`, `input_1`, etc. based on the order in `inputs`. You can mix both styles in the same SQL.
+
+### 8.10 Common Config (Reusable Rules)
+
+Define shared column mappings and SQL filters in `seeknal/common/`:
+
+```yaml
+# seeknal/common/rules.yml
+rules:
+  - id: callExpression
+    value: "service_type = 'Voice'"
+  - id: activeSubscriber
+    value: "status = 'Active'"
+```
+
+Reference them in transforms with `{{ }}` syntax:
+
+```yaml
+name: voice_revenue
+kind: transform
+inputs:
+  - ref: source.traffic
+transform: |
+  SELECT msisdn, SUM(revenue) AS voice_revenue
+  FROM ref('source.traffic')
+  WHERE {{ rules.callExpression }}
+    AND {{ rules.activeSubscriber }}
+  GROUP BY msisdn
+```
+
+See [Common Config](../building-blocks/common-config.md) for the full reference.
+
 ---
 
 ## Part 9: Production Tips
@@ -1359,23 +1411,18 @@ Apache Iceberg is a table format for analytic datasets that brings:
 
 #### Lakekeeper REST Catalog
 
-Seeknal uses Lakekeeper as the Iceberg catalog REST API server.
+Seeknal uses Lakekeeper as the Iceberg catalog REST API server. See [Lakekeeper documentation](https://www.lakekeeper.io/) for installation options.
 
-**Install Lakekeeper:**
+**Quick start with Docker:**
 ```bash
-# Clone Lakekeeper
-git clone https://github.com/anyproto/lakekeeper.git
-cd lakekeeper
-
-# Run with Docker (quick start)
+# Run Lakekeeper with Docker
 docker run -d \
   --name lakekeeper \
   -p 8181:8181 \
-  -e LAKEKEEPER__LOG__RUST_LOG=debug \
-  ghcr.io/anyproto/lakekeeper:latest
+  ghcr.io/lakekeeper/lakekeeper:latest
 
 # Verify it's running
-curl http://localhost:8181/metrics
+curl http://localhost:8181/health
 ```
 
 #### MinIO Object Storage
@@ -1407,34 +1454,36 @@ Set these environment variables for Seeknal to connect to Lakekeeper and MinIO:
 
 ```bash
 # Lakekeeper REST Catalog
-export SEEKNAL_ICEBERG_CATALOG_URI="http://localhost:8181/catalog/v1"
+export LAKEKEEPER_URI="http://localhost:8181"
 
-# Lakekeeper authentication (if using OAuth2/STS)
-export SEEKNAL_ICEBERG_CATALOG_CLIENT_ID="your-client-id"
-export SEEKNAL_ICEBERG_CATALOG_CLIENT_SECRET="your-client-secret"
-export SEEKNAL_ICEBERG_CATALOG_TOKEN_URI="https://your-keycloak.com/realms/your-realm/protocol/openid-connect/token"
-
-# MinIO/S3 credentials (for STS temporary credentials)
-export AWS_ACCESS_KEY_ID="your-access-key"
-export AWS_SECRET_ACCESS_KEY="your-secret-key"
-export AWS_ENDPOINT="http://localhost:9000"
+# MinIO/S3 credentials
+export AWS_ACCESS_KEY_ID="minioadmin"
+export AWS_SECRET_ACCESS_KEY="minioadmin"
+export AWS_ENDPOINT_URL="http://localhost:9000"
 export AWS_REGION="us-east-1"
+
+# OAuth2/Keycloak (if using authenticated catalog)
+export KEYCLOAK_TOKEN_URL="http://localhost:8080/realms/master/protocol/openid-connect/token"
+export KEYCLOAK_CLIENT_ID="duckdb"
+export KEYCLOAK_CLIENT_SECRET="your-client-secret"
 ```
 
 Or set them in a `.env` file:
 ```bash
 cat > .env << 'EOF'
 # Lakekeeper configuration
-SEEKNAL_ICEBERG_CATALOG_URI=http://localhost:8181/catalog/v1
-SEEKNAL_ICEBERG_CATALOG_CLIENT_ID=seeknal-client
-SEEKNAL_ICEBERG_CATALOG_CLIENT_SECRET=your-secret
-SEEKNAL_ICEBERG_CATALOG_TOKEN_URI=https://keycloak.example.com/realms/master/protocol/openid-connect/token
+LAKEKEEPER_URI=http://localhost:8181
 
 # MinIO credentials
 AWS_ACCESS_KEY_ID=minioadmin
 AWS_SECRET_ACCESS_KEY=minioadmin
-AWS_ENDPOINT=http://localhost:9000
+AWS_ENDPOINT_URL=http://localhost:9000
 AWS_REGION=us-east-1
+
+# OAuth2 (if using Keycloak with Lakekeeper)
+KEYCLOAK_TOKEN_URL=http://localhost:8080/realms/master/protocol/openid-connect/token
+KEYCLOAK_CLIENT_ID=duckdb
+KEYCLOAK_CLIENT_SECRET=your-client-secret
 EOF
 ```
 
@@ -1448,11 +1497,11 @@ name: customers
 description: "Customer master data"
 source: csv
 table: "customers.csv"
-# New: Iceberg materialization configuration
+# Iceberg materialization configuration
 materialization:
-  enabled: true           # Enable/disable materialization
-  table: "warehouse.curated.customers"  # Iceberg table name
-  mode: overwrite         # overwrite | append
+  enabled: true                          # Enable/disable materialization
+  table: "atlas.curated.customers"       # 3-part name: catalog.namespace.table
+  mode: overwrite                        # overwrite | append
 ```
 
 **Materialization field breakdown:**
@@ -1460,8 +1509,10 @@ materialization:
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
 | `enabled` | boolean | Enable materialization for this node | `true` or `false` |
-| `table` | string | Fully qualified Iceberg table name | `"warehouse.curated.customers"` |
+| `table` | string | 3-part Iceberg table name | `"atlas.curated.customers"` |
 | `mode` | string | Write mode | `overwrite` or `append` |
+
+> **Table naming:** The `table` field requires a 3-part format: `catalog.namespace.table`. The catalog is always `atlas` (the DuckDB alias for the Lakekeeper catalog). The namespace must exist in Lakekeeper before tables can be created.
 
 ### 10.4 Materialization Modes
 
@@ -1484,7 +1535,7 @@ source: csv
 table: "customers.csv"
 materialization:
   enabled: true
-  table: "warehouse.curated.customers"
+  table: "atlas.curated.customers"
   mode: overwrite  # Replace all data
 ```
 
@@ -1514,7 +1565,7 @@ inputs:
   - ref: source.orders
 materialization:
   enabled: true
-  table: "warehouse.curated.customer_orders"
+  table: "atlas.curated.customer_orders"
   mode: append  # Accumulate data
 ```
 
@@ -1536,7 +1587,7 @@ source: csv
 table: "customers.csv"
 materialization:
   enabled: true
-  table: "warehouse.curated.customers"
+  table: "atlas.curated.customers"
   mode: append
 schema:
   - name: customer_id
@@ -1559,7 +1610,7 @@ source: csv
 table: "orders.csv"
 materialization:
   enabled: true
-  table: "warehouse.curated.orders"
+  table: "atlas.curated.orders"
   mode: append
 schema:
   - name: order_id
@@ -1578,6 +1629,9 @@ tags: []
 kind: transform
 name: customer_orders
 description: "Join customers with their orders"
+inputs:
+  - ref: source.customers      # Referenced as input_0 in SQL
+  - ref: source.orders         # Referenced as input_1 in SQL
 transform: |
   SELECT
     c.customer_id,
@@ -1586,20 +1640,19 @@ transform: |
     o.order_id,
     o.order_date,
     o.amount
-  FROM source.customers c
-  INNER JOIN source.orders o
+  FROM input_0 c
+  INNER JOIN input_1 o
     ON c.customer_id = o.customer_id
-inputs:
-  - ref: source.customers
-  - ref: source.orders
 materialization:
   enabled: true
-  table: "warehouse.curated.customer_orders"
+  table: "atlas.curated.customer_orders"
   mode: overwrite
 tags:
   - transformation
   - join
 ```
+
+> **Note:** Multi-input transforms use `input_0`, `input_1`, etc. to reference inputs in the order they are listed.
 
 **Run the materialized pipeline:**
 ```bash
@@ -1625,12 +1678,12 @@ Execution
 1/5: customers [RUNNING]
   SUCCESS in 0.02s
   Rows: 5
-  ℹ Materialized to Iceberg table: warehouse.curated.customers (5 rows)
+  ℹ Materialized to Iceberg table: atlas.curated.customers (5 rows)
 
 2/5: orders [RUNNING]
   SUCCESS in 0.00s
   Rows: 5
-  ℹ Materialized to Iceberg table: warehouse.curated.orders (5 rows)
+  ℹ Materialized to Iceberg table: atlas.curated.orders (5 rows)
 
 3/5: active_customers [RUNNING]
   SUCCESS in 0.00s
@@ -1639,7 +1692,7 @@ Execution
 4/5: customer_orders [RUNNING]
   SUCCESS in 0.00s
   Rows: 5
-  ℹ Materialized to Iceberg table: warehouse.curated.customer_orders (5 rows)
+  ℹ Materialized to Iceberg table: atlas.curated.customer_orders (5 rows)
 
 5/5: customer_features [RUNNING]
   SUCCESS in 0.01s
@@ -1702,7 +1755,7 @@ kind: source
 name: raw_events
 materialization:
   enabled: true
-  table: "warehouse.raw.events"
+  table: "atlas.raw.events"
   mode: append  # Never delete raw data
 
 # Layer 2: Cleaned data (overwrite mode)
@@ -1712,7 +1765,7 @@ transform: |
   SELECT * FROM raw_events WHERE is_valid = true
 materialization:
   enabled: true
-  table: "warehouse.curated.events"
+  table: "atlas.curated.events"
   mode: overwrite  # Replace with latest clean version
 
 # Layer 3: Aggregations (append mode)
@@ -1720,7 +1773,7 @@ kind: transform
 name: daily_metrics
 materialization:
   enabled: true
-  table: "warehouse.analytics.daily_metrics"
+  table: "atlas.analytics.daily_metrics"
   mode: append  # Accumulate daily snapshots
 ```
 
@@ -1737,7 +1790,7 @@ transform: |
   WHERE order_date = CURRENT_DATE
 materialization:
   enabled: true
-  table: "warehouse.curated.orders"
+  table: "atlas.curated.orders"
   mode: append  # Add to existing data
 ```
 
@@ -1746,27 +1799,38 @@ materialization:
 #### Check Iceberg Table Exists
 
 ```bash
-# Using DuckDB with Iceberg extension
+# Using DuckDB with Iceberg extension and OAuth2 authentication
 python << 'EOF'
-import duckdb
+import duckdb, json, urllib.request
 
 con = duckdb.connect(':memory:')
-# Load Iceberg extension
 con.execute("INSTALL iceberg; LOAD iceberg;")
+con.execute("INSTALL httpfs; LOAD httpfs;")
 
-# Set Iceberg catalog
-con.execute("SET s3_endpoint = 'http://localhost:9000';")
-con.execute("SET s3_access_key_id = 'minioadmin';")
-con.execute("SET s3_secret_access_key = 'minioadmin';")
-con.execute("SET s3_use_ssl = false;")
+# Configure S3/MinIO
+con.execute("SET s3_region='us-east-1'; SET s3_endpoint='localhost:9000'")
+con.execute("SET s3_url_style='path'; SET s3_use_ssl=false")
+con.execute("SET s3_access_key_id='minioadmin'")
+con.execute("SET s3_secret_access_key='minioadmin'")
 
-# Attach Lakekeeper catalog
-con.execute("""
-  ATTACH 'http://localhost:8181/catalog/v1' AS iceberg (TYPE iceberg);
+# Get OAuth token (if using Keycloak)
+data = b'grant_type=client_credentials&client_id=duckdb&client_secret=your-client-secret'
+req = urllib.request.Request(
+    'http://localhost:8080/realms/master/protocol/openid-connect/token', data=data)
+token = json.loads(urllib.request.urlopen(req).read())['access_token']
+
+# Attach to Lakekeeper catalog as 'atlas'
+con.execute(f"""
+    ATTACH 'seeknal-warehouse' AS atlas (
+        TYPE ICEBERG,
+        ENDPOINT 'http://localhost:8181/catalog',
+        AUTHORIZATION_TYPE 'oauth2',
+        TOKEN '{token}'
+    );
 """)
 
-# Query materialized table
-result = con.execute("SELECT COUNT(*) FROM iceberg.warehouse.curated.customers").fetchone()
+# Query materialized table (3-part: atlas.namespace.table)
+result = con.execute("SELECT COUNT(*) FROM atlas.curated.customers").fetchone()
 print(f"Customers table has {result[0]} rows")
 EOF
 ```
@@ -1774,20 +1838,32 @@ EOF
 #### Query Materialized Data
 
 ```bash
-# Direct query with DuckDB
+# Same connection setup, then query
 python << 'EOF'
-import duckdb
+import duckdb, json, urllib.request
 
 con = duckdb.connect(':memory:')
 con.execute("INSTALL iceberg; LOAD iceberg;")
-con.execute("SET s3_endpoint = 'http://localhost:9000';")
-con.execute("SET s3_access_key_id = 'minioadmin';")
-con.execute("SET s3_secret_access_key = 'minioadmin';")
-con.execute("SET s3_use_ssl = false;")
-con.execute("ATTACH 'http://localhost:8181/catalog/v1' AS iceberg (TYPE iceberg);")
+con.execute("INSTALL httpfs; LOAD httpfs;")
+con.execute("SET s3_region='us-east-1'; SET s3_endpoint='localhost:9000'")
+con.execute("SET s3_url_style='path'; SET s3_use_ssl=false")
+con.execute("SET s3_access_key_id='minioadmin'")
+con.execute("SET s3_secret_access_key='minioadmin'")
+
+data = b'grant_type=client_credentials&client_id=duckdb&client_secret=your-client-secret'
+req = urllib.request.Request(
+    'http://localhost:8080/realms/master/protocol/openid-connect/token', data=data)
+token = json.loads(urllib.request.urlopen(req).read())['access_token']
+
+con.execute(f"""
+    ATTACH 'seeknal-warehouse' AS atlas (
+        TYPE ICEBERG, ENDPOINT 'http://localhost:8181/catalog',
+        AUTHORIZATION_TYPE 'oauth2', TOKEN '{token}'
+    );
+""")
 
 # Show sample data
-df = con.execute("SELECT * FROM iceberg.warehouse.curated.customers LIMIT 5").df()
+df = con.execute("SELECT * FROM atlas.curated.customers LIMIT 5").df()
 print(df)
 EOF
 ```
@@ -1798,7 +1874,7 @@ EOF
 
 **Symptoms:**
 ```
-ERROR: Connection refused to http://localhost:8181/catalog/v1
+ERROR: Connection refused to http://localhost:8181
 ```
 
 **Solutions:**
@@ -1813,8 +1889,8 @@ docker logs lakekeeper
 docker restart lakekeeper
 
 # Verify catalog URI
-echo $SEEKNAL_ICEBERG_CATALOG_URI
-# Should output: http://localhost:8181/catalog/v1
+echo $LAKEKEEPER_URI
+# Should output: http://localhost:8181
 ```
 
 #### Problem: "S3 credentials not available"
@@ -1832,14 +1908,14 @@ env | grep AWS
 # Set MinIO credentials
 export AWS_ACCESS_KEY_ID=minioadmin
 export AWS_SECRET_ACCESS_KEY=minioadmin
-export AWS_ENDPOINT=http://localhost:9000
+export AWS_ENDPOINT_URL=http://localhost:9000
 export AWS_REGION=us-east-1
 
 # Or use .env file
 cat > .env << 'EOF'
 AWS_ACCESS_KEY_ID=minioadmin
 AWS_SECRET_ACCESS_KEY=minioadmin
-AWS_ENDPOINT=http://localhost:9000
+AWS_ENDPOINT_URL=http://localhost:9000
 AWS_REGION=us-east-1
 EOF
 ```
@@ -1848,7 +1924,7 @@ EOF
 
 **Symptoms:**
 ```
-ERROR: Table warehouse.curated.customers already exists
+ERROR: Table atlas.curated.customers already exists
 ```
 
 **Solutions:**
@@ -1862,7 +1938,7 @@ grep -A 5 "materialization:" seeknal/sources/customers.yml
 # Should show:
 # materialization:
 #   enabled: true
-#   table: "warehouse.curated.customers"
+#   table: "atlas.curated.customers"
 #   mode: append  # Must be append, not overwrite
 ```
 

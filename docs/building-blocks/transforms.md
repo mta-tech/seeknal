@@ -19,16 +19,86 @@ Use SQL for data transformation:
 ```yaml
 name: clean_orders
 kind: transform
-sql: |
+inputs:
+  - ref: source.raw_orders
+transform: |
   SELECT
     order_id,
     customer_id,
     order_date,
     total_amount
-  FROM {{ source('raw_orders') }}
+  FROM input_0
   WHERE status = 'completed'
     AND total_amount > 0
 ```
+
+> **Input references:** You can reference inputs by name using `ref('source.raw_orders')` or by position using `input_0`, `input_1`, etc. Both styles work and can be mixed.
+
+### Named Input References
+
+Use `ref()` to reference inputs by name instead of positional index:
+
+```yaml
+name: enriched_sales
+kind: transform
+inputs:
+  - ref: source.sales
+  - ref: source.products
+transform: |
+  SELECT
+    s.*,
+    p.category,
+    p.brand
+  FROM ref('source.sales') s
+  JOIN ref('source.products') p
+    ON s.product_id = p.product_id
+```
+
+Named refs are resolved to positional `input_N` identifiers at execution time, based on the order of inputs. You can also mix named and positional syntax:
+
+```yaml
+transform: |
+  SELECT s.*, p.category
+  FROM ref('source.sales') s
+  JOIN input_1 p ON s.product_id = p.product_id
+```
+
+Both single quotes (`ref('...')`) and double quotes (`ref("...")`) are supported.
+
+### Common Config Expressions
+
+Use `{{ }}` expressions to reference reusable definitions from `seeknal/common/`:
+
+```yaml
+name: voice_revenue
+kind: transform
+inputs:
+  - ref: source.traffic
+transform: |
+  SELECT
+    date_id,
+    msisdn,
+    SUM(CASE WHEN {{ rules.callExpression }} THEN revenue ELSE 0 END) AS voice_revenue,
+    SUM(CASE WHEN {{ rules.smsExpression }} THEN revenue ELSE 0 END) AS sms_revenue
+  FROM ref('source.traffic')
+  WHERE {{ rules.activeSubscriber }}
+  GROUP BY date_id, msisdn
+```
+
+The expressions are resolved at build time from `seeknal/common/rules.yml`:
+
+```yaml
+# seeknal/common/rules.yml
+rules:
+  - id: callExpression
+    value: "service_type = 'Voice'"
+  - id: smsExpression
+    value: "service_type = 'SMS'"
+  - id: activeSubscriber
+    value: "status = 'Active'"
+```
+
+See [Common Config](common-config.md) for the full reference on sources, rules, and transformations config files.
 
 ### Python Transforms
 
@@ -56,30 +126,36 @@ def enrich(df):
 ```yaml
 name: clean_data
 kind: transform
-sql: |
+inputs:
+  - ref: source.raw_data
+transform: |
   SELECT
     id,
     COALESCE(name, 'Unknown') as name,
     LOWER(TRIM(email)) as email,
     CAST(amount AS FLOAT) as amount
-  FROM {{ source('raw_data') }}
+  FROM input_0
 ```
 
-### Data Enrichment
+### Data Enrichment (Multi-Input Join)
 
 ```yaml
 name: enriched_sales
 kind: transform
-sql: |
+inputs:
+  - ref: source.sales          # input_0
+  - ref: source.customers      # input_1
+  - ref: source.products       # input_2
+transform: |
   SELECT
     s.*,
     c.segment,
     c.tier,
     p.category
-  FROM {{ source('sales') }} s
-  LEFT JOIN {{ source('customers') }} c
+  FROM input_0 s
+  LEFT JOIN input_1 c
     ON s.customer_id = c.customer_id
-  LEFT JOIN {{ source('products') }} p
+  LEFT JOIN input_2 p
     ON s.product_id = p.product_id
 ```
 
@@ -88,13 +164,15 @@ sql: |
 ```yaml
 name: daily_metrics
 kind: transform
-sql: |
+inputs:
+  - ref: source.sales
+transform: |
   SELECT
     DATE(transaction_time) as date,
     COUNT(*) as transactions,
     SUM(amount) as total_amount,
     AVG(amount) as avg_amount
-  FROM {{ source('sales') }}
+  FROM input_0
   GROUP BY DATE(transaction_time)
 ```
 
@@ -114,6 +192,30 @@ sql: |
 
 ---
 
+## Iceberg Materialization
+
+Persist transform results as Iceberg tables:
+
+```yaml
+name: order_enriched
+kind: transform
+inputs:
+  - ref: source.orders
+  - ref: source.customers
+transform: |
+  SELECT o.order_id, o.amount, c.name, c.region
+  FROM input_0 o
+  JOIN input_1 c ON o.customer_id = c.customer_id
+materialization:
+  enabled: true
+  mode: overwrite
+  table: atlas.production.order_enriched
+```
+
+See [Iceberg Materialization](../iceberg-materialization.md) for full setup guide.
+
+---
+
 ## Best Practices
 
 1. **Use SQL** for simple transformations
@@ -121,6 +223,7 @@ sql: |
 3. **Chain transforms** for multi-step processing
 4. **Use descriptive names** for clarity
 5. **Document transform logic** in descriptions
+6. **Use `ref('source.name')`** for readable multi-input transforms (or `input_0`, `input_1` for brevity)
 
 ---
 
@@ -129,6 +232,7 @@ sql: |
 - [Sources](sources.md) - Input data for transforms
 - [Aggregations](aggregations.md) - Advanced aggregations
 - [YAML Pipeline Tutorial](../../tutorials/yaml-pipeline-tutorial.md) - Hands-on examples
+- [Iceberg Materialization](../iceberg-materialization.md) - Persist data to Iceberg tables
 
 ---
 

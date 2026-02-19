@@ -297,8 +297,20 @@ class TransformExecutor(BaseExecutor):
             # Get DuckDB connection
             con = self.context.get_duckdb_connection()
 
+            # Resolve {{ }} common config expressions (e.g., {{ rules.active }})
+            # This must happen BEFORE ref() resolution
+            if self.context.common_config:
+                from seeknal.workflow.parameters.resolver import ParameterResolver
+                param_resolver = ParameterResolver(
+                    common_config=self.context.common_config,
+                )
+                transform_sql = param_resolver.resolve_string(transform_sql)
+
+            # Resolve named ref() syntax (e.g., ref('source.sales') -> input_0)
+            resolved_sql = self._resolve_named_refs(transform_sql)
+
             # Resolve input refs
-            resolved_sql = self._resolve_input_refs(transform_sql, con)
+            resolved_sql = self._resolve_input_refs(resolved_sql, con)
 
             # Execute multi-statement SQL
             row_count, statements_executed = self._execute_sql(
@@ -456,15 +468,18 @@ class TransformExecutor(BaseExecutor):
         """
         transform_sql = self.node.config.get("transform", "")
 
+        # Resolve named ref() syntax (validates ref arguments even in dry-run)
+        resolved_sql = self._resolve_named_refs(transform_sql)
+
         # Basic syntax validation (check for balanced parentheses)
-        if not self._validate_sql_syntax(transform_sql):
+        if not self._validate_sql_syntax(resolved_sql):
             raise ExecutorValidationError(
                 self.node.id,
                 "SQL syntax validation failed: unbalanced parentheses or quotes"
             )
 
         # Count statements
-        statements = self._split_sql_statements(transform_sql)
+        statements = self._split_sql_statements(resolved_sql)
 
         return ExecutorResult(
             node_id=self.node.id,
@@ -478,6 +493,70 @@ class TransformExecutor(BaseExecutor):
             },
             is_dry_run=True,
         )
+
+    # Regex for ref('source.sales') or ref("source.sales")
+    _REF_PATTERN = re.compile(r"""ref\(\s*['"]([^'"]+)['"]\s*\)""")
+    # Validation pattern for ref arguments (safe SQL identifiers with dots/hyphens)
+    _REF_NAME_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$")
+
+    def _resolve_named_refs(self, sql: str) -> str:
+        """
+        Resolve named ref() syntax to positional input_N placeholders.
+
+        Replaces ``ref('source.sales')`` with ``input_0`` based on the
+        order of inputs defined in the node config.
+
+        Args:
+            sql: SQL string with potential ref() calls
+
+        Returns:
+            SQL string with ref() calls replaced by input_N identifiers
+
+        Raises:
+            ExecutorExecutionError: If a ref() argument is invalid or unknown
+        """
+        inputs = self.node.config.get("inputs", [])
+        if not inputs or not isinstance(inputs, list):
+            return sql
+
+        # Build lookup: {"source.sales": "input_0", "source.products": "input_1"}
+        ref_lookup: Dict[str, str] = {}
+        for i, item in enumerate(inputs):
+            if isinstance(item, dict):
+                ref_value = item.get("ref", "")
+            elif isinstance(item, str):
+                ref_value = item
+            else:
+                continue
+            if ref_value:
+                ref_lookup[ref_value] = f"input_{i}"
+
+        if not ref_lookup:
+            return sql
+
+        # Find all ref() calls in the SQL
+        def replace_ref(match: re.Match) -> str:
+            ref_name = match.group(1)
+
+            # Validate ref argument to prevent SQL injection
+            if not self._REF_NAME_PATTERN.match(ref_name):
+                raise ExecutorExecutionError(
+                    self.node.id,
+                    f"Invalid ref() argument: '{ref_name}'. "
+                    f"Must match pattern: {self._REF_NAME_PATTERN.pattern}"
+                )
+
+            if ref_name not in ref_lookup:
+                available = ", ".join(sorted(ref_lookup.keys()))
+                raise ExecutorExecutionError(
+                    self.node.id,
+                    f"Unknown ref('{ref_name}'). "
+                    f"Available inputs: {available}"
+                )
+
+            return ref_lookup[ref_name]
+
+        return self._REF_PATTERN.sub(replace_ref, sql)
 
     def _resolve_input_refs(
         self,
@@ -538,11 +617,11 @@ class TransformExecutor(BaseExecutor):
                     
                     if intermediate_path.exists():
                         # Load Python node output and register as DuckDB view
-                        view_name = f"__THIS__"
                         try:
                             con.execute(f"CREATE OR REPLACE VIEW __THIS__ AS SELECT * FROM read_parquet('{intermediate_path}')")
+                            con.execute(f"CREATE OR REPLACE VIEW input_0 AS SELECT * FROM read_parquet('{intermediate_path}')")
                             if self.context.verbose:
-                                _echo_info(f"Loaded Python node output from {intermediate_path}")
+                                _echo_info(f"Loaded Python node output as input_0")
                         except Exception as e:
                             raise ExecutorExecutionError(
                                 self.node.id,
@@ -553,29 +632,31 @@ class TransformExecutor(BaseExecutor):
                         # YAML source - should already be registered in DuckDB
                         # Generate table name from node ref
                         table_name = node_ref.replace(".", "_").replace("-", "_")
-                        # Create alias view for __THIS__
+                        # Create alias views for both __THIS__ and input_0
                         try:
                             con.execute(f"CREATE OR REPLACE VIEW __THIS__ AS SELECT * FROM {table_name}")
+                            con.execute(f"CREATE OR REPLACE VIEW input_0 AS SELECT * FROM {table_name}")
                             if self.context.verbose:
-                                _echo_info(f"Created __THIS__ view from {table_name}")
+                                _echo_info(f"Created input_0 view from {table_name}")
                         except Exception as e:
                             # Table might already exist with schema prefix
                             if "." in node_ref:
                                 schema, name = node_ref.split(".", 1)
                                 try:
                                     con.execute(f"CREATE OR REPLACE VIEW __THIS__ AS SELECT * FROM {schema}.{name}")
+                                    con.execute(f"CREATE OR REPLACE VIEW input_0 AS SELECT * FROM {schema}.{name}")
                                     if self.context.verbose:
-                                        _echo_info(f"Created __THIS__ view from {schema}.{name}")
+                                        _echo_info(f"Created input_0 view from {schema}.{name}")
                                 except Exception as e2:
                                     raise ExecutorExecutionError(
                                         self.node.id,
-                                        f"Failed to create __THIS__ view from {node_ref}: {str(e2)}",
+                                        f"Failed to create input_0 view from {node_ref}: {str(e2)}",
                                         e2
                                     ) from e2
                             else:
                                 raise ExecutorExecutionError(
                                     self.node.id,
-                                    f"Failed to create __THIS__ view from {node_ref}: {str(e)}",
+                                    f"Failed to create input_0 view from {node_ref}: {str(e)}",
                                     e
                                 ) from e
             else:

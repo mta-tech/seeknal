@@ -10,6 +10,7 @@ Building blocks are the fundamental components of Seeknal pipelines:
 
 - **Sources**: Define where your data comes from
 - **Transforms**: Specify how to transform your data
+- **Common Config**: Reusable column mappings, rules, and SQL snippets
 - **Aggregations**: Aggregate data across entities and time
 - **Feature Groups**: Organize features for ML use cases
 - **Semantic Models**: Define metrics for analytics
@@ -38,6 +39,7 @@ Building blocks are the fundamental components of Seeknal pipelines:
 |-------|-------------|----------|
 | [Sources](sources.md) | Data ingestion from files, databases, APIs | Getting data into Seeknal |
 | [Transforms](transforms.md) | Data transformations with SQL or Python | Cleaning, enriching, reshaping data |
+| [Common Config](common-config.md) | Shared column mappings, rules, SQL snippets | DRY pipelines, consistent naming |
 | [Aggregations](aggregations.md) | First and second-order aggregations | Computing metrics, rollups |
 | [Feature Groups](feature-groups.md) | Feature organization with point-in-time joins | ML feature engineering |
 | [Semantic Models](semantic-models.md) | Metric definitions for analytics | Business intelligence, KPIs |

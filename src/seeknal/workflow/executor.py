@@ -199,6 +199,12 @@ def execute_transform(
     """Execute transform node for preview.
 
     Resolves upstream refs to actual data sources and executes the transform SQL.
+    Creates ``input_0``, ``input_1``, … views that match what the real pipeline
+    executor provides, so the transform SQL can run unmodified.
+
+    Data loading priority for each input:
+    1. Intermediate parquet from a previous ``seeknal run`` (works for all source types)
+    2. Original source file (CSV only — loaded directly from the file path in the source YAML)
 
     Args:
         yaml_data: Parsed YAML data
@@ -224,113 +230,109 @@ def execute_transform(
     # Create DuckDB connection for preview
     con = duckdb.connect(":memory:")
 
-    # Track the first input to use for __THIS__ placeholder
-    first_input_view = None
+    # Resolve each input ref and register as input_N views
+    # This matches the naming convention used by the real transform executor
+    loaded_inputs: list[str] = []
 
-    # Resolve refs to actual data
-    for input_ref in inputs:
-        if isinstance(input_ref, dict) and "ref" in input_ref:
-            ref = input_ref["ref"]
+    for i, input_ref in enumerate(inputs):
+        if not isinstance(input_ref, dict) or "ref" not in input_ref:
+            _echo_warning(f"Input {i}: invalid format (expected dict with 'ref' key)")
+            continue
 
-            # Parse ref (format: kind.name, e.g., "source.customers")
-            if "." not in ref:
-                _echo_warning(f"Invalid ref format: {ref}")
+        ref = input_ref["ref"]
+        if "." not in ref:
+            _echo_warning(f"Input {i}: invalid ref format '{ref}' (expected kind.name)")
+            continue
+
+        kind, ref_name = ref.split(".", 1)
+        input_view = f"input_{i}"
+        project_path = Path.cwd()
+
+        # Priority 1: Load from intermediate parquet (works for ALL source types)
+        intermediate_path = project_path / "target" / "intermediate" / f"{kind}_{ref_name}.parquet"
+        if intermediate_path.exists():
+            try:
+                safe_path = str(intermediate_path.resolve()).replace("'", "''")
+                con.execute(f"CREATE OR REPLACE VIEW {input_view} AS SELECT * FROM read_parquet('{safe_path}')")
+                _echo_info(f"Loaded {input_view} <- {kind}.{ref_name} (from previous run)")
+                loaded_inputs.append(input_view)
                 continue
+            except Exception as e:
+                _echo_warning(f"Failed to load intermediate for {ref}: {e}")
 
-            kind, ref_name = ref.split(".", 1)
+        # Priority 2: Load original source data (CSV only)
+        if kind == "source":
+            source_path = _find_source_file(ref_name)
+            if source_path:
+                try:
+                    with open(source_path, "r") as f:
+                        source_data = yaml.safe_load(f)
 
-            # Use the first input as __THIS__
-            if not first_input_view:
-                first_input_view = f"{kind}_{ref_name}"
+                    source_type = source_data.get("source", "unknown")
+                    table = source_data.get("table", "unknown")
 
-            # Handle source refs
-            if kind == "source":
-                # Find the source YAML file
-                source_path = _find_source_file(ref_name)
+                    if source_type == "csv" and table.endswith(".csv"):
+                        table_path = Path(table)
+                        if not table_path.is_absolute():
+                            table_path = source_path.parent.parent.parent / table
 
-                if source_path:
-                    # Load source YAML to get table path
-                    try:
-                        with open(source_path, "r") as f:
-                            source_data = yaml.safe_load(f)
-
-                        source_type = source_data.get("source", "unknown")
-                        table = source_data.get("table", "unknown")
-
-                        if source_type == "csv" and table.endswith(".csv"):
-                            # Resolve table path
-                            table_path = Path(table)
-                            if not table_path.is_absolute():
-                                table_path = source_path.parent.parent.parent / table
-
-                            # Validate and load the CSV
-                            if table_path.exists():
-                                safe_path = str(table_path.resolve()).replace("'", "''")
-                                view_name = f"source_{ref_name}"
-
-                                # Create view from CSV
-                                con.execute(f"""
-                                    CREATE OR REPLACE VIEW {view_name} AS
-                                    SELECT * FROM read_csv_auto('{safe_path}')
-                                """)
-
-                                _echo_info(f"Loaded source '{ref_name}' from {table_path.name}")
-                            else:
-                                _echo_warning(f"Source file not found: {table_path}")
+                        if table_path.exists():
+                            safe_path = str(table_path.resolve()).replace("'", "''")
+                            con.execute(f"CREATE OR REPLACE VIEW {input_view} AS SELECT * FROM read_csv_auto('{safe_path}')")
+                            _echo_info(f"Loaded {input_view} <- source.{ref_name} (from {table_path.name})")
+                            loaded_inputs.append(input_view)
+                            continue
                         else:
-                            _echo_warning(f"Unsupported source type: {source_type}")
-                    except Exception as e:
-                        _echo_warning(f"Could not load source '{ref_name}': {e}")
-                else:
-                    _echo_warning(f"Source file not found: {ref}")
-            elif kind == "transform":
-                # Try to load from intermediate storage (from previous run)
-                project_path = Path.cwd()
-                intermediate_path = project_path / "target" / "intermediate" / f"{kind}_{ref_name}.parquet"
-
-                if intermediate_path.exists():
-                    view_name = f"transform_{ref_name}"
-                    con.execute(f"""
-                        CREATE OR REPLACE VIEW {view_name} AS
-                        SELECT * FROM read_parquet('{intermediate_path}')
-                    """)
-                    _echo_info(f"Loaded transform '{ref_name}' from intermediate storage")
-                else:
-                    _echo_warning(f"Transform '{ref_name}' not executed yet. Run 'seeknal run --nodes {ref_name}' first")
+                            _echo_warning(f"Source file not found: {table_path}")
+                    else:
+                        _echo_warning(
+                            f"Cannot preview {source_type} source '{ref_name}' directly. "
+                            f"Run 'seeknal run' first, then dry-run will use the intermediate output."
+                        )
+                except Exception as e:
+                    _echo_warning(f"Could not load source '{ref_name}': {e}")
             else:
-                _echo_warning(f"Unsupported kind: {kind}")
+                _echo_warning(f"Source YAML not found for: {ref_name}")
+        elif kind == "transform":
+            _echo_warning(
+                f"Transform '{ref_name}' has no intermediate output. "
+                f"Run 'seeknal run --nodes transform.{ref_name}' first."
+            )
+        else:
+            _echo_warning(f"Unsupported input kind: {kind}")
 
-    # Replace __THIS__ placeholder with first input view
-    if first_input_view:
-        resolved_sql = transform_sql.replace("__THIS__", first_input_view)
-    else:
-        resolved_sql = transform_sql
+    # Also register __THIS__ as alias for input_0 (single-input backward compat)
+    if loaded_inputs:
+        try:
+            con.execute(f"CREATE OR REPLACE VIEW __THIS__ AS SELECT * FROM input_0")
+        except Exception:
+            pass
 
-    # Replace refs in SQL (source.customers -> source_customers)
-    # (already handled by __THIS__ replacement, but keep for explicit refs)
-    for input_ref in inputs:
-        if isinstance(input_ref, dict) and "ref" in input_ref:
-            ref = input_ref["ref"]
-            if "." in ref:
-                _, ref_name = ref.split(".", 1)
-                # Replace kind.name with kind_name for DuckDB view names
-                resolved_sql = resolved_sql.replace(f"source.{ref_name}", f"source_{ref_name}")
-                resolved_sql = resolved_sql.replace(f"transform.{ref_name}", f"transform_{ref_name}")
+    # Resolve {{ }} common config expressions before ref() resolution
+    common_dir = Path.cwd() / "seeknal" / "common"
+    if common_dir.is_dir():
+        from seeknal.workflow.common.loader import load_common_config
+        from seeknal.workflow.parameters.resolver import ParameterResolver
+
+        common_config = load_common_config(common_dir)
+        if common_config:
+            resolver = ParameterResolver(common_config=common_config)
+            transform_sql = resolver.resolve_string(transform_sql)
+
+    # Resolve named ref() syntax: ref('source.sales') -> input_0
+    resolved_sql = _resolve_named_refs(transform_sql, inputs)
 
     # Execute the transform SQL with limit
     try:
-        # Add LIMIT to the query if not already present
         if "LIMIT" not in resolved_sql.upper() and "limit" not in resolved_sql:
             final_sql = f"SELECT * FROM ({resolved_sql}) AS subquery LIMIT {limit}"
         else:
             final_sql = resolved_sql
 
-        # Execute query
         result = con.execute(final_sql)
         rows = result.fetchall()
         columns = [desc[0] for desc in result.description]
 
-        # Display data as table
         if rows:
             print(tabulate(rows, headers=columns, tablefmt="psql"))
         else:
@@ -353,6 +355,62 @@ def execute_transform(
             "row_count": 0,
             "preview_available": False,
         }
+
+
+import re as _re
+
+# Patterns for ref() resolution (module-level to avoid recompilation)
+_REF_PATTERN = _re.compile(r"""ref\(\s*['"]([^'"]+)['"]\s*\)""")
+_REF_NAME_PATTERN = _re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$")
+
+
+def _resolve_named_refs(sql: str, inputs: list) -> str:
+    """Resolve named ref() syntax to positional input_N placeholders.
+
+    Replaces ``ref('source.sales')`` with ``input_0`` based on the
+    order of inputs. Falls through to original SQL if no ref() calls
+    or no list-style inputs.
+
+    Args:
+        sql: SQL string with potential ref() calls
+        inputs: List of input dicts with 'ref' keys
+
+    Returns:
+        SQL with ref() calls replaced by input_N identifiers
+    """
+    if not inputs or not isinstance(inputs, list):
+        return sql
+
+    # Build lookup: {"source.sales": "input_0", ...}
+    ref_lookup: Dict[str, str] = {}
+    for i, item in enumerate(inputs):
+        if isinstance(item, dict):
+            ref_value = item.get("ref", "")
+        elif isinstance(item, str):
+            ref_value = item
+        else:
+            continue
+        if ref_value:
+            ref_lookup[ref_value] = f"input_{i}"
+
+    if not ref_lookup:
+        return sql
+
+    def replace_ref(match):
+        ref_name = match.group(1)
+        # Validate ref argument
+        if not _REF_NAME_PATTERN.match(ref_name):
+            _echo_warning(f"Invalid ref() argument: '{ref_name}'")
+            return match.group(0)  # Return unchanged
+        if ref_name not in ref_lookup:
+            _echo_warning(
+                f"Unknown ref('{ref_name}'). "
+                f"Available: {', '.join(sorted(ref_lookup.keys()))}"
+            )
+            return match.group(0)  # Return unchanged
+        return ref_lookup[ref_name]
+
+    return _REF_PATTERN.sub(replace_ref, sql)
 
 
 def _find_source_file(source_name: str) -> Optional[Path]:

@@ -510,6 +510,7 @@ def init(
             "seeknal/models",
             "seeknal/pipelines",
             "seeknal/templates",
+            "seeknal/common",
             "target/intermediate",
         ]
 
@@ -1075,6 +1076,7 @@ def _run_yaml_pipeline(
         verbose=True,
         materialize_enabled=materialize,
         params={},  # Will be populated per-node from yaml_data
+        common_config=dag_builder._common_config,
     )
 
     # Step 5: Execute nodes in topological order
@@ -2995,6 +2997,130 @@ def dry_run(
     from seeknal.workflow.dry_run import dry_run_command
 
     dry_run_command(file_path, limit, timeout, schema_only)
+
+
+@app.command()
+def inspect(
+    node_id: Optional[str] = typer.Argument(
+        None,
+        help="Node ID to inspect (e.g., 'source.products', 'transform.sales_enriched')",
+    ),
+    limit: int = typer.Option(10, "--limit", "-l", help="Row limit for preview"),
+    schema_only: bool = typer.Option(False, "--schema", "-s", help="Show schema (columns + types) only"),
+    list_all: bool = typer.Option(False, "--list", help="List all available intermediate outputs"),
+    project_path: Path = typer.Option(".", help="Project directory"),
+):
+    """Inspect the intermediate output of a previously executed node.
+
+    Reads from the intermediate parquet files written by 'seeknal run'.
+    Useful for debugging pipeline failures by examining upstream outputs.
+
+    Examples:
+        # See the output of a source node
+        seeknal inspect source.products
+
+        # Inspect a transform with more rows
+        seeknal inspect transform.sales_enriched --limit 20
+
+        # Show only the schema (columns and types)
+        seeknal inspect transform.sales_enriched --schema
+
+        # List all available intermediate outputs
+        seeknal inspect --list
+    """
+    import duckdb
+    from tabulate import tabulate
+
+    target_path = Path(project_path) / "target"
+
+    # List mode
+    if list_all or node_id is None:
+        _inspect_list(target_path)
+        return
+
+    # Resolve node_id to parquet path
+    parquet_name = node_id.replace(".", "_") + ".parquet"
+    intermediate_path = target_path / "intermediate" / parquet_name
+
+    if not intermediate_path.exists():
+        _echo_error(f"No intermediate output found for '{node_id}'")
+        _echo_info(f"  Expected: {intermediate_path}")
+        _echo_info("  Run 'seeknal run' first, or check 'seeknal inspect --list'")
+
+        # Suggest available nodes
+        intermediate_dir = target_path / "intermediate"
+        if intermediate_dir.exists():
+            available = [
+                f.stem.replace("_", ".", 1) for f in intermediate_dir.glob("*.parquet")
+            ]
+            if available:
+                _echo_info(f"\n  Available nodes:")
+                for node in sorted(available):
+                    _echo_info(f"    - {node}")
+        raise typer.Exit(1)
+
+    try:
+        con = duckdb.connect(":memory:")
+        safe_path = str(intermediate_path.resolve()).replace("'", "''")
+
+        if schema_only:
+            # Show column names and types
+            result = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{safe_path}')")
+            rows = result.fetchall()
+            columns = [desc[0] for desc in result.description]
+            typer.echo(f"\nSchema for {node_id}:")
+            print(tabulate(rows, headers=columns, tablefmt="psql"))
+        else:
+            # Show data preview
+            count = con.execute(f"SELECT COUNT(*) FROM read_parquet('{safe_path}')").fetchone()[0]
+            result = con.execute(f"SELECT * FROM read_parquet('{safe_path}') LIMIT {limit}")
+            rows = result.fetchall()
+            columns = [desc[0] for desc in result.description]
+
+            typer.echo(f"\n{node_id}: {count} rows, {len(columns)} columns")
+            if rows:
+                print(tabulate(rows, headers=columns, tablefmt="psql"))
+            else:
+                _echo_info("(empty result)")
+
+        _echo_success(f"Inspected {intermediate_path.name}")
+
+    except Exception as e:
+        _echo_error(f"Failed to read {intermediate_path}: {e}")
+        raise typer.Exit(1)
+
+
+def _inspect_list(target_path: Path):
+    """List all available intermediate outputs."""
+    import duckdb
+    from tabulate import tabulate
+
+    intermediate_dir = target_path / "intermediate"
+    if not intermediate_dir.exists():
+        _echo_info("No intermediate outputs found. Run 'seeknal run' first.")
+        return
+
+    parquets = sorted(intermediate_dir.glob("*.parquet"))
+    if not parquets:
+        _echo_info("No intermediate outputs found. Run 'seeknal run' first.")
+        return
+
+    con = duckdb.connect(":memory:")
+    rows = []
+    for p in parquets:
+        node_id = p.stem.replace("_", ".", 1)
+        try:
+            safe_path = str(p.resolve()).replace("'", "''")
+            count = con.execute(f"SELECT COUNT(*) FROM read_parquet('{safe_path}')").fetchone()[0]
+            cols = con.execute(f"SELECT * FROM read_parquet('{safe_path}') LIMIT 0").description
+            col_count = len(cols)
+            size_kb = p.stat().st_size / 1024
+            rows.append([node_id, count, col_count, f"{size_kb:.1f} KB"])
+        except Exception:
+            rows.append([node_id, "?", "?", f"{p.stat().st_size / 1024:.1f} KB"])
+
+    typer.echo(f"\nIntermediate outputs ({len(rows)} nodes):")
+    print(tabulate(rows, headers=["Node", "Rows", "Columns", "Size"], tablefmt="psql"))
 
 
 @app.command()

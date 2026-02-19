@@ -62,6 +62,28 @@ connection_ref: my_mysql
 table: app.orders
 ```
 
+### Iceberg Sources
+
+Read from existing Iceberg tables via Lakekeeper REST catalog:
+
+```yaml
+name: orders
+kind: source
+source: iceberg
+table: atlas.my_namespace.orders
+params:
+  catalog_uri: http://lakekeeper:8181
+  warehouse: seeknal-warehouse
+```
+
+The `table` must use 3-part format: `catalog.namespace.table`. Connection details:
+- `catalog_uri`: Lakekeeper URL (or set `LAKEKEEPER_URL` env var)
+- `warehouse`: Warehouse name (default: `seeknal-warehouse`, or set `LAKEKEEPER_WAREHOUSE` env var)
+
+S3 and OAuth2 credentials are read from environment variables:
+- `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+- `KEYCLOAK_TOKEN_URL`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET`
+
 ### API Sources
 
 Ingest data from REST APIs:
@@ -142,6 +164,38 @@ incremental_key: updated_at
 
 ---
 
+## Iceberg Materialization
+
+Persist source data as Iceberg tables in S3/MinIO via Lakekeeper catalog:
+
+```yaml
+name: customers
+kind: source
+source: csv
+table: "customers.csv"
+schema:
+  - name: customer_id
+    data_type: integer
+  - name: name
+    data_type: string
+  - name: region
+    data_type: string
+materialization:
+  enabled: true
+  mode: overwrite                        # overwrite or append
+  table: atlas.production.customers      # 3-part name: catalog.namespace.table
+```
+
+| Field | Description |
+|-------|-------------|
+| `enabled` | Set `true` to write output to Iceberg |
+| `mode` | `overwrite` (full refresh) or `append` (accumulate) |
+| `table` | Fully qualified name: `catalog.namespace.table` |
+
+See [Iceberg Materialization](../iceberg-materialization.md) for full setup guide.
+
+---
+
 ## Best Practices
 
 1. **Use explicit column definitions** for type safety
@@ -149,6 +203,8 @@ incremental_key: updated_at
 3. **Use connection references** instead of hardcoded credentials
 4. **Configure incremental sources** for large datasets
 5. **Add descriptions** for documentation
+6. **Use `overwrite` mode** for dimension/reference data sources
+7. **Use `append` mode** for event/transaction data that accumulates
 
 ---
 
@@ -157,6 +213,7 @@ incremental_key: updated_at
 - [Transforms](transforms.md) - Process source data
 - [Incremental Processing](../getting-started/data-engineer-path/2-incremental-models.md) - Advanced source patterns
 - [Connections](../reference/configuration.md) - Configure database connections
+- [Iceberg Materialization](../iceberg-materialization.md) - Persist data to Iceberg tables
 
 ---
 

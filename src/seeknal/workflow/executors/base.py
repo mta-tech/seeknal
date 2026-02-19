@@ -181,6 +181,7 @@ class ExecutionContext:
     verbose: bool = False
     materialize_enabled: Optional[bool] = None  # None=use node config
     params: Dict[str, Any] = field(default_factory=dict)  # Resolved parameters
+    common_config: Optional[Dict[str, str]] = None  # Flat common config dict
 
     def get_duckdb_connection(self):
         """Get or create DuckDB connection."""

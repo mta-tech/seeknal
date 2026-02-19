@@ -116,7 +116,7 @@ class SourceExecutor(BaseExecutor):
         supported_sources = [
             "csv", "parquet", "json", "jsonl",
             "sqlite", "postgresql", "postgres", "hive",
-            "starrocks",
+            "starrocks", "iceberg",
             "bigquery", "snowflake", "redshift"
         ]
 
@@ -127,7 +127,7 @@ class SourceExecutor(BaseExecutor):
                 f"Supported types: {', '.join(supported_sources)}"
             )
 
-        # Validate file path for file-based sources
+        # Validate file path for file-based sources (skip for remote sources)
         if source_type in ["csv", "parquet", "json", "jsonl", "sqlite"]:
             try:
                 validate_file_path(table)
@@ -221,6 +221,8 @@ class SourceExecutor(BaseExecutor):
                 row_count = self._load_starrocks(con, table, params)
             elif source_type == "hive":
                 row_count = self._load_hive(con, table, params)
+            elif source_type == "iceberg":
+                row_count = self._load_iceberg(con, table, params)
             else:
                 raise ExecutorExecutionError(
                     self.node.id,
@@ -655,30 +657,50 @@ class SourceExecutor(BaseExecutor):
         database = params.get("database", "postgres")
         user = params.get("user", "postgres")
         password = params.get("password", "")
-        schema = params.get("schema", "public")
+        pg_schema = params.get("schema", "public")
+
+        # Create schema-qualified view name from node ID (consistent with CSV loader)
+        node_id = self.node.id
+        if "." in node_id:
+            duckdb_schema, view_name = node_id.split(".", 1)
+        else:
+            duckdb_schema, view_name = "source", node_id
 
         try:
             # Load postgres extension
-            con.execute("LOAD postgres")
+            try:
+                con.execute("LOAD postgres")
+            except Exception:
+                con.execute("INSTALL postgres; LOAD postgres;")
 
-            # Attach PostgreSQL database
-            attach_sql = f"""
-            ATTACH 'host={host} port={port} dbname={database} user={user} password={password}'
-            AS pg_db (TYPE postgres)
-            """
-            con.execute(attach_sql)
+            # Create DuckDB schema for the view
+            con.execute(f"CREATE SCHEMA IF NOT EXISTS {duckdb_schema}")
+
+            # Attach PostgreSQL database (use unique alias to avoid conflicts)
+            pg_alias = f"pg_{view_name}"
+            try:
+                con.execute(f"""
+                ATTACH 'host={host} port={port} dbname={database} user={user} password={password}'
+                AS {pg_alias} (TYPE postgres)
+                """)
+            except Exception as e:
+                # May already be attached from a previous source
+                if "already exists" not in str(e):
+                    raise
 
             # Create view from PostgreSQL table
-            full_table_name = f"pg_db.{schema}.{table}"
-            query = f"CREATE OR REPLACE VIEW loaded_data AS SELECT * FROM {full_table_name}"
-            con.execute(query)
+            full_table_name = f"{pg_alias}.{pg_schema}.{table}"
+            qualified_view = f"{duckdb_schema}.{view_name}"
+            con.execute(f"CREATE OR REPLACE VIEW {qualified_view} AS SELECT * FROM {full_table_name}")
 
             # Count rows
-            count_result = con.execute("SELECT COUNT(*) FROM loaded_data").fetchone()
+            count_result = con.execute(f"SELECT COUNT(*) FROM {qualified_view}").fetchone()
             row_count = count_result[0] if count_result else 0
 
             return row_count
 
+        except ExecutorExecutionError:
+            raise
         except Exception as e:
             raise ExecutorExecutionError(
                 self.node.id,
@@ -769,6 +791,173 @@ class SourceExecutor(BaseExecutor):
             raise ExecutorExecutionError(
                 self.node.id,
                 f"Failed to load from StarRocks table '{table}': {str(e)}",
+                e
+            ) from e
+
+    def _load_iceberg(
+        self,
+        con: Any,
+        table: str,
+        params: Dict[str, Any]
+    ) -> int:
+        """
+        Load data from an Iceberg table via Lakekeeper REST catalog.
+
+        Uses DuckDB's iceberg extension to ATTACH a Lakekeeper catalog
+        and create a view from the specified Iceberg table.
+
+        The table name must be a 3-part format: catalog.namespace.table
+        (e.g., atlas.my_namespace.my_table).
+
+        Connection details can be provided via params or environment variables:
+        - catalog_uri: Lakekeeper URL (env: LAKEKEEPER_URL)
+        - warehouse: Warehouse name (env: LAKEKEEPER_WAREHOUSE, default: seeknal-warehouse)
+
+        S3 and OAuth2 credentials are always read from environment variables:
+        - AWS_ENDPOINT_URL, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+        - KEYCLOAK_TOKEN_URL, KEYCLOAK_CLIENT_ID, KEYCLOAK_CLIENT_SECRET
+
+        Args:
+            con: DuckDB connection
+            table: Fully qualified Iceberg table name (catalog.namespace.table)
+            params: Optional connection parameters (catalog_uri, warehouse)
+
+        Returns:
+            Number of rows loaded
+
+        Raises:
+            ExecutorExecutionError: If loading fails
+        """
+        import os
+        import json
+        import urllib.request
+
+        # Validate 3-part table name
+        parts = table.split(".")
+        if len(parts) != 3:
+            raise ExecutorExecutionError(
+                self.node.id,
+                f"Iceberg table must be 3-part format 'catalog.namespace.table', "
+                f"got '{table}' ({len(parts)} parts)"
+            )
+
+        catalog_alias, namespace, table_name = parts
+
+        # Get connection config from params or env vars
+        catalog_uri = params.get(
+            "catalog_uri",
+            os.getenv("LAKEKEEPER_URL", "")
+        )
+        if not catalog_uri:
+            raise ExecutorExecutionError(
+                self.node.id,
+                "Iceberg source requires 'catalog_uri' in params or "
+                "LAKEKEEPER_URL environment variable"
+            )
+
+        warehouse = params.get(
+            "warehouse",
+            os.getenv("LAKEKEEPER_WAREHOUSE", "seeknal-warehouse")
+        )
+
+        # S3 credentials from env
+        minio_endpoint = os.getenv("AWS_ENDPOINT_URL", "")
+        s3_region = os.getenv("AWS_REGION", "us-east-1")
+        s3_access_key = os.getenv("AWS_ACCESS_KEY_ID", "")
+        s3_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+
+        # OAuth2 credentials from env
+        token_url = os.getenv("KEYCLOAK_TOKEN_URL", "")
+        client_id = os.getenv("KEYCLOAK_CLIENT_ID", "")
+        client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET", "")
+
+        # Create schema and view names from node qualified name
+        node_id = self.node.id
+        if "." in node_id:
+            schema, view_name = node_id.split(".", 1)
+        else:
+            schema, view_name = "source", node_id
+
+        try:
+            # Install and load required extensions
+            con.execute("INSTALL httpfs")
+            con.execute("LOAD httpfs")
+            con.execute("INSTALL iceberg")
+            con.execute("LOAD iceberg")
+
+            # Configure S3 if endpoint is provided
+            if minio_endpoint:
+                # Strip protocol for endpoint
+                endpoint = minio_endpoint.replace("http://", "").replace("https://", "")
+                con.execute(f"SET s3_region = '{s3_region}'")
+                con.execute(f"SET s3_endpoint = '{endpoint}'")
+                con.execute("SET s3_url_style = 'path'")
+                con.execute("SET s3_use_ssl = false")
+                con.execute(f"SET s3_access_key_id = '{s3_access_key}'")
+                con.execute(f"SET s3_secret_access_key = '{s3_secret_key}'")
+
+            # Get OAuth2 token
+            if token_url and client_id and client_secret:
+                token_data = (
+                    f"grant_type=client_credentials"
+                    f"&client_id={client_id}"
+                    f"&client_secret={client_secret}"
+                ).encode()
+                req = urllib.request.Request(token_url, data=token_data)
+                token_response = json.loads(
+                    urllib.request.urlopen(req).read()
+                )
+                token = token_response["access_token"]
+            else:
+                raise ExecutorExecutionError(
+                    self.node.id,
+                    "Iceberg source requires OAuth2 credentials: "
+                    "KEYCLOAK_TOKEN_URL, KEYCLOAK_CLIENT_ID, KEYCLOAK_CLIENT_SECRET"
+                )
+
+            # Build catalog URL
+            base_url = catalog_uri.rstrip("/")
+            if "/catalog" not in base_url:
+                catalog_url = f"{base_url}/catalog"
+            else:
+                catalog_url = base_url
+
+            # Attach Lakekeeper catalog (skip if already attached)
+            try:
+                con.execute(f"""
+                    ATTACH '{warehouse}' AS {catalog_alias} (
+                        TYPE ICEBERG,
+                        ENDPOINT '{catalog_url}',
+                        AUTHORIZATION_TYPE 'oauth2',
+                        TOKEN '{token}'
+                    )
+                """)
+            except Exception as attach_err:
+                # Catalog may already be attached from a previous source
+                if "already exists" not in str(attach_err).lower():
+                    raise
+
+            # Create local schema and view from the Iceberg table
+            con.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+            con.execute(
+                f"CREATE OR REPLACE VIEW {schema}.{view_name} AS "
+                f"SELECT * FROM {catalog_alias}.{namespace}.{table_name}"
+            )
+
+            # Count rows
+            count_result = con.execute(
+                f"SELECT COUNT(*) FROM {schema}.{view_name}"
+            ).fetchone()
+            row_count = count_result[0] if count_result else 0
+
+            return row_count
+
+        except ExecutorExecutionError:
+            raise
+        except Exception as e:
+            raise ExecutorExecutionError(
+                self.node.id,
+                f"Failed to load from Iceberg table '{table}': {str(e)}",
                 e
             ) from e
 

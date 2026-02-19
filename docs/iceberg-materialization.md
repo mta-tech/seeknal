@@ -65,19 +65,104 @@ Apache Iceberg is an open table format for huge analytic datasets. Iceberg adds 
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+## Quick Start (Lakekeeper + MinIO)
+
+This section shows a verified end-to-end setup using Lakekeeper REST catalog with MinIO S3-compatible storage.
+
+### Prerequisites
+
+| Component | Purpose | Default Address |
+|-----------|---------|-----------------|
+| Lakekeeper | Iceberg REST catalog | `http://localhost:8181` |
+| MinIO | S3-compatible object storage | `http://localhost:9000` |
+| Keycloak | OAuth2 authentication (optional) | `http://localhost:8080` |
+
+### 1. Set Environment Variables
+
+```bash
+# Lakekeeper catalog
+export LAKEKEEPER_URI=http://localhost:8181
+
+# MinIO/S3 credentials
+export AWS_ACCESS_KEY_ID=minioadmin
+export AWS_SECRET_ACCESS_KEY=your-minio-password
+export AWS_ENDPOINT_URL=http://localhost:9000
+export AWS_REGION=us-east-1
+
+# OAuth2 (if Lakekeeper uses Keycloak)
+export KEYCLOAK_TOKEN_URL=http://localhost:8080/realms/master/protocol/openid-connect/token
+export KEYCLOAK_CLIENT_ID=duckdb
+export KEYCLOAK_CLIENT_SECRET=your-client-secret
+```
+
+### 2. Create profiles.yml
+
+```yaml
+# profiles.yml (project root or ~/.seeknal/profiles.yml)
+default:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: target/dev.duckdb
+
+materialization:
+  enabled: true
+  catalog:
+    type: rest
+    uri: http://localhost:8181
+    warehouse: s3://my-bucket/warehouse
+    verify_tls: false                    # Set true for production
+  default_mode: append
+  schema_evolution:
+    mode: auto
+    allow_column_add: true
+    allow_column_type_change: false
+  duckdb:
+    iceberg_extension: true
+    threads: 4
+    memory_limit: 1GB
+```
+
+### 3. Add Materialization to YAML Nodes
+
+```yaml
+# seeknal/sources/customers.yml
+kind: source
+name: customers
+source: csv
+table: "customers.csv"
+materialization:
+  enabled: true
+  mode: overwrite
+  table: atlas.my_namespace.customers    # 3-part name: catalog.namespace.table
+```
+
+### 4. Run the Pipeline
+
+```bash
+seeknal run
+```
+
+### 5. Verify Data in Iceberg
+
+```bash
+seeknal iceberg profile-show --profile profiles.yml
+```
+
 ## Configuration
 
 ### profiles.yml Setup
 
-Create a `profiles.yml` file in `~/.seeknal/`:
+Create a `profiles.yml` file in your project root or `~/.seeknal/`:
 
 ```yaml
 materialization:
   enabled: true
   catalog:
     type: rest
-    uri: ${LAKEKEEPER_URI}              # e.g., https://lakekeeper.example.com
-    warehouse: s3://my-bucket/warehouse  # S3, GCS, or Azure path
+    uri: ${LAKEKEEPER_URI}              # e.g., http://lakekeeper.example.com:8181
+    warehouse: s3://my-bucket/warehouse  # S3/GCS/Azure path
     verify_tls: true                     # Enable TLS verification (default)
   default_mode: append                   # or "overwrite"
 
@@ -87,19 +172,34 @@ materialization:
     allow_column_type_change: false      # Allow type changes
     allow_column_drop: false             # Allow dropping columns
 
-  partition_by:                          # Optional partitioning
-    - event_date
-    - region
+  duckdb:
+    iceberg_extension: true
+    threads: 4                           # Number of DuckDB threads
+    memory_limit: 1GB                    # DuckDB memory limit
 ```
+
+> **Note:** When using `seeknal iceberg profile-show`, you must pass `--profile profiles.yml` explicitly if using a local project file. The default looks at `~/.seeknal/profiles.yml`.
 
 ### Environment Variables
 
 Set credentials as environment variables (recommended):
 
 ```bash
-export LAKEKEEPER_URI=https://lakekeeper.example.com
-export LAKEKEEPER_CREDENTIAL=user:password      # Optional bearer token
+# Lakekeeper REST catalog
+export LAKEKEEPER_URI=http://lakekeeper.example.com:8181
 export LAKEKEEPER_WAREHOUSE=s3://my-bucket/warehouse
+export LAKEKEEPER_WAREHOUSE_ID=your-warehouse-uuid   # From /catalog/v1/config endpoint
+
+# MinIO/S3 credentials
+export AWS_ACCESS_KEY_ID=minioadmin
+export AWS_SECRET_ACCESS_KEY=your-secret-key
+export AWS_ENDPOINT_URL=http://localhost:9000
+export AWS_REGION=us-east-1
+
+# OAuth2/Keycloak (if using authenticated catalog)
+export KEYCLOAK_TOKEN_URL=http://localhost:8080/realms/master/protocol/openid-connect/token
+export KEYCLOAK_CLIENT_ID=duckdb
+export KEYCLOAK_CLIENT_SECRET=your-client-secret
 ```
 
 ### Per-Node Override
@@ -111,10 +211,30 @@ kind: source
 name: orders
 materialization:
   enabled: true
-  mode: overwrite              # Override default mode
-  partition_by:
-    - order_date
+  mode: overwrite                        # Override default mode
+  table: atlas.my_namespace.orders       # 3-part name required
 ```
+
+### Table Naming Convention
+
+Materialization table names **must** use 3-part format:
+
+```
+catalog.namespace.table
+```
+
+| Part | Description | Example |
+|------|-------------|---------|
+| `catalog` | DuckDB catalog alias (always `atlas`) | `atlas` |
+| `namespace` | Iceberg namespace in Lakekeeper | `production`, `staging` |
+| `table` | Table name | `customers`, `orders` |
+
+Examples:
+- `atlas.production.customers`
+- `atlas.staging.order_enriched`
+- `atlas.iceberg_test.daily_metrics`
+
+> **Important:** The namespace must exist in Lakekeeper before tables can be created. See [Lakekeeper Setup](#lakekeeper-setup) below.
 
 ## Schema Evolution Modes
 
@@ -263,8 +383,8 @@ Prompts for:
 View all snapshots for a table:
 
 ```bash
-seeknal iceberg snapshot-list warehouse.prod.orders
-seeknal iceberg snapshot-list warehouse.prod.orders --limit 20
+seeknal iceberg snapshot-list atlas.production.orders
+seeknal iceberg snapshot-list atlas.production.orders --limit 20
 ```
 
 Output:
@@ -282,7 +402,7 @@ Found 10 snapshot(s):
 View detailed information about a snapshot:
 
 ```bash
-seeknal iceberg snapshot-show warehouse.prod.orders 12345678
+seeknal iceberg snapshot-show atlas.production.orders 12345678
 ```
 
 Output:
@@ -300,19 +420,38 @@ Snapshot Details
 
 ### Enable Materialization for a Node
 
+Add a `materialization` section to any source or transform node:
+
 ```yaml
 kind: source
 name: orders
-connection:
-  uri: postgresql://user:pass@host/db
-  table: public.orders
+source: csv
+table: "orders.csv"
+schema:
+  - name: order_id
+    data_type: integer
+  - name: customer_id
+    data_type: integer
+  - name: order_date
+    data_type: date
+  - name: amount
+    data_type: float
+  - name: status
+    data_type: string
 materialization:
   enabled: true
-  table: warehouse.prod.orders    # Optional: override table name
-  mode: append                    # Optional: override default mode
-  partition_by:
-    - order_date
+  table: atlas.production.orders         # 3-part name: catalog.namespace.table
+  mode: append                           # append or overwrite
 ```
+
+### Materialization Fields
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `enabled` | boolean | Yes | `false` | Enable materialization for this node |
+| `table` | string | When enabled | - | Fully qualified table name (`catalog.namespace.table`) |
+| `mode` | string | No | `append` | Write mode: `append` or `overwrite` |
+| `create_table` | boolean | No | `true` | Auto-create table if it doesn't exist |
 
 ### Configuration Hierarchy
 
@@ -322,64 +461,81 @@ materialization:
 
 ### Complete Example
 
+This example shows a working 3-node pipeline with Iceberg materialization:
+
 ```yaml
-# sources/orders.yml
+# seeknal/sources/customers.yml
+kind: source
+name: customers
+description: "Customer master data"
+source: csv
+table: "customers.csv"
+schema:
+  - name: customer_id
+    data_type: integer
+  - name: name
+    data_type: string
+  - name: email
+    data_type: string
+  - name: region
+    data_type: string
+materialization:
+  enabled: true
+  mode: overwrite                        # Full refresh each run
+  table: atlas.production.customers
+```
+
+```yaml
+# seeknal/sources/orders.yml
 kind: source
 name: orders
-connection:
-  uri: postgresql://user:pass@host/db
-  table: public.orders
+description: "Order transactions"
+source: csv
+table: "orders.csv"
+schema:
+  - name: order_id
+    data_type: integer
+  - name: customer_id
+    data_type: integer
+  - name: order_date
+    data_type: date
+  - name: amount
+    data_type: float
+  - name: status
+    data_type: string
 materialization:
   enabled: true
-  mode: append
-  partition_by:
-    - order_date
-
----
-
-# transforms/clean_orders.yml
-kind: transform
-name: clean_orders
-sql: |
-  SELECT
-    order_id,
-    customer_id,
-    order_date,
-    status,
-    total_amount
-  FROM source_orders
-  WHERE status != 'cancelled'
-depends_on:
-  - source.orders
-materialization:
-  enabled: true
-  mode: append
-  partition_by:
-    - order_date
-
----
-
-# feature_groups/daily_orders.yml
-kind: feature_group
-name: daily_orders
-entity: order
-features:
-  - name: order_count
-    type: int
-  - name: total_revenue
-    type: double
-  - name: avg_order_value
-    type: double
-keys:
-  - order_date
-depends_on:
-  - transform.clean_orders
-materialization:
-  enabled: true
-  mode: append
-  partition_by:
-    - order_date
+  mode: append                           # Accumulate across runs
+  table: atlas.production.orders
 ```
+
+```yaml
+# seeknal/transforms/order_enriched.yml
+kind: transform
+name: order_enriched
+description: "Orders enriched with customer data"
+inputs:
+  - ref: source.orders                   # Referenced as input_0 in SQL
+  - ref: source.customers                # Referenced as input_1 in SQL
+transform: |
+  SELECT
+    o.order_id,
+    o.customer_id,
+    c.name AS customer_name,
+    c.region,
+    o.order_date,
+    o.amount,
+    o.status
+  FROM input_0 o
+  JOIN input_1 c
+    ON o.customer_id = c.customer_id
+materialization:
+  enabled: true
+  mode: overwrite
+  table: atlas.production.order_enriched
+```
+
+> **Transform SQL syntax:** When a transform has multiple inputs, reference them as `input_0`, `input_1`, etc. in order of the `inputs` list. Single-input transforms can reference input by the source name.
 
 ## Time Travel Queries
 
@@ -387,14 +543,14 @@ After materializing data, you can query historical snapshots using DuckDB:
 
 ```sql
 -- Query current data
-SELECT * FROM warehouse.prod.orders;
+SELECT * FROM atlas.production.orders;
 
 -- Query snapshot as of specific time
-SELECT * FROM warehouse.prod.orders
+SELECT * FROM atlas.production.orders
 FOR VERSION AS OF '1234567812345678';
 
 -- Query snapshot as of specific timestamp
-SELECT * FROM warehouse.prod.orders
+SELECT * FROM atlas.production.orders
 FOR TIMESTAMP AS OF '2024-01-26 12:00:00';
 ```
 
@@ -567,11 +723,108 @@ All table names are validated and quoted:
 
 ```yaml
 # ✅ Valid
-table: warehouse.prod.orders
+table: atlas.production.orders
 
 # ❌ Blocked (SQL injection attempt)
 table: orders; DROP TABLE users;
 ```
+
+## Verifying Data in Iceberg
+
+After running a pipeline with materialization, verify your data using DuckDB:
+
+```python
+import duckdb, json, urllib.request
+
+con = duckdb.connect()
+con.install_extension('httpfs'); con.load_extension('httpfs')
+con.install_extension('iceberg'); con.load_extension('iceberg')
+
+# Configure S3/MinIO
+con.execute("SET s3_region='us-east-1'; SET s3_endpoint='localhost:9000'")
+con.execute("SET s3_url_style='path'; SET s3_use_ssl=false")
+con.execute("SET s3_access_key_id='minioadmin'")
+con.execute("SET s3_secret_access_key='your-secret-key'")
+
+# Get OAuth token (if using Keycloak)
+data = b'grant_type=client_credentials&client_id=duckdb&client_secret=your-client-secret'
+req = urllib.request.Request(
+    'http://localhost:8080/realms/master/protocol/openid-connect/token', data=data)
+token = json.loads(urllib.request.urlopen(req).read())['access_token']
+
+# Attach to Lakekeeper catalog
+con.execute(f"""
+    ATTACH 'seeknal-warehouse' AS atlas (
+        TYPE ICEBERG,
+        ENDPOINT 'http://localhost:8181/catalog',
+        AUTHORIZATION_TYPE 'oauth2',
+        TOKEN '{token}'
+    );
+""")
+
+# Query materialized tables
+con.execute("SELECT * FROM atlas.production.customers").fetchdf()
+con.execute("SELECT COUNT(*) FROM atlas.production.orders").fetchone()
+```
+
+You can also verify via the Lakekeeper REST API:
+
+```bash
+# Get OAuth token
+TOKEN=$(curl -s -X POST "http://localhost:8080/realms/master/protocol/openid-connect/token" \
+  -d "grant_type=client_credentials" \
+  -d "client_id=duckdb" \
+  -d "client_secret=your-client-secret" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+# Get warehouse UUID prefix
+curl -s "http://localhost:8181/catalog/v1/config?warehouse=seeknal-warehouse" \
+  -H "Authorization: Bearer $TOKEN"
+
+# List namespaces (replace {prefix} with UUID from above)
+curl -s "http://localhost:8181/catalog/v1/{prefix}/namespaces" \
+  -H "Authorization: Bearer $TOKEN"
+
+# List tables in a namespace
+curl -s "http://localhost:8181/catalog/v1/{prefix}/namespaces/production/tables" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## Lakekeeper Setup
+
+### Create Namespace
+
+Namespaces must exist in Lakekeeper before tables can be created:
+
+```bash
+# 1. Get warehouse prefix UUID
+PREFIX=$(curl -s "http://localhost:8181/catalog/v1/config?warehouse=seeknal-warehouse" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "import sys,json; print(json.load(sys.stdin)['overrides']['prefix'])")
+
+# 2. Create namespace
+curl -s -X POST "http://localhost:8181/catalog/v1/$PREFIX/namespaces" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"namespace": ["production"], "properties": {}}'
+```
+
+### Configure Storage Credentials
+
+Lakekeeper needs S3 credentials to manage Iceberg data files:
+
+```bash
+# Set storage credentials for the warehouse
+curl -s -X POST "http://localhost:8181/management/v1/warehouse/{warehouse-uuid}/storage-credential" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "s3",
+    "credential-type": "access-key",
+    "aws-access-key-id": "minioadmin",
+    "aws-secret-access-key": "your-secret-key"
+  }'
+```
+
+> **Note:** Lakekeeper validates credentials by performing a test write to S3 at registration time.
 
 ## Troubleshooting
 
@@ -580,9 +833,35 @@ table: orders; DROP TABLE users;
 **Problem:** `Failed to connect to catalog`
 
 **Solution:**
-1. Verify catalog URI is accessible: `curl https://lakekeeper.example.com/health`
-2. Check credentials: `echo $LAKEKEEPER_CREDENTIAL`
-3. Validate configuration: `seeknal iceberg validate-materialization`
+1. Verify catalog URI is accessible: `curl http://localhost:8181/health`
+2. Check environment variables: `env | grep LAKEKEEPER`
+3. Validate configuration: `seeknal iceberg validate-materialization --profile profiles.yml`
+
+### OAuth2 Token Issues
+
+**Problem:** `Failed to get OAuth token from Keycloak`
+
+**Solution:**
+1. Verify Keycloak is running: `curl http://localhost:8080/health`
+2. Check client credentials: `echo $KEYCLOAK_CLIENT_ID` / `echo $KEYCLOAK_CLIENT_SECRET`
+3. Test token endpoint manually:
+```bash
+curl -s -X POST "http://localhost:8080/realms/master/protocol/openid-connect/token" \
+  -d "grant_type=client_credentials" \
+  -d "client_id=$KEYCLOAK_CLIENT_ID" \
+  -d "client_secret=$KEYCLOAK_CLIENT_SECRET"
+```
+
+### HTTP 500 "Error fetching secret"
+
+**Problem:** Table creation fails with HTTP 500 from Lakekeeper.
+
+**Solution:** Lakekeeper can't access S3 storage credentials. Register credentials:
+```bash
+curl -s -X POST "http://localhost:8181/management/v1/warehouse/{uuid}/storage-credential" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"type":"s3","credential-type":"access-key","aws-access-key-id":"KEY","aws-secret-access-key":"SECRET"}'
+```
 
 ### Schema Mismatch
 
@@ -598,16 +877,20 @@ table: orders; DROP TABLE users;
 **Problem:** `Permission denied: s3://my-bucket/warehouse`
 
 **Solution:**
-1. Verify AWS credentials: `aws s3 ls s3://my-bucket/`
-2. Check IAM policies include: `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`
-3. Ensure bucket policy allows write access
+1. Verify AWS credentials: `env | grep AWS`
+2. Check S3 access: `aws s3 ls s3://my-bucket/ --endpoint-url http://localhost:9000`
+3. For MinIO with Docker: ensure Lakekeeper can reach MinIO (Docker networking can cause issues)
+4. As a development workaround for MinIO, set bucket to public:
+```bash
+mc anonymous set public myminio/my-bucket
+```
 
 ### Extension Loading
 
 **Problem:** `Failed to load Iceberg extension`
 
 **Solution:**
-1. Verify DuckDB version: `duckdb --version`
+1. Verify DuckDB version: `python -c "import duckdb; print(duckdb.__version__)"`
 2. Install latest DuckDB: `pip install --upgrade duckdb`
 3. Check extension installation: `INSTALL iceberg; LOAD iceberg;`
 
@@ -658,7 +941,7 @@ Manage storage costs:
 3. **Use VACUUM** to remove deleted data:
 
 ```sql
-VACUUM warehouse.prod.orders;
+VACUUM atlas.production.orders;
 ```
 
 ## Reference
@@ -700,14 +983,38 @@ class SchemaEvolutionConfig:
     allow_column_drop: bool = False
 ```
 
+## Known Issues
+
+| Issue | Status | Workaround |
+|-------|--------|------------|
+| `iceberg profile-show` defaults to `~/.seeknal/profiles.yml` | Bug | Pass `--profile profiles.yml` explicitly for local project files |
+| `iceberg validate-materialization` crashes | Bug | `RequestException` variable not imported in `materialization_cli.py` |
+| `iceberg snapshot-list` fails with 3-part names | Bug | DuckDB "NameListToString NOT IMPLEMENTED" error with `catalog.namespace.table` format |
+| Docker networking: Lakekeeper can't auth to MinIO | Infra | Set MinIO bucket to `public` for development environments |
+| Orders table accumulates with append mode | By Design | Use `overwrite` mode for full refresh, or clear between runs |
+| DuckDB `SUM()` produces HUGEINT, invalid for Iceberg | DuckDB Limitation | Cast aggregates explicitly: `CAST(SUM(col) AS BIGINT)` |
+
 ## Further Reading
 
 - [Apache Iceberg Specification](https://iceberg.apache.org/spec/)
 - [Lakekeeper Documentation](https://www.lakekeeper.io/)
 - [DuckDB Iceberg Extension](https://duckdb.org/docs/extensions/iceberg)
 - [Time Travel Queries](https://iceberg.apache.org/spec/#incremental-data-writes)
+- [YAML Pipeline Tutorial - Iceberg Section](tutorials/yaml-pipeline-tutorial.md#part-10-iceberg-materialization)
 
 ## Changelog
+
+### v1.1.0 (2026-02-18)
+
+End-to-end verified with Lakekeeper + MinIO:
+- Added Quick Start section with verified Lakekeeper + MinIO setup
+- Added OAuth2/Keycloak authentication documentation
+- Added 3-part table naming convention (`catalog.namespace.table`)
+- Added Lakekeeper namespace and storage credential setup
+- Added data verification section with DuckDB and REST API examples
+- Fixed transform SQL examples to use `input_0`/`input_1` syntax
+- Added Known Issues table from E2E testing
+- Updated environment variables for OAuth2 and S3 configuration
 
 ### v1.0.0 (2026-01-26)
 

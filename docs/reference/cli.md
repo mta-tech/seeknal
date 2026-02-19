@@ -1369,9 +1369,11 @@ seeknal iceberg validate-materialization [OPTIONS]
 # Validate default profile
 seeknal iceberg validate-materialization
 
-# Validate custom profile
-seeknal iceberg validate-materialization --profile custom-profiles.yml
+# Validate custom profile (recommended for local projects)
+seeknal iceberg validate-materialization --profile profiles.yml
 ```
+
+> **Known Issue:** This command currently crashes with a `RequestException` error due to a missing import in `materialization_cli.py`. This will be fixed in a future release.
 
 **See Also:** [Iceberg Materialization](../iceberg-materialization.md)
 
@@ -1391,7 +1393,7 @@ seeknal iceberg snapshot-list TABLE_NAME [OPTIONS]
 **Arguments:**
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `table_name` | TEXT | Yes | Fully qualified table name (e.g., warehouse.prod.orders) |
+| `table_name` | TEXT | Yes | Fully qualified table name (e.g., `atlas.production.orders`) |
 
 **Options:**
 | Flag | Type | Default | Description |
@@ -1401,11 +1403,13 @@ seeknal iceberg snapshot-list TABLE_NAME [OPTIONS]
 **Examples:**
 ```bash
 # List last 10 snapshots
-seeknal iceberg snapshot-list warehouse.prod.orders
+seeknal iceberg snapshot-list atlas.production.orders
 
 # List last 20 snapshots
-seeknal iceberg snapshot-list warehouse.prod.orders --limit 20
+seeknal iceberg snapshot-list atlas.production.orders --limit 20
 ```
+
+> **Known Issue:** This command currently fails with "NameListToString NOT IMPLEMENTED" when using 3-part table names (`catalog.namespace.table`). This is a DuckDB/Iceberg extension compatibility issue.
 
 ---
 
@@ -1423,13 +1427,13 @@ seeknal iceberg snapshot-show TABLE_NAME SNAPSHOT_ID
 **Arguments:**
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `table_name` | TEXT | Yes | Fully qualified table name (e.g., warehouse.prod.orders) |
+| `table_name` | TEXT | Yes | Fully qualified table name (e.g., `atlas.production.orders`) |
 | `snapshot_id` | TEXT | Yes | Snapshot ID (or first 8 characters) |
 
 **Examples:**
 ```bash
 # Show snapshot details
-seeknal iceberg snapshot-show warehouse.prod.orders 12345678
+seeknal iceberg snapshot-show atlas.production.orders 12345678
 ```
 
 ---
@@ -1481,12 +1485,14 @@ seeknal iceberg profile-show [OPTIONS]
 
 **Examples:**
 ```bash
-# Show default profile
+# Show default profile (reads from ~/.seeknal/profiles.yml)
 seeknal iceberg profile-show
 
-# Show custom profile
-seeknal iceberg profile-show --profile custom-profiles.yml
+# Show local project profile (recommended)
+seeknal iceberg profile-show --profile profiles.yml
 ```
+
+> **Known Issue:** The default path is `~/.seeknal/profiles.yml`, which may not be where your project's `profiles.yml` is located. For local projects, always pass `--profile profiles.yml` explicitly.
 
 ---
 

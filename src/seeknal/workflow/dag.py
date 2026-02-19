@@ -240,6 +240,9 @@ class DAGBuilder:
         self.cli_overrides: dict[str, Any] = cli_overrides or {}
         self.run_id: str | None = run_id
 
+        # Common config (loaded in build())
+        self._common_config: dict[str, str] | None = None
+
     def _merge_materialization_config(
         self,
         decorator_config: Optional[dict],
@@ -341,6 +344,13 @@ class DAGBuilder:
         Raises:
             ValueError: If no YAML or Python files are found
         """
+        # Load common config (seeknal/common/) before parsing nodes
+        common_dir = self.seeknal_dir / "common"
+        if common_dir.is_dir():
+            from seeknal.workflow.common.loader import load_common_config
+
+            self._common_config = load_common_config(common_dir)
+
         # Discover and parse YAML files
         yaml_files = self._discover_yaml_files()
 
@@ -373,13 +383,21 @@ class DAGBuilder:
         """
         Discover all *.yml files in the seeknal/ directory.
 
+        Excludes files under seeknal/common/ since those are loaded
+        separately by the common config loader.
+
         Returns:
             List of paths to YAML files
         """
         if not self.seeknal_dir.exists():
             return []
 
-        yaml_files = list(self.seeknal_dir.glob("**/*.yml"))
+        common_dir = self.seeknal_dir / "common"
+        yaml_files = [
+            f
+            for f in self.seeknal_dir.glob("**/*.yml")
+            if not f.is_relative_to(common_dir)
+        ]
         return yaml_files
 
     def _discover_python_files(self) -> list[Path]:
@@ -448,13 +466,24 @@ class DAGBuilder:
                 return
 
             # Resolve parameters if present
-            if "params" in data and (self.cli_overrides or self.run_id):
+            if "params" in data and (self.cli_overrides or self.run_id or self._common_config):
                 from seeknal.workflow.parameters.resolver import ParameterResolver
                 resolver = ParameterResolver(
                     cli_overrides=self.cli_overrides,
                     run_id=self.run_id,
+                    common_config=self._common_config,
                 )
                 data["params"] = resolver.resolve(data["params"])
+
+            # Resolve common config expressions in transform SQL
+            if "transform" in data and self._common_config:
+                from seeknal.workflow.parameters.resolver import ParameterResolver
+                resolver = ParameterResolver(
+                    cli_overrides=self.cli_overrides,
+                    run_id=self.run_id,
+                    common_config=self._common_config,
+                )
+                data["transform"] = resolver.resolve_string(data["transform"])
 
             # Create node
             node = DAGNode(

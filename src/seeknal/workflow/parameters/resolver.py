@@ -4,11 +4,12 @@ Parses and resolves {{ }} parameter expressions in YAML node configs.
 Supports CLI overrides and context-aware resolution.
 """
 
+import difflib
 import re
 import uuid
 import warnings
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .functions import get_function, env_var
 from .type_conversion import convert_to_bool
@@ -43,16 +44,20 @@ class ParameterResolver:
         self,
         cli_overrides: Optional[Dict[str, Any]] = None,
         run_id: Optional[str] = None,
+        common_config: Optional[Dict[str, str]] = None,
     ):
         """Initialize resolver.
 
         Args:
             cli_overrides: Parameter values from CLI flags (take precedence)
             run_id: Custom run ID (or auto-generated UUID)
+            common_config: Flat dict from common config loader (dotted keys).
+                Resolution priority: context > functions > env > common_config > passthrough.
         """
         self.cli_overrides = cli_overrides or {}
         self.run_id = run_id or str(uuid.uuid4())
         self.run_date = datetime.now().isoformat()
+        self._common_config: Optional[Dict[str, str]] = common_config
 
         # Build context values (runtime parameters)
         self._context_values: Dict[str, str] = {
@@ -163,6 +168,10 @@ class ParameterResolver:
             if expr.startswith('env:'):
                 return self._resolve_env_var(expr[4:])
 
+            # Check common config for dotted expressions (e.g., traffic.dateCol)
+            if '.' in expr:
+                return self._resolve_common_config(expr, match.group(0))
+
             # Return original if not resolved
             return match.group(0)
 
@@ -230,6 +239,39 @@ class ParameterResolver:
             return ""
 
         return env_var(var_name, default)
+
+    def _resolve_common_config(self, expr: str, original: str) -> str:
+        """Resolve a dotted expression against the common config.
+
+        Args:
+            expr: Dotted expression like ``traffic.dateCol`` or ``rules.callExpression``.
+            original: The original ``{{ expr }}`` text to return on passthrough.
+
+        Returns:
+            Resolved value from common config, or *original* if no common config is loaded.
+
+        Raises:
+            ValueError: If common config is loaded but the key is not found.
+        """
+        if self._common_config is None:
+            # No common config loaded -- pass through for backward compatibility
+            return original
+
+        if expr in self._common_config:
+            return self._common_config[expr]
+
+        # Common config loaded but key not found -- provide helpful error
+        suggestions = difflib.get_close_matches(
+            expr, self._common_config.keys(), n=3, cutoff=0.4
+        )
+        hint = ""
+        if suggestions:
+            hint = f" Did you mean: {', '.join(suggestions)}?"
+        raise ValueError(
+            f"Unknown common config key '{{{{ {expr} }}}}'. "
+            f"Available keys: {', '.join(sorted(self._common_config.keys()))}."
+            f"{hint}"
+        )
 
     def _parse_args(self, args_str: str) -> list:
         """Parse function arguments, handling numbers and negatives.
@@ -331,6 +373,43 @@ class ParameterResolver:
 
         # Keep as string
         return value
+
+    def resolve_string(self, value: str) -> str:
+        """Resolve {{ }} expressions in a standalone string.
+
+        Unlike ``_resolve_string``, this skips type conversion so that the
+        caller always receives a string back.  Useful for resolving SQL
+        templates where you do not want ``"100"`` silently converted to ``int``.
+
+        Args:
+            value: String potentially containing {{ }} expressions.
+
+        Returns:
+            String with all resolvable {{ }} expressions replaced.
+        """
+        def replace_match(match):
+            expr = match.group(1).strip()
+
+            if expr in self._context_values:
+                return self._context_values[expr]
+
+            if '(' in expr and expr.endswith(')'):
+                return self._resolve_function(expr)
+
+            func_info = get_function(expr)
+            if func_info:
+                func, _ = func_info
+                return str(func())
+
+            if expr.startswith('env:'):
+                return self._resolve_env_var(expr[4:])
+
+            if '.' in expr:
+                return self._resolve_common_config(expr, match.group(0))
+
+            return match.group(0)
+
+        return self.PARAM_PATTERN.sub(replace_match, value)
 
     def get_resolved_params(self) -> Dict[str, str]:
         """Get all runtime context parameters.

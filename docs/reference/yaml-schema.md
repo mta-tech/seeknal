@@ -199,7 +199,9 @@ transform: |
 - CTEs (Common Table Expressions)
 - Subqueries
 - Window functions
-- Reference upstream nodes: `source.name`, `transform.name`
+- Named input references: `ref('source.sales')`, `ref("transform.clean")`
+- Positional input references: `input_0`, `input_1`, etc.
+- Mixed syntax: `ref('source.sales') s JOIN input_1 p`
 - Use `__THIS__` placeholder to reference the first input
 
 ### Example
