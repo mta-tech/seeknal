@@ -226,19 +226,11 @@ class OutputFormat(str, Enum):
     YAML = "yaml"
 
 
-class WriteMode(str, Enum):
-    """Write mode options."""
-    OVERWRITE = "overwrite"
-    APPEND = "append"
-    MERGE = "merge"
-
-
 class ResourceType(str, Enum):
     """Resource types for listing."""
     PROJECTS = "projects"
     WORKSPACES = "workspaces"
     ENTITIES = "entities"
-    FLOWS = "flows"
     FEATURE_GROUPS = "feature-groups"
     OFFLINE_STORES = "offline-stores"
 
@@ -595,18 +587,6 @@ __pycache__/
 
 @app.command()
 def run(
-    flow_name: Optional[str] = typer.Argument(
-        None,
-        help="Name of the flow to run (legacy). If omitted, executes YAML pipeline from seeknal/ directory."
-    ),
-    start_date: Optional[str] = typer.Option(
-        None, "--start-date", "-s",
-        help="Start date for the flow (YYYY-MM-DD)"
-    ),
-    end_date: Optional[str] = typer.Option(
-        None, "--end-date", "-e",
-        help="End date for the flow (YYYY-MM-DD)"
-    ),
     dry_run: bool = typer.Option(
         False, "--dry-run",
         help="Show what would be executed without running"
@@ -685,18 +665,18 @@ def run(
         False, "--restate",
         help="Process restatement intervals marked for reprocessing"
     ),
+    profile: Optional[str] = typer.Option(
+        None, "--profile",
+        help="Path to profiles.yml for source_defaults and connections (default: ~/.seeknal/profiles.yml)"
+    ),
 ):
-    """Execute a feature transformation flow or YAML pipeline.
+    """Execute YAML/Python pipeline.
 
-    **Legacy Mode (with flow_name):**
-    Run a legacy Flow object by name.
-
-    **YAML Pipeline Mode (without flow_name):**
     Execute the DAG defined by YAML files in the seeknal/ directory.
     Supports incremental runs with change detection, parallel execution,
     and configurable error handling.
 
-    **YAML Pipeline Examples:**
+    **Examples:**
         # Run changed nodes only (incremental)
         seeknal run
 
@@ -743,9 +723,6 @@ def run(
         # Process restatement intervals
         seeknal run --restate
 
-    **Legacy Flow Examples:**
-        seeknal run my_flow --start-date 2024-01-01
-
     **Parameterization Examples:**
         # Use default (today's date)
         seeknal run
@@ -775,56 +752,32 @@ def run(
         )
         return
 
-    # Determine mode: legacy Flow vs YAML pipeline
-    if flow_name is not None:
-        # Legacy mode: run Flow object
-        from seeknal.flow import Flow
+    # Build CLI overrides for parameter resolution
+    cli_overrides: dict[str, Any] = {}
+    if param_date:
+        cli_overrides["date"] = param_date
+        cli_overrides["run_date"] = param_date
+        cli_overrides["today"] = param_date
+    if param_run_id:
+        cli_overrides["run_id"] = param_run_id
 
-        typer.echo(f"Running flow: {flow_name}")
-        if start_date:
-            typer.echo(f"  Start date: {start_date}")
-        if end_date:
-            typer.echo(f"  End date: {end_date}")
-
-        if dry_run:
-            _echo_warning("Dry run mode - no changes will be made")
-            return
-
-        try:
-            flow = Flow(name=flow_name).get_or_create()
-            result = flow.run()
-            _echo_success(f"Flow '{flow_name}' completed successfully!")
-            if result is not None:
-                typer.echo(f"  Result rows: {result.count()}")
-        except Exception as e:
-            _echo_error(f"Flow execution failed: {e}")
-            raise typer.Exit(1)
-    else:
-        # Build CLI overrides for parameter resolution
-        cli_overrides: dict[str, Any] = {}
-        if param_date:
-            cli_overrides["date"] = param_date
-            cli_overrides["run_date"] = param_date
-            cli_overrides["today"] = param_date
-        if param_run_id:
-            cli_overrides["run_id"] = param_run_id
-
-        # YAML pipeline mode: execute DAG from seeknal/ directory
-        _run_yaml_pipeline(
-            cli_overrides=cli_overrides,
-            run_id=param_run_id,
-            dry_run=dry_run,
-            full=full,
-            nodes=nodes,
-            types=types,
-            exclude_tags=exclude_tags,
-            continue_on_error=continue_on_error,
-            retry=retry,
-            show_plan=show_plan,
-            parallel=parallel,
-            max_workers=max_workers,
-            materialize=materialize,
-        )
+    # Execute DAG from seeknal/ directory
+    _run_yaml_pipeline(
+        cli_overrides=cli_overrides,
+        run_id=param_run_id,
+        dry_run=dry_run,
+        full=full,
+        nodes=nodes,
+        types=types,
+        exclude_tags=exclude_tags,
+        continue_on_error=continue_on_error,
+        retry=retry,
+        show_plan=show_plan,
+        parallel=parallel,
+        max_workers=max_workers,
+        materialize=materialize,
+        profile=profile,
+    )
 
 
 def _run_yaml_pipeline(
@@ -841,6 +794,7 @@ def _run_yaml_pipeline(
     parallel: bool = False,
     max_workers: int = 4,
     materialize: Optional[bool] = None,
+    profile: Optional[str] = None,
 ) -> None:
     """
     Execute YAML-based pipeline using DAGBuilder, state tracking, and executors.
@@ -889,11 +843,15 @@ def _run_yaml_pipeline(
     # Step 1: Build DAG from YAML files
     _echo_info("Building DAG from seeknal/ directory...")
 
+    # Resolve profile path for source_defaults
+    profile_path = Path(profile) if profile else None
+
     try:
         dag_builder = DAGBuilder(
             project_path=project_path,
             cli_overrides=cli_overrides,
             run_id=run_id,
+            profile_path=profile_path,
         )
         dag_builder.build()
     except ValueError as e:
@@ -1077,6 +1035,7 @@ def _run_yaml_pipeline(
         materialize_enabled=materialize,
         params={},  # Will be populated per-node from yaml_data
         common_config=dag_builder._common_config,
+        profile_path=profile_path,
     )
 
     # Step 5: Execute nodes in topological order
@@ -1259,81 +1218,6 @@ def _run_yaml_pipeline(
         raise typer.Exit(1)
 
 
-@app.command()
-def materialize(
-    feature_group: str = typer.Argument(
-        ..., help="Name of the feature group to materialize"
-    ),
-    start_date: str = typer.Option(
-        ..., "--start-date", "-s",
-        help="Start date for feature data (YYYY-MM-DD format)"
-    ),
-    end_date: Optional[str] = typer.Option(
-        None, "--end-date", "-e",
-        help="End date for feature data (YYYY-MM-DD format)"
-    ),
-    version: Optional[int] = typer.Option(
-        None, "--version", "-v",
-        help="Specific version number to materialize (defaults to latest). "
-             "Use 'seeknal version list' to see available versions."
-    ),
-    mode: WriteMode = typer.Option(
-        WriteMode.OVERWRITE, "--mode", "-m",
-        help="Write mode: overwrite, append, or merge"
-    ),
-    offline_only: bool = typer.Option(
-        False, "--offline-only",
-        help="Only materialize to offline store (skip online store)"
-    ),
-    online_only: bool = typer.Option(
-        False, "--online-only",
-        help="Only materialize to online store (skip offline store)"
-    ),
-):
-    """
-    Materialize features to offline/online stores.
-
-    Writes feature data to configured storage locations for the specified
-    date range. Supports version-specific materialization for rollbacks
-    or A/B testing scenarios.
-
-    Examples:
-        # Materialize latest version
-        seeknal materialize user_features --start-date 2024-01-01
-
-        # Materialize a specific version (rollback scenario)
-        seeknal materialize user_features --start-date 2024-01-01 --version 1
-
-        # Materialize with date range
-        seeknal materialize user_features -s 2024-01-01 -e 2024-01-31
-    """
-    from seeknal.featurestore.feature_group import FeatureGroup
-
-    # Parse dates with validation
-    start_dt = parse_date_safely(start_date, "start date")
-    end_dt = parse_date_safely(end_date, "end date") if end_date else None
-
-    typer.echo(f"Materializing feature group: {feature_group}")
-    if version is not None:
-        typer.echo(f"  Version: {version}")
-    typer.echo(f"  Start date: {start_date}")
-    if end_date:
-        typer.echo(f"  End date: {end_date}")
-    typer.echo(f"  Mode: {mode.value}")
-
-    try:
-        fg = FeatureGroup.load(name=feature_group, version=version)
-        fg.write(
-            feature_start_time=start_dt,
-            feature_end_time=end_dt,
-            mode=mode.value
-        )
-        _echo_success(f"Materialization completed: {feature_group}")
-    except Exception as e:
-        _echo_error(f"Materialization failed: {e}")
-        raise typer.Exit(1)
-
-
 @app.command("list")
 def list_resources(
     resource_type: ResourceType = typer.Argument(
@@ -1348,13 +1232,12 @@ def list_resources(
         help="Output format"
     ),
 ):
-    """List resources (projects, entities, flows, feature-groups, etc.)."""
+    """List resources (projects, entities, feature-groups, etc.)."""
     from seeknal.project import Project
     from seeknal.entity import Entity
-    from seeknal.flow import Flow
     from seeknal.featurestore.featurestore import OfflineStore
     from seeknal.models import (
-        WorkspaceTable, FeatureGroupTable, FlowTable
+        WorkspaceTable, FeatureGroupTable
     )
     from seeknal.request import get_db_session
     from sqlmodel import select
@@ -1376,16 +1259,6 @@ def list_resources(
                     typer.echo(tabulate(data, headers=headers, tablefmt="simple"))
             case ResourceType.ENTITIES:
                 Entity.list()
-            case ResourceType.FLOWS:
-                with get_db_session() as session:
-                    flows = session.exec(select(FlowTable)).all()
-                if not flows:
-                    typer.echo("No flows found.")
-                else:
-                    headers = ["Name", "Description", "Author", "Last Run"]
-                    data = [[f.name, f.description or "", f.author or "", f.last_run or ""]
-                            for f in flows]
-                    typer.echo(tabulate(data, headers=headers, tablefmt="simple"))
             case ResourceType.FEATURE_GROUPS:
                 with get_db_session() as session:
                     feature_groups = session.exec(select(FeatureGroupTable)).all()

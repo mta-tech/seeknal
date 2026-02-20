@@ -291,25 +291,6 @@ inputs:
         assert "Cycle detected" in result.stdout or "cycle" in result.stdout.lower()
 
 
-class TestSeeknalRunLegacyMode:
-    """Test legacy Flow mode (backward compatibility)."""
-
-    def test_legacy_flow_mode(self, monkeypatch, tmp_path):
-        """Test running legacy Flow object."""
-        monkeypatch.chdir(tmp_path)
-
-        # Mock the Flow class
-        with patch("seeknal.flow.Flow") as mock_flow_class:
-            mock_flow = MagicMock()
-            mock_flow.run.return_value = MagicMock(count=lambda: 100)
-            mock_flow_class.return_value = mock_flow
-
-            result = runner.invoke(app, ["run", "my_flow", "--start-date", "2024-01-01"])
-
-            assert result.exit_code == 0
-            assert "my_flow" in result.stdout
-
-
 class TestSeeknalRunProgressReporting:
     """Test progress reporting and execution summary."""
 

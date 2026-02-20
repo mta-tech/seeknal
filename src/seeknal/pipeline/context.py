@@ -99,6 +99,11 @@ class PipelineContext:
         intermediate_path = self.target_dir / "intermediate" / f"{node_id.replace('.', '_')}.parquet"
         if intermediate_path.exists():
             df = pd.read_parquet(intermediate_path)
+            # Convert Arrow-backed string columns to object dtype so DuckDB
+            # replacement scan can handle them (DuckDB doesn't recognize pd.StringDtype)
+            str_cols = df.select_dtypes(include=["string"]).columns
+            if len(str_cols) > 0:
+                df[str_cols] = df[str_cols].astype(object)
             self._node_outputs[node_id] = df
             return df
 

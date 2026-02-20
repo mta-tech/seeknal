@@ -70,6 +70,8 @@ tests/                     # pytest test suite
 - **Offline**: Batch processing for training data
 - **Online**: Low-latency serving for inference
 - Point-in-time joins prevent data leakage
+- **Multi-target**: Write to both PostgreSQL and Iceberg from one node via `materializations:` (plural) YAML key or stackable `@materialize` decorators
+- **PostgreSQL modes**: full (DROP+CREATE), incremental_by_time (DELETE range + INSERT), upsert_by_key (temp table + DELETE USING + INSERT)
 
 ### 5. **Version Management**
 - Feature groups are automatically versioned
@@ -290,6 +292,32 @@ def get_param(name, type=None):
 
 **Rationale:** Single source of truth ensures consistent behavior and easier maintenance.
 
+### Multi-Target Materialization
+
+**YAML Plural Syntax:**
+```yaml
+materializations:
+  - type: postgresql
+    connection: local_pg
+    table: analytics.my_table
+    mode: upsert_by_key
+    unique_keys: [id]
+  - type: iceberg
+    table: atlas.namespace.my_table
+```
+
+**Python Stackable Decorators:**
+```python
+@materialize(type='postgresql', connection='local_pg',
+             table='analytics.my_table', mode='full')
+@materialize(type='iceberg', table='atlas.ns.my_table')
+@transform(name="my_transform")
+def my_transform(ctx):
+    ...
+```
+
+**Backward Compatible:** Singular `materialization:` continues to work (normalized to list).
+
 ### Testing Patterns
 - Use pytest fixtures from `conftest.py`
 - Mock database operations
@@ -506,6 +534,9 @@ Based on real dataset (73,194 rows × 35 columns):
 6. **Date Validation**: Always use `parse_date_safely()` for user-provided dates
 7. **Parameter Names**: Must follow Python identifier syntax (no hyphens or special chars)
 8. **Reserved Names**: Avoid using `run_id`, `run_date`, `project_id`, `workspace_path` as parameter names
+9. **Subprocess Materialization**: PythonExecutor runs via `uv run` subprocess — DuckDB views don't persist to parent. Materialization uses intermediate parquet bridge in `post_execute()`
+10. **DuckDB Timestamp Arithmetic**: String literals need explicit `CAST('{value}' AS TIMESTAMP)` before INTERVAL arithmetic
+11. **Dispatcher Circular Imports**: MaterializationDispatcher uses lazy imports inside methods to avoid circular dependency through `seeknal.dag.manifest`
 
 ## Testing Before Commit
 
@@ -534,9 +565,6 @@ seeknal init --name my_project
 
 # List feature groups
 seeknal list feature-groups
-
-# Materialize features
-seeknal materialize <fg_name> --start-date 2024-01-01
 
 # Version management
 seeknal version list <fg_name>
