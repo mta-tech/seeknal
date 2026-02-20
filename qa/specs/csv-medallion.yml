@@ -1,0 +1,108 @@
+name: csv-medallion
+description: >
+  Test CSV file sources through a complete medallion pipeline (Bronze -> Silver -> Gold).
+  Validates: CSV source loading, named ref() syntax in transforms, multi-source joins,
+  basic transform SQL with filtering and aggregation.
+source_type: csv
+
+infrastructure:
+  requires: []  # CSV needs no external infrastructure
+
+seed_data:
+  raw_orders.csv: |
+    order_id,customer_id,amount,order_date,status
+    ORD001,C001,150.00,2026-01-15,completed
+    ORD002,C002,75.50,2026-01-16,completed
+    ORD003,C001,200.00,2026-01-17,pending
+    ORD004,C003,50.00,2026-01-18,completed
+    ORD005,C002,300.00,2026-01-19,cancelled
+    ORD006,C001,125.75,2026-01-20,completed
+    ORD007,C004,89.99,2026-01-21,completed
+    ORD008,C003,175.00,2026-01-22,pending
+    ORD009,C001,60.00,2026-01-23,completed
+    ORD010,C005,220.00,2026-01-24,completed
+  raw_customers.csv: |
+    customer_id,name,email,signup_date,tier
+    C001,Alice Johnson,alice@example.com,2025-06-01,gold
+    C002,Bob Smith,bob@example.com,2025-07-15,silver
+    C003,Charlie Brown,charlie@example.com,2025-08-20,bronze
+    C004,Diana Prince,diana@example.com,2025-09-10,gold
+    C005,Eve Wilson,eve@example.com,2025-10-05,silver
+
+pipeline:
+  bronze:
+    - kind: source
+      name: raw_orders
+      source: csv
+      table: "data/raw_orders.csv"
+      description: Raw order transactions from CSV file
+      tags: ["bronze", "orders"]
+
+    - kind: source
+      name: raw_customers
+      source: csv
+      table: "data/raw_customers.csv"
+      description: Customer master data from CSV file
+      tags: ["bronze", "customers"]
+
+  silver:
+    - kind: transform
+      name: clean_orders
+      description: Cleaned orders - only completed, with typed columns
+      inputs:
+        - ref: source.raw_orders
+      transform: |
+        SELECT
+          order_id,
+          customer_id,
+          CAST(amount AS DECIMAL(10,2)) AS amount,
+          CAST(order_date AS DATE) AS order_date,
+          status
+        FROM ref('source.raw_orders')
+        WHERE status = 'completed'
+      tags: ["silver", "cleaned"]
+
+  gold:
+    - kind: transform
+      name: customer_ltv
+      description: Customer lifetime value aggregation
+      inputs:
+        - ref: transform.clean_orders
+        - ref: source.raw_customers
+      transform: |
+        SELECT
+          c.customer_id,
+          c.name,
+          c.tier,
+          COUNT(o.order_id) AS total_orders,
+          CAST(SUM(o.amount) AS DECIMAL(10,2)) AS lifetime_value,
+          MIN(o.order_date) AS first_order,
+          MAX(o.order_date) AS last_order
+        FROM ref('source.raw_customers') c
+        JOIN ref('transform.clean_orders') o
+          ON c.customer_id = o.customer_id
+        GROUP BY c.customer_id, c.name, c.tier
+      tags: ["gold", "analytics"]
+
+validation:
+  dag:
+    expected_nodes: 4
+    expected_edges:
+      - [source.raw_orders, transform.clean_orders]
+      - [transform.clean_orders, transform.customer_ltv]
+      - [source.raw_customers, transform.customer_ltv]
+  execution:
+    success: true
+  outputs:
+    - node: transform.clean_orders
+      min_rows: 7   # 7 completed orders out of 10
+    - node: transform.customer_ltv
+      min_rows: 4   # 4 customers with completed orders (C001, C002, C004, C005)
+
+features_tested:
+  - csv_source
+  - named_refs
+  - transform_sql
+  - multi_source_join
+  - filter_transform
+  - aggregation_transform
