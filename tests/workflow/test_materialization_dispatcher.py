@@ -441,3 +441,115 @@ class TestProfileLoaderIntegration:
                 )
         loader.load_connection_profile.assert_called_once_with("my_pg")
         assert result.succeeded == 1
+
+
+# ---------------------------------------------------------------------------
+# Iceberg catalog fallback chain
+# ---------------------------------------------------------------------------
+
+class TestIcebergCatalogFallback:
+    """Tests for _materialize_iceberg catalog URI/warehouse fallback chain."""
+
+    def _make_profile_config(self, uri="", warehouse=""):
+        """Create a mock profile config with given catalog values."""
+        catalog = MagicMock()
+        catalog.uri = uri
+        catalog.warehouse = warehouse
+        catalog.bearer_token = None
+        catalog.interpolate_env_vars.return_value = catalog
+        config = MagicMock()
+        config.catalog = catalog
+        return config
+
+    def test_iceberg_falls_back_to_source_defaults(self, mock_con):
+        """When materialization.catalog is empty, falls back to source_defaults.iceberg."""
+        loader = MagicMock()
+        loader.load_profile.return_value = self._make_profile_config(uri="", warehouse="")
+        loader.load_source_defaults.return_value = {
+            "catalog_uri": "http://from-defaults:8181",
+            "warehouse": "defaults-warehouse",
+        }
+        dispatcher = MaterializationDispatcher(profile_loader=loader)
+
+        mock_ext = MagicMock()
+        mock_ext.get_oauth2_token.return_value = "token123"
+        mock_write = MagicMock(return_value=_ok_result(5))
+
+        with (
+            patch.dict("sys.modules", {
+                "seeknal.workflow.materialization.operations": MagicMock(
+                    DuckDBIcebergExtension=mock_ext,
+                    write_to_iceberg=mock_write,
+                ),
+            }),
+        ):
+            # Re-import to pick up the patched module
+            dispatcher._materialize_iceberg(
+                mock_con, "my_view", {"table": "atlas.ns.tbl", "mode": "append"}
+            )
+
+        # Verify source_defaults was consulted
+        loader.load_source_defaults.assert_called_once_with("iceberg")
+        # Verify the resolved URI and warehouse were used
+        mock_ext.attach_rest_catalog.assert_called_once()
+        call_kwargs = mock_ext.attach_rest_catalog.call_args[1]
+        assert call_kwargs["uri"] == "http://from-defaults:8181"
+        assert call_kwargs["warehouse_path"] == "defaults-warehouse"
+
+    def test_iceberg_falls_back_to_env_vars(self, mock_con, monkeypatch):
+        """When both catalog and source_defaults are empty, falls back to env vars."""
+        monkeypatch.setenv("LAKEKEEPER_URI", "http://from-env:8181")
+        monkeypatch.setenv("LAKEKEEPER_WAREHOUSE", "env-warehouse")
+
+        loader = MagicMock()
+        loader.load_profile.return_value = self._make_profile_config(uri="", warehouse="")
+        loader.load_source_defaults.return_value = {}
+        dispatcher = MaterializationDispatcher(profile_loader=loader)
+
+        mock_ext = MagicMock()
+        mock_ext.get_oauth2_token.return_value = "token123"
+        mock_write = MagicMock(return_value=_ok_result(5))
+
+        with patch.dict("sys.modules", {
+            "seeknal.workflow.materialization.operations": MagicMock(
+                DuckDBIcebergExtension=mock_ext,
+                write_to_iceberg=mock_write,
+            ),
+        }):
+            dispatcher._materialize_iceberg(
+                mock_con, "my_view", {"table": "atlas.ns.tbl", "mode": "append"}
+            )
+
+        call_kwargs = mock_ext.attach_rest_catalog.call_args[1]
+        assert call_kwargs["uri"] == "http://from-env:8181"
+        assert call_kwargs["warehouse_path"] == "env-warehouse"
+
+    def test_iceberg_catalog_section_takes_precedence(self, mock_con, monkeypatch):
+        """When materialization.catalog has values, they take precedence over defaults."""
+        monkeypatch.setenv("LAKEKEEPER_URI", "http://from-env:8181")
+
+        loader = MagicMock()
+        loader.load_profile.return_value = self._make_profile_config(
+            uri="http://from-catalog:8181", warehouse="catalog-warehouse"
+        )
+        dispatcher = MaterializationDispatcher(profile_loader=loader)
+
+        mock_ext = MagicMock()
+        mock_ext.get_oauth2_token.return_value = "token123"
+        mock_write = MagicMock(return_value=_ok_result(5))
+
+        with patch.dict("sys.modules", {
+            "seeknal.workflow.materialization.operations": MagicMock(
+                DuckDBIcebergExtension=mock_ext,
+                write_to_iceberg=mock_write,
+            ),
+        }):
+            dispatcher._materialize_iceberg(
+                mock_con, "my_view", {"table": "atlas.ns.tbl", "mode": "append"}
+            )
+
+        call_kwargs = mock_ext.attach_rest_catalog.call_args[1]
+        assert call_kwargs["uri"] == "http://from-catalog:8181"
+        assert call_kwargs["warehouse_path"] == "catalog-warehouse"
+        # source_defaults should NOT be consulted
+        loader.load_source_defaults.assert_not_called()

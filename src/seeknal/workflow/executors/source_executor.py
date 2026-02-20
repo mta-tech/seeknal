@@ -112,11 +112,8 @@ class SourceExecutor(BaseExecutor):
         has_query = isinstance(params, dict) and "query" in params
 
         if source_type in ("postgresql", "postgres"):
-            if has_table and has_query:
-                raise ExecutorValidationError(
-                    self.node.id,
-                    "Cannot specify both 'table' and 'query' — they are mutually exclusive"
-                )
+            # When both table and query are present, query takes precedence
+            # (table serves as documentation of the underlying table)
             if not has_table and not has_query:
                 raise ExecutorValidationError(
                     self.node.id,

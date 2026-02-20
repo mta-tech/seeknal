@@ -292,8 +292,8 @@ class TestPushdownQueryValidation:
         executor = SourceExecutor(node, context)
         executor.validate()
 
-    def test_mutual_exclusion_table_and_query(self, context):
-        """Cannot specify both table: and query: params."""
+    def test_table_and_query_coexist(self, context):
+        """When both table: and query: are present, query takes precedence."""
         node = Node(
             id="source.pg_users",
             name="pg_users",
@@ -305,8 +305,8 @@ class TestPushdownQueryValidation:
             },
         )
         executor = SourceExecutor(node, context)
-        with pytest.raises(ExecutorValidationError, match="mutually exclusive"):
-            executor.validate()
+        # Should NOT raise — table serves as documentation, query takes precedence
+        executor.validate()
 
     def test_reject_insert(self, context):
         """INSERT queries are rejected."""

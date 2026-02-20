@@ -476,7 +476,17 @@ class ProfileLoader:
             return {}
 
         canonical = _SOURCE_TYPE_ALIASES.get(source_type, source_type)
+        # Try canonical name first (e.g., "postgresql")
         source_defaults = defaults_section.get(canonical, {})
+        if not source_defaults and source_type != canonical:
+            # Try the original (un-normalized) key (e.g., "postgres")
+            source_defaults = defaults_section.get(source_type, {})
+        if not source_defaults:
+            # Try all known aliases that map to this canonical type
+            for alias, target in _SOURCE_TYPE_ALIASES.items():
+                if target == canonical and alias in defaults_section:
+                    source_defaults = defaults_section[alias]
+                    break
         if not source_defaults:
             return {}
 

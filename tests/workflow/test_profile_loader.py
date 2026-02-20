@@ -418,3 +418,27 @@ source_defaults:
         defaults = loader.load_source_defaults("iceberg")
 
         assert defaults == {}
+
+    def test_load_source_defaults_reverse_alias_lookup(self, tmp_path):
+        """When profile uses alias key 'postgres', lookup for canonical 'postgresql' finds it."""
+        profile_file = self._write_profile(tmp_path, """\
+source_defaults:
+  postgres:
+    connection: local_pg
+""")
+        loader = ProfileLoader(profile_path=profile_file)
+        defaults = loader.load_source_defaults("postgresql")
+
+        assert defaults["connection"] == "local_pg"
+
+    def test_load_source_defaults_alias_key_with_alias_query(self, tmp_path):
+        """When profile uses alias key 'postgres', query with alias 'postgres' also works."""
+        profile_file = self._write_profile(tmp_path, """\
+source_defaults:
+  postgres:
+    connection: local_pg
+""")
+        loader = ProfileLoader(profile_path=profile_file)
+        defaults = loader.load_source_defaults("postgres")
+
+        assert defaults["connection"] == "local_pg"

@@ -166,6 +166,8 @@ class MaterializationDispatcher:
         self, con: Any, view_name: str, target_config: Dict[str, Any]
     ) -> WriteResult:
         """Route to Iceberg materialization via operations module."""
+        import os
+
         from seeknal.workflow.materialization.operations import (  # ty: ignore[unresolved-import]
             DuckDBIcebergExtension,
             write_to_iceberg,
@@ -173,10 +175,8 @@ class MaterializationDispatcher:
         from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
 
         # Load Iceberg profile config
-        if self._profile_loader is not None:
-            profile_config = self._profile_loader.load_profile()
-        else:
-            profile_config = ProfileLoader().load_profile()
+        loader = self._profile_loader if self._profile_loader is not None else ProfileLoader()
+        profile_config = loader.load_profile()
 
         # Setup DuckDB extensions (httpfs + iceberg)
         DuckDBIcebergExtension.load_extension(con)
@@ -190,13 +190,41 @@ class MaterializationDispatcher:
         if not token:
             token = DuckDBIcebergExtension.get_oauth2_token()
 
+        # Resolve catalog URI and warehouse with fallback chain:
+        # 1. materialization.catalog section (from profile_config above)
+        # 2. target_config overrides (per-materialization YAML)
+        # 3. source_defaults.iceberg section
+        # 4. environment variables (LAKEKEEPER_URI, LAKEKEEPER_WAREHOUSE)
+        uri = catalog.uri
+        warehouse_path = catalog.warehouse
+
+        # Target-level overrides
+        if not uri:
+            uri = target_config.get("catalog_uri", "")
+        if not warehouse_path:
+            warehouse_path = target_config.get("warehouse", "")
+
+        # Fall back to source_defaults.iceberg
+        if not uri or not warehouse_path:
+            iceberg_defaults = loader.load_source_defaults("iceberg")
+            if not uri:
+                uri = iceberg_defaults.get("catalog_uri", "")
+            if not warehouse_path:
+                warehouse_path = iceberg_defaults.get("warehouse", "")
+
+        # Fall back to environment variables
+        if not uri:
+            uri = os.environ.get("LAKEKEEPER_URI", "")
+        if not warehouse_path:
+            warehouse_path = os.environ.get("LAKEKEEPER_WAREHOUSE", "")
+
         # Attach REST catalog using DuckDB ATTACH syntax
         catalog_name = "iceberg_catalog"
         DuckDBIcebergExtension.attach_rest_catalog(
             con=con,
             catalog_name=catalog_name,
-            uri=catalog.uri,
-            warehouse_path=catalog.warehouse,
+            uri=uri,
+            warehouse_path=warehouse_path,
             bearer_token=token,
         )
 
