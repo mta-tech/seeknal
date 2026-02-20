@@ -281,7 +281,7 @@ class DuckDBIcebergExtension:
     @staticmethod
     def load_extension(con: Any) -> None:
         """
-        Load Iceberg extension in DuckDB connection.
+        Load Iceberg and httpfs extensions in DuckDB connection.
 
         Args:
             con: DuckDB connection
@@ -290,8 +290,11 @@ class DuckDBIcebergExtension:
             MaterializationOperationError: If extension fails to load
         """
         try:
+            con.execute("INSTALL httpfs")
+            con.execute("LOAD httpfs")
+            con.execute("INSTALL iceberg")
             con.execute("LOAD iceberg")
-            logger.debug("DuckDB Iceberg extension loaded successfully")
+            logger.debug("DuckDB httpfs + Iceberg extensions loaded successfully")
         except Exception as e:
             raise MaterializationOperationError(
                 f"Failed to load DuckDB Iceberg extension: {e}. "
@@ -299,7 +302,64 @@ class DuckDBIcebergExtension:
             ) from e
 
     @staticmethod
-    def create_rest_catalog(
+    def configure_s3(con: Any) -> None:
+        """Configure S3/MinIO credentials from environment variables."""
+        import os
+
+        minio_endpoint = os.getenv("AWS_ENDPOINT_URL", "")
+        if minio_endpoint:
+            endpoint = minio_endpoint.replace("http://", "").replace("https://", "")
+            s3_region = os.getenv("AWS_REGION", "us-east-1")
+            s3_access_key = os.getenv("AWS_ACCESS_KEY_ID", "")
+            s3_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+            con.execute(f"SET s3_region = '{s3_region}'")
+            con.execute(f"SET s3_endpoint = '{endpoint}'")
+            con.execute("SET s3_url_style = 'path'")
+            con.execute("SET s3_use_ssl = false")
+            con.execute(f"SET s3_access_key_id = '{s3_access_key}'")
+            con.execute(f"SET s3_secret_access_key = '{s3_secret_key}'")
+            logger.debug(f"Configured S3 endpoint: {endpoint}")
+
+    @staticmethod
+    def get_oauth2_token() -> str:
+        """Get OAuth2 bearer token from Keycloak via client credentials flow.
+
+        Returns:
+            Bearer token string
+
+        Raises:
+            MaterializationOperationError: If token acquisition fails
+        """
+        import json
+        import os
+        import urllib.request
+
+        token_url = os.getenv("KEYCLOAK_TOKEN_URL", "")
+        client_id = os.getenv("KEYCLOAK_CLIENT_ID", "")
+        client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET", "")
+
+        if not (token_url and client_id and client_secret):
+            raise MaterializationOperationError(
+                "Iceberg materialization requires OAuth2 credentials: "
+                "KEYCLOAK_TOKEN_URL, KEYCLOAK_CLIENT_ID, KEYCLOAK_CLIENT_SECRET"
+            )
+
+        try:
+            token_data = (
+                f"grant_type=client_credentials"
+                f"&client_id={client_id}"
+                f"&client_secret={client_secret}"
+            ).encode()
+            req = urllib.request.Request(token_url, data=token_data)
+            token_response = json.loads(urllib.request.urlopen(req).read())
+            return token_response["access_token"]
+        except Exception as e:
+            raise MaterializationOperationError(
+                f"Failed to get OAuth2 token from {token_url}: {e}"
+            ) from e
+
+    @staticmethod
+    def attach_rest_catalog(
         con: Any,
         catalog_name: str,
         uri: str,
@@ -307,42 +367,58 @@ class DuckDBIcebergExtension:
         bearer_token: Optional[str] = None,
     ) -> None:
         """
-        Create REST catalog connection in DuckDB.
+        Attach REST catalog in DuckDB using ATTACH syntax (DuckDB 1.4+).
+
+        Uses DuckDB's native ``ATTACH ... (TYPE ICEBERG)`` syntax with
+        OAuth2 token authentication for Lakekeeper REST catalogs.
 
         Args:
             con: DuckDB connection
-            catalog_name: Name for the catalog
-            uri: REST catalog endpoint
-            warehouse_path: Warehouse path (S3/GCS)
-            bearer_token: Optional bearer token
+            catalog_name: Name for the catalog attachment
+            uri: REST catalog endpoint (e.g. http://host:8181)
+            warehouse_path: Warehouse name for the catalog
+            bearer_token: OAuth2 bearer token for authentication
 
         Raises:
-            MaterializationOperationError: If catalog creation fails
+            MaterializationOperationError: If catalog attachment fails
         """
         try:
-            # Build catalog creation SQL
-            sql_parts = [
-                f"CREATE REST CATALOG {catalog_name}",
-                f"TYPE REST",
-                f"URI '{uri}'",
-                f"USING (warehouse '{warehouse_path}'",
-            ]
+            # Build catalog endpoint URL (add /catalog if not present)
+            base_url = uri.rstrip("/")
+            if "/catalog" not in base_url:
+                catalog_url = f"{base_url}/catalog"
+            else:
+                catalog_url = base_url
 
-            # Add bearer token if provided
+            # Build ATTACH SQL with inline token auth
             if bearer_token:
-                sql_parts.append(f", bearer_token '{bearer_token}'")
-
-            sql_parts.append(")")
-
-            sql = " ".join(sql_parts)
+                sql = (
+                    f"ATTACH '{warehouse_path}' AS {catalog_name} ("
+                    f"TYPE ICEBERG, "
+                    f"ENDPOINT '{catalog_url}', "
+                    f"AUTHORIZATION_TYPE 'oauth2', "
+                    f"TOKEN '{bearer_token}'"
+                    f")"
+                )
+            else:
+                sql = (
+                    f"ATTACH '{warehouse_path}' AS {catalog_name} ("
+                    f"TYPE ICEBERG, "
+                    f"ENDPOINT '{catalog_url}'"
+                    f")"
+                )
 
             con.execute(sql)
-            logger.info(f"Created REST catalog: {catalog_name}")
+            logger.info(f"Attached REST catalog: {catalog_name} at {catalog_url}")
 
         except Exception as e:
-            raise MaterializationOperationError(
-                f"Failed to create REST catalog '{catalog_name}': {e}"
-            ) from e
+            # Catalog may already be attached
+            if "already exists" in str(e).lower():
+                logger.debug(f"Catalog '{catalog_name}' already attached, reusing")
+            else:
+                raise MaterializationOperationError(
+                    f"Failed to attach REST catalog '{catalog_name}': {e}"
+                ) from e
 
 
 class SnapshotManager:
@@ -607,7 +683,13 @@ def create_iceberg_table(
         partition_clause = f"PARTITIONED BY ({', '.join(partition_by)})"
 
     # Build SQL
-    full_table_name = f"{catalog_name}.{table_name}"
+    # When table_name is 3-part (catalog.namespace.table), strip the
+    # catalog prefix since ATTACH already provides it as catalog_name.
+    _parts = table_name.split(".")
+    if len(_parts) == 3:
+        full_table_name = f"{catalog_name}.{_parts[1]}.{_parts[2]}"
+    else:
+        full_table_name = f"{catalog_name}.{table_name}"
     sql = f"""
         CREATE TABLE IF NOT EXISTS {full_table_name} (
             {', '.join(column_defs)}
@@ -681,67 +763,77 @@ def write_to_iceberg(
             "started",
         )
 
-    full_table_name = f"{catalog_name}.{table_name}"
+    # When table_name is 3-part (catalog.namespace.table), strip the
+    # catalog prefix since ATTACH already provides it as catalog_name.
+    _parts = table_name.split(".")
+    if len(_parts) == 3:
+        full_table_name = f"{catalog_name}.{_parts[1]}.{_parts[2]}"
+        namespace = _parts[1]
+    elif len(_parts) == 2:
+        full_table_name = f"{catalog_name}.{table_name}"
+        namespace = _parts[0]
+    else:
+        full_table_name = f"{catalog_name}.{table_name}"
+        namespace = None
+
+    # Auto-create namespace and table if they don't exist
+    table_created = _ensure_table_exists(
+        con, catalog_name, full_table_name, namespace, view_name
+    )
 
     try:
-        # Execute write in transaction
-        con.execute("BEGIN TRANSACTION")
+        # Get row count
+        count_result = con.execute(f"SELECT COUNT(*) FROM {view_name}").fetchone()
+        row_count = count_result[0] if count_result else 0
 
-        try:
+        if table_created:
+            # Table was just created via CTAS — data already written
+            logger.info(f"Table created with {row_count} rows via CTAS")
+        else:
+            # Table already existed — use INSERT INTO or overwrite
             if mode == "overwrite":
-                # For overwrite: delete all data first
                 con.execute(f"DELETE FROM {full_table_name}")
-
-            # Get row count
-            count_result = con.execute(f"SELECT COUNT(*) FROM {view_name}").fetchone()
-            row_count = count_result[0] if count_result else 0
-
-            # Insert data
             con.execute(f"INSERT INTO {full_table_name} SELECT * FROM {view_name}")
 
-            # Commit transaction
-            con.execute("COMMIT")
-
-            # Get snapshot ID
+        # Get snapshot ID (best-effort — CTAS may not expose snapshots immediately)
+        try:
             snapshot_id = _get_current_snapshot_id(con, full_table_name)
+        except Exception:
+            snapshot_id = "unknown"
 
-            duration = time.time() - start_time
+        duration = time.time() - start_time
 
-            state.status = "completed"
-            state.snapshot_id = snapshot_id
-            state.completed_at = datetime.now()
+        state.status = "completed"
+        state.snapshot_id = snapshot_id
+        state.completed_at = datetime.now()
 
-            # Log success
-            if auditor:
-                auditor.log_operation(
-                    "write_to_iceberg",
-                    table_name,
-                    {
-                        "mode": mode,
-                        "materialization_id": materialization_id,
-                        "snapshot_id": snapshot_id,
-                        "row_count": row_count,
-                        "duration_seconds": duration,
-                    },
-                    "success",
-                )
-
-            logger.info(
-                f"Write successful: {full_table_name} "
-                f"({row_count} rows, snapshot {snapshot_id[:8]}, {duration:.2f}s)"
+        # Log success
+        if auditor:
+            auditor.log_operation(
+                "write_to_iceberg",
+                table_name,
+                {
+                    "mode": mode,
+                    "materialization_id": materialization_id,
+                    "snapshot_id": snapshot_id,
+                    "row_count": row_count,
+                    "duration_seconds": duration,
+                },
+                "success",
             )
 
-            return WriteResult(
-                success=True,
-                snapshot_id=snapshot_id,
-                row_count=row_count,
-                duration_seconds=duration,
-            )
+        snap_label = snapshot_id[:8] if len(snapshot_id) > 8 else snapshot_id
+        logger.info(
+            f"Write successful: {full_table_name} "
+            f"({row_count} rows, snapshot {snap_label}, {duration:.2f}s)"
+        )
 
-        except Exception as e:
-            # Rollback on error
-            con.execute("ROLLBACK")
-            raise
+        return WriteResult(
+            success=True,
+            snapshot_id=snapshot_id,
+            row_count=row_count,
+            duration_seconds=duration,
+        )
 
     except Exception as e:
         state.status = "failed"
@@ -766,6 +858,51 @@ def write_to_iceberg(
         raise WriteError(
             f"Failed to write to {full_table_name}: {e}"
         ) from e
+
+
+def _ensure_table_exists(
+    con: Any,
+    catalog_name: str,
+    full_table_name: str,
+    namespace: Optional[str],
+    view_name: str,
+) -> bool:
+    """Check if Iceberg table exists; if not, create namespace and table via CTAS.
+
+    Args:
+        con: DuckDB connection
+        catalog_name: Attached catalog alias (e.g. ``iceberg_catalog``)
+        full_table_name: Fully qualified table name (e.g. ``iceberg_catalog.ns.tbl``)
+        namespace: Namespace/schema name to create if missing (e.g. ``ns``)
+        view_name: DuckDB view containing data for CTAS
+
+    Returns:
+        True if a new table was created, False if it already existed.
+    """
+    # Probe whether the table already exists
+    try:
+        con.execute(f"SELECT 1 FROM {full_table_name} LIMIT 0")
+        return False  # table exists
+    except Exception:
+        pass  # table does not exist — create it
+
+    # Create namespace if provided
+    if namespace:
+        try:
+            con.execute(f"CREATE SCHEMA IF NOT EXISTS {catalog_name}.{namespace}")
+            logger.info(f"Created namespace: {catalog_name}.{namespace}")
+        except Exception as exc:
+            # Schema may already exist; log and continue
+            logger.debug(f"Namespace creation note: {exc}")
+
+    # Create table via CTAS (CREATE TABLE AS SELECT)
+    ctas_sql = (
+        f"CREATE TABLE {full_table_name} AS "
+        f"SELECT * FROM {view_name}"
+    )
+    con.execute(ctas_sql)
+    logger.info(f"Created Iceberg table via CTAS: {full_table_name}")
+    return True
 
 
 def _get_current_snapshot_id(con: Any, table_name: str) -> str:

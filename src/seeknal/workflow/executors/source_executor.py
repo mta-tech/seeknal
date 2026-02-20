@@ -709,7 +709,8 @@ class SourceExecutor(BaseExecutor):
         if connection_name:
             from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
 
-            loader = ProfileLoader()
+            profile_path = getattr(self.context, 'profile_path', None)
+            loader = ProfileLoader(profile_path=profile_path)
             profile = loader.load_connection_profile(connection_name)
             # Inline params override profile defaults
             for key in ("host", "port", "database", "user", "password", "schema",
@@ -1154,7 +1155,10 @@ class SourceExecutor(BaseExecutor):
                 try:
                     con = self.context.get_duckdb_connection()
                     view_name = f"{self.node.node_type.value}.{self.node.name}"
-                    dispatcher = MaterializationDispatcher()
+                    profile_path = getattr(self.context, 'profile_path', None)
+                    from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
+                    loader = ProfileLoader(profile_path=profile_path) if profile_path else None
+                    dispatcher = MaterializationDispatcher(profile_loader=loader)
                     dispatch_result = dispatcher.dispatch(
                         con=con,
                         view_name=view_name,

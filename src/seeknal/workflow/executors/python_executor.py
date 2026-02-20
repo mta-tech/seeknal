@@ -310,8 +310,11 @@ class PythonExecutor(BaseExecutor):
             )
 
             from seeknal.workflow.materialization.dispatcher import MaterializationDispatcher
+            from seeknal.workflow.materialization.profile_loader import ProfileLoader
 
-            dispatcher = MaterializationDispatcher()
+            profile_path = getattr(self.context, 'profile_path', None)
+            loader = ProfileLoader(profile_path=profile_path) if profile_path else None
+            dispatcher = MaterializationDispatcher(profile_loader=loader)
             dispatch_result = dispatcher.dispatch(
                 con=con,
                 view_name=view_name,

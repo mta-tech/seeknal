@@ -141,7 +141,7 @@ class MaterializationMixin:
 
     def _setup_catalog(self, con: Any) -> str:
         """
-        Setup REST catalog connection in DuckDB.
+        Setup REST catalog connection in DuckDB via ATTACH.
 
         Args:
             con: DuckDB connection
@@ -157,15 +157,23 @@ class MaterializationMixin:
         # Interpolate environment variables
         catalog = config.catalog.interpolate_env_vars()
 
-        # Create catalog
+        # Configure S3/MinIO credentials
+        DuckDBIcebergExtension.configure_s3(con)
+
+        # Get OAuth2 token
+        token = catalog.bearer_token
+        if not token:
+            token = DuckDBIcebergExtension.get_oauth2_token()
+
+        # Attach catalog
         catalog_name = "iceberg_catalog"
 
-        DuckDBIcebergExtension.create_rest_catalog(
+        DuckDBIcebergExtension.attach_rest_catalog(
             con=con,
             catalog_name=catalog_name,
             uri=catalog.uri,
             warehouse_path=catalog.warehouse,
-            bearer_token=catalog.bearer_token,
+            bearer_token=token,
         )
 
         return catalog_name

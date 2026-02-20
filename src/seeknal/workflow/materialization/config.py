@@ -117,17 +117,20 @@ class CatalogConfig:
             if not value:
                 return value
 
-            # Match ${VAR_NAME} pattern
-            pattern = r'\$\{([A-Z_][A-Z0-9_]*)\}'
+            # Match ${VAR_NAME} or ${VAR_NAME:default} pattern
+            pattern = r'\$\{([A-Z_][A-Z0-9_]*)(?::([^}]*))?\}'
 
             def replace_env_var(match):
                 var_name = match.group(1)
+                default_value = match.group(2)
                 env_value = os.environ.get(var_name)
-                if not env_value:
-                    raise ConfigurationError(
-                        f"Required environment variable '{var_name}' is not set"
-                    )
-                return env_value
+                if env_value:
+                    return env_value
+                if default_value is not None:
+                    return default_value
+                raise ConfigurationError(
+                    f"Required environment variable '{var_name}' is not set"
+                )
 
             return re.sub(pattern, replace_env_var, value)
 

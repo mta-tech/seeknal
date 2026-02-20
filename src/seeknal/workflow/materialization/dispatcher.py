@@ -178,17 +178,26 @@ class MaterializationDispatcher:
         else:
             profile_config = ProfileLoader().load_profile()
 
-        # Setup DuckDB Iceberg extension and catalog
+        # Setup DuckDB extensions (httpfs + iceberg)
         DuckDBIcebergExtension.load_extension(con)
 
+        # Configure S3/MinIO credentials from env
+        DuckDBIcebergExtension.configure_s3(con)
+
+        # Get OAuth2 token from Keycloak
         catalog = profile_config.catalog.interpolate_env_vars()
+        token = catalog.bearer_token
+        if not token:
+            token = DuckDBIcebergExtension.get_oauth2_token()
+
+        # Attach REST catalog using DuckDB ATTACH syntax
         catalog_name = "iceberg_catalog"
-        DuckDBIcebergExtension.create_rest_catalog(
+        DuckDBIcebergExtension.attach_rest_catalog(
             con=con,
             catalog_name=catalog_name,
             uri=catalog.uri,
             warehouse_path=catalog.warehouse,
-            bearer_token=catalog.bearer_token,
+            bearer_token=token,
         )
 
         table_name = target_config.get("table", "")

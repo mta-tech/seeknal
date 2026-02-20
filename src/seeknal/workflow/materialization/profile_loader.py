@@ -48,6 +48,12 @@ from seeknal.workflow.materialization.config import (  # ty: ignore[unresolved-i
 
 logger = logging.getLogger(__name__)
 
+# Source type aliases for normalization (e.g., "postgres" -> "postgresql")
+_SOURCE_TYPE_ALIASES: dict[str, str] = {
+    "postgres": "postgresql",
+    "jsonl": "json",
+}
+
 # Regex for ${VAR} or ${VAR:default} or $VAR patterns
 _ENV_VAR_RE = re.compile(
     r"\$\{(\w+)(?::([^}]*))?\}"  # ${VAR} or ${VAR:default}
@@ -435,6 +441,46 @@ class ProfileLoader:
 
         # Interpolate env vars (with ${VAR:default} support)
         return interpolate_env_vars_in_dict(profile)
+
+    def load_source_defaults(self, source_type: str) -> Dict[str, Any]:
+        """Load default params for a source type from the ``source_defaults:`` section.
+
+        Profile structure::
+
+            source_defaults:
+              iceberg:
+                catalog_uri: ${LAKEKEEPER_URI:http://localhost:8181}
+                warehouse: ${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}
+              postgresql:
+                connection: local_pg
+
+        The returned dict has env vars interpolated.  If the section or type
+        is missing, an empty dict is returned (no error).
+
+        Source type aliases are normalized: ``postgres`` -> ``postgresql``,
+        ``jsonl`` -> ``json``.
+
+        Args:
+            source_type: Source type string (e.g., "iceberg", "postgresql", "postgres")
+
+        Returns:
+            Dict with default params, env vars interpolated.  Empty dict if
+            no defaults defined for this source type.
+        """
+        profile_data = self._load_profile_data()
+        if not profile_data:
+            return {}
+
+        defaults_section = profile_data.get("source_defaults", {})
+        if not defaults_section:
+            return {}
+
+        canonical = _SOURCE_TYPE_ALIASES.get(source_type, source_type)
+        source_defaults = defaults_section.get(canonical, {})
+        if not source_defaults:
+            return {}
+
+        return interpolate_env_vars_in_dict(source_defaults)
 
     @staticmethod
     def clear_connection_credentials(profile: Dict[str, Any]) -> None:

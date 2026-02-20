@@ -312,3 +312,109 @@ class TestClearConnectionCredentials:
         ProfileLoader.clear_connection_credentials(profile)
         # Non-string password left as-is
         assert profile["password"] == 12345
+
+
+# =============================================================================
+# load_source_defaults tests
+# =============================================================================
+
+
+class TestLoadSourceDefaults:
+    """Tests for ProfileLoader.load_source_defaults()."""
+
+    def _write_profile(self, tmp_path, content):
+        """Helper to write profiles.yml in tmp_path."""
+        profile_file = tmp_path / "profiles.yml"
+        profile_file.write_text(content)
+        return profile_file
+
+    def test_load_source_defaults_iceberg(self, tmp_path):
+        profile_file = self._write_profile(tmp_path, """\
+source_defaults:
+  iceberg:
+    catalog_uri: http://localhost:8181
+    warehouse: seeknal-warehouse
+""")
+        loader = ProfileLoader(profile_path=profile_file)
+        defaults = loader.load_source_defaults("iceberg")
+
+        assert defaults["catalog_uri"] == "http://localhost:8181"
+        assert defaults["warehouse"] == "seeknal-warehouse"
+
+    def test_load_source_defaults_postgresql(self, tmp_path):
+        profile_file = self._write_profile(tmp_path, """\
+source_defaults:
+  postgresql:
+    connection: local_pg
+""")
+        loader = ProfileLoader(profile_path=profile_file)
+        defaults = loader.load_source_defaults("postgresql")
+
+        assert defaults["connection"] == "local_pg"
+
+    def test_load_source_defaults_env_var_interpolation(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MY_CATALOG_URI", "http://prod:8181")
+        profile_file = self._write_profile(tmp_path, """\
+source_defaults:
+  iceberg:
+    catalog_uri: ${MY_CATALOG_URI}
+    warehouse: ${MY_WAREHOUSE:default-warehouse}
+""")
+        loader = ProfileLoader(profile_path=profile_file)
+        defaults = loader.load_source_defaults("iceberg")
+
+        assert defaults["catalog_uri"] == "http://prod:8181"
+        assert defaults["warehouse"] == "default-warehouse"
+
+    def test_load_source_defaults_missing_section(self, tmp_path):
+        profile_file = self._write_profile(tmp_path, """\
+connections:
+  my_pg:
+    type: postgresql
+""")
+        loader = ProfileLoader(profile_path=profile_file)
+        defaults = loader.load_source_defaults("iceberg")
+
+        assert defaults == {}
+
+    def test_load_source_defaults_missing_type(self, tmp_path):
+        profile_file = self._write_profile(tmp_path, """\
+source_defaults:
+  iceberg:
+    catalog_uri: http://localhost:8181
+""")
+        loader = ProfileLoader(profile_path=profile_file)
+        defaults = loader.load_source_defaults("postgresql")
+
+        assert defaults == {}
+
+    def test_load_source_defaults_alias_normalization(self, tmp_path):
+        """'postgres' alias resolves to 'postgresql' key."""
+        profile_file = self._write_profile(tmp_path, """\
+source_defaults:
+  postgresql:
+    connection: local_pg
+""")
+        loader = ProfileLoader(profile_path=profile_file)
+        defaults = loader.load_source_defaults("postgres")
+
+        assert defaults["connection"] == "local_pg"
+
+    def test_load_source_defaults_empty_dict(self, tmp_path):
+        """Empty dict for a type returns {}."""
+        profile_file = self._write_profile(tmp_path, """\
+source_defaults:
+  iceberg: {}
+""")
+        loader = ProfileLoader(profile_path=profile_file)
+        defaults = loader.load_source_defaults("iceberg")
+
+        assert defaults == {}
+
+    def test_load_source_defaults_no_profile_file(self, tmp_path):
+        """Missing profile file returns {}."""
+        missing = tmp_path / "nonexistent.yml"
+        loader = ProfileLoader(profile_path=missing)
+        defaults = loader.load_source_defaults("iceberg")
+
+        assert defaults == {}
