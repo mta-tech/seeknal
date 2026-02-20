@@ -42,8 +42,9 @@ from .base import (
     register_executor,
 )
 
-# Iceberg materialization support
+# Materialization support
 from seeknal.workflow.materialization.yaml_integration import materialize_node_if_enabled
+from seeknal.workflow.materialization.dispatcher import MaterializationDispatcher  # ty: ignore[unresolved-import]
 
 logger = logging.getLogger(__name__)
 
@@ -417,41 +418,79 @@ class TransformExecutor(BaseExecutor):
             "..." if len(transform_sql) > 100 else ""
         )
 
-        # Handle Iceberg materialization if enabled
+        # Handle materialization if enabled
         if result.status == ExecutionStatus.SUCCESS and not result.is_dry_run:
-            try:
-                # Get the context's DuckDB connection (has the view)
-                con = self.context.get_duckdb_connection()
-                mat_result = materialize_node_if_enabled(
-                    self.node,
-                    source_con=con,
-                    enabled_override=getattr(self.context, 'materialize_enabled', None)
-                )
-                if mat_result:
-                    # Materialization was enabled and succeeded
+            # Check for multi-target materializations (new dispatcher path)
+            mat_targets = self.node.config.get("materializations", [])
+            if mat_targets and getattr(self.context, 'materialize_enabled', None) is not False:
+                try:
+                    con = self.context.get_duckdb_connection()
+                    view_name = f"{self.node.node_type.value}.{self.node.name}"
+                    dispatcher = MaterializationDispatcher()
+                    dispatch_result = dispatcher.dispatch(
+                        con=con,
+                        view_name=view_name,
+                        targets=mat_targets,
+                        node_id=self.node.id,
+                    )
                     result.metadata["materialization"] = {
                         "enabled": True,
-                        "success": mat_result.get("success", False),
-                        "table": mat_result.get("table"),
-                        "row_count": mat_result.get("row_count"),
-                        "mode": mat_result.get("mode"),
-                        "iceberg_table": mat_result.get("iceberg_table"),
+                        "success": dispatch_result.all_succeeded,
+                        "total": dispatch_result.total,
+                        "succeeded": dispatch_result.succeeded,
+                        "failed": dispatch_result.failed,
+                        "results": dispatch_result.results,
                     }
-                    logger.info(
-                        f"Materialized node '{self.node.id}' to Iceberg table "
-                        f"'{mat_result.get('table')}' ({mat_result.get('row_count')} rows)"
+                    if dispatch_result.all_succeeded:
+                        logger.info(
+                            f"Materialized node '{self.node.id}' to "
+                            f"{dispatch_result.succeeded}/{dispatch_result.total} targets"
+                        )
+                    else:
+                        logger.warning(
+                            f"Materialized node '{self.node.id}': "
+                            f"{dispatch_result.succeeded}/{dispatch_result.total} succeeded"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to materialize node '{self.node.id}': {e}"
                     )
-            except Exception as e:
-                # Log materialization error but don't fail the executor
-                # Materialization is optional/augmentation, not core functionality
-                logger.warning(
-                    f"Failed to materialize node '{self.node.id}' to Iceberg: {e}"
-                )
-                result.metadata["materialization"] = {
-                    "enabled": True,
-                    "success": False,
-                    "error": str(e),
-                }
+                    result.metadata["materialization"] = {
+                        "enabled": True,
+                        "success": False,
+                        "error": str(e),
+                    }
+            elif not mat_targets:
+                # Fallback: legacy Iceberg-only path (singular materialization config)
+                try:
+                    con = self.context.get_duckdb_connection()
+                    mat_result = materialize_node_if_enabled(
+                        self.node,
+                        source_con=con,
+                        enabled_override=getattr(self.context, 'materialize_enabled', None)
+                    )
+                    if mat_result:
+                        result.metadata["materialization"] = {
+                            "enabled": True,
+                            "success": mat_result.get("success", False),
+                            "table": mat_result.get("table"),
+                            "row_count": mat_result.get("row_count"),
+                            "mode": mat_result.get("mode"),
+                            "iceberg_table": mat_result.get("iceberg_table"),
+                        }
+                        logger.info(
+                            f"Materialized node '{self.node.id}' to Iceberg table "
+                            f"'{mat_result.get('table')}' ({mat_result.get('row_count')} rows)"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to materialize node '{self.node.id}' to Iceberg: {e}"
+                    )
+                    result.metadata["materialization"] = {
+                        "enabled": True,
+                        "success": False,
+                        "error": str(e),
+                    }
 
         return result
 
@@ -1060,7 +1099,7 @@ class TransformExecutor(BaseExecutor):
         Returns:
             True if the node's file path ends with .py, False otherwise
         """
-        return self.node.file_path.endswith('.py')
+        return bool(self.node.file_path) and self.node.file_path.endswith('.py')
 
     def _execute_python_transform(self) -> ExecutorResult:
         """

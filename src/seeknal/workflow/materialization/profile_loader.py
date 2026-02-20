@@ -1,5 +1,5 @@
 """
-Profile loader and credential manager for Iceberg materialization.
+Profile loader and credential manager for materialization.
 
 This module handles loading materialization profiles from profiles.yml
 and managing credentials from environment variables or system keyring.
@@ -9,29 +9,32 @@ Design Decisions:
 - Optional system keyring support (more secure, opt-in)
 - Profile defaults with per-node YAML overrides
 - Automatic credential clearing after use
+- Unified ``connections:`` section for all connection types
 
 Security Features:
 - Credentials never stored in plaintext
-- Environment variable interpolation
+- Environment variable interpolation with default values (${VAR:default})
 - Optional keyring integration
 - Automatic credential clearing from memory
 
 Key Components:
 - ProfileLoader: Load and parse profiles.yml
 - CredentialManager: Handle credentials from env vars or keyring
+- interpolate_env_vars: Env var interpolation with ${VAR:default} support
 """
 
 from __future__ import annotations
 
 import os
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import yaml
+import yaml  # ty: ignore[unresolved-import]
 
-from seeknal.context import CONFIG_BASE_URL
-from seeknal.workflow.materialization.config import (
+from seeknal.context import CONFIG_BASE_URL  # ty: ignore[unresolved-import]
+from seeknal.workflow.materialization.config import (  # ty: ignore[unresolved-import]
     MaterializationConfig,
     CatalogConfig,
     SchemaEvolutionConfig,
@@ -44,6 +47,74 @@ from seeknal.workflow.materialization.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Regex for ${VAR} or ${VAR:default} or $VAR patterns
+_ENV_VAR_RE = re.compile(
+    r"\$\{(\w+)(?::([^}]*))?\}"  # ${VAR} or ${VAR:default}
+    r"|"
+    r"\$(\w+)"  # $VAR (no default support)
+)
+
+
+def interpolate_env_vars(value: str) -> str:
+    """Replace ${VAR}, ${VAR:default}, and $VAR patterns with env var values.
+
+    Supports default values via ${VAR:default} syntax. If VAR is not set
+    and no default is provided, raises ValueError.
+
+    Args:
+        value: String potentially containing env var references
+
+    Returns:
+        String with env vars resolved
+
+    Raises:
+        ValueError: If a referenced env var is not set and has no default
+    """
+
+    def replacer(match: re.Match) -> str:
+        # ${VAR} or ${VAR:default}
+        braced_name = match.group(1)
+        default_val = match.group(2)
+        # $VAR
+        bare_name = match.group(3)
+
+        var_name = braced_name or bare_name
+        val = os.environ.get(var_name)
+
+        if val is not None:
+            return val
+
+        # Has default? Only possible with ${VAR:default} syntax
+        if braced_name and default_val is not None:
+            return default_val
+
+        raise ValueError(
+            f"Environment variable '{var_name}' is not set. "
+            f"Set it with: export {var_name}=<value>"
+        )
+
+    return _ENV_VAR_RE.sub(replacer, value)
+
+
+def interpolate_env_vars_in_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively interpolate env vars in all string values of a dict.
+
+    Args:
+        data: Dictionary with potentially templated string values
+
+    Returns:
+        New dictionary with env vars resolved in string values
+    """
+    result: Dict[str, Any] = {}
+    for key, val in data.items():
+        if isinstance(val, str):
+            result[key] = interpolate_env_vars(val)
+        elif isinstance(val, dict):
+            result[key] = interpolate_env_vars_in_dict(val)
+        else:
+            result[key] = val
+    return result
 
 
 class CredentialManager:
@@ -74,7 +145,7 @@ class CredentialManager:
         self._keyring = None
         if use_keyring:
             try:
-                import keyring
+                import keyring  # ty: ignore[unresolved-import]
                 self._keyring = keyring
             except ImportError:
                 logger.warning(
@@ -112,7 +183,9 @@ class CredentialManager:
         credentials = {}
 
         # Get URI from keyring
-        uri = self._keyring.get_password(self.keyring_service, "lakekeeper_uri")
+        uri = self._keyring.get_password(  # ty: ignore[unresolved-attribute]
+            self.keyring_service, "lakekeeper_uri"
+        )
         if not uri:
             raise CredentialError(
                 "Lakekeeper URI not found in keyring. "
@@ -121,7 +194,9 @@ class CredentialManager:
         credentials["uri"] = uri
 
         # Get bearer token from keyring (optional)
-        token = self._keyring.get_password(self.keyring_service, "lakekeeper_token")
+        token = self._keyring.get_password(  # ty: ignore[unresolved-attribute]
+            self.keyring_service, "lakekeeper_token"
+        )
         if token:
             credentials["bearer_token"] = token
 
@@ -197,11 +272,15 @@ class CredentialManager:
 
         try:
             # Store in keyring
-            self._keyring.set_password(self.keyring_service, "lakekeeper_uri", uri)
+            self._keyring.set_password(  # ty: ignore[unresolved-attribute]
+                self.keyring_service, "lakekeeper_uri", uri
+            )
             if token:
-                self._keyring.set_password(self.keyring_service, "lakekeeper_token", token)
+                self._keyring.set_password(  # ty: ignore[unresolved-attribute]
+                    self.keyring_service, "lakekeeper_token", token
+                )
 
-            print("✓ Credentials stored securely in system keyring")
+            print("Credentials stored securely in system keyring")
         except Exception as e:
             raise CredentialError(f"Failed to store credentials in keyring: {e}") from e
 
@@ -225,9 +304,19 @@ class CredentialManager:
 
 class ProfileLoader:
     """
-    Load materialization profiles from profiles.yml.
+    Load materialization and connection profiles from profiles.yml.
 
     Profile structure (in ~/.seeknal/profiles.yml):
+
+        connections:
+          my_pg:
+            type: postgresql
+            host: ${PG_HOST:localhost}
+            port: 5432
+            user: ${PG_USER:postgres}
+            password: ${PG_PASSWORD}
+            database: my_db
+            schema: public
 
         materialization:
           enabled: true
@@ -238,8 +327,6 @@ class ProfileLoader:
           default_mode: append
           schema_evolution:
             mode: safe
-            allow_column_add: false
-            allow_column_type_change: false
 
     Attributes:
         profile_path: Path to profiles.yml
@@ -262,6 +349,107 @@ class ProfileLoader:
         """
         self.profile_path = profile_path or self.DEFAULT_PROFILE_PATH
         self.credential_manager = CredentialManager(use_keyring=use_keyring)
+        self._profile_data: Optional[Dict[str, Any]] = None
+
+    def _load_profile_data(self) -> Dict[str, Any]:
+        """Load and cache raw profile data from profiles.yml.
+
+        Returns:
+            Parsed YAML data as dict
+
+        Raises:
+            ConfigurationError: If file cannot be read or parsed
+        """
+        if self._profile_data is not None:
+            return self._profile_data
+
+        if not self.profile_path.exists():
+            self._profile_data = {}
+            return self._profile_data
+
+        try:
+            with open(self.profile_path, "r") as f:
+                data = yaml.safe_load(f)
+            self._profile_data = data if isinstance(data, dict) else {}
+        except yaml.YAMLError as e:
+            raise ConfigurationError(
+                f"Failed to parse profile file {self.profile_path}: {e}"
+            ) from e
+        except Exception as e:
+            raise ConfigurationError(
+                f"Failed to read profile file {self.profile_path}: {e}"
+            ) from e
+
+        return self._profile_data
+
+    def load_connection_profile(self, name: str) -> Dict[str, Any]:
+        """Load a named connection profile from the ``connections:`` section.
+
+        Profile structure::
+
+            connections:
+              my_pg:
+                type: postgresql
+                host: ${PG_HOST:localhost}
+                port: 5432
+                user: ${PG_USER:postgres}
+                password: ${PG_PASSWORD}
+                database: analytics
+
+        Env var interpolation with defaults is supported: ``${VAR:default}``.
+        Credentials (password fields) are cleared from the returned dict
+        after the caller is done via :func:`clear_connection_credentials`.
+
+        Args:
+            name: Connection profile name (e.g., "my_pg")
+
+        Returns:
+            Dict with connection config, env vars interpolated
+
+        Raises:
+            ConfigurationError: If profile file missing, no connections
+                section, or named profile not found
+        """
+        profile_data = self._load_profile_data()
+
+        if not profile_data:
+            raise ConfigurationError(
+                f"Profile file not found: {self.profile_path}. "
+                f"Create it with a 'connections:' section."
+            )
+
+        connections_section = profile_data.get("connections", {})
+        if not connections_section:
+            raise ConfigurationError(
+                "No 'connections' section in profiles.yml. "
+                "Add one with named connection profiles."
+            )
+
+        profile = connections_section.get(name)
+        if not profile:
+            available = list(connections_section.keys())
+            raise ConfigurationError(
+                f"Connection profile '{name}' not found. "
+                f"Available profiles: {available}"
+            )
+
+        # Interpolate env vars (with ${VAR:default} support)
+        return interpolate_env_vars_in_dict(profile)
+
+    @staticmethod
+    def clear_connection_credentials(profile: Dict[str, Any]) -> None:
+        """Clear sensitive fields from a connection profile dict.
+
+        Overwrites password values with null bytes, then removes the keys.
+
+        Args:
+            profile: Connection profile dict to clear
+        """
+        sensitive_keys = {"password", "bearer_token", "token", "secret"}
+        for key in list(profile.keys()):
+            if key in sensitive_keys and isinstance(profile[key], str):
+                profile[key] = "\x00" * len(profile[key])
+                del profile[key]
 
     def load_profile(self) -> MaterializationConfig:
         """
@@ -274,24 +462,11 @@ class ProfileLoader:
             ConfigurationError: If profile is invalid
             CredentialError: If credentials cannot be loaded
         """
-        # Check if profile file exists
-        if not self.profile_path.exists():
+        profile_data = self._load_profile_data()
+
+        if not profile_data:
             logger.debug(f"Profile file not found: {self.profile_path}")
             return MaterializationConfig()  # Return defaults
-
-        try:
-            with open(self.profile_path, "r") as f:
-                profile_data = yaml.safe_load(f)
-
-        except yaml.YAMLError as e:
-            raise ConfigurationError(
-                f"Failed to parse profile file {self.profile_path}: {e}"
-            ) from e
-
-        except Exception as e:
-            raise ConfigurationError(
-                f"Failed to read profile file {self.profile_path}: {e}"
-            ) from e
 
         # Extract materialization section
         mat_config = profile_data.get("materialization", {})
@@ -449,17 +624,13 @@ class ProfileLoader:
         Raises:
             ConfigurationError: If profile is invalid or not found
         """
-        if not self.profile_path.exists():
+        profile_data = self._load_profile_data()
+
+        if not profile_data:
             raise ConfigurationError(
                 f"Profile file not found: {self.profile_path}. "
                 f"Create it with StarRocks connection details."
             )
-
-        try:
-            with open(self.profile_path, "r") as f:
-                profile_data = yaml.safe_load(f)
-        except yaml.YAMLError as e:
-            raise ConfigurationError(f"Failed to parse profile: {e}") from e
 
         starrocks_section = profile_data.get("starrocks", {})
         if not starrocks_section:
@@ -519,8 +690,8 @@ class ProfileLoader:
         # For REST catalog, try to connect
         if catalog.type == CatalogType.REST:
             try:
-                import requests
-                from urllib3.exceptions import RequestException
+                import requests  # ty: ignore[unresolved-import]
+                from urllib3.exceptions import RequestException  # ty: ignore[unresolved-import]
 
                 # Test connection with timeout
                 response = requests.get(
@@ -530,7 +701,7 @@ class ProfileLoader:
                 )
                 response.raise_for_status()
 
-                logger.info(f"✓ Catalog connection successful: {catalog.uri}")
+                logger.info(f"Catalog connection successful: {catalog.uri}")
 
             except RequestException as e:
                 raise ConfigurationError(

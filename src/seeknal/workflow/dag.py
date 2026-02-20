@@ -13,14 +13,14 @@ and builds a complete dependency graph that can be used for validation and execu
 
 from __future__ import annotations
 
-import yaml
+import yaml  # ty: ignore[unresolved-import]
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from seeknal.dag.manifest import NodeType
-from seeknal.utils.path_security import warn_if_insecure_path
+from seeknal.dag.manifest import NodeType  # ty: ignore[unresolved-import]
+from seeknal.utils.path_security import warn_if_insecure_path  # ty: ignore[unresolved-import]
 
 
 @dataclass(slots=True)
@@ -317,7 +317,7 @@ class DAGBuilder:
             return None
 
         try:
-            import yaml
+            import yaml  # ty: ignore[unresolved-import]
             with open(yaml_path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
 
@@ -329,6 +329,72 @@ class DAGBuilder:
         except Exception:
             # If loading fails, just return None (don't fail on override)
             return None
+
+    def _normalize_materializations(
+        self,
+        data: dict[str, Any],
+        file_path: Path,
+    ) -> dict[str, Any]:
+        """Normalize materialization config into a ``materializations`` list.
+
+        Handles three cases:
+
+        1. ``materializations:`` (plural) — already a list, validate and keep
+        2. ``materialization:`` (singular) — wrap in list, infer type
+        3. Both present — error with migration message
+
+        For backward compat, singular ``materialization:`` without a ``type:``
+        field is treated as Iceberg (the original default).
+
+        Args:
+            data: Parsed YAML data dict (mutated in place)
+            file_path: Source file path (for error messages)
+
+        Returns:
+            The (possibly mutated) data dict
+        """
+        has_singular = "materialization" in data
+        has_plural = "materializations" in data
+
+        if has_singular and has_plural:
+            self._parse_errors.append(
+                f"Both 'materialization' and 'materializations' present in "
+                f"{file_path}. Use only 'materializations' (plural) for "
+                f"multi-target support. Migrate: rename the key and wrap the "
+                f"value in a list."
+            )
+            return data
+
+        if has_plural:
+            mat_list = data["materializations"]
+            if not isinstance(mat_list, list):
+                self._parse_errors.append(
+                    f"'materializations' must be a list in {file_path}"
+                )
+                return data
+            # Store normalized key
+            data["materializations"] = mat_list
+            return data
+
+        if has_singular:
+            mat = data["materialization"]
+            if mat is None:
+                return data
+            if isinstance(mat, dict):
+                # Backward compat: singular without type → Iceberg
+                if "type" not in mat:
+                    mat["type"] = "iceberg"
+                data["materializations"] = [mat]
+            elif isinstance(mat, list):
+                # Someone already used a list under singular key — accept it
+                data["materializations"] = mat
+            else:
+                self._parse_errors.append(
+                    f"'materialization' must be a dictionary or list in "
+                    f"{file_path}"
+                )
+
+        return data
 
     def build(self) -> None:
         """
@@ -347,7 +413,7 @@ class DAGBuilder:
         # Load common config (seeknal/common/) before parsing nodes
         common_dir = self.seeknal_dir / "common"
         if common_dir.is_dir():
-            from seeknal.workflow.common.loader import load_common_config
+            from seeknal.workflow.common.loader import load_common_config  # ty: ignore[unresolved-import]
 
             self._common_config = load_common_config(common_dir)
 
@@ -467,7 +533,7 @@ class DAGBuilder:
 
             # Resolve parameters if present
             if "params" in data and (self.cli_overrides or self.run_id or self._common_config):
-                from seeknal.workflow.parameters.resolver import ParameterResolver
+                from seeknal.workflow.parameters.resolver import ParameterResolver  # ty: ignore[unresolved-import]
                 resolver = ParameterResolver(
                     cli_overrides=self.cli_overrides,
                     run_id=self.run_id,
@@ -477,13 +543,16 @@ class DAGBuilder:
 
             # Resolve common config expressions in transform SQL
             if "transform" in data and self._common_config:
-                from seeknal.workflow.parameters.resolver import ParameterResolver
+                from seeknal.workflow.parameters.resolver import ParameterResolver  # ty: ignore[unresolved-import]
                 resolver = ParameterResolver(
                     cli_overrides=self.cli_overrides,
                     run_id=self.run_id,
                     common_config=self._common_config,
                 )
                 data["transform"] = resolver.resolve_string(data["transform"])
+
+            # Normalize materializations (plural/singular)
+            data = self._normalize_materializations(data, file_path)
 
             # Create node
             node = DAGNode(
@@ -514,7 +583,7 @@ class DAGBuilder:
         Args:
             file_path: Path to the Python file
         """
-        from seeknal.pipeline.discoverer import PythonPipelineDiscoverer
+        from seeknal.pipeline.discoverer import PythonPipelineDiscoverer  # ty: ignore[unresolved-import]
 
         discoverer = PythonPipelineDiscoverer(self.project_path)
 
@@ -563,6 +632,9 @@ class DAGBuilder:
                     yaml_data["source"] = node_meta.get("source", "unknown")
                     yaml_data["table"] = node_meta.get("table", "")
                     yaml_data["columns"] = node_meta.get("columns", {})
+                    # Copy params (e.g., catalog_uri, warehouse for iceberg sources)
+                    if "params" in node_meta:
+                        yaml_data["params"] = node_meta["params"]
                 elif kind_str in ("transform", "feature_group"):
                     # Include inputs from metadata
                     if "inputs" in node_meta:
@@ -595,6 +667,26 @@ class DAGBuilder:
                         decorator_mat, yaml_mat, profile_mat
                     )
                     yaml_data["materialization"] = merged_mat
+
+                # Handle @materialize decorator list (plural)
+                decorator_mats = node_meta.get("materializations")
+                if decorator_mats and isinstance(decorator_mats, list):
+                    # Combine with existing singular materialization if present
+                    existing_list = []
+                    if "materialization" in yaml_data:
+                        mat = yaml_data["materialization"]
+                        if isinstance(mat, dict):
+                            if "type" not in mat:
+                                mat["type"] = "iceberg"
+                            existing_list.append(mat)
+                    yaml_data["materializations"] = existing_list + decorator_mats
+                elif "materialization" in yaml_data:
+                    # Normalize singular to list for consistency
+                    mat = yaml_data["materialization"]
+                    if isinstance(mat, dict):
+                        if "type" not in mat:
+                            mat["type"] = "iceberg"
+                        yaml_data["materializations"] = [mat]
 
                 # Create node
                 node = DAGNode(

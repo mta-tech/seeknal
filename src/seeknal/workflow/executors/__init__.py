@@ -89,9 +89,12 @@ def get_executor(node: "Node", context: ExecutionContext) -> BaseExecutor:
         >>> result = executor.run()
     """
     # Check if node is from a Python file (has file_path attribute ending in .py)
+    # Source nodes are always handled by SourceExecutor (even from Python files)
+    # because SourceExecutor has specialized loaders (iceberg, csv, parquet, etc.)
     if hasattr(node, 'file_path') and node.file_path and str(node.file_path).endswith('.py'):
-        # Route Python files to PythonExecutor
-        return PythonExecutor(node, context)
+        from seeknal.dag.manifest import NodeType as NT
+        if node.node_type != NT.SOURCE:
+            return PythonExecutor(node, context)
 
     # Use registry for standard YAML executors
     registry = ExecutorRegistry.get_instance()

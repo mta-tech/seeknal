@@ -266,6 +266,88 @@ class PythonExecutor(BaseExecutor):
                 metadata={"error": "Execution timed out after 30 minutes"},
             )
 
+    def post_execute(self, result: ExecutorResult) -> ExecutorResult:
+        """Post-execution: handle materialization for Python transforms.
+
+        Loads intermediate parquet into a DuckDB view and dispatches
+        materialization to configured targets.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        if result.status != ExecutionStatus.SUCCESS or result.is_dry_run:
+            return result
+
+        mat_targets = self.node.config.get("materializations", [])
+        if not mat_targets:
+            return result
+
+        if getattr(self.context, "materialize_enabled", None) is False:
+            return result
+
+        # Load intermediate parquet into DuckDB view for materialization
+        intermediate_path = (
+            self.context.target_path
+            / "intermediate"
+            / f"{self.node.id.replace('.', '_')}.parquet"
+        )
+        if not intermediate_path.exists():
+            logger.warning(
+                f"Intermediate file not found for '{self.node.id}', skipping materialization"
+            )
+            return result
+
+        try:
+            con = self.context.get_duckdb_connection()
+            view_name = f"transform.{self.node.name}"
+
+            # Create schema and view from parquet
+            con.execute("CREATE SCHEMA IF NOT EXISTS transform")
+            con.execute(
+                f"CREATE OR REPLACE VIEW {view_name} AS "
+                f"SELECT * FROM read_parquet('{intermediate_path}')"
+            )
+
+            from seeknal.workflow.materialization.dispatcher import MaterializationDispatcher
+
+            dispatcher = MaterializationDispatcher()
+            dispatch_result = dispatcher.dispatch(
+                con=con,
+                view_name=view_name,
+                targets=mat_targets,
+                node_id=self.node.id,
+            )
+
+            result.metadata["materialization"] = {
+                "enabled": True,
+                "success": dispatch_result.all_succeeded,
+                "total": dispatch_result.total,
+                "succeeded": dispatch_result.succeeded,
+                "failed": dispatch_result.failed,
+                "results": dispatch_result.results,
+            }
+
+            if dispatch_result.all_succeeded:
+                logger.info(
+                    f"Materialized node '{self.node.id}' to "
+                    f"{dispatch_result.succeeded}/{dispatch_result.total} targets"
+                )
+            else:
+                logger.warning(
+                    f"Materialized node '{self.node.id}': "
+                    f"{dispatch_result.succeeded}/{dispatch_result.total} succeeded"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to materialize node '{self.node.id}': {e}")
+            result.metadata["materialization"] = {
+                "enabled": True,
+                "success": False,
+                "error": str(e),
+            }
+
+        return result
+
     def _generate_runner_script(self) -> str:
         """Generate wrapper script to execute specific function.
 

@@ -1,15 +1,15 @@
 """
 Python pipeline decorators for defining data sources, transforms, and feature groups.
 
-Provides @source, @transform, and @feature_group decorators that register
-pipeline nodes in a global registry for later discovery and execution.
+Provides @source, @transform, @feature_group, and @materialize decorators that
+register pipeline nodes in a global registry for later discovery and execution.
 """
 
 import re
 from functools import wraps
 from typing import Callable, Optional, Any, Union
 
-from seeknal.pipeline.materialization_config import MaterializationConfig
+from seeknal.pipeline.materialization_config import MaterializationConfig  # ty: ignore[unresolved-import]
 
 # Global registry for discovered nodes
 _PIPELINE_REGISTRY: dict[str, dict] = {}
@@ -70,6 +70,68 @@ def _validate_materialization_config(
         )
 
 
+def _set_node_meta(wrapper: Callable, node_id: str, meta: dict) -> None:
+    """Store node metadata on the wrapper and register it globally."""
+    wrapper.__dict__["_seeknal_node"] = meta
+    _PIPELINE_REGISTRY[node_id] = meta
+
+
+def materialize(
+    type: str = "iceberg",
+    connection: Optional[str] = None,
+    table: str = "",
+    mode: str = "full",
+    time_column: Optional[str] = None,
+    lookback: Optional[str] = None,
+    unique_keys: Optional[list[str]] = None,
+    **kwargs,
+):
+    """Stackable decorator to attach materialization targets to a pipeline node.
+
+    Apply one or more @materialize decorators before @source, @transform, or
+    @feature_group to define multi-target materialization. Each decorator
+    appends a config dict to ``func._seeknal_materializations``.
+
+    Args:
+        type: Materialization target type ("iceberg", "postgresql")
+        connection: Named connection profile (required for postgresql)
+        table: Target table name
+        mode: Write mode ("full", "incremental_by_time", "upsert_by_key",
+              "append", "overwrite")
+        time_column: Column for incremental mode partitioning
+        lookback: Lookback window for incremental mode (e.g., "7d")
+        unique_keys: Key columns for upsert mode
+        **kwargs: Additional target-specific parameters
+
+    Example:
+        @transform(name="order_products", inputs=["source.orders"])
+        @materialize(type='postgresql', connection='local_pg',
+                     table='analytics.order_products', mode='upsert_by_key',
+                     unique_keys=['order_id'])
+        @materialize(type='iceberg', table='atlas.ns.order_products')
+        def order_products(ctx):
+            return ctx.ref('source.orders')
+    """
+    def decorator(func: Callable) -> Callable:
+        mat_config: dict[str, Any] = {"type": type, "table": table, "mode": mode}
+        if connection is not None:
+            mat_config["connection"] = connection
+        if time_column is not None:
+            mat_config["time_column"] = time_column
+        if lookback is not None:
+            mat_config["lookback"] = lookback
+        if unique_keys is not None:
+            mat_config["unique_keys"] = unique_keys
+        mat_config.update(kwargs)
+
+        # Stackable: append to existing list or create new
+        mats = func.__dict__.setdefault("_seeknal_materializations", [])
+        mats.append(mat_config)
+
+        return func
+    return decorator
+
+
 def source(
     name: str,
     source: str = "csv",
@@ -77,6 +139,8 @@ def source(
     columns: Optional[dict] = None,
     tags: Optional[list[str]] = None,
     materialization: Optional[Union[dict, MaterializationConfig]] = None,
+    query: Optional[str] = None,
+    connection: Optional[str] = None,
     **params,
 ):
     """Decorator to define a data source node.
@@ -92,6 +156,8 @@ def source(
         columns: Optional column schema definitions
         tags: Optional tags for organization
         materialization: Optional Iceberg materialization config (dict or MaterializationConfig)
+        query: Optional pushdown SQL query for database sources
+        connection: Optional named connection profile
         **params: Additional source-specific parameters
 
     Example:
@@ -100,22 +166,22 @@ def source(
             pass
 
         @source(
-            name="events",
+            name="pg_orders",
             source="postgres",
-            table="public.events",
-            columns={"event_id": "int", "user_id": "int"},
-            tags=["production"],
-            materialization=MaterializationConfig(
-                enabled=True,
-                table="warehouse.raw.events",
-                mode="append",
-            )
+            connection="my_pg",
+            query="SELECT * FROM orders WHERE status = 'active'",
         )
-        def events():
+        def pg_orders():
             pass
     """
     # Validate materialization config
     _validate_materialization_config(materialization)
+
+    # Pass query and connection through params
+    if query is not None:
+        params["query"] = query
+    if connection is not None:
+        params["connection"] = connection
 
     def decorator(func: Callable) -> Callable:
         node_id = f"source.{name}"
@@ -138,7 +204,7 @@ def source(
                 mat_dict = materialization.to_dict()
 
         # Register node metadata
-        wrapper._seeknal_node = {
+        _set_node_meta(wrapper, node_id, {
             "kind": "source",
             "name": name,
             "id": node_id,
@@ -149,8 +215,7 @@ def source(
             "params": params,
             "materialization": mat_dict,
             "func": func,
-        }
-        _PIPELINE_REGISTRY[node_id] = wrapper._seeknal_node
+        })
         return wrapper
     return decorator
 
@@ -200,7 +265,7 @@ def transform(
     _validate_materialization_config(materialization)
 
     def decorator(func: Callable) -> Callable:
-        node_name = name or func.__name__
+        node_name = name or getattr(func, "__name__", "unknown")
         node_id = f"transform.{node_name}"
 
         @wraps(func)
@@ -221,7 +286,7 @@ def transform(
             elif isinstance(materialization, MaterializationConfig):
                 mat_dict = materialization.to_dict()
 
-        wrapper._seeknal_node = {
+        _set_node_meta(wrapper, node_id, {
             "kind": "transform",
             "name": node_name,
             "id": node_id,
@@ -231,8 +296,7 @@ def transform(
             "params": params,
             "materialization": mat_dict,
             "func": func,
-        }
-        _PIPELINE_REGISTRY[node_id] = wrapper._seeknal_node
+        })
         return wrapper
     return decorator
 
@@ -289,7 +353,7 @@ def feature_group(
             return ctx.duckdb.sql("SELECT * FROM df").df()
     """
     def decorator(func: Callable) -> Callable:
-        node_name = name or func.__name__
+        node_name = name or getattr(func, "__name__", "unknown")
         node_id = f"feature_group.{node_name}"
 
         @wraps(func)
@@ -313,7 +377,7 @@ def feature_group(
                 # Old Materialization object
                 mat_dict = materialization.to_dict()
 
-        wrapper._seeknal_node = {
+        _set_node_meta(wrapper, node_id, {
             "kind": "feature_group",
             "name": node_name,
             "id": node_id,
@@ -324,8 +388,7 @@ def feature_group(
             "tags": tags or [],
             "params": params,
             "func": func,
-        }
-        _PIPELINE_REGISTRY[node_id] = wrapper._seeknal_node
+        })
         return wrapper
     return decorator
 
@@ -345,7 +408,7 @@ def second_order_aggregation(
     """Decorator to define a second-order aggregation node.
 
     Second-order aggregations perform aggregations on already-aggregated data,
-    enabling multi-level feature engineering (e.g., user → store → region).
+    enabling multi-level feature engineering (e.g., user -> store -> region).
 
     The decorated function receives a PipelineContext (ctx) and a pre-aggregated
     DataFrame (df), and must return the second-aggregated DataFrame.
@@ -374,21 +437,6 @@ def second_order_aggregation(
                 "total_spend_30d": ["mean", "std"],
                 "transaction_count": "sum"
             })
-
-        @second_order_aggregation(
-            name="weekly_patterns",
-            source="aggregation.daily_volume",
-            id_col="merchant_id",
-            feature_date_col="date",
-            materialization=MaterializationConfig(
-                enabled=True,
-                table="warehouse.analytics.weekly_patterns",
-                mode="append"
-            )
-        )
-        def weekly_patterns(ctx, df: pd.DataFrame) -> pd.DataFrame:
-            # Weekly aggregation logic
-            pass
     """
     # Validate materialization config
     _validate_materialization_config(materialization)
@@ -414,7 +462,7 @@ def second_order_aggregation(
             elif hasattr(materialization, 'to_dict'):
                 mat_dict = materialization.to_dict()
 
-        wrapper._seeknal_node = {
+        _set_node_meta(wrapper, node_id, {
             "kind": "second_order_aggregation",
             "name": name,
             "id": node_id,
@@ -429,8 +477,7 @@ def second_order_aggregation(
             "materialization": mat_dict,
             "params": params,
             "func": func,
-        }
-        _PIPELINE_REGISTRY[node_id] = wrapper._seeknal_node
+        })
         return wrapper
     return decorator
 

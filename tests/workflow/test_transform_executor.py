@@ -104,7 +104,7 @@ class TestTransformExecutorValidation:
         with pytest.raises(ExecutorValidationError) as exc_info:
             executor.validate()
 
-        assert "must be a dictionary" in str(exc_info.value)
+        assert "must be a list or dictionary" in str(exc_info.value)
 
 
 class TestTransformExecutorDryRun:

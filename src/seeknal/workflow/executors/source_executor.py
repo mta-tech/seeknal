@@ -27,9 +27,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from seeknal.dag.manifest import Node, NodeType
-from seeknal.validation import validate_file_path
-from seeknal.workflow.executors.base import (
+from seeknal.dag.manifest import Node, NodeType  # ty: ignore[unresolved-import]
+from seeknal.validation import validate_file_path  # ty: ignore[unresolved-import]
+from seeknal.workflow.executors.base import (  # ty: ignore[unresolved-import]
     BaseExecutor,
     ExecutionContext,
     ExecutionStatus,
@@ -39,8 +39,9 @@ from seeknal.workflow.executors.base import (
     register_executor,
 )
 
-# Iceberg materialization support
-from seeknal.workflow.materialization.yaml_integration import materialize_node_if_enabled
+# Materialization support
+from seeknal.workflow.materialization.yaml_integration import materialize_node_if_enabled  # ty: ignore[unresolved-import]
+from seeknal.workflow.materialization.dispatcher import MaterializationDispatcher  # ty: ignore[unresolved-import]
 
 logger = logging.getLogger(__name__)
 
@@ -103,14 +104,33 @@ class SourceExecutor(BaseExecutor):
                 "Missing required field 'source' in node configuration"
             )
 
-        if "table" not in config:
+        source_type = config["source"]
+
+        # PostgreSQL sources allow query: in params as alternative to table:
+        has_table = bool(config.get("table"))
+        params = config.get("params", {})
+        has_query = isinstance(params, dict) and "query" in params
+
+        if source_type in ("postgresql", "postgres"):
+            if has_table and has_query:
+                raise ExecutorValidationError(
+                    self.node.id,
+                    "Cannot specify both 'table' and 'query' — they are mutually exclusive"
+                )
+            if not has_table and not has_query:
+                raise ExecutorValidationError(
+                    self.node.id,
+                    "PostgreSQL source requires either 'table' or 'query' in params"
+                )
+            if has_query:
+                self._validate_pushdown_query(params["query"])
+        elif not has_table:
             raise ExecutorValidationError(
                 self.node.id,
                 "Missing required field 'table' in node configuration"
             )
 
-        source_type = config["source"]
-        table = config["table"]
+        table = config.get("table", "")
 
         # Validate source type
         supported_sources = [
@@ -201,7 +221,7 @@ class SourceExecutor(BaseExecutor):
 
         config = self.node.config
         source_type = config["source"]
-        table = config["table"]
+        table = config.get("table", "")
         params = config.get("params", {})
 
         try:
@@ -629,6 +649,80 @@ class SourceExecutor(BaseExecutor):
                 e
             ) from e
 
+    # DDL/DML keywords that must NOT appear at the start of pushdown queries
+    _FORBIDDEN_SQL_PREFIXES = (
+        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE",
+        "TRUNCATE", "GRANT", "REVOKE", "COPY", "VACUUM", "ANALYZE",
+    )
+
+    def _validate_pushdown_query(self, query: str) -> None:
+        """Validate a pushdown SQL query for safety.
+
+        Rules:
+        - Must start with SELECT or WITH (case-insensitive)
+        - Must not start with DDL/DML keywords
+
+        Args:
+            query: Raw SQL string from params
+
+        Raises:
+            ExecutorValidationError: If query is unsafe
+        """
+        stripped = query.strip()
+        if not stripped:
+            raise ExecutorValidationError(
+                self.node.id,
+                "Pushdown query is empty"
+            )
+
+        first_word = stripped.split()[0].upper()
+
+        if first_word in self._FORBIDDEN_SQL_PREFIXES:
+            raise ExecutorValidationError(
+                self.node.id,
+                f"Pushdown query must be a read-only SELECT/WITH statement, "
+                f"got '{first_word}' (DDL/DML not allowed)"
+            )
+
+        if first_word not in ("SELECT", "WITH"):
+            raise ExecutorValidationError(
+                self.node.id,
+                f"Pushdown query must start with SELECT or WITH, got '{first_word}'"
+            )
+
+    def _resolve_postgresql_config(self, params: Dict[str, Any]) -> Any:
+        """Resolve PostgreSQL config from profile connection or inline params.
+
+        If ``params`` contains a ``connection:`` key, loads the named profile
+        and merges inline params as overrides. Otherwise uses inline params
+        directly.
+
+        Args:
+            params: Source node params dict
+
+        Returns:
+            PostgreSQLConfig instance
+        """
+        from seeknal.connections.postgresql import parse_postgresql_config  # ty: ignore[unresolved-import]
+
+        connection_name = params.get("connection")
+        if connection_name:
+            from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
+
+            loader = ProfileLoader()
+            profile = loader.load_connection_profile(connection_name)
+            # Inline params override profile defaults
+            for key in ("host", "port", "database", "user", "password", "schema",
+                        "sslmode", "connect_timeout"):
+                if key in params:
+                    profile[key] = params[key]
+            config = parse_postgresql_config(profile)
+            loader.clear_connection_credentials(profile)
+        else:
+            config = parse_postgresql_config(params)
+
+        return config
+
     def _load_postgresql(
         self,
         con: Any,
@@ -638,12 +732,18 @@ class SourceExecutor(BaseExecutor):
         """
         Load data from PostgreSQL database using DuckDB.
 
+        Supports two connection modes:
+        1. **Profile-based**: ``params: { connection: my_pg }`` resolves from
+           ``profiles.yml`` connections section. Inline params override profile.
+        2. **Inline**: ``params: { host, port, database, user, password }``
+           (existing behavior, still works).
+
         Requires the postgres extension to be loaded.
 
         Args:
             con: DuckDB connection
             table: Table name in PostgreSQL database
-            params: Connection parameters (host, port, database, user, password, schema)
+            params: Connection parameters or connection profile reference
 
         Returns:
             Number of rows loaded
@@ -651,13 +751,9 @@ class SourceExecutor(BaseExecutor):
         Raises:
             ExecutorExecutionError: If loading fails
         """
-        # Get connection parameters
-        host = params.get("host", "localhost")
-        port = params.get("port", 5432)
-        database = params.get("database", "postgres")
-        user = params.get("user", "postgres")
-        password = params.get("password", "")
-        pg_schema = params.get("schema", "public")
+        from seeknal.connections.postgresql import mask_password  # ty: ignore[unresolved-import]
+
+        config = self._resolve_postgresql_config(params)
 
         # Create schema-qualified view name from node ID (consistent with CSV loader)
         node_id = self.node.id
@@ -665,6 +761,8 @@ class SourceExecutor(BaseExecutor):
             duckdb_schema, view_name = node_id.split(".", 1)
         else:
             duckdb_schema, view_name = "source", node_id
+
+        conn_str = config.to_libpq_string()
 
         try:
             # Load postgres extension
@@ -680,7 +778,7 @@ class SourceExecutor(BaseExecutor):
             pg_alias = f"pg_{view_name}"
             try:
                 con.execute(f"""
-                ATTACH 'host={host} port={port} dbname={database} user={user} password={password}'
+                ATTACH '{conn_str}'
                 AS {pg_alias} (TYPE postgres)
                 """)
             except Exception as e:
@@ -688,10 +786,29 @@ class SourceExecutor(BaseExecutor):
                 if "already exists" not in str(e):
                     raise
 
-            # Create view from PostgreSQL table
-            full_table_name = f"{pg_alias}.{pg_schema}.{table}"
             qualified_view = f"{duckdb_schema}.{view_name}"
-            con.execute(f"CREATE OR REPLACE VIEW {qualified_view} AS SELECT * FROM {full_table_name}")
+
+            # Use postgres_query() for pushdown queries, or table scan
+            pushdown_query = params.get("query")
+            if pushdown_query:
+                # Pushdown: run arbitrary SELECT on the remote PostgreSQL
+                escaped_query = pushdown_query.replace("'", "''")
+                con.execute(
+                    f"CREATE OR REPLACE VIEW {qualified_view} AS "
+                    f"SELECT * FROM postgres_query('{pg_alias}', '{escaped_query}')"
+                )
+            else:
+                # Table scan: SELECT * FROM attached table
+                # If table already contains schema (e.g., "public.customers"),
+                # use it directly; otherwise prepend config.schema
+                if "." in table:
+                    full_table_name = f"{pg_alias}.{table}"
+                else:
+                    full_table_name = f"{pg_alias}.{config.schema}.{table}"
+                con.execute(
+                    f"CREATE OR REPLACE VIEW {qualified_view} AS "
+                    f"SELECT * FROM {full_table_name}"
+                )
 
             # Count rows
             count_result = con.execute(f"SELECT COUNT(*) FROM {qualified_view}").fetchone()
@@ -702,9 +819,11 @@ class SourceExecutor(BaseExecutor):
         except ExecutorExecutionError:
             raise
         except Exception as e:
+            safe_msg = mask_password(str(e))
             raise ExecutorExecutionError(
                 self.node.id,
-                f"Failed to load from PostgreSQL database '{database}', table '{table}': {str(e)}",
+                f"Failed to load from PostgreSQL '{config.host}:{config.port}/{config.database}', "
+                f"table '{table}': {safe_msg}",
                 e
             ) from e
 
@@ -729,7 +848,7 @@ class SourceExecutor(BaseExecutor):
             Number of rows loaded
         """
         try:
-            from seeknal.connections.starrocks import create_starrocks_connection
+            from seeknal.connections.starrocks import create_starrocks_connection  # ty: ignore[unresolved-import]
         except ImportError:
             raise ExecutorExecutionError(
                 self.node.id,
@@ -775,7 +894,7 @@ class SourceExecutor(BaseExecutor):
                 return 0
 
             # Create DuckDB view from fetched data
-            import pandas as pd
+            import pandas as pd  # ty: ignore[unresolved-import]
             df = pd.DataFrame(rows, columns=columns)
 
             # Register as DuckDB table then create view
@@ -1027,40 +1146,78 @@ class SourceExecutor(BaseExecutor):
         if "source" not in result.metadata:
             result.metadata["source"] = self.node.config.get("source", "unknown")
 
-        # Handle Iceberg materialization if enabled
+        # Handle materialization if enabled
         if result.status == ExecutionStatus.SUCCESS and not result.is_dry_run:
-            try:
-                # Get the context's DuckDB connection (has the view)
-                con = self.context.get_duckdb_connection()
-                mat_result = materialize_node_if_enabled(
-                    self.node, 
-                    source_con=con,
-                    enabled_override=self.context.materialize_enabled
-                )
-                if mat_result:
-                    # Materialization was enabled and succeeded
+            # Check for multi-target materializations (new dispatcher path)
+            mat_targets = self.node.config.get("materializations", [])
+            if mat_targets and self.context.materialize_enabled is not False:
+                try:
+                    con = self.context.get_duckdb_connection()
+                    view_name = f"{self.node.node_type.value}.{self.node.name}"
+                    dispatcher = MaterializationDispatcher()
+                    dispatch_result = dispatcher.dispatch(
+                        con=con,
+                        view_name=view_name,
+                        targets=mat_targets,
+                        node_id=self.node.id,
+                    )
                     result.metadata["materialization"] = {
                         "enabled": True,
-                        "success": mat_result.get("success", False),
-                        "table": mat_result.get("table"),
-                        "row_count": mat_result.get("row_count"),
-                        "mode": mat_result.get("mode"),
-                        "iceberg_table": mat_result.get("iceberg_table"),
+                        "success": dispatch_result.all_succeeded,
+                        "total": dispatch_result.total,
+                        "succeeded": dispatch_result.succeeded,
+                        "failed": dispatch_result.failed,
+                        "results": dispatch_result.results,
                     }
-                    logger.info(
-                        f"Materialized node '{self.node.id}' to Iceberg table "
-                        f"'{mat_result.get('table')}' ({mat_result.get('row_count')} rows)"
+                    if dispatch_result.all_succeeded:
+                        logger.info(
+                            f"Materialized node '{self.node.id}' to "
+                            f"{dispatch_result.succeeded}/{dispatch_result.total} targets"
+                        )
+                    else:
+                        logger.warning(
+                            f"Materialized node '{self.node.id}': "
+                            f"{dispatch_result.succeeded}/{dispatch_result.total} succeeded"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to materialize node '{self.node.id}': {e}"
                     )
-            except Exception as e:
-                # Log materialization error but don't fail the executor
-                # Materialization is optional/augmentation, not core functionality
-                logger.warning(
-                    f"Failed to materialize node '{self.node.id}' to Iceberg: {e}"
-                )
-                result.metadata["materialization"] = {
-                    "enabled": True,
-                    "success": False,
-                    "error": str(e),
-                }
+                    result.metadata["materialization"] = {
+                        "enabled": True,
+                        "success": False,
+                        "error": str(e),
+                    }
+            elif not mat_targets:
+                # Fallback: legacy Iceberg-only path (singular materialization config)
+                try:
+                    con = self.context.get_duckdb_connection()
+                    mat_result = materialize_node_if_enabled(
+                        self.node,
+                        source_con=con,
+                        enabled_override=self.context.materialize_enabled
+                    )
+                    if mat_result:
+                        result.metadata["materialization"] = {
+                            "enabled": True,
+                            "success": mat_result.get("success", False),
+                            "table": mat_result.get("table"),
+                            "row_count": mat_result.get("row_count"),
+                            "mode": mat_result.get("mode"),
+                            "iceberg_table": mat_result.get("iceberg_table"),
+                        }
+                        logger.info(
+                            f"Materialized node '{self.node.id}' to Iceberg table "
+                            f"'{mat_result.get('table')}' ({mat_result.get('row_count')} rows)"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to materialize node '{self.node.id}' to Iceberg: {e}"
+                    )
+                    result.metadata["materialization"] = {
+                        "enabled": True,
+                        "success": False,
+                        "error": str(e),
+                    }
 
         return result

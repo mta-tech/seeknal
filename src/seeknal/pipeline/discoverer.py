@@ -64,7 +64,7 @@ class PythonPipelineDiscoverer:
             SyntaxError: If the file has syntax errors
             ImportError: If the file cannot be imported
         """
-        from seeknal.pipeline.decorators import get_registered_nodes, clear_registry
+        from seeknal.pipeline.decorators import get_registered_nodes, clear_registry  # ty: ignore[unresolved-import]
 
         # Clear registry before importing to avoid cross-file pollution
         clear_registry()
@@ -92,6 +92,12 @@ class PythonPipelineDiscoverer:
         # Collect registered nodes
         nodes = []
         for node_id, node_meta in get_registered_nodes().items():
+            # Pick up @materialize decorator list from the original function
+            func = node_meta.get("func")
+            if func is not None:
+                mat_list = getattr(func, "_seeknal_materializations", None)
+                if mat_list:
+                    node_meta["materializations"] = list(mat_list)
             nodes.append(node_meta)
 
         # Clear registry again for cleanliness
