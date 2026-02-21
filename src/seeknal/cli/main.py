@@ -151,6 +151,11 @@ from seeknal.cli.materialization_cli import app as iceberg_app
 
 app.add_typer(iceberg_app, name="iceberg")
 
+# Documentation search commands
+from seeknal.cli.docs import docs_app
+
+app.add_typer(docs_app, name="docs")
+
 # Virtual environment management
 env_app = typer.Typer(help="Virtual environments for safe pipeline development (plan/apply/promote)")
 app.add_typer(env_app, name="env")
