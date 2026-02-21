@@ -50,6 +50,7 @@ class EnvironmentPlan:
     removed_nodes: List[str]
     created_at: str
     total_nodes_to_execute: int
+    profile_path: Optional[str] = None  # Persisted profile path for apply
 
 
 @dataclass
@@ -96,7 +97,7 @@ class EnvironmentManager:
         with open(path) as f:
             return json.load(f)
 
-    def plan(self, env_name: str, new_manifest: Manifest) -> EnvironmentPlan:
+    def plan(self, env_name: str, new_manifest: Manifest, profile_path: Optional[Path] = None) -> EnvironmentPlan:
         """Create a plan for the given environment.
 
         1. Load production manifest
@@ -111,6 +112,7 @@ class EnvironmentManager:
         """
         prod_manifest = self._load_production_manifest()
         rebuild_map: Dict[str, ChangeCategory] = {}
+        profile_str = str(profile_path) if profile_path else None
         if prod_manifest is None:
             # First time - treat all nodes as new
             categorized = {nid: ChangeCategory.NON_BREAKING.value for nid in new_manifest.nodes}
@@ -122,6 +124,7 @@ class EnvironmentManager:
                 removed_nodes=[],
                 created_at=self._now_iso(),
                 total_nodes_to_execute=len(new_manifest.nodes),
+                profile_path=profile_str,
             )
         else:
             diff = ManifestDiff.compare(prod_manifest, new_manifest)
@@ -140,6 +143,7 @@ class EnvironmentManager:
                     1 for cat in rebuild_map.values()
                     if cat != ChangeCategory.METADATA
                 ),
+                profile_path=profile_str,
             )
 
         # Create env directory and save plan
@@ -258,17 +262,41 @@ class EnvironmentManager:
             if cat_str != ChangeCategory.METADATA.value
         }
 
+        # Restore profile_path from plan if saved
+        saved_profile = plan_data.get("profile_path")
+        profile_path = Path(saved_profile) if saved_profile else None
+
         return {
             "plan": plan_data,
             "manifest": new_manifest,
             "env_dir": env_dir,
             "nodes_to_execute": nodes_to_execute,
+            "profile_path": profile_path,
         }
 
-    def promote(self, from_env: str, to_env: str = "prod") -> None:
+    def promote(
+        self,
+        from_env: str,
+        to_env: str = "prod",
+        rematerialize: bool = False,
+        profile_path: Optional[Path] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
         """Promote environment outputs to production (or another env).
 
         Uses atomic two-phase approach: copy to temp, then rename.
+        When rematerialize=True, returns info needed by the CLI to
+        re-execute materialization targets with production credentials.
+
+        Args:
+            from_env: Source environment name.
+            to_env: Target ('prod' for production, or another env name).
+            rematerialize: If True, return materialization nodes for re-execution.
+            profile_path: Path to profiles.yml (used when rematerialize=True).
+            dry_run: If True, skip file operations and return plan only.
+
+        Returns:
+            Dict with promotion info: 'promoted', 'rematerialize_nodes', 'manifest'.
 
         Raises:
             ValueError: If source environment doesn't exist or hasn't been applied
@@ -289,6 +317,30 @@ class EnvironmentManager:
                 f"Environment '{from_env}' has not been applied. "
                 f"Run 'seeknal env apply {from_env}' first."
             )
+
+        # Load manifest for rematerialize info
+        manifest_data = self._load_json(from_dir / "manifest.json")
+        manifest = Manifest.from_dict(manifest_data) if manifest_data else None
+
+        # Collect nodes that have materializations for re-execution
+        rematerialize_nodes: Set[str] = set()
+        if rematerialize and manifest:
+            for node_id, node in manifest.nodes.items():
+                mat = node.config.get("materializations") or node.config.get("materialization")
+                if mat:
+                    rematerialize_nodes.add(node_id)
+
+        result: Dict[str, Any] = {
+            "promoted": not dry_run,
+            "rematerialize_nodes": rematerialize_nodes,
+            "manifest": manifest,
+            "from_env": from_env,
+            "to_env": to_env,
+            "profile_path": profile_path,
+        }
+
+        if dry_run:
+            return result
 
         if to_env == "prod":
             # Promote to production
@@ -344,6 +396,8 @@ class EnvironmentManager:
                         shutil.copytree(src, dst)
                     else:
                         shutil.copy2(src, dst)
+
+        return result
 
     def list_environments(self) -> List[EnvironmentConfig]:
         """List all environments with their status."""

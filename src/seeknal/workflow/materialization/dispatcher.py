@@ -75,6 +75,7 @@ class MaterializationDispatcher:
         view_name: str,
         targets: List[Dict[str, Any]],
         node_id: str = "",
+        env_name: Optional[str] = None,
     ) -> DispatchResult:
         """Materialize to all *targets*. Best-effort: continues on failure.
 
@@ -85,6 +86,9 @@ class MaterializationDispatcher:
                 contain at least a ``type`` key (``"iceberg"`` or
                 ``"postgresql"``).  If omitted, defaults to ``"iceberg"``.
             node_id: Node identifier used in log messages.
+            env_name: Optional environment name for namespace prefixing.
+                When set, PostgreSQL schemas and Iceberg namespaces are
+                prefixed with ``{env_name}_`` to isolate environments.
 
         Returns:
             ``DispatchResult`` with per-target outcomes.
@@ -92,6 +96,10 @@ class MaterializationDispatcher:
         result = DispatchResult(total=len(targets))
 
         for i, target in enumerate(targets):
+            # Apply env-based namespace prefix if running in an environment
+            if env_name:
+                target = self._prefix_target(target, env_name)
+
             target_type = target.get("type", "iceberg")
             target_label = (
                 f"{node_id}[{i}]:{target_type}" if node_id else f"[{i}]:{target_type}"
@@ -131,6 +139,79 @@ class MaterializationDispatcher:
         return result
 
     # ------------------------------------------------------------------
+    # Environment namespace prefixing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _prefix_target(
+        target: Dict[str, Any], env_name: str
+    ) -> Dict[str, Any]:
+        """Return a copy of *target* with env-prefixed schema/namespace.
+
+        For PostgreSQL targets: ``schema.table`` -> ``{env}_schema.table``
+        For Iceberg targets: ``catalog.ns.table`` -> ``catalog.{env}_ns.table``
+
+        Args:
+            target: Original materialization target config.
+            env_name: Environment name to use as prefix.
+
+        Returns:
+            New dict with prefixed table name.
+        """
+        prefixed = dict(target)
+        table = prefixed.get("table", "")
+        target_type = prefixed.get("type", "iceberg")
+
+        if target_type == "postgresql" and "." in table:
+            # PostgreSQL: schema.table -> {env}_schema.table
+            schema, table_name = table.split(".", 1)
+            prefixed["table"] = f"{env_name}_{schema}.{table_name}"
+        elif target_type == "iceberg" and table.count(".") >= 2:
+            # Iceberg: catalog.namespace.table -> catalog.{env}_namespace.table
+            parts = table.split(".", 2)
+            catalog_part, ns_part, table_part = parts[0], parts[1], parts[2]
+            prefixed["table"] = f"{catalog_part}.{env_name}_{ns_part}.{table_part}"
+
+        return prefixed
+
+    @staticmethod
+    def _ensure_pg_schema(con: Any, pg_config: Any, schema_name: str) -> None:
+        """Create a PostgreSQL schema if it doesn't exist.
+
+        Uses DuckDB's postgres extension to execute DDL on the remote database.
+
+        Args:
+            con: DuckDB connection (with postgres extension loaded).
+            pg_config: PostgreSQL config with ``to_libpq_string()`` method.
+            schema_name: Schema name to create.
+        """
+        if schema_name == "public":
+            return  # public always exists
+
+        import re
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", schema_name):
+            logger.warning("Skipping schema creation for unsafe name: %s", schema_name)
+            return
+
+        try:
+            libpq = pg_config.to_libpq_string()
+            alias = "_schema_check"
+            con.execute("INSTALL postgres; LOAD postgres;")
+            con.execute(f"ATTACH '{libpq}' AS {alias} (TYPE POSTGRES)")
+            try:
+                con.execute(
+                    f"CALL postgres_execute('{alias}', "
+                    f"'CREATE SCHEMA IF NOT EXISTS {schema_name}')"
+                )
+            finally:
+                try:
+                    con.execute(f"DETACH {alias}")
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("Could not ensure schema '%s' exists: %s", schema_name, exc)
+
+    # ------------------------------------------------------------------
     # Backend-specific routing
     # ------------------------------------------------------------------
 
@@ -157,6 +238,12 @@ class MaterializationDispatcher:
             conn_dict = ProfileLoader().load_connection_profile(connection_name)
 
         pg_config = parse_postgresql_config(conn_dict)
+
+        # Ensure schema exists (needed for env-prefixed schemas)
+        table_str = mat_config.table
+        if "." in table_str:
+            schema_name = table_str.split(".", 1)[0]
+            self._ensure_pg_schema(con, pg_config, schema_name)
 
         # Create helper and materialize
         helper = PostgresMaterializationHelper(pg_config, mat_config)

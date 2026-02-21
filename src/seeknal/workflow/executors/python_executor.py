@@ -320,6 +320,7 @@ class PythonExecutor(BaseExecutor):
                 view_name=view_name,
                 targets=mat_targets,
                 node_id=self.node.id,
+                env_name=getattr(self.context, 'env_name', None),
             )
 
             result.metadata["materialization"] = {

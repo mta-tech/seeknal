@@ -194,6 +194,7 @@ class DAGBuilder:
     project_path: str | Path = ".",
     cli_overrides: dict[str, Any] | None = None,
     run_id: str | None = None,
+    profile_path: Optional[Path] = None,
 ) -> None:
         """
         Initialize the DAG builder.
@@ -203,6 +204,7 @@ class DAGBuilder:
                          directory will be searched relative to this path.
             cli_overrides: Parameter values from CLI flags (takes precedence).
             run_id: Custom run ID for parameterization.
+            profile_path: Path to profiles.yml for source_defaults and connections.
 
         Raises:
             ValueError: If the project path contains path traversal sequences
@@ -239,6 +241,10 @@ class DAGBuilder:
         # Parameter resolution support
         self.cli_overrides: dict[str, Any] = cli_overrides or {}
         self.run_id: str | None = run_id
+
+        # Profile path for source_defaults (lazy-loaded)
+        self.profile_path: Optional[Path] = profile_path
+        self._profile_loader: Any = None  # Lazy ProfileLoader instance
 
         # Common config (loaded in build())
         self._common_config: dict[str, str] | None = None
@@ -396,6 +402,47 @@ class DAGBuilder:
 
         return data
 
+    def _get_profile_loader(self) -> Any:
+        """Get or create a ProfileLoader instance (lazy import to avoid circular deps).
+
+        Returns:
+            ProfileLoader instance, or None if no profile_path is set.
+        """
+        if self._profile_loader is not None:
+            return self._profile_loader
+        if self.profile_path is None:
+            return None
+        # Lazy import to avoid circular dependency through seeknal.dag.manifest
+        from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
+
+        self._profile_loader = ProfileLoader(profile_path=self.profile_path)
+        return self._profile_loader
+
+    def _merge_source_defaults(self, data: dict[str, Any], source_type: str) -> None:
+        """Merge source_defaults from profile into a source node's params.
+
+        Shallow merge: ``{**source_defaults[type], **inline_params}``.
+        Inline params always win over defaults.
+
+        Args:
+            data: Parsed YAML data dict (mutated in place)
+            source_type: Source type string (e.g., "iceberg", "postgresql")
+        """
+        loader = self._get_profile_loader()
+        if loader is None:
+            return
+
+        defaults = loader.load_source_defaults(source_type)
+        if not defaults:
+            return
+
+        # Guard against params: null in YAML
+        inline_params = data.get("params") or {}
+
+        # Shallow merge: defaults first, then inline overrides
+        merged = {**defaults, **inline_params}
+        data["params"] = merged
+
     def build(self) -> None:
         """
         Build the DAG by scanning and parsing all YAML and Python files.
@@ -551,6 +598,12 @@ class DAGBuilder:
                 )
                 data["transform"] = resolver.resolve_string(data["transform"])
 
+            # Merge source_defaults from profile into source nodes
+            if kind_str == "source":
+                source_type = data.get("source")
+                if source_type:
+                    self._merge_source_defaults(data, source_type)
+
             # Normalize materializations (plural/singular)
             data = self._normalize_materializations(data, file_path)
 
@@ -635,6 +688,10 @@ class DAGBuilder:
                     # Copy params (e.g., catalog_uri, warehouse for iceberg sources)
                     if "params" in node_meta:
                         yaml_data["params"] = node_meta["params"]
+                    # Merge source_defaults from profile
+                    source_type = yaml_data.get("source")
+                    if source_type:
+                        self._merge_source_defaults(yaml_data, source_type)
                 elif kind_str in ("transform", "feature_group"):
                     # Include inputs from metadata
                     if "inputs" in node_meta:

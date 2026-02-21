@@ -26,6 +26,11 @@ from seeknal.workflow.state import (
     calculate_node_hash, find_downstream_nodes,
 )
 
+# TYPE_CHECKING import to avoid circular deps at runtime
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from seeknal.workflow.executors.base import ExecutionContext
+
 
 class ExecutionStatus(Enum):
     """Status of a node execution."""
@@ -102,6 +107,7 @@ class DAGRunner:
         manifest: Manifest,
         old_manifest: Optional[Manifest] = None,
         target_path: Optional[Path] = None,
+        exec_context: Optional["ExecutionContext"] = None,
     ):
         """Initialize the runner.
 
@@ -109,12 +115,16 @@ class DAGRunner:
             manifest: The current manifest to execute
             old_manifest: Previous manifest for change detection
             target_path: Path to target directory (default: target/)
+            exec_context: Optional execution context for the new executor system.
+                When provided, _execute_by_type uses get_executor() instead of
+                the legacy execute_* functions.
         """
         self.manifest = manifest
         self.old_manifest = old_manifest
         self.target_path = target_path or Path("target")
         self.target_path.mkdir(parents=True, exist_ok=True)
         self.state_path = self.target_path / "run_state.json"
+        self.exec_context = exec_context
 
         # Load or initialize unified state
         self.run_state: RunState = load_state(self.state_path) or RunState()
@@ -410,6 +420,10 @@ class DAGRunner:
         """
         Execute a node based on its type.
 
+        When exec_context is provided, delegates to get_executor() from the
+        new executor system. Otherwise, falls back to the legacy execute_*
+        functions for backward compatibility.
+
         Args:
             node: Node to execute
 
@@ -419,6 +433,21 @@ class DAGRunner:
         Raises:
             NotImplementedError: If node type is not supported
         """
+        # New executor path: use get_executor when ExecutionContext is available
+        if self.exec_context is not None:
+            from seeknal.workflow.executors import get_executor
+
+            executor = get_executor(node, self.exec_context)
+            result = executor.run()
+
+            return {
+                "row_count": result.row_count,
+                "status": result.status.value,
+                "error_message": result.error_message,
+                **(result.metadata or {}),
+            }
+
+        # Legacy path: use execute_* functions from executor.py
         from seeknal.workflow.executor import (
             execute_source,
             execute_transform,

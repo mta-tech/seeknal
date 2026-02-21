@@ -754,6 +754,7 @@ def run(
             continue_on_error=continue_on_error,
             dry_run=dry_run,
             show_plan=show_plan,
+            profile_path=Path(profile) if profile else None,
         )
         return
 
@@ -1024,7 +1025,18 @@ def _run_yaml_pipeline(
             for downstream_id in dag_builder.get_downstream(node_id):
                 _manifest.add_edge(node_id, downstream_id)
 
-        _runner = _DAGRunner(_manifest, target_path=target_path)
+        _parallel_ctx = ExecutionContext(
+            project_name=project_path.name,
+            workspace_path=project_path,
+            target_path=target_path,
+            dry_run=dry_run,
+            verbose=True,
+            materialize_enabled=materialize,
+            params={},
+            common_config=dag_builder._common_config,
+            profile_path=profile_path,
+        )
+        _runner = _DAGRunner(_manifest, target_path=target_path, exec_context=_parallel_ctx)
         parallel_runner = ParallelDAGRunner(_runner, max_workers, continue_on_error)
         parallel_summary = parallel_runner.run(nodes_to_run, dry_run=dry_run)
         print_parallel_summary(parallel_summary)
@@ -2777,15 +2789,25 @@ def promote(
 
 
 @app.command()
-def repl():
+def repl(
+    profile: Optional[str] = typer.Option(
+        None, "--profile",
+        help="Path to profiles.yml for connections (default: ~/.seeknal/profiles.yml)"
+    ),
+):
     """Start interactive SQL REPL.
 
     The SQL REPL allows you to explore data across multiple sources using DuckDB
     as a unified query engine. Connect to PostgreSQL, MySQL, SQLite databases,
     or query local parquet/csv files.
 
+    When run inside a seeknal project directory, the REPL auto-registers
+    intermediate parquets, PostgreSQL tables, and Iceberg catalogs from the
+    most recent pipeline run.
+
     Examples:
         seeknal repl
+        seeknal repl --profile profiles.yml
         seeknal> .connect mydb                   (saved source)
         seeknal> .connect postgres://user:pass@host/db
         seeknal> .connect /path/to/data.parquet
@@ -2798,9 +2820,19 @@ def repl():
         seeknal source list
         seeknal source remove mydb
     """
+    from pathlib import Path
     from seeknal.cli.repl import run_repl
 
-    run_repl()
+    # Detect project context
+    project_path = None
+    cwd = Path.cwd().resolve()
+    if (cwd / "seeknal_project.yml").exists():
+        project_path = cwd
+
+    # Resolve profile path
+    profile_path = Path(profile) if profile else None
+
+    run_repl(project_path=project_path, profile_path=profile_path)
 
 
 @app.command()
@@ -3496,6 +3528,10 @@ def deploy_metrics(
 def env_plan(
     env_name: str = typer.Argument(..., help="Environment name (e.g., dev, staging)"),
     project_path: Path = typer.Option(".", help="Project directory"),
+    profile: Optional[str] = typer.Option(
+        None, "--profile",
+        help="Path to profiles.yml for source_defaults and connections"
+    ),
 ):
     """Preview changes in a virtual environment."""
     from seeknal.workflow.environment import EnvironmentManager
@@ -3503,18 +3539,20 @@ def env_plan(
 
     project_path = Path(project_path).resolve()
     target_path = project_path / "target"
+    explicit_profile = Path(profile) if profile else None
+    profile_path = _resolve_env_profile(env_name, project_path, explicit_profile)
 
     _echo_info(f"Planning environment '{env_name}'...")
 
     # Build current manifest from YAML files
-    dag_builder = DAGBuilder(project_path=project_path)
+    dag_builder = DAGBuilder(project_path=project_path, profile_path=profile_path)
     dag_builder.build()
 
     # Convert to Manifest using shared helper
     manifest = _build_manifest_from_dag(dag_builder, project_path.name)
 
     manager = EnvironmentManager(target_path)
-    plan = manager.plan(env_name, manifest)
+    plan = manager.plan(env_name, manifest, profile_path=profile_path)
 
     # Display plan
     _echo_info("")
@@ -3546,6 +3584,44 @@ def env_plan(
     _echo_success(f"Plan saved to {env_dir / 'plan.json'}")
 
 
+def _resolve_env_profile(
+    env_name: str,
+    project_path: Path,
+    explicit_profile: Optional[Path] = None,
+) -> Optional[Path]:
+    """Resolve profiles.yml with env-specific convention-based discovery.
+
+    Priority order:
+      1. Explicit --profile flag (highest)
+      2. profiles-{env}.yml in project root
+      3. ~/.seeknal/profiles-{env}.yml
+      4. None (fall through to default profiles.yml in ProfileLoader)
+
+    Args:
+        env_name: Environment name (e.g., "dev", "staging")
+        project_path: Resolved project root directory
+        explicit_profile: Explicitly provided --profile path (takes precedence)
+
+    Returns:
+        Resolved Path to profiles.yml, or None to use default
+    """
+    if explicit_profile is not None:
+        return explicit_profile
+
+    # Convention: profiles-{env}.yml in project root
+    project_env_profile = project_path / f"profiles-{env_name}.yml"
+    if project_env_profile.exists():
+        return project_env_profile
+
+    # Convention: ~/.seeknal/profiles-{env}.yml
+    from seeknal.context import CONFIG_BASE_URL
+    home_env_profile = Path(CONFIG_BASE_URL) / f"profiles-{env_name}.yml"
+    if home_env_profile.exists():
+        return home_env_profile
+
+    return None
+
+
 def _run_in_environment(
     env_name: str,
     project_path: Path,
@@ -3555,6 +3631,7 @@ def _run_in_environment(
     continue_on_error: bool = False,
     dry_run: bool = False,
     show_plan: bool = False,
+    profile_path: Optional[Path] = None,
 ) -> None:
     """Execute a plan in a virtual environment.
 
@@ -3573,7 +3650,11 @@ def _run_in_environment(
         continue_on_error: Continue execution after failures.
         dry_run: Show what would execute without running.
         show_plan: Show execution plan and exit (no execution).
+        profile_path: Path to profiles.yml for source_defaults and connections.
     """
+    # Auto-discover env-specific profile if not explicitly provided
+    profile_path = _resolve_env_profile(env_name, project_path, profile_path)
+
     from seeknal.workflow.environment import EnvironmentManager
 
     target_path = project_path / "target"
@@ -3591,6 +3672,10 @@ def _run_in_environment(
     nodes_to_execute = apply_info["nodes_to_execute"]
     env_dir = apply_info["env_dir"]
     manifest = apply_info["manifest"]
+
+    # Restore profile_path from plan.json if not explicitly provided
+    if profile_path is None and apply_info.get("profile_path"):
+        profile_path = apply_info["profile_path"]
 
     if not nodes_to_execute:
         _echo_success("No nodes to execute (metadata-only changes).")
@@ -3626,8 +3711,19 @@ def _run_in_environment(
 
     # Execute nodes using DAGRunner with env-specific target path
     from seeknal.workflow.runner import DAGRunner
+    from seeknal.workflow.executors import ExecutionContext
 
-    runner = DAGRunner(manifest, target_path=env_dir)
+    exec_context = ExecutionContext(
+        project_name=project_path.name,
+        workspace_path=project_path,
+        target_path=env_dir,
+        dry_run=dry_run,
+        verbose=True,
+        profile_path=profile_path,
+        env_name=env_name,
+    )
+
+    runner = DAGRunner(manifest, target_path=env_dir, exec_context=exec_context)
 
     if parallel:
         from seeknal.workflow.parallel import ParallelDAGRunner, print_parallel_summary
@@ -3696,6 +3792,10 @@ def env_apply(
     continue_on_error: bool = typer.Option(False, "--continue-on-error", help="Continue past failures"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would execute without running"),
     project_path: Path = typer.Option(".", help="Project directory"),
+    profile: Optional[str] = typer.Option(
+        None, "--profile",
+        help="Path to profiles.yml for source_defaults and connections"
+    ),
 ):
     """Execute a plan in a virtual environment.
 
@@ -3712,10 +3812,18 @@ def env_apply(
         max_workers=max_workers,
         continue_on_error=continue_on_error,
         dry_run=dry_run,
+        profile_path=Path(profile) if profile else None,
     )
 
 
-def _promote_environment(from_env: str, to_env: str, project_path: Path):
+def _promote_environment(
+    from_env: str,
+    to_env: str,
+    project_path: Path,
+    dry_run: bool = False,
+    profile: Optional[str] = None,
+    rematerialize: bool = False,
+):
     """Shared logic for promoting an environment.
 
     Used by both `seeknal promote` and `seeknal env promote`.
@@ -3724,6 +3832,7 @@ def _promote_environment(from_env: str, to_env: str, project_path: Path):
 
     project_path = Path(project_path).resolve()
     target_path = project_path / "target"
+    profile_path = Path(profile) if profile else None
 
     manager = EnvironmentManager(target_path)
     target_label = "production" if to_env == "prod" else f"environment '{to_env}'"
@@ -3742,16 +3851,72 @@ def _promote_environment(from_env: str, to_env: str, project_path: Path):
             _echo_info(f"  New nodes: {len(added)}")
         if removed:
             _echo_info(f"  Removed nodes: {len(removed)}")
+        if rematerialize:
+            _echo_info(f"  Re-materialization: enabled")
         _echo_info("")
+
+    if dry_run:
+        result = manager.promote(
+            from_env, to_env,
+            rematerialize=rematerialize,
+            profile_path=profile_path,
+            dry_run=True,
+        )
+        _echo_info(f"Dry run: would promote '{from_env}' to {target_label}")
+        if result["rematerialize_nodes"]:
+            _echo_info(f"  Nodes to re-materialize: {len(result['rematerialize_nodes'])}")
+            for nid in sorted(result["rematerialize_nodes"]):
+                manifest = result["manifest"]
+                node = manifest.get_node(nid) if manifest else None
+                _echo_info(f"    - {node.name if node else nid}")
+        return
 
     typer.confirm(
         f"Promote environment '{from_env}' to {target_label}?",
         abort=True,
     )
 
-    manager.promote(from_env, to_env)
+    result = manager.promote(
+        from_env, to_env,
+        rematerialize=rematerialize,
+        profile_path=profile_path,
+    )
 
     _echo_success(f"Environment '{from_env}' promoted to {target_label}.")
+
+    # Re-materialize if requested
+    if rematerialize and result["rematerialize_nodes"] and result["manifest"]:
+        _echo_info(f"Re-materializing {len(result['rematerialize_nodes'])} node(s)...")
+        from seeknal.workflow.runner import DAGRunner
+        from seeknal.workflow.executors import ExecutionContext
+
+        manifest = result["manifest"]
+        exec_context = ExecutionContext(
+            project_name=project_path.name,
+            workspace_path=project_path,
+            target_path=target_path,
+            verbose=True,
+            profile_path=profile_path,
+        )
+        runner = DAGRunner(manifest, target_path=target_path, exec_context=exec_context)
+
+        remat_ok = 0
+        remat_fail = 0
+        for node_id in sorted(result["rematerialize_nodes"]):
+            node = manifest.get_node(node_id)
+            node_name = node.name if node else node_id
+            _echo_info(f"  Re-materializing: {node_name}...")
+            node_result = runner._execute_node(node_id)
+            if node_result.status.value == "success":
+                _echo_success(f"  {node_name} completed in {node_result.duration:.2f}s")
+                remat_ok += 1
+            else:
+                _echo_error(f"  {node_name} failed: {node_result.error_message}")
+                remat_fail += 1
+
+        _echo_info(f"  Re-materialization: {remat_ok} succeeded, {remat_fail} failed")
+        if remat_fail > 0:
+            _echo_warning("Some re-materializations failed. Production cache was already updated.")
 
 
 @env_app.command("promote")
@@ -3760,9 +3925,23 @@ def env_promote(
     from_env: str = typer.Argument(..., help="Source environment"),
     to_env: str = typer.Argument("prod", help="Target (default: prod)"),
     project_path: Path = typer.Option(".", help="Project directory"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be promoted without executing"),
+    profile: Optional[str] = typer.Option(
+        None, "--profile",
+        help="Path to profiles.yml for re-materialization connections"
+    ),
+    rematerialize: bool = typer.Option(
+        False, "--rematerialize",
+        help="Re-execute materialization targets with production credentials after promotion"
+    ),
 ):
     """Promote environment to production."""
-    _promote_environment(from_env, to_env, project_path)
+    _promote_environment(
+        from_env, to_env, project_path,
+        dry_run=dry_run,
+        profile=profile,
+        rematerialize=rematerialize,
+    )
 
 
 @env_app.command("list")

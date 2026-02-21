@@ -182,6 +182,8 @@ class ExecutionContext:
     materialize_enabled: Optional[bool] = None  # None=use node config
     params: Dict[str, Any] = field(default_factory=dict)  # Resolved parameters
     common_config: Optional[Dict[str, str]] = None  # Flat common config dict
+    profile_path: Optional[Path] = None  # Path to profiles.yml for source_defaults
+    env_name: Optional[str] = None  # Environment name for namespace prefixing
 
     def get_duckdb_connection(self):
         """Get or create DuckDB connection."""

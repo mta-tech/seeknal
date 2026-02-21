@@ -84,13 +84,27 @@ EXTENSIONS = ["postgres", "mysql", "sqlite"]
 class REPL:
     """Simple SQL REPL using DuckDB as the single query engine."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        project_path: Optional[Path] = None,
+        profile_path: Optional[Path] = None,
+    ) -> None:
         self.conn = duckdb.connect(":memory:")
         self.attached: set[str] = set()
         self._starrocks_connections: dict = {}
         self._active_starrocks: Optional[str] = None
+        self.project_path = project_path
+        self.profile_path = profile_path
+        self._registered_parquets: int = 0
+        self._registered_pg: int = 0
+        self._registered_iceberg: int = 0
+        self._node_count: int = 0
+        self._last_run: Optional[str] = None
         self._load_extensions()
         self._setup_history()
+        if self.project_path:
+            self._load_run_state()
+            self._auto_register_project()
 
     def _load_extensions(self) -> None:
         """Install and load DuckDB scanner extensions."""
@@ -114,6 +128,149 @@ class REPL:
         except Exception:
             pass
 
+    def _load_run_state(self) -> None:
+        """Load run state to get node count and last run timestamp."""
+        state_path = self.project_path / "target" / "run_state.json"
+        if not state_path.exists():
+            return
+        try:
+            import json
+            with open(state_path) as f:
+                data = json.load(f)
+            self._node_count = len(data.get("nodes", {}))
+            self._last_run = data.get("last_run")
+        except Exception:
+            pass  # Best-effort
+
+    def _auto_register_project(self) -> None:
+        """Auto-register queryable data from the project context.
+
+        Three phases, each best-effort (failures emit warnings):
+        1. Register intermediate parquets from target/cache/ as views
+        2. Attach PostgreSQL connections read-only via DuckDB ATTACH
+        3. Attach Iceberg catalogs via DuckDB Iceberg extension
+        """
+        import warnings
+
+        # Phase 1: Register intermediate parquets
+        try:
+            self._register_parquets()
+        except Exception as e:
+            warnings.warn(f"REPL: Failed to register parquets: {e}")
+
+        # Phase 2: Attach PostgreSQL connections
+        try:
+            self._register_postgresql_connections()
+        except Exception as e:
+            warnings.warn(f"REPL: Failed to attach PostgreSQL connections: {e}")
+
+        # Phase 3: Attach Iceberg catalogs
+        try:
+            self._register_iceberg_catalogs()
+        except Exception as e:
+            warnings.warn(f"REPL: Failed to attach Iceberg catalogs: {e}")
+
+    def _register_parquets(self) -> None:
+        """Phase 1: Register intermediate parquets as DuckDB views."""
+        cache_dir = self.project_path / "target" / "cache"
+        if not cache_dir.exists():
+            return
+
+        for parquet_file in cache_dir.rglob("*.parquet"):
+            view_name = parquet_file.stem
+            safe_path = str(parquet_file.resolve()).replace("'", "''")
+            try:
+                self.conn.execute(
+                    f"CREATE VIEW \"{view_name}\" AS "
+                    f"SELECT * FROM read_parquet('{safe_path}')"
+                )
+                self._registered_parquets += 1
+            except Exception:
+                pass  # Skip files that can't be read
+
+    def _register_postgresql_connections(self) -> None:
+        """Phase 2: Attach PostgreSQL connections read-only via DuckDB ATTACH."""
+        from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+        loader = ProfileLoader(profile_path=self.profile_path)
+        profile_data = loader._load_profile_data()
+        connections = profile_data.get("connections", {})
+
+        for name, config in connections.items():
+            conn_type = config.get("type", "")
+            if conn_type not in ("postgresql", "postgres"):
+                continue
+
+            try:
+                from seeknal.workflow.materialization.profile_loader import (
+                    interpolate_env_vars_in_dict,
+                )
+
+                resolved = interpolate_env_vars_in_dict(config)
+                host = resolved.get("host", "localhost")
+                port = resolved.get("port", 5432)
+                user = resolved.get("user", "")
+                password = resolved.get("password", "")
+                database = resolved.get("database", "")
+
+                conn_str = (
+                    f"host={host} port={port} dbname={database} "
+                    f"user={user} password={password} "
+                    f"connect_timeout=5"
+                )
+                self.conn.execute(
+                    f"ATTACH '{conn_str}' AS \"{name}\" (TYPE postgres, READ_ONLY)"
+                )
+                self.attached.add(name)
+                self._registered_pg += 1
+            except Exception:
+                pass  # Best-effort: skip connections that fail
+
+    def _register_iceberg_catalogs(self) -> None:
+        """Phase 3: Attach Iceberg catalogs via DuckDB Iceberg extension."""
+        from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+        loader = ProfileLoader(profile_path=self.profile_path)
+        profile_data = loader._load_profile_data()
+        mat_config = profile_data.get("materialization", {})
+        catalog_data = mat_config.get("catalog", {})
+
+        if not catalog_data or catalog_data.get("type", "rest") != "rest":
+            return
+
+        from seeknal.workflow.materialization.profile_loader import (
+            interpolate_env_vars_in_dict,
+        )
+
+        resolved = interpolate_env_vars_in_dict(catalog_data)
+        uri = resolved.get("uri", "")
+        warehouse = resolved.get("warehouse", "")
+
+        if not uri:
+            return
+
+        from seeknal.workflow.materialization.operations import DuckDBIcebergExtension
+
+        DuckDBIcebergExtension.load_extension(self.conn)
+        DuckDBIcebergExtension.configure_s3(self.conn)
+
+        # Get OAuth2 token if configured
+        bearer_token = None
+        try:
+            bearer_token = DuckDBIcebergExtension.get_oauth2_token()
+        except Exception:
+            pass  # No OAuth2 configured, try without
+
+        DuckDBIcebergExtension.attach_rest_catalog(
+            con=self.conn,
+            catalog_name="iceberg",
+            uri=uri,
+            warehouse_path=warehouse,
+            bearer_token=bearer_token,
+        )
+        self.attached.add("iceberg")
+        self._registered_iceberg += 1
+
     def _save_history(self) -> None:
         """Save readline history."""
         try:
@@ -127,6 +284,33 @@ class REPL:
         print("Commands: .connect <url>, .tables, .schema <table>, .quit")
         print("Example: .connect postgres://user:pass@host/db")
         print("         .connect starrocks://user:pass@host:9030/db")
+        if self.project_path:
+            # Build project header with node count and last run
+            header = f"Project: {self.project_path.name}"
+            meta_parts = []
+            if self._node_count:
+                meta_parts.append(f"{self._node_count} nodes")
+            if self._last_run:
+                # Show date portion only (e.g., "2026-02-21 10:38")
+                last_run_display = self._last_run[:16].replace("T", " ")
+                meta_parts.append(f"last run: {last_run_display}")
+            if meta_parts:
+                header += f" ({', '.join(meta_parts)})"
+            print(header)
+
+            # Show registration details
+            parts = []
+            if self._registered_parquets:
+                parts.append(f"  Intermediate outputs: {self._registered_parquets} tables registered")
+            if self._registered_pg:
+                parts.append(f"  PostgreSQL: {self._registered_pg} connection(s) attached (read-only)")
+            if self._registered_iceberg:
+                parts.append(f"  Iceberg: {self._registered_iceberg} catalog(s) attached")
+            if parts:
+                for part in parts:
+                    print(part)
+            elif not self._node_count:
+                print("  (no data registered)")
         print()
 
         try:
@@ -423,8 +607,25 @@ Manage sources:
             print(f"StarRocks connection failed: {sanitize_error_message(str(e))}")
 
     def _show_tables(self) -> None:
-        """List tables in all attached databases."""
-        if not self.attached:
+        """List tables in all attached databases and auto-registered views."""
+        has_content = False
+
+        # Show auto-registered parquet views (in default catalog)
+        if self._registered_parquets > 0:
+            try:
+                result = self.conn.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_catalog = 'memory' AND table_schema = 'main' "
+                    "AND table_type = 'VIEW' ORDER BY table_name"
+                ).fetchall()
+                if result:
+                    has_content = True
+                    for (view_name,) in result:
+                        print(f"  {view_name}")
+            except Exception:
+                pass
+
+        if not self.attached and not has_content:
             print("No databases connected. Use .connect <url> first.")
             return
 
@@ -582,7 +783,10 @@ Manage sources:
             print(f"StarRocks error: {sanitize_error_message(str(e))}")
 
 
-def run_repl() -> None:
+def run_repl(
+    project_path: Optional[Path] = None,
+    profile_path: Optional[Path] = None,
+) -> None:
     """Entry point for REPL."""
-    repl = REPL()
+    repl = REPL(project_path=project_path, profile_path=profile_path)
     repl.run()
