@@ -318,6 +318,52 @@ def my_transform(ctx):
 
 **Backward Compatible:** Singular `materialization:` continues to work (normalized to list).
 
+### REPL Auto-Registration
+
+REPL uses three-phase best-effort registration at startup when a project directory is detected: parquets → PostgreSQL → Iceberg. Each phase is wrapped in an independent try/except that emits warnings on failure — a failure in one phase never blocks the next.
+
+**Correct:**
+```python
+def _auto_register_project(self) -> None:
+    import warnings
+    try:
+        self._register_parquets()
+    except Exception as e:
+        warnings.warn(f'REPL: Failed to register parquets: {e}')
+    try:
+        self._register_postgresql_connections()
+    except Exception as e:
+        warnings.warn(f'REPL: Failed to attach PostgreSQL connections: {e}')
+    try:
+        self._register_iceberg_catalogs()
+    except Exception as e:
+        warnings.warn(f'REPL: Failed to attach Iceberg catalogs: {e}')
+```
+
+**Incorrect:**
+```python
+def _auto_register_project(self) -> None:
+    try:
+        self._register_parquets()
+        self._register_postgresql_connections()  # If this fails...
+        self._register_iceberg_catalogs()        # ...this never runs
+    except Exception as e:
+        warnings.warn(f'REPL: Registration failed: {e}')
+```
+
+**Rationale:** REPL startup must degrade gracefully. A PostgreSQL timeout or unreachable Iceberg catalog should not prevent intermediate parquet files from being queryable. Use `connect_timeout=5` in the libpq string for PostgreSQL ATTACH to cap startup delay. Banner metadata (node count, last run) is loaded best-effort from `target/run_state.json`.
+
+### Environment-Aware Execution
+
+`ExecutionContext` is accepted as `Optional` in `DAGRunner` for backward compatibility — existing callers pass nothing and get the legacy path; new env-aware callers pass an `ExecutionContext` and get the new routing path.
+
+- **Per-env profile auto-discovery**: `--profile` flag > `profiles-{env}.yml` in project root > `~/.seeknal/profiles-{env}.yml` > default (`None`)
+- **Namespace prefixing**: PostgreSQL `schema.table` → `{env}_schema.table`; Iceberg `catalog.ns.table` → `catalog.{env}_ns.table` — prefix applies to schema/namespace only, not catalog or table name
+- **`profile_path` round-trip**: persisted as a string in `plan.json` during `env plan`, restored as `Path` during `env apply` — explicit `--profile` on apply still overrides
+- **Copy-on-write for targets**: `_prefix_target()` always works on `dict(target)`, never mutating the caller's dict
+
+**Rationale:** Optional `ExecutionContext` allows the new env-aware path to be purely opt-in — all existing callers continue working without modification. Namespace prefixing enforces environment isolation by convention without requiring a per-env profile.
+
 ### Testing Patterns
 - Use pytest fixtures from `conftest.py`
 - Mock database operations
@@ -537,6 +583,8 @@ Based on real dataset (73,194 rows × 35 columns):
 9. **Subprocess Materialization**: PythonExecutor runs via `uv run` subprocess — DuckDB views don't persist to parent. Materialization uses intermediate parquet bridge in `post_execute()`
 10. **DuckDB Timestamp Arithmetic**: String literals need explicit `CAST('{value}' AS TIMESTAMP)` before INTERVAL arithmetic
 11. **Dispatcher Circular Imports**: MaterializationDispatcher uses lazy imports inside methods to avoid circular dependency through `seeknal.dag.manifest`
+12. **DuckDB HUGEINT for Iceberg**: `COUNT(*)` and `SUM()` return HUGEINT by default — Iceberg has no HUGEINT type. Always `CAST(COUNT(*) AS BIGINT)` and `CAST(SUM(...) AS DOUBLE)` in transforms that write to Iceberg
+13. **source_defaults alias normalization**: Profile YAML dict keys are NOT normalized at load time — use the canonical type name (`postgresql` not `postgres`) as the key in the `source_defaults:` section of `profiles.yml`
 
 ## Testing Before Commit
 
