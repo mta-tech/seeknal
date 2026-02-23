@@ -48,6 +48,13 @@ profiles_yml: |
       catalog_uri: "${LAKEKEEPER_URI:http://172.19.0.9:8181}"
       warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
 
+  materialization:
+    enabled: true
+    catalog:
+      type: rest
+      uri: "${LAKEKEEPER_URI:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
 seed_sql: |
   -- Seed data for PostgreSQL medallion QA test
   -- Run against seeknal_test database

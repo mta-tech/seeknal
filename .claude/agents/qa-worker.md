@@ -93,7 +93,35 @@ CREATE OR REPLACE TABLE atlas.qa_iceberg.signal_events AS
   SELECT * FROM read_csv_auto('data/signal_events.csv');
 ```
 
-### 6. Write Pipeline YAML Files
+### 6. Write Pipeline Files
+
+**Check `pipeline_type`** to determine which format to write:
+
+#### 6a. Python Pipelines (`pipeline_type: python`)
+
+If the spec has `pipeline_type: python` or `pipeline_files` section:
+
+```bash
+mkdir -p {output_dir}/seeknal/pipelines
+```
+
+For each entry in `pipeline_files`:
+- Write the file content to `{output_dir}/seeknal/pipelines/{filename}`
+- Preserve exact indentation and formatting from the spec
+
+Example:
+```bash
+# Write pipeline_files.medallion.py to seeknal/pipelines/medallion.py
+```
+
+**IMPORTANT for Python pipelines:**
+- Python files go in `seeknal/pipelines/`, NOT `seeknal/sources/` or `seeknal/transforms/`
+- Source nodes defined with `@source` still use `SourceExecutor` (not `PythonExecutor`)
+- Transform nodes use `PythonExecutor` which runs via `uv run` subprocess
+- Always assign `ctx.ref()` to a local variable to avoid DuckDB variable shadowing
+- The `pipeline` section in the spec is used for validation metadata only (node counts, edges)
+
+#### 6b. YAML Pipelines (default)
 
 For each node in `pipeline.bronze`, `pipeline.silver`, `pipeline.gold`:
 

@@ -71,9 +71,22 @@ seeknal-test-1/
 # Sample data
 data/
 
+# QA automation runs (generated test projects)
+qa/runs/
+
 # AI-generated review/audit artifacts
 ARCHITECTURE_REVIEW_*.md
 DATA_INTEGRITY_AUDIT_*.md
 TEST_FIX_PLAN_REVIEW*.md
 plans/
 .worktrees
+.dmux/
+.dmux-hooks/
+.mypy_cache/
+.ruff_cache/
+logs/
+trees/
+.continues-handoff.md
+.auto-claude-status
+.claude/specs/task-analysis.json
+/specs/

@@ -302,7 +302,21 @@ seed_data:
 seed_sql: |                     # For PostgreSQL sources
   CREATE TABLE ...;
 
-# Pipeline definition
+# Pipeline type (optional, default: yaml)
+pipeline_type: yaml|python      # "python" uses seeknal/pipelines/*.py with decorators
+
+# Python pipeline files (only if pipeline_type: python)
+pipeline_files:
+  medallion.py: |               # Written to seeknal/pipelines/medallion.py
+    from seeknal.pipeline.decorators import source, transform, materialize
+    @source(name="x", source="csv", table="data/x.csv")
+    def x(): pass
+    @transform(name="y", inputs=["source.x"])
+    def y(ctx):
+        data = ctx.ref("source.x")  # Always assign to local var
+        return ctx.duckdb.sql("SELECT * FROM data").df()
+
+# Pipeline definition (for YAML pipelines: full node defs; for Python: validation metadata only)
 pipeline:
   bronze:
     - kind: source

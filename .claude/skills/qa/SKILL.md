@@ -36,7 +36,7 @@ seeknal CLI + DAGBuilder: actual pipeline execution against live infrastructure
 Before running any health checks or spawning workers, export these environment variables in your shell:
 
 ```bash
-export LAKEKEEPER_URI="http://172.19.0.9:8181"
+export LAKEKEEPER_URL="http://172.19.0.9:8181"
 export LAKEKEEPER_WAREHOUSE_ID="c008ea5c-fb89-11f0-aa64-c32ca2f52144"
 export LAKEKEEPER_WAREHOUSE="seeknal-warehouse"
 export KEYCLOAK_TOKEN_URL="http://172.19.0.9:8080/realms/atlas/protocol/openid-connect/token"
