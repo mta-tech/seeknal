@@ -6,7 +6,7 @@
         An all-in-one platform for data and AI/ML engineering
     </h3>
     <p align="center">
-        <img src="https://img.shields.io/badge/version-2.0.0-blue.svg" alt="Version 2.0.0">
+        <img src="https://img.shields.io/badge/version-2.1.0-blue.svg" alt="Version 2.1.0">
         <a href="docs/"><img src="https://img.shields.io/badge/docs-comprehensive-green.svg" alt="Documentation"></a>
         <a href="CLAUDE.md"><img src="https://img.shields.io/badge/CLAUDE.md-AI--ready-purple.svg" alt="CLAUDE.md"></a>
     </p>
