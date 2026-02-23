@@ -232,8 +232,7 @@ LIMIT 20
 seeknal query \
   --metrics total_revenue \
   --dimensions region \
-  --filter "order_date > '2024-01-01'" \
-  --filter "region IN ('US', 'EU')" \
+  --filter "order_date > '2024-01-01' AND region IN ('US', 'EU')" \
   --order-by -total_revenue  # '-' prefix for DESC
 ```
 

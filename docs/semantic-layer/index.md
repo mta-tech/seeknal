@@ -56,7 +56,7 @@ Metrics are calculations based on semantic models:
                               ▼
 ┌─────────────────────────────────────────────────────────┐
 │                    Data Warehouse                        │
-│  StarRocks | Snowflake | BigQuery | PostgreSQL          │
+│        StarRocks | PostgreSQL | DuckDB                  │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -86,9 +86,9 @@ Build reliable data products with governed metrics.
 
 ## Related Topics
 
-- [Analytics Engineer Path](../getting-started/analytics-engineer-path/) - Hands-on tutorial
-- [Building Blocks: Semantic Models](../building-blocks/semantic-models.md) - Detailed reference
-- [Semantic Layer Guide](../guides/semantic-layer.md) - Comprehensive guide
+- [Semantic Layer Guide](../guides/semantic-layer.md) - Comprehensive guide with CLI examples
+- [YAML Schema Reference](../reference/yaml-schema.md) - Semantic model and metric YAML definitions
+- [Testing & Audits](../guides/testing-and-audits.md) - Data quality validation
 
 ---
 

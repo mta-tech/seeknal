@@ -7,13 +7,8 @@ Seeknal's Python pipeline API provides decorators for defining pipeline nodes as
 Python decorators let you define data pipeline nodes directly in Python code with full access to the Python ecosystem.
 
 ```python
-from seeknal.pipeline import (
-    source,
-    transform,
-    feature_group,
-    second_order_aggregation,
-    PipelineContext,
-)
+from seeknal.pipeline import source, transform, feature_group, PipelineContext
+from seeknal.pipeline.decorators import materialize, second_order_aggregation
 ```
 
 **When to Use Python Pipelines:**
@@ -48,6 +43,8 @@ Define data ingestion from files or databases.
 | `source` | `str` | No | `"csv"` | Source type: `csv`, `parquet`, `json`, `postgres`, etc. |
 | `table` | `str` | No | `""` | Table name or file path |
 | `columns` | `dict` | No | `None` | Column schema definitions (`{"col": "type"}`) |
+| `query` | `str` | No | `None` | SQL query for database sources (pushdown query) |
+| `connection` | `str` | No | `None` | Connection profile name (for database sources) |
 | `tags` | `list[str]` | No | `None` | Tags for organization |
 | `materialization` | `dict \| MaterializationConfig` | No | `None` | Iceberg materialization config |
 | `**params` | `Any` | No | — | Additional source-specific parameters |
@@ -411,6 +408,63 @@ def product_affinity(ctx):
 
     return affinity
 ```
+
+---
+
+### @materialize (Stackable)
+
+Attach materialization targets to any node. Stack multiple `@materialize` decorators to write to multiple targets simultaneously.
+
+**Parameters:**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `type` | `str` | No | `"iceberg"` | Target type: `iceberg` or `postgresql` |
+| `connection` | `str` | No | `None` | Named connection from profiles.yml (required for PostgreSQL) |
+| `table` | `str` | No | `""` | Target table name (typically required in practice) |
+| `mode` | `str` | No | `"full"` | Write mode: `full`, `append`, `overwrite`, `incremental_by_time`, `upsert_by_key` |
+| `time_column` | `str` | No | `None` | Time column for incremental mode |
+| `lookback` | `str` | No | `None` | Lookback window (e.g., `"7d"`) |
+| `unique_keys` | `list[str]` | No | `None` | Columns for upsert matching |
+| `**kwargs` | `Any` | No | — | Additional target-specific parameters |
+
+**Examples:**
+
+**Single target (Iceberg):**
+```python
+@materialize(type="iceberg", table="atlas.warehouse.orders", mode="append")
+@transform(name="enriched_orders", inputs=["source.orders"])
+def enriched_orders(ctx):
+    orders = ctx.ref("source.orders")
+    return ctx.duckdb.sql("SELECT * FROM orders").df()
+```
+
+**Multi-target (PostgreSQL + Iceberg):**
+```python
+@materialize(type="postgresql", connection="local_pg",
+             table="analytics.orders", mode="upsert_by_key",
+             unique_keys=["order_id"])
+@materialize(type="iceberg", table="atlas.warehouse.orders", mode="append")
+@transform(name="enriched_orders", inputs=["source.orders"])
+def enriched_orders(ctx):
+    orders = ctx.ref("source.orders")
+    return ctx.duckdb.sql("SELECT * FROM orders").df()
+```
+
+**PostgreSQL incremental:**
+```python
+@materialize(type="postgresql", connection="analytics_db",
+             table="events.daily_metrics", mode="incremental_by_time",
+             time_column="event_date", lookback="7d")
+@transform(name="daily_metrics", inputs=["source.events"])
+def daily_metrics(ctx):
+    events = ctx.ref("source.events")
+    return ctx.duckdb.sql(
+        "SELECT event_date, COUNT(*) as count FROM events GROUP BY event_date"
+    ).df()
+```
+
+> **Note:** Decorators are applied bottom-up. Place `@materialize` above the node decorator (`@transform`, `@source`, `@feature_group`).
 
 ---
 

@@ -15,12 +15,12 @@ Seeknal uses a hierarchical configuration system that supports:
 
 Seeknal uses TOML format for configuration files. By default, it looks for:
 
-- User config: `~/.config.toml` (customizable via `__USER_CONFIG_PATH`)
-- Backend config: `~/.backend.toml` (customizable via `__BACKEND_CONFIG_PATH`)
+- User config: `~/config.toml` (customizable via `__USER_CONFIG_PATH` env var)
+- Backend config: `~/backend.toml` (customizable via `__BACKEND_CONFIG_PATH` env var)
 
 ### Basic Configuration File
 
-Create a configuration file at `~/.config.toml`:
+Create a configuration file at `~/config.toml`:
 
 ```toml
 # Seeknal Configuration File
@@ -436,6 +436,7 @@ def load_and_validate():
 
 After configuring Seeknal, you can:
 
-1. **Initialize Projects** - Set up your feature store ([Initialization Example](initialization.md))
-2. **Create Flows** - Build data pipelines ([Flows Example](flows.md))
-3. **Handle Errors** - Implement robust error handling ([Error Handling Example](error_handling.md))
+1. **Initialize Projects** - Set up your feature store ([Initialization](initialization.md))
+2. **Create Pipelines** - Build data pipelines ([Flows & Pipelines](flows.md))
+3. **Feature Store** - Manage ML features ([FeatureStore](featurestore.md))
+4. **Handle Errors** - Implement robust error handling ([Error Handling](error_handling.md))

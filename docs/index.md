@@ -22,7 +22,7 @@ Seeknal is an all-in-one platform for data and AI/ML engineering. Define transfo
 
 **[→ Quick Start Guide](getting-started-comprehensive.md)**
 
-1. Install Seeknal (download from [GitHub Releases](https://github.com/mta-tech/seeknal/releases))
+1. Install Seeknal (`pip install seeknal` or from [GitHub Releases](https://github.com/mta-tech/seeknal/releases))
 2. Load your data (CSV, Parquet, database)
 3. Transform with SQL
 4. Run your first pipeline
@@ -49,7 +49,7 @@ Seeknal's workflow is inspired by modern infrastructure tools like `terraform` a
 3. **`seeknal apply`** - Save your pipeline definition (like `git commit`)
 4. **`seeknal run --env prod`** - Execute in production with safety checks
 
-**Key benefits:** Dry-run validation, change detection, rollback support, and multi-environment support.
+**Key benefits:** Dry-run validation, change detection, rollback support, multi-environment support, and multi-target materialization (PostgreSQL + Iceberg).
 
 ---
 
@@ -141,6 +141,7 @@ Lookup documentation for commands, schemas, and configuration.
 - [YAML Schema](reference/yaml-schema.md) — Every field for all node kinds
 - [Configuration](reference/configuration.md) — Project files, profiles, and environment variables
 - [Python API](api/index.md) — Module reference
+- [CLI Docs Search](cli/docs.md) — Search documentation from the terminal (`seeknal docs`)
 
 ## Tutorials
 

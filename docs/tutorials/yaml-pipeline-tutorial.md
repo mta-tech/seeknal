@@ -1022,9 +1022,6 @@ EOF
    ```
 
 > **Important:** When using `source_feature`, reference the upstream feature name. First-level aggregations produce features with names like `spend_metrics_sum`, `spend_metrics_count`, etc. (feature name + aggregation function).
-       aggs: [sum]
-     source_feature: amount
-   ```
 
 #### Verify and Run
 
