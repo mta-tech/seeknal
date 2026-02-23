@@ -23,7 +23,9 @@ jobs:
         run: pip install build
 
       - name: Build package
-        run: python -m build
+        run: |
+          python -m build --wheel
+          python -m build --sdist
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
