@@ -12,20 +12,16 @@
     </p>
 </html>
 
-Seeknal is a platform that abstracts away the complexity of data transformation and AI/ML engineering. It is a collection of tools that help you transform data, store it, and use it for machine learning and data analytics.
+Seeknal is a platform that abstracts away the complexity of data transformation and AI/ML engineering. It provides tools for building, managing, and serving data pipelines and ML features at scale.
 
 Seeknal lets you:
 
-- **Define** data and feature transformations from raw data sources using Pythonic APIs and YAML.
-- **Register** transformations and feature groups by names and get transformed data and features for various use cases including AI/ML modeling, data engineering, business metrics calculation and more.
+- **Define** data pipelines using YAML, Python decorators, or both — with named references (`ref('source.X')`) across nodes.
+- **Run** pipelines through a `draft → dry-run → apply` workflow with change detection and safe execution.
+- **Materialize** outputs to multiple targets simultaneously (PostgreSQL, Apache Iceberg) from a single pipeline.
+- **Manage environments** with isolated namespaces, per-environment profiles, and `env plan/apply` commands.
+- **Explore data** interactively via a built-in SQL REPL with auto-registration of project data sources.
 - **Share** transformations and feature groups across teams and company.
-
-Seeknal is useful in multiple use cases including:
-
-- AI/ML modeling: computes your feature transformations and incorporates them into your training data, using point-in-time joins to prevent data leakage while supporting the materialization and deployment of your features for online use in production.
-- Data analytics: build data pipelines to extract features and metrics from raw data for Analytics and AI/ML modeling.
-
-Seeknal is designed as a comprehensive data processing tool that enables you to create an end-to-end pipeline by allowing you to utilize one or more data processing engines (such as Apache Spark combined with DuckDB). To facilitate execution across various engines, Seeknal defines the pipeline in JSON format, which the respective engine processes. In this context, the engines need to support JSON input for the pipeline to function correctly. Since some data processors do not naturally handle YAML input, we enhance these data processors to incorporate this feature, which we refer to as engines. These engines are located in the`engines` folder.
 
 ## Documentation
 
@@ -60,7 +56,13 @@ pip install -e ".[all]"
 seeknal --help
 ```
 
-### Option 2: Install from GitHub Releases
+### Option 2: Install from PyPI
+
+```bash
+pip install seeknal
+```
+
+### Option 3: Install from GitHub Releases
 
 Visit the [releases page](https://github.com/mta-tech/seeknal/releases) and download the latest wheel file.
 
@@ -100,6 +102,116 @@ pip install seeknal-<version>-py3-none-any.whl
 - **For Python API users**: Check out the demo notebooks:
   - `feature-store-demo.ipynb` - Spark-based feature store demo
   - `duckdb_feature_store_demo.ipynb` - DuckDB-based feature store demo (73K real data rows)
+
+## CLI Workflow
+
+Seeknal uses a dbt-inspired `draft → dry-run → apply` workflow for safe, reviewable pipeline execution.
+
+```bash
+# Initialize a new project
+seeknal init --name my_project
+
+# Create a pipeline scaffold
+seeknal draft --name my_pipeline --type transform
+
+# Preview execution without writing data
+seeknal dry-run
+
+# Execute the pipeline and write outputs
+seeknal apply
+
+# Run a specific pipeline directly
+seeknal run --start-date 2024-01-01 --end-date 2024-01-31
+```
+
+### Interactive REPL
+
+The built-in SQL REPL auto-registers project data sources (parquets, PostgreSQL, Iceberg) at startup:
+
+```bash
+seeknal repl
+```
+
+```sql
+-- Query any registered source directly
+SELECT * FROM source_orders LIMIT 10;
+
+-- Run ad-hoc SQL against your pipeline outputs
+SELECT customer_id, COUNT(*) as order_count
+FROM target.my_transform
+GROUP BY customer_id;
+```
+
+### Environment Management
+
+Manage isolated environments with separate namespaces and profiles:
+
+```bash
+# Plan an environment (preview changes)
+seeknal env plan dev --profile profiles-dev.yml
+
+# Apply the environment plan
+seeknal env apply dev
+
+# Run pipeline in a specific environment
+seeknal run --env dev
+```
+
+### Multi-Target Materialization
+
+Write pipeline outputs to multiple storage targets from a single node:
+
+```yaml
+# In your YAML pipeline node
+materializations:
+  - type: postgresql
+    connection: local_pg
+    table: analytics.my_table
+    mode: upsert_by_key
+    unique_keys: [id]
+  - type: iceberg
+    table: atlas.namespace.my_table
+```
+
+Or with Python decorators:
+
+```python
+@materialize(type='postgresql', connection='local_pg',
+             table='analytics.my_table', mode='full')
+@materialize(type='iceberg', table='atlas.ns.my_table')
+@transform(name="my_transform")
+def my_transform(ctx):
+    return ctx.ref("source.orders")
+```
+
+### Python Pipeline Decorators
+
+Define pipelines with Python decorators as an alternative to YAML:
+
+```python
+from seeknal.pipeline.decorators import source, transform, materialize
+
+@source(name="orders", type="csv", path="data/orders.csv")
+def orders():
+    pass
+
+@transform(name="order_metrics", depends_on=["source.orders"])
+def order_metrics(ctx):
+    orders = ctx.ref("source.orders")
+    return orders.sql("SELECT customer_id, SUM(amount) as total FROM orders GROUP BY customer_id")
+```
+
+### Searchable Documentation
+
+Access built-in documentation from the CLI:
+
+```bash
+# Browse all topics
+seeknal docs
+
+# Search for a specific topic
+seeknal docs --search materialization
+```
 
 ## DuckDB Integration
 
@@ -265,7 +377,7 @@ materialization:
 4. **Run your pipeline**:
 
 ```bash
-seeknal run
+seeknal apply
 ```
 
 ### CLI Commands
@@ -571,11 +683,11 @@ Summary: 2 added, 1 removed, 1 modified
 
 ### Version-Specific Materialization
 
-Materialize a specific version instead of the latest (useful for rollbacks):
+Write a specific version instead of the latest (useful for rollbacks):
 
-```bash
-# Materialize version 1 instead of latest
-seeknal materialize user_features --start-date 2024-01-01 --version 1
+```python
+fg = FeatureGroup(name="user_features").get_or_create()
+fg.write(feature_start_time=datetime(2024, 1, 1), version=1)
 ```
 
 ### Python API
@@ -619,9 +731,10 @@ When you need to roll back to a previous version:
    seeknal version diff user_features --from 2 --to 1
    ```
 
-3. **Materialize the previous version:**
-   ```bash
-   seeknal materialize user_features --start-date 2024-01-01 --version 1
+3. **Write the previous version:**
+   ```python
+   fg = FeatureGroup(name="user_features").get_or_create()
+   fg.write(feature_start_time=datetime(2024, 1, 1), version=1)
    ```
 
 ## Contributing
