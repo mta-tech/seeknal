@@ -33,10 +33,13 @@ class OfflineStoreEnum(str, Enum):
     Attributes:
         HIVE_TABLE: Store features as a Hive table in a database.
         FILE: Store features as files on the filesystem (e.g., Delta format).
+        ICEBERG: Store features in Apache Iceberg tables with ACID transactions,
+            time travel, and cloud storage compatibility.
     """
 
     HIVE_TABLE = "hive_table"
     FILE = "file"
+    ICEBERG = "iceberg"
 
 
 class OnlineStoreEnum(str, Enum):
@@ -110,6 +113,42 @@ class FeatureStoreHiveTableOutput:
 
 
 @dataclass
+class IcebergStoreOutput:
+    """Iceberg storage configuration for feature group materialization.
+
+    This configuration enables storing features in Apache Iceberg tables with
+    ACID transactions, time travel, and cloud storage compatibility.
+
+    Args:
+        table: Table name within namespace
+        catalog: Catalog name from profiles.yml (default: "lakekeeper")
+        namespace: Iceberg namespace/database (default: "default")
+        warehouse: Optional warehouse path override (s3://, gs://, azure://)
+        mode: Write mode - "append" or "overwrite" (default: "append")
+    """
+
+    table: str
+    catalog: str = "lakekeeper"
+    namespace: str = "default"
+    warehouse: Optional[str] = None
+    mode: str = "append"
+
+    def to_dict(self):
+        """Convert the configuration to a dictionary representation.
+
+        Returns:
+            dict: Dictionary with all Iceberg configuration keys.
+        """
+        return {
+            "catalog": self.catalog,
+            "warehouse": self.warehouse,
+            "namespace": self.namespace,
+            "table": self.table,
+            "mode": self.mode,
+        }
+
+
+@dataclass
 class OfflineStore:
     """
     Configuration for offline feature store storage.
@@ -123,7 +162,7 @@ class OfflineStore:
     """
 
     value: Optional[
-        Union[str, FeatureStoreFileOutput, FeatureStoreHiveTableOutput]
+        Union[str, FeatureStoreFileOutput, FeatureStoreHiveTableOutput, IcebergStoreOutput]
     ] = None
     kind: OfflineStoreEnum = OfflineStoreEnum.HIVE_TABLE
     name: Optional[str] = None
@@ -133,12 +172,9 @@ class OfflineStore:
         if self.kind == OfflineStoreEnum.FILE:
             self._validate_path_security()
 
-        if self.value is not None:
-            if hasattr(self.value, 'to_dict'):
-                self.value = self.value.to_dict()
-            elif not isinstance(self.value, (str, dict)):
-                self.value = str(self.value)
-        self.kind = self.kind.value
+        # Keep value as-is for type safety - conversion happens in __call__
+        # The value can be FeatureStoreFileOutput, FeatureStoreHiveTableOutput,
+        # or IcebergStoreOutput - don't convert to dict
 
     def _validate_path_security(self):
         """Validate and warn if the storage path is insecure."""
@@ -201,6 +237,9 @@ class OfflineStore:
                         path=value_params["path"],
                         kind=FileKindEnum(value_params["kind"]),
                     )
+            elif self.kind == OfflineStoreEnum.ICEBERG:
+                if self.value is not None:
+                    self.value = IcebergStoreOutput(**value_params)
             else:
                 self.value = value_params
         return self
@@ -307,9 +346,243 @@ class OfflineStore:
                     logger.info(f"Hive table does not exist: {full_table_name}")
                 return True
 
+            case OfflineStoreEnum.ICEBERG:
+                # Iceberg table deletion
+                if self.value is None:
+                    logger.warning("Iceberg configuration required for deletion")
+                    return False
+
+                # Get configuration
+                if isinstance(self.value, IcebergStoreOutput):
+                    iceberg_config = self.value
+                elif isinstance(self.value, dict):
+                    iceberg_config = IcebergStoreOutput(**self.value)
+                else:
+                    logger.warning(f"Invalid Iceberg configuration type: {type(self.value)}")
+                    return False
+
+                # Import Iceberg operations
+                from seeknal.workflow.materialization.operations import DuckDBIcebergExtension
+                from seeknal.workflow.materialization.profile_loader import ProfileLoader
+                from seeknal.workflow.materialization.config import MaterializationConfig, ConfigurationError
+
+                # Load profile for catalog configuration
+                profile_loader = ProfileLoader()
+                try:
+                    profile_config = profile_loader.load_profile()
+                except (ConfigurationError, Exception) as e:
+                    logger.warning(f"Could not load materialization profile: {e}. Using defaults.")
+                    profile_config = MaterializationConfig()
+
+                # Get catalog configuration
+                catalog_uri = profile_config.catalog.uri if profile_config.catalog.uri else ""
+                warehouse_path = (
+                    iceberg_config.warehouse or
+                    profile_config.catalog.warehouse
+                )
+                bearer_token = profile_config.catalog.bearer_token
+
+                # Validate required configuration
+                if not catalog_uri or not warehouse_path:
+                    logger.warning("Catalog URI and warehouse path required for Iceberg deletion")
+                    return False
+
+                # Validate table name
+                validate_table_name(iceberg_config.table)
+                validate_table_name(iceberg_config.namespace)
+
+                # Create DuckDB connection and drop table
+                import duckdb
+                con = duckdb.connect(":memory:")
+
+                try:
+                    # Load Iceberg extension
+                    DuckDBIcebergExtension.load_extension(con)
+
+                    # Setup REST catalog
+                    catalog_name = "seeknal_catalog"
+                    DuckDBIcebergExtension.create_rest_catalog(
+                        con=con,
+                        catalog_name=catalog_name,
+                        uri=catalog_uri,
+                        warehouse_path=warehouse_path,
+                        bearer_token=bearer_token,
+                    )
+
+                    # Create table reference and drop
+                    table_ref = f"{catalog_name}.{iceberg_config.namespace}.{iceberg_config.table}"
+                    con.execute(f"DROP TABLE IF EXISTS {table_ref}")
+                    logger.info(f"Dropped Iceberg table: {table_ref}")
+                    return True
+
+                except Exception as e:
+                    logger.error(f"Failed to drop Iceberg table: {e}")
+                    return False
+                finally:
+                    con.close()
+
             case _:
                 logger.warning(f"Unknown offline store kind: {self.kind}")
                 return False
+
+    def _write_to_iceberg(
+        self,
+        result: Optional[DataFrame] = None,
+        kwds: dict = None,
+    ) -> dict:
+        """Write DataFrame to Iceberg table using DuckDB extension.
+
+        This method reuses the existing Iceberg infrastructure from YAML pipelines:
+        - ProfileLoader for catalog configuration
+        - DuckDBIcebergExtension for catalog setup
+        - write_to_iceberg for atomic writes
+
+        Args:
+            result: The DataFrame (Spark or Pandas) containing feature data.
+            kwds: Keyword arguments including:
+                - project (str): Project name (unused, for API compatibility)
+                - entity (str): Entity name (unused, for API compatibility)
+
+        Returns:
+            dict: Result dictionary with keys:
+                - path: Full table reference (catalog.namespace.table)
+                - num_rows: Number of rows written
+                - storage_type: Always "iceberg"
+                - snapshot_id: Iceberg snapshot ID
+                - table: Table name within namespace
+                - namespace: Iceberg namespace
+
+        Raises:
+            ValueError: If Iceberg configuration is invalid or write fails.
+            MaterializationOperationError: If Iceberg extension or catalog fails.
+        """
+        from seeknal.workflow.materialization.operations import (
+            DuckDBIcebergExtension,
+            write_to_iceberg,
+        )
+        from seeknal.workflow.materialization.profile_loader import ProfileLoader
+        from seeknal.workflow.materialization.config import (
+            MaterializationConfig,
+            ConfigurationError,
+        )
+
+        if kwds is None:
+            kwds = {}
+
+        # Get Iceberg configuration from value
+        iceberg_config = self.value
+        if iceberg_config is None:
+            raise ValueError("IcebergStoreOutput configuration required for ICEBERG offline store")
+
+        # Handle dict case (from database deserialization)
+        if isinstance(iceberg_config, dict):
+            # Create a temporary IcebergStoreOutput from dict
+            from dataclasses import dataclass
+
+            @dataclass
+            class _TempIcebergConfig:
+                catalog: str = "lakekeeper"
+                warehouse: Optional[str] = None
+                namespace: str = "default"
+                table: str = ""
+                mode: str = "append"
+
+            iceberg_config = _TempIcebergConfig(**iceberg_config)
+
+        # Load profile for catalog configuration
+        profile_loader = ProfileLoader()
+        try:
+            profile_config = profile_loader.load_profile()
+        except (ConfigurationError, Exception) as e:
+            logger.warning(f"Could not load materialization profile: {e}. Using defaults.")
+            profile_config = MaterializationConfig()
+
+        # Merge profile config with IcebergStoreOutput
+        # Profile provides defaults, IcebergStoreOutput can override
+        catalog_uri = profile_config.catalog.uri if profile_config.catalog.uri else ""
+        warehouse_path = (
+            iceberg_config.warehouse or
+            profile_config.catalog.warehouse
+        )
+        bearer_token = profile_config.catalog.bearer_token
+
+        # Validate required configuration
+        if not catalog_uri:
+            raise ValueError(
+                "Catalog URI not configured. Set it in profiles.yml under "
+                "materialization.catalog.uri or via LAKEKEEPER_URI environment variable."
+            )
+
+        if not warehouse_path:
+            raise ValueError(
+                "Warehouse path not configured. Set it in profiles.yml under "
+                "materialization.catalog.warehouse or in IcebergStoreOutput.warehouse."
+            )
+
+        # Validate table name
+        validate_table_name(iceberg_config.table)
+        validate_table_name(iceberg_config.namespace)
+
+        # Convert Spark DataFrame to Pandas if needed
+        if result is not None and hasattr(result, 'toPandas'):
+            result = result.toPandas()
+
+        # Create DuckDB connection with Iceberg
+        import duckdb
+        con = duckdb.connect(":memory:")
+
+        try:
+            # Load Iceberg extension
+            DuckDBIcebergExtension.load_extension(con)
+
+            # Setup REST catalog
+            catalog_name = "seeknal_catalog"
+            DuckDBIcebergExtension.create_rest_catalog(
+                con=con,
+                catalog_name=catalog_name,
+                uri=catalog_uri,
+                warehouse_path=warehouse_path,
+                bearer_token=bearer_token,
+            )
+
+            # Create table reference
+            namespace = iceberg_config.namespace or "default"
+            table_name = iceberg_config.table
+            table_ref = f"{catalog_name}.{namespace}.{table_name}"
+
+            # Register DataFrame as view
+            if result is not None:
+                con.register('features_df', result)
+                view_name = 'features_df'
+            else:
+                raise ValueError("No data provided for writing to Iceberg")
+
+            # Write to Iceberg with atomic commit
+            write_mode = iceberg_config.mode or "append"
+            write_result = write_to_iceberg(
+                con=con,
+                catalog_name=catalog_name,
+                table_name=f"{namespace}.{table_name}",
+                view_name=view_name,
+                mode=write_mode,
+            )
+
+            # Return result dictionary
+            return {
+                "path": table_ref,
+                "num_rows": write_result.row_count,
+                "storage_type": "iceberg",
+                "snapshot_id": write_result.snapshot_id,
+                "table": table_name,
+                "namespace": namespace,
+                "catalog": iceberg_config.catalog,
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to write to Iceberg: {e}")
+            raise ValueError(f"Iceberg write failed: {e}") from e
+        finally:
+            con.close()
 
     def __call__(
         self,
@@ -597,6 +870,8 @@ class OfflineStore:
                     elif end_date is not None:
                         df = df.filter(df.event_time <= end_date)
                     return df
+            case OfflineStoreEnum.ICEBERG:
+                return self._write_to_iceberg(result, kwds)
 
 @dataclass
 class OnlineStore:

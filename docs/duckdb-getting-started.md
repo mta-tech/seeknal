@@ -1827,10 +1827,10 @@ validate_column_name("user id")  # Raises error (space not allowed)
 
 ## Next Steps
 
-- [Explore Flow Examples](./examples/duckdb-flow-examples.md)
-- [Feature Store Deep Dive](./api/duckdb-feature-store.md)
-- [API Reference](./api/duckdb-api.md)
-- [Migration Guide](./migration-spark-to-duckdb.md)
+- [Explore Flow Examples](./examples/flows.md)
+- [Feature Store Examples](./examples/featurestore.md)
+- [API Reference](./api/index.md)
+- [DuckDB Flow Guide](./duckdb-flow-guide.md)
 
 ---
 

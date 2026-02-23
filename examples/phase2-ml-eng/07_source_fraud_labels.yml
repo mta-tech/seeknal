@@ -1,0 +1,24 @@
+kind: source
+name: fraud_labels
+description: "Historical fraud labels for training"
+owner: "fraud-ops"
+source: csv
+table: "data/fraud_labels.csv"
+params:
+  delimiter: ","
+  header: true
+schema:
+  - name: txn_id
+    data_type: string
+  - name: is_fraud
+    data_type: boolean
+  - name: fraud_type
+    data_type: string
+  - name: confirmed_at
+    data_type: timestamp
+  - name: reported_by
+    data_type: string
+tags:
+  - raw
+  - labels
+  - layer-0

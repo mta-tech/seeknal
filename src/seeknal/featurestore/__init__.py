@@ -87,6 +87,7 @@ _EXPORTS = {
     # Output configurations
     "FeatureStoreFileOutput": "seeknal.featurestore.featurestore",
     "FeatureStoreHiveTableOutput": "seeknal.featurestore.featurestore",
+    "IcebergStoreOutput": "seeknal.featurestore.featurestore",
 }
 
 __all__ = list(_EXPORTS.keys())
@@ -126,4 +127,5 @@ if TYPE_CHECKING:
         FileKindEnum,
         FeatureStoreFileOutput,
         FeatureStoreHiveTableOutput,
+        IcebergStoreOutput,
     )

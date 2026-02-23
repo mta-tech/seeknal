@@ -1,0 +1,331 @@
+name: postgresql-medallion
+description: >
+  Test PostgreSQL sources through a complete medallion pipeline with multi-target
+  materialization. Validates: PostgreSQL source with profile connections, pushdown
+  queries, all three PostgreSQL write modes (full, incremental_by_time, upsert_by_key),
+  multi-target materialization (PostgreSQL + Iceberg), source_defaults with alias
+  normalization (postgres -> postgresql), profile path plumbing.
+source_type: postgresql
+
+infrastructure:
+  requires: [postgresql, lakekeeper]
+  health_checks:
+    postgresql: "pg_isready -h localhost -p 5432 -U seeknal"
+    lakekeeper: "curl -s --connect-timeout 5 -o /dev/null -w '%{http_code}' http://172.19.0.9:8181/catalog/v1/config?warehouse=seeknal-warehouse | grep -qE '^(200|401)'"
+
+env:
+  PG_HOST: "localhost"
+  PG_PORT: "5432"
+  PG_USER: "seeknal"
+  PG_PASSWORD: "seeknal_pass"
+  PG_DATABASE: "seeknal_test"
+  LAKEKEEPER_URI: "http://172.19.0.9:8181"
+  LAKEKEEPER_WAREHOUSE_ID: "c008ea5c-fb89-11f0-aa64-c32ca2f52144"
+  LAKEKEEPER_WAREHOUSE: "seeknal-warehouse"
+  KEYCLOAK_TOKEN_URL: "http://172.19.0.9:8080/realms/atlas/protocol/openid-connect/token"
+  KEYCLOAK_CLIENT_ID: "duckdb"
+  KEYCLOAK_CLIENT_SECRET: "duckdb-secret-change-in-production"
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "CHANGE_THIS_STRONG_PASSWORD"
+  AWS_ENDPOINT_URL: "http://172.19.0.9:9000"
+  AWS_REGION: "us-east-1"
+
+profiles_yml: |
+  connections:
+    local_pg:
+      type: postgresql
+      host: "${PG_HOST:localhost}"
+      port: ${PG_PORT:5432}
+      database: "${PG_DATABASE:seeknal_test}"
+      user: "${PG_USER:seeknal}"
+      password: "${PG_PASSWORD:seeknal_pass}"
+
+  source_defaults:
+    # Uses 'postgres' alias to test normalization -> 'postgresql'
+    postgres:
+      connection: local_pg
+    iceberg:
+      catalog_uri: "${LAKEKEEPER_URI:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
+  materialization:
+    enabled: true
+    catalog:
+      type: rest
+      uri: "${LAKEKEEPER_URI:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
+seed_sql: |
+  -- Seed data for PostgreSQL medallion QA test
+  -- Run against seeknal_test database
+
+  CREATE SCHEMA IF NOT EXISTS bronze;
+  CREATE SCHEMA IF NOT EXISTS analytics;
+
+  DROP TABLE IF EXISTS bronze.sales_orders CASCADE;
+  CREATE TABLE bronze.sales_orders (
+    order_id VARCHAR(20) PRIMARY KEY,
+    customer_id VARCHAR(10) NOT NULL,
+    product_id VARCHAR(10) NOT NULL,
+    quantity INTEGER NOT NULL,
+    unit_price DECIMAL(10,2) NOT NULL,
+    order_date DATE NOT NULL,
+    region VARCHAR(20) NOT NULL
+  );
+
+  INSERT INTO bronze.sales_orders VALUES
+    ('SO001', 'C001', 'P001', 2, 29.99, '2026-01-15', 'north'),
+    ('SO002', 'C002', 'P002', 1, 49.99, '2026-01-15', 'south'),
+    ('SO003', 'C001', 'P003', 3, 19.99, '2026-01-16', 'north'),
+    ('SO004', 'C003', 'P001', 1, 29.99, '2026-01-16', 'east'),
+    ('SO005', 'C002', 'P004', 2, 39.99, '2026-01-17', 'south'),
+    ('SO006', 'C004', 'P002', 1, 49.99, '2026-01-17', 'west'),
+    ('SO007', 'C001', 'P001', 4, 29.99, '2026-01-18', 'north'),
+    ('SO008', 'C003', 'P003', 2, 19.99, '2026-01-18', 'east'),
+    ('SO009', 'C005', 'P004', 1, 39.99, '2026-01-19', 'north'),
+    ('SO010', 'C004', 'P001', 3, 29.99, '2026-01-19', 'west'),
+    ('SO011', 'C002', 'P002', 2, 49.99, '2026-01-20', 'south'),
+    ('SO012', 'C001', 'P003', 1, 19.99, '2026-01-20', 'north');
+
+  DROP TABLE IF EXISTS bronze.products CASCADE;
+  CREATE TABLE bronze.products (
+    product_id VARCHAR(10) PRIMARY KEY,
+    product_name VARCHAR(100) NOT NULL,
+    category VARCHAR(50) NOT NULL,
+    cost_price DECIMAL(10,2) NOT NULL
+  );
+
+  INSERT INTO bronze.products VALUES
+    ('P001', 'Widget Alpha', 'widgets', 15.00),
+    ('P002', 'Gadget Beta', 'gadgets', 25.00),
+    ('P003', 'Widget Gamma', 'widgets', 10.00),
+    ('P004', 'Gadget Delta', 'gadgets', 20.00);
+
+  DROP TABLE IF EXISTS bronze.regions CASCADE;
+  CREATE TABLE bronze.regions (
+    region VARCHAR(20) PRIMARY KEY,
+    region_name VARCHAR(50) NOT NULL,
+    timezone VARCHAR(30) NOT NULL
+  );
+
+  INSERT INTO bronze.regions VALUES
+    ('north', 'Northern Region', 'Asia/Jakarta'),
+    ('south', 'Southern Region', 'Asia/Makassar'),
+    ('east', 'Eastern Region', 'Asia/Jayapura'),
+    ('west', 'Western Region', 'Asia/Jakarta');
+
+seed_data:
+  # CSV fallback data for nodes that don't use PostgreSQL source
+  # (none needed for this spec - all bronze is PostgreSQL)
+
+pipeline:
+  bronze:
+    # PostgreSQL source with connection profile (from source_defaults)
+    - kind: source
+      name: sales_orders
+      source: postgres
+      table: bronze.sales_orders
+      description: Raw sales orders from PostgreSQL
+      tags: ["bronze", "orders"]
+      # connection: local_pg  -- supplied by source_defaults (postgres -> postgresql alias)
+
+    # PostgreSQL source with pushdown query
+    - kind: source
+      name: recent_orders
+      source: postgres
+      table: bronze.sales_orders
+      description: Recent orders with server-side filtering (pushdown)
+      params:
+        query: "SELECT * FROM bronze.sales_orders WHERE order_date >= '2026-01-18'"
+      tags: ["bronze", "orders", "pushdown"]
+
+    - kind: source
+      name: products
+      source: postgres
+      table: bronze.products
+      description: Product catalog from PostgreSQL
+      tags: ["bronze", "products"]
+
+    - kind: source
+      name: regions
+      source: postgres
+      table: bronze.regions
+      description: Region reference data from PostgreSQL
+      tags: ["bronze", "reference"]
+
+  silver:
+    # Multi-target materialization: PostgreSQL (full mode) + Iceberg
+    - kind: transform
+      name: order_details
+      description: Orders enriched with product and region info
+      inputs:
+        - ref: source.sales_orders
+        - ref: source.products
+        - ref: source.regions
+      transform: |
+        SELECT
+          o.order_id,
+          o.customer_id,
+          o.product_id,
+          p.product_name,
+          p.category,
+          o.quantity,
+          o.unit_price,
+          CAST(o.quantity * o.unit_price AS DECIMAL(10,2)) AS line_total,
+          CAST(o.quantity * p.cost_price AS DECIMAL(10,2)) AS line_cost,
+          CAST(o.quantity * (o.unit_price - p.cost_price) AS DECIMAL(10,2)) AS line_margin,
+          o.order_date,
+          o.region,
+          r.region_name,
+          r.timezone
+        FROM ref('source.sales_orders') o
+        JOIN ref('source.products') p ON o.product_id = p.product_id
+        JOIN ref('source.regions') r ON o.region = r.region
+      materializations:
+        - type: postgresql
+          connection: local_pg
+          table: analytics.order_details
+          mode: full
+        - type: iceberg
+          table: atlas.qa_pg.silver_order_details
+      tags: ["silver", "enriched"]
+
+    # Incremental by time: only process new date ranges
+    - kind: transform
+      name: daily_sales
+      description: Daily sales summary by region
+      inputs:
+        - ref: transform.order_details
+      transform: |
+        SELECT
+          order_date,
+          region,
+          region_name,
+          COUNT(*) AS order_count,
+          CAST(SUM(line_total) AS DECIMAL(10,2)) AS total_revenue,
+          CAST(SUM(line_margin) AS DECIMAL(10,2)) AS total_margin
+        FROM ref('transform.order_details')
+        GROUP BY order_date, region, region_name
+      materializations:
+        - type: postgresql
+          connection: local_pg
+          table: analytics.daily_sales
+          mode: incremental_by_time
+          time_column: order_date
+      tags: ["silver", "aggregated"]
+
+  gold:
+    # Upsert by key: idempotent customer-level metrics
+    - kind: transform
+      name: customer_metrics
+      description: Customer-level purchase metrics with upsert semantics
+      inputs:
+        - ref: transform.order_details
+      transform: |
+        SELECT
+          customer_id,
+          COUNT(DISTINCT order_id) AS total_orders,
+          COUNT(DISTINCT product_id) AS unique_products,
+          CAST(SUM(line_total) AS DECIMAL(10,2)) AS total_spent,
+          CAST(AVG(line_total) AS DECIMAL(10,2)) AS avg_order_value,
+          MIN(order_date) AS first_order,
+          MAX(order_date) AS last_order
+        FROM ref('transform.order_details')
+        GROUP BY customer_id
+      materializations:
+        - type: postgresql
+          connection: local_pg
+          table: analytics.customer_metrics
+          mode: upsert_by_key
+          unique_keys: [customer_id]
+        - type: iceberg
+          table: atlas.qa_pg.gold_customer_metrics
+      tags: ["gold", "analytics"]
+
+    # Simple gold aggregation with full mode
+    - kind: transform
+      name: category_performance
+      description: Product category performance summary
+      inputs:
+        - ref: transform.order_details
+      transform: |
+        SELECT
+          category,
+          COUNT(*) AS total_line_items,
+          CAST(SUM(line_total) AS DECIMAL(10,2)) AS total_revenue,
+          CAST(SUM(line_margin) AS DECIMAL(10,2)) AS total_margin,
+          CAST(
+            SUM(line_margin) / NULLIF(SUM(line_total), 0) * 100
+            AS DECIMAL(5,2)
+          ) AS margin_pct
+        FROM ref('transform.order_details')
+        GROUP BY category
+      materializations:
+        - type: postgresql
+          connection: local_pg
+          table: analytics.category_performance
+          mode: full
+      tags: ["gold", "analytics"]
+
+validation:
+  dag:
+    expected_nodes: 8
+    expected_edges:
+      - [source.sales_orders, transform.order_details]
+      - [source.products, transform.order_details]
+      - [source.regions, transform.order_details]
+      - [transform.order_details, transform.daily_sales]
+      - [transform.order_details, transform.customer_metrics]
+      - [transform.order_details, transform.category_performance]
+      # recent_orders is standalone (no downstream transforms)
+  execution:
+    success: true
+  outputs:
+    - node: transform.order_details
+      min_rows: 12  # All 12 sales orders enriched
+    - node: transform.daily_sales
+      min_rows: 6   # ~6 unique date+region combos
+    - node: transform.customer_metrics
+      min_rows: 5   # 5 distinct customers
+    - node: transform.category_performance
+      min_rows: 2   # 2 categories (widgets, gadgets)
+  postgresql_tables:
+    # Verify tables exist in PostgreSQL after materialization
+    - schema: analytics
+      table: order_details
+      min_rows: 12
+    - schema: analytics
+      table: daily_sales
+      min_rows: 6
+    - schema: analytics
+      table: customer_metrics
+      min_rows: 5
+    - schema: analytics
+      table: category_performance
+      min_rows: 2
+  source_defaults_check:
+    # Verify alias normalization: postgres -> postgresql
+    - node: source.sales_orders
+      param: connection
+      expected: "local_pg"
+  pushdown_check:
+    # Verify pushdown query loaded fewer rows
+    - node: source.recent_orders
+      max_rows: 8  # Only orders from 2026-01-18 onwards (5 orders)
+
+features_tested:
+  - postgresql_source
+  - postgresql_connection_profile
+  - pushdown_query
+  - source_defaults
+  - source_defaults_alias_normalization
+  - env_var_interpolation
+  - multi_target_materialization
+  - postgresql_mode_full
+  - postgresql_mode_incremental_by_time
+  - postgresql_mode_upsert_by_key
+  - named_refs
+  - profile_path_plumbing
+  - iceberg_materialization
+  - multi_source_join
+  - aggregation_transform

@@ -6,7 +6,7 @@
         An all-in-one platform for data and AI/ML engineering
     </h3>
     <p align="center">
-        <img src="https://img.shields.io/badge/version-2.0.0-blue.svg" alt="Version 2.0.0">
+        <img src="https://img.shields.io/badge/version-2.1.0-blue.svg" alt="Version 2.1.0">
         <a href="docs/"><img src="https://img.shields.io/badge/docs-comprehensive-green.svg" alt="Documentation"></a>
         <a href="CLAUDE.md"><img src="https://img.shields.io/badge/CLAUDE.md-AI--ready-purple.svg" alt="CLAUDE.md"></a>
     </p>
@@ -27,59 +27,79 @@ Seeknal is useful in multiple use cases including:
 
 Seeknal is designed as a comprehensive data processing tool that enables you to create an end-to-end pipeline by allowing you to utilize one or more data processing engines (such as Apache Spark combined with DuckDB). To facilitate execution across various engines, Seeknal defines the pipeline in JSON format, which the respective engine processes. In this context, the engines need to support JSON input for the pipeline to function correctly. Since some data processors do not naturally handle YAML input, we enhance these data processors to incorporate this feature, which we refer to as engines. These engines are located in the`engines` folder.
 
+## Documentation
+
+- **[Documentation Homepage](docs/index.md)** — Start here
+- **[CLI Reference](docs/reference/cli.md)** — All commands and flags
+- **[YAML Schema](docs/reference/yaml-schema.md)** — Pipeline YAML reference
+- **[Glossary](docs/concepts/glossary.md)** — Key term definitions
+- **Tutorials**: [YAML Pipelines](docs/tutorials/yaml-pipeline-tutorial.md) · [Python Pipelines](docs/tutorials/python-pipelines-tutorial.md) · [Mixed YAML + Python](docs/tutorials/mixed-yaml-python-pipelines.md)
+- **Guides**: [Testing & Audits](docs/guides/testing-and-audits.md) · [Semantic Layer](docs/guides/semantic-layer.md) · [Training to Serving](docs/guides/training-to-serving.md)
+- **Concepts**: [Point-in-Time Joins](docs/concepts/point-in-time-joins.md) · [Virtual Environments](docs/concepts/virtual-environments.md) · [Change Categorization](docs/concepts/change-categorization.md)
+
 ## Getting started
-We recommend to use uv for installing Seeknal. The following steps are expecting you to have [UV](https://docs.astral.sh/uv/guides/install-python/) installed.
 
+### Option 1: Install from Source (Recommended)
 
-To install Seeknal, follow these steps:
+```bash
+# Clone the repository
+git clone https://github.com/mta-tech/seeknal.git
+cd seeknal
 
-1. Download the Seeknal package:
-    
-    - Visit the [releases](https://github.com/mta-tech/seeknal/releases) page and download the latest package.
+# Create virtual environment and install (using uv - faster)
+uv venv --python 3.11
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+uv pip install -e ".[all]"
 
-2. Extract the Downloaded File:
-    - Unzip the downloaded zip file to your working directory.
+# Or using standard pip
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+pip install -e ".[all]"
 
-3. Initialize the environment using uv:
-    - Open your terminal and navigate to the directory where you extracted the files. Then, run the following command to initialize the environment:
+# Verify installation
+seeknal --help
+```
 
-    ```
-    $ cd seeknal_build
-    $ uv venv --python 3.11
-    ```
+### Option 2: Install from GitHub Releases
 
-    - Activate the environment:
+Visit the [releases page](https://github.com/mta-tech/seeknal/releases) and download the latest wheel file.
 
-    ```
-    source .venv/bin/activate  
-    ```
+```bash
+pip install seeknal-<version>-py3-none-any.whl
+```
 
-4. Install Seeknal using `uv pip`:
-    ```
-    uv pip install seeknal-<version>-py3-none-any.whl
-    ```
-    Replace <version> with the actual version number of the wheel file you downloaded.
+### Configuration
 
-5. Verify the Installation:
+1. Copy example configuration files:
+   ```bash
+   cp .env.example .env
+   mkdir -p ~/.seeknal
+   cp config.toml.example ~/.seeknal/config.toml
+   ```
 
-    To ensure that Seeknal has been installed correctly, you can run:
-    
-    ```
-    uv pip show seeknal
-    ```
-    This command will display information about the installed package, confirming that the installation was successful.
+2. Edit the files with your settings:
+   ```bash
+   # .env - Set your paths
+   SEEKNAL_BASE_CONFIG_PATH="${HOME}/.seeknal"
+   SEEKNAL_USER_CONFIG_PATH="${HOME}/.seeknal/config.toml"
+   ```
 
-6. Edit `.env` variable `SEEKNAL_BASE_CONFIG_PATH` and `SEEKNAL_USER_CONFIG_PATH` to point to the directory where you have `config.toml` file. For getting started, we have an example config.toml which you can find inside the `seeknal_build` directory. This case necessary update to the .env to point to the directory.
+3. (Optional) For production with Turso:
+   ```toml
+   # ~/.seeknal/config.toml
+   [context.database]
+   TURSO_DATABASE_URL = "your-turso-database-url"
+   TURSO_AUTH_TOKEN = "your-turso-auth-token"
+   ```
 
-    ```
-    SEEKNAL_BASE_CONFIG_PATH="path/to/seeknal_build"
-    SEEKNAL_USER_CONFIG_PATH="path/to/seeknal_build/config.toml"
-    ```
+**Congratulations!** Seeknal is now installed and ready to use.
 
-Congratulation!
-Your seeknal has been installed on your machine and ready to use in your projects. To see it in action, check out:
-- `feature-store-demo.ipynb` - Spark-based feature store demo
-- `duckdb_feature_store_demo.ipynb` - DuckDB-based feature store demo (73K real data rows)
+**Next Steps:**
+
+- **For the CLI workflow (recommended for teams)**: Try the [Workflow Tutorial](docs/tutorials/workflow-tutorial-ecommerce.md) to learn the `draft → dry-run → apply` pattern for creating production-grade pipelines
+- **For Python API users**: Check out the demo notebooks:
+  - `feature-store-demo.ipynb` - Spark-based feature store demo
+  - `duckdb_feature_store_demo.ipynb` - DuckDB-based feature store demo (73K real data rows)
 
 ## DuckDB Integration
 
@@ -196,6 +216,77 @@ Based on a real-world dataset (73,194 rows × 35 columns):
 | **Point-in-time join** | <0.5s | - |
 
 For a complete demo, see `duckdb_feature_store_demo.ipynb`.
+
+## Apache Iceberg Materialization
+
+Seeknal supports Apache Iceberg table format for materializing pipeline outputs with ACID transactions, time travel, and incremental updates.
+
+### Why Iceberg?
+
+- **ACID Transactions**: Atomic commits with automatic rollback
+- **Time Travel**: Query data as it was at any point in time
+- **Schema Evolution**: Add/modify columns without rewriting data
+- **Hidden Partitioning**: Partition evolution without data migration
+- **Compatibility**: Works with DuckDB, Spark, Trino, and more
+
+### Quick Start
+
+1. **Configure Iceberg** in `~/.seeknal/profiles.yml`:
+
+```yaml
+materialization:
+  enabled: true
+  catalog:
+    type: rest
+    uri: ${LAKEKEEPER_URI}
+    warehouse: s3://my-bucket/warehouse
+  default_mode: append
+```
+
+2. **Set credentials** as environment variables:
+
+```bash
+export LAKEKEEPER_URI=https://lakekeeper.example.com
+export LAKEKEEPER_WAREHOUSE=s3://my-bucket/warehouse
+```
+
+3. **Enable materialization** in your YAML nodes:
+
+```yaml
+kind: source
+name: orders
+materialization:
+  enabled: true
+  mode: append
+  partition_by:
+    - order_date
+```
+
+4. **Run your pipeline**:
+
+```bash
+seeknal run
+```
+
+### CLI Commands
+
+```bash
+# Validate configuration
+seeknal iceberg validate-materialization
+
+# Show current profile
+seeknal iceberg profile-show
+
+# List snapshots
+seeknal iceberg snapshot-list warehouse.prod.orders
+
+# Interactive setup
+seeknal iceberg setup
+```
+
+### Documentation
+
+For comprehensive documentation, see [Iceberg Materialization Guide](docs/iceberg-materialization.md).
 
 ## Seeknal in action (Spark Engine)
 

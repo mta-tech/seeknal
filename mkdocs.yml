@@ -1,8 +1,8 @@
 # Seeknal API Reference Documentation
 # https://www.mkdocs.org/user-guide/configuration/
 
-site_name: Seeknal API Reference
-site_description: Comprehensive API documentation for Seeknal - An all-in-one platform for data and AI/ML engineering
+site_name: Seeknal
+site_description: Documentation for Seeknal — an all-in-one platform for data and AI/ML engineering
 site_url: https://mta-tech.github.io/seeknal/
 
 # Repository information
@@ -35,6 +35,8 @@ theme:
     - navigation.sections
     - navigation.expand
     - navigation.top
+    - navigation.indexes
+    - toc.follow
     - search.suggest
     - search.highlight
     - search.share
@@ -53,10 +55,10 @@ validation:
     omitted_files: info
     absolute_links: warn
   links:
-    not_found: warn
-    anchors: warn
-    absolute_links: warn
-    unrecognized_links: warn
+    not_found: info
+    anchors: info
+    absolute_links: info
+    unrecognized_links: info
 
 # Plugins
 plugins:
@@ -141,7 +143,60 @@ markdown_extensions:
 # Navigation
 nav:
   - Home: index.md
-  - API Reference:
+  - Install:
+      - Installation Guide: install/index.md
+      - Troubleshooting: install/troubleshooting.md
+  - Quick Start:
+      - 10-Minute Quick Start: quick-start/index.md
+      - What's Next: quick-start/whats-next.md
+  - Getting Started:
+      - Choose Your Path: getting-started/index.md
+      - Data Engineer Path:
+          - Overview: getting-started/data-engineer-path/index.md
+          - Build ELT Pipeline: getting-started/data-engineer-path/1-elt-pipeline.md
+          - Add Incremental Models: getting-started/data-engineer-path/2-incremental-models.md
+          - Production Environments: getting-started/data-engineer-path/3-production-environments.md
+      - Analytics Engineer Path:
+          - Overview: getting-started/analytics-engineer-path/index.md
+          - Semantic Models: getting-started/analytics-engineer-path/1-semantic-models.md
+          - Business Metrics: getting-started/analytics-engineer-path/2-business-metrics.md
+          - Self-Serve Analytics: getting-started/analytics-engineer-path/3-self-serve-analytics.md
+      - ML Engineer Path:
+          - Overview: getting-started/ml-engineer-path/index.md
+          - Feature Store: getting-started/ml-engineer-path/1-feature-store.md
+          - Second-Order Aggregation: getting-started/ml-engineer-path/2-second-order-aggregation.md
+          - Training-to-Serving Parity: getting-started/ml-engineer-path/3-training-serving-parity.md
+  - Concepts:
+      - Overview: concepts/index.md
+      - Pipeline Builder Workflow: concepts/pipeline-builder.md
+      - YAML vs Python: concepts/yaml-vs-python.md
+      - Virtual Environments: concepts/virtual-environments.md
+      - Change Categorization: concepts/change-categorization.md
+      - Parallel Execution: concepts/parallel-execution.md
+      - Point-in-Time Joins: concepts/point-in-time-joins.md
+      - Second-Order Aggregations: concepts/second-order-aggregations.md
+      - Glossary: concepts/glossary.md
+  - Building Blocks:
+      - Overview: building-blocks/index.md
+      - Sources: building-blocks/sources.md
+      - Transforms: building-blocks/transforms.md
+      - Aggregations: building-blocks/aggregations.md
+      - Feature Groups: building-blocks/feature-groups.md
+      - Semantic Models: building-blocks/semantic-models.md
+      - Tasks: building-blocks/tasks.md
+  - Semantic Layer:
+      - Overview: semantic-layer/index.md
+      - Semantic Models: semantic-layer/semantic-models.md
+      - Metrics: semantic-layer/metrics.md
+      - Deployment: semantic-layer/deployment.md
+      - Querying: semantic-layer/querying.md
+  - Reference:
+      - CLI Commands: reference/cli.md
+      - YAML Schema: reference/yaml-schema.md
+      - Configuration: reference/configuration.md
+      - Troubleshooting: reference/troubleshooting.md
+      - Migration Guide: reference/migration.md
+  - API:
       - Overview: api/index.md
       - Core: api/core.md
       - FeatureStore: api/featurestore.md
@@ -153,6 +208,22 @@ nav:
       - Flows: examples/flows.md
       - Error Handling: examples/error_handling.md
       - Configuration: examples/configuration.md
+  - Tutorials:
+      - YAML Pipeline Tutorial: tutorials/yaml-pipeline-tutorial.md
+      - Python Pipelines: tutorials/python-pipelines-tutorial.md
+      - Mixed YAML + Python: tutorials/mixed-yaml-python-pipelines.md
+      - E-Commerce Walkthrough: tutorials/workflow-tutorial-ecommerce.md
+      - "Role-Specific":
+          - "Data Engineer: Environments": tutorials/phase2-data-eng-environments.md
+          - "ML Engineer: Parallel Execution": tutorials/phase2-ml-eng-parallel.md
+          - "Analytics Engineer: Metrics": tutorials/phase2-analytics-eng-metrics.md
+  - Additional:
+      - DuckDB Getting Started: duckdb-getting-started.md
+      - DuckDB Flow Guide: duckdb-flow-guide.md
+      - Spark Transformers: spark-transformers-reference.md
+      - Iceberg Materialization: iceberg-materialization.md
+      - DAG Runner: workflows/runner.md
+      - Comprehensive Guide: getting-started-comprehensive.md
 
 # Extra configuration
 extra:

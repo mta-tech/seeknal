@@ -1,0 +1,35 @@
+kind: feature_group
+name: {{ name }}
+description: "{{ description | default('Feature group definition') }}"
+owner: "{{ owner | default('ml-team@example.com') }}"
+tags: {{ tags | default(['features']) | tojson }}
+entity:
+  name: {{ entity_name | default('user') }}
+  join_keys: {{ join_keys | default(['id']) | tojson }}
+materialization:
+  event_time_col: {{ event_time_col | default('event_timestamp') }}
+  offline:
+    enabled: {{ offline_enabled | default(true) }}
+    format: {{ offline_format | default('parquet') }}
+  online:
+    enabled: {{ online_enabled | default(false) }}
+    ttl: {{ online_ttl | default('7d') }}
+inputs:
+  - ref: source.raw_data
+transform: |
+  SELECT
+    id,
+    COUNT(*) as event_count,
+    AVG(value) as avg_value
+  FROM source_table
+  GROUP BY id
+features:
+  event_count:
+    description: "Total events"
+    dtype: int
+  avg_value:
+    description: "Average value"
+    dtype: float
+tests:
+  - not_null: {{ join_keys | default(['id']) }}
+  - unique: {{ join_keys | default(['id']) }}

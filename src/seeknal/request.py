@@ -891,6 +891,51 @@ class FeatureGroupRequest(RequestFactory):
 
         save_to_db()
 
+    def add_iceberg_watermark(
+        self,
+        snapshot_id: str,
+        table: str,
+        namespace: str,
+        row_count: int,
+    ):
+        """Add Iceberg snapshot watermark for a feature group.
+
+        Args:
+            snapshot_id: Iceberg snapshot ID
+            table: Table name
+            namespace: Iceberg namespace
+            row_count: Number of rows in snapshot
+        """
+        def save_to_db():
+            feature_group_id = self.body.get("feature_group_id")
+            feature_group_version_id = self.body.get("feature_group_version_id")
+
+            with get_db_session() as session:
+                watermark = OfflineWatermarkTable(
+                    feature_group_id=feature_group_id,
+                    feature_group_version_id=feature_group_version_id,
+                    date=datetime.now(),
+                )
+                session.add(watermark)
+                session.commit()
+                session.refresh(watermark)
+
+                # Store Iceberg metadata as JSON in additional_info
+                # Note: The schema may need to be extended to properly support
+                # Iceberg-specific fields like snapshot_id, table, namespace
+                import json
+                watermark.additional_info = json.dumps({
+                    "snapshot_id": snapshot_id,
+                    "table": table,
+                    "namespace": namespace,
+                    "row_count": row_count,
+                    "storage_type": "iceberg",
+                })
+                session.commit()
+                session.refresh(watermark)
+
+        save_to_db()
+
     def update_materialization(self):
         def save_to_db():
             feature_group_id = self.body.get("feature_group_id")
@@ -1531,3 +1576,95 @@ class OnlineTableRequest(RequestFactory):
                 return online_table.id
 
         save_to_db()
+
+
+@dataclass
+class ReplSourceRequest(RequestFactory):
+    """CRUD operations for REPL data sources with encrypted credentials."""
+
+    @staticmethod
+    def select_all() -> List[ReplSourceTable]:
+        """Get all REPL sources."""
+        with get_db_session() as session:
+            statement = select(ReplSourceTable).order_by(ReplSourceTable.name)
+            return session.exec(statement).all()
+
+    @staticmethod
+    def select_by_name(name: str) -> Optional[ReplSourceTable]:
+        """Get a REPL source by name."""
+        with get_db_session() as session:
+            statement = select(ReplSourceTable).where(ReplSourceTable.name == name)
+            return session.exec(statement).first()
+
+    @staticmethod
+    def select_by_id(id: int) -> Optional[ReplSourceTable]:
+        """Get a REPL source by ID."""
+        with get_db_session() as session:
+            statement = select(ReplSourceTable).where(ReplSourceTable.id == id)
+            return session.exec(statement).first()
+
+    @staticmethod
+    def delete_by_name(name: str) -> bool:
+        """Delete a REPL source by name."""
+        with get_db_session() as session:
+            source = ReplSourceRequest.select_by_name(name)
+            if source:
+                session.delete(source)
+                session.commit()
+                return True
+            return False
+
+    def save(self) -> int:
+        """Save or update a REPL source.
+
+        Body fields:
+            name: Source name (required)
+            source_type: Type of source (required)
+            masked_url: URL with credentials masked (required)
+            encrypted_credentials: Encrypted password/token (optional)
+            host, port, database, username: Connection parts (optional)
+        """
+        name = self.body.get("name")
+        if not name:
+            raise ValueError("Source name is required.")
+
+        source_type = self.body.get("source_type")
+        if not source_type:
+            raise ValueError("Source type is required.")
+
+        masked_url = self.body.get("masked_url")
+        if not masked_url:
+            raise ValueError("Masked URL is required.")
+
+        existing = ReplSourceRequest.select_by_name(name)
+        if existing is None:
+            with get_db_session() as session:
+                source = ReplSourceTable(
+                    name=name,
+                    source_type=source_type,
+                    masked_url=masked_url,
+                    encrypted_credentials=self.body.get("encrypted_credentials"),
+                    host=self.body.get("host"),
+                    port=self.body.get("port"),
+                    database=self.body.get("database"),
+                    username=self.body.get("username"),
+                    workspace_id=context.workspace_id if hasattr(context, "workspace_id") else None,
+                )
+                session.add(source)
+                session.commit()
+                session.refresh(source)
+                return source.id
+        else:
+            with get_db_session() as session:
+                existing.source_type = source_type
+                existing.masked_url = masked_url
+                existing.encrypted_credentials = self.body.get("encrypted_credentials")
+                existing.host = self.body.get("host")
+                existing.port = self.body.get("port")
+                existing.database = self.body.get("database")
+                existing.username = self.body.get("username")
+                existing.updated_at = datetime.now()
+                session.add(existing)
+                session.commit()
+                session.refresh(existing)
+                return existing.id

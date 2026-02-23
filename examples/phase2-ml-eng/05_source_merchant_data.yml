@@ -1,0 +1,28 @@
+kind: source
+name: merchant_data
+description: "Merchant information and profiles"
+owner: "merchant-ops"
+source: csv
+table: "data/merchant_data.csv"
+params:
+  delimiter: ","
+  header: true
+schema:
+  - name: merchant_id
+    data_type: integer
+  - name: merchant_name
+    data_type: string
+  - name: category
+    data_type: string
+  - name: country
+    data_type: string
+  - name: chargeback_rate
+    data_type: float
+  - name: is_verified
+    data_type: boolean
+  - name: onboarded_at
+    data_type: timestamp
+tags:
+  - raw
+  - merchants
+  - layer-0

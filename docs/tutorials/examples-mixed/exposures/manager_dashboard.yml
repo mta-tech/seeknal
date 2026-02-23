@@ -1,0 +1,9 @@
+name: manager_dashboard
+kind: exposure
+type: file
+description: Export for regional management dashboard
+depends_on:
+  - ref: transform.sales_forecast
+params:
+  path: exports/manager_dashboard.csv
+  format: csv

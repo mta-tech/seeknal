@@ -1,0 +1,10 @@
+kind: exposure
+name: {{ name }}
+description: "{{ description | default('Downstream consumer') }}"
+owner: "{{ owner | default('data-team@example.com') }}"
+tags: {{ tags | default(['exposure']) | tojson }}
+depends_on:
+  - ref: {{ depends_on_ref | default('feature_group.features') }}
+type: {{ exposure_type | default('dashboard') }}
+url: "{{ url | default('https://dashboard.example.com') }}"
+owner: "{{ owner | default('data-team@example.com') }}"

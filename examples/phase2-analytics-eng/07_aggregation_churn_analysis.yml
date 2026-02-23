@@ -1,0 +1,41 @@
+kind: aggregation
+name: churn_rate_analysis
+description: Customer churn and retention analysis metrics
+id_col: customer_id
+feature_date_col: signup_date
+application_date_col: analysis_date
+features:
+  - name: subscription_stability
+    basic:
+      - count
+      - sum
+    column: subscription_count
+    rolling:
+      - window: 90d
+        functions:
+          - avg
+          - sum
+      - window: 180d
+        functions:
+          - avg
+          - sum
+  - name: revenue_retention
+    basic:
+      - sum
+      - avg
+    column: total_mrr
+    rolling:
+      - window: 90d
+        functions:
+          - sum
+          - avg
+      - window: 180d
+        functions:
+          - sum
+          - avg
+inputs:
+  - ref: transform.customer_metrics
+tags:
+  - aggregation
+  - churn
+  - retention

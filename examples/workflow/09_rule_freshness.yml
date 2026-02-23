@@ -1,0 +1,13 @@
+kind: rule
+name: freshness_rules
+description: Ensure data freshness
+rule:
+  value: "timestamp >= CURRENT_DATE - INTERVAL '7' DAY"
+params:
+  severity: warn
+  error_message: "Transaction data is stale (older than 7 days)"
+columns:
+  - timestamp
+tags:
+  - validation
+  - freshness

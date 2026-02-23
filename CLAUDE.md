@@ -70,6 +70,8 @@ tests/                     # pytest test suite
 - **Offline**: Batch processing for training data
 - **Online**: Low-latency serving for inference
 - Point-in-time joins prevent data leakage
+- **Multi-target**: Write to both PostgreSQL and Iceberg from one node via `materializations:` (plural) YAML key or stackable `@materialize` decorators
+- **PostgreSQL modes**: full (DROP+CREATE), incremental_by_time (DELETE range + INSERT), upsert_by_key (temp table + DELETE USING + INSERT)
 
 ### 5. **Version Management**
 - Feature groups are automatically versioned
@@ -97,10 +99,270 @@ tests/                     # pytest test suite
 - Context provides database connection: `context.con`
 
 ### Security
-- **SQL Injection Prevention**: Always use `validate_sql_value()` and `validate_column_name()`
-- **Path Security**: Use `path_security.py` to validate file paths
-- Never use `/tmp` or world-writable directories
+
+#### SQL Injection Prevention
+- Always use `validate_sql_value()` and `validate_column_name()` from `validation.py`
+- Never concatenate user input into SQL queries
+
+#### Path Security
+- Use `path_security.is_insecure_path()` to validate file paths
+- Never use `/tmp`, `/var/tmp`, or world-writable directories
 - Default secure path: `~/.seeknal/`
+
+#### Path Sanitization
+- Always sanitize user input used in file paths to prevent path traversal attacks
+- Remove dangerous sequences (`../`, `..\\`, `/`, `\\`) before path construction
+- Validate base paths at initialization time
+
+**Correct:**
+```python
+def _sanitize_run_id(self, run_id: str) -> str:
+    sanitized = re.sub(r'\.\.[/\\]', '', run_id)  # Remove ../ or ..\
+    sanitized = re.sub(r'[/\\]', '', sanitized)   # Remove remaining slashes
+    sanitized = re.sub(r'\.\.', '', sanitized)     # Remove any remaining ..
+    return sanitized
+
+def __init__(self, base_path: Path):
+    if is_insecure_path(str(base_path)):
+        raise ValueError(
+            f"Insecure base path detected: '{base_path}'. "
+            "Use a secure location such as ~/.seeknal/state"
+        )
+```
+
+**Incorrect:**
+```python
+def _get_run_state_path(self, run_id: str) -> Path:
+    return self.base_path / run_id  # VULNERABLE to path traversal
+```
+
+**Rationale:** Prevents attackers from escaping the base directory using `../` sequences.
+
+### Validation Patterns
+
+#### Parameter Name Validation
+- Validate parameter names using regex to ensure they follow safe naming conventions
+- Parameter names must be valid Python identifiers (alphanumeric + underscores, starting with letter/underscore)
+
+**Correct:**
+```python
+PARAM_NAME_PATTERN = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+if not PARAM_NAME_PATTERN.match(name):
+    raise ValueError(
+        f"Invalid parameter name '{name}'. "
+        f"Parameter names must be alphanumeric with underscores only."
+    )
+```
+
+**Incorrect:**
+```python
+# No validation - any name accepted
+value = os.environ.get(env_name)
+```
+
+**Rationale:** Prevents confusion and potential security issues from invalid parameter names.
+
+#### Date Parsing with Range Validation
+- Always validate dates from user input with reasonable bounds
+- Set year range limits (e.g., 2000-2100 for data engineering)
+- Provide clear error messages that include the parameter name
+
+**Correct:**
+```python
+def parse_date_safely(date_str: str, param_name: str = "date") -> datetime:
+    dt = datetime.fromisoformat(date_str)
+    if dt.year < 2000 or dt.year > 2100:
+        raise ValueError(f"{param_name}: Year {dt.year} is out of valid range (2000-2100)")
+    if dt > datetime.now() + timedelta(days=365):
+        raise ValueError(f"{param_name}: Date too far in future")
+    return dt
+```
+
+**Incorrect:**
+```python
+dt = datetime.fromisoformat(date_str)  # No validation - accepts invalid dates
+```
+
+**Rationale:** Prevents errors from unreasonable dates and provides clear error messages.
+
+#### Consistent Type Conversion
+- Accept multiple string representations for boolean values for user-friendliness
+- Centralize type conversion logic in a dedicated module
+
+**Correct:**
+```python
+def convert_to_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        normalized = value.lower().strip()
+        if normalized in ('true', '1', 'yes', 'on'):
+            return True
+        if normalized in ('false', '0', 'no', 'off'):
+            return False
+    return bool(value)
+```
+
+**Incorrect:**
+```python
+# Only 'true'/'false' accepted
+if value == 'true':
+    return True
+elif value == 'false':
+    return False
+else:
+    raise ValueError(f"Invalid boolean: {value}")
+```
+
+**Rationale:** Users may expect different boolean representations - accepting common variants improves UX.
+
+### API Design Patterns
+
+#### Reserved Parameter Name Handling
+- When user-provided names could collide with system names, emit warnings
+- Ensure system values always take precedence over user parameters
+
+**Correct:**
+```python
+RESERVED_PARAM_NAMES = {"run_id", "run_date", "project_id", "workspace_path"}
+
+if key in RESERVED_PARAM_NAMES:
+    warnings.warn(
+        f"Parameter '{key}' collides with reserved system name. "
+        f"System value will take precedence. Use a different name."
+    )
+```
+
+**Incorrect:**
+```python
+# No validation - silent override
+resolved[key] = cli_params[key]
+```
+
+**Rationale:** Maintains backward compatibility while alerting users to potential issues.
+
+### Code Quality Patterns
+
+#### Avoid Python Built-in Shadowing
+- Never use Python built-in names (type, list, dict, id, input) as variable or parameter names
+
+**Correct:**
+```python
+def get_param(name: str, param_type: Optional[Type[T]] = None) -> Any:
+    if param_type is not None:
+        return convert_to_type(value, param_type)
+```
+
+**Incorrect:**
+```python
+def get_param(name: str, type: Optional[Type[T]] = None) -> Any:
+    if type is not None:
+        return convert_to_type(value, type)  # 'type' shadows built-in
+```
+
+**Rationale:** Shadowing built-ins causes confusion and can hide bugs.
+
+#### Shared Type Conversion Module
+- Centralize type conversion logic in a dedicated module to ensure consistency
+- Avoid duplicating conversion logic across multiple files
+
+**Correct:**
+```python
+# type_conversion.py
+def convert_to_type(value: Any, target_type: Type) -> Any:
+    if target_type == bool:
+        return convert_to_bool(value)
+    # ... other types
+
+# Used in both resolver and helpers
+from .type_conversion import convert_to_type
+```
+
+**Incorrect:**
+```python
+# Duplicated in resolver.py
+def _type_convert(self, value: str) -> Any:
+    if value.lower() in ('true', 'false'):
+        return value == 'true'
+
+# Duplicated differently in helpers.py
+def get_param(name, type=None):
+    if type == bool:
+        return bool(value)  # Different logic!
+```
+
+**Rationale:** Single source of truth ensures consistent behavior and easier maintenance.
+
+### Multi-Target Materialization
+
+**YAML Plural Syntax:**
+```yaml
+materializations:
+  - type: postgresql
+    connection: local_pg
+    table: analytics.my_table
+    mode: upsert_by_key
+    unique_keys: [id]
+  - type: iceberg
+    table: atlas.namespace.my_table
+```
+
+**Python Stackable Decorators:**
+```python
+@materialize(type='postgresql', connection='local_pg',
+             table='analytics.my_table', mode='full')
+@materialize(type='iceberg', table='atlas.ns.my_table')
+@transform(name="my_transform")
+def my_transform(ctx):
+    ...
+```
+
+**Backward Compatible:** Singular `materialization:` continues to work (normalized to list).
+
+### REPL Auto-Registration
+
+REPL uses three-phase best-effort registration at startup when a project directory is detected: parquets → PostgreSQL → Iceberg. Each phase is wrapped in an independent try/except that emits warnings on failure — a failure in one phase never blocks the next.
+
+**Correct:**
+```python
+def _auto_register_project(self) -> None:
+    import warnings
+    try:
+        self._register_parquets()
+    except Exception as e:
+        warnings.warn(f'REPL: Failed to register parquets: {e}')
+    try:
+        self._register_postgresql_connections()
+    except Exception as e:
+        warnings.warn(f'REPL: Failed to attach PostgreSQL connections: {e}')
+    try:
+        self._register_iceberg_catalogs()
+    except Exception as e:
+        warnings.warn(f'REPL: Failed to attach Iceberg catalogs: {e}')
+```
+
+**Incorrect:**
+```python
+def _auto_register_project(self) -> None:
+    try:
+        self._register_parquets()
+        self._register_postgresql_connections()  # If this fails...
+        self._register_iceberg_catalogs()        # ...this never runs
+    except Exception as e:
+        warnings.warn(f'REPL: Registration failed: {e}')
+```
+
+**Rationale:** REPL startup must degrade gracefully. A PostgreSQL timeout or unreachable Iceberg catalog should not prevent intermediate parquet files from being queryable. Use `connect_timeout=5` in the libpq string for PostgreSQL ATTACH to cap startup delay. Banner metadata (node count, last run) is loaded best-effort from `target/run_state.json`.
+
+### Environment-Aware Execution
+
+`ExecutionContext` is accepted as `Optional` in `DAGRunner` for backward compatibility — existing callers pass nothing and get the legacy path; new env-aware callers pass an `ExecutionContext` and get the new routing path.
+
+- **Per-env profile auto-discovery**: `--profile` flag > `profiles-{env}.yml` in project root > `~/.seeknal/profiles-{env}.yml` > default (`None`)
+- **Namespace prefixing**: PostgreSQL `schema.table` → `{env}_schema.table`; Iceberg `catalog.ns.table` → `catalog.{env}_ns.table` — prefix applies to schema/namespace only, not catalog or table name
+- **`profile_path` round-trip**: persisted as a string in `plan.json` during `env plan`, restored as `Path` during `env apply` — explicit `--profile` on apply still overrides
+- **Copy-on-write for targets**: `_prefix_target()` always works on `dict(target)`, never mutating the caller's dict
+
+**Rationale:** Optional `ExecutionContext` allows the new env-aware path to be purely opt-in — all existing callers continue working without modification. Namespace prefixing enforces environment isolation by convention without requiring a per-env profile.
 
 ### Testing Patterns
 - Use pytest fixtures from `conftest.py`
@@ -154,6 +416,13 @@ tests/                     # pytest test suite
 3. Implement `validate()` method
 4. Register in validation config
 5. Add tests in `tests/test_feature_validators.py`
+
+### Adding Security Validation
+1. Use `path_security.is_insecure_path()` for path validation
+2. Sanitize user input with regex before using in file paths
+3. Use `parse_date_safely()` for date validation from CLI/user input
+4. Validate parameter names with `PARAM_NAME_PATTERN` regex
+5. Use `convert_to_type()` from `type_conversion.py` for type conversion
 
 ### Modifying Database Schema
 1. Update models in `models.py`
@@ -304,10 +573,18 @@ Based on real dataset (73,194 rows × 35 columns):
 ## Known Issues & Gotchas
 
 1. **Spark Engine**: Pure PySpark implementation (no JVM required for transformers)
-2. **Path Security**: Always validate paths with `path_security.py`
+2. **Path Security**: Always validate paths with `path_security.py` and sanitize user input
 3. **SQL Injection**: Use validation functions from `validation.py`
 4. **Context Required**: Most operations need workspace/project context
 5. **Version Tracking**: Schema changes auto-create new versions
+6. **Date Validation**: Always use `parse_date_safely()` for user-provided dates
+7. **Parameter Names**: Must follow Python identifier syntax (no hyphens or special chars)
+8. **Reserved Names**: Avoid using `run_id`, `run_date`, `project_id`, `workspace_path` as parameter names
+9. **Subprocess Materialization**: PythonExecutor runs via `uv run` subprocess — DuckDB views don't persist to parent. Materialization uses intermediate parquet bridge in `post_execute()`
+10. **DuckDB Timestamp Arithmetic**: String literals need explicit `CAST('{value}' AS TIMESTAMP)` before INTERVAL arithmetic
+11. **Dispatcher Circular Imports**: MaterializationDispatcher uses lazy imports inside methods to avoid circular dependency through `seeknal.dag.manifest`
+12. **DuckDB HUGEINT for Iceberg**: `COUNT(*)` and `SUM()` return HUGEINT by default — Iceberg has no HUGEINT type. Always `CAST(COUNT(*) AS BIGINT)` and `CAST(SUM(...) AS DOUBLE)` in transforms that write to Iceberg
+13. **source_defaults alias normalization**: Profile YAML dict keys are NOT normalized at load time — use the canonical type name (`postgresql` not `postgres`) as the key in the `source_defaults:` section of `profiles.yml`
 
 ## Testing Before Commit
 
@@ -337,9 +614,6 @@ seeknal init --name my_project
 # List feature groups
 seeknal list feature-groups
 
-# Materialize features
-seeknal materialize <fg_name> --start-date 2024-01-01
-
 # Version management
 seeknal version list <fg_name>
 seeknal version show <fg_name> --version 1
@@ -358,7 +632,11 @@ seeknal delete feature-group <fg_name>
 2. **Read Tests**: Tests show expected behavior
 3. **Update Docs**: Keep documentation in sync
 4. **Follow Patterns**: Use existing decorators, error handling, CLI patterns
-5. **Security First**: Validate all inputs, use secure paths
+5. **Security First**:
+   - Validate all inputs at initialization (fail fast with clear errors)
+   - Sanitize user input used in file paths
+   - Use shared validation modules (type_conversion.py, validation.py, path_security.py)
+   - Test with malicious inputs (path traversal, invalid dates, special characters)
 6. **Version Awareness**: Schema changes create new versions automatically
 
 ## Resources
@@ -370,4 +648,70 @@ seeknal delete feature-group <fg_name>
 
 ---
 
-**Last Updated**: January 2026 based on recent development context
+**Last Updated**: February 2026 based on recent development context (Security and Validation patterns)
+
+# Instructions MUST FOLLOW when work
+
+Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+## 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+## 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+---
+
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

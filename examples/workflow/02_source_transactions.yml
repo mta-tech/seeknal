@@ -1,0 +1,26 @@
+kind: source
+name: transactions
+source: csv
+table: data/transactions.csv
+columns:
+  transaction_id:
+    description: Unique transaction identifier
+    dtype: string
+  user_id:
+    description: User who made the transaction
+    dtype: string
+  amount:
+    description: Transaction amount
+    dtype: float
+  currency:
+    description: Currency code (USD, EUR, etc.)
+    dtype: string
+  timestamp:
+    description: Transaction timestamp
+    dtype: datetime
+  merchant:
+    description: Merchant name
+    dtype: string
+tags:
+  - raw-data
+  - financial

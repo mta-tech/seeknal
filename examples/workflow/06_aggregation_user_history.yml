@@ -1,0 +1,45 @@
+kind: aggregation
+name: user_transaction_history
+description: Time-series aggregation of user transactions
+id_col: user_id
+feature_date_col: timestamp
+application_date_col: application_date
+features:
+  - name: transaction_metrics
+    basic:
+      - count
+      - sum
+      - avg
+    column: amount
+    rolling:
+      - window: 7d
+        functions:
+          - sum
+          - avg
+          - count
+      - window: 30d
+        functions:
+          - sum
+          - avg
+          - count
+      - window: 90d
+        functions:
+          - sum
+          - avg
+          - count
+  - name: merchant_frequency
+    basic:
+      - count
+    column: merchant
+    rolling:
+      - window: 7d
+        functions:
+          - count
+      - window: 30d
+        functions:
+          - count
+inputs:
+  - ref: source.transactions
+tags:
+  - aggregation
+  - time-series

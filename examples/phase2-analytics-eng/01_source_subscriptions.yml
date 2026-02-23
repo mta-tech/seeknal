@@ -1,0 +1,33 @@
+kind: source
+name: subscriptions
+description: SaaS subscription records with plan details
+source: postgresql
+table: raw.subscriptions
+columns:
+  subscription_id:
+    description: Unique subscription identifier
+    dtype: string
+  customer_id:
+    description: Customer reference
+    dtype: string
+  plan_id:
+    description: Subscription plan reference
+    dtype: string
+  mrr:
+    description: Monthly recurring revenue in USD
+    dtype: decimal
+  start_date:
+    description: Subscription start date
+    dtype: date
+  end_date:
+    description: Subscription end date (NULL if active)
+    dtype: date
+  status:
+    description: Subscription status (active, cancelled, expired)
+    dtype: string
+  created_at:
+    description: Record creation timestamp
+    dtype: datetime
+tags:
+  - raw-data
+  - revenue

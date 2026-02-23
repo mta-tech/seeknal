@@ -1,0 +1,220 @@
+name: iceberg-medallion
+description: >
+  Test Iceberg sources via Lakekeeper through a complete medallion pipeline.
+  Validates: Iceberg source loading, source_defaults from profiles.yml, environment
+  variable interpolation (${VAR:default}), inline param override priority, named ref()
+  syntax, Iceberg materialization, profile path plumbing.
+source_type: iceberg
+
+infrastructure:
+  requires: [lakekeeper]
+  health_checks:
+    lakekeeper: "curl -s --connect-timeout 5 -o /dev/null -w '%{http_code}' http://172.19.0.9:8181/catalog/v1/config?warehouse=seeknal-warehouse | grep -qE '^(200|401)'"
+
+env:
+  LAKEKEEPER_URI: "http://172.19.0.9:8181"
+  LAKEKEEPER_WAREHOUSE_ID: "c008ea5c-fb89-11f0-aa64-c32ca2f52144"
+  LAKEKEEPER_WAREHOUSE: "seeknal-warehouse"
+  KEYCLOAK_TOKEN_URL: "http://172.19.0.9:8080/realms/atlas/protocol/openid-connect/token"
+  KEYCLOAK_CLIENT_ID: "duckdb"
+  KEYCLOAK_CLIENT_SECRET: "duckdb-secret-change-in-production"
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "CHANGE_THIS_STRONG_PASSWORD"
+  AWS_ENDPOINT_URL: "http://172.19.0.9:9000"
+  AWS_REGION: "us-east-1"
+  PG_PASSWORD: "seeknal_pass"
+
+profiles_yml: |
+  source_defaults:
+    iceberg:
+      catalog_uri: "${LAKEKEEPER_URI:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
+  materialization:
+    enabled: true
+    catalog:
+      type: rest
+      uri: "${LAKEKEEPER_URI:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
+seed_data:
+  # Iceberg tables must be pre-seeded in Lakekeeper namespace 'qa_iceberg'
+  # The worker agent should create and populate these via DuckDB + Iceberg extension
+  setup_instructions: |
+    Create namespace 'qa_iceberg' in Lakekeeper if not exists.
+    Create and populate three Iceberg tables:
+    - atlas.qa_iceberg.signal_events (signal_id, device_id, signal_type, strength, ts)
+    - atlas.qa_iceberg.device_registry (device_id, device_name, location, install_date)
+    - atlas.qa_iceberg.signal_thresholds (signal_type, min_strength, max_strength)
+
+  signal_events.csv: |
+    signal_id,device_id,signal_type,strength,ts
+    S001,D001,temperature,72.5,2026-01-15 08:00:00
+    S002,D002,humidity,45.2,2026-01-15 08:05:00
+    S003,D001,temperature,73.1,2026-01-15 09:00:00
+    S004,D003,pressure,1013.25,2026-01-15 08:10:00
+    S005,D002,humidity,44.8,2026-01-15 09:05:00
+    S006,D001,temperature,71.9,2026-01-15 10:00:00
+    S007,D003,pressure,1012.80,2026-01-15 09:10:00
+    S008,D004,temperature,68.3,2026-01-15 08:30:00
+    S009,D004,temperature,69.1,2026-01-15 09:30:00
+    S010,D002,humidity,46.0,2026-01-15 10:05:00
+  device_registry.csv: |
+    device_id,device_name,location,install_date
+    D001,Sensor-Alpha,Building-A,2025-06-01
+    D002,Sensor-Beta,Building-B,2025-07-15
+    D003,Sensor-Gamma,Building-A,2025-08-20
+    D004,Sensor-Delta,Building-C,2025-09-10
+  signal_thresholds.csv: |
+    signal_type,min_strength,max_strength
+    temperature,60.0,85.0
+    humidity,30.0,70.0
+    pressure,980.0,1050.0
+
+pipeline:
+  bronze:
+    # Source defaults supply catalog_uri and warehouse automatically
+    - kind: source
+      name: signal_events
+      source: iceberg
+      table: "atlas.qa_iceberg.signal_events"
+      description: Raw IoT signal events from Iceberg
+      tags: ["bronze", "signals"]
+      # No params needed - source_defaults provides catalog_uri + warehouse
+
+    - kind: source
+      name: device_registry
+      source: iceberg
+      table: "atlas.qa_iceberg.device_registry"
+      description: Device master registry from Iceberg
+      tags: ["bronze", "devices"]
+      # No params needed - source_defaults provides catalog_uri + warehouse
+
+    - kind: source
+      name: signal_thresholds
+      source: iceberg
+      table: "atlas.qa_iceberg.signal_thresholds"
+      description: Signal type threshold configuration
+      tags: ["bronze", "config"]
+      # Inline override to test priority - overrides source_defaults warehouse
+      params:
+        warehouse: "seeknal-warehouse"
+
+  silver:
+    - kind: transform
+      name: enriched_signals
+      description: Signals enriched with device location and threshold bounds
+      inputs:
+        - ref: source.signal_events
+        - ref: source.device_registry
+        - ref: source.signal_thresholds
+      transform: |
+        SELECT
+          s.signal_id,
+          s.device_id,
+          d.device_name,
+          d.location,
+          s.signal_type,
+          s.strength,
+          t.min_strength,
+          t.max_strength,
+          CASE
+            WHEN s.strength < t.min_strength THEN 'below'
+            WHEN s.strength > t.max_strength THEN 'above'
+            ELSE 'normal'
+          END AS status,
+          s.ts
+        FROM ref('source.signal_events') s
+        JOIN ref('source.device_registry') d ON s.device_id = d.device_id
+        JOIN ref('source.signal_thresholds') t ON s.signal_type = t.signal_type
+      materialization:
+        enabled: true
+        mode: overwrite
+        table: atlas.qa_iceberg.silver_enriched_signals
+      tags: ["silver", "enriched"]
+
+  gold:
+    - kind: transform
+      name: device_signal_summary
+      description: Per-device signal type summary with anomaly counts
+      inputs:
+        - ref: transform.enriched_signals
+      transform: |
+        SELECT
+          device_id,
+          device_name,
+          location,
+          signal_type,
+          COUNT(*) AS reading_count,
+          CAST(AVG(strength) AS DECIMAL(10,2)) AS avg_strength,
+          CAST(MIN(strength) AS DECIMAL(10,2)) AS min_reading,
+          CAST(MAX(strength) AS DECIMAL(10,2)) AS max_reading,
+          SUM(CASE WHEN status != 'normal' THEN 1 ELSE 0 END) AS anomaly_count
+        FROM ref('transform.enriched_signals')
+        GROUP BY device_id, device_name, location, signal_type
+      materialization:
+        enabled: true
+        mode: overwrite
+        table: atlas.qa_iceberg.gold_device_signal_summary
+      tags: ["gold", "analytics"]
+
+    - kind: transform
+      name: location_health
+      description: Location-level health score based on anomaly rates
+      inputs:
+        - ref: transform.enriched_signals
+      transform: |
+        SELECT
+          location,
+          COUNT(*) AS total_readings,
+          SUM(CASE WHEN status = 'normal' THEN 1 ELSE 0 END) AS normal_count,
+          CAST(
+            SUM(CASE WHEN status = 'normal' THEN 1.0 ELSE 0.0 END) / COUNT(*) * 100
+            AS DECIMAL(5,2)
+          ) AS health_pct
+        FROM ref('transform.enriched_signals')
+        GROUP BY location
+      materialization:
+        enabled: true
+        mode: overwrite
+        table: atlas.qa_iceberg.gold_location_health
+      tags: ["gold", "analytics"]
+
+validation:
+  dag:
+    expected_nodes: 6
+    expected_edges:
+      - [source.signal_events, transform.enriched_signals]
+      - [source.device_registry, transform.enriched_signals]
+      - [source.signal_thresholds, transform.enriched_signals]
+      - [transform.enriched_signals, transform.device_signal_summary]
+      - [transform.enriched_signals, transform.location_health]
+  execution:
+    success: true
+  outputs:
+    - node: transform.enriched_signals
+      min_rows: 10  # All 10 signal events enriched
+    - node: transform.device_signal_summary
+      min_rows: 4   # 4 device-signal_type combos (D001-temp, D002-humidity, D003-pressure, D004-temp)
+    - node: transform.location_health
+      min_rows: 3   # 3 locations (Building-A, Building-B, Building-C)
+  source_defaults_check:
+    # Verify source_defaults were applied correctly
+    - node: source.signal_events
+      param: catalog_uri
+      expected: "http://172.19.0.9:8181"
+    - node: source.signal_thresholds
+      param: warehouse
+      expected: "seeknal-warehouse"  # inline override takes precedence
+
+features_tested:
+  - iceberg_source
+  - source_defaults
+  - env_var_interpolation
+  - inline_param_override
+  - named_refs
+  - iceberg_materialization
+  - profile_path_plumbing
+  - multi_source_join
+  - case_expression
+  - aggregation_transform

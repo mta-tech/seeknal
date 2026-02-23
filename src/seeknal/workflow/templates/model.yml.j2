@@ -1,0 +1,30 @@
+kind: model
+name: {{ name }}
+description: "{{ description | default('ML model definition') }}"
+owner: "{{ owner | default('ml-team@example.com') }}"
+tags: {{ tags | default(['ml', 'model']) | tojson }}
+output_columns:
+  - prediction
+  - probability
+inputs:
+  - ref: feature_group.features
+aggregation:
+  id_col: {{ id_col | default('id') }}
+  feature_date_col: {{ feature_date_col | default('event_date') }}
+  application_date_col: {{ application_date_col | default('prediction_date') }}
+  features:
+    - name: value
+      basic: [sum, mean, max]
+      rolling:
+        - window: [1, 7]
+          aggs: [sum, mean]
+training:
+  label_source: {{ label_source | default('source.labels') }}
+  label_column: {{ label_column | default('target') }}
+  algorithm: {{ algorithm | default('xgboost') }}
+  params:
+    n_estimators: 100
+    max_depth: 6
+tests:
+  - min_accuracy: {{ min_accuracy | default(0.8) }}
+  - no_train_serve_skew: true

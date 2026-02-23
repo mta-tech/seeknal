@@ -307,7 +307,7 @@ def test_complete_pipeline():
 
     # Load and examine data
     conn = duckdb.connect()
-    conn.sql(f"SELECT COUNT(*) as row_count, STRING_AGG(*, ', ') as columns FROM '{parquet}'").show()
+    conn.sql(f"SELECT COUNT(*) as row_count, STRING_AGG(*, ', ') as columns FROM '{parquet_path}'").show()
 
     result = (
         DuckDBTask(name="complete_pipeline")

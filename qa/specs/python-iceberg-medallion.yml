@@ -1,0 +1,262 @@
+name: python-iceberg-medallion
+description: >
+  Test Python pipeline decorators with Iceberg sources and materialization.
+  Validates: @source with Iceberg params, @transform with ctx.ref(), @materialize decorator
+  for single-target Iceberg writes, MaterializationConfig on transform parameter,
+  source_defaults from profiles.yml, PythonExecutor post_execute parquet bridge.
+source_type: iceberg
+pipeline_type: python
+
+infrastructure:
+  requires: [lakekeeper]
+  health_checks:
+    lakekeeper: "curl -s --connect-timeout 5 -o /dev/null -w '%{http_code}' http://172.19.0.9:8181/catalog/v1/config?warehouse=seeknal-warehouse | grep -qE '^(200|401)'"
+
+env:
+  LAKEKEEPER_URI: "http://172.19.0.9:8181"
+  LAKEKEEPER_WAREHOUSE_ID: "c008ea5c-fb89-11f0-aa64-c32ca2f52144"
+  LAKEKEEPER_WAREHOUSE: "seeknal-warehouse"
+  KEYCLOAK_TOKEN_URL: "http://172.19.0.9:8080/realms/atlas/protocol/openid-connect/token"
+  KEYCLOAK_CLIENT_ID: "duckdb"
+  KEYCLOAK_CLIENT_SECRET: "duckdb-secret-change-in-production"
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "CHANGE_THIS_STRONG_PASSWORD"
+  AWS_ENDPOINT_URL: "http://172.19.0.9:9000"
+  AWS_REGION: "us-east-1"
+  PG_PASSWORD: "seeknal_pass"
+
+profiles_yml: |
+  source_defaults:
+    iceberg:
+      catalog_uri: "${LAKEKEEPER_URI:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
+  materialization:
+    enabled: true
+    catalog:
+      type: rest
+      uri: "${LAKEKEEPER_URI:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
+seed_data:
+  setup_instructions: |
+    Create namespace 'qa_py_iceberg' in Lakekeeper if not exists.
+    Create and populate three Iceberg tables:
+    - atlas.qa_py_iceberg.signal_events (signal_id, device_id, signal_type, strength, ts)
+    - atlas.qa_py_iceberg.device_registry (device_id, device_name, location, install_date)
+    - atlas.qa_py_iceberg.signal_thresholds (signal_type, min_strength, max_strength)
+
+  signal_events.csv: |
+    signal_id,device_id,signal_type,strength,ts
+    S001,D001,temperature,72.5,2026-01-15 08:00:00
+    S002,D002,humidity,45.2,2026-01-15 08:05:00
+    S003,D001,temperature,73.1,2026-01-15 09:00:00
+    S004,D003,pressure,1013.25,2026-01-15 08:10:00
+    S005,D002,humidity,44.8,2026-01-15 09:05:00
+    S006,D001,temperature,71.9,2026-01-15 10:00:00
+    S007,D003,pressure,1012.80,2026-01-15 09:10:00
+    S008,D004,temperature,68.3,2026-01-15 08:30:00
+    S009,D004,temperature,69.1,2026-01-15 09:30:00
+    S010,D002,humidity,46.0,2026-01-15 10:05:00
+  device_registry.csv: |
+    device_id,device_name,location,install_date
+    D001,Sensor-Alpha,Building-A,2025-06-01
+    D002,Sensor-Beta,Building-B,2025-07-15
+    D003,Sensor-Gamma,Building-A,2025-08-20
+    D004,Sensor-Delta,Building-C,2025-09-10
+  signal_thresholds.csv: |
+    signal_type,min_strength,max_strength
+    temperature,60.0,85.0
+    humidity,30.0,70.0
+    pressure,980.0,1050.0
+
+pipeline_files:
+  medallion.py: |
+    """Python Iceberg medallion pipeline for QA testing.
+
+    Tests @source with Iceberg, @transform with ctx.ref(),
+    MaterializationConfig for Iceberg writes, and @materialize decorator.
+    """
+    from seeknal.pipeline.decorators import source, transform, materialize
+    from seeknal.pipeline.materialization_config import MaterializationConfig
+
+    # --- Bronze layer: Iceberg sources ---
+    # source_defaults provide catalog_uri + warehouse automatically
+
+    @source(name="signal_events", source="iceberg",
+            table="atlas.qa_py_iceberg.signal_events",
+            tags=["bronze", "signals"])
+    def signal_events():
+        pass
+
+    @source(name="device_registry", source="iceberg",
+            table="atlas.qa_py_iceberg.device_registry",
+            tags=["bronze", "devices"])
+    def device_registry():
+        pass
+
+    @source(name="signal_thresholds", source="iceberg",
+            table="atlas.qa_py_iceberg.signal_thresholds",
+            tags=["bronze", "config"],
+            warehouse="seeknal-warehouse")  # inline override to test priority
+    def signal_thresholds():
+        pass
+
+    # --- Silver layer: enriched signals with MaterializationConfig ---
+
+    @transform(
+        name="enriched_signals",
+        inputs=["source.signal_events", "source.device_registry",
+                "source.signal_thresholds"],
+        tags=["silver", "enriched"],
+        materialization=MaterializationConfig(
+            enabled=True,
+            table="atlas.qa_py_iceberg.silver_enriched_signals",
+            mode="overwrite",
+        ),
+    )
+    def enriched_signals(ctx):
+        events = ctx.ref("source.signal_events")
+        devices = ctx.ref("source.device_registry")
+        thresholds = ctx.ref("source.signal_thresholds")
+        return ctx.duckdb.sql("""
+            SELECT
+                s.signal_id,
+                s.device_id,
+                d.device_name,
+                d.location,
+                s.signal_type,
+                s.strength,
+                t.min_strength,
+                t.max_strength,
+                CASE
+                    WHEN s.strength < t.min_strength THEN 'below'
+                    WHEN s.strength > t.max_strength THEN 'above'
+                    ELSE 'normal'
+                END AS status,
+                s.ts
+            FROM events s
+            JOIN devices d ON s.device_id = d.device_id
+            JOIN thresholds t ON s.signal_type = t.signal_type
+        """).df()
+
+    # --- Gold layer: summaries with @materialize decorator ---
+
+    @transform(
+        name="device_signal_summary",
+        inputs=["transform.enriched_signals"],
+        tags=["gold", "analytics"],
+    )
+    @materialize(type="iceberg",
+                 table="atlas.qa_py_iceberg.gold_device_signal_summary",
+                 mode="overwrite")
+    def device_signal_summary(ctx):
+        enriched = ctx.ref("transform.enriched_signals")
+        return ctx.duckdb.sql("""
+            SELECT
+                device_id,
+                device_name,
+                location,
+                signal_type,
+                COUNT(*) AS reading_count,
+                CAST(AVG(strength) AS DECIMAL(10,2)) AS avg_strength,
+                CAST(MIN(strength) AS DECIMAL(10,2)) AS min_reading,
+                CAST(MAX(strength) AS DECIMAL(10,2)) AS max_reading,
+                SUM(CASE WHEN status != 'normal' THEN 1 ELSE 0 END) AS anomaly_count
+            FROM enriched
+            GROUP BY device_id, device_name, location, signal_type
+        """).df()
+
+    @transform(
+        name="location_health",
+        inputs=["transform.enriched_signals"],
+        tags=["gold", "analytics"],
+    )
+    @materialize(type="iceberg",
+                 table="atlas.qa_py_iceberg.gold_location_health",
+                 mode="overwrite")
+    def location_health(ctx):
+        enriched = ctx.ref("transform.enriched_signals")
+        return ctx.duckdb.sql("""
+            SELECT
+                location,
+                COUNT(*) AS total_readings,
+                SUM(CASE WHEN status = 'normal' THEN 1 ELSE 0 END) AS normal_count,
+                CAST(
+                    SUM(CASE WHEN status = 'normal' THEN 1.0 ELSE 0.0 END)
+                    / COUNT(*) * 100
+                    AS DECIMAL(5,2)
+                ) AS health_pct
+            FROM enriched
+            GROUP BY location
+        """).df()
+
+pipeline:
+  bronze:
+    - kind: source
+      name: signal_events
+      source: iceberg
+    - kind: source
+      name: device_registry
+      source: iceberg
+    - kind: source
+      name: signal_thresholds
+      source: iceberg
+  silver:
+    - kind: transform
+      name: enriched_signals
+      inputs:
+        - ref: source.signal_events
+        - ref: source.device_registry
+        - ref: source.signal_thresholds
+  gold:
+    - kind: transform
+      name: device_signal_summary
+      inputs:
+        - ref: transform.enriched_signals
+    - kind: transform
+      name: location_health
+      inputs:
+        - ref: transform.enriched_signals
+
+validation:
+  dag:
+    expected_nodes: 6
+    expected_edges:
+      - [source.signal_events, transform.enriched_signals]
+      - [source.device_registry, transform.enriched_signals]
+      - [source.signal_thresholds, transform.enriched_signals]
+      - [transform.enriched_signals, transform.device_signal_summary]
+      - [transform.enriched_signals, transform.location_health]
+  execution:
+    success: true
+  outputs:
+    - node: transform.enriched_signals
+      min_rows: 10
+    - node: transform.device_signal_summary
+      min_rows: 4
+    - node: transform.location_health
+      min_rows: 3
+  source_defaults_check:
+    - node: source.signal_events
+      param: catalog_uri
+      expected: "http://172.19.0.9:8181"
+    - node: source.signal_thresholds
+      param: warehouse
+      expected: "seeknal-warehouse"
+
+features_tested:
+  - python_source_decorator
+  - python_transform_decorator
+  - ctx_ref_input_loading
+  - ctx_duckdb_sql
+  - duckdb_variable_shadowing_pattern
+  - python_executor_subprocess
+  - materialize_decorator
+  - materialization_config_param
+  - iceberg_source_python
+  - iceberg_materialization_python
+  - source_defaults_python
+  - inline_param_override_python
+  - post_execute_parquet_bridge
+  - multi_source_join_python

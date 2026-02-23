@@ -1,0 +1,452 @@
+name: project-aware-repl-env-aware-execution
+description: >
+  Test project-aware REPL auto-registration and environment-aware execution through
+  a complete medallion pipeline with PostgreSQL and Iceberg sources. Validates: REPL
+  project auto-detection (seeknal_project.yml), intermediate parquet registration as
+  queryable views, PostgreSQL read-only attach via profile, Iceberg catalog attach,
+  --profile flag override, REPL startup banner with project context, .tables listing,
+  environment-isolated execution with profile_path propagation, per-env profile
+  auto-discovery (profiles-{env}.yml), convention-based namespace prefixing ({env}_schema
+  for PostgreSQL, {env}_namespace for Iceberg), ExecutionContext backward compatibility,
+  promotion with re-materialization, and --dry-run mode.
+source_type: postgresql
+
+infrastructure:
+  requires: [postgresql, lakekeeper]
+  health_checks:
+    postgresql: "pg_isready -h localhost -p 5432 -U seeknal"
+    lakekeeper: "curl -s --connect-timeout 5 -o /dev/null -w '%{http_code}' http://172.19.0.9:8181/catalog/v1/config?warehouse=seeknal-warehouse | grep -qE '^(200|401)'"
+
+env:
+  PG_HOST: "localhost"
+  PG_PORT: "5432"
+  PG_USER: "seeknal"
+  PG_PASSWORD: "seeknal_pass"
+  PG_DATABASE: "seeknal_test"
+  LAKEKEEPER_URI: "http://172.19.0.9:8181"
+  LAKEKEEPER_WAREHOUSE_ID: "c008ea5c-fb89-11f0-aa64-c32ca2f52144"
+  LAKEKEEPER_WAREHOUSE: "seeknal-warehouse"
+  KEYCLOAK_TOKEN_URL: "http://172.19.0.9:8080/realms/atlas/protocol/openid-connect/token"
+  KEYCLOAK_CLIENT_ID: "duckdb"
+  KEYCLOAK_CLIENT_SECRET: "duckdb-secret-change-in-production"
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "CHANGE_THIS_STRONG_PASSWORD"
+  AWS_ENDPOINT_URL: "http://172.19.0.9:9000"
+  AWS_REGION: "us-east-1"
+
+profiles_yml: |
+  connections:
+    local_pg:
+      type: postgresql
+      host: "${PG_HOST:localhost}"
+      port: ${PG_PORT:5432}
+      database: "${PG_DATABASE:seeknal_test}"
+      user: "${PG_USER:seeknal}"
+      password: "${PG_PASSWORD:seeknal_pass}"
+
+  source_defaults:
+    postgresql:
+      connection: local_pg
+    iceberg:
+      catalog_uri: "${LAKEKEEPER_URI:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
+  materialization:
+    enabled: true
+    catalog:
+      type: rest
+      uri: "${LAKEKEEPER_URI:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
+# Per-env profile for testing auto-discovery (profiles-dev.yml)
+profiles_dev_yml: |
+  connections:
+    local_pg:
+      type: postgresql
+      host: "${PG_HOST:localhost}"
+      port: ${PG_PORT:5432}
+      database: "${PG_DATABASE:seeknal_test}"
+      user: "${PG_USER:seeknal}"
+      password: "${PG_PASSWORD:seeknal_pass}"
+
+  source_defaults:
+    postgresql:
+      connection: local_pg
+    iceberg:
+      catalog_uri: "${LAKEKEEPER_URI:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
+  materialization:
+    enabled: true
+    catalog:
+      type: rest
+      uri: "${LAKEKEEPER_URI:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
+seed_sql: |
+  -- Seed data for project-aware REPL + env-aware execution QA test
+  -- Run against seeknal_test database
+
+  CREATE SCHEMA IF NOT EXISTS bronze;
+  CREATE SCHEMA IF NOT EXISTS analytics;
+
+  DROP TABLE IF EXISTS bronze.work_orders CASCADE;
+  CREATE TABLE bronze.work_orders (
+    work_order_id VARCHAR(20) PRIMARY KEY,
+    technician_id VARCHAR(10) NOT NULL,
+    site_id VARCHAR(10) NOT NULL,
+    task_type VARCHAR(30) NOT NULL,
+    priority INTEGER NOT NULL,
+    hours_spent DECIMAL(5,2) NOT NULL,
+    completion_date DATE NOT NULL,
+    status VARCHAR(20) NOT NULL
+  );
+
+  INSERT INTO bronze.work_orders VALUES
+    ('WO001', 'T001', 'S001', 'maintenance', 2, 3.5, '2026-01-10', 'completed'),
+    ('WO002', 'T002', 'S002', 'installation', 1, 6.0, '2026-01-11', 'completed'),
+    ('WO003', 'T001', 'S003', 'repair', 3, 2.0, '2026-01-12', 'completed'),
+    ('WO004', 'T003', 'S001', 'inspection', 2, 1.5, '2026-01-13', 'completed'),
+    ('WO005', 'T002', 'S004', 'maintenance', 1, 4.0, '2026-01-14', 'completed'),
+    ('WO006', 'T001', 'S002', 'repair', 3, 2.5, '2026-01-15', 'completed'),
+    ('WO007', 'T004', 'S003', 'installation', 1, 5.5, '2026-01-16', 'completed'),
+    ('WO008', 'T003', 'S001', 'maintenance', 2, 3.0, '2026-01-17', 'completed'),
+    ('WO009', 'T002', 'S004', 'repair', 3, 2.0, '2026-01-18', 'pending'),
+    ('WO010', 'T001', 'S002', 'inspection', 2, 1.0, '2026-01-19', 'completed'),
+    ('WO011', 'T004', 'S003', 'maintenance', 1, 4.5, '2026-01-20', 'completed'),
+    ('WO012', 'T003', 'S004', 'installation', 2, 5.0, '2026-01-21', 'completed');
+
+  DROP TABLE IF EXISTS bronze.technicians CASCADE;
+  CREATE TABLE bronze.technicians (
+    technician_id VARCHAR(10) PRIMARY KEY,
+    tech_name VARCHAR(100) NOT NULL,
+    skill_level VARCHAR(20) NOT NULL,
+    region VARCHAR(20) NOT NULL
+  );
+
+  INSERT INTO bronze.technicians VALUES
+    ('T001', 'Andi Pratama', 'senior', 'jakarta'),
+    ('T002', 'Budi Santoso', 'mid', 'surabaya'),
+    ('T003', 'Citra Dewi', 'junior', 'jakarta'),
+    ('T004', 'Dian Kurnia', 'senior', 'bandung');
+
+  DROP TABLE IF EXISTS bronze.sites CASCADE;
+  CREATE TABLE bronze.sites (
+    site_id VARCHAR(10) PRIMARY KEY,
+    site_name VARCHAR(100) NOT NULL,
+    site_type VARCHAR(30) NOT NULL,
+    city VARCHAR(50) NOT NULL
+  );
+
+  INSERT INTO bronze.sites VALUES
+    ('S001', 'Tower Alpha', 'cell_tower', 'Jakarta'),
+    ('S002', 'Data Center Beta', 'data_center', 'Surabaya'),
+    ('S003', 'Tower Gamma', 'cell_tower', 'Bandung'),
+    ('S004', 'Hub Delta', 'network_hub', 'Jakarta');
+
+seed_data:
+  # Iceberg seed data for source nodes that use Iceberg
+  setup_instructions: |
+    Create namespace 'qa_repl_env' in Lakekeeper if not exists.
+    Create and populate Iceberg table:
+    - atlas.qa_repl_env.equipment_inventory (equipment_id, site_id, equipment_type, install_date, status)
+  equipment_inventory.csv: |
+    equipment_id,site_id,equipment_type,install_date,status
+    E001,S001,antenna,2025-03-01,active
+    E002,S001,power_unit,2025-03-01,active
+    E003,S002,server_rack,2025-04-15,active
+    E004,S002,cooling_unit,2025-04-15,maintenance
+    E005,S003,antenna,2025-06-01,active
+    E006,S003,power_unit,2025-06-01,inactive
+    E007,S004,router,2025-07-10,active
+    E008,S004,switch,2025-07-10,active
+
+pipeline:
+  bronze:
+    # PostgreSQL source with connection via source_defaults
+    - kind: source
+      name: work_orders
+      source: postgresql
+      table: bronze.work_orders
+      description: Work orders from PostgreSQL (connection via source_defaults)
+      tags: ["bronze", "work_orders"]
+
+    # PostgreSQL source - technician reference data
+    - kind: source
+      name: technicians
+      source: postgresql
+      table: bronze.technicians
+      description: Technician roster from PostgreSQL
+      tags: ["bronze", "reference"]
+
+    # PostgreSQL source - site reference data
+    - kind: source
+      name: sites
+      source: postgresql
+      table: bronze.sites
+      description: Site registry from PostgreSQL
+      tags: ["bronze", "reference"]
+
+    # Iceberg source with source_defaults
+    - kind: source
+      name: equipment_inventory
+      source: iceberg
+      table: "atlas.qa_repl_env.equipment_inventory"
+      description: Equipment inventory from Iceberg catalog
+      tags: ["bronze", "equipment"]
+
+  silver:
+    # Join work orders with technicians and sites
+    - kind: transform
+      name: enriched_work_orders
+      description: Work orders enriched with technician and site details
+      inputs:
+        - ref: source.work_orders
+        - ref: source.technicians
+        - ref: source.sites
+      transform: |
+        SELECT
+          wo.work_order_id,
+          wo.technician_id,
+          t.tech_name,
+          t.skill_level,
+          t.region AS tech_region,
+          wo.site_id,
+          s.site_name,
+          s.site_type,
+          s.city,
+          wo.task_type,
+          wo.priority,
+          wo.hours_spent,
+          wo.completion_date,
+          wo.status
+        FROM ref('source.work_orders') wo
+        JOIN ref('source.technicians') t ON wo.technician_id = t.technician_id
+        JOIN ref('source.sites') s ON wo.site_id = s.site_id
+      materializations:
+        - type: postgresql
+          connection: local_pg
+          table: analytics.enriched_work_orders
+          mode: full
+        - type: iceberg
+          table: atlas.qa_repl_env.silver_enriched_work_orders
+      tags: ["silver", "enriched"]
+
+    # Equipment status summary per site (from Iceberg source)
+    - kind: transform
+      name: site_equipment_status
+      description: Equipment status counts per site
+      inputs:
+        - ref: source.equipment_inventory
+        - ref: source.sites
+      transform: |
+        SELECT
+          e.site_id,
+          s.site_name,
+          s.site_type,
+          COUNT(*) AS total_equipment,
+          SUM(CASE WHEN e.status = 'active' THEN 1 ELSE 0 END) AS active_count,
+          SUM(CASE WHEN e.status = 'maintenance' THEN 1 ELSE 0 END) AS maintenance_count,
+          SUM(CASE WHEN e.status = 'inactive' THEN 1 ELSE 0 END) AS inactive_count
+        FROM ref('source.equipment_inventory') e
+        JOIN ref('source.sites') s ON e.site_id = s.site_id
+      materializations:
+        - type: postgresql
+          connection: local_pg
+          table: analytics.site_equipment_status
+          mode: full
+      tags: ["silver", "equipment"]
+
+  gold:
+    # Technician performance metrics with upsert
+    - kind: transform
+      name: technician_performance
+      description: Technician performance metrics for REPL querying
+      inputs:
+        - ref: transform.enriched_work_orders
+      transform: |
+        SELECT
+          technician_id,
+          tech_name,
+          skill_level,
+          COUNT(DISTINCT work_order_id) AS total_work_orders,
+          COUNT(DISTINCT site_id) AS sites_visited,
+          CAST(SUM(hours_spent) AS DECIMAL(10,2)) AS total_hours,
+          CAST(AVG(hours_spent) AS DECIMAL(10,2)) AS avg_hours_per_task,
+          SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_count
+        FROM ref('transform.enriched_work_orders')
+        GROUP BY technician_id, tech_name, skill_level
+      materializations:
+        - type: postgresql
+          connection: local_pg
+          table: analytics.technician_performance
+          mode: upsert_by_key
+          unique_keys: [technician_id]
+        - type: iceberg
+          table: atlas.qa_repl_env.gold_technician_performance
+      tags: ["gold", "analytics"]
+
+    # Site operations summary
+    - kind: transform
+      name: site_operations_summary
+      description: Site-level operations summary combining work orders and equipment
+      inputs:
+        - ref: transform.enriched_work_orders
+        - ref: transform.site_equipment_status
+      transform: |
+        SELECT
+          wo.site_id,
+          wo.site_name,
+          wo.site_type,
+          wo.city,
+          COUNT(DISTINCT wo.work_order_id) AS total_work_orders,
+          CAST(SUM(wo.hours_spent) AS DECIMAL(10,2)) AS total_labor_hours,
+          eq.total_equipment,
+          eq.active_count AS active_equipment,
+          eq.maintenance_count AS equipment_in_maintenance
+        FROM ref('transform.enriched_work_orders') wo
+        JOIN ref('transform.site_equipment_status') eq ON wo.site_id = eq.site_id
+        GROUP BY wo.site_id, wo.site_name, wo.site_type, wo.city,
+                 eq.total_equipment, eq.active_count, eq.maintenance_count
+      materializations:
+        - type: postgresql
+          connection: local_pg
+          table: analytics.site_operations_summary
+          mode: full
+      tags: ["gold", "analytics"]
+
+validation:
+  dag:
+    expected_nodes: 8
+    expected_edges:
+      - [source.work_orders, transform.enriched_work_orders]
+      - [source.technicians, transform.enriched_work_orders]
+      - [source.sites, transform.enriched_work_orders]
+      - [source.equipment_inventory, transform.site_equipment_status]
+      - [source.sites, transform.site_equipment_status]
+      - [transform.enriched_work_orders, transform.technician_performance]
+      - [transform.enriched_work_orders, transform.site_operations_summary]
+      - [transform.site_equipment_status, transform.site_operations_summary]
+  execution:
+    success: true
+  outputs:
+    - node: transform.enriched_work_orders
+      min_rows: 12  # All 12 work orders enriched
+    - node: transform.site_equipment_status
+      min_rows: 4   # 4 sites with equipment
+    - node: transform.technician_performance
+      min_rows: 4   # 4 technicians
+    - node: transform.site_operations_summary
+      min_rows: 4   # 4 sites
+  postgresql_tables:
+    - schema: analytics
+      table: enriched_work_orders
+      min_rows: 12
+    - schema: analytics
+      table: site_equipment_status
+      min_rows: 4
+    - schema: analytics
+      table: technician_performance
+      min_rows: 4
+    - schema: analytics
+      table: site_operations_summary
+      min_rows: 4
+  source_defaults_check:
+    - node: source.work_orders
+      param: connection
+      expected: "local_pg"
+    - node: source.equipment_inventory
+      param: catalog_uri
+      expected: "http://172.19.0.9:8181"
+  # REPL auto-registration validation (post-pipeline checks)
+  repl_auto_registration:
+    # After pipeline run, REPL should auto-detect project and register outputs
+    - check: project_detection
+      description: "seeknal repl inside project dir detects seeknal_project.yml"
+    - check: intermediate_parquet_views
+      description: "Intermediate parquets from target/intermediate/ are queryable as DuckDB views"
+      expected_views:
+        - "source.work_orders"
+        - "source.technicians"
+        - "source.sites"
+        - "source.equipment_inventory"
+        - "transform.enriched_work_orders"
+        - "transform.site_equipment_status"
+        - "transform.technician_performance"
+        - "transform.site_operations_summary"
+    - check: postgresql_read_only_attach
+      description: "PostgreSQL databases attached read-only via profile credentials"
+      connection: local_pg
+    - check: iceberg_catalog_attach
+      description: "Iceberg catalog attached via REST catalog with OAuth2"
+    - check: banner_project_context
+      description: "Startup banner shows project name, node count, and registration summary"
+    - check: tables_command
+      description: ".tables lists all auto-registered views and attached databases"
+    - check: profile_flag_override
+      description: "--profile flag overrides default ~/.seeknal/profiles.yml"
+    - check: repl_outside_project_no_regression
+      description: "seeknal repl outside project works exactly as before"
+    - check: phase_independent_failure
+      description: "Each registration phase fails independently with warning, not error"
+  # Environment-aware execution validation
+  env_aware_execution:
+    - check: execution_context_backward_compat
+      description: "DAGRunner works without ExecutionContext (backward compatibility)"
+    - check: profile_path_env_plan_apply
+      description: "seeknal env plan saves profile_path in plan.json, env apply restores it"
+    - check: env_profile_auto_discovery
+      description: "seeknal run --env dev auto-discovers profiles-dev.yml if it exists"
+      profile_file: "profiles-dev.yml"
+    - check: namespace_prefix_postgresql
+      description: "Without per-env profile, PostgreSQL tables get {env}_ prefix on schema"
+      env_name: dev
+      expected_schema: dev_analytics
+    - check: namespace_prefix_iceberg
+      description: "Without per-env profile, Iceberg tables get {env}_ prefix on namespace"
+      env_name: dev
+      expected_namespace: dev_qa_repl_env
+    - check: promote_rematerialize
+      description: "seeknal env promote re-materializes to production targets"
+    - check: promote_dry_run
+      description: "--dry-run shows what would be written without executing"
+    - check: parallel_profile_propagation
+      description: "seeknal run --parallel --profile profiles-dev.yml uses dev profile"
+    - check: auto_create_schema
+      description: "Dev schema auto-created in PostgreSQL if not exists"
+    - check: auto_create_namespace
+      description: "Dev namespace auto-created in Iceberg if not exists"
+
+features_tested:
+  - repl_project_auto_detection
+  - repl_intermediate_parquet_registration
+  - repl_postgresql_read_only_attach
+  - repl_iceberg_catalog_attach
+  - repl_startup_banner_project_context
+  - repl_tables_command_auto_views
+  - repl_profile_flag_override
+  - repl_outside_project_no_regression
+  - repl_phase_independent_failure
+  - env_execution_context_backward_compat
+  - env_profile_path_propagation
+  - env_per_env_profile_auto_discovery
+  - env_namespace_prefix_postgresql
+  - env_namespace_prefix_iceberg
+  - env_promote_rematerialize
+  - env_promote_dry_run
+  - env_parallel_profile_propagation
+  - env_auto_create_schema
+  - env_auto_create_namespace
+  - postgresql_source
+  - postgresql_connection_profile
+  - source_defaults
+  - iceberg_source
+  - iceberg_materialization
+  - multi_target_materialization
+  - postgresql_mode_full
+  - postgresql_mode_upsert_by_key
+  - named_refs
+  - multi_source_join
+  - aggregation_transform
+  - env_var_interpolation
+  - profile_path_plumbing

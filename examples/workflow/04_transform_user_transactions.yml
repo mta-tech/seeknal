@@ -1,0 +1,26 @@
+kind: transform
+name: user_transactions
+description: Join users with their transactions
+transform: |
+  SELECT
+    u.user_id,
+    u.name,
+    u.email,
+    u.country,
+    t.transaction_id,
+    t.amount,
+    t.currency,
+    t.timestamp as transaction_timestamp,
+    t.merchant
+  FROM transform.clean_users u
+  INNER JOIN source.transactions t
+    ON u.user_id = t.user_id
+  WHERE t.timestamp >= '2024-01-01'
+inputs:
+  - ref: transform.clean_users
+  - ref: source.transactions
+params:
+  min_date: "2024-01-01"
+tags:
+  - joins
+  - transformation

@@ -1,0 +1,38 @@
+kind: transform
+name: alert_features
+description: "Real-time alert-based features"
+owner: "ml-team"
+transform: |
+  SELECT
+    t.txn_id,
+
+    -- Alert counts
+    COUNT(a.alert_id) AS alert_count,
+    COUNT(CASE WHEN a.severity = 'HIGH' THEN 1 END) AS high_severity_alerts,
+    COUNT(CASE WHEN a.severity = 'MEDIUM' THEN 1 END) AS medium_severity_alerts,
+
+    -- Alert types
+    COUNT(CASE WHEN a.alert_type = 'VELOCITY' THEN 1 END) AS velocity_alerts,
+    COUNT(CASE WHEN a.alert_type = 'LOCATION' THEN 1 END) AS location_alerts,
+    COUNT(CASE WHEN a.alert_type = 'DEVICE' THEN 1 END) AS device_alerts,
+
+    -- Alert timing
+    MIN(EXTRACT(EPOCH FROM (t.timestamp - a.triggered_at))) AS seconds_since_first_alert,
+
+    -- Alert flags
+    CASE WHEN COUNT(a.alert_id) > 0 THEN 1 ELSE 0 END AS has_alerts,
+    CASE WHEN COUNT(CASE WHEN a.severity = 'HIGH' THEN 1 END) > 0 THEN 1 ELSE 0 END AS has_high_severity
+
+  FROM source.transactions t
+  LEFT JOIN source.realtime_alerts a
+    ON t.txn_id = a.txn_id
+  GROUP BY
+    t.txn_id,
+    t.timestamp
+inputs:
+  - ref: source.transactions
+  - ref: source.realtime_alerts
+tags:
+  - transformation
+  - alerts
+  - layer-1

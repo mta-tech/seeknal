@@ -8,11 +8,10 @@ The Tasks module provides essential classes for building data processing pipelin
 
 | Class | Purpose |
 |-------|---------|
-| [`Task`](#seeknal.tasks.base.Task) | Abstract base class defining the task interface |
-| [`SparkEngineTask`](#seeknal.tasks.sparkengine.sparkengine.SparkEngineTask) | Spark-based task for large-scale data processing |
-| [`DuckDBTask`](#seeknal.tasks.duckdb.duckdb.DuckDBTask) | Lightweight task using DuckDB for local processing |
-| [`Stage`](#seeknal.tasks.sparkengine.sparkengine.Stage) | Configuration for a single pipeline stage |
-| [`Stages`](#seeknal.tasks.sparkengine.sparkengine.Stages) | Container for multiple pipeline stages |
+| [`Task`](#task) | Abstract base class defining the task interface |
+| [`SparkEngineTask`](#sparkenginetask) | Spark-based task for large-scale data processing |
+| [`DuckDBTask`](#duckdbtask) | Lightweight task using DuckDB for local processing |
+| [`Stage`](#stage) | Configuration for a single pipeline stage |
 
 ## Task
 
@@ -30,7 +29,7 @@ The `Task` class is the abstract base class that defines the interface for all d
 
 The `SparkEngineTask` class provides a fluent interface for building Spark-based data transformation pipelines with support for extractors, transformers, aggregators, and loaders.
 
-:::seeknal.tasks.sparkengine.sparkengine.SparkEngineTask
+:::seeknal.tasks.sparkengine.py_impl.spark_engine_task.SparkEngineTask
     options:
       show_root_heading: false
       show_source: true
@@ -42,19 +41,7 @@ The `SparkEngineTask` class provides a fluent interface for building Spark-based
 
 The `Stage` class represents a single step in a SparkEngine transformation pipeline.
 
-:::seeknal.tasks.sparkengine.sparkengine.Stage
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
----
-
-## Stages
-
-The `Stages` class is a container for grouping multiple Stage instances together.
-
-:::seeknal.tasks.sparkengine.sparkengine.Stages
+:::seeknal.tasks.sparkengine.py_impl.spark_engine_task.Stage
     options:
       show_root_heading: false
       show_source: true
@@ -74,165 +61,11 @@ The `DuckDBTask` class provides a lightweight task implementation using DuckDB f
 
 ---
 
-## Transformers
-
-Transformers modify data within a pipeline stage. The transformers module provides various transformation types.
-
-### Transformer
-
-Base class for all transformers.
-
-:::seeknal.tasks.sparkengine.transformers.base_transformer.Transformer
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
-### FeatureTransformer
-
-Transformer specialized for feature engineering operations.
-
-:::seeknal.tasks.sparkengine.transformers.base_transformer.FeatureTransformer
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
-### SQL
-
-Execute SQL transformations on data.
-
-:::seeknal.tasks.sparkengine.transformers.spark_engine_transformers.SQL
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
-### AddColumnByExpr
-
-Add a column using a Spark SQL expression.
-
-:::seeknal.tasks.sparkengine.transformers.spark_engine_transformers.AddColumnByExpr
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
-### FilterByExpr
-
-Filter data using a Spark SQL expression.
-
-:::seeknal.tasks.sparkengine.transformers.spark_engine_transformers.FilterByExpr
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
-### ColumnRenamed
-
-Rename a column in the DataFrame.
-
-:::seeknal.tasks.sparkengine.transformers.spark_engine_transformers.ColumnRenamed
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
-### PointInTime
-
-Point-in-time join transformer for temporal feature engineering.
-
-:::seeknal.tasks.sparkengine.transformers.spark_engine_transformers.PointInTime
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
----
-
-## Extractors
-
-Extractors load data from external sources into the pipeline.
-
-### Extractor
-
-Base class for all data extractors.
-
-:::seeknal.tasks.sparkengine.extractors.base_extractor.Extractor
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
----
-
-## Loaders
-
-Loaders write processed data to external destinations.
-
-### Loader
-
-Base class for all data loaders.
-
-:::seeknal.tasks.sparkengine.loaders.base_loader.Loader
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
----
-
-## Aggregators
-
-Aggregators perform grouping and aggregation operations on data.
-
-### Aggregator
-
-Base class for all aggregators.
-
-:::seeknal.tasks.sparkengine.aggregators.base_aggregator.Aggregator
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
-### AggregatorFunction
-
-Defines an aggregation function for use with aggregators.
-
-:::seeknal.tasks.sparkengine.aggregators.base_aggregator.AggregatorFunction
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
-### LastNDaysAggregator
-
-Aggregate data over the last N days.
-
-:::seeknal.tasks.sparkengine.aggregators.base_aggregator.LastNDaysAggregator
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
-### SecondOrderAggregator
+## SecondOrderAggregator
 
 Perform second-order aggregations (aggregations on aggregated data).
 
-:::seeknal.tasks.sparkengine.aggregators.second_order_aggregator.SecondOrderAggregator
-    options:
-      show_root_heading: false
-      show_source: true
-      members_order: source
-
----
-
-## Module Reference
-
-Complete module reference for the tasks package.
-
-:::seeknal.tasks
+:::seeknal.tasks.sparkengine.py_impl.aggregators.second_order_aggregator.SecondOrderAggregator
     options:
       show_root_heading: false
       show_source: true

@@ -1,0 +1,32 @@
+kind: model
+name: churn_predictor
+description: Predict customer churn probability
+training:
+  algorithm: RandomForestClassifier
+  params:
+    n_estimators: 100
+    max_depth: 10
+    random_state: 42
+  test_size: 0.2
+output_columns:
+  - user_id
+  - churn_probability
+  - churn_risk_level
+transform: |
+  SELECT
+    user_id,
+    transaction_count,
+    total_amount,
+    avg_transaction_value,
+    days_since_last_transaction,
+    CASE
+      WHEN days_since_last_transaction > 90 THEN 1
+      ELSE 0
+    END as is_churned
+  FROM feature_group.user_features
+inputs:
+  - ref: feature_group.user_features
+tags:
+  - ml
+  - prediction
+  - churn

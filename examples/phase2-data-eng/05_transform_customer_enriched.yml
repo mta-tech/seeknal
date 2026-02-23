@@ -1,0 +1,37 @@
+kind: transform
+name: customer_enriched
+description: Enrich customer profiles with order metrics
+owner: analytics-team
+transform: |
+  WITH order_stats AS (
+    SELECT
+      customer_id,
+      COUNT(*) as total_orders,
+      SUM(total_amount) as lifetime_value,
+      MAX(order_date) as last_order_date,
+      MIN(order_date) as first_order_date
+    FROM transform.clean_orders
+    WHERE validation_status = 'valid'
+    GROUP BY customer_id
+  )
+  SELECT
+    c.customer_id,
+    c.email,
+    c.first_name,
+    c.last_name,
+    c.country,
+    c.signup_date,
+    c.customer_segment,
+    COALESCE(o.total_orders, 0) as total_orders,
+    COALESCE(o.lifetime_value, 0.0) as lifetime_value,
+    o.last_order_date,
+    o.first_order_date
+  FROM source.customers c
+  LEFT JOIN order_stats o
+    ON c.customer_id = o.customer_id
+inputs:
+  - ref: source.customers
+  - ref: transform.clean_orders
+tags:
+  - transformation
+  - enrichment

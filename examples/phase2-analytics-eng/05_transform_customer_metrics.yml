@@ -1,0 +1,30 @@
+kind: transform
+name: customer_metrics
+description: Per-customer revenue statistics
+transform: |
+  SELECT
+    c.customer_id,
+    c.company_name,
+    c.industry,
+    c.country,
+    c.signup_date,
+    COUNT(DISTINCT r.subscription_id) as subscription_count,
+    SUM(r.mrr) as total_mrr,
+    SUM(r.payment_amount) as total_payments,
+    MIN(r.start_date) as first_subscription_date,
+    MAX(CASE WHEN r.subscription_status = 'cancelled' THEN r.end_date END) as last_churn_date
+  FROM source.customers c
+  LEFT JOIN transform.revenue_base r
+    ON c.customer_id = r.customer_id
+  GROUP BY
+    c.customer_id,
+    c.company_name,
+    c.industry,
+    c.country,
+    c.signup_date
+inputs:
+  - ref: source.customers
+  - ref: transform.revenue_base
+tags:
+  - transform
+  - customer-analytics

@@ -1,0 +1,30 @@
+kind: source
+name: payments
+description: Payment transaction records
+source: postgresql
+table: raw.payments
+columns:
+  payment_id:
+    description: Unique payment identifier
+    dtype: string
+  subscription_id:
+    description: Related subscription
+    dtype: string
+  customer_id:
+    description: Customer reference
+    dtype: string
+  amount:
+    description: Payment amount in USD
+    dtype: decimal
+  payment_date:
+    description: Date payment was processed
+    dtype: date
+  status:
+    description: Payment status (success, failed, refunded)
+    dtype: string
+  created_at:
+    description: Record creation timestamp
+    dtype: datetime
+tags:
+  - raw-data
+  - revenue

@@ -217,3 +217,30 @@ class WorkspaceOnlineTable(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     workspace_id: int = Field(foreign_key="workspace.id")
     online_table_id: int = Field(foreign_key="online_table.id")
+
+
+class ReplSourceTable(SQLModel, table=True):
+    """Data source connection storage for REPL with encrypted credentials."""
+
+    __tablename__: str = "repl_source"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(unique=True, index=True)
+    source_type: str  # postgres, mysql, sqlite, parquet, csv
+
+    # URL with password masked (for display)
+    masked_url: str
+
+    # Encrypted sensitive parts (password, auth tokens)
+    encrypted_credentials: Optional[str] = None
+
+    # Non-sensitive connection parts
+    host: Optional[str] = None
+    port: Optional[int] = None
+    database: Optional[str] = None
+    username: Optional[str] = None
+
+    # Metadata
+    workspace_id: Optional[int] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)

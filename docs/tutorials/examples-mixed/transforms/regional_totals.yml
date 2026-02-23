@@ -1,0 +1,15 @@
+name: regional_totals
+kind: transform
+description: Aggregate sales by region
+inputs:
+  - ref: transform.enriched_sales
+transform: |
+  SELECT
+    region,
+    product_category,
+    COUNT(*) as transaction_count,
+    SUM(quantity) as total_quantity,
+    SUM(margin) as total_margin
+  FROM __THIS__
+  GROUP BY region, product_category
+  ORDER BY total_margin DESC

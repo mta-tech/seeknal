@@ -1,0 +1,48 @@
+kind: feature_group
+name: txn_features
+description: "Transaction-level fraud detection features"
+owner: "ml-team"
+entity:
+  name: transaction
+  join_keys: ["txn_id"]
+materialization:
+  event_time_col: txn_timestamp
+  offline:
+    enabled: true
+    format: parquet
+  online:
+    enabled: false
+    ttl: 1d
+features:
+  txn_id:
+    dtype: string
+  customer_id:
+    dtype: integer
+  amount:
+    dtype: float
+  currency:
+    dtype: string
+  txn_timestamp:
+    dtype: timestamp
+  account_age_days:
+    dtype: integer
+  kyc_verified:
+    dtype: boolean
+  device_risk_score:
+    dtype: float
+  ip_reputation_score:
+    dtype: float
+  country_mismatch:
+    dtype: integer
+  merchant_fraud_rate:
+    dtype: float
+  risk_tier:
+    dtype: string
+inputs:
+  - ref: transform.txn_enriched
+  - ref: transform.merchant_risk
+tags:
+  - ml
+  - features
+  - transaction-level
+  - layer-2

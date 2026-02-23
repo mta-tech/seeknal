@@ -14,7 +14,6 @@ from typer.testing import CliRunner
 from seeknal.cli.main import (
     app,
     OutputFormat,
-    WriteMode,
     ResourceType,
     DeleteResourceType,
     _get_version,
@@ -132,11 +131,6 @@ class TestListCommand:
         result = runner.invoke(app, ["list", "entities"])
         assert result.exit_code == 0
 
-    def test_list_flows(self):
-        """List command should list flows."""
-        result = runner.invoke(app, ["list", "flows"])
-        assert result.exit_code == 0
-
     def test_list_workspaces(self):
         """List command should list workspaces."""
         result = runner.invoke(app, ["list", "workspaces"])
@@ -182,57 +176,6 @@ class TestShowCommand:
         )
         # May succeed or fail depending on project existence
         assert result.exit_code in [0, 1]
-
-
-class TestMaterializeCommand:
-    """Tests for the materialize command."""
-
-    def test_materialize_requires_feature_group(self):
-        """Materialize command should require feature group argument."""
-        result = runner.invoke(app, ["materialize"])
-        assert result.exit_code != 0
-
-    def test_materialize_requires_start_date(self):
-        """Materialize command should require start date."""
-        result = runner.invoke(app, ["materialize", "test_fg"])
-        assert result.exit_code != 0
-
-    def test_materialize_invalid_date_format(self):
-        """Materialize command should reject invalid date format."""
-        result = runner.invoke(
-            app, ["materialize", "test_fg", "--start-date", "invalid-date"]
-        )
-        assert result.exit_code == 1
-        assert "Invalid date format" in result.stdout
-
-
-class TestRunCommand:
-    """Tests for the run command."""
-
-    def test_run_requires_flow_name(self):
-        """Run command should require flow name argument."""
-        result = runner.invoke(app, ["run"])
-        assert result.exit_code != 0
-
-    def test_run_dry_run_mode(self):
-        """Run command should support dry-run mode."""
-        result = runner.invoke(app, ["run", "test_flow", "--dry-run"])
-        assert result.exit_code == 0
-        assert "Dry run mode" in result.stdout
-
-    def test_run_with_date_range(self):
-        """Run command should accept date range options."""
-        result = runner.invoke(
-            app,
-            [
-                "run", "test_flow",
-                "--dry-run",
-                "--start-date", "2024-01-01",
-                "--end-date", "2024-12-31"
-            ]
-        )
-        assert result.exit_code == 0
-        assert "Start date: 2024-01-01" in result.stdout
 
 
 class TestCleanCommand:
@@ -289,22 +232,6 @@ class TestOutputFormatEnum:
         assert OutputFormat.YAML.value == "yaml"
 
 
-class TestWriteModeEnum:
-    """Tests for WriteMode enum."""
-
-    def test_overwrite_mode(self):
-        """WriteMode should have OVERWRITE value."""
-        assert WriteMode.OVERWRITE.value == "overwrite"
-
-    def test_append_mode(self):
-        """WriteMode should have APPEND value."""
-        assert WriteMode.APPEND.value == "append"
-
-    def test_merge_mode(self):
-        """WriteMode should have MERGE value."""
-        assert WriteMode.MERGE.value == "merge"
-
-
 class TestResourceTypeEnum:
     """Tests for ResourceType enum."""
 
@@ -319,10 +246,6 @@ class TestResourceTypeEnum:
     def test_entities_type(self):
         """ResourceType should have ENTITIES value."""
         assert ResourceType.ENTITIES.value == "entities"
-
-    def test_flows_type(self):
-        """ResourceType should have FLOWS value."""
-        assert ResourceType.FLOWS.value == "flows"
 
     def test_feature_groups_type(self):
         """ResourceType should have FEATURE_GROUPS value."""
@@ -367,14 +290,6 @@ class TestHelpCommand:
         result = runner.invoke(app, ["list", "--help"])
         assert result.exit_code == 0
         assert "RESOURCE_TYPE" in result.stdout
-
-    def test_materialize_help(self):
-        """Materialize command help should display options."""
-        result = runner.invoke(app, ["materialize", "--help"])
-        assert result.exit_code == 0
-        assert "--start-date" in result.stdout
-        assert "--mode" in result.stdout
-
 
 class TestValidateFeaturesCommand:
     """Tests for the validate-features command."""

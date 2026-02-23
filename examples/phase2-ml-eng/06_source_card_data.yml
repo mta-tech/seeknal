@@ -1,0 +1,28 @@
+kind: source
+name: card_data
+description: "Payment card information"
+owner: "payments-team"
+source: csv
+table: "data/card_data.csv"
+params:
+  delimiter: ","
+  header: true
+schema:
+  - name: card_id
+    data_type: integer
+  - name: customer_id
+    data_type: integer
+  - name: card_type
+    data_type: string
+  - name: issuing_bank
+    data_type: string
+  - name: card_country
+    data_type: string
+  - name: is_prepaid
+    data_type: boolean
+  - name: added_at
+    data_type: timestamp
+tags:
+  - raw
+  - payments
+  - layer-0

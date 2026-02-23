@@ -1,0 +1,46 @@
+kind: feature_group
+name: user_risk
+description: "User-level risk features"
+owner: "ml-team"
+entity:
+  name: user
+  join_keys: ["customer_id"]
+materialization:
+  event_time_col: txn_timestamp
+  offline:
+    enabled: true
+    format: parquet
+  online:
+    enabled: true
+    ttl: 7d
+features:
+  customer_id:
+    dtype: integer
+  txn_timestamp:
+    dtype: timestamp
+  max_txns_per_hour:
+    dtype: integer
+  max_txns_per_day:
+    dtype: integer
+  max_amount_per_hour:
+    dtype: float
+  max_amount_per_day:
+    dtype: float
+  high_velocity_flag:
+    dtype: integer
+  alert_count:
+    dtype: integer
+  high_severity_alerts:
+    dtype: integer
+  has_alerts:
+    dtype: integer
+  has_high_severity:
+    dtype: integer
+inputs:
+  - ref: transform.card_velocity
+  - ref: transform.alert_features
+tags:
+  - ml
+  - features
+  - user-level
+  - layer-2

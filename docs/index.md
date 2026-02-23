@@ -1,107 +1,162 @@
-# Seeknal API Reference
+# Welcome to Seeknal
 
-Welcome to the Seeknal API Reference documentation. This site provides comprehensive API documentation for Seeknal, an all-in-one platform for data and AI/ML engineering.
+> **Build data pipelines and ML features in minutes, not days.**
 
-## What is Seeknal?
+Seeknal is an all-in-one platform for data and AI/ML engineering. Define transformations in YAML or Python, run them with DuckDB or Spark, and deploy features to production with a single CLI.
 
-Seeknal is a platform that abstracts away the complexity of data transformation and AI/ML engineering. It is a collection of tools that help you transform data, store it, and use it for machine learning and data analytics.
+---
 
-Seeknal lets you:
+## What Can You Build With Seeknal?
 
-- **Define** data and feature transformations from raw data sources using Pythonic APIs and YAML.
-- **Register** transformations and feature groups by names and get transformed data and features for various use cases including AI/ML modeling, data engineering, business metrics calculation and more.
-- **Share** transformations and feature groups across teams and company.
+| For ML Engineers | For Data Engineers | For Analytics Engineers |
+|------------------|-------------------|-------------------------|
+| **Feature stores** with point-in-time correctness | **ELT pipelines** with incremental execution | **Semantic layers** with consistent metrics |
+| **Training datasets** from raw events | **Data transformations** with SQL | **Business metrics** with change tracking |
+| **Online serving** for real-time inference | **Multi-engine workflows** (DuckDB + Spark) | **Self-serve analytics** for stakeholders |
 
-## Use Cases
+**Common use cases:** Recommendation systems, churn prediction, customer segmentation, real-time dashboards, A/B test analysis, fraud detection.
 
-Seeknal is useful in multiple scenarios:
+---
 
-- **AI/ML Modeling**: Computes your feature transformations and incorporates them into your training data, using point-in-time joins to prevent data leakage while supporting the materialization and deployment of your features for online use in production.
-- **Data Analytics**: Build data pipelines to extract features and metrics from raw data for Analytics and AI/ML modeling.
+## Get Started in 10 Minutes
 
-## Quick Links
+**[→ Quick Start Guide](getting-started-comprehensive.md)**
 
-<div class="grid cards" markdown>
+1. Install Seeknal (download from [GitHub Releases](https://github.com/mta-tech/seeknal/releases))
+2. Load your data (CSV, Parquet, database)
+3. Transform with SQL
+4. Run your first pipeline
 
--   :material-code-braces: **API Reference**
+No infrastructure required. Works on your laptop.
 
-    ---
+---
 
-    Explore the complete API documentation for all Seeknal modules.
+## How Seeknal Works: The Pipeline Builder
 
-    [:octicons-arrow-right-24: API Reference](api/index.md)
+Seeknal's workflow is inspired by modern infrastructure tools like `terraform` and `kubectl`:
 
--   :material-book-open-variant: **Examples**
-
-    ---
-
-    Learn through practical code examples demonstrating common patterns.
-
-    [:octicons-arrow-right-24: Examples](examples/index.md)
-
-</div>
-
-## Getting Started
-
-### Installation
-
-We recommend using uv for installing Seeknal:
-
-```bash
-# Create and activate virtual environment
-uv venv --python 3.11
-source .venv/bin/activate
-
-# Install Seeknal
-uv pip install seeknal-<version>-py3-none-any.whl
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│     init        │ →   │     draft       │ →   │     apply       │ →   │   run --env     │
+│  (setup project)│     │  (write YAML)   │     │  (save changes) │     │  (execute)      │
+└─────────────────┘     └─────────────────┘     └─────────────────┘     └─────────────────┘
 ```
 
-### Quick Example
+### Step-by-Step
 
-```python
-from seeknal.project import Project
-from seeknal.flow import Flow, FlowInput, FlowOutput, FlowInputEnum, FlowOutputEnum
-from seeknal.tasks.sparkengine import SparkEngineTask
+1. **`seeknal init`** - Create a new project
+2. **`seeknal draft`** - Generate YAML templates for sources, transforms, feature groups
+3. **`seeknal apply`** - Save your pipeline definition (like `git commit`)
+4. **`seeknal run --env prod`** - Execute in production with safety checks
 
-# Create a project
-project = Project(name="my_project", description="My project")
-project.get_or_create()
+**Key benefits:** Dry-run validation, change detection, rollback support, and multi-environment support.
 
-# Define a data pipeline
-flow_input = FlowInput(kind=FlowInputEnum.HIVE_TABLE, value="my_df")
-task = SparkEngineTask().add_sql("SELECT * FROM __THIS__ WHERE active = true")
-flow = Flow(
-    name="my_flow",
-    input=flow_input,
-    tasks=[task],
-    output=FlowOutput(),
-)
+---
 
-# Save and run the pipeline
-flow.get_or_create()
-result = flow.run()
-```
+## Choose Your Learning Path
 
-## Core Modules
+Seeknal supports different workflows depending on your role and goals.
 
-| Module | Description |
-|--------|-------------|
-| [`seeknal.project`](api/core.md#project) | Project management and configuration |
-| [`seeknal.entity`](api/core.md#entity) | Entity definitions for feature stores |
-| [`seeknal.flow`](api/core.md#flow) | Data pipeline and transformation flows |
-| [`seeknal.featurestore`](api/featurestore.md) | Feature store management and materialization |
-| [`seeknal.tasks`](api/tasks.md) | Task definitions for Spark, DuckDB, and more |
+### 🆕 New to Seeknal?
 
-## Environment Setup
+Start here if you're evaluating or just getting started:
 
-Seeknal requires the following environment variables:
+**[→ Quick Start Guide (10 min)](getting-started-comprehensive.md)**
 
-| Variable | Description |
-|----------|-------------|
-| `SEEKNAL_BASE_CONFIG_PATH` | Path to base configuration directory |
-| `SEEKNAL_USER_CONFIG_PATH` | Path to user config file (e.g., `/path/to/config.toml`) |
+Install, load data, create features, and run your first pipeline.
+
+---
+
+### 🏗️ Data Engineer Path
+
+**Goal:** Build reliable ELT pipelines with incremental execution and production safety.
+
+**Start with:** [YAML Pipeline Tutorial (75 min)](tutorials/yaml-pipeline-tutorial.md)
+
+**Then learn:**
+- [Virtual Environments](tutorials/phase2-data-eng-environments.md) - Safe development with isolated environments
+- [Incremental Models](concepts/second-order-aggregations.md) - Efficient incremental processing
+- [Change Categorization](concepts/change-categorization.md) - Understand breaking vs. non-breaking changes
+
+**Typical use case:** "I need to transform raw data into analytics-ready tables, incrementally, with production safety."
+
+---
+
+### 📊 Analytics Engineer Path
+
+**Goal:** Define metrics and build a semantic layer for self-serve analytics.
+
+**Start with:** [YAML Pipeline Tutorial (75 min)](tutorials/yaml-pipeline-tutorial.md)
+
+**Then learn:**
+- [Semantic Layer & Metrics](guides/semantic-layer.md) - Define and query consistent metrics
+- [Change Categorization](tutorials/phase2-analytics-eng-metrics.md) - Track metric changes over time
+- [Testing & Audits](guides/testing-and-audits.md) - Validate data quality
+
+**Typical use case:** "I need consistent metrics across dashboards and tools, with change tracking."
+
+---
+
+### 🤖 ML Engineer Path
+
+**Goal:** Build feature stores with point-in-time joins for ML models.
+
+**Start with:** [Getting Started (30 min)](getting-started-comprehensive.md)
+
+**Then learn:**
+- [Python Pipelines](tutorials/python-pipelines-tutorial.md) - Feature engineering with Python
+- [Training to Serving](guides/training-to-serving.md) - End-to-end ML workflow
+- [Parallel Execution](tutorials/phase2-ml-eng-parallel.md) - Speed up large pipelines
+
+**Typical use case:** "I need features for training that prevent data leakage, with online serving."
+
+---
+
+## Concepts
+
+Learn the mental model behind Seeknal.
+
+- [Glossary](concepts/glossary.md) — Definitions of all key terms
+- [Point-in-Time Joins](concepts/point-in-time-joins.md) — Prevent data leakage in ML features
+- [Second-Order Aggregations](concepts/second-order-aggregations.md) — Hierarchical rollups and multi-level analytics
+- [Virtual Environments](concepts/virtual-environments.md) — Isolated workspaces for safe development
+- [Change Categorization](concepts/change-categorization.md) — BREAKING, NON_BREAKING, and METADATA changes
+- [Python API vs YAML Workflows](concepts/python-vs-yaml.md) — Choose the right paradigm
+
+## Guides
+
+Task-oriented walkthroughs for specific workflows.
+
+- [Python Pipelines](guides/python-pipelines.md) — Write Python feature transforms and custom logic
+- [Testing & Audits](guides/testing-and-audits.md) — Data quality validation with `seeknal audit`
+- [Semantic Layer & Metrics](guides/semantic-layer.md) — Define and query metrics with `seeknal query`
+- [Training to Serving](guides/training-to-serving.md) — End-to-end ML feature workflow
+- [Seeknal vs dbt vs SQLMesh vs Feast](guides/comparison.md) — Feature comparison
+
+## Reference
+
+Lookup documentation for commands, schemas, and configuration.
+
+- [CLI Commands](reference/cli.md) — All 35+ commands with flags and examples
+- [YAML Schema](reference/yaml-schema.md) — Every field for all node kinds
+- [Configuration](reference/configuration.md) — Project files, profiles, and environment variables
+- [Python API](api/index.md) — Module reference
+
+## Tutorials
+
+Step-by-step learning paths with copy-pasteable code.
+
+- [YAML Pipeline Tutorial](tutorials/yaml-pipeline-tutorial.md) — Build a complete pipeline from scratch (75 min)
+- [Mixed YAML + Python](tutorials/mixed-yaml-python-pipelines.md) — Combine both paradigms (60 min)
+- [Virtual Environments](tutorials/phase2-data-eng-environments.md) — Safe development with environments (45 min)
+- [Parallel Execution](tutorials/phase2-ml-eng-parallel.md) — Speed up large pipelines (45 min)
+- [Change Categorization](tutorials/phase2-analytics-eng-metrics.md) — Understand change impact (20 min)
+- [E-Commerce Walkthrough](tutorials/workflow-tutorial-ecommerce.md) — Real-world example
 
 ## Additional Resources
 
-- [GitHub Repository](https://github.com/mta-tech/seeknal)
-- [README](https://github.com/mta-tech/seeknal/blob/main/README.md)
+- [DuckDB Getting Started](duckdb-getting-started.md) — DuckDB engine quickstart
+- [DuckDB Flow Guide](duckdb-flow-guide.md) — DuckDB flow patterns
+- [Spark Transformers Reference](spark-transformers-reference.md) — Spark-specific reference
+- [Iceberg Materialization](iceberg-materialization.md) — Apache Iceberg integration
+- [DAGRunner Documentation](workflows/runner.md) — Workflow runner internals

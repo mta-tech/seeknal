@@ -1,0 +1,14 @@
+kind: exposure
+name: churn_predictions_export
+description: Export churn predictions to file
+type: file
+params:
+  path: outputs/churn_predictions.parquet
+  format: parquet
+  compression: snappy
+  partition_by: [churn_risk_level]
+inputs:
+  - ref: model.churn_predictor
+tags:
+  - export
+  - output

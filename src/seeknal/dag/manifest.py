@@ -23,7 +23,11 @@ class NodeType(Enum):
     MODEL = "model"
     RULE = "rule"
     AGGREGATION = "aggregation"
+    SECOND_ORDER_AGGREGATION = "second_order_aggregation"
     EXPOSURE = "exposure"
+    PYTHON = "python"  # For nodes that need special Python execution
+    SEMANTIC_MODEL = "semantic_model"
+    METRIC = "metric"
 
 
 @dataclass(slots=True)

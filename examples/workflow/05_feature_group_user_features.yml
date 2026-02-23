@@ -1,0 +1,41 @@
+kind: feature_group
+name: user_features
+description: User-level features for ML
+entity: user
+features:
+  transaction_count:
+    description: Total number of transactions
+    dtype: int
+  total_amount:
+    description: Sum of all transaction amounts
+    dtype: float
+  avg_transaction_value:
+    description: Average transaction amount
+    dtype: float
+  favorite_merchant:
+    description: Most frequently visited merchant
+    dtype: string
+  days_since_last_transaction:
+    description: Days since last transaction
+    dtype: int
+transform: |
+  SELECT
+    user_id,
+    COUNT(*) as transaction_count,
+    SUM(amount) as total_amount,
+    AVG(amount) as avg_transaction_value,
+    MODE() WITHIN GROUP (ORDER BY merchant) as favorite_merchant,
+    DATEDIFF('day', CURRENT_DATE, MAX(timestamp)) as days_since_last_transaction
+  FROM transform.user_transactions
+  GROUP BY user_id
+materialization:
+  offline:
+    format: parquet
+    partition_by: [country]
+  online:
+    enabled: true
+inputs:
+  - ref: transform.user_transactions
+tags:
+  - features
+  - ml

@@ -1,0 +1,19 @@
+kind: transform
+name: {{ name }}
+description: "{{ description | default('Data transformation') }}"
+owner: "{{ owner | default('data-team@example.com') }}"
+tags: {{ tags | default(['transform']) | tojson }}
+inputs:
+  - ref: source.raw_data
+params:
+  key: value
+transform: |
+  SELECT
+    id,
+    COUNT(*) as count
+  FROM source_table
+  GROUP BY id
+output:
+  columns:
+    id: "Unique identifier"
+    count: "Record count"

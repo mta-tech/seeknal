@@ -107,7 +107,6 @@ class TestListingWorkflow:
         resource_types = [
             "projects",
             "entities",
-            "flows",
             "workspaces",
             "feature-groups",
             "offline-stores"
@@ -120,23 +119,6 @@ class TestListingWorkflow:
 
 class TestDryRunWorkflow:
     """E2E tests for dry-run workflows."""
-
-    def test_run_flow_dry_run(self, clean_test_env):
-        """Test running a flow in dry-run mode."""
-        runner.invoke(app, ["init", "--name", "dry_run_test"])
-
-        result = runner.invoke(
-            app,
-            [
-                "run", "test_flow",
-                "--dry-run",
-                "--start-date", "2024-01-01",
-                "--end-date", "2024-12-31"
-            ]
-        )
-        assert result.exit_code == 0
-        assert "Dry run mode" in result.stdout
-        assert "no changes will be made" in result.stdout
 
     def test_clean_dry_run(self, clean_test_env):
         """Test cleaning feature data in dry-run mode."""
@@ -174,42 +156,6 @@ class TestVersionWorkflow:
         assert len(lines) >= 4  # At least 4 version lines
 
 
-class TestMaterializeWorkflow:
-    """E2E tests for materialization workflows."""
-
-    def test_materialize_displays_parameters(self, clean_test_env):
-        """Test that materialize command displays parameters correctly."""
-        runner.invoke(app, ["init", "--name", "materialize_test"])
-
-        result = runner.invoke(
-            app,
-            [
-                "materialize", "test_fg",
-                "--start-date", "2024-01-01",
-                "--end-date", "2024-12-31",
-                "--mode", "overwrite"
-            ]
-        )
-        # Will fail because feature group doesn't exist, but should show parameters
-        assert "Materializing feature group: test_fg" in result.stdout
-        assert "Start date: 2024-01-01" in result.stdout
-        assert "Mode: overwrite" in result.stdout
-
-    def test_materialize_with_append_mode(self, clean_test_env):
-        """Test materialize with append mode."""
-        runner.invoke(app, ["init", "--name", "materialize_append_test"])
-
-        result = runner.invoke(
-            app,
-            [
-                "materialize", "test_fg",
-                "--start-date", "2024-06-01",
-                "--mode", "append"
-            ]
-        )
-        assert "Mode: append" in result.stdout
-
-
 class TestErrorHandling:
     """E2E tests for error handling."""
 
@@ -217,16 +163,6 @@ class TestErrorHandling:
         """Test error handling for invalid resource types."""
         result = runner.invoke(app, ["list", "invalid-type"])
         assert result.exit_code != 0
-
-    def test_invalid_date_format_error(self, clean_test_env):
-        """Test error handling for invalid date formats."""
-        runner.invoke(app, ["init", "--name", "error_test"])
-
-        result = runner.invoke(
-            app, ["materialize", "test_fg", "--start-date", "not-a-date"]
-        )
-        assert result.exit_code == 1
-        assert "Invalid date format" in result.stdout
 
     def test_nonexistent_project_show_error(self, clean_test_env):
         """Test error handling when showing non-existent project."""
@@ -246,7 +182,7 @@ class TestHelpWorkflow:
         assert result.exit_code == 0
 
         expected_commands = [
-            "init", "run", "materialize", "list",
+            "init", "run", "list",
             "show", "validate", "version", "debug", "clean"
         ]
 
@@ -256,7 +192,7 @@ class TestHelpWorkflow:
     def test_all_commands_have_help(self):
         """Test that all commands have help documentation."""
         commands = [
-            "init", "run", "materialize", "list",
+            "init", "run", "list",
             "show", "validate", "version", "debug", "clean"
         ]
 
@@ -325,7 +261,7 @@ class TestCLIIntegration:
         assert result.exit_code == 0
 
         # List all resource types
-        for resource in ["projects", "entities", "flows", "offline-stores"]:
+        for resource in ["projects", "entities", "offline-stores"]:
             result = runner.invoke(app, ["list", resource])
             assert result.exit_code == 0
 

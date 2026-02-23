@@ -1,0 +1,24 @@
+kind: second_order_aggregation
+name: {{ name }}
+description: "{{ description | default('Aggregates aggregated features to meta-features') }}"
+owner: "{{ owner | default('ml-team@example.com') }}"
+id_col: {{ id_col | default('region_id') }}
+feature_date_col: {{ feature_date_col | default('date') }}
+application_date_col: {{ application_date_col | default('application_date') }}
+source: aggregation.{{ source_aggregation | default('upstream_aggregation') }}
+features:
+  total_entities:
+    basic: [count]
+  avg_feature_value:
+    basic: [mean, stddev]
+    source_feature: feature_value
+  weekly_total:
+    window: [7, 7]
+    basic: [sum]
+    source_feature: daily_amount
+  recent_vs_historical:
+    ratio:
+      numerator: [1, 7]
+      denominator: [8, 30]
+      aggs: [sum]
+    source_feature: transaction_amount

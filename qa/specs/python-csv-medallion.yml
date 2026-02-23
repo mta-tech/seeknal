@@ -1,0 +1,140 @@
+name: python-csv-medallion
+description: >
+  Test Python pipeline decorators with CSV sources through a complete medallion pipeline.
+  Validates: @source decorator for CSV, @transform with ctx.ref() and ctx.duckdb.sql(),
+  DuckDB variable shadowing pattern (local variable assignment), multi-source joins via
+  Python/DuckDB, DataFrame return from transforms, PythonExecutor subprocess execution.
+source_type: csv
+pipeline_type: python
+
+infrastructure:
+  requires: []  # CSV needs no external infrastructure
+
+seed_data:
+  raw_orders.csv: |
+    order_id,customer_id,amount,order_date,status
+    ORD001,C001,150.00,2026-01-15,completed
+    ORD002,C002,75.50,2026-01-16,completed
+    ORD003,C001,200.00,2026-01-17,pending
+    ORD004,C003,50.00,2026-01-18,completed
+    ORD005,C002,300.00,2026-01-19,cancelled
+    ORD006,C001,125.75,2026-01-20,completed
+    ORD007,C004,89.99,2026-01-21,completed
+    ORD008,C003,175.00,2026-01-22,pending
+    ORD009,C001,60.00,2026-01-23,completed
+    ORD010,C005,220.00,2026-01-24,completed
+  raw_customers.csv: |
+    customer_id,name,email,signup_date,tier
+    C001,Alice Johnson,alice@example.com,2025-06-01,gold
+    C002,Bob Smith,bob@example.com,2025-07-15,silver
+    C003,Charlie Brown,charlie@example.com,2025-08-20,bronze
+    C004,Diana Prince,diana@example.com,2025-09-10,gold
+    C005,Eve Wilson,eve@example.com,2025-10-05,silver
+
+pipeline_files:
+  medallion.py: |
+    """Python CSV medallion pipeline for QA testing.
+
+    Tests @source and @transform decorators with CSV sources,
+    ctx.ref() for input loading, and ctx.duckdb.sql() for transforms.
+    """
+    from seeknal.pipeline.decorators import source, transform
+
+    # --- Bronze layer: CSV sources ---
+
+    @source(name="raw_orders", source="csv", table="data/raw_orders.csv",
+            tags=["bronze", "orders"])
+    def raw_orders():
+        pass  # SourceExecutor handles CSV loading
+
+    @source(name="raw_customers", source="csv", table="data/raw_customers.csv",
+            tags=["bronze", "customers"])
+    def raw_customers():
+        pass  # SourceExecutor handles CSV loading
+
+    # --- Silver layer: filtered + typed ---
+
+    @transform(name="clean_orders", inputs=["source.raw_orders"],
+               tags=["silver", "cleaned"])
+    def clean_orders(ctx):
+        # Always assign ctx.ref() to a local variable (DuckDB variable shadowing)
+        orders = ctx.ref("source.raw_orders")
+        return ctx.duckdb.sql("""
+            SELECT
+                order_id,
+                customer_id,
+                CAST(amount AS DECIMAL(10,2)) AS amount,
+                CAST(order_date AS DATE) AS order_date,
+                status
+            FROM orders
+            WHERE status = 'completed'
+        """).df()
+
+    # --- Gold layer: aggregated LTV ---
+
+    @transform(name="customer_ltv",
+               inputs=["transform.clean_orders", "source.raw_customers"],
+               tags=["gold", "analytics"])
+    def customer_ltv(ctx):
+        orders = ctx.ref("transform.clean_orders")
+        customers = ctx.ref("source.raw_customers")
+        return ctx.duckdb.sql("""
+            SELECT
+                c.customer_id,
+                c.name,
+                c.tier,
+                COUNT(o.order_id) AS total_orders,
+                CAST(SUM(o.amount) AS DECIMAL(10,2)) AS lifetime_value,
+                MIN(o.order_date) AS first_order,
+                MAX(o.order_date) AS last_order
+            FROM customers c
+            JOIN orders o ON c.customer_id = o.customer_id
+            GROUP BY c.customer_id, c.name, c.tier
+        """).df()
+
+pipeline:
+  bronze:
+    - kind: source
+      name: raw_orders
+      source: csv
+    - kind: source
+      name: raw_customers
+      source: csv
+  silver:
+    - kind: transform
+      name: clean_orders
+      inputs:
+        - ref: source.raw_orders
+  gold:
+    - kind: transform
+      name: customer_ltv
+      inputs:
+        - ref: transform.clean_orders
+        - ref: source.raw_customers
+
+validation:
+  dag:
+    expected_nodes: 4
+    expected_edges:
+      - [source.raw_orders, transform.clean_orders]
+      - [transform.clean_orders, transform.customer_ltv]
+      - [source.raw_customers, transform.customer_ltv]
+  execution:
+    success: true
+  outputs:
+    - node: transform.clean_orders
+      min_rows: 7   # 7 completed orders out of 10
+    - node: transform.customer_ltv
+      min_rows: 4   # 4 customers with completed orders (C001, C002, C004, C005)
+
+features_tested:
+  - python_source_decorator
+  - python_transform_decorator
+  - ctx_ref_input_loading
+  - ctx_duckdb_sql
+  - duckdb_variable_shadowing_pattern
+  - python_executor_subprocess
+  - multi_source_join_python
+  - dataframe_return
+  - filter_transform_python
+  - aggregation_transform_python

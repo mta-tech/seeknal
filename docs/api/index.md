@@ -14,6 +14,16 @@ Seeknal is organized into several key modules, each serving a specific purpose i
 | [FeatureStore](featurestore.md) | Feature store management, feature groups, and materialization |
 | [Tasks](tasks.md) | Task definitions for different data processing engines |
 
+### Workflow Modules
+
+| Module | Description |
+|--------|-------------|
+| [Intervals](workflow.md#intervals) | Interval tracking and cron-based scheduling for incremental processing |
+| [Change Detection](workflow.md#change-detection) | SQL-aware change detection for efficient incremental rebuilds |
+| [State Backends](workflow.md#state-backends) | Pluggable state storage for distributed execution |
+| [Environments](workflow.md#environments) | Environment management for plan/apply workflow |
+| [Prefect Integration](workflow.md#prefect) | Prefect flows for distributed execution |
+
 ## Module Hierarchy
 
 ```
@@ -52,7 +62,7 @@ seeknal/
 ### Task Classes
 
 - **[Task](tasks.md#seeknal.tasks.base.Task)** - Base class for all tasks
-- **[SparkEngineTask](tasks.md#seeknal.tasks.sparkengine.sparkengine.SparkEngineTask)** - Spark-based data processing
+- **[SparkEngineTask](tasks.md#sparkenginetask)** - Spark-based data processing
 - **[DuckDBTask](tasks.md#seeknal.tasks.duckdb.duckdb.DuckDBTask)** - DuckDB-based data processing
 
 ## Docstring Format

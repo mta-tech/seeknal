@@ -1,0 +1,30 @@
+kind: source
+name: customers
+description: Customer profile data
+source: postgresql
+table: raw.customers
+columns:
+  customer_id:
+    description: Unique customer identifier
+    dtype: string
+  email:
+    description: Customer email address
+    dtype: string
+  company_name:
+    description: Company name
+    dtype: string
+  industry:
+    description: Industry vertical
+    dtype: string
+  signup_date:
+    description: Account creation date
+    dtype: date
+  country:
+    description: Customer country
+    dtype: string
+  created_at:
+    description: Record creation timestamp
+    dtype: datetime
+tags:
+  - raw-data
+  - customer-profile

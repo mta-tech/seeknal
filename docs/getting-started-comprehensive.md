@@ -12,6 +12,7 @@ This comprehensive guide takes you from installation to your first materialized 
 - [What You'll Learn](#what-youll-learn)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
+- [Development Approaches](#development-approaches)
 - [Quick Start Tutorial](#quick-start-tutorial)
   - [Part 1: Load and Explore Data](#part-1-load-and-explore-data-5-minutes)
   - [Part 2: Feature Engineering](#part-2-feature-engineering-10-minutes)
@@ -47,6 +48,75 @@ Unlike other feature stores that require complex infrastructure setup, Seeknal:
 
 ---
 
+## Development Approaches
+
+Seeknal supports two development workflows. Choose based on your preference:
+
+### Approach 1: CLI-Based Workflow (Recommended for Teams)
+
+The **draft workflow** provides a structured, team-friendly approach:
+
+```bash
+# 1. Create a draft with scaffolding
+seeknal draft source raw_data --description "Raw customer data"
+
+# 2. Edit the generated template
+# Edit draft_source_raw_data.yml
+
+# 3. Preview what will happen
+seeknal dry-run draft_source_raw_data.yml
+
+# 4. Apply to create the actual source
+seeknal apply draft_source_raw_data.yml
+```
+
+**Benefits:**
+- Validated templates prevent errors
+- Preview changes before applying
+- Git-friendly YAML files
+- Works with CI/CD pipelines
+- **If you're coming from dbt, this will feel familiar!**
+
+**When to use:** Team collaboration, production pipelines, GitOps workflows
+
+**Learn more:** [Workflow Tutorial](./tutorials/workflow-tutorial-ecommerce.md)
+
+### Approach 2: Python API (This Tutorial)
+
+The **Python API** provides programmatic control:
+
+```python
+from seeknal.tasks.duckdb import DuckDBTask
+
+# Create task and define transformation
+task = DuckDBTask()
+task.add_input(dataframe=arrow_table)
+task.add_sql("SELECT user_id, SUM(amount) FROM __THIS__ GROUP BY user_id")
+result = task.transform()
+```
+
+**Benefits:**
+- Full Python flexibility
+- Jupyter Notebook compatible
+- Interactive development
+- Direct debugging
+
+**When to use:** Exploratory analysis, notebooks, data science workflows
+
+**Learn more:** Continue with this tutorial
+
+### Choosing Your Approach
+
+| Factor | CLI Workflow | Python API |
+|--------|--------------|------------|
+| **Team size** | Multiple developers | Individual or small team |
+| **Deployment** | Production pipelines | Notebooks & scripts |
+| **Version control** | Git-friendly YAML | Standard Python |
+| **Learning curve** | Moderate | Low (if you know Python) |
+| **Use case** | Production features | Exploratory analysis |
+
+---
+
 ## What You'll Learn
 
 By completing this guide, you will:
@@ -57,6 +127,8 @@ By completing this guide, you will:
 4. **Aggregate user behavior** into ML-ready features
 5. **Save features** in efficient formats (Parquet, CSV)
 6. **Understand** when to use DuckDB vs Spark
+
+> **Note:** This tutorial teaches Seeknal's **Python API** for programmatic feature engineering. If you prefer a **CLI-based workflow** with YAML definitions and the `draft → dry-run → apply` pattern, see the [Workflow Tutorial](./tutorials/workflow-tutorial-ecommerce.md). Both approaches are valid - choose based on your workflow preference.
 
 ---
 
@@ -681,13 +753,184 @@ task.add_sql("SELECT user_id, SUM(amount) FROM __THIS__ GROUP BY user_id")
 
 ---
 
+## Using Iceberg Storage
+
+**Apache Iceberg** provides ACID transactions, time travel, and cloud-native storage for feature groups. With Iceberg, you can store features in S3, GCS, or Azure Blob storage while maintaining full version history and rollback capabilities.
+
+### Prerequisites
+
+For Iceberg storage, you need:
+- **DuckDB** with Iceberg extension (included with Seeknal)
+- **REST Catalog** (e.g., Lakekeeper, Hive Metastore)
+- **Cloud storage** (S3, GCS, Azure) or local filesystem
+
+### Configure Catalog
+
+Create or update `~/.seeknal/profiles.yml`:
+
+```yaml
+materialization:
+  catalog:
+    uri: http://localhost:8181  # Lakekeeper REST catalog
+    warehouse: s3://my-bucket/warehouse
+    bearer_token: optional_token  # If auth required
+```
+
+Or use environment variables:
+```bash
+export LAKEKEEPER_URI=http://localhost:8181
+export LAKEKEEPER_WAREHOUSE=s3://my-bucket/warehouse
+```
+
+### Create Feature Group with Iceberg
+
+```python
+from seeknal.featurestore import (
+    FeatureGroup,
+    Materialization,
+    OfflineMaterialization,
+    OfflineStore,
+    OfflineStoreEnum,
+    IcebergStoreOutput,
+)
+from seeknal.entity import Entity
+from datetime import datetime
+import pandas as pd
+
+# Create sample data
+df = pd.DataFrame({
+    "customer_id": ["A001", "A002", "A003"],
+    "event_date": [datetime(2024, 1, 1)] * 3,
+    "total_orders": [5, 10, 3],
+    "total_spend": [100.0, 250.0, 75.0],
+})
+
+# Create entity
+customer_entity = Entity(name="customer", join_keys=["customer_id"])
+
+# Create feature group with Iceberg storage
+fg = FeatureGroup(
+    name="customer_features",
+    entity=customer_entity,
+    materialization=Materialization(
+        event_time_col="event_date",
+        offline=True,
+        offline_materialization=OfflineMaterialization(
+            store=OfflineStore(
+                kind=OfflineStoreEnum.ICEBERG,  # Use Iceberg!
+                value=IcebergStoreOutput(
+                    catalog="lakekeeper",        # Catalog name from profiles.yml
+                    namespace="prod",            # Iceberg namespace (database)
+                    table="customer_features",   # Table name
+                    mode="append"               # "append" or "overwrite"
+                )
+            ),
+            mode="append"
+        )
+    )
+)
+
+# Write features to Iceberg
+fg.set_dataframe(df).set_features()
+fg.write(feature_start_time=datetime(2024, 1, 1))
+
+# Features are now in Iceberg table: lakekeeper.prod.customer_features
+```
+
+### Query Iceberg Tables
+
+After writing, query features with DuckDB or Spark:
+
+```python
+import duckdb
+
+# Query Iceberg table directly
+con = duckdb.connect(":memory:")
+
+# Load Iceberg extension
+con.install_extension("iceberg")
+con.load_extension("iceberg")
+
+# Attach REST catalog
+con.execute(f"""
+    ATTACH 'http://localhost:8181' AS iceberg_catalog (
+        TYPE iceberg,
+        WAREHOUSE 's3://my-bucket/warehouse'
+    )
+""")
+
+# Query features
+result = con.execute("""
+    SELECT customer_id, total_orders, total_spend
+    FROM iceberg_catalog.prod.customer_features
+""").fetchall()
+
+print(result)  # [('A001', 5, 100.0), ('A002', 10, 250.0), ...]
+```
+
+### Time Travel with Iceberg
+
+Iceberg supports time travel - query features as of any snapshot:
+
+```python
+# Get snapshot ID from write result
+result = fg.write(feature_start_time=datetime(2024, 1, 1))
+snapshot_id = result["snapshot_id"]
+
+# Query as of specific snapshot
+con.execute(f"USE SNAPSHOT '{snapshot_id}'")
+historical_features = con.execute("""
+    SELECT * FROM iceberg_catalog.prod.customer_features
+""").fetchall()
+```
+
+### Write Modes
+
+**Append Mode** (default):
+```python
+IcebergStoreOutput(table="features", mode="append")
+# Adds new rows to existing table
+```
+
+**Overwrite Mode**:
+```python
+IcebergStoreOutput(table="features", mode="overwrite")
+# Replaces table data (keeps schema history)
+```
+
+### Benefits of Iceberg Storage
+
+| Feature | Benefit |
+|---------|---------|
+| **ACID Transactions** | Atomic writes, no partial data |
+| **Time Travel** | Query features as of any point in time |
+| **Schema Evolution** | Add/modify features without rewrites |
+| **Cloud Storage** | S3, GCS, Azure Blob support |
+| **Compatibility** | Works with DuckDB, Spark, Trino, and more |
+| **Partitioning** | Efficient data pruning for large datasets |
+
+---
+
 ## Next Steps
+
+### Choose Your Path
+
+**For production-ready, team-based development:**
+- **[Workflow Tutorial: E-commerce Analytics Pipeline](./tutorials/workflow-tutorial-ecommerce.md)** - Learn the `draft → dry-run → apply` CLI workflow for creating production-grade pipelines with YAML definitions.
+
+**For continued Python API learning:**
+- **[Spark Transformers Reference](./spark-transformers-reference.md)** - Production-scale feature engineering
+- **[Feature Store Examples](./examples/featurestore.md)** - Complete feature store workflow
+- **[Python Pipelines Tutorial](./tutorials/python-pipelines-tutorial.md)** - Advanced Python pipeline patterns
 
 ### Learn More
 
-- **[Spark Quickstart](../examples/quickstart/quickstart_spark.py)** - Production-scale feature engineering
-- **[Feature Store Demo](../feature-store-demo.ipynb)** - Complete feature store workflow
-- **[API Reference](https://github.com/mta-tech/seeknal)** - Full documentation
+-- **[API Reference](https://github.com/mta-tech/seeknal)** - Full documentation
+-- **[Spark Transformers Reference](./spark-transformers-reference.md)** - Production-scale feature engineering
+-- **[Feature Store Examples](./examples/featurestore.md)** - Complete feature store workflow
+-- **[API Reference](./api/)** - Full API documentation
+-- **[Workflow Guides](./guides/)** - Advanced workflow features
+
 
 ### Try These Exercises
 
@@ -829,6 +1072,7 @@ If you're still stuck:
 2. **Search GitHub Issues** - Someone may have solved your problem
 3. **Open a new issue** - Include your Python version, OS, and error message
 4. **Join discussions** - Ask the community for help
+5. **See the [Troubleshooting Guide](reference/troubleshooting.md)** - Comprehensive issue diagnosis
 
 ---
 
