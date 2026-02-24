@@ -153,7 +153,7 @@ class DAGRunner:
         # Kahn's algorithm
         in_degree: Dict[str, int] = {node_id: 0 for node_id in self.manifest.nodes}
         for edge in self.manifest.edges:
-            if edge.to_node in in_degree:
+            if edge.to_node in in_degree and edge.from_node in in_degree:
                 in_degree[edge.to_node] += 1
 
         # Start with nodes that have no dependencies
@@ -191,9 +191,9 @@ class DAGRunner:
         in_degree: Dict[str, int] = {node_id: 0 for node_id in self.manifest.nodes}
         downstream_adj: Dict[str, Set[str]] = {node_id: set() for node_id in self.manifest.nodes}
         for edge in self.manifest.edges:
-            if edge.to_node in in_degree:
+            if edge.to_node in in_degree and edge.from_node in in_degree:
                 in_degree[edge.to_node] += 1
-            if edge.from_node in downstream_adj:
+            if edge.from_node in downstream_adj and edge.to_node in downstream_adj:
                 downstream_adj[edge.from_node].add(edge.to_node)
 
         layers: List[List[str]] = []

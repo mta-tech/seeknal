@@ -78,16 +78,54 @@ class LineageDataBuilder:
         )
 
     def _serialize_node(self, node: Node) -> dict:
-        """Convert Node to Cytoscape.js element format."""
+        """Convert Node to Cytoscape.js element format.
+
+        Normalizes two YAML column formats into a uniform structure:
+          - Simple:   {col_name: "description"}
+          - Detailed: {col_name: {description: "...", dtype: "..."}}
+        Output: {col_name: {type: "...", description: "..."}}
+
+        For semantic models, extracts dimensions and measures as columns.
+        """
+        columns = {}
+        for col_name, col_val in (node.columns or {}).items():
+            if isinstance(col_val, dict):
+                columns[col_name] = {
+                    "type": col_val.get("dtype", ""),
+                    "description": col_val.get("description", ""),
+                }
+            elif isinstance(col_val, str):
+                columns[col_name] = {
+                    "type": "",
+                    "description": col_val,
+                }
+            else:
+                columns[col_name] = {"type": str(col_val) if col_val else "", "description": ""}
+
+        # Semantic models: extract dimensions and measures as columns
+        if node.node_type.value == "semantic_model" and not columns:
+            for dim in node.config.get("dimensions", []):
+                if isinstance(dim, dict) and dim.get("name"):
+                    columns[dim["name"]] = {
+                        "type": dim.get("type", "dimension"),
+                        "description": dim.get("description", ""),
+                    }
+            for measure in node.config.get("measures", []):
+                if isinstance(measure, dict) and measure.get("name"):
+                    columns[measure["name"]] = {
+                        "type": measure.get("agg", "measure"),
+                        "description": measure.get("description", ""),
+                    }
+
         return {
             "data": {
                 "id": node.id,
                 "label": node.name,
                 "node_type": node.node_type.value,
                 "description": node.description or "",
-                "columns": node.columns or {},
+                "columns": columns,
                 "file_path": node.file_path or "",
-                "sql": node.config.get("sql", ""),
+                "sql": node.config.get("sql") or node.config.get("transform", ""),
             }
         }
 
@@ -113,7 +151,7 @@ class LineageDataBuilder:
         for node_id, node in self.manifest.nodes.items():
             if focused_node_ids and node_id not in focused_node_ids:
                 continue
-            sql = node.config.get("sql")
+            sql = node.config.get("sql") or node.config.get("transform")
             if not sql:
                 continue
             try:

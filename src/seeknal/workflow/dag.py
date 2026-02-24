@@ -187,6 +187,8 @@ class DAGBuilder:
         "second_order_aggregation": NodeType.SECOND_ORDER_AGGREGATION,
         "rule": NodeType.RULE,
         "exposure": NodeType.EXPOSURE,
+        "semantic_model": NodeType.SEMANTIC_MODEL,
+        "metric": NodeType.METRIC,
     }
 
     def __init__(
@@ -777,10 +779,27 @@ class DAGBuilder:
           - ref: source.raw_data
           - ref: transform.clean_data
 
+        Exposures use 'depends_on' instead of 'inputs':
+
+        depends_on:
+          - ref: transform.daily_revenue
+
         Args:
             node: Node to extract dependencies from
         """
+        # Semantic models use 'model: ref(...)' for their dependency
+        model_ref = node.yaml_data.get("model", "")
+        if isinstance(model_ref, str) and model_ref.startswith("ref("):
+            dep_ref = model_ref.strip("ref('\")")
+            if dep_ref:
+                edge = DAGEdge(from_node=dep_ref, to_node=node.qualified_name)
+                self.edges.append(edge)
+
         inputs = node.yaml_data.get("inputs", [])
+
+        # Exposures use 'depends_on' instead of 'inputs'
+        if not inputs:
+            inputs = node.yaml_data.get("depends_on", [])
 
         if not inputs:
             return
@@ -980,9 +999,9 @@ class DAGBuilder:
         # Kahn's algorithm
         in_degree: dict[str, int] = {node: 0 for node in self.nodes}
 
-        # Calculate in-degrees
+        # Calculate in-degrees (only count edges where both nodes exist)
         for edge in self.edges:
-            if edge.to_node in in_degree:
+            if edge.to_node in in_degree and edge.from_node in in_degree:
                 in_degree[edge.to_node] += 1
 
         # Initialize queue with nodes that have no dependencies
