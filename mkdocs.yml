@@ -166,6 +166,15 @@ nav:
           - Feature Store: getting-started/ml-engineer-path/1-feature-store.md
           - Second-Order Aggregation: getting-started/ml-engineer-path/2-second-order-aggregation.md
           - Training-to-Serving Parity: getting-started/ml-engineer-path/3-training-serving-parity.md
+      - Advanced Guide:
+          - Overview: getting-started/advanced/index.md
+          - File Sources: getting-started/advanced/1-file-sources.md
+          - Transformations: getting-started/advanced/2-transformations.md
+          - Data Rules: getting-started/advanced/3-data-rules.md
+          - Lineage & Inspection: getting-started/advanced/4-lineage.md
+          - Named References: getting-started/advanced/5-named-refs.md
+          - Common Configuration: getting-started/advanced/6-common-config.md
+          - Data Profiling: getting-started/advanced/7-data-profiling.md
   - Concepts:
       - Overview: concepts/index.md
       - Pipeline Builder Workflow: concepts/pipeline-builder.md
@@ -214,9 +223,9 @@ nav:
       - Mixed YAML + Python: tutorials/mixed-yaml-python-pipelines.md
       - E-Commerce Walkthrough: tutorials/workflow-tutorial-ecommerce.md
       - "Role-Specific":
-          - "Data Engineer: Environments": tutorials/phase2-data-eng-environments.md
-          - "ML Engineer: Parallel Execution": tutorials/phase2-ml-eng-parallel.md
-          - "Analytics Engineer: Metrics": tutorials/phase2-analytics-eng-metrics.md
+          - "Data Engineer: Environments": tutorials/environment-management.md
+          - "ML Engineer: Parallel Execution": tutorials/parallel-execution.md
+          - "Analytics Engineer: Metrics": tutorials/metrics-change-tracking.md
   - Additional:
       - DuckDB Getting Started: duckdb-getting-started.md
       - DuckDB Flow Guide: duckdb-flow-guide.md
