@@ -25,8 +25,16 @@ NODE_TYPES = {
     "model": "model",
     "aggregation": "aggregation",
     "second-order-aggregation": "second_order_aggregation",
+    "profile": "profile",
     "rule": "rule",
     "exposure": "exposure",
+    "semantic-model": "semantic_model",
+    "semantic_model": "semantic_model",
+    "metric": "metric",
+    "common-source": "common_source",
+    "common-rule": "common_rule",
+    "common-transformation": "common_transformation",
+    "common-transform": "common_transformation",
 }
 
 # Template file mapping
@@ -37,8 +45,14 @@ TEMPLATE_FILES = {
     "model": "model.yml.j2",
     "aggregation": "aggregation.yml.j2",
     "second_order_aggregation": "second_order_aggregation.yml.j2",
+    "profile": "profile.yml.j2",
     "rule": "rule.yml.j2",
     "exposure": "exposure.yml.j2",
+    "semantic_model": "semantic_model.yml.j2",
+    "metric": "metric.yml.j2",
+    "common_source": "common_source.yml.j2",
+    "common_rule": "common_rule.yml.j2",
+    "common_transformation": "common_transformation.yml.j2",
 }
 
 # Python template file mapping

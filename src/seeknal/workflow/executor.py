@@ -92,6 +92,8 @@ def execute_preview(
         return execute_model(yaml_data, limit, timeout)
     elif kind == "aggregation":
         return execute_aggregation(yaml_data, limit, timeout)
+    elif kind == "profile":
+        return execute_profile(yaml_data, limit, timeout)
     elif kind == "rule":
         return execute_rule(yaml_data, limit, timeout)
     elif kind == "exposure":
@@ -108,8 +110,10 @@ def execute_source(
 ) -> Dict[str, Any]:
     """Execute source node for preview with actual data.
 
-    For CSV sources, reads and displays sample data rows.
-    For other sources, shows schema information.
+    Tries to load data in order:
+    1. Intermediate parquet from a previous ``seeknal run``
+    2. Original CSV file (CSV sources only)
+    3. Falls back to schema-only display
 
     Args:
         yaml_data: Parsed YAML data
@@ -126,68 +130,86 @@ def execute_source(
     import time
     start_time = time.time()
 
-    # Handle CSV sources with actual data preview
-    if source_type == "csv" and table.endswith(".csv"):
+    data_loaded = False
+    row_count = 0
+    con = duckdb.connect(":memory:")
+
+    # Priority 1: Load from intermediate parquet (works for ALL source types)
+    intermediate_path = Path.cwd() / "target" / "intermediate" / f"source_{name}.parquet"
+    if intermediate_path.exists():
         try:
-            # Convert to absolute path
-            from pathlib import Path
-            table_path = Path(table)
-            if not table_path.is_absolute():
-                table_path = Path.cwd() / table
-
-            # Security: Validate path against security requirements
-            validated_path = validate_source_path(table_path)
-
-            # Use DuckDB to read CSV and display data
-            con = duckdb.connect(":memory:")
-
-            # Escape single quotes in path to prevent SQL injection
-            # Note: DuckDB doesn't support true parameterization for file paths
-            safe_path = str(validated_path).replace("'", "''")
-
-            # Build query with escaped path
-            query = f"SELECT * FROM read_csv_auto('{safe_path}') LIMIT {limit}"
-
-            # Execute query
+            safe_path = str(intermediate_path.resolve()).replace("'", "''")
+            query = f"SELECT * FROM read_parquet('{safe_path}') LIMIT {limit}"
             result = con.execute(query)
             rows = result.fetchall()
             columns = [desc[0] for desc in result.description]
 
-            # Display data as table
             if rows:
+                _echo_info(f"Data preview ({len(rows)} rows from previous run):")
                 print(tabulate(rows, headers=columns, tablefmt="psql"))
+                row_count = len(rows)
+                data_loaded = True
             else:
-                _echo_info(f"No data found in source: {name}")
-
-            duration = time.time() - start_time
-            return {
-                "duration": duration,
-                "row_count": len(rows),
-                "schema_only": False,
-            }
-
-        except ValueError as e:
-            # Security validation error
-            _echo_warning(f"Security validation failed: {e}")
-            _echo_info("Showing schema instead:")
+                _echo_info(f"No data found in intermediate output: {name}")
         except Exception as e:
-            _echo_warning(f"Could not preview data: {e}")
-            _echo_info("Showing schema instead:")
+            _echo_warning(f"Could not load intermediate parquet: {e}")
 
-    # Fallback to schema display
-    columns = yaml_data.get("columns", {})
+    # Priority 2: Load original source file (CSV, JSONL, Parquet)
+    if not data_loaded and table and table != "unknown":
+        try:
+            table_path = Path(table)
+            if not table_path.is_absolute():
+                table_path = Path.cwd() / table
 
-    if columns:
-        # Format as table
-        rows = [[col, desc] for col, desc in columns.items()]
-        print(tabulate(rows, headers=["Column", "Description"], tablefmt="psql"))
-    else:
-        _echo_info(f"No columns defined for source: {name}")
+            if table_path.exists():
+                safe_path = str(table_path.resolve()).replace("'", "''")
+                suffix = table_path.suffix.lower()
 
+                if suffix == ".csv":
+                    read_fn = f"read_csv_auto('{safe_path}')"
+                elif suffix in (".jsonl", ".json", ".ndjson"):
+                    read_fn = f"read_json_auto('{safe_path}')"
+                elif suffix == ".parquet":
+                    read_fn = f"read_parquet('{safe_path}')"
+                else:
+                    read_fn = None
+
+                if read_fn:
+                    query = f"SELECT * FROM {read_fn} LIMIT {limit}"
+                    result = con.execute(query)
+                    rows = result.fetchall()
+                    columns = [desc[0] for desc in result.description]
+
+                    if rows:
+                        _echo_info(f"Data preview ({len(rows)} rows):")
+                        print(tabulate(rows, headers=columns, tablefmt="psql"))
+                        row_count = len(rows)
+                        data_loaded = True
+                    else:
+                        _echo_info(f"No data found in source: {name}")
+            else:
+                _echo_warning(f"Source file not found: {table_path}")
+        except ValueError as e:
+            _echo_warning(f"Security validation failed: {e}")
+        except Exception as e:
+            _echo_warning(f"Could not preview source data: {e}")
+
+    # Fallback: schema-only display
+    if not data_loaded:
+        col_defs = yaml_data.get("columns", {})
+        if col_defs:
+            _echo_info("Schema (no data available — run 'seeknal run' first):")
+            schema_rows = [[col, desc] for col, desc in col_defs.items()]
+            print(tabulate(schema_rows, headers=["Column", "Description"], tablefmt="psql"))
+        else:
+            _echo_info(f"No columns defined for source: {name}")
+            _echo_info("Run 'seeknal run' first to generate intermediate data for preview")
+
+    duration = time.time() - start_time
     return {
-        "duration": time.time() - start_time,
-        "row_count": 0,
-        "schema_only": True,
+        "duration": duration,
+        "row_count": row_count,
+        "schema_only": not data_loaded,
     }
 
 
@@ -538,6 +560,60 @@ def execute_aggregation(
         "row_count": 0,
         "aggregation_info": True,
     }
+
+
+def execute_profile(
+    yaml_data: Dict[str, Any],
+    limit: int,
+    timeout: int,
+) -> Dict[str, Any]:
+    """Execute profile node for preview.
+
+    Shows profile configuration and sample stats from intermediate output
+    if available from a previous run.
+
+    Args:
+        yaml_data: Parsed YAML data
+        limit: Row limit
+        timeout: Query timeout
+
+    Returns:
+        Result dict with execution info
+    """
+    name = yaml_data.get("name", "unknown")
+    profile_config = yaml_data.get("profile", {})
+    columns = profile_config.get("columns", [])
+    max_top_values = profile_config.get("params", {}).get("max_top_values", 5)
+
+    _echo_info(f"Profile: {name}")
+    if columns:
+        _echo_info(f"  Columns: {', '.join(columns)}")
+    else:
+        _echo_info("  Columns: all (auto-detect)")
+    _echo_info(f"  Max top values: {max_top_values}")
+
+    # Try to show stats from previous run
+    intermediate_path = Path.cwd() / "target" / "intermediate" / f"profile_{name}.parquet"
+    if intermediate_path.exists():
+        try:
+            con = duckdb.connect(":memory:")
+            safe_path = str(intermediate_path.resolve()).replace("'", "''")
+            result = con.execute(
+                f"SELECT * FROM read_parquet('{safe_path}') LIMIT {limit}"
+            )
+            rows = result.fetchall()
+            cols = [desc[0] for desc in result.description]
+            con.close()
+
+            if rows:
+                _echo_info(f"\nProfile stats ({len(rows)} metrics from previous run):")
+                print(tabulate(rows, headers=cols, tablefmt="psql"))
+                return {"duration": 0.1, "row_count": len(rows), "preview_available": True}
+        except Exception as e:
+            _echo_warning(f"Could not load profile stats: {e}")
+
+    _echo_info("\nNo profile stats available — run 'seeknal run' first")
+    return {"duration": 0.1, "row_count": 0, "preview_available": False}
 
 
 def execute_rule(

@@ -185,6 +185,7 @@ class DAGBuilder:
         "model": NodeType.MODEL,
         "aggregation": NodeType.AGGREGATION,
         "second_order_aggregation": NodeType.SECOND_ORDER_AGGREGATION,
+        "profile": NodeType.PROFILE,
         "rule": NodeType.RULE,
         "exposure": NodeType.EXPOSURE,
         "semantic_model": NodeType.SEMANTIC_MODEL,

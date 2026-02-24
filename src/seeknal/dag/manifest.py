@@ -21,6 +21,7 @@ class NodeType(Enum):
     TRANSFORM = "transform"
     FEATURE_GROUP = "feature_group"
     MODEL = "model"
+    PROFILE = "profile"
     RULE = "rule"
     AGGREGATION = "aggregation"
     SECOND_ORDER_AGGREGATION = "second_order_aggregation"

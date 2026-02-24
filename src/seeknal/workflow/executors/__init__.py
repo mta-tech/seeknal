@@ -51,6 +51,7 @@ from seeknal.workflow.executors.aggregation_executor import AggregationExecutor 
 from seeknal.workflow.executors.second_order_aggregation_executor import SecondOrderAggregationExecutor  # ty: ignore[unresolved-import]
 from seeknal.workflow.executors.feature_group_executor import FeatureGroupExecutor  # ty: ignore[unresolved-import]
 from seeknal.workflow.executors.model_executor import ModelExecutor  # ty: ignore[unresolved-import]
+from seeknal.workflow.executors.profile_executor import ProfileExecutor  # ty: ignore[unresolved-import]
 from seeknal.workflow.executors.rule_executor import RuleExecutor  # ty: ignore[unresolved-import]
 from seeknal.workflow.executors.exposure_executor import (  # ty: ignore[unresolved-import]
     ExposureExecutor,
@@ -131,6 +132,7 @@ __all__ = [
     "SecondOrderAggregationExecutor",
     "FeatureGroupExecutor",
     "ModelExecutor",
+    "ProfileExecutor",
     "RuleExecutor",
     "ExposureExecutor",
     "PythonExecutor",
