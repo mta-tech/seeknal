@@ -178,6 +178,12 @@ class REPL:
         except Exception as e:
             warnings.warn(f"REPL: Failed to register parquets: {e}")
 
+        # Phase 1b: Register consolidated entity parquets
+        try:
+            self._register_consolidated_entities()
+        except Exception as e:
+            warnings.warn(f"REPL: Failed to register consolidated entities: {e}")
+
         # Phase 2: Attach PostgreSQL connections
         try:
             self._register_postgresql_connections()
@@ -253,6 +259,34 @@ class REPL:
                 )
                 self._registered_parquets += 1
                 registered_names.add(view_name)
+            except Exception:
+                pass  # Skip files that can't be read
+
+    def _register_consolidated_entities(self) -> None:
+        """Phase 1b: Register consolidated entity parquets as DuckDB views.
+
+        Scans target/feature_store/{entity}/features.parquet and registers
+        each as a view named 'entity_{name}' (e.g. 'entity_customer').
+        """
+        feature_store_dir = self.project_path / "target" / "feature_store"
+        if not feature_store_dir or not feature_store_dir.exists():
+            return
+
+        for entity_dir in feature_store_dir.iterdir():
+            if not entity_dir.is_dir():
+                continue
+            parquet_path = entity_dir / "features.parquet"
+            if not parquet_path.exists():
+                continue
+
+            view_name = f"entity_{entity_dir.name}"
+            safe_path = str(parquet_path.resolve()).replace("'", "''")
+            try:
+                self.conn.execute(
+                    f'CREATE VIEW "{view_name}" AS '
+                    f"SELECT * FROM read_parquet('{safe_path}')"
+                )
+                self._registered_parquets += 1
             except Exception:
                 pass  # Skip files that can't be read
 

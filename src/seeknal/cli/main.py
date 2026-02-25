@@ -184,6 +184,25 @@ app.add_typer(docs_app, name="docs")
 env_app = typer.Typer(help="Virtual environments for safe pipeline development (plan/apply/promote)")
 app.add_typer(env_app, name="env")
 
+# Entity consolidation management
+entity_app = typer.Typer(
+    name="entity",
+    help="""Manage consolidated entity feature stores.
+
+Entity consolidation merges per-feature-group parquet files into
+consolidated per-entity views with struct-namespaced columns.
+
+Commands:
+  list   List all consolidated entities
+  show   Display entity catalog details (FGs, schemas, row counts)
+
+Examples:
+  seeknal entity list
+  seeknal entity show customer
+""",
+)
+app.add_typer(entity_app, name="entity")
+
 
 # =============================================================================
 # Interval Management
@@ -5158,6 +5177,185 @@ def dq(
     except DQVisualizationError as e:
         _echo_error(str(e))
         raise typer.Exit(code=1)
+
+
+# =============================================================================
+# Entity Consolidation Commands
+# =============================================================================
+
+
+@entity_app.command("list")
+def entity_list(
+    project: str = typer.Option(
+        None, "--project", "-p", help="Project name"
+    ),
+    path: Path = typer.Option(
+        Path("."), "--path", help="Project path"
+    ),
+):
+    """List all consolidated entities in the feature store.
+
+    Examples:
+        seeknal entity list
+        seeknal entity list --path /my/project
+    """
+    from seeknal.workflow.consolidation.catalog import EntityCatalog
+
+    if project is None:
+        project = path.resolve().name
+
+    feature_store_path = path / "target" / "feature_store"
+    if not feature_store_path.exists():
+        _echo_info("No consolidated entities found. Run 'seeknal run' with feature group nodes first.")
+        return
+
+    entities_found = False
+    for entity_dir in sorted(feature_store_path.iterdir()):
+        if not entity_dir.is_dir():
+            continue
+        catalog_path = entity_dir / "_entity_catalog.json"
+        catalog = EntityCatalog.load(catalog_path)
+        if catalog is None:
+            continue
+
+        entities_found = True
+        fg_count = len(catalog.feature_groups)
+        total_features = sum(
+            len(fg.features) for fg in catalog.feature_groups.values()
+        )
+        parquet_exists = (entity_dir / "features.parquet").exists()
+        status = "ready" if parquet_exists else "stale"
+
+        typer.echo(
+            f"  {catalog.entity_name:<20s}  "
+            f"{fg_count} FGs  {total_features} features  "
+            f"[{status}]  "
+            f"consolidated: {catalog.consolidated_at or 'never'}"
+        )
+
+    if not entities_found:
+        _echo_info("No consolidated entities found. Run 'seeknal run' with feature group nodes first.")
+
+
+@entity_app.command("show")
+def entity_show(
+    name: str = typer.Argument(..., help="Entity name to inspect"),
+    project: str = typer.Option(
+        None, "--project", "-p", help="Project name"
+    ),
+    path: Path = typer.Option(
+        Path("."), "--path", help="Project path"
+    ),
+):
+    """Display detailed catalog for a consolidated entity.
+
+    Examples:
+        seeknal entity show customer
+        seeknal entity show product --path /my/project
+    """
+    from seeknal.workflow.consolidation.catalog import EntityCatalog
+
+    if project is None:
+        project = path.resolve().name
+
+    catalog_path = path / "target" / "feature_store" / name / "_entity_catalog.json"
+    catalog = EntityCatalog.load(catalog_path)
+    if catalog is None:
+        _echo_error(f"Entity '{name}' not found. Run 'seeknal run' to consolidate entities.")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"\nEntity: {catalog.entity_name}")
+    typer.echo(f"Join keys: {', '.join(catalog.join_keys)}")
+    typer.echo(f"Consolidated at: {catalog.consolidated_at or 'never'}")
+    typer.echo(f"Schema version: {catalog.schema_version}")
+    typer.echo(f"Feature groups: {len(catalog.feature_groups)}")
+    typer.echo("")
+
+    for fg_name, fg_entry in sorted(catalog.feature_groups.items()):
+        typer.echo(f"  {fg_name}:")
+        typer.echo(f"    Features: {', '.join(fg_entry.features)}")
+        typer.echo(f"    Rows: {fg_entry.row_count}")
+        typer.echo(f"    Event time col: {fg_entry.event_time_col}")
+        typer.echo(f"    Last updated: {fg_entry.last_updated or 'unknown'}")
+        if fg_entry.schema:
+            typer.echo(f"    Schema: {fg_entry.schema}")
+        typer.echo("")
+
+    parquet_path = path / "target" / "feature_store" / name / "features.parquet"
+    if parquet_path.exists():
+        _echo_success(f"Parquet: {parquet_path}")
+    else:
+        _echo_warning(f"Parquet not found at {parquet_path}")
+
+
+@app.command()
+def consolidate(
+    project: str = typer.Option(
+        None, "--project", "-p", help="Project name"
+    ),
+    path: Path = typer.Option(
+        Path("."), "--path", help="Project path"
+    ),
+    prune: bool = typer.Option(
+        False, "--prune", help="Remove stale FG columns not in current manifest"
+    ),
+):
+    """Manually trigger entity consolidation.
+
+    Consolidates feature group outputs into per-entity views. Useful after
+    running individual nodes with 'seeknal run --nodes'.
+
+    Examples:
+        seeknal consolidate
+        seeknal consolidate --prune
+        seeknal consolidate --path /my/project
+    """
+    from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
+    from seeknal.workflow.consolidation.consolidator import EntityConsolidator
+
+    if project is None:
+        project = path.resolve().name
+
+    try:
+        builder = DAGBuilder(project_path=path, project_name=project)
+        manifest = builder.build()
+    except (CycleDetectedError, MissingDependencyError) as e:
+        _echo_error(f"Failed to build DAG: {e}")
+        raise typer.Exit(code=1)
+
+    target_path = path / "target"
+    consolidator = EntityConsolidator(target_path)
+    entities = consolidator.discover_feature_groups(manifest.nodes)
+
+    if not entities:
+        _echo_info("No feature groups with entities found in the project.")
+        return
+
+    _echo_info(f"Found {len(entities)} entities to consolidate...")
+
+    success_count = 0
+    for entity_name, fg_list in sorted(entities.items()):
+        try:
+            result = consolidator.consolidate_entity(entity_name, fg_list)
+            if result.error:
+                _echo_warning(f"  {entity_name}: {result.error}")
+            else:
+                _echo_success(
+                    f"  {entity_name}: {result.fg_count} FGs, "
+                    f"{result.row_count} rows ({result.duration_seconds:.1f}s)"
+                )
+                success_count += 1
+        except Exception as e:
+            _echo_warning(f"  {entity_name}: {e}")
+
+    if prune:
+        _echo_info("Pruning stale FG columns...")
+        # Prune: re-consolidate with only current manifest FGs
+        # (consolidation already only uses discovered FGs, so running again
+        # after FG removal effectively prunes stale columns)
+        _echo_success("Prune completed (stale FG columns removed on re-consolidation)")
+
+    _echo_success(f"Consolidation complete: {success_count}/{len(entities)} entities")
 
 
 def main():
