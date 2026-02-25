@@ -1,291 +1,151 @@
 # ML Engineer Path
 
-> **Time Commitment:** 3 chapters × 25-35 minutes | **Prerequisites:** [Quick Start](../../quick-start/) completed
+**Duration:** ~90 minutes | **Format:** Python Pipeline | **Prerequisites:** Python, [DE Path Chapter 1](../data-engineer-path/1-elt-pipeline.md) completed
 
-Build production feature stores that prevent data leakage and ensure training-serving parity for ML models.
-
----
-
-## Who This Path Is For
-
-This path is ideal for:
-
-- **ML Engineers** building feature stores for production ML
-- **Data Scientists** transitioning models to production
-- **ML Platform Engineers** creating feature infrastructure
-- **Applied Scientists** needing robust feature engineering
-
-**You'll love this path if you:**
-- Need to prevent data leakage in your features
-- Want training-serving parity without duplicate code
-- Care about feature versioning and reproducibility
-- Need low-latency online feature serving
+Build production feature stores and ML models using Python pipeline decorators (`@source`, `@feature_group`, `@transform`) and Seeknal's declarative YAML SOA engine.
 
 ---
 
 ## What You'll Learn
 
-By completing this path, you will:
+The ML Engineer path teaches you to build production-grade feature stores and ML models with Seeknal's Python pipeline API. You'll learn to:
 
-1. **Build Feature Stores** — Create feature groups with entities and point-in-time joins
-2. **Second-Order Aggregations** — Create multi-level features from aggregations
-3. **Training-to-Serving Parity** — Ensure consistency between offline training and online serving
-
-| Chapter | Focus | Duration |
-|---------|-------|----------|
-| [Chapter 1](1-feature-store.md) | Build Feature Stores | 30 min |
-| [Chapter 2](2-second-order-aggregation.md) | Second-Order Aggregations | 35 min |
-| [Chapter 3](3-training-to-serving-parity.md) | Training-to-Serving Parity | 30 min |
-
-**Total Time:** ~95 minutes
+1. **Build Feature Stores** — Create feature groups with `@feature_group`, evolve schemas iteratively
+2. **Second-Order Aggregations** — Generate hierarchical features with the YAML SOA engine (basic, window, ratio)
+3. **Train & Serve ML Models** — Build scikit-learn models inside `@transform` nodes, validate features
 
 ---
 
 ## Prerequisites
 
-Before starting this path, ensure you've completed:
+Before starting this path, ensure you have:
 
-- [ ] [Quick Start](../../quick-start/) — Understand the pipeline builder workflow
-- [ ] Python 3.11+ installed
-- [ ] Seeknal CLI installed
-- [ ] Basic Python knowledge (functions, classes, decorators)
-- [ ] Understanding of ML concepts (features, training, inference)
-
-!!! tip "New to Seeknal?"
-    Start with the [Quick Start](../../quick-start/) if you haven't already. It takes 10 minutes and teaches the fundamentals.
+- **[DE Path Chapter 1](../data-engineer-path/1-elt-pipeline.md)** completed — You'll use the e-commerce data
+- Python 3.11+ and `uv` installed (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- Understanding of ML features and training data
 
 ---
 
-## Chapter Overview
+## Chapters
 
-### Chapter 1: Build Feature Stores (30 minutes)
+### Chapter 1: Build a Feature Store (~30 minutes)
 
-**Use Case:** Predict customer churn with temporal features
+Create feature groups using Python decorators:
 
-You'll create a feature store that:
-- Defines entities (customers, products)
-- Creates feature groups with point-in-time joins
-- Implements historical feature retrieval
-- Manages feature versioning and rollbacks
+```
+source.transactions (Python) ──→ feature_group.customer_features (Python)
+                                          ↓
+                                    REPL Exploration
+```
 
-**What You'll Learn:**
-- Feature store architecture and concepts
-- Entity definitions and join keys
-- Point-in-time joins to prevent data leakage
-- Feature group versioning for reproducibility
+**You'll build:**
+- Python sources with `@source` decorator and PEP 723 dependencies
+- Feature groups with `@feature_group` and `ctx.ref()`
+- Schema evolution workflow for iterating on features
 
-**Start Chapter 1 →** [1-feature-store.md](1-feature-store.md)
+**[Start Chapter 1 →](1-feature-store.md)**
 
 ---
 
-### Chapter 2: Second-Order Aggregations (35 minutes)
+### Chapter 2: Second-Order Aggregations (~30 minutes)
 
-**Use Case:** Customer behavior features from transaction data
+Generate hierarchical features from raw transactions:
 
-You'll build features that:
-- Aggregate events (transactions, clicks, sessions)
-- Create multi-level rollups (user → category → global)
-- Handle time-based windows (7-day, 30-day, 90-day)
-- Optimize computation for production
+```
+source.transactions (Ch.1) → transform.customer_daily_agg → second_order_aggregation.region_metrics
+         (Python @transform)              (YAML SOA engine)
+         ├── SUM, COUNT per day           ├── basic: sum, mean, max, stddev
+         └── application_date             ├── window: recent 7-day totals
+                                          └── ratio: recent vs past spending
+```
 
-**What You'll Learn:**
-- Second-order aggregation concept and patterns
-- Hierarchical feature engineering
-- Window-based aggregations
-- Performance optimization techniques
+**You'll build:**
+- Python transforms with `@transform` and `ctx.duckdb.sql()`
+- YAML SOA with declarative `features:` spec (basic, window, ratio)
+- Time-window features using `application_date_col`
 
-**Start Chapter 2 →** [2-second-order-aggregation.md](2-second-order-aggregation.md)
+**[Start Chapter 2 →](2-second-order-aggregation.md)**
 
 ---
 
-### Chapter 3: Training-to-Serving Parity (30 minutes)
+### Chapter 3: Build and Serve an ML Model (~30 minutes)
 
-**Use Case:** Deploy churn prediction model with consistent features
+Train a machine learning model inside the pipeline:
 
-You'll learn to:
-- Materialize offline features for model training
-- Create online serving tables for inference
-- Ensure feature consistency between offline and online
-- Implement feature refresh schedules
+```
+feature_group.customer_features ──→ transform.training_data
+                                            ↓
+source.churn_labels ──────────────→ transform.churn_model (scikit-learn)
+                                            ↓
+                                    REPL: Query predictions
+                                            ↓
+                                    seeknal validate-features
+```
 
-**What You'll Learn:**
-- Offline and online store architecture
-- Materialization strategies
-- Online serving with low latency
-- Feature refresh and consistency guarantees
+**You'll learn:**
+- Training scikit-learn models inside `@transform` nodes
+- Joining features with labels via `ctx.ref()`
+- Querying predictions in the REPL
+- Feature validation to detect quality issues
 
-**Start Chapter 3 →** [3-training-to-serving-parity.md](3-training-to-serving-parity.md)
+**[Start Chapter 3 →](3-training-serving-parity.md)**
 
 ---
 
-## What Makes This Path Different
+## What You'll Build
 
-### ML Engineer Focus
+By the end of this path, you'll have a complete ML pipeline:
 
-Unlike generic feature engineering tutorials, this path teaches production feature store concepts:
-
-```python
-# Real-world feature group with point-in-time joins
-from seeknal.featurestore.duckdbengine.feature_group import (
-    FeatureGroupDuckDB,
-    HistoricalFeaturesDuckDB,
-    OnlineFeaturesDuckDB,
-)
-from seeknal.entity import Entity
-from datetime import datetime
-
-# Define entity and feature group
-entity = Entity(name="customer", join_keys=["customer_id"])
-fg = FeatureGroupDuckDB(
-    name="customer_features",
-    entity=entity,
-    description="Customer behavior features",
-)
-fg.set_dataframe(df)
-fg.set_features()
-
-# Write to offline store with time travel
-fg.write(feature_start_time=datetime(2024, 1, 1))
-
-# Point-in-time correct historical features
-hist = HistoricalFeaturesDuckDB(lookups=[FeatureLookup(source=fg)])
-training_df = hist.to_dataframe(
-    entity_df=spine_df,  # Prediction points
-    feature_start_time=datetime(2024, 1, 1),
-)
-
-# Serve online for inference
-online = OnlineFeaturesDuckDB(name="customer_features_online", lookup_key=entity)
-features = online.get_features(keys=[{"customer_id": "123"}])
-```
-
-### Data Leakage Prevention
-
-Point-in-time joins ensure your model never trains on future data:
-
-```
-Timeline:
-────────────────────────────────────────────────────>
-Jan 1    Jan 10     Jan 15     Jan 20     Jan 30
-
-Events:    purchase   PREDICTION   purchase    purchase
-           $50        (here)       $200        $100
-
-Without PIT: avg_spend = ($50 + $200 + $100) / 3 = $116.67  ❌ Data leakage!
-With PIT:    avg_spend = $50 / 1 = $50.00                   ✅ Correct!
-```
-
-### Training-to-Serving Parity
-
-Single feature definition works for both training and serving:
-
-| Stage | Traditional Approach | Seeknal Approach |
-|-------|---------------------|------------------|
-| **Training** | SQL script to compute features | `HistoricalFeatures.to_dataframe()` |
-| **Serving** | Different code for online features | `OnlineFeatures.get_features()` |
-| **Consistency** | Manual verification required | Guaranteed by design |
-| **Versioning** | Ad-hoc feature versions | Automatic schema versioning |
+| Component | Decorator | Purpose |
+|-----------|-----------|---------|
+| **Sources** | `@source` | Declare data ingestion (CSV, Parquet, DB) |
+| **Feature Groups** | `@feature_group` | Compute and version ML features |
+| **Transforms** | `@transform` | Data prep, model training, predictions |
+| **SOA** | YAML `features:` spec | Hierarchical meta-features (basic, window, ratio) |
+| **Validation** | CLI | Detect feature quality issues |
 
 ---
 
-## Real-World Use Cases
+## Key Commands You'll Learn
 
-After completing this path, you'll be ready to:
+```bash
+# Python pipeline templates
+seeknal draft source <name> --python --deps pandas
+seeknal draft feature-group <name> --python --deps pandas,duckdb
+seeknal draft transform <name> --python --deps pandas,scikit-learn
+seeknal draft second-order-aggregation <name>
 
-### Churn Prediction
-```
-Customer Events → Feature Groups → PIT Join → Training Data → Model
-                        ↓
-                 Online Serving → Inference Features → Real-time Prediction
-```
+# Preview and apply
+seeknal dry-run <draft_file>.py
+seeknal apply <draft_file>.py
+seeknal apply <draft_file>.yml
 
-### Recommendation Systems
-```
-User Interactions → Second-Order Aggregations → User Features → Model Ranking
-                                        ↓
-                            Item Features + Context → Personalized Recs
-```
+# Pipeline execution
+seeknal plan
+seeknal run
 
-### Fraud Detection
-```
-Transaction Stream → Window Aggregations → Risk Features → Model Score
-                                    ↓
-                         Online Serving → Real-time Fraud Detection
+# Feature management
+seeknal validate-features <fg_name> --mode fail
+seeknal lineage <node> --ascii
+
+# Interactive verification
+seeknal repl
 ```
 
 ---
 
-## See Also
+## Resources
 
-Want to explore related topics?
+### Reference
+- [Python Pipelines Guide](../../guides/python-pipelines.md) — Full decorator reference and patterns
+- [CLI Reference](../../reference/cli.md) — All commands and flags
+- [YAML Schema Reference](../../reference/yaml-schema.md) — Feature group and SOA schemas
 
-- **Data Engineer Path** — ELT pipelines and data infrastructure
-- **Analytics Engineer Path** — Semantic layers and business metrics
-- **[Point-in-Time Joins](../../concepts/point-in-time-joins.md)** — Deep dive on PIT concepts
-- **[Glossary](../../concepts/glossary.md)** — Feature store terminology
-
----
-
-## After This Path
-
-Once you complete the ML Engineer path, you can:
-
-1. **Explore Other Paths**
-   - [Data Engineer Path](../data-engineer-path/) — Data pipelines and infrastructure
-   - [Analytics Engineer Path](../analytics-engineer-path/) — Semantic layers and metrics
-
-2. **Dive Deeper**
-   - [Training to Serving Guide](../../guides/training-to-serving.md) — Complete ML workflow
-   - [Python Pipelines](../../guides/python-pipelines.md) — Python API for ML workflows
-   - [Second-Order Aggregations](../../concepts/second-order-aggregations.md) — Advanced patterns
-   - [CLI Reference](../../reference/cli.md) — All commands and flags
-
-3. **Build Your Feature Store**
-   - Define feature groups for your ML use cases
-   - Implement point-in-time joins for training data
-   - Deploy online serving for inference
+### Related Paths
+- [Data Engineer Path](../data-engineer-path/) — ELT pipelines (prerequisite)
+- [Analytics Engineer Path](../analytics-engineer-path/) — Semantic layers and metrics
+- [Advanced Guide: Python Pipelines](../advanced/8-python-pipelines.md) — Mixed YAML + Python
 
 ---
 
-## Quick Reference
-
-| Concept | Chapter | Key Command/Class |
-|---------|---------|-------------------|
-| Feature Groups | 1 | `FeatureGroupDuckDB` |
-| Entities | 1 | `Entity(join_keys=[...])` |
-| Point-in-Time Joins | 1 | `HistoricalFeaturesDuckDB` |
-| Feature Versioning | 1 | `seeknal version list <fg_name>` |
-| Second-Order Aggregations | 2 | `@second_order_aggregation` decorator |
-| Window Aggregations | 2 | Time-based window functions |
-| Offline Materialization | 3 | `fg.write(feature_start_time=...)` |
-| Online Serving | 3 | `OnlineFeaturesDuckDB.get_features()` |
-
----
-
-## Before You Start
-
-**Recommended reading:**
-- [Point-in-Time Joins](../../concepts/point-in-time-joins.md) — Understand temporal correctness
-- [Glossary](../../concepts/glossary.md) — Feature store and ML terminology
-
-**Helpful skills:**
-- Python programming (functions, classes, decorators)
-- Understanding of ML workflows (features, training, inference)
-- Basic data manipulation (Pandas, SQL)
-- Familiarity with feature engineering concepts
-
----
-
-## Migration from Other Tools
-
-Coming from other feature stores? See our migration guides:
-
-- **[Feast to Seeknal](../../reference/migration.md#migrating-from-feast-to-seeknal)** — Feature view and entity mapping
-- **[Featuretools to Seeknal](../../reference/migration.md#migrating-from-featuretools-to-seeknal)** — Entity sets and DFS patterns
-- **[Spark to DuckDB](../../reference/migration.md#migrating-from-spark-to-duckdb)** — Engine migration for faster development
-
----
-
-**Ready to build production feature stores?**
-
-[Start Chapter 1: Build Feature Stores →](1-feature-store.md)
+*Last updated: February 2026 | Seeknal Documentation*

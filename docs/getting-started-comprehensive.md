@@ -48,87 +48,18 @@ Unlike other feature stores that require complex infrastructure setup, Seeknal:
 
 ---
 
-## Development Approaches
-
-Seeknal supports two development workflows. Choose based on your preference:
-
-### Approach 1: CLI-Based Workflow (Recommended for Teams)
-
-The **draft workflow** provides a structured, team-friendly approach:
-
-```bash
-# 1. Create a draft with scaffolding
-seeknal draft source raw_data --description "Raw customer data"
-
-# 2. Edit the generated template
-# Edit draft_source_raw_data.yml
-
-# 3. Preview what will happen
-seeknal dry-run draft_source_raw_data.yml
-
-# 4. Apply to create the actual source
-seeknal apply draft_source_raw_data.yml
-```
-
-**Benefits:**
-- Validated templates prevent errors
-- Preview changes before applying
-- Git-friendly YAML files
-- Works with CI/CD pipelines
-- **If you're coming from dbt, this will feel familiar!**
-
-**When to use:** Team collaboration, production pipelines, GitOps workflows
-
-**Learn more:** [Workflow Tutorial](./tutorials/workflow-tutorial-ecommerce.md)
-
-### Approach 2: Python API (This Tutorial)
-
-The **Python API** provides programmatic control:
-
-```python
-from seeknal.tasks.duckdb import DuckDBTask
-
-# Create task and define transformation
-task = DuckDBTask()
-task.add_input(dataframe=arrow_table)
-task.add_sql("SELECT user_id, SUM(amount) FROM __THIS__ GROUP BY user_id")
-result = task.transform()
-```
-
-**Benefits:**
-- Full Python flexibility
-- Jupyter Notebook compatible
-- Interactive development
-- Direct debugging
-
-**When to use:** Exploratory analysis, notebooks, data science workflows
-
-**Learn more:** Continue with this tutorial
-
-### Choosing Your Approach
-
-| Factor | CLI Workflow | Python API |
-|--------|--------------|------------|
-| **Team size** | Multiple developers | Individual or small team |
-| **Deployment** | Production pipelines | Notebooks & scripts |
-| **Version control** | Git-friendly YAML | Standard Python |
-| **Learning curve** | Moderate | Low (if you know Python) |
-| **Use case** | Production features | Exploratory analysis |
-
----
-
 ## What You'll Learn
 
 By completing this guide, you will:
 
-1. **Install Seeknal** on your local machine
-2. **Load data** using DuckDBTask for local processing
-3. **Engineer features** with SQL transformations
-4. **Aggregate user behavior** into ML-ready features
-5. **Save features** in efficient formats (Parquet, CSV)
-6. **Understand** when to use DuckDB vs Spark
+1. **Install Seeknal** and initialize a project
+2. **Define data sources** with YAML pipeline definitions
+3. **Create transforms** using SQL-based data transformations
+4. **Build feature groups** for ML-ready feature engineering
+5. **Run the pipeline** with the `draft → dry-run → apply → run` workflow
+6. **Explore results** using the interactive REPL
 
-> **Note:** This tutorial teaches Seeknal's **Python API** for programmatic feature engineering. If you prefer a **CLI-based workflow** with YAML definitions and the `draft → dry-run → apply` pattern, see the [Workflow Tutorial](./tutorials/workflow-tutorial-ecommerce.md). Both approaches are valid - choose based on your workflow preference.
+> **Note:** This tutorial uses Seeknal's **YAML pipeline workflow** — a dbt-inspired approach with CLI commands. For Python decorator-based pipelines, see the [Python Pipelines Tutorial](./tutorials/python-pipelines-tutorial.md).
 
 ---
 
@@ -155,91 +86,13 @@ Before starting, ensure you have:
 
 Choose your preferred installation method based on your operating system.
 
-### Method 1: Using uv (Recommended)
-
-[uv](https://docs.astral.sh/uv/) is a fast Python package manager. This is the recommended approach.
-
-#### macOS / Linux
+### Install from PyPI
 
 ```bash
-# Install uv if you don't have it
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Create and activate a virtual environment
-uv venv --python 3.11
-source .venv/bin/activate
-
-# Download Seeknal from releases
-# Visit: https://github.com/mta-tech/seeknal/releases
-# Download the latest .whl file
-
-# Install Seeknal
-uv pip install seeknal-<version>-py3-none-any.whl
-
-# Install additional dependencies for this tutorial
-uv pip install pandas pyarrow
+pip install seeknal
 ```
 
-#### Windows (PowerShell)
-
-```powershell
-# Install uv if you don't have it
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# Create and activate a virtual environment
-uv venv --python 3.11
-.\.venv\Scripts\activate
-
-# Download Seeknal from releases
-# Visit: https://github.com/mta-tech/seeknal/releases
-# Download the latest .whl file
-
-# Install Seeknal
-uv pip install seeknal-<version>-py3-none-any.whl
-
-# Install additional dependencies for this tutorial
-uv pip install pandas pyarrow
-```
-
-### Method 2: Using pip
-
-If you prefer standard pip:
-
-#### macOS / Linux
-
-```bash
-# Create a virtual environment
-python -m venv .venv
-source .venv/bin/activate
-
-# Upgrade pip
-pip install --upgrade pip
-
-# Download and install Seeknal
-# Visit: https://github.com/mta-tech/seeknal/releases
-pip install seeknal-<version>-py3-none-any.whl
-
-# Install additional dependencies
-pip install pandas pyarrow
-```
-
-#### Windows (PowerShell)
-
-```powershell
-# Create a virtual environment
-python -m venv .venv
-.\.venv\Scripts\activate
-
-# Upgrade pip
-pip install --upgrade pip
-
-# Download and install Seeknal
-# Visit: https://github.com/mta-tech/seeknal/releases
-pip install seeknal-<version>-py3-none-any.whl
-
-# Install additional dependencies
-pip install pandas pyarrow
-```
+This installs Seeknal and all required dependencies (DuckDB, pandas, pyarrow, etc.).
 
 ### Verify Installation
 
@@ -256,499 +109,303 @@ Seeknal installed successfully!
 
 ### Configure Environment (Optional)
 
-For advanced usage, create a configuration file:
+Seeknal works out of the box with sensible defaults. Configuration is **not required** for this tutorial.
+
+For advanced usage (custom config location, database backends, or team environments), you can override the default paths:
 
 ```bash
-# Create a config directory
-mkdir -p ~/.seeknal
-
-# Set environment variables (add to your .bashrc or .zshrc)
+# Optional: Override default config directory (default: ~/.seeknal/)
 export SEEKNAL_BASE_CONFIG_PATH="$HOME/.seeknal"
+
+# Optional: Override user config file (default: ~/.seeknal/config.toml)
 export SEEKNAL_USER_CONFIG_PATH="$HOME/.seeknal/config.toml"
 ```
 
-For this quickstart tutorial, configuration is **not required** - Seeknal works out of the box with sensible defaults.
+**When would you need this?**
+
+- **Custom install paths** — if your home directory is not writable or you want config in a shared location
+- **Multiple environments** — separate configs for dev/staging/prod via different `SEEKNAL_BASE_CONFIG_PATH` values
+- **CI/CD pipelines** — point to ephemeral config directories
+
+Seeknal auto-creates `~/.seeknal/` and its SQLite database on first use, so most users never need to set these.
 
 ---
 
 ## Quick Start Tutorial
 
-> **Total Estimated Time:** 20 minutes
+> **Total Estimated Time:** 15 minutes
 
-In this tutorial, you'll build user behavior features from e-commerce data. These features could be used for:
+In this tutorial, you'll build a data pipeline that loads CSV data, cleans it, and creates user features — all using YAML definitions and the CLI.
 
-- **Recommendation systems** - Suggest products based on user preferences
-- **Churn prediction** - Identify users likely to leave
-- **Customer segmentation** - Group users by behavior patterns
-
-### Sample Dataset Overview
-
-We'll use a sample dataset (`sample_data.csv`) containing e-commerce user behavior:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `user_id` | string | Unique user identifier |
-| `event_time` | datetime | When the event occurred |
-| `product_category` | string | Category of product (Electronics, Clothing, etc.) |
-| `action_type` | string | User action (view, add_to_cart, purchase, etc.) |
-| `device_type` | string | Device used (mobile, desktop, tablet) |
-| `purchase_amount` | float | Purchase value (0.0 if no purchase) |
-| `session_duration` | int | Session length in seconds |
-| `items_viewed` | int | Number of items viewed |
-| `cart_value` | float | Current cart value |
-
----
-
-### Part 1: Load and Explore Data (5 minutes)
-
-> **Goal:** Load sample data and understand its structure
-
-#### Step 1.1: Get the Sample Data
-
-First, download the quickstart examples:
+### Step 1: Initialize a Project (2 minutes)
 
 ```bash
-# Clone the examples (or download from GitHub)
-git clone https://github.com/mta-tech/seeknal.git
-cd seeknal/examples/quickstart
+seeknal init --name ecommerce_analytics --description "E-commerce user features"
+cd ecommerce_analytics
 ```
 
-Or create the sample data manually by copying from the examples directory.
+This creates the project structure:
 
-#### Step 1.2: Create Your First Script
-
-Create a new file called `my_first_features.py`:
-
-```python
-#!/usr/bin/env python3
-"""
-My First Seeknal Features
-=========================
-This script demonstrates loading data and creating features with Seeknal.
-"""
-
-import pandas as pd
-import pyarrow as pa
-from seeknal.tasks.duckdb import DuckDBTask
-
-# Step 1: Load the sample data
-print("Loading sample data...")
-df = pd.read_csv("sample_data.csv")
-
-print(f"Loaded {len(df):,} rows")
-print(f"Columns: {list(df.columns)}")
-print("\nFirst 5 rows:")
-print(df.head())
+```
+ecommerce_analytics/
+├── seeknal_project.yml    # Project configuration
+├── profiles.yml           # Connection credentials (gitignored)
+├── seeknal/
+│   ├── sources/           # Data source definitions
+│   ├── transforms/        # SQL transformations
+│   └── feature_groups/    # Feature engineering
+└── target/                # Pipeline outputs
 ```
 
-#### Step 1.3: Run and Verify
+### Step 2: Create a Data Source (3 minutes)
+
+Generate a source template:
 
 ```bash
-python my_first_features.py
+seeknal draft source raw_orders --description "Raw e-commerce orders"
 ```
 
-**Expected Output:**
-```
-Loading sample data...
-Loaded 750 rows
-Columns: ['user_id', 'event_time', 'product_category', 'action_type', 'device_type', 'purchase_amount', 'session_duration', 'items_viewed', 'cart_value']
+Edit the generated `draft_source_raw_orders.yml`:
 
-First 5 rows:
-   user_id           event_time product_category action_type device_type  purchase_amount  session_duration  items_viewed  cart_value
-  user_089  2024-01-01 03:49:27           Sports        view      tablet              0.0              1090             8       10.04
-  user_008  2024-01-01 06:19:13    Home & Garden    purchase      mobile            68.78              1048            12      355.90
-  ...
-```
-
-**Checkpoint:** You should see 750 rows with 9 columns. If not, check that `sample_data.csv` is in the same directory.
-
----
-
-### Part 2: Feature Engineering (10 minutes)
-
-> **Goal:** Transform raw events into user-level features
-
-#### Step 2.1: Create a DuckDB Task
-
-Add the following to your script:
-
-```python
-# Step 2: Create a DuckDB Task
-print("\nCreating DuckDB task...")
-
-# Convert pandas DataFrame to PyArrow Table (required for DuckDBTask)
-arrow_table = pa.Table.from_pandas(df)
-
-# Create the task and add input data
-duckdb_task = DuckDBTask()
-duckdb_task.add_input(dataframe=arrow_table)
-
-print(f"Task created: {duckdb_task.kind}")
-print(f"Uses Spark: {duckdb_task.is_spark_job}")  # False - we're using DuckDB
+```yaml
+kind: source
+name: raw_orders
+description: "Raw e-commerce order data"
+tags: ["orders", "ecommerce"]
+source: csv
+table: "data/orders.csv"
+columns:
+  order_id: "Unique order identifier"
+  customer_id: "Customer who placed the order"
+  order_date: "Date the order was placed"
+  product: "Product name"
+  quantity: "Number of items"
+  price: "Unit price"
+  total: "Order total amount"
 ```
 
-**Why PyArrow?** DuckDB works with Apache Arrow tables for efficient columnar processing. Converting from pandas is straightforward with `pa.Table.from_pandas()`.
+Validate and preview:
 
-#### Step 2.2: Define Feature Engineering SQL
-
-Now, define the SQL to aggregate user behavior into features:
-
-```python
-# Step 3: Define feature engineering SQL
-user_features_sql = """
-SELECT
-    user_id,
-
-    -- Transaction counts
-    COUNT(*) as total_events,
-    COUNT(CASE WHEN action_type = 'purchase' THEN 1 END) as total_purchases,
-    COUNT(CASE WHEN action_type = 'view' THEN 1 END) as total_views,
-    COUNT(CASE WHEN action_type = 'add_to_cart' THEN 1 END) as total_cart_adds,
-
-    -- Revenue metrics
-    SUM(purchase_amount) as total_revenue,
-    AVG(purchase_amount) as avg_purchase_amount,
-    MAX(purchase_amount) as max_purchase_amount,
-
-    -- Engagement metrics
-    AVG(session_duration) as avg_session_duration,
-    SUM(items_viewed) as total_items_viewed,
-    AVG(items_viewed) as avg_items_per_session,
-
-    -- Cart behavior
-    AVG(cart_value) as avg_cart_value,
-    MAX(cart_value) as max_cart_value,
-
-    -- Device preferences
-    COUNT(CASE WHEN device_type = 'mobile' THEN 1 END) as mobile_sessions,
-    COUNT(CASE WHEN device_type = 'desktop' THEN 1 END) as desktop_sessions,
-    COUNT(CASE WHEN device_type = 'tablet' THEN 1 END) as tablet_sessions,
-
-    -- Category preferences
-    MODE(product_category) as favorite_category,
-    COUNT(DISTINCT product_category) as categories_explored,
-
-    -- Time range
-    MIN(event_time) as first_event_time,
-    MAX(event_time) as last_event_time
-
-FROM __THIS__
-GROUP BY user_id
-ORDER BY total_revenue DESC
-"""
-
-# Add SQL to the task
-duckdb_task.add_sql(user_features_sql)
-print("\nFeature SQL added to pipeline")
+```bash
+seeknal dry-run draft_source_raw_orders.yml
 ```
 
-**Key Points:**
-- `__THIS__` is a placeholder that refers to the input data
-- SQL runs on DuckDB, supporting advanced functions like `MODE()`
-- Features are aggregated at the user level (`GROUP BY user_id`)
+Apply to register the source:
 
-#### Step 2.3: Execute the Transformation
-
-```python
-# Step 4: Execute the transformation
-print("\nExecuting feature transformation...")
-result_arrow = duckdb_task.transform()
-
-# Convert back to pandas for inspection
-result_df = result_arrow.to_pandas()
-
-print(f"Created features for {len(result_df):,} unique users")
-print(f"Number of features: {len(result_df.columns)}")
-print("\nFeature columns:")
-for col in result_df.columns:
-    print(f"  - {col}")
+```bash
+seeknal apply draft_source_raw_orders.yml
 ```
 
-**Expected Output:**
-```
-Executing feature transformation...
-Created features for 100 unique users
-Number of features: 19
+### Step 3: Create a Transform (3 minutes)
 
-Feature columns:
-  - user_id
-  - total_events
-  - total_purchases
-  - total_views
-  - total_cart_adds
-  - total_revenue
-  ...
+Generate a transform template:
+
+```bash
+seeknal draft transform clean_orders --description "Clean and validate orders"
 ```
 
----
+Edit `draft_transform_clean_orders.yml`:
 
-### Part 3: Save and Analyze Features (5 minutes)
-
-> **Goal:** Persist features and run analysis
-
-#### Step 3.1: Save Features to Files
-
-```python
-# Step 5: Save features
-from pathlib import Path
-
-output_dir = Path("output")
-output_dir.mkdir(exist_ok=True)
-
-# Save as Parquet (efficient for ML pipelines)
-parquet_path = output_dir / "user_features.parquet"
-result_df.to_parquet(parquet_path, index=False)
-print(f"\nSaved Parquet: {parquet_path}")
-
-# Save as CSV (human-readable)
-csv_path = output_dir / "user_features.csv"
-result_df.to_csv(csv_path, index=False)
-print(f"Saved CSV: {csv_path}")
+```yaml
+kind: transform
+name: clean_orders
+description: "Remove invalid orders and add computed columns"
+input:
+  - ref('source.raw_orders')
+query: |
+  SELECT
+      order_id,
+      customer_id,
+      CAST(order_date AS DATE) AS order_date,
+      product,
+      quantity,
+      price,
+      total,
+      (quantity * price) AS computed_total
+  FROM input_0
+  WHERE
+      quantity > 0
+      AND price > 0
+      AND customer_id IS NOT NULL
 ```
 
-#### Step 3.2: Analyze Your Features
+Apply it:
 
-```python
-# Step 6: Analyze the features
-print("\n" + "="*50)
-print(" Feature Analysis")
-print("="*50)
-
-# Top users by revenue
-print("\nTop 5 Users by Revenue:")
-print(result_df[['user_id', 'total_purchases', 'total_revenue', 'favorite_category']].head())
-
-# Feature statistics
-print("\nFeature Statistics:")
-stats_cols = ['total_events', 'total_purchases', 'total_revenue', 'avg_session_duration']
-print(result_df[stats_cols].describe().round(2))
+```bash
+seeknal dry-run draft_transform_clean_orders.yml
+seeknal apply draft_transform_clean_orders.yml
 ```
 
-#### Step 3.3: Create User Segments (Bonus)
+### Step 4: Create a Feature Group (3 minutes)
 
-Run additional analysis using DuckDB:
+Generate a feature group template:
 
-```python
-# Step 7: Create user segments
-print("\n" + "="*50)
-print(" User Segmentation")
-print("="*50)
+```bash
+seeknal draft feature-group customer_features --description "Customer purchase features"
+```
 
-# Create a new task for segmentation
-segment_task = DuckDBTask()
-segment_task.add_input(dataframe=pa.Table.from_pandas(result_df))
+Edit `draft_feature_group_customer_features.yml`:
 
-segment_sql = """
+```yaml
+kind: feature_group
+name: customer_features
+description: "Customer-level purchase behavior features"
+entity: customer
+entity_keys:
+  - customer_id
+input:
+  - ref('transform.clean_orders')
+query: |
+  SELECT
+      customer_id,
+      COUNT(DISTINCT order_id) AS order_count,
+      SUM(total) AS total_spend,
+      AVG(total) AS avg_order_value,
+      MAX(total) AS max_order_value,
+      MIN(order_date) AS first_order_date,
+      MAX(order_date) AS last_order_date,
+      COUNT(DISTINCT product) AS unique_products
+  FROM input_0
+  GROUP BY customer_id
+materialization:
+  format: parquet
+```
+
+Apply it:
+
+```bash
+seeknal dry-run draft_feature_group_customer_features.yml
+seeknal apply draft_feature_group_customer_features.yml
+```
+
+### Step 5: Run the Pipeline (2 minutes)
+
+Preview the execution plan, then run:
+
+```bash
+# See what will be executed
+seeknal run --dry-run
+
+# Execute the full pipeline
+seeknal run
+```
+
+**Expected output:**
+
+```
+Seeknal Pipeline Execution
+============================================================
+ℹ Building DAG from seeknal/ directory...
+✓ DAG built: 3 nodes, 2 edges
+
+Execution Plan:
+   1. RUN raw_orders [orders, ecommerce]
+   2. RUN clean_orders
+   3. RUN customer_features
+
+Execution
+============================================================
+1/3: raw_orders [RUNNING]
+  SUCCESS in 0.5s — Rows: 1,000
+
+2/3: clean_orders [RUNNING]
+  SUCCESS in 0.3s — Rows: 985
+
+3/3: customer_features [RUNNING]
+  SUCCESS in 0.4s — Rows: 200
+
+✓ All nodes executed successfully
+```
+
+### Step 6: Explore Results (2 minutes)
+
+Use the interactive REPL to query your pipeline outputs:
+
+```bash
+seeknal repl
+```
+
+```sql
+-- The REPL auto-registers all pipeline outputs
+-- Query your feature group directly:
+SELECT * FROM customer_features ORDER BY total_spend DESC LIMIT 5;
+
+-- Explore the intermediate transform:
+SELECT * FROM clean_orders LIMIT 10;
+
+-- Run ad-hoc analysis:
 SELECT
     CASE
-        WHEN total_purchases = 0 THEN 'Browser'
-        WHEN total_purchases = 1 THEN 'One-time Buyer'
-        WHEN total_purchases <= 3 THEN 'Occasional Buyer'
-        ELSE 'Frequent Buyer'
-    END as segment,
-    COUNT(*) as user_count,
-    ROUND(AVG(total_revenue), 2) as avg_revenue,
-    ROUND(AVG(avg_session_duration), 0) as avg_session_secs
-FROM __THIS__
+        WHEN order_count = 1 THEN 'One-time'
+        WHEN order_count <= 3 THEN 'Occasional'
+        ELSE 'Frequent'
+    END AS segment,
+    COUNT(*) AS customer_count,
+    ROUND(AVG(total_spend), 2) AS avg_spend
+FROM customer_features
 GROUP BY 1
-ORDER BY user_count DESC
-"""
-
-segment_task.add_sql(segment_sql)
-segments = segment_task.transform().to_pandas()
-
-print("\nUser Segments:")
-print(segments.to_string(index=False))
+ORDER BY customer_count DESC;
 ```
 
-**Expected Output:**
-```
-User Segments:
-         segment  user_count  avg_revenue  avg_session_secs
-         Browser          45         0.00               850
-  One-time Buyer          28       125.50               920
-Occasional Buyer          20       380.25              1050
-  Frequent Buyer           7       890.00              1180
-```
+Output files are in `target/intermediate/`:
 
----
-
-### Complete Script
-
-Here's the complete script for reference:
-
-```python
-#!/usr/bin/env python3
-"""
-Complete Seeknal Quickstart Script
-==================================
-Creates user behavior features from e-commerce data.
-"""
-
-import pandas as pd
-import pyarrow as pa
-from pathlib import Path
-from seeknal.tasks.duckdb import DuckDBTask
-
-def main():
-    # Load data
-    print("Loading sample data...")
-    df = pd.read_csv("sample_data.csv")
-    print(f"Loaded {len(df):,} rows")
-
-    # Create DuckDB task
-    print("\nCreating DuckDB task...")
-    arrow_table = pa.Table.from_pandas(df)
-    duckdb_task = DuckDBTask()
-    duckdb_task.add_input(dataframe=arrow_table)
-
-    # Define features
-    user_features_sql = """
-    SELECT
-        user_id,
-        COUNT(*) as total_events,
-        COUNT(CASE WHEN action_type = 'purchase' THEN 1 END) as total_purchases,
-        SUM(purchase_amount) as total_revenue,
-        AVG(session_duration) as avg_session_duration,
-        MODE(product_category) as favorite_category,
-        COUNT(DISTINCT product_category) as categories_explored
-    FROM __THIS__
-    GROUP BY user_id
-    ORDER BY total_revenue DESC
-    """
-
-    duckdb_task.add_sql(user_features_sql)
-
-    # Execute
-    print("\nExecuting transformation...")
-    result = duckdb_task.transform().to_pandas()
-    print(f"Created features for {len(result):,} users")
-
-    # Save
-    output_dir = Path("output")
-    output_dir.mkdir(exist_ok=True)
-    result.to_parquet(output_dir / "user_features.parquet", index=False)
-    result.to_csv(output_dir / "user_features.csv", index=False)
-    print(f"\nFeatures saved to {output_dir}/")
-
-    # Display results
-    print("\nTop 5 users by revenue:")
-    print(result.head())
-
-if __name__ == "__main__":
-    main()
+```bash
+ls target/intermediate/
+# feature_group_customer_features.parquet
+# transform_clean_orders.parquet
+# source_raw_orders.parquet
 ```
 
 ---
 
 ## Core Concepts
 
-### Tasks
+### Pipeline Nodes
 
-**Tasks** are the building blocks of Seeknal pipelines. They define transformations on data.
+Seeknal pipelines are built from **nodes** — YAML or Python files that define each step of your data workflow:
 
-```python
-from seeknal.tasks.duckdb import DuckDBTask
-from seeknal.tasks.sparkengine import SparkEngineTask
+| Node Type | Purpose | Example |
+|-----------|---------|---------|
+| **Source** | Load raw data (CSV, PostgreSQL, etc.) | `kind: source` |
+| **Transform** | SQL-based data transformations | `kind: transform` |
+| **Feature Group** | ML feature engineering with entity keys | `kind: feature_group` |
+| **Model** | ML model training/inference | `kind: model` |
+| **Exposure** | Export results to external systems | `kind: exposure` |
 
-# DuckDB for local development
-duckdb_task = DuckDBTask()
-duckdb_task.add_input(dataframe=arrow_table)
-duckdb_task.add_sql("SELECT * FROM __THIS__ WHERE value > 0")
+### DAG (Directed Acyclic Graph)
 
-# Spark for production (same SQL works!)
-spark_task = SparkEngineTask()
-spark_task.add_sql("SELECT * FROM __THIS__ WHERE value > 0")
+Nodes are connected via `ref()` references, forming a DAG that Seeknal executes in dependency order:
+
+```
+source.raw_orders → transform.clean_orders → feature_group.customer_features
 ```
 
-### Flows
+### CLI Workflow
 
-**Flows** chain multiple tasks together into a pipeline:
+The core workflow follows a dbt-inspired pattern:
 
-```python
-from seeknal.flow import Flow, FlowInput, FlowOutput
-
-flow = Flow(
-    name="my_feature_pipeline",
-    input=FlowInput(kind="hive_table", value="raw_events"),
-    tasks=[task1, task2, task3],
-    output=FlowOutput()
-)
-
-# Save and reuse the flow
-flow.get_or_create()
-result = flow.run()
+```bash
+seeknal draft <type> <name>   # Generate a YAML template
+seeknal dry-run <file>        # Validate and preview
+seeknal apply <file>          # Register the node
+seeknal run                   # Execute the full DAG
+seeknal repl                  # Query results interactively
 ```
 
-### Feature Groups
+### Materialization
 
-**Feature Groups** are collections of related features with metadata:
+Pipeline outputs are saved as Parquet files by default. You can also materialize to:
 
-```python
-from seeknal.entity import Entity
-from seeknal.featurestore.feature_group import FeatureGroup
+- **PostgreSQL** — `type: postgresql` with modes: `full`, `incremental_by_time`, `upsert_by_key`
+- **Apache Iceberg** — `type: iceberg` for lakehouse storage with time travel
 
-# Define the entity (primary key)
-entity = Entity(name="user", join_keys=["user_id"])
+### Environments
 
-# Create feature group
-fg = FeatureGroup(
-    name="user_behavior_features",
-    entity=entity,
-    description="User behavior features for ML models"
-)
+Isolate dev/staging/prod with environment-aware execution:
 
-# Attach transformation and register features
-fg.set_flow(my_flow)
-fg.set_features()
-fg.get_or_create()
-```
-
-### Projects and Workspaces
-
-Organize your work with **Projects** and **Workspaces**:
-
-```python
-from seeknal.project import Project
-from seeknal.workspace import Workspace
-
-# Create a project
-project = Project(name="ecommerce_ml", description="E-commerce ML features")
-project.get_or_create()
-
-# Create a workspace within the project
-workspace = Workspace(name="user_features")
-workspace.get_or_create()
-```
-
----
-
-## DuckDB vs Spark: When to Use Each
-
-| Aspect | DuckDB | Spark |
-|--------|--------|-------|
-| **Best For** | Development, prototyping, small data | Production, large scale |
-| **Data Size** | < 10GB | Unlimited |
-| **Setup** | None (embedded) | Cluster required |
-| **Speed** | Fast for small data | Fast for large data |
-| **Use Case** | Local feature development | Production materialization |
-
-### Development Workflow
-
-1. **Develop with DuckDB** - Fast iteration, no infrastructure
-2. **Test locally** - Verify logic and outputs
-3. **Switch to Spark** - Same SQL, production scale
-
-```python
-# Development (DuckDB)
-from seeknal.tasks.duckdb import DuckDBTask
-task = DuckDBTask()
-task.add_sql("SELECT user_id, SUM(amount) FROM __THIS__ GROUP BY user_id")
-
-# Production (Spark) - Same SQL!
-from seeknal.tasks.sparkengine import SparkEngineTask
-task = SparkEngineTask()
-task.add_sql("SELECT user_id, SUM(amount) FROM __THIS__ GROUP BY user_id")
+```bash
+seeknal env plan dev          # Create a dev environment plan
+seeknal env apply dev         # Execute with environment isolation
 ```
 
 ---
@@ -913,37 +570,30 @@ IcebergStoreOutput(table="features", mode="overwrite")
 
 ## Next Steps
 
-### Choose Your Path
+### Tutorials
 
-**For production-ready, team-based development:**
-- **[Workflow Tutorial: E-commerce Analytics Pipeline](./tutorials/workflow-tutorial-ecommerce.md)** - Learn the `draft → dry-run → apply` CLI workflow for creating production-grade pipelines with YAML definitions.
+- **[YAML Pipeline Tutorial](./tutorials/yaml-pipeline-tutorial.md)** — Deep dive into the YAML workflow with a complete e-commerce dataset
+- **[Python Pipelines Tutorial](./tutorials/python-pipelines-tutorial.md)** — Build pipelines using Python decorators (`@source`, `@transform`, `@feature_group`)
+- **[E-commerce Workflow Tutorial](./tutorials/workflow-tutorial-ecommerce.md)** — Full draft/dry-run/apply workflow with 5 tables
 
-**For continued Python API learning:**
-- **[Spark Transformers Reference](./spark-transformers-reference.md)** - Production-scale feature engineering
-- **[Feature Store Examples](./examples/featurestore.md)** - Complete feature store workflow
-- **[Python Pipelines Tutorial](./tutorials/python-pipelines-tutorial.md)** - Advanced Python pipeline patterns
+### Guides
 
-### Learn More
+- **[Python Pipelines Guide](./guides/python-pipelines.md)** — Decorator API reference and patterns
+- **[Training to Serving](./guides/training-to-serving.md)** — End-to-end ML feature lifecycle
+- **[Testing and Audits](./guides/testing-and-audits.md)** — Data quality validation
+- **[Semantic Layer](./guides/semantic-layer.md)** — Metrics and materialized views
 
--- **[API Reference](https://github.com/mta-tech/seeknal)** - Full documentation
--- **[Spark Transformers Reference](./spark-transformers-reference.md)** - Production-scale feature engineering
--- **[Feature Store Examples](./examples/featurestore.md)** - Complete feature store workflow
--- **[API Reference](./api/)** - Full API documentation
--- **[Workflow Guides](./guides/)** - Advanced workflow features
+### Reference
 
+- **[CLI Reference](./reference/cli.md)** — All CLI commands and options
+- **[YAML Schema Reference](./reference/yaml-schema.md)** — Complete YAML node specification
+- **[Configuration](./reference/configuration.md)** — Profiles, connections, and settings
 
-### Try These Exercises
-
-1. **Add more features** - Extend the SQL to include day-of-week patterns
-2. **Create time windows** - Calculate 7-day and 30-day rolling metrics
-3. **Use Spark** - Run the same features with SparkEngineTask
-4. **Build a model** - Use the features in a scikit-learn classifier
-
-### Join the Community
+### Community
 
 - **GitHub**: [mta-tech/seeknal](https://github.com/mta-tech/seeknal)
 - **Issues**: Report bugs or request features
-- **Discussions**: Ask questions and share ideas
+- **PyPI**: `pip install seeknal`
 
 ---
 
@@ -965,7 +615,7 @@ source .venv/bin/activate  # Linux/macOS
 .\.venv\Scripts\activate   # Windows
 
 # Reinstall Seeknal
-pip install seeknal-<version>-py3-none-any.whl
+pip install seeknal
 ```
 
 #### "ImportError: cannot import name 'DuckDBTask'"
@@ -978,101 +628,41 @@ pip install seeknal-<version>-py3-none-any.whl
 pip show seeknal
 
 # Update to latest version if needed
-pip install --upgrade seeknal-<version>-py3-none-any.whl
+pip install --upgrade seeknal
 ```
 
 ### Runtime Issues
 
-#### "FileNotFoundError: sample_data.csv"
+#### "FileNotFoundError" for CSV source
 
-**Cause:** Script can't find the sample data file.
-
-**Solution:**
-```bash
-# Ensure you're in the correct directory
-cd examples/quickstart
-
-# Verify the file exists
-ls -la sample_data.csv
-
-# Or use absolute path in your script
-df = pd.read_csv("/full/path/to/sample_data.csv")
-```
-
-#### "pyarrow.lib.ArrowInvalid: Could not convert..."
-
-**Cause:** Data type mismatch when converting to Arrow.
-
-**Solution:**
-```python
-# Ensure clean data types before conversion
-df = df.fillna(0)  # Handle null values
-df['column'] = df['column'].astype(str)  # Explicit type conversion
-
-# Then convert to Arrow
-arrow_table = pa.Table.from_pandas(df)
-```
-
-### Performance Issues
-
-#### "Transformation is slow"
-
-**Cause:** Large dataset or complex SQL.
-
-**Solutions:**
-1. **Sample your data** during development:
-   ```python
-   df_sample = df.sample(n=10000)
-   ```
-
-2. **Optimize SQL** - Add filters early:
-   ```sql
-   SELECT * FROM __THIS__
-   WHERE event_time >= '2024-01-01'  -- Filter first
-   ```
-
-3. **Use Spark** for large datasets:
-   ```python
-   from seeknal.tasks.sparkengine import SparkEngineTask
-   task = SparkEngineTask()  # Handles large data efficiently
-   ```
-
-### Windows-Specific Issues
-
-#### "Path issues with backslashes"
-
-**Cause:** Windows uses backslashes in paths.
-
-**Solution:**
-```python
-from pathlib import Path
-
-# Use Path for cross-platform compatibility
-data_path = Path("examples") / "quickstart" / "sample_data.csv"
-df = pd.read_csv(data_path)
-```
-
-#### "Permission denied when saving files"
-
-**Cause:** File is open in another program or restricted directory.
+**Cause:** The `table:` path in your source YAML doesn't point to an existing file.
 
 **Solution:**
 ```bash
-# Close any programs using the output files
-# Save to a directory where you have write permissions
-output_dir = Path.home() / "seeknal_output"
-output_dir.mkdir(exist_ok=True)
+# Check the path in your source YAML
+# Use absolute paths or paths relative to the project root
+ls -la data/orders.csv
+```
+
+#### "ref not found" in dry-run
+
+**Cause:** The referenced upstream node hasn't been applied yet.
+
+**Solution:**
+```bash
+# Apply nodes in dependency order
+seeknal apply draft_source_raw_orders.yml       # Apply source first
+seeknal apply draft_transform_clean_orders.yml   # Then transform
 ```
 
 ### Getting Help
 
 If you're still stuck:
 
-1. **Check the logs** - Look for error messages in the console
-2. **Search GitHub Issues** - Someone may have solved your problem
-3. **Open a new issue** - Include your Python version, OS, and error message
-4. **Join discussions** - Ask the community for help
-5. **See the [Troubleshooting Guide](reference/troubleshooting.md)** - Comprehensive issue diagnosis
+1. **Check the logs** — Look for error messages in the console
+2. **Use `seeknal docs`** — Search built-in documentation from the CLI
+3. **Search GitHub Issues** — Someone may have solved your problem
+4. **Open a new issue** — Include your Python version, OS, and error message
 
 ---
 
@@ -1080,14 +670,14 @@ If you're still stuck:
 
 Congratulations! You've completed the Seeknal Getting Started guide. You now know how to:
 
-- Install Seeknal on any platform
-- Load data with DuckDBTask
-- Engineer features with SQL transformations
-- Save features in efficient formats
-- Choose between DuckDB and Spark
+- Install Seeknal from PyPI
+- Initialize a project with `seeknal init`
+- Define sources, transforms, and feature groups in YAML
+- Use the `draft → dry-run → apply → run` workflow
+- Query results with `seeknal repl`
 
-**Time to build something amazing with your features!**
+**Ready for more?** Try the [YAML Pipeline Tutorial](./tutorials/yaml-pipeline-tutorial.md) for a deeper walkthrough, or the [Python Pipelines Tutorial](./tutorials/python-pipelines-tutorial.md) for decorator-based pipelines.
 
 ---
 
-*Last updated: January 2024 | Seeknal Documentation*
+*Last updated: February 2026 | Seeknal Documentation*

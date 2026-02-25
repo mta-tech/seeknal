@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "seeknal"
-version = "2.1.0"
+version = "2.2.0"
 description = "All-in-one platform for data and AI/ML engineering"
 authors = [
     {name = "Fitra Kacamarga"}

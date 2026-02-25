@@ -448,14 +448,8 @@ from seeknal.featurestore.duckdbengine.feature_group import (
     OnlineFeaturesDuckDB,
 )
 
-# Option 1: Serve latest features
-online_table = hist.using_latest().serve(name="user_features_online")
-
-# Option 2: Serve specific time range
-online_table = hist.serve(
-    name="user_features_online",
-    feature_start_time=datetime(2024, 1, 1)
-)
+# Serve features to online store
+online_table = hist.serve(name="user_features_online")
 
 print(f"Online table created: {online_table.name}")
 ```
@@ -470,23 +464,14 @@ model = joblib.load("churn_model.pkl")
 # Get features for a specific user
 user_keys = [{"user_id": "user_12345"}]
 
-features = online_table.get_features(keys=user_keys)
-print(features)
+feature_df = online_table.get_features(keys=user_keys)
+print(feature_df)
 
-# Example output:
-# [
-#   {
-#     "user_id": "user_12345",
-#     "total_sessions_7d": 15,
-#     "avg_session_duration": 180.5,
-#     "pages_per_session": 3.2,
-#     "conversion_count": 2
-#   }
-# ]
+# Example output (pd.DataFrame):
+#       user_id  total_sessions_7d  avg_session_duration  pages_per_session  conversion_count
+# 0  user_12345                 15                 180.5                3.2                 2
 
 # Make prediction
-import pandas as pd
-feature_df = pd.DataFrame(features)
 X_inference = feature_df[feature_cols]
 prediction = model.predict_proba(X_inference)[:, 1]
 
@@ -503,8 +488,7 @@ user_keys = [
     {"user_id": "user_003"},
 ]
 
-features = online_table.get_features(keys=user_keys)
-feature_df = pd.DataFrame(features)
+feature_df = online_table.get_features(keys=user_keys)
 
 # Batch prediction
 X_batch = feature_df[feature_cols]
@@ -551,9 +535,12 @@ print(results)
 ### Verifying Parity
 
 ```python
-# Check feature schema
-fg = FeatureGroupDuckDB(name="user_behavior_features")
-fg.get_or_create()
+# Check feature schema (reconstruct from saved config)
+fg = FeatureGroupDuckDB(
+    name="user_behavior_features",
+    entity=Entity(name="user", join_keys=["user_id"]),
+    materialization=Materialization(event_time_col="event_timestamp"),
+)
 
 print(f"Features: {fg.features}")
 print(f"Entity: {fg.entity.join_keys}")

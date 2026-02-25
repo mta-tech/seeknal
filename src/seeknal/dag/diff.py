@@ -180,8 +180,15 @@ def _classify_config_change(old_node: Node, new_node: Node) -> ChangeCategory:
             else:
                 category = max(category, ChangeCategory.NON_BREAKING, key=_severity)
         elif key == "inputs":
-            old_inputs = set(old_config.get("inputs", []))
-            new_inputs = set(new_config.get("inputs", []))
+            # inputs are lists of dicts (e.g. [{"ref": "source.X"}]) — convert to
+            # frozensets of sorted items so they are hashable for set operations
+            def _hashable(items: list) -> set:
+                return {
+                    frozenset(sorted(d.items())) if isinstance(d, dict) else d
+                    for d in items
+                }
+            old_inputs = _hashable(old_config.get("inputs", []))
+            new_inputs = _hashable(new_config.get("inputs", []))
             if old_inputs - new_inputs:  # input removed
                 category = max(category, ChangeCategory.BREAKING, key=_severity)
             else:

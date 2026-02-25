@@ -1,27 +1,26 @@
 # Chapter 2: Add Incremental Models
 
-> **Duration:** 30 minutes | **Difficulty:** Intermediate | **Format:** YAML & Python
+> **Duration:** 25 minutes | **Difficulty:** Intermediate | **Format:** YAML
 
-Learn to optimize Seeknal pipelines with incremental processing, reducing computation time and cost by only processing new or changed data.
+Learn to extend your pipeline with multiple transforms, understand Seeknal's caching system, and handle growing datasets with merge logic and aggregation.
 
 ---
 
 ## What You'll Build
 
-An incremental order processing pipeline:
+Extend the Chapter 1 pipeline with aggregation and merge transforms:
 
 ```
-Source (REST API) → Incremental Load → Transform → Warehouse
-                          ↓
-                    Change Detection
-                    (last_modified timestamp)
+raw_orders (CSV) ──→ orders_cleaned ──┐
+                                      ├──→ orders_merged ──→ daily_revenue
+orders_updates (CSV) ─────────────────┘
 ```
 
 **After this chapter, you'll have:**
-- Incremental source that only fetches new/changed data
-- CDC (Change Data Capture) patterns for detecting updates
-- Scheduled pipeline runs for automated processing
-- Monitoring and validation for incremental updates
+- A multi-step DAG with source, transform, and aggregation layers
+- Understanding of Seeknal's incremental caching system
+- Merge logic that handles data corrections and new records
+- An aggregation layer for daily revenue metrics
 
 ---
 
@@ -29,779 +28,509 @@ Source (REST API) → Incremental Load → Transform → Warehouse
 
 Before starting, ensure you've completed:
 
-- [ ] [Chapter 1: Build ELT Pipeline](1-elt-pipeline.md) — Basic pipeline knowledge
-- [ ] Comfortable with SQL window functions
-- [ ] Understanding of timestamp-based queries
+- [ ] [Chapter 1: Build ELT Pipeline](1-elt-pipeline.md) — Working pipeline with `raw_orders` and `orders_cleaned`
+- [ ] Comfortable with SQL window functions (`ROW_NUMBER`, `PARTITION BY`)
 
 ---
 
-## Part 1: Configure Incremental Source (10 minutes)
+## Part 1: Understand Incremental Caching (5 minutes)
 
-### Understanding Incremental Loading
+### How Seeknal's Caching Works
 
-Incremental loading only processes new or changed data since the last run:
-
-| Strategy | Use Case | Benefit |
-|----------|----------|---------|
-| **Timestamp-based** | Data has `updated_at` column | Simple to implement |
-| **CDC-based** | Database has change logs | Captures deletes |
-| **Watermark-based** | Streaming data sources | Exactly-once processing |
-
-=== "YAML Approach"
-
-    Modify your HTTP source to support incremental loading:
-
-    Edit `pipelines/sources/orders_api.yaml`:
-
-    ```yaml
-    kind: source
-    name: orders_api
-
-    http:
-      url: https://api.example.com/orders
-
-      headers:
-        Authorization: "Bearer ${API_TOKEN}"
-
-      # Incremental loading configuration
-      incremental:
-        enabled: true
-        strategy: timestamp  # Use timestamp-based CDC
-        column: updated_at   # Column to track changes
-
-        # Initial load parameters
-        initial_load:
-          # Fetch all historical data on first run
-          mode: full
-
-        # Incremental parameters
-        params:
-          # Only fetch records modified since last run
-          since: "{{ last_successful_run }}"
-          limit: 10000
-
-      # Polling configuration
-      poll:
-        interval: "15m"  # Check every 15 minutes
-        strategy: "incremental"
-
-    format:
-      type: json
-      array: true
-
-    schema:
-      - column: order_id
-        type: string
-        primary_key: true
-      - column: customer_id
-        type: string
-      - column: order_date
-        type: timestamp
-      - column: updated_at
-        type: timestamp
-      - column: status
-        type: string
-      - column: revenue
-        type: float
-      - column: items
-        type: integer
-    ```
-
-=== "Python Approach"
-
-    Modify `pipeline.py` to support incremental loading:
-
-    ```python
-    #!/usr/bin/env python3
-    """
-    Incremental ELT Pipeline - Chapter 2
-    Only processes new or changed orders
-    """
-
-    import os
-    import json
-    import pandas as pd
-    import requests
-    from pathlib import Path
-    from datetime import datetime, timedelta
-    from seeknal.tasks.duckdb import DuckDBTask
-
-    # Track last successful run
-    STATE_FILE = Path("pipeline_state.json")
-
-    def load_state():
-        """Load the last successful run timestamp."""
-        if STATE_FILE.exists():
-            with open(STATE_FILE, 'r') as f:
-                return json.load(f)
-        return {"last_successful_run": None}
-
-    def save_state(timestamp):
-        """Save the last successful run timestamp."""
-        with open(STATE_FILE, 'w') as f:
-            json.dump({"last_successful_run": timestamp}, f)
-
-    def fetch_orders_incremental():
-        """Fetch only new or changed orders."""
-        state = load_state()
-        last_run = state.get("last_successful_run")
-
-        url = "https://api.example.com/orders"
-        headers = {
-            "Authorization": f"Bearer {os.getenv('API_TOKEN')}"
-        }
-
-        # Build query parameters
-        params = {"limit": "10000"}
-
-        # If we have a previous run, only get new data
-        if last_run:
-            params["updated_since"] = last_run
-            print(f"Fetching orders updated since: {last_run}")
-        else:
-            print("Initial load: fetching all orders")
-
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
-
-        data = response.json()
-        df = pd.DataFrame(data)
-
-        print(f"Fetched {len(df)} orders")
-        return df
-
-    # Load and prepare data
-    print("Fetching incremental orders from API...")
-    orders_df = fetch_orders_incremental()
-
-    if len(orders_df) == 0:
-        print("No new data to process. Exiting.")
-        exit(0)
-    ```
-
-### Apply the Incremental Source
+When you run `seeknal run`, Seeknal fingerprints each node (SQL hash, input files, dependencies). On the next run, unchanged nodes are skipped automatically:
 
 ```bash
-# YAML approach
-seeknal apply pipelines/sources/orders_api.yaml
+seeknal run
+```
 
-# Verify incremental configuration
-seeknal describe source orders_api
+If nothing changed since Chapter 1, you'll see all nodes cached:
+
+```
+Seeknal Pipeline Execution
+============================================================
+  Project: ecommerce-pipeline
+  Mode: Incremental
+ℹ Building DAG from seeknal/ directory...
+✓ DAG built: 2 nodes, 1 edges
+ℹ Loaded previous state from run: 20260223_155912
+ℹ Detecting changes...
+✓ No changes detected. Nothing to run.
+```
+
+This is incremental execution — only nodes with changes re-run.
+
+### Trigger a Selective Re-run
+
+Add new orders to `data/orders.csv` to see selective re-execution:
+
+```bash
+cat >> data/orders.csv << 'EOF'
+ORD-010,CUST-106,2026-01-20 10:00:00,completed,175.50,3
+ORD-011,CUST-100,2026-01-20 14:30:00,completed,89.99,2
+ORD-012,CUST-107,2026-01-21 09:15:00,pending,0.00,1
+EOF
+```
+
+```bash
+seeknal run
 ```
 
 **Expected output:**
 ```
-Source: orders_api
-Type: HTTP
-Incremental: Enabled
-  Strategy: timestamp
-  Column: updated_at
-  Last Run: 2026-02-09 10:30:00
+Seeknal Pipeline Execution
+============================================================
+  Project: ecommerce-pipeline
+  Mode: Incremental
+ℹ Building DAG from seeknal/ directory...
+✓ DAG built: 2 nodes, 1 edges
+ℹ Loaded previous state from run: 20260223_160204
+ℹ Detecting changes...
+ℹ Nodes to run: 2
+
+Execution
+============================================================
+1/2: raw_orders [RUNNING]
+  SUCCESS in 0.04s
+  Rows: 13
+2/2: orders_cleaned [RUNNING]
+ℹ Loaded Python node output as input_0
+ℹ Resolved SQL for orders_cleaned
+ℹ   Executing statement 1/1
+ℹ Created view 'transform.orders_cleaned' for materialization
+ℹ Wrote transform output to ./target/intermediate/transform_orders_cleaned.parquet
+  SUCCESS in 0.13s
+  Rows: 12
+✓ State saved
+
+Execution Summary
+============================================================
+  Total nodes:    2
+  Executed:       2
+  Duration:       0.17s
+============================================================
 ```
 
-!!! tip "Choosing Your Incremental Strategy"
-    **Timestamp-based** (shown above): Best for REST APIs with `updated_at` columns
+Notice: `raw_orders` re-runs because the CSV file changed, and `orders_cleaned` re-runs because its upstream input changed. Other nodes stay cached.
 
-    **High-watermark**: Best for databases with auto-incrementing IDs
+### Verify in REPL
 
-    **CDC logs**: Best for capturing deletes and updates
+```bash
+seeknal repl
+```
+
+```sql
+-- Confirm new orders are included
+SELECT order_id, customer_id, status, revenue
+FROM orders_cleaned
+ORDER BY order_id;
+```
+
+**Checkpoint:** You should see 12 unique orders (ORD-001 through ORD-012, with duplicate ORD-001 deduplicated).
 
 ---
 
-## Part 2: Implement Change Data Capture (12 minutes)
+## Part 2: Add a Daily Revenue Aggregation (8 minutes)
 
-### Understanding CDC Patterns
+Build a summary layer on top of the cleaned orders for business metrics.
 
-Change Data Capture (CDC) detects and processes data changes:
+### Draft and Edit the Aggregation
 
-| Pattern | Detects | Use Case |
-|---------|---------|----------|
-| **Append-only** | New rows | Event streams, logs |
-| **Updates tracking** | New + updated | Transactional data |
-| **Full CDC** | New + updated + deleted | Critical systems |
+```bash
+seeknal draft transform daily_revenue
+```
 
-=== "YAML Approach"
+Edit `draft_transform_daily_revenue.yml`:
 
-    Create a CDC-aware transform:
+```yaml
+kind: transform
+name: daily_revenue
+description: "Daily revenue summary from cleaned orders"
 
-    ```bash
-    seeknal draft transform --name orders_cdc --input orders_api
-    ```
+inputs:
+  - ref: transform.orders_cleaned
 
-    Edit `pipelines/transforms/orders_cdc.yaml`:
+transform: |
+  SELECT
+    order_date,
+    COUNT(*) as total_orders,
+    COUNT(CASE WHEN status = 'COMPLETED' THEN 1 END) as completed_orders,
+    COUNT(CASE WHEN status = 'PENDING' THEN 1 END) as pending_orders,
+    COALESCE(SUM(revenue), 0) as total_revenue,
+    ROUND(COALESCE(AVG(revenue), 0), 2) as avg_order_value,
+    SUM(items) as total_items,
+    COUNT(CASE WHEN quality_flag = 1 THEN 1 END) as flagged_orders
 
-    ```yaml
-    kind: transform
-    name: orders_cdc
+  FROM ref('transform.orders_cleaned')
+  WHERE status != 'CANCELLED'
+  GROUP BY order_date
+  ORDER BY order_date
+```
 
-    input: orders_api
+### Apply and Run
 
-    engine: duckdb
+```bash
+seeknal dry-run draft_transform_daily_revenue.yml
+seeknal apply draft_transform_daily_revenue.yml
+```
 
-    sql: |
-      WITH ranked_orders AS (
-        SELECT
-          order_id,
-          customer_id,
-          order_date,
-          updated_at,
-          status,
-          revenue,
-          items,
+**Expected output:**
+```
+ℹ Validating YAML...
+✓ YAML syntax valid
+✓ Schema validation passed
+✓ Dependency check passed
+ℹ Executing preview (limit 10 rows)...
+ℹ Loaded input_0 <- transform.orders_cleaned (from previous run)
++--------------+----------------+--------------------+------------------+-----------------+-------------------+---------------+------------------+
+| order_date   |   total_orders |   completed_orders |   pending_orders |   total_revenue |   avg_order_value |   total_items |   flagged_orders |
+|--------------+----------------+--------------------+------------------+-----------------+-------------------+---------------+------------------|
+| 2026-01-15   |              1 |                  1 |                0 |           89.5  |             89.5  |             2 |                0 |
+| 2026-01-16   |              2 |                  1 |                1 |          250    |            125    |             6 |                1 |
+| 2026-01-17   |              2 |                  2 |                0 |           75.25 |             75.25 |             3 |                1 |
+| 2026-01-18   |              2 |                  2 |                0 |          365.99 |            183    |             2 |                1 |
+| 2026-01-19   |              2 |                  2 |                0 |          349.94 |            174.97 |             7 |                0 |
+| 2026-01-20   |              2 |                  2 |                0 |          265.49 |            132.75 |             5 |                0 |
+| 2026-01-21   |              1 |                  0 |                1 |            0    |              0    |             1 |                0 |
++--------------+----------------+--------------------+------------------+-----------------+-------------------+---------------+------------------+
+✓ Preview completed in 0.0s
+ℹ Run 'seeknal apply draft_transform_daily_revenue.yml' to apply
+ℹ Validating...
+✓ All checks passed
+ℹ Moving file...
+ℹ   FROM: draft_transform_daily_revenue.yml
+ℹ   TO:  ./seeknal/transforms/daily_revenue.yml
+ℹ Updating manifest...
+✓ Manifest regenerated
+ℹ 
+ℹ Added:
+ℹ   + transform.daily_revenue
+ℹ     - depends_on: transform.orders_cleaned
+✓ Applied successfully
+```
 
-          -- CDC operation type
-          CASE
-            WHEN __operation__ = 'DELETE' THEN 'DELETE'
-            WHEN updated_at > __last_run_time__ THEN 'UPDATE'
-            ELSE 'INSERT'
-          END as cdc_operation,
+Now generate the DAG and run:
 
-          -- Row versioning for deduplication
-          ROW_NUMBER() OVER (
-            PARTITION BY order_id
-            ORDER BY updated_at DESC
-          ) as row_version,
+```bash
+seeknal plan
+seeknal run
+```
 
-          CURRENT_TIMESTAMP as processed_at
+### Verify in REPL
 
-        FROM __THIS__
-      )
+```bash
+seeknal repl
+```
 
-      SELECT
-        order_id,
-        customer_id,
-        order_date,
-        updated_at,
-        status,
-        revenue,
-        items,
-        cdc_operation,
-        processed_at
+```sql
+-- Daily revenue summary
+SELECT * FROM daily_revenue;
 
-      FROM ranked_orders
+-- Best performing day
+SELECT order_date, total_revenue, total_orders
+FROM daily_revenue
+ORDER BY total_revenue DESC
+LIMIT 3;
 
-      -- Only keep latest version of each order
-      WHERE row_version = 1
+-- Days with quality issues
+SELECT order_date, flagged_orders, total_orders
+FROM daily_revenue
+WHERE flagged_orders > 0;
+```
 
-      -- Track quality metrics
-      QUALIFY CASE
-        WHEN cdc_operation = 'DELETE' THEN 1
-        WHEN revenue < 0 THEN 1
-        ELSE 0
-      END = 0
-      OR cdc_operation IN ('UPDATE', 'DELETE')
-    ```
+**Checkpoint:** You should see 7 rows (one per day), with January 18th having the highest revenue from the ORD-007 ($320) order.
 
-=== "Python Approach"
+---
 
-    Add CDC logic to `pipeline.py`:
+## Part 3: Handle Data Updates with Merge Logic (10 minutes)
 
-    ```python
-    # Create CDC-aware transformation
-    print("Creating CDC transformation...")
+In real-world pipelines, data arrives with corrections and late updates. Let's handle this with a merge transform.
 
-    task = DuckDBTask()
+### Create Updated Order Data
 
-    # Add input data
-    arrow_table = pa.Table.from_pandas(orders_df)
-    task.add_input(dataframe=arrow_table)
+Create a second CSV with corrections and new orders:
 
-    # Define CDC transformation SQL
-    sql = """
-    WITH ranked_orders AS (
-      SELECT
-        order_id,
-        customer_id,
-        order_date,
-        updated_at,
-        status,
-        revenue,
-        items,
+```bash
+cat > data/orders_updates.csv << 'EOF'
+order_id,customer_id,order_date,status,revenue,items
+ORD-004,CUST-100,2026-01-16 14:20:00,completed,55.00,1
+ORD-005,CUST-102,2026-01-17 08:15:00,completed,25.00,2
+ORD-013,CUST-108,2026-01-22 11:00:00,completed,299.99,5
+ORD-014,CUST-109,2026-01-22 15:30:00,completed,42.50,1
+EOF
+```
 
-        -- Detect operation type based on timestamps
-        CASE
-          WHEN status = 'CANCELLED' THEN 'DELETE'
-          ELSE 'UPSERT'
-        END as cdc_operation,
+!!! info "What's in the Updates?"
+    - **ORD-004**: Status changed from `PENDING` → `completed`, revenue corrected to `$55.00`
+    - **ORD-005**: Revenue corrected from `-$10.00` → `$25.00` (was flagged as quality issue)
+    - **ORD-013, ORD-014**: Brand new orders
 
-        -- Row versioning for deduplication
-        ROW_NUMBER() OVER (
-          PARTITION BY order_id
-          ORDER BY updated_at DESC
-        ) as row_version,
+### Create a Source for Updates
 
-        CURRENT_TIMESTAMP as processed_at
-      FROM __THIS__
-    )
+```bash
+seeknal draft source orders_updates
+```
+
+Edit `draft_source_orders_updates.yml`:
+
+```yaml
+kind: source
+name: orders_updates
+description: "Order corrections and new data"
+source: csv
+table: "data/orders_updates.csv"
+columns:
+  order_id: "Order identifier"
+  customer_id: "Customer identifier"
+  order_date: "Order timestamp"
+  status: "Order status"
+  revenue: "Order revenue in USD"
+  items: "Number of items"
+```
+
+```bash
+seeknal dry-run draft_source_orders_updates.yml
+seeknal apply draft_source_orders_updates.yml
+```
+
+### Create a Merge Transform
+
+```bash
+seeknal draft transform orders_merged
+```
+
+Edit `draft_transform_orders_merged.yml`:
+
+```yaml
+kind: transform
+name: orders_merged
+description: "Merge original orders with updates, keeping latest version"
+
+inputs:
+  - ref: transform.orders_cleaned
+  - ref: source.orders_updates
+
+transform: |
+  WITH combined AS (
+    -- Original cleaned orders
+    SELECT
+      order_id, customer_id, order_date, status,
+      revenue, items, quality_flag,
+      'original' as source_batch
+    FROM ref('transform.orders_cleaned')
+
+    UNION ALL
+
+    -- Updates and corrections (apply same cleaning)
     SELECT
       order_id,
       customer_id,
-      order_date,
-      updated_at,
-      status,
-      revenue,
-      items,
-      cdc_operation,
-      processed_at
-    FROM ranked_orders
-    WHERE row_version = 1  -- Keep latest version only
-    """
+      DATE(order_date) as order_date,
+      UPPER(TRIM(status)) as status,
+      CASE WHEN revenue >= 0 THEN revenue ELSE NULL END as revenue,
+      CASE WHEN items >= 0 THEN items ELSE 0 END as items,
+      CASE
+        WHEN revenue < 0 OR items < 0 THEN 1
+        ELSE 0
+      END as quality_flag,
+      'update' as source_batch
+    FROM ref('source.orders_updates')
+  )
 
-    task.add_sql(sql)
+  SELECT
+    order_id, customer_id, order_date, status,
+    revenue, items, quality_flag, source_batch,
+    CURRENT_TIMESTAMP as merged_at
+  FROM combined
+  -- Keep updates over originals, then latest date
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY order_id
+    ORDER BY
+      CASE WHEN source_batch = 'update' THEN 0 ELSE 1 END,
+      order_date DESC
+  ) = 1
+```
 
-    # Execute transformation
-    print("Executing CDC transformation...")
-    result_arrow = task.transform()
-    cdc_df = result_arrow.to_pandas()
-
-    # Report CDC statistics
-    operation_counts = cdc_df['cdc_operation'].value_counts()
-    print(f"CDC Operations:")
-    for op, count in operation_counts.items():
-        print(f"  {op}: {count}")
-    ```
-
-### Apply the CDC Transform
+### Apply and Run
 
 ```bash
-# YAML approach
-seeknal apply pipelines/transforms/orders_cdc.yaml
-
-# Test CDC logic
-seeknal run --dry-run --since "2026-02-09 00:00:00"
+seeknal dry-run draft_transform_orders_merged.yml
+seeknal apply draft_transform_orders_merged.yml
+seeknal plan
+seeknal run
 ```
 
-**Expected output:**
-```
-Applying transform 'orders_cdc'...
-  ✓ Validated SQL syntax
-  ✓ Verified CDC column references
-  ✓ Registered transform 'orders_cdc'
-Transform applied successfully!
+### Verify the Merge
+
+```bash
+seeknal repl
 ```
 
-!!! info "CDC Operation Types"
-    - **INSERT**: New records (first time seen)
-    - **UPDATE**: Existing records with changed values
-    - **DELETE**: Records marked for removal
-    - **UPSERT**: Combination of insert/update logic
+```sql
+-- All merged orders
+SELECT order_id, status, revenue, source_batch
+FROM orders_merged
+ORDER BY order_id;
+
+-- Verify ORD-004 was updated (was PENDING $0, now COMPLETED $55)
+SELECT order_id, status, revenue, source_batch
+FROM orders_merged
+WHERE order_id = 'ORD-004';
+
+-- Verify ORD-005 revenue was corrected (was negative, now $25)
+SELECT order_id, revenue, quality_flag, source_batch
+FROM orders_merged
+WHERE order_id = 'ORD-005';
+
+-- Count by source batch
+SELECT source_batch, COUNT(*) as cnt
+FROM orders_merged
+GROUP BY source_batch;
+```
+
+**Checkpoint:** You should see:
+
+- **14 total orders** (12 original + 2 new, with 2 updated in place)
+- **ORD-004**: `status = COMPLETED`, `revenue = 55.00`, `source_batch = update`
+- **ORD-005**: `revenue = 25.00`, `quality_flag = 0`, `source_batch = update`
+- **ORD-013, ORD-014**: New orders with `source_batch = update`
+
+!!! success "Merge Complete!"
+    Updates override originals via `QUALIFY ROW_NUMBER()` with batch priority ordering. The same pattern works for any correction workflow — just add new data and re-run.
+
+### Update Daily Revenue to Use Merged Data
+
+Now that `orders_merged` has the corrected data, `daily_revenue` should aggregate from it instead of `orders_cleaned`.
+
+Open `seeknal/transforms/daily_revenue.yml` and update the input ref and the `FROM` clause:
+
+```yaml
+inputs:
+  - ref: transform.orders_merged    # was: transform.orders_cleaned
+
+transform: |
+  SELECT
+    order_date,
+    COUNT(*) as total_orders,
+    COUNT(CASE WHEN status = 'COMPLETED' THEN 1 END) as completed_orders,
+    COUNT(CASE WHEN status = 'PENDING' THEN 1 END) as pending_orders,
+    COALESCE(SUM(revenue), 0) as total_revenue,
+    ROUND(COALESCE(AVG(revenue), 0), 2) as avg_order_value,
+    SUM(items) as total_items,
+    COUNT(CASE WHEN quality_flag = 1 THEN 1 END) as flagged_orders
+
+  FROM ref('transform.orders_merged')
+  WHERE status != 'CANCELLED'
+  GROUP BY order_date
+  ORDER BY order_date
+```
+
+Run to pick up the change:
+
+```bash
+seeknal run
+```
+
+Seeknal detects the SQL change in `daily_revenue` and re-runs only that node:
+
+```
+ℹ Detecting changes...
+ℹ Nodes to run: 1
+
+Execution
+============================================================
+1/1: daily_revenue [RUNNING]
+  SUCCESS in 0.05s
+```
+
+Verify in the REPL that daily revenue now includes the corrected orders and new dates:
+
+```bash
+seeknal repl
+```
+
+```sql
+SELECT * FROM daily_revenue ORDER BY order_date;
+```
+
+**Checkpoint:** You should now see **8 rows** (Jan 15–22), including Jan 22nd from the new orders (ORD-013, ORD-014).
 
 ---
 
-## Part 3: Schedule Automated Pipeline Runs (8 minutes)
+## Part 4: Observe Incremental Behavior (2 minutes)
 
-### Understanding Pipeline Scheduling
-
-Seeknal supports multiple scheduling strategies:
-
-| Strategy | Syntax | Use Case |
-|----------|--------|----------|
-| **Interval-based** | `--every 15m` | Simple periodic runs |
-| **Cron-based** | `--schedule "*/5 * * * *"` | Complex schedules |
-| **Event-driven** | `--trigger file arrival` | Data-driven workflows |
-
-=== "YAML Approach"
-
-    Create a scheduled pipeline configuration:
-
-    Create `pipelines/scheduled_orders.yaml`:
-
-    ```yaml
-    kind: pipeline
-    name: orders_incremental_pipeline
-
-    description: >
-      Incremental order processing pipeline.
-      Fetches new orders every 15 minutes and updates warehouse.
-
-    # Pipeline components
-    sources:
-      - orders_api
-
-    transforms:
-      - orders_cdc
-
-    outputs:
-      - warehouse_orders
-
-    # Schedule configuration
-    schedule:
-      # Run every 15 minutes
-      cron: "*/15 * * * *"
-
-      # Timezone
-      timezone: UTC
-
-      # Incremental loading
-      incremental:
-        enabled: true
-        backfill: false  # Don't backfill historical data
-
-    # Monitoring and alerts
-    monitoring:
-      # Alert on failures
-      on_failure:
-        notify:
-          - type: slack
-            webhook: ${SLACK_WEBHOOK}
-
-      # Alert on data quality issues
-      on_quality_issue:
-        threshold: 0.05  # Alert if >5% records have quality issues
-        notify:
-          - type: email
-            address: data-team@example.com
-
-    # Retention policies
-    retention:
-      # Keep raw source data for 30 days
-      source:
-        days: 30
-
-      # Keep transformed data for 1 year
-      transformed:
-        days: 365
-    ```
-
-=== "Python Approach"
-
-    Create a scheduled pipeline script:
-
-    Create `scripts/run_scheduled.py`:
-
-    ```python
-    #!/usr/bin/env python3
-    """
-    Scheduled Incremental Pipeline
-    Runs every 15 minutes via cron or scheduler
-    """
-
-    import os
-    import sys
-    from pathlib import Path
-    from datetime import datetime
-
-    # Add project root to path
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-
-    from pipeline import (
-        fetch_orders_incremental,
-        transform_orders_cdc,
-        save_to_warehouse
-    )
-    from pipeline_state import load_state, save_state
-
-    def run_pipeline():
-        """Execute the incremental pipeline."""
-        run_start = datetime.now()
-        print(f"Pipeline run started: {run_start}")
-
-        try:
-            # 1. Load previous state
-            state = load_state()
-            last_run = state.get("last_successful_run")
-
-            # 2. Fetch incremental data
-            print("Fetching incremental data...")
-            orders_df = fetch_orders_incremental()
-
-            if len(orders_df) == 0:
-                print("No new data. Pipeline complete.")
-                return
-
-            # 3. Apply CDC transformation
-            print("Applying CDC transformation...")
-            cdc_df = transform_orders_cdc(orders_df)
-
-            # 4. Save to warehouse
-            print("Saving to warehouse...")
-            save_to_warehouse(cdc_df, mode="upsert")
-
-            # 5. Update state
-            save_state(run_start.isoformat())
-
-            # 6. Report metrics
-            print(f"Pipeline completed successfully!")
-            print(f"Processed {len(cdc_df)} orders")
-            print(f"Duration: {datetime.now() - run_start}")
-
-        except Exception as e:
-            print(f"Pipeline failed: {e}")
-            # Send alert (Slack, email, etc.)
-            raise
-
-    if __name__ == "__main__":
-        run_pipeline()
-    ```
-
-    Set up cron schedule:
-
-    ```bash
-    # Edit crontab
-    crontab -e
-
-    # Add schedule (run every 15 minutes)
-    */15 * * * * cd /path/to/project && python scripts/run_scheduled.py >> logs/pipeline.log 2>&1
-    ```
-
-### Apply the Scheduled Pipeline
+Now see caching in action with a larger DAG. Run the pipeline again without any changes:
 
 ```bash
-# YAML approach
-seeknal apply pipelines/scheduled_orders.yaml
-
-# Verify schedule
-seeknal describe pipeline orders_incremental_pipeline
-
-# Manually trigger a run
-seeknal run --pipeline orders_incremental_pipeline
+seeknal run
 ```
 
 **Expected output:**
 ```
-Pipeline: orders_incremental_pipeline
-Schedule: */15 * * * * (Every 15 minutes)
-Next Run: 2026-02-09 10:45:00
-Last Run: 2026-02-09 10:30:00
-Status: Active
+Seeknal Pipeline Execution
+============================================================
+  Project: ecommerce-pipeline
+  Mode: Incremental
+ℹ Building DAG from seeknal/ directory...
+✓ DAG built: 5 nodes, 5 edges
+ℹ Loaded previous state from run: 20260223_150123
+ℹ Detecting changes...
+✓ No changes detected. Nothing to run.
 ```
 
-!!! success "Automated Pipeline Running!"
-    Your pipeline is now scheduled to run every 15 minutes, automatically fetching and processing new orders.
+All 5 nodes are cached. Now add a column to the aggregation SQL to trigger a selective re-run.
 
----
+Open `seeknal/transforms/daily_revenue.yml` and add `max_order_value` after the `avg_order_value` line:
 
-## Part 4: Monitor and Validate Incremental Updates (5 minutes)
+```yaml
+    ROUND(COALESCE(AVG(revenue), 0), 2) as avg_order_value,
+    MAX(revenue) as max_order_value,                         -- add this line
+    SUM(items) as total_items,
+```
 
-### Understanding Pipeline Monitoring
-
-Monitor key metrics to ensure healthy incremental processing:
-
-| Metric | Healthy Value | Warning Threshold |
-|--------|---------------|-------------------|
-| **Rows processed** | Consistent with expected rate | <10% of average |
-| **Processing time** | <5 minutes | >10 minutes |
-| **Error rate** | 0% | >1% |
-| **Data quality issues** | <2% | >5% |
-
-=== "YAML Approach"
-
-    Create a monitoring dashboard query:
-
-    Create `pipelines/queries/pipeline_metrics.yaml`:
-
-    ```yaml
-    kind: query
-    name: pipeline_health_metrics
-
-    description: Monitor incremental pipeline health
-
-    sql: |
-      -- Recent pipeline runs
-      WITH pipeline_runs AS (
-        SELECT
-          DATE_TRUNC('hour', processed_at) as hour,
-          COUNT(*) as record_count,
-          COUNT(DISTINCT order_id) as unique_orders,
-          SUM(CASE WHEN quality_flag = 1 THEN 1 ELSE 0 END) as quality_issues,
-          AVG(processed_at - updated_at) as processing_lag_seconds
-
-        FROM warehouse_orders
-
-        WHERE processed_at >= NOW() - INTERVAL '24 hours'
-
-        GROUP BY hour
-        ORDER BY hour DESC
-        LIMIT 24
-      )
-
-      SELECT
-        hour,
-        record_count,
-        unique_orders,
-        quality_issues,
-        ROUND(quality_issues * 100.0 / NULLIF(record_count, 0), 2) as quality_issue_pct,
-        ROUND(processing_lag_seconds, 2) as avg_lag_seconds
-
-      FROM pipeline_runs
-    ```
-
-    Run health check:
-
-    ```bash
-    seeknal query pipelines/queries/pipeline_metrics.yaml
-    ```
-
-=== "Python Approach"
-
-    Create a monitoring script:
-
-    Create `scripts/monitor_pipeline.py`:
-
-    ```python
-    #!/usr/bin/env python3
-    """
-    Pipeline Health Monitoring
-    """
-
-    import pandas as pd
-    from datetime import datetime, timedelta
-    from pathlib import Path
-
-    def load_recent_data():
-        """Load recent pipeline output."""
-        output_path = Path("output/orders.parquet")
-        df = pd.read_parquet(output_path)
-
-        # Filter last 24 hours
-        cutoff = datetime.now() - timedelta(hours=24)
-        df['processed_at'] = pd.to_datetime(df['processed_at'])
-        return df[df['processed_at'] >= cutoff]
-
-    def calculate_metrics(df):
-        """Calculate pipeline health metrics."""
-        metrics = {
-            "total_records": len(df),
-            "unique_orders": df['order_id'].nunique(),
-            "quality_issues": df.get('quality_flag', pd.Series([0])).sum(),
-            "quality_issue_pct": 0,
-            "processing_lag_hours": (
-                df['processed_at'] - pd.to_datetime(df['updated_at'])
-            ).mean().total_seconds() / 3600,
-            "last_processed": df['processed_at'].max()
-        }
-
-        if metrics["total_records"] > 0:
-            metrics["quality_issue_pct"] = (
-                metrics["quality_issues"] * 100.0 / metrics["total_records"]
-            )
-
-        return metrics
-
-    def check_health(metrics):
-        """Check if pipeline is healthy."""
-        warnings = []
-        errors = []
-
-        # Check data freshness
-        time_since_last = (
-            datetime.now() - metrics["last_processed"]
-        ).total_seconds() / 60  # minutes
-
-        if time_since_last > 30:
-            errors.append(f"No data processed in {time_since_last:.0f} minutes")
-
-        # Check quality issues
-        if metrics["quality_issue_pct"] > 5:
-            errors.append(
-                f"High quality issue rate: {metrics['quality_issue_pct']:.1f}%"
-            )
-        elif metrics["quality_issue_pct"] > 2:
-            warnings.append(
-                f"Elevated quality issues: {metrics['quality_issue_pct']:.1f}%"
-            )
-
-        # Check processing lag
-        if metrics["processing_lag_hours"] > 1:
-            warnings.append(
-                f"High processing lag: {metrics['processing_lag_hours']:.1f} hours"
-            )
-
-        return warnings, errors
-
-    def main():
-        """Run health check."""
-        print("Pipeline Health Check")
-        print("=" * 50)
-
-        df = load_recent_data()
-        metrics = calculate_metrics(df)
-        warnings, errors = check_health(metrics)
-
-        print(f"Records (24h): {metrics['total_records']:,}")
-        print(f"Unique Orders: {metrics['unique_orders']:,}")
-        print(f"Quality Issues: {metrics['quality_issues']} ({metrics['quality_issue_pct']:.2f}%)")
-        print(f"Processing Lag: {metrics['processing_lag_hours']:.2f} hours")
-        print(f"Last Processed: {metrics['last_processed']}")
-        print()
-
-        if errors:
-            print("❌ ERRORS:")
-            for error in errors:
-                print(f"  - {error}")
-        if warnings:
-            print("⚠️  WARNINGS:")
-            for warning in warnings:
-                print(f"  - {warning}")
-        if not errors and not warnings:
-            print("✅ Pipeline is healthy!")
-
-        return len(errors) == 0
-
-    if __name__ == "__main__":
-        import sys
-        sys.exit(0 if main() else 1)
-    ```
-
-    Run health check:
-
-    ```bash
-    python scripts/monitor_pipeline.py
-    ```
-
-### Run Pipeline Health Check
+Run the pipeline:
 
 ```bash
-# Check recent pipeline runs
-seeknal query pipeline_metrics
-
-# View pipeline status
-seeknal status pipeline orders_incremental_pipeline
-
-# View recent logs
-seeknal logs --pipeline orders_incremental_pipeline --tail 50
+seeknal run
 ```
 
-**Expected output:**
-```
-Pipeline Health Check
-==================================================
-Records (24h): 15,432
-Unique Orders: 15,432
-Quality Issues: 23 (0.15%)
-Processing Lag: 0.12 hours
-Last Processed: 2026-02-09 10:30:15
+Only `daily_revenue` re-runs — sources and other transforms stay cached:
 
-✅ Pipeline is healthy!
+```
+ℹ Detecting changes...
+ℹ Nodes to run: 1
+
+Execution
+============================================================
+1/1: daily_revenue [RUNNING]
+  SUCCESS in 0.05s
 ```
 
-!!! success "Incremental Pipeline Complete!"
-    You've built a production-grade incremental pipeline that:
-    - Only processes new/changed data
-    - Detects updates and deletes with CDC
-    - Runs automatically every 15 minutes
-    - Monitors health and alerts on issues
+This is how Seeknal keeps large pipelines fast — only the node whose SQL changed re-executes.
 
 ---
 
 ## What Could Go Wrong?
 
 !!! danger "Common Pitfalls"
-    **1. Missing or Null Timestamps**
-    - Symptom: Records not processed incrementally
-    - Fix: Add default timestamp or handle NULLs in WHERE clause
+    **1. Duplicates After Merge**
 
-    **2. Late-Arriving Data**
-    - Symptom: Records appear out of order
-    - Fix: Use watermark strategy with buffer period
+    - Symptom: Same `order_id` appears multiple times
+    - Fix: Ensure `QUALIFY ROW_NUMBER()` with proper `PARTITION BY` and `ORDER BY`
 
-    **3. Duplicate Processing**
-    - Symptom: Same records processed multiple times
-    - Fix: Implement idempotent writes with upsert logic
+    **2. Column Mismatch in UNION**
 
-    **4. Schedule Skew**
-    - Symptom: Pipeline runs overlap
-    - Fix: Ensure run duration < schedule interval
+    - Symptom: `UNION column count mismatch` error
+    - Fix: Both sides of `UNION ALL` must have the same number and types of columns
+
+    **3. Cache Not Invalidated**
+
+    - Symptom: Old data still appears after updating a CSV
+    - Fix: Seeknal detects file changes automatically — ensure you saved the file
+
+    **4. Missing Dependencies**
+
+    - Symptom: `Referenced node not found` error
+    - Fix: Check that `inputs:` list includes every `ref()` used in the SQL
 
 ---
 
@@ -809,18 +538,27 @@ Last Processed: 2026-02-09 10:30:15
 
 In this chapter, you learned:
 
-- [x] **Incremental Sources** — Configure HTTP sources to only fetch new data
-- [x] **CDC Patterns** — Detect inserts, updates, and deletes
-- [x] **Pipeline Scheduling** — Automate runs with cron or interval-based schedules
-- [x] **Monitoring** — Track health metrics and alert on issues
-- [x] **Validation** — Verify incremental updates are working correctly
+- [x] **Incremental Caching** — Seeknal fingerprints nodes and skips unchanged ones
+- [x] **Aggregation** — Build daily metrics on top of cleaned data
+- [x] **Merge Logic** — Combine datasets with update priority using `QUALIFY`
+- [x] **Multi-step DAG** — Chain source → transform → aggregation layers
+- [x] **Selective Re-execution** — Only modified nodes and their dependents re-run
+
+**Your DAG now looks like:**
+```
+raw_orders (CSV) ──→ orders_cleaned ──┐
+                                      ├──→ orders_merged ──→ daily_revenue
+orders_updates (CSV) ─────────────────┘
+```
 
 **Key Commands:**
 ```bash
-seeknal apply pipelines/scheduled_orders.yaml
-seeknal run --pipeline orders_incremental_pipeline
-seeknal query pipeline_health_metrics
-seeknal logs --pipeline orders_incremental_pipeline
+seeknal draft transform <name>     # Generate transform template
+seeknal dry-run <file>             # Validate before applying
+seeknal apply <file>               # Save node definition
+seeknal plan                       # Regenerate DAG manifest
+seeknal run                        # Execute (with caching)
+seeknal repl                       # Inspect results interactively
 ```
 
 ---
@@ -829,7 +567,7 @@ seeknal logs --pipeline orders_incremental_pipeline
 
 [Chapter 3: Deploy to Production Environments →](3-production-environments.md)
 
-Learn to use virtual environments for safe testing and production deployment, with change categorization and promotion workflows.
+Learn to use environments for safe testing and production deployment, with isolated namespaces and environment-specific profiles.
 
 ---
 
@@ -837,4 +575,4 @@ Learn to use virtual environments for safe testing and production deployment, wi
 
 - **[Virtual Environments](../../concepts/virtual-environments.md)** — Isolate development and production
 - **[Change Categorization](../../concepts/change-categorization.md)** — Understanding breaking vs non-breaking changes
-- **[Pipeline Builder](../../concepts/pipeline-builder.md)** — Core workflow for all pipelines
+- **[YAML Schema Reference](../../reference/yaml-schema.md)** — All supported source types and fields

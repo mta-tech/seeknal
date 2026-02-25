@@ -91,19 +91,16 @@ Expected output includes commands:
 
 ## Part 1: Setup and Sample Data
 
-### 1.1 Create Project Directory
+### 1.1 Initialize Project
 
-Create a clean workspace for the tutorial:
+Create a Seeknal project for the tutorial:
 
 ```bash
-# Create and enter project directory
-mkdir -p ~/seeknal-tutorial
-cd ~/seeknal-tutorial
-
-# Verify current directory
-pwd
-# Expected output: /Users/your-username/seeknal-tutorial
+seeknal init --name seeknal-tutorial --description "YAML pipeline tutorial"
+cd seeknal-tutorial
 ```
+
+This creates the full project structure with `seeknal_project.yml`, `profiles.yml`, and the `seeknal/` directory tree.
 
 ### 1.2 Create Sample Data
 
@@ -157,13 +154,7 @@ Expected output:
 
 Sources define where your raw data comes from. We'll create two sources: customers and orders.
 
-### 2.1 Create the Source Directory
-
-```bash
-mkdir -p seeknal/sources
-```
-
-### 2.2 Create Customers Source
+### 2.1 Create Customers Source
 
 Create `seeknal/sources/customers.yml`:
 
@@ -255,13 +246,7 @@ seeknal/
 
 Transforms define SQL logic to process and join data. We'll create two transforms.
 
-### 3.1 Create Transform Directory
-
-```bash
-mkdir -p seeknal/transforms
-```
-
-### 3.2 Create Active Customers Transform
+### 3.1 Create Active Customers Transform
 
 This transform filters for US customers only.
 
@@ -360,13 +345,7 @@ seeknal/
 
 Feature groups define ML features with entity keys for serving.
 
-### 4.1 Create Feature Group Directory
-
-```bash
-mkdir -p seeknal/feature_groups
-```
-
-### 4.2 Create Customer Features
+### 4.1 Create Customer Features
 
 Create `seeknal/feature_groups/customer_features.yml`:
 
@@ -881,12 +860,7 @@ Raw Data → First-Level Aggregation → Second-Order Aggregation
 
 First, let's create an aggregation node (first level), then aggregate it again (second order).
 
-**Step 1: Create an aggregation directory**
-```bash
-mkdir -p seeknal/aggregations
-```
-
-**Step 2: Create first-level aggregation (user daily features)**
+**Step 1: Create first-level aggregation (user daily features)**
 
 Create `seeknal/aggregations/user_daily_features.yml`:
 
@@ -1022,9 +996,6 @@ EOF
    ```
 
 > **Important:** When using `source_feature`, reference the upstream feature name. First-level aggregations produce features with names like `spend_metrics_sum`, `spend_metrics_count`, etc. (feature name + aggregation function).
-       aggs: [sum]
-     source_feature: amount
-   ```
 
 #### Verify and Run
 

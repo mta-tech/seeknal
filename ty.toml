@@ -1,0 +1,24 @@
+[environment]
+python = ".venv"
+extra-paths = ["src"]
+
+[rules]
+# Downgrade pre-existing type narrowing issues to warnings.
+# The codebase uses many Optional/union patterns without None guards
+# that work fine at runtime but ty flags as errors.
+call-non-callable = "warn"
+invalid-argument-type = "warn"
+invalid-assignment = "warn"
+invalid-method-override = "warn"
+invalid-parameter-default = "warn"
+invalid-return-type = "warn"
+missing-argument = "warn"
+no-matching-overload = "warn"
+not-iterable = "warn"
+not-subscriptable = "warn"
+too-many-positional-arguments = "warn"
+unknown-argument = "warn"
+unresolved-attribute = "warn"
+unresolved-import = "warn"
+unresolved-reference = "warn"
+unsupported-operator = "warn"

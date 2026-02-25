@@ -1,0 +1,39 @@
+{
+  "spec": {
+    "path": "specs/lineage-visualization.md",
+    "title": "feat: Interactive Lineage Visualization"
+  },
+  "build": {
+    "mode": "team",
+    "teamName": "lineage-visualization",
+    "startedAt": "2026-02-13T21:00:00+07:00",
+    "completedAt": "2026-02-13T21:25:00+07:00",
+    "totalTasks": 7,
+    "lastUpdated": "2026-02-13T21:25:00+07:00"
+  },
+  "tasks": [
+    {"id": "1", "subject": "Create visualization backend", "status": "completed", "assignee": "builder-backend"},
+    {"id": "2", "subject": "Create HTML template", "status": "completed", "assignee": "builder-frontend"},
+    {"id": "3", "subject": "Add CLI lineage command", "status": "completed", "assignee": "builder-backend"},
+    {"id": "4", "subject": "Update pyproject.toml", "status": "completed", "assignee": "builder-backend"},
+    {"id": "5", "subject": "Write unit tests", "status": "completed", "assignee": "builder-frontend"},
+    {"id": "6", "subject": "Write CLI tests", "status": "completed", "assignee": "builder-backend"},
+    {"id": "7", "subject": "QA Validation", "status": "completed", "assignee": "qa-tester"}
+  ],
+  "artifacts": [
+    {"taskId": "1", "action": "created", "path": "src/seeknal/dag/visualize.py"},
+    {"taskId": "2", "action": "created", "path": "src/seeknal/dag/templates/lineage.html.j2"},
+    {"taskId": "3", "action": "modified", "path": "src/seeknal/cli/main.py"},
+    {"taskId": "4", "action": "modified", "path": "pyproject.toml"},
+    {"taskId": "5", "action": "created", "path": "tests/dag/test_visualize.py"},
+    {"taskId": "6", "action": "created", "path": "tests/cli/test_lineage_command.py"}
+  ],
+  "validation": {
+    "status": "PASS",
+    "unitTests": "62/62 passed",
+    "cliTests": "8/8 passed",
+    "existingTests": "251/257 passed (6 pre-existing failures)",
+    "bugFound": "Jinja2 autoescaping JSON - fixed with | safe filter",
+    "securityChecks": "PASS (CSP, SRI, no innerHTML, no XSS vectors)"
+  }
+}

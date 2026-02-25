@@ -42,13 +42,25 @@ SCHEMAS = {
         "required": ["kind", "name", "id_col", "feature_date_col", "source", "features"],
         "optional": ["description", "owner", "application_date_col", "inputs", "tags", "materialization"],
     },
+    "profile": {
+        "required": ["kind", "name", "inputs"],
+        "optional": ["description", "owner", "tags", "profile"],
+    },
     "rule": {
         "required": ["kind", "name", "rule"],
         "optional": ["description", "owner", "params"],
     },
     "exposure": {
         "required": ["kind", "name", "type"],
-        "optional": ["description", "owner", "tags", "depends_on", "url"],
+        "optional": ["description", "owner", "tags", "depends_on", "url", "params"],
+    },
+    "semantic_model": {
+        "required": ["kind", "name", "model"],
+        "optional": ["description", "default_time_dimension", "entities", "dimensions", "measures", "joins", "metrics"],
+    },
+    "metric": {
+        "required": ["kind", "name", "type"],
+        "optional": ["description", "filter", "measure", "numerator", "denominator", "grain_to_date", "expr", "inputs"],
     },
 }
 

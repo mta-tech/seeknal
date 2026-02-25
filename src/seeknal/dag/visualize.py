@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import jinja2
+import jinja2  # ty: ignore[unresolved-import]
 
 from seeknal.dag.lineage import LineageBuilder
 from seeknal.dag.manifest import Manifest, Node, Edge
@@ -78,16 +78,54 @@ class LineageDataBuilder:
         )
 
     def _serialize_node(self, node: Node) -> dict:
-        """Convert Node to Cytoscape.js element format."""
+        """Convert Node to Cytoscape.js element format.
+
+        Normalizes two YAML column formats into a uniform structure:
+          - Simple:   {col_name: "description"}
+          - Detailed: {col_name: {description: "...", dtype: "..."}}
+        Output: {col_name: {type: "...", description: "..."}}
+
+        For semantic models, extracts dimensions and measures as columns.
+        """
+        columns = {}
+        for col_name, col_val in (node.columns or {}).items():
+            if isinstance(col_val, dict):
+                columns[col_name] = {
+                    "type": col_val.get("dtype", ""),
+                    "description": col_val.get("description", ""),
+                }
+            elif isinstance(col_val, str):
+                columns[col_name] = {
+                    "type": "",
+                    "description": col_val,
+                }
+            else:
+                columns[col_name] = {"type": str(col_val) if col_val else "", "description": ""}
+
+        # Semantic models: extract dimensions and measures as columns
+        if node.node_type.value == "semantic_model" and not columns:
+            for dim in node.config.get("dimensions", []):
+                if isinstance(dim, dict) and dim.get("name"):
+                    columns[dim["name"]] = {
+                        "type": dim.get("type", "dimension"),
+                        "description": dim.get("description", ""),
+                    }
+            for measure in node.config.get("measures", []):
+                if isinstance(measure, dict) and measure.get("name"):
+                    columns[measure["name"]] = {
+                        "type": measure.get("agg", "measure"),
+                        "description": measure.get("description", ""),
+                    }
+
         return {
             "data": {
                 "id": node.id,
                 "label": node.name,
                 "node_type": node.node_type.value,
                 "description": node.description or "",
-                "columns": node.columns or {},
+                "columns": columns,
                 "file_path": node.file_path or "",
-                "sql": node.config.get("sql", ""),
+                "sql": node.config.get("sql") or node.config.get("transform", ""),
             }
         }
 
@@ -113,7 +151,7 @@ class LineageDataBuilder:
         for node_id, node in self.manifest.nodes.items():
             if focused_node_ids and node_id not in focused_node_ids:
                 continue
-            sql = node.config.get("sql")
+            sql = node.config.get("sql") or node.config.get("transform")
             if not sql:
                 continue
             try:
@@ -251,14 +289,109 @@ class HTMLRenderer:
         )
         template = env.get_template("lineage.html.j2")
 
-        # Sanitize JSON to prevent script injection
+        # Sanitize JSON for embedding in JS single-quoted string literal
         json_str = json.dumps(dataclasses.asdict(lineage_data))
-        json_str = json_str.replace("</", "<\\/")
+        json_str = json_str.replace("\\", "\\\\")  # Escape backslashes first
+        json_str = json_str.replace("'", "\\'")    # Escape single quotes for JS
+        json_str = json_str.replace("</", "<\\/")  # Prevent </script> injection
 
         html_content = template.render(lineage_data_json=json_str)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(html_content)
         return output_path
+
+
+def render_ascii_tree(
+    manifest: Manifest,
+    focus_node: Optional[str] = None,
+) -> str:
+    """Render DAG as ASCII tree to stdout.
+
+    Builds a tree from manifest edges where source nodes (no upstream
+    dependencies) are roots. Each root starts a new section. Nodes with
+    multiple parents appear under each parent (repeated).
+
+    When *focus_node* is given, only the upstream + downstream subgraph
+    is shown (same BFS logic as the HTML focus mode).
+    """
+    if focus_node and focus_node not in manifest.nodes:
+        available = ", ".join(sorted(manifest.nodes.keys())[:10])
+        raise LineageVisualizationError(
+            f"Node '{focus_node}' not found. Available: {available}"
+        )
+
+    # Build adjacency from edges
+    children: dict[str, list[str]] = {}
+    parent_set: dict[str, set[str]] = {}
+    for edge in manifest.edges:
+        children.setdefault(edge.from_node, []).append(edge.to_node)
+        parent_set.setdefault(edge.to_node, set()).add(edge.from_node)
+
+    # Filter to focus subgraph if specified
+    if focus_node:
+        keep = _get_focus_subgraph(manifest, focus_node)
+        children = {
+            k: [v for v in vs if v in keep]
+            for k, vs in children.items() if k in keep
+        }
+        parent_set = {
+            k: {v for v in vs if v in keep}
+            for k, vs in parent_set.items() if k in keep
+        }
+        all_nodes = keep
+    else:
+        all_nodes = set(manifest.nodes.keys())
+
+    # Roots = nodes with no parents in the current subgraph
+    roots = sorted(n for n in all_nodes if n not in parent_set or not parent_set[n])
+
+    lines: list[str] = []
+    for root in roots:
+        _walk_tree(root, "", True, children, lines)
+    return "\n".join(lines)
+
+
+def _walk_tree(
+    node: str,
+    prefix: str,
+    is_root: bool,
+    children: dict[str, list[str]],
+    lines: list[str],
+) -> None:
+    """Recursively build tree lines with Unicode box-drawing characters."""
+    if is_root:
+        lines.append(node)
+    child_list = sorted(children.get(node, []))
+    for i, child in enumerate(child_list):
+        is_last = i == len(child_list) - 1
+        connector = "\u2514\u2500\u2500 " if is_last else "\u251c\u2500\u2500 "
+        lines.append(f"{prefix}{connector}{child}")
+        extension = "    " if is_last else "\u2502   "
+        _walk_tree(child, prefix + extension, False, children, lines)
+
+
+def _get_focus_subgraph(manifest: Manifest, focus_node: str) -> set[str]:
+    """BFS upstream + downstream of focus node."""
+    forward: dict[str, list[str]] = {}
+    reverse: dict[str, list[str]] = {}
+    for edge in manifest.edges:
+        forward.setdefault(edge.from_node, []).append(edge.to_node)
+        reverse.setdefault(edge.to_node, []).append(edge.from_node)
+
+    def bfs(start: str, adj: dict[str, list[str]]) -> set[str]:
+        visited: set[str] = set()
+        queue = [start]
+        while queue:
+            current = queue.pop(0)
+            for neighbor in adj.get(current, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+        return visited
+
+    upstream = bfs(focus_node, reverse)
+    downstream = bfs(focus_node, forward)
+    return upstream | downstream | {focus_node}
 
 
 def generate_lineage_html(

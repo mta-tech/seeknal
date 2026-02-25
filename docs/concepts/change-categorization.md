@@ -577,4 +577,4 @@ class NodeChange:
 
 - [Virtual Environments](virtual-environments.md) - Isolated workspaces for testing changes
 - [YAML Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md) - Pipeline basics
-- [Phase 2 Tutorial](../tutorials/phase2-analytics-eng-metrics.md) - Hands-on change categorization
+- [Metrics Change Tracking Tutorial](../tutorials/metrics-change-tracking.md) - Hands-on change categorization

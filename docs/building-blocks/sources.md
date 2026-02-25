@@ -84,18 +84,19 @@ S3 and OAuth2 credentials are read from environment variables:
 - `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 - `KEYCLOAK_TOKEN_URL`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET`
 
-### API Sources
+### JSON / JSONL Sources
 
-Ingest data from REST APIs:
+Ingest data from JSON or JSONL files:
 
 ```yaml
-name: api_ingestion
+name: json_ingestion
 kind: source
-source: http
-url: https://api.example.com/data
-method: GET
-headers:
-  Authorization: "Bearer ${API_TOKEN}"
+source: jsonl
+table: "data/events.jsonl"
+columns:
+  event_id: "Unique event identifier"
+  event_type: "Type of event"
+  payload: "Event payload data"
 ```
 
 ---

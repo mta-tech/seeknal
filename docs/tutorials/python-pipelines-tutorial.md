@@ -406,7 +406,7 @@ from seeknal.pipeline import transform
 )
 def marketing_segments_export(ctx):
     """Prepare customer segments for marketing export."""
-    df = ctx.ref("model.customer_segments")
+    df = ctx.ref("transform.customer_segments")
 
     return ctx.duckdb.sql("""
         SELECT

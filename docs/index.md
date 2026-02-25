@@ -22,7 +22,7 @@ Seeknal is an all-in-one platform for data and AI/ML engineering. Define transfo
 
 **[→ Quick Start Guide](getting-started-comprehensive.md)**
 
-1. Install Seeknal (download from [GitHub Releases](https://github.com/mta-tech/seeknal/releases))
+1. Install Seeknal (`pip install seeknal` or from [GitHub Releases](https://github.com/mta-tech/seeknal/releases))
 2. Load your data (CSV, Parquet, database)
 3. Transform with SQL
 4. Run your first pipeline
@@ -49,7 +49,7 @@ Seeknal's workflow is inspired by modern infrastructure tools like `terraform` a
 3. **`seeknal apply`** - Save your pipeline definition (like `git commit`)
 4. **`seeknal run --env prod`** - Execute in production with safety checks
 
-**Key benefits:** Dry-run validation, change detection, rollback support, and multi-environment support.
+**Key benefits:** Dry-run validation, change detection, rollback support, multi-environment support, and multi-target materialization (PostgreSQL + Iceberg).
 
 ---
 
@@ -74,7 +74,7 @@ Install, load data, create features, and run your first pipeline.
 **Start with:** [YAML Pipeline Tutorial (75 min)](tutorials/yaml-pipeline-tutorial.md)
 
 **Then learn:**
-- [Virtual Environments](tutorials/phase2-data-eng-environments.md) - Safe development with isolated environments
+- [Environment Management](tutorials/environment-management.md) - Safe development with isolated environments
 - [Incremental Models](concepts/second-order-aggregations.md) - Efficient incremental processing
 - [Change Categorization](concepts/change-categorization.md) - Understand breaking vs. non-breaking changes
 
@@ -90,7 +90,7 @@ Install, load data, create features, and run your first pipeline.
 
 **Then learn:**
 - [Semantic Layer & Metrics](guides/semantic-layer.md) - Define and query consistent metrics
-- [Change Categorization](tutorials/phase2-analytics-eng-metrics.md) - Track metric changes over time
+- [Change Categorization](tutorials/metrics-change-tracking.md) - Track metric changes over time
 - [Testing & Audits](guides/testing-and-audits.md) - Validate data quality
 
 **Typical use case:** "I need consistent metrics across dashboards and tools, with change tracking."
@@ -106,7 +106,7 @@ Install, load data, create features, and run your first pipeline.
 **Then learn:**
 - [Python Pipelines](tutorials/python-pipelines-tutorial.md) - Feature engineering with Python
 - [Training to Serving](guides/training-to-serving.md) - End-to-end ML workflow
-- [Parallel Execution](tutorials/phase2-ml-eng-parallel.md) - Speed up large pipelines
+- [Parallel Execution](tutorials/parallel-execution.md) - Speed up large pipelines
 
 **Typical use case:** "I need features for training that prevent data leakage, with online serving."
 
@@ -141,6 +141,7 @@ Lookup documentation for commands, schemas, and configuration.
 - [YAML Schema](reference/yaml-schema.md) — Every field for all node kinds
 - [Configuration](reference/configuration.md) — Project files, profiles, and environment variables
 - [Python API](api/index.md) — Module reference
+- [CLI Docs Search](cli/docs.md) — Search documentation from the terminal (`seeknal docs`)
 
 ## Tutorials
 
@@ -148,9 +149,9 @@ Step-by-step learning paths with copy-pasteable code.
 
 - [YAML Pipeline Tutorial](tutorials/yaml-pipeline-tutorial.md) — Build a complete pipeline from scratch (75 min)
 - [Mixed YAML + Python](tutorials/mixed-yaml-python-pipelines.md) — Combine both paradigms (60 min)
-- [Virtual Environments](tutorials/phase2-data-eng-environments.md) — Safe development with environments (45 min)
-- [Parallel Execution](tutorials/phase2-ml-eng-parallel.md) — Speed up large pipelines (45 min)
-- [Change Categorization](tutorials/phase2-analytics-eng-metrics.md) — Understand change impact (20 min)
+- [Environment Management](tutorials/environment-management.md) — Safe development with environments (45 min)
+- [Parallel Execution](tutorials/parallel-execution.md) — Speed up large pipelines (45 min)
+- [Change Categorization](tutorials/metrics-change-tracking.md) — Understand change impact (20 min)
 - [E-Commerce Walkthrough](tutorials/workflow-tutorial-ecommerce.md) — Real-world example
 
 ## Additional Resources

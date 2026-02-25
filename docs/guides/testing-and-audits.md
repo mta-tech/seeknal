@@ -324,8 +324,9 @@ seeknal run
 # 2. Run audits on cached outputs
 seeknal audit
 
-# 3. If audits fail, inspect the data
-seeknal query "SELECT * FROM transform.clean_orders LIMIT 10"
+# 3. If audits fail, inspect the data in the REPL
+seeknal repl
+# Then run: SELECT * FROM transform.clean_orders LIMIT 10
 ```
 
 ---
@@ -342,9 +343,9 @@ Audit results show:
 
 **Exit codes:**
 - `0` - All audits passed
-- `1` - One or more audits failed with `severity: error`
+- `1` - One or more audits failed (regardless of severity)
 
-**Note:** Audits with `severity: warn` do not cause exit code 1, allowing the pipeline to succeed with warnings.
+**Note:** Both `severity: error` and `severity: warn` failures contribute to the exit code. The severity level is displayed in the output to help you distinguish between critical and non-critical issues.
 
 ---
 

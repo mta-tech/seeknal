@@ -1,0 +1,147 @@
+{
+  "spec": {
+    "path": "specs/fix-integration-security-issues.md",
+    "checksum": "sha256-placeholder",
+    "title": "Fix Integration Security and Functionality Issues"
+  },
+  "build": {
+    "mode": "subagent",
+    "startedAt": "2026-02-11T15:00:00Z",
+    "totalTasks": 12,
+    "completedTasks": 4,
+    "lastUpdated": "2026-02-11T15:04:00Z"
+  },
+  "tasks": [
+    {
+      "id": "54",
+      "taskDefId": "security-001",
+      "subject": "Fix Path Traversal Vulnerability in FileStateBackend",
+      "status": "completed",
+      "agentType": "general-purpose",
+      "assignedTo": "builder-security",
+      "dependencies": [],
+      "agentId": "a0e6e50",
+      "completedAt": "2026-02-11T15:01:00Z"
+    },
+    {
+      "id": "59",
+      "taskDefId": "security-003",
+      "subject": "Fix Parameter Name Collision",
+      "status": "completed",
+      "agentType": "general-purpose",
+      "assignedTo": "builder-backend",
+      "dependencies": [],
+      "agentId": "ae6ec44",
+      "completedAt": "2026-02-11T15:03:00Z"
+    },
+    {
+      "id": "62",
+      "taskDefId": "validation-001",
+      "subject": "Add Date Range Validation",
+      "status": "completed",
+      "agentType": "general-purpose",
+      "assignedTo": "builder-backend",
+      "dependencies": [],
+      "agentId": "ab887f4",
+      "completedAt": "2026-02-11T15:01:30Z"
+    },
+    {
+      "id": "65",
+      "taskDefId": "docs-001",
+      "subject": "Document Environment Variable Type Loss",
+      "status": "completed",
+      "agentType": "general-purpose",
+      "assignedTo": "builder-docs",
+      "dependencies": [],
+      "agentId": "afb43f5",
+      "completedAt": "2026-02-11T15:01:30Z"
+    },
+    {
+      "id": "55",
+      "taskDefId": "security-004",
+      "subject": "Add Parameter Name Validation",
+      "status": "in-progress",
+      "agentType": "general-purpose",
+      "assignedTo": "builder-security",
+      "dependencies": ["59"],
+      "agentId": "a9427f0",
+      "startedAt": "2026-02-11T15:04:00Z"
+    },
+    {
+      "id": "56",
+      "taskDefId": "security-002",
+      "subject": "Add Security Tests for Path Traversal",
+      "status": "in-progress",
+      "agentType": "general-purpose",
+      "assignedTo": "builder-test",
+      "dependencies": ["54"],
+      "agentId": "a9f4edb",
+      "startedAt": "2026-02-11T15:04:00Z"
+    },
+    {
+      "id": "61",
+      "taskDefId": "test-001",
+      "subject": "Add Date Validation Tests",
+      "status": "in-progress",
+      "agentType": "general-purpose",
+      "assignedTo": "builder-test",
+      "dependencies": ["62"],
+      "agentId": "a9b6641",
+      "startedAt": "2026-02-11T15:01:30Z"
+    },
+    {
+      "id": "63",
+      "taskDefId": "docs-002",
+      "subject": "Update Documentation for Reserved Parameters",
+      "status": "in-progress",
+      "agentType": "general-purpose",
+      "assignedTo": "builder-docs",
+      "dependencies": ["59"],
+      "agentId": "a220e4c",
+      "startedAt": "2026-02-11T15:04:00Z"
+    },
+    {
+      "id": "64",
+      "taskDefId": "verify-001",
+      "subject": "Verify path_security.py Integration",
+      "status": "in-progress",
+      "agentType": "general-purpose",
+      "assignedTo": "builder-security",
+      "dependencies": ["54"],
+      "agentId": "a9c8afc",
+      "startedAt": "2026-02-11T15:04:00Z"
+    },
+    {
+      "id": "58",
+      "taskDefId": "refactor-001",
+      "subject": "Fix type Parameter Shadowing",
+      "status": "pending",
+      "agentType": "general-purpose",
+      "assignedTo": "builder-backend",
+      "dependencies": ["55"]
+    },
+    {
+      "id": "57",
+      "taskDefId": "refactor-002",
+      "subject": "Create Shared Type Conversion Module",
+      "status": "pending",
+      "agentType": "general-purpose",
+      "assignedTo": "builder-backend",
+      "dependencies": ["58"]
+    },
+    {
+      "id": "60",
+      "taskDefId": "test-002",
+      "subject": "Run Full Test Suite",
+      "status": "pending",
+      "agentType": "general-purpose",
+      "assignedTo": "builder-test",
+      "dependencies": ["56", "55", "57", "61"]
+    }
+  ],
+  "validation": {
+    "commandsRun": [],
+    "acceptanceCriteria": []
+  },
+  "artifacts": []
+}

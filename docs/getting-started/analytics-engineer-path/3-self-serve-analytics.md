@@ -1,26 +1,27 @@
 # Chapter 3: Deploy for Self-Serve Analytics
 
-> **Duration:** 25 minutes | **Difficulty:** Advanced | **Format:** YAML & Python
+> **Duration:** 25 minutes | **Difficulty:** Advanced | **Format:** YAML & CLI
 
-Learn to deploy semantic models and metrics to StarRocks, and enable BI tool integration for self-serve analytics across your organization.
+Learn to deploy your semantic layer metrics to StarRocks as materialized views, enabling fast BI queries for your organization.
 
 ---
 
 ## What You'll Build
 
-A complete self-serve analytics deployment:
+A production analytics deployment:
 
 ```
-Semantic Models + Metrics → StarRocks → BI Tools → Business Users
-                                         ↓
-                                   Governed Access
+Metrics (YAML) → seeknal deploy-metrics → StarRocks MVs → BI Tools
+                                               ↓
+                                         MySQL Protocol
+                                    (Tableau, Metabase, etc.)
 ```
 
 **After this chapter, you'll have:**
-- StarRocks deployment with semantic models
-- Materialized views for performance
-- BI tool connections (Tableau, Power BI, Metabase)
-- User access controls and governance
+- StarRocks connection configured
+- Metrics deployed as materialized views
+- DDL preview with `--dry-run`
+- BI tool connections via MySQL protocol
 
 ---
 
@@ -28,339 +29,266 @@ Semantic Models + Metrics → StarRocks → BI Tools → Business Users
 
 Before starting, ensure you've completed:
 
-- [ ] [Chapter 1: Semantic Models](1-semantic-models.md) — Semantic layer foundation
-- [ ] [Chapter 2: Business Metrics](2-business-metrics.md) — Business metrics defined
-- [ ] StarRocks installed or access to StarRocks instance
-- [ ] Basic understanding of BI tools
+- [ ] [Chapter 1: Semantic Models](1-semantic-models.md) — Semantic model defined
+- [ ] [Chapter 2: Business Metrics](2-business-metrics.md) — Metrics defined
+- [ ] StarRocks instance accessible (local or remote)
+
+!!! info "StarRocks Optional"
+    This chapter requires access to a StarRocks instance. If you don't have one, you can still follow along using the `--dry-run` flag to preview the DDL that would be generated. The semantic layer and metrics from Chapters 1-2 work without StarRocks.
 
 ---
 
-## Part 1: Deploy to StarRocks (10 minutes)
+## Part 1: Configure StarRocks Connection (8 minutes)
 
 ### Understanding StarRocks
 
-StarRocks is a fast, real-time analytics database that powers:
+StarRocks is a fast, real-time analytics database:
 
-- **High-concurrency queries** — Many users simultaneously
-- **Sub-second response** — Interactive dashboards
-- **SQL compatibility** — Standard MySQL protocol
+- **Sub-second queries** — Interactive dashboards
+- **MySQL protocol** — Standard BI tool compatibility
 - **Materialized views** — Pre-computed aggregations
+- **High concurrency** — Many users simultaneously
 
-!!! info "Why StarRocks?"
-    StarRocks combines the best of:
-    - **Data warehouses** (Snowflake, BigQuery)
-    - **OLAP databases** (ClickHouse, Apache Doris)
-    - **Feature stores** (Real-time serving)
+### Set Up Connection
 
-=== "Configure StarRocks Connection"
+Add StarRocks connection to your `profiles.yml`:
 
-    Edit `seeknal.yml`:
+```yaml
+# profiles.yml (or ~/.seeknal/profiles.yml)
+connections:
+  starrocks:
+    type: starrocks
+    host: localhost
+    port: 9030
+    user: root
+    password: ""
+    database: analytics
+```
 
-    ```yaml
-    project:
-      name: ecommerce-analytics
+Or use a connection URL directly:
 
-    # StarRocks configuration
-    warehouses:
-      starrocks:
-        type: starrocks
-        host: ${STARROCKS_HOST}
-        port: 9030
-        user: ${STARROCKS_USER}
-        password: ${STARROCKS_PASSWORD}
-        database: analytics
+```bash
+export STARROCKS_URL="starrocks://root@localhost:9030/analytics"
+```
 
-        # Connection pool settings
-        pool:
-          min_size: 2
-          max_size: 10
-          timeout: 30
-    ```
+### Test Connection
 
-    Set environment variables:
+Verify the connection works:
 
-    ```bash
-    export STARROCKS_HOST="starrocks.example.com"
-    export STARROCKS_USER="admin"
-    export STARROCKS_PASSWORD="your-password"
-    ```
+```bash
+seeknal repl
+```
 
-=== "Deploy Semantic Layer"
+```sql
+-- If using StarRocks connection in profiles
+.connect starrocks
+SELECT 1 AS test;
+```
 
-    ```bash
-    # Deploy semantic models and metrics to StarRocks
-    seeknal deploy-semantic-layer --target starrocks
-    ```
-
-    **Expected output:**
-    ```
-    Deploying semantic layer to StarRocks...
-      ✓ Validating semantic models
-      ✓ Validating metrics
-      ✓ Creating database schema
-      ✓ Creating tables: orders, customers, products
-      ✓ Creating materialized views: mv_daily_revenue
-      ✓ Creating views: v_orders_status
-      ✓ Deploying 12 metrics
-      ✓ Granting permissions
-    Semantic layer deployed successfully!
-
-    StarRocks endpoint: jdbc:starrocks://starrocks.example.com:9030/analytics
-    ```
-
-=== "What Gets Deployed"
-
-    **Tables**: Base semantic model tables
-    ```sql
-    CREATE TABLE orders (
-      order_id STRING,
-      customer_id STRING,
-      order_date DATE,
-      status STRING,
-      revenue DECIMAL(10,2),
-      ...
-    )
-    ```
-
-    **Materialized Views**: Pre-aggregated data
-    ```sql
-    CREATE MATERIALIZED VIEW mv_daily_revenue AS
-    SELECT
-      order_date,
-      status,
-      SUM(revenue) as total_revenue,
-      COUNT(*) as order_count
-    FROM orders
-    GROUP BY order_date, status
-    ```
-
-    **Views**: Virtual layer for metrics
-    ```sql
-    CREATE VIEW v_orders_status AS
-    SELECT
-      status,
-      COUNT(*) as order_count
-    FROM orders
-    GROUP BY status
-    ```
+**Checkpoint:** You should see a successful query result. If StarRocks isn't available, proceed with `--dry-run` in the next parts.
 
 ---
 
-## Part 2: Create Materialized Views (8 minutes)
+## Part 2: Deploy Metrics as Materialized Views (10 minutes)
 
-### Understanding Materialization Strategies
+### Preview DDL
 
-Materialized views pre-compute aggregations for performance:
+Always preview before deploying:
 
-| Strategy | Use Case | Refresh |
-|----------|----------|---------|
-| **Incremental** | Append-only data | Every 5 minutes |
-| **Full** | Frequently changing data | Every hour |
-| **On-demand** | Rarely accessed | Manual refresh |
+```bash
+seeknal deploy-metrics \
+  --connection "starrocks://root@localhost:9030/analytics" \
+  --dry-run
+```
 
-=== "Define Materialization Strategy"
+**Expected output:**
+```
+ℹ Auto-including dimension 'order_date' (required for StarRocks MV keys)
 
-    Edit `semantic-models/orders.yaml`:
+ℹ -- Metric: avg_order_value_ratio -> mv_avg_order_value_ratio
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_avg_order_value_ratio
+REFRESH ASYNC EVERY(INTERVAL 1 DAY)
+AS
+SELECT
+  order_date,
+  SUM(revenue) / NULLIF(COUNT(1), 0) AS avg_order_value_ratio
+FROM orders_cleaned
+GROUP BY order_date
 
-    ```yaml
-    kind: semantic_model
-    name: orders
-    # ... existing configuration ...
+ℹ -- Metric: total_revenue -> mv_total_revenue
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_total_revenue
+REFRESH ASYNC EVERY(INTERVAL 1 DAY)
+AS
+SELECT
+  order_date,
+  SUM(revenue) AS total_revenue
+FROM orders_cleaned
+GROUP BY order_date
 
-    # Materialization strategy
-    materialization:
-      target: starrocks
+ℹ -- Metric: order_count -> mv_order_count
+...
 
-      # Materialized views
-      views:
-        - name: mv_daily_revenue_by_status
-          sql: |
-            SELECT
-              order_date,
-              status,
-              SUM(revenue) as total_revenue,
-              COUNT(*) as order_count,
-              COUNT(DISTINCT customer_id) as unique_customers
-            FROM orders
-            WHERE status = 'completed'
-            GROUP BY order_date, status
-          schedule: "0 */2 * * *"  # Every 2 hours
+ℹ Dry run: 4 MVs would be created
+```
 
-        - name: mv_monthly_metrics
-          sql: |
-            SELECT
-              DATE_TRUNC('month', order_date) as month,
-              SUM(revenue) as total_revenue,
-              AVG(revenue) as avg_revenue,
-              COUNT(*) as order_count
-            FROM orders
-            WHERE status = 'completed'
-            GROUP BY DATE_TRUNC('month', order_date)
-          schedule: "0 2 * * *"  # Daily at 2 AM
+!!! tip "Auto-Include Dimensions"
+    When you don't specify `--dimensions`, seeknal automatically includes the `default_time_dimension` from your semantic model (in this case, `order_date`). StarRocks MVs require at least one non-aggregate key column, and the time dimension fulfills that. You can override this by passing `--dimensions` explicitly.
 
-      # Indexes for performance
-      indexes:
-        - name: idx_orders_date
-          columns: [order_date]
-          type: btree
+!!! tip "Review Before Deploy"
+    The `--dry-run` flag shows exactly what DDL will execute. Review column types, refresh intervals, and filter logic before deploying.
 
-        - name: idx_orders_customer
-          columns: [customer_id]
-          type: btree
-    ```
+!!! info "Cumulative Metrics Are Skipped"
+    Cumulative metrics use window functions which StarRocks materialized views don't support. These metrics are automatically skipped during deployment — query them via `seeknal query` instead.
 
-=== "Refresh Materialized Views"
+### Deploy for Real
 
-    ```bash
-    # Refresh all materialized views
-    seeknal refresh-materialized-views
+```bash
+seeknal deploy-metrics --connection "starrocks://root@localhost:9030/analytics"
+```
 
-    # Refresh specific view
-    seeknal refresh-materialized-views --view mv_daily_revenue_by_status
+**Expected output:**
+```
+ℹ Auto-including dimension 'order_date' (required for StarRocks MV keys)
+✓ Deployed avg_order_value_ratio -> mv_avg_order_value_ratio
+✓ Deployed total_revenue -> mv_total_revenue
+✓ Deployed order_count -> mv_order_count
+✓ Deployed avg_order_value -> mv_avg_order_value
+ℹ Deployed: 4 succeeded, 0 failed
+```
 
-    # Schedule automatic refresh
-    seeknal schedule-materialized-views --schedule "0 */2 * * *"
-    ```
+### Add Extra Dimensions to MVs
 
----
+To include additional dimensions beyond the auto-included time dimension, use `--dimensions`:
 
-## Part 3: Connect BI Tools (7 minutes)
+```bash
+seeknal deploy-metrics \
+  --connection "starrocks://root@localhost:9030/analytics" \
+  --dimensions order_date,status \
+  --dry-run
+```
 
-### Understanding BI Integration
+This generates MVs grouped by both `order_date` and `status`, enabling fast GROUP BY queries on those dimensions.
 
-Seeknal's semantic layer works with any BI tool that supports:
+### Customize Refresh Interval
 
-| BI Tool | Connection Method | Best For |
-|---------|------------------|----------|
-| **Tableau** | ODBC/JDBC | Interactive dashboards |
-| **Power BI** | ODBC | Enterprise reporting |
-| **Metabase** | MySQL protocol | Self-serve analytics |
-| **Looker** | LookML | Embedded analytics |
-| **Superset** | SQLAlchemy | Open-source dashboards |
+```bash
+seeknal deploy-metrics \
+  --connection "starrocks://root@localhost:9030/analytics" \
+  --refresh-interval "1 HOUR"
+```
 
-=== "Tableau Integration"
+!!! info "Refresh Intervals"
+    - `1 HOUR` — Near real-time dashboards
+    - `1 DAY` — Daily reporting (default)
+    - StarRocks handles refresh automatically in the background
 
-    **Step 1: Install ODBC Driver**
+### Drop and Recreate
 
-    Download StarRocks ODBC driver:
-    ```bash
-    # macOS
-    brew install starrocks-odbc
+If you change metric definitions, use `--drop-existing`:
 
-    # Windows
-    # Download from StarRocks releases page
-    ```
-
-    **Step 2: Configure DSN**
-
-    Create `/etc/odbcinst.ini`:
-    ```ini
-    [StarRocks ODBC Driver]
-    Description = StarRocks ODBC Driver
-    Driver = /usr/local/lib/libstarrocks_odbc.so
-    UsageCount = 1
-    ```
-
-    Create `~/.odbc.ini`:
-    ```ini
-    [StarRocks Analytics]
-    Driver = StarRocks ODBC Driver
-    SERVER = starrocks.example.com
-    PORT = 9030
-    DATABASE = analytics
-    UID = admin
-    PWD = your-password
-    ```
-
-    **Step 3: Connect Tableau**
-
-    1. Open Tableau
-    2. Select "Connect to Server" → "Other Databases (ODBC)"
-    3. Select "StarRocks Analytics" DSN
-    4. Drag tables to canvas
-    5. Build your dashboard
-
-=== "Power BI Integration"
-
-    **Step 1: Get Connection String**
-
-    ```bash
-    seeknal get-connection-string --target starrocks
-    ```
-
-    **Output:**
-    ```
-    jdbc:starrocks://starrocks.example.com:9030/analytics
-    ODBC;DRIVER={StarRocks ODBC Driver};SERVER=starrocks.example.com;PORT=9030;DATABASE=analytics
-    ```
-
-    **Step 2: Connect Power BI**
-
-    1. Open Power BI Desktop
-    2. Select "Get Data" → "Database" → "ODBC"
-    3. Enter connection string
-    4. Enter credentials
-    5. Select tables/views
-    6. Load and build reports
-
-=== "Metabase Integration"
-
-    **Step 1: Add Database Connection**
-
-    In Metabase:
-    1. Click "Add database" → "MySQL"
-    2. Enter connection details:
-       - Host: `starrocks.example.com`
-       - Port: `9030`
-       - Database: `analytics`
-       - Username: `admin`
-       - Password: `your-password`
-    3. Click "Connect"
-
-    **Step 2: Enable Semantic Layer**
-
-    Metabase can query views directly:
-
-    ```sql
-    -- Business-friendly query
-    SELECT
-      status,
-      SUM(total_revenue) as revenue,
-      SUM(order_count) as orders
-    FROM v_orders_status
-    GROUP BY status
-    ```
+```bash
+seeknal deploy-metrics \
+  --connection "starrocks://root@localhost:9030/analytics" \
+  --drop-existing
+```
 
 ---
 
-## User Access & Governance
+## Part 3: Query Deployed Metrics (7 minutes)
 
-!!! tip "Role-Based Access Control"
-    ```yaml
-    # Define user roles
-    roles:
-      - name: executive
-        permissions:
-          - read:metrics:executive-dashboard
-          - read:models:orders,customers
+### Query StarRocks Directly
 
-      - name: analyst
-        permissions:
-          - read:metrics:*
-          - query:models:*
-          - write:dashboards:*
+Connect to StarRocks using any MySQL client:
 
-      - name: viewer
-        permissions:
-          - read:dashboards:*
-    ```
+```bash
+mysql -h localhost -P 9030 -u root analytics
+```
 
-!!! warning "Governance Best Practices"
-    - **Approve all metrics** before deployment
-    - **Document metric definitions** in one place
-    - **Version control** all semantic model changes
-    - **Audit access** to sensitive data
-    - **Test queries** in development first
+```sql
+-- Query materialized view directly
+SELECT * FROM mv_total_revenue ORDER BY order_date;
+
+-- Aggregated query across MVs
+SELECT
+  t.order_date,
+  t.total_revenue,
+  c.order_count,
+  a.avg_order_value_ratio
+FROM mv_total_revenue t
+JOIN mv_order_count c ON t.order_date = c.order_date
+JOIN mv_avg_order_value_ratio a ON t.order_date = a.order_date
+ORDER BY t.order_date;
+```
+
+### Connect BI Tools
+
+StarRocks uses MySQL protocol, so any MySQL-compatible BI tool works:
+
+| BI Tool | Connection Type | Port |
+|---------|----------------|------|
+| **Metabase** | MySQL | 9030 |
+| **Tableau** | MySQL JDBC | 9030 |
+| **Power BI** | MySQL ODBC | 9030 |
+| **Grafana** | MySQL data source | 9030 |
+| **Apache Superset** | MySQL SQLAlchemy | 9030 |
+
+**Connection string format:**
+```
+mysql://root@localhost:9030/analytics
+```
+
+### Verify Metrics Match
+
+Compare deployed MV results with your local `seeknal query`:
+
+```bash
+# Local query
+seeknal query --metrics total_revenue --dimensions order_date --format csv
+
+# StarRocks query (via mysql CLI)
+mysql -h localhost -P 9030 -u root analytics -e \
+  "SELECT order_date, total_revenue FROM mv_total_revenue ORDER BY order_date"
+```
+
+**Checkpoint:** Both should return identical results.
+
+!!! success "Congratulations!"
+    You've deployed a governed semantic layer. Stakeholders can now query consistent metrics through any BI tool, without writing SQL or worrying about metric definitions.
+
+---
+
+## What Could Go Wrong?
+
+!!! danger "Common Pitfalls"
+    **1. Connection refused**
+
+    - Symptom: `Can't connect to StarRocks`
+    - Fix: Verify StarRocks is running and port 9030 is accessible
+
+    **2. "Table not found" in MV**
+
+    - Symptom: MV creation fails with table reference error
+    - Fix: The base table (`orders_cleaned`) must exist in StarRocks. Load your pipeline data first.
+
+    **3. MV refresh failures**
+
+    - Symptom: Stale data in materialized views
+    - Fix: Check `SHOW MATERIALIZED VIEWS` for refresh status. Adjust interval if needed.
+
+    **4. Permission denied**
+
+    - Symptom: Cannot create materialized views
+    - Fix: Ensure your StarRocks user has CREATE MATERIALIZED VIEW privilege
+
+    **5. Replication error on single-node StarRocks**
+
+    - Symptom: `Table replication num should be less than or equal to the number of available backends`
+    - Fix: Set `PROPERTIES ("replication_num" = "1")` when creating the base table
+
+    **6. Cumulative metric skipped**
+
+    - Symptom: `SKIPPED: Cumulative metric uses window functions`
+    - Explanation: Window functions are not supported in StarRocks MVs. Use `seeknal query --metrics cumulative_revenue` locally instead
 
 ---
 
@@ -368,52 +296,44 @@ Seeknal's semantic layer works with any BI tool that supports:
 
 In this chapter, you learned:
 
-- [x] **StarRocks Deployment** — Deploy semantic models to StarRocks
-- [x] **Materialized Views** — Create pre-computed aggregations
-- [x] **BI Tool Integration** — Connect Tableau, Power BI, Metabase
-- [x] **User Access Control** — Implement role-based permissions
-- [x] **Governance** — Best practices for managed analytics
+- [x] **StarRocks Connection** — Configure connection in profiles.yml or URL
+- [x] **DDL Preview** — Use `--dry-run` to review before deploying
+- [x] **Metric Deployment** — Deploy metrics as materialized views
+- [x] **Refresh Intervals** — Control how often MVs refresh
+- [x] **BI Integration** — Connect any MySQL-compatible BI tool
 
 **Key Commands:**
 ```bash
-seeknal deploy-semantic-layer --target starrocks
-seeknal refresh-materialized-views
-seeknal get-connection-string --target starrocks
+seeknal deploy-metrics --connection <url> --dry-run    # Preview DDL
+seeknal deploy-metrics --connection <url>              # Deploy MVs
+seeknal deploy-metrics --connection <url> --drop-existing  # Recreate
+seeknal deploy-metrics --dimensions <names>            # Include dimensions
+seeknal deploy-metrics --refresh-interval "1 HOUR"     # Custom refresh
 ```
 
 ---
 
-## Path Completion
+## Path Complete!
 
-Congratulations! You've completed the Analytics Engineer path.
+You've completed the Analytics Engineer path. Here's what you built:
 
-### What You've Learned
+```
+orders_cleaned → Semantic Model → Metrics → StarRocks MVs → BI Tools
+                      ↓               ↓
+                 entities         simple, ratio,
+                 dimensions       cumulative, derived
+                 measures
+```
 
-1. **Semantic Models** — Define reusable entities, dimensions, measures
-2. **Business Metrics** — Create governed KPIs and business metrics
-3. **Self-Serve Analytics** — Deploy to StarRocks and enable BI tools
+### What's Next?
 
-### Next Steps
-
-**Continue Learning:**
-- [ ] [Data Engineer Path](../data-engineer-path/) — Data pipelines and infrastructure
-- [ ] [ML Engineer Path](../ml-engineer-path/) — Feature stores and ML workflows
-
-**Deep Dives:**
-- [ ] [Semantic Layer Guide](../../guides/semantic-layer.md) — Advanced semantic layer concepts
-- [ ] [StarRocks Documentation](../../reference/starrocks.md) — Database specifics
-
-**Build Your Semantic Layer:**
-- [ ] Deploy semantic models for your data
-- [ ] Create business metrics and KPIs
-- [ ] Enable self-serve analytics for your team
+- **[Data Engineer Path](../data-engineer-path/)** — Build production ELT pipelines
+- **[ML Engineer Path](../ml-engineer-path/)** — Feature stores and ML workflows
+- **[CLI Reference](../../reference/cli.md)** — Full command reference
 
 ---
 
 ## See Also
 
-- **[StarRocks Guide](../../guides/starrocks.md)** — Deep dive on StarRocks
-- **[BI Tool Integration](../../guides/bi-integration.md)** — BI-specific guides
-- **[Governance](../../guides/governance.md)** — Access control and governance
-
-**Analytics Engineer Path complete!** 🎉
+- **[CLI Reference](../../reference/cli.md)** — All `seeknal deploy-metrics` flags
+- **[YAML Schema Reference](../../reference/yaml-schema.md)** — Semantic model and metric schemas

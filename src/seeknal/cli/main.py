@@ -86,19 +86,42 @@ Examples:
 For more information, see: https://github.com/mta-tech/seeknal
 """
 
-import typer
+import typer  # ty: ignore[unresolved-import]
+import typer.core as _typer_core  # ty: ignore[unresolved-import]
 from typing import Optional, Callable, List, Any
 from datetime import datetime, timedelta
+from difflib import get_close_matches
 from enum import Enum
 from functools import wraps
 import os
 import sys
 from pathlib import Path
 
+
+class SuggestGroup(_typer_core.TyperGroup):
+    """Typer group that suggests similar commands on typos."""
+
+    def resolve_command(self, ctx: Any, args: list[str]) -> Any:
+        try:
+            return super().resolve_command(ctx, args)
+        except Exception as e:
+            if "No such command" not in str(e):
+                raise
+            cmd_name = args[0] if args else None
+            if cmd_name is not None:
+                matches = get_close_matches(
+                    cmd_name, self.list_commands(ctx), n=3, cutoff=0.4
+                )
+                if matches:
+                    suggestion = ", ".join(f"'{m}'" for m in matches)
+                    msg = f"No such command '{cmd_name}'.\n\nDid you mean: {suggestion}?"
+                    raise type(e)(msg) from e
+            raise
+
 # Load .env file if present (for local development)
 # This makes environment variables available for all CLI commands
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv  # ty: ignore[unresolved-import]
     
     # Try to find .env in current directory or up to 3 parent directories
     cwd = Path.cwd()
@@ -117,6 +140,7 @@ app = typer.Typer(
     name="seeknal",
     help="Feature store management CLI - similar to dbt",
     add_completion=False,
+    cls=SuggestGroup,
 )
 
 # Version command group for feature group version management
@@ -142,17 +166,17 @@ Examples:
 app.add_typer(version_app, name="version")
 
 # Source management for REPL
-from seeknal.cli.source import app as source_app
+from seeknal.cli.source import app as source_app  # ty: ignore[unresolved-import]
 
 app.add_typer(source_app, name="source")
 
 # Iceberg materialization commands
-from seeknal.cli.materialization_cli import app as iceberg_app
+from seeknal.cli.materialization_cli import app as iceberg_app  # ty: ignore[unresolved-import]
 
 app.add_typer(iceberg_app, name="iceberg")
 
 # Documentation search commands
-from seeknal.cli.docs import docs_app
+from seeknal.cli.docs import docs_app  # ty: ignore[unresolved-import]
 
 app.add_typer(docs_app, name="docs")
 
@@ -394,18 +418,25 @@ def _build_manifest_from_dag(dag_builder, project_name: str):
         "python": ManifestNodeType.PYTHON,
         "semantic_model": ManifestNodeType.SEMANTIC_MODEL,
         "metric": ManifestNodeType.METRIC,
+        "profile": ManifestNodeType.PROFILE,
     }
 
     manifest = Manifest(project=project_name)
     for node_id, node in dag_builder.nodes.items():
         kind_str = node.kind.value if hasattr(node.kind, 'value') else str(node.kind)
         manifest_node_type = node_type_map.get(kind_str, ManifestNodeType.SOURCE)
+        # Extract columns dict from YAML data
+        raw_columns = {}
+        if hasattr(node, 'yaml_data'):
+            raw_columns = node.yaml_data.get("columns", {}) or {}
+
         manifest.add_node(Node(
             id=node_id,
             name=node.name,
             node_type=manifest_node_type,
             description=node.yaml_data.get("description") if hasattr(node, 'yaml_data') else None,
             tags=list(node.tags) if hasattr(node, 'tags') and node.tags else [],
+            columns=raw_columns,
             config=node.yaml_data if hasattr(node, 'yaml_data') else {},
             file_path=node.file_path if hasattr(node, 'file_path') else None,
         ))
@@ -531,19 +562,41 @@ def init(
         project_file.write_text(yaml.dump(project_config, sort_keys=False))
         typer.echo(f"  Created: seeknal_project.yml")
 
-        # Generate profiles.yml
-        profiles_config = {
-            "default": {
-                "target": "dev",
-                "outputs": {
-                    "dev": {
-                        "type": "duckdb",
-                        "path": "target/dev.duckdb",
-                    }
-                }
-            }
-        }
-        (project_path / "profiles.yml").write_text(yaml.dump(profiles_config, sort_keys=False))
+        # Generate profiles.yml with correct connections + source_defaults structure
+        profiles_content = """\
+# Seeknal profiles — connection credentials and source defaults.
+# This file is gitignored. Edit it to match your environment.
+#
+# Usage:
+#   seeknal run                          (uses this file)
+#   seeknal run --profile profiles.yml   (explicit)
+#   seeknal repl --profile profiles.yml  (REPL with connections)
+#
+# Environment variables are supported: ${VAR_NAME:default_value}
+
+connections:
+  # Example PostgreSQL connection (uncomment to use):
+  # local_pg:
+  #   type: postgresql
+  #   host: localhost
+  #   port: 5432
+  #   database: my_database
+  #   user: my_user
+  #   password: "${PG_PASSWORD:my_password}"
+
+source_defaults:
+  # Default connection for each source type (uncomment to use):
+  # postgresql:
+  #   connection: local_pg
+  # iceberg:
+  #   catalog_uri: "http://localhost:8181"
+  #   warehouse: my-warehouse
+
+# Default target directory for pipeline outputs
+target:
+  path: target/
+"""
+        (project_path / "profiles.yml").write_text(profiles_content)
         typer.echo(f"  Created: profiles.yml (gitignored)")
 
         # Generate .gitignore
@@ -875,6 +928,12 @@ def _run_yaml_pipeline(
 
     _echo_success(f"DAG built: {node_count} nodes, {edge_count} edges")
 
+    # Save manifest so it stays in sync with YAML definitions
+    manifest = _build_manifest_from_dag(dag_builder, project_path.name)
+    manifest_file = target_path / "manifest.json"
+    target_path.mkdir(parents=True, exist_ok=True)
+    manifest.save(str(manifest_file))
+
     # Get topological order
     try:
         execution_order = dag_builder.topological_sort()
@@ -1077,6 +1136,7 @@ def _run_yaml_pipeline(
     successful = 0
     failed = 0
     cached = 0
+    rule_quality = []  # Track rule results: (node_id, passed, severity, message)
 
     for idx, node_id in enumerate(execution_order, 1):
         node = dag_builder.nodes[node_id]
@@ -1087,17 +1147,6 @@ def _run_yaml_pipeline(
                 typer.echo(f"{idx}/{len(execution_order)}: {node.name} [{typer.style('CACHED', fg=typer.colors.BLUE)}]")
                 cached += 1
             continue
-
-        # Check if node has changed hash (skip for SOURCE nodes as they're needed for downstream transforms)
-        # SOURCE nodes are relatively cheap to execute and create DuckDB views needed by transforms
-        current_hash = current_hashes.get(node_id, "")
-        if old_state and node_id in old_state.nodes and node.kind.value != "source":
-            old_hash = old_state.nodes[node_id].hash
-            if old_hash == current_hash and old_state.nodes[node_id].is_success():
-                typer.echo(f"{idx}/{len(execution_order)}: {node.name} [{typer.style('CACHED', fg=typer.colors.BLUE)}]")
-                run_state.nodes[node_id] = old_state.nodes[node_id]
-                cached += 1
-                continue
 
         # Execute the node
         typer.echo(f"{idx}/{len(execution_order)}: {node.name} [{typer.style('RUNNING', fg=typer.colors.YELLOW)}]")
@@ -1229,7 +1278,54 @@ def _run_yaml_pipeline(
         failed_msg = typer.style(str(failed), fg=typer.colors.RED, bold=True)
         typer.echo(f"  Failed:         {failed_msg}")
     typer.echo(f"  Duration:       {total_duration:.2f}s")
+
+    # Data quality summary for rule nodes
+    _rule_passed = 0
+    _rule_warns = 0
+    _rule_errors = 0
+    for _nid, _ns in run_state.nodes.items():
+        if not _nid.startswith("rule."):
+            continue
+        _meta = _ns.metadata or {}
+        _has_warns = _meta.get("warned", 0) > 0
+        if _ns.status == "failed":
+            _rule_errors += 1
+        elif _has_warns and _meta.get("passed", True):
+            _rule_warns += 1
+        elif _meta.get("passed", True):
+            _rule_passed += 1
+        elif _meta.get("severity") == "warn":
+            _rule_warns += 1
+        else:
+            _rule_errors += 1
+    _rule_total = _rule_passed + _rule_warns + _rule_errors
+    if _rule_total > 0:
+        typer.echo("")
+        typer.echo(f"  Data Quality:   {_rule_total} rule(s)")
+        if _rule_passed > 0:
+            typer.echo(f"                  {typer.style(str(_rule_passed) + ' passed', fg=typer.colors.GREEN)}")
+        if _rule_warns > 0:
+            typer.echo(f"                  {typer.style(str(_rule_warns) + ' warning(s)', fg=typer.colors.YELLOW, bold=True)}")
+        if _rule_errors > 0:
+            typer.echo(f"                  {typer.style(str(_rule_errors) + ' error(s)', fg=typer.colors.RED, bold=True)}")
+
     typer.echo("=" * 60)
+
+    # Show rule warning details
+    for _nid, _ns in run_state.nodes.items():
+        if not _nid.startswith("rule."):
+            continue
+        _meta = _ns.metadata or {}
+        _has_warns = _meta.get("warned", 0) > 0
+        _is_failed_warn = not _meta.get("passed", True) and _meta.get("severity") == "warn"
+        if _has_warns or _is_failed_warn:
+            _msg = _meta.get("message", "")
+            if "results" in _meta:
+                for _c in _meta["results"]:
+                    if _c.get("status") == "warn" or not _c.get("passed", True):
+                        _echo_warning(f"  Data quality warning: {_nid}: {_c['message']}")
+            elif _msg:
+                _echo_warning(f"  Data quality warning: {_nid}: {_msg}")
 
     if failed > 0:
         raise typer.Exit(1)
@@ -2794,8 +2890,28 @@ def repl(
         None, "--profile",
         help="Path to profiles.yml for connections (default: ~/.seeknal/profiles.yml)"
     ),
+    env: Optional[str] = typer.Option(
+        None, "--env",
+        help="Load data from a virtual environment (e.g., dev) instead of production"
+    ),
+    exec_sql: Optional[str] = typer.Option(
+        None, "--exec", "-e",
+        help="Execute SQL query and exit (non-interactive). Use '-' to read from stdin."
+    ),
+    format: str = typer.Option(
+        "table", "--format", "-f",
+        help="Output format for --exec: table, json, csv"
+    ),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o",
+        help="Export --exec results to file (format inferred from .csv, .json, .parquet)"
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit",
+        help="Limit number of result rows for --exec"
+    ),
 ):
-    """Start interactive SQL REPL.
+    """Start interactive SQL REPL or execute a one-shot query.
 
     The SQL REPL allows you to explore data across multiple sources using DuckDB
     as a unified query engine. Connect to PostgreSQL, MySQL, SQLite databases,
@@ -2805,23 +2921,32 @@ def repl(
     intermediate parquets, PostgreSQL tables, and Iceberg catalogs from the
     most recent pipeline run.
 
-    Examples:
+    Use --exec/-e to run a single query and exit (non-interactive mode).
+    Use --env to query outputs from a virtual environment instead of production.
+
+    Examples (interactive):
         seeknal repl
         seeknal repl --profile profiles.yml
-        seeknal> .connect mydb                   (saved source)
-        seeknal> .connect postgres://user:pass@host/db
-        seeknal> .connect /path/to/data.parquet
-        seeknal> SELECT * FROM db0.users LIMIT 10
-        seeknal> .tables
-        seeknal> .quit
+        seeknal repl --env dev
 
-    Manage sources:
-        seeknal source add mydb --url postgres://user:pass@host/db
-        seeknal source list
-        seeknal source remove mydb
+    Examples (one-shot):
+        seeknal repl -e "SELECT * FROM orders LIMIT 5"
+        seeknal repl -e "SELECT * FROM orders" --format json
+        seeknal repl -e "SELECT * FROM orders" --format csv | head -20
+        seeknal repl -e "SELECT * FROM orders" --output results.csv
+        seeknal repl -e "SELECT * FROM orders" --output results.parquet
+        seeknal repl -e "SELECT * FROM orders" --limit 50
+        echo "SELECT * FROM orders" | seeknal repl -e -
+        cat query.sql | seeknal repl -e -
     """
+    import sys
     from pathlib import Path
-    from seeknal.cli.repl import run_repl
+    from seeknal.cli.repl import REPL, run_repl
+
+    # Validate exec-only flags
+    if not exec_sql and (format != "table" or output or limit is not None):
+        _echo_error("The --format, --output, and --limit flags require --exec/-e")
+        raise typer.Exit(code=1)
 
     # Detect project context
     project_path = None
@@ -2829,15 +2954,124 @@ def repl(
     if (cwd / "seeknal_project.yml").exists():
         project_path = cwd
 
-    # Resolve profile path
-    profile_path = Path(profile) if profile else None
+    # Validate env exists if specified
+    if env and project_path:
+        env_dir = project_path / "target" / "environments" / env
+        if not env_dir.exists():
+            _echo_error(
+                f"Environment '{env}' not found. "
+                f"Run 'seeknal env plan {env}' to create it."
+            )
+            raise typer.Exit(1)
 
-    run_repl(project_path=project_path, profile_path=profile_path)
+    # Auto-discover env-specific profile if not explicitly provided
+    if env and not profile and project_path:
+        profile_path = _resolve_env_profile(env, project_path, None)
+    else:
+        profile_path = Path(profile) if profile else None
+
+    if exec_sql:
+        # One-shot execution mode
+        repl_instance = REPL(
+            project_path=project_path,
+            profile_path=profile_path,
+            env_name=env,
+            skip_history=True,
+        )
+
+        try:
+            columns, rows = repl_instance.execute_oneshot(exec_sql, limit=limit)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            raise typer.Exit(code=1)
+        except Exception as e:
+            from seeknal.db_utils import sanitize_error_message
+            print(f"Error: {sanitize_error_message(str(e))}", file=sys.stderr)
+            raise typer.Exit(code=1)
+
+        if not columns:
+            print("Query executed successfully.", file=sys.stderr)
+            raise typer.Exit(0)
+
+        # File export (--output takes precedence over --format)
+        if output:
+            _exec_export_to_file(columns, rows, output)
+            raise typer.Exit(0)
+
+        # Stdout formatting
+        _exec_format_output(columns, rows, format)
+        raise typer.Exit(0)
+
+    # Interactive REPL path (existing behavior)
+    run_repl(project_path=project_path, profile_path=profile_path, env_name=env)
+
+
+def _exec_format_output(columns: list, rows: list, fmt: str) -> None:
+    """Format --exec query results to stdout."""
+    import json as json_mod
+
+    if fmt == "json":
+        data = [dict(zip(columns, row)) for row in rows]
+        typer.echo(json_mod.dumps(data, indent=2, default=str))
+    elif fmt == "csv":
+        import csv
+        import io
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(columns)
+        writer.writerows(rows)
+        typer.echo(buf.getvalue().rstrip("\n"))
+    elif fmt == "table":
+        from tabulate import tabulate as tabfmt
+
+        typer.echo(tabfmt(rows, headers=columns, tablefmt="simple"))
+    else:
+        import sys
+
+        print(
+            f"Unsupported format: '{fmt}'. Use table, json, or csv.",
+            file=sys.stderr,
+        )
+        raise typer.Exit(code=1)
+
+
+def _exec_export_to_file(columns: list, rows: list, output_path: str) -> None:
+    """Export --exec query results to file with format inferred from extension."""
+    import sys
+    from pathlib import Path as P
+
+    import pandas as pd
+
+    df = pd.DataFrame(rows, columns=columns)
+    out_path = P(output_path)
+    ext = out_path.suffix.lower()
+
+    try:
+        if ext == ".csv":
+            df.to_csv(out_path, index=False)
+        elif ext == ".json":
+            df.to_json(out_path, orient="records", indent=2, default_handler=str)
+        elif ext == ".parquet":
+            df.to_parquet(out_path, index=False)
+        else:
+            print(
+                f"Unsupported file format: '{ext}'. Use .csv, .json, or .parquet",
+                file=sys.stderr,
+            )
+            raise typer.Exit(code=1)
+    except typer.Exit:
+        raise
+    except Exception as e:
+        print(f"Error writing file: {e}", file=sys.stderr)
+        raise typer.Exit(code=1)
+
+    print(f"Exported {len(rows)} rows to {out_path}", file=sys.stderr)
 
 
 @app.command()
 def draft(
-    node_type: str = typer.Argument(..., help="Node type (source, transform, feature-group, model, aggregation, rule, exposure)"),
+    node_type: str = typer.Argument(..., help="Node type (source, transform, feature-group, semantic-model, model, aggregation, rule, exposure)"),
     name: str = typer.Argument(..., help="Node name"),
     description: Optional[str] = typer.Option(None, "--description", "-d", help="Node description"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing draft file"),
@@ -3285,6 +3519,7 @@ def query(
     limit: int = typer.Option(100, help="Maximum rows to return"),
     compile_only: bool = typer.Option(False, "--compile", help="Show generated SQL without executing"),
     format: str = typer.Option("table", help="Output format: table, json, csv"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Export results to file (format inferred from extension: .csv, .json, .parquet)"),
     project_path: str = typer.Option(".", help="Path to project directory"),
 ):
     """
@@ -3303,6 +3538,7 @@ def query(
     from seeknal.workflow.semantic.models import (
         Metric as MetricModel,
         MetricQuery,
+        MetricType,
         SemanticModel,
     )
     from seeknal.workflow.semantic.compiler import MetricCompiler
@@ -3323,18 +3559,46 @@ def query(
         _echo_error("No semantic models found. Create YAML files in seeknal/semantic_models/")
         raise typer.Exit(code=1)
 
-    # Load metrics
-    metrics_dir = project / "seeknal" / "metrics"
+    # Collect metrics from three sources (in priority order):
+    # 1. Inline metrics defined in semantic model YAML (metrics: section)
+    # 2. Separate metric YAML files in seeknal/metrics/
+    # 3. Auto-generated simple metrics from measures (fallback)
     metric_list = []
+    seen_names: set[str] = set()
+
+    # Source 1: Inline metrics from semantic models
+    for sm in semantic_models:
+        for m in sm.metrics:
+            if m.name not in seen_names:
+                metric_list.append(m)
+                seen_names.add(m.name)
+
+    # Source 2: Separate metric YAML files
+    metrics_dir = project / "seeknal" / "metrics"
     if metrics_dir.exists():
         for yml_path in sorted(metrics_dir.glob("*.yml")):
             with open(yml_path, "r") as f:
                 for doc in yaml.safe_load_all(f):
                     if doc and doc.get("kind") == "metric":
-                        metric_list.append(MetricModel.from_dict(doc))
+                        m = MetricModel.from_dict(doc)
+                        if m.name not in seen_names:
+                            metric_list.append(m)
+                            seen_names.add(m.name)
+
+    # Source 3: Auto-generate simple metrics from measures (Cube.js-style)
+    for sm in semantic_models:
+        for measure in sm.measures:
+            if measure.name not in seen_names:
+                metric_list.append(MetricModel(
+                    name=measure.name,
+                    type=MetricType.SIMPLE,
+                    description=measure.description,
+                    measure=measure.name,
+                ))
+                seen_names.add(measure.name)
 
     if not metric_list:
-        _echo_error("No metrics found. Create YAML files in seeknal/metrics/")
+        _echo_error("No metrics or measures found. Define measures in seeknal/semantic_models/ or metrics in seeknal/metrics/")
         raise typer.Exit(code=1)
 
     # Build compiler
@@ -3368,13 +3632,26 @@ def query(
     import duckdb
     conn = duckdb.connect(":memory:")
 
-    # Register semantic model tables from cached parquet files
-    target = P(project_path) / "target" / "cache"
-    if target.exists():
-        for pf in target.glob("**/*.parquet"):
-            table_name = f"{pf.parent.name}.{pf.stem}"
+    # Register tables from cached parquet files (target/cache/{kind}/{name}.parquet)
+    target_cache = P(project_path) / "target" / "cache"
+    if target_cache.exists():
+        for pf in target_cache.glob("**/*.parquet"):
+            table_name = pf.stem  # e.g., orders_cleaned
             try:
                 conn.execute(f"CREATE VIEW \"{table_name}\" AS SELECT * FROM read_parquet('{pf}')")
+            except Exception:
+                pass
+
+    # Register tables from intermediate parquet files (target/intermediate/{kind}_{name}.parquet)
+    target_intermediate = P(project_path) / "target" / "intermediate"
+    if target_intermediate.exists():
+        for pf in target_intermediate.glob("*.parquet"):
+            # Filename is {kind}_{name}.parquet — strip the kind prefix
+            stem = pf.stem  # e.g., transform_orders_cleaned
+            parts = stem.split("_", 1)
+            table_name = parts[1] if len(parts) > 1 else stem
+            try:
+                conn.execute(f"CREATE OR REPLACE VIEW \"{table_name}\" AS SELECT * FROM read_parquet('{pf}')")
             except Exception:
                 pass
 
@@ -3386,18 +3663,36 @@ def query(
         _echo_error(f"Query execution error: {e}")
         raise typer.Exit(code=1)
 
-    # Format output
+    # Export to file if --output is specified
+    if output:
+        import pandas as pd
+        df = pd.DataFrame(rows, columns=columns)
+        out_path = P(output)
+        ext = out_path.suffix.lower()
+        if ext == ".csv":
+            df.to_csv(out_path, index=False)
+        elif ext == ".json":
+            df.to_json(out_path, orient="records", indent=2, default_handler=str)
+        elif ext == ".parquet":
+            df.to_parquet(out_path, index=False)
+        else:
+            _echo_error(f"Unsupported file format: '{ext}'. Use .csv, .json, or .parquet")
+            raise typer.Exit(code=1)
+        _echo_success(f"Exported {len(rows)} rows to {out_path}")
+        return
+
+    # Format output to stdout
     if format == "json":
         data = [dict(zip(columns, row)) for row in rows]
         typer.echo(json_mod.dumps(data, indent=2, default=str))
     elif format == "csv":
         import csv
         import io
-        output = io.StringIO()
-        writer = csv.writer(output)
+        buf = io.StringIO()
+        writer = csv.writer(buf)
         writer.writerow(columns)
         writer.writerows(rows)
-        typer.echo(output.getvalue())
+        typer.echo(buf.getvalue())
     else:
         try:
             from tabulate import tabulate as tabfmt
@@ -3434,6 +3729,7 @@ def deploy_metrics(
 
     from seeknal.workflow.semantic.models import (
         Metric as MetricModel,
+        MetricType as MetricTypeModel,
         SemanticModel,
     )
     from seeknal.workflow.semantic.compiler import MetricCompiler
@@ -3455,18 +3751,46 @@ def deploy_metrics(
         _echo_error("No semantic models found.")
         raise typer.Exit(code=1)
 
-    # Load metrics
-    metrics_dir = project / "seeknal" / "metrics"
+    # Collect metrics from three sources (in priority order):
+    # 1. Inline metrics from semantic model YAML (metrics: section)
+    # 2. Separate metric YAML files in seeknal/metrics/
+    # 3. Auto-generated simple metrics from measures (fallback)
     metric_list = []
+    seen_names: set[str] = set()
+
+    # Source 1: Inline metrics from semantic models
+    for sm in semantic_models:
+        for m in sm.metrics:
+            if m.name not in seen_names:
+                metric_list.append(m)
+                seen_names.add(m.name)
+
+    # Source 2: Separate metric YAML files
+    metrics_dir = project / "seeknal" / "metrics"
     if metrics_dir.exists():
         for yml_path in sorted(metrics_dir.glob("*.yml")):
             with open(yml_path, "r") as f:
                 for doc in yaml.safe_load_all(f):
                     if doc and doc.get("kind") == "metric":
-                        metric_list.append(MetricModel.from_dict(doc))
+                        m = MetricModel.from_dict(doc)
+                        if m.name not in seen_names:
+                            metric_list.append(m)
+                            seen_names.add(m.name)
+
+    # Source 3: Auto-generate simple metrics from measures
+    for sm in semantic_models:
+        for measure in sm.measures:
+            if measure.name not in seen_names:
+                metric_list.append(MetricModel(
+                    name=measure.name,
+                    type=MetricTypeModel.SIMPLE,
+                    description=measure.description,
+                    measure=measure.name,
+                ))
+                seen_names.add(measure.name)
 
     if not metric_list:
-        _echo_error("No metrics found.")
+        _echo_error("No metrics or measures found.")
         raise typer.Exit(code=1)
 
     # Resolve connection config
@@ -3493,14 +3817,26 @@ def deploy_metrics(
 
     dim_list = [d.strip() for d in dimensions.split(",")] if dimensions else None
 
+    # StarRocks MVs require at least one non-aggregate key column.
+    # Auto-include default_time_dimension when no dimensions specified.
+    if not dim_list:
+        for sm in semantic_models:
+            if sm.default_time_dimension:
+                dim_list = [sm.default_time_dimension]
+                _echo_info(f"Auto-including dimension '{sm.default_time_dimension}' (required for StarRocks MV keys)")
+                break
+
     deployer = MetricDeployer(compiler, conn_config)
     results = deployer.deploy(metric_list, config, dim_list, dry_run=dry_run)
 
     # Display results
     for r in results:
         if dry_run:
-            _echo_info(f"\n-- Metric: {r.metric_name} -> {r.mv_name}")
-            typer.echo(r.ddl)
+            if r.success:
+                _echo_info(f"\n-- Metric: {r.metric_name} -> {r.mv_name}")
+                typer.echo(r.ddl)
+            else:
+                _echo_error(f"\n-- Metric: {r.metric_name} -> SKIPPED: {r.error}")
         elif r.success:
             _echo_success(f"Deployed {r.metric_name} -> {r.mv_name}")
         else:
@@ -3510,11 +3846,14 @@ def deploy_metrics(
     failed = sum(1 for r in results if not r.success)
 
     if dry_run:
-        _echo_info(f"\nDry run: {len(results)} MVs would be created")
+        msg = f"\nDry run: {succeeded} MVs would be created"
+        if failed > 0:
+            msg += f", {failed} skipped"
+        _echo_info(msg)
     else:
         _echo_info(f"\nDeployed: {succeeded} succeeded, {failed} failed")
 
-    if failed > 0:
+    if failed > 0 and not dry_run:
         raise typer.Exit(code=1)
 
 
@@ -3690,24 +4029,49 @@ def _run_in_environment(
             _echo_info(f"    - {node_name}")
         return
 
-    _echo_info(f"Executing {len(nodes_to_execute)} node(s) in environment '{env_name}'...")
-
-    # Set up env cache directory
-    env_cache = env_dir / "cache"
-    env_cache.mkdir(parents=True, exist_ok=True)
-
-    # Copy production refs for unchanged nodes (zero-copy references)
+    # Copy production refs for unchanged nodes into env intermediate/
+    # so the executor can find upstream parquets when running changed nodes.
+    # Destination filename must be <type>_<name>.parquet to match what the
+    # executor expects: target_path / "intermediate" / f"{node_id.replace('.','_')}.parquet"
     refs_data = manager._load_json(env_dir / "refs.json")
+    copied_refs: set[str] = set()
     if refs_data:
         import shutil
+        env_intermediate = env_dir / "intermediate"
+        env_intermediate.mkdir(parents=True, exist_ok=True)
         for ref in refs_data.get("refs", []):
             src_path = Path(ref["output_path"])
             if src_path.exists():
-                # Determine destination in env cache
-                dest = env_cache / src_path.relative_to(target_path / "cache")
-                dest.parent.mkdir(parents=True, exist_ok=True)
+                node_id_ref = ref["node_id"]
+                dest_name = f"{node_id_ref.replace('.', '_')}.parquet"
+                dest = env_intermediate / dest_name
                 if not dest.exists():
                     shutil.copy2(src_path, dest)
+                copied_refs.add(node_id_ref)
+
+    # If upstream nodes have no production output (no prior seeknal run),
+    # add them to the execution set so the full dependency chain runs.
+    missing_upstream: set[str] = set()
+    for node_id in list(nodes_to_execute):
+        for upstream_id in manifest.get_upstream_nodes(node_id):
+            if upstream_id not in nodes_to_execute and upstream_id not in copied_refs:
+                missing_upstream.add(upstream_id)
+    if missing_upstream:
+        # Transitively include all their upstreams too
+        queue = list(missing_upstream)
+        while queue:
+            nid = queue.pop()
+            for up in manifest.get_upstream_nodes(nid):
+                if up not in nodes_to_execute and up not in copied_refs and up not in missing_upstream:
+                    missing_upstream.add(up)
+                    queue.append(up)
+        nodes_to_execute = nodes_to_execute | missing_upstream
+        _echo_info(
+            f"No production outputs for {len(missing_upstream)} upstream node(s) — "
+            f"including them in execution."
+        )
+
+    _echo_info(f"Executing {len(nodes_to_execute)} node(s) in environment '{env_name}'...")
 
     # Execute nodes using DAGRunner with env-specific target path
     from seeknal.workflow.runner import DAGRunner
@@ -3837,36 +4201,57 @@ def _promote_environment(
     manager = EnvironmentManager(target_path)
     target_label = "production" if to_env == "prod" else f"environment '{to_env}'"
 
-    # Show promotion preview
+    # Run dry_run first to get diff analysis (warnings, changed files)
+    preview = manager.promote(
+        from_env, to_env,
+        rematerialize=rematerialize,
+        profile_path=profile_path,
+        dry_run=True,
+    )
+
+    # Show promotion preview with per-node detail
     env_dir = target_path / "environments" / from_env
     plan_data = manager._load_json(env_dir / "plan.json")
+    _echo_info(f"Promotion preview for '{from_env}' -> {target_label}:")
     if plan_data:
         changes = plan_data.get("categorized_changes", {})
         added = plan_data.get("added_nodes", [])
         removed = plan_data.get("removed_nodes", [])
-        _echo_info(f"Promotion preview for '{from_env}' -> {target_label}:")
+        manifest = preview.get("manifest")
         if changes:
-            _echo_info(f"  Changed nodes: {len(changes)}")
+            _echo_info(f"  Changed nodes ({len(changes)}):")
+            for nid, cat in sorted(changes.items()):
+                node = manifest.get_node(nid) if manifest else None
+                name = node.name if node else nid
+                _echo_info(f"    {cat:15s}  {name}")
         if added:
-            _echo_info(f"  New nodes: {len(added)}")
+            _echo_info(f"  New nodes ({len(added)}):")
+            for nid in sorted(added):
+                node = manifest.get_node(nid) if manifest else None
+                _echo_info(f"    + {node.name if node else nid}")
         if removed:
-            _echo_info(f"  Removed nodes: {len(removed)}")
+            _echo_info(f"  Removed nodes ({len(removed)}):")
+            for nid in sorted(removed):
+                _echo_info(f"    - {nid}")
         if rematerialize:
             _echo_info(f"  Re-materialization: enabled")
-        _echo_info("")
+    _echo_info("")
+
+    # Show drift warnings
+    for warning in preview.get("warnings", []):
+        _echo_warning(f"  {warning}")
 
     if dry_run:
-        result = manager.promote(
-            from_env, to_env,
-            rematerialize=rematerialize,
-            profile_path=profile_path,
-            dry_run=True,
-        )
         _echo_info(f"Dry run: would promote '{from_env}' to {target_label}")
-        if result["rematerialize_nodes"]:
-            _echo_info(f"  Nodes to re-materialize: {len(result['rematerialize_nodes'])}")
-            for nid in sorted(result["rematerialize_nodes"]):
-                manifest = result["manifest"]
+        changed = preview.get("changed_filenames", set())
+        if changed:
+            _echo_info(f"  Files to overwrite ({len(changed)}):")
+            for fname in sorted(changed):
+                _echo_info(f"    {fname}")
+        if preview["rematerialize_nodes"]:
+            _echo_info(f"  Nodes to re-materialize: {len(preview['rematerialize_nodes'])}")
+            for nid in sorted(preview["rematerialize_nodes"]):
+                manifest = preview["manifest"]
                 node = manifest.get_node(nid) if manifest else None
                 _echo_info(f"    - {node.name if node else nid}")
         return
@@ -3882,7 +4267,11 @@ def _promote_environment(
         profile_path=profile_path,
     )
 
-    _echo_success(f"Environment '{from_env}' promoted to {target_label}.")
+    changed_count = len(result.get("changed_filenames", set()))
+    _echo_success(
+        f"Environment '{from_env}' promoted to {target_label} "
+        f"({changed_count} file(s) updated)."
+    )
 
     # Re-materialize if requested
     if rematerialize and result["rematerialize_nodes"] and result["manifest"]:
@@ -4628,6 +5017,9 @@ def lineage(
     no_open: bool = typer.Option(
         False, "--no-open", help="Don't auto-open browser"
     ),
+    ascii_output: bool = typer.Option(
+        False, "--ascii", help="Print DAG as ASCII tree to stdout instead of HTML"
+    ),
 ):
     """Generate interactive lineage visualization.
 
@@ -4636,6 +5028,7 @@ def lineage(
         seeknal lineage transform.clean_orders       # Focus on node
         seeknal lineage transform.X --column total   # Trace column
         seeknal lineage --output dag.html            # Custom path
+        seeknal lineage --ascii                      # ASCII tree to stdout
     """
     from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
     from seeknal.dag.visualize import generate_lineage_html, LineageVisualizationError
@@ -4657,6 +5050,12 @@ def lineage(
             _echo_warning("No nodes found. Add pipeline files to your project.")
             raise typer.Exit(code=1)
 
+        if ascii_output:
+            from seeknal.dag.visualize import render_ascii_tree  # ty: ignore[unresolved-import]
+            tree_text = render_ascii_tree(manifest, focus_node=node_id)
+            typer.echo(tree_text)
+            return
+
         if output is None:
             output = path / "target" / "lineage.html"
 
@@ -4669,6 +5068,94 @@ def lineage(
         )
         _echo_success(f"Lineage visualization generated: {result_path}")
     except LineageVisualizationError as e:
+        _echo_error(str(e))
+        raise typer.Exit(code=1)
+
+
+
+
+@app.command()
+def dq(
+    node_id: Optional[str] = typer.Argument(
+        None, help="Focus on a specific profile or rule node"
+    ),
+    project: str = typer.Option(
+        None, "--project", "-p", help="Project name"
+    ),
+    path: Path = typer.Option(
+        Path("."), "--path", help="Project path"
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o",
+        help="Output HTML file path (default: target/dq_report.html)"
+    ),
+    no_open: bool = typer.Option(
+        False, "--no-open", help="Don't auto-open browser"
+    ),
+    ascii_output: bool = typer.Option(
+        False, "--ascii", help="Print ASCII report to stdout instead of HTML"
+    ),
+):
+    """Generate data quality dashboard from profile stats and rule results.
+
+    Examples:
+        seeknal dq                              # Full DQ report (HTML)
+        seeknal dq --ascii                      # ASCII report to stdout
+        seeknal dq rule.check_orders            # Focus on specific node
+        seeknal dq --output report.html         # Custom output path
+        seeknal dq --no-open                    # Generate without opening browser
+    """
+    from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
+    from seeknal.dag.dq import (
+        DQDataBuilder, DQVisualizationError,
+        render_dq_ascii as _render_dq_ascii,
+        generate_dq_html as _generate_dq_html,
+    )
+    from seeknal.workflow.state import load_state
+
+    if project is None:
+        project = path.resolve().name
+
+    try:
+        try:
+            dag_builder = DAGBuilder(project_path=path)
+            dag_builder.build()
+        except (ValueError, CycleDetectedError, MissingDependencyError) as e:
+            _echo_error(f"DAG build failed: {e}")
+            raise typer.Exit(code=1)
+
+        manifest = _build_manifest_from_dag(dag_builder, project)
+
+        if not manifest.nodes:
+            _echo_warning("No nodes found. Add pipeline files to your project.")
+            raise typer.Exit(code=1)
+
+        # Load run state
+        state_path = path / "target" / "run_state.json"
+        state = load_state(state_path)
+        if state is None:
+            from seeknal.workflow.state import RunState
+            state = RunState()
+            _echo_warning("No run state found. Run 'seeknal run' first for DQ data.")
+
+        target_path = path / "target"
+        builder = DQDataBuilder(state, manifest, target_path)
+        dq_data = builder.build(focus_node=node_id)
+
+        if ascii_output:
+            typer.echo(_render_dq_ascii(dq_data))
+            return
+
+        if output is None:
+            output = path / "target" / "dq_report.html"
+
+        result_path = _generate_dq_html(
+            dq_data=dq_data,
+            output_path=output,
+            open_browser=not no_open,
+        )
+        _echo_success(f"Data quality report generated: {result_path}")
+    except DQVisualizationError as e:
         _echo_error(str(e))
         raise typer.Exit(code=1)
 

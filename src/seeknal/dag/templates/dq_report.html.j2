@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src https://cdn.jsdelivr.net 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:;">
+<title>Seeknal Data Quality Report</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"
+        integrity="sha384-UxLMsiJPMqnEeVMiEGFqJHGFvSsVpbfOPg4nmDMFmuZJrz2YQQZ/urwOagtwMiS"
+        crossorigin="anonymous"></script>
+<style>
+/* ===== Reset & Base ===== */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  background: #f8fafc; color: #1e293b; line-height: 1.5;
+}
+
+/* ===== Header ===== */
+.header {
+  background: #fff; border-bottom: 1px solid #e2e8f0;
+  padding: 16px 24px; display: flex; align-items: center; gap: 16px;
+}
+.header .logo {
+  display: flex; align-items: center; gap: 8px;
+  font-weight: 700; font-size: 15px;
+}
+.header .logo-icon {
+  width: 24px; height: 24px; border-radius: 4px;
+  background: #3b82f6; color: #fff; display: flex;
+  align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 800;
+}
+.header .meta {
+  margin-left: auto; font-size: 13px; color: #64748b;
+  display: flex; gap: 16px; align-items: center;
+}
+.health-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 12px; border-radius: 9999px; font-weight: 600; font-size: 13px;
+}
+.health-good { background: #dcfce7; color: #166534; }
+.health-warn { background: #fef9c3; color: #854d0e; }
+.health-bad  { background: #fee2e2; color: #991b1b; }
+
+/* ===== Container ===== */
+.container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+/* ===== Summary Cards ===== */
+.summary-cards {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px; margin-bottom: 24px;
+}
+.card {
+  background: #fff; border: 1px solid #e2e8f0; border-radius: 8px;
+  padding: 16px; text-align: center;
+}
+.card .label { font-size: 12px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; }
+.card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+.card .value.green { color: #16a34a; }
+.card .value.yellow { color: #ca8a04; }
+.card .value.red { color: #dc2626; }
+
+/* ===== Section ===== */
+.section {
+  background: #fff; border: 1px solid #e2e8f0; border-radius: 8px;
+  margin-bottom: 16px; overflow: hidden;
+}
+.section-header {
+  padding: 12px 16px; border-bottom: 1px solid #e2e8f0;
+  font-weight: 600; font-size: 14px; background: #f8fafc;
+  display: flex; align-items: center; gap: 8px;
+}
+
+/* ===== Stats Table ===== */
+.stats-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+}
+.stats-table th {
+  text-align: left; padding: 8px 12px; background: #f8fafc;
+  border-bottom: 1px solid #e2e8f0; font-weight: 600; color: #475569;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+}
+.stats-table td {
+  padding: 8px 12px; border-bottom: 1px solid #f1f5f9;
+}
+.stats-table tr:hover { background: #f8fafc; }
+.stats-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ===== Rule Results ===== */
+.rule-row { display: flex; align-items: center; padding: 10px 16px; border-bottom: 1px solid #f1f5f9; cursor: pointer; gap: 10px; }
+.rule-row:last-child { border-bottom: none; }
+.rule-row:hover { background: #f8fafc; }
+.status-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 2px 10px; border-radius: 4px; font-size: 11px;
+  font-weight: 600; text-transform: uppercase; min-width: 48px; flex-shrink: 0;
+}
+.status-pass { background: #dcfce7; color: #166534; }
+.status-warn { background: #fef9c3; color: #854d0e; }
+.status-fail { background: #fee2e2; color: #991b1b; }
+.rule-info { flex: 1; min-width: 0; }
+.rule-info-top { display: flex; align-items: center; gap: 8px; }
+.rule-name { font-weight: 500; font-size: 13px; }
+.rule-type-tag {
+  display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px;
+  font-weight: 600; text-transform: uppercase; background: #f1f5f9; color: #64748b;
+  letter-spacing: 0.03em;
+}
+.rule-message { color: #64748b; font-size: 12px; margin-top: 2px; }
+.rule-arrow { color: #cbd5e1; font-size: 14px; flex-shrink: 0; }
+
+/* ===== Detail Panel ===== */
+.detail-panel {
+  position: fixed; right: -400px; top: 0; width: 400px; height: 100vh;
+  background: #fff; border-left: 1px solid #e2e8f0; z-index: 100;
+  transition: right 0.2s ease; overflow-y: auto; padding: 20px;
+  box-shadow: -4px 0 12px rgba(0,0,0,0.05);
+}
+.detail-panel.open { right: 0; }
+.detail-panel .close-btn {
+  position: absolute; top: 12px; right: 12px; background: none;
+  border: none; font-size: 18px; cursor: pointer; color: #94a3b8;
+}
+.detail-panel h3 { font-size: 16px; margin-bottom: 12px; }
+.detail-panel .check-item {
+  padding: 8px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px;
+}
+
+/* ===== Trend Charts ===== */
+.chart-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+  gap: 16px; padding: 16px;
+}
+.chart-container {
+  background: #fff; border: 1px solid #e2e8f0; border-radius: 8px;
+  padding: 16px;
+}
+.chart-container h4 { font-size: 13px; color: #475569; margin-bottom: 8px; }
+.chart-container canvas { max-height: 200px; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="logo">
+    <span class="logo-icon">S</span>
+    <span>Seeknal</span>
+  </div>
+  <span style="color:#cbd5e1">|</span>
+  <span style="font-size:14px;font-weight:500">Data Quality Report</span>
+  <div class="meta">
+    <span id="meta-run"></span>
+    <span id="meta-time"></span>
+    <span id="health-badge"></span>
+  </div>
+</div>
+
+<!-- Main Content -->
+<div class="container">
+  <div class="summary-cards" id="summary-cards"></div>
+  <div id="rule-section"></div>
+  <div id="pipeline-overview"></div>
+  <div id="profile-sections"></div>
+  <div id="trend-section"></div>
+</div>
+
+<!-- Detail Panel -->
+<div class="detail-panel" id="detail-panel">
+  <button class="close-btn" onclick="closeDetail()">&times;</button>
+  <div id="detail-content"></div>
+</div>
+
+<script>
+// Data injection — JSON sanitized server-side (same pattern as lineage)
+var DATA = JSON.parse('{{ dq_data_json | safe }}');
+
+document.addEventListener('DOMContentLoaded', function() {
+  renderMeta();
+  renderSummaryCards();
+  renderRules();
+  renderPipelineOverview();
+  renderProfiles();
+  renderTrends();
+});
+
+function renderMeta() {
+  var m = DATA.metadata;
+  document.getElementById('meta-run').textContent = 'Run: ' + (m.run_id || 'N/A');
+  document.getElementById('meta-time').textContent = m.timestamp ? new Date(m.timestamp).toLocaleString() : '';
+
+  var badge = document.getElementById('health-badge');
+  var score = m.health_score;
+  var cls = 'health-good', label = 'Healthy';
+  if (score < 70) { cls = 'health-bad'; label = 'Critical'; }
+  else if (score < 100) { cls = 'health-warn'; label = 'Warning'; }
+  badge.className = 'health-badge ' + cls;
+  badge.textContent = score.toFixed(0) + '% ' + label;
+}
+
+function renderSummaryCards() {
+  var m = DATA.metadata;
+  var cards = [
+    { label: 'Total Nodes', value: m.total_nodes, cls: '' },
+    { label: 'Succeeded', value: m.nodes_succeeded, cls: 'green' },
+    { label: 'Failed Nodes', value: m.nodes_failed, cls: m.nodes_failed > 0 ? 'red' : '' },
+    { label: 'Profiles', value: m.total_profiles, cls: '' },
+    { label: 'Total Rules', value: m.total_rules, cls: '' },
+    { label: 'Rules Passed', value: m.rules_passed, cls: 'green' },
+    { label: 'Warnings', value: m.rules_warned, cls: 'yellow' },
+    { label: 'Rules Failed', value: m.rules_failed, cls: 'red' }
+  ];
+  var container = document.getElementById('summary-cards');
+  cards.forEach(function(c) {
+    var div = document.createElement('div');
+    div.className = 'card';
+    var labelEl = document.createElement('div');
+    labelEl.className = 'label';
+    labelEl.textContent = c.label;
+    var valueEl = document.createElement('div');
+    valueEl.className = 'value ' + c.cls;
+    valueEl.textContent = c.value;
+    div.appendChild(labelEl);
+    div.appendChild(valueEl);
+    container.appendChild(div);
+  });
+}
+
+function renderPipelineOverview() {
+  var container = document.getElementById('pipeline-overview');
+  if (!DATA.node_summaries || !DATA.node_summaries.length) return;
+
+  var section = document.createElement('div');
+  section.className = 'section';
+
+  var header = document.createElement('div');
+  header.className = 'section-header';
+  header.textContent = 'Pipeline Overview';
+  section.appendChild(header);
+
+  var body = document.createElement('div');
+  body.className = 'section-body';
+
+  var table = document.createElement('table');
+  table.className = 'stats-table';
+
+  var thead = document.createElement('thead');
+  var hrow = document.createElement('tr');
+  ['Name', 'Type', 'Status', 'Rows', 'Duration'].forEach(function(h) {
+    var th = document.createElement('th');
+    th.textContent = h;
+    if (h === 'Rows' || h === 'Duration') th.className = 'num';
+    hrow.appendChild(th);
+  });
+  thead.appendChild(hrow);
+  table.appendChild(thead);
+
+  var tbody = document.createElement('tbody');
+  DATA.node_summaries.forEach(function(ns) {
+    var tr = document.createElement('tr');
+
+    var tdName = document.createElement('td');
+    var strong = document.createElement('strong');
+    strong.textContent = ns.name;
+    tdName.appendChild(strong);
+    tr.appendChild(tdName);
+
+    var tdType = document.createElement('td');
+    tdType.textContent = ns.node_type;
+    tr.appendChild(tdType);
+
+    var tdStatus = document.createElement('td');
+    var statusCls = ns.status === 'success' ? 'status-pass'
+      : ns.status === 'failed' ? 'status-fail' : 'status-warn';
+    var badge = document.createElement('span');
+    badge.className = 'status-badge ' + statusCls;
+    badge.textContent = ns.status.toUpperCase();
+    tdStatus.appendChild(badge);
+    tr.appendChild(tdStatus);
+
+    var tdRows = document.createElement('td');
+    tdRows.className = 'num';
+    tdRows.textContent = ns.row_count.toLocaleString();
+    tr.appendChild(tdRows);
+
+    var tdDur = document.createElement('td');
+    tdDur.className = 'num';
+    tdDur.textContent = ns.duration_ms >= 1000
+      ? (ns.duration_ms / 1000).toFixed(1) + 's'
+      : ns.duration_ms + 'ms';
+    tr.appendChild(tdDur);
+
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  body.appendChild(table);
+  section.appendChild(body);
+  container.appendChild(section);
+}
+
+function renderProfiles() {
+  var container = document.getElementById('profile-sections');
+  if (!DATA.profiles.length) return;
+
+  DATA.profiles.forEach(function(profile) {
+    var section = document.createElement('div');
+    section.className = 'section';
+
+    var header = document.createElement('div');
+    header.className = 'section-header';
+    header.textContent = profile.name + ' (' + profile.row_count + ' rows, ' + profile.column_count + ' cols)';
+    section.appendChild(header);
+
+    var body = document.createElement('div');
+    body.className = 'section-body';
+
+    if (profile.columns.length) {
+      var metrics = ['null_percent', 'distinct_count', 'min', 'avg', 'max', 'stddev'];
+      var headers = ['null%', 'distinct', 'min', 'avg', 'max', 'stddev'];
+
+      var table = document.createElement('table');
+      table.className = 'stats-table';
+
+      // Build header
+      var thead = document.createElement('thead');
+      var hrow = document.createElement('tr');
+      var th0 = document.createElement('th');
+      th0.textContent = 'Column';
+      hrow.appendChild(th0);
+      headers.forEach(function(h) {
+        var th = document.createElement('th');
+        th.className = 'num';
+        th.textContent = h;
+        hrow.appendChild(th);
+      });
+      thead.appendChild(hrow);
+      table.appendChild(thead);
+
+      // Build body
+      var tbody = document.createElement('tbody');
+      profile.columns.forEach(function(col) {
+        var tr = document.createElement('tr');
+        var tdName = document.createElement('td');
+        var strong = document.createElement('strong');
+        strong.textContent = col.name;
+        tdName.appendChild(strong);
+        tr.appendChild(tdName);
+
+        metrics.forEach(function(m) {
+          var td = document.createElement('td');
+          td.className = 'num';
+          var val = col.metrics[m];
+          var display = '--';
+          if (val !== null && val !== undefined) {
+            var num = parseFloat(val);
+            if (!isNaN(num)) {
+              if (m === 'null_percent') display = num.toFixed(1) + '%';
+              else if (Math.abs(num) >= 1000) display = num.toFixed(0);
+              else display = num.toFixed(2);
+            } else {
+              display = String(val);
+            }
+          }
+          td.textContent = display;
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      body.appendChild(table);
+    }
+
+    section.appendChild(body);
+    container.appendChild(section);
+  });
+}
+
+function renderRules() {
+  var container = document.getElementById('rule-section');
+  if (!DATA.rules.length) return;
+
+  var section = document.createElement('div');
+  section.className = 'section';
+
+  var header = document.createElement('div');
+  header.className = 'section-header';
+  header.textContent = 'Rule Results';
+  section.appendChild(header);
+
+  var body = document.createElement('div');
+  body.className = 'section-body';
+
+  DATA.rules.forEach(function(rule, idx) {
+    var row = document.createElement('div');
+    row.className = 'rule-row';
+    row.onclick = function() { showRuleDetail(idx); };
+
+    var statusCls = rule.status === 'pass' ? 'status-pass'
+      : rule.status === 'warn' ? 'status-warn' : 'status-fail';
+
+    var badge = document.createElement('span');
+    badge.className = 'status-badge ' + statusCls;
+    badge.textContent = rule.status.toUpperCase();
+
+    var info = document.createElement('div');
+    info.className = 'rule-info';
+
+    var top = document.createElement('div');
+    top.className = 'rule-info-top';
+
+    var name = document.createElement('span');
+    name.className = 'rule-name';
+    name.textContent = rule.name;
+
+    var typeTag = document.createElement('span');
+    typeTag.className = 'rule-type-tag';
+    typeTag.textContent = rule.rule_type;
+
+    top.appendChild(name);
+    top.appendChild(typeTag);
+    info.appendChild(top);
+
+    var msg = document.createElement('div');
+    msg.className = 'rule-message';
+    msg.textContent = rule.message;
+    info.appendChild(msg);
+
+    var arrow = document.createElement('span');
+    arrow.className = 'rule-arrow';
+    arrow.textContent = '\u203a';
+
+    row.appendChild(badge);
+    row.appendChild(info);
+    row.appendChild(arrow);
+    body.appendChild(row);
+  });
+
+  section.appendChild(body);
+  container.appendChild(section);
+}
+
+function renderTrends() {
+  var container = document.getElementById('trend-section');
+  var trendKeys = Object.keys(DATA.trends);
+  if (!trendKeys.length) return;
+
+  var section = document.createElement('div');
+  section.className = 'section';
+
+  var header = document.createElement('div');
+  header.className = 'section-header';
+  header.textContent = 'Trends';
+  section.appendChild(header);
+
+  var grid = document.createElement('div');
+  grid.className = 'chart-grid';
+
+  trendKeys.forEach(function(key) {
+    var points = DATA.trends[key];
+    if (points.length < 2) return;
+
+    var chartDiv = document.createElement('div');
+    chartDiv.className = 'chart-container';
+
+    var title = document.createElement('h4');
+    title.textContent = key;
+    chartDiv.appendChild(title);
+
+    var canvas = document.createElement('canvas');
+    chartDiv.appendChild(canvas);
+    grid.appendChild(chartDiv);
+
+    new Chart(canvas, {
+      type: 'line',
+      data: {
+        labels: points.map(function(p) { return p.run_id; }),
+        datasets: [{
+          data: points.map(function(p) { return p.value; }),
+          borderColor: '#3b82f6',
+          backgroundColor: 'rgba(59,130,246,0.1)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 3
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { display: true, grid: { display: false },
+               ticks: { font: { size: 10 }, maxRotation: 45 } },
+          y: { display: true, grid: { color: '#f1f5f9' },
+               ticks: { font: { size: 10 } } }
+        }
+      }
+    });
+  });
+
+  section.appendChild(grid);
+  container.appendChild(section);
+}
+
+function showRuleDetail(idx) {
+  var rule = DATA.rules[idx];
+  var panel = document.getElementById('detail-panel');
+  var content = document.getElementById('detail-content');
+
+  // Clear previous content
+  while (content.firstChild) content.removeChild(content.firstChild);
+
+  var h3 = document.createElement('h3');
+  h3.textContent = rule.name;
+  content.appendChild(h3);
+
+  // Rule metadata
+  var metaDiv = document.createElement('div');
+  metaDiv.style.cssText = 'margin-bottom:16px;display:flex;flex-wrap:wrap;gap:8px;align-items:center';
+
+  var typeTag = document.createElement('span');
+  typeTag.className = 'rule-type-tag';
+  typeTag.textContent = rule.rule_type;
+  metaDiv.appendChild(typeTag);
+
+  var statusCls = rule.status === 'pass' ? 'status-pass'
+    : rule.status === 'warn' ? 'status-warn' : 'status-fail';
+  var statusTag = document.createElement('span');
+  statusTag.className = 'status-badge ' + statusCls;
+  statusTag.textContent = rule.status.toUpperCase();
+  metaDiv.appendChild(statusTag);
+
+  var durSpan = document.createElement('span');
+  durSpan.style.cssText = 'color:#94a3b8;font-size:12px';
+  durSpan.textContent = rule.duration_ms + 'ms';
+  metaDiv.appendChild(durSpan);
+
+  content.appendChild(metaDiv);
+
+  // Message
+  var msgP = document.createElement('p');
+  msgP.style.cssText = 'color:#475569;font-size:13px;margin-bottom:16px;padding:8px 12px;background:#f8fafc;border-radius:6px';
+  msgP.textContent = rule.message;
+  content.appendChild(msgP);
+
+  // Checks (profile_check results)
+  if (rule.checks && rule.checks.length) {
+    var h4 = document.createElement('h4');
+    h4.style.cssText = 'font-size:13px;margin-bottom:8px;color:#475569';
+    h4.textContent = 'Check Results (' + rule.checks.length + ')';
+    content.appendChild(h4);
+
+    rule.checks.forEach(function(check) {
+      var item = document.createElement('div');
+      item.className = 'check-item';
+      item.style.cssText = 'display:flex;align-items:flex-start;gap:8px';
+
+      var chkStatus = check.status || 'unknown';
+      var chkCls = chkStatus === 'pass' ? 'status-pass'
+        : chkStatus === 'warn' ? 'status-warn' : 'status-fail';
+
+      var badge = document.createElement('span');
+      badge.className = 'status-badge ' + chkCls;
+      badge.style.cssText = 'flex-shrink:0;margin-top:2px';
+      badge.textContent = chkStatus.toUpperCase();
+      item.appendChild(badge);
+
+      var detail = document.createElement('div');
+
+      var label = document.createElement('strong');
+      label.style.fontSize = '13px';
+      var colName = check.column || '_table_';
+      var metricName = check.metric || '';
+      label.textContent = colName + (metricName ? '.' + metricName : '');
+      detail.appendChild(label);
+
+      // Show value if present
+      if (check.value !== undefined && check.value !== null) {
+        var valSpan = document.createElement('span');
+        valSpan.style.cssText = 'color:#64748b;font-size:12px;margin-left:6px';
+        valSpan.textContent = '= ' + check.value;
+        detail.appendChild(valSpan);
+      }
+
+      // Show check message
+      if (check.message) {
+        var msgDiv = document.createElement('div');
+        msgDiv.style.cssText = 'color:#94a3b8;font-size:12px;margin-top:2px';
+        msgDiv.textContent = check.message;
+        detail.appendChild(msgDiv);
+      }
+
+      item.appendChild(detail);
+      content.appendChild(item);
+    });
+  }
+
+  panel.classList.add('open');
+}
+
+function closeDetail() {
+  document.getElementById('detail-panel').classList.remove('open');
+}
+
+document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeDetail(); });
+</script>
+</body>
+</html>

@@ -35,9 +35,12 @@ class Entity:
 # ── Dimension ───────────────────────────────────────────────────────────────
 
 class DimensionType(Enum):
-    """Dimension types."""
+    """Dimension types (Cube.js-compatible)."""
     TIME = "time"
     CATEGORICAL = "categorical"
+    STRING = "string"
+    NUMBER = "number"
+    BOOLEAN = "boolean"
 
 
 @dataclass(slots=True)
@@ -51,9 +54,13 @@ class Dimension:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Dimension":
+        raw_type = data.get("type", "categorical")
+        # Normalize: "string" is an alias for "categorical"
+        if raw_type == "string":
+            raw_type = "categorical"
         return cls(
             name=data["name"],
-            type=DimensionType(data.get("type", "categorical")),
+            type=DimensionType(raw_type),
             expr=data.get("expr", data["name"]),
             time_granularity=data.get("time_granularity"),
             description=data.get("description"),
@@ -80,6 +87,7 @@ class Measure:
     expr: str
     agg: AggregationType
     description: Optional[str] = None
+    filters: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Measure":
@@ -87,11 +95,45 @@ class Measure:
         # Normalize "avg" to "average"
         if agg_value == "avg":
             agg_value = "average"
+        # Parse filters: [{sql: "..."}, ...] or ["...", ...]
+        raw_filters = data.get("filters", [])
+        filters = []
+        for f in raw_filters:
+            if isinstance(f, dict):
+                filters.append(f.get("sql", ""))
+            else:
+                filters.append(str(f))
         return cls(
             name=data["name"],
             expr=data.get("expr", data["name"]),
             agg=AggregationType(agg_value),
             description=data.get("description"),
+            filters=[f for f in filters if f],
+        )
+
+
+# ── Joins ──────────────────────────────────────────────────────────────────
+
+class JoinRelationship(Enum):
+    """Join relationship types (Cube.js-compatible)."""
+    ONE_TO_ONE = "one_to_one"
+    ONE_TO_MANY = "one_to_many"
+    MANY_TO_ONE = "many_to_one"
+
+
+@dataclass(slots=True)
+class Join:
+    """A join definition between semantic models."""
+    name: str  # target model name
+    relationship: JoinRelationship
+    sql: str  # join condition, e.g. "{CUBE}.customer_id = {customers}.customer_id"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Join":
+        return cls(
+            name=data["name"],
+            relationship=JoinRelationship(data.get("relationship", "many_to_one")),
+            sql=data.get("sql", ""),
         )
 
 
@@ -102,12 +144,17 @@ class SemanticModel:
     """
     A semantic model maps a Seeknal node to business entities, dimensions,
     and measures. It provides the foundation for metric definitions.
+
+    Advanced metrics (ratio, cumulative, derived) can be defined inline
+    via the ``metrics`` field, eliminating the need for separate metric YAML files.
     """
     name: str
     model_ref: str  # Reference to a Seeknal node, e.g. "ref('transform.orders')"
     entities: list[Entity] = field(default_factory=list)
     dimensions: list[Dimension] = field(default_factory=list)
     measures: list[Measure] = field(default_factory=list)
+    joins: list[Join] = field(default_factory=list)
+    metrics: list["Metric"] = field(default_factory=list)
     description: Optional[str] = None
     default_time_dimension: Optional[str] = None
 
@@ -139,6 +186,13 @@ class SemanticModel:
                 return e
         return None
 
+    def get_join(self, target_name: str) -> Optional[Join]:
+        """Find a join definition by target model name."""
+        for j in self.joins:
+            if j.name == target_name:
+                return j
+        return None
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SemanticModel":
         return cls(
@@ -149,6 +203,8 @@ class SemanticModel:
             entities=[Entity.from_dict(e) for e in data.get("entities", [])],
             dimensions=[Dimension.from_dict(d) for d in data.get("dimensions", [])],
             measures=[Measure.from_dict(m) for m in data.get("measures", [])],
+            joins=[Join.from_dict(j) for j in data.get("joins", [])],
+            metrics=[Metric.from_dict(m) for m in data.get("metrics", [])],
         )
 
     def validate(self) -> list[str]:
@@ -189,6 +245,20 @@ class SemanticModel:
         measure_names = [m.name for m in self.measures]
         if len(measure_names) != len(set(measure_names)):
             errors.append(f"Semantic model '{self.name}' has duplicate measure names")
+
+        # Validate joins
+        for join in self.joins:
+            if not join.sql:
+                errors.append(
+                    f"Semantic model '{self.name}': join to '{join.name}' missing 'sql' condition"
+                )
+
+        # Validate inline metrics
+        metric_names = [m.name for m in self.metrics]
+        if len(metric_names) != len(set(metric_names)):
+            errors.append(f"Semantic model '{self.name}' has duplicate metric names")
+        for m in self.metrics:
+            errors.extend(m.validate())
 
         return errors
 

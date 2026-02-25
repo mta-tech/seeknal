@@ -23,7 +23,7 @@ Usage:
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from seeknal.workflow.executors.base import (
+from seeknal.workflow.executors.base import (  # ty: ignore[unresolved-import]
     # Core interfaces
     BaseExecutor,
     ExecutorResult,
@@ -42,28 +42,35 @@ from seeknal.workflow.executors.base import (
 )
 
 # Import parameter helper
-from seeknal.workflow.parameters.helpers import get_param, list_params, has_param
+from seeknal.workflow.parameters.helpers import get_param, list_params, has_param  # ty: ignore[unresolved-import]
 
 # Import executors to trigger registration via @register_executor decorator
-from seeknal.workflow.executors.source_executor import SourceExecutor
-from seeknal.workflow.executors.transform_executor import TransformExecutor
-from seeknal.workflow.executors.aggregation_executor import AggregationExecutor
-from seeknal.workflow.executors.second_order_aggregation_executor import SecondOrderAggregationExecutor
-from seeknal.workflow.executors.feature_group_executor import FeatureGroupExecutor
-from seeknal.workflow.executors.model_executor import ModelExecutor
-from seeknal.workflow.executors.rule_executor import RuleExecutor
-from seeknal.workflow.executors.exposure_executor import (
+from seeknal.workflow.executors.source_executor import SourceExecutor  # ty: ignore[unresolved-import]
+from seeknal.workflow.executors.transform_executor import TransformExecutor  # ty: ignore[unresolved-import]
+from seeknal.workflow.executors.aggregation_executor import AggregationExecutor  # ty: ignore[unresolved-import]
+from seeknal.workflow.executors.second_order_aggregation_executor import SecondOrderAggregationExecutor  # ty: ignore[unresolved-import]
+from seeknal.workflow.executors.feature_group_executor import FeatureGroupExecutor  # ty: ignore[unresolved-import]
+from seeknal.workflow.executors.model_executor import ModelExecutor  # ty: ignore[unresolved-import]
+from seeknal.workflow.executors.profile_executor import ProfileExecutor  # ty: ignore[unresolved-import]
+from seeknal.workflow.executors.rule_executor import RuleExecutor  # ty: ignore[unresolved-import]
+from seeknal.workflow.executors.exposure_executor import (  # ty: ignore[unresolved-import]
     ExposureExecutor,
     ExposureType,
     FileFormat,
 )
 
 # Import PythonExecutor for registration
-from seeknal.workflow.executors.python_executor import PythonExecutor
+from seeknal.workflow.executors.python_executor import PythonExecutor  # ty: ignore[unresolved-import]
+
+# Import semantic model executors for registration
+from seeknal.workflow.executors.semantic_model_executor import (  # ty: ignore[unresolved-import]
+    SemanticModelExecutor,
+    MetricExecutor,
+)
 
 # Type checking imports to avoid circular imports
 if TYPE_CHECKING:
-    from seeknal.dag.manifest import Node
+    from seeknal.dag.manifest import Node  # ty: ignore[unresolved-import]
 
 
 def get_executor(node: "Node", context: ExecutionContext) -> BaseExecutor:
@@ -92,8 +99,8 @@ def get_executor(node: "Node", context: ExecutionContext) -> BaseExecutor:
     # Source nodes are always handled by SourceExecutor (even from Python files)
     # because SourceExecutor has specialized loaders (iceberg, csv, parquet, etc.)
     if hasattr(node, 'file_path') and node.file_path and str(node.file_path).endswith('.py'):
-        from seeknal.dag.manifest import NodeType as NT
-        if node.node_type != NT.SOURCE:
+        from seeknal.dag.manifest import NodeType as NT  # ty: ignore[unresolved-import]
+        if node.node_type not in (NT.SOURCE, NT.SECOND_ORDER_AGGREGATION):
             return PythonExecutor(node, context)
 
     # Use registry for standard YAML executors
@@ -125,9 +132,12 @@ __all__ = [
     "SecondOrderAggregationExecutor",
     "FeatureGroupExecutor",
     "ModelExecutor",
+    "ProfileExecutor",
     "RuleExecutor",
     "ExposureExecutor",
     "PythonExecutor",
+    "SemanticModelExecutor",
+    "MetricExecutor",
     "ExposureType",
     "FileFormat",
 
@@ -138,4 +148,4 @@ __all__ = [
 ]
 
 # Version info
-__version__ = "2.1.0"
+__version__ = "2.2.0"

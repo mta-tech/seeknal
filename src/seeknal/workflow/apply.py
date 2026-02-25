@@ -21,6 +21,25 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from seeknal.cli.main import _echo_success, _echo_error, _echo_warning, _echo_info
 from seeknal.utils.path_security import warn_if_insecure_path
 
+# Common config kind → target file mapping
+COMMON_CONFIG_MAPPING = {
+    "common-source": {
+        "file": "sources.yml",
+        "list_key": "sources",
+        "fields": ["ref", "params"],
+    },
+    "common-rule": {
+        "file": "rules.yml",
+        "list_key": "rules",
+        "fields": ["value"],
+    },
+    "common-transformation": {
+        "file": "transformations.yml",
+        "list_key": "transformations",
+        "fields": ["sql"],
+    },
+}
+
 
 def validate_draft_file(file_path: str) -> Path:
     """Validate draft file exists.
@@ -508,7 +527,7 @@ def extract_decorators_from_tree(tree: ast.AST) -> dict:
                 elif isinstance(decorator, ast.Name):
                     decorator_name = decorator.id
 
-                if decorator_name in ["source", "transform", "feature_group"]:
+                if decorator_name in ["source", "transform", "feature_group", "second_order_aggregation"]:
                     docstring = ast.get_docstring(node)
                     return {
                         "kind": decorator_name,
@@ -573,6 +592,81 @@ def update_manifest(target_path: Path) -> bool:
         return True
 
 
+def apply_common_config(
+    draft_path: Path, yaml_data: dict, kind: str, name: str, force: bool, no_parse: bool
+) -> None:
+    """Merge a common config entry into seeknal/common/<file>.yml.
+
+    Instead of moving the draft file, this reads the target common config file,
+    appends the new entry, and writes it back.
+
+    Args:
+        draft_path: Path to the draft file
+        yaml_data: Parsed YAML data from draft
+        kind: The common config kind (e.g., "common-source")
+        name: Entry name/id
+        force: Overwrite existing entry without prompt
+        no_parse: Skip manifest regeneration
+    """
+    mapping = COMMON_CONFIG_MAPPING[kind]
+    target_dir = Path.cwd() / "seeknal" / "common"
+    target_file = target_dir / mapping["file"]
+    list_key = mapping["list_key"]
+    fields = mapping["fields"]
+
+    # Build the entry dict
+    entry = {"id": name}
+    for field in fields:
+        if field in yaml_data:
+            entry[field] = yaml_data[field]
+
+    # Read existing file or create empty structure
+    existing_data = {}
+    if target_file.exists():
+        try:
+            with open(target_file, "r") as f:
+                existing_data = yaml.safe_load(f) or {}
+        except yaml.YAMLError as e:
+            _echo_error(f"Invalid YAML in {target_file}: {e}")
+            raise typer.Exit(1)
+
+    entries = existing_data.get(list_key, [])
+
+    # Check for ID collision
+    existing_ids = [e.get("id") for e in entries]
+    if name in existing_ids:
+        if not force:
+            _echo_warning(f"Entry '{name}' already exists in {target_file}")
+            confirm = typer.confirm("Overwrite existing entry?")
+            if not confirm:
+                _echo_info("Cancelled.")
+                raise typer.Exit(0)
+        # Remove existing entry for replacement
+        entries = [e for e in entries if e.get("id") != name]
+
+    # Append entry
+    entries.append(entry)
+    existing_data[list_key] = entries
+
+    # Write merged YAML
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with open(target_file, "w") as f:
+        yaml.dump(existing_data, f, default_flow_style=False, sort_keys=False)
+
+    # Delete draft file
+    draft_path.unlink()
+
+    _echo_success(f"Merged '{name}' into {target_file.relative_to(Path.cwd())}")
+
+    # Update manifest
+    if not no_parse:
+        _echo_info("Updating manifest...")
+        if update_manifest(target_file):
+            _echo_success("Manifest regenerated")
+        else:
+            _echo_warning("Manifest update failed, but entry was merged")
+
+
 def apply_command(
     file_path: str = typer.Argument(..., help="Path to draft YAML file"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing file without prompt"),
@@ -616,6 +710,11 @@ def apply_command(
     except ValueError as e:
         _echo_error(str(e))
         raise typer.Exit(1)
+
+    # Route common config kinds to merge logic
+    if node_type in COMMON_CONFIG_MAPPING:
+        apply_common_config(draft_path, yaml_data, node_type, name, force, no_parse)
+        return
 
     # Get target path
     target_path = get_target_path(node_type, name)
@@ -686,8 +785,13 @@ def apply_command(
 
         # Show columns if present
         if "columns" in yaml_data:
-            for col, desc in yaml_data["columns"].items():
-                _echo_info(f"    - {col} ({desc})")
+            columns = yaml_data["columns"]
+            if isinstance(columns, dict):
+                for col, desc in columns.items():
+                    _echo_info(f"    - {col} ({desc})")
+            elif isinstance(columns, list):
+                for col in columns:
+                    _echo_info(f"    - {col}")
 
         # Show features if present
         if "features" in yaml_data:

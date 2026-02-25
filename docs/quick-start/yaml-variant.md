@@ -43,38 +43,17 @@ Before starting, ensure you have:
 
 ### Step 1: Install Seeknal
 
-Seeknal is distributed as a wheel file via GitHub releases.
-
-!!! info "Installation Guide"
-    For detailed installation instructions, see the **[Installation Guide](../install/)**.
-
-    **Quick install summary:**
-    1. Download the latest wheel from [GitHub Releases](https://github.com/mta-tech/seeknal/releases)
-    2. Install with: `uv pip install seeknal-<version>-py3-none-any.whl`
-
 ```bash
-# Create a virtual environment (recommended)
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .\.venv\Scripts\activate
-
-# Install uv (recommended package manager)
-curl -LsSf https://astral.sh/uv/install.sh | sh  # macOS/Linux
-# powershell -c "irm https://astral.sh/uv/install.ps1 | iex"  # Windows
-
-# Download Seeknal wheel from GitHub releases
-# Visit: https://github.com/mta-tech/seeknal/releases
-
-# Install Seeknal (replace <version> with actual version)
-uv pip install seeknal-<version>-py3-none-any.whl
-
-# Or use pip instead:
-# pip install seeknal-<version>-py3-none-any.whl
+pip install seeknal
 
 # Verify installation
 seeknal --version
 ```
 
 **Expected output:** `seeknal x.x.x`
+
+!!! info "More Options"
+    For detailed installation instructions, see the **[Installation Guide](../install/)**.
 
 ### Step 2: Initialize Your Project
 
@@ -98,21 +77,25 @@ Project initialized successfully!
 
 ## Part 2: Understand the YAML Pipeline Workflow (2 minutes)
 
-Seeknal's YAML workflow follows a simple 4-step process:
+Seeknal's YAML workflow follows a **draft → validate → apply → run** process:
 
 ```mermaid
 graph LR
     A[init] --> B[draft]
-    B --> C[apply]
-    C --> D[run]
+    B --> C[dry-run]
+    C --> D[apply]
+    D --> E[plan]
+    E --> F[run]
 ```
 
 | Step | Command | What It Does |
 |------|---------|--------------|
-| **1. init** | `seeknal init <name>` | Creates project structure |
-| **2. draft** | `seeknal draft <kind>` | Generates YAML template |
-| **3. apply** | `seeknal apply <file>` | Adds to your project |
-| **4. run** | `seeknal run` | Executes pipeline |
+| **1. init** | `seeknal init --name <name>` | Creates project structure |
+| **2. draft** | `seeknal draft <kind> <name>` | Generates YAML template |
+| **3. dry-run** | `seeknal dry-run <file>` | Validates YAML without executing |
+| **4. apply** | `seeknal apply <file>` | Saves node definition |
+| **5. plan** | `seeknal plan` | Generates DAG manifest |
+| **6. run** | `seeknal run` | Executes pipeline |
 
 !!! tip "Why This Workflow?"
     YAML files become part of your codebase — track them in git, review them in PRs, and deploy them with confidence.
@@ -138,112 +121,76 @@ date,product_category,quantity,revenue
 2024-01-03,Home & Garden,3,90.00
 ```
 
-### Step 2: Draft a Source
+### Step 2: Draft and Edit the Source
 
 ```bash
-seeknal draft source --name sales_data --path data/sales.csv
+seeknal draft source sales_data
 ```
 
-**Expected output:** `Created draft: pipelines/sources/sales_data.yaml`
-
-Edit `pipelines/sources/sales_data.yaml`:
+Edit `seeknal/sources/sales_data.yml`:
 
 ```yaml
 kind: source
 name: sales_data
-
-format:
-  type: csv
-  path: data/sales.csv
-
-schema:
-  - column: date
-    type: date
-  - column: product_category
-    type: string
-  - column: quantity
-    type: integer
-  - column: revenue
-    type: float
+description: "Sales transaction data"
+source: csv
+table: "data/sales.csv"
+columns:
+  date: "Transaction date"
+  product_category: "Product category"
+  quantity: "Quantity sold"
+  revenue: "Revenue in USD"
 ```
 
-### Step 3: Apply the Source
+Validate and apply:
 
 ```bash
-seeknal apply pipelines/sources/sales_data.yaml
+seeknal dry-run seeknal/sources/sales_data.yml
+seeknal apply seeknal/sources/sales_data.yml
 ```
 
-**Expected output:** `Source 'sales_data' applied successfully.`
-
-### Step 4: Draft a Transform
+### Step 3: Draft and Edit the Transform
 
 ```bash
-seeknal draft transform --name daily_revenue --input sales_data
+seeknal draft transform daily_revenue
 ```
 
-**Expected output:** `Created draft: pipelines/transforms/daily_revenue.yaml`
-
-Edit `pipelines/transforms/daily_revenue.yaml`:
+Edit `seeknal/transforms/daily_revenue.yml`:
 
 ```yaml
 kind: transform
 name: daily_revenue
+description: "Daily revenue by product category"
 
-input: sales_data
-
-sql: |
+transform: |
   SELECT
     date,
     product_category,
     SUM(quantity) as total_quantity,
     SUM(revenue) as daily_revenue
-  FROM __THIS__
+  FROM ref('source.sales_data')
   GROUP BY date, product_category
   ORDER BY date, daily_revenue DESC
+
+inputs:
+  - ref: source.sales_data
 ```
 
-!!! info "__THIS__ Placeholder"
-    The `__THIS__` placeholder automatically references your input. No complex table names or joins needed.
-
-### Step 5: Apply the Transform
+Validate and apply:
 
 ```bash
-seeknal apply pipelines/transforms/daily_revenue.yaml
+seeknal dry-run seeknal/transforms/daily_revenue.yml
+seeknal apply seeknal/transforms/daily_revenue.yml
 ```
 
-### Step 6: Draft an Output
-
-```bash
-seeknal draft output --name results --input daily_revenue
-```
-
-**Expected output:** `Created draft: pipelines/outputs/results.yaml`
-
-Edit `pipelines/outputs/results.yaml`:
-
-```yaml
-kind: output
-name: results
-
-input: daily_revenue
-
-target:
-  type: file
-  format: parquet
-  path: output/daily_revenue.parquet
-```
-
-### Step 7: Apply the Output
-
-```bash
-seeknal apply pipelines/outputs/results.yaml
-```
+!!! info "Named References with `ref()`"
+    The `ref('source.sales_data')` function references your input source by name. This creates an explicit dependency in the DAG, enabling Seeknal to determine execution order automatically. The `inputs:` section declares these dependencies.
 
 !!! success "Checkpoint"
-    You now have three YAML files defining your entire pipeline:
-    - `pipelines/sources/sales_data.yaml`
-    - `pipelines/transforms/daily_revenue.yaml`
-    - `pipelines/outputs/results.yaml`
+    You now have two YAML files defining your pipeline:
+
+    - `seeknal/sources/sales_data.yml`
+    - `seeknal/transforms/daily_revenue.yml`
 
     These files can be version-controlled, code-reviewed, and deployed like any other code.
 
@@ -251,26 +198,39 @@ seeknal apply pipelines/outputs/results.yaml
 
 ## Part 4: Run and Verify (2 minutes)
 
-### Step 1: Execute Your Pipeline
+### Step 1: Generate Manifest and Execute
 
 ```bash
+# Generate the DAG manifest
+seeknal plan
+
+# Run the full pipeline
 seeknal run
 ```
 
 **Expected output:**
 ```
-Running pipeline...
-  → Loading source: sales_data
-  → Transforming: daily_revenue
-  → Writing output: results
-✓ Pipeline completed successfully!
+Seeknal Pipeline Execution
+============================================================
+1/2: sales_data [RUNNING]
+  SUCCESS in 0.02s
+
+2/2: daily_revenue [RUNNING]
+  SUCCESS in 0.03s
+
+✓ State saved
 ```
 
 ### Step 2: View Your Results
 
+Use the interactive REPL to query results:
+
 ```bash
-# Inspect the Parquet file
-python -c "import pandas as pd; print(pd.read_parquet('output/daily_revenue.parquet'))"
+seeknal repl
+```
+
+```sql
+SELECT * FROM daily_revenue;
 ```
 
 **Expected output:**

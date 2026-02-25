@@ -1,5 +1,5 @@
 """
-Tests for Phase 2 ML Engineering tutorial files.
+Tests for ML Engineering tutorial files.
 
 Validates that the fraud detection pipeline YAML files:
 - Parse correctly
@@ -19,10 +19,10 @@ from seeknal.dag.diff import ManifestDiff, ChangeCategory
 
 
 # Path to tutorial example files
-EXAMPLES_DIR = Path(__file__).parent.parent.parent / "examples" / "phase2-ml-eng"
+EXAMPLES_DIR = Path(__file__).parent.parent.parent / "examples" / "ml-eng"
 
 
-class TestPhase2MLEngTutorial:
+class TestMLEngTutorial:
     """Test suite for Phase 2 ML Engineering tutorial."""
 
     def test_all_yaml_files_exist(self):
@@ -126,7 +126,7 @@ class TestPhase2MLEngTutorial:
                     ref = input_ref["ref"]
                     edges.append(Edge(from_node=ref, to_node=node_id))
 
-        manifest = Manifest(project="phase2-ml-eng")
+        manifest = Manifest(project="ml-eng")
         manifest.nodes = nodes
         manifest.edges = edges
 
@@ -207,7 +207,7 @@ class TestPhase2MLEngTutorial:
                     ref = input_ref["ref"]
                     edges.append(Edge(from_node=ref, to_node=node_id))
 
-        manifest = Manifest(project="phase2-ml-eng")
+        manifest = Manifest(project="ml-eng")
         manifest.nodes = nodes
         manifest.edges = edges
 
@@ -407,7 +407,7 @@ class TestPhase2MLEngTutorial:
                     ref = input_ref["ref"]
                     edges.append(Edge(from_node=ref, to_node=node_id))
 
-        manifest = Manifest(project="phase2-ml-eng")
+        manifest = Manifest(project="ml-eng")
         manifest.nodes = nodes
         manifest.edges = edges
 

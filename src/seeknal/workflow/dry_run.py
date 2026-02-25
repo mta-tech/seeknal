@@ -70,7 +70,7 @@ def validate_python_syntax(file_path: Path) -> dict:
 
     if not transform_info:
         raise ValueError(
-            "No pipeline decorator found. Expected @source, @transform, or @feature_group decorator"
+            "No pipeline decorator found. Expected @source, @transform, @feature_group, or @second_order_aggregation decorator"
         )
 
     return {
@@ -173,7 +173,7 @@ def extract_decorators(tree: ast.AST) -> dict:
                     decorator_name = decorator.id
 
                 # Check if it's a pipeline decorator
-                if decorator_name in ["source", "transform", "feature_group"]:
+                if decorator_name in ["source", "transform", "feature_group", "second_order_aggregation"]:
                     docstring = ast.get_docstring(node)
                     return {
                         "kind": decorator_name,

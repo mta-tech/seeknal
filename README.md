@@ -22,10 +22,11 @@ seeknal dry-run
 seeknal apply
 ```
 
-Explore your data interactively:
+Explore your data interactively or search docs from the terminal:
 
 ```bash
-seeknal repl
+seeknal repl          # Interactive SQL on pipeline outputs
+seeknal docs query    # Search documentation from the CLI
 ```
 
 ```sql
@@ -39,17 +40,18 @@ GROUP BY customer_id;
 **Dual Pipeline Authoring** — Write pipelines in YAML, Python decorators, or both:
 
 ```python
-from seeknal.pipeline.decorators import source, transform, materialize
+from seeknal.pipeline import source, transform
 
-@source(name="orders", type="csv", path="data/orders.csv")
+@source(name="orders", source="csv", table="data/orders.csv")
 def orders():
     pass
 
-@transform(name="order_metrics", depends_on=["source.orders"])
+@transform(name="order_metrics", inputs=["source.orders"])
 def order_metrics(ctx):
-    return ctx.ref("source.orders").sql(
-        "SELECT customer_id, SUM(amount) as total FROM orders GROUP BY customer_id"
-    )
+    df = ctx.ref("source.orders")
+    return ctx.duckdb.sql(
+        "SELECT customer_id, SUM(amount) as total FROM df GROUP BY customer_id"
+    ).df()
 ```
 
 **Multi-Target Materialization** — Write to PostgreSQL and Iceberg from a single node:
@@ -101,8 +103,9 @@ training_df = hist.to_dataframe(feature_start_time=datetime(2024, 1, 1))
 | **[Getting Started](docs/index.md)** | Installation, configuration, first pipeline |
 | **[CLI Reference](docs/reference/cli.md)** | All commands and flags |
 | **[YAML Schema](docs/reference/yaml-schema.md)** | Pipeline YAML reference |
+| **[CLI Docs Search](docs/cli/docs.md)** | Search documentation from the terminal (`seeknal docs`) |
 | **Tutorials** | [YAML Pipelines](docs/tutorials/yaml-pipeline-tutorial.md) · [Python Pipelines](docs/tutorials/python-pipelines-tutorial.md) · [Mixed](docs/tutorials/mixed-yaml-python-pipelines.md) |
-| **Guides** | [Testing & Audits](docs/guides/testing-and-audits.md) · [Iceberg Materialization](docs/iceberg-materialization.md) · [Training to Serving](docs/guides/training-to-serving.md) |
+| **Guides** | [Python Pipelines](docs/guides/python-pipelines.md) · [Testing & Audits](docs/guides/testing-and-audits.md) · [Iceberg Materialization](docs/iceberg-materialization.md) · [Training to Serving](docs/guides/training-to-serving.md) |
 | **Concepts** | [Point-in-Time Joins](docs/concepts/point-in-time-joins.md) · [Virtual Environments](docs/concepts/virtual-environments.md) · [Glossary](docs/concepts/glossary.md) |
 
 ## Install from Source
@@ -118,7 +121,7 @@ uv pip install -e ".[all]"
 
 ## Contributing
 
-Contributions are welcome! Please read our contributing guidelines before submitting pull requests.
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, code style, testing, and PR guidelines.
 
 ## License
 

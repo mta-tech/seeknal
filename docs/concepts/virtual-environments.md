@@ -175,8 +175,8 @@ seeknal env list
 # Delete an environment
 seeknal env delete <env_name>
 
-# Clean up expired environments (TTL-based)
-seeknal env cleanup
+# Delete an expired or unused environment
+seeknal env delete old-experiment
 ```
 
 ## Environment Configuration
@@ -193,7 +193,7 @@ Each environment has metadata in `env_config.json`:
 }
 ```
 
-**TTL (Time-To-Live)**: Environments auto-expire after 7 days of inactivity by default. Use `seeknal env cleanup` to remove expired environments.
+**TTL (Time-To-Live)**: Environments auto-expire after 7 days of inactivity by default. Use `seeknal env delete <name>` to remove expired environments.
 
 ## Production References
 
@@ -407,8 +407,49 @@ seeknal plan dev
 seeknal run --env dev
 ```
 
+## Per-Environment Profiles
+
+Each environment can use its own `profiles.yml` for isolated database connections:
+
+```bash
+# Create environment with custom profile
+seeknal env plan staging --profile profiles-staging.yml
+```
+
+Seeknal auto-discovers per-env profiles following a priority chain:
+1. Explicit `--profile` flag (highest priority)
+2. `profiles-{env}.yml` in the project root
+3. `~/.seeknal/profiles-{env}.yml`
+4. Default `profiles.yml`
+
+The profile path is persisted in `plan.json`, so `env apply` automatically uses the same profile.
+
+## Namespace Prefixing (Convention-Based Isolation)
+
+When materializing in a virtual environment, Seeknal prefixes the schema or namespace
+with the environment name to prevent production data conflicts:
+
+- **PostgreSQL**: `schema.table` → `{env}_schema.table`
+- **Iceberg**: `catalog.namespace.table` → `catalog.{env}_namespace.table`
+
+This provides environment isolation without requiring separate databases or profiles.
+The prefix is applied automatically — no configuration needed.
+
+## TTL and Cleanup
+
+Environments have a default time-to-live (TTL) of 7 days since last access.
+Expired environments are **not** removed automatically in the background. Use `seeknal env list` to check environment status and `seeknal env delete` to remove stale environments manually.
+
+```bash
+# Check environment status and TTL
+seeknal env list
+
+# Delete an expired or unused environment
+seeknal env delete old-experiment
+```
+
 ## See Also
 
 - **Concepts**: [Change Categorization](change-categorization.md), [Plan](glossary.md#plan), [Promote](glossary.md#promote)
-- **Tutorials**: [YAML Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md), [Virtual Environments Tutorial](../tutorials/phase2-data-eng-environments.md)
+- **Tutorials**: [YAML Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md), [Environment Management Tutorial](../tutorials/environment-management.md)
 - **Reference**: [CLI Environment Commands](../reference/cli.md#virtual-environments), [Configuration Reference](../reference/configuration.md)

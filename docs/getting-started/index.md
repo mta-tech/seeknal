@@ -67,6 +67,22 @@ Before starting any path, complete the [10-Minute Quick Start](../quick-start/) 
 
 ---
 
+## Advanced Guide
+
+After completing a learning path, level up with the **[Advanced Guide](advanced/)** covering:
+
+- **File Sources** — Load CSV, Parquet, and JSONL data
+- **Data Rules** — Validate data quality with automated checks
+- **Lineage & Inspection** — Visualize data flow and debug outputs
+- **Named ref() References** — Self-documenting, reorder-safe SQL references
+- **Common Configuration** — Shared column mappings, rules, and SQL snippets
+
+**Time commitment**: 6 chapters (~110 minutes)
+
+[Start Advanced Guide →](advanced/)
+
+---
+
 ## Path Completion
 
 Each path ends with a completion page summarizing what you've learned and suggesting next steps. You can complete multiple paths to become a Seeknal expert.

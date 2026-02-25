@@ -16,10 +16,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from seeknal.cli.main import _echo_success, _echo_error, _echo_info, _echo_warning
-from seeknal.dag.manifest import Manifest, Node, NodeType
-from seeknal.dag.diff import ManifestDiff
-from seeknal.workflow.state import (
+from seeknal.cli.main import _echo_success, _echo_error, _echo_info, _echo_warning  # ty: ignore[unresolved-import]
+from seeknal.dag.manifest import Manifest, Node, NodeType  # ty: ignore[unresolved-import]
+from seeknal.dag.diff import ManifestDiff  # ty: ignore[unresolved-import]
+from seeknal.workflow.state import (  # ty: ignore[unresolved-import]
     RunState, NodeStatus, NodeFingerprint,
     load_state, save_state, update_node_state,
     compute_node_fingerprint, compute_dag_fingerprints,
@@ -29,7 +29,7 @@ from seeknal.workflow.state import (
 # TYPE_CHECKING import to avoid circular deps at runtime
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from seeknal.workflow.executors.base import ExecutionContext
+    from seeknal.workflow.executors.base import ExecutionContext  # ty: ignore[unresolved-import]
 
 
 class ExecutionStatus(Enum):
@@ -153,7 +153,7 @@ class DAGRunner:
         # Kahn's algorithm
         in_degree: Dict[str, int] = {node_id: 0 for node_id in self.manifest.nodes}
         for edge in self.manifest.edges:
-            if edge.to_node in in_degree:
+            if edge.to_node in in_degree and edge.from_node in in_degree:
                 in_degree[edge.to_node] += 1
 
         # Start with nodes that have no dependencies
@@ -191,9 +191,9 @@ class DAGRunner:
         in_degree: Dict[str, int] = {node_id: 0 for node_id in self.manifest.nodes}
         downstream_adj: Dict[str, Set[str]] = {node_id: set() for node_id in self.manifest.nodes}
         for edge in self.manifest.edges:
-            if edge.to_node in in_degree:
+            if edge.to_node in in_degree and edge.from_node in in_degree:
                 in_degree[edge.to_node] += 1
-            if edge.from_node in downstream_adj:
+            if edge.from_node in downstream_adj and edge.to_node in downstream_adj:
                 downstream_adj[edge.from_node].add(edge.to_node)
 
         layers: List[List[str]] = []
@@ -260,6 +260,12 @@ class DAGRunner:
         else:
             # Fingerprint-based change detection
             to_run, skip_reasons = self._fingerprint_based_detection()
+
+        # Always include RULE nodes — data quality checks should run every time
+        for node_id, node in self.manifest.nodes.items():
+            if node.node_type == NodeType.RULE and node_id not in to_run:
+                to_run.add(node_id)
+                skip_reasons[node_id] = "always run (data quality)"
 
         # Apply type filter
         if node_types:
@@ -435,7 +441,7 @@ class DAGRunner:
         """
         # New executor path: use get_executor when ExecutionContext is available
         if self.exec_context is not None:
-            from seeknal.workflow.executors import get_executor
+            from seeknal.workflow.executors import get_executor  # ty: ignore[unresolved-import]
 
             executor = get_executor(node, self.exec_context)
             result = executor.run()
@@ -448,7 +454,7 @@ class DAGRunner:
             }
 
         # Legacy path: use execute_* functions from executor.py
-        from seeknal.workflow.executor import (
+        from seeknal.workflow.executor import (  # ty: ignore[unresolved-import]
             execute_source,
             execute_transform,
             execute_feature_group,
@@ -609,9 +615,111 @@ class DAGRunner:
         # Save state if not dry run
         if not dry_run:
             save_state(self.run_state, self.state_path)
+            self._append_dq_history(summary)
 
         summary.total_duration = time.time() - start_time
         return summary
+
+
+    def _append_dq_history(self, summary: ExecutionSummary) -> None:
+        """Append DQ results to history parquet after run (best-effort)."""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        try:
+            from datetime import datetime
+            import duckdb  # ty: ignore[unresolved-import]
+
+            rows = []
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().isoformat()
+
+            for result in summary.results:
+                node_id = result.node_id
+                meta = result.metadata or {}
+
+                if node_id.startswith("rule."):
+                    passed = meta.get("passed", result.status == ExecutionStatus.SUCCESS)
+                    status_val = "pass" if passed else "fail"
+                    if meta.get("warned", 0) > 0:
+                        status_val = "warn"
+                    rows.append({
+                        "run_id": run_id, "timestamp": timestamp,
+                        "node_id": node_id, "node_type": "rule",
+                        "column_name": "_table_", "metric": "passed",
+                        "value": 1.0 if passed else 0.0,
+                        "status": status_val, "detail": None,
+                    })
+                elif node_id.startswith("profile."):
+                    profile_name = node_id.split(".", 1)[1]
+                    profile_path = (
+                        self.target_path / "intermediate"
+                        / f"profile_{profile_name}.parquet"
+                    )
+                    if profile_path.exists():
+                        con = duckdb.connect()
+                        try:
+                            df_rows = con.execute(
+                                f"SELECT column_name, metric, value "
+                                f"FROM \'{profile_path}\' "
+                                f"WHERE metric IN "
+                                f"(\'row_count\', \'null_percent\', \'avg\')"
+                            ).fetchall()
+                        finally:
+                            con.close()
+
+                        for col_name, metric, value in df_rows:
+                            try:
+                                val = float(value) if value else None
+                            except (ValueError, TypeError):
+                                val = None
+                            if val is not None:
+                                rows.append({
+                                    "run_id": run_id, "timestamp": timestamp,
+                                    "node_id": node_id, "node_type": "profile",
+                                    "column_name": col_name, "metric": metric,
+                                    "value": val, "status": None, "detail": None,
+                                })
+
+            if not rows:
+                return
+
+            history_path = self.target_path / "dq_history.parquet"
+            con = duckdb.connect()
+            try:
+                # Create table from rows list
+                con.execute("""
+                    CREATE TABLE new_rows (
+                        run_id VARCHAR, timestamp VARCHAR,
+                        node_id VARCHAR, node_type VARCHAR,
+                        column_name VARCHAR, metric VARCHAR,
+                        value DOUBLE, status VARCHAR, detail VARCHAR
+                    )
+                """)
+                for row in rows:
+                    con.execute(
+                        "INSERT INTO new_rows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [row["run_id"], row["timestamp"], row["node_id"],
+                         row["node_type"], row["column_name"], row["metric"],
+                         row["value"], row["status"], row["detail"]],
+                    )
+
+                if history_path.exists():
+                    con.execute(f"""
+                        COPY (
+                            SELECT * FROM \'{history_path}\'
+                            UNION ALL
+                            SELECT * FROM new_rows
+                        ) TO \'{history_path}\' (FORMAT PARQUET)
+                    """)
+                else:
+                    con.execute(
+                        f"COPY new_rows TO \'{history_path}\' (FORMAT PARQUET)"
+                    )
+            finally:
+                con.close()
+        except Exception as exc:
+            logger.warning("Failed to append DQ history: %s", exc)
 
     def print_plan(
         self,
@@ -702,6 +810,60 @@ def print_summary(summary: ExecutionSummary) -> None:
         print(f"  Skipped:         {summary.skipped_nodes}")
 
     print(f"  Duration:        {summary.total_duration:.2f}s")
+
+    # Collect rule/data quality results
+    # Two sources: (1) successful rules with metadata, (2) failed rule nodes (severity=error)
+    rule_results_with_meta = []
+    failed_rule_nodes = []
+    for result in summary.results:
+        is_rule_node = result.node_id.startswith("rule.")
+        meta = result.metadata
+        if meta and ("rule_type" in meta or "checks" in meta):
+            rule_results_with_meta.append(result)
+        elif is_rule_node and result.status == ExecutionStatus.FAILED:
+            failed_rule_nodes.append(result)
+
+    total_rules = len(rule_results_with_meta) + len(failed_rule_nodes)
+
+    if total_rules > 0:
+        warnings_count = 0
+        errors_count = len(failed_rule_nodes)
+        passed_count = 0
+        for r in rule_results_with_meta:
+            m = r.metadata
+            is_passed = m.get("passed", True)
+            has_warns = m.get("warned", 0) > 0
+            sev = m.get("severity", "error")
+            if has_warns and is_passed:
+                # profile_check: checks passed but some had warnings
+                warnings_count += 1
+            elif is_passed:
+                passed_count += 1
+            elif sev == "warn":
+                warnings_count += 1
+            else:
+                errors_count += 1
+
+        print("")
+        print(f"  Data Quality:    {total_rules} rule(s)")
+        if passed_count > 0:
+            passed_msg = typer.style(f"{passed_count} passed", fg=typer.colors.GREEN)
+            print(f"                   {passed_msg}")
+        if warnings_count > 0:
+            warn_msg = typer.style(
+                f"{warnings_count} warning(s)",
+                fg=typer.colors.YELLOW,
+                bold=True,
+            )
+            print(f"                   {warn_msg}")
+        if errors_count > 0:
+            err_msg = typer.style(
+                f"{errors_count} error(s)",
+                fg=typer.colors.RED,
+                bold=True,
+            )
+            print(f"                   {err_msg}")
+
     _echo_info("=" * 60)
 
     # Show failed nodes
@@ -712,6 +874,30 @@ def print_summary(summary: ExecutionSummary) -> None:
             if result.status == ExecutionStatus.FAILED:
                 _echo_error(f"  - {result.node_id}: {result.error_message}")
 
+    # Show rule warnings detail
+    if rule_results_with_meta:
+        warn_rules = []
+        for r in rule_results_with_meta:
+            m = r.metadata
+            has_warns = m.get("warned", 0) > 0
+            is_failed_warn = not m.get("passed", True) and m.get("severity") == "warn"
+            if has_warns or is_failed_warn:
+                warn_rules.append(r)
+        if warn_rules:
+            _echo_warning("")
+            _echo_warning("Data quality warnings:")
+            for r in warn_rules:
+                m = r.metadata
+                if "results" in m:
+                    warn_checks = [
+                        c for c in m["results"]
+                        if c.get("status") == "warn" or not c.get("passed", True)
+                    ]
+                    for c in warn_checks:
+                        _echo_warning(f"  - {r.node_id}: {c['message']}")
+                else:
+                    _echo_warning(f"  - {r.node_id}: {m.get('message', '')}")
+
 
 # Import typer for styling
-import typer
+import typer  # ty: ignore[unresolved-import]

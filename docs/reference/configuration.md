@@ -508,8 +508,8 @@ Use these commands to validate your configuration:
 
 ```bash
 # Check project configuration
-seeknal init --name test --path /tmp/test
-cat /tmp/test/seeknal_project.yml
+seeknal init --name test --path ./test-project
+cat ./test-project/seeknal_project.yml
 
 # Validate Iceberg materialization
 seeknal iceberg validate-materialization

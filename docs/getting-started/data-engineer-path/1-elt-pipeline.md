@@ -1,8 +1,8 @@
 # Chapter 1: Build ELT Pipeline
 
-> **Duration:** 25 minutes | **Difficulty:** Intermediate | **Format:** YAML & Python
+> **Duration:** 25 minutes | **Difficulty:** Intermediate | **Format:** YAML
 
-Learn to build production-grade ELT pipelines with Seeknal, transforming raw data sources into clean warehouse tables.
+Learn to build a production-grade ELT pipeline with Seeknal, transforming raw CSV data into clean, validated tables.
 
 ---
 
@@ -11,16 +11,14 @@ Learn to build production-grade ELT pipelines with Seeknal, transforming raw dat
 A complete e-commerce order processing pipeline:
 
 ```
-REST API → Orders (Raw) → Transform → Orders (Clean) → Warehouse
-            ↓                    ↓
-          JSON                  Parquet
+CSV Files → Sources (Raw) → Transform → Orders (Clean) → Parquet
 ```
 
 **After this chapter, you'll have:**
-- HTTP source that fetches data from REST APIs
+- CSV sources that load raw data files
 - DuckDB transformation with data quality checks
-- Warehouse output with proper schema enforcement
-- Error handling and retry logic
+- Clean output with deduplication and validation
+- A pipeline you can run end-to-end on your laptop
 
 ---
 
@@ -34,166 +32,127 @@ Before starting, ensure you've completed:
 
 ---
 
-## Part 1: Ingest Data from REST API (8 minutes)
+## Part 1: Set Up Project and Load Data (8 minutes)
 
-### Understanding HTTP Sources
-
-Seeknal's HTTP sources fetch data from REST APIs automatically:
-
-| Feature | Benefit |
-|---------|---------|
-| **Scheduled Fetching** | Poll on intervals (every 5 min, hourly, etc.) |
-| **Authentication** | Bearer tokens, API keys, OAuth support |
-| **Error Handling** | Retry with exponential backoff |
-| **Pagination** | Handle large datasets automatically |
-
-=== "YAML Approach"
-
-    Create a new project:
-
-    ```bash
-    seeknal init ecommerce-pipeline
-    cd ecommerce-pipeline
-    ```
-
-    Draft an HTTP source:
-
-    ```bash
-    seeknal draft source --name orders_api --type http
-    ```
-
-    Edit `pipelines/sources/orders_api.yaml`:
-
-    ```yaml
-    kind: source
-    name: orders_api
-
-    http:
-      # API endpoint
-      url: https://api.example.com/orders
-
-      # Authentication (bearer token)
-      headers:
-        Authorization: "Bearer ${API_TOKEN}"
-
-      # Query parameters
-      params:
-        status: "completed"
-        limit: "1000"
-
-      # Polling configuration
-      poll:
-        interval: "5m"  # Check every 5 minutes
-        strategy: "incremental"  # Only fetch new data
-
-    # Response format
-    format:
-      type: json
-      array: true  # Response is a JSON array
-
-    # Schema definition
-    schema:
-      - column: order_id
-        type: string
-        primary_key: true
-      - column: customer_id
-        type: string
-      - column: order_date
-        type: timestamp
-      - column: status
-        type: string
-      - column: revenue
-        type: float
-      - column: items
-        type: integer
-    ```
-
-!!! tip "Environment Variables"
-    Use `${VARIABLE}` syntax for secrets:
-    ```bash
-    export API_TOKEN="your-token-here"
-    seeknal apply pipelines/sources/orders_api.yaml
-    ```
-
-=== "Python Approach"
-
-    Create `pipeline.py`:
-
-    ```python
-    #!/usr/bin/env python3
-    """
-    ELT Pipeline - Chapter 1
-    Fetches orders from API, transforms, and outputs to warehouse
-    """
-
-    import os
-    import pandas as pd
-    import requests
-    import pyarrow as pa
-    from pathlib import Path
-    from seeknal.tasks.duckdb import DuckDBTask
-
-    # Fetch data from REST API
-    def fetch_orders():
-        """Fetch orders from the API."""
-        url = "https://api.example.com/orders"
-        headers = {
-            "Authorization": f"Bearer {os.getenv('API_TOKEN')}"
-        }
-        params = {
-            "status": "completed",
-            "limit": "1000"
-        }
-
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
-
-        data = response.json()
-        return pd.DataFrame(data)
-
-    # Load and prepare data
-    print("Fetching orders from API...")
-    orders_df = fetch_orders()
-    print(f"Fetched {len(orders_df)} orders")
-    ```
-
-### Apply the Source
+### Initialize the Project
 
 ```bash
-# YAML approach
-seeknal apply pipelines/sources/orders_api.yaml
+seeknal init --name ecommerce-pipeline --description "E-commerce ELT pipeline"
+```
 
-# Verify the source
-seeknal status
+### Create Sample Data
+
+Create a CSV file with sample order data:
+
+```bash
+mkdir data
+cat > data/orders.csv << 'EOF'
+order_id,customer_id,order_date,status,revenue,items
+ORD-001,CUST-100,2026-01-15 10:30:00,completed,149.99,3
+ORD-002,CUST-101,2026-01-15 11:45:00,completed,89.50,2
+ORD-003,,2026-01-16 09:00:00,completed,250.00,5
+ORD-004,CUST-100,2026-01-16 14:20:00,pending,0.00,1
+ORD-005,CUST-102,2026-01-17 08:15:00,completed,-10.00,2
+ORD-006,CUST-103,2026-01-17 16:30:00,  Completed  ,75.25,1
+ORD-007,CUST-101,2026-01-18 12:00:00,completed,320.00,-1
+ORD-008,CUST-104,2026-01-18 15:45:00,completed,45.99,2
+ORD-001,CUST-100,2026-01-19 10:30:00,completed,149.99,3
+ORD-009,CUST-105,2026-01-19 09:00:00,completed,199.95,4
+EOF
+```
+
+!!! info "Data Quality Issues (On Purpose)"
+    This sample data includes common real-world problems that your pipeline will handle:
+
+    - **Row 3**: Missing `customer_id`
+    - **Row 5**: Negative `revenue`
+    - **Row 6**: Inconsistent status formatting (`  Completed  `)
+    - **Row 7**: Negative `items`
+    - **Row 9**: Duplicate `ORD-001`
+
+### Understanding CSV Sources
+
+Seeknal's source nodes load data from files or databases into your pipeline DAG:
+
+| Source Type | Use Case |
+|-------------|----------|
+| `csv` | CSV files |
+| `parquet` | Parquet files |
+| `json` / `jsonl` | JSON files |
+| `postgresql` | PostgreSQL databases |
+| `iceberg` | Apache Iceberg tables |
+
+### Draft and Edit the Source
+
+```bash
+seeknal draft source raw_orders
+```
+
+Edit `draft_source_raw_orders.yml`:
+
+```yaml
+kind: source
+name: raw_orders
+description: "Raw e-commerce order data"
+source: csv
+table: "data/orders.csv"
+columns:
+  order_id: "Order identifier"
+  customer_id: "Customer identifier"
+  order_date: "Order timestamp"
+  status: "Order status"
+  revenue: "Order revenue in USD"
+  items: "Number of items"
+```
+
+Validate and apply the source:
+
+```bash
+seeknal dry-run draft_source_raw_orders.yml
+seeknal apply draft_source_raw_orders.yml
 ```
 
 **Expected output:**
 ```
-Applying source 'orders_api'...
-  ✓ Validated HTTP configuration
-  ✓ Tested API endpoint (200 OK)
-  ✓ Registered source 'orders_api'
-Source applied successfully!
+ℹ Validating YAML...
+✓ YAML syntax valid
+✓ Schema validation passed
+✓ Dependency check passed
+ℹ Executing preview (limit 10 rows)...
++------------+---------------+---------------------+-----------+-----------+---------+
+| order_id   | customer_id   | order_date          | status    |   revenue |   items |
+|------------+---------------+---------------------+-----------+-----------+---------|
+| ORD-001    | CUST-100      | 2026-01-15 10:30:00 | completed |    149.99 |       3 |
+| ORD-002    | CUST-101      | 2026-01-15 11:45:00 | completed |     89.5  |       2 |
+| ORD-003    |               | 2026-01-16 09:00:00 | completed |    250    |       5 |
+| ORD-004    | CUST-100      | 2026-01-16 14:20:00 | pending   |      0    |       1 |
+| ORD-005    | CUST-102      | 2026-01-17 08:15:00 | completed |    -10    |       2 |
+| ORD-006    | CUST-103      | 2026-01-17 16:30:00 | Completed |     75.25 |       1 |
+| ORD-007    | CUST-101      | 2026-01-18 12:00:00 | completed |    320    |      -1 |
+| ORD-008    | CUST-104      | 2026-01-18 15:45:00 | completed |     45.99 |       2 |
+| ORD-001    | CUST-100      | 2026-01-19 10:30:00 | completed |    149.99 |       3 |
+| ORD-009    | CUST-105      | 2026-01-19 09:00:00 | completed |    199.95 |       4 |
++------------+---------------+---------------------+-----------+-----------+---------+
+✓ Preview completed in 0.0s
+ℹ Run 'seeknal apply draft_source_raw_orders.yml' to apply
+ℹ Validating...
+✓ All checks passed
+ℹ Moving file...
+ℹ   FROM: draft_source_raw_orders.yml
+ℹ   TO:   ./seeknal/sources/raw_orders.yml
+ℹ Updating manifest...
+✓ Manifest regenerated
+ℹ 
+ℹ Added:
+ℹ   + source.raw_orders
+ℹ     - order_id (Order identifier)
+ℹ     - customer_id (Customer identifier)
+ℹ     - order_date (Order timestamp)
+ℹ     - status (Order status)
+ℹ     - revenue (Order revenue in USD)
+ℹ     - items (Number of items)
+✓ Applied successfully
 ```
-
-!!! stuck "Stuck? API Authentication"
-    **Problem:** `401 Unauthorized` error
-
-    **Solution:** Check your API token:
-    ```bash
-    # Verify token is set
-    echo $API_TOKEN
-
-    # Test manually
-    curl -H "Authorization: Bearer $API_TOKEN" https://api.example.com/orders
-    ```
-
-    **Problem:** `Connection timeout`
-
-    **Solution:** Check network connectivity:
-    ```bash
-    ping api.example.com
-    ```
 
 ---
 
@@ -208,147 +167,117 @@ DuckDB is an in-process SQL OLAP database — perfect for data transformations:
 - **Zero Setup**: No database server required
 - **Scalable**: Handles millions of rows on a laptop
 
-=== "YAML Approach"
+### Draft and Edit the Transform
 
-    Draft a transform:
+```bash
+seeknal draft transform orders_cleaned
+```
 
-    ```bash
-    seeknal draft transform --name orders_cleaned --input orders_api
-    ```
+Edit `draft_transform_orders_cleaned.yml`:
 
-    Edit `pipelines/transforms/orders_cleaned.yaml`:
+```yaml
+kind: transform
+name: orders_cleaned
+description: "Clean and validate order data"
 
-    ```yaml
-    kind: transform
-    name: orders_cleaned
+transform: |
+  SELECT
+    -- Primary key
+    order_id,
 
-    input: orders_api
+    -- Foreign key with validation
+    CASE
+      WHEN customer_id IS NOT NULL
+      AND LENGTH(customer_id) > 0
+      THEN customer_id
+      ELSE 'UNKNOWN'
+    END as customer_id,
 
-    engine: duckdb
+    -- Date processing
+    DATE(order_date) as order_date,
+    CAST(order_date AS TIME) as order_time,
 
-    sql: |
-      SELECT
-        -- Primary key
-        order_id,
+    -- Status normalization
+    UPPER(TRIM(status)) as status,
 
-        -- Foreign key with validation
-        CASE
-          WHEN customer_id IS NOT NULL
-          AND LENGTH(customer_id) > 0
-          THEN customer_id
-          ELSE 'UNKNOWN'
-        END as customer_id,
+    -- Revenue validation
+    CASE
+      WHEN revenue >= 0 THEN revenue
+      ELSE NULL  -- Flag negative values
+    END as revenue,
 
-        -- Date processing
-        DATE(order_date) as order_date,
-        CAST(order_date AS TIME) as order_time,
+    -- Items validation
+    CASE
+      WHEN items >= 0 THEN items
+      ELSE 0
+    END as items,
 
-        -- Status normalization
-        UPPER(TRIM(status)) as status,
+    -- Data quality flag
+    CASE
+      WHEN revenue < 0 THEN 1
+      WHEN customer_id IS NULL OR LENGTH(customer_id) = 0 THEN 1
+      WHEN items < 0 THEN 1
+      ELSE 0
+    END as quality_flag,
 
-        -- Revenue validation
-        CASE
-          WHEN revenue >= 0 THEN revenue
-          ELSE NULL  -- Flag negative values
-        END as revenue,
+    -- Audit column
+    CURRENT_TIMESTAMP as processed_at
 
-        -- Items validation
-        CASE
-          WHEN items >= 0 THEN items
-          ELSE 0
-        END as items,
+  FROM ref('source.raw_orders')
 
-        -- Data quality checks
-        CASE
-          WHEN revenue < 0 THEN 1
-          WHEN customer_id IS NULL THEN 1
-          WHEN items < 0 THEN 1
-          ELSE 0
-        END as quality_flag,
+  -- Remove duplicates (keep latest)
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY order_id
+    ORDER BY order_date DESC
+  ) = 1
 
-        -- Audit columns
-        CURRENT_TIMESTAMP as processed_at
-
-      FROM __THIS__
-
-      -- Remove duplicates (keep latest)
-      QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY order_id
-        ORDER BY processed_at DESC
-      ) = 1
-    ```
-
-=== "Python Approach"
-
-    Add transformation to `pipeline.py`:
-
-    ```python
-    # Create transformation task
-    print("Creating DuckDB transformation...")
-
-    task = DuckDBTask()
-
-    # Add input data (convert pandas to Arrow)
-    arrow_table = pa.Table.from_pandas(orders_df)
-    task.add_input(dataframe=arrow_table)
-
-    # Define transformation SQL
-    sql = """
-    SELECT
-      order_id,
-      COALESCE(customer_id, 'UNKNOWN') as customer_id,
-      DATE(order_date) as order_date,
-      CAST(order_date AS TIME) as order_time,
-      UPPER(TRIM(status)) as status,
-      CASE
-        WHEN revenue >= 0 THEN revenue
-        ELSE NULL
-      END as revenue,
-      CASE
-        WHEN items >= 0 THEN items
-        ELSE 0
-      END as items,
-      CASE
-        WHEN revenue < 0 THEN 1
-        WHEN customer_id IS NULL THEN 1
-        ELSE 0
-      END as quality_flag,
-      CURRENT_TIMESTAMP as processed_at
-    FROM __THIS__
-    QUALIFY ROW_NUMBER() OVER (
-      PARTITION BY order_id
-      ORDER BY processed_at DESC
-    ) = 1
-    """
-
-    task.add_sql(sql)
-
-    # Execute transformation
-    print("Executing transformation...")
-    result_arrow = task.transform()
-    cleaned_df = result_arrow.to_pandas()
-
-    print(f"Cleaned {len(cleaned_df)} orders")
-    print(f"Quality issues: {cleaned_df['quality_flag'].sum()}")
-    ```
+inputs:
+  - ref: source.raw_orders
+```
 
 ### Apply the Transform
 
 ```bash
-# YAML approach
-seeknal apply pipelines/transforms/orders_cleaned.yaml
-
-# Test the transformation
-seeknal run --dry-run
+seeknal dry-run draft_transform_orders_cleaned.yml
+seeknal apply draft_transform_orders_cleaned.yml
 ```
 
 **Expected output:**
 ```
-Applying transform 'orders_cleaned'...
-  ✓ Validated SQL syntax
-  ✓ Checked input schema
-  ✓ Registered transform 'orders_cleaned'
-Transform applied successfully!
+seeknal apply draft_transform_orders_cleaned.yml
+ℹ Validating YAML...
+✓ YAML syntax valid
+✓ Schema validation passed
+✓ Dependency check passed
+ℹ Executing preview (limit 10 rows)...
+ℹ Loaded input_0 <- source.raw_orders (from orders.csv)
++------------+---------------+--------------+--------------+-----------+-----------+---------+----------------+----------------------------------+
+| order_id   | customer_id   | order_date   | order_time   | status    |   revenue |   items |   quality_flag | processed_at                     |
+|------------+---------------+--------------+--------------+-----------+-----------+---------+----------------+----------------------------------|
+| ORD-009    | CUST-105      | 2026-01-19   | 09:00:00     | COMPLETED |    199.95 |       4 |              0 | 2026-02-23 14:49:14.347492+07:00 |
+| ORD-005    | CUST-102      | 2026-01-17   | 08:15:00     | COMPLETED |           |       2 |              1 | 2026-02-23 14:49:14.347492+07:00 |
+| ORD-007    | CUST-101      | 2026-01-18   | 12:00:00     | COMPLETED |    320    |       0 |              1 | 2026-02-23 14:49:14.347492+07:00 |
+| ORD-001    | CUST-100      | 2026-01-19   | 10:30:00     | COMPLETED |    149.99 |       3 |              0 | 2026-02-23 14:49:14.347492+07:00 |
+| ORD-002    | CUST-101      | 2026-01-15   | 11:45:00     | COMPLETED |     89.5  |       2 |              0 | 2026-02-23 14:49:14.347492+07:00 |
+| ORD-003    | UNKNOWN       | 2026-01-16   | 09:00:00     | COMPLETED |    250    |       5 |              1 | 2026-02-23 14:49:14.347492+07:00 |
+| ORD-006    | CUST-103      | 2026-01-17   | 16:30:00     | COMPLETED |     75.25 |       1 |              0 | 2026-02-23 14:49:14.347492+07:00 |
+| ORD-008    | CUST-104      | 2026-01-18   | 15:45:00     | COMPLETED |     45.99 |       2 |              0 | 2026-02-23 14:49:14.347492+07:00 |
+| ORD-004    | CUST-100      | 2026-01-16   | 14:20:00     | PENDING   |      0    |       1 |              0 | 2026-02-23 14:49:14.347492+07:00 |
++------------+---------------+--------------+--------------+-----------+-----------+---------+----------------+----------------------------------+
+✓ Preview completed in 0.2s
+ℹ Run 'seeknal apply draft_transform_orders_cleaned.yml' to apply
+ℹ Validating...
+✓ All checks passed
+ℹ Moving file...
+ℹ   FROM: draft_transform_orders_cleaned.yml
+ℹ   TO:   ./seeknal/transforms/orders_cleaned.yml
+ℹ Updating manifest...
+✓ Manifest regenerated
+ℹ 
+ℹ Added:
+ℹ   + transform.orders_cleaned
+ℹ     - depends_on: source.raw_orders
+✓ Applied successfully
 ```
 
 !!! info "What's QUALIFY?"
@@ -356,195 +285,127 @@ Transform applied successfully!
 
 ---
 
-## Part 3: Output to Data Warehouse (7 minutes)
+## Part 3: Run the Pipeline (5 minutes)
 
-### Understanding Warehouse Outputs
-
-Seeknal can output to multiple warehouse types:
-
-| Type | Use Case | Connection |
-|------|----------|------------|
-| **File-based** | Local/dev | Local filesystem |
-| **PostgreSQL** | Production | JDBC/ODBC |
-| **Snowflake** | Cloud warehouse | Connection string |
-| **BigQuery** | Analytics | Google Cloud |
-
-=== "YAML Approach"
-
-    Draft an output:
-
-    ```bash
-    seeknal draft output --name warehouse_orders --input orders_cleaned
-    ```
-
-    Edit `pipelines/outputs/warehouse_orders.yaml`:
-
-    ```yaml
-    kind: output
-    name: warehouse_orders
-
-    input: orders_cleaned
-
-    target:
-      type: warehouse
-
-      # Database connection
-      connection:
-        type: postgresql
-        host: ${WAREHOUSE_HOST}
-        port: 5432
-        database: analytics
-        user: ${WAREHOUSE_USER}
-        password: ${WAREHOUSE_PASSWORD}
-
-      # Table configuration
-      table: orders
-
-      # Materialization strategy
-      materialization:
-        strategy: incremental  # Append new records
-        key: order_id         # Upsert on this key
-
-      # Partitioning (for large tables)
-      partition:
-        type: range
-        column: order_date
-        granularity: day  # One partition per day
-
-      # Performance optimizations
-      indexes:
-        - column: customer_id
-          type: btree
-        - column: order_date
-          type: btree
-        - column: status
-          type: btree
-    ```
-
-    For local development, use file-based output:
-
-    ```yaml
-    kind: output
-    name: warehouse_orders
-
-    input: orders_cleaned
-
-    target:
-      type: file
-      format: parquet
-      path: output/orders.parquet
-
-      # Partition output
-      partition:
-        column: order_date
-        granularity: day
-    ```
-
-=== "Python Approach"
-
-    Add output to `pipeline.py`:
-
-    ```python
-    # Save to warehouse
-    print("Saving to warehouse...")
-
-    # For local development (Parquet)
-    output_dir = Path("output")
-    output_dir.mkdir(exist_ok=True)
-    output_path = output_dir / "orders.parquet"
-
-    cleaned_df.to_parquet(output_path, index=False)
-    print(f"Saved to: {output_path}")
-
-    # For production database
-    # import sqlalchemy
-    # engine = sqlalchemy.create_engine(
-    #     f"postgresql://{user}:{password}@{host}:5432/analytics"
-    # )
-    # cleaned_df.to_sql(
-    #     "orders",
-    #     engine,
-    #     if_exists="append",
-    #     index=False
-    # )
-    ```
-
-### Apply the Output
+### Generate Manifest and Execute
 
 ```bash
-# YAML approach
-seeknal apply pipelines/outputs/warehouse_orders.yaml
+# Generate the DAG manifest
+seeknal plan
 
-# Set environment variables
-export WAREHOUSE_HOST="localhost"
-export WAREHOUSE_USER="analytics"
-export WAREHOUSE_PASSWORD="secret"
-
-# Verify output configuration
-seeknal status
-```
-
----
-
-## Part 4: Run and Verify (5 minutes)
-
-### Execute the Full Pipeline
-
-```bash
-# YAML approach
+# Run the full pipeline
 seeknal run
-
-# Python approach
-python pipeline.py
 ```
 
 **Expected output:**
 ```
-Running pipeline...
-  → Fetching from HTTP: orders_api
-    Fetched 1,000 orders from API
-  → Transforming: orders_cleaned
-    Cleaned 998 orders (2 quality issues)
-  → Writing output: warehouse_orders
-    Wrote 998 orders to warehouse
-✓ Pipeline completed successfully!
+> seeknal plan
+ℹ Building DAG from seeknal/ directory...
+✓ DAG built: 2 nodes, 1 edges
+
+Node Summary:
+  - source: 1
+  - transform: 1
+ℹ No previous manifest found (first run)
+✓ Manifest saved to ./target/manifest.json
+
+Execution Plan:
+------------------------------------------------------------
+   1. RUN raw_orders
+   2. RUN orders_cleaned
+
+ℹ Total: 2 nodes, 2 to run
+> seeknal run
+
+Seeknal Pipeline Execution
+============================================================
+  Project: ecommerce-pipeline
+  Mode: Incremental
+ℹ Building DAG from seeknal/ directory...
+✓ DAG built: 2 nodes, 1 edges
+ℹ No previous state found (first run)
+ℹ Detecting changes...
+ℹ Nodes to run: 2
+
+Execution
+============================================================
+1/2: raw_orders [RUNNING]
+  SUCCESS in 0.04s
+  Rows: 10
+2/2: orders_cleaned [RUNNING]
+ℹ Loaded Python node output as input_0
+ℹ Resolved SQL for orders_cleaned
+ℹ   Executing statement 1/1
+ℹ Created view 'transform.orders_cleaned' for materialization
+ℹ Wrote transform output to ./target/intermediate/transform_orders_cleaned.parquet
+  SUCCESS in 0.11s
+  Rows: 9
+✓ State saved
+
+Execution Summary
+============================================================
+  Total nodes:    2
+  Executed:       2
+  Duration:       0.14s
+============================================================
 ```
 
 ### Verify Output
 
+Use the REPL to inspect the results:
+
 ```bash
-# Check the output
-python -c "import pandas as pd; df = pd.read_parquet('output/orders.parquet'); print(df.describe())"
+seeknal repl
+```
+
+```sql
+-- Check cleaned orders
+SELECT * FROM orders_cleaned;
+
+-- Count quality issues
+SELECT quality_flag, COUNT(*) as cnt
+FROM orders_cleaned
+GROUP BY quality_flag;
+
+-- Verify deduplication (ORD-001 should appear only once)
+SELECT order_id, COUNT(*) as cnt
+FROM orders_cleaned
+GROUP BY order_id
+HAVING cnt > 1;
 ```
 
 **Checkpoint:** You should see:
-- Order counts by status
-- Revenue statistics
-- Quality flag counts
+- 9 unique orders (duplicate ORD-001 removed)
+- 3 rows with `quality_flag = 1` (missing customer, negative revenue, negative items)
+- All statuses normalized to uppercase
 
-!!! success "Congratulations! :tada:"
-    You've built a complete ELT pipeline with API ingestion, DuckDB transformation, and warehouse output.
+!!! success "Congratulations!"
+    You've built a complete ELT pipeline with CSV ingestion, DuckDB transformation, and data quality validation.
 
 ---
 
 ## What Could Go Wrong?
 
 !!! danger "Common Pitfalls"
-    **1. API Rate Limiting**
-    - Symptom: `429 Too Many Requests`
-    - Fix: Increase `poll.interval` or implement backoff
+    **1. File Not Found**
 
-    **2. Large JSON Responses**
-    - Symptom: Memory errors or timeouts
-    - Fix: Use pagination in HTTP source configuration
+    - Symptom: `FileNotFoundError: data/orders.csv`
+    - Fix: Ensure the CSV file exists relative to your project root
 
-    **3. Schema Drift**
+    **2. Schema Drift**
+
     - Symptom: `Column not found` errors
     - Fix: Use `COALESCE` for new optional columns
 
-    **4. Duplicate Records**
-    - Symptom: More output rows than input
+    **3. Duplicate Records**
+
+    - Symptom: More output rows than expected
     - Fix: Add `QUALIFY ROW_NUMBER()` to deduplicate
+
+    **4. Type Mismatches**
+
+    - Symptom: `Conversion Error` in DuckDB
+    - Fix: Use explicit `CAST()` for type conversions
 
 ---
 
@@ -552,18 +413,22 @@ python -c "import pandas as pd; df = pd.read_parquet('output/orders.parquet'); p
 
 In this chapter, you learned:
 
-- [x] **HTTP Sources** — Fetch data from REST APIs with authentication
+- [x] **CSV Sources** — Load data files into your pipeline
 - [x] **DuckDB Transforms** — Clean and validate data with SQL
-- [x] **Warehouse Outputs** — Materialize to databases or data lakes
-- [x] **Error Handling** — Retry logic and data quality checks
-- [x] **Production Patterns** — Incremental loading and partitioning
+- [x] **Data Quality Flags** — Identify and handle bad records
+- [x] **Deduplication** — Remove duplicate rows with `QUALIFY`
+- [x] **REPL Verification** — Inspect results interactively
 
 **Key Commands:**
 ```bash
-seeknal draft source --name <name> --type http
-seeknal draft transform --name <name> --engine duckdb
-seeknal draft output --name <name> --target warehouse
-seeknal run  # Execute the full pipeline
+seeknal init --name <name>         # Create project
+seeknal draft source <name>        # Generate source template
+seeknal draft transform <name>     # Generate transform template
+seeknal dry-run <file>             # Validate YAML
+seeknal apply <file>               # Save node definition
+seeknal plan                       # Generate DAG manifest
+seeknal run                        # Execute pipeline
+seeknal repl                       # Interactive SQL queries
 ```
 
 ---
@@ -580,4 +445,4 @@ Make your pipeline more efficient with incremental processing, change data captu
 
 - **[Virtual Environments](../../concepts/virtual-environments.md)** — Isolate development and production
 - **[Change Categorization](../../concepts/change-categorization.md)** — Understanding breaking vs non-breaking changes
-- **[Python vs YAML Workflows](../../concepts/python-vs-yaml.md)** — Choose the right paradigm
+- **[YAML Schema Reference](../../reference/yaml-schema.md)** — All supported source types and fields

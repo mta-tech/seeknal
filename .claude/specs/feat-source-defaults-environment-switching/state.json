@@ -1,0 +1,64 @@
+{
+  "specPath": "specs/2026-02-20-feat-source-defaults-environment-switching.md",
+  "specChecksum": "initial",
+  "build": {
+    "mode": "team",
+    "teamName": "feat-source-defaults-environment-switching",
+    "totalTasks": 11,
+    "startedAt": "2026-02-20T12:10:00.000Z",
+    "lastUpdated": "2026-02-20T12:30:00.000Z",
+    "completedAt": "2026-02-20T12:30:00.000Z"
+  },
+  "tasks": [
+    {"id": "3", "subject": "A-1: Add load_source_defaults() to ProfileLoader", "status": "completed", "teammateName": "builder"},
+    {"id": "4", "subject": "A-2: Plumb profile_path into DAGBuilder", "status": "completed", "teammateName": "builder"},
+    {"id": "5", "subject": "A-3: Integrate merge into YAML source parsing", "status": "completed", "teammateName": "builder"},
+    {"id": "6", "subject": "A-4: Integrate merge into Python source parsing", "status": "completed", "teammateName": "builder"},
+    {"id": "7", "subject": "A-5: Pass profile_path through ExecutionContext", "status": "completed", "teammateName": "builder"},
+    {"id": "8", "subject": "A-6: Write unit + integration tests", "status": "completed", "teammateName": "builder"},
+    {"id": "9", "subject": "B-1: Setup QA test project scaffold", "status": "completed", "teammateName": "builder-qa"},
+    {"id": "10", "subject": "B-2: Create Bronze sources (all 3 types, minimal config)", "status": "completed", "teammateName": "builder-qa"},
+    {"id": "11", "subject": "B-3: Create Silver transforms and exposure", "status": "completed", "teammateName": "builder-qa"},
+    {"id": "12", "subject": "B-4: Run full E2E pipeline and validate", "status": "completed", "teammateName": "builder-qa"},
+    {"id": "13", "subject": "B-5: Create README and validate inline override", "status": "completed", "teammateName": "builder-qa"}
+  ],
+  "ralph": {
+    "active": false,
+    "maxIterations": 5,
+    "currentIteration": 1,
+    "selfHeal": false,
+    "completionPromise": null,
+    "status": "completed",
+    "taskRetryCounters": {},
+    "history": [{"iteration": 1, "status": "completed", "tasksCompleted": 11, "tasksFailed": 0}]
+  },
+  "validation": {
+    "commandsRun": [
+      "pytest tests/workflow/test_profile_loader.py -v → 38 passed",
+      "pytest tests/workflow/test_dag_source_defaults.py -v → 10 passed"
+    ],
+    "acceptanceCriteria": [
+      {"criterion": "load_source_defaults returns defaults with env vars interpolated", "met": true},
+      {"criterion": "Missing section/type returns {} (no errors)", "met": true},
+      {"criterion": "postgres alias resolves to postgresql", "met": true},
+      {"criterion": "DAGBuilder accepts profile_path", "met": true},
+      {"criterion": "ProfileLoader lazily instantiated", "met": true},
+      {"criterion": "_merge_source_defaults guards against params: null", "met": true},
+      {"criterion": "YAML sources without params get defaults", "met": true},
+      {"criterion": "Python @source without catalog_uri gets defaults", "met": true},
+      {"criterion": "PostgreSQL connection uses same profile as source_defaults", "met": true},
+      {"criterion": "18+ new tests", "met": true},
+      {"criterion": "All existing tests pass (no regressions)", "met": true},
+      {"criterion": "E2E pipeline with 8 nodes executes", "met": true}
+    ]
+  },
+  "artifacts": [
+    {"path": "src/seeknal/workflow/materialization/profile_loader.py", "action": "modified"},
+    {"path": "src/seeknal/workflow/dag.py", "action": "modified"},
+    {"path": "src/seeknal/workflow/executors/source_executor.py", "action": "modified"},
+    {"path": "src/seeknal/workflow/executors/base.py", "action": "modified"},
+    {"path": "src/seeknal/cli/main.py", "action": "modified"},
+    {"path": "tests/workflow/test_profile_loader.py", "action": "modified"},
+    {"path": "tests/workflow/test_dag_source_defaults.py", "action": "created"}
+  ]
+}

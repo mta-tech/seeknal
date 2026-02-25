@@ -14,7 +14,7 @@ multiple sources using DuckDB as a unified query engine.
 ## Synopsis
 
 ```bash
-seeknal repl
+seeknal repl [--profile PATH]
 ```
 
 ## Description
@@ -28,6 +28,23 @@ The `repl` command launches an interactive SQL shell that allows you to:
 
 This is useful for data exploration, debugging, and prototyping queries
 before adding them to your pipeline.
+
+When launched from a Seeknal project directory (containing `seeknal_project.yml`),
+the REPL automatically registers your pipeline data at startup:
+
+1. **Parquet files** from `target/cache/` are registered as queryable views
+2. **PostgreSQL connections** from `profiles.yml` are attached read-only
+3. **Iceberg catalogs** from `profiles.yml` are attached via REST API
+
+Each phase runs independently — a PostgreSQL timeout won't prevent parquet
+files from being available. A startup banner shows registration counts and
+last pipeline run date.
+
+## Options
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--profile` | PATH | None | Path to profiles.yml for auto-registration |
 
 ## Examples
 
@@ -48,13 +65,37 @@ seeknal> .tables
 seeknal> .quit
 ```
 
+## Project-Aware Mode
+
+When run inside a project directory, the REPL prints a startup banner and
+auto-registers available data sources:
+
+```
+Seeknal REPL v2.1.0  |  project: my_project
+  parquet views : 5
+  pg connections: 2
+  iceberg tables: 8
+  last run      : 2026-02-20 14:32:01
+
+seeknal>
+```
+
+Use `--profile` to point at a specific profiles file if it is not in the
+project root or the default location (`~/.seeknal/profiles.yml`):
+
+```bash
+seeknal repl --profile ./profiles-dev.yml
+```
+
 ## REPL Commands
 
 | Command | Description |
 |---------|-------------|
 | `.connect <source>` | Connect to a database or file |
 | `.tables` | List available tables |
-| `.schema <table>` | Show table schema |
+| `.sources` | List registered pipeline sources |
+| `.schema <table>` | Show table column details |
+| `.duckdb` | Switch back to DuckDB query mode |
 | `.quit` | Exit the REPL |
 | `.help` | Show available commands |
 
@@ -78,6 +119,7 @@ seeknal source remove mydb
 - PostgreSQL
 - MySQL
 - SQLite
+- StarRocks
 - Parquet files
 - CSV files
 - JSON files

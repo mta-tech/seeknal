@@ -10,19 +10,21 @@
 
 ### QS-001: Installation Method ✅ RESOLVED
 
-**Problem**: Documentation showed `pip install seeknal` but Seeknal is not on PyPI.
+**Problem**: Documentation showed `.whl` download method but Seeknal is now published on PyPI (v2.1.0).
 
-**Solution**: Updated all Quick Start documentation to reference the correct installation method:
-1. Download wheel file from GitHub Releases
-2. Install with `uv pip install seeknal-<version>-py3-none-any.whl`
+**Solution**: Updated all documentation to use `pip install seeknal` as the primary installation method:
+1. Primary: `pip install seeknal` (from PyPI)
+2. Alternative: Download `.whl` from GitHub Releases (for specific versions)
 
 **Files Modified**:
 - `docs/quick-start/index.md`
 - `docs/quick-start/yaml-variant.md`
 - `docs/quick-start/python-variant.md`
-- `docs/index.md`
+- `docs/install/index.md`
+- `docs/install/troubleshooting.md`
+- `docs/reference/troubleshooting.md`
 
-**Impact**: Users can now successfully install Seeknal using the documented method.
+**Impact**: Users can now install Seeknal directly from PyPI with a single command.
 
 ---
 

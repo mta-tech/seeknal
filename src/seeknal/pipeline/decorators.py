@@ -395,9 +395,9 @@ def feature_group(
 
 def second_order_aggregation(
     name: str,
-    source: str,
     id_col: str,
     feature_date_col: str,
+    features: dict,
     application_date_col: Optional[str] = None,
     description: Optional[str] = None,
     owner: Optional[str] = None,
@@ -405,19 +405,17 @@ def second_order_aggregation(
     materialization: Optional[Union[dict, Any]] = None,
     **params,
 ):
-    """Decorator to define a second-order aggregation node.
+    """Decorator to define a second-order aggregation node using the built-in SOA engine.
 
-    Second-order aggregations perform aggregations on already-aggregated data,
-    enabling multi-level feature engineering (e.g., user -> store -> region).
-
-    The decorated function receives a PipelineContext (ctx) and a pre-aggregated
-    DataFrame (df), and must return the second-aggregated DataFrame.
+    The decorated function loads data via ctx.ref() (supporting multiple sources),
+    optionally joins/filters, and returns a DataFrame. The built-in SOA engine
+    (SecondOrderAggregator) then applies the declared aggregations automatically.
 
     Args:
-        name: Second-order aggregation name (e.g., "region_user_metrics")
-        source: Upstream aggregation reference (e.g., "aggregation.user_daily_features")
-        id_col: Entity ID column for grouping (e.g., "region_id")
+        name: Second-order aggregation name (e.g., "region_metrics")
+        id_col: Entity ID column for grouping (e.g., "region")
         feature_date_col: Date column for time-based operations
+        features: Aggregation specifications dict, same structure as YAML features block
         application_date_col: Optional reference date column for window calculations
         description: Optional human-readable description
         owner: Optional team/person responsible
@@ -428,15 +426,16 @@ def second_order_aggregation(
     Example:
         @second_order_aggregation(
             name="region_metrics",
-            source="aggregation.user_metrics",
-            id_col="region_id",
-            feature_date_col="date"
+            id_col="region",
+            feature_date_col="order_date",
+            application_date_col="application_date",
+            features={
+                "daily_amount": {"basic": ["sum", "mean", "max", "stddev"]},
+                "daily_count": {"basic": ["sum", "mean"]},
+            },
         )
-        def region_metrics(ctx, df: pd.DataFrame) -> pd.DataFrame:
-            return df.groupby("region_id").agg({
-                "total_spend_30d": ["mean", "std"],
-                "transaction_count": "sum"
-            })
+        def region_metrics(ctx):
+            return ctx.ref("transform.customer_daily_agg")
     """
     # Validate materialization config
     _validate_materialization_config(materialization)
@@ -445,14 +444,11 @@ def second_order_aggregation(
         node_id = f"second_order_aggregation.{name}"
 
         @wraps(func)
-        def wrapper(ctx, df=None):
-            result = func(ctx, df)
+        def wrapper(ctx):
+            result = func(ctx)
             if result is not None and ctx is not None:
                 ctx._store_output(node_id, result)
             return result
-
-        # Build inputs list from source
-        inputs = [{"ref": source}] if source else []
 
         # Normalize materialization to dict
         mat_dict = None
@@ -471,8 +467,7 @@ def second_order_aggregation(
             "id_col": id_col,
             "feature_date_col": feature_date_col,
             "application_date_col": application_date_col,
-            "source": source,
-            "inputs": inputs,
+            "features": features,
             "tags": tags or [],
             "materialization": mat_dict,
             "params": params,

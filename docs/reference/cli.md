@@ -9,13 +9,13 @@ Complete reference for all Seeknal CLI commands. Commands are organized by categ
 - [Project Management](#project-management)
   - [init](#seeknal-init) - Initialize a new project
   - [info](#seeknal-info) - Show version information
+  - [docs](#seeknal-docs) - Search CLI documentation
 - [Pipeline Execution](#pipeline-execution)
   - [run](#seeknal-run) - Execute pipelines
   - [plan](#seeknal-plan) - Analyze changes and show execution plan
   - [parse](#seeknal-parse) - Parse project and generate manifest
   - [promote](#seeknal-promote) - Promote environment changes
 - [Feature Store Operations](#feature-store-operations)
-  - [materialize](#seeknal-materialize) - Materialize features to stores
   - [list](#seeknal-list) - List resources
   - [show](#seeknal-show) - Show resource details
   - [delete](#seeknal-delete) - Delete resources
@@ -26,6 +26,8 @@ Complete reference for all Seeknal CLI commands. Commands are organized by categ
   - [debug](#seeknal-debug) - Show sample data for debugging
   - [audit](#seeknal-audit) - Run data quality audits
   - [clean](#seeknal-clean) - Clean old feature data
+- [Change Management](#change-management)
+  - [diff](#seeknal-diff) - Show pipeline changes since last apply
 - [Development Workflow](#development-workflow)
   - [draft](#seeknal-draft) - Generate templates
   - [dry-run](#seeknal-dry-run) - Validate and preview execution
@@ -48,6 +50,13 @@ Complete reference for all Seeknal CLI commands. Commands are organized by categ
   - [source add](#seeknal-source-add) - Add data source
   - [source list](#seeknal-source-list) - List data sources
   - [source remove](#seeknal-source-remove) - Remove data source
+- [Interval Management](#interval-management)
+  - [intervals list](#seeknal-intervals-list) - List completed intervals
+  - [intervals pending](#seeknal-intervals-pending) - Show pending intervals
+  - [intervals backfill](#seeknal-intervals-backfill) - Execute backfill for missing intervals
+  - [intervals restatement-add](#seeknal-intervals-restatement-add) - Mark interval for restatement
+  - [intervals restatement-list](#seeknal-intervals-restatement-list) - List restatement intervals
+  - [intervals restatement-clear](#seeknal-intervals-restatement-clear) - Clear restatement intervals
 - [Iceberg Materialization](#iceberg-materialization)
   - [iceberg validate-materialization](#seeknal-iceberg-validate-materialization) - Validate configuration
   - [iceberg snapshot-list](#seeknal-iceberg-snapshot-list) - List table snapshots
@@ -68,7 +77,7 @@ Complete reference for all Seeknal CLI commands. Commands are organized by categ
 |---------|-------------|
 | `seeknal init` | Initialize a new project |
 | `seeknal run` | Execute pipelines |
-| `seeknal materialize` | Materialize features to stores |
+| `seeknal docs` | Search CLI documentation |
 | `seeknal list` | List resources |
 | `seeknal show` | Show resource details |
 | `seeknal validate` | Validate configurations |
@@ -93,6 +102,8 @@ Complete reference for all Seeknal CLI commands. Commands are organized by categ
 | `seeknal version` | Manage feature group versions |
 | `seeknal source` | Manage data sources for REPL |
 | `seeknal iceberg` | Iceberg materialization commands |
+| `seeknal diff` | Show pipeline changes since last apply |
+| `seeknal intervals` | Manage execution intervals and backfill |
 | `seeknal env` | Virtual environment management |
 | `seeknal atlas` | Atlas Data Platform integration |
 
@@ -181,31 +192,57 @@ seeknal info
 
 ---
 
-# Pipeline Execution
+## seeknal docs
 
-## seeknal run
-
-Execute a feature transformation flow or YAML pipeline.
-
-**Legacy Mode (with flow_name):** Run a legacy Flow object by name.
-
-**YAML Pipeline Mode (without flow_name):** Execute the DAG defined by YAML files in the seeknal/ directory. Supports incremental runs with change detection, parallel execution, and configurable error handling.
+Search and browse CLI documentation from the terminal.
 
 **Usage:**
 ```bash
-seeknal run [FLOW_NAME] [OPTIONS]
+seeknal docs [QUERY] [OPTIONS]
 ```
-
-**Arguments:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `flow_name` | TEXT | No | Name of legacy flow to run. If omitted, executes YAML pipeline |
 
 **Options:**
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--start-date`, `-s` | TEXT | None | Start date for the flow (YYYY-MM-DD) |
-| `--end-date`, `-e` | TEXT | None | End date for the flow (YYYY-MM-DD) |
+| `QUERY` | TEXT | None | Search query or exact topic name |
+| `--list`, `-l` | FLAG | False | List all available topics |
+| `--json` | FLAG | False | Output as JSON |
+| `--max-results`, `-n` | INTEGER | 10 | Maximum search results |
+
+**Examples:**
+```bash
+# List all doc topics
+seeknal docs --list
+
+# Search for a topic
+seeknal docs repl
+
+# Full-text search
+seeknal docs "materialization"
+```
+
+**See Also:** [CLI Documentation](../cli/docs.md)
+
+---
+
+# Pipeline Execution
+
+## seeknal run
+
+Execute the DAG defined by YAML and Python files in the seeknal/ directory. Supports incremental runs with change detection, parallel execution, and configurable error handling.
+
+**Usage:**
+```bash
+seeknal run [OPTIONS]
+```
+
+**Options:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--start` | TEXT | None | Start date for the pipeline (YYYY-MM-DD) |
+| `--end` | TEXT | None | End date for the pipeline (YYYY-MM-DD) |
+| `--date` | TEXT | None | Set date context (overrides run_date, date, today params) |
+| `--run-id` | TEXT | None | Custom run identifier |
 | `--dry-run` | FLAG | False | Show what would be executed without running |
 | `--full`, `-f` | FLAG | False | Run all nodes regardless of state (ignore incremental run cache) |
 | `--nodes`, `-n` | TEXT (multiple) | None | Run specific nodes only (e.g., --nodes transform.clean_data) |
@@ -217,6 +254,9 @@ seeknal run [FLOW_NAME] [OPTIONS]
 | `--parallel` | FLAG | False | Execute independent nodes in parallel (layer-based concurrency) |
 | `--max-workers` | INTEGER | 4 | Maximum parallel workers (max recommended: CPU count) |
 | `--materialize/--no-materialize` | FLAG | None | Enable/disable Iceberg materialization (overrides node config) |
+| `--backfill` | FLAG | False | Fill missing intervals |
+| `--restate` | FLAG | False | Reprocess marked intervals |
+| `--profile` | PATH | None | Path to profiles.yml |
 | `--env` | TEXT | None | Run in isolated virtual environment (requires a plan) |
 
 **Examples:**
@@ -254,14 +294,20 @@ seeknal run --parallel
 # Run in parallel with custom worker count
 seeknal run --parallel --max-workers 8
 
+# Run with date range
+seeknal run --start 2024-01-01 --end 2024-01-31
+
+# Run with date context
+seeknal run --date 2024-06-15
+
+# Run with custom run ID and profile
+seeknal run --run-id daily-2024-01-15 --profile profiles.yml
+
 # Run in an isolated environment
 seeknal run --env dev
 
 # Run in environment with parallel execution
 seeknal run --env dev --parallel
-
-# Legacy: Run named flow
-seeknal run my_flow --start-date 2024-01-01
 ```
 
 **See Also:** [Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md)
@@ -384,54 +430,6 @@ seeknal promote staging prod
 ---
 
 # Feature Store Operations
-
-## seeknal materialize
-
-Materialize features to offline/online stores.
-
-Writes feature data to configured storage locations for the specified date range. Supports version-specific materialization for rollbacks or A/B testing scenarios.
-
-**Usage:**
-```bash
-seeknal materialize FEATURE_GROUP [OPTIONS]
-```
-
-**Arguments:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `feature_group` | TEXT | Yes | Name of the feature group to materialize |
-
-**Options:**
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--start-date`, `-s` | TEXT | Required | Start date for feature data (YYYY-MM-DD format) |
-| `--end-date`, `-e` | TEXT | None | End date for feature data (YYYY-MM-DD format) |
-| `--version`, `-v` | INTEGER | Latest | Specific version number to materialize |
-| `--mode`, `-m` | [overwrite\|append\|merge] | "overwrite" | Write mode |
-| `--offline-only` | FLAG | False | Only materialize to offline store (skip online store) |
-| `--online-only` | FLAG | False | Only materialize to online store (skip offline store) |
-
-**Examples:**
-```bash
-# Materialize latest version
-seeknal materialize user_features --start-date 2024-01-01
-
-# Materialize a specific version (rollback scenario)
-seeknal materialize user_features --start-date 2024-01-01 --version 1
-
-# Materialize with date range
-seeknal materialize user_features -s 2024-01-01 -e 2024-01-31
-
-# Offline store only
-seeknal materialize user_features --start-date 2024-01-01 --offline-only
-
-# Append mode
-seeknal materialize user_features --start-date 2024-01-01 --mode append
-```
-
-**See Also:** [Version Management](#version-management)
-
----
 
 ## seeknal list
 
@@ -733,6 +731,50 @@ seeknal clean user_features --before 2024-01-01 --dry-run
 
 ---
 
+# Change Management
+
+## seeknal diff
+
+Show changes in pipeline files since last apply.
+
+Like `git diff` for your Seeknal pipelines. Shows unified YAML diffs with semantic annotations (BREAKING/NON_BREAKING/METADATA).
+
+**Usage:**
+```bash
+seeknal diff [NODE] [OPTIONS]
+```
+
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `node` | TEXT | No | Node to diff (e.g., `sources/orders`) |
+
+**Options:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--type`, `-t` | TEXT | None | Filter by node type (e.g., `transforms`, `sources`) |
+| `--stat` | FLAG | False | Show summary statistics only |
+| `--project-path`, `-p` | PATH | "." | Project directory |
+
+**Examples:**
+```bash
+# Show all changes
+seeknal diff
+
+# Diff a specific node
+seeknal diff sources/orders
+
+# Filter by node type
+seeknal diff --type transforms
+
+# Show summary statistics only
+seeknal diff --stat
+```
+
+**See Also:** [Change Categorization](../concepts/change-categorization.md)
+
+---
+
 # Development Workflow
 
 ## seeknal draft
@@ -961,8 +1003,13 @@ The SQL REPL allows you to explore data across multiple sources using DuckDB as 
 
 **Usage:**
 ```bash
-seeknal repl
+seeknal repl [OPTIONS]
 ```
+
+**Options:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--profile` | PATH | None | Path to profiles.yml for auto-registration |
 
 **REPL Commands:**
 - `.connect <source>` - Connect to saved source
@@ -1139,6 +1186,7 @@ seeknal env plan ENV_NAME [OPTIONS]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--project-path` | PATH | "." | Project directory |
+| `--profile` | PATH | None | Path to profiles.yml (auto-discovered if omitted) |
 
 **Examples:**
 ```bash
@@ -1175,6 +1223,7 @@ seeknal env apply ENV_NAME [OPTIONS]
 | `--max-workers` | INTEGER | 4 | Max parallel workers |
 | `--continue-on-error` | FLAG | False | Continue past failures |
 | `--dry-run` | FLAG | False | Show what would execute without running |
+| `--profile` | PATH | None | Path to profiles.yml (overrides plan.json) |
 | `--project-path` | PATH | "." | Project directory |
 
 **Examples:**
@@ -1213,6 +1262,9 @@ seeknal env promote FROM_ENV [TO_ENV] [OPTIONS]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--project-path` | PATH | "." | Project directory |
+| `--profile` | PATH | None | Path to profiles YAML for target environment |
+| `--rematerialize` | FLAG | False | Re-run materialization against target credentials |
+| `--dry-run` | FLAG | False | Show what would be promoted without executing |
 
 **Examples:**
 ```bash
@@ -1337,6 +1389,186 @@ seeknal source remove NAME
 **Examples:**
 ```bash
 seeknal source remove mydb
+```
+
+---
+
+# Interval Management
+
+Manage execution intervals for incremental pipelines — list completed intervals, find gaps, execute backfills, and mark intervals for restatement.
+
+## seeknal intervals list
+
+List completed intervals for a node.
+
+Shows all time intervals that have been successfully executed for the specified node.
+
+**Usage:**
+```bash
+seeknal intervals list NODE_ID [OPTIONS]
+```
+
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `node_id` | TEXT | Yes | Node identifier (e.g., `transform.clean_data`) |
+
+**Options:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--output`, `-o` | [table\|json] | "table" | Output format |
+
+**Examples:**
+```bash
+# List completed intervals
+seeknal intervals list transform.clean_data
+
+# JSON output
+seeknal intervals list feature_group.user_features --output json
+```
+
+---
+
+## seeknal intervals pending
+
+Show pending intervals for a node.
+
+Calculates which intervals need to be executed based on the schedule and compares against completed intervals to find gaps.
+
+**Usage:**
+```bash
+seeknal intervals pending NODE_ID [OPTIONS]
+```
+
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `node_id` | TEXT | Yes | Node identifier |
+
+**Options:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--start`, `-s` | TEXT | Required | Start date (YYYY-MM-DD or ISO timestamp) |
+| `--end`, `-e` | TEXT | None | End date (defaults to next scheduled run) |
+| `--schedule` | TEXT | "daily" | Schedule preset (daily, hourly, weekly, monthly, yearly) |
+
+**Examples:**
+```bash
+# Show pending daily intervals
+seeknal intervals pending feature_group.user_features --start 2024-01-01
+
+# Show pending intervals for a date range
+seeknal intervals pending transform.clean_data --start 2024-01-01 --end 2024-01-31
+
+# Hourly intervals
+seeknal intervals pending feature_group.user_features --start 2024-01-01 --schedule hourly
+```
+
+---
+
+## seeknal intervals backfill
+
+Execute backfill for missing intervals.
+
+Calculates pending intervals for the specified date range and executes the node for each missing interval.
+
+**Usage:**
+```bash
+seeknal intervals backfill NODE_ID [OPTIONS]
+```
+
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `node_id` | TEXT | Yes | Node identifier to backfill |
+
+**Options:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--start`, `-s` | TEXT | Required | Start date (YYYY-MM-DD) |
+| `--end`, `-e` | TEXT | Required | End date (YYYY-MM-DD) |
+| `--schedule` | TEXT | "daily" | Schedule preset |
+| `--dry-run` | FLAG | False | Show what would be executed without running |
+
+**Examples:**
+```bash
+# Backfill daily intervals
+seeknal intervals backfill feature_group.user_features --start 2024-01-01 --end 2024-01-31
+
+# Dry run to preview
+seeknal intervals backfill transform.clean_data --start 2024-01-01 --end 2024-01-31 --dry-run
+
+# Hourly backfill
+seeknal intervals backfill feature_group.user_features --start 2024-01-01 --end 2024-01-31 --schedule hourly
+```
+
+---
+
+## seeknal intervals restatement-add
+
+Mark an interval for restatement. The next run will re-process data for this interval.
+
+**Usage:**
+```bash
+seeknal intervals restatement-add NODE_ID [OPTIONS]
+```
+
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `node_id` | TEXT | Yes | Node identifier |
+
+**Options:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--start`, `-s` | TEXT | Required | Start date (YYYY-MM-DD) |
+| `--end`, `-e` | TEXT | Required | End date (YYYY-MM-DD) |
+
+**Examples:**
+```bash
+seeknal intervals restatement-add feature_group.user_features --start 2024-01-01 --end 2024-01-31
+```
+
+---
+
+## seeknal intervals restatement-list
+
+List all intervals marked for restatement.
+
+**Usage:**
+```bash
+seeknal intervals restatement-list NODE_ID
+```
+
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `node_id` | TEXT | Yes | Node identifier |
+
+**Examples:**
+```bash
+seeknal intervals restatement-list feature_group.user_features
+```
+
+---
+
+## seeknal intervals restatement-clear
+
+Clear all restatement intervals for a node.
+
+**Usage:**
+```bash
+seeknal intervals restatement-clear NODE_ID
+```
+
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `node_id` | TEXT | Yes | Node identifier |
+
+**Examples:**
+```bash
+seeknal intervals restatement-clear feature_group.user_features
 ```
 
 ---
@@ -1606,6 +1838,49 @@ seeknal atlas lineage show user_features
 
 # Publish lineage
 seeknal atlas lineage publish my_pipeline
+```
+
+---
+
+## seeknal lineage
+
+Generate interactive lineage visualization for your project's DAG.
+
+**Usage:**
+```bash
+seeknal lineage [NODE_ID] [OPTIONS]
+```
+
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `node_id` | TEXT | No | Node to focus on (e.g., `transform.clean_orders`) |
+
+**Options:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--column`, `-c` | TEXT | None | Column to trace lineage for (requires node argument) |
+| `--project`, `-p` | TEXT | None | Project name |
+| `--path` | PATH | "." | Project path |
+| `--output`, `-o` | PATH | `target/lineage.html` | Output HTML file path |
+| `--no-open` | FLAG | False | Don't auto-open browser |
+
+**Examples:**
+```bash
+# Full DAG visualization
+seeknal lineage
+
+# Focus on a specific node
+seeknal lineage transform.clean_orders
+
+# Trace column-level lineage
+seeknal lineage transform.clean_orders --column total_amount
+
+# Custom output path
+seeknal lineage --output dag.html
+
+# Generate without opening browser
+seeknal lineage --no-open
 ```
 
 ---

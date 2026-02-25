@@ -143,7 +143,7 @@ class TestSecondOrderAggregationDraftPython:
         assert "requires-python" in content
         assert "second_order_aggregation" in content
         assert "def region_metrics" in content
-        assert "PipelineContext" in content
+        assert "ctx.ref(" in content
 
     def test_draft_python_with_dependencies(self, temp_project_dir, monkeypatch):
         """Test Python draft with custom dependencies."""
@@ -330,9 +330,9 @@ class TestSecondOrderAggregationTemplateContent:
         content = draft_file.read_text()
 
         assert "@second_order_aggregation" in content
-        assert "source=" in content
         assert "id_col=" in content
         assert "feature_date_col=" in content
+        assert "features=" in content
 
     def test_python_template_has_function_signature(self, temp_project_dir, monkeypatch):
         """Test Python template has correct function signature."""
@@ -347,8 +347,8 @@ class TestSecondOrderAggregationTemplateContent:
         content = draft_file.read_text()
 
         assert "def region_metrics" in content
-        assert "ctx:" in content
-        assert "pd.DataFrame" in content
+        assert "ctx)" in content
+        assert "ctx.ref(" in content
 
 
 class TestSecondOrderAggregationDraftIntegration:

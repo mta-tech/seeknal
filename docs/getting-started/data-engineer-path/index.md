@@ -10,7 +10,7 @@ Build production-ready ELT pipelines with Seeknal, from data ingestion to produc
 
 The Data Engineer path teaches you to build production-grade ELT pipelines with Seeknal. You'll learn to:
 
-1. **Build ELT Pipelines** - Extract from REST APIs, transform with DuckDB, load to warehouse
+1. **Build ELT Pipelines** - Load data from CSV/Parquet sources, transform with DuckDB, save results
 2. **Add Incremental Models** - Implement CDC, scheduling, and change data capture
 3. **Deploy to Production** - Use virtual environments, promotion workflows, and rollback procedures
 
@@ -34,14 +34,14 @@ Before starting this path, ensure you have:
 Learn to build a complete e-commerce order processing pipeline:
 
 ```
-REST API → Orders (Raw) → Transform → Orders (Clean) → Warehouse
+CSV Source → Orders (Raw) → Transform → Orders (Clean) → Parquet
 ```
 
 **You'll build:**
-- HTTP source that fetches data from REST APIs
+- CSV source that loads order data
 - DuckDB transformation with data quality checks
-- Warehouse output with proper schema enforcement
-- Error handling and retry logic
+- Clean output saved to Parquet format
+- Data validation and deduplication logic
 
 **[Start Chapter 1 →](1-elt-pipeline.md)**
 
@@ -52,13 +52,13 @@ REST API → Orders (Raw) → Transform → Orders (Clean) → Warehouse
 Optimize your pipeline with incremental processing:
 
 ```
-Source → Incremental Load → Transform → Warehouse
-                    ↓
-              Change Detection
+Source → Incremental Load → Transform → Output
+                  ↓
+            Change Detection
 ```
 
 **You'll build:**
-- Incremental source that only fetches new/changed data
+- Incremental source that only processes new/changed data
 - CDC (Change Data Capture) patterns for detecting updates
 - Scheduled pipeline runs for automated processing
 - Monitoring and validation for incremental updates
@@ -91,9 +91,9 @@ By the end of this path, you'll have a complete production-ready pipeline:
 
 | Component | Technology | Purpose |
 |-----------|------------|---------|
-| **HTTP Source** | REST API | Fetch orders from API |
+| **CSV/Parquet Source** | File-based | Load order data |
 | **DuckDB Transform** | SQL | Clean, validate, deduplicate |
-| **Warehouse Output** | Parquet/DB | Store processed data |
+| **Parquet Output** | Columnar storage | Store processed data |
 | **Incremental Loading** | CDC | Only process new data |
 | **Scheduling** | Cron | Automated pipeline runs |
 | **Virtual Environments** | Isolation | Safe dev → prod workflow |
@@ -107,10 +107,11 @@ By the end of this path, you'll have a complete production-ready pipeline:
 seeknal init --name ecommerce-pipeline
 
 # Draft a new source
-seeknal draft source --name orders_api --type http
+seeknal draft source orders_data
 
-# Apply to project
-seeknal apply pipelines/sources/orders_api.yaml
+# Validate and apply to project
+seeknal dry-run seeknal/sources/orders_data.yml
+seeknal apply seeknal/sources/orders_data.yml
 
 # Run pipeline
 seeknal run

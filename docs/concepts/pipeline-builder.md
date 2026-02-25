@@ -36,7 +36,7 @@ seeknal init --name my_project
 Generate template files for sources, transforms, or other components.
 
 ```bash
-seeknal draft source --name raw_sales
+seeknal draft source raw_sales
 ```
 
 **Creates**:

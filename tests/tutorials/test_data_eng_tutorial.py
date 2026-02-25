@@ -1,5 +1,5 @@
 """
-Test suite for Phase 2 Data Engineering Tutorial.
+Test suite for Data Engineering Tutorial.
 
 Validates:
 1. All YAML files parse correctly
@@ -19,7 +19,7 @@ from seeknal.dag.manifest import Manifest, Node, NodeType
 @pytest.fixture
 def tutorial_dir():
     """Path to tutorial example files."""
-    return Path(__file__).parent.parent.parent / "examples" / "phase2-data-eng"
+    return Path(__file__).parent.parent.parent / "examples" / "data-eng"
 
 
 @pytest.fixture

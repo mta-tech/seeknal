@@ -23,76 +23,32 @@ python --version
 
 ---
 
-## Installation Methods
+## Installation
 
-### Method 1: Using uv (Recommended)
-
-[uv](https://docs.astral.sh/uv/) is a fast Python package manager. This is the recommended approach.
-
-#### Step 1: Install uv
-
-**macOS / Linux:**
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-**Windows (PowerShell):**
-```powershell
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-#### Step 2: Create Virtual Environment
+### From PyPI (Recommended)
 
 ```bash
-# Create environment with Python 3.11
-uv venv --python 3.11
-
-# Activate the environment
-source .venv/bin/activate  # Linux/macOS
-.\\.venv\\Scripts\\activate  # Windows
+pip install seeknal
 ```
 
-#### Step 3: Install Seeknal
+This installs Seeknal and all required dependencies.
+
+### From GitHub Releases
+
+If you need a specific version or pre-release build:
 
 ```bash
-# Download the latest wheel from GitHub releases
 # Visit: https://github.com/mta-tech/seeknal/releases
-
-# Install Seeknal
-uv pip install seeknal-<version>-py3-none-any.whl
-```
-
----
-
-### Method 2: Using pip
-
-If you prefer standard pip:
-
-#### Step 1: Create Virtual Environment
-
-```bash
-# Create environment
-python -m venv .venv
-
-# Activate the environment
-source .venv/bin/activate  # Linux/macOS
-.\\.venv\\Scripts\\activate  # Windows
-```
-
-#### Step 2: Upgrade pip
-
-```bash
-pip install --upgrade pip
-```
-
-#### Step 3: Install Seeknal
-
-```bash
-# Download the latest wheel from GitHub releases
-# Visit: https://github.com/mta-tech/seeknal/releases
-
-# Install Seeknal
+# Download the .whl file, then:
 pip install seeknal-<version>-py3-none-any.whl
+```
+
+### Using uv
+
+[uv](https://docs.astral.sh/uv/) is a fast Python package manager:
+
+```bash
+uv pip install seeknal
 ```
 
 ---
@@ -111,7 +67,7 @@ python -c "from seeknal.tasks.duckdb import DuckDBTask; print('✓ Seeknal insta
 
 **Expected output:**
 ```
-Seeknal 2.0.0
+Seeknal 2.1.0
 ✓ Seeknal installed successfully!
 ```
 
@@ -119,18 +75,19 @@ Seeknal 2.0.0
 
 ## Optional Configuration
 
-For advanced usage, configure environment variables:
+Seeknal works out of the box — no configuration required for basic usage.
+
+For advanced usage (custom config location, team environments), you can override defaults:
 
 ```bash
-# Create config directory
-mkdir -p ~/.seeknal
-
-# Set environment variables (add to ~/.bashrc or ~/.zshrc)
+# Optional: Override default config directory (default: ~/.seeknal/)
 export SEEKNAL_BASE_CONFIG_PATH="$HOME/.seeknal"
+
+# Optional: Override user config file (default: ~/.seeknal/config.toml)
 export SEEKNAL_USER_CONFIG_PATH="$HOME/.seeknal/config.toml"
 ```
 
-**Note**: For basic usage, configuration is not required. Seeknal works out of the box with sensible defaults.
+Seeknal auto-creates `~/.seeknal/` and its SQLite database on first use.
 
 ---
 

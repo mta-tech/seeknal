@@ -1,0 +1,73 @@
+kind: semantic_model
+name: {{ name }}
+description: "{{ description | default('Semantic model description') }}"
+model: "ref('transform.{{ name }}')"
+default_time_dimension: event_date
+
+entities:
+  - name: id
+    type: primary
+
+dimensions:
+  - name: event_date
+    type: time
+    expr: event_date
+    time_granularity: day
+    description: "Event date"
+
+  - name: status
+    type: string
+    expr: status
+    description: "Record status"
+
+  - name: amount
+    type: number
+    expr: amount
+    description: "Amount value"
+
+measures:
+  - name: total_amount
+    expr: amount
+    agg: sum
+    description: "Total amount"
+
+  - name: record_count
+    expr: "1"
+    agg: count
+    description: "Number of records"
+
+  # Example: filtered measure (Cube.js-style)
+  # - name: completed_amount
+  #   expr: amount
+  #   agg: sum
+  #   description: "Total amount for completed records"
+  #   filters:
+  #     - sql: "status = 'COMPLETED'"
+
+# Example: advanced metrics (ratio, cumulative, derived)
+# metrics:
+#   - name: avg_amount
+#     type: ratio
+#     description: "Average amount per record"
+#     numerator: total_amount
+#     denominator: record_count
+#
+#   - name: cumulative_amount
+#     type: cumulative
+#     description: "Running total of amount"
+#     measure: total_amount
+#     grain_to_date: month
+#
+#   - name: amount_per_customer
+#     type: derived
+#     description: "Amount per unique customer"
+#     expr: "total_amount / unique_customers"
+#     inputs:
+#       - metric: total_amount
+#       - metric: unique_customers
+
+# Example: joins to other semantic models (Cube.js-style)
+# joins:
+#   - name: customers
+#     relationship: many_to_one
+#     sql: "{CUBE}.customer_id = {customers}.customer_id"

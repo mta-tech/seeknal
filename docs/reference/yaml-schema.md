@@ -176,7 +176,8 @@ Transforms define SQL-based data transformations.
 |-------|------|----------|-------------|---------|
 | `transform` | string | **Yes** | SQL query or transformation logic (multi-statement supported) | - |
 | `inputs` | list[object] | **Yes** | Dependencies (upstream nodes) | - |
-| `materialization` | object | No | Iceberg materialization config (see [Materialization](#materialization)) | - |
+| `materialization` | object | No | Single-target materialization config (see [Materialization](#materialization)) | - |
+| `materializations` | list[object] | No | Multi-target materialization (see [Multi-Target Materialization](#multi-target-materialization)) | - |
 
 ### Transform SQL
 
@@ -189,7 +190,7 @@ transform: |
     TRIM(name) as name,
     LOWER(email) as email,
     created_at
-  FROM source.users
+  FROM input_0
   WHERE email IS NOT NULL
 ```
 
@@ -202,7 +203,8 @@ transform: |
 - Named input references: `ref('source.sales')`, `ref("transform.clean")`
 - Positional input references: `input_0`, `input_1`, etc.
 - Mixed syntax: `ref('source.sales') s JOIN input_1 p`
-- Use `__THIS__` placeholder to reference the first input
+- **Preferred:** Use `ref('source.name')` or `ref('transform.name')` to reference inputs by name
+- Legacy: `__THIS__` placeholder references the first input (still supported but not recommended)
 
 ### Example
 
@@ -218,7 +220,7 @@ transform: |
     LOWER(email) as email,
     UPPER(country) as country,
     created_at
-  FROM source.users
+  FROM input_0
   WHERE email IS NOT NULL
     AND email LIKE '%@%'
 inputs:
@@ -351,12 +353,12 @@ features:
 transform: |
   SELECT
     user_id,
-    COUNT(*) as transaction_count,
-    SUM(amount) as total_amount,
-    AVG(amount) as avg_transaction_value,
-    MODE() WITHIN GROUP (ORDER BY merchant) as favorite_merchant,
-    DATEDIFF('day', CURRENT_DATE, MAX(timestamp)) as days_since_last_transaction
-  FROM transform.user_transactions
+    CAST(COUNT(*) AS BIGINT) as transaction_count,
+    CAST(SUM(amount) AS DOUBLE) as total_amount,
+    CAST(AVG(amount) AS DOUBLE) as avg_transaction_value,
+    MODE(merchant) as favorite_merchant,
+    DATEDIFF('day', MAX(event_timestamp), CURRENT_DATE) as days_since_last_transaction
+  FROM input_0
   GROUP BY user_id
 inputs:
   - ref: transform.user_transactions
@@ -939,7 +941,10 @@ Metrics define business metric calculations.
 | Field | Type | Required | Description | Default |
 |-------|------|----------|-------------|---------|
 | `type` | string | **Yes** | Metric type: `simple`, `ratio`, `derived` | - |
-| `type_params` | object | **Yes** | Type-specific parameters (see [Metric Types](#metric-types)) | - |
+| `measure` | string | For `simple` | Measure name from a semantic model | - |
+| `numerator` | string | For `ratio` | Numerator metric name | - |
+| `denominator` | string | For `ratio` | Denominator metric name | - |
+| `expr` | string | For `derived` | Expression referencing other metrics | - |
 | `filter` | string | No | SQL filter expression | - |
 
 ### Metric Types
@@ -947,23 +952,25 @@ Metrics define business metric calculations.
 **Simple metric:**
 ```yaml
 type: simple
-type_params:
-  measure: revenue
+measure: revenue
 ```
 
 **Ratio metric:**
 ```yaml
 type: ratio
-type_params:
-  numerator: active_users
-  denominator: total_users
+numerator: active_users
+denominator: total_users
 ```
 
 **Derived metric:**
 ```yaml
 type: derived
-type_params:
-  expr: "metric('revenue') / metric('order_count')"
+expr: "total_revenue / order_count"
+inputs:
+  - metric: total_revenue
+    alias: total_revenue
+  - metric: order_count
+    alias: order_count
 ```
 
 ### Example
@@ -974,8 +981,7 @@ name: total_revenue
 description: "Total revenue across all orders"
 owner: "finance"
 type: simple
-type_params:
-  measure: revenue
+measure: revenue
 filter: "status = 'completed'"
 tags:
   - metric
@@ -987,6 +993,11 @@ tags:
 ## Materialization
 
 Materialization enables persisting transform outputs as Apache Iceberg tables.
+
+!!! warning "DuckDB HUGEINT Compatibility"
+    DuckDB returns `HUGEINT` for `COUNT(*)` and `SUM()` by default, which Iceberg does not support. Always cast aggregation results in transforms that write to Iceberg:
+    - `CAST(COUNT(*) AS BIGINT)` instead of bare `COUNT(*)`
+    - `CAST(SUM(...) AS DOUBLE)` instead of bare `SUM(...)`
 
 ### Fields
 
@@ -1036,6 +1047,95 @@ materialization:
   table: "warehouse.prod.sales_forecast"
   mode: overwrite
   create_table: true
+```
+
+---
+
+## Multi-Target Materialization
+
+Write pipeline outputs to multiple storage targets simultaneously using the plural `materializations:` key.
+
+### Fields
+
+| Field | Type | Required | Description | Default |
+|-------|------|----------|-------------|---------|
+| `type` | string | **Yes** | Target type: `iceberg` or `postgresql` | - |
+| `connection` | string | For PostgreSQL | Named connection from `profiles.yml` | - |
+| `table` | string | **Yes** | Target table name | - |
+| `mode` | string | **Yes** | Write mode (see modes below) | - |
+| `unique_keys` | list[string] | For `upsert_by_key` | Columns for upsert matching | - |
+| `time_column` | string | For `incremental_by_time` | Time column for range-based incremental | - |
+| `lookback` | string | No | Lookback window for incremental (e.g., `7d`) | - |
+
+### Write Modes
+
+| Mode | Target | Behavior |
+|------|--------|----------|
+| `overwrite` | Both | Drop and recreate table |
+| `append` | Both | Insert new rows |
+| `full` | PostgreSQL | DROP + CREATE (alias for overwrite) |
+| `incremental_by_time` | PostgreSQL | DELETE time range + INSERT |
+| `upsert_by_key` | PostgreSQL | Match by unique keys, update or insert |
+
+### Example: Dual Materialization
+
+```yaml
+kind: transform
+name: enriched_orders
+transform: |
+  SELECT * FROM ref('source.orders')
+inputs:
+  - ref: source.orders
+materializations:
+  - type: postgresql
+    connection: local_pg
+    table: analytics.enriched_orders
+    mode: upsert_by_key
+    unique_keys: [order_id]
+  - type: iceberg
+    table: atlas.warehouse.enriched_orders
+    mode: append
+```
+
+### PostgreSQL Upsert Example
+
+```yaml
+materializations:
+  - type: postgresql
+    connection: analytics_db
+    table: reporting.daily_metrics
+    mode: upsert_by_key
+    unique_keys: [date, region]
+```
+
+### PostgreSQL Incremental Example
+
+```yaml
+materializations:
+  - type: postgresql
+    connection: analytics_db
+    table: events.user_actions
+    mode: incremental_by_time
+    time_column: event_time
+    lookback: 7d
+```
+
+### Backward Compatibility
+
+The singular `materialization:` key continues to work and is normalized to a list internally.
+When no `type:` field is present, the target defaults to Iceberg for backward compatibility.
+
+```yaml
+# These are equivalent:
+materialization:
+  enabled: true
+  table: "warehouse.ns.orders"
+  mode: append
+
+materializations:
+  - type: iceberg
+    table: "warehouse.ns.orders"
+    mode: append
 ```
 
 ---

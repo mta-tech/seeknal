@@ -88,6 +88,8 @@ class REPL:
         self,
         project_path: Optional[Path] = None,
         profile_path: Optional[Path] = None,
+        env_name: Optional[str] = None,
+        skip_history: bool = False,
     ) -> None:
         self.conn = duckdb.connect(":memory:")
         self.attached: set[str] = set()
@@ -95,13 +97,15 @@ class REPL:
         self._active_starrocks: Optional[str] = None
         self.project_path = project_path
         self.profile_path = profile_path
+        self.env_name = env_name
         self._registered_parquets: int = 0
         self._registered_pg: int = 0
         self._registered_iceberg: int = 0
         self._node_count: int = 0
         self._last_run: Optional[str] = None
         self._load_extensions()
-        self._setup_history()
+        if not skip_history:
+            self._setup_history()
         if self.project_path:
             self._load_run_state()
             self._auto_register_project()
@@ -129,7 +133,23 @@ class REPL:
             pass
 
     def _load_run_state(self) -> None:
-        """Load run state to get node count and last run timestamp."""
+        """Load run state to get node count and last run timestamp.
+
+        When env_name is set, tries the environment's run_state first,
+        falls back to production state.
+        """
+        if self.env_name:
+            env_state = self.project_path / "target" / "environments" / self.env_name / "run_state.json"
+            if env_state.exists():
+                try:
+                    import json
+                    with open(env_state) as f:
+                        data = json.load(f)
+                    self._node_count = len(data.get("nodes", {}))
+                    self._last_run = data.get("last_run")
+                    return
+                except Exception:
+                    pass
         state_path = self.project_path / "target" / "run_state.json"
         if not state_path.exists():
             return
@@ -146,7 +166,7 @@ class REPL:
         """Auto-register queryable data from the project context.
 
         Three phases, each best-effort (failures emit warnings):
-        1. Register intermediate parquets from target/cache/ as views
+        1. Register intermediate parquets from target/intermediate/ and target/cache/ as views
         2. Attach PostgreSQL connections read-only via DuckDB ATTACH
         3. Attach Iceberg catalogs via DuckDB Iceberg extension
         """
@@ -171,13 +191,60 @@ class REPL:
             warnings.warn(f"REPL: Failed to attach Iceberg catalogs: {e}")
 
     def _register_parquets(self) -> None:
-        """Phase 1: Register intermediate parquets as DuckDB views."""
-        cache_dir = self.project_path / "target" / "cache"
-        if not cache_dir.exists():
-            return
+        """Phase 1: Register intermediate parquets as DuckDB views.
 
-        for parquet_file in cache_dir.rglob("*.parquet"):
-            view_name = parquet_file.stem
+        Scans both target/intermediate/ (primary, written by all executors)
+        and target/cache/ (legacy) for parquet files.
+
+        When env_name is set, scans the environment's intermediate/ first
+        (changed nodes), then falls back to production intermediate/ and
+        cache/ for unchanged nodes. Env outputs take priority.
+
+        Files in target/intermediate/ use naming convention
+        {kind}_{name}.parquet (e.g. transform_orders_cleaned.parquet).
+        The kind prefix is stripped to produce the view name (orders_cleaned).
+        """
+        registered_names: set[str] = set()
+
+        # If in an environment, scan env intermediate first (changed nodes)
+        if self.env_name:
+            env_intermediate = (
+                self.project_path / "target" / "environments"
+                / self.env_name / "intermediate"
+            )
+            if env_intermediate.exists():
+                self._scan_parquet_dir(env_intermediate, registered_names, strip_prefix=True)
+
+        # Primary: target/intermediate/ (all executor outputs go here)
+        intermediate_dir = self.project_path / "target" / "intermediate"
+        if intermediate_dir.exists():
+            self._scan_parquet_dir(intermediate_dir, registered_names, strip_prefix=True)
+
+        # Legacy: target/cache/ (backward compat)
+        cache_dir = self.project_path / "target" / "cache"
+        if cache_dir.exists():
+            self._scan_parquet_dir(cache_dir, registered_names, strip_prefix=False)
+
+    def _scan_parquet_dir(
+        self, directory: Path, registered_names: set, strip_prefix: bool
+    ) -> None:
+        """Register parquet files from a directory as DuckDB views.
+
+        Args:
+            directory: Directory to scan for .parquet files.
+            registered_names: Already-registered view names (skipped, updated in place).
+            strip_prefix: If True, strip kind prefixes (transform_, source_, etc.).
+        """
+        for parquet_file in directory.rglob("*.parquet"):
+            raw_name = parquet_file.stem
+            view_name = raw_name
+            if strip_prefix:
+                for pfx in ("transform_", "source_", "model_", "aggregation_", "exposure_", "feature_group_", "profile_"):
+                    if raw_name.startswith(pfx):
+                        view_name = raw_name[len(pfx):]
+                        break
+            if view_name in registered_names:
+                continue
             safe_path = str(parquet_file.resolve()).replace("'", "''")
             try:
                 self.conn.execute(
@@ -185,6 +252,7 @@ class REPL:
                     f"SELECT * FROM read_parquet('{safe_path}')"
                 )
                 self._registered_parquets += 1
+                registered_names.add(view_name)
             except Exception:
                 pass  # Skip files that can't be read
 
@@ -271,6 +339,61 @@ class REPL:
         self.attached.add("iceberg")
         self._registered_iceberg += 1
 
+    def execute_oneshot(
+        self, sql: str, limit: Optional[int] = None
+    ) -> tuple[list[str], list[tuple]]:
+        """Execute a single SQL query and return structured results.
+
+        Used by --exec mode for non-interactive one-shot execution.
+
+        Args:
+            sql: SQL query string, or "-" to read from stdin.
+            limit: Optional row limit to apply.
+
+        Returns:
+            Tuple of (column_names, rows).
+
+        Raises:
+            ValueError: On validation failure, empty input, or multi-statement SQL.
+        """
+        import sys
+
+        # Read from stdin if sql is "-"
+        if sql == "-":
+            if sys.stdin.isatty():
+                print(
+                    "Reading SQL from stdin (end with Ctrl+D)...",
+                    file=sys.stderr,
+                )
+            sql = sys.stdin.read().strip()
+            if not sql:
+                raise ValueError("No SQL provided on stdin")
+
+        # Reject multi-statement queries
+        stripped = sql.strip().rstrip(";")
+        if ";" in stripped:
+            raise ValueError(
+                "Only single SQL statements are supported with --exec. "
+                "Found multiple statements separated by ';'."
+            )
+
+        # Validate SQL (same read-only allowlist as interactive REPL)
+        is_valid, error_msg = validate_sql(sql)
+        if not is_valid:
+            raise ValueError(f"Query rejected: {error_msg}")
+
+        # Apply --limit by wrapping query
+        if limit is not None:
+            sql = f"SELECT * FROM ({sql}) AS _q LIMIT {int(limit)}"
+
+        result = self.conn.execute(sql)
+        if not result.description:
+            return [], []
+
+        columns = [desc[0] for desc in result.description]
+        rows = result.fetchall()
+        return columns, rows
+
     def _save_history(self) -> None:
         """Save readline history."""
         try:
@@ -287,6 +410,8 @@ class REPL:
         if self.project_path:
             # Build project header with node count and last run
             header = f"Project: {self.project_path.name}"
+            if self.env_name:
+                header += f" [env: {self.env_name}]"
             meta_parts = []
             if self._node_count:
                 meta_parts.append(f"{self._node_count} nodes")
@@ -316,7 +441,12 @@ class REPL:
         try:
             while True:
                 try:
-                    prompt = f"seeknal[{self._active_starrocks}]> " if self._active_starrocks else "seeknal> "
+                    if self._active_starrocks:
+                        prompt = f"seeknal[{self._active_starrocks}]> "
+                    elif self.env_name:
+                        prompt = f"seeknal[{self.env_name}]> "
+                    else:
+                        prompt = "seeknal> "
                     line = input(prompt).strip()
                     if not line:
                         continue
@@ -786,7 +916,8 @@ Manage sources:
 def run_repl(
     project_path: Optional[Path] = None,
     profile_path: Optional[Path] = None,
+    env_name: Optional[str] = None,
 ) -> None:
     """Entry point for REPL."""
-    repl = REPL(project_path=project_path, profile_path=profile_path)
+    repl = REPL(project_path=project_path, profile_path=profile_path, env_name=env_name)
     repl.run()
