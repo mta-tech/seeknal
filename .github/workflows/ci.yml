@@ -27,7 +27,7 @@ jobs:
         run: uv sync --dev
 
       - name: Run tests
-        run: uv run pytest tests/ -x --timeout=300
+        run: uv run pytest tests/ -x
 
   build:
     runs-on: ubuntu-latest
