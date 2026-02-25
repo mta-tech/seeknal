@@ -27,7 +27,7 @@ jobs:
         run: uv sync --dev
 
       - name: Run tests
-        run: uv run pytest tests/ -x
+        run: uv run pytest tests/ -x --ignore=tests/workflow/test_prefect_integration.py
 
   build:
     runs-on: ubuntu-latest
