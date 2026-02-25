@@ -306,3 +306,41 @@ class TestCalculateNodeHash:
         data = {"kind": "source", "params": {"path": "data.csv"}}
         h = calculate_node_hash(data, Path("s.yml"))
         assert len(h) == 64
+
+    def test_file_source_hash_changes_when_file_modified(self, tmp_path):
+        """File-based source hash changes when the data file content changes."""
+        csv_file = tmp_path / "orders.csv"
+        csv_file.write_text("id,name\n1,Alice\n")
+
+        data = {"kind": "source", "source": "csv", "table": str(csv_file)}
+        h1 = calculate_node_hash(data, Path("s.yml"))
+
+        # Append data to the file
+        with open(csv_file, "a") as f:
+            f.write("2,Bob\n")
+
+        h2 = calculate_node_hash(data, Path("s.yml"))
+        assert h1 != h2, "Hash should change when data file is modified"
+
+    def test_file_source_hash_stable_when_unchanged(self, tmp_path):
+        """File-based source hash is stable when file hasn't changed."""
+        csv_file = tmp_path / "orders.csv"
+        csv_file.write_text("id,name\n1,Alice\n")
+
+        data = {"kind": "source", "source": "csv", "table": str(csv_file)}
+        h1 = calculate_node_hash(data, Path("s.yml"))
+        h2 = calculate_node_hash(data, Path("s.yml"))
+        assert h1 == h2
+
+    def test_file_source_hash_nonexistent_file_still_works(self):
+        """Non-existent data file doesn't break hash calculation."""
+        data = {"kind": "source", "source": "csv", "table": "nonexistent.csv"}
+        h = calculate_node_hash(data, Path("s.yml"))
+        assert len(h) == 64
+
+    def test_non_file_source_ignores_file_metadata(self):
+        """Database sources (postgresql, iceberg) don't include file metadata."""
+        data = {"kind": "source", "source": "postgresql", "table": "public.orders"}
+        h1 = calculate_node_hash(data, Path("s.yml"))
+        h2 = calculate_node_hash(data, Path("s.yml"))
+        assert h1 == h2

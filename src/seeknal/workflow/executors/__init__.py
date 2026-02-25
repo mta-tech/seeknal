@@ -100,7 +100,7 @@ def get_executor(node: "Node", context: ExecutionContext) -> BaseExecutor:
     # because SourceExecutor has specialized loaders (iceberg, csv, parquet, etc.)
     if hasattr(node, 'file_path') and node.file_path and str(node.file_path).endswith('.py'):
         from seeknal.dag.manifest import NodeType as NT  # ty: ignore[unresolved-import]
-        if node.node_type != NT.SOURCE:
+        if node.node_type not in (NT.SOURCE, NT.SECOND_ORDER_AGGREGATION):
             return PythonExecutor(node, context)
 
     # Use registry for standard YAML executors
@@ -148,4 +148,4 @@ __all__ = [
 ]
 
 # Version info
-__version__ = "2.1.0"
+__version__ = "2.2.0"

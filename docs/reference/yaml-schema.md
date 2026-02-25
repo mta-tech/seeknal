@@ -203,7 +203,8 @@ transform: |
 - Named input references: `ref('source.sales')`, `ref("transform.clean")`
 - Positional input references: `input_0`, `input_1`, etc.
 - Mixed syntax: `ref('source.sales') s JOIN input_1 p`
-- Use `__THIS__` placeholder to reference the first input
+- **Preferred:** Use `ref('source.name')` or `ref('transform.name')` to reference inputs by name
+- Legacy: `__THIS__` placeholder references the first input (still supported but not recommended)
 
 ### Example
 

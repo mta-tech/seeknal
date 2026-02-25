@@ -44,32 +44,8 @@ Before starting, ensure you have:
 
 ### Step 1: Install Seeknal
 
-Seeknal is distributed as a wheel file via GitHub releases.
-
-!!! info "Installation Guide"
-    For detailed installation instructions, see the **[Installation Guide](../install/)**.
-
-    **Quick install summary:**
-    1. Download the latest wheel from [GitHub Releases](https://github.com/mta-tech/seeknal/releases)
-    2. Install with: `uv pip install seeknal-<version>-py3-none-any.whl`
-
 ```bash
-# Create a virtual environment (recommended)
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .\.venv\Scripts\activate
-
-# Install uv (recommended package manager)
-curl -LsSf https://astral.sh/uv/install.sh | sh  # macOS/Linux
-# powershell -c "irm https://astral.sh/uv/install.ps1 | iex"  # Windows
-
-# Download Seeknal wheel from GitHub releases
-# Visit: https://github.com/mta-tech/seeknal/releases
-
-# Install Seeknal with pandas (replace <version> with actual version)
-uv pip install seeknal-<version>-py3-none-any.whl pandas pyarrow
-
-# Or use pip instead:
-# pip install seeknal-<version>-py3-none-any.whl pandas pyarrow
+pip install seeknal
 
 # Verify installation
 python -c "import seeknal; print('Seeknal installed successfully!')"
@@ -77,11 +53,13 @@ python -c "import seeknal; print('Seeknal installed successfully!')"
 
 **Expected output:** `Seeknal installed successfully!`
 
+!!! info "More Options"
+    For detailed installation instructions, see the **[Installation Guide](../install/)**.
+
 ### Step 2: Create Your Project
 
 ```bash
-# Create a project directory
-mkdir quickstart-python
+seeknal init --name quickstart-python --description "Python pipeline quickstart"
 cd quickstart-python
 ```
 

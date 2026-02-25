@@ -19,7 +19,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional, Set, Dict, List
+from typing import Any, Callable, Optional, Set, Dict, List
 
 
 class NodeStatus(Enum):
@@ -304,7 +304,7 @@ def calculate_node_hash(yaml_data: Dict[str, Any], yaml_path: Path) -> str:
     - transform SQL
     - features (for feature_groups)
     - dependencies/inputs
-    - table/source
+    - table/source (and data file metadata for file-based sources)
     - aggregation config
     - rule definition
 
@@ -408,6 +408,19 @@ def calculate_node_hash(yaml_data: Dict[str, Any], yaml_path: Path) -> str:
                 functional_content["params"] = yaml_data["params"]
             if "freshness" in yaml_data:
                 functional_content["freshness"] = yaml_data["freshness"]
+
+            # For file-based sources, include data file metadata in hash
+            # so changes to the data file (e.g. appending rows to a CSV)
+            # invalidate the cache and trigger re-execution.
+            _FILE_BASED_SOURCES = {"csv", "parquet", "json", "jsonl"}
+            source_type = str(yaml_data.get("source", "")).lower()
+            table_path = yaml_data.get("table", "")
+            if source_type in _FILE_BASED_SOURCES and table_path:
+                data_file = Path(table_path)
+                if data_file.exists():
+                    stat = data_file.stat()
+                    functional_content["_file_mtime"] = stat.st_mtime
+                    functional_content["_file_size"] = stat.st_size
 
         # Convert to normalized JSON string with sorted keys
         # This ensures consistent hashing regardless of dict ordering
@@ -665,8 +678,8 @@ def include_upstream_sources(
 
 def build_dag_adjacency(
     nodes: List[Any],
-    get_node_id: callable,
-    get_dependencies: callable,
+    get_node_id: Callable,
+    get_dependencies: Callable,
 ) -> Dict[str, Set[str]]:
     """
     Build DAG adjacency mapping from node list.

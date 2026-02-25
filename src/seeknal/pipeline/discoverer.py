@@ -143,7 +143,7 @@ class PythonPipelineDiscoverer:
                 """Visit function definition and track current function."""
                 # Skip decorator functions themselves
                 for decorator in node.decorator_list:
-                    if isinstance(decorator, ast.Name) and decorator.id in ("source", "transform", "feature_group"):
+                    if isinstance(decorator, ast.Name) and decorator.id in ("source", "transform", "feature_group", "second_order_aggregation"):
                         return
 
                 self.current_func = node.name

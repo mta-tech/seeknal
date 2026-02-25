@@ -112,14 +112,14 @@ source .venv/bin/activate  # Linux/macOS
 .\\.venv\\Scripts\\activate  # Windows
 
 # Now install Seeknal
-pip install seeknal-<version>-py3-none-any.whl
+pip install seeknal
 ```
 
 #### Option 2: Use User Install
 
 ```bash
 # Install to user directory (no sudo needed)
-pip install --user seeknal-<version>-py3-none-any.whl
+pip install --user seeknal
 
 # Add user bin to PATH (add to ~/.bashrc or ~/.zshrc)
 export PATH="$HOME/.local/bin:$PATH"
@@ -148,14 +148,12 @@ Some Python packages require C compilation on Windows.
 
 ### Solution
 
-#### Option 1: Install Pre-built Wheel (Recommended)
+#### Option 1: Install from PyPI (Recommended)
 
-Seeknal distributes pre-built wheels. Make sure you're downloading the `.whl` file:
+Seeknal distributes pre-built wheels on PyPI:
 
 ```bash
-# Download from https://github.com/mta-tech/seeknal/releases
-# Install the wheel file directly
-pip install seeknal-<version>-py3-none-any.whl
+pip install seeknal
 ```
 
 #### Option 2: Install Visual Studio Build Tools
@@ -293,7 +291,7 @@ Seeknal version 2.0.0
 Enable verbose output to see what's happening:
 
 ```bash
-pip install -v seeknal-<version>-py3-none-any.whl
+pip install -v seeknal
 ```
 
 ### 2. Try a Clean Install
@@ -310,7 +308,7 @@ source .venv/bin/activate
 pip install --upgrade pip
 
 # Install Seeknal
-pip install seeknal-<version>-py3-none-any.whl
+pip install seeknal
 ```
 
 ### 3. Search GitHub Issues
@@ -357,11 +355,8 @@ python -m venv .venv
 source .venv/bin/activate  # Linux/macOS
 .\\.venv\\Scripts\\activate  # Windows
 
-# Install with uv (recommended)
-uv pip install seeknal-<version>-py3-none-any.whl
-
-# Install with pip
-pip install seeknal-<version>-py3-none-any.whl
+# Install from PyPI (recommended)
+pip install seeknal
 
 # Verify installation
 pip show seeknal

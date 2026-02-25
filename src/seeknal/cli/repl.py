@@ -239,7 +239,7 @@ class REPL:
             raw_name = parquet_file.stem
             view_name = raw_name
             if strip_prefix:
-                for pfx in ("transform_", "source_", "model_", "aggregation_", "exposure_"):
+                for pfx in ("transform_", "source_", "model_", "aggregation_", "exposure_", "feature_group_", "profile_"):
                     if raw_name.startswith(pfx):
                         view_name = raw_name[len(pfx):]
                         break

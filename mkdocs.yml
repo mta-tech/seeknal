@@ -165,7 +165,7 @@ nav:
           - Overview: getting-started/ml-engineer-path/index.md
           - Feature Store: getting-started/ml-engineer-path/1-feature-store.md
           - Second-Order Aggregation: getting-started/ml-engineer-path/2-second-order-aggregation.md
-          - Training-to-Serving Parity: getting-started/ml-engineer-path/3-training-serving-parity.md
+          - Build & Serve ML Model: getting-started/ml-engineer-path/3-training-serving-parity.md
       - Advanced Guide:
           - Overview: getting-started/advanced/index.md
           - File Sources: getting-started/advanced/1-file-sources.md
@@ -175,6 +175,7 @@ nav:
           - Named References: getting-started/advanced/5-named-refs.md
           - Common Configuration: getting-started/advanced/6-common-config.md
           - Data Profiling: getting-started/advanced/7-data-profiling.md
+          - Python Pipelines: getting-started/advanced/8-python-pipelines.md
   - Concepts:
       - Overview: concepts/index.md
       - Pipeline Builder Workflow: concepts/pipeline-builder.md

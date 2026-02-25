@@ -1,0 +1,20 @@
+kind: metric
+name: {{ name }}
+description: "{{ description | default('Metric description') }}"
+
+# Metric type: simple, ratio, cumulative, or derived
+type: ratio
+
+# For ratio metrics:
+numerator: total_amount
+denominator: record_count
+
+# For simple/cumulative metrics:
+# measure: total_amount
+# grain_to_date: month  # cumulative only: month, quarter, year
+
+# For derived metrics:
+# expr: "metric_a / metric_b"
+# inputs:
+#   - metric: metric_a
+#   - metric: metric_b

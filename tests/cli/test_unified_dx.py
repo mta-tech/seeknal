@@ -476,7 +476,8 @@ class TestRunInEnvironmentHelper:
 
         with patch("seeknal.workflow.environment.EnvironmentManager", return_value=mock_manager):
             from seeknal.cli.main import _run_in_environment
-            with pytest.raises(ValueError, match="No plan found"):
+            from click.exceptions import Exit as ClickExit
+            with pytest.raises(ClickExit):
                 _run_in_environment(
                     env_name="dev",
                     project_path=tmp_path,
@@ -629,7 +630,17 @@ class TestPromoteEnvironmentHelper:
 
         mock_manager = MagicMock()
         mock_manager._load_json.return_value = plan_data
-        mock_manager.promote.return_value = None
+        promote_result = {
+            "promoted": True,
+            "rematerialize_nodes": set(),
+            "manifest": None,
+            "from_env": "dev",
+            "to_env": "prod",
+            "profile_path": None,
+            "changed_filenames": {"source_raw_users.parquet"},
+            "warnings": [],
+        }
+        mock_manager.promote.return_value = promote_result
 
         with patch("seeknal.workflow.environment.EnvironmentManager", return_value=mock_manager):
             result = runner.invoke(app, ["promote", "dev"], input="y\n")

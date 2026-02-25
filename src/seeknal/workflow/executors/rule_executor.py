@@ -252,7 +252,7 @@ class RuleExecutor(BaseExecutor):
                 f"{label}: missing required 'type' field"
             )
 
-        valid_rule_types = ["null", "range", "uniqueness", "freshness", "custom", "profile_check"]
+        valid_rule_types = ["null", "range", "uniqueness", "freshness", "custom", "profile_check", "sql_assertion"]
         if rule_type not in valid_rule_types:
             raise ExecutorValidationError(
                 self.node.id,
@@ -331,6 +331,14 @@ class RuleExecutor(BaseExecutor):
                                 self.node.id,
                                 f"{label}.checks[{ci}].{level}: {e}"
                             )
+
+        elif rule_type == "sql_assertion":
+            sql = check.get("sql")
+            if not sql or not isinstance(sql, str):
+                raise ExecutorValidationError(
+                    self.node.id,
+                    f"{label}: rule type 'sql_assertion' requires a 'sql' string"
+                )
 
     def execute(self) -> ExecutorResult:
         """
@@ -467,6 +475,13 @@ class RuleExecutor(BaseExecutor):
                     )
                     con.close()
                     return profile_results
+
+                elif rule_type == "sql_assertion":
+                    assertion_results = self._execute_sql_assertion(
+                        con, rule_config
+                    )
+                    con.close()
+                    return assertion_results
 
                 else:
                     con.close()
@@ -1029,6 +1044,115 @@ class RuleExecutor(BaseExecutor):
             row_count=0,
             metadata=metadata,
         )
+
+    def _register_input_views(self, con: "Any") -> None:
+        """Register all input refs as named DuckDB views.
+
+        Each input ``ref`` is converted to a view name by replacing dots
+        with underscores (e.g. ``source.orders`` -> ``source_orders``).
+        The first input is also aliased as ``input_data`` for backward
+        compatibility with other rule types.
+        """
+        inputs = self.node.config.get("inputs", [])
+        for idx, inp in enumerate(inputs):
+            if isinstance(inp, dict) and "ref" in inp:
+                ref = inp["ref"]
+            elif isinstance(inp, str):
+                ref = inp
+            else:
+                continue
+
+            ref_path = ref.replace(".", "_")
+            intermediate = self.context.target_path / "intermediate" / f"{ref_path}.parquet"
+            if not intermediate.exists():
+                parts = ref.split(".")
+                if len(parts) == 2:
+                    kind, name = parts
+                    cache = self.context.target_path / "cache" / kind / f"{name}.parquet"
+                    if cache.exists():
+                        intermediate = cache
+                    else:
+                        continue
+                else:
+                    continue
+
+            view_name = ref_path  # e.g. "source_orders"
+            con.execute(
+                f"CREATE OR REPLACE VIEW \"{view_name}\" AS "
+                f"SELECT * FROM read_parquet('{intermediate}')"
+            )
+
+    def _execute_sql_assertion(
+        self,
+        con: "Any",
+        rule_config: Dict[str, Any],
+    ) -> ExecutorResult:
+        """Execute sql_assertion rule type.
+
+        Runs the user's SQL query. If the query returns any rows, those
+        are treated as violations (dbt-style test pattern).
+
+        All input refs are registered as named views before the query runs.
+        """
+        start_time = time.time()
+        severity = self.node.config.get("params", {}).get("severity", "error")
+        error_msg_override = self.node.config.get("params", {}).get("error_message")
+        sql = rule_config["sql"]
+
+        # Register all inputs as named views
+        self._register_input_views(con)
+
+        try:
+            result_rel = con.execute(sql)
+            violations_df = result_rel.fetchall()
+            violation_count = len(violations_df)
+        except Exception as e:
+            raise ExecutorExecutionError(
+                self.node.id,
+                f"sql_assertion query failed: {e}"
+            ) from e
+
+        passed = violation_count == 0
+        message = (
+            f"SQL assertion passed (0 violations)"
+            if passed
+            else f"SQL assertion failed: {violation_count} violation row(s) returned"
+        )
+
+        metadata = {
+            "rule_type": "sql_assertion",
+            "passed": passed,
+            "violations": violation_count,
+            "message": message,
+            "severity": severity,
+            "sql": sql,
+        }
+
+        if passed:
+            logger.info(f"SQL assertion PASSED: {message}")
+            return ExecutorResult(
+                node_id=self.node.id,
+                status=ExecutionStatus.SUCCESS,
+                duration_seconds=time.time() - start_time,
+                row_count=violation_count,
+                metadata=metadata,
+            )
+        else:
+            error_msg = error_msg_override or message
+            if severity == "warn":
+                logger.warning(f"SQL assertion WARNING: {error_msg}")
+                return ExecutorResult(
+                    node_id=self.node.id,
+                    status=ExecutionStatus.SUCCESS,
+                    duration_seconds=time.time() - start_time,
+                    row_count=violation_count,
+                    metadata=metadata,
+                )
+            else:
+                raise ExecutorExecutionError(
+                    self.node.id,
+                    f"SQL assertion failed: {error_msg} ({violation_count} violations)"
+                )
 
     def post_execute(self, result: ExecutorResult) -> ExecutorResult:
         """

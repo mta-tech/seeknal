@@ -1,4 +1,4 @@
-# Phase 2 ML Engineering: Fraud Detection Pipeline
+# ML Engineering: Fraud Detection Pipeline
 
 This example demonstrates parallel execution for feature engineering at scale. The fraud detection pipeline includes 8 independent data sources that execute simultaneously, achieving up to 3x speedup.
 
@@ -38,7 +38,7 @@ Layer 3 (1 exposure):
 
 ### Sequential Execution
 ```bash
-cd examples/phase2-ml-eng
+cd examples/ml-eng
 seeknal parse
 seeknal run
 ```
@@ -79,7 +79,7 @@ On an 8-core machine:
 ## Tutorial
 
 For a complete walkthrough, see:
-`docs/tutorials/phase2-ml-eng-parallel.md`
+`docs/tutorials/ml-eng-parallel.md`
 
 ## Data Requirements
 

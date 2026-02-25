@@ -86,19 +86,42 @@ Examples:
 For more information, see: https://github.com/mta-tech/seeknal
 """
 
-import typer
+import typer  # ty: ignore[unresolved-import]
+import typer.core as _typer_core  # ty: ignore[unresolved-import]
 from typing import Optional, Callable, List, Any
 from datetime import datetime, timedelta
+from difflib import get_close_matches
 from enum import Enum
 from functools import wraps
 import os
 import sys
 from pathlib import Path
 
+
+class SuggestGroup(_typer_core.TyperGroup):
+    """Typer group that suggests similar commands on typos."""
+
+    def resolve_command(self, ctx: Any, args: list[str]) -> Any:
+        try:
+            return super().resolve_command(ctx, args)
+        except Exception as e:
+            if "No such command" not in str(e):
+                raise
+            cmd_name = args[0] if args else None
+            if cmd_name is not None:
+                matches = get_close_matches(
+                    cmd_name, self.list_commands(ctx), n=3, cutoff=0.4
+                )
+                if matches:
+                    suggestion = ", ".join(f"'{m}'" for m in matches)
+                    msg = f"No such command '{cmd_name}'.\n\nDid you mean: {suggestion}?"
+                    raise type(e)(msg) from e
+            raise
+
 # Load .env file if present (for local development)
 # This makes environment variables available for all CLI commands
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv  # ty: ignore[unresolved-import]
     
     # Try to find .env in current directory or up to 3 parent directories
     cwd = Path.cwd()
@@ -117,6 +140,7 @@ app = typer.Typer(
     name="seeknal",
     help="Feature store management CLI - similar to dbt",
     add_completion=False,
+    cls=SuggestGroup,
 )
 
 # Version command group for feature group version management
@@ -142,17 +166,17 @@ Examples:
 app.add_typer(version_app, name="version")
 
 # Source management for REPL
-from seeknal.cli.source import app as source_app
+from seeknal.cli.source import app as source_app  # ty: ignore[unresolved-import]
 
 app.add_typer(source_app, name="source")
 
 # Iceberg materialization commands
-from seeknal.cli.materialization_cli import app as iceberg_app
+from seeknal.cli.materialization_cli import app as iceberg_app  # ty: ignore[unresolved-import]
 
 app.add_typer(iceberg_app, name="iceberg")
 
 # Documentation search commands
-from seeknal.cli.docs import docs_app
+from seeknal.cli.docs import docs_app  # ty: ignore[unresolved-import]
 
 app.add_typer(docs_app, name="docs")
 
@@ -394,6 +418,7 @@ def _build_manifest_from_dag(dag_builder, project_name: str):
         "python": ManifestNodeType.PYTHON,
         "semantic_model": ManifestNodeType.SEMANTIC_MODEL,
         "metric": ManifestNodeType.METRIC,
+        "profile": ManifestNodeType.PROFILE,
     }
 
     manifest = Manifest(project=project_name)
@@ -1111,6 +1136,7 @@ def _run_yaml_pipeline(
     successful = 0
     failed = 0
     cached = 0
+    rule_quality = []  # Track rule results: (node_id, passed, severity, message)
 
     for idx, node_id in enumerate(execution_order, 1):
         node = dag_builder.nodes[node_id]
@@ -1252,7 +1278,54 @@ def _run_yaml_pipeline(
         failed_msg = typer.style(str(failed), fg=typer.colors.RED, bold=True)
         typer.echo(f"  Failed:         {failed_msg}")
     typer.echo(f"  Duration:       {total_duration:.2f}s")
+
+    # Data quality summary for rule nodes
+    _rule_passed = 0
+    _rule_warns = 0
+    _rule_errors = 0
+    for _nid, _ns in run_state.nodes.items():
+        if not _nid.startswith("rule."):
+            continue
+        _meta = _ns.metadata or {}
+        _has_warns = _meta.get("warned", 0) > 0
+        if _ns.status == "failed":
+            _rule_errors += 1
+        elif _has_warns and _meta.get("passed", True):
+            _rule_warns += 1
+        elif _meta.get("passed", True):
+            _rule_passed += 1
+        elif _meta.get("severity") == "warn":
+            _rule_warns += 1
+        else:
+            _rule_errors += 1
+    _rule_total = _rule_passed + _rule_warns + _rule_errors
+    if _rule_total > 0:
+        typer.echo("")
+        typer.echo(f"  Data Quality:   {_rule_total} rule(s)")
+        if _rule_passed > 0:
+            typer.echo(f"                  {typer.style(str(_rule_passed) + ' passed', fg=typer.colors.GREEN)}")
+        if _rule_warns > 0:
+            typer.echo(f"                  {typer.style(str(_rule_warns) + ' warning(s)', fg=typer.colors.YELLOW, bold=True)}")
+        if _rule_errors > 0:
+            typer.echo(f"                  {typer.style(str(_rule_errors) + ' error(s)', fg=typer.colors.RED, bold=True)}")
+
     typer.echo("=" * 60)
+
+    # Show rule warning details
+    for _nid, _ns in run_state.nodes.items():
+        if not _nid.startswith("rule."):
+            continue
+        _meta = _ns.metadata or {}
+        _has_warns = _meta.get("warned", 0) > 0
+        _is_failed_warn = not _meta.get("passed", True) and _meta.get("severity") == "warn"
+        if _has_warns or _is_failed_warn:
+            _msg = _meta.get("message", "")
+            if "results" in _meta:
+                for _c in _meta["results"]:
+                    if _c.get("status") == "warn" or not _c.get("passed", True):
+                        _echo_warning(f"  Data quality warning: {_nid}: {_c['message']}")
+            elif _msg:
+                _echo_warning(f"  Data quality warning: {_nid}: {_msg}")
 
     if failed > 0:
         raise typer.Exit(1)
@@ -4944,6 +5017,9 @@ def lineage(
     no_open: bool = typer.Option(
         False, "--no-open", help="Don't auto-open browser"
     ),
+    ascii_output: bool = typer.Option(
+        False, "--ascii", help="Print DAG as ASCII tree to stdout instead of HTML"
+    ),
 ):
     """Generate interactive lineage visualization.
 
@@ -4952,6 +5028,7 @@ def lineage(
         seeknal lineage transform.clean_orders       # Focus on node
         seeknal lineage transform.X --column total   # Trace column
         seeknal lineage --output dag.html            # Custom path
+        seeknal lineage --ascii                      # ASCII tree to stdout
     """
     from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
     from seeknal.dag.visualize import generate_lineage_html, LineageVisualizationError
@@ -4973,6 +5050,12 @@ def lineage(
             _echo_warning("No nodes found. Add pipeline files to your project.")
             raise typer.Exit(code=1)
 
+        if ascii_output:
+            from seeknal.dag.visualize import render_ascii_tree  # ty: ignore[unresolved-import]
+            tree_text = render_ascii_tree(manifest, focus_node=node_id)
+            typer.echo(tree_text)
+            return
+
         if output is None:
             output = path / "target" / "lineage.html"
 
@@ -4985,6 +5068,94 @@ def lineage(
         )
         _echo_success(f"Lineage visualization generated: {result_path}")
     except LineageVisualizationError as e:
+        _echo_error(str(e))
+        raise typer.Exit(code=1)
+
+
+
+
+@app.command()
+def dq(
+    node_id: Optional[str] = typer.Argument(
+        None, help="Focus on a specific profile or rule node"
+    ),
+    project: str = typer.Option(
+        None, "--project", "-p", help="Project name"
+    ),
+    path: Path = typer.Option(
+        Path("."), "--path", help="Project path"
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o",
+        help="Output HTML file path (default: target/dq_report.html)"
+    ),
+    no_open: bool = typer.Option(
+        False, "--no-open", help="Don't auto-open browser"
+    ),
+    ascii_output: bool = typer.Option(
+        False, "--ascii", help="Print ASCII report to stdout instead of HTML"
+    ),
+):
+    """Generate data quality dashboard from profile stats and rule results.
+
+    Examples:
+        seeknal dq                              # Full DQ report (HTML)
+        seeknal dq --ascii                      # ASCII report to stdout
+        seeknal dq rule.check_orders            # Focus on specific node
+        seeknal dq --output report.html         # Custom output path
+        seeknal dq --no-open                    # Generate without opening browser
+    """
+    from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
+    from seeknal.dag.dq import (
+        DQDataBuilder, DQVisualizationError,
+        render_dq_ascii as _render_dq_ascii,
+        generate_dq_html as _generate_dq_html,
+    )
+    from seeknal.workflow.state import load_state
+
+    if project is None:
+        project = path.resolve().name
+
+    try:
+        try:
+            dag_builder = DAGBuilder(project_path=path)
+            dag_builder.build()
+        except (ValueError, CycleDetectedError, MissingDependencyError) as e:
+            _echo_error(f"DAG build failed: {e}")
+            raise typer.Exit(code=1)
+
+        manifest = _build_manifest_from_dag(dag_builder, project)
+
+        if not manifest.nodes:
+            _echo_warning("No nodes found. Add pipeline files to your project.")
+            raise typer.Exit(code=1)
+
+        # Load run state
+        state_path = path / "target" / "run_state.json"
+        state = load_state(state_path)
+        if state is None:
+            from seeknal.workflow.state import RunState
+            state = RunState()
+            _echo_warning("No run state found. Run 'seeknal run' first for DQ data.")
+
+        target_path = path / "target"
+        builder = DQDataBuilder(state, manifest, target_path)
+        dq_data = builder.build(focus_node=node_id)
+
+        if ascii_output:
+            typer.echo(_render_dq_ascii(dq_data))
+            return
+
+        if output is None:
+            output = path / "target" / "dq_report.html"
+
+        result_path = _generate_dq_html(
+            dq_data=dq_data,
+            output_path=output,
+            open_browser=not no_open,
+        )
+        _echo_success(f"Data quality report generated: {result_path}")
+    except DQVisualizationError as e:
         _echo_error(str(e))
         raise typer.Exit(code=1)
 

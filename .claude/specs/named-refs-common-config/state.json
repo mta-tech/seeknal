@@ -1,0 +1,32 @@
+{
+  "build": {
+    "specPath": "specs/named-refs-common-config.md",
+    "mode": "team",
+    "teamName": "named-refs-common-config",
+    "totalTasks": 18,
+    "startedAt": "2026-02-19T22:45:00.000Z",
+    "lastUpdated": "2026-02-19T22:45:00.000Z"
+  },
+  "tasks": [
+    {"id": "10", "subject": "Add _resolve_named_refs() to TransformExecutor", "status": "pending", "owner": "ref-syntax-builder"},
+    {"id": "11", "subject": "Add ref() resolution to dry-run preview", "status": "pending", "owner": "ref-syntax-builder", "blockedBy": ["10"]},
+    {"id": "12", "subject": "Write ref() syntax tests", "status": "pending", "owner": "ref-syntax-builder", "blockedBy": ["10", "11"]},
+    {"id": "13", "subject": "Update transforms documentation for ref()", "status": "pending", "owner": "ref-syntax-builder", "blockedBy": ["10"]},
+    {"id": "14", "subject": "Create CommonConfig Pydantic models", "status": "pending", "owner": "common-config-builder"},
+    {"id": "15", "subject": "Create CommonConfigLoader", "status": "pending", "owner": "common-config-builder", "blockedBy": ["14"]},
+    {"id": "16", "subject": "Extend ParameterResolver with common_config", "status": "pending", "owner": "common-config-builder", "blockedBy": ["15"]},
+    {"id": "17", "subject": "Integrate common config into DAG builder", "status": "pending", "owner": "common-config-builder", "blockedBy": ["15", "16"]},
+    {"id": "18", "subject": "Resolve {{ }} in transform SQL at execution time", "status": "pending", "owner": "common-config-builder", "blockedBy": ["16", "17", "10", "11"]},
+    {"id": "19", "subject": "Resolve {{ }} in dry-run preview", "status": "pending", "owner": "common-config-builder", "blockedBy": ["18"]},
+    {"id": "20", "subject": "Add seeknal/common to init scaffolding", "status": "pending", "owner": "common-config-builder"},
+    {"id": "21", "subject": "Write common config tests", "status": "pending", "owner": "common-config-builder", "blockedBy": ["14", "15", "16", "17", "18"]},
+    {"id": "22", "subject": "Write common config documentation", "status": "pending", "owner": "common-config-builder", "blockedBy": ["18"]},
+    {"id": "23", "subject": "Create QA test project with telecom data", "status": "pending", "owner": "qa-tester", "blockedBy": ["10", "11", "14", "15", "16", "17", "18", "19"]},
+    {"id": "24", "subject": "Run pipeline end-to-end with Iceberg", "status": "pending", "owner": "qa-tester", "blockedBy": ["23"]},
+    {"id": "25", "subject": "Create Iceberg verification script", "status": "pending", "owner": "qa-tester", "blockedBy": ["24"]},
+    {"id": "26", "subject": "Update documentation with real examples", "status": "pending", "owner": "qa-tester", "blockedBy": ["24", "22"]},
+    {"id": "27", "subject": "Write QA test project README", "status": "pending", "owner": "qa-tester", "blockedBy": ["24", "25"]}
+  ],
+  "artifacts": [],
+  "validation": {}
+}

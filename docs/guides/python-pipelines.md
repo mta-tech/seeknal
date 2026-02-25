@@ -989,7 +989,7 @@ inputs:
   - ref: transform.enriched_sales  # From enriched_sales.py
 transform: |
   SELECT region, SUM(amount) as total_sales
-  FROM __THIS__
+  FROM ref('transform.enriched_sales')
   GROUP BY region
 ```
 

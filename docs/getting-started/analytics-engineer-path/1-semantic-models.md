@@ -1,26 +1,26 @@
-# Chapter 1: Define Semantic Models
+# Chapter 1: Build a Semantic Model
 
-> **Duration:** 25 minutes | **Difficulty:** Intermediate | **Format:** YAML & Python
+> **Duration:** 25 minutes | **Difficulty:** Intermediate | **Format:** YAML
 
-Learn to create semantic models that provide business-friendly views of your data, enabling self-service analytics across your organization.
+Learn to create a semantic model that provides business-friendly views of your data, enabling self-service analytics.
 
 ---
 
 ## What You'll Build
 
-A semantic model for e-commerce analytics that defines:
+A semantic model for e-commerce analytics:
 
 ```
-Orders Semantic Model
-├── Entities (Order, Customer, Product)
-├── Dimensions (Status, Date, Category)
-└── Measures (Revenue, Count, AOV)
+orders_cleaned (transform) → Semantic Model YAML → seeknal query
+                                  ├── Entities (order_id, customer_id)
+                                  ├── Dimensions (order_date, status)
+                                  └── Measures (total_revenue, order_count, avg_order_value)
 ```
 
 **After this chapter, you'll have:**
-- A complete semantic model with entities, dimensions, and measures
-- Queryable semantic layer for business users
-- Foundation for business metrics
+- A semantic model YAML defining entities, dimensions, and measures
+- Queryable metrics via `seeknal query`
+- Foundation for business metrics in Chapter 2
 
 ---
 
@@ -28,468 +28,332 @@ Orders Semantic Model
 
 Before starting, ensure you've completed:
 
-- [ ] [Quick Start](../../quick-start/) — Basic pipeline builder workflow
+- [ ] [DE Path Chapter 1](../data-engineer-path/1-elt-pipeline.md) — You need the `orders_cleaned` transform
 - [ ] [AE Path Overview](index.md) — Introduction to this path
-- [ ] Comfortable with SQL JOINs and aggregations
+- [ ] Comfortable with SQL aggregations
 
 ---
 
-## Part 1: Understand Semantic Models (7 minutes)
+## Part 1: Verify Your Data Foundation (5 minutes)
 
-### What Are Semantic Models?
+### Check Your Pipeline
 
-Semantic models provide **business-friendly views** of your data:
-
-| Traditional SQL | Semantic Model |
-|-----------------|----------------|
-| `SELECT SUM(revenue) FROM orders WHERE status = 'completed'` | `orders.total_revenue` |
-| `SELECT COUNT(*) FROM users WHERE created_at > '2024-01-01'` | `users.new_users` |
-| `SELECT AVG(amount) FROM transactions` | `transactions.avg_amount` |
-
-**Benefits:**
-- **Business language**: Use terms stakeholders understand
-- **Reusable**: Define once, query from anywhere
-- **Governed**: Controlled definitions prevent inconsistencies
-- **Self-serve**: Non-technical users can build queries
-
-### Semantic Model Components
-
-=== "Entities"
-
-    **Entities** are the core business objects in your data:
-
-    ```yaml
-    entities:
-      - name: customer
-        id: customer_id
-        type: profile  # Profile vs Transaction
-
-      - name: order
-        id: order_id
-        type: transaction
-    ```
-
-    **Entity Types:**
-    - **Profile**: Stable attributes (customer, product)
-    - **Transaction**: Events over time (order, visit, click)
-
-=== "Dimensions"
-
-    **Dimensions** are attributes for filtering and grouping:
-
-    ```yaml
-    dimensions:
-      # Categorical dimension
-      - name: order_status
-        type: categorical
-        values: [pending, completed, cancelled]
-
-      # Time dimension
-      - name: order_date
-        type: time
-        granularity: [day, week, month]
-
-      # Geographic dimension
-      - name: country
-        type: geographic
-        hierarchy: [country, region, city]
-    ```
-
-=== "Measures"
-
-    **Measures** are aggregatable metrics:
-
-    ```yaml
-    measures:
-      - name: total_revenue
-        expression: SUM(revenue)
-        type: currency
-
-      - name: order_count
-        expression: COUNT(*)
-        type: numeric
-
-      - name: avg_order_value
-        expression: AVG(revenue)
-        type: currency
-    ```
-
----
-
-## Part 2: Create Semantic Model (10 minutes)
-
-=== "YAML Approach"
-
-    Create a new project:
-
-    ```bash
-    seeknal init ecommerce-analytics
-    cd ecommerce-analytics
-    ```
-
-    Create the orders semantic model:
-
-    ```bash
-    seeknal draft semantic-model --name orders
-    ```
-
-    Edit `semantic-models/orders.yaml`:
-
-    ```yaml
-    kind: semantic_model
-    name: orders
-    description: "E-commerce order transactions"
-
-    # Data source
-    source: warehouse.orders
-
-    # Entities
-    entities:
-      - name: order
-        id: order_id
-        type: transaction
-        description: "Individual order transaction"
-
-      - name: customer
-        id: customer_id
-        type: profile
-        description: "Customer who placed the order"
-
-      - name: product
-        id: product_id
-        type: profile
-        description: "Product purchased"
-
-    # Dimensions
-    dimensions:
-      # Categorical dimensions
-      - name: status
-        type: categorical
-        column: order_status
-        description: "Order status"
-        values: [pending, completed, cancelled, refunded]
-
-      - name: category
-        type: categorical
-        column: product_category
-        description: "Product category"
-
-      # Time dimensions
-      - name: order_date
-        type: time
-        column: created_at
-        description: "Date order was placed"
-        granularity: [day, week, month, quarter, year]
-
-      - name: order_hour
-        type: time
-        column: created_at
-        description: "Hour of day order was placed"
-        granularity: [hour]
-
-      # Geographic dimensions
-      - name: country
-        type: geographic
-        column: billing_country
-        description: "Customer billing country"
-
-      - name: region
-        type: geographic
-        column: billing_state
-        description: "Customer billing state/region"
-
-    # Measures
-    measures:
-      - name: total_revenue
-        expression: SUM(revenue)
-        type: currency
-        description: "Total order revenue"
-
-      - name: order_count
-        expression: COUNT(*)
-        type: numeric
-        description: "Total number of orders"
-
-      - name: avg_order_value
-        expression: AVG(revenue)
-        type: currency
-        description: "Average order value"
-
-      - name: total_items
-        expression: SUM(quantity)
-        type: numeric
-        description: "Total items ordered"
-
-      - name: unique_customers
-        expression: COUNT(DISTINCT customer_id)
-        type: numeric
-        description: "Number of unique customers"
-
-    # Relationships
-    relationships:
-      - from: customer
-        to: order
-        type: one_to_many
-        description: "A customer can have many orders"
-
-      - from: product
-        to: order
-        type: one_to_many
-        description: "A product can be in many orders"
-    ```
-
-=== "Python Approach"
-
-    Create `semantic_models.py`:
-
-    ```python
-    #!/usr/bin/env python3
-    """
-    Semantic Models - Chapter 1
-    Define semantic models for e-commerce analytics
-    """
-
-    from seeknal.semantic_layer import SemanticModel, Entity, Dimension, Measure
-
-    # Create orders semantic model
-    orders_model = SemanticModel(
-        name="orders",
-        description="E-commerce order transactions",
-        source="warehouse.orders"
-    )
-
-    # Add entities
-    orders_model.add_entity(Entity(
-        name="order",
-        id="order_id",
-        type="transaction",
-        description="Individual order transaction"
-    ))
-
-    orders_model.add_entity(Entity(
-        name="customer",
-        id="customer_id",
-        type="profile",
-        description="Customer who placed the order"
-    ))
-
-    orders_model.add_entity(Entity(
-        name="product",
-        id="product_id",
-        type="profile",
-        description="Product purchased"
-    ))
-
-    # Add dimensions
-    orders_model.add_dimension(Dimension(
-        name="status",
-        type="categorical",
-        column="order_status",
-        description="Order status",
-        values=["pending", "completed", "cancelled", "refunded"]
-    ))
-
-    orders_model.add_dimension(Dimension(
-        name="order_date",
-        type="time",
-        column="created_at",
-        description="Date order was placed",
-        granularity=["day", "week", "month"]
-    ))
-
-    orders_model.add_dimension(Dimension(
-        name="country",
-        type="geographic",
-        column="billing_country",
-        description="Customer billing country"
-    ))
-
-    # Add measures
-    orders_model.add_measure(Measure(
-        name="total_revenue",
-        expression="SUM(revenue)",
-        type="currency",
-        description="Total order revenue"
-    ))
-
-    orders_model.add_measure(Measure(
-        name="order_count",
-        expression="COUNT(*)",
-        type="numeric",
-        description="Total number of orders"
-    ))
-
-    orders_model.add_measure(Measure(
-        name="avg_order_value",
-        expression="AVG(revenue)",
-        type="currency",
-        description="Average order value"
-    ))
-
-    # Add relationships
-    orders_model.add_relationship(
-        from_entity="customer",
-        to_entity="order",
-        type="one_to_many"
-    )
-
-    # Save the model
-    orders_model.save("semantic-models/orders.yaml")
-
-    print("Semantic model created successfully!")
-    ```
-
-### Apply the Semantic Model
+You should already have a working e-commerce pipeline from the DE path. Verify it:
 
 ```bash
-# YAML approach
-seeknal apply semantic-models/orders.yaml
+seeknal repl
+```
 
-# Python approach
-python semantic_models.py
+```sql
+SELECT * FROM orders_cleaned LIMIT 5;
+```
+
+**Checkpoint:** You should see cleaned order data with columns: `order_id`, `customer_id`, `order_date`, `status`, `revenue`, `items`, `quality_flag`, `processed_at`.
+
+!!! tip "Don't have the pipeline yet?"
+    Complete [DE Path Chapter 1](../data-engineer-path/1-elt-pipeline.md) first. It takes 25 minutes and sets up the e-commerce data you'll use throughout this path.
+
+### Understand the Data
+
+Run a quick summary in the REPL:
+
+```sql
+SELECT
+  COUNT(*) as total_orders,
+  COUNT(DISTINCT customer_id) as unique_customers,
+  SUM(revenue) as total_revenue,
+  AVG(revenue) as avg_revenue
+FROM orders_cleaned
+WHERE quality_flag = 0;
 ```
 
 **Expected output:**
 ```
-Applying semantic model 'orders'...
-  ✓ Validated YAML schema
-  ✓ Checked entity definitions
-  ✓ Verified dimensions
-  ✓ Registered measures
-Semantic model applied successfully!
++----------------+--------------------+-----------------+--------------+
+|   total_orders |   unique_customers |   total_revenue |   avg_revenue |
+|----------------+--------------------+-----------------+--------------|
+|              9 |                  7 |          826.17 |       91.7967|
++----------------+--------------------+-----------------+--------------+
+```
+
+This is the data your semantic model will describe.
+
+---
+
+## Part 2: Define the Semantic Model (12 minutes)
+
+### What Is a Semantic Model?
+
+A semantic model maps your data to business concepts:
+
+| Traditional SQL | Semantic Model |
+|-----------------|----------------|
+| `SELECT SUM(revenue) FROM orders_cleaned` | `total_revenue` measure |
+| `WHERE status = 'COMPLETED'` | `status` dimension |
+| `GROUP BY DATE(order_date)` | `order_date` time dimension |
+
+Benefits:
+- **Business language** — stakeholders query `total_revenue`, not raw SQL
+- **Governed** — one definition, consistent everywhere
+- **Reusable** — same model feeds metrics, queries, and BI tools
+
+### Generate the Semantic Model Template
+
+```bash
+seeknal draft semantic-model orders
+```
+
+**Expected output:**
+```
+ℹ Using package templates
+✓ Draft file created: draft_semantic_model_orders.yml
+```
+
+### Edit the Draft YAML
+
+Open `draft_semantic_model_orders.yml` and replace its contents with:
+
+```yaml
+kind: semantic_model
+name: orders
+description: "E-commerce order analytics model"
+model: "ref('transform.orders_cleaned')"
+default_time_dimension: order_date
+
+entities:
+  - name: order_id
+    type: primary
+
+  - name: customer_id
+    type: foreign
+
+dimensions:
+  - name: order_date
+    type: time
+    expr: order_date
+    time_granularity: day
+    description: "Date the order was placed"
+
+  - name: status
+    type: string
+    expr: status
+    description: "Order status (COMPLETED, PENDING, etc.)"
+
+  - name: revenue
+    type: number
+    expr: revenue
+    description: "Order revenue amount"
+
+measures:
+  - name: total_revenue
+    expr: revenue
+    agg: sum
+    description: "Total revenue from orders"
+
+  - name: completed_revenue
+    expr: revenue
+    agg: sum
+    description: "Revenue from completed orders only"
+    filters:
+      - sql: "status = 'COMPLETED'"
+
+  - name: order_count
+    expr: "1"
+    agg: count
+    description: "Number of orders"
+
+  - name: avg_order_value
+    expr: revenue
+    agg: average
+    description: "Average order value"
+```
+
+### Validate and Apply
+
+```bash
+seeknal dry-run draft_semantic_model_orders.yml
+seeknal apply draft_semantic_model_orders.yml
+```
+
+**Expected output:**
+```
+ℹ Validating YAML...
+✓ YAML syntax valid
+✓ Schema validation passed
+✓ Dependency check passed
+ℹ Moving file...
+ℹ   TO: ./seeknal/semantic_models/orders.yml
+✓ Applied successfully
+```
+
+!!! info "YAML Format Reference"
+    - **kind**: Must be `semantic_model`
+    - **model**: References a Seeknal node using `ref('kind.name')` format
+    - **entities**: Columns that identify business objects (`primary`, `foreign`, `unique`)
+    - **dimensions**: Attributes for filtering/grouping (`time`, `string`, `number`, `boolean`)
+    - **measures**: Aggregatable expressions (`sum`, `count`, `average`, `min`, `max`, `count_distinct`)
+    - **metrics**: Advanced metrics (`ratio`, `cumulative`, `derived`) — see [Chapter 2](2-business-metrics.md)
+    - **joins**: Relationships to other semantic models (`one_to_one`, `one_to_many`, `many_to_one`)
+
+### Understand Each Component
+
+**Entities** identify business objects in your data:
+
+```yaml
+entities:
+  - name: order_id      # Primary key
+    type: primary
+  - name: customer_id   # Foreign key (links to customers)
+    type: foreign
+```
+
+**Dimensions** are what you filter and group by:
+
+```yaml
+dimensions:
+  - name: order_date
+    type: time           # Enables time-based queries (day, week, month)
+    time_granularity: day
+  - name: status
+    type: string         # Text dimension for GROUP BY
+  - name: revenue
+    type: number         # Numeric dimension
+```
+
+**Measures** are what you aggregate:
+
+```yaml
+measures:
+  - name: total_revenue
+    expr: revenue        # Column to aggregate
+    agg: sum             # Aggregation function
+
+  - name: completed_revenue
+    expr: revenue
+    agg: sum
+    filters:             # Measure-level filters (Cube.js-style)
+      - sql: "status = 'COMPLETED'"
+```
+
+**Joins** connect semantic models (for multi-model queries):
+
+```yaml
+joins:
+  - name: customers              # Target model name
+    relationship: many_to_one    # one_to_one, one_to_many, many_to_one
+    sql: "{CUBE}.customer_id = {customers}.customer_id"
 ```
 
 ---
 
-## Part 3: Query Semantic Models (8 minutes)
+## Part 3: Query the Semantic Layer (8 minutes)
 
-### Understanding Semantic Queries
+### Query Metrics by Dimension
 
-Semantic models automatically generate business-friendly SQL:
+`seeknal query` can query measures directly from your semantic model — no separate metric files needed:
 
-=== "Query with seeknal query"
+```bash
+seeknal query --metrics total_revenue,order_count --dimensions status
+```
 
-    ```bash
-    # Query total revenue by status
-    seeknal query --model orders --measure total_revenue --group-by status
-    ```
+**Expected output:**
+```
+status       total_revenue    order_count
+---------  ---------------  -------------
+PENDING               0                 2
+COMPLETED          1396.17             10
+ℹ 
+2 rows returned
+```
 
-    **Generated SQL:**
-    ```sql
-    SELECT
-      order_status as status,
-      SUM(revenue) as total_revenue
-    FROM warehouse.orders
-    GROUP BY order_status
-    ORDER BY total_revenue DESC
-    ```
+### Show Generated SQL
 
-    **Expected output:**
-    ```
-    status          | total_revenue
-    ----------------|--------------
-    completed       | $125,430.00
-    pending         | $15,230.00
-    cancelled       | $3,420.00
-    ```
+Use the `--compile` flag to see what SQL is generated:
 
-=== "Query with Python"
+```bash
+seeknal query --metrics total_revenue --dimensions order_date --compile
+```
 
-    ```python
-    from seeknal.semantic_layer import Query
+**Expected output:**
+```sql
+SELECT
+  order_date,
+  SUM(revenue) AS total_revenue
+FROM orders_cleaned
+GROUP BY order_date
+ORDER BY order_date
+```
 
-    # Create a query
-    query = Query(model="orders")
+!!! info "How It Works"
+    `seeknal query` reads your metric YAMLs and semantic model, resolves the `model` reference to the underlying transform, compiles measures into SQL aggregations, applies dimension grouping, and executes against DuckDB.
 
-    # Add measures and dimensions
-    query.add_measure("total_revenue")
-    query.add_dimension("status")
+### Verify in REPL
 
-    # Add filters
-    query.filter("order_date >= '2024-01-01'")
+Open the REPL and run the equivalent SQL manually:
 
-    # Execute
-    results = query.execute()
-    print(results)
-    ```
+```bash
+seeknal repl
+```
 
-    **Expected output:**
-    ```
-       status  total_revenue
-    0  completed      125430.00
-    1    pending       15230.00
-    2  cancelled        3420.00
-    ```
+```sql
+-- This is what seeknal query generates under the hood
+SELECT
+  status,
+  SUM(revenue) AS total_revenue,
+  COUNT(*) AS order_count
+FROM orders_cleaned
+GROUP BY status;
+```
 
-### Advanced Queries
+**Checkpoint:** The REPL results should match the `seeknal query` output exactly.
 
-=== "Time-based Analysis"
+### Add a Filter
 
-    ```bash
-    # Daily revenue trend
-    seeknal query --model orders \
-      --measure total_revenue,order_count \
-      --group-by order_date \
-      --filter "order_date >= '2024-01-01'" \
-      --order-by order_date
-    ```
+```bash
+seeknal query --metrics total_revenue --dimensions order_date --filter "status = 'COMPLETED'"
+```
 
-=== "Multi-dimensional Analysis"
+**Expected output:**
+```
+order_date      total_revenue
+------------  ---------------
+2026-01-15              89.5
+2026-01-16             250
+2026-01-17              75.25
+2026-01-18             365.99
+2026-01-19             349.94
+2026-01-20             265.49
+ℹ 
+6 rows returned
+```
 
-    ```bash
-    # Revenue by status and category
-    seeknal query --model orders \
-      --measure total_revenue \
-      --group-by status,category \
-      --filter "order_date >= '2024-01-01'"
-    ```
-
-=== "Comparison Analysis"
-
-    ```python
-    # Python: Month-over-month comparison
-    query = Query(model="orders")
-
-    query.add_measure("total_revenue")
-    query.add_dimension("order_date")
-
-    # Add time comparison
-    query.compare_periods(
-        period="month",
-        comparison="previous_period"
-    )
-
-    results = query.execute()
-    ```
+!!! success "Congratulations!"
+    You've built a semantic model that turns raw SQL into business-friendly queries. Stakeholders can now query `total_revenue` by `status` or `order_date` without writing SQL.
 
 ---
 
-## What Makes Semantic Models Powerful?
+## What Could Go Wrong?
 
-!!! success "Single Source of Truth"
-    Before semantic models:
-    ```sql
-    -- Analyst A's definition
-    SUM(CASE WHEN status = 'completed' THEN revenue END)
+!!! danger "Common Pitfalls"
+    **1. "No semantic models found"**
 
-    -- Analyst B's definition
-    SUM(CASE WHEN status IN ('completed', 'pending') THEN revenue END)
-    ```
+    - Symptom: `seeknal query` says no semantic models found
+    - Fix: Ensure your YAML is in `seeknal/semantic_models/` directory and has `kind: semantic_model`
 
-    After semantic models:
-    ```yaml
-    # Everyone uses the same definition
-    measure: total_revenue
-    expression: SUM(CASE WHEN status = 'completed' THEN revenue END)
-    ```
+    **2. Missing `model` reference**
 
-!!! tip "Self-Serve Analytics"
-    Business users can now ask:
-    - "What's our revenue by month?"
-    - "How many orders per category?"
-    - "What's the average order value by region?"
+    - Symptom: Validation error about missing model
+    - Fix: The `model` field must reference an existing node: `ref('transform.orders_cleaned')`
 
-    Without writing SQL!
+    **3. Invalid aggregation type**
+
+    - Symptom: Error parsing measure
+    - Fix: Use one of: `sum`, `count`, `count_distinct`, `average`, `min`, `max`
+
+    **4. Dimension not found in query**
+
+    - Symptom: Column not found error
+    - Fix: Ensure the dimension `expr` matches an actual column in your transform output
 
 ---
 
@@ -497,31 +361,32 @@ Semantic models automatically generate business-friendly SQL:
 
 In this chapter, you learned:
 
-- [x] **Semantic Model Components** — Entities, dimensions, measures
-- [x] **Creating Semantic Models** — YAML and Python approaches
-- [x] **Entity Relationships** — One-to-many, many-to-many
-- [x] **Querying Semantic Models** — Business-friendly queries
-- [x] **Governance Benefits** — Single source of truth
+- [x] **Semantic Models** — Define business-friendly data views in YAML
+- [x] **Entities** — Identify primary and foreign keys
+- [x] **Dimensions** — Create time, string, number, and boolean groupings
+- [x] **Measures** — Define aggregatable metrics with optional filters
+- [x] **Joins** — Connect semantic models with relationship types
+- [x] **seeknal query** — Query the semantic layer from the CLI (no separate metric files needed)
 
 **Key Commands:**
 ```bash
-seeknal draft semantic-model --name <name>
-seeknal apply semantic-models/<name>.yaml
-seeknal query --model <name> --measure <measure>
+seeknal query --metrics <names> --dimensions <names>   # Query metrics
+seeknal query --metrics <names> --compile              # Show generated SQL
+seeknal query --metrics <names> --filter "<expr>"      # Filter results
+seeknal repl                                           # Interactive verification
 ```
 
 ---
 
 ## What's Next?
 
-[Chapter 2: Create Business Metrics →](2-business-metrics.md)
+[Chapter 2: Define Business Metrics →](2-business-metrics.md)
 
-Build on your semantic models to create reusable business metrics and KPIs.
+Create reusable business metrics — simple KPIs, ratio metrics, cumulative totals, and derived metrics that compose from simpler ones.
 
 ---
 
 ## See Also
 
-- **[Semantic Layer Guide](../../guides/semantic-layer.md)** — Deep dive on semantic layer
-- **[Building Blocks: Semantic Models](../../building-blocks/semantic-models.md)** — Reference documentation
-- **[CLI Reference](../../reference/cli.md)** — All semantic model commands
+- **[YAML Schema Reference](../../reference/yaml-schema.md)** — Semantic model field reference
+- **[CLI Reference](../../reference/cli.md)** — All `seeknal query` flags

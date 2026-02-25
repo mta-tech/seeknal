@@ -118,7 +118,10 @@ class TestLineageDataBuilder:
         assert result["data"]["label"] == "orders"
         assert result["data"]["node_type"] == "source"
         assert result["data"]["description"] == "Raw orders table"
-        assert result["data"]["columns"] == {"order_id": "PK", "amount": "decimal"}
+        assert result["data"]["columns"] == {
+            "order_id": {"type": "", "description": "PK"},
+            "amount": {"type": "", "description": "decimal"},
+        }
         assert result["data"]["file_path"] == "models/source.yml"
         assert result["data"]["sql"] == ""
 

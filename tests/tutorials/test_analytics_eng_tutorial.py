@@ -1,5 +1,5 @@
 """
-Test suite for Phase 2 Analytics Engineering tutorial.
+Test suite for Analytics Engineering tutorial.
 
 Validates that all YAML examples parse correctly and demonstrate
 proper change categorization behavior.
@@ -13,7 +13,7 @@ from seeknal.dag.manifest import Manifest, Node, NodeType, Edge
 
 
 # Example YAML directory
-EXAMPLES_DIR = Path(__file__).parent.parent.parent / "examples" / "phase2-analytics-eng"
+EXAMPLES_DIR = Path(__file__).parent.parent.parent / "examples" / "analytics-eng"
 
 
 class TestAnalyticsEngTutorialExamples:

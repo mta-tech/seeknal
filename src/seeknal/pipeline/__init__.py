@@ -57,6 +57,7 @@ from seeknal.pipeline.decorators import (
     source,
     transform,
     feature_group,
+    second_order_aggregation,
     get_registered_nodes,
     clear_registry,
 )
@@ -73,6 +74,7 @@ __all__ = [
     "source",
     "transform",
     "feature_group",
+    "second_order_aggregation",
     # Context
     "PipelineContext",
     # Materialization

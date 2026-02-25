@@ -93,21 +93,18 @@ Expected output should include `env plan`, `env apply`, `env promote` commands.
 
 ## Part 1: Setup Sample Pipeline
 
-### 1.1 Create Project Directory
+### 1.1 Initialize Project
 
 ```bash
-mkdir -p ~/seeknal-phase2-tutorial
-cd ~/seeknal-phase2-tutorial
+seeknal init --name env-tutorial --description "Environment management tutorial"
+cd env-tutorial
 ```
 
 ### 1.2 Copy Example YAML Files
 
 ```bash
-# Create seeknal directory structure
-mkdir -p seeknal/sources seeknal/transforms seeknal/aggregations seeknal/exposures
-
 # Copy the 8 example YAML files from the examples directory
-cp -r /path/to/seeknal/examples/phase2-data-eng/* seeknal/
+cp -r /path/to/seeknal/examples/environment-management/* seeknal/
 
 # Verify structure
 tree seeknal/
@@ -183,8 +180,8 @@ seeknal plan
 
 Expected output:
 ```
-Parsing project: seeknal-phase2-tutorial
-  Path: /Users/you/seeknal-phase2-tutorial
+Parsing project: env-tutorial
+  Path: /Users/you/env-tutorial
 ✓ Manifest generated: target/manifest.json
   Nodes: 8
   Edges: 7
@@ -202,7 +199,7 @@ Expected output:
 ```
 Seeknal Pipeline Execution
 ============================================================
-  Project: seeknal-phase2-tutorial
+  Project: env-tutorial
   Mode: Incremental
 ℹ Building DAG from seeknal/ directory...
 ✓ DAG built: 8 nodes, 7 edges
@@ -689,7 +686,7 @@ Expected output:
 ```
 Seeknal Pipeline Execution (Parallel Mode)
 ============================================================
-  Project: seeknal-phase2-tutorial
+  Project: env-tutorial
   Mode: Incremental
   Parallelism: enabled
   Max workers: 4

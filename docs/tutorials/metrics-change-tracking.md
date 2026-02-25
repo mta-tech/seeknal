@@ -12,7 +12,7 @@ seeknal init --name revenue-analytics && cd revenue-analytics && mkdir -p workfl
 
 ## 1. Define Sources
 
-Copy source YAMLs from `examples/phase2-analytics-eng/` to `workflows/`:
+Copy source YAMLs from `examples/metrics-change-tracking/` to `workflows/`:
 - `01_source_subscriptions.yml` — subscription records
 - `02_source_payments.yml` — payment transactions
 - `03_source_customers.yml` — customer profiles
@@ -50,7 +50,7 @@ inputs: [{ref: source.customers}, {ref: transform.revenue_base}]
 
 ## 3. Define Aggregations
 
-Copy aggregation YAMLs from `examples/phase2-analytics-eng/`:
+Copy aggregation YAMLs from `examples/metrics-change-tracking/`:
 - `06_aggregation_monthly_revenue.yml` — MRR metrics with 30d/90d windows
 - `07_aggregation_churn_analysis.yml` — subscription stability metrics
 

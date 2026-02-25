@@ -64,7 +64,34 @@ body {
 #sidebar {
   width: 280px; background: #fff; border-right: 1px solid #e2e8f0;
   display: flex; flex-direction: column; flex-shrink: 0; z-index: 20;
+  transition: width 0.25s ease, min-width 0.25s ease;
+  min-width: 280px; overflow: hidden; position: relative;
 }
+#sidebar.collapsed {
+  width: 0; min-width: 0; border-right: none;
+}
+#sidebar.collapsed #sidebar-header,
+#sidebar.collapsed #sidebar-list { opacity: 0; pointer-events: none; }
+#sidebar-toggle {
+  width: 24px; height: 24px; border-radius: 50%;
+  background: #f1f5f9; border: 1px solid #e2e8f0;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; flex-shrink: 0;
+  transition: background 0.15s;
+  font-size: 12px; color: #64748b; line-height: 1; padding: 0;
+}
+#sidebar-toggle:hover { background: #e2e8f0; color: #334155; }
+/* Expand button inside stats bar, visible only when sidebar collapsed */
+#sidebar-toggle-float {
+  display: none; width: 24px; height: 24px; border-radius: 50%;
+  background: #f1f5f9; border: 1px solid #e2e8f0;
+  align-items: center; justify-content: center;
+  cursor: pointer; flex-shrink: 0;
+  transition: background 0.15s;
+  font-size: 12px; color: #64748b; line-height: 1; padding: 0;
+}
+#sidebar-toggle-float:hover { background: #e2e8f0; color: #334155; }
+#sidebar.collapsed ~ #graph-area #sidebar-toggle-float { display: flex; }
 #sidebar-header {
   padding: 12px 14px; border-bottom: 1px solid #e2e8f0;
   display: flex; align-items: center; gap: 8px;
@@ -133,8 +160,13 @@ body {
 .stat-pill {
   font-size: 12px; color: #64748b; padding: 3px 0;
 }
+.stat-pill.clickable { cursor: pointer; padding: 3px 8px; border-radius: 10px; transition: background 0.15s; }
+.stat-pill.clickable:hover { background: #f1f5f9; }
+.stat-pill.active-filter { background: #eff6ff; color: #2563eb; }
+.stat-pill.active-filter b { color: #1d4ed8; }
 .stat-pill b { color: #334155; font-weight: 600; }
 .stat-divider { color: #e2e8f0; font-size: 12px; }
+#stat-types { display: contents; }
 #stats-bar .search-box {
   margin-left: auto; display: flex; align-items: center;
   border: 1px solid #e2e8f0; border-radius: 6px; padding: 0 10px;
@@ -309,10 +341,21 @@ body {
   font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
 }
 #details-panel .detail-columns li {
-  display: flex; justify-content: space-between;
-  padding: 5px 0; border-bottom: 1px solid #f1f5f9; color: #334155;
+  display: flex; justify-content: space-between; align-items: flex-start;
+  padding: 6px 0; border-bottom: 1px solid #f1f5f9; color: #334155; gap: 8px;
 }
-#details-panel .detail-columns .dt-col-type { color: #94a3b8; font-size: 11px; }
+#details-panel .detail-columns .dt-col-left {
+  display: flex; flex-direction: column; min-width: 0; flex: 1;
+}
+#details-panel .detail-columns .dt-col-name {
+  font-weight: 500;
+}
+#details-panel .detail-columns .dt-col-desc {
+  font-size: 11px; color: #94a3b8; margin-top: 2px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  line-height: 1.4; word-break: break-word;
+}
+#details-panel .detail-columns .dt-col-type { color: #94a3b8; font-size: 11px; flex-shrink: 0; }
 #details-panel .detail-more { font-size: 11px; color: #94a3b8; font-style: italic; margin-top: 6px; }
 #details-panel .sql-block {
   font-size: 11px; font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
@@ -406,6 +449,7 @@ body {
     <div id="sidebar-header">
       <input type="text" id="sidebar-filter" placeholder="Filter items">
       <span id="sidebar-count">0</span>
+      <button id="sidebar-toggle" title="Collapse sidebar">&#x276E;</button>
     </div>
     <div id="sidebar-list"></div>
   </div>
@@ -414,12 +458,12 @@ body {
   <div id="graph-area">
     <!-- Stats Bar -->
     <div id="stats-bar">
+      <button id="sidebar-toggle-float" title="Expand sidebar">&#x276F;</button>
       <span class="focused-name" id="focused-label">Seeknal Lineage</span>
       <span class="stat-divider">|</span>
       <span class="stat-pill" id="stat-all"></span>
       <span class="stat-pill" id="stat-hidden"></span>
-      <span class="stat-pill" id="stat-sources"></span>
-      <span class="stat-pill" id="stat-lineage"></span>
+      <span id="stat-types"></span>
       <div class="search-box">
         <span class="search-icon">&#128269;</span>
         <input type="text" id="search-input" placeholder="Find">
@@ -534,28 +578,148 @@ body {
   };
 
   /* ===== Helpers ===== */
+  function generateAutoDescription(dep) {
+    if (!dep) return '';
+    var expr = dep.expression || '';
+    var type = dep.transformation_type || '';
+    var inputs = dep.inputs || [];
+    var source = dep.source_table || '';
+
+    // Clean source table name: ref('transform.orders_merged') -> orders_merged
+    var cleanSource = source.replace(/ref\(['"]?([^'")\s]+)['"]?\)/, '$1')
+                            .replace(/^(source|transform)\./, '');
+
+    // Direct passthrough
+    if (type === 'direct' || type === 'passthrough') {
+      if (cleanSource) return 'From ' + cleanSource;
+      if (inputs.length > 0) return 'From ' + inputs[0];
+      return '';
+    }
+
+    // COUNT(*)
+    if (/COUNT\s*\(\s*\*\s*\)/i.test(expr)) return 'Count of all rows';
+
+    // COUNT(DISTINCT col)
+    var distinctMatch = expr.match(/COUNT\s*\(\s*DISTINCT\s+(\w+)\s*\)/i);
+    if (distinctMatch) return 'Count of distinct ' + distinctMatch[1];
+
+    // COUNT(CASE WHEN ... THEN ...)
+    if (/COUNT\s*\(\s*CASE/i.test(expr)) {
+      var whenMatch = expr.match(/WHEN\s+(.+?)\s+THEN/i);
+      if (whenMatch) {
+        var cond = whenMatch[1].replace(/\s+/g, ' ').trim();
+        if (cond.length > 40) cond = cond.substring(0, 37) + '...';
+        return 'Count where ' + cond;
+      }
+      return 'Conditional count';
+    }
+
+    // Aggregate functions: SUM, AVG, MIN, MAX, COUNT
+    var aggMatch = expr.match(/\b(SUM|AVG|MIN|MAX|COUNT)\s*\(\s*(\w+)\s*\)/i);
+    if (aggMatch) {
+      var labels = { SUM: 'Sum', AVG: 'Average', MIN: 'Minimum', MAX: 'Maximum', COUNT: 'Count' };
+      var fn = aggMatch[1].toUpperCase();
+      return (labels[fn] || fn) + ' of ' + aggMatch[2];
+    }
+
+    // Wrapped aggregates: COALESCE(SUM(x), 0) or ROUND(COALESCE(AVG(x), 0), 2)
+    var wrappedAgg = expr.match(/\b(SUM|AVG|MIN|MAX|COUNT)\s*\(\s*(\w+)\s*\)/i);
+    if (!wrappedAgg) {
+      var nestedMatch = expr.match(/(SUM|AVG|MIN|MAX|COUNT)\s*\(/i);
+      if (nestedMatch) {
+        var innerCol = expr.match(new RegExp(nestedMatch[1] + '\\s*\\(\\s*(\\w+)', 'i'));
+        if (innerCol) {
+          var lbl = { SUM: 'Sum', AVG: 'Average', MIN: 'Minimum', MAX: 'Maximum', COUNT: 'Count' };
+          return (lbl[nestedMatch[1].toUpperCase()] || nestedMatch[1]) + ' of ' + innerCol[1];
+        }
+      }
+    }
+
+    // CASE WHEN expressions
+    if (type === 'case_when' || /^\s*CASE\s/i.test(expr)) {
+      if (inputs.length > 0) return 'Conditional on ' + inputs.join(', ');
+      return 'Conditional expression';
+    }
+
+    // Window functions
+    if (/ROW_NUMBER|RANK|DENSE_RANK|NTILE|LAG|LEAD/i.test(expr)) {
+      return 'Window function';
+    }
+
+    // CURRENT_TIMESTAMP / CURRENT_DATE
+    if (/CURRENT_TIMESTAMP/i.test(expr)) return 'Current timestamp';
+    if (/CURRENT_DATE/i.test(expr)) return 'Current date';
+
+    // Function wrapping with known inputs (UPPER, TRIM, DATE, CAST, etc.)
+    if (inputs.length > 0) {
+      return 'Derived from ' + inputs.join(', ');
+    }
+
+    // Fallback: show truncated expression
+    if (expr.length > 50) return expr.substring(0, 47) + '...';
+    return expr || '';
+  }
+
   function getNodeColumns(nodeData) {
     var cols = [];
     var colLineage = LINEAGE_DATA.column_lineage[nodeData.id];
 
+    // Build lookup of explicit column metadata (from YAML columns: field)
+    var explicitCols = {};
     if (nodeData.columns && Object.keys(nodeData.columns).length > 0) {
       Object.entries(nodeData.columns).forEach(function(entry) {
-        cols.push({ name: entry[0], type: entry[1] || '' });
+        var val = entry[1];
+        if (val && typeof val === 'object') {
+          explicitCols[entry[0]] = { type: val.type || '', description: val.description || '' };
+        } else {
+          explicitCols[entry[0]] = { type: '', description: String(val || '') };
+        }
       });
-    } else if (colLineage && colLineage.output_columns) {
+    }
+
+    // Build lookup of SQL-derived columns with auto-generated descriptions
+    var lineageCols = {};
+    if (colLineage && colLineage.output_columns) {
       colLineage.output_columns.forEach(function(colName) {
         var colType = '';
+        var autoDesc = '';
         if (colLineage.dependencies) {
           for (var i = 0; i < colLineage.dependencies.length; i++) {
             if (colLineage.dependencies[i].output === colName) {
               colType = colLineage.dependencies[i].transformation_type || '';
+              autoDesc = generateAutoDescription(colLineage.dependencies[i]);
               break;
             }
           }
         }
-        cols.push({ name: colName, type: colType });
+        lineageCols[colName] = { type: colType, autoDesc: autoDesc };
       });
     }
+
+    // Merge: explicit columns enriched with SQL-derived type + auto-desc fallback
+    var seen = {};
+    Object.keys(explicitCols).forEach(function(name) {
+      var ec = explicitCols[name];
+      var lc = lineageCols[name];
+      cols.push({
+        name: name,
+        type: ec.type || (lc ? lc.type : ''),
+        description: ec.description || (lc ? lc.autoDesc : '')
+      });
+      seen[name] = true;
+    });
+
+    // Append SQL-derived columns not in explicit list (with auto-description)
+    Object.keys(lineageCols).forEach(function(name) {
+      if (!seen[name]) {
+        cols.push({
+          name: name,
+          type: lineageCols[name].type,
+          description: lineageCols[name].autoDesc
+        });
+      }
+    });
+
     return cols;
   }
 
@@ -643,18 +807,53 @@ body {
     document.getElementById('sidebar-count').textContent = String(visible);
   });
 
+  /* ===== Sidebar Collapse/Expand ===== */
+  var sidebar = document.getElementById('sidebar');
+  document.getElementById('sidebar-toggle').addEventListener('click', function() {
+    sidebar.classList.add('collapsed');
+  });
+  document.getElementById('sidebar-toggle-float').addEventListener('click', function() {
+    sidebar.classList.remove('collapsed');
+  });
+
   /* ===== Stats ===== */
   var totalNodes = LINEAGE_DATA.nodes.length;
-  var sourceCount = 0;
+  var typeCounts = {};
   LINEAGE_DATA.nodes.forEach(function(n) {
-    if (n.data.node_type === 'source') sourceCount++;
+    var t = n.data.node_type;
+    typeCounts[t] = (typeCounts[t] || 0) + 1;
   });
-  var upDownCount = totalNodes - sourceCount;
 
-  setStatText(document.getElementById('stat-all'), 'All', totalNodes);
+  var TYPE_READABLE = {
+    source: 'Sources', transform: 'Transforms', feature_group: 'Feature Groups',
+    aggregation: 'Aggregations', second_order_aggregation: '2nd Order Agg',
+    exposure: 'Exposures', rule: 'Rules', python: 'Python',
+    semantic_model: 'Semantic Models', metric: 'Metrics', model: 'Models'
+  };
+  var TYPE_ORDER = ['source', 'transform', 'aggregation', 'second_order_aggregation',
+    'feature_group', 'exposure', 'rule', 'python', 'semantic_model', 'metric', 'model'];
+
+  var statAllEl = document.getElementById('stat-all');
+  statAllEl.className = 'stat-pill clickable';
+  statAllEl.setAttribute('data-filter-type', 'all');
+  setStatText(statAllEl, 'All', totalNodes);
   setStatText(document.getElementById('stat-hidden'), 'Hidden', 0);
-  setStatText(document.getElementById('stat-sources'), 'Sources', sourceCount);
-  setStatText(document.getElementById('stat-lineage'), 'Upstream/Downstream', upDownCount);
+
+  var statTypesEl = document.getElementById('stat-types');
+  function createTypePill(t, count) {
+    var pill = document.createElement('span');
+    pill.className = 'stat-pill clickable';
+    pill.setAttribute('data-filter-type', t);
+    setStatText(pill, TYPE_READABLE[t] || t, count);
+    statTypesEl.appendChild(pill);
+  }
+  TYPE_ORDER.forEach(function(t) {
+    if (typeCounts[t]) createTypePill(t, typeCounts[t]);
+  });
+  // Any types not in TYPE_ORDER
+  Object.keys(typeCounts).forEach(function(t) {
+    if (TYPE_ORDER.indexOf(t) === -1) createTypePill(t, typeCounts[t]);
+  });
   setHeaderStat(document.getElementById('h-nodes'), totalNodes, 'Nodes');
   setHeaderStat(document.getElementById('h-edges'), LINEAGE_DATA.edges.length, 'Edges');
 
@@ -802,6 +1001,9 @@ body {
         var row = document.createElement('div');
         row.className = 'col-row';
         row.setAttribute('data-col-name', col.name);
+        if (col.description) {
+          row.title = col.description;
+        }
 
         var colName = document.createElement('span');
         colName.className = 'col-name';
@@ -914,9 +1116,24 @@ body {
       var visible = cols.slice(0, 25);
       visible.forEach(function(col) {
         var li = document.createElement('li');
+
+        var leftWrap = document.createElement('div');
+        leftWrap.className = 'dt-col-left';
+
         var cn = document.createElement('span');
+        cn.className = 'dt-col-name';
         cn.textContent = col.name;
-        li.appendChild(cn);
+        leftWrap.appendChild(cn);
+
+        if (col.description) {
+          var desc = document.createElement('span');
+          desc.className = 'dt-col-desc';
+          desc.textContent = col.description;
+          leftWrap.appendChild(desc);
+        }
+
+        li.appendChild(leftWrap);
+
         if (col.type) {
           var ct = document.createElement('span');
           ct.className = 'dt-col-type';
@@ -1065,6 +1282,8 @@ body {
   document.getElementById('btn-lock').addEventListener('click', function() {
     layoutLocked = !layoutLocked;
     cy.autoungrabify(layoutLocked);
+    cy.userPanningEnabled(!layoutLocked);
+    cy.userZoomingEnabled(!layoutLocked);
     this.classList.toggle('active', layoutLocked);
     this.textContent = layoutLocked ? '\u{1f510}' : '\u{1f512}';
   });
@@ -1095,6 +1314,96 @@ body {
       this.dispatchEvent(new Event('input'));
     }
   });
+
+  /* ===== Type Filter State ===== */
+  var activeTypeFilter = null;
+
+  /* ===== Show All (Reset View) ===== */
+  document.getElementById('btn-show').addEventListener('click', function() {
+    resetHighlight();
+    hideDetailsPanel();
+    searchInput.value = '';
+    activeTypeFilter = null;
+    var allPills = document.querySelectorAll('.stat-pill.clickable');
+    for (var i = 0; i < allPills.length; i++) {
+      allPills[i].classList.remove('active-filter');
+    }
+    Object.keys(cardElements).forEach(function(id) {
+      cardElements[id].classList.remove('dimmed', 'search-match');
+    });
+    cy.edges().removeClass('dimmed upstream downstream');
+    setStatText(document.getElementById('stat-hidden'), 'Hidden', 0);
+    cy.fit(null, 40);
+    syncOverlay();
+  });
+
+  /* ===== Filter by Node Type (stat pill click) ===== */
+  function applyTypeFilter(filterType) {
+    // Clear previous filter state
+    var allPills = document.querySelectorAll('.stat-pill.clickable');
+    for (var i = 0; i < allPills.length; i++) {
+      allPills[i].classList.remove('active-filter');
+    }
+
+    // Toggle: clicking same filter again clears it
+    if (filterType === 'all' || filterType === activeTypeFilter) {
+      activeTypeFilter = null;
+      // Show all
+      Object.keys(cardElements).forEach(function(id) {
+        cardElements[id].classList.remove('dimmed');
+      });
+      cy.edges().removeClass('dimmed');
+      setStatText(document.getElementById('stat-hidden'), 'Hidden', 0);
+      statAllEl.classList.add('active-filter');
+      return;
+    }
+
+    activeTypeFilter = filterType;
+    var hiddenCount = 0;
+
+    // Dim non-matching nodes
+    cy.nodes().forEach(function(cyNode) {
+      var nid = cyNode.id();
+      var ntype = cyNode.data('node_type');
+      var card = cardElements[nid];
+      if (ntype === filterType) {
+        if (card) card.classList.remove('dimmed');
+      } else {
+        if (card) card.classList.add('dimmed');
+        hiddenCount++;
+      }
+    });
+
+    // Dim edges not connecting two matching nodes
+    cy.edges().forEach(function(edge) {
+      var srcType = edge.source().data('node_type');
+      var tgtType = edge.target().data('node_type');
+      if (srcType === filterType && tgtType === filterType) {
+        edge.removeClass('dimmed');
+      } else {
+        edge.addClass('dimmed');
+      }
+    });
+
+    // Highlight active pill
+    var activePill = document.querySelector('.stat-pill.clickable[data-filter-type="' + filterType + '"]');
+    if (activePill) activePill.classList.add('active-filter');
+
+    setStatText(document.getElementById('stat-hidden'), 'Hidden', hiddenCount);
+  }
+
+  // Attach click handlers to all clickable stat pills
+  var clickablePills = document.querySelectorAll('.stat-pill.clickable');
+  for (var pi = 0; pi < clickablePills.length; pi++) {
+    (function(pill) {
+      pill.addEventListener('click', function() {
+        var filterType = this.getAttribute('data-filter-type');
+        resetHighlight();
+        hideDetailsPanel();
+        applyTypeFilter(filterType);
+      });
+    })(clickablePills[pi]);
+  }
 
   /* ===== Column Trace Breadcrumb ===== */
   function renderColumnTrace() {

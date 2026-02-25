@@ -249,9 +249,53 @@ class SecondOrderAggregationExecutor(BaseExecutor):
         result.metadata["executor_version"] = "1.0.0"
         return result
 
+    def _is_python_node(self) -> bool:
+        """Check if this node originates from a Python pipeline file."""
+        if not hasattr(self.node, 'file_path') or not self.node.file_path:
+            return False
+        return str(self.node.file_path).endswith('.py')
+
+    def _execute_python_preprocessing(self) -> Path:
+        """Run the Python function body via subprocess to produce intermediate parquet.
+
+        Returns:
+            Path to the intermediate parquet file
+
+        Raises:
+            ExecutorExecutionError: If preprocessing fails
+        """
+        from seeknal.workflow.executors.python_executor import PythonExecutor  # ty: ignore[unresolved-import]
+
+        py_executor = PythonExecutor(self.node, self.context)
+        result = py_executor.execute()
+
+        if result.status != ExecutionStatus.SUCCESS:
+            error_msg = result.metadata.get('stderr', 'unknown error') if result.metadata else 'unknown error'
+            raise ExecutorExecutionError(
+                self.node.id,
+                f"Python preprocessing failed: {error_msg}"
+            )
+
+        # PythonExecutor saves to target/intermediate/{node_id_dots_replaced}.parquet
+        node_id_safe = self.node.id.replace('.', '_')
+        parquet_path = Path(self.context.target_path) / "intermediate" / f"{node_id_safe}.parquet"
+        if not parquet_path.exists():
+            raise ExecutorExecutionError(
+                self.node.id,
+                "Python preprocessing did not produce output parquet"
+            )
+        return parquet_path
+
     def _execute_duckdb(self) -> ExecutorResult:
         """
         Execute second-order aggregation using DuckDB.
+
+        For Python SOA nodes: runs the function body via subprocess first
+        to produce a pre-processed DataFrame (intermediate parquet), then
+        runs the SOA engine on that result.
+
+        For YAML SOA nodes: loads source data from upstream node's
+        intermediate storage, then runs the SOA engine.
 
         Returns:
             ExecutorResult with execution results
@@ -265,12 +309,21 @@ class SecondOrderAggregationExecutor(BaseExecutor):
         # Get DuckDB connection
         con = self.context.get_duckdb_connection()
 
-        # Resolve source aggregation
-        source_ref = config["source"]
-        source_node = self._resolve_source_node(source_ref)
+        source_ref = config.get("source", "")
 
-        # Load source data from intermediate storage
-        source_table_name = self._load_source_data(con, source_node)
+        if self._is_python_node():
+            # Phase 1: Run function body to get pre-processed data
+            parquet_path = self._execute_python_preprocessing()
+            # Load the pre-processed data directly as SOA input
+            source_table_name = f"soa_input_{self.node.name}"
+            con.execute(
+                f"CREATE OR REPLACE VIEW {source_table_name} AS "
+                f"SELECT * FROM '{parquet_path}'"
+            )
+        else:
+            # YAML path: load from upstream node
+            source_node = self._resolve_source_node(source_ref)
+            source_table_name = self._load_source_data(con, source_node)
 
         # Build aggregation specs from YAML features
         aggregation_specs = self._build_aggregation_specs(config)

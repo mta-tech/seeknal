@@ -74,7 +74,7 @@ Install, load data, create features, and run your first pipeline.
 **Start with:** [YAML Pipeline Tutorial (75 min)](tutorials/yaml-pipeline-tutorial.md)
 
 **Then learn:**
-- [Virtual Environments](tutorials/phase2-data-eng-environments.md) - Safe development with isolated environments
+- [Environment Management](tutorials/environment-management.md) - Safe development with isolated environments
 - [Incremental Models](concepts/second-order-aggregations.md) - Efficient incremental processing
 - [Change Categorization](concepts/change-categorization.md) - Understand breaking vs. non-breaking changes
 
@@ -90,7 +90,7 @@ Install, load data, create features, and run your first pipeline.
 
 **Then learn:**
 - [Semantic Layer & Metrics](guides/semantic-layer.md) - Define and query consistent metrics
-- [Change Categorization](tutorials/phase2-analytics-eng-metrics.md) - Track metric changes over time
+- [Change Categorization](tutorials/metrics-change-tracking.md) - Track metric changes over time
 - [Testing & Audits](guides/testing-and-audits.md) - Validate data quality
 
 **Typical use case:** "I need consistent metrics across dashboards and tools, with change tracking."
@@ -106,7 +106,7 @@ Install, load data, create features, and run your first pipeline.
 **Then learn:**
 - [Python Pipelines](tutorials/python-pipelines-tutorial.md) - Feature engineering with Python
 - [Training to Serving](guides/training-to-serving.md) - End-to-end ML workflow
-- [Parallel Execution](tutorials/phase2-ml-eng-parallel.md) - Speed up large pipelines
+- [Parallel Execution](tutorials/parallel-execution.md) - Speed up large pipelines
 
 **Typical use case:** "I need features for training that prevent data leakage, with online serving."
 
@@ -149,9 +149,9 @@ Step-by-step learning paths with copy-pasteable code.
 
 - [YAML Pipeline Tutorial](tutorials/yaml-pipeline-tutorial.md) — Build a complete pipeline from scratch (75 min)
 - [Mixed YAML + Python](tutorials/mixed-yaml-python-pipelines.md) — Combine both paradigms (60 min)
-- [Virtual Environments](tutorials/phase2-data-eng-environments.md) — Safe development with environments (45 min)
-- [Parallel Execution](tutorials/phase2-ml-eng-parallel.md) — Speed up large pipelines (45 min)
-- [Change Categorization](tutorials/phase2-analytics-eng-metrics.md) — Understand change impact (20 min)
+- [Environment Management](tutorials/environment-management.md) — Safe development with environments (45 min)
+- [Parallel Execution](tutorials/parallel-execution.md) — Speed up large pipelines (45 min)
+- [Change Categorization](tutorials/metrics-change-tracking.md) — Understand change impact (20 min)
 - [E-Commerce Walkthrough](tutorials/workflow-tutorial-ecommerce.md) — Real-world example
 
 ## Additional Resources

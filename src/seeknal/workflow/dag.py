@@ -711,6 +711,17 @@ class DAGBuilder:
                         # Only AST dependencies found
                         yaml_data["inputs"] = [{"ref": d} for d in deps_map[name]]
 
+                elif kind_str == "second_order_aggregation":
+                    # Copy SOA-specific fields from decorator metadata
+                    yaml_data["id_col"] = node_meta.get("id_col")
+                    yaml_data["feature_date_col"] = node_meta.get("feature_date_col")
+                    yaml_data["application_date_col"] = node_meta.get("application_date_col")
+                    yaml_data["features"] = node_meta.get("features", {})
+                    # Synthesize source and inputs from ctx.ref() AST deps
+                    if name in deps_map and deps_map[name]:
+                        yaml_data["source"] = deps_map[name][0]
+                        yaml_data["inputs"] = [{"ref": d} for d in deps_map[name]]
+
                 if kind_str == "feature_group":
                     yaml_data["entity"] = node_meta.get("entity")
                     yaml_data["features"] = node_meta.get("features", {})

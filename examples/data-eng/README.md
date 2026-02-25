@@ -1,6 +1,6 @@
-# Phase 2 Data Engineering Tutorial Examples
+# Data Engineering Tutorial Examples
 
-This directory contains 8 example YAML files for the Phase 2 tutorial on virtual environments and parallel execution.
+This directory contains 8 example YAML files for the data engineering tutorial on virtual environments and parallel execution.
 
 ## Files
 
@@ -38,18 +38,18 @@ Exposures (1)
 
 ## Usage
 
-Follow the tutorial at: `docs/tutorials/phase2-data-eng-environments.md`
+Follow the tutorial at: `docs/tutorials/data-eng-environments.md`
 
 ### Quick Start
 
 ```bash
 # Create project directory
-mkdir -p ~/seeknal-phase2-tutorial
-cd ~/seeknal-phase2-tutorial
+mkdir -p ~/seeknal-data-eng-tutorial
+cd ~/seeknal-data-eng-tutorial
 
 # Copy example files
 mkdir -p seeknal
-cp /path/to/seeknal/examples/phase2-data-eng/*.yml seeknal/
+cp /path/to/seeknal/examples/data-eng/*.yml seeknal/
 
 # Create sample data (see tutorial for details)
 mkdir -p data
@@ -105,6 +105,6 @@ This validates:
 
 ## Learn More
 
-- [Phase 2 Tutorial](../../docs/tutorials/phase2-data-eng-environments.md)
+- [Data Engineering Tutorial](../../docs/tutorials/data-eng-environments.md)
 - [YAML Pipeline Tutorial](../../docs/tutorials/yaml-pipeline-tutorial.md)
 - [API Reference](../../docs/api/yaml-schema.md)

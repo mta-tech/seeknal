@@ -84,8 +84,8 @@ mkdir -p ~/fraud-detection
 cd ~/fraud-detection
 
 # Copy example files (adjust path to your Seeknal installation)
-cp -r <seeknal-install>/examples/phase2-ml-eng/ .
-cd phase2-ml-eng/
+cp -r <seeknal-install>/examples/parallel-execution/ .
+cd parallel-execution/
 ```
 
 ### 2. Generate Manifest
@@ -98,8 +98,8 @@ seeknal plan
 
 Expected output:
 ```
-Parsing project: phase2-ml-eng
-  Path: ~/fraud-detection/phase2-ml-eng
+Parsing project: parallel-execution
+  Path: ~/fraud-detection/parallel-execution
 ✓ Manifest generated: target/manifest.json
   Nodes: 15
   Edges: 22
@@ -117,7 +117,7 @@ Expected output:
 ```
 Seeknal Pipeline Execution
 ============================================================
-  Project: phase2-ml-eng
+  Project: parallel-execution
   Mode: Incremental
 
 Execution
@@ -205,7 +205,7 @@ Expected output:
 ```
 Seeknal Parallel Execution
 ============================================================
-  Project: phase2-ml-eng
+  Project: parallel-execution
   Mode: Full (ignore cache)
   Max Workers: 8
 

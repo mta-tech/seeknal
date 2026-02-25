@@ -11,6 +11,7 @@ from seeknal.workflow.semantic.compiler import MetricCompiler
 from seeknal.workflow.semantic.models import (
     Metric,
     MetricQuery,
+    MetricType,
 )
 
 
@@ -68,6 +69,14 @@ class MetricDeployer:
         """
         if config is None:
             config = DeployConfig()
+
+        # Cumulative metrics use window functions which StarRocks MVs don't support
+        if metric.type == MetricType.CUMULATIVE:
+            raise ValueError(
+                f"Cumulative metric '{metric.name}' uses window functions "
+                "which are not supported in StarRocks materialized views. "
+                "Query it via 'seeknal query' instead."
+            )
 
         mv_name = f"mv_{metric.name}"
 

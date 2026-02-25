@@ -1,8 +1,8 @@
 # Advanced Guide
 
-**Duration:** ~130 minutes | **Difficulty:** Intermediate | **Format:** YAML & CLI
+**Duration:** ~155 minutes | **Difficulty:** Intermediate | **Format:** YAML, Python & CLI
 
-Go deeper with Seeknal's advanced capabilities: multi-format file sources, data quality rules, pipeline lineage visualization, named references, and shared configuration.
+Go deeper with Seeknal's advanced capabilities: multi-format file sources, data quality rules, pipeline lineage visualization, named references, shared configuration, and Python pipelines.
 
 ---
 
@@ -17,6 +17,7 @@ Take your Seeknal skills to the next level with advanced features that improve p
 5. **Named ref() References** - Self-documenting, reorder-safe SQL references
 6. **Common Configuration** - Shared column mappings, rules, and SQL snippets
 7. **Data Profiling** - Compute statistics and validate with threshold checks
+8. **Python Pipelines** - Build nodes with Python decorators and mix with YAML
 
 ---
 
@@ -74,7 +75,7 @@ source.sales_events ────────┘
 
 ---
 
-### Chapter 3: Data Rules (~20 minutes)
+### Chapter 3: Data Rules (~25 minutes)
 
 Validate data quality with automated rule checks:
 
@@ -82,11 +83,13 @@ Validate data quality with automated rule checks:
 transform.events_cleaned ──→ rule.not_null_quantity  (null check)
                          ──→ rule.positive_quantity  (range check)
 source.products          ──→ rule.valid_prices       (range on source)
+transform.events_cleaned ──→ rule.no_duplicate_events (sql_assertion)
 ```
 
 **You'll learn:**
 - Creating rule nodes for data validation
 - Expression-based rules (null, range, freshness)
+- SQL assertion rules (dbt-style custom SQL checks)
 - Severity levels: `error` vs `warn`
 - Integrating rules into your pipeline DAG
 
@@ -94,7 +97,7 @@ source.products          ──→ rule.valid_prices       (range on source)
 
 ---
 
-### Chapter 4: Lineage & Inspection (~15 minutes)
+### Chapter 4: Lineage & Inspection (~17 minutes)
 
 Visualize data lineage and inspect intermediate pipeline outputs:
 
@@ -102,12 +105,14 @@ Visualize data lineage and inspect intermediate pipeline outputs:
 seeknal lineage                              →  Full DAG (HTML)
 seeknal lineage transform.sales_enriched     →  Focused node view
 seeknal lineage transform.X --column total   →  Column-level trace
+seeknal lineage --ascii                      →  ASCII tree to stdout
 seeknal inspect transform.sales_enriched     →  Data preview
 ```
 
 **You'll learn:**
 - Interactive HTML lineage visualization with Cytoscape.js
 - Focused node and column-level lineage tracing
+- ASCII tree output for terminal use and AI agent consumption
 - Inspecting intermediate node outputs for debugging
 - Schema inspection for column types
 
@@ -176,6 +181,27 @@ source.products ──→ profile.products_stats ──→ rule.products_quality
 
 ---
 
+### Chapter 8: Python Pipelines (~25 minutes)
+
+Build pipeline nodes using Python decorators and mix them with existing YAML nodes:
+
+```
+source.products (YAML) ───────────┐
+                                  ├──→ transform.customer_analytics (Python)
+transform.sales_enriched (YAML) ──┘
+source.exchange_rates (Python) ────────→ transform.category_insights (Python)
+```
+
+**You'll learn:**
+- Creating Python sources and transforms with `@source` and `@transform`
+- PEP 723 per-file dependency isolation
+- Referencing YAML nodes from Python via `ctx.ref()`
+- Running mixed YAML + Python pipelines
+
+**[Start Chapter 8 →](8-python-pipelines.md)**
+
+---
+
 ## Continue Learning
 
 Explore other persona paths or dive into the reference documentation:
@@ -199,6 +225,8 @@ seeknal draft source my_source
 seeknal draft transform my_transform
 seeknal draft rule my_rule
 seeknal draft profile my_profile
+seeknal draft source my_source --python      # Python source template
+seeknal draft transform my_transform --python  # Python transform template
 seeknal dry-run draft_source_my_source.yml
 seeknal apply draft_source_my_source.yml
 
@@ -212,6 +240,8 @@ seeknal repl
 # Visualize data lineage
 seeknal lineage
 seeknal lineage transform.my_transform --column my_col
+seeknal lineage --ascii                          # ASCII tree to stdout
+seeknal lineage transform.my_transform --ascii   # Focused ASCII tree
 
 # Inspect intermediate outputs
 seeknal inspect transform.my_transform

@@ -7,7 +7,7 @@ This script documents the commands that need to be tested against the actual See
 ### Installation Verification
 
 ```bash
-# After installation from GitHub Releases wheel file
+# After installation from PyPI
 seeknal --version
 # Expected: seeknal x.x.x
 
@@ -24,11 +24,11 @@ seeknal init test-project
 # Expected: Creates project structure
 
 # 2. Create source
-seeknal draft source --name test_data --path data/test.csv
-# Expected: Creates draft file
+seeknal draft source test_data
+# Expected: Creates draft file at seeknal/sources/test_data.yml
 
 # 3. Apply source
-seeknal apply pipelines/sources/test_data.yaml
+seeknal apply seeknal/sources/test_data.yml
 # Expected: Source applied successfully
 
 # 4. Run pipeline
@@ -41,37 +41,35 @@ seeknal run
 ### Chapter 1: ELT Pipeline
 
 ```bash
-# HTTP source creation
-seeknal draft source --name orders_api --type http
-# Expected: Creates HTTP source template
+# CSV source creation
+seeknal draft source orders_data
+# Expected: Creates source template at seeknal/sources/orders_data.yml
 
-# Apply HTTP source
-seeknal apply pipelines/sources/orders_api.yaml
-# Expected: HTTP source applied
+# Apply CSV source
+seeknal dry-run seeknal/sources/orders_data.yml
+seeknal apply seeknal/sources/orders_data.yml
+# Expected: Source applied successfully
 
 # DuckDB transform
-seeknal draft transform --name orders_cleaned --input orders_api
-# Expected: Creates transform template
-
-# Warehouse output
-seeknal draft output --name warehouse_orders --input orders_cleaned --target warehouse
-# Expected: Creates output template
+seeknal draft transform orders_cleaned
+# Expected: Creates transform template at seeknal/transforms/orders_cleaned.yml
 ```
 
 ### Chapter 2: Incremental Models
 
 ```bash
 # Incremental source
-seeknal apply pipelines/sources/orders_incremental.yaml
-# Expected: Incremental source configured
+seeknal apply seeknal/sources/orders_data.yml
+# Expected: Source applied
 
 # CDC transform
-seeknal apply pipelines/transforms/orders_cdc.yaml
+seeknal apply seeknal/transforms/orders_cdc.yml
 # Expected: CDC transform applied
 
-# Scheduled pipeline
-seeknal apply pipelines/scheduled_orders.yaml
-# Expected: Scheduled pipeline created
+# Run pipeline
+seeknal plan
+seeknal run
+# Expected: Pipeline executes successfully
 ```
 
 ### Chapter 3: Production Environments
@@ -170,7 +168,7 @@ The following commands are documented but need runtime verification:
 
 | Command Category | Needs Verification |
 |-----------------|-------------------|
-| HTTP source polling | Actual API connectivity |
+| CSV/Parquet source loading | File reading and schema detection |
 | DuckDB transformations | SQL execution on real data |
 | Warehouse outputs | Database connection and write |
 | Virtual environments | Environment isolation behavior |
@@ -203,9 +201,9 @@ for cmd in commands:
 seeknal init test-cli-verification
 
 # Test basic workflow
-seeknal draft source --name test --path test.csv
-echo "id,value\n1,100" > test.csv
-seeknal apply pipelines/sources/test.yaml
+seeknal draft source test_src
+echo "id,value\n1,100" > data/test.csv
+seeknal apply seeknal/sources/test_src.yml
 seeknal run
 
 # Verify output
@@ -214,7 +212,7 @@ seeknal run
 
 ## Next Steps
 
-1. **Set up test environment** with Seeknal installed from GitHub Releases
+1. **Set up test environment** with Seeknal installed from PyPI (`pip install seeknal`)
 2. **Run verification script** against actual Seeknal installation
 3. **Update documentation** with any discovered discrepancies
 4. **Add known issues** section for commands that don't work as documented

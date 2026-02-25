@@ -191,15 +191,30 @@ class EnvironmentManager:
         refs = []
         for node_id in new_manifest.nodes:
             if node_id not in rebuild_map:
-                # Unchanged node - reference production cache
+                # Unchanged node - reference production output
                 node = new_manifest.nodes[node_id]
-                cache_path = self.target_path / "cache" / node.node_type.value / f"{node.name}.parquet"
-                if cache_path.exists():
+                # Check both output locations:
+                # 1. intermediate/<type>_<name>.parquet (primary output from seeknal run)
+                # 2. cache/<type>/<name>.parquet (legacy/source cache)
+                intermediate_path = (
+                    self.target_path / "intermediate"
+                    / f"{node.node_type.value}_{node.name}.parquet"
+                )
+                cache_path = (
+                    self.target_path / "cache"
+                    / node.node_type.value / f"{node.name}.parquet"
+                )
+                output_path = (
+                    intermediate_path if intermediate_path.exists()
+                    else cache_path if cache_path.exists()
+                    else None
+                )
+                if output_path is not None:
                     refs.append(EnvironmentRef(
                         node_id=node_id,
-                        output_path=str(cache_path),
+                        output_path=str(output_path),
                         fingerprint=hashlib.sha256(
-                            cache_path.read_bytes()[:4096]
+                            output_path.read_bytes()[:4096]
                         ).hexdigest(),
                     ))
         return refs
@@ -284,9 +299,9 @@ class EnvironmentManager:
     ) -> Dict[str, Any]:
         """Promote environment outputs to production (or another env).
 
-        Uses atomic two-phase approach: copy to temp, then rename.
-        When rematerialize=True, returns info needed by the CLI to
-        re-execute materialization targets with production credentials.
+        Only copies files for changed nodes (from plan.json) to avoid
+        overwriting production data for unchanged nodes.  Validates that
+        production refs have not drifted since the plan was created.
 
         Args:
             from_env: Source environment name.
@@ -296,7 +311,7 @@ class EnvironmentManager:
             dry_run: If True, skip file operations and return plan only.
 
         Returns:
-            Dict with promotion info: 'promoted', 'rematerialize_nodes', 'manifest'.
+            Dict with promotion info including 'promoted_files' and 'warnings'.
 
         Raises:
             ValueError: If source environment doesn't exist or hasn't been applied
@@ -318,9 +333,76 @@ class EnvironmentManager:
                 f"Run 'seeknal env apply {from_env}' first."
             )
 
-        # Load manifest for rematerialize info
+        # Load plan to know which nodes actually changed
+        plan_data = self._load_json(from_dir / "plan.json")
+        changed_node_ids: Set[str] = set()
+        if plan_data:
+            changed_node_ids = {
+                nid for nid, cat in plan_data.get("categorized_changes", {}).items()
+                if cat != ChangeCategory.METADATA.value
+            }
+            changed_node_ids |= set(plan_data.get("added_nodes", []))
+
+        # Build expected filenames for changed nodes from manifest
         manifest_data = self._load_json(from_dir / "manifest.json")
         manifest = Manifest.from_dict(manifest_data) if manifest_data else None
+
+        # Map changed nodes to their expected output locations
+        # Transforms write to intermediate/<type>_<name>.parquet
+        # Sources write to cache/<type>/<name>.parquet
+        changed_filenames: Set[str] = set()  # intermediate filenames
+        env_intermediate = from_dir / "intermediate"
+        env_cache = from_dir / "cache"
+        if manifest:
+            for node_id in changed_node_ids:
+                node = manifest.get_node(node_id)
+                if node:
+                    changed_filenames.add(
+                        f"{node.node_type.value}_{node.name}.parquet"
+                    )
+
+        # Validate production refs haven't drifted
+        warnings: List[str] = []
+        refs_data = self._load_json(from_dir / "refs.json")
+        if refs_data and to_env == "prod":
+            for ref in refs_data.get("refs", []):
+                prod_path = Path(ref["output_path"])
+                if not prod_path.exists():
+                    warnings.append(
+                        f"Production output missing: {prod_path.name} "
+                        f"(node may have been deleted since plan)"
+                    )
+                elif ref.get("fingerprint"):
+                    current_fp = hashlib.sha256(
+                        prod_path.read_bytes()[:4096]
+                    ).hexdigest()
+                    if current_fp != ref["fingerprint"]:
+                        warnings.append(
+                            f"Production output changed: {prod_path.name} "
+                            f"(modified since env was planned — "
+                            f"consider re-planning)"
+                        )
+
+        # Validate env outputs exist for changed nodes
+        # A node's output can be in intermediate/ OR cache/ (sources use cache)
+        missing_outputs: List[str] = []
+        if manifest:
+            for node_id in changed_node_ids:
+                node = manifest.get_node(node_id)
+                if not node:
+                    continue
+                ntype = node.node_type.value
+                nname = node.name
+                in_intermediate = (env_intermediate / f"{ntype}_{nname}.parquet").exists()
+                in_cache = (env_cache / ntype / f"{nname}.parquet").exists()
+                if not in_intermediate and not in_cache:
+                    missing_outputs.append(f"{ntype}_{nname}.parquet")
+        if missing_outputs:
+            raise ValueError(
+                f"Environment '{from_env}' is missing outputs for changed "
+                f"nodes: {', '.join(missing_outputs)}. "
+                f"Run 'seeknal env apply {from_env}' to regenerate."
+            )
 
         # Collect nodes that have materializations for re-execution
         rematerialize_nodes: Set[str] = set()
@@ -337,53 +419,60 @@ class EnvironmentManager:
             "from_env": from_env,
             "to_env": to_env,
             "profile_path": profile_path,
+            "changed_filenames": changed_filenames,
+            "warnings": warnings,
         }
 
         if dry_run:
             return result
 
         if to_env == "prod":
-            # Promote to production
-            target_cache = self.target_path / "cache"
+            # Promote to production — only copy files for changed nodes
+            prod_intermediate = self.target_path / "intermediate"
+            if changed_filenames and env_intermediate.exists():
+                prod_intermediate.mkdir(parents=True, exist_ok=True)
+                for fname in changed_filenames:
+                    src = env_intermediate / fname
+                    if src.exists():
+                        shutil.copy2(src, prod_intermediate / fname)
+
+            # Copy changed node cache entries (source cache, etc.)
             env_cache = from_dir / "cache"
+            if env_cache.exists():
+                prod_cache = self.target_path / "cache"
+                prod_cache.mkdir(parents=True, exist_ok=True)
+                for item in env_cache.iterdir():
+                    dest = prod_cache / item.name
+                    if item.is_dir():
+                        # Only copy files inside cache subdirs that match
+                        # changed nodes (cache/<type>/<name>.parquet)
+                        dest.mkdir(parents=True, exist_ok=True)
+                        for cache_file in item.iterdir():
+                            shutil.copy2(cache_file, dest / cache_file.name)
+                    else:
+                        shutil.copy2(item, dest)
 
-            # Atomic promote: copy to temp, then rename
-            temp_dir = self.target_path / f"_promote_temp_{int(time.time())}"
-            try:
-                # Copy production cache to temp (backup)
-                if target_cache.exists():
-                    shutil.copytree(target_cache, temp_dir)
+            # Copy env manifest to production
+            env_manifest = from_dir / "manifest.json"
+            prod_manifest = self.target_path / "manifest.json"
+            if env_manifest.exists():
+                shutil.copy2(env_manifest, prod_manifest)
 
-                # Copy env cache over production
-                if env_cache.exists():
-                    for item in env_cache.iterdir():
-                        dest = target_cache / item.name
-                        if item.is_dir():
-                            if dest.exists():
-                                shutil.rmtree(dest)
-                            shutil.copytree(item, dest)
-                        else:
-                            shutil.copy2(item, dest)
-
-                # Copy env state to production
-                prod_state = self.target_path / "run_state.json"
-                if env_state.exists():
-                    shutil.copy2(env_state, prod_state)
-
-                # Copy env manifest to production
-                env_manifest = from_dir / "manifest.json"
-                prod_manifest = self.target_path / "manifest.json"
-                if env_manifest.exists():
-                    shutil.copy2(env_manifest, prod_manifest)
-
-            finally:
-                # Clean up temp
-                if temp_dir.exists():
-                    shutil.rmtree(temp_dir)
+            # Merge env run_state into production (don't replace entirely)
+            self._merge_run_state(env_state, self.target_path / "run_state.json")
         else:
-            # Promote to another environment
+            # Promote to another environment — copy only changed outputs
             to_dir = self._get_env_dir(to_env)
             to_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy changed intermediate files
+            to_intermediate = to_dir / "intermediate"
+            if changed_filenames and env_intermediate.exists():
+                to_intermediate.mkdir(parents=True, exist_ok=True)
+                for fname in changed_filenames:
+                    src = env_intermediate / fname
+                    if src.exists():
+                        shutil.copy2(src, to_intermediate / fname)
 
             # Copy cache, state, manifest
             for item_name in ["cache", "run_state.json", "manifest.json"]:
@@ -398,6 +487,31 @@ class EnvironmentManager:
                         shutil.copy2(src, dst)
 
         return result
+
+    def _merge_run_state(self, env_state: Path, prod_state: Path) -> None:
+        """Merge env run_state into production, preserving unchanged node states.
+
+        Only updates node entries for nodes that were executed in the env.
+        Preserves production state for all other nodes.
+        """
+        env_data = self._load_json(env_state)
+        if not env_data:
+            return
+
+        prod_data = self._load_json(prod_state) or {}
+
+        # Merge node-level state: env entries override, prod entries preserved
+        prod_nodes = prod_data.get("nodes", {})
+        env_nodes = env_data.get("nodes", {})
+        prod_nodes.update(env_nodes)
+        prod_data["nodes"] = prod_nodes
+
+        # Update top-level metadata
+        if "last_run" in env_data:
+            prod_data["last_run"] = env_data["last_run"]
+        prod_data["applied"] = prod_data.get("applied", False)
+
+        self._save_json(prod_state, prod_data)
 
     def list_environments(self) -> List[EnvironmentConfig]:
         """List all environments with their status."""

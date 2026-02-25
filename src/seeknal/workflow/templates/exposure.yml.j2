@@ -4,7 +4,28 @@ description: "{{ description | default('Downstream consumer') }}"
 owner: "{{ owner | default('data-team@example.com') }}"
 tags: {{ tags | default(['exposure']) | tojson }}
 depends_on:
-  - ref: {{ depends_on_ref | default('feature_group.features') }}
-type: {{ exposure_type | default('dashboard') }}
-url: "{{ url | default('https://dashboard.example.com') }}"
-owner: "{{ owner | default('data-team@example.com') }}"
+  - ref: {{ depends_on_ref | default('transform.my_transform') }}
+type: {{ exposure_type | default('file') }}
+
+# For file exposures:
+params:
+  format: csv
+  path: "target/exports/{{ name }}.csv"
+
+# For API exposures:
+# url: "https://api.example.com/data"
+# params:
+#   headers:
+#     Authorization: "Bearer ${{ API_TOKEN }}"
+#   timeout: 30
+
+# For notification exposures (webhook/slack):
+# params:
+#   channel: webhook
+#   url: "https://hooks.slack.com/services/..."
+
+# For StarRocks MV exposures:
+# params:
+#   mv_name: my_materialized_view
+#   query: "SELECT * FROM my_table"
+#   refresh: "ASYNC EVERY(INTERVAL 1 DAY)"

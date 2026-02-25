@@ -65,7 +65,7 @@ source .venv/bin/activate  # Linux/macOS
 pip show seeknal
 
 # If not installed, install it
-pip install seeknal-<version>-py3-none-any.whl
+pip install seeknal
 ```
 
 ### "ImportError: cannot import name 'DuckDBTask'"
@@ -86,9 +86,9 @@ from seeknal.tasks.duckdb import DuckDBTask
 # Check Seeknal version
 pip show seeknal
 
-# Reinstall with correct version
+# Reinstall
 pip uninstall seeknal
-pip install seeknal-<version>-py3-none-any.whl
+pip install seeknal
 
 # Verify installation
 python -c "from seeknal.tasks.duckdb import DuckDBTask; print('OK')"
@@ -257,7 +257,7 @@ source .venv/bin/activate
 which seeknal
 
 # If not, reinstall with pip
-pip install seeknal-<version>-py3-none-any.whl
+pip install seeknal
 
 # Or use python -m seeknal
 python -m seeknal.cli --help

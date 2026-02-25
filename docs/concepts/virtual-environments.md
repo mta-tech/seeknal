@@ -451,5 +451,5 @@ seeknal env delete old-experiment
 ## See Also
 
 - **Concepts**: [Change Categorization](change-categorization.md), [Plan](glossary.md#plan), [Promote](glossary.md#promote)
-- **Tutorials**: [YAML Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md), [Virtual Environments Tutorial](../tutorials/phase2-data-eng-environments.md)
+- **Tutorials**: [YAML Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md), [Environment Management Tutorial](../tutorials/environment-management.md)
 - **Reference**: [CLI Environment Commands](../reference/cli.md#virtual-environments), [Configuration Reference](../reference/configuration.md)

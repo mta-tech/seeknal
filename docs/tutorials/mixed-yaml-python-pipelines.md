@@ -224,7 +224,7 @@ transform: |
     COUNT(*) as transaction_count,
     SUM(quantity) as total_quantity,
     SUM(margin) as total_margin
-  FROM __THIS__
+  FROM ref('transform.enriched_sales')
   GROUP BY region, product_category
   ORDER BY total_margin DESC
 ```
@@ -444,9 +444,6 @@ The Python transform code remains the same. Materialization is configured separa
 **Create the materialization config:**
 
 ```bash
-# Create the transforms directory
-mkdir -p seeknal/transforms
-
 # Create materialization config
 cat > seeknal/transforms/sales_forecast.yml << 'EOF'
 name: sales_forecast
@@ -578,12 +575,7 @@ df.show()
 
 ## Step 8: Create YAML Exposure
 
-First create the exposures directory:
-```bash
-mkdir -p seeknal/exposures
-```
-
-Then create `seeknal/exposures/manager_dashboard.yml`:
+Create `seeknal/exposures/manager_dashboard.yml`:
 
 ```yaml
 name: manager_dashboard
@@ -801,7 +793,7 @@ transform: |
     AVG(avg_order_value) as segment_aov,
     SUM(predicted_ltv) as total_ltv,
     AVG(days_since_first_order) as avg_recency
-  FROM __THIS__
+  FROM ref('transform.customer_ltv')
   GROUP BY value_segment, ltv_decile
   ORDER BY total_ltv DESC
 ```
@@ -932,7 +924,7 @@ transform: |
     forecast_margin,
     trend,
     RANK() OVER (ORDER BY forecast_margin DESC) as margin_rank
-  FROM __THIS__
+  FROM ref('transform.sales_forecast')
   WHERE trend IN ('UP', 'STABLE')
 
 # Exposure: Export the filtered data
@@ -1035,7 +1027,7 @@ inputs:
   - ref: transform.computed_metrics
 transform: |
   SELECT DATE(event_time) as date, SUM(value) as total
-  FROM __THIS__
+  FROM ref('transform.computed_metrics')
   GROUP BY DATE(event_time)
 ```
 
