@@ -556,4 +556,5 @@ class TestProfileExecutorExecution:
         # DuckDB STDDEV on single row returns NULL
         assert len(stddev_row) == 1
         val = stddev_row.iloc[0]["value"]
-        assert val is None or val == "None" or val == "nan" or float(val) == 0.0
+        import math
+        assert val is None or val == "None" or val == "nan" or (isinstance(val, float) and math.isnan(val)) or float(val) == 0.0
