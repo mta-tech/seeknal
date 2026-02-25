@@ -8,10 +8,12 @@ cross-FG feature retrieval.
 
 from seeknal.workflow.consolidation.catalog import EntityCatalog, FGCatalogEntry
 from seeknal.workflow.consolidation.consolidator import EntityConsolidator, ConsolidationResult
+from seeknal.workflow.consolidation.materializer import ConsolidationMaterializer
 
 __all__ = [
     "EntityCatalog",
     "FGCatalogEntry",
     "EntityConsolidator",
     "ConsolidationResult",
+    "ConsolidationMaterializer",
 ]
