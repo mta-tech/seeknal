@@ -76,14 +76,16 @@ dev = [
     "pytest>=8.3.4",
 ]
 
-[tool.hatch.build]
-include-package-data = true
+[tool.hatch.build.targets.wheel]
 packages = ["src/seeknal"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/seeknal", "LICENSE", "README.md", "pyproject.toml"]
 
 # Pytest configuration
 [tool.pytest.ini_options]
 # Test paths and discovery
-testpaths = ["src/tests"]
+testpaths = ["tests"]
 pythonpath = ["src"]
 
 # Test output options
