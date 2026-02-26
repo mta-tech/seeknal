@@ -208,6 +208,34 @@ Seeknal Pipeline Execution
 ✓ State saved
 ```
 
+### Where Is the Data Stored?
+
+After `seeknal run`, each node's output is written to an **intermediate parquet** file:
+
+```
+target/
+└── intermediate/
+    ├── source_transactions.parquet            ← source output
+    └── feature_group_customer_features.parquet ← feature group output
+```
+
+This is the per-node execution output. The REPL reads from these parquets.
+
+When you have **multiple feature groups for the same entity** (e.g., `customer_features` and `product_preferences` both with `entity="customer"`), Seeknal automatically consolidates them into a unified **entity store** with struct-namespaced columns:
+
+```
+target/
+├── intermediate/
+│   ├── feature_group_customer_features.parquet
+│   └── feature_group_product_preferences.parquet
+└── feature_store/                               ← created by consolidation
+    └── customer/
+        ├── features.parquet                     ← merged entity view
+        └── _entity_catalog.json                 ← catalog metadata
+```
+
+You'll build this in [Chapter 4: Entity Consolidation](4-entity-consolidation.md). For now, your single feature group stores its output as `target/intermediate/feature_group_customer_features.parquet`.
+
 ### Explore in REPL
 
 ```bash
