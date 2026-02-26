@@ -2,7 +2,7 @@
 
 > **Duration:** 30 minutes | **Difficulty:** Advanced | **Format:** Python Transform + SOA Engine
 
-Learn to generate hierarchical features from transaction data using a Python `@transform` for first-order aggregation and Seeknal's SOA engine for second-order meta-features — with built-in support for basic, window, and ratio aggregations. Choose between **YAML** (declarative) or **Python** (`@second_order_aggregation` decorator) to define your SOA nodes.
+Learn to generate hierarchical features from transaction data using a Python `@feature_group` for first-order aggregation and Seeknal's SOA engine for second-order meta-features — with built-in support for basic, window, and ratio aggregations. Choose between **YAML** (declarative) or **Python** (`@second_order_aggregation` decorator) to define your SOA nodes.
 
 ---
 
@@ -14,15 +14,15 @@ Building on Chapter 1's feature store, you'll add a hierarchical feature pipelin
 (from Chapter 1)
 source.transactions ──→ feature_group.customer_features
          ↓
-transform.customer_daily_agg ──→ second_order_aggregation.region_metrics
-         (Python @transform)              (YAML or Python SOA)
-                                          ├── basic: sum, mean, max, stddev
-                                          ├── window: recent 7-day totals
-                                          └── ratio: recent vs past spending
+feature_group.customer_daily_agg ──→ second_order_aggregation.region_metrics
+         (Python @feature_group)              (YAML or Python SOA)
+                                              ├── basic: sum, mean, max, stddev
+                                              ├── window: recent 7-day totals
+                                              └── ratio: recent vs past spending
 ```
 
 **After this chapter, you'll have:**
-- A Python transform computing first-order aggregations via `ctx.ref()`
+- A Python feature group computing first-order daily aggregations via `ctx.ref()`
 - An SOA node using the built-in aggregation engine (basic, window, ratio) — via YAML or Python
 - Pipeline execution with REPL verification
 - Understanding of hierarchical feature engineering
@@ -125,15 +125,17 @@ The engine then uses `_days_between` to filter time windows:
 
 Chapter 1 already created `source.transactions` from `data/transactions.csv` with columns: `customer_id`, `order_id`, `order_date`, `revenue`, `product_category`, `region`. We'll reference it directly — no need to create a new source.
 
-### Step 1: Create the First-Order Transform (Python)
+### Step 1: Create the First-Order Feature Group (Python)
 
-This transform aggregates raw transactions to daily per-customer metrics — the input for the SOA engine. It **must** include both `order_date` (as `feature_date_col`) and `application_date` (as `application_date_col`) in its output.
+This feature group aggregates raw transactions to daily per-customer metrics — the input for the SOA engine. We use `@feature_group` (instead of `@transform`) because daily customer metrics **are features** — they capture temporal purchase behavior that downstream nodes (SOA, training pipelines) will consume.
+
+The output **must** include both `order_date` (as `feature_date_col`) and `application_date` (as `application_date_col`).
 
 ```bash
-seeknal draft transform customer_daily_agg --python --deps pandas,duckdb
+seeknal draft feature-group customer_daily_agg --python --deps pandas,duckdb
 ```
 
-Edit `draft_transform_customer_daily_agg.py`:
+Edit `draft_feature_group_customer_daily_agg.py`:
 
 ```python
 # /// script
@@ -145,12 +147,12 @@ Edit `draft_transform_customer_daily_agg.py`:
 # ]
 # ///
 
-"""Transform: Daily aggregation per customer for SOA input."""
+"""Feature Group: Daily aggregation per customer for SOA input."""
 
-from seeknal.pipeline import transform
+from seeknal.pipeline import feature_group
 
 
-@transform(
+@feature_group(
     name="customer_daily_agg",
     description="Daily aggregation per customer with region context",
 )
@@ -165,11 +167,15 @@ def customer_daily_agg(ctx):
             CAST(order_date AS DATE) AS order_date,
             CAST('2026-01-21' AS DATE) AS application_date,
             CAST(SUM(revenue) AS DOUBLE) AS daily_amount,
-            CAST(COUNT(*) AS BIGINT) AS daily_count
+            CAST(COUNT(*) AS BIGINT) AS daily_count,
+            CURRENT_TIMESTAMP AS event_time
         FROM txn
         GROUP BY customer_id, region, CAST(order_date AS DATE)
     """).df()
 ```
+
+!!! info "Why `@feature_group` without `entity`?"
+    We omit the `entity=` parameter here because this feature group has a **daily granularity** (one row per customer per day), not an entity-level granularity (one row per customer). Without `entity`, it won't participate in entity consolidation (Chapter 4), but it's still a feature group — it computes reusable features that the SOA engine and training pipelines consume.
 
 !!! info "The `application_date` column in practice"
     We use a fixed date (`2026-01-21`) that is one day after the latest transaction in our sample data. This ensures all transactions have a positive `_days_between` value and fall within calculable window ranges. In production, replace with `CURRENT_DATE` or a parameterized run date. See the `application_date` section above for details.
@@ -177,9 +183,11 @@ def customer_daily_agg(ctx):
     **Both `order_date` and `application_date` must appear in the SELECT** — the SOA engine reads them from the upstream output to compute `_days_between`. If either is missing, you'll get a "column not found" error.
 
 ```bash
-seeknal dry-run draft_transform_customer_daily_agg.py
-seeknal apply draft_transform_customer_daily_agg.py
+seeknal dry-run draft_feature_group_customer_daily_agg.py
+seeknal apply draft_feature_group_customer_daily_agg.py
 ```
+
+**Checkpoint:** The file moves to `seeknal/feature_groups/customer_daily_agg.py`.
 
 ### Step 2: Create the Second-Order Aggregation (YAML)
 
@@ -198,7 +206,7 @@ description: "Region-level meta-features from customer daily aggregations"
 id_col: region
 feature_date_col: order_date
 application_date_col: application_date
-source: transform.customer_daily_agg
+source: feature_group.customer_daily_agg
 features:
   daily_amount:
     basic: [sum, mean, max, stddev]
@@ -213,7 +221,7 @@ features:
 | `id_col` | `region` | Group-by column for second-order aggregation |
 | `feature_date_col` | `order_date` | Date column for time-window calculations |
 | `application_date_col` | `application_date` | Reference date column for `_days_between` (must exist in upstream output) |
-| `source` | `transform.customer_daily_agg` | Upstream node to aggregate from |
+| `source` | `feature_group.customer_daily_agg` | Upstream feature group to aggregate from |
 | `features` | `daily_amount`, `daily_count` | Feature columns and their aggregation types |
 
 The `basic: [sum, mean, max, stddev]` declaration tells the SOA engine to generate four aggregations per feature — no manual SQL or pandas code needed.
@@ -263,7 +271,7 @@ from seeknal.pipeline import second_order_aggregation
 )
 def region_metrics(ctx):
     """Load data for SOA engine — the engine handles aggregation."""
-    return ctx.ref("transform.customer_daily_agg")
+    return ctx.ref("feature_group.customer_daily_agg")
 ```
 
 ```bash
@@ -307,10 +315,11 @@ Seeknal Pipeline Execution
   SUCCESS in 0.8s
   Rows: 4
 ✓ State saved
+✓ Consolidated entity 'customer': 1 FGs, 6 rows in 0.01s
 ```
 
 !!! note "Chapter 1 Nodes Run Too"
-    `seeknal run` executes the full pipeline. You'll see `transactions` and `customer_features` from Chapter 1 re-run alongside the new nodes. This is expected — all nodes execute in DAG order.
+    `seeknal run` executes the full pipeline. You'll see `transactions` and `customer_features` from Chapter 1 run alongside the new nodes. The consolidation output shows `customer_features` (the only FG with `entity="customer"`) being consolidated — `customer_daily_agg` has no entity so it's excluded from consolidation.
 
 ---
 
@@ -324,7 +333,7 @@ seeknal repl
 
 ```sql
 -- View region-level meta-features
-SELECT * FROM region_metrics;
+SELECT * FROM second_order_aggregation_region_metrics;
 ```
 
 **Expected output:**
@@ -346,7 +355,7 @@ SELECT * FROM region_metrics;
 
 ```sql
 -- See all generated feature columns
-DESCRIBE region_metrics;
+DESCRIBE second_order_aggregation_region_metrics;
 ```
 
 You'll see columns like:
@@ -361,7 +370,7 @@ SELECT
     ROUND(daily_amount_SUM, 2) AS total_spend,
     ROUND(daily_amount_MEAN, 2) AS avg_spend,
     ROUND(daily_amount_STDDEV, 2) AS spend_stddev
-FROM region_metrics
+FROM second_order_aggregation_region_metrics
 ORDER BY daily_amount_SUM DESC;
 ```
 
@@ -382,7 +391,7 @@ The real power of the SOA engine is its **time-window** and **ratio** features. 
     id_col: region
     feature_date_col: order_date
     application_date_col: application_date
-    source: transform.customer_daily_agg
+    source: feature_group.customer_daily_agg
     features:
       daily_amount:
         basic: [sum, mean, max, stddev]
@@ -429,7 +438,7 @@ The real power of the SOA engine is its **time-window** and **ratio** features. 
         },
     )
     def region_metrics(ctx):
-        return ctx.ref("transform.customer_daily_agg")
+        return ctx.ref("feature_group.customer_daily_agg")
     ```
 
 **What the new features do:**
@@ -456,7 +465,7 @@ SELECT
     region,
     ROUND("daily_amount_SUM_1_7", 2) AS recent_7d,
     ROUND("daily_amount_SUM1_7_SUM8_14", 2) AS trend_ratio
-FROM region_metrics
+FROM second_order_aggregation_region_metrics
 ORDER BY "daily_amount_SUM1_7_SUM8_14" DESC NULLS LAST;
 ```
 
@@ -489,12 +498,12 @@ ORDER BY "daily_amount_SUM1_7_SUM8_14" DESC NULLS LAST;
 
     - Symptom: `Binder Error: Referenced column "application_date" not found in FROM clause!`
     - Cause: The upstream transform's SELECT clause doesn't include `application_date` (or `order_date`).
-    - Fix: Add both columns to your transform's SQL output. See the `application_date` section in Part 1 for what value to use. If you've fixed the SQL but still get the error, run `seeknal run --force-nodes customer_daily_agg` to rebuild the cached output.
+    - Fix: Add both columns to your feature group's SQL output. See the `application_date` section in Part 1 for what value to use. If you've fixed the SQL but still get the error, run `seeknal run --full` to rebuild the cached output.
 
     **2. Wrong source reference format**
 
     - Symptom: `Invalid source reference: 'customer_daily_agg'. Expected format: 'kind.name'`
-    - Fix: Source must be `kind.name` format, e.g., `source: transform.customer_daily_agg`
+    - Fix: Source must be `kind.name` format, e.g., `source: feature_group.customer_daily_agg`
 
     **3. Window features all NULL**
 
@@ -504,12 +513,12 @@ ORDER BY "daily_amount_SUM1_7_SUM8_14" DESC NULLS LAST;
     **4. Feature column not found**
 
     - Symptom: `Missing feature columns: {'daily_amount'}`
-    - Fix: Ensure the `features:` key names (or `source_feature:` values) match actual column names in the upstream transform output.
+    - Fix: Ensure the `features:` key names (or `source_feature:` values) match actual column names in the upstream feature group output.
 
     **5. Empty output (0 rows)**
 
     - Symptom: 0 rows in result
-    - Fix: Check that `id_col` matches an actual column in the source transform output.
+    - Fix: Check that `id_col` matches an actual column in the source feature group output.
 
 ---
 
@@ -517,7 +526,7 @@ ORDER BY "daily_amount_SUM1_7_SUM8_14" DESC NULLS LAST;
 
 In this chapter, you learned:
 
-- [x] **Python Transforms** — Compute first-order aggregations with `@transform` and `ctx.ref()`
+- [x] **Feature Groups for Aggregation** — Compute first-order daily aggregations with `@feature_group` and `ctx.ref()`
 - [x] **SOA Engine** — Declare meta-features with `features:` spec (basic, window, ratio)
 - [x] **YAML vs Python SOA** — YAML for simple single-source SOA; Python `@second_order_aggregation` for custom data prep
 - [x] **Application Date** — Reference date column for `_days_between` computation; must be present in upstream data
@@ -535,7 +544,7 @@ In this chapter, you learned:
 
 **Key Commands:**
 ```bash
-seeknal draft transform <name> --python                # Python transform template
+seeknal draft feature-group <name> --python             # Python feature group template
 seeknal draft second-order-aggregation <name>           # YAML SOA template
 seeknal draft second-order-aggregation <name> --python  # Python SOA template
 seeknal dry-run <file>.py                               # Preview Python node

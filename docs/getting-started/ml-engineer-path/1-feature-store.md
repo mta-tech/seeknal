@@ -244,14 +244,14 @@ seeknal repl
 
 ```sql
 -- View customer features
-SELECT * FROM customer_features;
+SELECT * FROM feature_group_customer_features;
 
 -- Check feature distributions
 SELECT
     COUNT(*) AS num_customers,
     ROUND(AVG(total_revenue), 2) AS avg_revenue,
     MAX(total_orders) AS max_orders
-FROM customer_features;
+FROM feature_group_customer_features;
 ```
 
 **Checkpoint:** You should see features for 6 customers with `total_orders`, `total_revenue`, `avg_order_value`, etc.
@@ -312,14 +312,14 @@ seeknal repl
 
 ```sql
 -- Check the updated schema
-DESCRIBE customer_features;
+DESCRIBE feature_group_customer_features;
 
 -- Verify the new feature has values
 SELECT
     customer_id,
     total_orders,
     days_since_first_order
-FROM customer_features
+FROM feature_group_customer_features
 ORDER BY days_since_first_order DESC;
 ```
 

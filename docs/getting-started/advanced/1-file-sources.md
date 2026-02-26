@@ -219,17 +219,17 @@ seeknal repl
 
 ```sql
 -- Check all three sources
-SELECT * FROM products;
-SELECT * FROM sales_events;
-SELECT * FROM sales_snapshot;
+SELECT * FROM source_products;
+SELECT * FROM source_sales_events;
+SELECT * FROM source_sales_snapshot;
 
 -- Try a quick join across sources
 SELECT
     p.name,
     p.category,
     COUNT(s.event_id) AS event_count
-FROM products p
-JOIN sales_events s ON p.product_id = s.product_id
+FROM source_products p
+JOIN source_sales_events s ON p.product_id = s.product_id
 GROUP BY p.name, p.category;
 ```
 

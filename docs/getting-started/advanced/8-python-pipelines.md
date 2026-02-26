@@ -327,11 +327,11 @@ seeknal repl
 
 ```sql
 -- Revenue by region with USD conversion
-SELECT * FROM customer_analytics;
+SELECT * FROM transform_customer_analytics;
 
 -- Category market share ranking
 SELECT category, total_revenue, revenue_share_pct, rank
-FROM category_insights
+FROM transform_category_insights
 ORDER BY rank;
 ```
 

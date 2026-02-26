@@ -298,7 +298,7 @@ SELECT
     churned,
     ROUND(churn_probability, 3) AS churn_prob,
     churn_prediction
-FROM churn_model
+FROM transform_churn_model
 ORDER BY churn_probability DESC;
 ```
 
@@ -319,7 +319,7 @@ ORDER BY churn_probability DESC;
 ```sql
 -- High-risk customers (churn probability > 50%)
 SELECT customer_id, ROUND(churn_probability, 3) AS churn_prob
-FROM churn_model
+FROM transform_churn_model
 WHERE churn_probability > 0.5
 ORDER BY churn_probability DESC;
 ```
@@ -410,25 +410,25 @@ seeknal repl
 
 ```sql
 -- Check row counts across the pipeline
-SELECT 'transactions' AS node, COUNT(*) AS rows FROM transactions
+SELECT 'source_transactions' AS node, COUNT(*) AS rows FROM source_transactions
 UNION ALL
-SELECT 'customer_features', COUNT(*) FROM customer_features
+SELECT 'feature_group_customer_features', COUNT(*) FROM feature_group_customer_features
 UNION ALL
-SELECT 'training_data', COUNT(*) FROM training_data
+SELECT 'transform_training_data', COUNT(*) FROM transform_training_data
 UNION ALL
-SELECT 'churn_model', COUNT(*) FROM churn_model;
+SELECT 'transform_churn_model', COUNT(*) FROM transform_churn_model;
 ```
 
 **Expected output:**
 ```
-+-------------------+------+
-| node              | rows |
-+-------------------+------+
-| transactions      |   10 |
-| customer_features |    6 |
-| training_data     |    6 |
-| churn_model       |    6 |
-+-------------------+------+
++----------------------------------+------+
+| node                             | rows |
++----------------------------------+------+
+| source_transactions              |   10 |
+| feature_group_customer_features  |    6 |
+| transform_training_data          |    6 |
+| transform_churn_model            |    6 |
++----------------------------------+------+
 ```
 
 !!! success "Congratulations!"

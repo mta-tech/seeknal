@@ -166,6 +166,7 @@ nav:
           - Feature Store: getting-started/ml-engineer-path/1-feature-store.md
           - Second-Order Aggregation: getting-started/ml-engineer-path/2-second-order-aggregation.md
           - Build & Serve ML Model: getting-started/ml-engineer-path/3-training-serving-parity.md
+          - Entity Consolidation: getting-started/ml-engineer-path/4-entity-consolidation.md
       - Advanced Guide:
           - Overview: getting-started/advanced/index.md
           - File Sources: getting-started/advanced/1-file-sources.md

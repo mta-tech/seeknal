@@ -1003,9 +1003,11 @@ seeknal deploy-metrics --connection starrocks://root@localhost:9030/analytics --
 
 ## seeknal repl
 
-Start interactive SQL REPL.
+Start interactive SQL REPL or execute a one-shot query.
 
 The SQL REPL allows you to explore data across multiple sources using DuckDB as a unified query engine. Connect to PostgreSQL, MySQL, SQLite databases, or query local parquet/csv files.
+
+When run inside a seeknal project directory, the REPL auto-registers intermediate parquets, PostgreSQL tables, and Iceberg catalogs from the most recent pipeline run. Use `--exec`/`-e` to run a single query and exit (non-interactive mode). Use `--env` to query outputs from a virtual environment instead of production.
 
 **Usage:**
 ```bash
@@ -1015,27 +1017,90 @@ seeknal repl [OPTIONS]
 **Options:**
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--profile` | PATH | None | Path to profiles.yml for auto-registration |
+| `--profile` | PATH | None | Path to profiles.yml for connections (default: `~/.seeknal/profiles.yml`) |
+| `--env` | TEXT | None | Load data from a virtual environment instead of production |
+| `--exec`, `-e` | TEXT | None | Execute SQL query and exit (non-interactive). Use `'-'` for stdin. |
+| `--format`, `-f` | TEXT | `"table"` | Output format for `--exec`: `table`, `json`, `csv` |
+| `--output`, `-o` | PATH | None | Export `--exec` results to file (format inferred from `.csv`, `.json`, `.parquet`) |
+| `--limit` | INTEGER | None | Limit number of result rows for `--exec` |
 
 **REPL Commands:**
 - `.connect <source>` - Connect to saved source
 - `.connect <url>` - Connect to database URL
 - `.connect <path>` - Query local file (parquet/csv)
 - `.tables` - List available tables
+- `.schema <table>` - Show table schema
+- `.duckdb` - Switch back to DuckDB query mode
 - `.quit` - Exit REPL
 
-**Examples:**
+### Auto-Registration and View Naming
+
+When run inside a seeknal project directory, the REPL performs a four-phase best-effort auto-registration at startup. Each phase is independent -- a failure in one phase never blocks the next.
+
+**Phase 1 -- Intermediate parquets:** Files in `target/intermediate/` are registered as DuckDB views using **type-prefixed** names. The view name matches the parquet file stem, which follows the convention `{kind}_{name}`. This keeps nodes of different types with the same name from colliding:
+
+| Node type | View name example |
+|-----------|-------------------|
+| Source | `source_transactions` |
+| Transform | `transform_orders_cleaned` |
+| Feature group | `feature_group_customer_features` |
+| Second-order aggregation | `second_order_aggregation_region_metrics` |
+| Profile | `profile_products_stats` |
+
+**Phase 1b -- Consolidated entity parquets:** Parquets from `target/feature_store/{entity}/features.parquet` are registered as `entity_{name}` views (e.g., `entity_customer`).
+
+**Phase 2 -- PostgreSQL connections:** Connections defined in `profiles.yml` are attached as read-only DuckDB schemas.
+
+**Phase 3 -- Iceberg catalogs:** Iceberg catalogs defined in `profiles.yml` are attached as DuckDB catalogs.
+
+All registered views appear in the `.tables` output. When using `--env`, environment-specific intermediate outputs take priority over production outputs.
+
+### Interactive Examples
+
 ```bash
 # Start REPL
 seeknal repl
+
+# Start REPL with a custom profile
+seeknal repl --profile profiles.yml
+
+# Start REPL loading a virtual environment
+seeknal repl --env dev
 
 # Inside REPL
 seeknal> .connect mydb                   # (saved source)
 seeknal> .connect postgres://user:pass@host/db
 seeknal> .connect /path/to/data.parquet
 seeknal> SELECT * FROM db0.users LIMIT 10
+seeknal> SELECT * FROM source_orders LIMIT 5
+seeknal> SELECT * FROM entity_customer LIMIT 10
+seeknal> .schema source_orders
 seeknal> .tables
 seeknal> .quit
+```
+
+### One-Shot Query Examples
+
+```bash
+# Execute a query and print results as a table
+seeknal repl -e "SELECT * FROM source_orders LIMIT 5"
+
+# Output as JSON
+seeknal repl -e "SELECT * FROM source_orders" --format json
+
+# Output as CSV
+seeknal repl -e "SELECT * FROM source_orders" --format csv
+
+# Export results to a file (format inferred from extension)
+seeknal repl -e "SELECT * FROM source_orders" --output results.csv
+seeknal repl -e "SELECT * FROM source_orders" --output results.parquet
+
+# Limit result rows
+seeknal repl -e "SELECT * FROM source_orders" --limit 50
+
+# Read SQL from stdin
+echo "SELECT * FROM source_orders" | seeknal repl -e -
+cat query.sql | seeknal repl -e -
 ```
 
 **Managing Sources:**
@@ -1951,17 +2016,24 @@ seeknal entity show customer
 # Feature groups: 2
 #
 #   customer_features:
-#     Features: revenue, orders, avg_spend
+#     Features: total_orders, total_revenue, avg_order_value,
+#               first_order_date, last_order_date, days_since_first_order
 #     Rows: 50000
 #     Event time col: event_time
 #     Last updated: 2026-02-26T10:30:00
 #
-#   product_features:
-#     Features: price, category
+#   product_preferences:
+#     Features: top_category, category_count, electronics_ratio
 #     Rows: 45000
 #     Event time col: event_time
 #     Last updated: 2026-02-26T10:30:00
 ```
+
+> **REPL Integration:** Consolidated entity parquets are automatically registered in the REPL as `entity_{name}` views. After consolidation, you can query the combined feature table directly:
+> ```bash
+> seeknal repl -e "SELECT * FROM entity_customer LIMIT 5"
+> ```
+> Use `.tables` inside the REPL to see all available entity views.
 
 ---
 

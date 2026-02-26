@@ -360,16 +360,16 @@ seeknal repl
 
 ```sql
 -- Check cleaned orders
-SELECT * FROM orders_cleaned;
+SELECT * FROM transform_orders_cleaned;
 
 -- Count quality issues
 SELECT quality_flag, COUNT(*) as cnt
-FROM orders_cleaned
+FROM transform_orders_cleaned
 GROUP BY quality_flag;
 
 -- Verify deduplication (ORD-001 should appear only once)
 SELECT order_id, COUNT(*) as cnt
-FROM orders_cleaned
+FROM transform_orders_cleaned
 GROUP BY order_id
 HAVING cnt > 1;
 ```

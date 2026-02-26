@@ -120,7 +120,7 @@ seeknal query --metrics total_revenue,completed_revenue --compile
 SELECT
   SUM(revenue) AS total_revenue,
   SUM(CASE WHEN status = 'COMPLETED' THEN revenue END) AS completed_revenue
-FROM orders_cleaned
+FROM transform_orders_cleaned
 ```
 
 !!! info "Cube.js-Style Measure Filters"
@@ -193,7 +193,7 @@ seeknal repl
 SELECT
   order_date,
   SUM(revenue) / NULLIF(COUNT(*), 0) AS avg_order_value_ratio
-FROM orders_cleaned
+FROM transform_orders_cleaned
 GROUP BY order_date
 ORDER BY order_date;
 ```
