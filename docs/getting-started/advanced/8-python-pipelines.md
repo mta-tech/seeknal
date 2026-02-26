@@ -123,7 +123,7 @@ seeknal dry-run draft_source_exchange_rates.py
 seeknal apply draft_source_exchange_rates.py
 ```
 
-**Checkpoint:** The dry-run shows a preview of the Python source configuration. The file moves to `seeknal/pipelines/exchange_rates.py`.
+**Checkpoint:** The dry-run shows a preview of the Python source configuration. The file moves to `seeknal/sources/exchange_rates.py`.
 
 ---
 
@@ -203,7 +203,7 @@ seeknal dry-run draft_transform_customer_analytics.py
 seeknal apply draft_transform_customer_analytics.py
 ```
 
-**Checkpoint:** The dry-run shows the transform configuration. The file moves to `seeknal/pipelines/customer_analytics.py`.
+**Checkpoint:** The dry-run shows the transform configuration. The file moves to `seeknal/transforms/customer_analytics.py`.
 
 ---
 
@@ -273,7 +273,7 @@ seeknal dry-run draft_transform_category_insights.py
 seeknal apply draft_transform_category_insights.py
 ```
 
-**Checkpoint:** Applied to `seeknal/pipelines/category_insights.py`.
+**Checkpoint:** Applied to `seeknal/transforms/category_insights.py`.
 
 ---
 

@@ -886,7 +886,7 @@ seeknal dry-run draft_transform.yml --timeout 60
 Apply file to production.
 
 - **YAML files:** Moves to `seeknal/<type>s/<name>.yml` and updates manifest
-- **Python files:** Copies to `seeknal/pipelines/<name>.py` and validates
+- **Python files:** Moves to `seeknal/<type>s/<name>.py` (by decorator kind) and validates
 
 **Usage:**
 ```bash

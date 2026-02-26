@@ -404,7 +404,7 @@ The real power of the SOA engine is its **time-window** and **ratio** features. 
 
 === "Python"
 
-    Edit `seeknal/pipelines/region_metrics.py`:
+    Edit `seeknal/second_order_aggregations/region_metrics.py`:
 
     ```python
     @second_order_aggregation(

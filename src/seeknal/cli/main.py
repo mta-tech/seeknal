@@ -511,9 +511,9 @@ def init(
         seeknal/
         ├── sources/         # YAML source definitions
         ├── transforms/      # YAML transforms
-        ├── feature_groups/  # YAML feature groups
+        ├── feature_groups/  # Feature groups (YAML + Python)
         ├── models/          # YAML models
-        ├── pipelines/       # Python pipeline scripts (*.py)
+        ├── pipelines/       # Legacy Python pipeline scripts (*.py)
         └── templates/       # Custom Jinja templates (optional)
         target/
         └── intermediate/    # Node output storage for cross-references
@@ -3295,7 +3295,7 @@ def apply(
     """Apply file to production.
 
     YAML files: Moves to seeknal/<type>s/<name>.yml and updates manifest
-    Python files: Copies to seeknal/pipelines/<name>.py and validates
+    Python files: Moves to seeknal/<type>s/<name>.py (by decorator kind) and validates
 
     Examples:
         # Apply YAML draft
@@ -3321,11 +3321,23 @@ def apply(
         try:
             metadata = validate_python_syntax(path)
             node_name = metadata.get("name", path.stem)
+            node_kind = metadata.get("kind", "transform")
         except Exception:
             # Fallback to filename stem if validation fails
             node_name = path.stem
+            node_kind = "transform"
 
-        target_path = Path.cwd() / "seeknal" / "pipelines" / f"{node_name}.py"
+        # Route Python files to kind-specific directories (matching YAML convention)
+        # e.g., feature_group → seeknal/feature_groups/, source → seeknal/sources/
+        # Falls back to seeknal/pipelines/ for unknown kinds
+        kind_dir_map = {
+            "source": "sources",
+            "transform": "transforms",
+            "feature_group": "feature_groups",
+            "second_order_aggregation": "second_order_aggregations",
+        }
+        target_dir_name = kind_dir_map.get(node_kind, "pipelines")
+        target_path = Path.cwd() / "seeknal" / target_dir_name / f"{node_name}.py"
 
         # Check if file exists and show diff
         if target_path.exists() and target_path.resolve() != path.resolve():

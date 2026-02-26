@@ -107,7 +107,7 @@ seeknal dry-run draft_source_transactions.py
 seeknal apply draft_source_transactions.py
 ```
 
-**Checkpoint:** The file moves to `seeknal/pipelines/transactions.py`.
+**Checkpoint:** The file moves to `seeknal/sources/transactions.py`.
 
 ---
 
@@ -270,7 +270,7 @@ As your ML models mature, you'll need to add, modify, or remove features. With S
 
 ### Add a New Feature
 
-Update `seeknal/pipelines/customer_features.py` to add a derived feature:
+Update `seeknal/feature_groups/customer_features.py` to add a derived feature:
 
 ```python
 @feature_group(
