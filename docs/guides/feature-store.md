@@ -178,8 +178,37 @@ fg.write(feature_start_time=datetime(2020, 1, 1))
 
 ---
 
+## Entity Consolidation
+
+When you have multiple feature groups for the same entity (e.g., `customer_features` and `product_features` both keyed on `customer_id`), Seeknal automatically consolidates them into a single per-entity view with struct-namespaced columns.
+
+```bash
+# List consolidated entities
+seeknal entity list
+
+# Show entity details
+seeknal entity show customer
+```
+
+Retrieve features across feature groups in your transforms:
+
+```python
+@transform(name="training_data")
+def build_training_data(ctx):
+    df = ctx.features("customer", [
+        "customer_features.revenue",
+        "product_features.avg_price",
+    ])
+    return df
+```
+
+See the **[Entity Consolidation Guide](entity-consolidation.md)** for full details.
+
+---
+
 ## Related Topics
 
+- **[Entity Consolidation](entity-consolidation.md)** — Cross-FG retrieval and materialization
 - **[Point-in-Time Joins](../concepts/point-in-time-joins.md)** — Preventing data leakage
 - **[Training-to-Serving Parity](../concepts/training-to-serving.md)** — Ensuring consistency
 - **[ML Engineer Path](../getting-started/ml-engineer-path/)** — Complete feature store tutorial

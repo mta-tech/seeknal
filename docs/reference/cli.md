@@ -63,6 +63,10 @@ Complete reference for all Seeknal CLI commands. Commands are organized by categ
   - [iceberg snapshot-show](#seeknal-iceberg-snapshot-show) - Show snapshot details
   - [iceberg setup](#seeknal-iceberg-setup) - Interactive credential setup
   - [iceberg profile-show](#seeknal-iceberg-profile-show) - Show profile configuration
+- [Entity Consolidation](#entity-consolidation)
+  - [entity list](#seeknal-entity-list) - List consolidated entities
+  - [entity show](#seeknal-entity-show) - Show entity catalog details
+  - [consolidate](#seeknal-consolidate) - Manually trigger consolidation
 - [StarRocks Integration](#starrocks-integration)
   - [starrocks-setup-catalog](#seeknal-starrocks-setup-catalog) - Generate catalog setup SQL
   - [connection-test](#seeknal-connection-test) - Test StarRocks connectivity
@@ -105,6 +109,8 @@ Complete reference for all Seeknal CLI commands. Commands are organized by categ
 | `seeknal diff` | Show pipeline changes since last apply |
 | `seeknal intervals` | Manage execution intervals and backfill |
 | `seeknal env` | Virtual environment management |
+| `seeknal entity` | Manage consolidated entity feature stores |
+| `seeknal consolidate` | Manually trigger entity consolidation |
 | `seeknal atlas` | Atlas Data Platform integration |
 
 ---
@@ -1882,6 +1888,111 @@ seeknal lineage --output dag.html
 # Generate without opening browser
 seeknal lineage --no-open
 ```
+
+---
+
+# Entity Consolidation
+
+## seeknal entity list
+
+List all consolidated entities in the feature store.
+
+```bash
+seeknal entity list [--project PROJECT] [--path PATH]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--project, -p` | Project name | Current directory name |
+| `--path` | Project path | `.` |
+
+**Output:**
+
+Shows entity name, number of feature groups, total features, status (ready/stale), and consolidation timestamp.
+
+```bash
+# List all entities
+seeknal entity list
+
+# Output:
+#   customer              2 FGs  15 features  [ready]  consolidated: 2026-02-26T10:30:00
+#   product               3 FGs   8 features  [ready]  consolidated: 2026-02-26T10:30:00
+```
+
+---
+
+## seeknal entity show
+
+Display detailed catalog for a consolidated entity.
+
+```bash
+seeknal entity show <name> [--project PROJECT] [--path PATH]
+```
+
+| Argument/Option | Description | Default |
+|-----------------|-------------|---------|
+| `name` | Entity name to inspect | *(required)* |
+| `--project, -p` | Project name | Current directory name |
+| `--path` | Project path | `.` |
+
+**Output:**
+
+Shows entity metadata, join keys, and per-feature-group details (features, row counts, schema).
+
+```bash
+# Show entity details
+seeknal entity show customer
+
+# Output:
+# Entity: customer
+# Join keys: customer_id
+# Consolidated at: 2026-02-26T10:30:00
+# Schema version: 1
+# Feature groups: 2
+#
+#   customer_features:
+#     Features: revenue, orders, avg_spend
+#     Rows: 50000
+#     Event time col: event_time
+#     Last updated: 2026-02-26T10:30:00
+#
+#   product_features:
+#     Features: price, category
+#     Rows: 45000
+#     Event time col: event_time
+#     Last updated: 2026-02-26T10:30:00
+```
+
+---
+
+## seeknal consolidate
+
+Manually trigger entity consolidation. Useful after running individual nodes with `seeknal run --nodes`.
+
+```bash
+seeknal consolidate [--project PROJECT] [--path PATH] [--prune]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--project, -p` | Project name | Current directory name |
+| `--path` | Project path | `.` |
+| `--prune` | Remove stale FG columns not in current manifest | `false` |
+
+**Examples:**
+
+```bash
+# Consolidate all entities
+seeknal consolidate
+
+# Re-consolidate and remove stale FG columns
+seeknal consolidate --prune
+
+# Consolidate from specific project path
+seeknal consolidate --path /my/project
+```
+
+> **Note:** Consolidation runs automatically after `seeknal run`. Use this command when you need to manually trigger consolidation, for example after running individual nodes with `seeknal run --nodes feature_group.customer_features`.
 
 ---
 
