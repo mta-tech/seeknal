@@ -1283,6 +1283,43 @@ def _run_yaml_pipeline(
         except Exception as e:
             _echo_warning(f"Failed to save state: {e}")
 
+    # Step 6b: Entity consolidation (best-effort)
+    if not dry_run:
+        try:
+            # Check if any FG nodes succeeded
+            changed_fgs = set()
+            for node_id in nodes_to_run:
+                if (
+                    node_id.startswith("feature_group.")
+                    and node_id in run_state.nodes
+                    and run_state.nodes[node_id].is_success()
+                ):
+                    changed_fgs.add(node_id.split(".", 1)[1])
+
+            if changed_fgs:
+                from seeknal.workflow.consolidation.consolidator import EntityConsolidator
+
+                consolidator = EntityConsolidator(target_path)
+                results = consolidator.consolidate_all(
+                    manifest.nodes,
+                    changed_fgs=changed_fgs,
+                )
+                for result in results:
+                    if result.success:
+                        _echo_success(
+                            f"Consolidated entity '{result.entity_name}': "
+                            f"{result.fg_count} FGs, {result.row_count} rows "
+                            f"in {result.duration_seconds:.2f}s"
+                        )
+                    else:
+                        _echo_warning(
+                            f"Entity consolidation failed for '{result.entity_name}': "
+                            f"{result.error}"
+                        )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Entity consolidation failed: %s", exc)
+
     # Step 7: Print summary
     total_duration = time.time() - start_time
 

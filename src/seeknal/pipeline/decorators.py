@@ -303,7 +303,7 @@ def transform(
 
 def feature_group(
     name: Optional[str] = None,
-    entity: Optional[str] = None,
+    entity: Optional[Any] = None,
     features: Optional[dict] = None,
     inputs: Optional[list[str]] = None,
     materialization: Optional[Any] = None,
@@ -317,7 +317,9 @@ def feature_group(
 
     Args:
         name: Feature group name (defaults to function name if not specified)
-        entity: Entity name for joins (e.g., "user", "product")
+        entity: Entity name or config for joins. Can be a string (e.g., "customer")
+            which auto-infers join_keys as ["customer_id"], or a dict with explicit
+            keys: {"name": "customer", "join_keys": ["cust_id"]}
         features: Optional feature schema definitions
         inputs: List of upstream node IDs this feature group depends on
         materialization: Optional Materialization config for offline/online stores

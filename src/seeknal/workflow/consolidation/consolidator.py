@@ -110,8 +110,13 @@ class EntityConsolidator:
                 logger.debug("FG '%s' has no entity config, skipping", node.name)
                 continue
 
-            entity_name = entity_config.get("name", "")
-            join_keys = entity_config.get("join_keys", [])
+            # Handle both dict and string entity config
+            if isinstance(entity_config, str):
+                entity_name = entity_config
+                join_keys = [f"{entity_config}_id"]
+            else:
+                entity_name = entity_config.get("name", "")
+                join_keys = entity_config.get("join_keys", [])
             if not entity_name or not join_keys:
                 logger.debug("FG '%s' has incomplete entity config, skipping", node.name)
                 continue

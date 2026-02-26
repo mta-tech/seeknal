@@ -320,6 +320,38 @@ class TestEntityConsolidatorDiscover:
         assert len(entity_fgs["product"]) == 1
 
 
+    def test_discover_string_entity_config(self, tmp_path):
+        """String entity config (from Python decorators) is normalized to dict."""
+        df = pd.DataFrame({
+            "customer_id": ["C1", "C2"],
+            "event_time": pd.to_datetime(["2026-01-01", "2026-01-02"]),
+            "total_orders": [10, 20],
+        })
+        _write_fg_parquet(tmp_path, "customer_features", df)
+
+        # Simulate Python decorator output: entity is a string, not a dict
+        nodes = {
+            "feature_group.customer_features": _StubNode(
+                id="feature_group.customer_features",
+                name="customer_features",
+                node_type=_NodeType.FEATURE_GROUP,
+                config={
+                    "entity": "customer",  # string, not dict
+                    "materialization": {"event_time_col": "event_time"},
+                },
+            ),
+        }
+        consolidator = EntityConsolidator(tmp_path)
+        entity_fgs = consolidator.discover_feature_groups(nodes)
+
+        assert "customer" in entity_fgs
+        assert len(entity_fgs["customer"]) == 1
+        fg = entity_fgs["customer"][0]
+        assert fg.entity_name == "customer"
+        assert fg.join_keys == ["customer_id"]
+        assert "total_orders" in fg.features
+
+
 class TestEntityConsolidatorConsolidate:
     def test_single_entity_two_fgs(self, tmp_path):
         """Two FGs for one entity produce a consolidated parquet with struct cols."""

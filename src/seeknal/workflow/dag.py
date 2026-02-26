@@ -735,7 +735,16 @@ class DAGBuilder:
                         yaml_data["inputs"] = [{"ref": d} for d in deps_map[name]]
 
                 if kind_str == "feature_group":
-                    yaml_data["entity"] = node_meta.get("entity")
+                    entity_raw = node_meta.get("entity")
+                    # Normalize entity to dict format for consolidator compatibility
+                    # Decorator accepts string ("customer") or dict ({"name": "customer", "join_keys": [...]})
+                    if isinstance(entity_raw, str) and entity_raw:
+                        yaml_data["entity"] = {
+                            "name": entity_raw,
+                            "join_keys": [f"{entity_raw}_id"],
+                        }
+                    else:
+                        yaml_data["entity"] = entity_raw
                     yaml_data["features"] = node_meta.get("features", {})
 
                 # Handle materialization for all node types (source, transform, feature_group)
