@@ -210,7 +210,7 @@ Explore other persona paths or dive into the reference documentation:
 |------|-------|------|
 | **[Data Engineer →](../data-engineer-path/)** | ELT pipelines, incremental processing, production environments | ~75 min |
 | **[Analytics Engineer →](../analytics-engineer-path/)** | Semantic models, business metrics, BI deployment | ~75 min |
-| **[ML Engineer →](../ml-engineer-path/)** | Feature stores, aggregations, training-serving parity | ~90 min |
+| **[ML Engineer →](../ml-engineer-path/)** | Feature stores, aggregations, entity consolidation | ~115 min |
 
 ---
 

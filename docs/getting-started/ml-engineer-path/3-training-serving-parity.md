@@ -488,26 +488,11 @@ seeknal version diff <fg_name> --from 1 --to 2                # Compare versions
 
 ---
 
-## Path Complete!
+## What's Next?
 
-You've completed the ML Engineer path. Here's what you built:
+[Chapter 4: Entity Consolidation →](4-entity-consolidation.md)
 
-```
-source.transactions ──→ feature_group.customer_features ──→ transform.training_data
-                                                                      ↓
-source.churn_labels ─────────────────────────────────────→ transform.churn_model
-                                                                      ↓
-second_order_aggregation.region_metrics                    REPL: Query predictions
-          ↓
-  Regional meta-features                           seeknal validate-features
-```
-
-### What's Next?
-
-- **[Advanced Guide: Python Pipelines](../advanced/8-python-pipelines.md)** — Mixed YAML + Python, advanced decorators
-- **[Python Pipelines Guide](../../guides/python-pipelines.md)** — Full decorator reference
-- **[Data Engineer Path](../data-engineer-path/)** — Build production ELT pipelines
-- **[Analytics Engineer Path](../analytics-engineer-path/)** — Semantic layers and metrics
+Consolidate multiple feature groups into unified per-entity views, retrieve features across FGs with `ctx.features()`, and explore consolidated entities in the REPL.
 
 ---
 
