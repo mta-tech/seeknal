@@ -93,7 +93,7 @@ def test_register_parquets(tmp_path, mock_duckdb):
 
 
 def test_register_intermediate_parquets(tmp_path, mock_duckdb):
-    """Phase 1: parquet files in target/intermediate/ are registered with kind prefix stripped."""
+    """Phase 1: parquet files in target/intermediate/ are registered with kind prefix kept."""
     from seeknal.cli.repl import REPL
 
     intermediate_dir = tmp_path / "target" / "intermediate"
@@ -103,16 +103,13 @@ def test_register_intermediate_parquets(tmp_path, mock_duckdb):
 
     r = REPL(project_path=tmp_path)
     assert r._registered_parquets == 2
-    # View names should have kind prefix stripped
+    # View names should keep the kind prefix to avoid collisions
     view_calls = [
         str(c) for c in mock_duckdb.execute.call_args_list
         if "CREATE VIEW" in str(c)
     ]
-    assert any("orders_cleaned" in c for c in view_calls)
-    assert any("raw_orders" in c for c in view_calls)
-    # Should NOT contain the prefix in view names
-    assert not any('"transform_orders_cleaned"' in c for c in view_calls)
-    assert not any('"source_raw_orders"' in c for c in view_calls)
+    assert any('"transform_orders_cleaned"' in c for c in view_calls)
+    assert any('"source_raw_orders"' in c for c in view_calls)
 
 
 def test_register_intermediate_deduplicates_with_cache(tmp_path, mock_duckdb):
@@ -121,14 +118,15 @@ def test_register_intermediate_deduplicates_with_cache(tmp_path, mock_duckdb):
 
     intermediate_dir = tmp_path / "target" / "intermediate"
     intermediate_dir.mkdir(parents=True)
-    (intermediate_dir / "source_orders.parquet").write_bytes(b"fake")
+    # Use same stem so intermediate and cache would produce the same view name
+    (intermediate_dir / "orders.parquet").write_bytes(b"fake")
 
-    cache_dir = tmp_path / "target" / "cache" / "source"
+    cache_dir = tmp_path / "target" / "cache"
     cache_dir.mkdir(parents=True)
     (cache_dir / "orders.parquet").write_bytes(b"fake")
 
     r = REPL(project_path=tmp_path)
-    # Should only register once (intermediate wins)
+    # Should only register once (intermediate wins due to dedup)
     assert r._registered_parquets == 1
 
 

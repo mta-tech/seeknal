@@ -123,7 +123,7 @@ seeknal dry-run draft_source_exchange_rates.py
 seeknal apply draft_source_exchange_rates.py
 ```
 
-**Checkpoint:** The dry-run shows a preview of the Python source configuration. The file moves to `seeknal/pipelines/exchange_rates.py`.
+**Checkpoint:** The dry-run shows a preview of the Python source configuration. The file moves to `seeknal/sources/exchange_rates.py`.
 
 ---
 
@@ -203,7 +203,7 @@ seeknal dry-run draft_transform_customer_analytics.py
 seeknal apply draft_transform_customer_analytics.py
 ```
 
-**Checkpoint:** The dry-run shows the transform configuration. The file moves to `seeknal/pipelines/customer_analytics.py`.
+**Checkpoint:** The dry-run shows the transform configuration. The file moves to `seeknal/transforms/customer_analytics.py`.
 
 ---
 
@@ -273,7 +273,7 @@ seeknal dry-run draft_transform_category_insights.py
 seeknal apply draft_transform_category_insights.py
 ```
 
-**Checkpoint:** Applied to `seeknal/pipelines/category_insights.py`.
+**Checkpoint:** Applied to `seeknal/transforms/category_insights.py`.
 
 ---
 
@@ -327,11 +327,11 @@ seeknal repl
 
 ```sql
 -- Revenue by region with USD conversion
-SELECT * FROM customer_analytics;
+SELECT * FROM transform_customer_analytics;
 
 -- Category market share ranking
 SELECT category, total_revenue, revenue_share_pct, rank
-FROM category_insights
+FROM transform_category_insights
 ORDER BY rank;
 ```
 
@@ -423,9 +423,10 @@ seeknal repl                               # Query results
 
 ## What's Next?
 
-Explore other advanced capabilities or go deeper with Python pipelines:
+In **[Chapter 9: Database & External Sources](9-database-sources.md)**, you'll learn to load data from PostgreSQL, StarRocks (MySQL), and Iceberg tables using connection profiles and pushdown queries.
 
-- **[Chapter 7: Data Profiling](7-data-profiling.md)** — Compute statistics and validate with threshold checks
+Or explore other resources:
+
 - **[Python Pipelines Guide](../../guides/python-pipelines.md)** — Full decorator reference and patterns
 - **[Mixed YAML + Python Tutorial](../../tutorials/mixed-yaml-python-pipelines.md)** — Comprehensive mixed pipeline examples
 

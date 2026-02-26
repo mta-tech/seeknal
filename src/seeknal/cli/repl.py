@@ -178,6 +178,12 @@ class REPL:
         except Exception as e:
             warnings.warn(f"REPL: Failed to register parquets: {e}")
 
+        # Phase 1b: Register consolidated entity parquets
+        try:
+            self._register_consolidated_entities()
+        except Exception as e:
+            warnings.warn(f"REPL: Failed to register consolidated entities: {e}")
+
         # Phase 2: Attach PostgreSQL connections
         try:
             self._register_postgresql_connections()
@@ -202,7 +208,9 @@ class REPL:
 
         Files in target/intermediate/ use naming convention
         {kind}_{name}.parquet (e.g. transform_orders_cleaned.parquet).
-        The kind prefix is stripped to produce the view name (orders_cleaned).
+        The kind prefix is kept to avoid collisions between nodes of
+        different types with the same name (e.g. source_products vs
+        transform_products).
         """
         registered_names: set[str] = set()
 
@@ -213,36 +221,33 @@ class REPL:
                 / self.env_name / "intermediate"
             )
             if env_intermediate.exists():
-                self._scan_parquet_dir(env_intermediate, registered_names, strip_prefix=True)
+                self._scan_parquet_dir(env_intermediate, registered_names)
 
         # Primary: target/intermediate/ (all executor outputs go here)
         intermediate_dir = self.project_path / "target" / "intermediate"
         if intermediate_dir.exists():
-            self._scan_parquet_dir(intermediate_dir, registered_names, strip_prefix=True)
+            self._scan_parquet_dir(intermediate_dir, registered_names)
 
-        # Legacy: target/cache/ (backward compat)
+        # Legacy: target/cache/ (backward compat — files have no kind prefix)
         cache_dir = self.project_path / "target" / "cache"
         if cache_dir.exists():
-            self._scan_parquet_dir(cache_dir, registered_names, strip_prefix=False)
+            self._scan_parquet_dir(cache_dir, registered_names)
 
     def _scan_parquet_dir(
-        self, directory: Path, registered_names: set, strip_prefix: bool
+        self, directory: Path, registered_names: set
     ) -> None:
         """Register parquet files from a directory as DuckDB views.
+
+        View names use the file stem directly (e.g. transform_orders_cleaned.parquet
+        becomes view ``transform_orders_cleaned``). The kind prefix is kept so that
+        nodes of different types with the same name don't collide.
 
         Args:
             directory: Directory to scan for .parquet files.
             registered_names: Already-registered view names (skipped, updated in place).
-            strip_prefix: If True, strip kind prefixes (transform_, source_, etc.).
         """
         for parquet_file in directory.rglob("*.parquet"):
-            raw_name = parquet_file.stem
-            view_name = raw_name
-            if strip_prefix:
-                for pfx in ("transform_", "source_", "model_", "aggregation_", "exposure_", "feature_group_", "profile_"):
-                    if raw_name.startswith(pfx):
-                        view_name = raw_name[len(pfx):]
-                        break
+            view_name = parquet_file.stem
             if view_name in registered_names:
                 continue
             safe_path = str(parquet_file.resolve()).replace("'", "''")
@@ -253,6 +258,34 @@ class REPL:
                 )
                 self._registered_parquets += 1
                 registered_names.add(view_name)
+            except Exception:
+                pass  # Skip files that can't be read
+
+    def _register_consolidated_entities(self) -> None:
+        """Phase 1b: Register consolidated entity parquets as DuckDB views.
+
+        Scans target/feature_store/{entity}/features.parquet and registers
+        each as a view named 'entity_{name}' (e.g. 'entity_customer').
+        """
+        feature_store_dir = self.project_path / "target" / "feature_store"
+        if not feature_store_dir or not feature_store_dir.exists():
+            return
+
+        for entity_dir in feature_store_dir.iterdir():
+            if not entity_dir.is_dir():
+                continue
+            parquet_path = entity_dir / "features.parquet"
+            if not parquet_path.exists():
+                continue
+
+            view_name = f"entity_{entity_dir.name}"
+            safe_path = str(parquet_path.resolve()).replace("'", "''")
+            try:
+                self.conn.execute(
+                    f'CREATE VIEW "{view_name}" AS '
+                    f"SELECT * FROM read_parquet('{safe_path}')"
+                )
+                self._registered_parquets += 1
             except Exception:
                 pass  # Skip files that can't be read
 

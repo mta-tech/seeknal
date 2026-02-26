@@ -363,10 +363,20 @@ class SecondOrderAggregationExecutor(BaseExecutor):
         view_name = f"second_order_aggregation.{self.node.name}"
         con.register(view_name, result_df)
 
-        # Save to intermediate storage for materialization
+        # Save to node-specific output directory for materialization
         output_path = self.context.get_output_path(self.node)
         intermediate_path = output_path / "result.parquet"
         result_df.to_parquet(intermediate_path, index=False)
+
+        # Also write to target/intermediate/ so the REPL and downstream
+        # nodes see the aggregated result (not the raw preprocessing input).
+        # For Python SOA nodes, PythonExecutor already wrote the raw input
+        # here — overwrite it with the actual SOA output.
+        intermediate_dir = Path(self.context.target_path) / "intermediate"
+        intermediate_dir.mkdir(parents=True, exist_ok=True)
+        node_id_safe = self.node.id.replace(".", "_")
+        repl_parquet = intermediate_dir / f"{node_id_safe}.parquet"
+        result_df.to_parquet(repl_parquet, index=False)
 
         duration = time.time() - start_time
 

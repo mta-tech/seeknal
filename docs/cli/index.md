@@ -9,19 +9,22 @@ related:
 
 # Seeknal CLI Reference
 
-The Seeknal CLI (`seeknal`) provides commands for managing feature stores, data pipelines, and ML features.
+The Seeknal CLI (`seeknal`) provides commands for managing data pipelines, feature stores, entity consolidation, and ML features.
 
 ## Quick Reference
 
 | Command | Description |
 |---------|-------------|
 | `init` | Initialize a new Seeknal project |
-| `run` | Execute a YAML or Python pipeline |
+| `run` | Execute YAML/Python pipeline |
+| `plan` | Analyze changes and show execution plan |
+| `repl` | Interactive SQL REPL or one-shot queries |
 | `list` | List resources in the current project |
 | `show` | Show details of a specific resource |
-| `delete` | Delete resources |
-| `validate` | Validate configurations |
-| `version` | Manage feature group versions |
+| `entity` | Manage consolidated entity feature stores |
+| `consolidate` | Manually trigger entity consolidation |
+| `lineage` | Generate interactive lineage visualization |
+| `dq` | Generate data quality dashboard |
 
 ## Command Categories
 
@@ -33,10 +36,11 @@ The Seeknal CLI (`seeknal`) provides commands for managing feature stores, data 
 
 ### Pipeline Operations
 
-- `run` - Execute a pipeline
+- `run` - Execute pipeline (DAG-based, incremental, parallel)
 - `plan` - Analyze changes and show execution plan
 - `diff` - Show changes in pipeline files
-- `apply` - Apply a file to production
+- `draft` - Generate template files for new nodes
+- `apply` - Apply a draft file to production
 - `dry-run` - Validate and preview without executing
 
 ### Resource Management
@@ -46,24 +50,29 @@ The Seeknal CLI (`seeknal`) provides commands for managing feature stores, data 
 - `delete` - Delete resources
 - `delete-table` - Delete online tables
 
-### Feature Operations
+### Feature Store & Entity
 
+- `entity list` - List consolidated entities
+- `entity show` - Show entity catalog details
+- `consolidate` - Manually trigger entity consolidation
 - `validate-features` - Validate feature group data quality
-- `clean` - Remove old feature data
-- `debug` - Debug feature group issues
-
-### Version Control
-
 - `version list` - List feature group versions
 - `version show` - Show version details
 - `version diff` - Compare versions
+- `clean` - Remove old feature data
 
-### Data Operations
+### Data Exploration
 
+- `repl` - Start interactive SQL REPL or one-shot queries
 - `inspect` - Inspect intermediate pipeline output
 - `intervals` - List completed intervals
-- `repl` - Start interactive SQL REPL
 - `query` - Query metrics from semantic layer
+
+### Visualization & Quality
+
+- `lineage` - Generate interactive lineage visualization (HTML or ASCII)
+- `dq` - Generate data quality dashboard (HTML or ASCII)
+- `audit` - Run data quality audits
 
 ### Integration
 

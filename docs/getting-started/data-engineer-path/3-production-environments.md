@@ -172,7 +172,7 @@ Seeknal SQL REPL (DuckDB + StarRocks)
 Project: my-project [env: dev]
   Intermediate outputs: 4 tables registered
 
-seeknal[dev]> SELECT * FROM daily_revenue LIMIT 5;
+seeknal[dev]> SELECT * FROM transform_daily_revenue LIMIT 5;
 ```
 
 You should see the `unique_customers` column in `daily_revenue`. Compare with production by running the REPL without `--env`:
@@ -182,7 +182,7 @@ seeknal repl
 ```
 
 ```
-seeknal> SELECT * FROM daily_revenue LIMIT 5;
+seeknal> SELECT * FROM transform_daily_revenue LIMIT 5;
 ```
 
 Production still has the original schema — no `unique_customers` column. Your change is safely isolated in `dev`.

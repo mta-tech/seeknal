@@ -49,9 +49,10 @@ Before starting any path, complete the [10-Minute Quick Start](../quick-start/) 
 **What you'll learn**:
 - Build feature groups with point-in-time joins
 - Create second-order aggregations for ML features
-- Deploy features for online serving
+- Train and serve ML models inside the pipeline
+- Consolidate multiple feature groups into unified entity views
 
-**Time commitment**: 3 chapters × 20-30 minutes
+**Time commitment**: 4 chapters (~115 minutes)
 
 [Start ML Engineer Path →](ml-engineer-path/)
 
@@ -76,8 +77,10 @@ After completing a learning path, level up with the **[Advanced Guide](advanced/
 - **Lineage & Inspection** — Visualize data flow and debug outputs
 - **Named ref() References** — Self-documenting, reorder-safe SQL references
 - **Common Configuration** — Shared column mappings, rules, and SQL snippets
+- **Python Pipelines** — Build nodes with Python decorators
+- **Database & External Sources** — Connect to PostgreSQL, StarRocks, and Iceberg
 
-**Time commitment**: 6 chapters (~110 minutes)
+**Time commitment**: 9 chapters (~180 minutes)
 
 [Start Advanced Guide →](advanced/)
 

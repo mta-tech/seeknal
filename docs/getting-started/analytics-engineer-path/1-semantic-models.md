@@ -45,7 +45,7 @@ seeknal repl
 ```
 
 ```sql
-SELECT * FROM orders_cleaned LIMIT 5;
+SELECT * FROM transform_orders_cleaned LIMIT 5;
 ```
 
 **Checkpoint:** You should see cleaned order data with columns: `order_id`, `customer_id`, `order_date`, `status`, `revenue`, `items`, `quality_flag`, `processed_at`.
@@ -63,7 +63,7 @@ SELECT
   COUNT(DISTINCT customer_id) as unique_customers,
   SUM(revenue) as total_revenue,
   AVG(revenue) as avg_revenue
-FROM orders_cleaned
+FROM transform_orders_cleaned
 WHERE quality_flag = 0;
 ```
 
@@ -279,7 +279,7 @@ seeknal query --metrics total_revenue --dimensions order_date --compile
 SELECT
   order_date,
   SUM(revenue) AS total_revenue
-FROM orders_cleaned
+FROM transform_orders_cleaned
 GROUP BY order_date
 ORDER BY order_date
 ```
@@ -301,7 +301,7 @@ SELECT
   status,
   SUM(revenue) AS total_revenue,
   COUNT(*) AS order_count
-FROM orders_cleaned
+FROM transform_orders_cleaned
 GROUP BY status;
 ```
 

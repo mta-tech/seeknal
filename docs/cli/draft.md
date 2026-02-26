@@ -31,7 +31,7 @@ Template discovery order:
 
 | Option | Description |
 |--------|-------------|
-| `NODE_TYPE` | Node type: `source`, `transform`, `feature-group`, `model`, `aggregation`, `rule`, `exposure` |
+| `NODE_TYPE` | Node type: `source`, `transform`, `feature-group`, `second-order-aggregation`, `model`, `aggregation`, `rule`, `exposure`, `semantic-model` |
 | `NAME` | Node name (used for filename) |
 | `--description`, `-d` | Node description |
 | `--force`, `-f` | Overwrite existing draft file |
@@ -68,6 +68,18 @@ seeknal draft source raw_users --python --deps pandas,requests
 
 ```bash
 seeknal draft feature-group user_behavior --description "User behavior features"
+```
+
+### Create a second-order aggregation draft
+
+```bash
+seeknal draft second-order-aggregation region_metrics
+```
+
+### Create a Python feature group with dependencies
+
+```bash
+seeknal draft feature-group customer_features --python --deps pandas,duckdb
 ```
 
 ### Overwrite existing draft

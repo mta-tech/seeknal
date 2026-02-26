@@ -26,6 +26,13 @@ src/seeknal/
 ├── feature_validation/    # Feature validation framework
 │   ├── validators.py     # Validation logic
 │   └── models.py         # Validation configuration models
+├── workflow/
+│   ├── consolidation/    # Entity-level feature consolidation
+│   │   ├── catalog.py    # EntityCatalog dataclass + JSON I/O
+│   │   ├── consolidator.py # Core JOIN + struct_pack logic
+│   │   └── materializer.py # Iceberg/PostgreSQL materialization
+│   ├── runner.py         # DAGRunner with consolidation phase
+│   └── executors/        # Node executors
 ├── flow.py               # Data pipeline (Flow) orchestration
 ├── entity.py             # Entity definitions (join keys)
 ├── project.py            # Project management
@@ -77,6 +84,15 @@ tests/                     # pytest test suite
 - Feature groups are automatically versioned
 - CLI commands: `version list`, `version show`, `version diff`
 - Can materialize specific versions (rollback capability)
+
+### 6. **Entity Consolidation**
+- Merges per-FG parquets into per-entity views with struct-namespaced columns
+- Runs automatically after `seeknal run` (best-effort, never fails the pipeline)
+- Storage: `target/feature_store/{entity}/features.parquet` + `_entity_catalog.json`
+- Retrieval: `ctx.features("entity", ["fg.feature", ...])` for cross-FG feature selection
+- Retrieval: `ctx.entity("entity")` for full struct column access
+- External materialization: Iceberg (native struct), PostgreSQL (flattened `fg__feature` columns)
+- CLI: `seeknal entity list`, `seeknal entity show <name>`, `seeknal consolidate`
 
 ## Important Patterns & Conventions
 
@@ -585,6 +601,8 @@ Based on real dataset (73,194 rows × 35 columns):
 11. **Dispatcher Circular Imports**: MaterializationDispatcher uses lazy imports inside methods to avoid circular dependency through `seeknal.dag.manifest`
 12. **DuckDB HUGEINT for Iceberg**: `COUNT(*)` and `SUM()` return HUGEINT by default — Iceberg has no HUGEINT type. Always `CAST(COUNT(*) AS BIGINT)` and `CAST(SUM(...) AS DOUBLE)` in transforms that write to Iceberg
 13. **source_defaults alias normalization**: Profile YAML dict keys are NOT normalized at load time — use the canonical type name (`postgresql` not `postgres`) as the key in the `source_defaults:` section of `profiles.yml`
+14. **Entity Consolidation**: Runs automatically after `seeknal run` as best-effort (never fails the pipeline). Uses `getattr(node.node_type, 'value', ...)` for enum comparison to handle stub nodes in tests. Consolidated parquets at `target/feature_store/{entity}/features.parquet`
+15. **PostgreSQL 63-char identifier limit**: Entity materialization flattens struct columns to `{fg_name}__{feature_name}` — when this exceeds 63 chars, it's truncated with CRC32 hash suffix. See `consolidation/materializer.py`
 
 ## Testing Before Commit
 

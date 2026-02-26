@@ -616,10 +616,72 @@ class DAGRunner:
         if not dry_run:
             save_state(self.run_state, self.state_path)
             self._append_dq_history(summary)
+            self._consolidate_entities(summary, dry_run=False)
 
         summary.total_duration = time.time() - start_time
         return summary
 
+
+    def _consolidate_entities(self, summary: ExecutionSummary, dry_run: bool = False) -> None:
+        """Consolidate per-FG parquets into per-entity views (best-effort).
+
+        Runs after all nodes execute and state is saved. Groups FG nodes by
+        entity, performs LEFT JOINs with struct_pack(), writes consolidated
+        parquets. Failures are logged as warnings — never fails the pipeline.
+        """
+        import logging
+        clogger = logging.getLogger(__name__)
+
+        if dry_run:
+            return
+
+        try:
+            # Check if any FG nodes exist in the manifest
+            # Use .value comparison for compatibility with stub nodes in tests
+            fg_nodes = {
+                nid: node for nid, node in self.manifest.nodes.items()
+                if getattr(node.node_type, 'value', str(node.node_type)) == "feature_group"
+            }
+            if not fg_nodes:
+                return
+
+            # Determine which FGs succeeded in this run
+            changed_fgs = set()
+            for result in summary.results:
+                if (
+                    result.status == ExecutionStatus.SUCCESS
+                    and result.node_id.startswith("feature_group.")
+                ):
+                    fg_name = result.node_id.split(".", 1)[1]
+                    changed_fgs.add(fg_name)
+
+            if not changed_fgs:
+                clogger.debug("No FG nodes succeeded in this run, skipping consolidation")
+                return
+
+            from seeknal.workflow.consolidation.consolidator import EntityConsolidator  # ty: ignore[unresolved-import]
+
+            consolidator = EntityConsolidator(self.target_path)
+            results = consolidator.consolidate_all(
+                self.manifest.nodes,
+                changed_fgs=changed_fgs,
+            )
+
+            for result in results:
+                if result.success:
+                    _echo_success(
+                        f"Consolidated entity '{result.entity_name}': "
+                        f"{result.fg_count} FGs, {result.row_count} rows "
+                        f"in {result.duration_seconds:.2f}s"
+                    )
+                else:
+                    _echo_warning(
+                        f"Entity consolidation failed for '{result.entity_name}': "
+                        f"{result.error}"
+                    )
+
+        except Exception as exc:
+            clogger.warning("Entity consolidation failed: %s", exc)
 
     def _append_dq_history(self, summary: ExecutionSummary) -> None:
         """Append DQ results to history parquet after run (best-effort)."""

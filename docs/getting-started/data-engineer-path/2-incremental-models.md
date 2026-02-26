@@ -121,7 +121,7 @@ seeknal repl
 ```sql
 -- Confirm new orders are included
 SELECT order_id, customer_id, status, revenue
-FROM orders_cleaned
+FROM transform_orders_cleaned
 ORDER BY order_id;
 ```
 
@@ -223,17 +223,17 @@ seeknal repl
 
 ```sql
 -- Daily revenue summary
-SELECT * FROM daily_revenue;
+SELECT * FROM transform_daily_revenue;
 
 -- Best performing day
 SELECT order_date, total_revenue, total_orders
-FROM daily_revenue
+FROM transform_daily_revenue
 ORDER BY total_revenue DESC
 LIMIT 3;
 
 -- Days with quality issues
 SELECT order_date, flagged_orders, total_orders
-FROM daily_revenue
+FROM transform_daily_revenue
 WHERE flagged_orders > 0;
 ```
 
@@ -368,22 +368,22 @@ seeknal repl
 ```sql
 -- All merged orders
 SELECT order_id, status, revenue, source_batch
-FROM orders_merged
+FROM transform_orders_merged
 ORDER BY order_id;
 
 -- Verify ORD-004 was updated (was PENDING $0, now COMPLETED $55)
 SELECT order_id, status, revenue, source_batch
-FROM orders_merged
+FROM transform_orders_merged
 WHERE order_id = 'ORD-004';
 
 -- Verify ORD-005 revenue was corrected (was negative, now $25)
 SELECT order_id, revenue, quality_flag, source_batch
-FROM orders_merged
+FROM transform_orders_merged
 WHERE order_id = 'ORD-005';
 
 -- Count by source batch
 SELECT source_batch, COUNT(*) as cnt
-FROM orders_merged
+FROM transform_orders_merged
 GROUP BY source_batch;
 ```
 
@@ -449,7 +449,7 @@ seeknal repl
 ```
 
 ```sql
-SELECT * FROM daily_revenue ORDER BY order_date;
+SELECT * FROM transform_daily_revenue ORDER BY order_date;
 ```
 
 **Checkpoint:** You should now see **8 rows** (Jan 15–22), including Jan 22nd from the new orders (ORD-013, ORD-014).

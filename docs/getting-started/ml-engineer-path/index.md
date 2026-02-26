@@ -1,6 +1,6 @@
 # ML Engineer Path
 
-**Duration:** ~90 minutes | **Format:** Python Pipeline | **Prerequisites:** Python, [DE Path Chapter 1](../data-engineer-path/1-elt-pipeline.md) completed
+**Duration:** ~115 minutes | **Format:** Python Pipeline | **Prerequisites:** Python, [DE Path Chapter 1](../data-engineer-path/1-elt-pipeline.md) completed
 
 Build production feature stores and ML models using Python pipeline decorators (`@source`, `@feature_group`, `@transform`) and Seeknal's declarative YAML SOA engine.
 
@@ -13,6 +13,7 @@ The ML Engineer path teaches you to build production-grade feature stores and ML
 1. **Build Feature Stores** — Create feature groups with `@feature_group`, evolve schemas iteratively
 2. **Second-Order Aggregations** — Generate hierarchical features with the YAML SOA engine (basic, window, ratio)
 3. **Train & Serve ML Models** — Build scikit-learn models inside `@transform` nodes, validate features
+4. **Entity Consolidation** — Merge feature groups into per-entity views, build training datasets with SOA + entity features
 
 ---
 
@@ -52,15 +53,15 @@ source.transactions (Python) ──→ feature_group.customer_features (Python)
 Generate hierarchical features from raw transactions:
 
 ```
-source.transactions (Ch.1) → transform.customer_daily_agg → second_order_aggregation.region_metrics
-         (Python @transform)              (YAML SOA engine)
-         ├── SUM, COUNT per day           ├── basic: sum, mean, max, stddev
-         └── application_date             ├── window: recent 7-day totals
-                                          └── ratio: recent vs past spending
+source.transactions (Ch.1) → feature_group.customer_daily_agg → second_order_aggregation.region_metrics
+         (Python @feature_group)              (YAML SOA engine)
+         ├── SUM, COUNT per day               ├── basic: sum, mean, max, stddev
+         └── application_date                 ├── window: recent 7-day totals
+                                              └── ratio: recent vs past spending
 ```
 
 **You'll build:**
-- Python transforms with `@transform` and `ctx.duckdb.sql()`
+- Feature groups with `@feature_group` and `ctx.duckdb.sql()`
 - YAML SOA with declarative `features:` spec (basic, window, ratio)
 - Time-window features using `application_date_col`
 
@@ -92,17 +93,41 @@ source.churn_labels ──────────────→ transform.chur
 
 ---
 
+### Chapter 4: Entity Consolidation (~25 minutes)
+
+Consolidate multiple feature groups into unified entity views and build training datasets:
+
+```
+feature_group.customer_features ──┐
+                                  ├──→ Entity Consolidation ──→ entity_customer
+feature_group.product_preferences ┘         (automatic)              ↓
+                                                    SOA training features + entity features
+                                                                     ↓
+                                                          seeknal entity list/show
+```
+
+**You'll build:**
+- A second feature group (`product_preferences`) for the customer entity
+- SOA-based per-customer training features (reusing the SOA engine from Ch2)
+- A training dataset combining SOA temporal features + entity profiles + labels
+- CLI commands to inspect consolidated entities
+
+**[Start Chapter 4 →](4-entity-consolidation.md)**
+
+---
+
 ## What You'll Build
 
 By the end of this path, you'll have a complete ML pipeline:
 
-| Component | Decorator | Purpose |
-|-----------|-----------|---------|
+| Component | Decorator / Tool | Purpose |
+|-----------|------------------|---------|
 | **Sources** | `@source` | Declare data ingestion (CSV, Parquet, DB) |
 | **Feature Groups** | `@feature_group` | Compute and version ML features |
 | **Transforms** | `@transform` | Data prep, model training, predictions |
 | **SOA** | YAML `features:` spec | Hierarchical meta-features (basic, window, ratio) |
 | **Validation** | CLI | Detect feature quality issues |
+| **Entity Consolidation** | SOA + entity features / CLI | Training datasets, unified entity views |
 
 ---
 
@@ -128,6 +153,11 @@ seeknal run
 seeknal validate-features <fg_name> --mode fail
 seeknal lineage <node> --ascii
 
+# Entity consolidation
+seeknal entity list
+seeknal entity show <entity_name>
+seeknal consolidate
+
 # Interactive verification
 seeknal repl
 ```
@@ -138,6 +168,7 @@ seeknal repl
 
 ### Reference
 - [Python Pipelines Guide](../../guides/python-pipelines.md) — Full decorator reference and patterns
+- [Entity Consolidation Guide](../../guides/entity-consolidation.md) — Cross-FG retrieval and materialization
 - [CLI Reference](../../reference/cli.md) — All commands and flags
 - [YAML Schema Reference](../../reference/yaml-schema.md) — Feature group and SOA schemas
 

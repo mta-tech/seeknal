@@ -207,7 +207,7 @@ seeknal repl
 
 ```sql
 -- Revenue by category
-SELECT * FROM sales_summary;
+SELECT * FROM transform_sales_summary;
 ```
 
 **Checkpoint:** You should see categories like Electronics, Kitchen, Sports, Apparel with their aggregated metrics. The orphan PRD-999 row is excluded by `WHERE category IS NOT NULL`.

@@ -452,7 +452,7 @@ class DAGBuilder:
 
         This method:
         1. Discovers all *.yml files in seeknal/ subdirectories
-        2. Discovers all *.py files in seeknal/pipelines/
+        2. Discovers all *.py files in seeknal/ subdirectories
         3. Parses each file to extract node metadata
         4. Extracts dependencies from inputs (YAML) or ctx.ref() calls (Python)
         5. Builds the adjacency list representation
@@ -476,7 +476,7 @@ class DAGBuilder:
         if not yaml_files and not python_files:
             raise ValueError(
                 f"No YAML or Python files found in {self.seeknal_dir}. "
-                "Create at least one YAML file in seeknal/ or Python file in seeknal/pipelines/ "
+                "Create at least one YAML or Python file in seeknal/ subdirectories "
                 "to define nodes."
             )
 
@@ -518,18 +518,30 @@ class DAGBuilder:
 
     def _discover_python_files(self) -> list[Path]:
         """
-        Discover all *.py files in the seeknal/pipelines/ directory.
+        Discover all *.py files in the seeknal/ directory tree.
+
+        Scans all subdirectories (sources/, transforms/, feature_groups/,
+        pipelines/, etc.) for Python pipeline files. Excludes common/
+        and templates/ directories, as well as private files starting
+        with underscore.
 
         Returns:
             List of paths to Python files
         """
-        pipelines_dir = self.seeknal_dir / "pipelines"
-        if not pipelines_dir.exists():
+        if not self.seeknal_dir.exists():
             return []
 
-        python_files = list(pipelines_dir.glob("*.py"))
-        # Exclude private files (starting with _)
-        return [f for f in python_files if not f.name.startswith("_")]
+        common_dir = self.seeknal_dir / "common"
+        templates_dir = self.seeknal_dir / "templates"
+
+        python_files = [
+            f
+            for f in self.seeknal_dir.glob("**/*.py")
+            if not f.is_relative_to(common_dir)
+            and not f.is_relative_to(templates_dir)
+            and not f.name.startswith("_")
+        ]
+        return python_files
 
     def _parse_yaml_file(self, file_path: Path) -> None:
         """
@@ -723,7 +735,16 @@ class DAGBuilder:
                         yaml_data["inputs"] = [{"ref": d} for d in deps_map[name]]
 
                 if kind_str == "feature_group":
-                    yaml_data["entity"] = node_meta.get("entity")
+                    entity_raw = node_meta.get("entity")
+                    # Normalize entity to dict format for consolidator compatibility
+                    # Decorator accepts string ("customer") or dict ({"name": "customer", "join_keys": [...]})
+                    if isinstance(entity_raw, str) and entity_raw:
+                        yaml_data["entity"] = {
+                            "name": entity_raw,
+                            "join_keys": [f"{entity_raw}_id"],
+                        }
+                    else:
+                        yaml_data["entity"] = entity_raw
                     yaml_data["features"] = node_meta.get("features", {})
 
                 # Handle materialization for all node types (source, transform, feature_group)
