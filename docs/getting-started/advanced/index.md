@@ -1,8 +1,8 @@
 # Advanced Guide
 
-**Duration:** ~155 minutes | **Difficulty:** Intermediate | **Format:** YAML, Python & CLI
+**Duration:** ~180 minutes | **Difficulty:** Intermediate | **Format:** YAML, Python & CLI
 
-Go deeper with Seeknal's advanced capabilities: multi-format file sources, data quality rules, pipeline lineage visualization, named references, shared configuration, and Python pipelines.
+Go deeper with Seeknal's advanced capabilities: multi-format file sources, data quality rules, pipeline lineage visualization, named references, shared configuration, Python pipelines, and database/external source connections.
 
 ---
 
@@ -18,6 +18,7 @@ Take your Seeknal skills to the next level with advanced features that improve p
 6. **Common Configuration** - Shared column mappings, rules, and SQL snippets
 7. **Data Profiling** - Compute statistics and validate with threshold checks
 8. **Python Pipelines** - Build nodes with Python decorators and mix with YAML
+9. **Database & External Sources** - Connect to PostgreSQL, StarRocks, and Iceberg
 
 ---
 
@@ -202,6 +203,28 @@ source.exchange_rates (Python) ────────→ transform.category_in
 
 ---
 
+### Chapter 9: Database & External Sources (~25 minutes)
+
+Connect to PostgreSQL, StarRocks (MySQL), and Iceberg lakehouse tables:
+
+```
+PostgreSQL  →  source.pg_customers       (table scan)
+            →  source.pg_active_orders   (pushdown query)
+StarRocks   →  source.sr_daily_metrics   (MySQL protocol)
+Iceberg     →  source.ice_events         (REST catalog)
+```
+
+**You'll learn:**
+- Connection profiles with env var interpolation (`profiles.yml`)
+- PostgreSQL table scan and pushdown query sources
+- StarRocks sources via MySQL protocol (pymysql)
+- Iceberg sources via Lakekeeper REST catalog with OAuth2
+- `source_defaults` for per-type default connections
+
+**[Start Chapter 9 →](9-database-sources.md)**
+
+---
+
 ## Continue Learning
 
 Explore other persona paths or dive into the reference documentation:
@@ -251,6 +274,10 @@ seeknal dry-run seeknal/transforms/my_transform.yml
 
 # Override common config at runtime
 seeknal run --params events.quantityCol=units_sold
+
+# Run with connection profile
+seeknal run --profile profiles.yml
+seeknal dry-run draft_source_pg.yml --profile profiles.yml
 ```
 
 ---

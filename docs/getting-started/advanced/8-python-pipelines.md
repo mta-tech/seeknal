@@ -423,9 +423,10 @@ seeknal repl                               # Query results
 
 ## What's Next?
 
-Explore other advanced capabilities or go deeper with Python pipelines:
+In **[Chapter 9: Database & External Sources](9-database-sources.md)**, you'll learn to load data from PostgreSQL, StarRocks (MySQL), and Iceberg tables using connection profiles and pushdown queries.
 
-- **[Chapter 7: Data Profiling](7-data-profiling.md)** — Compute statistics and validate with threshold checks
+Or explore other resources:
+
 - **[Python Pipelines Guide](../../guides/python-pipelines.md)** — Full decorator reference and patterns
 - **[Mixed YAML + Python Tutorial](../../tutorials/mixed-yaml-python-pipelines.md)** — Comprehensive mixed pipeline examples
 
