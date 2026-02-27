@@ -20,6 +20,7 @@ Take your Seeknal skills to the next level with advanced features that improve p
 8. **Python Pipelines** - Build nodes with Python decorators and mix with YAML
 9. **Database & External Sources** - Connect to PostgreSQL, StarRocks, and Iceberg
 10. **Custom Sources** - Bring data from REST APIs, cloud storage, and any Python-accessible system
+11. **Pipeline Tags** - Organize nodes with tags and run filtered subsets of your pipeline
 
 ---
 
@@ -249,6 +250,27 @@ Faker (synthetic data)    →  transform.generated_synthetic_data
 
 ---
 
+### Chapter 11: Pipeline Tags (~15 minutes)
+
+Organize nodes with tags and run, plan, or visualize filtered subsets:
+
+```
+seeknal run --tags churn_pipeline        →  Run tagged nodes + upstream deps
+seeknal plan --tags revenue_pipeline     →  Filtered execution plan
+seeknal lineage --tags ml --ascii        →  ASCII tree with [tag] annotations
+seeknal run --tags ml --exclude-tags exp →  Include then exclude
+```
+
+**You'll learn:**
+- Adding tags to YAML nodes and Python decorators
+- Running filtered subsets with `--tags`
+- Filter composition rules (`--tags` + `--exclude-tags` + `--nodes`)
+- Filtered plan and lineage visualization with tag annotations
+
+**[Start Chapter 11 →](11-pipeline-tags.md)**
+
+---
+
 ## Continue Learning
 
 Explore other persona paths or dive into the reference documentation:
@@ -289,12 +311,17 @@ seeknal lineage
 seeknal lineage transform.my_transform --column my_col
 seeknal lineage --ascii                          # ASCII tree to stdout
 seeknal lineage transform.my_transform --ascii   # Focused ASCII tree
+seeknal lineage --tags revenue_pipeline --ascii   # Tag-filtered ASCII tree
 
 # Inspect intermediate outputs
 seeknal inspect transform.my_transform
 
 # Preview resolved SQL (ref() and {{ }} expressions)
 seeknal dry-run seeknal/transforms/my_transform.yml
+
+# Run filtered by tags
+seeknal run --tags churn_pipeline
+seeknal run --tags ml --exclude-tags experimental
 
 # Override common config at runtime
 seeknal run --params events.quantityCol=units_sold
