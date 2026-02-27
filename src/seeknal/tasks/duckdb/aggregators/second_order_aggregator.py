@@ -159,7 +159,7 @@ class SecondOrderAggregator:
 
     def _build_basic_agg_expr(self, feature: str, agg: str, agg_func: str) -> str:
         col_alias = self._quote(f"{feature}_{agg.upper()}")
-        return f"{agg_func}({self._quote(feature)}) AS {col_alias}"
+        return f"{agg_func}({self._quote(feature)}) FILTER (WHERE _days_between >= 0) AS {col_alias}"
 
     def _build_days_agg_expr(self, feature: str, agg: str, agg_func: str, rule) -> str:
         lower, upper = rule.dayLimitLower1, rule.dayLimitUpper1
