@@ -5235,6 +5235,14 @@ def lineage(
     ascii_output: bool = typer.Option(
         False, "--ascii", help="Print DAG as ASCII tree to stdout instead of HTML"
     ),
+    tags: Optional[List[str]] = typer.Option(
+        None, "--tags",
+        help="Show only nodes with these tags (plus upstream deps). OR logic."
+    ),
+    exclude_tags: Optional[List[str]] = typer.Option(
+        None, "--exclude-tags",
+        help="Hide nodes with these tags from the lineage."
+    ),
 ):
     """Generate interactive lineage visualization.
 
@@ -5244,6 +5252,7 @@ def lineage(
         seeknal lineage transform.X --column total   # Trace column
         seeknal lineage --output dag.html            # Custom path
         seeknal lineage --ascii                      # ASCII tree to stdout
+        seeknal lineage --tags churn_pipeline        # Filter by tag
     """
     from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
     from seeknal.dag.visualize import generate_lineage_html, LineageVisualizationError
@@ -5264,6 +5273,62 @@ def lineage(
         if not manifest.nodes:
             _echo_warning("No nodes found. Add pipeline files to your project.")
             raise typer.Exit(code=1)
+
+        # Reject conflicting --tags + node_id
+        if tags and node_id:
+            _echo_error("Cannot use --tags and node_id together. Use one or the other.")
+            raise typer.Exit(code=1)
+
+        # Apply tag filtering to manifest
+        if tags or exclude_tags:
+            from seeknal.dag.manifest import Manifest as ManifestClass
+
+            keep_ids: Optional[set[str]] = None
+
+            if tags:
+                tag_set = set(tags)
+                tag_matched = {
+                    nid for nid, node in manifest.nodes.items()
+                    if any(t in tag_set for t in node.tags)
+                }
+                if not tag_matched:
+                    _echo_warning(f"No nodes found with tags: {', '.join(tags)}")
+                    raise typer.Exit(code=0)
+
+                # Auto-include all transitive upstream deps via BFS
+                keep_ids = set(tag_matched)
+                from collections import deque
+                queue = deque(tag_matched)
+                while queue:
+                    current = queue.popleft()
+                    for parent in manifest.get_upstream_nodes(current):
+                        if parent not in keep_ids:
+                            keep_ids.add(parent)
+                            queue.append(parent)
+
+            if exclude_tags:
+                exclude_set = set(exclude_tags)
+                if keep_ids is not None:
+                    keep_ids = {
+                        nid for nid in keep_ids
+                        if not any(t in exclude_set for t in manifest.nodes[nid].tags)
+                    }
+                else:
+                    keep_ids = {
+                        nid for nid, node in manifest.nodes.items()
+                        if not any(t in exclude_set for t in node.tags)
+                    }
+
+            # Build filtered manifest
+            if keep_ids is not None:
+                filtered = ManifestClass(project=manifest.metadata.project)
+                for nid in keep_ids:
+                    if nid in manifest.nodes:
+                        filtered.add_node(manifest.nodes[nid])
+                for edge in manifest.edges:
+                    if edge.from_node in keep_ids and edge.to_node in keep_ids:
+                        filtered.add_edge(edge.from_node, edge.to_node)
+                manifest = filtered
 
         if ascii_output:
             from seeknal.dag.visualize import render_ascii_tree  # ty: ignore[unresolved-import]
