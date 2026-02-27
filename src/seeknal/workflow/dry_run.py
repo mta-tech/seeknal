@@ -333,12 +333,12 @@ def dry_run_python(file_path: Path, file_path_str: str, limit: int, timeout: int
             spec = importlib.util.spec_from_file_location("pipeline_module", str(file_path))
             module = importlib.util.module_from_spec(spec)
 
-            # Monkey-patch to limit output
-            original_limit = limit
-
-            # Execute the function
+            # Execute the module to register decorators
             spec.loader.exec_module(module)
-            func = getattr(module, metadata.get('name'))
+
+            # Use Python function name (not decorator name=) for module lookup
+            func_name = metadata.get('function_name') or metadata.get('name')
+            func = getattr(module, func_name)
 
             start_time = time.time()
             result = func(ctx)
@@ -346,22 +346,39 @@ def dry_run_python(file_path: Path, file_path_str: str, limit: int, timeout: int
 
             # Display preview
             if result is not None:
-                try:
-                    import pandas as pd
-                    if isinstance(result, pd.DataFrame):
-                        # Show first N rows
-                        preview_df = result.head(limit)
+                import pandas as pd
 
-                        # Pretty print table
-                        _echo_info(f"Preview ({len(result)} total rows, showing {limit}):")
-                        print(preview_df.to_string(index=False))
-                    else:
-                        _echo_info(f"Result type: {type(result).__name__}")
-                        _echo_info(f"Result: {result}")
-                except ImportError:
-                    # pandas not available, just show basic info
+                # Convert non-DataFrame results to pandas for display
+                result_df = None
+                if isinstance(result, pd.DataFrame):
+                    result_df = result
+                else:
+                    # Try pyarrow Table
+                    try:
+                        import pyarrow as pa
+                        if isinstance(result, pa.Table):
+                            result_df = result.to_pandas()
+                    except ImportError:
+                        pass
+
+                    # Try DuckDB relation
+                    if result_df is None:
+                        try:
+                            if hasattr(result, 'df'):
+                                result_df = result.df()
+                        except Exception:
+                            pass
+
+                if result_df is not None:
+                    preview_df = result_df.head(limit)
+                    _echo_info(f"Preview ({len(result_df)} total rows, showing {min(limit, len(result_df))}):")
+                    typer.echo(preview_df.to_string(index=False))
+                else:
                     _echo_info(f"Result type: {type(result).__name__}")
                     _echo_info(f"Result: {str(result)[:200]}")
+            else:
+                _echo_warning("Function returned no data (None)")
+                _echo_info("Source nodes with 'pass' body return no preview — use 'seeknal run' for full execution")
 
             ctx.close()
             _echo_success(f"Preview completed in {duration:.1f}s")
