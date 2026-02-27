@@ -59,9 +59,10 @@ def test_second_order_aggregator_basic(spark_session: SparkSession):
     assert "amount_SUM" in result.columns
     assert "amount_MEAN" in result.columns
 
-    # Check user 1: 100 + 150 + 200 + 120 = 570
+    # Check user 1: only historical data (feature_date <= application_date)
+    # Jan 1 (100) + Jan 15 (150) = 250 — Feb 1 and Feb 15 are future, excluded
     user1_row = result.filter(result.user_id == 1).collect()[0]
-    assert user1_row["amount_SUM"] == 570.0
+    assert user1_row["amount_SUM"] == 250.0
 
 
 def test_second_order_aggregator_basic_days(spark_session: SparkSession):

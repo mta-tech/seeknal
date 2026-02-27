@@ -1,8 +1,8 @@
 # Chapter 4: Entity Consolidation
 
-> **Duration:** 25 minutes | **Difficulty:** Intermediate | **Format:** Python Pipeline + CLI
+> **Duration:** 15 minutes | **Difficulty:** Intermediate | **Format:** Python Pipeline + CLI
 
-Learn to consolidate multiple feature groups into unified per-entity views, build training datasets by combining SOA with entity features, and explore consolidated entities in the REPL.
+Learn to consolidate multiple feature groups into unified per-entity views and explore consolidated entities with struct columns in the REPL.
 
 ---
 
@@ -16,15 +16,13 @@ feature_group.customer_features (Ch1) ──┐
 feature_group.product_preferences ──────┘         (automatic)              ↓
                                                                     REPL Exploration
                                                                            ↓
-                                                    SOA training features + entity features
-                                                                           ↓
                                                            seeknal entity list/show
 ```
 
 **After this chapter, you'll have:**
 - A second feature group (`product_preferences`) for the same customer entity
 - Automatic consolidation into `target/feature_store/customer/features.parquet`
-- A training dataset combining SOA temporal features with entity profile features
+- Struct-namespaced columns for cross-FG feature access
 - CLI commands to inspect consolidated entities
 
 ---
@@ -229,191 +227,7 @@ DESCRIBE entity_customer;
 
 ---
 
-## Part 3: Build Training Dataset with SOA (10 minutes)
-
-### Why SOA for Training Data?
-
-In practice, ML training datasets are built by **aggregating historical features over time windows**. Raw feature group output captures point-in-time values, but ML models need patterns like:
-
-- "How much did this customer spend in the last 7 days?"
-- "Is spending trending up or down?"
-- "What's the average daily order count?"
-
-The SOA engine from Chapter 2 is the right tool for this — you already used it to compute regional meta-features. Now you'll use the **same engine** with a different `id_col` to produce per-customer training features.
-
-### Create the Training Feature SOA
-
-This SOA aggregates daily customer features (from Chapter 2's `feature_group.customer_daily_agg`) into per-customer training features with time-window context:
-
-```bash
-seeknal draft second-order-aggregation customer_training_features
-```
-
-Edit `draft_second_order_aggregation_customer_training_features.yml`:
-
-```yaml
-kind: second_order_aggregation
-name: customer_training_features
-description: "Per-customer training features aggregated from daily purchase data"
-id_col: customer_id
-feature_date_col: order_date
-application_date_col: application_date
-source: feature_group.customer_daily_agg
-features:
-  daily_amount:
-    basic: [sum, mean, max]
-  daily_count:
-    basic: [sum, mean]
-  recent_spending:
-    window: [1, 7]
-    basic: [sum]
-    source_feature: daily_amount
-  spending_trend:
-    ratio:
-      numerator: [1, 7]
-      denominator: [8, 14]
-      aggs: [sum]
-    source_feature: daily_amount
-```
-
-!!! tip "Same Engine, Different Grouping"
-    Compare this with Chapter 2's `region_metrics`:
-
-    | | Chapter 2 (region_metrics) | Chapter 4 (customer_training_features) |
-    |-|---------------------------|---------------------------------------|
-    | **id_col** | `region` | `customer_id` |
-    | **Purpose** | Regional meta-features | Per-customer training features |
-    | **Output rows** | 4 (one per region) | 6 (one per customer) |
-    | **Use case** | Understanding regional patterns | ML model input |
-
-    The SOA engine handles both — the `id_col` determines the grouping key.
-
-### Apply and Run
-
-```bash
-seeknal apply draft_second_order_aggregation_customer_training_features.yml
-seeknal run
-```
-
-**Expected output:**
-```
-...
-customer_training_features [RUNNING]
-  SUCCESS in 0.8s
-  Rows: 6
-✓ State saved
-✓ Consolidated entity 'customer': 2 FGs, 6 rows in 0.02s
-```
-
-### Build the Complete Training Dataset
-
-Now create a transform that combines the SOA training features with entity-consolidated features and labels:
-
-```bash
-seeknal draft transform training_dataset --python --deps pandas,duckdb
-```
-
-Edit `draft_transform_training_dataset.py`:
-
-```python
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "pandas",
-#     "pyarrow",
-#     "duckdb",
-# ]
-# ///
-
-"""Transform: Combine SOA features with entity features for model training."""
-
-from seeknal.pipeline import transform
-
-
-@transform(
-    name="training_dataset",
-    description="Training dataset combining historical aggregations with entity features",
-)
-def training_dataset(ctx):
-    """Build training dataset from SOA + entity features + labels."""
-    # SOA-aggregated historical features (time-window aware)
-    soa = ctx.ref("second_order_aggregation.customer_training_features")
-
-    # Entity-level features from consolidated store
-    prefs = ctx.ref("feature_group.product_preferences")
-
-    # Churn labels (from Chapter 3 data)
-    labels = ctx.ref("source.churn_labels")
-
-    return ctx.duckdb.sql("""
-        SELECT
-            s.customer_id,
-            -- Historical spending patterns (from SOA)
-            s.daily_amount_SUM AS total_spend,
-            s.daily_amount_MEAN AS avg_daily_spend,
-            s.daily_amount_MAX AS max_daily_spend,
-            s.daily_count_SUM AS total_orders,
-            -- Product preferences (from entity consolidation)
-            p.category_count,
-            p.electronics_ratio,
-            -- Labels
-            CAST(l.churned AS INTEGER) AS churned
-        FROM soa s
-        LEFT JOIN prefs p ON s.customer_id = p.customer_id
-        LEFT JOIN labels l ON s.customer_id = l.customer_id
-    """).df()
-```
-
-!!! info "Why combine SOA + entity features?"
-    The SOA provides **temporal patterns** (spending trends, recent vs historical behavior), while entity-consolidated feature groups provide **static profiles** (category preferences, product affinity). Together, they create a rich training dataset that captures both temporal dynamics and entity characteristics.
-
-```bash
-seeknal apply draft_transform_training_dataset.py
-seeknal run
-```
-
-### Verify the Results
-
-```bash
-seeknal repl
-```
-
-```sql
--- View the complete training dataset
-SELECT * FROM transform_training_dataset;
-
--- Check the feature columns
-DESCRIBE transform_training_dataset;
-
--- Expected columns:
--- customer_id        VARCHAR
--- total_spend        DOUBLE    (from SOA: sum of daily amounts)
--- avg_daily_spend    DOUBLE    (from SOA: mean of daily amounts)
--- max_daily_spend    DOUBLE    (from SOA: max daily spend)
--- total_orders       BIGINT    (from SOA: count of transactions)
--- category_count     BIGINT    (from entity FG: product diversity)
--- electronics_ratio  DOUBLE    (from entity FG: electronics affinity)
--- churned            INTEGER   (label)
-```
-
-```sql
--- Preview: who's likely to churn?
-SELECT
-    customer_id,
-    ROUND(total_spend, 2) AS total_spend,
-    total_orders,
-    category_count,
-    ROUND(electronics_ratio, 2) AS elec_ratio,
-    churned
-FROM transform_training_dataset
-ORDER BY total_spend;
-```
-
-**Checkpoint:** You should see 6 customers with combined SOA + entity features. Customers with lower spend and fewer categories are more likely churned.
-
----
-
-## Part 4: Manual Consolidation (Optional)
+## Part 3: Manual Consolidation (Optional)
 
 ### When to Use seeknal consolidate
 
@@ -445,30 +259,20 @@ seeknal run --nodes feature_group.customer_features
 ## What Could Go Wrong?
 
 !!! danger "Common Pitfalls"
-    **1. SOA source not found**
-
-    - Symptom: `ValueError: Source 'feature_group.customer_daily_agg' not found`
-    - Fix: Ensure Chapter 2's `customer_daily_agg` feature group is applied and has run successfully before creating the SOA.
-
-    **2. Entity not found**
+    **1. Entity not found**
 
     - Symptom: `FileNotFoundError: Entity 'X' not found`
     - Fix: Run the pipeline first (`seeknal run`) to create the consolidated parquet. Feature groups must succeed before consolidation can run.
 
-    **3. Mismatched join keys**
+    **2. Mismatched join keys**
 
     - Symptom: `ValueError: Join key mismatch for entity 'customer'`
     - Fix: All feature groups for the same entity must use the same join keys. Check that both FGs have `entity="customer"` with `customer_id` in their output.
 
-    **4. REPL view not showing**
+    **3. REPL view not showing**
 
     - Symptom: `entity_customer` view not found in REPL
     - Fix: The consolidated parquet must exist at `target/feature_store/customer/features.parquet`. Run `seeknal run` or `seeknal consolidate` first.
-
-    **5. Training dataset has NULL columns**
-
-    - Symptom: `category_count` or `electronics_ratio` columns are all NULL
-    - Fix: Ensure `product_preferences` feature group ran successfully and the `customer_id` values match between SOA output and feature group output.
 
 ---
 
@@ -479,8 +283,6 @@ In this chapter, you learned:
 - [x] **Multiple Feature Groups** — Create separate FGs for the same entity
 - [x] **Automatic Consolidation** — Entity views are created after `seeknal run`
 - [x] **Struct Columns** — FG features are namespaced in DuckDB struct columns
-- [x] **SOA for Training Data** — Reuse the SOA engine with `id_col: customer_id` for per-customer features
-- [x] **Training Dataset** — Combine SOA temporal features + entity profiles + labels
 - [x] **CLI Commands** — `seeknal entity list/show` and `seeknal consolidate`
 
 **Key Commands:**
@@ -507,15 +309,17 @@ source.transactions ├──→ feature_group.product_preferences ┤
                     │                                      │
                     └──→ feature_group.customer_daily_agg ──→ SOA: region_metrics
                               ↓                                 (regional meta-features)
+                    @transform: pit_training_data ←─── source.churn_labels
+                      (PIT join with HistoricalFeaturesDuckDB)
+                              ↓
                     SOA: customer_training_features
+                      (per-customer temporal features)
                               ↓
-                    transform.training_dataset ←── feature_group.product_preferences
-                              ↓                              (entity features)
-                    transform.training_data ←──── source.churn_labels
+                    @transform: churn_model
+                      (RandomForest predictions)
                               ↓
-                    transform.churn_model
-                              ↓
-                    REPL: Query predictions        seeknal validate-features
+                    REPL: Online serving demo
+                      (OnlineFeaturesDuckDB)
 ```
 
 ### What's Next?

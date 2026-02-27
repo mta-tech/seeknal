@@ -131,7 +131,7 @@ class SourceExecutor(BaseExecutor):
 
         # Validate source type
         supported_sources = [
-            "csv", "parquet", "json", "jsonl",
+            "csv", "parquet", "json", "jsonl", "excel",
             "sqlite", "postgresql", "postgres", "hive",
             "starrocks", "iceberg",
             "bigquery", "snowflake", "redshift"
@@ -145,7 +145,7 @@ class SourceExecutor(BaseExecutor):
             )
 
         # Validate file path for file-based sources (skip for remote sources)
-        if source_type in ["csv", "parquet", "json", "jsonl", "sqlite"]:
+        if source_type in ["csv", "parquet", "json", "jsonl", "excel", "sqlite"]:
             try:
                 validate_file_path(table)
             except Exception as e:
@@ -232,6 +232,8 @@ class SourceExecutor(BaseExecutor):
                 row_count = self._load_parquet(con, table, params)
             elif source_type == "json" or source_type == "jsonl":
                 row_count = self._load_json(con, table, params)
+            elif source_type == "excel":
+                row_count = self._load_excel(con, table, params)
             elif source_type in ["sqlite", "postgresql", "postgres"]:
                 row_count = self._load_database(con, source_type, table, params)
             elif source_type == "starrocks":
@@ -545,6 +547,66 @@ class SourceExecutor(BaseExecutor):
             raise ExecutorExecutionError(
                 self.node.id,
                 f"Failed to load JSON from '{abs_path}': {str(e)}",
+                e
+            ) from e
+
+    def _load_excel(
+        self,
+        con: Any,
+        table: str,
+        params: Dict[str, Any]
+    ) -> int:
+        """
+        Load data from Excel file using DuckDB spatial extension (st_read).
+
+        Args:
+            con: DuckDB connection
+            table: Excel file path (.xlsx, .xls)
+            params: Additional parameters (sheet_name)
+
+        Returns:
+            Number of rows loaded
+
+        Raises:
+            ExecutorExecutionError: If loading fails
+        """
+        abs_path = self._resolve_path(table)
+
+        node_id = self.node.id
+        if "." in node_id:
+            schema, view_name = node_id.split(".", 1)
+        else:
+            schema, view_name = "source", node_id
+
+        con.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+
+        # Get optional sheet name
+        sheet_name = params.get("sheet_name", "")
+
+        try:
+            # Load spatial extension for st_read
+            try:
+                con.execute("LOAD spatial")
+            except Exception:
+                con.execute("INSTALL spatial; LOAD spatial;")
+
+            # Build st_read query
+            if sheet_name:
+                query = f"CREATE OR REPLACE VIEW {schema}.{view_name} AS SELECT * FROM st_read('{abs_path}', layer='{sheet_name}')"
+            else:
+                query = f"CREATE OR REPLACE VIEW {schema}.{view_name} AS SELECT * FROM st_read('{abs_path}')"
+
+            con.execute(query)
+
+            count_result = con.execute(f"SELECT COUNT(*) FROM {schema}.{view_name}").fetchone()
+            row_count = count_result[0] if count_result else 0
+
+            return row_count
+
+        except Exception as e:
+            raise ExecutorExecutionError(
+                self.node.id,
+                f"Failed to load Excel from '{abs_path}': {str(e)}",
                 e
             ) from e
 
