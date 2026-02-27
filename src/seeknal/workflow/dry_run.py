@@ -285,7 +285,7 @@ def _load_source_data(node_meta: dict, project_path: Path):
         return None
 
     # File-based sources
-    if source_type in ("csv", "parquet", "json", "jsonl", "hive"):
+    if source_type in ("csv", "parquet", "json", "jsonl", "excel", "hive"):
         return _load_file_source(source_type, table, params, project_path)
 
     # SQLite
@@ -345,6 +345,17 @@ def _load_file_source(source_type: str, table: str, params: dict, project_path: 
                 )
             else:
                 result = con.execute(f"SELECT * FROM read_json_auto('{abs_path}')")
+
+        elif source_type == "excel":
+            try:
+                con.execute("LOAD spatial")
+            except Exception:
+                con.execute("INSTALL spatial; LOAD spatial;")
+            sheet_name = params.get("sheet_name", "")
+            if sheet_name:
+                result = con.execute(f"SELECT * FROM st_read('{abs_path}', layer='{sheet_name}')")
+            else:
+                result = con.execute(f"SELECT * FROM st_read('{abs_path}')")
 
         elif source_type == "hive":
             # Hive: detect file type from extension
