@@ -277,7 +277,7 @@ class PipelineContext:
                 feat_select = ", ".join(struct_selects)
 
                 query = (
-                    f"SELECT {spine_key_cols}, _pit_spine.{date_col}, "
+                    f"SELECT _pit_spine.*, "
                     f"{feat_select}, "
                     f"ROW_NUMBER() OVER ("
                     f"  PARTITION BY {spine_key_cols}, _pit_spine.{date_col} "
