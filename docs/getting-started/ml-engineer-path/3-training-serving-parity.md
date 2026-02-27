@@ -197,11 +197,11 @@ def pit_training_data(ctx):
     )
 
     # PIT join: for each label row, get features as-of application_date
-    # Returns a plain DataFrame — one row per spine entry
+    # join_keys and date_col are always kept — only specify extra spine columns
     pit_df = ff.pit_join(
         spine=labels,
         date_col="application_date",
-        keep_cols=["customer_id", "churned"],
+        keep_cols=["churned"],
     )
 
     return pit_df
@@ -721,7 +721,7 @@ In this chapter, you learned:
 | API | Purpose |
 |-----|---------|
 | `FeatureFrame(df, entity_name, join_keys, event_time_col)` | Wrap a DataFrame with entity metadata |
-| `.pit_join(spine, date_col, keep_cols)` | Point-in-time join — one line |
+| `.pit_join(spine, date_col, keep_cols)` | Point-in-time join — join_keys + date_col always kept |
 | `.as_of("2026-01-20")` | Snapshot features at a specific date |
 | `.to_df()` | Get the underlying plain DataFrame |
 | `ctx.ref("feature_group.X")` | Returns `FeatureFrame` when FG has `entity=` |
