@@ -494,9 +494,17 @@ seeknal repl                                                     # Query entity_
 
 ---
 
-## ML Engineer Path Complete!
+## What's Next?
 
-You've completed the ML Engineer path. Here's the full pipeline you built:
+[Chapter 5: End-to-End ML — Customer Targeting with MLflow →](5-e2e-ml-customer-targeting.md)
+
+Train a propensity model with MLflow experiment tracking and run batch predictions to score customers for a marketing campaign.
+
+---
+
+## Full Pipeline Overview
+
+Here's the full pipeline you built across Chapters 1–4:
 
 ```
                     ┌──→ feature_group.customer_features ──┐
@@ -518,7 +526,7 @@ source.transactions ├──→ feature_group.product_preferences ┤
                     REPL: Query predictions        seeknal validate-features
 ```
 
-### What's Next?
+### Explore More
 
 - **[Advanced Guide: Python Pipelines](../advanced/8-python-pipelines.md)** — Mixed YAML + Python, advanced decorators
 - **[Entity Consolidation Guide](../../guides/entity-consolidation.md)** — Deep dive into materialization and storage

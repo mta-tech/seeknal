@@ -1,6 +1,6 @@
 # ML Engineer Path
 
-**Duration:** ~115 minutes | **Format:** Python Pipeline | **Prerequisites:** Python, [DE Path Chapter 1](../data-engineer-path/1-elt-pipeline.md) completed
+**Duration:** ~135 minutes | **Format:** Python Pipeline | **Prerequisites:** Python, [DE Path Chapter 1](../data-engineer-path/1-elt-pipeline.md) completed
 
 Build production feature stores and ML models using Python pipeline decorators (`@source`, `@feature_group`, `@transform`) and Seeknal's declarative YAML SOA engine.
 
@@ -14,6 +14,7 @@ The ML Engineer path teaches you to build production-grade feature stores and ML
 2. **Second-Order Aggregations** — Generate hierarchical features with the YAML SOA engine (basic, window, ratio)
 3. **Train & Serve ML Models** — Build scikit-learn models inside `@transform` nodes, validate features
 4. **Entity Consolidation** — Merge feature groups into per-entity views, build training datasets with SOA + entity features
+5. **End-to-End ML with MLflow** — Train propensity models, track experiments, run batch predictions
 
 ---
 
@@ -116,6 +117,30 @@ feature_group.product_preferences ┘         (automatic)              ↓
 
 ---
 
+### Chapter 5: End-to-End ML — Customer Targeting with MLflow (~20 minutes)
+
+Train a propensity model, track experiments, and score customers for targeting:
+
+```
+transform.training_dataset (Ch4) ──→ transform.train_propensity (sklearn + MLflow)
+                                              ↓
+                                        mlruns/ (model artifact)
+                                              ↓
+SOA + entity features ──────────────→ transform.score_customers
+                                              ↓
+                                    REPL: Propensity ranking + segments
+```
+
+**You'll learn:**
+- MLflow experiment tracking (params, metrics, model artifacts)
+- Separate training and prediction pipelines (production pattern)
+- Batch scoring with propensity ranks and customer segments
+- Pipeline composition — reusing Chapter 4's training dataset
+
+**[Start Chapter 5 →](5-e2e-ml-customer-targeting.md)**
+
+---
+
 ## What You'll Build
 
 By the end of this path, you'll have a complete ML pipeline:
@@ -128,6 +153,8 @@ By the end of this path, you'll have a complete ML pipeline:
 | **SOA** | YAML `features:` spec | Hierarchical meta-features (basic, window, ratio) |
 | **Validation** | CLI | Detect feature quality issues |
 | **Entity Consolidation** | SOA + entity features / CLI | Training datasets, unified entity views |
+| **Experiment Tracking** | MLflow (manual) | Log params, metrics, model artifacts |
+| **Batch Prediction** | `@transform` + MLflow | Score customers, rank, segment |
 
 ---
 
@@ -160,6 +187,11 @@ seeknal consolidate
 
 # Interactive verification
 seeknal repl
+
+# MLflow experiment tracking (Chapter 5)
+mlflow ui --backend-store-uri file:./mlruns
+seeknal run --nodes transform.train_propensity
+seeknal run --nodes transform.score_customers
 ```
 
 ---
