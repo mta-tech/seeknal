@@ -227,10 +227,25 @@ class PythonExecutor(BaseExecutor):
             duration = time.time() - start_time
 
             if result.returncode != 0:
+                # Extract last meaningful line from stderr for summary
+                stderr_lines = [l for l in result.stderr.strip().splitlines() if l.strip()]
+                last_stderr = stderr_lines[-1] if stderr_lines else "Unknown error"
+                error_msg = f"Process exited with code {result.returncode}: {last_stderr}"
+
+                # Build untruncated output for log files
+                output_parts = []
+                if result.stdout:
+                    output_parts.append(f"stdout:\n{result.stdout}")
+                if result.stderr:
+                    output_parts.append(f"stderr:\n{result.stderr}")
+                full_output = "\n\n".join(output_parts) if output_parts else None
+
                 return ExecutorResult(
                     node_id=self.node.id,
                     status=ExecutionStatus.FAILED,
                     duration_seconds=duration,
+                    error_message=error_msg,
+                    output_log=full_output,
                     metadata={
                         "stdout": result.stdout[-10000:] if len(result.stdout) > 10000 else result.stdout,
                         "stderr": result.stderr[-10000:] if len(result.stderr) > 10000 else result.stderr,
@@ -263,6 +278,7 @@ class PythonExecutor(BaseExecutor):
                 node_id=self.node.id,
                 status=ExecutionStatus.FAILED,
                 duration_seconds=duration,
+                error_message="Execution timed out after 30 minutes",
                 metadata={"error": "Execution timed out after 30 minutes"},
             )
 

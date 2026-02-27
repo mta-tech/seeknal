@@ -746,6 +746,10 @@ def run(
         None, "--profile",
         help="Path to profiles.yml for source_defaults and connections (default: ~/.seeknal/profiles.yml)"
     ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="Show full tracebacks and subprocess output inline on failure; write detailed log file for all nodes"
+    ),
 ):
     """Execute YAML/Python pipeline.
 
@@ -855,6 +859,7 @@ def run(
         max_workers=max_workers,
         materialize=materialize,
         profile=profile,
+        verbose=verbose,
     )
 
 
@@ -873,6 +878,7 @@ def _run_yaml_pipeline(
     max_workers: int = 4,
     materialize: Optional[bool] = None,
     profile: Optional[str] = None,
+    verbose: bool = False,
 ) -> None:
     """
     Execute YAML-based pipeline using DAGBuilder, state tracking, and executors.
@@ -1108,7 +1114,7 @@ def _run_yaml_pipeline(
             workspace_path=project_path,
             target_path=target_path,
             dry_run=dry_run,
-            verbose=True,
+            verbose=verbose,
             materialize_enabled=materialize,
             params={},
             common_config=dag_builder._common_config,
@@ -1118,6 +1124,31 @@ def _run_yaml_pipeline(
         parallel_runner = ParallelDAGRunner(_runner, max_workers, continue_on_error)
         parallel_summary = parallel_runner.run(nodes_to_run, dry_run=dry_run)
         print_parallel_summary(parallel_summary)
+
+        # Write run log for parallel execution
+        from seeknal.workflow.run_logger import RunLogger as _RunLogger
+        _run_logger = _RunLogger(
+            target_path=target_path,
+            run_id=_runner.run_state.run_id if hasattr(_runner, 'run_state') else "",
+            project_name=project_path.name,
+            verbose=verbose,
+            flags=["--parallel", "--verbose"] if verbose else ["--parallel"],
+        )
+        for _r in parallel_summary.results:
+            _run_logger.log_node(
+                _r.node_id,
+                _r.status.value.upper(),
+                duration_seconds=_r.duration,
+                error_message=_r.error_message,
+                row_count=_r.row_count,
+            )
+        try:
+            _log_path = _run_logger.write()
+            if _log_path:
+                _echo_info(f"Run log: {_log_path}")
+        except Exception:
+            pass  # best-effort
+
         return
 
     # Step 4: Create execution context
@@ -1126,7 +1157,7 @@ def _run_yaml_pipeline(
         workspace_path=project_path,
         target_path=target_path,
         dry_run=dry_run,
-        verbose=True,
+        verbose=verbose,
         materialize_enabled=materialize,
         params={},  # Will be populated per-node from yaml_data
         common_config=dag_builder._common_config,
@@ -1140,6 +1171,25 @@ def _run_yaml_pipeline(
     # Initialize run state
     run_state = RunState(
         config={"full": full, "nodes": nodes, "types": types},
+    )
+
+    # Initialize run logger
+    from seeknal.workflow.run_logger import RunLogger
+    run_flags = []
+    if verbose:
+        run_flags.append("--verbose")
+    if full:
+        run_flags.append("--full")
+    if continue_on_error:
+        run_flags.append("--continue-on-error")
+    if parallel:
+        run_flags.append("--parallel")
+    run_logger = RunLogger(
+        target_path=target_path,
+        run_id=run_state.run_id,
+        project_name=project_path.name,
+        verbose=verbose,
+        flags=run_flags,
     )
 
     # Copy previous successful states
@@ -1165,6 +1215,7 @@ def _run_yaml_pipeline(
             if node_id in run_state.nodes and run_state.nodes[node_id].is_success():
                 typer.echo(f"{idx}/{len(execution_order)}: {node.name} [{typer.style('CACHED', fg=typer.colors.BLUE)}]")
                 cached += 1
+                run_logger.log_node(node_id, "CACHED")
             continue
 
         # Execute the node
@@ -1208,10 +1259,22 @@ def _run_yaml_pipeline(
                     hash=current_hash,
                 )
                 successful += 1
+                run_logger.log_node(
+                    node_id, "SUCCESS",
+                    duration_seconds=duration,
+                    row_count=result.row_count,
+                )
 
             elif result.is_failed() or result.status.value == "failed":
                 status_msg = typer.style("FAILED", fg=typer.colors.RED, bold=True)
                 typer.echo(f"  {status_msg}: {result.error_message}")
+
+                # Verbose mode: show full subprocess output inline
+                if verbose and result.output_log:
+                    typer.echo("")
+                    for line in result.output_log.splitlines():
+                        typer.echo(f"    {line}")
+                    typer.echo("")
 
                 update_node_state(
                     run_state,
@@ -1221,6 +1284,16 @@ def _run_yaml_pipeline(
                     metadata={"error": result.error_message},
                 )
                 failed += 1
+                run_logger.log_node(
+                    node_id, "FAILED",
+                    duration_seconds=duration,
+                    error_message=result.error_message,
+                    output_log=result.output_log,
+                )
+
+                # Show log path hint (non-verbose mode)
+                if not verbose:
+                    _echo_info(f"  Details: {run_logger.log_path}")
 
                 if not continue_on_error:
                     typer.echo("")
@@ -1229,6 +1302,16 @@ def _run_yaml_pipeline(
 
                 # Retry logic
                 if retry > 0:
+                    total_attempts = retry + 1  # initial + retries
+                    # Log the initial failure as attempt 1
+                    run_logger.log_node(
+                        node_id, "FAILED",
+                        duration_seconds=duration,
+                        error_message=result.error_message,
+                        output_log=result.output_log,
+                        attempt=1,
+                        total_attempts=total_attempts,
+                    )
                     for attempt in range(1, retry + 1):
                         typer.echo(f"  Retry {attempt}/{retry}...")
 
@@ -1252,9 +1335,32 @@ def _run_yaml_pipeline(
                                 )
                                 failed -= 1
                                 successful += 1
+                                run_logger.log_node(
+                                    node_id, "SUCCESS",
+                                    duration_seconds=duration,
+                                    row_count=result.row_count,
+                                    attempt=attempt + 1,
+                                    total_attempts=total_attempts,
+                                )
                                 break
+                            else:
+                                run_logger.log_node(
+                                    node_id, "FAILED",
+                                    duration_seconds=time.time() - node_start,
+                                    error_message=result.error_message,
+                                    output_log=result.output_log,
+                                    attempt=attempt + 1,
+                                    total_attempts=total_attempts,
+                                )
                         except Exception as e:
                             typer.echo(f"  Retry {attempt} failed: {e}")
+                            run_logger.log_node(
+                                node_id, "FAILED",
+                                duration_seconds=time.time() - node_start,
+                                error_message=str(e),
+                                attempt=attempt + 1,
+                                total_attempts=total_attempts,
+                            )
 
         except Exception as e:
             duration = time.time() - node_start
@@ -1269,6 +1375,11 @@ def _run_yaml_pipeline(
                 metadata={"error": str(e)},
             )
             failed += 1
+            run_logger.log_node(
+                node_id, "FAILED",
+                duration_seconds=duration,
+                error_message=str(e),
+            )
 
             if not continue_on_error:
                 typer.echo("")
@@ -1282,6 +1393,15 @@ def _run_yaml_pipeline(
             _echo_success("State saved")
         except Exception as e:
             _echo_warning(f"Failed to save state: {e}")
+
+    # Step 6a: Write run log file (best-effort)
+    if not dry_run:
+        try:
+            log_path = run_logger.write()
+            if log_path:
+                _echo_info(f"Run log: {log_path}")
+        except Exception as e:
+            _echo_warning(f"Failed to write run log: {e}")
 
     # Step 6b: Entity consolidation (best-effort)
     if not dry_run:
@@ -1334,6 +1454,8 @@ def _run_yaml_pipeline(
         failed_msg = typer.style(str(failed), fg=typer.colors.RED, bold=True)
         typer.echo(f"  Failed:         {failed_msg}")
     typer.echo(f"  Duration:       {total_duration:.2f}s")
+    if run_logger.log_path.exists():
+        typer.echo(f"  Log:            {run_logger.log_path}")
 
     # Data quality summary for rule nodes
     _rule_passed = 0
