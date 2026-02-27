@@ -235,6 +235,36 @@ class TestPITJoin:
         assert "label_date" in result.columns
         assert "customer_id" in result.columns
 
+    def test_pit_join_overlapping_columns(self):
+        """Overlapping columns between spine and features should not duplicate."""
+        features_df = pd.DataFrame({
+            "customer_id": ["C1", "C1"],
+            "order_date": pd.to_datetime(["2026-01-10", "2026-01-20"]),
+            "application_date": pd.to_datetime(["2026-01-21", "2026-01-21"]),
+            "region": ["north", "north"],
+            "daily_amount": [100.0, 200.0],
+        })
+        spine = pd.DataFrame({
+            "customer_id": ["C1"],
+            "churned": [0],
+            "application_date": pd.to_datetime(["2026-01-15"]),
+        })
+        ff = FeatureFrame(
+            features_df, "customer", ["customer_id"], "order_date"
+        )
+        result = ff.pit_join(spine=spine, date_col="application_date")
+
+        # No duplicate columns (application_date_1 must NOT appear)
+        assert "application_date_1" not in result.columns
+        # Spine's application_date is kept
+        assert "application_date" in result.columns
+        # Feature-only columns pass through
+        assert "region" in result.columns
+        assert "daily_amount" in result.columns
+        assert "order_date" in result.columns
+        # PIT correctness: Jan 10 row (before spine's Jan 15)
+        assert result["daily_amount"].iloc[0] == 100.0
+
 
 class TestAsOf:
     def test_as_of_filters_correctly(self, ff):

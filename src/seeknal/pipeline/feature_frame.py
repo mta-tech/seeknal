@@ -95,7 +95,12 @@ class FeatureFrame:
             join_conditions = " AND ".join(
                 [f"spine.{k} = features.{k}" for k in self.join_keys]
             )
-            exclude_cols = ", ".join(self.join_keys)
+            # Exclude join keys + columns overlapping with spine
+            # (prevents DuckDB auto-renaming e.g. application_date → application_date_1)
+            spine_col_set = set(spine_copy.columns)
+            feature_col_set = set(features.columns)
+            exclude_set = set(self.join_keys) | (spine_col_set & feature_col_set)
+            exclude_cols = ", ".join(sorted(exclude_set))
             partition_cols = ", ".join(
                 [f"spine.{k}" for k in self.join_keys]
             )
@@ -120,14 +125,17 @@ class FeatureFrame:
 
             # Filter columns if keep_cols specified
             if keep_cols:
-                keep_set = set(keep_cols + self.join_keys + [date_col])
-                feature_cols = [
-                    c
-                    for c in result.columns
-                    if c not in spine_copy.columns or c in keep_set
+                keep_set = set(keep_cols) | set(self.join_keys) | {date_col}
+                # Feature-only columns always pass through
+                feature_only = [
+                    c for c in result.columns if c not in spine_col_set
                 ]
                 result = result[
-                    [c for c in result.columns if c in keep_set or c in feature_cols]
+                    [
+                        c
+                        for c in result.columns
+                        if c in keep_set or c in feature_only
+                    ]
                 ]
 
             return result

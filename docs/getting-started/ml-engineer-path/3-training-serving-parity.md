@@ -180,11 +180,15 @@ def pit_training_data(ctx):
     labels = ctx.ref("source.churn_labels")
 
     # Load daily features from Chapter 2
-    # customer_daily_agg has no entity= (daily granularity, not entity-level),
-    # so ctx.ref() returns a plain DataFrame. Wrap it in a FeatureFrame to
-    # get .pit_join() — this tells Seeknal which column is the entity key
-    # and which is the event timestamp.
+    # customer_daily_agg has columns: customer_id, region, order_date,
+    # application_date, daily_amount, daily_count, event_time.
+    # Select only the feature columns we need for training.
     daily_features = ctx.ref("feature_group.customer_daily_agg")
+    daily_features = daily_features[
+        ["customer_id", "order_date", "daily_amount", "daily_count"]
+    ]
+
+    # Wrap in FeatureFrame for PIT join support
     ff = FeatureFrame(
         df=daily_features,
         entity_name="customer",
@@ -203,16 +207,17 @@ def pit_training_data(ctx):
     return pit_df
 ```
 
-!!! tip "When `ctx.ref()` returns a FeatureFrame automatically"
+!!! tip "Column Selection Before PIT Join"
+    The `customer_daily_agg` feature group outputs metadata columns like `region`, `application_date`, and `event_time` (used by the SOA engine in Chapter 2). Always select only the columns you need before wrapping in a `FeatureFrame` — this keeps your training data clean.
+
     Feature groups with `entity=` (like `customer_features` from Chapter 1) return a `FeatureFrame` directly from `ctx.ref()` — no wrapping needed:
 
     ```python
-    # customer_features has entity="customer", so this is already a FeatureFrame
     ff = ctx.ref("feature_group.customer_features")
     pit_df = ff.pit_join(spine=labels, date_col="label_date")
     ```
 
-    Since `customer_daily_agg` omits `entity=` (daily granularity), we wrap it manually. This is the only extra step.
+    Since `customer_daily_agg` omits `entity=` (daily granularity), we wrap it manually.
 
 ```bash
 seeknal dry-run draft_transform_pit_training_data.py
