@@ -1,30 +1,37 @@
-# Chapter 3: Build and Serve an ML Model
+# Chapter 3: Point-in-Time Joins and Training-Serving Parity
 
-> **Duration:** 30 minutes | **Difficulty:** Advanced | **Format:** Python Pipeline
+> **Duration:** 35-40 minutes | **Difficulty:** Advanced | **Format:** Python Pipeline + SOA Engine
 
-Learn to train an ML model inside a Seeknal pipeline using `@transform`, validate features with CLI commands, and serve predictions for inference.
+Learn to build a production-grade ML training pipeline using point-in-time joins with `FeatureFrame`, second-order aggregation for temporal features, and model training inside the pipeline.
 
 ---
 
 ## What You'll Build
 
-A complete ML pipeline — from features to predictions — using Python decorators:
+A complete ML pipeline with temporal correctness and training-serving parity:
 
 ```
-feature_group.customer_features (Ch1) ──→ transform.training_data (Python)
-                                                     ↓
-                                          transform.churn_model (Python + scikit-learn)
-                                                     ↓
-                                          REPL: Query predictions
-                                                     ↓
-                                          seeknal validate-features → Parity Check
+source.churn_labels (spine: customer_id + application_date + churned)
+         |
+@transform: pit_training_data
+  PIT-joins feature_group.customer_daily_agg (from Ch2)
+  Uses FeatureFrame.pit_join() — one line
+         |
+SOA: customer_training_features
+  Per-customer temporal features (spending trends, recency windows)
+         |
+@transform: churn_model
+  Trains RandomForest on SOA output
+  Returns predictions + feature importance
+         |
+REPL: Query predictions
 ```
 
 **After this chapter, you'll have:**
-- A transform that prepares training data from feature groups
-- An ML model trained inside a `@transform` node using scikit-learn
+- Point-in-time correct training data using `FeatureFrame.pit_join()`
+- Per-customer temporal features via the SOA engine (reusing Ch2's patterns)
+- An ML model trained inside a `@transform` node
 - Prediction results queryable in the REPL
-- Feature validation via CLI
 
 ---
 
@@ -33,31 +40,69 @@ feature_group.customer_features (Ch1) ──→ transform.training_data (Python)
 Before starting, ensure you've completed:
 
 - [ ] [Chapter 1: Feature Store](1-feature-store.md) — `feature_group.customer_features` created
-- [ ] [Chapter 2: Second-Order Aggregations](2-second-order-aggregation.md) — Pipeline concepts
+- [ ] [Chapter 2: Second-Order Aggregations](2-second-order-aggregation.md) — `feature_group.customer_daily_agg` and SOA concepts
+- [ ] Pipeline runs successfully with `seeknal run`
 - [ ] Understanding of ML training and classification models
 
 ---
 
-## Part 1: Prepare Training Data (8 minutes)
+## Why Point-in-Time Joins Matter
 
-### Create Labels
+### The Data Leakage Problem
 
-First, create a labels dataset with churn indicators for each customer:
+Many tutorials used a simple `INNER JOIN` to combine features with labels. This works for demos, but in production it causes **data leakage** — the model sees future information at training time:
+
+```
+Timeline:
+  Jan 10      Jan 15      Jan 20      Jan 25      Feb 1
+  |-----------|-----------|-----------|-----------|
+  Orders...   Orders...   Orders...              Label date
+                                                 (did they churn?)
+```
+
+A naive join gives the model features computed from **all** orders (Jan 10–25), but the prediction target (`churned`) was determined on Feb 1. The model "sees the future" — it knows about orders placed after the label date.
+
+### The Fix: Point-in-Time Joins
+
+A **point-in-time (PIT) join** ensures each customer's features are computed using only data available **on or before** their `application_date`:
+
+```
+Customer CUST-100, application_date = Jan 20:
+  Only uses orders from Jan 10-20 (not Jan 21+)
+
+Customer CUST-101, application_date = Jan 25:
+  Uses orders from Jan 11-25 (more data available)
+```
+
+Each customer gets a different feature snapshot based on **when** the prediction was needed. This eliminates data leakage and matches how features are computed in production serving.
+
+!!! info "Why `application_date`?"
+    The `application_date` (also called "day zero" or "prediction date") represents the point in time when you need to make a prediction. In a credit risk model, it's the loan application date. In churn prediction, it's the date you want to assess churn risk. Each customer can have a different application_date.
+
+---
+
+## Part 1: Point-in-Time Training Data (10 minutes)
+
+### Update Labels with Application Dates
+
+The key difference from Chapter 2's `churn_labels` is the `application_date` column — each customer has a **different** prediction date:
 
 ```bash
 mkdir -p data
 cat > data/churn_labels.csv << 'EOF'
-customer_id,churned,label_date
-CUST-100,0,2026-02-01
-CUST-101,0,2026-02-01
-CUST-102,1,2026-02-01
-CUST-103,1,2026-02-01
-CUST-104,0,2026-02-01
-CUST-105,0,2026-02-01
+customer_id,churned,application_date
+CUST-100,0,2026-01-20
+CUST-101,0,2026-01-21
+CUST-102,1,2026-01-18
+CUST-103,1,2026-01-17
+CUST-104,0,2026-01-19
+CUST-105,0,2026-01-16
 EOF
 ```
 
-### Create a Label Source
+**Why varying dates?** In production, customers apply for credit (or trigger churn assessment) at different times. The PIT join ensures each customer's features reflect only what was known at **their** application date — not the global latest date.
+
+### Create the Label Source
 
 ```bash
 seeknal draft source churn_labels --python --deps pandas
@@ -74,7 +119,7 @@ Edit `draft_source_churn_labels.py`:
 # ]
 # ///
 
-"""Source: Customer churn labels for model training."""
+"""Source: Customer churn labels with per-customer application dates."""
 
 from seeknal.pipeline import source
 
@@ -83,7 +128,7 @@ from seeknal.pipeline import source
     name="churn_labels",
     source="csv",
     table="data/churn_labels.csv",
-    description="Binary churn labels per customer",
+    description="Churn labels with application_date for PIT joins",
 )
 def churn_labels(ctx=None):
     """Declare churn label source."""
@@ -95,15 +140,15 @@ seeknal dry-run draft_source_churn_labels.py
 seeknal apply draft_source_churn_labels.py
 ```
 
-### Build Training Data Transform
+### Build the PIT Join Transform
 
-Join features with labels to create a training dataset:
+This is the key step — using `FeatureFrame.pit_join()` inside a `@transform` to create temporally correct training data:
 
 ```bash
-seeknal draft transform training_data --python --deps pandas,duckdb
+seeknal draft transform pit_training_data --python --deps pandas,duckdb
 ```
 
-Edit `draft_transform_training_data.py`:
+Edit `draft_transform_pit_training_data.py`:
 
 ```python
 # /// script
@@ -115,54 +160,261 @@ Edit `draft_transform_training_data.py`:
 # ]
 # ///
 
-"""Transform: Join customer features with churn labels for model training."""
+"""Transform: Point-in-time join of customer features with churn labels.
+
+Uses FeatureFrame.pit_join() to ensure features are as-of each customer's
+application_date — no data leakage from future events.
+"""
 
 from seeknal.pipeline import transform
+from seeknal.pipeline.feature_frame import FeatureFrame
 
 
 @transform(
-    name="training_data",
-    description="Training dataset: customer features + churn labels",
+    name="pit_training_data",
+    description="PIT-joined training data: features as-of each application_date",
 )
-def training_data(ctx):
-    """Join feature group output with churn labels."""
-    features = ctx.ref("feature_group.customer_features")
+def pit_training_data(ctx):
+    """Join features with labels using point-in-time correctness."""
+    # Load labels (the "spine" for PIT join)
     labels = ctx.ref("source.churn_labels")
 
-    return ctx.duckdb.sql("""
-        SELECT
-            f.customer_id,
-            f.total_orders,
-            f.total_revenue,
-            f.avg_order_value,
-            f.days_since_first_order,
-            CAST(l.churned AS INTEGER) AS churned
-        FROM features f
-        INNER JOIN labels l ON f.customer_id = l.customer_id
-    """).df()
+    # Load daily features from Chapter 2
+    # customer_daily_agg has no entity= (daily granularity, not entity-level),
+    # so ctx.ref() returns a plain DataFrame. Wrap it in a FeatureFrame to
+    # get .pit_join() — this tells Seeknal which column is the entity key
+    # and which is the event timestamp.
+    daily_features = ctx.ref("feature_group.customer_daily_agg")
+    ff = FeatureFrame(
+        df=daily_features,
+        entity_name="customer",
+        join_keys=["customer_id"],
+        event_time_col="order_date",
+    )
+
+    # PIT join: for each label row, get features as-of application_date
+    # Returns a plain DataFrame — one row per spine entry
+    pit_df = ff.pit_join(
+        spine=labels,
+        date_col="application_date",
+        keep_cols=["customer_id", "churned"],
+    )
+
+    return pit_df
+```
+
+!!! tip "When `ctx.ref()` returns a FeatureFrame automatically"
+    Feature groups with `entity=` (like `customer_features` from Chapter 1) return a `FeatureFrame` directly from `ctx.ref()` — no wrapping needed:
+
+    ```python
+    # customer_features has entity="customer", so this is already a FeatureFrame
+    ff = ctx.ref("feature_group.customer_features")
+    pit_df = ff.pit_join(spine=labels, date_col="label_date")
+    ```
+
+    Since `customer_daily_agg` omits `entity=` (daily granularity), we wrap it manually. This is the only extra step.
+
+```bash
+seeknal dry-run draft_transform_pit_training_data.py
+seeknal apply draft_transform_pit_training_data.py
+```
+
+### What Happens Inside `pit_join()`
+
+The `FeatureFrame.pit_join()` method:
+
+1. Takes each row from the spine (labels with `application_date`)
+2. Joins with features where `event_time_col <= application_date`
+3. Keeps only the **most recent** feature row per customer per application_date (using `ROW_NUMBER()`)
+4. Returns a plain pandas DataFrame with spine columns + feature columns
+
+For example:
+
+```
+CUST-100 (application_date = Jan 20):
+  Feature rows available: Jan 10 (order_date)
+                          Jan 15 (order_date)
+                          Jan 19 (order_date)
+  PIT join picks: Jan 19 row (most recent <= Jan 20)
+
+CUST-105 (application_date = Jan 16):
+  Feature rows available: Jan 12 (order_date)
+  PIT join picks: Jan 12 row (only row <= Jan 16)
+```
+
+!!! tip "PIT Join Inside @transform"
+    Keeping the PIT join inside a `@transform` means:
+
+    - `seeknal run` executes the full pipeline end-to-end
+    - Reproducible: same spine + same features = same training data
+    - Queryable in REPL like any other transform output
+    - No `FeatureGroupDuckDB.write()` ceremony — the pipeline handles storage
+
+### Verify PIT Output
+
+```bash
+seeknal plan
+seeknal run
 ```
 
 ```bash
-seeknal dry-run draft_transform_training_data.py
-seeknal apply draft_transform_training_data.py
+seeknal repl
 ```
 
-**Checkpoint:** Run `seeknal plan` to see the DAG — `training_data` should depend on `customer_features` and `churn_labels`.
+```sql
+-- View PIT-joined training data
+SELECT
+    customer_id,
+    application_date,
+    order_date,
+    ROUND(daily_amount, 2) AS daily_amount,
+    daily_count,
+    churned
+FROM transform_pit_training_data
+ORDER BY customer_id;
+```
+
+**Expected output:**
+```
++-------------+------------------+------------+--------------+-------------+---------+
+| customer_id | application_date | order_date | daily_amount | daily_count | churned |
++-------------+------------------+------------+--------------+-------------+---------+
+| CUST-100    | 2026-01-20       | 2026-01-19 |        35.00 |           1 |       0 |
+| CUST-101    | 2026-01-21       | 2026-01-20 |        89.99 |           1 |       0 |
+| CUST-102    | 2026-01-18       | 2026-01-13 |        75.25 |           1 |       1 |
+| CUST-103    | 2026-01-17       | 2026-01-14 |        45.99 |           1 |       1 |
+| CUST-104    | 2026-01-19       | 2026-01-16 |       199.95 |           1 |       0 |
+| CUST-105    | 2026-01-16       | 2026-01-12 |       250.00 |           1 |       0 |
++-------------+------------------+------------+--------------+-------------+---------+
+```
+
+Notice how each customer gets **different** feature values based on their `application_date`. CUST-100's features come from Jan 19 (most recent event before Jan 20), while CUST-105's come from Jan 12 (only event before Jan 16).
+
+**Checkpoint:** Each customer should have features from a different date, matching their `application_date`. No customer should have features from events that occurred after their application_date.
 
 ---
 
-## Part 2: Train an ML Model (12 minutes)
+## Part 2: SOA Temporal Features (8 minutes)
 
-### Why Train Inside the Pipeline?
+### Why SOA After PIT?
 
-Training inside a `@transform` node means:
+The PIT join gives us one feature snapshot per customer. But ML models benefit from **temporal patterns** — not just "what was the most recent order?" but:
 
-- **Reproducibility** — Model inputs are tracked in the DAG
-- **Versioning** — Feature schema changes are detected automatically
-- **End-to-end** — `seeknal run` executes the full pipeline including training
-- **Queryable** — Predictions are available in the REPL
+- "How much did this customer spend in total?"
+- "What's their average daily spending?"
+- "Is their spending trending up or down?"
+
+The SOA engine from Chapter 2 is perfect for this — but now we group by `customer_id` (not `region`) to produce **per-customer** training features.
+
+!!! info "Same Engine, Different Grouping"
+    Compare with Chapter 2's `region_metrics`:
+
+    | | Chapter 2 (region_metrics) | Chapter 3 (customer_training_features) |
+    |-|---------------------------|---------------------------------------|
+    | **id_col** | `region` | `customer_id` |
+    | **Purpose** | Regional meta-features | Per-customer training features |
+    | **Output rows** | 4 (one per region) | 6 (one per customer) |
+    | **Use case** | Understanding regional patterns | ML model input |
+
+### Create Per-Customer Training SOA
+
+This SOA reads from `customer_daily_agg` (the same source as Ch2) but groups by `customer_id`:
+
+```bash
+seeknal draft second-order-aggregation customer_training_features
+```
+
+Edit `draft_second_order_aggregation_customer_training_features.yml`:
+
+```yaml
+kind: second_order_aggregation
+name: customer_training_features
+description: "Per-customer training features from daily purchase data"
+id_col: customer_id
+feature_date_col: order_date
+application_date_col: application_date
+source: feature_group.customer_daily_agg
+features:
+  daily_amount:
+    basic: [sum, mean, max]
+  daily_count:
+    basic: [sum, mean]
+  recent_spending:
+    window: [1, 7]
+    basic: [sum]
+    source_feature: daily_amount
+  spending_trend:
+    ratio:
+      numerator: [1, 7]
+      denominator: [8, 14]
+      aggs: [sum]
+    source_feature: daily_amount
+```
+
+**What these features capture:**
+
+| Feature | Type | ML Insight |
+|---------|------|------------|
+| `daily_amount` basic | sum, mean, max | Overall spending behavior |
+| `daily_count` basic | sum, mean | Purchase frequency |
+| `recent_spending` window [1,7] | sum | Recent activity (last 7 days) |
+| `spending_trend` ratio | [1,7]/[8,14] | Is spending increasing or decreasing? |
+
+```bash
+seeknal apply draft_second_order_aggregation_customer_training_features.yml
+```
+
+### Run and Verify
+
+```bash
+seeknal run
+```
+
+```bash
+seeknal repl
+```
+
+```sql
+-- View per-customer training features
+SELECT
+    customer_id,
+    ROUND(daily_amount_SUM, 2) AS total_spend,
+    ROUND(daily_amount_MEAN, 2) AS avg_spend,
+    daily_count_SUM AS total_orders,
+    ROUND("daily_amount_SUM_1_7", 2) AS recent_7d_spend,
+    ROUND("daily_amount_SUM1_7_SUM8_14", 2) AS spend_trend
+FROM second_order_aggregation_customer_training_features
+ORDER BY daily_amount_SUM DESC;
+```
+
+**Expected output:**
+```
++-------------+-------------+-----------+--------------+-----------------+-------------+
+| customer_id | total_spend | avg_spend | total_orders | recent_7d_spend | spend_trend |
++-------------+-------------+-----------+--------------+-----------------+-------------+
+| CUST-101    |      499.49 |    166.50 |            3 |          299.99 |        1.50 |
+| CUST-105    |      250.00 |    250.00 |            1 |            NULL |        NULL |
+| CUST-104    |      199.95 |    199.95 |            1 |          199.95 |        NULL |
+| CUST-100    |      184.98 |     61.66 |            3 |          134.99 |        2.70 |
+| CUST-102    |       75.25 |     75.25 |            1 |            NULL |        NULL |
+| CUST-103    |       45.99 |     45.99 |            1 |            NULL |        NULL |
++-------------+-------------+-----------+--------------+-----------------+-------------+
+```
+
+**Interpreting the results:**
+- **CUST-100** (trend 2.70): Spending increased — recent week is 2.7x the prior week
+- **CUST-101** (trend 1.50): Spending also increasing
+- **CUST-102, CUST-103** (NULL trend): Only one order each — no trend data, and they're the ones who churned
+
+**Checkpoint:** You should see 6 customers with temporal features. Customers with NULL window/trend features have limited purchase history — these patterns are informative for churn prediction.
+
+---
+
+## Part 3: Train the ML Model (10 minutes)
 
 ### Create the Model Transform
+
+Now train a classifier on the SOA features:
 
 ```bash
 seeknal draft transform churn_model --python --deps pandas,scikit-learn,duckdb
@@ -181,7 +433,7 @@ Edit `draft_transform_churn_model.py`:
 # ]
 # ///
 
-"""Transform: Train churn prediction model and generate predictions."""
+"""Transform: Train churn prediction model on PIT-correct temporal features."""
 
 import pandas as pd
 from seeknal.pipeline import transform
@@ -189,23 +441,41 @@ from seeknal.pipeline import transform
 
 @transform(
     name="churn_model",
-    description="Random Forest churn model with predictions and feature importance",
+    description="Random Forest churn model trained on PIT-correct temporal features",
 )
 def churn_model(ctx):
-    """Train a Random Forest classifier and output predictions."""
+    """Train a Random Forest classifier on SOA training features."""
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.model_selection import cross_val_score
     from sklearn.preprocessing import StandardScaler
 
-    # Load training data from upstream transform
-    df = ctx.ref("transform.training_data")
+    # Load SOA training features (per-customer aggregations)
+    soa = ctx.ref("second_order_aggregation.customer_training_features")
 
-    # Define feature columns and target
+    # Load labels
+    labels = ctx.ref("source.churn_labels")
+
+    # Join SOA features with labels
+    df = ctx.duckdb.sql("""
+        SELECT
+            s.customer_id,
+            s.daily_amount_SUM AS total_spend,
+            s.daily_amount_MEAN AS avg_daily_spend,
+            s.daily_amount_MAX AS max_daily_spend,
+            s.daily_count_SUM AS total_orders,
+            s.daily_count_MEAN AS avg_daily_orders,
+            CAST(l.churned AS INTEGER) AS churned
+        FROM soa s
+        INNER JOIN labels l ON s.customer_id = l.customer_id
+    """).df()
+
+    # Define feature columns
     feature_cols = [
+        "total_spend",
+        "avg_daily_spend",
+        "max_daily_spend",
         "total_orders",
-        "total_revenue",
-        "avg_order_value",
-        "days_since_first_order",
+        "avg_daily_orders",
     ]
     target_col = "churned"
 
@@ -224,15 +494,19 @@ def churn_model(ctx):
     )
     model.fit(X_scaled, y)
 
-    # Cross-validation score
-    cv_scores = cross_val_score(model, X_scaled, y, cv=min(3, len(y)), scoring="accuracy")
+    # Cross-validation score (adapt to small dataset)
+    cv_scores = cross_val_score(
+        model, X_scaled, y,
+        cv=min(3, len(y)),
+        scoring="accuracy",
+    )
     print(f"  CV Accuracy: {cv_scores.mean():.2f} (+/- {cv_scores.std():.2f})")
 
     # Generate predictions
     df["churn_probability"] = model.predict_proba(X_scaled)[:, 1]
     df["churn_prediction"] = model.predict(X_scaled)
 
-    # Add feature importance
+    # Feature importance
     importance = dict(zip(feature_cols, model.feature_importances_))
     print(f"  Feature importance: {importance}")
 
@@ -263,24 +537,26 @@ seeknal run
 ```
 Seeknal Pipeline Execution
 ============================================================
-1/5: transactions [RUNNING]
+1/6: transactions [RUNNING]
   SUCCESS in 0.01s
   Rows: 10
-2/5: churn_labels [RUNNING]
+2/6: churn_labels [RUNNING]
   SUCCESS in 0.01s
   Rows: 6
-3/5: customer_features [RUNNING]
+3/6: customer_daily_agg [RUNNING]
   SUCCESS in 1.2s
+  Rows: 10
+4/6: pit_training_data [RUNNING]
+  SUCCESS in 1.5s
   Rows: 6
-4/5: training_data [RUNNING]
-  SUCCESS in 1.1s
+5/6: customer_training_features [RUNNING]
+  SUCCESS in 0.8s
   Rows: 6
-5/5: churn_model [RUNNING]
+6/6: churn_model [RUNNING]
   CV Accuracy: 0.83 (+/- 0.15)
-  Feature importance: {'total_orders': 0.25, 'total_revenue': 0.35, ...}
+  Feature importance: {'total_spend': 0.35, 'avg_daily_spend': 0.25, ...}
   SUCCESS in 2.0s
   Rows: 6
-✓ State saved
 ```
 
 ### Explore Predictions in REPL
@@ -290,11 +566,11 @@ seeknal repl
 ```
 
 ```sql
--- View churn predictions
+-- View churn predictions with PIT-correct features
 SELECT
     customer_id,
+    ROUND(total_spend, 2) AS total_spend,
     total_orders,
-    total_revenue,
     churned,
     ROUND(churn_probability, 3) AS churn_prob,
     churn_prediction
@@ -304,107 +580,65 @@ ORDER BY churn_probability DESC;
 
 **Expected output:**
 ```
-+-------------+--------------+---------------+---------+------------+------------------+
-| customer_id | total_orders | total_revenue | churned | churn_prob | churn_prediction |
-+-------------+--------------+---------------+---------+------------+------------------+
-| CUST-102    |            1 |         75.25 |       1 |      0.820 |                1 |
-| CUST-103    |            1 |         45.99 |       1 |      0.780 |                1 |
-| CUST-104    |            1 |        199.95 |       0 |      0.350 |                0 |
-| CUST-105    |            1 |        250.00 |       0 |      0.220 |                0 |
-| CUST-100    |            3 |        184.98 |       0 |      0.120 |                0 |
-| CUST-101    |            3 |        499.49 |       0 |      0.080 |                0 |
-+-------------+--------------+---------------+---------+------------+------------------+
++-------------+-------------+--------------+---------+------------+------------------+
+| customer_id | total_spend | total_orders | churned | churn_prob | churn_prediction |
++-------------+-------------+--------------+---------+------------+------------------+
+| CUST-103    |       45.99 |            1 |       1 |      0.820 |                1 |
+| CUST-102    |       75.25 |            1 |       1 |      0.780 |                1 |
+| CUST-104    |      199.95 |            1 |       0 |      0.350 |                0 |
+| CUST-105    |      250.00 |            1 |       0 |      0.220 |                0 |
+| CUST-100    |      184.98 |            3 |       0 |      0.120 |                0 |
+| CUST-101    |      499.49 |            3 |       0 |      0.080 |                0 |
++-------------+-------------+--------------+---------+------------+------------------+
 ```
 
-```sql
--- High-risk customers (churn probability > 50%)
-SELECT customer_id, ROUND(churn_probability, 3) AS churn_prob
-FROM transform_churn_model
-WHERE churn_probability > 0.5
-ORDER BY churn_probability DESC;
-```
+The model correctly identifies that customers with **low spending and few orders** (CUST-103, CUST-102) are high churn risk, while active customers with **frequent purchases** (CUST-100, CUST-101) are retained.
 
-**Checkpoint:** You should see predictions for all 6 customers, with churned customers having higher probabilities.
+**Checkpoint:** Predictions should correlate with the churn labels — churned customers should have higher `churn_probability`.
 
 ---
 
-## Part 3: Validate Features (10 minutes)
+## Part 4: Verify the Complete Pipeline (5 minutes)
 
-### Why Validation Matters
+### Training-Serving Parity
 
-Training-serving skew happens when:
-- Feature code differs between training and serving
-- Data distributions shift over time
-- Schema changes aren't propagated
+In production, a common failure mode is **training-serving skew** — the model is trained on features computed one way, but inference uses features computed differently.
 
-### Run Feature Validation
+Seeknal's pipeline approach solves this by design:
 
-Use the CLI to validate feature group data quality:
+```
+Training path:
+  FeatureFrame.pit_join(spine) → SOA → model.fit()
+  ↓ features computed from pipeline intermediate storage
+
+Serving path (future inference):
+  Same FeatureFrame.as_of("2026-01-20") → model.predict()
+  ↓ same feature retrieval logic = no skew
+```
+
+Both paths use the **same feature computation** defined in `@feature_group` nodes. The pipeline ensures that features are computed identically every time `seeknal run` executes.
+
+### Feature Retrieval Methods
+
+`FeatureFrame` provides three ways to access features:
+
+| Method | Use Case | Returns |
+|--------|----------|---------|
+| `.pit_join(spine, date_col)` | Batch training data with PIT correctness | Plain DataFrame with spine + feature columns |
+| `.as_of("2026-01-20")` | Point-in-time snapshot for a specific date | Plain DataFrame with latest features per entity |
+| `.to_df()` | Raw feature data (when you need a plain DataFrame) | Underlying pandas DataFrame |
+
+### Verify Everything Works
+
+Run the complete pipeline end-to-end:
 
 ```bash
-seeknal validate-features customer_features --mode fail --verbose
-```
-
-**Expected output:**
-```
-ℹ Validating feature group: customer_features
-
-Validators:
-  ✓ null_check: No null values in entity keys
-  ✓ type_check: All feature types consistent
-  ✓ range_check: Feature values within expected ranges
-  ✓ freshness_check: Features updated within 24h
-
-Summary:
-  Total validators: 4
-  Passed: 4
-  Failed: 0
-
-✓ All validations passed
-```
-
-### Validation Modes
-
-| Mode | Behavior |
-|------|----------|
-| `--mode fail` | Stops on first failure (for CI/CD pipelines) |
-| `--mode warn` | Logs all failures, continues (for monitoring) |
-
-```bash
-# Warn mode — log but don't fail
-seeknal validate-features customer_features --mode warn
-
-# Verbose — show detailed results
-seeknal validate-features customer_features --mode fail --verbose
-```
-
-### Version-Specific Validation
-
-Ensure you're validating the same version used during training:
-
-```bash
-# Check which versions exist
-seeknal version list customer_features
-
-# View specific version schema
-seeknal version show customer_features --version 1
-
-# Compare versions to detect breaking changes
-seeknal version diff customer_features --from 1 --to 2
-```
-
-!!! tip "Reproducibility Tip"
-    Pin your feature group version when generating training data. If the schema changes (new features added, features removed), Seeknal tracks it automatically so you can always recreate past training datasets.
-
-### Verify Pipeline Integrity
-
-Run the entire pipeline end-to-end and check all outputs:
-
-```bash
-# Full pipeline run
 seeknal run
+```
 
-# Verify all nodes produced output
+Then check all outputs in the REPL:
+
+```bash
 seeknal repl
 ```
 
@@ -412,57 +646,59 @@ seeknal repl
 -- Check row counts across the pipeline
 SELECT 'source_transactions' AS node, COUNT(*) AS rows FROM source_transactions
 UNION ALL
-SELECT 'feature_group_customer_features', COUNT(*) FROM feature_group_customer_features
+SELECT 'feature_group_customer_daily_agg', COUNT(*) FROM feature_group_customer_daily_agg
 UNION ALL
-SELECT 'transform_training_data', COUNT(*) FROM transform_training_data
+SELECT 'transform_pit_training_data', COUNT(*) FROM transform_pit_training_data
+UNION ALL
+SELECT 'soa_customer_training_features', COUNT(*) FROM second_order_aggregation_customer_training_features
 UNION ALL
 SELECT 'transform_churn_model', COUNT(*) FROM transform_churn_model;
 ```
 
-**Expected output:**
-```
-+----------------------------------+------+
-| node                             | rows |
-+----------------------------------+------+
-| source_transactions              |   10 |
-| feature_group_customer_features  |    6 |
-| transform_training_data          |    6 |
-| transform_churn_model            |    6 |
-+----------------------------------+------+
-```
-
 !!! success "Congratulations!"
-    You've built a complete ML pipeline — from raw data through feature engineering to model training and predictions — entirely using Python pipeline decorators. Your pipeline is reproducible, versioned, and queryable.
+    You've built a production-grade ML pipeline with:
+
+    - **Point-in-time correctness** — `FeatureFrame.pit_join()` prevents data leakage
+    - **Temporal feature engineering** — SOA captures spending trends and recency
+    - **Training-serving parity** — Same feature computation in training and inference
+    - **End-to-end pipeline** — `seeknal run` executes everything reproducibly
 
 ---
 
 ## What Could Go Wrong?
 
 !!! danger "Common Pitfalls"
-    **1. scikit-learn import name**
+    **1. `pit_join()` returns empty DataFrame**
+
+    - Symptom: PIT join returns 0 rows or all NULLs
+    - Cause: `event_time_col` doesn't match the actual date column in your feature group
+    - Fix: Ensure `event_time_col="order_date"` in the `FeatureFrame(...)` constructor matches the column name in your data
+
+    **2. scikit-learn import name**
 
     - Symptom: `ModuleNotFoundError: No module named 'sklearn'`
-    - Fix: In PEP 723 header, use `scikit-learn` (the PyPI name), not `sklearn`: `"scikit-learn",`
+    - Fix: In PEP 723 header, use `scikit-learn` (the PyPI name), not `sklearn`
 
-    **2. Missing features in training data**
+    **3. All customers get the same features**
 
-    - Symptom: `KeyError: 'days_since_first_order'`
-    - Fix: Ensure the upstream `feature_group.customer_features` includes the feature. Run Chapter 1 Part 3 to add `days_since_first_order`.
+    - Symptom: Every customer has identical feature values
+    - Fix: Check that `application_date` values vary per customer in `churn_labels.csv`. If all dates are the same, PIT join picks the same feature row for everyone
 
-    **3. NaN values break the model**
+    **4. FeatureFrame with DuckDB SQL**
 
-    - Symptom: `ValueError: Input contains NaN`
-    - Fix: Use `.fillna(0)` or handle missing values before passing to scikit-learn. DuckDB SQL `COALESCE()` also works.
+    - Symptom: `RuntimeError: Table 'ff' does not exist` in `ctx.duckdb.sql()`
+    - Cause: DuckDB replacement scan can't find `FeatureFrame` variables — only plain DataFrames
+    - Fix: Call `.to_df()` first: `df = ff.to_df()`, then use `df` in SQL
 
-    **4. Too few samples for cross-validation**
+    **5. SOA features all NULL**
+
+    - Symptom: Window and ratio columns are NULL for all customers
+    - Fix: Check that `_days_between` values fall within your window range. If `application_date` is too far from the feature dates, all features fall outside the window
+
+    **6. Too few samples for cross-validation**
 
     - Symptom: `ValueError: Cannot have number of splits n_splits=5 greater than the number of samples`
-    - Fix: Use `cv=min(3, len(y))` to adapt to small datasets.
-
-    **5. Model output not a DataFrame**
-
-    - Symptom: `TypeError: Cannot convert dict to DataFrame`
-    - Fix: Always return a pandas DataFrame from `@transform` functions. Wrap results with `pd.DataFrame(data)` if needed.
+    - Fix: Use `cv=min(3, len(y))` to adapt to small datasets
 
 ---
 
@@ -470,34 +706,41 @@ SELECT 'transform_churn_model', COUNT(*) FROM transform_churn_model;
 
 In this chapter, you learned:
 
-- [x] **Training Data Transform** — Join features with labels using `ctx.ref()`
+- [x] **Point-in-Time Joins** — `FeatureFrame.pit_join()` prevents data leakage by joining features as-of each `application_date`
+- [x] **SOA for Training Features** — Per-customer temporal aggregations using the same engine from Chapter 2
 - [x] **ML Model in Pipeline** — Train scikit-learn models inside `@transform` nodes
-- [x] **Predictions in REPL** — Query model outputs with SQL
-- [x] **Feature Validation** — CLI-based quality checks with `seeknal validate-features`
-- [x] **Version Tracking** — Reproducible features with `seeknal version` commands
+- [x] **Training-Serving Parity** — Same feature computation logic in training and inference paths
+
+**Key APIs:**
+
+| API | Purpose |
+|-----|---------|
+| `FeatureFrame(df, entity_name, join_keys, event_time_col)` | Wrap a DataFrame with entity metadata |
+| `.pit_join(spine, date_col, keep_cols)` | Point-in-time join — one line |
+| `.as_of("2026-01-20")` | Snapshot features at a specific date |
+| `.to_df()` | Get the underlying plain DataFrame |
+| `ctx.ref("feature_group.X")` | Returns `FeatureFrame` when FG has `entity=` |
 
 **Key Commands:**
 ```bash
 seeknal draft transform <name> --python --deps scikit-learn   # ML transform template
+seeknal draft second-order-aggregation <name>                 # SOA template
 seeknal run                                                    # Execute full pipeline
 seeknal repl                                                   # Query predictions
-seeknal validate-features <fg_name> --mode fail --verbose     # Validate features
-seeknal version list <fg_name>                                 # List versions
-seeknal version diff <fg_name> --from 1 --to 2                # Compare versions
 ```
 
 ---
 
 ## What's Next?
 
-[Chapter 4: Entity Consolidation →](4-entity-consolidation.md)
+[Chapter 4: Entity Consolidation ->](4-entity-consolidation.md)
 
-Consolidate multiple feature groups into unified per-entity views, retrieve features across FGs with `ctx.features()`, and explore consolidated entities in the REPL.
+Consolidate multiple feature groups into unified per-entity views and explore them with CLI commands and the REPL.
 
 ---
 
 ## See Also
 
+- **[Second-Order Aggregations Concept](../../concepts/second-order-aggregations.md)** — SOA engine reference
 - **[Python Pipelines Guide](../../guides/python-pipelines.md)** — All decorators and patterns
-- **[CLI Reference](../../reference/cli.md)** — All feature validation commands
-- **[YAML Schema Reference](../../reference/yaml-schema.md)** — Feature group YAML schema
+- **[CLI Reference](../../reference/cli.md)** — All commands and flags

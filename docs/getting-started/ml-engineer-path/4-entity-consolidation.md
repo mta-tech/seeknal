@@ -340,7 +340,8 @@ def training_dataset(ctx):
     soa = ctx.ref("second_order_aggregation.customer_training_features")
 
     # Entity-level features from consolidated store
-    prefs = ctx.ref("feature_group.product_preferences")
+    # .to_df() converts FeatureFrame → plain DataFrame for DuckDB SQL
+    prefs = ctx.ref("feature_group.product_preferences").to_df()
 
     # Churn labels (from Chapter 3 data)
     labels = ctx.ref("source.churn_labels")
