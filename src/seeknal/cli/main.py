@@ -2624,6 +2624,14 @@ def plan(
         help="Environment name (optional). Without: show changes vs last run. With: create environment plan."
     ),
     project_path: Path = typer.Option(".", help="Project directory"),
+    tags: Optional[List[str]] = typer.Option(
+        None, "--tags",
+        help="Show only nodes with these tags (plus upstream deps). OR logic. Production mode only."
+    ),
+    exclude_tags: Optional[List[str]] = typer.Option(
+        None, "--exclude-tags",
+        help="Hide nodes with these tags from the plan."
+    ),
 ):
     """Analyze changes and show execution plan.
 
@@ -2634,6 +2642,7 @@ def plan(
         seeknal plan              # What changed since last run?
         seeknal plan dev          # Plan changes in dev environment
         seeknal plan staging      # Plan changes in staging
+        seeknal plan --tags churn_pipeline  # Plan only churn pipeline nodes
     """
     from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
 
@@ -2828,11 +2837,50 @@ def plan(
             _echo_error(f"Cycle detected: {e.message}")
             raise typer.Exit(1)
 
+        # Apply tag filtering (production mode only)
+        plan_filter_set: Optional[set[str]] = None
+        if tags and env_name is None:
+            tag_set = set(tags)
+            tag_matched = {
+                node_id for node_id in dag_builder.nodes
+                if any(t in tag_set for t in dag_builder.nodes[node_id].tags)
+            }
+            if not tag_matched:
+                _echo_warning(
+                    f"No nodes found with tags: {', '.join(tags)}. "
+                    "Showing full plan."
+                )
+            else:
+                # Auto-include all transitive upstream deps
+                with_upstream = set(tag_matched)
+                for node_id in tag_matched:
+                    with_upstream |= dag_builder.get_all_upstream(node_id)
+                plan_filter_set = with_upstream
+
+        if exclude_tags and env_name is None:
+            exclude_set = set(exclude_tags)
+            if plan_filter_set is not None:
+                plan_filter_set = {
+                    node_id for node_id in plan_filter_set
+                    if not any(t in exclude_set for t in dag_builder.nodes[node_id].tags)
+                }
+            else:
+                plan_filter_set = {
+                    node_id for node_id in dag_builder.nodes
+                    if not any(t in exclude_set for t in dag_builder.nodes[node_id].tags)
+                }
+
+        # Filter display order when tags/exclude-tags active
+        display_order = execution_order
+        if plan_filter_set is not None:
+            display_order = [n for n in execution_order if n in plan_filter_set]
+            nodes_to_run = nodes_to_run & plan_filter_set
+
         typer.echo("")
         typer.echo(typer.style("Execution Plan:", bold=True))
         typer.echo("-" * 60)
 
-        for idx, node_id in enumerate(execution_order, 1):
+        for idx, node_id in enumerate(display_order, 1):
             node = dag_builder.nodes[node_id]
             if node_id in nodes_to_run:
                 status = "RUN"
@@ -2848,7 +2896,18 @@ def plan(
             typer.echo(f"  {idx:2d}. {status_msg} {node.name}{tags_str}")
 
         typer.echo("")
-        _echo_info(f"Total: {len(execution_order)} nodes, {len(nodes_to_run)} to run")
+        if plan_filter_set is not None:
+            filter_desc = []
+            if tags:
+                filter_desc.append(f"tags: {', '.join(tags)}")
+            if exclude_tags:
+                filter_desc.append(f"exclude: {', '.join(exclude_tags)}")
+            _echo_info(
+                f"Showing {len(display_order)} of {len(execution_order)} nodes "
+                f"(filtered by {', '.join(filter_desc)}), {len(nodes_to_run)} to run"
+            )
+        else:
+            _echo_info(f"Total: {len(execution_order)} nodes, {len(nodes_to_run)} to run")
 
 
 @app.command(name="diff")
