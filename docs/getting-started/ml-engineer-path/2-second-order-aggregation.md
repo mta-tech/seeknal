@@ -559,9 +559,9 @@ seeknal repl                                            # Interactive verificati
 
 ## What's Next?
 
-[Chapter 3: Build an ML Model →](3-training-serving-parity.md)
+[Chapter 3: Point-in-Time Joins & Training-Serving Parity →](3-training-serving-parity.md)
 
-Train a machine learning model using your feature pipeline, with feature validation and serving for inference.
+Build a production ML pipeline with point-in-time correct training data, temporal SOA features, and online serving for inference.
 
 ---
 
