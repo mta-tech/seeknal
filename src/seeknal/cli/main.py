@@ -681,6 +681,10 @@ def run(
         None, "--types", "-t",
         help="Filter by node types (e.g., --types transform,feature_group)"
     ),
+    tags: Optional[List[str]] = typer.Option(
+        None, "--tags",
+        help="Run only nodes with these tags (plus upstream deps). OR logic."
+    ),
     exclude_tags: Optional[List[str]] = typer.Option(
         None, "--exclude-tags",
         help="Skip nodes with these tags"
@@ -847,6 +851,7 @@ def run(
         full=full,
         nodes=nodes,
         types=types,
+        tags=tags,
         exclude_tags=exclude_tags,
         continue_on_error=continue_on_error,
         retry=retry,
@@ -865,6 +870,7 @@ def _run_yaml_pipeline(
     full: bool = False,
     nodes: Optional[List[str]] = None,
     types: Optional[List[str]] = None,
+    tags: Optional[List[str]] = None,
     exclude_tags: Optional[List[str]] = None,
     continue_on_error: bool = False,
     retry: int = 0,
@@ -889,6 +895,7 @@ def _run_yaml_pipeline(
         full: Run all nodes regardless of state
         nodes: Run specific nodes only
         types: Filter by node types
+        tags: Run only nodes with these tags (plus upstream deps)
         exclude_tags: Skip nodes with these tags
         continue_on_error: Continue after failures
         retry: Number of retries for failed nodes
@@ -991,8 +998,47 @@ def _run_yaml_pipeline(
 
     # Apply filters
     if full:
-        # Override: run all nodes
+        # Override: run all nodes (--full overrides --tags)
+        if tags:
+            _echo_info("Note: --full overrides --tags (running all nodes)")
         nodes_to_run = set(dag_builder.nodes.keys())
+    elif tags and nodes:
+        # Union: tag-matched nodes (+ upstream) AND explicitly named nodes (+ downstream)
+        tag_set = set(tags)
+        tag_matched = {
+            node_id for node_id in dag_builder.nodes
+            if any(t in tag_set for t in dag_builder.nodes[node_id].tags)
+        }
+        if not tag_matched:
+            _echo_warning(f"No nodes found with tags: {', '.join(tags)}")
+        # Add upstream for tag-matched nodes
+        with_upstream = set(tag_matched)
+        for node_id in tag_matched:
+            with_upstream |= dag_builder.get_all_upstream(node_id)
+        # Add downstream for explicitly named nodes
+        specified = set()
+        for node_name in nodes:
+            for node_id, node in dag_builder.nodes.items():
+                if node.name == node_name or node_id == node_name:
+                    specified.add(node_id)
+                    specified.update(dag_builder.get_all_downstream(node_id))
+                    break
+        nodes_to_run = with_upstream | specified
+    elif tags:
+        # Run only tag-matched nodes + their upstream dependencies
+        tag_set = set(tags)
+        tag_matched = {
+            node_id for node_id in dag_builder.nodes
+            if any(t in tag_set for t in dag_builder.nodes[node_id].tags)
+        }
+        if not tag_matched:
+            _echo_warning(f"No nodes found with tags: {', '.join(tags)}. Nothing to run.")
+            return
+        # Auto-include all transitive upstream deps
+        with_upstream = set(tag_matched)
+        for node_id in tag_matched:
+            with_upstream |= dag_builder.get_all_upstream(node_id)
+        nodes_to_run = with_upstream
     elif nodes:
         # Run specific nodes and their downstream
         specified = set()
@@ -1013,9 +1059,40 @@ def _run_yaml_pipeline(
             if dag_builder.nodes[node_id].kind.value in type_set
         }
 
+    # Apply type filter on top of tags (narrowing)
+    if tags and types and not full:
+        type_set = set(types)
+        # Only narrow the tag-matched nodes, keep upstream deps regardless of type
+        tag_set = set(tags)
+        tag_matched = {
+            node_id for node_id in dag_builder.nodes
+            if any(t in tag_set for t in dag_builder.nodes[node_id].tags)
+        }
+        nodes_to_run = {
+            node_id for node_id in nodes_to_run
+            if node_id not in tag_matched or dag_builder.nodes[node_id].kind.value in type_set
+        }
+
     if exclude_tags:
         # Filter out nodes with excluded tags
         exclude_set = set(exclude_tags)
+        # Warn if excluding an upstream dependency of a tag-matched node
+        if tags:
+            tag_set_for_warn = set(tags)
+            tag_matched_for_warn = {
+                node_id for node_id in dag_builder.nodes
+                if any(t in tag_set_for_warn for t in dag_builder.nodes[node_id].tags)
+            }
+            for node_id in list(nodes_to_run):
+                if any(tag in exclude_set for tag in dag_builder.nodes[node_id].tags):
+                    # Check if this node is an upstream dep of a tag-matched node
+                    for matched_id in tag_matched_for_warn:
+                        if node_id in dag_builder.get_all_upstream(matched_id):
+                            _echo_warning(
+                                f"Upstream node '{node_id}' excluded by --exclude-tags "
+                                f"but required by '{matched_id}'. Execution may fail."
+                            )
+                            break
         nodes_to_run = {
             node_id for node_id in nodes_to_run
             if not any(tag in exclude_set for tag in dag_builder.nodes[node_id].tags)
@@ -1023,7 +1100,7 @@ def _run_yaml_pipeline(
 
     # Include upstream source dependencies for transforms
     # This ensures DuckDB views/tables are available for transform SQL
-    if not full:
+    if not full and not tags:
         nodes_to_run = include_upstream_sources(nodes_to_run, dag_upstream)
 
     if show_plan:
@@ -1032,7 +1109,12 @@ def _run_yaml_pipeline(
         _echo_info("Execution Plan:")
         _echo_info("-" * 60)
 
-        for idx, node_id in enumerate(execution_order, 1):
+        # When --tags is active, only show the filtered subgraph
+        display_order = execution_order
+        if tags:
+            display_order = [n for n in execution_order if n in nodes_to_run]
+
+        for idx, node_id in enumerate(display_order, 1):
             node = dag_builder.nodes[node_id]
             if node_id in nodes_to_run:
                 status = "RUN"
@@ -1048,7 +1130,13 @@ def _run_yaml_pipeline(
             typer.echo(f"  {idx:2d}. {status_msg} {node.name}{tags_str}")
 
         typer.echo("")
-        _echo_info(f"Total: {len(execution_order)} nodes, {len(nodes_to_run)} to run")
+        if tags:
+            _echo_info(
+                f"Showing {len(display_order)} of {len(execution_order)} nodes "
+                f"(filtered by tags: {', '.join(tags)}), {len(nodes_to_run)} to run"
+            )
+        else:
+            _echo_info(f"Total: {len(execution_order)} nodes, {len(nodes_to_run)} to run")
         return
 
     if not nodes_to_run:
