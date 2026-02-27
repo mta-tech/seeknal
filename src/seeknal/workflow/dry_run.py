@@ -247,6 +247,56 @@ def dry_run_command(
         dry_run_yaml(draft_path, file_path, limit, timeout, schema_only)
 
 
+def _load_source_data(node_meta: dict, project_path: Path):
+    """Load data from a source node's configuration for preview.
+
+    Args:
+        node_meta: Node metadata from @source decorator
+        project_path: Project root path for resolving relative paths
+
+    Returns:
+        DataFrame or None if loading fails
+    """
+    import pandas as pd
+
+    source_type = node_meta.get("source", "").lower()
+    table = node_meta.get("table", "")
+
+    if not table:
+        return None
+
+    # Resolve relative paths against project root
+    table_path = Path(table)
+    if not table_path.is_absolute():
+        table_path = project_path / table_path
+
+    if not table_path.exists():
+        _echo_warning(f"Source file not found: {table_path}")
+        return None
+
+    try:
+        if source_type == "csv":
+            return pd.read_csv(table_path)
+        elif source_type in ("parquet", "pq"):
+            return pd.read_parquet(table_path)
+        elif source_type in ("json", "jsonl"):
+            return pd.read_json(table_path, lines=source_type == "jsonl")
+        else:
+            _echo_info(f"Source type '{source_type}' — loading from file")
+            # Try common formats based on extension
+            ext = table_path.suffix.lower()
+            if ext == ".csv":
+                return pd.read_csv(table_path)
+            elif ext in (".parquet", ".pq"):
+                return pd.read_parquet(table_path)
+            elif ext in (".json", ".jsonl"):
+                return pd.read_json(table_path, lines=ext == ".jsonl")
+    except Exception as e:
+        _echo_warning(f"Could not load source data: {e}")
+
+    return None
+
+
 def dry_run_python(file_path: Path, file_path_str: str, limit: int, timeout: int, schema_only: bool):
     """Dry-run for Python pipeline files.
 
@@ -344,6 +394,12 @@ def dry_run_python(file_path: Path, file_path_str: str, limit: int, timeout: int
             result = func(ctx)
             duration = time.time() - start_time
 
+            # For source nodes with pass body, load data from source config
+            if result is None and metadata.get('kind') == 'source':
+                node_meta = getattr(func, '_seeknal_node', None)
+                if node_meta:
+                    result = _load_source_data(node_meta, project_path)
+
             # Display preview
             if result is not None:
                 import pandas as pd
@@ -377,8 +433,8 @@ def dry_run_python(file_path: Path, file_path_str: str, limit: int, timeout: int
                     _echo_info(f"Result type: {type(result).__name__}")
                     _echo_info(f"Result: {str(result)[:200]}")
             else:
-                _echo_warning("Function returned no data (None)")
-                _echo_info("Source nodes with 'pass' body return no preview — use 'seeknal run' for full execution")
+                _echo_warning("No preview data available")
+                _echo_info("Use 'seeknal run' for full execution")
 
             ctx.close()
             _echo_success(f"Preview completed in {duration:.1f}s")
