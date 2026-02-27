@@ -65,6 +65,7 @@ class ExecutorResult:
         metadata: Additional executor-specific metadata (metrics, warnings, etc.)
         is_dry_run: Whether this was a dry-run execution
         created_at: ISO timestamp of execution completion
+        output_log: Optional untruncated subprocess output for log files (not persisted to state)
 
     Example:
         >>> result = ExecutorResult(
@@ -88,6 +89,7 @@ class ExecutorResult:
     created_at: str = field(
         default_factory=lambda: time.time()
     )
+    output_log: Optional[str] = None
 
     def is_success(self) -> bool:
         """Check if execution was successful."""
