@@ -437,6 +437,25 @@ class FeatureGroupExecutor(BaseExecutor):
                 # View creation is not critical for feature group execution
                 logger.warning(f"Failed to create view '{view_name}': {e}")
 
+            # Write intermediate parquet for ctx.ref() and entity consolidation
+            intermediate_dir = self.context.target_path / "intermediate"
+            intermediate_dir.mkdir(parents=True, exist_ok=True)
+            parquet_path = intermediate_dir / f"{self.node.id.replace('.', '_')}.parquet"
+            source_df.to_parquet(parquet_path, index=False)
+
+            # Write metadata sidecar for FeatureFrame detection
+            import json as _json
+            meta_path = intermediate_dir / f"{self.node.id.replace('.', '_')}_meta.json"
+            meta_path.write_text(_json.dumps({
+                "entity_name": entity.name,
+                "join_keys": entity.join_keys,
+                "event_time_col": mat_config.get("event_time_col", "event_time"),
+            }))
+            logger.info(
+                "Wrote intermediate parquet: %s (%d rows)",
+                parquet_path, len(source_df)
+            )
+
             row_count = len(source_df)
         else:
             # Empty source - no features to write

@@ -69,25 +69,26 @@ source.transactions (Ch.1) → feature_group.customer_daily_agg → second_order
 
 ---
 
-### Chapter 3: Build and Serve an ML Model (~30 minutes)
+### Chapter 3: Point-in-Time Joins and Training-Serving Parity (~35 minutes)
 
-Train a machine learning model inside the pipeline:
+Build a production-grade ML training pipeline with temporal correctness:
 
 ```
-feature_group.customer_features ──→ transform.training_data
-                                            ↓
-source.churn_labels ──────────────→ transform.churn_model (scikit-learn)
-                                            ↓
-                                    REPL: Query predictions
-                                            ↓
-                                    seeknal validate-features
+source.churn_labels (spine) ──→ transform.pit_training_data
+                                  FeatureFrame.pit_join()
+feature_group.customer_daily_agg ─┘       ↓
+                                  SOA: customer_training_features
+                                          ↓
+                                  transform.churn_model (scikit-learn)
+                                          ↓
+                                  REPL: Query predictions
 ```
 
 **You'll learn:**
+- Point-in-time joins with `FeatureFrame.pit_join()` — no data leakage
+- Per-customer temporal features via second-order aggregation
 - Training scikit-learn models inside `@transform` nodes
-- Joining features with labels via `ctx.ref()`
-- Querying predictions in the REPL
-- Feature validation to detect quality issues
+- Training-serving parity through consistent feature computation
 
 **[Start Chapter 3 →](3-training-serving-parity.md)**
 

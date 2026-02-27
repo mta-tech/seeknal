@@ -230,6 +230,88 @@ params:
         assert "tagged_source" not in result.stdout or "SKIP" in result.stdout
 
 
+class TestSeeknalRunTagFiltering:
+    """Test --tags flag for include filtering."""
+
+    def test_include_tags(self, temp_project_path, monkeypatch):
+        """Test --tags flag includes only matching nodes + upstream."""
+        # Create source (no tags)
+        source_yaml = """
+kind: source
+name: raw_data
+description: Raw data source
+source: csv
+params:
+  path: data/raw.csv
+"""
+        (temp_project_path / "seeknal" / "sources" / "raw_data.yml").write_text(
+            source_yaml
+        )
+
+        # Create tagged transform
+        transform_yaml = """
+kind: transform
+name: tagged_transform
+description: Tagged transform
+tags:
+  - churn_pipeline
+transform: SELECT * FROM source.raw_data
+inputs:
+  - ref: source.raw_data
+"""
+        (temp_project_path / "seeknal" / "transforms" / "tagged.yml").write_text(
+            transform_yaml
+        )
+
+        # Create untagged transform
+        untagged_yaml = """
+kind: transform
+name: untagged_transform
+description: Untagged transform
+transform: SELECT 1
+"""
+        (temp_project_path / "seeknal" / "transforms" / "untagged.yml").write_text(
+            untagged_yaml
+        )
+
+        monkeypatch.chdir(temp_project_path)
+
+        result = runner.invoke(
+            app, ["run", "--show-plan", "--tags", "churn_pipeline"]
+        )
+
+        assert result.exit_code == 0
+        # Tagged transform should be shown
+        assert "tagged_transform" in result.stdout
+        # Upstream source should be included
+        assert "raw_data" in result.stdout
+        # Untagged transform should NOT be shown
+        assert "untagged_transform" not in result.stdout
+
+    def test_tags_no_match(self, temp_project_path, monkeypatch):
+        """Test --tags with no matching nodes shows warning."""
+        source_yaml = """
+kind: source
+name: basic_source
+description: Basic source
+source: csv
+params:
+  path: data/basic.csv
+"""
+        (temp_project_path / "seeknal" / "sources" / "basic.yml").write_text(
+            source_yaml
+        )
+
+        monkeypatch.chdir(temp_project_path)
+
+        result = runner.invoke(
+            app, ["run", "--show-plan", "--tags", "nonexistent"]
+        )
+
+        assert result.exit_code == 0
+        assert "No nodes found with tags" in result.stdout
+
+
 class TestSeeknalRunErrorHandling:
     """Test error handling for cycles and missing dependencies."""
 

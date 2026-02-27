@@ -126,6 +126,7 @@ class LineageDataBuilder:
                 "columns": columns,
                 "file_path": node.file_path or "",
                 "sql": node.config.get("sql") or node.config.get("transform", ""),
+                "tags": list(node.tags) if node.tags else [],
             }
         }
 
@@ -345,9 +346,15 @@ def render_ascii_tree(
     # Roots = nodes with no parents in the current subgraph
     roots = sorted(n for n in all_nodes if n not in parent_set or not parent_set[n])
 
+    # Build tag lookup for ASCII display
+    tag_lookup: dict[str, list[str]] = {}
+    for nid, node in manifest.nodes.items():
+        if node.tags:
+            tag_lookup[nid] = list(node.tags)
+
     lines: list[str] = []
     for root in roots:
-        _walk_tree(root, "", True, children, lines)
+        _walk_tree(root, "", True, children, lines, tag_lookup)
     return "\n".join(lines)
 
 
@@ -357,17 +364,24 @@ def _walk_tree(
     is_root: bool,
     children: dict[str, list[str]],
     lines: list[str],
+    tag_lookup: Optional[dict[str, list[str]]] = None,
 ) -> None:
     """Recursively build tree lines with Unicode box-drawing characters."""
+    tags_suffix = ""
+    if tag_lookup and node in tag_lookup:
+        tags_suffix = f" [{', '.join(tag_lookup[node])}]"
     if is_root:
-        lines.append(node)
+        lines.append(f"{node}{tags_suffix}")
     child_list = sorted(children.get(node, []))
     for i, child in enumerate(child_list):
         is_last = i == len(child_list) - 1
         connector = "\u2514\u2500\u2500 " if is_last else "\u251c\u2500\u2500 "
-        lines.append(f"{prefix}{connector}{child}")
+        child_tags = ""
+        if tag_lookup and child in tag_lookup:
+            child_tags = f" [{', '.join(tag_lookup[child])}]"
+        lines.append(f"{prefix}{connector}{child}{child_tags}")
         extension = "    " if is_last else "\u2502   "
-        _walk_tree(child, prefix + extension, False, children, lines)
+        _walk_tree(child, prefix + extension, False, children, lines, tag_lookup)
 
 
 def _get_focus_subgraph(manifest: Manifest, focus_node: str) -> set[str]:

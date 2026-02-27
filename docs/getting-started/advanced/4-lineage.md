@@ -312,6 +312,8 @@ seeknal lineage <node> --column <col>        # Column-level trace
 seeknal lineage --ascii                      # ASCII tree to stdout
 seeknal lineage <node> --ascii               # Focused ASCII tree
 seeknal lineage --output <path> --no-open    # Custom output, no browser
+seeknal lineage --tags revenue_pipeline      # Tag-filtered HTML lineage
+seeknal lineage --tags ml --ascii            # Tag-filtered ASCII tree
 seeknal inspect --list                       # List available outputs
 seeknal inspect <node>                       # Preview node data
 seeknal inspect <node> --schema              # Show schema only
@@ -323,6 +325,9 @@ seeknal inspect <node> --limit 20            # More rows
 ## What's Next?
 
 In **[Chapter 5: Named ref() References](5-named-refs.md)**, you'll learn to use named `ref()` syntax in transform SQL for self-documenting, reorder-safe pipeline definitions.
+
+!!! tip "Tag-Based Filtering"
+    In **[Chapter 11: Pipeline Tags](11-pipeline-tags.md)**, you'll learn to filter lineage by tags: `seeknal lineage --tags revenue_pipeline` shows only the tagged subgraph with tag annotations.
 
 ---
 

@@ -681,6 +681,10 @@ def run(
         None, "--types", "-t",
         help="Filter by node types (e.g., --types transform,feature_group)"
     ),
+    tags: Optional[List[str]] = typer.Option(
+        None, "--tags",
+        help="Run only nodes with these tags (plus upstream deps). OR logic."
+    ),
     exclude_tags: Optional[List[str]] = typer.Option(
         None, "--exclude-tags",
         help="Skip nodes with these tags"
@@ -847,6 +851,7 @@ def run(
         full=full,
         nodes=nodes,
         types=types,
+        tags=tags,
         exclude_tags=exclude_tags,
         continue_on_error=continue_on_error,
         retry=retry,
@@ -865,6 +870,7 @@ def _run_yaml_pipeline(
     full: bool = False,
     nodes: Optional[List[str]] = None,
     types: Optional[List[str]] = None,
+    tags: Optional[List[str]] = None,
     exclude_tags: Optional[List[str]] = None,
     continue_on_error: bool = False,
     retry: int = 0,
@@ -889,6 +895,7 @@ def _run_yaml_pipeline(
         full: Run all nodes regardless of state
         nodes: Run specific nodes only
         types: Filter by node types
+        tags: Run only nodes with these tags (plus upstream deps)
         exclude_tags: Skip nodes with these tags
         continue_on_error: Continue after failures
         retry: Number of retries for failed nodes
@@ -991,8 +998,47 @@ def _run_yaml_pipeline(
 
     # Apply filters
     if full:
-        # Override: run all nodes
+        # Override: run all nodes (--full overrides --tags)
+        if tags:
+            _echo_info("Note: --full overrides --tags (running all nodes)")
         nodes_to_run = set(dag_builder.nodes.keys())
+    elif tags and nodes:
+        # Union: tag-matched nodes (+ upstream) AND explicitly named nodes (+ downstream)
+        tag_set = set(tags)
+        tag_matched = {
+            node_id for node_id in dag_builder.nodes
+            if any(t in tag_set for t in dag_builder.nodes[node_id].tags)
+        }
+        if not tag_matched:
+            _echo_warning(f"No nodes found with tags: {', '.join(tags)}")
+        # Add upstream for tag-matched nodes
+        with_upstream = set(tag_matched)
+        for node_id in tag_matched:
+            with_upstream |= dag_builder.get_all_upstream(node_id)
+        # Add downstream for explicitly named nodes
+        specified = set()
+        for node_name in nodes:
+            for node_id, node in dag_builder.nodes.items():
+                if node.name == node_name or node_id == node_name:
+                    specified.add(node_id)
+                    specified.update(dag_builder.get_all_downstream(node_id))
+                    break
+        nodes_to_run = with_upstream | specified
+    elif tags:
+        # Run only tag-matched nodes + their upstream dependencies
+        tag_set = set(tags)
+        tag_matched = {
+            node_id for node_id in dag_builder.nodes
+            if any(t in tag_set for t in dag_builder.nodes[node_id].tags)
+        }
+        if not tag_matched:
+            _echo_warning(f"No nodes found with tags: {', '.join(tags)}. Nothing to run.")
+            return
+        # Auto-include all transitive upstream deps
+        with_upstream = set(tag_matched)
+        for node_id in tag_matched:
+            with_upstream |= dag_builder.get_all_upstream(node_id)
+        nodes_to_run = with_upstream
     elif nodes:
         # Run specific nodes and their downstream
         specified = set()
@@ -1013,9 +1059,40 @@ def _run_yaml_pipeline(
             if dag_builder.nodes[node_id].kind.value in type_set
         }
 
+    # Apply type filter on top of tags (narrowing)
+    if tags and types and not full:
+        type_set = set(types)
+        # Only narrow the tag-matched nodes, keep upstream deps regardless of type
+        tag_set = set(tags)
+        tag_matched = {
+            node_id for node_id in dag_builder.nodes
+            if any(t in tag_set for t in dag_builder.nodes[node_id].tags)
+        }
+        nodes_to_run = {
+            node_id for node_id in nodes_to_run
+            if node_id not in tag_matched or dag_builder.nodes[node_id].kind.value in type_set
+        }
+
     if exclude_tags:
         # Filter out nodes with excluded tags
         exclude_set = set(exclude_tags)
+        # Warn if excluding an upstream dependency of a tag-matched node
+        if tags:
+            tag_set_for_warn = set(tags)
+            tag_matched_for_warn = {
+                node_id for node_id in dag_builder.nodes
+                if any(t in tag_set_for_warn for t in dag_builder.nodes[node_id].tags)
+            }
+            for node_id in list(nodes_to_run):
+                if any(tag in exclude_set for tag in dag_builder.nodes[node_id].tags):
+                    # Check if this node is an upstream dep of a tag-matched node
+                    for matched_id in tag_matched_for_warn:
+                        if node_id in dag_builder.get_all_upstream(matched_id):
+                            _echo_warning(
+                                f"Upstream node '{node_id}' excluded by --exclude-tags "
+                                f"but required by '{matched_id}'. Execution may fail."
+                            )
+                            break
         nodes_to_run = {
             node_id for node_id in nodes_to_run
             if not any(tag in exclude_set for tag in dag_builder.nodes[node_id].tags)
@@ -1023,7 +1100,7 @@ def _run_yaml_pipeline(
 
     # Include upstream source dependencies for transforms
     # This ensures DuckDB views/tables are available for transform SQL
-    if not full:
+    if not full and not tags:
         nodes_to_run = include_upstream_sources(nodes_to_run, dag_upstream)
 
     if show_plan:
@@ -1032,7 +1109,12 @@ def _run_yaml_pipeline(
         _echo_info("Execution Plan:")
         _echo_info("-" * 60)
 
-        for idx, node_id in enumerate(execution_order, 1):
+        # When --tags is active, only show the filtered subgraph
+        display_order = execution_order
+        if tags:
+            display_order = [n for n in execution_order if n in nodes_to_run]
+
+        for idx, node_id in enumerate(display_order, 1):
             node = dag_builder.nodes[node_id]
             if node_id in nodes_to_run:
                 status = "RUN"
@@ -1048,7 +1130,13 @@ def _run_yaml_pipeline(
             typer.echo(f"  {idx:2d}. {status_msg} {node.name}{tags_str}")
 
         typer.echo("")
-        _echo_info(f"Total: {len(execution_order)} nodes, {len(nodes_to_run)} to run")
+        if tags:
+            _echo_info(
+                f"Showing {len(display_order)} of {len(execution_order)} nodes "
+                f"(filtered by tags: {', '.join(tags)}), {len(nodes_to_run)} to run"
+            )
+        else:
+            _echo_info(f"Total: {len(execution_order)} nodes, {len(nodes_to_run)} to run")
         return
 
     if not nodes_to_run:
@@ -2536,6 +2624,14 @@ def plan(
         help="Environment name (optional). Without: show changes vs last run. With: create environment plan."
     ),
     project_path: Path = typer.Option(".", help="Project directory"),
+    tags: Optional[List[str]] = typer.Option(
+        None, "--tags",
+        help="Show only nodes with these tags (plus upstream deps). OR logic. Production mode only."
+    ),
+    exclude_tags: Optional[List[str]] = typer.Option(
+        None, "--exclude-tags",
+        help="Hide nodes with these tags from the plan."
+    ),
 ):
     """Analyze changes and show execution plan.
 
@@ -2546,6 +2642,7 @@ def plan(
         seeknal plan              # What changed since last run?
         seeknal plan dev          # Plan changes in dev environment
         seeknal plan staging      # Plan changes in staging
+        seeknal plan --tags churn_pipeline  # Plan only churn pipeline nodes
     """
     from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
 
@@ -2740,11 +2837,50 @@ def plan(
             _echo_error(f"Cycle detected: {e.message}")
             raise typer.Exit(1)
 
+        # Apply tag filtering (production mode only)
+        plan_filter_set: Optional[set[str]] = None
+        if tags and env_name is None:
+            tag_set = set(tags)
+            tag_matched = {
+                node_id for node_id in dag_builder.nodes
+                if any(t in tag_set for t in dag_builder.nodes[node_id].tags)
+            }
+            if not tag_matched:
+                _echo_warning(
+                    f"No nodes found with tags: {', '.join(tags)}. "
+                    "Showing full plan."
+                )
+            else:
+                # Auto-include all transitive upstream deps
+                with_upstream = set(tag_matched)
+                for node_id in tag_matched:
+                    with_upstream |= dag_builder.get_all_upstream(node_id)
+                plan_filter_set = with_upstream
+
+        if exclude_tags and env_name is None:
+            exclude_set = set(exclude_tags)
+            if plan_filter_set is not None:
+                plan_filter_set = {
+                    node_id for node_id in plan_filter_set
+                    if not any(t in exclude_set for t in dag_builder.nodes[node_id].tags)
+                }
+            else:
+                plan_filter_set = {
+                    node_id for node_id in dag_builder.nodes
+                    if not any(t in exclude_set for t in dag_builder.nodes[node_id].tags)
+                }
+
+        # Filter display order when tags/exclude-tags active
+        display_order = execution_order
+        if plan_filter_set is not None:
+            display_order = [n for n in execution_order if n in plan_filter_set]
+            nodes_to_run = nodes_to_run & plan_filter_set
+
         typer.echo("")
         typer.echo(typer.style("Execution Plan:", bold=True))
         typer.echo("-" * 60)
 
-        for idx, node_id in enumerate(execution_order, 1):
+        for idx, node_id in enumerate(display_order, 1):
             node = dag_builder.nodes[node_id]
             if node_id in nodes_to_run:
                 status = "RUN"
@@ -2760,7 +2896,18 @@ def plan(
             typer.echo(f"  {idx:2d}. {status_msg} {node.name}{tags_str}")
 
         typer.echo("")
-        _echo_info(f"Total: {len(execution_order)} nodes, {len(nodes_to_run)} to run")
+        if plan_filter_set is not None:
+            filter_desc = []
+            if tags:
+                filter_desc.append(f"tags: {', '.join(tags)}")
+            if exclude_tags:
+                filter_desc.append(f"exclude: {', '.join(exclude_tags)}")
+            _echo_info(
+                f"Showing {len(display_order)} of {len(execution_order)} nodes "
+                f"(filtered by {', '.join(filter_desc)}), {len(nodes_to_run)} to run"
+            )
+        else:
+            _echo_info(f"Total: {len(execution_order)} nodes, {len(nodes_to_run)} to run")
 
 
 @app.command(name="diff")
@@ -5088,6 +5235,14 @@ def lineage(
     ascii_output: bool = typer.Option(
         False, "--ascii", help="Print DAG as ASCII tree to stdout instead of HTML"
     ),
+    tags: Optional[List[str]] = typer.Option(
+        None, "--tags",
+        help="Show only nodes with these tags (plus upstream deps). OR logic."
+    ),
+    exclude_tags: Optional[List[str]] = typer.Option(
+        None, "--exclude-tags",
+        help="Hide nodes with these tags from the lineage."
+    ),
 ):
     """Generate interactive lineage visualization.
 
@@ -5097,6 +5252,7 @@ def lineage(
         seeknal lineage transform.X --column total   # Trace column
         seeknal lineage --output dag.html            # Custom path
         seeknal lineage --ascii                      # ASCII tree to stdout
+        seeknal lineage --tags churn_pipeline        # Filter by tag
     """
     from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
     from seeknal.dag.visualize import generate_lineage_html, LineageVisualizationError
@@ -5117,6 +5273,62 @@ def lineage(
         if not manifest.nodes:
             _echo_warning("No nodes found. Add pipeline files to your project.")
             raise typer.Exit(code=1)
+
+        # Reject conflicting --tags + node_id
+        if tags and node_id:
+            _echo_error("Cannot use --tags and node_id together. Use one or the other.")
+            raise typer.Exit(code=1)
+
+        # Apply tag filtering to manifest
+        if tags or exclude_tags:
+            from seeknal.dag.manifest import Manifest as ManifestClass
+
+            keep_ids: Optional[set[str]] = None
+
+            if tags:
+                tag_set = set(tags)
+                tag_matched = {
+                    nid for nid, node in manifest.nodes.items()
+                    if any(t in tag_set for t in node.tags)
+                }
+                if not tag_matched:
+                    _echo_warning(f"No nodes found with tags: {', '.join(tags)}")
+                    raise typer.Exit(code=0)
+
+                # Auto-include all transitive upstream deps via BFS
+                keep_ids = set(tag_matched)
+                from collections import deque
+                queue = deque(tag_matched)
+                while queue:
+                    current = queue.popleft()
+                    for parent in manifest.get_upstream_nodes(current):
+                        if parent not in keep_ids:
+                            keep_ids.add(parent)
+                            queue.append(parent)
+
+            if exclude_tags:
+                exclude_set = set(exclude_tags)
+                if keep_ids is not None:
+                    keep_ids = {
+                        nid for nid in keep_ids
+                        if not any(t in exclude_set for t in manifest.nodes[nid].tags)
+                    }
+                else:
+                    keep_ids = {
+                        nid for nid, node in manifest.nodes.items()
+                        if not any(t in exclude_set for t in node.tags)
+                    }
+
+            # Build filtered manifest
+            if keep_ids is not None:
+                filtered = ManifestClass(project=manifest.metadata.project)
+                for nid in keep_ids:
+                    if nid in manifest.nodes:
+                        filtered.add_node(manifest.nodes[nid])
+                for edge in manifest.edges:
+                    if edge.from_node in keep_ids and edge.to_node in keep_ids:
+                        filtered.add_edge(edge.from_node, edge.to_node)
+                manifest = filtered
 
         if ascii_output:
             from seeknal.dag.visualize import render_ascii_tree  # ty: ignore[unresolved-import]

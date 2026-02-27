@@ -332,6 +332,14 @@ body {
   padding: 8px 10px; background: #f8fafc; border-radius: 6px;
   border: 1px solid #e2e8f0;
 }
+#details-panel .detail-tags {
+  display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 14px;
+}
+#details-panel .detail-tag-chip {
+  font-size: 11px; color: #6366f1; background: #eef2ff;
+  border: 1px solid #c7d2fe; border-radius: 12px;
+  padding: 2px 8px; font-weight: 500;
+}
 #details-panel h3 {
   font-size: 12px; color: #475569; margin: 16px 0 8px;
   font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
@@ -1102,6 +1110,19 @@ body {
       fp.className = 'detail-path';
       fp.textContent = nodeData.file_path;
       panel.appendChild(fp);
+    }
+
+    // Tags
+    if (nodeData.tags && nodeData.tags.length > 0) {
+      var tagsDiv = document.createElement('div');
+      tagsDiv.className = 'detail-tags';
+      nodeData.tags.forEach(function(tag) {
+        var chip = document.createElement('span');
+        chip.className = 'detail-tag-chip';
+        chip.textContent = tag;
+        tagsDiv.appendChild(chip);
+      });
+      panel.appendChild(tagsDiv);
     }
 
     // Columns

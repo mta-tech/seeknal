@@ -177,6 +177,9 @@ nav:
           - Common Configuration: getting-started/advanced/6-common-config.md
           - Data Profiling: getting-started/advanced/7-data-profiling.md
           - Python Pipelines: getting-started/advanced/8-python-pipelines.md
+          - Database Sources: getting-started/advanced/9-database-sources.md
+          - Custom Sources: getting-started/advanced/10-custom-sources.md
+          - Pipeline Tags: getting-started/advanced/11-pipeline-tags.md
   - Concepts:
       - Overview: concepts/index.md
       - Pipeline Builder Workflow: concepts/pipeline-builder.md
