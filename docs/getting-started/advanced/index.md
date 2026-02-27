@@ -19,6 +19,7 @@ Take your Seeknal skills to the next level with advanced features that improve p
 7. **Data Profiling** - Compute statistics and validate with threshold checks
 8. **Python Pipelines** - Build nodes with Python decorators and mix with YAML
 9. **Database & External Sources** - Connect to PostgreSQL, StarRocks, and Iceberg
+10. **Custom Sources** - Bring data from REST APIs, cloud storage, and any Python-accessible system
 
 ---
 
@@ -222,6 +223,29 @@ Iceberg     →  source.ice_events         (REST catalog)
 - `source_defaults` for per-type default connections
 
 **[Start Chapter 9 →](9-database-sources.md)**
+
+---
+
+### Chapter 10: Custom Sources (~20 minutes)
+
+Bring data from REST APIs, cloud storage, and any Python-accessible system:
+
+```
+REST API (Open-Meteo)     →  transform.api_weather_data
+S3/MinIO (boto3)          →  transform.s3_inventory_data
+Faker (synthetic data)    →  transform.generated_synthetic_data
+                                       ↓
+                              transform.enriched_report (joins all three)
+```
+
+**You'll learn:**
+- When to use `@transform` vs `@source` for data ingestion
+- REST API sources with retry and error handling
+- Cloud storage sources using boto3
+- Synthetic data generation for testing
+- Best practices: timeouts, credentials, idempotency
+
+**[Start Chapter 10 →](10-custom-sources.md)**
 
 ---
 
