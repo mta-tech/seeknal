@@ -1,0 +1,31 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run $CLAUDE_PLUGIN_ROOT/hooks/validators/ruff_validator.py",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "uv run $CLAUDE_PLUGIN_ROOT/hooks/validators/ty_validator.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PLUGIN_ROOT/hooks/ralph-stop-hook.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
