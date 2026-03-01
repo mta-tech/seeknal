@@ -10,12 +10,12 @@ hooks:
     - hooks:
         - type: command
           command: >-
-            uv run $CLAUDE_PLUGIN_ROOT/hooks/validators/validate_new_file.py
+            uv run .claude/hooks/validators/validate_new_file.py
             --directory specs
             --extension .md
         - type: command
           command: >-
-            uv run $CLAUDE_PLUGIN_ROOT/hooks/validators/validate_file_contains.py
+            uv run .claude/hooks/validators/validate_file_contains.py
             --directory specs
             --extension .md
             --contains '## Task Description'
