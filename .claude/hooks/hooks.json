@@ -6,12 +6,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run $CLAUDE_PLUGIN_ROOT/hooks/validators/ruff_validator.py",
+            "command": "uv run .claude/hooks/validators/ruff_validator.py",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "uv run $CLAUDE_PLUGIN_ROOT/hooks/validators/ty_validator.py",
+            "command": "uv run .claude/hooks/validators/ty_validator.py",
             "timeout": 30
           }
         ]
@@ -22,7 +22,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PLUGIN_ROOT/hooks/ralph-stop-hook.sh"
+            "command": ".claude/hooks/ralph-stop-hook.sh"
           }
         ]
       }
