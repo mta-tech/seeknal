@@ -1,0 +1,149 @@
+# PostgreSQL Incremental Detection QA Specification
+#
+# Tests the full flow of PostgreSQL incremental reads including:
+# - Watermark detection and comparison
+# - WHERE clause injection for incremental reads
+# - State persistence across runs
+# - Skip optimization for unchanged sources
+#
+# Prerequisites:
+# - PostgreSQL database with events table
+# - Environment variables: PG_HOST, PG_PORT, PG_DATABASE, PG_USER, PG_PASSWORD
+
+metadata:
+  name: postgresql-incremental-detection
+  description: E2E test for PostgreSQL incremental detection feature
+  version: "1.0"
+  tags:
+    - postgresql
+    - incremental
+    - e2e
+
+profiles:
+  connections:
+    test_pg:
+      type: postgresql
+      host: ${PG_HOST:-localhost}
+      port: ${PG_PORT:-5432}
+      database: ${PG_DATABASE:-seeknal_test}
+      user: ${PG_USER:-postgres}
+      password: ${PG_PASSWORD:-postgres}
+      schema: public
+
+seed_data:
+  - connection: test_pg
+    table: events
+    schema: |
+      CREATE TABLE IF NOT EXISTS events (
+        id SERIAL PRIMARY KEY,
+        event_type VARCHAR(50) NOT NULL,
+        payload JSONB,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+      )
+    data:
+      - event_type: "page_view"
+        payload: '{"page": "/home"}'
+        created_at: "2026-03-01 10:00:00"
+      - event_type: "click"
+        payload: '{"button": "submit"}'
+        created_at: "2026-03-02 10:00:00"
+      - event_type: "purchase"
+        payload: '{"amount": 99.99}'
+        created_at: "2026-03-03 10:00:00"
+
+pipeline:
+  # Run 1: First run with freshness config
+  # Expected: Full table scan, watermark stored
+  - kind: source
+    name: events
+    source: postgresql
+    table: public.events
+    description: Raw events from PostgreSQL with incremental detection
+    freshness:
+      time_column: created_at
+    params:
+      connection: test_pg
+
+  - kind: transform
+    name: events_summary
+    description: Aggregate events by type
+    inputs:
+      - ref: source.events
+    transform: |
+      SELECT
+        event_type,
+        COUNT(*) as event_count,
+        MAX(created_at) as latest_event
+      FROM source.events
+      GROUP BY event_type
+
+  - kind: feature_group
+    name: event_metrics
+    description: Event metrics feature group
+    entity:
+      name: event
+      join_keys: [event_type]
+    inputs:
+      - ref: transform.events_summary
+    features:
+      event_count: "COUNT of events"
+      latest_event: "Most recent event timestamp"
+    materialization:
+      type: parquet
+      path: target/feature_store/event_metrics.parquet
+
+# Validation steps
+validation:
+  # Run 1: Initial load
+  - step: first_run
+    action: run
+    expect:
+      - source.events should execute
+      - transform.events_summary should execute
+      - feature_group.event_metrics should execute
+      - run_state.json should contain pg_last_watermark for source.events
+      - pg_last_watermark should be "2026-03-03 10:00:00"
+
+  # Run 2: No changes - should skip
+  - step: second_run_no_changes
+    action: run
+    expect:
+      - source.events should be skipped (watermark match)
+      - transform.events_summary should be skipped (cached)
+      - feature_group.event_metrics should be skipped (cached)
+
+  # Run 3: Insert new data
+  - step: insert_new_data
+    action: sql
+    connection: test_pg
+    query: |
+      INSERT INTO events (event_type, payload, created_at)
+      VALUES ('signup', '{"plan": "pro"}', '2026-03-04 10:00:00')
+
+  - step: third_run_with_changes
+    action: run
+    expect:
+      - source.events should execute (watermark changed)
+      - WHERE clause should filter to created_at > '2026-03-03 10:00:00'
+      - Only 1 new row should be loaded
+      - pg_last_watermark should update to "2026-03-04 10:00:00"
+
+  # Run 4: Full refresh
+  - step: full_refresh
+    action: run
+    flags: [--full]
+    expect:
+      - source.events should execute (full refresh)
+      - All rows should be loaded (no WHERE clause)
+      - Watermark should be recalculated
+
+  # Run 5: Custom query disables incremental
+  - step: custom_query_run
+    action: run
+    override:
+      source.events:
+        params:
+          query: "SELECT * FROM events WHERE event_type = 'purchase'"
+    expect:
+      - source.events should execute (custom query disables incremental)
+      - No WHERE clause injection for incremental
