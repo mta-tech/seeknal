@@ -32,7 +32,7 @@ class TestPostgreSQLIncrementalDetection:
 
         # Mock get_max_watermark to return new watermark
         with patch(
-            "seeknal.workflow.runner.get_max_watermark"
+            "seeknal.workflow.postgresql_metadata.get_max_watermark"
         ) as mock_wm:
             mock_wm.return_value = "2026-03-03 10:30:00"
 
@@ -53,7 +53,7 @@ class TestPostgreSQLIncrementalDetection:
 
         # Mock get_max_watermark to return same watermark
         with patch(
-            "seeknal.workflow.runner.get_max_watermark"
+            "seeknal.workflow.postgresql_metadata.get_max_watermark"
         ) as mock_wm:
             mock_wm.return_value = "2026-03-03 10:30:00"
 
@@ -72,7 +72,7 @@ class TestPostgreSQLIncrementalDetection:
 
         # Mock get_max_watermark to return earlier watermark (regression)
         with patch(
-            "seeknal.workflow.runner.get_max_watermark"
+            "seeknal.workflow.postgresql_metadata.get_max_watermark"
         ) as mock_wm:
             # Simulate data deletion causing watermark to go backwards
             mock_wm.return_value = "2026-03-01 00:00:00"
@@ -86,7 +86,7 @@ class TestPostgreSQLIncrementalDetection:
         stored_state = None
 
         with patch(
-            "seeknal.workflow.runner.get_max_watermark"
+            "seeknal.workflow.postgresql_metadata.get_max_watermark"
         ) as mock_wm:
             mock_wm.return_value = None
 
@@ -103,7 +103,7 @@ class TestPostgreSQLIncrementalDetection:
         )
 
         with patch(
-            "seeknal.workflow.runner.get_max_watermark"
+            "seeknal.workflow.postgresql_metadata.get_max_watermark"
         ) as mock_wm:
             mock_wm.return_value = "2026-03-03 10:00:00"
 
