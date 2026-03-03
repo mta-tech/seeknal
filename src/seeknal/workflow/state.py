@@ -119,6 +119,11 @@ class NodeState:
     iceberg_snapshot_timestamp: Optional[str] = None
     iceberg_table_ref: Optional[str] = None
     iceberg_schema_version: Optional[int] = None
+    last_watermark: Optional[str] = None
+
+    # PostgreSQL incremental detection fields
+    pg_last_watermark: Optional[str] = None
+    pg_time_column: Optional[str] = None
 
     # Interval tracking fields
     completed_intervals: List[tuple[str, str]] = field(default_factory=list)
@@ -172,6 +177,10 @@ class NodeState:
             iceberg_snapshot_timestamp=data.get("iceberg_snapshot_timestamp"),
             iceberg_table_ref=data.get("iceberg_table_ref"),
             iceberg_schema_version=data.get("iceberg_schema_version"),
+            last_watermark=data.get("last_watermark"),
+            # PostgreSQL fields (with backward compatibility)
+            pg_last_watermark=data.get("pg_last_watermark"),
+            pg_time_column=data.get("pg_time_column"),
             # Interval tracking fields (with backward compatibility)
             completed_intervals=completed_intervals,
             completed_partitions=completed_partitions,

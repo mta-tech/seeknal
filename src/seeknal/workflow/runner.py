@@ -9,12 +9,15 @@ This module provides the core workflow runner that:
 - Reports progress and collects results
 """
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 from seeknal.cli.main import _echo_success, _echo_error, _echo_info, _echo_warning  # ty: ignore[unresolved-import]
 from seeknal.dag.manifest import Manifest, Node, NodeType  # ty: ignore[unresolved-import]
@@ -241,6 +244,19 @@ class DAGRunner:
             to_run.update(self.manifest.nodes.keys())
             for nid in to_run:
                 skip_reasons[nid] = "full refresh"
+            # Compute fingerprints even on full refresh so incremental runs can compare
+            upstream_map: Dict[str, Set[str]] = {}
+            for nid in self.manifest.nodes:
+                upstream_map[nid] = self.manifest.get_upstream_nodes(nid)
+            manifest_nodes = {}
+            for nid, node in self.manifest.nodes.items():
+                manifest_nodes[nid] = {
+                    "kind": node.node_type.value,
+                    "config": node.config,
+                    "file_path": node.file_path or "unknown.yml",
+                    "columns": node.columns,
+                }
+            self._current_fingerprints = compute_dag_fingerprints(manifest_nodes, upstream_map)
         elif nodes:
             # Run specific nodes
             for node_name in nodes:
@@ -324,6 +340,110 @@ class DAGRunner:
                     changed.add(nid)
                     skip_reasons[nid] = "cache missing"
 
+        # Iceberg-specific data change detection
+        # For Iceberg source nodes, compare current snapshot ID with stored
+        # to detect data changes that don't affect the YAML hash
+        for nid, node in self.manifest.nodes.items():
+            if nid in changed:
+                continue  # already marked changed
+            if node.node_type != NodeType.SOURCE:
+                continue
+            if node.config.get("source") != "iceberg":
+                continue
+
+            table_ref = node.config.get("table")
+            if not table_ref:
+                continue
+
+            from seeknal.workflow.iceberg_metadata import get_current_snapshot_id
+
+            current_snap, _ = get_current_snapshot_id(
+                table_ref=table_ref,
+                params=node.config.get("params", {}),
+            )
+
+            stored_node = self.run_state.nodes.get(nid)
+            stored_snap = stored_node.iceberg_snapshot_id if stored_node else None
+
+            if current_snap is None:
+                # Can't reach catalog — force re-execution to be safe
+                changed.add(nid)
+                skip_reasons[nid] = "iceberg catalog unreachable"
+            elif current_snap != stored_snap:
+                changed.add(nid)
+                skip_reasons[nid] = "iceberg data changed"
+            # else: same snapshot → stays cached (no action)
+
+        # PostgreSQL-specific data change detection
+        # For PostgreSQL source nodes with freshness.time_column, compare MAX(time_column)
+        # with stored watermark to detect data changes that don't affect the YAML hash
+        for nid, node in self.manifest.nodes.items():
+            if nid in changed:
+                continue  # already marked changed
+            if node.node_type != NodeType.SOURCE:
+                continue
+            # Check for postgresql source (normalize "postgres" to "postgresql")
+            source_type = node.config.get("source", "").lower()
+            if source_type not in ("postgresql", "postgres"):
+                continue
+
+            # Check for freshness.time_column config
+            freshness = node.config.get("freshness", {})
+            time_column = freshness.get("time_column") if freshness else None
+            if not time_column:
+                continue  # No incremental detection without time_column
+
+            # Skip if custom query is set (can't safely inject WHERE)
+            params = node.config.get("params", {})
+            if params.get("query"):
+                logger.debug(f"PostgreSQL source {nid} has custom query, skipping incremental detection")
+                continue
+
+            table = node.config.get("table")
+            if not table:
+                continue
+
+            from seeknal.workflow.postgresql_metadata import get_max_watermark
+
+            # Resolve connection params
+            connection_params = self._resolve_postgresql_params(params)
+
+            # Parse schema and table name
+            if "." in table:
+                schema, table_name = table.split(".", 1)
+            else:
+                schema = connection_params.get("schema", "public")
+                table_name = table
+
+            current_wm = get_max_watermark(
+                connection_params=connection_params,
+                schema=schema,
+                table=table_name,
+                time_column=time_column,
+            )
+
+            stored_node = self.run_state.nodes.get(nid)
+            stored_wm = stored_node.pg_last_watermark if stored_node else None
+
+            if current_wm is None:
+                # Can't reach database or table empty — force re-execution to be safe
+                changed.add(nid)
+                skip_reasons[nid] = "postgresql watermark query failed or table empty"
+            elif stored_wm is None:
+                # First run with freshness config — needs to run
+                changed.add(nid)
+                skip_reasons[nid] = "postgresql first incremental run"
+            elif current_wm != stored_wm:
+                # Check for watermark regression
+                if current_wm < stored_wm:
+                    logger.warning(
+                        f"PostgreSQL watermark regression detected for {nid}: "
+                        f"{current_wm} < {stored_wm}, forcing full scan"
+                    )
+                changed.add(nid)
+                skip_reasons[nid] = "postgresql data changed"
+            # else: same watermark → stays cached (no action)
+
         # Store current fingerprints for later saving
         self._current_fingerprints = current_fps
 
@@ -341,6 +461,33 @@ class DAGRunner:
                 skip_reasons[nid] = "downstream of changed node"
 
         return to_run, skip_reasons
+
+    def _resolve_postgresql_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Resolve PostgreSQL connection parameters from params and profile.
+
+        Supports two modes:
+        1. Profile-based: params.connection references a profiles.yml connection
+        2. Inline: params contains host, port, database, user, password directly
+
+        Args:
+            params: Node params dict, may contain 'connection' key or inline credentials
+
+        Returns:
+            Resolved connection parameters dict
+        """
+        from seeknal.workflow.postgresql_metadata import resolve_postgresql_connection
+
+        # Get profile loader if available (from exec_context)
+        profile_loader = getattr(self, '_profile_loader', None)
+        if not profile_loader and self.exec_context:
+            profile_path = getattr(self.exec_context, 'profile_path', None)
+            if profile_path:
+                from seeknal.workflow.materialization.profile_loader import ProfileLoader
+                profile_loader = ProfileLoader(profile_path=profile_path)
+                self._profile_loader = profile_loader
+
+        return resolve_postgresql_connection(params, profile_loader)
 
     def _get_all_downstream(self, node_id: str) -> Set[str]:
         """Get all downstream nodes recursively."""
@@ -401,6 +548,37 @@ class DAGRunner:
             )
 
         try:
+            # Inject Iceberg watermark for incremental reads
+            # Skip watermark on --full refresh so executor does a full scan
+            if self.exec_context is not None:
+                if (
+                    node.node_type == NodeType.SOURCE
+                    and node.config.get("source") == "iceberg"
+                    and not getattr(self, "_full_refresh", False)
+                ):
+                    stored = self.run_state.nodes.get(node_id)
+                    if stored and stored.last_watermark:
+                        self.exec_context.config["_iceberg_last_watermark"] = stored.last_watermark
+                    else:
+                        self.exec_context.config.pop("_iceberg_last_watermark", None)
+                else:
+                    self.exec_context.config.pop("_iceberg_last_watermark", None)
+
+                # Inject PostgreSQL watermark for incremental reads
+                # Skip watermark on --full refresh so executor does a full scan
+                if (
+                    node.node_type == NodeType.SOURCE
+                    and node.config.get("source") in ("postgresql", "postgres")
+                    and not getattr(self, "_full_refresh", False)
+                ):
+                    stored = self.run_state.nodes.get(node_id)
+                    if stored and stored.pg_last_watermark:
+                        self.exec_context.config["_pg_last_watermark"] = stored.pg_last_watermark
+                    else:
+                        self.exec_context.config.pop("_pg_last_watermark", None)
+                else:
+                    self.exec_context.config.pop("_pg_last_watermark", None)
+
             # Route to appropriate executor based on node type
             result = self._execute_by_type(node)
 
@@ -514,6 +692,7 @@ class DAGRunner:
             ExecutionSummary with results
         """
         start_time = time.time()
+        self._full_refresh = full
 
         # Determine nodes to run
         to_run, skip_reasons = self._get_nodes_to_run(
@@ -587,6 +766,35 @@ class DAGRunner:
                     # Store fingerprint if computed
                     if hasattr(self, '_current_fingerprints') and node_id in self._current_fingerprints:
                         self.run_state.nodes[node_id].fingerprint = self._current_fingerprints[node_id]
+
+                    # Store Iceberg metadata for source nodes
+                    node = self.manifest.get_node(node_id)
+                    if (
+                        node
+                        and node.node_type == NodeType.SOURCE
+                        and node.config.get("source") == "iceberg"
+                    ):
+                        iceberg_meta = result.metadata or {}
+                        node_state = self.run_state.nodes.get(node_id)
+                        if node_state:
+                            if iceberg_meta.get("iceberg_snapshot_id"):
+                                node_state.iceberg_snapshot_id = iceberg_meta["iceberg_snapshot_id"]
+                            if iceberg_meta.get("iceberg_snapshot_timestamp"):
+                                node_state.iceberg_snapshot_timestamp = iceberg_meta["iceberg_snapshot_timestamp"]
+                            if iceberg_meta.get("iceberg_table_ref"):
+                                node_state.iceberg_table_ref = iceberg_meta["iceberg_table_ref"]
+                            if iceberg_meta.get("last_watermark"):
+                                node_state.last_watermark = iceberg_meta["last_watermark"]
+
+                    # Persist PostgreSQL watermark metadata to node state
+                    pg_meta = result.metadata or {}
+                    if any(k.startswith("pg_") for k in pg_meta):
+                        pg_node_state = self.run_state.nodes.get(node_id)
+                        if pg_node_state:
+                            if pg_meta.get("pg_last_watermark"):
+                                pg_node_state.pg_last_watermark = pg_meta["pg_last_watermark"]
+                            if pg_meta.get("pg_time_column"):
+                                pg_node_state.pg_time_column = pg_meta["pg_time_column"]
 
             elif result.status == ExecutionStatus.FAILED:
                 _echo_error(f"{node.name} failed: {result.error_message}")

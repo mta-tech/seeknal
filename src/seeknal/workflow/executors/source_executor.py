@@ -233,13 +233,31 @@ class SourceExecutor(BaseExecutor):
             elif source_type == "json" or source_type == "jsonl":
                 row_count = self._load_json(con, table, params)
             elif source_type in ["sqlite", "postgresql", "postgres"]:
-                row_count = self._load_database(con, source_type, table, params)
+                # Extract incremental read parameters for PostgreSQL
+                freshness = config.get("freshness", {})
+                time_column = freshness.get("time_column") if isinstance(freshness, dict) else None
+                pg_last_watermark = self.context.config.get("_pg_last_watermark")
+
+                row_count = self._load_database(
+                    con, source_type, table, params,
+                    time_column=time_column,
+                    last_watermark=pg_last_watermark,
+                )
             elif source_type == "starrocks":
                 row_count = self._load_starrocks(con, table, params)
             elif source_type == "hive":
                 row_count = self._load_hive(con, table, params)
             elif source_type == "iceberg":
-                row_count = self._load_iceberg(con, table, params)
+                # Extract incremental read parameters
+                freshness = config.get("freshness", {})
+                time_column = freshness.get("time_column") if isinstance(freshness, dict) else None
+                iceberg_last_watermark = self.context.config.get("_iceberg_last_watermark")
+
+                row_count = self._load_iceberg(
+                    con, table, params,
+                    time_column=time_column,
+                    last_watermark=iceberg_last_watermark,
+                )
             else:
                 raise ExecutorExecutionError(
                     self.node.id,
@@ -282,19 +300,30 @@ class SourceExecutor(BaseExecutor):
                         import warnings
                         warnings.warn(f"Failed to cache result: {str(e)}")
 
+            # Build result metadata
+            result_metadata = {
+                "source": source_type,
+                "table": table,
+                "params": params,
+                "cached": cache_path.exists() if cache_path else False,
+                "intermediate_path": str(intermediate_path) if intermediate_path else None,
+            }
+
+            # Merge Iceberg result metadata if available
+            if hasattr(self, '_iceberg_result_metadata'):
+                result_metadata.update(self._iceberg_result_metadata)
+
+            # Merge PostgreSQL result metadata if available
+            if hasattr(self, '_pg_result_metadata'):
+                result_metadata.update(self._pg_result_metadata)
+
             return ExecutorResult(
                 node_id=self.node.id,
                 status=ExecutionStatus.SUCCESS,
                 duration_seconds=duration,
                 row_count=row_count,
                 output_path=self.context.get_output_path(self.node),
-                metadata={
-                    "source": source_type,
-                    "table": table,
-                    "params": params,
-                    "cached": cache_path.exists() if cache_path else False,
-                    "intermediate_path": str(intermediate_path) if intermediate_path else None,
-                }
+                metadata=result_metadata,
             )
 
         except ExecutorExecutionError:
@@ -553,7 +582,9 @@ class SourceExecutor(BaseExecutor):
         con: Any,
         source_type: str,
         table: str,
-        params: Dict[str, Any]
+        params: Dict[str, Any],
+        time_column: Optional[str] = None,
+        last_watermark: Optional[str] = None,
     ) -> int:
         """
         Load data from database using DuckDB.
@@ -567,6 +598,8 @@ class SourceExecutor(BaseExecutor):
             source_type: Type of database (sqlite, postgresql, postgres)
             table: Table name (or file path for SQLite)
             params: Connection parameters
+            time_column: Optional column name for incremental reads (PostgreSQL only)
+            last_watermark: Optional last watermark for incremental reads (PostgreSQL only)
 
         Returns:
             Number of rows loaded
@@ -578,7 +611,11 @@ class SourceExecutor(BaseExecutor):
             if source_type == "sqlite":
                 return self._load_sqlite(con, table, params)
             elif source_type in ["postgresql", "postgres"]:
-                return self._load_postgresql(con, table, params)
+                return self._load_postgresql(
+                    con, table, params,
+                    time_column=time_column,
+                    last_watermark=last_watermark,
+                )
             else:
                 raise ExecutorExecutionError(
                     self.node.id,
@@ -725,7 +762,9 @@ class SourceExecutor(BaseExecutor):
         self,
         con: Any,
         table: str,
-        params: Dict[str, Any]
+        params: Dict[str, Any],
+        time_column: Optional[str] = None,
+        last_watermark: Optional[str] = None,
     ) -> int:
         """
         Load data from PostgreSQL database using DuckDB.
@@ -736,12 +775,18 @@ class SourceExecutor(BaseExecutor):
         2. **Inline**: ``params: { host, port, database, user, password }``
            (existing behavior, still works).
 
+        Supports incremental reads via time_column and last_watermark:
+        - If both are provided, injects WHERE clause: time_col > watermark OR time_col IS NULL
+        - Custom query (params.query) disables incremental mode
+
         Requires the postgres extension to be loaded.
 
         Args:
             con: DuckDB connection
             table: Table name in PostgreSQL database
             params: Connection parameters or connection profile reference
+            time_column: Optional column name for incremental reads
+            last_watermark: Optional last watermark for incremental reads
 
         Returns:
             Number of rows loaded
@@ -786,19 +831,57 @@ class SourceExecutor(BaseExecutor):
 
             qualified_view = f"{duckdb_schema}.{view_name}"
 
-            # Use postgres_query() for pushdown queries, or table scan
+            # Determine incremental mode
+            # Disable incremental if custom query is provided (can't safely inject WHERE)
             pushdown_query = params.get("query")
+            use_incremental = (
+                time_column
+                and last_watermark
+                and not pushdown_query
+                and last_watermark != "NULL"  # NULL watermark means full scan
+            )
+
             if pushdown_query:
                 # Pushdown: run arbitrary SELECT on the remote PostgreSQL
+                # Incremental mode is disabled for custom queries
+                if time_column:
+                    logger.info(
+                        f"PostgreSQL source {node_id} has custom query, "
+                        "incremental mode disabled"
+                    )
                 escaped_query = pushdown_query.replace("'", "''")
                 con.execute(
                     f"CREATE OR REPLACE VIEW {qualified_view} AS "
                     f"SELECT * FROM postgres_query('{pg_alias}', '{escaped_query}')"
                 )
+            elif use_incremental:
+                # Incremental read: inject WHERE clause for new data only
+                # Pattern: time_col > watermark OR time_col IS NULL (for new rows)
+                from seeknal.validation import validate_column_name
+                validate_column_name(time_column)
+
+                # Build incremental WHERE clause
+                # Note: Use direct comparison (DuckDB handles timestamp casting)
+                where_clause = (
+                    f"WHERE \"{time_column}\" > '{last_watermark}' "
+                    f"OR \"{time_column}\" IS NULL"
+                )
+
+                if "." in table:
+                    full_table_name = f"{pg_alias}.{table}"
+                else:
+                    full_table_name = f"{pg_alias}.{config.schema}.{table}"
+
+                logger.info(
+                    f"PostgreSQL incremental read from {full_table_name}: "
+                    f"{time_column} > '{last_watermark}'"
+                )
+                con.execute(
+                    f"CREATE OR REPLACE VIEW {qualified_view} AS "
+                    f"SELECT * FROM {full_table_name} {where_clause}"
+                )
             else:
-                # Table scan: SELECT * FROM attached table
-                # If table already contains schema (e.g., "public.customers"),
-                # use it directly; otherwise prepend config.schema
+                # Full table scan: first run, no time_column, or NULL watermark
                 if "." in table:
                     full_table_name = f"{pg_alias}.{table}"
                 else:
@@ -811,6 +894,29 @@ class SourceExecutor(BaseExecutor):
             # Count rows
             count_result = con.execute(f"SELECT COUNT(*) FROM {qualified_view}").fetchone()
             row_count = count_result[0] if count_result else 0
+
+            # Compute new watermark for incremental reads
+            new_watermark = None
+            if time_column and not params.get("query"):
+                try:
+                    wm_result = con.execute(
+                        f"SELECT MAX(\"{time_column}\") FROM {qualified_view}"
+                    ).fetchone()
+                    if wm_result and wm_result[0] is not None:
+                        new_watermark = str(wm_result[0])
+                        logger.debug(
+                            f"PostgreSQL watermark computed: {time_column} = {new_watermark}"
+                        )
+                except Exception as wm_err:
+                    logger.warning(
+                        f"Failed to compute PostgreSQL watermark for {node_id}: {wm_err}"
+                    )
+
+            # Store metadata for state persistence (similar to Iceberg pattern)
+            self._pg_result_metadata = {
+                "pg_last_watermark": new_watermark,
+                "pg_time_column": time_column if time_column else None,
+            }
 
             return row_count
 
@@ -915,7 +1021,9 @@ class SourceExecutor(BaseExecutor):
         self,
         con: Any,
         table: str,
-        params: Dict[str, Any]
+        params: Dict[str, Any],
+        time_column: Optional[str] = None,
+        last_watermark: Optional[str] = None,
     ) -> int:
         """
         Load data from an Iceberg table via Lakekeeper REST catalog.
@@ -1054,18 +1162,78 @@ class SourceExecutor(BaseExecutor):
                 if "already exists" not in str(attach_err).lower():
                     raise
 
+            # Validate time_column if provided
+            if time_column:
+                try:
+                    cols = con.execute(
+                        f"DESCRIBE {catalog_alias}.{namespace}.{table_name}"
+                    ).fetchall()
+                    col_names = [c[0] for c in cols]
+                    if time_column not in col_names:
+                        raise ExecutorExecutionError(
+                            self.node.id,
+                            f"freshness.time_column '{time_column}' not found in Iceberg table '{table}'. "
+                            f"Available columns: {', '.join(col_names)}"
+                        )
+                except ExecutorExecutionError:
+                    raise
+                except Exception:
+                    pass  # DESCRIBE may not work on all catalogs, fall through
+
             # Create local schema and view from the Iceberg table
             con.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
-            con.execute(
-                f"CREATE OR REPLACE VIEW {schema}.{view_name} AS "
-                f"SELECT * FROM {catalog_alias}.{namespace}.{table_name}"
-            )
+
+            if time_column and last_watermark and not params.get("query"):
+                # Incremental: partition-pruned read — only new data since last watermark
+                from seeknal.validation import validate_column_name
+                validate_column_name(time_column)
+                view_sql = (
+                    f"SELECT * FROM {catalog_alias}.{namespace}.{table_name} "
+                    f"WHERE \"{time_column}\" > CAST('{last_watermark}' AS TIMESTAMP) "
+                    f"OR \"{time_column}\" IS NULL"
+                )
+            else:
+                # Full scan: first run, no time_column, or custom query
+                view_sql = f"SELECT * FROM {catalog_alias}.{namespace}.{table_name}"
+
+            con.execute(f"CREATE OR REPLACE VIEW {schema}.{view_name} AS {view_sql}")
 
             # Count rows
             count_result = con.execute(
                 f"SELECT COUNT(*) FROM {schema}.{view_name}"
             ).fetchone()
             row_count = count_result[0] if count_result else 0
+
+            # Compute new watermark from loaded data
+            new_watermark = None
+            if time_column:
+                try:
+                    wm_result = con.execute(
+                        f"SELECT MAX(\"{time_column}\") FROM {schema}.{view_name}"
+                    ).fetchone()
+                    if wm_result and wm_result[0] is not None:
+                        new_watermark = str(wm_result[0])
+                except Exception:
+                    pass  # Non-critical: watermark computation failure
+
+            # Get current snapshot ID from DuckDB
+            snapshot_id = None
+            try:
+                snap_result = con.execute(
+                    f"SELECT snapshot_id FROM iceberg_snapshots('{catalog_alias}.{namespace}.{table_name}') "
+                    f"ORDER BY timestamp_ms DESC LIMIT 1"
+                ).fetchone()
+                if snap_result:
+                    snapshot_id = str(snap_result[0])
+            except Exception:
+                pass  # iceberg_snapshots() may not be available
+
+            # Store metadata for runner to persist in NodeState
+            self._iceberg_result_metadata = {
+                "iceberg_snapshot_id": snapshot_id,
+                "iceberg_table_ref": table,
+                "last_watermark": new_watermark or last_watermark,
+            }
 
             return row_count
 
