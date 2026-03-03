@@ -222,6 +222,7 @@ class DAGRunner:
         full: bool = False,
         node_types: Optional[List[str]] = None,
         nodes: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
         exclude_tags: Optional[List[str]] = None,
     ) -> tuple[Set[str], Dict[str, str]]:
         """
@@ -231,6 +232,7 @@ class DAGRunner:
             full: Run all nodes regardless of state
             node_types: Filter by node types
             nodes: Run specific nodes only
+            tags: Run only nodes with these tags (plus upstream deps)
             exclude_tags: Skip nodes with these tags
 
         Returns:
@@ -240,7 +242,7 @@ class DAGRunner:
         skip_reasons: Dict[str, str] = {}
 
         if full:
-            # Run all nodes
+            # Run all nodes (--full overrides --tags)
             to_run.update(self.manifest.nodes.keys())
             for nid in to_run:
                 skip_reasons[nid] = "full refresh"
@@ -257,6 +259,48 @@ class DAGRunner:
                     "columns": node.columns,
                 }
             self._current_fingerprints = compute_dag_fingerprints(manifest_nodes, upstream_map)
+        elif tags and nodes:
+            # Union: tag-matched (+ upstream) AND explicit nodes (+ downstream)
+            tag_set = set(tags)
+            tag_matched = {
+                node_id for node_id, node in self.manifest.nodes.items()
+                if any(t in tag_set for t in node.tags)
+            }
+            with_upstream = set(tag_matched)
+            for node_id in tag_matched:
+                upstream = self._get_all_upstream(node_id)
+                with_upstream |= upstream
+            for nid in tag_matched:
+                skip_reasons[nid] = f"tag match ({', '.join(tags)})"
+            for nid in with_upstream - tag_matched:
+                skip_reasons[nid] = "upstream of tag-matched node"
+            # Also add explicitly named nodes + downstream
+            for node_name in nodes:
+                for node_id, node in self.manifest.nodes.items():
+                    if node.name == node_name or node_id == node_name:
+                        with_upstream.add(node_id)
+                        skip_reasons[node_id] = "explicitly selected"
+                        downstream = self._get_all_downstream(node_id)
+                        with_upstream.update(downstream)
+                        for d in downstream:
+                            skip_reasons[d] = f"downstream of {node_name}"
+                        break
+            to_run = with_upstream
+        elif tags:
+            # Run tag-matched nodes + all transitive upstream deps
+            tag_set = set(tags)
+            tag_matched = {
+                node_id for node_id, node in self.manifest.nodes.items()
+                if any(t in tag_set for t in node.tags)
+            }
+            to_run = set(tag_matched)
+            for node_id in tag_matched:
+                upstream = self._get_all_upstream(node_id)
+                to_run |= upstream
+            for nid in tag_matched:
+                skip_reasons[nid] = f"tag match ({', '.join(tags)})"
+            for nid in to_run - tag_matched:
+                skip_reasons[nid] = "upstream of tag-matched node"
         elif nodes:
             # Run specific nodes
             for node_name in nodes:
@@ -278,10 +322,12 @@ class DAGRunner:
             to_run, skip_reasons = self._fingerprint_based_detection()
 
         # Always include RULE nodes — data quality checks should run every time
-        for node_id, node in self.manifest.nodes.items():
-            if node.node_type == NodeType.RULE and node_id not in to_run:
-                to_run.add(node_id)
-                skip_reasons[node_id] = "always run (data quality)"
+        # (unless filtering by tags, where only tagged rules should run)
+        if not tags:
+            for node_id, node in self.manifest.nodes.items():
+                if node.node_type == NodeType.RULE and node_id not in to_run:
+                    to_run.add(node_id)
+                    skip_reasons[node_id] = "always run (data quality)"
 
         # Apply type filter
         if node_types:
@@ -503,6 +549,20 @@ class DAGRunner:
 
         return downstream
 
+    def _get_all_upstream(self, node_id: str) -> Set[str]:
+        """Get all upstream nodes recursively (transitive closure)."""
+        upstream: Set[str] = set()
+        queue = deque([node_id])
+
+        while queue:
+            current = queue.popleft()
+            for parent in self.manifest.get_upstream_nodes(current):
+                if parent not in upstream:
+                    upstream.add(parent)
+                    queue.append(parent)
+
+        return upstream
+
     def _should_skip_node(self, node_id: str, to_run: Set[str]) -> bool:
         """Check if a node should be skipped."""
         return node_id not in to_run
@@ -672,6 +732,7 @@ class DAGRunner:
         dry_run: bool = False,
         node_types: Optional[List[str]] = None,
         nodes: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
         exclude_tags: Optional[List[str]] = None,
         continue_on_error: bool = False,
         retry: int = 0,
@@ -684,6 +745,7 @@ class DAGRunner:
             dry_run: Show plan without executing
             node_types: Filter by node types
             nodes: Run specific nodes only
+            tags: Run only nodes with these tags (plus upstream deps)
             exclude_tags: Skip nodes with these tags
             continue_on_error: Continue execution after failures
             retry: Number of retries for failed nodes
@@ -699,6 +761,7 @@ class DAGRunner:
             full=full,
             node_types=node_types,
             nodes=nodes,
+            tags=tags,
             exclude_tags=exclude_tags,
         )
 
@@ -996,6 +1059,7 @@ class DAGRunner:
         full: bool = False,
         node_types: Optional[List[str]] = None,
         nodes: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
         exclude_tags: Optional[List[str]] = None,
     ) -> None:
         """Print execution plan without running.
@@ -1004,16 +1068,22 @@ class DAGRunner:
             full: Show all nodes
             node_types: Filter by node types
             nodes: Show specific nodes only
+            tags: Run only nodes with these tags (plus upstream deps)
             exclude_tags: Exclude nodes with these tags
         """
         to_run, skip_reasons = self._get_nodes_to_run(
             full=full,
             node_types=node_types,
             nodes=nodes,
+            tags=tags,
             exclude_tags=exclude_tags,
         )
 
         execution_order = self._get_topological_order()
+
+        # When filtering by tags, only show nodes in the filtered set
+        if tags:
+            execution_order = [n for n in execution_order if n in to_run]
 
         _echo_info("Execution Plan:")
         _echo_info("=" * 60)
@@ -1040,7 +1110,14 @@ class DAGRunner:
             print(f"  {idx:2d}. {status_msg} {node.name}{tags_str}{reason_str}")
 
         _echo_info("=" * 60)
-        _echo_info(f"Total: {len(execution_order)} nodes, {len(to_run)} to run")
+        total_nodes = len(self.manifest.nodes)
+        if tags:
+            _echo_info(
+                f"Showing {len(execution_order)} of {total_nodes} nodes "
+                f"(filtered by tags: {', '.join(tags)}), {len(to_run)} to run"
+            )
+        else:
+            _echo_info(f"Total: {total_nodes} nodes, {len(to_run)} to run")
 
 
 def print_summary(summary: ExecutionSummary) -> None:

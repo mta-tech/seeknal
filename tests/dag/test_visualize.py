@@ -15,6 +15,7 @@ from seeknal.dag.visualize import (
     HTMLRenderer,
     LineageVisualizationError,
     generate_lineage_html,
+    render_ascii_tree,
 )
 
 
@@ -784,3 +785,67 @@ class TestGenerateLineageHtml:
                 )
             error_msg = str(exc_info.value)
             assert "order_id" in error_msg or "Available:" in error_msg
+
+
+class TestTagsInVisualization:
+    """Test tags field in _serialize_node and ASCII tree rendering."""
+
+    def test_serialize_node_includes_tags(self):
+        """Node with tags includes them in serialized output."""
+        m = Manifest(project="test")
+        node = Node(
+            id="transform.tagged",
+            name="tagged",
+            node_type=NodeType.TRANSFORM,
+            tags=["churn_pipeline", "ml"],
+        )
+        m.add_node(node)
+        builder = LineageDataBuilder(m)
+        result = builder._serialize_node(node)
+
+        assert result["data"]["tags"] == ["churn_pipeline", "ml"]
+
+    def test_serialize_node_empty_tags(self):
+        """Node without tags has empty list in serialized output."""
+        m = Manifest(project="test")
+        node = Node(id="source.no_tags", name="no_tags", node_type=NodeType.SOURCE)
+        m.add_node(node)
+        builder = LineageDataBuilder(m)
+        result = builder._serialize_node(node)
+
+        assert result["data"]["tags"] == []
+
+    def test_ascii_tree_shows_tags(self):
+        """ASCII tree appends tags as suffix to node names."""
+        m = Manifest(project="test")
+        m.add_node(Node(
+            id="source.raw",
+            name="raw",
+            node_type=NodeType.SOURCE,
+        ))
+        m.add_node(Node(
+            id="transform.clean",
+            name="clean",
+            node_type=NodeType.TRANSFORM,
+            tags=["churn_pipeline"],
+        ))
+        m.add_edge("source.raw", "transform.clean")
+
+        result = render_ascii_tree(m)
+
+        assert "source.raw" in result
+        assert "transform.clean [churn_pipeline]" in result
+
+    def test_ascii_tree_no_tags(self):
+        """ASCII tree shows no suffix when nodes have no tags."""
+        m = Manifest(project="test")
+        m.add_node(Node(
+            id="source.raw",
+            name="raw",
+            node_type=NodeType.SOURCE,
+        ))
+
+        result = render_ascii_tree(m)
+
+        assert "source.raw" in result
+        assert "[" not in result

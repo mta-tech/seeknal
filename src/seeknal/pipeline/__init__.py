@@ -62,6 +62,7 @@ from seeknal.pipeline.decorators import (
     clear_registry,
 )
 from seeknal.pipeline.context import PipelineContext
+from seeknal.pipeline.feature_frame import FeatureFrame
 from seeknal.pipeline.materialization import (
     Materialization,
     OfflineConfig,
@@ -77,6 +78,8 @@ __all__ = [
     "second_order_aggregation",
     # Context
     "PipelineContext",
+    # Feature Frame
+    "FeatureFrame",
     # Materialization
     "Materialization",
     "OfflineConfig",

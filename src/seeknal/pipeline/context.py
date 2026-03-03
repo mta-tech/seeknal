@@ -104,6 +104,21 @@ class PipelineContext:
             str_cols = df.select_dtypes(include=["string"]).columns
             if len(str_cols) > 0:
                 df[str_cols] = df[str_cols].astype(object)
+
+            # Check for feature group metadata sidecar → return FeatureFrame
+            if node_id.startswith("feature_group."):
+                meta_path = intermediate_path.parent / f"{node_id.replace('.', '_')}_meta.json"
+                if meta_path.exists():
+                    import json
+                    meta = json.loads(meta_path.read_text())
+                    from seeknal.pipeline.feature_frame import FeatureFrame
+                    df = FeatureFrame(
+                        df=df,
+                        entity_name=meta["entity_name"],
+                        join_keys=meta["join_keys"],
+                        event_time_col=meta["event_time_col"],
+                    )
+
             self._node_outputs[node_id] = df
             return df
 
@@ -133,21 +148,33 @@ class PipelineContext:
                 "Ensure it is in the PEP 723 dependencies."
             )
 
-        # Store in memory
+        # Handle FeatureFrame — store inner DataFrame + metadata sidecar
+        from seeknal.pipeline.feature_frame import FeatureFrame
+        actual_df = df
+        meta_to_write = None
+        if isinstance(df, FeatureFrame):
+            actual_df = df.to_df()
+            meta_to_write = {
+                "entity_name": df.entity_name,
+                "join_keys": df.join_keys,
+                "event_time_col": df.event_time_col,
+            }
+
+        # Store in memory (preserve FeatureFrame wrapper)
         self._node_outputs[node_id] = df
 
         # Store to disk
         output_path = self.target_dir / "intermediate" / f"{node_id.replace('.', '_')}.parquet"
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Use pandas to_parquet if available, otherwise fallback
-        if hasattr(df, "to_parquet"):
-            df.to_parquet(output_path, index=False)
-        else:
-            # Fallback for non-DataFrame objects
-            import pickle
-            with open(output_path.with_suffix(".pkl"), "wb") as f:
-                pickle.dump(df, f)
+        if hasattr(actual_df, "to_parquet"):
+            actual_df.to_parquet(output_path, index=False)
+
+        # Write metadata sidecar for FeatureFrame round-trip
+        if meta_to_write:
+            import json
+            meta_path = output_path.parent / f"{node_id.replace('.', '_')}_meta.json"
+            meta_path.write_text(json.dumps(meta_to_write))
 
         return output_path
 
@@ -156,6 +183,9 @@ class PipelineContext:
         entity_name: str,
         feature_list: list[str],
         as_of: Optional[str] = None,
+        spine: Optional[Any] = None,
+        date_col: Optional[str] = None,
+        keep_cols: Optional[list[str]] = None,
     ) -> Any:
         """Retrieve selected features from a consolidated entity view.
 
@@ -167,6 +197,13 @@ class PipelineContext:
             feature_list: List of "fg_name.feature_name" strings
             as_of: Optional ISO date/datetime string for point-in-time filter.
                 Returns latest row per entity key where event_time <= as_of.
+            spine: Optional DataFrame for point-in-time join. When provided,
+                for each row in spine, returns features as they existed at
+                or before the date in *date_col*.
+            date_col: Column in *spine* containing the point-in-time date.
+                Required when *spine* is provided.
+            keep_cols: Optional list of spine columns to keep in the result.
+                Entity keys and *date_col* are always kept.
 
         Returns:
             pandas DataFrame with join_keys, event_time, and selected features
@@ -174,7 +211,8 @@ class PipelineContext:
 
         Raises:
             FileNotFoundError: If consolidated parquet doesn't exist
-            ValueError: If feature_list contains invalid references
+            ValueError: If feature_list contains invalid references or
+                spine is provided without date_col
         """
         import duckdb as _duckdb
 
@@ -211,6 +249,65 @@ class PipelineContext:
         key_cols = ", ".join(join_keys) + ", " if join_keys else ""
         select_clause = f"{key_cols}event_time, " + ", ".join(struct_selects)
 
+        # PIT join branch: spine-based point-in-time join
+        if spine is not None:
+            if date_col is None:
+                raise ValueError(
+                    "date_col is required when using spine for PIT join"
+                )
+            import pandas as _pd
+            con = _duckdb.connect()
+            try:
+                spine_copy = spine.copy()
+                if date_col in spine_copy.columns:
+                    spine_copy[date_col] = _pd.to_datetime(spine_copy[date_col])
+                con.register("_pit_spine", spine_copy)
+                con.execute(
+                    f"CREATE OR REPLACE VIEW _pit_features "
+                    f"AS SELECT * FROM '{parquet_path}'"
+                )
+
+                # Build PIT join
+                join_conds = " AND ".join(
+                    [f"_pit_spine.{k} = _pit_features.{k}" for k in join_keys]
+                )
+                spine_key_cols = ", ".join(
+                    [f"_pit_spine.{k}" for k in join_keys]
+                )
+                feat_select = ", ".join(struct_selects)
+
+                query = (
+                    f"SELECT _pit_spine.*, "
+                    f"{feat_select}, "
+                    f"ROW_NUMBER() OVER ("
+                    f"  PARTITION BY {spine_key_cols}, _pit_spine.{date_col} "
+                    f"  ORDER BY _pit_features.event_time DESC"
+                    f") AS _rn "
+                    f"FROM _pit_spine "
+                    f"LEFT JOIN _pit_features "
+                    f"  ON {join_conds} "
+                    f"  AND _pit_features.event_time <= _pit_spine.{date_col}"
+                )
+                result = con.execute(
+                    f"SELECT * EXCLUDE (_rn) FROM ({query}) WHERE _rn = 1 OR _rn IS NULL"
+                ).df()
+
+                # Filter columns if keep_cols specified
+                if keep_cols:
+                    keep_set = set(keep_cols + join_keys + [date_col])
+                    feature_cols = [
+                        c for c in result.columns
+                        if c not in spine_copy.columns or c in keep_set
+                    ]
+                    result = result[
+                        [c for c in result.columns if c in keep_set or c in feature_cols]
+                    ]
+
+                return result
+            finally:
+                con.close()
+
+        # Standard query (no spine)
         con = _duckdb.connect()
         try:
             if as_of:

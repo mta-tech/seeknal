@@ -1,8 +1,8 @@
 # Advanced Guide
 
-**Duration:** ~217 minutes | **Difficulty:** Intermediate | **Format:** YAML, Python & CLI
+**Duration:** ~252 minutes | **Difficulty:** Intermediate | **Format:** YAML, Python & CLI
 
-Go deeper with Seeknal's advanced capabilities: multi-format file sources, data quality rules, pipeline lineage visualization, named references, shared configuration, Python pipelines, database/external source connections with incremental detection, and incremental Iceberg processing.
+Go deeper with Seeknal's advanced capabilities: multi-format file sources, data quality rules, pipeline lineage visualization, named references, shared configuration, Python pipelines, database/external source connections with incremental detection, Iceberg incremental processing, custom sources, and pipeline tags.
 
 ---
 
@@ -20,6 +20,8 @@ Take your Seeknal skills to the next level with advanced features that improve p
 8. **Python Pipelines** - Build nodes with Python decorators and mix with YAML
 9. **Database & External Sources** - Connect to PostgreSQL, StarRocks, and Iceberg with incremental detection
 10. **Iceberg Incremental Processing** - Snapshot detection, watermark tracking, and selective cascade
+11. **Custom Sources** - Bring data from REST APIs, cloud storage, and any Python-accessible system
+12. **Pipeline Tags** - Organize nodes with tags and run filtered subsets of your pipeline
 
 ---
 
@@ -253,6 +255,50 @@ CSV (categories)  ────────────────────�
 
 ---
 
+### Chapter 11: Custom Sources (~20 minutes)
+
+Bring data from REST APIs, cloud storage, and any Python-accessible system:
+
+```
+REST API (Open-Meteo)     →  transform.api_weather_data
+S3/MinIO (boto3)          →  transform.s3_inventory_data
+Faker (synthetic data)    →  transform.generated_synthetic_data
+                                       ↓
+                              transform.enriched_report (joins all three)
+```
+
+**You'll learn:**
+- When to use `@transform` vs `@source` for data ingestion
+- REST API sources with retry and error handling
+- Cloud storage sources using boto3
+- Synthetic data generation for testing
+- Best practices: timeouts, credentials, idempotency
+
+**[Start Chapter 11 →](11-custom-sources.md)**
+
+---
+
+### Chapter 12: Pipeline Tags (~15 minutes)
+
+Organize nodes with tags and run, plan, or visualize filtered subsets:
+
+```
+seeknal run --tags churn_pipeline        →  Run tagged nodes + upstream deps
+seeknal plan --tags revenue_pipeline     →  Filtered execution plan
+seeknal lineage --tags ml --ascii        →  ASCII tree with [tag] annotations
+seeknal run --tags ml --exclude-tags exp →  Include then exclude
+```
+
+**You'll learn:**
+- Adding tags to YAML nodes and Python decorators
+- Running filtered subsets with `--tags`
+- Filter composition rules (`--tags` + `--exclude-tags` + `--nodes`)
+- Filtered plan and lineage visualization with tag annotations
+
+**[Start Chapter 12 →](12-pipeline-tags.md)**
+
+---
+
 ## Continue Learning
 
 Explore other persona paths or dive into the reference documentation:
@@ -293,12 +339,17 @@ seeknal lineage
 seeknal lineage transform.my_transform --column my_col
 seeknal lineage --ascii                          # ASCII tree to stdout
 seeknal lineage transform.my_transform --ascii   # Focused ASCII tree
+seeknal lineage --tags revenue_pipeline --ascii   # Tag-filtered ASCII tree
 
 # Inspect intermediate outputs
 seeknal inspect transform.my_transform
 
 # Preview resolved SQL (ref() and {{ }} expressions)
 seeknal dry-run seeknal/transforms/my_transform.yml
+
+# Run filtered by tags
+seeknal run --tags churn_pipeline
+seeknal run --tags ml --exclude-tags experimental
 
 # Override common config at runtime
 seeknal run --params events.quantityCol=units_sold
@@ -310,4 +361,4 @@ seeknal dry-run draft_source_pg.yml --profile profiles.yml
 
 ---
 
-*Last updated: February 2026 | Seeknal Documentation*
+*Last updated: March 2026 | Seeknal Documentation*
