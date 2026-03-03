@@ -23,6 +23,7 @@ class MockExecutionContext:
         self.materialize_enabled = False
         self._duckdb_conn = duckdb.connect(":memory:")
         self.duckdb_connection = self._duckdb_conn
+        self.config = {}  # Execution context config (e.g., for incremental detection)
 
     def get_duckdb_connection(self):
         return self._duckdb_conn
