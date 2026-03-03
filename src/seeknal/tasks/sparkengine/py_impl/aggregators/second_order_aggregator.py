@@ -221,12 +221,13 @@ class SecondOrderAggregator:
         # Load the table and add days_between column
         df = self.spark.table(table_name)
 
-        # Add days_between column
+        # Add days_between column: application_date - feature_date
+        # Positive = historical (feature before application), negative = future
         df = df.withColumn(
             "_days_between",
             F.datediff(
-                F.to_date(F.col(self.featureDateCol), self.featureDateFormat),
                 F.to_date(F.col(self.applicationDateCol), self.applicationDateFormat),
+                F.to_date(F.col(self.featureDateCol), self.featureDateFormat),
             ),
         )
 
@@ -275,13 +276,17 @@ class SecondOrderAggregator:
         return result
 
     def _basic_aggregations(self, features: List[str], aggs: List[str]) -> List[Column]:
-        """Generate basic aggregations (no time window)."""
+        """Generate basic aggregations filtered to historical data only (_days_between >= 0)."""
         result = []
         methods = self._get_methods()
         for feat in features:
             for agg in aggs:
                 if agg in methods:
-                    result.append(methods[agg](F.col(feat)).alias(f"{feat}_{agg.upper()}"))
+                    filtered = F.when(
+                        (F.col("_days_between") >= 0) & F.col(feat).isNotNull(),
+                        F.col(feat),
+                    )
+                    result.append(methods[agg](filtered).alias(f"{feat}_{agg.upper()}"))
         return result
 
     def _basic_days_aggregations(

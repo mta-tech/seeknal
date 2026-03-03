@@ -9,12 +9,15 @@ This module provides the core workflow runner that:
 - Reports progress and collects results
 """
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 from seeknal.cli.main import _echo_success, _echo_error, _echo_info, _echo_warning  # ty: ignore[unresolved-import]
 from seeknal.dag.manifest import Manifest, Node, NodeType  # ty: ignore[unresolved-import]
@@ -219,6 +222,7 @@ class DAGRunner:
         full: bool = False,
         node_types: Optional[List[str]] = None,
         nodes: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
         exclude_tags: Optional[List[str]] = None,
     ) -> tuple[Set[str], Dict[str, str]]:
         """
@@ -228,6 +232,7 @@ class DAGRunner:
             full: Run all nodes regardless of state
             node_types: Filter by node types
             nodes: Run specific nodes only
+            tags: Run only nodes with these tags (plus upstream deps)
             exclude_tags: Skip nodes with these tags
 
         Returns:
@@ -237,10 +242,65 @@ class DAGRunner:
         skip_reasons: Dict[str, str] = {}
 
         if full:
-            # Run all nodes
+            # Run all nodes (--full overrides --tags)
             to_run.update(self.manifest.nodes.keys())
             for nid in to_run:
                 skip_reasons[nid] = "full refresh"
+            # Compute fingerprints even on full refresh so incremental runs can compare
+            upstream_map: Dict[str, Set[str]] = {}
+            for nid in self.manifest.nodes:
+                upstream_map[nid] = self.manifest.get_upstream_nodes(nid)
+            manifest_nodes = {}
+            for nid, node in self.manifest.nodes.items():
+                manifest_nodes[nid] = {
+                    "kind": node.node_type.value,
+                    "config": node.config,
+                    "file_path": node.file_path or "unknown.yml",
+                    "columns": node.columns,
+                }
+            self._current_fingerprints = compute_dag_fingerprints(manifest_nodes, upstream_map)
+        elif tags and nodes:
+            # Union: tag-matched (+ upstream) AND explicit nodes (+ downstream)
+            tag_set = set(tags)
+            tag_matched = {
+                node_id for node_id, node in self.manifest.nodes.items()
+                if any(t in tag_set for t in node.tags)
+            }
+            with_upstream = set(tag_matched)
+            for node_id in tag_matched:
+                upstream = self._get_all_upstream(node_id)
+                with_upstream |= upstream
+            for nid in tag_matched:
+                skip_reasons[nid] = f"tag match ({', '.join(tags)})"
+            for nid in with_upstream - tag_matched:
+                skip_reasons[nid] = "upstream of tag-matched node"
+            # Also add explicitly named nodes + downstream
+            for node_name in nodes:
+                for node_id, node in self.manifest.nodes.items():
+                    if node.name == node_name or node_id == node_name:
+                        with_upstream.add(node_id)
+                        skip_reasons[node_id] = "explicitly selected"
+                        downstream = self._get_all_downstream(node_id)
+                        with_upstream.update(downstream)
+                        for d in downstream:
+                            skip_reasons[d] = f"downstream of {node_name}"
+                        break
+            to_run = with_upstream
+        elif tags:
+            # Run tag-matched nodes + all transitive upstream deps
+            tag_set = set(tags)
+            tag_matched = {
+                node_id for node_id, node in self.manifest.nodes.items()
+                if any(t in tag_set for t in node.tags)
+            }
+            to_run = set(tag_matched)
+            for node_id in tag_matched:
+                upstream = self._get_all_upstream(node_id)
+                to_run |= upstream
+            for nid in tag_matched:
+                skip_reasons[nid] = f"tag match ({', '.join(tags)})"
+            for nid in to_run - tag_matched:
+                skip_reasons[nid] = "upstream of tag-matched node"
         elif nodes:
             # Run specific nodes
             for node_name in nodes:
@@ -262,10 +322,12 @@ class DAGRunner:
             to_run, skip_reasons = self._fingerprint_based_detection()
 
         # Always include RULE nodes — data quality checks should run every time
-        for node_id, node in self.manifest.nodes.items():
-            if node.node_type == NodeType.RULE and node_id not in to_run:
-                to_run.add(node_id)
-                skip_reasons[node_id] = "always run (data quality)"
+        # (unless filtering by tags, where only tagged rules should run)
+        if not tags:
+            for node_id, node in self.manifest.nodes.items():
+                if node.node_type == NodeType.RULE and node_id not in to_run:
+                    to_run.add(node_id)
+                    skip_reasons[node_id] = "always run (data quality)"
 
         # Apply type filter
         if node_types:
@@ -324,6 +386,110 @@ class DAGRunner:
                     changed.add(nid)
                     skip_reasons[nid] = "cache missing"
 
+        # Iceberg-specific data change detection
+        # For Iceberg source nodes, compare current snapshot ID with stored
+        # to detect data changes that don't affect the YAML hash
+        for nid, node in self.manifest.nodes.items():
+            if nid in changed:
+                continue  # already marked changed
+            if node.node_type != NodeType.SOURCE:
+                continue
+            if node.config.get("source") != "iceberg":
+                continue
+
+            table_ref = node.config.get("table")
+            if not table_ref:
+                continue
+
+            from seeknal.workflow.iceberg_metadata import get_current_snapshot_id
+
+            current_snap, _ = get_current_snapshot_id(
+                table_ref=table_ref,
+                params=node.config.get("params", {}),
+            )
+
+            stored_node = self.run_state.nodes.get(nid)
+            stored_snap = stored_node.iceberg_snapshot_id if stored_node else None
+
+            if current_snap is None:
+                # Can't reach catalog — force re-execution to be safe
+                changed.add(nid)
+                skip_reasons[nid] = "iceberg catalog unreachable"
+            elif current_snap != stored_snap:
+                changed.add(nid)
+                skip_reasons[nid] = "iceberg data changed"
+            # else: same snapshot → stays cached (no action)
+
+        # PostgreSQL-specific data change detection
+        # For PostgreSQL source nodes with freshness.time_column, compare MAX(time_column)
+        # with stored watermark to detect data changes that don't affect the YAML hash
+        for nid, node in self.manifest.nodes.items():
+            if nid in changed:
+                continue  # already marked changed
+            if node.node_type != NodeType.SOURCE:
+                continue
+            # Check for postgresql source (normalize "postgres" to "postgresql")
+            source_type = node.config.get("source", "").lower()
+            if source_type not in ("postgresql", "postgres"):
+                continue
+
+            # Check for freshness.time_column config
+            freshness = node.config.get("freshness", {})
+            time_column = freshness.get("time_column") if freshness else None
+            if not time_column:
+                continue  # No incremental detection without time_column
+
+            # Skip if custom query is set (can't safely inject WHERE)
+            params = node.config.get("params", {})
+            if params.get("query"):
+                logger.debug(f"PostgreSQL source {nid} has custom query, skipping incremental detection")
+                continue
+
+            table = node.config.get("table")
+            if not table:
+                continue
+
+            from seeknal.workflow.postgresql_metadata import get_max_watermark
+
+            # Resolve connection params
+            connection_params = self._resolve_postgresql_params(params)
+
+            # Parse schema and table name
+            if "." in table:
+                schema, table_name = table.split(".", 1)
+            else:
+                schema = connection_params.get("schema", "public")
+                table_name = table
+
+            current_wm = get_max_watermark(
+                connection_params=connection_params,
+                schema=schema,
+                table=table_name,
+                time_column=time_column,
+            )
+
+            stored_node = self.run_state.nodes.get(nid)
+            stored_wm = stored_node.pg_last_watermark if stored_node else None
+
+            if current_wm is None:
+                # Can't reach database or table empty — force re-execution to be safe
+                changed.add(nid)
+                skip_reasons[nid] = "postgresql watermark query failed or table empty"
+            elif stored_wm is None:
+                # First run with freshness config — needs to run
+                changed.add(nid)
+                skip_reasons[nid] = "postgresql first incremental run"
+            elif current_wm != stored_wm:
+                # Check for watermark regression
+                if current_wm < stored_wm:
+                    logger.warning(
+                        f"PostgreSQL watermark regression detected for {nid}: "
+                        f"{current_wm} < {stored_wm}, forcing full scan"
+                    )
+                changed.add(nid)
+                skip_reasons[nid] = "postgresql data changed"
+            # else: same watermark → stays cached (no action)
+
         # Store current fingerprints for later saving
         self._current_fingerprints = current_fps
 
@@ -342,6 +508,33 @@ class DAGRunner:
 
         return to_run, skip_reasons
 
+    def _resolve_postgresql_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Resolve PostgreSQL connection parameters from params and profile.
+
+        Supports two modes:
+        1. Profile-based: params.connection references a profiles.yml connection
+        2. Inline: params contains host, port, database, user, password directly
+
+        Args:
+            params: Node params dict, may contain 'connection' key or inline credentials
+
+        Returns:
+            Resolved connection parameters dict
+        """
+        from seeknal.workflow.postgresql_metadata import resolve_postgresql_connection
+
+        # Get profile loader if available (from exec_context)
+        profile_loader = getattr(self, '_profile_loader', None)
+        if not profile_loader and self.exec_context:
+            profile_path = getattr(self.exec_context, 'profile_path', None)
+            if profile_path:
+                from seeknal.workflow.materialization.profile_loader import ProfileLoader
+                profile_loader = ProfileLoader(profile_path=profile_path)
+                self._profile_loader = profile_loader
+
+        return resolve_postgresql_connection(params, profile_loader)
+
     def _get_all_downstream(self, node_id: str) -> Set[str]:
         """Get all downstream nodes recursively."""
         downstream: Set[str] = set()
@@ -355,6 +548,20 @@ class DAGRunner:
                     queue.append(child)
 
         return downstream
+
+    def _get_all_upstream(self, node_id: str) -> Set[str]:
+        """Get all upstream nodes recursively (transitive closure)."""
+        upstream: Set[str] = set()
+        queue = deque([node_id])
+
+        while queue:
+            current = queue.popleft()
+            for parent in self.manifest.get_upstream_nodes(current):
+                if parent not in upstream:
+                    upstream.add(parent)
+                    queue.append(parent)
+
+        return upstream
 
     def _should_skip_node(self, node_id: str, to_run: Set[str]) -> bool:
         """Check if a node should be skipped."""
@@ -401,6 +608,37 @@ class DAGRunner:
             )
 
         try:
+            # Inject Iceberg watermark for incremental reads
+            # Skip watermark on --full refresh so executor does a full scan
+            if self.exec_context is not None:
+                if (
+                    node.node_type == NodeType.SOURCE
+                    and node.config.get("source") == "iceberg"
+                    and not getattr(self, "_full_refresh", False)
+                ):
+                    stored = self.run_state.nodes.get(node_id)
+                    if stored and stored.last_watermark:
+                        self.exec_context.config["_iceberg_last_watermark"] = stored.last_watermark
+                    else:
+                        self.exec_context.config.pop("_iceberg_last_watermark", None)
+                else:
+                    self.exec_context.config.pop("_iceberg_last_watermark", None)
+
+                # Inject PostgreSQL watermark for incremental reads
+                # Skip watermark on --full refresh so executor does a full scan
+                if (
+                    node.node_type == NodeType.SOURCE
+                    and node.config.get("source") in ("postgresql", "postgres")
+                    and not getattr(self, "_full_refresh", False)
+                ):
+                    stored = self.run_state.nodes.get(node_id)
+                    if stored and stored.pg_last_watermark:
+                        self.exec_context.config["_pg_last_watermark"] = stored.pg_last_watermark
+                    else:
+                        self.exec_context.config.pop("_pg_last_watermark", None)
+                else:
+                    self.exec_context.config.pop("_pg_last_watermark", None)
+
             # Route to appropriate executor based on node type
             result = self._execute_by_type(node)
 
@@ -494,6 +732,7 @@ class DAGRunner:
         dry_run: bool = False,
         node_types: Optional[List[str]] = None,
         nodes: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
         exclude_tags: Optional[List[str]] = None,
         continue_on_error: bool = False,
         retry: int = 0,
@@ -506,6 +745,7 @@ class DAGRunner:
             dry_run: Show plan without executing
             node_types: Filter by node types
             nodes: Run specific nodes only
+            tags: Run only nodes with these tags (plus upstream deps)
             exclude_tags: Skip nodes with these tags
             continue_on_error: Continue execution after failures
             retry: Number of retries for failed nodes
@@ -514,12 +754,14 @@ class DAGRunner:
             ExecutionSummary with results
         """
         start_time = time.time()
+        self._full_refresh = full
 
         # Determine nodes to run
         to_run, skip_reasons = self._get_nodes_to_run(
             full=full,
             node_types=node_types,
             nodes=nodes,
+            tags=tags,
             exclude_tags=exclude_tags,
         )
 
@@ -587,6 +829,35 @@ class DAGRunner:
                     # Store fingerprint if computed
                     if hasattr(self, '_current_fingerprints') and node_id in self._current_fingerprints:
                         self.run_state.nodes[node_id].fingerprint = self._current_fingerprints[node_id]
+
+                    # Store Iceberg metadata for source nodes
+                    node = self.manifest.get_node(node_id)
+                    if (
+                        node
+                        and node.node_type == NodeType.SOURCE
+                        and node.config.get("source") == "iceberg"
+                    ):
+                        iceberg_meta = result.metadata or {}
+                        node_state = self.run_state.nodes.get(node_id)
+                        if node_state:
+                            if iceberg_meta.get("iceberg_snapshot_id"):
+                                node_state.iceberg_snapshot_id = iceberg_meta["iceberg_snapshot_id"]
+                            if iceberg_meta.get("iceberg_snapshot_timestamp"):
+                                node_state.iceberg_snapshot_timestamp = iceberg_meta["iceberg_snapshot_timestamp"]
+                            if iceberg_meta.get("iceberg_table_ref"):
+                                node_state.iceberg_table_ref = iceberg_meta["iceberg_table_ref"]
+                            if iceberg_meta.get("last_watermark"):
+                                node_state.last_watermark = iceberg_meta["last_watermark"]
+
+                    # Persist PostgreSQL watermark metadata to node state
+                    pg_meta = result.metadata or {}
+                    if any(k.startswith("pg_") for k in pg_meta):
+                        pg_node_state = self.run_state.nodes.get(node_id)
+                        if pg_node_state:
+                            if pg_meta.get("pg_last_watermark"):
+                                pg_node_state.pg_last_watermark = pg_meta["pg_last_watermark"]
+                            if pg_meta.get("pg_time_column"):
+                                pg_node_state.pg_time_column = pg_meta["pg_time_column"]
 
             elif result.status == ExecutionStatus.FAILED:
                 _echo_error(f"{node.name} failed: {result.error_message}")
@@ -788,6 +1059,7 @@ class DAGRunner:
         full: bool = False,
         node_types: Optional[List[str]] = None,
         nodes: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
         exclude_tags: Optional[List[str]] = None,
     ) -> None:
         """Print execution plan without running.
@@ -796,16 +1068,22 @@ class DAGRunner:
             full: Show all nodes
             node_types: Filter by node types
             nodes: Show specific nodes only
+            tags: Run only nodes with these tags (plus upstream deps)
             exclude_tags: Exclude nodes with these tags
         """
         to_run, skip_reasons = self._get_nodes_to_run(
             full=full,
             node_types=node_types,
             nodes=nodes,
+            tags=tags,
             exclude_tags=exclude_tags,
         )
 
         execution_order = self._get_topological_order()
+
+        # When filtering by tags, only show nodes in the filtered set
+        if tags:
+            execution_order = [n for n in execution_order if n in to_run]
 
         _echo_info("Execution Plan:")
         _echo_info("=" * 60)
@@ -832,7 +1110,14 @@ class DAGRunner:
             print(f"  {idx:2d}. {status_msg} {node.name}{tags_str}{reason_str}")
 
         _echo_info("=" * 60)
-        _echo_info(f"Total: {len(execution_order)} nodes, {len(to_run)} to run")
+        total_nodes = len(self.manifest.nodes)
+        if tags:
+            _echo_info(
+                f"Showing {len(execution_order)} of {total_nodes} nodes "
+                f"(filtered by tags: {', '.join(tags)}), {len(to_run)} to run"
+            )
+        else:
+            _echo_info(f"Total: {total_nodes} nodes, {len(to_run)} to run")
 
 
 def print_summary(summary: ExecutionSummary) -> None:

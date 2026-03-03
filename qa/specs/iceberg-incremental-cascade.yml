@@ -1,0 +1,250 @@
+name: iceberg-incremental-cascade
+description: >
+  Test downstream cascade invalidation when Iceberg source data changes.
+  Validates: multi-level DAG cascade (source → silver → gold), mixed source types
+  (Iceberg + CSV), only Iceberg-changed branch cascades while CSV branch stays cached.
+source_type: iceberg
+
+infrastructure:
+  requires: [lakekeeper]
+  health_checks:
+    lakekeeper: "curl -s --connect-timeout 5 -o /dev/null -w '%{http_code}' http://172.19.0.9:8181/catalog/v1/config?warehouse=seeknal-warehouse | grep -qE '^(200|401)'"
+
+env:
+  LAKEKEEPER_URL: "http://172.19.0.9:8181"
+  LAKEKEEPER_WAREHOUSE_ID: "c008ea5c-fb89-11f0-aa64-c32ca2f52144"
+  LAKEKEEPER_WAREHOUSE: "seeknal-warehouse"
+  KEYCLOAK_TOKEN_URL: "http://172.19.0.9:8080/realms/atlas/protocol/openid-connect/token"
+  KEYCLOAK_CLIENT_ID: "duckdb"
+  KEYCLOAK_CLIENT_SECRET: "duckdb-secret-change-in-production"
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "CHANGE_THIS_STRONG_PASSWORD"
+  AWS_ENDPOINT_URL: "http://172.19.0.9:9000"
+  AWS_REGION: "us-east-1"
+
+profiles_yml: |
+  source_defaults:
+    iceberg:
+      catalog_uri: "${LAKEKEEPER_URL:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
+seed_data:
+  setup_instructions: |
+    Create namespace 'qa_cascade' in Lakekeeper if not exists.
+    Create Iceberg table: atlas.qa_cascade.transactions (txn_id, merchant_id, amount, txn_time)
+
+  transactions.csv: |
+    txn_id,merchant_id,amount,txn_time
+    T001,M01,50.00,2026-01-10 10:00:00
+    T002,M02,120.00,2026-01-10 11:00:00
+    T003,M01,75.00,2026-01-10 14:00:00
+    T004,M03,200.00,2026-01-11 09:00:00
+    T005,M02,90.00,2026-01-11 15:00:00
+
+  transactions_new.csv: |
+    txn_id,merchant_id,amount,txn_time
+    T006,M01,110.00,2026-01-12 08:00:00
+    T007,M03,350.00,2026-01-12 12:00:00
+
+  merchants.csv: |
+    merchant_id,merchant_name,city
+    M01,Coffee House,New York
+    M02,Book Store,Boston
+    M03,Tech Shop,San Francisco
+
+pipeline:
+  bronze:
+    - kind: source
+      name: transactions
+      source: iceberg
+      table: "atlas.qa_cascade.transactions"
+      description: Transaction data from Iceberg (changes frequently)
+      tags: ["bronze", "transactions"]
+      freshness:
+        time_column: txn_time
+
+    - kind: source
+      name: merchants
+      source: csv
+      table: "data/merchants.csv"
+      description: Merchant master data from CSV (static, never changes)
+      tags: ["bronze", "merchants"]
+
+  silver:
+    - kind: transform
+      name: enriched_transactions
+      description: Transactions joined with merchant names
+      inputs:
+        - ref: source.transactions
+        - ref: source.merchants
+      transform: |
+        SELECT
+          t.txn_id,
+          t.merchant_id,
+          m.merchant_name,
+          m.city,
+          CAST(t.amount AS DECIMAL(10,2)) AS amount,
+          t.txn_time
+        FROM ref('source.transactions') t
+        JOIN ref('source.merchants') m ON t.merchant_id = m.merchant_id
+      tags: ["silver", "enriched"]
+
+  gold:
+    - kind: transform
+      name: merchant_daily_totals
+      description: Per-merchant daily transaction totals
+      inputs:
+        - ref: transform.enriched_transactions
+      transform: |
+        SELECT
+          merchant_id,
+          merchant_name,
+          city,
+          CAST(txn_time AS DATE) AS txn_date,
+          CAST(COUNT(*) AS BIGINT) AS txn_count,
+          CAST(SUM(amount) AS DECIMAL(10,2)) AS daily_total,
+          CAST(AVG(amount) AS DECIMAL(10,2)) AS avg_amount
+        FROM ref('transform.enriched_transactions')
+        GROUP BY merchant_id, merchant_name, city, CAST(txn_time AS DATE)
+      tags: ["gold", "analytics"]
+
+    - kind: transform
+      name: city_summary
+      description: Per-city transaction summary
+      inputs:
+        - ref: transform.enriched_transactions
+      transform: |
+        SELECT
+          city,
+          CAST(COUNT(*) AS BIGINT) AS total_txns,
+          CAST(SUM(amount) AS DECIMAL(10,2)) AS total_revenue,
+          COUNT(DISTINCT merchant_id) AS merchant_count
+        FROM ref('transform.enriched_transactions')
+        GROUP BY city
+      tags: ["gold", "analytics"]
+
+execution_plan:
+  description: >
+    Tests that when Iceberg source changes, its entire downstream branch cascades,
+    but the CSV source branch stays cached.
+
+  steps:
+    - name: "Run 1: Initial full load"
+      description: "Load all data from both sources, build full pipeline"
+      seed_before:
+        tables:
+          - name: atlas.qa_cascade.transactions
+            csv: transactions.csv
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run seeknal run --profile profiles.yml --full 2>&1
+      validation:
+        execution_success: true
+        outputs:
+          - node: transform.enriched_transactions
+            min_rows: 5
+          - node: transform.merchant_daily_totals
+            min_rows: 3
+          - node: transform.city_summary
+            min_rows: 3
+
+    - name: "Insert new transactions into Iceberg (CSV unchanged)"
+      description: "Add 2 new rows to Iceberg. CSV file is NOT modified."
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run python -c "
+        import duckdb, os, json, urllib.request
+
+        con = duckdb.connect(':memory:')
+        con.execute('INSTALL httpfs; LOAD httpfs;')
+        con.execute('INSTALL iceberg; LOAD iceberg;')
+
+        endpoint = os.environ['AWS_ENDPOINT_URL'].replace('http://', '').replace('https://', '')
+        con.execute(f\"SET s3_region = '{os.environ['AWS_REGION']}'\")
+        con.execute(f\"SET s3_endpoint = '{endpoint}'\")
+        con.execute('SET s3_url_style = \\'path\\'')
+        con.execute('SET s3_use_ssl = false')
+        con.execute(f\"SET s3_access_key_id = '{os.environ['AWS_ACCESS_KEY_ID']}'\")
+        con.execute(f\"SET s3_secret_access_key = '{os.environ['AWS_SECRET_ACCESS_KEY']}'\")
+
+        token_data = f'grant_type=client_credentials&client_id={os.environ[\"KEYCLOAK_CLIENT_ID\"]}&client_secret={os.environ[\"KEYCLOAK_CLIENT_SECRET\"]}'.encode()
+        req = urllib.request.Request(os.environ['KEYCLOAK_TOKEN_URL'], data=token_data)
+        token = json.loads(urllib.request.urlopen(req).read())['access_token']
+
+        catalog_url = os.environ['LAKEKEEPER_URL'].rstrip('/') + '/catalog'
+        warehouse = os.environ['LAKEKEEPER_WAREHOUSE']
+
+        con.execute(f\"\"\"
+            ATTACH '{warehouse}' AS atlas (
+                TYPE ICEBERG,
+                ENDPOINT '{catalog_url}',
+                AUTHORIZATION_TYPE 'oauth2',
+                TOKEN '{token}'
+            )
+        \"\"\")
+
+        con.execute(\"\"\"
+            INSERT INTO atlas.qa_cascade.transactions
+            SELECT * FROM read_csv_auto('data/transactions_new.csv')
+        \"\"\")
+        count = con.execute('SELECT COUNT(*) FROM atlas.qa_cascade.transactions').fetchone()[0]
+        print(f'Total transactions after insert: {count}')
+        assert count == 7, f'Expected 7 rows, got {count}'
+        "
+
+    - name: "Run 2: Incremental — only Iceberg branch cascades"
+      description: >
+        Iceberg source.transactions has new snapshot → re-executes along with
+        downstream enriched_transactions, merchant_daily_totals, city_summary.
+        CSV source.merchants is unchanged → should be CACHED.
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run seeknal run --profile profiles.yml --verbose 2>&1
+      validation:
+        execution_success: true
+        outputs:
+          - node: transform.enriched_transactions
+            min_rows: 2
+          - node: transform.merchant_daily_totals
+            min_rows: 2
+          - node: transform.city_summary
+            min_rows: 2
+        expect_executed:
+          description: "Iceberg source and its downstream should re-execute"
+          nodes: [source.transactions, transform.enriched_transactions, transform.merchant_daily_totals, transform.city_summary]
+        expect_cached:
+          description: "CSV source should be cached (file unchanged, no Iceberg snapshot)"
+          nodes: [source.merchants]
+
+validation:
+  dag:
+    expected_nodes: 5
+    expected_edges:
+      - [source.transactions, transform.enriched_transactions]
+      - [source.merchants, transform.enriched_transactions]
+      - [transform.enriched_transactions, transform.merchant_daily_totals]
+      - [transform.enriched_transactions, transform.city_summary]
+  execution:
+    success: true
+  outputs:
+    - node: transform.enriched_transactions
+      min_rows: 5
+    - node: transform.merchant_daily_totals
+      min_rows: 3
+    - node: transform.city_summary
+      min_rows: 3
+
+features_tested:
+  - iceberg_source
+  - csv_source
+  - mixed_source_types
+  - iceberg_snapshot_detection
+  - downstream_cascade_on_iceberg_change
+  - csv_source_stays_cached
+  - freshness_time_column
+  - partition_pruned_incremental_read
+  - multi_level_dag_cascade
+  - watermark_tracking

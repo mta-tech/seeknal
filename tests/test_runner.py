@@ -157,6 +157,106 @@ def test_get_nodes_to_run_exclude_tags(simple_manifest):
     assert "feature_group.user_features" in to_run
 
 
+def test_get_nodes_to_run_include_tags(simple_manifest):
+    """Test including nodes by tags with upstream auto-include."""
+    runner = DAGRunner(simple_manifest)
+    # Tag "features" only on feature_group.user_features
+    to_run, reasons = runner._get_nodes_to_run(tags=["features"])
+
+    # Should include the tagged node plus all upstream deps
+    assert "feature_group.user_features" in to_run
+    assert "transform.clean_users" in to_run  # upstream
+    assert "source.users" in to_run  # transitive upstream
+    assert reasons["feature_group.user_features"] == "tag match (features)"
+    assert "upstream" in reasons.get("source.users", "")
+
+
+def test_get_nodes_to_run_include_tags_or_logic(simple_manifest):
+    """Test --tags uses OR logic (matches any tag)."""
+    runner = DAGRunner(simple_manifest)
+    to_run, _ = runner._get_nodes_to_run(tags=["source", "features"])
+
+    # Both source (tag:source) and feature_group (tag:features) match
+    assert "source.users" in to_run
+    assert "feature_group.user_features" in to_run
+    assert "transform.clean_users" in to_run  # upstream of feature_group
+
+
+def test_get_nodes_to_run_tags_no_match(simple_manifest):
+    """Test --tags with no matching nodes returns empty set."""
+    runner = DAGRunner(simple_manifest)
+    to_run, _ = runner._get_nodes_to_run(tags=["nonexistent_tag"])
+
+    assert len(to_run) == 0
+
+
+def test_get_nodes_to_run_tags_and_exclude_tags(simple_manifest):
+    """Test --tags + --exclude-tags compose: include first, then exclude."""
+    runner = DAGRunner(simple_manifest)
+    # Include "features" tag (feature_group + upstream), exclude "source" tag
+    to_run, _ = runner._get_nodes_to_run(
+        tags=["features"], exclude_tags=["source"]
+    )
+
+    # feature_group and transform should remain, source excluded
+    assert "feature_group.user_features" in to_run
+    assert "transform.clean_users" in to_run
+    assert "source.users" not in to_run  # excluded by --exclude-tags
+
+
+def test_get_nodes_to_run_tags_and_nodes_union(simple_manifest):
+    """Test --tags + --nodes compose as union."""
+    runner = DAGRunner(simple_manifest)
+    # Tags match source (tag:source), nodes match clean_users (+ downstream)
+    to_run, _ = runner._get_nodes_to_run(
+        tags=["source"], nodes=["clean_users"]
+    )
+
+    # Source from tags, clean_users from --nodes, user_features as downstream
+    assert "source.users" in to_run
+    assert "transform.clean_users" in to_run
+    assert "feature_group.user_features" in to_run
+
+
+def test_get_nodes_to_run_full_overrides_tags(simple_manifest):
+    """Test --full overrides --tags (runs everything)."""
+    runner = DAGRunner(simple_manifest)
+    to_run, _ = runner._get_nodes_to_run(full=True, tags=["features"])
+
+    # --full runs all nodes regardless of tags
+    assert len(to_run) == 3
+
+
+def test_get_nodes_to_run_tags_skip_rules():
+    """When filtering by tags, rules without the tag should NOT auto-include."""
+    manifest = Manifest(project="test_project")
+    source = Node(
+        id="source.data", name="data",
+        node_type=NodeType.SOURCE, tags=["etl"],
+    )
+    manifest.add_node(source)
+    transform = Node(
+        id="transform.clean", name="clean",
+        node_type=NodeType.TRANSFORM, tags=["etl"],
+    )
+    manifest.add_node(transform)
+    rule = Node(
+        id="rule.check", name="check",
+        node_type=NodeType.RULE, tags=["quality"],
+    )
+    manifest.add_node(rule)
+    manifest.add_edge("source.data", "transform.clean")
+    manifest.add_edge("transform.clean", "rule.check")
+
+    runner = DAGRunner(manifest)
+    to_run, _ = runner._get_nodes_to_run(tags=["etl"])
+
+    # Only etl-tagged nodes should run; rule.check has "quality" tag, not "etl"
+    assert "source.data" in to_run
+    assert "transform.clean" in to_run
+    assert "rule.check" not in to_run
+
+
 def test_get_nodes_to_run_specific_nodes(simple_manifest):
     """Test running specific nodes."""
     runner = DAGRunner(simple_manifest)

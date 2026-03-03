@@ -1,0 +1,378 @@
+name: iceberg-incremental-partition-pruning
+description: >
+  Test Iceberg partition-pruned incremental reads using freshness.time_column and watermark.
+  Validates: WHERE clause injection with stored watermark, watermark update after execution,
+  NULL handling in WHERE clause, full refresh override (--full clears watermark),
+  state persistence of last_watermark field.
+source_type: iceberg
+
+infrastructure:
+  requires: [lakekeeper]
+  health_checks:
+    lakekeeper: "curl -s --connect-timeout 5 -o /dev/null -w '%{http_code}' http://172.19.0.9:8181/catalog/v1/config?warehouse=seeknal-warehouse | grep -qE '^(200|401)'"
+
+env:
+  LAKEKEEPER_URL: "http://172.19.0.9:8181"
+  LAKEKEEPER_WAREHOUSE_ID: "c008ea5c-fb89-11f0-aa64-c32ca2f52144"
+  LAKEKEEPER_WAREHOUSE: "seeknal-warehouse"
+  KEYCLOAK_TOKEN_URL: "http://172.19.0.9:8080/realms/atlas/protocol/openid-connect/token"
+  KEYCLOAK_CLIENT_ID: "duckdb"
+  KEYCLOAK_CLIENT_SECRET: "duckdb-secret-change-in-production"
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "CHANGE_THIS_STRONG_PASSWORD"
+  AWS_ENDPOINT_URL: "http://172.19.0.9:9000"
+  AWS_REGION: "us-east-1"
+
+profiles_yml: |
+  source_defaults:
+    iceberg:
+      catalog_uri: "${LAKEKEEPER_URL:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
+seed_data:
+  setup_instructions: |
+    Create namespace 'qa_partition_pruning' in Lakekeeper if not exists.
+    Create and populate two Iceberg tables:
+    - atlas.qa_partition_pruning.events (event_id, category, amount, event_time)
+    - atlas.qa_partition_pruning.categories (category, label)
+
+  events_batch1.csv: |
+    event_id,category,amount,event_time
+    E001,sales,100.00,2026-01-10 08:00:00
+    E002,sales,250.00,2026-01-10 12:00:00
+    E003,returns,50.00,2026-01-10 14:00:00
+    E004,sales,175.00,2026-01-11 09:00:00
+    E005,returns,30.00,2026-01-11 11:00:00
+    E006,sales,320.00,2026-01-12 10:00:00
+
+  events_batch2.csv: |
+    event_id,category,amount,event_time
+    E007,sales,180.00,2026-01-13 08:00:00
+    E008,returns,45.00,2026-01-13 15:00:00
+    E009,sales,290.00,2026-01-14 09:00:00
+    E010,sales,410.00,2026-01-14 16:00:00
+
+  events_batch3_with_nulls.csv: |
+    event_id,category,amount,event_time
+    E011,sales,500.00,2026-01-15 10:00:00
+    E012,returns,65.00,2026-01-15 14:00:00
+    E013,sales,120.00,
+
+  categories.csv: |
+    category,label
+    sales,Sales Transaction
+    returns,Return/Refund
+
+pipeline:
+  bronze:
+    - kind: source
+      name: events
+      source: iceberg
+      table: "atlas.qa_partition_pruning.events"
+      description: Event data from Iceberg with time-based partitioning
+      tags: ["bronze", "events"]
+      # freshness.time_column enables partition-pruned incremental reads
+      freshness:
+        time_column: event_time
+        warn_after: 24h
+        error_after: 48h
+
+    - kind: source
+      name: categories
+      source: iceberg
+      table: "atlas.qa_partition_pruning.categories"
+      description: Category lookup table (no freshness — always full scan)
+      tags: ["bronze", "lookup"]
+
+  silver:
+    - kind: transform
+      name: enriched_events
+      description: Events joined with category labels
+      inputs:
+        - ref: source.events
+        - ref: source.categories
+      transform: |
+        SELECT
+          e.event_id,
+          e.category,
+          c.label AS category_label,
+          CAST(e.amount AS DECIMAL(10,2)) AS amount,
+          e.event_time
+        FROM ref('source.events') e
+        JOIN ref('source.categories') c ON e.category = c.category
+      tags: ["silver", "enriched"]
+
+  gold:
+    - kind: transform
+      name: daily_summary
+      description: Daily aggregation by category
+      inputs:
+        - ref: transform.enriched_events
+      transform: |
+        SELECT
+          CAST(event_time AS DATE) AS event_date,
+          category,
+          category_label,
+          CAST(COUNT(*) AS BIGINT) AS event_count,
+          CAST(SUM(amount) AS DECIMAL(10,2)) AS total_amount,
+          CAST(AVG(amount) AS DECIMAL(10,2)) AS avg_amount
+        FROM ref('transform.enriched_events')
+        WHERE event_time IS NOT NULL
+        GROUP BY CAST(event_time AS DATE), category, category_label
+      tags: ["gold", "analytics"]
+
+# --- Multi-run execution plan ---
+execution_plan:
+  description: >
+    This test requires FOUR sequential runs to validate partition-pruned
+    incremental reads with watermark tracking.
+
+  steps:
+    - name: "Run 1: Initial full load (batch 1)"
+      description: "First run — no watermark exists, full scan loads all 6 rows"
+      seed_before:
+        description: "Create Iceberg tables and load batch 1 data"
+        tables:
+          - name: atlas.qa_partition_pruning.events
+            csv: events_batch1.csv
+          - name: atlas.qa_partition_pruning.categories
+            csv: categories.csv
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run seeknal run --profile profiles.yml --full 2>&1
+      validation:
+        execution_success: true
+        outputs:
+          - node: transform.enriched_events
+            min_rows: 6
+          - node: transform.daily_summary
+            min_rows: 3
+        state_check:
+          description: "Verify watermark and snapshot stored in run_state.json"
+          command: |
+            python -c "
+            import json
+            state = json.load(open('target/run_state.json'))
+            ns = state.get('nodes', {}).get('source.events', {})
+            snap = ns.get('iceberg_snapshot_id')
+            watermark = ns.get('last_watermark')
+            assert snap is not None, f'Expected iceberg_snapshot_id, got None'
+            assert watermark is not None, f'Expected last_watermark, got None'
+            # Watermark should be MAX(event_time) = 2026-01-12 10:00:00
+            assert '2026-01-12' in watermark, f'Expected watermark around 2026-01-12, got {watermark}'
+            print(f'Run 1 — snapshot: {snap}, watermark: {watermark}')
+            "
+
+    - name: "Insert batch 2 into Iceberg table"
+      description: "Add 4 new rows with event_time after the stored watermark"
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run python -c "
+        import duckdb, os, json, urllib.request
+
+        con = duckdb.connect(':memory:')
+        con.execute('INSTALL httpfs; LOAD httpfs;')
+        con.execute('INSTALL iceberg; LOAD iceberg;')
+
+        endpoint = os.environ['AWS_ENDPOINT_URL'].replace('http://', '').replace('https://', '')
+        con.execute(f\"SET s3_region = '{os.environ['AWS_REGION']}'\")
+        con.execute(f\"SET s3_endpoint = '{endpoint}'\")
+        con.execute('SET s3_url_style = \\'path\\'')
+        con.execute('SET s3_use_ssl = false')
+        con.execute(f\"SET s3_access_key_id = '{os.environ['AWS_ACCESS_KEY_ID']}'\")
+        con.execute(f\"SET s3_secret_access_key = '{os.environ['AWS_SECRET_ACCESS_KEY']}'\")
+
+        token_data = f'grant_type=client_credentials&client_id={os.environ[\"KEYCLOAK_CLIENT_ID\"]}&client_secret={os.environ[\"KEYCLOAK_CLIENT_SECRET\"]}'.encode()
+        req = urllib.request.Request(os.environ['KEYCLOAK_TOKEN_URL'], data=token_data)
+        token = json.loads(urllib.request.urlopen(req).read())['access_token']
+
+        catalog_url = os.environ['LAKEKEEPER_URL'].rstrip('/') + '/catalog'
+        warehouse = os.environ['LAKEKEEPER_WAREHOUSE']
+
+        con.execute(f\"\"\"
+            ATTACH '{warehouse}' AS atlas (
+                TYPE ICEBERG,
+                ENDPOINT '{catalog_url}',
+                AUTHORIZATION_TYPE 'oauth2',
+                TOKEN '{token}'
+            )
+        \"\"\")
+
+        con.execute(\"\"\"
+            INSERT INTO atlas.qa_partition_pruning.events
+            SELECT * FROM read_csv_auto('data/events_batch2.csv')
+        \"\"\")
+        count = con.execute('SELECT COUNT(*) FROM atlas.qa_partition_pruning.events').fetchone()[0]
+        print(f'Total rows after batch 2 insert: {count}')
+        assert count == 10, f'Expected 10 rows, got {count}'
+        "
+
+    - name: "Run 2: Incremental with partition pruning"
+      description: >
+        Snapshot changed → source re-executes. freshness.time_column='event_time'
+        with stored watermark '2026-01-12 10:00:00' → WHERE clause filters to only
+        new rows (E007-E010). Downstream transforms re-run with updated data.
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run seeknal run --profile profiles.yml --verbose 2>&1
+      validation:
+        execution_success: true
+        outputs:
+          - node: transform.enriched_events
+            description: "Should include ALL 10 rows (view rebuilt from incremental + historical)"
+            min_rows: 4
+          - node: transform.daily_summary
+            min_rows: 2
+        expect_executed:
+          description: >
+            Source should re-execute with reason 'iceberg data changed'.
+            Look for partition pruning evidence in verbose output.
+          nodes: [source.events]
+        state_check:
+          description: "Watermark should advance to MAX of batch 2 = 2026-01-14 16:00:00"
+          command: |
+            python -c "
+            import json
+            state = json.load(open('target/run_state.json'))
+            ns = state.get('nodes', {}).get('source.events', {})
+            watermark = ns.get('last_watermark')
+            assert watermark is not None, 'Expected last_watermark after run 2'
+            assert '2026-01-14' in watermark, f'Expected watermark around 2026-01-14, got {watermark}'
+            print(f'Run 2 — watermark: {watermark}')
+            "
+
+    - name: "Insert batch 3 with NULL event_time rows"
+      description: "Add 3 rows including one with NULL event_time to test NULL handling"
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run python -c "
+        import duckdb, os, json, urllib.request
+
+        con = duckdb.connect(':memory:')
+        con.execute('INSTALL httpfs; LOAD httpfs;')
+        con.execute('INSTALL iceberg; LOAD iceberg;')
+
+        endpoint = os.environ['AWS_ENDPOINT_URL'].replace('http://', '').replace('https://', '')
+        con.execute(f\"SET s3_region = '{os.environ['AWS_REGION']}'\")
+        con.execute(f\"SET s3_endpoint = '{endpoint}'\")
+        con.execute('SET s3_url_style = \\'path\\'')
+        con.execute('SET s3_use_ssl = false')
+        con.execute(f\"SET s3_access_key_id = '{os.environ['AWS_ACCESS_KEY_ID']}'\")
+        con.execute(f\"SET s3_secret_access_key = '{os.environ['AWS_SECRET_ACCESS_KEY']}'\")
+
+        token_data = f'grant_type=client_credentials&client_id={os.environ[\"KEYCLOAK_CLIENT_ID\"]}&client_secret={os.environ[\"KEYCLOAK_CLIENT_SECRET\"]}'.encode()
+        req = urllib.request.Request(os.environ['KEYCLOAK_TOKEN_URL'], data=token_data)
+        token = json.loads(urllib.request.urlopen(req).read())['access_token']
+
+        catalog_url = os.environ['LAKEKEEPER_URL'].rstrip('/') + '/catalog'
+        warehouse = os.environ['LAKEKEEPER_WAREHOUSE']
+
+        con.execute(f\"\"\"
+            ATTACH '{warehouse}' AS atlas (
+                TYPE ICEBERG,
+                ENDPOINT '{catalog_url}',
+                AUTHORIZATION_TYPE 'oauth2',
+                TOKEN '{token}'
+            )
+        \"\"\")
+
+        con.execute(\"\"\"
+            INSERT INTO atlas.qa_partition_pruning.events
+            SELECT * FROM read_csv_auto('data/events_batch3_with_nulls.csv', nullstr='')
+        \"\"\")
+        count = con.execute('SELECT COUNT(*) FROM atlas.qa_partition_pruning.events').fetchone()[0]
+        null_count = con.execute('SELECT COUNT(*) FROM atlas.qa_partition_pruning.events WHERE event_time IS NULL').fetchone()[0]
+        print(f'Total rows: {count}, NULL event_time: {null_count}')
+        assert count == 13, f'Expected 13 rows, got {count}'
+        assert null_count >= 1, f'Expected at least 1 NULL event_time, got {null_count}'
+        "
+
+    - name: "Run 3: Incremental with NULL event_time handling"
+      description: >
+        WHERE clause should be: event_time > watermark OR event_time IS NULL.
+        The NULL row (E013) must be included in the incremental read.
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run seeknal run --profile profiles.yml --verbose 2>&1
+      validation:
+        execution_success: true
+        outputs:
+          - node: transform.enriched_events
+            description: "Incremental should pick up batch 3 rows including NULL event_time"
+            min_rows: 3
+        state_check:
+          description: "Watermark should advance to 2026-01-15 (ignoring NULL)"
+          command: |
+            python -c "
+            import json
+            state = json.load(open('target/run_state.json'))
+            ns = state.get('nodes', {}).get('source.events', {})
+            watermark = ns.get('last_watermark')
+            assert watermark is not None, 'Expected watermark after run 3'
+            assert '2026-01-15' in watermark, f'Expected watermark around 2026-01-15, got {watermark}'
+            print(f'Run 3 — watermark: {watermark}')
+            "
+
+    - name: "Run 4: Full refresh overrides watermark"
+      description: >
+        Run with --full flag. Even though watermark exists, the source should
+        do a full scan (no WHERE clause). Watermark should be recalculated
+        from the full table.
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run seeknal run --profile profiles.yml --full --verbose 2>&1
+      validation:
+        execution_success: true
+        outputs:
+          - node: transform.enriched_events
+            description: "Full scan should load ALL 13 rows (12 with event_time + 1 NULL)"
+            min_rows: 12
+          - node: transform.daily_summary
+            description: "Full aggregation across all dates"
+            min_rows: 4
+        state_check:
+          description: "Watermark should reflect MAX of entire table"
+          command: |
+            python -c "
+            import json
+            state = json.load(open('target/run_state.json'))
+            ns = state.get('nodes', {}).get('source.events', {})
+            watermark = ns.get('last_watermark')
+            snap = ns.get('iceberg_snapshot_id')
+            assert watermark is not None, 'Expected watermark after full refresh'
+            assert snap is not None, 'Expected snapshot_id after full refresh'
+            print(f'Run 4 (full) — snapshot: {snap}, watermark: {watermark}')
+            "
+
+validation:
+  dag:
+    expected_nodes: 4
+    expected_edges:
+      - [source.events, transform.enriched_events]
+      - [source.categories, transform.enriched_events]
+      - [transform.enriched_events, transform.daily_summary]
+  execution:
+    success: true
+  outputs:
+    - node: transform.enriched_events
+      min_rows: 6
+    - node: transform.daily_summary
+      min_rows: 3
+
+features_tested:
+  - iceberg_source
+  - freshness_time_column
+  - partition_pruned_incremental_read
+  - watermark_tracking
+  - watermark_update_after_execution
+  - null_event_time_handling
+  - full_refresh_overrides_watermark
+  - state_persistence_last_watermark
+  - iceberg_snapshot_detection
+  - downstream_cascade

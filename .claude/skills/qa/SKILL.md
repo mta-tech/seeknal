@@ -29,6 +29,7 @@ seeknal CLI + DAGBuilder: actual pipeline execution against live infrastructure
 **Input modes:**
 - `/qa` — run all specs in `qa/specs/`
 - `/qa qa/specs/foo.yml` — run a specific YAML spec
+- `/qa qa/specs/a.yml,qa/specs/b.yml` — run multiple YAML specs (comma-separated)
 - `/qa specs/feature.md` — interpret feature spec, generate YAML, then run it
 
 ## Default Infrastructure Credentials
@@ -63,7 +64,19 @@ Check if the `/qa` skill received a file argument.
 
 **Case A — No argument**: Set `target_specs = null`, proceed to Step 1 (discovers all `qa/specs/*.yml`).
 
-**Case B — Argument ends with `.yml`**: Set `target_specs = [argument_path]`, skip to Step 1.
+**Case B — Argument contains `.yml`**:
+
+Split the argument by comma (`,`) to get a list of paths. Trim whitespace from each path.
+
+- **Single spec**: `/qa qa/specs/foo.yml` → `target_specs = ["qa/specs/foo.yml"]`
+- **Multiple specs**: `/qa qa/specs/a.yml,qa/specs/b.yml` → `target_specs = ["qa/specs/a.yml", "qa/specs/b.yml"]`
+- **With spaces**: `/qa qa/specs/a.yml, qa/specs/b.yml` → same result (trim whitespace)
+
+For each path in the list:
+1. Validate the file exists. If not found, abort with: `Error: File not found: {path}`
+2. Validate it ends with `.yml`. If not, abort with: `Error: Expected .yml file: {path}`
+
+Set `target_specs = [list of validated paths]`, skip to Step 1.
 
 **Case C — Argument ends with `.md`**:
 
