@@ -29,7 +29,7 @@ Example:
 For more information, see the documentation at https://seeknal.readthedocs.io/
 """
 
-__version__ = "2.2.2"
+__version__ = "2.3.0"
 
 # Export validation functions
 from .validation import (

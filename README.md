@@ -108,6 +108,41 @@ training_df = hist.to_dataframe(feature_start_time=datetime(2024, 1, 1))
 | **Guides** | [Python Pipelines](docs/guides/python-pipelines.md) · [Testing & Audits](docs/guides/testing-and-audits.md) · [Iceberg Materialization](docs/iceberg-materialization.md) · [Training to Serving](docs/guides/training-to-serving.md) |
 | **Concepts** | [Point-in-Time Joins](docs/concepts/point-in-time-joins.md) · [Virtual Environments](docs/concepts/virtual-environments.md) · [Glossary](docs/concepts/glossary.md) |
 
+## Changelog
+
+### v2.3.0 (March 2026)
+
+**Incremental Detection** — Automatically skip unchanged data sources and process only new data:
+
+```yaml
+# PostgreSQL watermark-based incremental detection
+- kind: source
+  name: events
+  source: postgresql
+  table: public.events
+  freshness:
+    time_column: created_at  # Tracks MAX(created_at) watermark
+  params:
+    connection: my_pg
+```
+
+- **PostgreSQL Incremental**: Watermark-based detection using `MAX(time_column)` comparison. Automatically generates `WHERE time_col > 'watermark' OR time_col IS NULL` for incremental reads.
+- **Iceberg Incremental**: Snapshot-based detection comparing current snapshot ID. Supports partition pruning for time-partitioned tables.
+- **Skip Optimization**: If fingerprint and watermark match, source execution is skipped entirely.
+- **Cascade Invalidation**: Dependent nodes are automatically invalidated when source data changes.
+- **Full Refresh**: Use `--full` flag to ignore stored watermarks and reload all data.
+
+**Other Changes**:
+- Enhanced QA automation with multi-spec execution support
+- Pipeline error logging with `--verbose` mode
+- Security fix: Updated `cryptography` to 46.0.5 (CVE-2026-26007)
+
+### v2.2.2 (February 2026)
+
+- Entity consolidation for per-entity feature views
+- Multi-target materialization (PostgreSQL + Iceberg from single node)
+- Environment-aware execution with namespace prefixing
+
 ## Install from Source
 
 For development or contributing:
