@@ -247,6 +247,313 @@ def dry_run_command(
         dry_run_yaml(draft_path, file_path, limit, timeout, schema_only)
 
 
+def _resolve_source_path(table: str, project_path: Path) -> Path:
+    """Resolve a source table path against project root.
+
+    Args:
+        table: Table path (relative or absolute)
+        project_path: Project root path
+
+    Returns:
+        Resolved absolute Path
+    """
+    table_path = Path(table)
+    if not table_path.is_absolute():
+        table_path = project_path / table_path
+    return table_path
+
+
+def _load_source_data(node_meta: dict, project_path: Path):
+    """Load data from a source node's configuration for preview.
+
+    Supports all Seeknal source types:
+    - File-based: csv, parquet, json, jsonl, hive
+    - Database: sqlite, postgresql/postgres, starrocks, iceberg
+
+    Args:
+        node_meta: Node metadata from @source decorator
+        project_path: Project root path for resolving relative paths
+
+    Returns:
+        pandas DataFrame or None if loading fails
+    """
+    source_type = node_meta.get("source", "").lower()
+    table = node_meta.get("table", "")
+    params = node_meta.get("params", {})
+
+    if not table and source_type not in ("postgresql", "postgres", "starrocks", "iceberg"):
+        return None
+
+    # File-based sources
+    if source_type in ("csv", "parquet", "json", "jsonl", "excel", "hive"):
+        return _load_file_source(source_type, table, params, project_path)
+
+    # SQLite
+    if source_type == "sqlite":
+        return _load_sqlite_source(table, params, project_path)
+
+    # PostgreSQL
+    if source_type in ("postgresql", "postgres"):
+        return _load_postgresql_source(table, params, project_path)
+
+    # StarRocks
+    if source_type == "starrocks":
+        return _load_starrocks_source(table, params)
+
+    # Iceberg
+    if source_type == "iceberg":
+        return _load_iceberg_source(table, params)
+
+    _echo_warning(f"Source type '{source_type}' not supported for dry-run preview")
+    return None
+
+
+def _load_file_source(source_type: str, table: str, params: dict, project_path: Path):
+    """Load file-based source data using DuckDB."""
+    import duckdb
+
+    table_path = _resolve_source_path(table, project_path)
+    if not table_path.exists():
+        _echo_warning(f"Source file not found: {table_path}")
+        return None
+
+    abs_path = str(table_path.resolve())
+    con = duckdb.connect()
+
+    try:
+        if source_type == "csv":
+            delimiter = params.get("delimiter", "")
+            if delimiter:
+                result = con.execute(
+                    f"SELECT * FROM read_csv('{abs_path}', delim='{delimiter}')"
+                )
+            else:
+                result = con.execute(f"SELECT * FROM read_csv_auto('{abs_path}')")
+
+        elif source_type == "parquet":
+            result = con.execute(f"SELECT * FROM read_parquet('{abs_path}')")
+
+        elif source_type in ("json", "jsonl"):
+            json_format = params.get("format", "auto")
+            if source_type == "jsonl" or json_format == "newline":
+                result = con.execute(
+                    f"SELECT * FROM read_json_auto('{abs_path}', format='newline_delimited')"
+                )
+            elif json_format == "array":
+                result = con.execute(
+                    f"SELECT * FROM read_json_auto('{abs_path}', format='array')"
+                )
+            else:
+                result = con.execute(f"SELECT * FROM read_json_auto('{abs_path}')")
+
+        elif source_type == "excel":
+            try:
+                con.execute("LOAD spatial")
+            except Exception:
+                con.execute("INSTALL spatial; LOAD spatial;")
+            sheet_name = params.get("sheet_name", "")
+            if sheet_name:
+                result = con.execute(f"SELECT * FROM st_read('{abs_path}', layer='{sheet_name}')")
+            else:
+                result = con.execute(f"SELECT * FROM st_read('{abs_path}')")
+
+        elif source_type == "hive":
+            # Hive: detect file type from extension
+            ext = table_path.suffix.lower()
+            if ext in (".parquet", ".pq"):
+                result = con.execute(f"SELECT * FROM read_parquet('{abs_path}')")
+            elif ext == ".csv":
+                result = con.execute(f"SELECT * FROM read_csv_auto('{abs_path}')")
+            else:
+                _echo_warning(f"Cannot detect file format for hive source: {ext}")
+                con.close()
+                return None
+        else:
+            con.close()
+            return None
+
+        df = result.df()
+        con.close()
+        return df
+
+    except Exception as e:
+        con.close()
+        _echo_warning(f"Could not load {source_type} source: {e}")
+        return None
+
+
+def _load_sqlite_source(table: str, params: dict, project_path: Path):
+    """Load SQLite source data using DuckDB."""
+    import duckdb
+
+    db_path = params.get("path", table)
+    query_table = table
+
+    # If table looks like a file path, treat it as db_path
+    if table.endswith((".db", ".sqlite", ".sqlite3")):
+        db_path = table
+        query_table = params.get("table", "main")
+
+    resolved_path = _resolve_source_path(db_path, project_path)
+    if not resolved_path.exists():
+        _echo_warning(f"SQLite database not found: {resolved_path}")
+        return None
+
+    con = duckdb.connect()
+    try:
+        con.execute("INSTALL sqlite; LOAD sqlite;")
+        con.execute(f"ATTACH '{resolved_path}' AS sqlite_db (TYPE sqlite)")
+        schema = params.get("schema", "main")
+        full_table = f"sqlite_db.{schema}.{query_table}" if schema != "main" else f"sqlite_db.{query_table}"
+        df = con.execute(f"SELECT * FROM {full_table}").df()
+        con.close()
+        return df
+    except Exception as e:
+        con.close()
+        _echo_warning(f"Could not load SQLite source: {e}")
+        return None
+
+
+def _load_postgresql_source(table: str, params: dict, project_path: Path):
+    """Load PostgreSQL source data using DuckDB postgres extension."""
+    import duckdb
+
+    connection_name = params.get("connection", "")
+    query = params.get("query", "")
+
+    # Resolve connection config from profiles or inline params
+    conn_params = dict(params)
+    if connection_name:
+        try:
+            from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
+            loader = ProfileLoader()
+            profile = loader.load_connection_profile(connection_name)
+            # Profile as base, inline params override
+            for key, val in conn_params.items():
+                profile[key] = val
+            conn_params = profile
+        except Exception as e:
+            _echo_warning(f"Could not load connection profile '{connection_name}': {e}")
+
+    host = conn_params.get("host", "localhost")
+    port = conn_params.get("port", 5432)
+    user = conn_params.get("user", "")
+    password = conn_params.get("password", "")
+    database = conn_params.get("database", "")
+
+    if not database:
+        _echo_warning("PostgreSQL: no database configured — skipping preview")
+        return None
+
+    dsn = f"host={host} port={port} dbname={database}"
+    if user:
+        dsn += f" user={user}"
+    if password:
+        dsn += f" password={password}"
+    dsn += " connect_timeout=5"
+
+    con = duckdb.connect()
+    try:
+        con.execute("INSTALL postgres; LOAD postgres;")
+        con.execute(f"ATTACH '{dsn}' AS pg_db (TYPE postgres, READ_ONLY)")
+
+        if query:
+            df = con.execute(f"SELECT * FROM postgres_query('pg_db', '{query}')").df()
+        elif table:
+            df = con.execute(f"SELECT * FROM pg_db.{table}").df()
+        else:
+            con.close()
+            _echo_warning("PostgreSQL: no table or query specified")
+            return None
+
+        con.close()
+        return df
+    except Exception as e:
+        con.close()
+        _echo_warning(f"Could not load PostgreSQL source: {e}")
+        _echo_info("Check connection config or use 'seeknal run' for full execution")
+        return None
+
+
+def _load_starrocks_source(table: str, params: dict):
+    """Load StarRocks source data using pymysql."""
+    try:
+        import pymysql
+        import pandas as pd
+    except ImportError:
+        _echo_warning("StarRocks preview requires pymysql: pip install pymysql")
+        return None
+
+    host = params.get("host", "localhost")
+    port = int(params.get("port", 9030))
+    user = params.get("user", "root")
+    password = params.get("password", "")
+    database = params.get("database", "")
+    query = params.get("query", "")
+
+    if not database:
+        _echo_warning("StarRocks: no database configured — skipping preview")
+        return None
+
+    try:
+        conn = pymysql.connect(
+            host=host, port=port, user=user, password=password,
+            database=database, connect_timeout=5
+        )
+        sql = query if query else f"SELECT * FROM {table}"
+        df = pd.read_sql(sql, conn)
+        conn.close()
+        return df
+    except Exception as e:
+        _echo_warning(f"Could not load StarRocks source: {e}")
+        _echo_info("Check connection config or use 'seeknal run' for full execution")
+        return None
+
+
+def _load_iceberg_source(table: str, params: dict):
+    """Load Iceberg source data using DuckDB iceberg extension."""
+    import duckdb
+    import os
+
+    catalog_uri = params.get("catalog_uri", os.environ.get("LAKEKEEPER_URL", ""))
+    warehouse = params.get("warehouse", os.environ.get("LAKEKEEPER_WAREHOUSE", ""))
+
+    if not catalog_uri:
+        _echo_warning("Iceberg: no catalog_uri configured — skipping preview")
+        _echo_info("Set LAKEKEEPER_URL env var or add catalog_uri to params")
+        return None
+
+    con = duckdb.connect()
+    try:
+        con.execute("INSTALL iceberg; LOAD iceberg;")
+
+        # Build ATTACH command with REST catalog
+        attach_opts = f"TYPE ICEBERG, ENDPOINT '{catalog_uri}'"
+        if warehouse:
+            attach_opts += f", WAREHOUSE '{warehouse}'"
+
+        # Add S3/OAuth2 config from environment
+        for env_key, duck_key in [
+            ("AWS_ENDPOINT_URL", "ENDPOINT"),
+            ("AWS_REGION", "REGION"),
+            ("AWS_ACCESS_KEY_ID", "KEY_ID"),
+            ("AWS_SECRET_ACCESS_KEY", "SECRET"),
+        ]:
+            val = os.environ.get(env_key, "")
+            if val:
+                attach_opts += f", {duck_key} '{val}'"
+
+        con.execute(f"ATTACH '' AS iceberg_cat ({attach_opts})")
+        df = con.execute(f"SELECT * FROM iceberg_cat.{table}").df()
+        con.close()
+        return df
+    except Exception as e:
+        con.close()
+        _echo_warning(f"Could not load Iceberg source: {e}")
+        _echo_info("Check Iceberg/Lakekeeper config or use 'seeknal run' for full execution")
+        return None
+
+
 def dry_run_python(file_path: Path, file_path_str: str, limit: int, timeout: int, schema_only: bool):
     """Dry-run for Python pipeline files.
 
@@ -333,35 +640,58 @@ def dry_run_python(file_path: Path, file_path_str: str, limit: int, timeout: int
             spec = importlib.util.spec_from_file_location("pipeline_module", str(file_path))
             module = importlib.util.module_from_spec(spec)
 
-            # Monkey-patch to limit output
-            original_limit = limit
-
-            # Execute the function
+            # Execute the module to register decorators
             spec.loader.exec_module(module)
-            func = getattr(module, metadata.get('name'))
+
+            # Use Python function name (not decorator name=) for module lookup
+            func_name = metadata.get('function_name') or metadata.get('name')
+            func = getattr(module, func_name)
 
             start_time = time.time()
             result = func(ctx)
             duration = time.time() - start_time
 
+            # For source nodes with pass body, load data from source config
+            if result is None and metadata.get('kind') == 'source':
+                node_meta = getattr(func, '_seeknal_node', None)
+                if node_meta:
+                    result = _load_source_data(node_meta, project_path)
+
             # Display preview
             if result is not None:
-                try:
-                    import pandas as pd
-                    if isinstance(result, pd.DataFrame):
-                        # Show first N rows
-                        preview_df = result.head(limit)
+                import pandas as pd
 
-                        # Pretty print table
-                        _echo_info(f"Preview ({len(result)} total rows, showing {limit}):")
-                        print(preview_df.to_string(index=False))
-                    else:
-                        _echo_info(f"Result type: {type(result).__name__}")
-                        _echo_info(f"Result: {result}")
-                except ImportError:
-                    # pandas not available, just show basic info
+                # Convert non-DataFrame results to pandas for display
+                result_df = None
+                if isinstance(result, pd.DataFrame):
+                    result_df = result
+                else:
+                    # Try pyarrow Table
+                    try:
+                        import pyarrow as pa
+                        if isinstance(result, pa.Table):
+                            result_df = result.to_pandas()
+                    except ImportError:
+                        pass
+
+                    # Try DuckDB relation
+                    if result_df is None:
+                        try:
+                            if hasattr(result, 'df'):
+                                result_df = result.df()
+                        except Exception:
+                            pass
+
+                if result_df is not None:
+                    preview_df = result_df.head(limit)
+                    _echo_info(f"Preview ({len(result_df)} total rows, showing {min(limit, len(result_df))}):")
+                    typer.echo(preview_df.to_string(index=False))
+                else:
                     _echo_info(f"Result type: {type(result).__name__}")
                     _echo_info(f"Result: {str(result)[:200]}")
+            else:
+                _echo_warning("No preview data available")
+                _echo_info("Use 'seeknal run' for full execution")
 
             ctx.close()
             _echo_success(f"Preview completed in {duration:.1f}s")

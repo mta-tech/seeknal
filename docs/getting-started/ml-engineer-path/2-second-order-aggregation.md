@@ -115,7 +115,7 @@ The engine then uses `_days_between` to filter time windows:
     ```
     The fix is to add `application_date` to your transform's SELECT clause (see Step 1 below).
 
-**For basic-only aggregations** (no window or ratio features), the `application_date_col` is still required by the engine but `_days_between` values won't affect your results since basic aggregations operate over all rows regardless of time.
+**All aggregation types respect `_days_between`** — including basic aggregations (no window or ratio). The engine filters to `_days_between >= 0`, meaning only rows where `feature_date <= application_date` are included. This prevents data leakage by ensuring no future data is aggregated.
 
 ---
 
@@ -559,9 +559,9 @@ seeknal repl                                            # Interactive verificati
 
 ## What's Next?
 
-[Chapter 3: Build an ML Model →](3-training-serving-parity.md)
+[Chapter 3: Point-in-Time Joins & Training-Serving Parity →](3-training-serving-parity.md)
 
-Train a machine learning model using your feature pipeline, with feature validation and serving for inference.
+Build a production ML pipeline with point-in-time correct training data, temporal SOA features, and online serving for inference.
 
 ---
 
