@@ -10,6 +10,14 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
+import duckdb
+
+from seeknal.connections.postgresql import (
+    parse_postgresql_config,
+    mask_password,
+)
+from seeknal.validation import validate_column_name
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,13 +50,6 @@ def get_max_watermark(
         The watermark is stored as-is from the database (no timezone conversion).
         Comparison is string-based for simplicity.
     """
-    import duckdb
-
-    from seeknal.connections.postgresql import (
-        parse_postgresql_config,
-        mask_password,
-    )
-    from seeknal.validation import validate_column_name
 
     # Validate column name to prevent SQL injection
     validate_column_name(time_column)

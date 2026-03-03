@@ -16,35 +16,37 @@ class TestGetMaxWatermark:
     """Tests for get_max_watermark function."""
 
     @patch("seeknal.workflow.postgresql_metadata.duckdb")
-    def test_get_max_watermark_returns_timestamp(self, mock_duckdb):
+    @patch("seeknal.workflow.postgresql_metadata.parse_postgresql_config")
+    def test_get_max_watermark_returns_timestamp(
+        self, mock_parse_config, mock_duckdb
+    ):
         """Test that get_max_watermark returns the MAX value as string."""
-        # Setup mock
+        # Setup mock config
+        mock_config = MagicMock()
+        mock_config.to_libpq_string.return_value = "postgresql://user:pass@host:5432/db"
+        mock_config.host = "localhost"
+        mock_config.port = 5432
+        mock_config.database = "test_db"
+        mock_parse_config.return_value = mock_config
+
+        # Setup mock connection
         mock_con = MagicMock()
         mock_duckdb.connect.return_value = mock_con
-        mock_con.execute.return_value = None
-        mock_con.__enter__ = MagicMock(return_value=mock_con)
-        mock_con.__exit__ = MagicMock(return_value=None)
 
-        # Mock the query result
-        mock_con.execute.return_value = None
-        mock_fetchone = MagicMock(return_value=("2026-03-03 10:30:00",))
-        mock_con.execute.return_value = None
-        mock_con.execute.side_effect = lambda q: None
-
-        # Actually set up the mock properly
-        mock_result = [("2026-03-03 10:30:00",)]
-        mock_con.execute.return_value = None
-
-        # Create a sequence of return values for execute().fetchone()
-        execute_results = [None, None, None, ("2026-03-03 10:30:00",), (100,)]
+        # Track execute calls
+        execute_results = [
+            None,  # LOAD postgres
+            None,  # ATTACH
+            ("2026-03-03 10:30:00",),  # SELECT MAX query
+        ]
 
         def execute_side_effect(query):
             result = execute_results.pop(0)
             if result is None:
-                return
-            mock_result_obj = MagicMock()
-            mock_result_obj.fetchone.return_value = result
-            return mock_result_obj
+                return None
+            mock_result = MagicMock()
+            mock_result.fetchone.return_value = result
+            return mock_result
 
         mock_con.execute.side_effect = execute_side_effect
 
@@ -68,22 +70,37 @@ class TestGetMaxWatermark:
         assert result == "2026-03-03 10:30:00"
 
     @patch("seeknal.workflow.postgresql_metadata.duckdb")
-    def test_get_max_watermark_returns_none_on_empty_table(self, mock_duckdb):
+    @patch("seeknal.workflow.postgresql_metadata.parse_postgresql_config")
+    def test_get_max_watermark_returns_none_on_empty_table(
+        self, mock_parse_config, mock_duckdb
+    ):
         """Test that get_max_watermark returns None for empty table (MAX returns NULL)."""
-        # Setup mock
+        # Setup mock config
+        mock_config = MagicMock()
+        mock_config.to_libpq_string.return_value = "postgresql://user:pass@host:5432/db"
+        mock_config.host = "localhost"
+        mock_config.port = 5432
+        mock_config.database = "test_db"
+        mock_parse_config.return_value = mock_config
+
+        # Setup mock connection
         mock_con = MagicMock()
         mock_duckdb.connect.return_value = mock_con
 
         # Mock the query result - MAX returns NULL for empty table
-        execute_results = [None, None, None, (None,), (0,)]
+        execute_results = [
+            None,  # LOAD postgres
+            None,  # ATTACH
+            (None,),  # SELECT MAX returns NULL
+        ]
 
         def execute_side_effect(query):
             result = execute_results.pop(0)
             if result is None:
-                return
-            mock_result_obj = MagicMock()
-            mock_result_obj.fetchone.return_value = result
-            return mock_result_obj
+                return None
+            mock_result = MagicMock()
+            mock_result.fetchone.return_value = result
+            return mock_result
 
         mock_con.execute.side_effect = execute_side_effect
 
@@ -133,7 +150,10 @@ class TestGetMaxWatermark:
         connection_params = {"host": "localhost"}
 
         # Test with invalid column name (SQL injection attempt)
-        with pytest.raises(ValueError, match="invalid column name"):
+        # The actual exception is InvalidIdentifierError, which is a subclass of ValueError
+        from seeknal.exceptions._validation_exceptions import InvalidIdentifierError
+
+        with pytest.raises(InvalidIdentifierError):
             get_max_watermark(
                 connection_params=connection_params,
                 schema="public",
