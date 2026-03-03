@@ -1,6 +1,6 @@
 # Chapter 9: Database & External Sources
 
-> **Duration:** 25 minutes | **Difficulty:** Intermediate | **Format:** YAML, Python & CLI
+> **Duration:** 32 minutes | **Difficulty:** Intermediate | **Format:** YAML, Python & CLI
 
 Learn to load data from PostgreSQL, MySQL-compatible databases (StarRocks), and Iceberg tables into your Seeknal pipeline.
 
@@ -8,10 +8,11 @@ Learn to load data from PostgreSQL, MySQL-compatible databases (StarRocks), and 
 
 ## What You'll Build
 
-Three source nodes, each loading from a different external system:
+Four source nodes, each loading from a different external system:
 
 ```
 PostgreSQL (warehouse)  →  source.pg_customers       (table scan)
+PostgreSQL (incremental)→  source.events             (watermark tracking)
 PostgreSQL (pushdown)   →  source.pg_active_orders   (server-side query)
 StarRocks (MySQL)       →  source.sr_daily_metrics   (analytics DB)
 Iceberg (Lakekeeper)    →  source.ice_events         (lakehouse)
@@ -19,7 +20,7 @@ Iceberg (Lakekeeper)    →  source.ice_events         (lakehouse)
 
 **After this chapter, you'll have:**
 - Understanding of profile-based connection management
-- PostgreSQL sources with both table scan and pushdown queries
+- PostgreSQL sources with table scan, pushdown queries, and incremental detection
 - StarRocks sources via MySQL protocol
 - Iceberg sources via REST catalog
 - Python `@source` equivalents for each type
@@ -234,6 +235,166 @@ def pg_active_orders(ctx=None):
 ```
 
 **Checkpoint:** Run `seeknal plan` — you should see `pg_customers` and `pg_active_orders` in the DAG.
+
+---
+
+## Part 2.5: PostgreSQL Incremental Detection (7 minutes)
+
+### What is Incremental Detection?
+
+When processing large PostgreSQL tables on a schedule, loading the entire table every run is wasteful. **Incremental detection** automatically tracks the maximum value of a timestamp column (watermark) and only loads new rows on subsequent runs.
+
+**Benefits:**
+
+- ⚡ **Faster execution** — Only load rows added since last run
+- 💰 **Lower costs** — Reduce network transfer and DuckDB memory
+- 🔄 **Automatic tracking** — Watermark persisted in `run_state.json`
+
+### How It Works
+
+1. **First run:** Full table scan, maximum timestamp stored as watermark
+2. **Subsequent runs:**
+   - Compare current max timestamp with stored watermark
+   - If unchanged: **Skip the source** (no new data)
+   - If changed: Inject `WHERE time_column > 'watermark'` and load only new rows
+3. **Full refresh:** Use `--full` flag to ignore watermark and load everything
+
+### Enable Incremental Detection
+
+Add a `freshness` config with `time_column` to your PostgreSQL source:
+
+```yaml
+# seeknal/sources/events.yml
+kind: source
+name: events
+description: "Raw events from PostgreSQL with incremental detection"
+source: postgresql
+table: public.events
+connection: warehouse_pg
+freshness:
+  time_column: created_at        # Column to track for incremental reads
+```
+
+### Run Behavior Examples
+
+**Run 1: Initial Load**
+
+```bash
+seeknal run --profile profiles.yml
+```
+
+- Loads all rows from `public.events`
+- Stores watermark: `pg_last_watermark: "2026-03-03 10:00:00"`
+- `run_state.json` records the maximum `created_at`
+
+**Run 2: No Changes (Skip Optimization)**
+
+```bash
+seeknal run --profile profiles.yml
+```
+
+- Detects watermark unchanged (max `created_at` still `2026-03-03 10:00:00`)
+- **Skips** the `source.events` node entirely
+- Downstream transforms are also skipped (cached)
+
+**Run 3: New Data Inserted**
+
+```sql
+-- New row inserted into PostgreSQL
+INSERT INTO events (event_type, payload, created_at)
+VALUES ('signup', '{"plan": "pro"}', '2026-03-04 10:00:00');
+```
+
+```bash
+seeknal run --profile profiles.yml
+```
+
+- Detects watermark changed (new max is `2026-03-04 10:00:00`)
+- Injects WHERE clause: `WHERE created_at > '2026-03-03 10:00:00'`
+- Loads only the 1 new row
+- Updates watermark to `2026-03-04 10:00:00`
+
+**Run 4: Full Refresh**
+
+```bash
+seeknal run --profile profiles.yml --full
+```
+
+- Ignores stored watermark
+- Loads all rows (no WHERE clause injection)
+- Recalculates and updates watermark
+
+### Custom Queries Disable Incremental
+
+When you use `params.query`, incremental detection is automatically disabled because Seeknal cannot safely modify your custom SQL:
+
+```yaml
+kind: source
+name: purchase_events
+source: postgresql
+connection: warehouse_pg
+freshness:
+  time_column: created_at        # Has no effect with custom query
+params:
+  query: "SELECT * FROM events WHERE event_type = 'purchase'"
+```
+
+- No WHERE clause injection (your query runs as-is)
+- No watermark tracking (would be inaccurate for filtered data)
+- Every run executes the full query
+
+### View Watermark State
+
+Check `target/run_state.json` after each run:
+
+```json
+{
+  "nodes": {
+    "source.events": {
+      "metadata": {
+        "pg_last_watermark": "2026-03-04 10:00:00",
+        "pg_time_column": "created_at",
+        "row_count": 4
+      }
+    }
+  }
+}
+```
+
+### Python Equivalent
+
+```python
+from seeknal.pipeline import source
+
+@source(
+    name="events",
+    source="postgresql",
+    table="public.events",
+    connection="warehouse_pg",
+    freshness={"time_column": "created_at"},  # Enable incremental
+)
+def events(ctx=None):
+    """Load events incrementally based on created_at watermark."""
+    pass
+```
+
+### When to Use Incremental Detection
+
+| Scenario | Recommendation |
+|----------|----------------|
+| Append-only tables (logs, events) | ✅ Use incremental with `time_column` |
+| Large tables with frequent inserts | ✅ Use incremental |
+| Tables with updates/deletes | ⚠️ Use with caution (may miss updates) |
+| Custom filtered queries | ❌ Incremental disabled automatically |
+| Ad-hoc analysis | ❌ Use `--full` for complete data |
+
+!!! tip "Best Practices"
+    - Choose a **monotonically increasing** column (timestamps, auto-increment IDs)
+    - Use `created_at` for append-only tables, not `updated_at`
+    - Monitor `run_state.json` to verify watermark updates
+    - Use `--full` for backfills or when you need complete data
+
+**Checkpoint:** Add `freshness.time_column` to your PostgreSQL source and run twice — observe skip behavior on the second run.
 
 ---
 
@@ -470,6 +631,21 @@ table: atlas.events.signals
     - Symptom: `Cannot specify both 'table' and 'query' in params`
     - Fix: For pushdown queries, put the query in `params.query` only. Remove or leave `table:` as documentation.
 
+    **8. Incremental detection with non-monotonic column**
+
+    - Symptom: Missed rows when using `updated_at` for incremental
+    - Fix: Use a monotonically increasing column like `created_at` or auto-increment ID. Avoid `updated_at` for append-only logic.
+
+    **9. Incremental not working with custom query**
+
+    - Symptom: Watermark not tracked, full data loaded every run
+    - Fix: Incremental detection is **automatically disabled** for custom queries (`params.query`). This is expected behavior — the custom query runs as-is.
+
+    **10. Stale watermark after data deletion**
+
+    - Symptom: No new rows loaded after deleting recent data
+    - Fix: Run with `--full` flag to reset watermark, or manually edit `target/run_state.json` to clear `pg_last_watermark`.
+
 ---
 
 ## Summary
@@ -477,7 +653,8 @@ table: atlas.events.signals
 In this chapter, you learned:
 
 - [x] **Connection Profiles** — Centralize credentials in `profiles.yml` with env var interpolation
-- [x] **PostgreSQL Sources** — Table scan (`table: schema.table`) and pushdown query (`params.query`)
+- [x] **PostgreSQL Sources** — Table scan (`table: schema.table`), pushdown query (`params.query`), and incremental detection (`freshness.time_column`)
+- [x] **Incremental Detection** — Automatic watermark tracking, WHERE clause injection, skip optimization, and `--full` refresh
 - [x] **StarRocks Sources** — MySQL protocol via pymysql (port 9030)
 - [x] **Iceberg Sources** — REST catalog with OAuth2 and S3 credentials
 - [x] **source_defaults** — Default connection settings per source type in profiles
@@ -490,6 +667,7 @@ In this chapter, you learned:
 | **Connection** | `connection: name` | inline `params:` | env vars + `params:` |
 | **Table format** | `schema.table` | `database.table` | `catalog.namespace.table` |
 | **Pushdown** | `params.query` | `params.query` | Not supported |
+| **Incremental** | `freshness.time_column` | Not supported | See Chapter 10 |
 | **DuckDB mechanism** | `ATTACH` + postgres ext | pymysql → pandas → view | `ATTACH` + iceberg ext |
 
 **Key Commands:**
@@ -505,12 +683,9 @@ seeknal repl                                          # Query results
 
 ## What's Next?
 
-You've completed the Advanced Guide! Explore other paths or dive into reference documentation:
+Now that you can connect to external databases and Iceberg catalogs, learn how to **process Iceberg data incrementally** — detecting changes via snapshots, loading only new rows with watermark tracking, and cascading selectively through mixed-source pipelines.
 
-- **[Python Pipelines Guide](../../guides/python-pipelines.md)** — Full decorator reference
-- **[Entity Consolidation Guide](../../guides/entity-consolidation.md)** — Cross-FG retrieval and materialization
-- **[CLI Reference](../../reference/cli.md)** — All commands and flags
-- **[YAML Schema Reference](../../reference/yaml-schema.md)** — Source, transform, and profile schemas
+**[Chapter 10: Iceberg Incremental Processing →](10-iceberg-incremental.md)**
 
 ---
 

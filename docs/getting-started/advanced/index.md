@@ -1,8 +1,8 @@
 # Advanced Guide
 
-**Duration:** ~180 minutes | **Difficulty:** Intermediate | **Format:** YAML, Python & CLI
+**Duration:** ~217 minutes | **Difficulty:** Intermediate | **Format:** YAML, Python & CLI
 
-Go deeper with Seeknal's advanced capabilities: multi-format file sources, data quality rules, pipeline lineage visualization, named references, shared configuration, Python pipelines, and database/external source connections.
+Go deeper with Seeknal's advanced capabilities: multi-format file sources, data quality rules, pipeline lineage visualization, named references, shared configuration, Python pipelines, database/external source connections with incremental detection, and incremental Iceberg processing.
 
 ---
 
@@ -18,7 +18,8 @@ Take your Seeknal skills to the next level with advanced features that improve p
 6. **Common Configuration** - Shared column mappings, rules, and SQL snippets
 7. **Data Profiling** - Compute statistics and validate with threshold checks
 8. **Python Pipelines** - Build nodes with Python decorators and mix with YAML
-9. **Database & External Sources** - Connect to PostgreSQL, StarRocks, and Iceberg
+9. **Database & External Sources** - Connect to PostgreSQL, StarRocks, and Iceberg with incremental detection
+10. **Iceberg Incremental Processing** - Snapshot detection, watermark tracking, and selective cascade
 
 ---
 
@@ -203,12 +204,13 @@ source.exchange_rates (Python) ────────→ transform.category_in
 
 ---
 
-### Chapter 9: Database & External Sources (~25 minutes)
+### Chapter 9: Database & External Sources (~32 minutes)
 
 Connect to PostgreSQL, StarRocks (MySQL), and Iceberg lakehouse tables:
 
 ```
 PostgreSQL  →  source.pg_customers       (table scan)
+            →  source.events             (incremental detection)
             →  source.pg_active_orders   (pushdown query)
 StarRocks   →  source.sr_daily_metrics   (MySQL protocol)
 Iceberg     →  source.ice_events         (REST catalog)
@@ -216,12 +218,38 @@ Iceberg     →  source.ice_events         (REST catalog)
 
 **You'll learn:**
 - Connection profiles with env var interpolation (`profiles.yml`)
-- PostgreSQL table scan and pushdown query sources
+- PostgreSQL table scan, pushdown query, and incremental detection sources
+- Automatic watermark tracking and WHERE clause injection for incremental reads
+- Skip optimization for unchanged sources and `--full` refresh override
 - StarRocks sources via MySQL protocol (pymysql)
 - Iceberg sources via Lakekeeper REST catalog with OAuth2
 - `source_defaults` for per-type default connections
 
 **[Start Chapter 9 →](9-database-sources.md)**
+
+---
+
+### Chapter 10: Iceberg Incremental Processing (~30 minutes)
+
+Detect Iceberg data changes, load only new rows, and cascade selectively:
+
+```
+Iceberg (events)  ──→  transform.event_summary  ──→  transform.enriched_events
+                         ▲                              ▲
+                    watermark tracked              selective cascade
+                    in run_state.json              (only changed branches)
+CSV (categories)  ─────────────────────────────────────┘
+```
+
+**You'll learn:**
+
+- Snapshot-based change detection (automatic caching)
+- Partition-pruned incremental reads with `freshness.time_column`
+- Watermark tracking and NULL-safe filters
+- Mixed-source cascade (Iceberg + CSV)
+- Full refresh override with `--full`
+
+**[Start Chapter 10 →](10-iceberg-incremental.md)**
 
 ---
 

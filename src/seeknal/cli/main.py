@@ -995,6 +995,52 @@ def _run_yaml_pipeline(
     # Determine nodes to run
     nodes_to_run = get_nodes_to_run(current_hashes, old_state, dag_adjacency)
 
+    # Iceberg snapshot-based change detection:
+    # Check if any Iceberg source nodes have new data (changed snapshot ID)
+    # even if the YAML hash hasn't changed.
+    if not full and old_state:
+        from seeknal.workflow.state import find_downstream_nodes
+
+        iceberg_changed: set[str] = set()
+        for node_id, node in dag_builder.nodes.items():
+            if node_id in nodes_to_run:
+                continue  # already marked for execution
+            if node.kind.value != "source":
+                continue
+            yaml_data = node.yaml_data or {}
+            if yaml_data.get("source") != "iceberg":
+                continue
+            table_ref = yaml_data.get("table")
+            if not table_ref:
+                continue
+
+            try:
+                from seeknal.workflow.iceberg_metadata import get_current_snapshot_id
+                current_snap, _ = get_current_snapshot_id(
+                    table_ref=table_ref,
+                    params=yaml_data.get("params", {}),
+                )
+            except Exception:
+                current_snap = None
+
+            stored_node = old_state.nodes.get(node_id)
+            # Look for snapshot in top-level field first, then metadata
+            stored_snap = None
+            if stored_node:
+                stored_snap = stored_node.iceberg_snapshot_id
+                if not stored_snap:
+                    stored_snap = stored_node.metadata.get("iceberg_snapshot_id")
+
+            if current_snap is None:
+                # Catalog unreachable -- force re-execution
+                iceberg_changed.add(node_id)
+            elif current_snap != stored_snap:
+                iceberg_changed.add(node_id)
+
+        if iceberg_changed:
+            iceberg_to_run = find_downstream_nodes(dag_adjacency, iceberg_changed)
+            nodes_to_run |= iceberg_to_run
+
     # Apply filters
     if full:
         # Override: run all nodes
@@ -1231,6 +1277,29 @@ def _run_yaml_pipeline(
         # Actual execution using executors
         node_start = time.time()
 
+        # Inject Iceberg watermark for incremental reads
+        # Skip watermark on --full refresh so executor does a full scan
+        if (
+            node.kind.value == "source"
+            and node.yaml_data.get("source") == "iceberg"
+            and not full
+        ):
+            # Check current run_state first, then fall back to old_state
+            stored = run_state.nodes.get(node_id)
+            if not stored and old_state:
+                stored = old_state.nodes.get(node_id)
+            wm = None
+            if stored:
+                wm = stored.last_watermark
+                if not wm:
+                    wm = stored.metadata.get("last_watermark")
+            if wm:
+                exec_context.config["_iceberg_last_watermark"] = wm
+            else:
+                exec_context.config.pop("_iceberg_last_watermark", None)
+        else:
+            exec_context.config.pop("_iceberg_last_watermark", None)
+
         try:
             # Get executor for node type
             executor = get_executor(node, exec_context)
@@ -1258,6 +1327,19 @@ def _run_yaml_pipeline(
                     metadata=result.metadata,
                     hash=current_hash,
                 )
+
+                # Persist Iceberg metadata to top-level NodeState fields
+                # so snapshot-based change detection works on next run
+                if node.kind.value == "source" and node.yaml_data.get("source") == "iceberg":
+                    iceberg_meta = result.metadata or {}
+                    ns = run_state.nodes.get(node_id)
+                    if ns and iceberg_meta.get("iceberg_snapshot_id"):
+                        ns.iceberg_snapshot_id = iceberg_meta["iceberg_snapshot_id"]
+                    if ns and iceberg_meta.get("iceberg_table_ref"):
+                        ns.iceberg_table_ref = iceberg_meta["iceberg_table_ref"]
+                    if ns and iceberg_meta.get("last_watermark"):
+                        ns.last_watermark = iceberg_meta["last_watermark"]
+
                 successful += 1
                 run_logger.log_node(
                     node_id, "SUCCESS",

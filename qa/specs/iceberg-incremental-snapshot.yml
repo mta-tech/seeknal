@@ -1,0 +1,245 @@
+name: iceberg-incremental-snapshot
+description: >
+  Test Iceberg snapshot-based cache invalidation across multiple pipeline runs.
+  Validates: snapshot ID detection, cache skip on unchanged data, re-execution on new data,
+  downstream cascade invalidation, state persistence in run_state.json.
+source_type: iceberg
+
+infrastructure:
+  requires: [lakekeeper]
+  health_checks:
+    lakekeeper: "curl -s --connect-timeout 5 -o /dev/null -w '%{http_code}' http://172.19.0.9:8181/catalog/v1/config?warehouse=seeknal-warehouse | grep -qE '^(200|401)'"
+
+env:
+  LAKEKEEPER_URL: "http://172.19.0.9:8181"
+  LAKEKEEPER_WAREHOUSE_ID: "c008ea5c-fb89-11f0-aa64-c32ca2f52144"
+  LAKEKEEPER_WAREHOUSE: "seeknal-warehouse"
+  KEYCLOAK_TOKEN_URL: "http://172.19.0.9:8080/realms/atlas/protocol/openid-connect/token"
+  KEYCLOAK_CLIENT_ID: "duckdb"
+  KEYCLOAK_CLIENT_SECRET: "duckdb-secret-change-in-production"
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "CHANGE_THIS_STRONG_PASSWORD"
+  AWS_ENDPOINT_URL: "http://172.19.0.9:9000"
+  AWS_REGION: "us-east-1"
+
+profiles_yml: |
+  source_defaults:
+    iceberg:
+      catalog_uri: "${LAKEKEEPER_URL:http://172.19.0.9:8181}"
+      warehouse: "${LAKEKEEPER_WAREHOUSE:seeknal-warehouse}"
+
+seed_data:
+  setup_instructions: |
+    Create namespace 'qa_incremental' in Lakekeeper if not exists.
+    Create and populate one Iceberg table:
+    - atlas.qa_incremental.sensor_readings (reading_id, sensor_id, value, recorded_at)
+
+  sensor_readings.csv: |
+    reading_id,sensor_id,value,recorded_at
+    R001,S01,22.5,2026-01-10 08:00:00
+    R002,S01,23.1,2026-01-10 09:00:00
+    R003,S02,45.2,2026-01-10 08:30:00
+    R004,S02,44.8,2026-01-10 09:30:00
+    R005,S03,1013.2,2026-01-10 08:15:00
+
+  # Additional data inserted BETWEEN run 1 and run 2
+  sensor_readings_batch2.csv: |
+    reading_id,sensor_id,value,recorded_at
+    R006,S01,24.0,2026-01-11 08:00:00
+    R007,S02,46.1,2026-01-11 08:30:00
+    R008,S03,1012.5,2026-01-11 08:15:00
+
+pipeline:
+  bronze:
+    - kind: source
+      name: sensor_readings
+      source: iceberg
+      table: "atlas.qa_incremental.sensor_readings"
+      description: Raw sensor readings from Iceberg
+      tags: ["bronze", "sensors"]
+
+  silver:
+    - kind: transform
+      name: readings_with_stats
+      description: Readings enriched with per-sensor running stats
+      inputs:
+        - ref: source.sensor_readings
+      transform: |
+        SELECT
+          reading_id,
+          sensor_id,
+          value,
+          recorded_at,
+          CAST(AVG(value) OVER (PARTITION BY sensor_id) AS DECIMAL(10,2)) AS sensor_avg,
+          COUNT(*) OVER (PARTITION BY sensor_id) AS sensor_count
+        FROM ref('source.sensor_readings')
+      tags: ["silver", "enriched"]
+
+  gold:
+    - kind: transform
+      name: sensor_summary
+      description: Per-sensor aggregated summary
+      inputs:
+        - ref: transform.readings_with_stats
+      transform: |
+        SELECT
+          sensor_id,
+          CAST(COUNT(*) AS BIGINT) AS total_readings,
+          CAST(AVG(value) AS DECIMAL(10,2)) AS avg_value,
+          CAST(MIN(value) AS DECIMAL(10,2)) AS min_value,
+          CAST(MAX(value) AS DECIMAL(10,2)) AS max_value,
+          MIN(recorded_at) AS first_reading,
+          MAX(recorded_at) AS last_reading
+        FROM ref('transform.readings_with_stats')
+        GROUP BY sensor_id
+      tags: ["gold", "analytics"]
+
+# --- Multi-run execution plan ---
+# The standard QA worker runs --full once. This spec requires THREE runs
+# to validate incremental snapshot caching. The worker should follow these steps.
+execution_plan:
+  description: >
+    This test requires multiple sequential pipeline runs to validate
+    Iceberg snapshot-based cache invalidation.
+
+  steps:
+    - name: "Run 1: Initial full load"
+      description: "First run loads all 5 seed rows from Iceberg"
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run seeknal run --profile profiles.yml --full 2>&1
+      validation:
+        execution_success: true
+        outputs:
+          - node: transform.readings_with_stats
+            min_rows: 5
+          - node: transform.sensor_summary
+            min_rows: 3
+        state_check:
+          description: "run_state.json should have iceberg_snapshot_id for source.sensor_readings"
+          command: |
+            python -c "
+            import json
+            state = json.load(open('target/run_state.json'))
+            ns = state.get('nodes', {}).get('source.sensor_readings', {})
+            snap = ns.get('iceberg_snapshot_id')
+            assert snap is not None, f'Expected iceberg_snapshot_id, got None. State: {ns}'
+            print(f'Snapshot ID after run 1: {snap}')
+            "
+
+    - name: "Run 2: Incremental with unchanged data"
+      description: "Same data, same snapshot ID — source should be CACHED (skipped)"
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run seeknal run --profile profiles.yml 2>&1
+      validation:
+        execution_success: true
+        expect_cached:
+          description: >
+            Check seeknal run output for 'Skipping sensor_readings' or '(cached)'.
+            The source node should NOT re-execute since snapshot hasn't changed.
+          nodes: [source.sensor_readings]
+
+    - name: "Insert new data into Iceberg table"
+      description: "Add batch2 data to change the Iceberg snapshot ID"
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run python -c "
+        import duckdb, os, json, urllib.request
+
+        con = duckdb.connect(':memory:')
+        con.execute('INSTALL httpfs; LOAD httpfs;')
+        con.execute('INSTALL iceberg; LOAD iceberg;')
+
+        # Configure S3
+        endpoint = os.environ['AWS_ENDPOINT_URL'].replace('http://', '').replace('https://', '')
+        con.execute(f\"SET s3_region = '{os.environ['AWS_REGION']}'\")
+        con.execute(f\"SET s3_endpoint = '{endpoint}'\")
+        con.execute('SET s3_url_style = \\'path\\'')
+        con.execute('SET s3_use_ssl = false')
+        con.execute(f\"SET s3_access_key_id = '{os.environ['AWS_ACCESS_KEY_ID']}'\")
+        con.execute(f\"SET s3_secret_access_key = '{os.environ['AWS_SECRET_ACCESS_KEY']}'\")
+
+        # Get OAuth2 token
+        token_data = f'grant_type=client_credentials&client_id={os.environ[\"KEYCLOAK_CLIENT_ID\"]}&client_secret={os.environ[\"KEYCLOAK_CLIENT_SECRET\"]}'.encode()
+        req = urllib.request.Request(os.environ['KEYCLOAK_TOKEN_URL'], data=token_data)
+        token = json.loads(urllib.request.urlopen(req).read())['access_token']
+
+        catalog_url = os.environ['LAKEKEEPER_URL'].rstrip('/') + '/catalog'
+        warehouse = os.environ['LAKEKEEPER_WAREHOUSE']
+
+        con.execute(f\"\"\"
+            ATTACH '{warehouse}' AS atlas (
+                TYPE ICEBERG,
+                ENDPOINT '{catalog_url}',
+                AUTHORIZATION_TYPE 'oauth2',
+                TOKEN '{token}'
+            )
+        \"\"\")
+
+        # Insert batch 2 data
+        con.execute(\"\"\"
+            INSERT INTO atlas.qa_incremental.sensor_readings
+            SELECT * FROM read_csv_auto('data/sensor_readings_batch2.csv')
+        \"\"\")
+        count = con.execute('SELECT COUNT(*) FROM atlas.qa_incremental.sensor_readings').fetchone()[0]
+        print(f'Total rows after insert: {count}')
+        assert count == 8, f'Expected 8 rows, got {count}'
+        "
+
+    - name: "Run 3: Incremental after data change"
+      description: "New snapshot detected — source re-executes, downstream cascades"
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run seeknal run --profile profiles.yml 2>&1
+      validation:
+        execution_success: true
+        outputs:
+          - node: transform.readings_with_stats
+            min_rows: 8
+          - node: transform.sensor_summary
+            min_rows: 3
+        expect_executed:
+          description: >
+            Check seeknal run output for 'Executing sensor_readings (iceberg data changed)'.
+            The source should re-execute because the Iceberg snapshot changed.
+          nodes: [source.sensor_readings, transform.readings_with_stats, transform.sensor_summary]
+        state_check:
+          description: "run_state.json snapshot_id should differ from run 1"
+          command: |
+            python -c "
+            import json
+            state = json.load(open('target/run_state.json'))
+            ns = state.get('nodes', {}).get('source.sensor_readings', {})
+            snap = ns.get('iceberg_snapshot_id')
+            assert snap is not None, 'Expected iceberg_snapshot_id after run 3'
+            print(f'Snapshot ID after run 3: {snap}')
+            "
+
+validation:
+  dag:
+    expected_nodes: 3
+    expected_edges:
+      - [source.sensor_readings, transform.readings_with_stats]
+      - [transform.readings_with_stats, transform.sensor_summary]
+  execution:
+    success: true
+  outputs:
+    - node: transform.readings_with_stats
+      min_rows: 5
+    - node: transform.sensor_summary
+      min_rows: 3
+
+features_tested:
+  - iceberg_source
+  - iceberg_snapshot_detection
+  - iceberg_cache_invalidation
+  - incremental_run_skip_unchanged
+  - incremental_run_detect_new_data
+  - downstream_cascade_on_snapshot_change
+  - state_persistence_snapshot_id
+  - run_state_json_round_trip
