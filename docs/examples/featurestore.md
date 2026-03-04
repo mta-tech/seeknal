@@ -89,34 +89,42 @@ fg.write(feature_start_time=datetime(2024, 1, 1))
 
 ### Retrieving Historical Features
 
-```python
-# Create feature lookup
-lookup = FeatureLookup(source=fg)
+Use `FeatureFrame.pit_join()` within transforms:
 
-# Retrieve latest features
-hist = HistoricalFeaturesDuckDB(lookups=[lookup])
-df = hist.to_dataframe(feature_start_time=datetime(2024, 1, 1))
-print(df)
+```python
+from seeknal.pipeline import transform
+
+@transform(name="training_data")
+def training_data(ctx):
+    # Get labels spine (user_id, application_date, label)
+    labels = ctx.ref("source.churn_labels")
+
+    # PIT join: features as of each application_date
+    features_df = ctx.ref("feature_group.user_activity_features").pit_join(
+        spine=labels,
+        date_col="application_date",
+        keep_cols=["label"],
+    )
+    return features_df
 ```
 
 ### Online Feature Serving
 
+Use `ctx.features()` for real-time feature lookup:
+
 ```python
-# Serve features for real-time inference
-online_table = hist.serve(name="user_features_online")
+from seeknal.pipeline import transform
 
-# Get features for specific entity keys
-features = online_table.get_features(keys=[{"user_id": "user_001"}])
-print(features)
-# Output: [{"user_id": "user_001", "total_spend": 150.0, "order_count": 3}]
+@transform(name="predictions")
+def predictions(ctx):
+    # Get latest features for all users
+    features = ctx.features("user", [
+        "user_activity_features.total_spend",
+        "user_activity_features.order_count",
+    ])
 
-# Get features for multiple entities
-features = online_table.get_features(
-    keys=[
-        {"user_id": "user_001"},
-        {"user_id": "user_002"},
-    ]
-)
+    # features is a DataFrame with all users' latest features
+    return features
 ```
 
 ### DuckDB Performance
@@ -250,36 +258,28 @@ df_features.write()
 
 ---
 
-## Retrieving Historical Features (Spark)
+## Retrieving Historical Features (Pipeline Approach)
 
-### Point-in-Time Joins with Spine
+### Point-in-Time Joins in Transforms
 
-For training data, use a spine DataFrame to ensure point-in-time correctness:
+For training data, use `FeatureFrame.pit_join()` in a transform:
 
 ```python
-import pandas as pd
-from seeknal.featurestore import HistoricalFeatures, FeatureLookup
+from seeknal.pipeline import transform
 
-# Training data spine with entity keys and timestamps
-spine = pd.DataFrame({
-    "user_id": ["user_001", "user_002", "user_003"],
-    "label_date": ["2024-01-20", "2024-01-20", "2024-01-20"],
-    "target": [1, 0, 1],
-})
+@transform(name="training_data")
+def training_data(ctx):
+    # Get labels spine (user_id, label_date, target)
+    labels = ctx.ref("source.churn_labels")
 
-# Retrieve features with point-in-time correctness
-training_df = (
-    HistoricalFeatures(lookups=[FeatureLookup(source=user_features)])
-    .using_spine(
-        spine=spine,
+    # PIT join: get features as of each label_date
+    training_df = ctx.ref("feature_group.user_activity_features").pit_join(
+        spine=labels,
         date_col="label_date",
-        offset=0,
         keep_cols=["target"],
     )
-    .to_dataframe()
-)
 
-training_df.show()
+    return training_df
 ```
 
 !!! warning "Point-in-Time Correctness"
@@ -289,19 +289,26 @@ training_df.show()
 ### Handling Null Values
 
 ```python
-from seeknal.featurestore import HistoricalFeatures, FeatureLookup, FillNull
+@transform(name="training_data")
+def training_data(ctx):
+    labels = ctx.ref("source.churn_labels")
 
-fill_nulls = [
-    FillNull(value="0", dataType="double", columns=["total_spend"]),
-    FillNull(value="-1", dataType="int", columns=["order_count"]),
-]
+    training_df = ctx.ref("feature_group.user_features").pit_join(
+        spine=labels,
+        date_col="label_date",
+        keep_cols=["target"],
+    )
 
-historical = HistoricalFeatures(
-    lookups=[FeatureLookup(source=user_features)],
-    fill_nulls=fill_nulls,
-)
-
-df = historical.using_latest().to_dataframe()
+    # Fill nulls using DuckDB SQL
+    return ctx.duckdb.sql("""
+        SELECT
+            user_id,
+            label_date,
+            target,
+            COALESCE(total_spend, 0.0) AS total_spend,
+            COALESCE(order_count, -1) AS order_count
+        FROM training_df
+    """).df()
 ```
 
 ---

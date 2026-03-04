@@ -230,65 +230,30 @@ user_features.write(
 
 Use point-in-time joins to create training datasets without data leakage.
 
-### Basic Historical Features
+### Point-in-Time Join with FeatureFrame (Recommended)
+
+Within a `@transform` function, use `FeatureFrame.pit_join()` for the simplest API:
 
 ```python
-from seeknal.featurestore.duckdbengine.feature_group import (
-    HistoricalFeaturesDuckDB,
-    FeatureLookup,
+from seeknal.pipeline import transform
+
+@transform(
+    name="training_data",
+    description="PIT-joined training data for churn model"
 )
+def training_data(ctx):
+    """Create training dataset with point-in-time correctness."""
+    # Get labels spine (has user_id, application_date, label)
+    labels = ctx.ref("source.churn_labels")
 
-# Define which features to retrieve
-lookup = FeatureLookup(
-    source=user_features,
-    features=[  # Optional: specific features
-        "total_sessions_7d",
-        "avg_session_duration",
-        "conversion_count"
-    ]
-)
+    # PIT join: get features as of each application_date
+    training_df = ctx.ref("feature_group.user_behavior_features").pit_join(
+        spine=labels,
+        date_col="application_date",
+        keep_cols=["label"],
+    )
 
-# Create historical features retriever
-hist = HistoricalFeaturesDuckDB(lookups=[lookup])
-
-# Get features as DataFrame
-training_df = hist.to_dataframe(
-    feature_start_time=datetime(2024, 1, 1),
-    feature_end_time=datetime(2024, 10, 31),
-)
-
-print(f"Training dataset: {training_df.shape}")
-print(training_df.head())
-```
-
-### Point-in-Time Join with Spine
-
-For more control, use a **spine** (DataFrame with entity keys and application dates):
-
-```python
-import pandas as pd
-
-# Create spine: user_id + date when we want features
-spine = pd.DataFrame({
-    'user_id': ['user_001', 'user_002', 'user_003'],
-    'application_date': [
-        datetime(2024, 3, 15),
-        datetime(2024, 6, 20),
-        datetime(2024, 9, 10),
-    ],
-    'label': [1, 0, 1],  # Churn label
-})
-
-# Point-in-time join: get features as of application_date
-training_df = hist.using_spine(
-    spine=spine,
-    date_col='application_date',
-    keep_cols=['label']  # Keep label column
-).to_dataframe_with_spine()
-
-# Result: features as they existed at application_date
-# No future data leakage!
-print(training_df.head())
+    return training_df
 ```
 
 **What Point-in-Time Join Does:**
@@ -301,41 +266,53 @@ For each row in the spine:
 
 ### Multiple Feature Groups
 
-Join features from multiple feature groups:
+Join features from multiple feature groups by chaining PIT joins:
 
 ```python
-from seeknal.featurestore.duckdbengine.feature_group import FeatureLookup
+@transform(name="training_data")
+def training_data(ctx):
+    labels = ctx.ref("source.churn_labels")
 
-# Define multiple lookups
-user_lookup = FeatureLookup(source=user_features)
-product_lookup = FeatureLookup(source=product_features)
+    # PIT join from user features
+    df = ctx.ref("feature_group.user_behavior_features").pit_join(
+        spine=labels,
+        date_col="application_date",
+        keep_cols=["label"],
+    )
 
-# Join features from both groups
-hist = HistoricalFeaturesDuckDB(
-    lookups=[user_lookup, product_lookup]
-)
+    # PIT join from product features (use previous result as spine)
+    df = ctx.ref("feature_group.product_features").pit_join(
+        spine=df,
+        date_col="application_date",
+    )
 
-training_df = hist.to_dataframe(
-    feature_start_time=datetime(2024, 1, 1)
-)
+    return df
 ```
 
 ### Handle Missing Features
 
 ```python
-from seeknal.featurestore.duckdbengine.feature_group import FillNull
+@transform(name="training_data")
+def training_data(ctx):
+    labels = ctx.ref("source.churn_labels")
 
-# Define fill strategies
-fillnull_strategy = FillNull(value="0.0", dataType="double")
+    training_df = ctx.ref("feature_group.user_behavior_features").pit_join(
+        spine=labels,
+        date_col="application_date",
+        keep_cols=["label"],
+    )
 
-hist = HistoricalFeaturesDuckDB(
-    lookups=[lookup],
-    fill_nulls=[fillnull_strategy]
-)
-
-training_df = hist.to_dataframe(
-    feature_start_time=datetime(2024, 1, 1)
-)
+    # Fill nulls using DuckDB COALESCE
+    return ctx.duckdb.sql("""
+        SELECT
+            user_id,
+            application_date,
+            label,
+            COALESCE(total_sessions_7d, 0) AS total_sessions_7d,
+            COALESCE(avg_session_duration, 0.0) AS avg_session_duration,
+            COALESCE(conversion_count, 0) AS conversion_count
+        FROM training_df
+    """).df()
 ```
 
 ## Step 4: Train Your Model
@@ -441,65 +418,81 @@ torch.save(model.state_dict(), "churn_model.pth")
 
 Deploy features to the online store for low-latency inference.
 
-### Deploy to Online Store
+### Retrieve Features with ctx.features()
+
+Within a `@transform` function, use `ctx.features()` for online feature lookup:
 
 ```python
-from seeknal.featurestore.duckdbengine.feature_group import (
-    OnlineFeaturesDuckDB,
-)
+from seeknal.pipeline import transform
 
-# Serve features to online store
-online_table = hist.serve(name="user_features_online")
+@transform(name="predictions")
+def predictions(ctx):
+    """Generate predictions using online features."""
+    # Get latest features from consolidated entity store
+    features = ctx.features("user", [
+        "user_behavior.total_sessions_7d",
+        "user_behavior.avg_session_duration",
+        "user_behavior.pages_per_session",
+        "user_behavior.conversion_count",
+    ])
 
-print(f"Online table created: {online_table.name}")
+    return features
 ```
 
 ### Retrieve Features for Inference
 
 ```python
-# Load model
-import joblib
-model = joblib.load("churn_model.pkl")
+@transform(name="churn_predictions")
+def churn_predictions(ctx):
+    import joblib
 
-# Get features for a specific user
-user_keys = [{"user_id": "user_12345"}]
+    # Load trained model
+    model = joblib.load("models/churn_model.pkl")
 
-feature_df = online_table.get_features(keys=user_keys)
-print(feature_df)
+    # Get latest features for all users
+    features_df = ctx.features("user", [
+        "user_behavior.total_sessions_7d",
+        "user_behavior.avg_session_duration",
+        "user_behavior.pages_per_session",
+        "user_behavior.conversion_count",
+    ])
 
-# Example output (pd.DataFrame):
-#       user_id  total_sessions_7d  avg_session_duration  pages_per_session  conversion_count
-# 0  user_12345                 15                 180.5                3.2                 2
+    # Make predictions
+    feature_cols = [
+        "total_sessions_7d",
+        "avg_session_duration",
+        "pages_per_session",
+        "conversion_count",
+    ]
 
-# Make prediction
-X_inference = feature_df[feature_cols]
-prediction = model.predict_proba(X_inference)[:, 1]
+    X = features_df[feature_cols].fillna(0)
+    features_df["churn_probability"] = model.predict_proba(X)[:, 1]
 
-print(f"Churn probability: {prediction[0]:.4f}")
+    return features_df[["user_id", "churn_probability"]]
 ```
 
 ### Batch Inference
 
 ```python
-# Get features for multiple users
-user_keys = [
-    {"user_id": "user_001"},
-    {"user_id": "user_002"},
-    {"user_id": "user_003"},
-]
+@transform(name="batch_predictions")
+def batch_predictions(ctx):
+    import joblib
 
-feature_df = online_table.get_features(keys=user_keys)
+    model = joblib.load("models/churn_model.pkl")
 
-# Batch prediction
-X_batch = feature_df[feature_cols]
-predictions = model.predict_proba(X_batch)[:, 1]
+    # Get features for all users in the entity store
+    features_df = ctx.features("user", [
+        "user_behavior.total_sessions_7d",
+        "user_behavior.avg_session_duration",
+        "user_behavior.conversion_count",
+    ])
 
-results = pd.DataFrame({
-    'user_id': feature_df['user_id'],
-    'churn_probability': predictions
-})
+    # Batch prediction
+    feature_cols = ["total_sessions_7d", "avg_session_duration", "conversion_count"]
+    X = features_df[feature_cols].fillna(0)
+    features_df["churn_probability"] = model.predict_proba(X)[:, 1]
 
-print(results)
+    return features_df[["user_id", "churn_probability"]]
 ```
 
 ## Training-Serving Parity
@@ -534,30 +527,33 @@ print(results)
 
 ### Verifying Parity
 
+In REPL, verify that training and serving use the same features:
+
+```sql
+-- Check feature schema from consolidated entity
+DESCRIBE entity_user;
+
+-- Check offline training data schema
+DESCRIBE transform_training_data;
+
+-- Compare column names and types
+SELECT column_name, data_type
+FROM (DESCRIBE transform_training_data)
+ORDER BY column_name;
+```
+
+Or in Python:
+
 ```python
-# Check feature schema (reconstruct from saved config)
-fg = FeatureGroupDuckDB(
-    name="user_behavior_features",
-    entity=Entity(name="user", join_keys=["user_id"]),
-    materialization=Materialization(event_time_col="event_timestamp"),
-)
+# Check entity catalog
+!seeknal entity show user
 
-print(f"Features: {fg.features}")
-print(f"Entity: {fg.entity.join_keys}")
-print(f"Event time: {fg.materialization.event_time_col}")
-
-# Verify offline data
-hist = HistoricalFeaturesDuckDB(lookups=[FeatureLookup(source=fg)])
-offline_df = hist.to_dataframe(feature_start_time=datetime(2024, 1, 1))
-
-print(f"Offline schema: {offline_df.dtypes}")
-print(f"Offline count: {len(offline_df)}")
-
-# Verify online data
-online_table = hist.serve(name="user_features_online")
-online_features = online_table.get_features(keys=[{"user_id": "user_001"}])
-
-print(f"Online features: {online_features}")
+# Verify features are available
+features = ctx.features("user", [
+    "user_behavior.total_sessions_7d",
+    "user_behavior.avg_session_duration",
+])
+print(f"Features available: {list(features.columns)}")
 ```
 
 ## Production Patterns
@@ -581,85 +577,111 @@ for month in pd.date_range('2024-01-01', '2024-12-31', freq='MS'):
 
 ### Pattern 2: Daily Feature Updates
 
-```python
-from datetime import datetime, timedelta
+```bash
+# Daily batch job - run the pipeline to update features
+seeknal run --nodes feature_group.user_behavior_features
 
-# Daily batch job
-today = datetime.now().date()
-yesterday = today - timedelta(days=1)
-
-# Compute features for yesterday
-df_yesterday = compute_features(yesterday)
-
-# Write to offline store
-user_features.set_dataframe(df_yesterday)
-user_features.write(
-    feature_start_time=datetime.combine(yesterday, datetime.min.time()),
-    feature_end_time=datetime.combine(yesterday, datetime.max.time()),
-    mode="append"
-)
-
-# Update online store
-hist = HistoricalFeaturesDuckDB(lookups=[FeatureLookup(source=user_features)])
-hist.serve(name="user_features_online")
+# Entity consolidation happens automatically after run
+# Features are now available via ctx.features()
 ```
 
 ### Pattern 3: Model Retraining
 
+Use a transform node for retraining:
+
 ```python
-# 1. Get latest training data
-hist = HistoricalFeaturesDuckDB(lookups=[FeatureLookup(source=user_features)])
-training_df = hist.to_dataframe(
-    feature_start_time=datetime(2024, 1, 1),
-    feature_end_time=datetime.now()
-)
+from seeknal.pipeline import transform
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_auc_score
+import joblib
 
-# 2. Train new model
-X = training_df[feature_cols]
-y = training_df['label']
-model = RandomForestClassifier()
-model.fit(X, y)
+@transform(name="retrain_model")
+def retrain_model(ctx):
+    """Retrain model with latest data."""
+    from datetime import datetime, timedelta
 
-# 3. Validate with holdout
-test_df = hist.to_dataframe(
-    feature_start_time=datetime.now() - timedelta(days=7),
-    feature_end_time=datetime.now()
-)
-X_test = test_df[feature_cols]
-y_test = test_df['label']
-auc = roc_auc_score(y_test, model.predict_proba(X_test)[:, 1])
+    # 1. Get training data (from PIT-joined transform)
+    training_df = ctx.ref("transform.training_data")
 
-# 4. Deploy if performance is good
-if auc > 0.75:
-    joblib.dump(model, f"churn_model_v{version}.pkl")
-    print(f"Model deployed with AUC: {auc:.4f}")
+    # 2. Train new model
+    feature_cols = ["total_sessions_7d", "avg_session_duration", "conversion_count"]
+    X = training_df[feature_cols].fillna(0)
+    y = training_df["label"]
+
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X, y)
+
+    # 3. Validate
+    # (In production, you'd use a separate test set)
+    y_pred = model.predict_proba(X)[:, 1]
+    auc = roc_auc_score(y, y_pred)
+
+    # 4. Save model if good
+    if auc > 0.75:
+        joblib.dump(model, "models/churn_model_latest.pkl")
+        print(f"Model saved with AUC: {auc:.4f}")
+
+    return pd.DataFrame([{"auc": auc, "model_saved": auc > 0.75}])
+```
+
+Run retraining:
+
+```bash
+# Run the retraining transform
+seeknal run --nodes transform.retrain_model
 ```
 
 ### Pattern 4: Feature Monitoring
 
 ```python
-# Monitor feature distributions
-hist = HistoricalFeaturesDuckDB(lookups=[FeatureLookup(source=user_features)])
+@transform(name="feature_drift_report")
+def feature_drift_report(ctx):
+    """Monitor feature distributions for drift."""
+    from datetime import datetime, timedelta
 
-# Last 7 days
-recent_df = hist.to_dataframe(
-    feature_start_time=datetime.now() - timedelta(days=7)
-)
+    # Get current features
+    current = ctx.features("user", [
+        "user_behavior.total_sessions_7d",
+        "user_behavior.avg_session_duration",
+    ])
 
-# Compare to baseline (3 months ago)
-baseline_df = hist.to_dataframe(
-    feature_start_time=datetime.now() - timedelta(days=90),
-    feature_end_time=datetime.now() - timedelta(days=83)
-)
+    # Compare to baseline (stored in a reference table)
+    # In REPL, you can query historical snapshots:
+    # SELECT * FROM feature_group_user_behavior_features
+    # WHERE event_time >= '2024-01-01' AND event_time < '2024-01-08';
 
-# Check for drift
-for col in feature_cols:
-    recent_mean = recent_df[col].mean()
-    baseline_mean = baseline_df[col].mean()
-    drift = abs(recent_mean - baseline_mean) / baseline_mean
+    # Check for drift
+    feature_cols = ["total_sessions_7d", "avg_session_duration"]
+    drift_report = []
 
-    if drift > 0.2:  # 20% drift threshold
-        print(f"WARNING: Feature '{col}' has drifted {drift:.2%}")
+    for col in feature_cols:
+        current_mean = current[col].mean()
+        # Compare to stored baseline mean
+        # baseline_mean = ... (load from reference)
+        # drift = abs(current_mean - baseline_mean) / baseline_mean
+
+        drift_report.append({
+            "feature": col,
+            "current_mean": current_mean,
+            # "baseline_mean": baseline_mean,
+            # "drift_pct": drift,
+        })
+
+    return pd.DataFrame(drift_report)
+```
+
+In REPL, you can monitor feature distributions:
+
+```sql
+-- Check recent feature distributions
+SELECT
+    'total_sessions_7d' as feature,
+    AVG(total_sessions_7d) as mean_value,
+    STDDEV(total_sessions_7d) as stddev,
+    MIN(total_sessions_7d) as min_value,
+    MAX(total_sessions_7d) as max_value
+FROM feature_group_user_behavior_features
+WHERE event_time >= CURRENT_DATE - INTERVAL 7 DAY;
 ```
 
 ## Best Practices

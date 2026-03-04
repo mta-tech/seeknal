@@ -90,36 +90,42 @@ fg.set_dataframe(features_df).set_features()
 fg.write(feature_start_time=datetime(2024, 1, 1))
 ```
 
-### 2. Read Historical Features
+### 2. Read Historical Features (PIT Join)
+
+Use `FeatureFrame.pit_join()` within a transform:
 
 ```python
-from seeknal.featurestore.duckdbengine.feature_group import (
-    HistoricalFeaturesDuckDB,
-    FeatureLookup,
-)
+from seeknal.pipeline import transform
 
-# Create lookup
-lookup = FeatureLookup(source=fg)
+@transform(name="training_data")
+def training_data(ctx):
+    # Spine with entity keys and prediction dates
+    labels = ctx.ref("source.churn_labels")  # user_id, application_date, label
 
-# Get historical features with point-in-time joins
-hist = HistoricalFeaturesDuckDB(lookups=[lookup])
-
-# Read features
-features_df = hist.to_dataframe(
-    feature_start_time=datetime(2024, 1, 1)
-)
+    # PIT join: get features as of each application_date
+    features_df = ctx.ref("feature_group.user_features").pit_join(
+        spine=labels,
+        date_col="application_date",
+        keep_cols=["label"],
+    )
+    return features_df
 ```
 
 ### 3. Serve Online Features
 
-```python
-# Materialize to online store
-online_table = hist.serve(name="user_features_online")
+Use `ctx.features()` for real-time feature lookup:
 
-# Get features for a specific user
-features = online_table.get_features(
-    keys=[{"user_id": "user_001"}]
-)
+```python
+from seeknal.pipeline import transform
+
+@transform(name="online_predictions")
+def online_predictions(ctx):
+    # Get latest features from consolidated entity store
+    features = ctx.features("user", [
+        "user_features.total_purchases",
+        "user_features.avg_spend",
+    ])
+    return features
 ```
 
 ---

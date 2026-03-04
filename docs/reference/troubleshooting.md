@@ -383,25 +383,33 @@ Error: Online table 'user_features_online' not found
 ```
 
 **Causes:**
-1. Online serving not enabled
-2. Table not created with serve()
+1. Entity not consolidated
+2. Features not written to feature group
 
 **Solutions:**
 
+```bash
+# Run the pipeline to materialize features
+seeknal run --nodes feature_group.user_features
+
+# Consolidate entities
+seeknal consolidate
+
+# Verify entity exists
+seeknal entity show user
+```
+
+In transforms, use `ctx.features()`:
+
 ```python
-# Create online table
-from seeknal.featurestore.duckdbengine.feature_group import (
-    HistoricalFeaturesDuckDB,
-)
-
-lookup = FeatureLookup(source=fg)
-hist = HistoricalFeaturesDuckDB(lookups=[lookup])
-
-# Serve to online store
-online_table = hist.serve(name="user_features_online")
-
-# Verify table exists
-seeknal show feature-group user_features
+@transform(name="predictions")
+def predictions(ctx):
+    # Get features from consolidated entity store
+    features = ctx.features("user", [
+        "user_features.total_spend",
+        "user_features.order_count",
+    ])
+    return features
 ```
 
 ---

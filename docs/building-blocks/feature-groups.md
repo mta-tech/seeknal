@@ -83,40 +83,42 @@ fg.set_features({
 
 ## Point-in-Time Joins
 
-Prevent data leakage by joining features as they appeared at prediction time:
+Prevent data leakage by joining features as they appeared at prediction time. Use `FeatureFrame.pit_join()` in transforms:
 
 ```python
-from seeknal.featurestore.duckdbengine.feature_group import HistoricalFeaturesDuckDB
+from seeknal.pipeline import transform
 
-lookup = FeatureLookup(source=fg)
+@transform(name="training_data")
+def training_data(ctx):
+    # Spine with entity keys and prediction dates
+    labels = ctx.ref("source.churn_labels")
 
-hist = HistoricalFeaturesDuckDB(
-    lookups=[lookup],
-    feature_start_time=datetime(2024, 1, 1)
-)
-
-# Get features with point-in-time correctness
-features_df = hist.to_dataframe(
-    spine_df=prediction_times,
-    feature_start_time=datetime(2024, 1, 1)
-)
+    # PIT join: get features as of each application_date
+    features_df = ctx.ref("feature_group.customer_features").pit_join(
+        spine=labels,
+        date_col="application_date",
+        keep_cols=["label"],
+    )
+    return features_df
 ```
 
 ---
 
 ## Online Serving
 
-Deploy features for low-latency serving:
+Retrieve features for low-latency serving using `ctx.features()`:
 
 ```python
-from seeknal.featurestore.duckdbengine.feature_group import OnlineFeaturesDuckDB
+from seeknal.pipeline import transform
 
-online = hist.serve(name="customer_features_online")
-
-# Get features for inference
-features = online.get_features(
-    keys=[{"customer_id": "CUST001"}]
-)
+@transform(name="predictions")
+def predictions(ctx):
+    # Get latest features from entity store
+    features = ctx.features("customer", [
+        "customer_features.total_purchases",
+        "customer_features.avg_order_value",
+    ])
+    return features
 ```
 
 ---

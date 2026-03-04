@@ -87,58 +87,30 @@ training_df = hist.to_dataframe(
 
 ## Code Example
 
-### Basic Point-in-Time Join
+### Using FeatureFrame in Pipeline Transforms (Recommended)
+
+The simplest way to perform PIT joins is within a `@transform` function using `FeatureFrame.pit_join()`:
 
 ```python
-from seeknal.featurestore.duckdbengine.feature_group import (
-    FeatureGroupDuckDB,
-    HistoricalFeaturesDuckDB,
-    FeatureLookup,
-    Materialization,
+from seeknal.pipeline import transform
+
+@transform(
+    name="training_data",
+    description="PIT-joined training data"
 )
-from seeknal.entity import Entity
-from datetime import datetime
-import pandas as pd
+def training_data(ctx):
+    """Create training data with point-in-time correctness."""
+    # Spine with entity keys and prediction dates
+    labels = ctx.ref("source.churn_labels")  # has user_id, application_date, label
 
-# Define entity and feature group
-user_entity = Entity(name="user", join_keys=["user_id"])
+    # PIT join: get features as of each application_date
+    training_df = ctx.ref("feature_group.user_transactions").pit_join(
+        spine=labels,
+        date_col="application_date",
+        keep_cols=["label"],
+    )
 
-materialization = Materialization(
-    event_time_col="transaction_date",  # Temporal anchor
-    offline=True
-)
-
-fg = FeatureGroupDuckDB(
-    name="user_transactions",
-    entity=user_entity,
-    materialization=materialization,
-    project="my_project"
-)
-
-# Prepare transaction data
-transactions_df = pd.DataFrame({
-    'user_id': ['user_001', 'user_001', 'user_002'],
-    'transaction_date': [
-        datetime(2024, 1, 10),
-        datetime(2024, 1, 20),  # Future data for Jan 15 prediction
-        datetime(2024, 1, 12)
-    ],
-    'amount': [50.0, 200.0, 75.0]
-})
-
-# Write features
-fg.set_dataframe(transactions_df).set_features()
-fg.write(feature_start_time=datetime(2024, 1, 1))
-
-# Read with PIT join - only includes data up to the label timestamp
-lookup = FeatureLookup(source=fg)
-hist = HistoricalFeaturesDuckDB(lookups=[lookup])
-
-# Get features as of Jan 15 - transaction on Jan 20 won't be included
-training_df = hist.to_dataframe(
-    feature_start_time=datetime(2024, 1, 1),
-    feature_end_time=datetime(2024, 1, 15)
-)
+    return training_df
 ```
 
 ### Point-in-Time Join with Spine
@@ -146,60 +118,47 @@ training_df = hist.to_dataframe(
 A **spine** is a DataFrame containing entity keys and application dates (when predictions should be made). This is the most common pattern for training data preparation.
 
 ```python
-# Create spine with prediction dates
-spine_df = pd.DataFrame({
-    'user_id': ['user_001', 'user_001', 'user_002'],
-    'application_date': [
-        datetime(2024, 1, 15),  # Predict churn on Jan 15
-        datetime(2024, 1, 25),  # Predict again on Jan 25
-        datetime(2024, 1, 18)
-    ],
-    'label': [0, 1, 0]  # Churn labels (ground truth)
-})
+@transform(name="training_data")
+def training_data(ctx):
+    # Create spine with prediction dates
+    spine = ctx.ref("source.churn_labels")  # user_id, application_date, label
 
-# Perform point-in-time join
-hist = HistoricalFeaturesDuckDB(lookups=[lookup])
-training_df = hist.using_spine(
-    spine=spine_df,
-    date_col='application_date',
-    keep_cols=['label']  # Keep ground truth labels
-).to_dataframe_with_spine()
+    # PIT join: features as they existed at application_date
+    training_df = ctx.ref("feature_group.user_transactions").pit_join(
+        spine=spine,
+        date_col='application_date',
+        keep_cols=['label']  # Keep ground truth labels
+    )
 
-# Result: features joined correctly at each application_date
-# user_001 on Jan 15 will only see transaction from Jan 10 ($50)
-# user_001 on Jan 25 will see transactions from Jan 10 and Jan 20 ($250 total)
+    # Result: features joined correctly at each application_date
+    # user_001 on Jan 15 will only see transaction from Jan 10 ($50)
+    # user_001 on Jan 25 will see transactions from Jan 10 and Jan 20 ($250 total)
+    return training_df
 ```
 
 ### Multiple Feature Groups
 
+Join features from multiple feature groups with a single spine:
+
 ```python
-# Define multiple feature groups
-purchase_fg = FeatureGroupDuckDB(
-    name="purchase_features",
-    entity=user_entity,
-    materialization=Materialization(event_time_col="purchase_date")
-)
+@transform(name="training_data")
+def training_data(ctx):
+    labels = ctx.ref("source.churn_labels")
 
-clickstream_fg = FeatureGroupDuckDB(
-    name="clickstream_features",
-    entity=user_entity,
-    materialization=Materialization(event_time_col="click_timestamp")
-)
+    # PIT join from first feature group
+    df = ctx.ref("feature_group.purchase_features").pit_join(
+        spine=labels,
+        date_col="application_date",
+        keep_cols=["label"],
+    )
 
-# Perform point-in-time join across all feature groups
-hist = HistoricalFeaturesDuckDB(
-    lookups=[
-        FeatureLookup(source=purchase_fg),
-        FeatureLookup(source=clickstream_fg)
-    ]
-)
+    # Merge with second feature group (already PIT-correct)
+    df = ctx.ref("feature_group.clickstream_features").pit_join(
+        spine=df,  # Use previous result as spine
+        date_col="application_date",
+    )
 
-training_df = hist.using_spine(
-    spine=spine_df,
-    date_col='application_date'
-).to_dataframe_with_spine()
-
-# Both feature groups are joined with temporal correctness
+    return df
 ```
 
 ## How Seeknal Implements Point-in-Time Joins
@@ -365,19 +324,23 @@ windowed_features = conn.execute("""
 
 ### Online Serving with Point-in-Time Consistency
 
-When serving features online, point-in-time logic ensures production predictions use only available data:
+When serving features online, use `ctx.features()` for real-time feature lookup:
 
 ```python
-# Materialize latest features to online store
-online_table = hist.serve(name="user_features_online")
+from seeknal.pipeline import transform
 
-# At serving time, features are retrieved as of "now"
-# Automatically respects temporal ordering
-features = online_table.get_features(
-    keys=[{"user_id": "user_001"}]
-)
+@transform(name="prediction")
+def prediction(ctx):
+    """Online feature lookup for inference."""
+    # Get latest features for entity keys
+    features = ctx.features("user", [
+        "transactions.total_spend",
+        "transactions.order_count",
+    ])
 
-# Only includes transactions that have occurred before this moment
+    # Features are retrieved as of "now" with temporal ordering
+    # Only includes data that has been materialized
+    return features
 ```
 
 ## Debugging Point-in-Time Joins
@@ -385,21 +348,22 @@ features = online_table.get_features(
 ### Verify Temporal Alignment
 
 ```python
-# Check event times in your features
-print(transactions_df[['user_id', 'transaction_date', 'amount']].sort_values('transaction_date'))
+# In REPL, check your data before joining
+SELECT user_id, transaction_date, amount
+FROM source_transactions
+ORDER BY transaction_date;
 
-# Check spine dates
-print(spine_df[['user_id', 'application_date']].sort_values('application_date'))
+# Check your spine (labels) dates
+SELECT user_id, application_date, label
+FROM source_churn_labels
+ORDER BY application_date;
 
-# After PIT join, verify no future data leakage
-result = hist.using_spine(spine_df, date_col='application_date').to_dataframe_with_spine()
+# After PIT join in transform, verify in REPL
+SELECT user_id, application_date, event_time, amount
+FROM transform_training_data
+WHERE event_time > application_date;  -- Should return 0 rows
 
-# Each row should only contain features with event_time <= application_date
-for idx, row in result.iterrows():
-    app_date = row['application_date']
-    event_time = row.get('event_time', None)
-    if event_time and event_time > app_date:
-        print(f"WARNING: Future data leakage detected at index {idx}")
+# If any rows returned, there's data leakage!
 ```
 
 ### Inspect Generated SQL

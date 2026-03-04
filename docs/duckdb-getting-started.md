@@ -1057,61 +1057,47 @@ fg.set_dataframe(df).set_features()
 fg.write(feature_start_time=pd.Timestamp("2024-01-01"))
 ```
 
-### Historical Features
+### Historical Features (Point-in-Time Joins)
+
+Use `FeatureFrame.pit_join()` in transforms for point-in-time joins:
 
 ```python
-from seeknal.featurestore.duckdbengine.feature_group import (
-    HistoricalFeaturesDuckDB,
-    FeatureLookup
-)
+from seeknal.pipeline import transform
 
-# Create feature lookup
-lookup = FeatureLookup(
-    source=fg,
-    features=["total_amount", "transaction_count", "avg_amount"]
-)
+@transform(name="training_data")
+def training_data(ctx):
+    # Get spine with entity keys and prediction dates
+    spine = ctx.ref("source.application_labels")  # user_id, application_date, label
 
-# Create historical features with point-in-time joins
-hist = HistoricalFeaturesDuckDB(
-    lookups=[lookup],
-    event_time_col="application_date",
-    event_timestamp_format="yyyy-MM-dd"
-)
+    # PIT join: features as of each application_date
+    features_df = ctx.ref("feature_group.user_features").pit_join(
+        spine=spine,
+        date_col="application_date",
+        keep_cols=["label"],
+    )
 
-# Get historical features
-spine_df = pd.DataFrame({
-    "user_id": ["A", "B", "C"],
-    "application_date": ["2024-01-05", "2024-01-10", "2024-01-15"]
-})
-
-# Convert spine to PyArrow and get features
-spine_arrow = pa.Table.from_pandas(spine_df)
-features_df = hist.to_dataframe(
-    spine=spine_arrow,
-    feature_start_time=pd.Timestamp("2024-01-01")
-).to_pandas()
+    return features_df
 ```
 
 ### Online Features
 
+Use `ctx.features()` for real-time feature lookup:
+
 ```python
-from seeknal.featurestore.duckdbengine.feature_group import OnlineFeaturesDuckDB
+from seeknal.pipeline import transform
 
-# Create online serving table
-online_table = hist.serve(
-    name="user_features_online",
-    feature_start_time=pd.Timestamp("2024-01-01")
-)
+@transform(name="predictions")
+def predictions(ctx):
+    # Get latest features from entity store
+    features = ctx.features("user", [
+        "user_features.total_amount",
+        "user_features.transaction_count",
+        "user_features.avg_amount",
+    ])
 
-# Query online features
-features = online_table.get_features(
-    keys=[{"user_id": "A"}, {"user_id": "B"}]
-)
-
-print(features)
-# Output:
-# [{'user_id': 'A', 'total_amount': 1000, 'transaction_count': 10, ...},
-#  {'user_id': 'B', 'total_amount': 2000, 'transaction_count': 20, ...}]
+    # features is a DataFrame with latest values for all users
+    print(features.head())
+    return features
 ```
 
 ### Feature Group Versioning
