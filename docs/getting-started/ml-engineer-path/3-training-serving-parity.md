@@ -15,7 +15,7 @@ source.churn_labels (spine: customer_id + application_date + churned)
          |
 @transform: pit_training_data
   PIT-joins feature_group.customer_daily_agg (from Ch2)
-  Uses HistoricalFeaturesDuckDB with spine
+  Uses FeatureFrame.pit_join() for point-in-time correctness
          |
 SOA: customer_training_features
   Per-customer temporal features (spending trends, recency windows)
@@ -25,11 +25,11 @@ SOA: customer_training_features
   Returns predictions + feature importance
          |
 REPL: Online serving demo
-  OnlineFeaturesDuckDB.get_features() for inference parity
+  ctx.features() for inference parity
 ```
 
 **After this chapter, you'll have:**
-- Point-in-time correct training data using `HistoricalFeaturesDuckDB`
+- Point-in-time correct training data using `FeatureFrame.pit_join()`
 - Per-customer temporal features via the SOA engine (reusing Ch2's patterns)
 - An ML model trained inside a `@transform` node
 - Online serving demo proving training-serving parity
@@ -143,7 +143,7 @@ seeknal apply draft_source_churn_labels.py
 
 ### Build the PIT Join Transform
 
-This is the key step — using `HistoricalFeaturesDuckDB` inside a `@transform` to create temporally correct training data:
+This is the key step — using `FeatureFrame.pit_join()` inside a `@transform` to create temporally correct training data:
 
 ```bash
 seeknal draft transform pit_training_data --python --deps pandas,duckdb
@@ -163,19 +163,12 @@ Edit `draft_transform_pit_training_data.py`:
 
 """Transform: Point-in-time join of customer features with churn labels.
 
-Uses HistoricalFeaturesDuckDB to ensure features are as-of each customer's
+Uses FeatureFrame.pit_join() to ensure features are as-of each customer's
 application_date — no data leakage from future events.
 """
 
 import pandas as pd
 from seeknal.pipeline import transform
-from seeknal.featurestore.duckdbengine.feature_group import (
-    FeatureGroupDuckDB,
-    FeatureLookup,
-    HistoricalFeaturesDuckDB,
-    Materialization,
-)
-from seeknal.entity import Entity
 
 
 @transform(
@@ -187,37 +180,17 @@ def pit_training_data(ctx):
     # Load labels (the "spine" for PIT join)
     labels = ctx.ref("source.churn_labels")
 
-    # Load daily features from Chapter 2
-    daily_features = ctx.ref("feature_group.customer_daily_agg")
-
-    # Create a FeatureGroupDuckDB pointing to the daily features
-    # event_time_col="order_date" tells the PIT join which column has the feature timestamp
-    fg = FeatureGroupDuckDB(
-        name="customer_daily_agg",
-        entity=Entity(name="customer", join_keys=["customer_id"]),
-        materialization=Materialization(event_time_col="order_date"),
-    )
-
-    # Set the daily features as the feature group's data
-    fg.set_dataframe(daily_features).set_features()
-
-    # Write to offline store so HistoricalFeaturesDuckDB can read it
-    fg.write()
-
-    # Create PIT join: for each label row, get features as-of application_date
-    lookup = FeatureLookup(source=fg)
-    hist = HistoricalFeaturesDuckDB(lookups=[lookup])
-    hist = hist.using_spine(
+    # ctx.ref() on feature_group nodes returns a FeatureFrame
+    # Use pit_join() for point-in-time correctness:
+    #   - For each label row, finds features where event_time <= application_date
+    #   - Keeps only the most recent feature row per customer
+    training_data = ctx.ref("feature_group.customer_daily_agg").pit_join(
         spine=labels,
         date_col="application_date",
         keep_cols=["churned"],
     )
 
-    # Execute PIT join — returns one row per spine entry
-    # Each customer gets features from the most recent event <= application_date
-    pit_df = hist.to_dataframe_with_spine()
-
-    return pit_df
+    return training_data
 ```
 
 ```bash
@@ -227,7 +200,7 @@ seeknal apply draft_transform_pit_training_data.py
 
 ### What Happens Inside the PIT Join
 
-The `HistoricalFeaturesDuckDB.to_dataframe_with_spine()` method:
+The `FeatureFrame.pit_join()` method:
 
 1. Takes each row from the spine (labels with `application_date`)
 2. Joins with features where `event_time <= application_date`
@@ -248,11 +221,13 @@ CUST-105 (application_date = Jan 16):
   PIT join picks: Jan 12 row (only row <= Jan 16)
 ```
 
-!!! tip "PIT Join Inside @transform"
-    Keeping the PIT join inside a `@transform` means:
+!!! tip "FeatureFrame API Benefits"
+    The `FeatureFrame` API (introduced in v2.3.0) provides:
 
-    - `seeknal run` executes the full pipeline end-to-end
-    - Reproducible: same spine + same features = same training data
+    - **Cleaner syntax**: `ctx.ref("feature_group.X").pit_join(spine, date_col)`
+    - **Automatic metadata**: Entity and event_time_col are inferred from the feature group
+    - **Chainable**: Can chain `.pit_join()`, `.as_of()`, and other operations
+    - **Duck-typed**: Works like a DataFrame but carries feature store metadata
     - Queryable in REPL like any other transform output
 
 ### Verify PIT Output
@@ -614,7 +589,7 @@ Training:  PIT join → SOA → model.fit()     ← features computed from offli
 Serving:   ??? → model.predict()             ← features computed how?
 ```
 
-Seeknal solves this with `OnlineFeaturesDuckDB` — the same `HistoricalFeaturesDuckDB` that built training data can also serve features for inference, ensuring the **same feature retrieval logic** is used in both paths.
+Seeknal solves this with `ctx.features()` — the same `FeatureFrame` that built training data can also serve features for inference, ensuring the **same feature retrieval logic** is used in both paths.
 
 ### Demo: Online Feature Serving
 
@@ -628,68 +603,61 @@ Create a standalone Python script to demonstrate:
 Run this after 'seeknal run' to demonstrate feature retrieval for inference.
 """
 import pandas as pd
-from seeknal.featurestore.duckdbengine.feature_group import (
-    FeatureGroupDuckDB,
-    FeatureLookup,
-    HistoricalFeaturesDuckDB,
-    Materialization,
-)
-from seeknal.entity import Entity
 
-# --- Step 1: Set up the feature group (same as training) ---
-fg = FeatureGroupDuckDB(
-    name="customer_daily_agg",
-    entity=Entity(name="customer", join_keys=["customer_id"]),
-    materialization=Materialization(event_time_col="order_date"),
-)
+# --- Step 1: Use ctx.features() for online inference ---
+# In a transform, you would use:
+#   features = ctx.features("customer", ["customer_daily_agg.daily_amount", ...])
+#
+# For standalone demo, load the consolidated entity features directly:
+from seeknal.workflow.consolidation.catalog import EntityCatalog
 
-# --- Step 2: Create online table from historical features ---
-lookup = FeatureLookup(source=fg)
-hist = HistoricalFeaturesDuckDB(lookups=[lookup])
+catalog = EntityCatalog.load("target/feature_store/customer/_entity_catalog.json")
+print("Available feature groups:", catalog.list_feature_groups())
 
-# Serve latest features for online inference
-online = hist.serve(name="customer_features_online")
+# --- Step 2: Query features for specific customers ---
+# The consolidated parquet contains all features for the customer entity
+import duckdb
+conn = duckdb.connect()
+conn.execute("CREATE VIEW customer_features AS SELECT * FROM read_parquet('target/feature_store/customer/features.parquet')")
 
-# --- Step 3: Get features for specific customers ---
-result = online.get_features(keys=[
-    {"customer_id": "CUST-100"},
-    {"customer_id": "CUST-101"},
-])
+result = conn.execute("""
+    SELECT customer_id, daily_amount, daily_count
+    FROM customer_features
+    WHERE customer_id IN ('CUST-100', 'CUST-101')
+""").df()
 
 print("Online features for inference:")
 print(result.to_string(index=False))
 
-# --- Step 4: Verify parity ---
-# The features returned here use the same offline store data
-# that HistoricalFeaturesDuckDB used during training.
+# --- Step 3: Verify parity ---
+# The features returned here use the same underlying parquet files
+# that FeatureFrame.pit_join() used during training.
 # Same data source + same retrieval logic = training-serving parity.
 print("\nTraining-serving parity verified!")
-print("Same FeatureGroupDuckDB → same features → no skew.")
+print("Same feature store → same features → no skew.")
 ```
 
 ### Understanding the Serving Path
 
 ```
 Training path:
-  HistoricalFeaturesDuckDB.using_spine(labels) → .to_dataframe_with_spine()
-  ↓ reads from offline store
+  ctx.ref("feature_group.X").pit_join(spine, date_col)
+  ↓ reads from feature group parquet
 
 Serving path:
-  HistoricalFeaturesDuckDB → .serve(name="online_table")
-  ↓ reads from offline store → writes to online store
-  OnlineFeaturesDuckDB.get_features(keys=[...])
-  ↓ reads from online store
+  ctx.features("entity", ["fg.feature", ...])
+  ↓ reads from consolidated entity parquet
 ```
 
-Both paths read from the **same offline store** data. The serving path adds an online store layer for low-latency lookups, but the underlying features are identical.
+Both paths read from the **same feature store** data. The serving path uses entity-consolidated parquets for low-latency lookups, but the underlying features are identical.
 
 ### When to Use Each
 
 | API | Use Case | Returns |
 |-----|----------|---------|
-| `hist.to_dataframe_with_spine()` | Batch training data with PIT correctness | Full DataFrame with spine columns |
-| `hist.to_dataframe()` | Batch feature retrieval (all features) | Full DataFrame |
-| `hist.serve()` → `online.get_features()` | Real-time inference for specific entities | Features for requested keys |
+| `ctx.ref("feature_group.X").pit_join()` | Batch training data with PIT correctness | Full DataFrame with spine columns |
+| `ctx.ref("feature_group.X")` | FeatureFrame for chaining operations | FeatureFrame (DataFrame-like) |
+| `ctx.features("entity", [...])` | Real-time inference for specific features | DataFrame with requested columns |
 
 !!! success "Congratulations!"
     You've built a production-grade ML pipeline with:
@@ -704,21 +672,21 @@ Both paths read from the **same offline store** data. The serving path adds an o
 ## What Could Go Wrong?
 
 !!! danger "Common Pitfalls"
-    **1. HistoricalFeaturesDuckDB returns empty DataFrame**
+    **1. FeatureFrame.pit_join() returns empty DataFrame**
 
     - Symptom: PIT join returns 0 rows or all NULLs
-    - Cause: The feature group hasn't been written to the offline store
-    - Fix: Ensure `fg.write()` is called before the PIT join, or that `seeknal run` has previously materialized the feature group
+    - Cause: The feature group hasn't been materialized by `seeknal run`
+    - Fix: Ensure `seeknal run` has previously executed and materialized the feature group to parquet
 
     **2. scikit-learn import name**
 
     - Symptom: `ModuleNotFoundError: No module named 'sklearn'`
     - Fix: In PEP 723 header, use `scikit-learn` (the PyPI name), not `sklearn`
 
-    **3. event_time_col doesn't match**
+    **3. event_time column mismatch**
 
     - Symptom: PIT join returns wrong results or all the same row
-    - Fix: Ensure `Materialization(event_time_col="order_date")` matches the actual date column in your feature group output. The PIT join uses this column to filter `event_time <= application_date`
+    - Fix: Ensure the feature group's `event_time_col` matches the actual date column. The PIT join filters `event_time <= date_col` from the spine
 
     **4. All customers get the same features**
 
@@ -741,20 +709,18 @@ Both paths read from the **same offline store** data. The serving path adds an o
 
 In this chapter, you learned:
 
-- [x] **Point-in-Time Joins** — `HistoricalFeaturesDuckDB` prevents data leakage by joining features as-of each `application_date`
+- [x] **Point-in-Time Joins** — `FeatureFrame.pit_join()` prevents data leakage by joining features as-of each `application_date`
 - [x] **SOA for Training Features** — Per-customer temporal aggregations using the same engine from Chapter 2
 - [x] **ML Model in Pipeline** — Train scikit-learn models inside `@transform` nodes
-- [x] **Training-Serving Parity** — `OnlineFeaturesDuckDB.get_features()` uses the same feature store as training
+- [x] **Training-Serving Parity** — `ctx.features()` uses the same feature store as training
 
 **Key APIs:**
 
 | API | Purpose |
 |-----|---------|
-| `HistoricalFeaturesDuckDB` | Point-in-time feature retrieval for training |
-| `.using_spine(df, date_col)` | Set the label spine with application dates |
-| `.to_dataframe_with_spine()` | Execute PIT join |
-| `.serve(name)` | Create online table for inference |
-| `OnlineFeaturesDuckDB.get_features()` | Real-time feature lookup |
+| `ctx.ref("feature_group.X")` | Returns FeatureFrame with entity metadata |
+| `FeatureFrame.pit_join(spine, date_col, keep_cols)` | Point-in-time join for training |
+| `ctx.features("entity", ["fg.feature", ...])` | Real-time feature lookup from consolidated store |
 
 **Key Commands:**
 ```bash
