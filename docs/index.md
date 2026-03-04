@@ -69,6 +69,8 @@ Install, load data, create features, and run your first pipeline.
 
 ### 🏗️ Data Engineer Path
 
+**[→ Start Data Engineer Path](getting-started/data-engineer-path/)**
+
 **Goal:** Build reliable ELT pipelines with incremental execution and production safety.
 
 **Start with:** [YAML Pipeline Tutorial (75 min)](tutorials/yaml-pipeline-tutorial.md)
@@ -84,6 +86,8 @@ Install, load data, create features, and run your first pipeline.
 
 ### 📊 Analytics Engineer Path
 
+**[→ Start Analytics Engineer Path](getting-started/analytics-engineer-path/)**
+
 **Goal:** Define metrics and build a semantic layer for self-serve analytics.
 
 **Start with:** [YAML Pipeline Tutorial (75 min)](tutorials/yaml-pipeline-tutorial.md)
@@ -98,6 +102,8 @@ Install, load data, create features, and run your first pipeline.
 ---
 
 ### 🤖 ML Engineer Path
+
+**[→ Start ML Engineer Path](getting-started/ml-engineer-path/)**
 
 **Goal:** Build feature stores with point-in-time joins for ML models.
 
