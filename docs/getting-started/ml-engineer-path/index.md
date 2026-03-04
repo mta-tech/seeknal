@@ -78,20 +78,20 @@ Build a production ML pipeline with temporal correctness:
 source.churn_labels (spine with application_date)
          ↓
 @transform: pit_training_data
-  PIT-joins customer_daily_agg via HistoricalFeaturesDuckDB
+  PIT-joins customer_daily_agg via FeatureFrame.pit_join()
          ↓
 SOA: customer_training_features (per-customer temporal features)
          ↓
 @transform: churn_model (scikit-learn)
          ↓
-REPL: Online serving demo (OnlineFeaturesDuckDB)
+REPL: Online serving demo (ctx.features())
 ```
 
 **You'll learn:**
-- Point-in-time joins with `HistoricalFeaturesDuckDB` to prevent data leakage
+- Point-in-time joins with `FeatureFrame.pit_join()` to prevent data leakage
 - Per-customer SOA temporal features (spending trends, recency)
 - Training scikit-learn models inside `@transform` nodes
-- Online serving with `OnlineFeaturesDuckDB.get_features()` for training-serving parity
+- Online serving with `ctx.features()` for training-serving parity
 
 **[Start Chapter 3 →](3-training-serving-parity.md)**
 
