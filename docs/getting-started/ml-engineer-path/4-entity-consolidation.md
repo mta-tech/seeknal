@@ -310,7 +310,7 @@ source.transactions ├──→ feature_group.product_preferences ┤
                     └──→ feature_group.customer_daily_agg ──→ SOA: region_metrics
                               ↓                                 (regional meta-features)
                     @transform: pit_training_data ←─── source.churn_labels
-                      (PIT join with HistoricalFeaturesDuckDB)
+                      (PIT join with FeatureFrame.pit_join())
                               ↓
                     SOA: customer_training_features
                       (per-customer temporal features)
@@ -319,7 +319,7 @@ source.transactions ├──→ feature_group.product_preferences ┤
                       (RandomForest predictions)
                               ↓
                     REPL: Online serving demo
-                      (OnlineFeaturesDuckDB)
+                      (ctx.features() for real-time lookup)
 ```
 
 ### What's Next?
