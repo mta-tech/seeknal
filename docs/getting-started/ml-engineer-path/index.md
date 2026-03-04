@@ -1,6 +1,6 @@
 # ML Engineer Path
 
-**Duration:** ~110 minutes | **Format:** Python Pipeline | **Prerequisites:** Python, [DE Path Chapter 1](../data-engineer-path/1-elt-pipeline.md) completed
+**Duration:** ~130 minutes | **Format:** Python Pipeline | **Prerequisites:** Python, [DE Path Chapter 1](../data-engineer-path/1-elt-pipeline.md) completed
 
 Build production feature stores and ML models using Python pipeline decorators (`@source`, `@feature_group`, `@transform`) and Seeknal's declarative YAML SOA engine.
 
@@ -12,8 +12,9 @@ The ML Engineer path teaches you to build production-grade feature stores and ML
 
 1. **Build Feature Stores** — Create feature groups with `@feature_group`, evolve schemas iteratively
 2. **Second-Order Aggregations** — Generate hierarchical features with the YAML SOA engine (basic, window, ratio)
-3. **Point-in-Time Joins & Training-Serving Parity** — Build PIT-correct training data with `HistoricalFeaturesDuckDB`, temporal SOA features, and online serving
+3. **Point-in-Time Joins & Training-Serving Parity** — Build PIT-correct training data with `FeatureFrame.pit_join()`, temporal SOA features, and online serving
 4. **Entity Consolidation** — Merge feature groups into per-entity views with struct columns
+5. **End-to-End ML with MLflow** — Train propensity models, track experiments, and run batch predictions
 
 ---
 
@@ -118,6 +119,31 @@ feature_group.product_preferences ┘         (automatic)              ↓
 
 ---
 
+### Chapter 5: End-to-End ML with MLflow (~20 minutes)
+
+Build a complete ML workflow with experiment tracking and batch predictions:
+
+```
+transform.training_dataset (Ch4) ──→ transform.train_propensity (scikit-learn + MLflow)
+                                              ↓
+                                        mlruns/ (model artifact)
+                                              ↓
+second_order_aggregation.customer_training_features ─┐
+                                                     ├──→ transform.score_customers
+feature_group.product_preferences ───────────────────┘          ↓
+                                                     REPL: Propensity ranking
+```
+
+**You'll build:**
+- A training pipeline that logs experiments to MLflow (params, metrics, model artifact)
+- A prediction pipeline that loads the trained model and scores all customers
+- Propensity scores with ranks and segments queryable in the REPL
+- Separation of training and inference — the production pattern
+
+**[Start Chapter 5 →](5-e2e-ml-customer-targeting.md)**
+
+---
+
 ## What You'll Build
 
 By the end of this path, you'll have a complete ML pipeline:
@@ -128,9 +154,11 @@ By the end of this path, you'll have a complete ML pipeline:
 | **Feature Groups** | `@feature_group` | Compute and version ML features |
 | **Transforms** | `@transform` | Data prep, PIT joins, model training |
 | **SOA** | YAML `features:` spec | Hierarchical meta-features (basic, window, ratio) |
-| **PIT Joins** | `HistoricalFeaturesDuckDB` | Temporally correct training data |
-| **Online Serving** | `OnlineFeaturesDuckDB` | Training-serving parity for inference |
+| **PIT Joins** | `FeatureFrame.pit_join()` | Temporally correct training data |
+| **Online Serving** | `ctx.features()` | Training-serving parity for inference |
 | **Entity Consolidation** | CLI + REPL | Unified per-entity views with struct columns |
+| **Experiment Tracking** | MLflow | Log parameters, metrics, and model artifacts |
+| **Batch Predictions** | `@transform` + MLflow | Load trained models, score customers |
 
 ---
 
@@ -160,6 +188,9 @@ seeknal lineage <node> --ascii
 seeknal entity list
 seeknal entity show <entity_name>
 seeknal consolidate
+
+# ML experiment tracking
+mlflow ui --backend-store-uri file:./mlruns
 
 # Interactive verification
 seeknal repl
