@@ -26,6 +26,18 @@ AGENT_BLOCKED_FUNCTIONS = {
     "http_post",
     "httpfs_get",
     "httpfs_post",
+    # Scan aliases that bypass read_parquet block
+    "parquet_scan",
+    "scan_parquet",
+    "iceberg_scan",
+    "iceberg_metadata",
+    "delta_scan",
+    # Write functions
+    "write_parquet",
+    "write_csv",
+    # Environment / settings leakage
+    "getenv",
+    "current_setting",
 }
 
 # Additional keywords blocked for agent connections beyond REPL's list.
@@ -95,3 +107,5 @@ def configure_safe_connection(conn) -> None:
         conn: A DuckDB connection object.
     """
     conn.execute("SET enable_external_access = false")
+    conn.execute("SET max_memory = '512MB'")
+    conn.execute("SET threads = 2")

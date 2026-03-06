@@ -1,11 +1,10 @@
 """LLM provider factory for Seeknal Ask.
 
 Supports Google Gemini (primary) and Ollama (local).
-Configuration via environment variables or ask_config.yaml.
+Configuration via environment variables.
 """
 
 import os
-from pathlib import Path
 from typing import Optional
 
 from langchain_core.language_models import BaseChatModel
@@ -88,27 +87,3 @@ def _create_ollama(
         base_url=base_url,
         temperature=temperature,
     )
-
-
-def load_config(project_path: Optional[Path] = None) -> dict:
-    """Load ask configuration from YAML file.
-
-    Search order:
-    1. {project_path}/.seeknal/ask_config.yaml
-    2. ~/.seeknal/ask_config.yaml
-
-    Returns:
-        Configuration dict, or empty dict if no config found.
-    """
-    import yaml
-
-    search_paths = []
-    if project_path:
-        search_paths.append(project_path / ".seeknal" / "ask_config.yaml")
-    search_paths.append(Path.home() / ".seeknal" / "ask_config.yaml")
-
-    for path in search_paths:
-        if path.exists():
-            with open(path) as f:
-                return yaml.safe_load(f) or {}
-    return {}

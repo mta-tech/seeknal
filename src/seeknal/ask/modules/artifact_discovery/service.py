@@ -68,7 +68,6 @@ class ArtifactDiscovery:
                 try:
                     with open(catalog_path) as f:
                         catalog = json.load(f)
-                    catalog["_dir"] = str(entity_dir)
                     entities.append(catalog)
                 except (json.JSONDecodeError, OSError):
                     continue

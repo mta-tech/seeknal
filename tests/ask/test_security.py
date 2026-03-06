@@ -90,6 +90,22 @@ class TestValidateSqlForAgent:
         with pytest.raises(ValueError, match="read_text"):
             validate_sql_for_agent("SELECT * FROM read_text ('/etc/passwd')")
 
+    def test_blocks_getenv(self):
+        with pytest.raises(ValueError, match="getenv"):
+            validate_sql_for_agent("SELECT getenv('GOOGLE_API_KEY')")
+
+    def test_blocks_current_setting(self):
+        with pytest.raises(ValueError, match="current_setting"):
+            validate_sql_for_agent("SELECT current_setting('enable_external_access')")
+
+    def test_blocks_parquet_scan(self):
+        with pytest.raises(ValueError, match="parquet_scan"):
+            validate_sql_for_agent("SELECT * FROM parquet_scan('/data/secret.parquet')")
+
+    def test_blocks_iceberg_scan(self):
+        with pytest.raises(ValueError, match="iceberg_scan"):
+            validate_sql_for_agent("SELECT * FROM iceberg_scan('/data/table')")
+
     def test_all_blocked_functions_covered(self):
         """Every function in the blocklist should be caught."""
         for func in AGENT_BLOCKED_FUNCTIONS:
@@ -111,5 +127,22 @@ class TestConfigureSafeConnection:
         # After disabling, read_text should fail
         with pytest.raises(Exception):
             conn.execute("SELECT * FROM read_text('/etc/passwd')")
+
+        conn.close()
+
+    def test_sets_resource_limits(self):
+        import duckdb
+
+        conn = duckdb.connect(":memory:")
+        from seeknal.ask.security import configure_safe_connection
+
+        configure_safe_connection(conn)
+
+        # Verify resource limits are set (512MB = 488.2 MiB)
+        result = conn.execute("SELECT current_setting('max_memory')").fetchone()
+        assert "488" in str(result[0]) or "512" in str(result[0])
+
+        result = conn.execute("SELECT current_setting('threads')").fetchone()
+        assert str(result[0]) == "2"
 
         conn.close()
