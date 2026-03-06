@@ -4,9 +4,15 @@ The ToolContext holds the REPL instance and artifact discovery service.
 It's set once at agent initialization and accessed by tools via get_tool_context().
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
+    from seeknal.cli.repl import REPL
 
 _tool_context: Optional["ToolContext"] = None
 
@@ -15,8 +21,8 @@ _tool_context: Optional["ToolContext"] = None
 class ToolContext:
     """Shared context for all agent tools."""
 
-    repl: object  # seeknal.cli.repl.REPL
-    artifact_discovery: object  # ArtifactDiscovery
+    repl: REPL
+    artifact_discovery: ArtifactDiscovery
     project_path: Path
 
 

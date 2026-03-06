@@ -15,6 +15,9 @@ class ArtifactDiscovery:
     def __init__(self, project_path: Path):
         self.project_path = project_path
         self.target_path = project_path / "target"
+        self._entities_cache: Optional[list[dict]] = None
+        self._dag_cache: Optional[dict] = None
+        self._intermediates_cache: Optional[list[str]] = None
 
     def get_context_for_prompt(self) -> str:
         """Build a complete context string for the LLM system prompt.
@@ -48,9 +51,13 @@ class ArtifactDiscovery:
 
     def _discover_entities(self) -> list[dict]:
         """Load entity catalogs from target/feature_store/."""
+        if self._entities_cache is not None:
+            return self._entities_cache
+
         feature_store = self.target_path / "feature_store"
         if not feature_store.exists():
-            return []
+            self._entities_cache = []
+            return self._entities_cache
 
         entities = []
         for entity_dir in sorted(feature_store.iterdir()):
@@ -65,27 +72,37 @@ class ArtifactDiscovery:
                     entities.append(catalog)
                 except (json.JSONDecodeError, OSError):
                     continue
-        return entities
+        self._entities_cache = entities
+        return self._entities_cache
 
     def _discover_dag(self) -> Optional[dict]:
         """Load DAG manifest from target/manifest.json."""
+        if self._dag_cache is not None:
+            return self._dag_cache
+
         manifest_path = self.target_path / "manifest.json"
         if not manifest_path.exists():
             return None
         try:
             with open(manifest_path) as f:
-                return json.load(f)
+                self._dag_cache = json.load(f)
+                return self._dag_cache
         except (json.JSONDecodeError, OSError):
             return None
 
     def _discover_intermediates(self) -> list[str]:
         """List intermediate parquet files in target/intermediate/."""
+        if self._intermediates_cache is not None:
+            return self._intermediates_cache
+
         intermediate_dir = self.target_path / "intermediate"
         if not intermediate_dir.exists():
-            return []
-        return sorted(
+            self._intermediates_cache = []
+            return self._intermediates_cache
+        self._intermediates_cache = sorted(
             p.stem for p in intermediate_dir.glob("*.parquet")
         )
+        return self._intermediates_cache
 
     def get_entities_summary(self) -> list[dict]:
         """Get a summary list of all entities for the get_entities tool."""
