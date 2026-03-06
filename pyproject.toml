@@ -57,6 +57,7 @@ dependencies = [
 
 # Seeknal Ask — NL-to-Analysis Agent
 ask = [
+    "deepagents>=0.4.0",
     "langchain>=0.3.0",
     "langgraph>=0.4.0",
     "langchain-google-genai>=2.0.0",

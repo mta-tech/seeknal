@@ -1,14 +1,14 @@
-"""LangGraph ReAct agent for Seeknal Ask.
+"""Deep agent for Seeknal Ask.
 
-Single-agent architecture with self-correction via the ReAct loop:
+Uses deepagents (built on LangGraph) for planning and auto-summarization.
 LLM generates SQL -> execute_sql tool -> error? -> LLM retries.
+For complex analyses, the agent decomposes tasks via the planning tool.
 """
 
 from pathlib import Path
 from typing import Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 
 from seeknal.ask.agents.tools.execute_sql import execute_sql
@@ -16,10 +16,16 @@ from seeknal.ask.agents.tools.list_tables import list_tables
 from seeknal.ask.agents.tools.describe_table import describe_table
 from seeknal.ask.agents.tools.get_entities import get_entities
 from seeknal.ask.agents.tools.get_entity_schema import get_entity_schema
+from seeknal.ask.agents.tools.read_pipeline import read_pipeline
+from seeknal.ask.agents.tools.search_pipelines import search_pipelines
 from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
 from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
 
-TOOLS = [execute_sql, list_tables, describe_table, get_entities, get_entity_schema]
+TOOLS = [
+    execute_sql, list_tables, describe_table,
+    get_entities, get_entity_schema,
+    read_pipeline, search_pipelines,
+]
 
 SYSTEM_PROMPT = """You are Seeknal Ask, an AI data analyst for seeknal projects.
 
@@ -32,7 +38,9 @@ You can:
 1. List available tables and entities
 2. Describe table schemas (columns and types)
 3. Execute read-only SQL queries against the data
-4. Explain results and suggest follow-up analyses
+4. Read pipeline definitions to understand how data is produced
+5. Search across pipelines to find specific calculations or columns
+6. Explain results and suggest follow-up analyses
 
 ## Workflow
 
@@ -42,6 +50,13 @@ When a user asks a data question:
 3. Write and execute a DuckDB SQL query with `execute_sql`
 4. Summarize the results in natural language
 5. Suggest relevant follow-up questions
+
+When a user asks HOW data is produced or WHY a calculation works a certain way:
+1. Use `search_pipelines` to find the relevant pipeline definition
+2. Use `read_pipeline` to read the full YAML/Python definition
+3. Explain the logic based on the pipeline definition AND query results
+
+For complex multi-step analyses, break your work into clear sub-tasks.
 
 ## DuckDB SQL Rules
 
@@ -55,7 +70,7 @@ When a user asks a data question:
 ## Security
 
 - Only SELECT/WITH queries are allowed (read-only)
-- Never reference file paths or use file-reading functions
+- Never reference file paths or use file-reading functions in SQL
 - Only query tables that appear in list_tables output
 
 ## Data Context
@@ -105,21 +120,40 @@ def create_agent(
     llm = get_llm(provider=provider, model=model, api_key=api_key)
 
     # Build system prompt with project context
-    system_message = SystemMessage(
-        content=SYSTEM_PROMPT.format(context=context)
-    )
+    system_prompt = SYSTEM_PROMPT.format(context=context)
 
-    # Create ReAct agent with memory
+    # Create deep agent with planning and auto-summarization
     checkpointer = MemorySaver()
-    agent = create_react_agent(
-        llm,
-        tools=TOOLS,
-        checkpointer=checkpointer,
-        prompt=system_message,
+    agent = _create_agent_graph(
+        llm, system_prompt, checkpointer
     )
 
     config = {"configurable": {"thread_id": "default"}}
     return agent, config
+
+
+def _create_agent_graph(llm, system_prompt: str, checkpointer):
+    """Create the agent graph, trying deepagents first with ReAct fallback."""
+    try:
+        from deepagents import create_deep_agent
+
+        return create_deep_agent(
+            model=llm,
+            tools=TOOLS,
+            system_prompt=system_prompt,
+            checkpointer=checkpointer,
+        )
+    except ImportError:
+        # Fallback to ReAct agent if deepagents not installed
+        from langchain_core.messages import SystemMessage
+        from langgraph.prebuilt import create_react_agent
+
+        return create_react_agent(
+            llm,
+            tools=TOOLS,
+            checkpointer=checkpointer,
+            prompt=SystemMessage(content=system_prompt),
+        )
 
 
 def ask(

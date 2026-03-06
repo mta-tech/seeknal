@@ -187,4 +187,62 @@ def qa_project(tmp_path_factory):
     }
     (target / "run_state.json").write_text(json.dumps(run_state, indent=2))
 
+    # ── Pipeline definitions (seeknal/ source folder) ────────────
+    seeknal_dir = project / "seeknal"
+    (seeknal_dir / "sources").mkdir(parents=True)
+    (seeknal_dir / "transforms").mkdir(parents=True)
+    (seeknal_dir / "feature_groups").mkdir(parents=True)
+
+    (seeknal_dir / "sources" / "raw_customers.yml").write_text(
+        "kind: source\n"
+        "name: raw_customers\n"
+        "description: Raw customer data from CRM export\n"
+        "source: csv\n"
+        "table: data/customers.csv\n"
+    )
+    (seeknal_dir / "sources" / "raw_orders.yml").write_text(
+        "kind: source\n"
+        "name: raw_orders\n"
+        "description: Raw order transactions\n"
+        "source: csv\n"
+        "table: data/orders.csv\n"
+    )
+    (seeknal_dir / "transforms" / "orders_cleaned.yml").write_text(
+        "kind: transform\n"
+        "name: orders_cleaned\n"
+        "description: Clean orders — filter cancelled, calculate revenue\n"
+        "inputs:\n"
+        "  - ref: source.raw_orders\n"
+        "sql: |\n"
+        "  SELECT *,\n"
+        "    amount * quantity AS revenue\n"
+        "  FROM raw_orders\n"
+        "  WHERE status = 'completed'\n"
+    )
+    (seeknal_dir / "transforms" / "monthly_revenue.yml").write_text(
+        "kind: transform\n"
+        "name: monthly_revenue\n"
+        "description: Monthly revenue aggregation\n"
+        "inputs:\n"
+        "  - ref: transform.orders_cleaned\n"
+        "sql: |\n"
+        "  SELECT\n"
+        "    strftime(order_date, '%Y-%m') AS month,\n"
+        "    CAST(SUM(revenue) AS DOUBLE) AS total_revenue,\n"
+        "    CAST(COUNT(*) AS BIGINT) AS total_orders,\n"
+        "    CAST(AVG(revenue) AS DOUBLE) AS avg_order_value\n"
+        "  FROM orders_cleaned\n"
+        "  GROUP BY 1\n"
+    )
+    (seeknal_dir / "feature_groups" / "customer_demographics.yml").write_text(
+        "kind: feature_group\n"
+        "name: customer_demographics\n"
+        "description: Customer demographic features\n"
+        "entity:\n"
+        "  name: customer\n"
+        "  join_keys: [customer_id]\n"
+        "inputs:\n"
+        "  - ref: source.raw_customers\n"
+    )
+
     return project

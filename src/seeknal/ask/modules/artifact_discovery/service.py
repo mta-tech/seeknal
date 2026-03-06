@@ -1,28 +1,37 @@
 """Artifact discovery service for Seeknal Ask.
 
-Scans seeknal project artifacts (entities, manifests, intermediates)
-and builds LLM-ready context for the agent's system prompt.
+Scans seeknal project artifacts (entities, manifests, intermediates,
+and source pipeline definitions) and builds LLM-ready context for
+the agent's system prompt.
 """
 
 import json
 from pathlib import Path
 from typing import Optional
 
+import yaml
+
 
 class ArtifactDiscovery:
     """Discovers and describes seeknal project artifacts for the LLM agent."""
 
+    # Files that must never be exposed to the agent
+    _BLOCKED_FILES = {".env", "profiles.yml", "profiles.yaml"}
+
     def __init__(self, project_path: Path):
         self.project_path = project_path
         self.target_path = project_path / "target"
+        self.seeknal_dir = project_path / "seeknal"
         self._entities_cache: Optional[list[dict]] = None
         self._dag_cache: Optional[dict] = None
         self._intermediates_cache: Optional[list[str]] = None
+        self._pipelines_cache: Optional[list[dict]] = None
 
     def get_context_for_prompt(self) -> str:
         """Build a complete context string for the LLM system prompt.
 
-        Includes: entity list with schemas, DAG overview, available tables.
+        Includes: entity list with schemas, DAG overview, available tables,
+        and a summary of source pipeline definitions.
 
         Returns:
             Markdown-formatted context string.
@@ -40,6 +49,10 @@ class ArtifactDiscovery:
         intermediates = self._discover_intermediates()
         if intermediates:
             sections.append(self._format_intermediates(intermediates))
+
+        pipelines = self._discover_source_pipelines()
+        if pipelines:
+            sections.append(self._format_source_pipelines(pipelines))
 
         if not sections:
             return (
@@ -166,4 +179,129 @@ class ArtifactDiscovery:
         )
         for name in intermediates[:30]:  # Limit for prompt size
             lines.append(f"- `{name}`")
+        return "\n".join(lines)
+
+    # --- Source pipeline discovery ---
+
+    def _discover_source_pipelines(self) -> list[dict]:
+        """Scan seeknal/ dir for YAML and Python pipeline files.
+
+        Returns list of dicts with keys: kind, name, description, file_path.
+        Reuses the same glob patterns as DAGBuilder._discover_yaml_files().
+        """
+        if self._pipelines_cache is not None:
+            return self._pipelines_cache
+
+        if not self.seeknal_dir.exists():
+            self._pipelines_cache = []
+            return self._pipelines_cache
+
+        common_dir = self.seeknal_dir / "common"
+        templates_dir = self.seeknal_dir / "templates"
+        pipelines: list[dict] = []
+
+        # Discover YAML pipeline files
+        for f in sorted(self.seeknal_dir.glob("**/*.yml")):
+            if f.is_relative_to(common_dir):
+                continue
+            try:
+                with open(f, encoding="utf-8") as fh:
+                    data = yaml.safe_load(fh)
+                if isinstance(data, dict):
+                    pipelines.append({
+                        "kind": data.get("kind", "unknown"),
+                        "name": data.get("name", f.stem),
+                        "description": data.get("description", ""),
+                        "file_path": str(f.relative_to(self.project_path)),
+                    })
+            except Exception:
+                continue
+
+        # Discover Python pipeline files
+        for f in sorted(self.seeknal_dir.glob("**/*.py")):
+            if f.is_relative_to(common_dir) or f.is_relative_to(templates_dir):
+                continue
+            if f.name.startswith("_"):
+                continue
+            pipelines.append({
+                "kind": "python_pipeline",
+                "name": f.stem,
+                "description": "",
+                "file_path": str(f.relative_to(self.project_path)),
+            })
+
+        self._pipelines_cache = pipelines
+        return self._pipelines_cache
+
+    def get_pipeline_content(self, file_path: str) -> Optional[str]:
+        """Read a pipeline definition file securely.
+
+        Args:
+            file_path: Path relative to the project root.
+
+        Returns:
+            File content as string, or None if the path is invalid/blocked.
+        """
+        resolved = (self.project_path / file_path).resolve()
+
+        # Security: must stay within project root
+        if not resolved.is_relative_to(self.project_path.resolve()):
+            return None
+
+        # Block credential and secret files
+        if resolved.name in self._BLOCKED_FILES:
+            return None
+
+        if not resolved.exists() or not resolved.is_file():
+            return None
+
+        try:
+            return resolved.read_text(encoding="utf-8")
+        except Exception:
+            return None
+
+    def search_pipeline_content(self, query: str) -> list[dict]:
+        """Search pipeline files for matching content (case-insensitive).
+
+        Returns list of dicts with keys: kind, name, file_path, matched_line, context.
+        """
+        pipelines = self._discover_source_pipelines()
+        query_lower = query.lower()
+        results = []
+
+        for p in pipelines:
+            content = self.get_pipeline_content(p["file_path"])
+            if content and query_lower in content.lower():
+                for i, line in enumerate(content.splitlines(), 1):
+                    if query_lower in line.lower():
+                        results.append({
+                            **p,
+                            "matched_line": i,
+                            "context": line.strip(),
+                        })
+                        break
+            if len(results) >= 20:
+                break
+
+        return results
+
+    def get_pipelines_summary(self) -> list[dict]:
+        """Get a summary list of all pipeline definitions."""
+        return self._discover_source_pipelines()
+
+    def _format_source_pipelines(self, pipelines: list[dict]) -> str:
+        lines = ["## Pipeline Definitions\n"]
+        lines.append(
+            "Source pipeline files that define how data is produced. "
+            "Use `read_pipeline` to see the full definition.\n"
+        )
+        by_kind: dict[str, list[dict]] = {}
+        for p in pipelines:
+            by_kind.setdefault(p["kind"], []).append(p)
+        for kind, items in sorted(by_kind.items()):
+            lines.append(f"### {kind} ({len(items)} nodes)")
+            for item in items[:20]:
+                desc = f" — {item['description']}" if item["description"] else ""
+                lines.append(f"- `{item['name']}`{desc} (`{item['file_path']}`)")
+            lines.append("")
         return "\n".join(lines)
