@@ -267,6 +267,34 @@ def _register_atlas_commands():
 _register_atlas_commands()
 
 
+# =============================================================================
+# Seeknal Ask Integration (Optional)
+# =============================================================================
+# The Ask command group is loaded dynamically if seeknal[ask] deps are installed.
+
+def _register_ask_commands():
+    """Register Ask commands if langchain/langgraph are available."""
+    try:
+        from seeknal.cli.ask import ask_app
+        app.add_typer(ask_app, name="ask")
+    except ImportError:
+        @app.command("ask", hidden=True)
+        def ask_not_installed():
+            """AI-powered data analysis (not installed).
+
+            Install with: pip install seeknal[ask]
+            """
+            typer.echo(typer.style("✗ Seeknal Ask is not installed.", fg=typer.colors.RED))
+            typer.echo("")
+            typer.echo("Install with:")
+            typer.echo(typer.style("  pip install seeknal[ask]", fg=typer.colors.CYAN))
+            raise typer.Exit(1)
+
+
+# Register Ask commands
+_register_ask_commands()
+
+
 class OutputFormat(str, Enum):
     """Output format options."""
     TABLE = "table"

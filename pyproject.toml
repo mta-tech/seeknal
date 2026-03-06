@@ -55,6 +55,15 @@ dependencies = [
 #     "uvicorn[standard]>=0.27.0",
 # ]
 
+# Seeknal Ask — NL-to-Analysis Agent
+ask = [
+    "langchain>=0.3.0",
+    "langgraph>=0.4.0",
+    "langchain-google-genai>=2.0.0",
+    "langchain-ollama>=0.3.0",
+    "rich>=13.0.0",
+]
+
 # Development dependencies
 dev = [
     "black>=24.10.0",
