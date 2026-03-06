@@ -100,12 +100,15 @@ def validate_sql_for_agent(sql: str) -> None:
 def configure_safe_connection(conn) -> None:
     """Apply security settings to a DuckDB connection used by the agent.
 
-    Disables external file/network access so that even if a blocked function
-    slips through validation, DuckDB itself will refuse the operation.
+    Note: We do NOT set enable_external_access = false because DuckDB views
+    are lazy — they re-evaluate read_parquet() on each query. Disabling
+    external access would break all registered views. Instead, security is
+    enforced by the function blocklist in validate_sql_for_agent().
+
+    Resource limits prevent DoS via expensive queries.
 
     Args:
         conn: A DuckDB connection object.
     """
-    conn.execute("SET enable_external_access = false")
     conn.execute("SET max_memory = '512MB'")
     conn.execute("SET threads = 2")

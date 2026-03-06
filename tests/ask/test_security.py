@@ -116,20 +116,6 @@ class TestValidateSqlForAgent:
 class TestConfigureSafeConnection:
     """Tests for DuckDB connection hardening."""
 
-    def test_disables_external_access(self):
-        import duckdb
-
-        conn = duckdb.connect(":memory:")
-        from seeknal.ask.security import configure_safe_connection
-
-        configure_safe_connection(conn)
-
-        # After disabling, read_text should fail
-        with pytest.raises(Exception):
-            conn.execute("SELECT * FROM read_text('/etc/passwd')")
-
-        conn.close()
-
     def test_sets_resource_limits(self):
         import duckdb
 

@@ -145,5 +145,15 @@ def ask(
     messages = result.get("messages", [])
     for msg in reversed(messages):
         if hasattr(msg, "content") and msg.type == "ai" and msg.content:
-            return msg.content
+            content = msg.content
+            # Gemini returns content as list of blocks: [{'type':'text','text':'...'}]
+            if isinstance(content, list):
+                parts = []
+                for block in content:
+                    if isinstance(block, dict) and "text" in block:
+                        parts.append(block["text"])
+                    elif isinstance(block, str):
+                        parts.append(block)
+                return "\n".join(parts) if parts else "No response generated."
+            return content
     return "No response generated."
