@@ -6,14 +6,17 @@ and the final answer -- all rendered via Rich Console.
 """
 
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage
+from rich.console import Console
+from rich.markup import escape
 
-
-# Ralph Loop: max retries when agent returns tool calls but no final text
-_MAX_RALPH_RETRIES = 3
-_NO_RESPONSE = "No response generated."
+from seeknal.ask.agents.agent import (
+    _MAX_RALPH_RETRIES,
+    _NO_RESPONSE,
+    _normalize_content,
+)
 
 # Strip raw ANSI escape sequences from tool output to prevent terminal injection
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -24,39 +27,21 @@ def _sanitize_output(text: str) -> str:
     return _ANSI_ESCAPE.sub("", text)
 
 
-def _normalize_content(content) -> str:
-    """Normalize Gemini's list[dict] content format to plain string.
-
-    Gemini returns content as [{'type':'text','text':'...'}] or plain str.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict) and "text" in block:
-                parts.append(block["text"])
-            elif isinstance(block, str):
-                parts.append(block)
-        return "".join(parts)
-    return str(content) if content else ""
-
-
 # ---------------------------------------------------------------------------
 # Rendering helpers -- thin wrappers around Rich Console
 # ---------------------------------------------------------------------------
 
 
-def _show_reasoning(console, text: str) -> None:
+def _show_reasoning(console: Console, text: str) -> None:
     """Display LLM reasoning text in a dim Panel."""
     from rich.panel import Panel
 
     console.print(Panel(text.strip(), title="Reasoning", border_style="dim"))
 
 
-def _show_tool_start(console, name: str, args: Optional[dict] = None) -> None:
+def _show_tool_start(console: Console, name: str, args: Optional[dict] = None) -> None:
     """Display tool invocation start."""
-    console.print(f"\n[bold]> {name}[/bold]")
+    console.print(f"\n[bold]> {escape(name)}[/bold]")
     if args and name == "execute_sql" and "sql" in args:
         _show_sql(console, args["sql"])
     elif args:
@@ -64,10 +49,10 @@ def _show_tool_start(console, name: str, args: Optional[dict] = None) -> None:
         arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
         if len(arg_str) > 200:
             arg_str = arg_str[:200] + "..."
-        console.print(f"  [dim]{arg_str}[/dim]")
+        console.print(f"  [dim]{escape(arg_str)}[/dim]")
 
 
-def _show_tool_end(console, name: str, output: str) -> None:
+def _show_tool_end(console: Console, name: str, output: str) -> None:
     """Display tool result summary, with special handling for execute_sql."""
     output = _sanitize_output(output)
 
@@ -75,17 +60,17 @@ def _show_tool_end(console, name: str, output: str) -> None:
         _show_sql_result_table(console, output)
     else:
         summary = output[:200] + "..." if len(output) > 200 else output
-        console.print(f"  [dim]Done: {summary}[/dim]")
+        console.print(f"  [dim]Done: {escape(summary)}[/dim]")
 
 
-def _show_sql(console, sql: str) -> None:
+def _show_sql(console: Console, sql: str) -> None:
     """Display syntax-highlighted SQL."""
     from rich.syntax import Syntax
 
     console.print(Syntax(sql.strip(), "sql", theme="monokai", padding=(0, 2)))
 
 
-def _show_sql_result_table(console, output: str) -> None:
+def _show_sql_result_table(console: Console, output: str) -> None:
     """Parse markdown table output from execute_sql and render as Rich Table."""
     from rich.table import Table
 
@@ -137,7 +122,7 @@ def _show_sql_result_table(console, output: str) -> None:
         console.print(f"  [dim]({remaining} more rows)[/dim]")
 
 
-def _show_answer(console, text: str) -> None:
+def _show_answer(console: Console, text: str) -> None:
     """Display final answer as Markdown in a Panel."""
     from rich.markdown import Markdown
     from rich.panel import Panel
@@ -145,7 +130,7 @@ def _show_answer(console, text: str) -> None:
     console.print(Panel(Markdown(text.strip()), title="Answer", border_style="green"))
 
 
-def _show_retry(console, attempt: int, max_retries: int) -> None:
+def _show_retry(console: Console, attempt: int, max_retries: int) -> None:
     """Display retry separator for Ralph Loop."""
     console.print(
         f"\n[dim]--- Requesting summary (attempt {attempt}/{max_retries})... ---[/dim]\n"
@@ -157,12 +142,15 @@ def _show_retry(console, attempt: int, max_retries: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _stream_one_pass(agent, config: dict, question: str, console) -> str:
+async def _stream_one_pass(
+    agent: Any, config: dict, question: str, console: Console
+) -> str:
     """Run a single astream_events pass and render events progressively.
 
     Returns the final answer text, or empty string if no answer was produced.
     """
     text_buffer: list[str] = []
+    accumulated = ""  # Cached join to avoid O(n^2) re-joining
 
     async for event in agent.astream_events(
         {"messages": [HumanMessage(content=question)]},
@@ -183,20 +171,22 @@ async def _stream_one_pass(agent, config: dict, question: str, console) -> str:
             # Gemini cumulative dedup: if the new token contains all
             # previously buffered text as a prefix, it's cumulative --
             # replace the buffer. Otherwise it's a delta -- append.
-            accumulated = "".join(text_buffer)
             if accumulated and token.startswith(accumulated) and len(token) > len(accumulated):
                 # Cumulative mode: token = all previous + new
                 text_buffer.clear()
                 text_buffer.append(token)
+                accumulated = token
             else:
                 # Delta mode: each chunk is new content
                 text_buffer.append(token)
+                accumulated += token
 
         elif kind == "on_tool_start":
             # Flush text buffer as reasoning (if any text accumulated)
             if text_buffer:
-                _show_reasoning(console, "".join(text_buffer))
+                _show_reasoning(console, accumulated)
                 text_buffer.clear()
+                accumulated = ""
 
             name = event.get("name", "unknown")
             args = event.get("data", {}).get("input", {})
@@ -212,18 +202,17 @@ async def _stream_one_pass(agent, config: dict, question: str, console) -> str:
 
     # Stream ended -- flush remaining buffer as answer
     if text_buffer:
-        answer = "".join(text_buffer)
-        _show_answer(console, answer)
-        return answer
+        _show_answer(console, accumulated)
+        return accumulated
 
     return ""
 
 
 async def stream_ask(
-    agent,
+    agent: Any,
     config: dict,
     question: str,
-    console,
+    console: Console,
     quiet: bool = False,
 ) -> str:
     """Stream agent events with step-by-step visibility and Ralph Loop retry.
@@ -263,9 +252,9 @@ async def stream_ask(
 
 
 async def chat_session(
-    agent,
+    agent: Any,
     config: dict,
-    console,
+    console: Console,
     quiet: bool = False,
 ) -> None:
     """Run an interactive chat session with streaming visibility.

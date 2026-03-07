@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from seeknal.ask.agents.agent import _normalize_content
 from seeknal.ask.streaming import (
-    _normalize_content,
     _sanitize_output,
     _show_reasoning,
     _show_tool_start,

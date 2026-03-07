@@ -156,12 +156,50 @@ def _create_agent_graph(llm, system_prompt: str, checkpointer):
         )
 
 
+_NO_RESPONSE = "No response generated."
+
+# Ralph Loop: max retries when agent returns tool calls but no final text
+_MAX_RALPH_RETRIES = 3
+
+
+def _normalize_content(content) -> str:
+    """Normalize Gemini's list[dict] content format to plain string.
+
+    Gemini returns content as [{'type':'text','text':'...'}] or plain str.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and "text" in block:
+                parts.append(block["text"])
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content) if content else ""
+
+
+def _extract_response(messages: list) -> str:
+    """Extract the last AI text message from agent output."""
+    for msg in reversed(messages):
+        if hasattr(msg, "content") and msg.type == "ai" and msg.content:
+            text = _normalize_content(msg.content)
+            if text:
+                return text
+    return ""
+
+
 def ask(
     agent,
     config: dict,
     question: str,
 ) -> str:
     """Send a question to the agent and get a response.
+
+    Uses the Ralph Loop technique: if the agent ends on tool calls without
+    producing a final text response, nudge it to summarize its findings.
+    Retries up to _MAX_RALPH_RETRIES times before giving up.
 
     Args:
         agent: The compiled LangGraph agent.
@@ -171,23 +209,26 @@ def ask(
     Returns:
         The agent's text response.
     """
+    # Initial invocation
     result = agent.invoke(
         {"messages": [HumanMessage(content=question)]},
         config=config,
     )
-    # Extract the last AI message
-    messages = result.get("messages", [])
-    for msg in reversed(messages):
-        if hasattr(msg, "content") and msg.type == "ai" and msg.content:
-            content = msg.content
-            # Gemini returns content as list of blocks: [{'type':'text','text':'...'}]
-            if isinstance(content, list):
-                parts = []
-                for block in content:
-                    if isinstance(block, dict) and "text" in block:
-                        parts.append(block["text"])
-                    elif isinstance(block, str):
-                        parts.append(block)
-                return "\n".join(parts) if parts else "No response generated."
-            return content
-    return "No response generated."
+    response = _extract_response(result.get("messages", []))
+    if response:
+        return response
+
+    # Ralph Loop: nudge the agent to produce a text summary
+    for _ in range(_MAX_RALPH_RETRIES):
+        result = agent.invoke(
+            {"messages": [HumanMessage(
+                content="Please summarize your findings from the tool calls above "
+                        "and provide your analysis as a text response."
+            )]},
+            config=config,
+        )
+        response = _extract_response(result.get("messages", []))
+        if response:
+            return response
+
+    return _NO_RESPONSE
