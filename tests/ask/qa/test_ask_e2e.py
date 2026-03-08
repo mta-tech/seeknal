@@ -10,9 +10,7 @@ Tests three question categories against a realistic e-commerce data pipeline:
 """
 
 import os
-import re
 import pytest
-from pathlib import Path
 
 # Skip entire module if no API key
 pytestmark = pytest.mark.skipif(
@@ -21,27 +19,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(scope="session")
-def agent_and_config(qa_project):
-    """Create a real agent with Gemini against the QA project."""
+def _fresh_agent(qa_project):
+    """Create a fresh agent with its own thread for isolated tests."""
     from seeknal.ask.agents.agent import create_agent
-
-    agent, config = create_agent(
+    return create_agent(
         project_path=qa_project,
         provider="google",
         model="gemini-2.5-flash",
     )
-    return agent, config
 
 
 class TestWhatQuestions:
     """WHAT — Factual data questions that require SQL execution."""
 
-    def test_how_many_customers(self, agent_and_config):
+    def test_how_many_customers(self, qa_project):
         """Agent should count customers and return ~50."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = agent_and_config
+        agent, config = _fresh_agent(qa_project)
         answer = ask(agent, config, "How many customers are in the dataset?")
 
         print(f"\n--- WHAT: How many customers? ---\n{answer}\n")
@@ -49,11 +44,11 @@ class TestWhatQuestions:
         # Should mention the number 50 somewhere
         assert "50" in answer
 
-    def test_what_categories_exist(self, agent_and_config):
+    def test_what_categories_exist(self, qa_project):
         """Agent should list product/order categories."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = agent_and_config
+        agent, config = _fresh_agent(qa_project)
         answer = ask(agent, config, "What product categories exist in the orders data?")
 
         print(f"\n--- WHAT: Categories? ---\n{answer}\n")
@@ -65,11 +60,11 @@ class TestWhatQuestions:
         )
         assert categories_found >= 3, f"Only found {categories_found} categories in answer"
 
-    def test_what_cities_have_most_customers(self, agent_and_config):
+    def test_what_cities_have_most_customers(self, qa_project):
         """Agent should identify cities with most customers."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = agent_and_config
+        agent, config = _fresh_agent(qa_project)
         answer = ask(agent, config,
             "What are the top 3 cities by number of customers?"
         )
@@ -87,11 +82,11 @@ class TestWhatQuestions:
 class TestWhyQuestions:
     """WHY — Analytical questions requiring reasoning over data."""
 
-    def test_why_revenue_varies_by_category(self, agent_and_config):
+    def test_why_revenue_varies_by_category(self, qa_project):
         """Agent should analyze why some categories perform better."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = agent_and_config
+        agent, config = _fresh_agent(qa_project)
         answer = ask(agent, config,
             "Why do some product categories generate more revenue than others? "
             "Show me the data and explain."
@@ -104,11 +99,11 @@ class TestWhyQuestions:
         found = sum(1 for w in analysis_indicators if w.lower() in answer.lower())
         assert found >= 2, "Answer lacks analytical content about revenue and categories"
 
-    def test_why_customer_segments_differ(self, agent_and_config):
+    def test_why_customer_segments_differ(self, qa_project):
         """Agent should compare customer segments and explain differences."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = agent_and_config
+        agent, config = _fresh_agent(qa_project)
         answer = ask(agent, config,
             "Why might Premium customers behave differently from Basic customers? "
             "Look at spending patterns and order frequency."
@@ -123,11 +118,11 @@ class TestWhyQuestions:
 class TestHowQuestions:
     """HOW — Methodology questions about data pipeline and metrics."""
 
-    def test_how_is_revenue_calculated(self, agent_and_config):
+    def test_how_is_revenue_calculated(self, qa_project):
         """Agent should explain how revenue is computed from the data."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = agent_and_config
+        agent, config = _fresh_agent(qa_project)
         answer = ask(agent, config,
             "How is revenue calculated in this dataset? "
             "What columns contribute to it?"
@@ -140,11 +135,11 @@ class TestHowQuestions:
         found = sum(1 for t in relevant_terms if t.lower() in answer.lower())
         assert found >= 2, "Answer doesn't explain revenue calculation"
 
-    def test_how_many_orders_were_cancelled(self, agent_and_config):
+    def test_how_many_orders_were_cancelled(self, qa_project):
         """Agent should find cancelled orders and explain the rate."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = agent_and_config
+        agent, config = _fresh_agent(qa_project)
         answer = ask(agent, config,
             "How many orders were cancelled vs completed? "
             "What is the cancellation rate?"
@@ -155,11 +150,11 @@ class TestHowQuestions:
         # Should mention both statuses
         assert "cancel" in answer.lower() or "complet" in answer.lower()
 
-    def test_how_data_pipeline_is_structured(self, agent_and_config):
+    def test_how_data_pipeline_is_structured(self, qa_project):
         """Agent should describe the available data tables and entities."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = agent_and_config
+        agent, config = _fresh_agent(qa_project)
         answer = ask(agent, config,
             "How is this data pipeline structured? "
             "What tables and entities are available for analysis?"
@@ -207,11 +202,11 @@ class TestMultiTurnConversation:
 class TestEdgeCases:
     """Edge cases and error handling with real LLM."""
 
-    def test_question_about_nonexistent_data(self, agent_and_config):
+    def test_question_about_nonexistent_data(self, qa_project):
         """Agent should gracefully handle questions about missing data."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = agent_and_config
+        agent, config = _fresh_agent(qa_project)
         answer = ask(agent, config,
             "What is the average delivery time for orders?"
         )
@@ -220,11 +215,11 @@ class TestEdgeCases:
         # Should indicate that delivery time data doesn't exist
         # (no delivery_time column in our dataset)
 
-    def test_ambiguous_question(self, agent_and_config):
+    def test_ambiguous_question(self, qa_project):
         """Agent should handle ambiguous questions sensibly."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = agent_and_config
+        agent, config = _fresh_agent(qa_project)
         answer = ask(agent, config,
             "Show me the top performers"
         )

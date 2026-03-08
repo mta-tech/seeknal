@@ -3920,6 +3920,7 @@ ask = [
     { name = "langchain-ollama" },
     { name = "langgraph" },
     { name = "rich" },
+    { name = "ruamel-yaml" },
 ]
 dev = [
     { name = "black" },
@@ -3968,6 +3969,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "quinn", specifier = ">=0.10.3" },
     { name = "rich", marker = "extra == 'ask'", specifier = ">=13.0.0" },
+    { name = "ruamel-yaml", marker = "extra == 'ask'", specifier = ">=0.18.0" },
     { name = "s3fs", specifier = ">=2024.12.0" },
     { name = "seeknal", extras = ["dev"], marker = "extra == 'all'" },
     { name = "sqlalchemy", specifier = ">=1.4.0" },
