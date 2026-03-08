@@ -8,16 +8,35 @@ Usage:
     seeknal ask chat                         Interactive multi-turn chat
 """
 
+import click
 import typer
+import typer.core
 from pathlib import Path
 from typing import Optional
 
 from seeknal.ask.project import find_project_path
 
 
+class _AskGroup(typer.core.TyperGroup):
+    """Custom TyperGroup that treats unrecognised commands as a question.
+
+    When the first positional arg isn't a known subcommand (like 'chat'),
+    moves all args to ctx.args so the callback handles them as a question.
+    """
+
+    def invoke(self, ctx):
+        if ctx._protected_args:
+            first_arg = ctx._protected_args[0]
+            if first_arg not in self.commands:
+                ctx.args = [*ctx._protected_args, *ctx.args]
+                ctx._protected_args = []
+        return super().invoke(ctx)
+
+
 ask_app = typer.Typer(
     name="ask",
     help="AI-powered natural language data analysis.",
+    cls=_AskGroup,
     invoke_without_command=True,
     context_settings={"allow_extra_args": True},
 )

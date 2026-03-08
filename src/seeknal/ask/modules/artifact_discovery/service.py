@@ -161,7 +161,12 @@ class ArtifactDiscovery:
 
     def _format_dag(self, dag: dict) -> str:
         lines = ["## DAG Overview\n"]
-        nodes = dag.get("nodes", [])
+        nodes_raw = dag.get("nodes", {})
+        # nodes can be a dict (keyed by node id) or a list
+        if isinstance(nodes_raw, dict):
+            nodes = list(nodes_raw.values())
+        else:
+            nodes = nodes_raw
         if nodes:
             lines.append(f"Total nodes: {len(nodes)}\n")
             for node in nodes[:20]:  # Limit to 20 nodes for prompt size
