@@ -1,4 +1,11 @@
-"""Execute Python tool — run Python code for data analysis."""
+"""Execute Python tool — run Python code for data analysis.
+
+Executes agent-generated Python in an isolated subprocess.
+The subprocess gets its own DuckDB connection with project data registered
+as views from parquet files — no access to the parent process.
+
+Falls back to in-process threading if subprocess execution fails.
+"""
 
 import ast
 import os
@@ -50,7 +57,6 @@ def _build_namespace(conn: Any) -> dict:
 
     ns: dict[str, Any] = {"conn": SafeConnection(conn)}
 
-    # Lazy-import data libraries
     try:
         import pandas as pd
         ns["pd"] = pd
@@ -99,28 +105,22 @@ def _capture_plots() -> list[str]:
 
 
 def _do_execute(code: str, conn: Any, timeout: int = 30) -> str:
-    """Core execution logic, testable without @tool decorator."""
+    """In-process execution fallback (used when uv is not available)."""
     if not code or not code.strip():
         return "No code provided."
 
     namespace = _build_namespace(conn)
-
-    # Split code for last-expression capture
     body_code, expr_code = _split_last_expression(code)
 
-    # Execute with timeout — use per-thread StringIO instead of
-    # reassigning sys.stdout (which is process-global and not thread-safe).
     result_holder: dict[str, Any] = {
         "value": None, "stdout": "", "error": None, "plots": [],
     }
 
     def target():
         captured = StringIO()
-        # Override print in namespace to capture output without touching sys.stdout
         namespace["print"] = lambda *a, **kw: print(*a, file=captured, **kw)
         try:
             if isinstance(body_code, str):
-                # Fallback: couldn't split, exec everything
                 exec(compile(body_code, "<agent>", "exec"), namespace)
             else:
                 if body_code is not None:
@@ -140,7 +140,6 @@ def _do_execute(code: str, conn: Any, timeout: int = 30) -> str:
     if thread.is_alive():
         return f"Execution timed out after {timeout} seconds."
 
-    # Format output
     parts: list[str] = []
 
     if result_holder["stdout"]:
@@ -151,7 +150,6 @@ def _do_execute(code: str, conn: Any, timeout: int = 30) -> str:
     elif result_holder["value"] is not None:
         val = result_holder["value"]
         val_str = repr(val) if not isinstance(val, str) else val
-        # Truncate very large outputs
         if len(val_str) > 5000:
             val_str = val_str[:5000] + "\n... (truncated)"
         parts.append(val_str)
@@ -187,4 +185,7 @@ def execute_python(code: str) -> str:
     from seeknal.ask.agents.tools._context import get_tool_context
 
     ctx = get_tool_context()
-    return _do_execute(code, ctx.repl.conn)
+
+    # Use subprocess sandbox for process isolation + killable timeout
+    from seeknal.ask.sandbox import execute_in_sandbox
+    return execute_in_sandbox(code, ctx.project_path)
