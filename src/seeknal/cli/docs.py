@@ -515,3 +515,57 @@ def docs_command(
     # Exit code 1 if no results
     if not results:
         raise typer.Exit(1)
+
+
+@docs_app.command("generate")
+def generate_command(
+    project: Optional[str] = typer.Option(
+        None, "--project", help="Path to seeknal project (auto-detected)"
+    ),
+    provider: Optional[str] = typer.Option(
+        None, "--provider", "-p", help="LLM provider: google, ollama"
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m", help="Model name override"
+    ),
+    pipeline: Optional[str] = typer.Option(
+        None, "--pipeline", help="Generate docs for a specific pipeline only"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Preview changes without writing files"
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite existing documentation"
+    ),
+):
+    """Generate LLM-powered documentation for pipeline YAML files.
+
+    Enriches pipeline YAML files with descriptions and column documentation
+    using an LLM, preserving YAML formatting and comments.
+
+    Examples:
+        seeknal docs generate
+        seeknal docs generate --pipeline my_transform
+        seeknal docs generate --dry-run
+        seeknal docs generate --force --provider google
+    """
+    try:
+        from seeknal.cli.document import generate_docs
+    except ImportError:
+        typer.echo(typer.style(
+            "Documentation generation dependencies not installed.",
+            fg=typer.colors.RED,
+        ))
+        typer.echo("Install with: " + typer.style(
+            "pip install seeknal[ask]", fg=typer.colors.CYAN
+        ))
+        raise typer.Exit(1)
+
+    generate_docs(
+        project=project,
+        provider=provider,
+        model=model,
+        pipeline_name=pipeline,
+        dry_run=dry_run,
+        force=force,
+    )

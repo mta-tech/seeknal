@@ -63,6 +63,7 @@ ask = [
     "langchain-google-genai>=2.0.0",
     "langchain-ollama>=0.3.0",
     "rich>=13.0.0",
+    "ruamel.yaml>=0.18.0",
 ]
 
 # Development dependencies

@@ -186,7 +186,8 @@ class ArtifactDiscovery:
     def _discover_source_pipelines(self) -> list[dict]:
         """Scan seeknal/ dir for YAML and Python pipeline files.
 
-        Returns list of dicts with keys: kind, name, description, file_path.
+        Returns list of dicts with keys: kind, name, description,
+        column_descriptions, file_path.
         Reuses the same glob patterns as DAGBuilder._discover_yaml_files().
         """
         if self._pipelines_cache is not None:
@@ -212,6 +213,7 @@ class ArtifactDiscovery:
                         "kind": data.get("kind", "unknown"),
                         "name": data.get("name", f.stem),
                         "description": data.get("description", ""),
+                        "column_descriptions": data.get("column_descriptions", {}),
                         "file_path": str(f.relative_to(self.project_path)),
                     })
             except Exception:
@@ -303,5 +305,9 @@ class ArtifactDiscovery:
             for item in items[:20]:
                 desc = f" — {item['description']}" if item["description"] else ""
                 lines.append(f"- `{item['name']}`{desc} (`{item['file_path']}`)")
+                col_descs = item.get("column_descriptions", {})
+                if col_descs:
+                    for col_name, col_desc in col_descs.items():
+                        lines.append(f"  - `{col_name}`: {col_desc}")
             lines.append("")
         return "\n".join(lines)

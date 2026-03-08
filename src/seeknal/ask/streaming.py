@@ -44,6 +44,8 @@ def _show_tool_start(console: Console, name: str, args: Optional[dict] = None) -
     console.print(f"\n[bold]> {escape(name)}[/bold]")
     if args and name == "execute_sql" and "sql" in args:
         _show_sql(console, args["sql"])
+    elif args and name == "execute_python" and "code" in args:
+        _show_python(console, args["code"])
     elif args:
         # Show truncated args for other tools
         arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
@@ -53,11 +55,13 @@ def _show_tool_start(console: Console, name: str, args: Optional[dict] = None) -
 
 
 def _show_tool_end(console: Console, name: str, output: str) -> None:
-    """Display tool result summary, with special handling for execute_sql."""
+    """Display tool result summary, with special handling for execute_sql/execute_python."""
     output = _sanitize_output(output)
 
     if name == "execute_sql" and "|" in output:
         _show_sql_result_table(console, output)
+    elif name == "execute_python":
+        _show_python_output(console, output)
     else:
         summary = output[:200] + "..." if len(output) > 200 else output
         console.print(f"  [dim]Done: {escape(summary)}[/dim]")
@@ -68,6 +72,31 @@ def _show_sql(console: Console, sql: str) -> None:
     from rich.syntax import Syntax
 
     console.print(Syntax(sql.strip(), "sql", theme="monokai", padding=(0, 2)))
+
+
+def _show_python(console: Console, code: str) -> None:
+    """Display syntax-highlighted Python code."""
+    from rich.syntax import Syntax
+
+    console.print(Syntax(code.strip(), "python", theme="monokai", padding=(0, 2)))
+
+
+def _show_python_output(console: Console, output: str) -> None:
+    """Display Python execution output, showing full content."""
+    if not output:
+        console.print("  [dim]Done (no output)[/dim]")
+        return
+
+    # Show plot paths prominently
+    if "Plots saved:" in output:
+        parts = output.split("Plots saved:")
+        if parts[0].strip():
+            console.print(f"  [dim]{escape(parts[0].strip())}[/dim]")
+        console.print(f"  [bold green]Plots saved:{escape(parts[1])}[/bold green]")
+    else:
+        # Show full output (not truncated like generic tools)
+        display = output[:2000] + "..." if len(output) > 2000 else output
+        console.print(f"  [dim]{escape(display)}[/dim]")
 
 
 def _show_sql_result_table(console: Console, output: str) -> None:
