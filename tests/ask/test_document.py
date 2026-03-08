@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from seeknal.ask.project import find_project_path
 from seeknal.cli.document import (
     _find_project_path,
     _gather_pipeline_context,
@@ -23,6 +24,14 @@ class TestFindProjectPath:
 
         with pytest.raises(typer.BadParameter, match="not found"):
             _find_project_path("/nonexistent/path/xyz")
+
+    def test_shared_find_project_path_explicit(self, tmp_path):
+        result = find_project_path(str(tmp_path))
+        assert result == tmp_path
+
+    def test_shared_find_project_path_nonexistent(self):
+        with pytest.raises(FileNotFoundError, match="not found"):
+            find_project_path("/nonexistent/path/xyz")
 
 
 class TestGatherPipelineContext:

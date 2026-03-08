@@ -12,9 +12,6 @@ from pathlib import Path
 from typing import Optional
 
 import typer
-from rich.console import Console
-
-console = Console()
 
 # Documentation generation prompt template
 _DOC_PROMPT = """\
@@ -52,22 +49,15 @@ Respond with ONLY the JSON block, no other text.
 
 
 def _find_project_path(project: Optional[str] = None) -> Path:
-    """Find the seeknal project path."""
-    if project:
-        p = Path(project)
-        if p.exists():
-            return p
-        raise typer.BadParameter(f"Project path not found: {project}")
+    """Find the seeknal project path.
 
-    # Check current directory
-    cwd = Path.cwd()
-    if (cwd / "seeknal").is_dir():
-        return cwd
-
-    raise typer.BadParameter(
-        "Not in a seeknal project directory. "
-        "Use --project to specify the path."
-    )
+    Wraps the shared find_project_path() with typer.BadParameter errors.
+    """
+    try:
+        from seeknal.ask.project import find_project_path
+        return find_project_path(project)
+    except FileNotFoundError as e:
+        raise typer.BadParameter(str(e))
 
 
 def _gather_pipeline_context(
@@ -222,8 +212,10 @@ def generate_docs(
         from seeknal.ask.agents.providers import get_llm
         from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
     except ImportError:
-        console.print("[red]seeknal[ask] dependencies not installed.[/red]")
-        console.print("Install with: pip install seeknal[ask]")
+        typer.echo(typer.style(
+            "seeknal[ask] dependencies not installed.", fg=typer.colors.RED
+        ))
+        typer.echo("Install with: pip install seeknal[ask]")
         raise typer.Exit(1)
 
     # Discover pipelines
@@ -231,20 +223,22 @@ def generate_docs(
     pipelines = discovery.get_pipelines_summary()
 
     if not pipelines:
-        console.print("[yellow]No pipeline files found.[/yellow]")
+        typer.echo("No pipeline files found.")
         return
 
     # Filter by name if specified
     if pipeline_name:
         pipelines = [p for p in pipelines if p["name"] == pipeline_name]
         if not pipelines:
-            console.print(f"[red]Pipeline '{pipeline_name}' not found.[/red]")
+            typer.echo(typer.style(
+                f"Pipeline '{pipeline_name}' not found.", fg=typer.colors.RED
+            ))
             raise typer.Exit(1)
 
     # Only process YAML pipelines (not Python)
     yaml_pipelines = [p for p in pipelines if p["file_path"].endswith((".yml", ".yaml"))]
     if not yaml_pipelines:
-        console.print("[yellow]No YAML pipeline files to document.[/yellow]")
+        typer.echo("No YAML pipeline files to document.")
         return
 
     # Create LLM
@@ -256,8 +250,8 @@ def generate_docs(
         from seeknal.cli.repl import REPL
         repl = REPL(project_path=project_path, skip_history=True)
         conn = repl.conn
-    except Exception:
-        pass
+    except Exception as e:
+        warnings.warn(f"Could not create REPL connection for schema lookup: {e}")
 
     # Process each pipeline
     total = len(yaml_pipelines)
@@ -268,7 +262,7 @@ def generate_docs(
     for i, pipeline in enumerate(yaml_pipelines, 1):
         name = pipeline["name"]
         file_path = project_path / pipeline["file_path"]
-        console.print(f"[dim]Documenting [{i}/{total}] {name}...[/dim]")
+        typer.echo(f"  Documenting [{i}/{total}] {name}...")
 
         try:
             context = _gather_pipeline_context(pipeline, project_path, conn)
@@ -279,7 +273,7 @@ def generate_docs(
 
             parsed = _parse_llm_response(response_text)
             if not parsed:
-                console.print(f"  [yellow]Could not parse LLM response for {name}[/yellow]")
+                typer.echo(f"  Could not parse LLM response for {name}")
                 failed += 1
                 continue
 
@@ -293,21 +287,23 @@ def generate_docs(
 
             if changed:
                 prefix = "[DRY RUN] " if dry_run else ""
-                console.print(f"  [green]{prefix}Updated {name}[/green]")
+                typer.echo(typer.style(
+                    f"  {prefix}Updated {name}", fg=typer.colors.GREEN
+                ))
                 if message:
-                    console.print(f"  [dim]{message}[/dim]")
+                    typer.echo(f"  {message}")
                 documented += 1
             else:
-                console.print(f"  [dim]{message}[/dim]")
+                typer.echo(f"  {message}")
                 skipped += 1
 
         except Exception as e:
-            console.print(f"  [red]Error: {e}[/red]")
+            typer.echo(typer.style(f"  Error: {e}", fg=typer.colors.RED))
             failed += 1
 
     # Summary
-    console.print()
-    console.print(f"[bold]Documentation complete:[/bold]")
-    console.print(f"  Documented: {documented}")
-    console.print(f"  Skipped: {skipped}")
-    console.print(f"  Failed: {failed}")
+    typer.echo()
+    typer.echo("Documentation complete:")
+    typer.echo(f"  Documented: {documented}")
+    typer.echo(f"  Skipped: {skipped}")
+    typer.echo(f"  Failed: {failed}")

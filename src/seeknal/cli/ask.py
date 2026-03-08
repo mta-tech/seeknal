@@ -12,6 +12,8 @@ import typer
 from pathlib import Path
 from typing import Optional
 
+from seeknal.ask.project import find_project_path
+
 
 ask_app = typer.Typer(
     name="ask",
@@ -19,26 +21,6 @@ ask_app = typer.Typer(
     invoke_without_command=True,
     context_settings={"allow_extra_args": True},
 )
-
-
-def _find_project_path() -> Path:
-    """Find seeknal project root from current directory."""
-    cwd = Path.cwd()
-
-    # Check for seeknal markers
-    markers = ["seeknal.yml", "seeknal.yaml", "target"]
-    for marker in markers:
-        if (cwd / marker).exists():
-            return cwd
-
-    # Walk up directories
-    for parent in cwd.parents:
-        for marker in markers:
-            if (parent / marker).exists():
-                return parent
-
-    # Default to cwd
-    return cwd
 
 
 @ask_app.callback()
@@ -86,7 +68,7 @@ def _run_oneshot(
     quiet: bool = False,
 ):
     """Execute a one-shot question and print the answer."""
-    project_path = project or _find_project_path()
+    project_path = project or find_project_path()
 
     try:
         from seeknal.ask.agents.agent import create_agent, ask as agent_ask
@@ -158,7 +140,7 @@ def chat_command(
     ),
 ):
     """Start an interactive multi-turn chat session."""
-    project_path = project or _find_project_path()
+    project_path = project or find_project_path()
 
     try:
         from seeknal.ask.agents.agent import create_agent, ask as agent_ask

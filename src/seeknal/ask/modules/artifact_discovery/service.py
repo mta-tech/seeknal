@@ -11,12 +11,11 @@ from typing import Optional
 
 import yaml
 
+from seeknal.ask.agents.tools._security import BLOCKED_FILES
+
 
 class ArtifactDiscovery:
     """Discovers and describes seeknal project artifacts for the LLM agent."""
-
-    # Files that must never be exposed to the agent
-    _BLOCKED_FILES = {".env", "profiles.yml", "profiles.yaml"}
 
     def __init__(self, project_path: Path):
         self.project_path = project_path
@@ -251,7 +250,7 @@ class ArtifactDiscovery:
             return None
 
         # Block credential and secret files
-        if resolved.name in self._BLOCKED_FILES:
+        if resolved.name.lower() in BLOCKED_FILES:
             return None
 
         if not resolved.exists() or not resolved.is_file():
