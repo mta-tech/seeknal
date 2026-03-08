@@ -7,6 +7,11 @@ docs/solutions/security-vulnerabilities/path-traversal-file-state-backend.md
 import re
 from pathlib import Path
 
+# Pre-compiled patterns for path sanitization
+_PATH_TRAVERSAL_RE = re.compile(r"\.\.[/\\]")
+_BACKSLASH_RE = re.compile(r"[\\]")
+_DOUBLE_DOT_RE = re.compile(r"\.\.")
+
 # Files that must never be exposed to the agent
 BLOCKED_FILES = {".env", "profiles.yml", "profiles.yaml"}
 
@@ -31,10 +36,10 @@ def validate_project_path(path: str, project_path: Path) -> Path:
     """Validate and resolve a file path with defense-in-depth.
 
     Layers:
-    1. Sanitize: strip ../ and ..\\ sequences
-    2. Normalize: convert backslash to forward slash
-    3. Resolve: resolve to absolute path
-    4. Containment: must be within project root
+    1. Sanitize: strip ../ and ..\\ sequences, normalize separators
+    2. Resolve: resolve to absolute path
+    3. Containment: must be within project root
+    4. Symlink: resolved symlink targets must stay within project
     5. Sensitive file check: block .env, profiles.yml, etc.
 
     Args:
@@ -48,9 +53,9 @@ def validate_project_path(path: str, project_path: Path) -> Path:
         ValueError: If the path fails any validation layer.
     """
     # Layer 1: Sanitize path traversal sequences
-    sanitized = re.sub(r"\.\.[/\\]", "", path)
-    sanitized = re.sub(r"[\\]", "/", sanitized)  # Normalize separators
-    sanitized = re.sub(r"\.\.", "", sanitized)  # Remove remaining ..
+    sanitized = _PATH_TRAVERSAL_RE.sub("", path)
+    sanitized = _BACKSLASH_RE.sub("/", sanitized)  # Normalize separators
+    sanitized = _DOUBLE_DOT_RE.sub("", sanitized)  # Remove remaining ..
 
     # Layer 2: Resolve to absolute
     resolved = (project_path / sanitized).resolve()
@@ -60,7 +65,13 @@ def validate_project_path(path: str, project_path: Path) -> Path:
     if not resolved.is_relative_to(project_root):
         raise ValueError(f"Path traversal blocked: {path}")
 
-    # Layer 4: Sensitive file check
+    # Layer 4: Symlink check — resolved path must still be inside project
+    if resolved.is_symlink():
+        real = resolved.resolve(strict=True)
+        if not real.is_relative_to(project_root):
+            raise ValueError(f"Symlink escapes project root: {path}")
+
+    # Layer 5: Sensitive file check
     if resolved.name.lower() in BLOCKED_FILES:
         raise ValueError(f"Access to sensitive file blocked: {resolved.name}")
 

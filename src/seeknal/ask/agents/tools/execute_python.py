@@ -1,10 +1,12 @@
 """Execute Python tool — run Python code for data analysis."""
 
 import ast
-import sys
+import os
+import tempfile
 import threading
 import traceback
 from io import StringIO
+from typing import Any
 
 from langchain_core.tools import tool
 
@@ -42,11 +44,11 @@ def _split_last_expression(code: str):
     return body_code, expr_code
 
 
-def _build_namespace(conn):
+def _build_namespace(conn: Any) -> dict:
     """Build execution namespace with pre-loaded libraries."""
     from seeknal.ask.agents.tools._safe_connection import SafeConnection
 
-    ns = {"conn": SafeConnection(conn)}
+    ns: dict[str, Any] = {"conn": SafeConnection(conn)}
 
     # Lazy-import data libraries
     try:
@@ -73,7 +75,7 @@ def _build_namespace(conn):
     return ns
 
 
-def _capture_plots():
+def _capture_plots() -> list[str]:
     """Save any open matplotlib figures to temp files."""
     try:
         import matplotlib.pyplot as plt
@@ -84,12 +86,10 @@ def _capture_plots():
     if not fig_nums:
         return []
 
-    import tempfile
-    paths = []
+    paths: list[str] = []
     for i, fig_num in enumerate(fig_nums):
         fig = plt.figure(fig_num)
         fd, path = tempfile.mkstemp(suffix=".png", prefix=f"plot_{i}_")
-        import os
         os.close(fd)
         fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="white")
         paths.append(path)
@@ -98,7 +98,7 @@ def _capture_plots():
     return paths
 
 
-def _do_execute(code: str, conn, timeout: int = 30) -> str:
+def _do_execute(code: str, conn: Any, timeout: int = 30) -> str:
     """Core execution logic, testable without @tool decorator."""
     if not code or not code.strip():
         return "No code provided."
@@ -108,12 +108,16 @@ def _do_execute(code: str, conn, timeout: int = 30) -> str:
     # Split code for last-expression capture
     body_code, expr_code = _split_last_expression(code)
 
-    # Execute with timeout
-    result_holder = {"value": None, "stdout": "", "error": None, "plots": []}
-    old_stdout = sys.stdout
+    # Execute with timeout — use per-thread StringIO instead of
+    # reassigning sys.stdout (which is process-global and not thread-safe).
+    result_holder: dict[str, Any] = {
+        "value": None, "stdout": "", "error": None, "plots": [],
+    }
 
     def target():
-        sys.stdout = captured = StringIO()
+        captured = StringIO()
+        # Override print in namespace to capture output without touching sys.stdout
+        namespace["print"] = lambda *a, **kw: print(*a, file=captured, **kw)
         try:
             if isinstance(body_code, str):
                 # Fallback: couldn't split, exec everything
@@ -128,19 +132,16 @@ def _do_execute(code: str, conn, timeout: int = 30) -> str:
         except Exception:
             result_holder["stdout"] = captured.getvalue()
             result_holder["error"] = traceback.format_exc()
-        finally:
-            sys.stdout = old_stdout
 
     thread = threading.Thread(target=target, daemon=True)
     thread.start()
     thread.join(timeout)
 
     if thread.is_alive():
-        sys.stdout = old_stdout
         return f"Execution timed out after {timeout} seconds."
 
     # Format output
-    parts = []
+    parts: list[str] = []
 
     if result_holder["stdout"]:
         parts.append(result_holder["stdout"].rstrip())

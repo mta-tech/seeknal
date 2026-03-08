@@ -4,27 +4,41 @@ Routes all SQL queries through validate_sql_for_agent() so that
 Python code execution cannot bypass the SQL security blocklist.
 """
 
+from typing import Any
+
 
 class SafeConnection:
-    """DuckDB connection wrapper that validates all SQL before execution."""
+    """DuckDB connection wrapper that validates all SQL before execution.
 
-    def __init__(self, conn):
-        self._conn = conn
+    Uses name-mangling (__conn) to prevent LLM-generated code from
+    accessing the underlying connection directly via conn._conn.
+    """
 
-    def sql(self, query: str, *args, **kwargs):
-        """Execute SQL after validation."""
+    def __init__(self, conn: Any) -> None:
+        self.__conn = conn
+
+    def _validate(self, query: str) -> None:
         from seeknal.ask.security import validate_sql_for_agent
 
+        # Block multi-statement queries (semicolons)
+        stripped = query.strip().rstrip(";")
+        if ";" in stripped:
+            raise ValueError(
+                "Multi-statement queries are not allowed. "
+                "Execute one statement at a time."
+            )
         validate_sql_for_agent(query)
-        return self._conn.sql(query, *args, **kwargs)
 
-    def execute(self, query: str, *args, **kwargs):
+    def sql(self, query: str, *args: Any, **kwargs: Any) -> Any:
         """Execute SQL after validation."""
-        from seeknal.ask.security import validate_sql_for_agent
+        self._validate(query)
+        return self.__conn.sql(query, *args, **kwargs)
 
-        validate_sql_for_agent(query)
-        return self._conn.execute(query, *args, **kwargs)
+    def execute(self, query: str, *args: Any, **kwargs: Any) -> Any:
+        """Execute SQL after validation."""
+        self._validate(query)
+        return self.__conn.execute(query, *args, **kwargs)
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
         """Delegate non-SQL methods to the underlying connection."""
-        return getattr(self._conn, name)
+        return getattr(self.__conn, name)

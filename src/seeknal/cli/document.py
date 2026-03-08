@@ -6,8 +6,8 @@ formatting and comments via ruamel.yaml round-trip mode.
 """
 
 import json
+import re
 import warnings
-from io import StringIO
 from pathlib import Path
 from typing import Optional
 
@@ -88,25 +88,29 @@ def _gather_pipeline_context(
     name = pipeline["name"]
 
     if conn is not None:
-        try:
-            result = conn.execute(f"DESCRIBE {name}").fetchall()
-            if result:
-                cols = "\n".join(f"  - {row[0]}: {row[1]}" for row in result)
-                schema_section = f"## Output Schema\n{cols}"
-        except Exception:
-            pass
+        # Validate table name to prevent SQL injection
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", name):
+            warnings.warn(f"Skipping schema lookup for invalid table name: {name}")
+        else:
+            desc_result = None
+            try:
+                desc_result = conn.execute(f"DESCRIBE {name}").fetchall()
+                if desc_result:
+                    cols = "\n".join(f"  - {row[0]}: {row[1]}" for row in desc_result)
+                    schema_section = f"## Output Schema\n{cols}"
+            except Exception:
+                pass
 
-        try:
-            result = conn.execute(f"SELECT * FROM {name} LIMIT 3").fetchall()
-            if result:
-                desc = conn.execute(f"DESCRIBE {name}").fetchall()
-                col_names = [row[0] for row in desc]
-                rows = []
-                for row in result:
-                    rows.append(", ".join(f"{c}={v!r}" for c, v in zip(col_names, row)))
-                sample_section = f"## Sample Data (first 3 rows)\n" + "\n".join(rows)
-        except Exception:
-            pass
+            try:
+                result = conn.execute(f"SELECT * FROM {name} LIMIT 3").fetchall()
+                if result and desc_result:
+                    col_names = [row[0] for row in desc_result]
+                    rows = []
+                    for row in result:
+                        rows.append(", ".join(f"{c}={v!r}" for c, v in zip(col_names, row)))
+                    sample_section = f"## Sample Data (first 3 rows)\n" + "\n".join(rows)
+            except Exception:
+                pass
 
     return {
         "kind": pipeline["kind"],
