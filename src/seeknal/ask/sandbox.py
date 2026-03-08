@@ -253,6 +253,9 @@ def execute_in_sandbox(
     if not code or not code.strip():
         return "No code provided."
 
+    # Resolve to absolute so paths work correctly with cwd
+    project_path = project_path.resolve()
+
     # Set up paths
     target_dir = project_path / "target"
     runner_dir = target_dir / ".ask_sandbox"
