@@ -116,7 +116,13 @@ def _ensure_node_modules(report_path: Path, timeout: int = 60) -> str:
     Returns:
         Empty string if OK, error message otherwise.
     """
+    report_path = report_path.resolve()
     node_modules = report_path / "node_modules"
+
+    # Remove broken symlinks
+    if node_modules.is_symlink() and not node_modules.exists():
+        node_modules.unlink()
+
     if node_modules.exists():
         return ""
 
@@ -125,9 +131,10 @@ def _ensure_node_modules(report_path: Path, timeout: int = 60) -> str:
     cache_modules = cache_dir / "node_modules"
 
     if cache_modules.exists() and cache_modules.is_dir():
-        # Symlink from cache
+        # Symlink from cache using relative path (../.evidence-cache/node_modules)
         try:
-            node_modules.symlink_to(cache_modules)
+            rel_target = os.path.relpath(cache_modules, report_path)
+            node_modules.symlink_to(rel_target)
             return ""
         except OSError:
             pass  # Fall through to npm install
@@ -162,10 +169,11 @@ def _ensure_node_modules(report_path: Path, timeout: int = 60) -> str:
             stderr = stderr[-1000:]
         return f"npm install failed:\n{stderr}"
 
-    # Symlink into report directory
+    # Symlink into report directory using relative path
     if cache_modules.exists():
         try:
-            node_modules.symlink_to(cache_modules)
+            rel_target = os.path.relpath(cache_modules, report_path)
+            node_modules.symlink_to(rel_target)
         except OSError:
             # Fallback: install directly in report dir
             try:

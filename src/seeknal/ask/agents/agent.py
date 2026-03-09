@@ -101,21 +101,22 @@ SQL query syntax (inside markdown):
 SELECT ... FROM table_name
 ```
 
-Components (use after defining a query):
-- <BarChart data={{query_name}} x=column y=column />
-- <LineChart data={{query_name}} x=date_col y=value_col />
-- <AreaChart data={{query_name}} x=date_col y=value_col />
-- <DataTable data={{query_name}} />
-- <BigValue data={{query_name}} value=column_name />
-- <ScatterPlot data={{query_name}} x=col1 y=col2 />
-- <Histogram data={{query_name}} x=column bins=20 />
-- <FunnelChart data={{query_name}} name=stage value=count />
+Components (use single curly braces for data binding — NOT double braces):
+- <BarChart data={query_name} x=column y=column />
+- <LineChart data={query_name} x=date_col y=value_col />
+- <AreaChart data={query_name} x=date_col y=value_col />
+- <DataTable data={query_name} />
+- <BigValue data={query_name} value=column_name />
+- <ScatterPlot data={query_name} x=col1 y=col2 />
+- <Histogram data={query_name} x=column bins=20 />
+- <FunnelChart data={query_name} name=stage value=count />
 
 Tips:
 - Name queries descriptively (e.g., revenue_by_month, top_customers)
 - Use markdown headers (##) to structure the page
 - Add brief text explanations between visualizations
 - Keep SQL in the page — do NOT use conn.sql() syntax
+- Do NOT include semicolons at the end of SQL queries
 - Use the same table names from list_tables output
 
 ## Report Codification

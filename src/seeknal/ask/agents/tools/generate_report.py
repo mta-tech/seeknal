@@ -6,6 +6,7 @@ builds static HTML, and returns the output path.
 """
 
 import json
+import re
 
 from langchain_core.tools import tool
 
@@ -99,5 +100,31 @@ def generate_report(title: str, page_content: str) -> str:
     from seeknal.ask.agents.tools._context import get_tool_context
 
     ctx = get_tool_context()
+    page_content = _fix_evidence_syntax(page_content)
     pages = [{"name": "index", "content": page_content}]
     return _do_generate(title, pages, ctx.project_path)
+
+
+def _fix_evidence_syntax(content: str) -> str:
+    """Fix common LLM mistakes in Evidence markdown.
+
+    LLMs frequently generate ``data={{query}}`` (double braces) instead
+    of the correct ``data={query}`` (single braces) for Evidence components.
+    Also strips trailing semicolons from SQL blocks.
+    """
+    # Fix double braces in component props: data={{name}} → data={name}
+    content = re.sub(r'\{\{(\w+)\}\}', r'{\1}', content)
+
+    # Strip trailing semicolons from SQL fenced blocks
+    def _strip_sql_semicolons(match: re.Match) -> str:
+        sql = match.group(1).rstrip().rstrip(";")
+        return sql + "\n```"
+
+    content = re.sub(
+        r'(```sql\s+\w+\s*\n.*?);\s*\n```',
+        _strip_sql_semicolons,
+        content,
+        flags=re.DOTALL,
+    )
+
+    return content
