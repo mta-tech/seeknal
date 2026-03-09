@@ -199,7 +199,10 @@ def create_agent(
         llm, system_prompt, checkpointer
     )
 
-    config = {"configurable": {"thread_id": "default"}}
+    config = {
+        "configurable": {"thread_id": "default"},
+        "recursion_limit": 100,
+    }
     return agent, config
 
 

@@ -11,6 +11,7 @@ def execute_sql(sql: str, limit: int = 100) -> str:
     Only SELECT queries are allowed. Results are returned as a formatted table.
 
     DuckDB SQL dialect notes:
+    - Do NOT include trailing semicolons in queries
     - Use CAST('2024-01-01' AS TIMESTAMP) for timestamp literals before INTERVAL arithmetic
     - Use CAST(COUNT(*) AS BIGINT) for aggregation counts
     - Use CAST(SUM(x) AS DOUBLE) for numeric aggregations
@@ -25,6 +26,9 @@ def execute_sql(sql: str, limit: int = 100) -> str:
     from seeknal.ask.security import validate_sql_for_agent
 
     ctx = get_tool_context()
+
+    # Strip trailing semicolons — LLMs often include them but DuckDB rejects them
+    sql = sql.strip().rstrip(";").strip()
 
     try:
         validate_sql_for_agent(sql)
