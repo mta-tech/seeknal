@@ -510,7 +510,7 @@ def _run_deterministic_exposure(
         console = None
 
     if console:
-        console.print(f"\n[bold]Running deterministic exposure:[/bold] {name}")
+        console.print(f"\n[bold]Running exposure:[/bold] {name}")
         console.print(f"[dim]Project: {project_path}[/dim]")
         section_count = len(exposure["sections"])
         console.print(f"[dim]Sections: {section_count}[/dim]\n")
