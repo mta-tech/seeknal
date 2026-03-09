@@ -6,7 +6,6 @@ builds static HTML, and returns the output path.
 """
 
 import json
-from typing import Union
 
 from langchain_core.tools import tool
 
@@ -69,7 +68,7 @@ def _do_generate(title: str, pages_json: str, project_path) -> str:
 
 
 @tool
-def generate_report(title: str, pages: Union[list, str]) -> str:
+def generate_report(title: str, pages: list) -> str:
     """Generate an interactive HTML report with charts and tables.
 
     Creates an Evidence.dev project from markdown pages containing SQL
