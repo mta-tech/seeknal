@@ -10,12 +10,12 @@ import json
 from langchain_core.tools import tool
 
 
-def _do_generate(title: str, pages_json: str, project_path) -> str:
+def _do_generate(title: str, pages_json, project_path) -> str:
     """Core report generation logic, separated for testability.
 
     Args:
         title: Report title.
-        pages_json: JSON string of page definitions [{name, content}, ...].
+        pages_json: Pages as list[dict], or JSON string of [{name, content}, ...].
         project_path: Path to the seeknal project root.
 
     Returns:
@@ -32,11 +32,13 @@ def _do_generate(title: str, pages_json: str, project_path) -> str:
     # Parse pages — accept both list and JSON string
     if isinstance(pages_json, list):
         pages = pages_json
-    else:
+    elif isinstance(pages_json, str):
         try:
             pages = json.loads(pages_json)
         except (json.JSONDecodeError, TypeError) as e:
             return f"Error: Invalid pages JSON — {e}"
+    else:
+        return "Error: 'pages' must be a non-empty array of {name, content} objects."
 
     if not isinstance(pages, list) or not pages:
         return "Error: 'pages' must be a non-empty array of {name, content} objects."
@@ -68,24 +70,34 @@ def _do_generate(title: str, pages_json: str, project_path) -> str:
 
 
 @tool
-def generate_report(title: str, pages: list) -> str:
+def generate_report(title: str, page_content: str) -> str:
     """Generate an interactive HTML report with charts and tables.
 
-    Creates an Evidence.dev project from markdown pages containing SQL
+    Creates an Evidence.dev project from markdown content containing SQL
     queries and visualization components, then builds it into a static
     HTML dashboard.
 
-    Write Evidence-compatible markdown for each page. Pages should contain:
-    - SQL queries in fenced blocks: ```sql query_name\\nSELECT ...\\n```
-    - Chart components referencing queries: <BarChart data={query_name} x=col y=col />
+    Write Evidence-compatible markdown content. The content should include:
+    - SQL queries in fenced blocks: ```sql query_name
+      SELECT ... FROM table_name
+      ```
+    - Chart components referencing queries: <BarChart data={query_name} x="col" y="col" />
+    - Table components: <DataTable data={query_name} />
     - Markdown text for explanations and section headers
+
+    Example content:
+      # Sales Overview
+      ```sql total_sales
+      SELECT region, SUM(amount) as total FROM sales GROUP BY region
+      ```
+      <BarChart data={total_sales} x="region" y="total" />
 
     Args:
         title: Report title (e.g., "Customer Segmentation Analysis").
-        pages: Array of page objects, each with 'name' and 'content' fields.
-            Example: [{"name": "overview", "content": "# Overview\\n```sql ..."}]
+        page_content: Evidence-compatible markdown content for the report page.
     """
     from seeknal.ask.agents.tools._context import get_tool_context
 
     ctx = get_tool_context()
+    pages = [{"name": "index", "content": page_content}]
     return _do_generate(title, pages, ctx.project_path)
