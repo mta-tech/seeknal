@@ -18,8 +18,10 @@ _SQL_BLOCK_RE = re.compile(
 # Valid page name: lowercase alphanumeric + hyphens
 _PAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
-# Evidence package version to pin
-_EVIDENCE_VERSION = "^33.0.0"
+# Evidence package versions (each package has independent versioning)
+_EVIDENCE_PKG_VERSION = "^40.0.0"
+_CORE_COMPONENTS_VERSION = "^5.0.0"
+_DUCKDB_VERSION = "^2.0.0"
 
 
 def scaffold_report(
@@ -211,9 +213,9 @@ def _write_package_json(report_dir: Path, title: str) -> None:
         },
         "type": "module",
         "dependencies": {
-            "@evidence-dev/evidence": _EVIDENCE_VERSION,
-            "@evidence-dev/core-components": _EVIDENCE_VERSION,
-            "@evidence-dev/duckdb": _EVIDENCE_VERSION,
+            "@evidence-dev/evidence": _EVIDENCE_PKG_VERSION,
+            "@evidence-dev/core-components": _CORE_COMPONENTS_VERSION,
+            "@evidence-dev/duckdb": _DUCKDB_VERSION,
         },
     }
     (report_dir / "package.json").write_text(

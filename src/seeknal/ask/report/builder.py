@@ -30,7 +30,8 @@ def build_report(report_path: Path, timeout: int = 120) -> str:
         return node_error
 
     # Ensure dependencies are installed (shared cache)
-    install_error = _ensure_node_modules(report_path, timeout=60)
+    # First install can take 2-3 minutes; subsequent installs are near-instant via cache
+    install_error = _ensure_node_modules(report_path, timeout=180)
     if install_error:
         return install_error
 

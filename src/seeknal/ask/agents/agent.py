@@ -100,14 +100,14 @@ SELECT ... FROM table_name
 ```
 
 Components (use after defining a query):
-- <BarChart data={query_name} x=column y=column />
-- <LineChart data={query_name} x=date_col y=value_col />
-- <AreaChart data={query_name} x=date_col y=value_col />
-- <DataTable data={query_name} />
-- <BigValue data={query_name} value=column_name />
-- <ScatterPlot data={query_name} x=col1 y=col2 />
-- <Histogram data={query_name} x=column bins=20 />
-- <FunnelChart data={query_name} name=stage value=count />
+- <BarChart data={{query_name}} x=column y=column />
+- <LineChart data={{query_name}} x=date_col y=value_col />
+- <AreaChart data={{query_name}} x=date_col y=value_col />
+- <DataTable data={{query_name}} />
+- <BigValue data={{query_name}} value=column_name />
+- <ScatterPlot data={{query_name}} x=col1 y=col2 />
+- <Histogram data={{query_name}} x=column bins=20 />
+- <FunnelChart data={{query_name}} name=stage value=count />
 
 Tips:
 - Name queries descriptively (e.g., revenue_by_month, top_customers)
