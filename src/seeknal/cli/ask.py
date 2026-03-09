@@ -427,6 +427,13 @@ def _run_exposure(
         typer.echo(typer.style(f"Invalid exposure: {e}", fg=typer.colors.RED))
         raise typer.Exit(1)
 
+    # Branch: deterministic (sections) vs agent-driven (prompt-only)
+    if exposure.get("sections"):
+        _run_deterministic_exposure(
+            name, exposure, project_path, provider=provider, model=model
+        )
+        return
+
     params = exposure.get("params", {})
     inputs = exposure.get("inputs", [])
     prompt_template = params.get("prompt", "")
@@ -486,6 +493,72 @@ def _run_exposure(
         typer.echo(answer)
         if answer and answer.strip():
             _save_report_markdown(project_path, name, answer)
+
+
+def _run_deterministic_exposure(
+    name: str,
+    exposure: dict,
+    project_path: Path,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+):
+    """Run the deterministic report path for exposures with sections."""
+    try:
+        from rich.console import Console
+        console = Console()
+    except ImportError:
+        console = None
+
+    if console:
+        console.print(f"\n[bold]Running deterministic exposure:[/bold] {name}")
+        console.print(f"[dim]Project: {project_path}[/dim]")
+        section_count = len(exposure["sections"])
+        console.print(f"[dim]Sections: {section_count}[/dim]\n")
+
+    try:
+        from seeknal.ask.report.deterministic import render_deterministic_report
+
+        if console:
+            with console.status("[bold green]Rendering report..."):
+                html_path, markdown = render_deterministic_report(
+                    exposure, project_path,
+                    provider=provider, model=model,
+                )
+        else:
+            html_path, markdown = render_deterministic_report(
+                exposure, project_path,
+                provider=provider, model=model,
+            )
+
+        # Save rendered markdown
+        if markdown and markdown.strip():
+            _save_report_markdown(project_path, name, markdown, console)
+
+        # Report success
+        if console:
+            if html_path.endswith(".html"):
+                console.print(
+                    f"\n[bold green]Report built:[/bold green] {html_path}"
+                )
+            else:
+                console.print(f"\n[yellow]{html_path}[/yellow]")
+        else:
+            typer.echo(f"\nReport: {html_path}")
+
+    except ValueError as e:
+        msg = f"Deterministic report failed: {e}"
+        if console:
+            console.print(f"[red]{msg}[/red]")
+        else:
+            typer.echo(msg)
+        raise typer.Exit(1)
+    except Exception as e:
+        msg = f"Unexpected error: {e}"
+        if console:
+            console.print(f"[red]{msg}[/red]")
+        else:
+            typer.echo(msg)
+        raise typer.Exit(1)
 
 
 @report_app.command("serve")

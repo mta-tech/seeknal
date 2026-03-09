@@ -176,9 +176,16 @@ def _validate_report_exposure(data: Any, file_path: Path) -> dict[str, Any]:
         )
 
     params = data.get("params", {})
-    if not isinstance(params, dict) or not params.get("prompt"):
+    if not isinstance(params, dict):
+        params = {}
+
+    has_sections = bool(data.get("sections"))
+
+    # params.prompt is required unless sections are defined
+    if not has_sections and not params.get("prompt"):
         raise ValueError(
-            f"{file_path}: params.prompt is required for report exposures."
+            f"{file_path}: params.prompt is required for report exposures "
+            "without sections."
         )
 
     output_format = params.get("format", "markdown")
