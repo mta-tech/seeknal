@@ -552,6 +552,284 @@ def assemble_page(
 
 
 # ---------------------------------------------------------------------------
+# Readable Markdown (standalone, no Evidence syntax)
+# ---------------------------------------------------------------------------
+
+
+def generate_readable_markdown(
+    sections: list[SectionConfig],
+    query_results: dict[str, dict[str, Any]],
+    narratives: dict[int, str],
+    title: str = "",
+) -> str:
+    """Generate a standalone readable markdown report.
+
+    Replaces SQL blocks with markdown tables and Evidence chart components
+    with ASCII visualizations. This output is saved to target/reported/
+    and is readable without Evidence.dev.
+
+    Args:
+        sections: Validated section configs.
+        query_results: Pre-executed query results.
+        narratives: LLM-generated narrative text by section index.
+        title: Optional report title.
+
+    Returns:
+        Standalone markdown string.
+    """
+    parts: list[str] = []
+
+    if title:
+        parts.append(f"# {title}\n")
+
+    for i, section in enumerate(sections):
+        parts.append(f"## {section.title}\n")
+
+        if section.description:
+            parts.append(f"{section.description}\n")
+
+        for query in section.queries:
+            result = query_results.get(query.name)
+            if not result or result.get("error"):
+                error_msg = result["error"] if result else "Query not executed"
+                parts.append(f"> **{query.name}**: {error_msg}\n")
+                continue
+
+            columns = result["columns"]
+            rows = result["rows"]
+
+            if query.chart == ChartType.BIG_VALUE:
+                parts.append(_render_bigvalue_readable(query, columns, rows))
+            elif query.chart in (
+                ChartType.BAR_CHART, ChartType.FUNNEL_CHART,
+            ):
+                chart_title = query.props.get("title", query.name)
+                parts.append(f"**{chart_title}**\n")
+                x_col = query.props.get("x", columns[0] if columns else "")
+                y_col = query.props.get("y", columns[1] if len(columns) > 1 else "")
+                parts.append(_render_bar_ascii(columns, rows, x_col, y_col))
+            elif query.chart in (
+                ChartType.LINE_CHART, ChartType.AREA_CHART,
+            ):
+                chart_title = query.props.get("title", query.name)
+                parts.append(f"**{chart_title}**\n")
+                x_col = query.props.get("x", columns[0] if columns else "")
+                y_col = query.props.get("y", columns[1] if len(columns) > 1 else "")
+                parts.append(_render_line_ascii(columns, rows, x_col, y_col))
+            else:
+                # DataTable, ScatterPlot, Histogram — render as markdown table
+                chart_title = query.props.get("title", "")
+                if chart_title:
+                    parts.append(f"**{chart_title}**\n")
+                parts.append(_render_markdown_table(columns, rows))
+
+            parts.append("")
+
+        # Narrative text
+        if i in narratives:
+            parts.append(narratives[i])
+            parts.append("")
+
+    return "\n".join(parts)
+
+
+def _render_bigvalue_readable(
+    query: QueryConfig,
+    columns: list[str],
+    rows: list[list],
+) -> str:
+    """Render BigValue as a readable KPI block."""
+    if not rows:
+        return ""
+    row = rows[0]
+    values = query.props.get("value", [])
+    labels = query.props.get("labels", values)
+    if isinstance(values, str):
+        values = [values]
+    if isinstance(labels, str):
+        labels = [labels]
+
+    if not values:
+        # Fallback: show all columns
+        values = columns
+        labels = columns
+
+    lines: list[str] = []
+    col_map = {c: idx for idx, c in enumerate(columns)}
+    for val_col, label in zip(values, labels):
+        idx = col_map.get(val_col)
+        if idx is not None and idx < len(row):
+            raw = row[idx]
+            formatted = _format_number(raw)
+            lines.append(f"| **{label}** | **{formatted}** |")
+        else:
+            lines.append(f"| **{label}** | — |")
+
+    header = "| Metric | Value |\n| --- | ---: |"
+    return header + "\n" + "\n".join(lines) + "\n"
+
+
+def _render_markdown_table(columns: list[str], rows: list[list]) -> str:
+    """Render query results as a markdown table."""
+    if not columns:
+        return "*No data.*\n"
+
+    lines: list[str] = []
+    lines.append("| " + " | ".join(columns) + " |")
+    lines.append("| " + " | ".join("---" for _ in columns) + " |")
+    for row in rows:
+        cells = [_format_number(v) if isinstance(v, (int, float)) else
+                 str(v) if v is not None else "—" for v in row]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def _render_bar_ascii(
+    columns: list[str],
+    rows: list[list],
+    x_col: str,
+    y_col: str,
+    width: int = 40,
+) -> str:
+    """Render a horizontal ASCII bar chart."""
+    if not rows or not columns:
+        return "*No data.*\n"
+
+    col_map = {c: i for i, c in enumerate(columns)}
+    x_idx = col_map.get(x_col)
+    y_idx = col_map.get(y_col)
+    if x_idx is None or y_idx is None:
+        return _render_markdown_table(columns, rows)
+
+    items: list[tuple[str, float]] = []
+    for row in rows:
+        label = str(row[x_idx]) if row[x_idx] is not None else "—"
+        try:
+            val = float(row[y_idx]) if row[y_idx] is not None else 0.0
+        except (ValueError, TypeError):
+            val = 0.0
+        items.append((label, val))
+
+    if not items:
+        return "*No data.*\n"
+
+    max_val = max(v for _, v in items) if items else 1.0
+    if max_val == 0:
+        max_val = 1.0
+    max_label = max(len(label) for label, _ in items)
+
+    lines: list[str] = ["```"]
+    for label, val in items:
+        bar_len = int((val / max_val) * width)
+        bar = "█" * bar_len
+        formatted = _format_number(val)
+        lines.append(f"{label:>{max_label}} │ {bar} {formatted}")
+    lines.append("```\n")
+    return "\n".join(lines)
+
+
+def _render_line_ascii(
+    columns: list[str],
+    rows: list[list],
+    x_col: str,
+    y_col: str,
+    width: int = 50,
+    height: int = 10,
+) -> str:
+    """Render a simple ASCII sparkline/trend chart."""
+    if not rows or not columns:
+        return "*No data.*\n"
+
+    col_map = {c: i for i, c in enumerate(columns)}
+    x_idx = col_map.get(x_col)
+    y_idx = col_map.get(y_col)
+    if x_idx is None or y_idx is None:
+        return _render_markdown_table(columns, rows)
+
+    labels: list[str] = []
+    values: list[float] = []
+    for row in rows:
+        labels.append(str(row[x_idx]) if row[x_idx] is not None else "")
+        try:
+            values.append(float(row[y_idx]) if row[y_idx] is not None else 0.0)
+        except (ValueError, TypeError):
+            values.append(0.0)
+
+    if not values:
+        return "*No data.*\n"
+
+    min_val = min(values)
+    max_val = max(values)
+    val_range = max_val - min_val if max_val != min_val else 1.0
+
+    # Build a simple grid
+    lines: list[str] = ["```"]
+
+    # Scale values to height
+    scaled = [int((v - min_val) / val_range * (height - 1)) for v in values]
+
+    for row_idx in range(height - 1, -1, -1):
+        # Y-axis label on first and last row
+        if row_idx == height - 1:
+            y_label = _format_number(max_val)
+        elif row_idx == 0:
+            y_label = _format_number(min_val)
+        else:
+            y_label = ""
+        y_pad = max(8, len(_format_number(max_val)))
+
+        chars: list[str] = []
+        for col_idx, s in enumerate(scaled):
+            if s == row_idx:
+                chars.append("●")
+            elif s > row_idx and col_idx > 0 and scaled[col_idx - 1] < row_idx:
+                chars.append("╱")
+            elif s < row_idx and col_idx > 0 and scaled[col_idx - 1] > row_idx:
+                chars.append("╲")
+            elif s > row_idx:
+                chars.append("│")
+            else:
+                chars.append(" ")
+
+        # Space out points if few data points
+        spacing = max(1, width // max(len(scaled), 1))
+        spaced = (" " * (spacing - 1)).join(chars)
+        lines.append(f"{y_label:>{y_pad}} │ {spaced}")
+
+    # X-axis
+    axis_width = len((" " * (max(1, width // max(len(scaled), 1)) - 1)).join(
+        ["x"] * len(scaled)
+    ))
+    lines.append(" " * (max(8, len(_format_number(max_val))) + 1) + "└" + "─" * (axis_width + 2))
+
+    # X labels (first and last)
+    if labels:
+        x_line = " " * (max(8, len(_format_number(max_val))) + 3)
+        x_line += labels[0]
+        if len(labels) > 1:
+            gap = axis_width - len(labels[0]) - len(labels[-1])
+            if gap > 0:
+                x_line += " " * gap + labels[-1]
+        lines.append(x_line)
+
+    lines.append("```\n")
+    return "\n".join(lines)
+
+
+def _format_number(val: Any) -> str:
+    """Format a number for display — add commas, round decimals."""
+    if val is None:
+        return "—"
+    if isinstance(val, float):
+        if val == int(val) and abs(val) < 1e15:
+            return f"{int(val):,}"
+        return f"{val:,.2f}"
+    if isinstance(val, int):
+        return f"{val:,}"
+    return str(val)
+
+
+# ---------------------------------------------------------------------------
 # Main Entry Point
 # ---------------------------------------------------------------------------
 
@@ -630,13 +908,19 @@ def render_deterministic_report(
     else:
         narratives = {}
 
-    # 5. Assemble final page
-    _progress("Assembling final page...")
-    page_content = assemble_page(skeleton, narratives)
+    # 5. Assemble Evidence page (for HTML build)
+    _progress("Assembling Evidence page...")
+    evidence_page = assemble_page(skeleton, narratives)
 
-    # 6. Scaffold & build via existing pipeline
+    # 6. Generate readable markdown (for saved .md report)
+    _progress("Generating readable markdown...")
+    readable_md = generate_readable_markdown(
+        sections, query_results, narratives, title=report_title,
+    )
+
+    # 7. Scaffold & build via existing pipeline
     _progress("Scaffolding Evidence project...")
-    pages = [{"name": "index", "content": page_content}]
+    pages = [{"name": "index", "content": evidence_page}]
     report_dir = scaffold_report(
         project_path=project_path,
         title=report_title,
@@ -646,4 +930,4 @@ def render_deterministic_report(
     _progress("Building HTML report (npm)...")
     html_path = build_report(report_dir)
 
-    return html_path, page_content
+    return html_path, readable_md

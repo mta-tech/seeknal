@@ -686,6 +686,226 @@ class TestAssemblePage:
 
 
 # ---------------------------------------------------------------------------
+# generate_readable_markdown() — standalone readable output
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateReadableMarkdown:
+    """Test standalone readable markdown generation."""
+
+    def test_bigvalue_renders_as_table(self):
+        from seeknal.ask.report.deterministic import (
+            ChartType,
+            QueryConfig,
+            SectionConfig,
+            generate_readable_markdown,
+        )
+
+        sections = [
+            SectionConfig(
+                title="KPIs",
+                queries=[
+                    QueryConfig(
+                        name="kpis",
+                        sql="SELECT 1",
+                        chart=ChartType.BIG_VALUE,
+                        props={
+                            "value": ["total", "avg"],
+                            "labels": ["Total Revenue", "Average"],
+                        },
+                    )
+                ],
+            )
+        ]
+        results = {
+            "kpis": {
+                "columns": ["total", "avg"],
+                "rows": [[56836.08, 447.53]],
+                "error": None,
+            }
+        }
+        md = generate_readable_markdown(sections, results, {}, "Report")
+        assert "| **Total Revenue** | **56,836.08** |" in md
+        assert "| **Average** | **447.53** |" in md
+        assert "<BigValue" not in md
+
+    def test_barchart_renders_as_ascii(self):
+        from seeknal.ask.report.deterministic import (
+            ChartType,
+            QueryConfig,
+            SectionConfig,
+            generate_readable_markdown,
+        )
+
+        sections = [
+            SectionConfig(
+                title="Revenue",
+                queries=[
+                    QueryConfig(
+                        name="rev",
+                        sql="SELECT 1",
+                        chart=ChartType.BAR_CHART,
+                        props={"x": "seg", "y": "val", "title": "By Segment"},
+                    )
+                ],
+            )
+        ]
+        results = {
+            "rev": {
+                "columns": ["seg", "val"],
+                "rows": [["Premium", 500], ["Basic", 200]],
+                "error": None,
+            }
+        }
+        md = generate_readable_markdown(sections, results, {})
+        assert "**By Segment**" in md
+        assert "Premium" in md
+        assert "█" in md
+        assert "<BarChart" not in md
+
+    def test_linechart_renders_as_ascii(self):
+        from seeknal.ask.report.deterministic import (
+            ChartType,
+            QueryConfig,
+            SectionConfig,
+            generate_readable_markdown,
+        )
+
+        sections = [
+            SectionConfig(
+                title="Trend",
+                queries=[
+                    QueryConfig(
+                        name="trend",
+                        sql="SELECT 1",
+                        chart=ChartType.LINE_CHART,
+                        props={"x": "month", "y": "rev", "title": "Monthly"},
+                    )
+                ],
+            )
+        ]
+        results = {
+            "trend": {
+                "columns": ["month", "rev"],
+                "rows": [["Jan", 100], ["Feb", 200], ["Mar", 150]],
+                "error": None,
+            }
+        }
+        md = generate_readable_markdown(sections, results, {})
+        assert "**Monthly**" in md
+        assert "●" in md
+        assert "<LineChart" not in md
+
+    def test_datatable_renders_as_markdown_table(self):
+        from seeknal.ask.report.deterministic import (
+            ChartType,
+            QueryConfig,
+            SectionConfig,
+            generate_readable_markdown,
+        )
+
+        sections = [
+            SectionConfig(
+                title="Detail",
+                queries=[
+                    QueryConfig(
+                        name="detail",
+                        sql="SELECT 1",
+                        chart=ChartType.DATA_TABLE,
+                        props={},
+                    )
+                ],
+            )
+        ]
+        results = {
+            "detail": {
+                "columns": ["name", "value"],
+                "rows": [["Alice", 100], ["Bob", 200]],
+                "error": None,
+            }
+        }
+        md = generate_readable_markdown(sections, results, {})
+        assert "| name | value |" in md
+        assert "| Alice | 100 |" in md
+        assert "<DataTable" not in md
+
+    def test_narratives_included(self):
+        from seeknal.ask.report.deterministic import (
+            SectionConfig,
+            generate_readable_markdown,
+        )
+
+        sections = [
+            SectionConfig(title="Analysis", narrative=True),
+        ]
+        narratives = {0: "Revenue grew **15%** year-over-year."}
+        md = generate_readable_markdown(sections, {}, narratives)
+        assert "Revenue grew **15%** year-over-year." in md
+
+    def test_error_result_shown(self):
+        from seeknal.ask.report.deterministic import (
+            ChartType,
+            QueryConfig,
+            SectionConfig,
+            generate_readable_markdown,
+        )
+
+        sections = [
+            SectionConfig(
+                title="Bad",
+                queries=[
+                    QueryConfig(name="bad_q", sql="SELECT 1", chart=ChartType.DATA_TABLE)
+                ],
+            )
+        ]
+        results = {
+            "bad_q": {"columns": [], "rows": [], "error": "Table not found"}
+        }
+        md = generate_readable_markdown(sections, results, {})
+        assert "Table not found" in md
+
+    def test_no_evidence_syntax(self):
+        from seeknal.ask.report.deterministic import (
+            ChartType,
+            QueryConfig,
+            SectionConfig,
+            generate_readable_markdown,
+        )
+
+        sections = [
+            SectionConfig(
+                title="Mixed",
+                queries=[
+                    QueryConfig(
+                        name="q1", sql="SELECT 1", chart=ChartType.BIG_VALUE,
+                        props={"value": ["x"], "labels": ["X"]},
+                    ),
+                    QueryConfig(
+                        name="q2", sql="SELECT 1", chart=ChartType.BAR_CHART,
+                        props={"x": "a", "y": "b"},
+                    ),
+                    QueryConfig(
+                        name="q3", sql="SELECT 1", chart=ChartType.DATA_TABLE,
+                    ),
+                ],
+                narrative=True,
+            )
+        ]
+        results = {
+            "q1": {"columns": ["x"], "rows": [[42]], "error": None},
+            "q2": {"columns": ["a", "b"], "rows": [["A", 10]], "error": None},
+            "q3": {"columns": ["c"], "rows": [["v"]], "error": None},
+        }
+        md = generate_readable_markdown(sections, results, {0: "Insight."})
+        # No Evidence syntax anywhere
+        assert "```sql" not in md
+        assert "<BigValue" not in md
+        assert "<BarChart" not in md
+        assert "<DataTable" not in md
+        assert "<LineChart" not in md
+
+
+# ---------------------------------------------------------------------------
 # execute_section_queries() — with real DuckDB
 # ---------------------------------------------------------------------------
 
@@ -1066,13 +1286,19 @@ class TestRenderDeterministicReport:
 
         assert html_path == "/path/to/report.html"
         assert "## Segments" in markdown
-        assert "seg_data" in markdown
-        assert "DataTable" in markdown
+        # Readable markdown should contain actual data, not Evidence syntax
+        assert "| seg | rev |" in markdown
+        assert "| A | 100 |" in markdown
+        # No Evidence syntax in saved markdown
+        assert "<DataTable" not in markdown
+        assert "```sql" not in markdown
 
-        # Verify scaffold was called with the generated page
+        # Verify scaffold was called with the Evidence page (not readable md)
         pages_arg = mock_scaffold.call_args[1]["pages"]
         assert len(pages_arg) == 1
         assert pages_arg[0]["name"] == "index"
+        # Evidence page should still have Evidence syntax
+        assert "<DataTable" in pages_arg[0]["content"]
 
     def test_full_pipeline_with_narrative(self, tmp_path):
         pytest.importorskip("duckdb")
