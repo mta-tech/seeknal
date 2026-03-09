@@ -48,6 +48,8 @@ def _show_tool_start(console: Console, name: str, args: Optional[dict] = None) -
         _show_python(console, args["code"])
     elif args and name == "generate_report" and "title" in args:
         console.print(f"  [dim]Title: {escape(args['title'])}[/dim]")
+    elif args and name == "save_report_exposure" and "name" in args:
+        console.print(f"  [dim]Name: {escape(args['name'])}[/dim]")
     elif args:
         # Show truncated args for other tools
         arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
@@ -66,6 +68,11 @@ def _show_tool_end(console: Console, name: str, output: str) -> None:
         _show_python_output(console, output)
     elif name == "generate_report":
         _show_report_output(console, output)
+    elif name == "save_report_exposure":
+        if output.startswith("Error"):
+            console.print(f"  [red]{escape(output)}[/red]")
+        else:
+            console.print(f"  [bold green]{escape(output)}[/bold green]")
     else:
         summary = output[:200] + "..." if len(output) > 200 else output
         console.print(f"  [dim]Done: {escape(summary)}[/dim]")

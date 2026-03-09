@@ -22,6 +22,7 @@ from seeknal.ask.agents.tools.search_project_files import search_project_files
 from seeknal.ask.agents.tools.read_project_file import read_project_file
 from seeknal.ask.agents.tools.execute_python import execute_python
 from seeknal.ask.agents.tools.generate_report import generate_report
+from seeknal.ask.agents.tools.save_report_exposure import save_report_exposure
 from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
 from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
 
@@ -32,6 +33,7 @@ TOOLS = [
     search_project_files, read_project_file,
     execute_python,
     generate_report,
+    save_report_exposure,
 ]
 
 SYSTEM_PROMPT = """You are Seeknal Ask, an AI data analyst for seeknal projects.
@@ -115,6 +117,17 @@ Tips:
 - Add brief text explanations between visualizations
 - Keep SQL in the page — do NOT use conn.sql() syntax
 - Use the same table names from list_tables output
+
+## Report Codification
+
+After completing an analysis, if the user wants to save it as a regular
+repeatable report, call save_report_exposure with:
+- A snake_case name (e.g. "monthly_revenue_report")
+- A distilled prompt summarizing the analysis goal
+- The table refs you used as a JSON array (e.g. '["transform.revenue"]')
+- The output format ("markdown", "html", or "both")
+
+The generated YAML can be re-run with: seeknal ask report --exposure {name}
 
 ## DuckDB SQL Rules
 

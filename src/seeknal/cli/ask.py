@@ -264,15 +264,25 @@ def report_callback(
     project: Optional[Path] = typer.Option(
         None, "--project", help="Project path (auto-detected if not set)"
     ),
+    exposure: Optional[str] = typer.Option(
+        None, "--exposure", "-e",
+        help="Run a predefined report exposure by name",
+    ),
 ):
-    """Generate an interactive HTML report via AI-guided analysis.
+    """Generate reports via AI-guided analysis.
 
     Usage:
-        seeknal ask report "customer analysis"   Generate report interactively
-        seeknal ask report serve my-report        Live-preview an existing report
-        seeknal ask report list                   List existing reports
+        seeknal ask report "customer analysis"            Interactive report
+        seeknal ask report --exposure monthly_report      Run YAML spec
+        seeknal ask report serve my-report                Live-preview
+        seeknal ask report list                           List reports
     """
     if ctx.invoked_subcommand is not None:
+        return
+
+    # Mode 2: YAML spec execution
+    if exposure:
+        _run_exposure(exposure, provider=provider, model=model, project=project)
         return
 
     if not ctx.args:
@@ -343,12 +353,13 @@ def _run_report(
             )
 
         import asyncio
-        from seeknal.ask.streaming import chat_session
+        from seeknal.ask.streaming import chat_session, stream_ask
 
-        # Send initial report prompt, then enter chat for scoping questions
-        from seeknal.ask.streaming import stream_ask
         try:
-            asyncio.run(stream_ask(agent, config, report_prompt, console))
+            answer = asyncio.run(stream_ask(agent, config, report_prompt, console))
+            # Save rendered markdown
+            if answer and answer.strip():
+                _save_report_markdown(project_path, topic, answer, console)
             # Continue in chat mode for follow-up
             asyncio.run(chat_session(agent, config, console))
         except KeyboardInterrupt:
@@ -360,6 +371,121 @@ def _run_report(
         )
         answer = agent_ask(agent, config, report_prompt)
         typer.echo(answer)
+        if answer and answer.strip():
+            _save_report_markdown(project_path, topic, answer)
+
+
+def _save_report_markdown(
+    project_path: Path,
+    topic: str,
+    content: str,
+    console=None,
+):
+    """Save rendered markdown from a report analysis."""
+    from seeknal.ask.report.exposure import save_rendered_markdown
+
+    try:
+        output_path = save_rendered_markdown(project_path, topic, content)
+        if console:
+            console.print(f"\n[bold green]Report saved:[/bold green] {output_path}")
+        else:
+            typer.echo(f"\nReport saved: {output_path}")
+    except ValueError as e:
+        if console:
+            console.print(f"[red]Failed to save report: {e}[/red]")
+        else:
+            typer.echo(f"Failed to save report: {e}")
+
+
+def _run_exposure(
+    name: str,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    project: Optional[Path] = None,
+):
+    """Execute a predefined report exposure by name (Mode 2)."""
+    project_path = project or find_project_path()
+
+    try:
+        from seeknal.ask.report.exposure import load_report_exposure, resolve_prompt
+    except ImportError:
+        typer.echo(typer.style(
+            "Seeknal Ask dependencies not installed.", fg=typer.colors.RED
+        ))
+        typer.echo("Install with: " + typer.style(
+            "pip install seeknal[ask]", fg=typer.colors.CYAN
+        ))
+        raise typer.Exit(1)
+
+    # Load and validate exposure YAML
+    try:
+        exposure = load_report_exposure(project_path, name)
+    except FileNotFoundError as e:
+        typer.echo(typer.style(str(e), fg=typer.colors.RED))
+        raise typer.Exit(1)
+    except ValueError as e:
+        typer.echo(typer.style(f"Invalid exposure: {e}", fg=typer.colors.RED))
+        raise typer.Exit(1)
+
+    params = exposure.get("params", {})
+    inputs = exposure.get("inputs", [])
+    prompt_template = params.get("prompt", "")
+
+    # Resolve Jinja2 template variables
+    try:
+        prompt = resolve_prompt(prompt_template, project_path, inputs, params)
+    except Exception as e:
+        typer.echo(typer.style(
+            f"Failed to resolve prompt template: {e}", fg=typer.colors.RED
+        ))
+        raise typer.Exit(1)
+
+    try:
+        from seeknal.ask.agents.agent import create_agent
+    except ImportError:
+        typer.echo(typer.style(
+            "Seeknal Ask dependencies not installed.", fg=typer.colors.RED
+        ))
+        raise typer.Exit(1)
+
+    try:
+        from rich.console import Console
+        console = Console()
+    except ImportError:
+        console = None
+
+    if console:
+        console.print(f"\n[bold]Running exposure:[/bold] {name}")
+        console.print(f"[dim]Project: {project_path}[/dim]")
+        console.print(f"[dim]Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}[/dim]\n")
+
+        with console.status("[bold green]Loading agent..."):
+            agent, config = create_agent(
+                project_path, provider=provider, model=model,
+            )
+
+        import asyncio
+        from seeknal.ask.streaming import stream_ask
+
+        try:
+            answer = asyncio.run(stream_ask(agent, config, prompt, console))
+            if answer and answer.strip():
+                _save_report_markdown(project_path, name, answer, console)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Cancelled.[/dim]")
+    else:
+        from seeknal.ask.agents.agent import ask as agent_ask
+
+        typer.echo(f"Running exposure: {name}")
+        typer.echo(f"Project: {project_path}\n")
+
+        agent, config = create_agent(
+            project_path, provider=provider, model=model,
+        )
+        answer = agent_ask(agent, config, prompt)
+        typer.echo(answer)
+        if answer and answer.strip():
+            _save_report_markdown(project_path, name, answer)
 
 
 @report_app.command("serve")
