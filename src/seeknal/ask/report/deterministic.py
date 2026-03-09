@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 class ChartType(str, Enum):
@@ -276,6 +276,7 @@ def _bigvalue_to_evidence(query: QueryConfig) -> str:
 def execute_section_queries(
     sections: list[SectionConfig],
     project_path: Path,
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> dict[str, dict[str, Any]]:
     """Pre-execute all pinned SQL queries and capture results.
 
@@ -285,6 +286,7 @@ def execute_section_queries(
     Args:
         sections: Validated section configs.
         project_path: Path to the seeknal project root.
+        on_progress: Optional callback for progress updates.
 
     Returns:
         Dict mapping query name to {"columns": [...], "rows": [...], "error": str|None}.
@@ -321,6 +323,8 @@ def execute_section_queries(
             for q in section.queries:
                 if not q.sql:
                     continue
+                if on_progress:
+                    on_progress(f"Executing query: {q.name}")
                 try:
                     result = conn.execute(q.sql)
                     columns = [desc[0] for desc in result.description]
@@ -433,6 +437,7 @@ def generate_narratives(
     model: Optional[str] = None,
     api_key: Optional[str] = None,
     global_context: str = "",
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> dict[int, str]:
     """Generate LLM narratives for sections with narrative=true.
 
@@ -443,6 +448,7 @@ def generate_narratives(
         model: Model name override.
         api_key: API key override.
         global_context: Global prompt context (from params.prompt).
+        on_progress: Optional callback for progress updates.
 
     Returns:
         Dict mapping section index to narrative text.
@@ -476,6 +482,9 @@ def generate_narratives(
 
         if not section.narrative:
             continue
+
+        if on_progress:
+            on_progress(f"Writing narrative: {section.title}")
 
         # For this section, include its own queries + context from prior
         section_query_names = [q.name for q in section.queries if q.sql]
@@ -552,6 +561,7 @@ def render_deterministic_report(
     project_path: Path,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> tuple[str, str]:
     """Render a deterministic report from an exposure with sections.
 
@@ -563,6 +573,7 @@ def render_deterministic_report(
         project_path: Path to the seeknal project root.
         provider: LLM provider override.
         model: Model name override.
+        on_progress: Optional callback for progress updates.
 
     Returns:
         Tuple of (report_html_path, markdown_content).
@@ -573,13 +584,33 @@ def render_deterministic_report(
     from seeknal.ask.report.builder import build_report
     from seeknal.ask.report.scaffolder import scaffold_report
 
+    def _progress(msg: str) -> None:
+        if on_progress:
+            on_progress(msg)
+
     # 1. Parse and validate sections
+    _progress("Validating sections...")
     sections = parse_sections(exposure["sections"])
+    total_queries = sum(len(s.queries) for s in sections)
+    narrative_count = sum(1 for s in sections if s.narrative)
+    _progress(
+        f"Validated {len(sections)} sections, "
+        f"{total_queries} queries, {narrative_count} narratives"
+    )
 
     # 2. Pre-execute queries for LLM context
-    query_results = execute_section_queries(sections, project_path)
+    _progress(f"Executing {total_queries} pinned queries...")
+    query_results = execute_section_queries(
+        sections, project_path, on_progress=on_progress,
+    )
+    errors = sum(1 for r in query_results.values() if r.get("error"))
+    if errors:
+        _progress(f"Queries done — {errors} failed")
+    else:
+        _progress(f"All {len(query_results)} queries executed")
 
     # 3. Generate Evidence markdown skeleton
+    _progress("Generating Evidence markdown...")
     report_title = exposure.get("description", exposure.get("name", "Report"))
     skeleton = generate_evidence_page(sections, title=report_title)
 
@@ -589,18 +620,22 @@ def render_deterministic_report(
     has_narrative = any(s.narrative for s in sections)
 
     if has_narrative:
+        _progress(f"Generating {narrative_count} narratives via LLM...")
         narratives = generate_narratives(
             sections, query_results,
             provider=provider, model=model,
             global_context=global_context,
+            on_progress=on_progress,
         )
     else:
         narratives = {}
 
     # 5. Assemble final page
+    _progress("Assembling final page...")
     page_content = assemble_page(skeleton, narratives)
 
     # 6. Scaffold & build via existing pipeline
+    _progress("Scaffolding Evidence project...")
     pages = [{"name": "index", "content": page_content}]
     report_dir = scaffold_report(
         project_path=project_path,
@@ -608,6 +643,7 @@ def render_deterministic_report(
         pages=pages,
     )
 
+    _progress("Building HTML report (npm)...")
     html_path = build_report(report_dir)
 
     return html_path, page_content

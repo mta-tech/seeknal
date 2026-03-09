@@ -519,10 +519,14 @@ def _run_deterministic_exposure(
         from seeknal.ask.report.deterministic import render_deterministic_report
 
         if console:
-            with console.status("[bold green]Rendering report..."):
+            with console.status("") as status:
+                def _on_progress(msg: str) -> None:
+                    status.update(f"[bold green]{msg}")
+
                 html_path, markdown = render_deterministic_report(
                     exposure, project_path,
                     provider=provider, model=model,
+                    on_progress=_on_progress,
                 )
         else:
             html_path, markdown = render_deterministic_report(
