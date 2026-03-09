@@ -1,7 +1,7 @@
 """Evidence build runner for seeknal reports.
 
 Handles npm install (with shared node_modules cache) and
-``npx evidence build`` execution via subprocess.
+Evidence build execution via subprocess (npx → npm run fallback).
 """
 
 import os
@@ -15,7 +15,7 @@ def build_report(report_path: Path, timeout: int = 120) -> str:
     """Build an Evidence report into static HTML.
 
     Checks for Node.js availability, installs dependencies if needed
-    (using a shared cache), then runs ``npx evidence build``.
+    (using a shared cache), then runs ``npm run build``.
 
     Args:
         report_path: Path to the Evidence project directory.
@@ -35,21 +35,11 @@ def build_report(report_path: Path, timeout: int = 120) -> str:
     if install_error:
         return install_error
 
-    # Run evidence build
+    # Run evidence build: try npx with scoped name first, fall back to npm run
     env = _get_build_env()
-    try:
-        result = subprocess.run(
-            ["npx", "evidence", "build"],
-            cwd=str(report_path),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
+    result = _run_evidence_build(report_path, env, timeout)
+    if result is None:
         return f"Evidence build timed out after {timeout} seconds."
-    except OSError as e:
-        return f"Error launching Evidence build: {e}"
 
     if result.returncode != 0:
         stderr = result.stderr.strip()
@@ -75,17 +65,17 @@ def build_report(report_path: Path, timeout: int = 120) -> str:
 
 
 def _check_node() -> str:
-    """Check that Node.js 18+ and npx are available.
+    """Check that Node.js 18+ and npm/npx are available.
 
     Returns:
         Empty string if OK, error message otherwise.
     """
-    npx = shutil.which("npx")
-    if not npx:
+    npm = shutil.which("npm")
+    if not npm:
         return (
             "Node.js is required for report generation but was not found.\n"
             "Install Node.js 18+ from https://nodejs.org/ and ensure "
-            "'npx' is on your PATH."
+            "'npm' is on your PATH."
         )
 
     node = shutil.which("node")
@@ -191,6 +181,59 @@ def _ensure_node_modules(report_path: Path, timeout: int = 60) -> str:
                 return "Failed to install dependencies."
 
     return ""
+
+
+def _run_evidence_build(
+    report_path: Path, env: dict[str, str], timeout: int
+) -> subprocess.CompletedProcess | None:
+    """Run Evidence build, trying npx first then falling back to npm run.
+
+    Returns:
+        CompletedProcess on success or failure, None on timeout.
+    """
+    # Try npx with scoped package name (more direct)
+    try:
+        result = subprocess.run(
+            ["npx", "@evidence-dev/evidence", "build"],
+            cwd=str(report_path),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        if result.returncode == 0:
+            return result
+        # If npx failed with "could not determine executable", try npm run
+        if "could not determine executable" in result.stderr:
+            pass  # Fall through to npm run
+        else:
+            return result  # Real build error, return as-is
+    except subprocess.TimeoutExpired:
+        return None
+    except OSError:
+        pass  # npx not available, fall through
+
+    # Fallback: npm run build (uses scripts.build from package.json)
+    try:
+        return subprocess.run(
+            ["npm", "run", "build"],
+            cwd=str(report_path),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    except OSError as e:
+        # Return a fake failed result with the error
+        result = subprocess.CompletedProcess(
+            args=["npm", "run", "build"],
+            returncode=1,
+            stdout="",
+            stderr=f"Error launching build: {e}",
+        )
+        return result
 
 
 def _get_build_env() -> dict[str, str]:

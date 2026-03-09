@@ -11,18 +11,18 @@ import pytest
 class TestCheckNode:
     """Test Node.js availability checking."""
 
-    def test_no_npx_returns_error(self):
+    def test_no_npm_returns_error(self):
         from seeknal.ask.report.builder import _check_node
 
         with patch("shutil.which", return_value=None):
             result = _check_node()
             assert "Node.js is required" in result
 
-    def test_npx_available_no_node_returns_error(self):
+    def test_npm_available_no_node_returns_error(self):
         from seeknal.ask.report.builder import _check_node
 
         def mock_which(name):
-            return "/usr/bin/npx" if name == "npx" else None
+            return "/usr/bin/npm" if name == "npm" else None
 
         with patch("shutil.which", side_effect=mock_which):
             result = _check_node()
@@ -159,7 +159,7 @@ class TestBuildReport:
 
 
 @pytest.mark.skipif(
-    not shutil.which("npx"), reason="Node.js required for integration test"
+    not shutil.which("npm"), reason="Node.js required for integration test"
 )
 class TestBuildIntegration:
     """Integration tests that require Node.js."""
