@@ -191,7 +191,7 @@ def create_agent(
     llm = get_llm(provider=provider, model=model, api_key=api_key)
 
     # Build system prompt with project context
-    system_prompt = SYSTEM_PROMPT.format(context=context)
+    system_prompt = SYSTEM_PROMPT.replace("{context}", context)
 
     # Create deep agent with planning and auto-summarization
     checkpointer = MemorySaver()
