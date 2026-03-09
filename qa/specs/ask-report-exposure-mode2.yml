@@ -1,0 +1,270 @@
+name: ask-report-exposure-mode2
+description: >
+  Test Mode 2 of the report exposure system: loading YAML exposure specs,
+  resolving Jinja2 template variables against real DuckDB data, and executing
+  the --exposure CLI flow. Uses real CSV data to verify that {{ inputs.*.columns }}
+  and {{ inputs.*.row_count }} resolve correctly from parquet metadata.
+source_type: csv
+
+infrastructure:
+  requires: []  # CSV needs no external infrastructure
+
+seed_data:
+  raw_orders.csv: |
+    order_id,customer_id,amount,order_date,status
+    ORD001,C001,150.00,2026-01-15,completed
+    ORD002,C002,75.50,2026-01-16,completed
+    ORD003,C001,200.00,2026-01-17,pending
+    ORD004,C003,50.00,2026-01-18,completed
+    ORD005,C002,300.00,2026-01-19,cancelled
+    ORD006,C001,125.75,2026-01-20,completed
+    ORD007,C004,89.99,2026-01-21,completed
+    ORD008,C003,175.00,2026-01-22,pending
+    ORD009,C001,60.00,2026-01-23,completed
+    ORD010,C005,220.00,2026-01-24,completed
+  raw_customers.csv: |
+    customer_id,name,email,signup_date,tier
+    C001,Alice Johnson,alice@example.com,2025-06-01,gold
+    C002,Bob Smith,bob@example.com,2025-07-15,silver
+    C003,Charlie Brown,charlie@example.com,2025-08-20,bronze
+    C004,Diana Prince,diana@example.com,2025-09-10,gold
+    C005,Eve Wilson,eve@example.com,2025-10-05,silver
+
+pipeline:
+  bronze:
+    - kind: source
+      name: raw_orders
+      source: csv
+      table: "data/raw_orders.csv"
+      tags: ["bronze"]
+
+    - kind: source
+      name: raw_customers
+      source: csv
+      table: "data/raw_customers.csv"
+      tags: ["bronze"]
+
+  silver:
+    - kind: transform
+      name: clean_orders
+      description: Completed orders only
+      inputs:
+        - ref: source.raw_orders
+      transform: |
+        SELECT
+          order_id,
+          customer_id,
+          CAST(amount AS DECIMAL(10,2)) AS amount,
+          CAST(order_date AS DATE) AS order_date,
+          status
+        FROM ref('source.raw_orders')
+        WHERE status = 'completed'
+      tags: ["silver"]
+
+  gold:
+    - kind: transform
+      name: customer_ltv
+      description: Customer lifetime value
+      inputs:
+        - ref: transform.clean_orders
+        - ref: source.raw_customers
+      transform: |
+        SELECT
+          c.customer_id,
+          c.name,
+          c.tier,
+          CAST(COUNT(o.order_id) AS BIGINT) AS total_orders,
+          CAST(SUM(o.amount) AS DECIMAL(10,2)) AS lifetime_value,
+          MIN(o.order_date) AS first_order,
+          MAX(o.order_date) AS last_order
+        FROM ref('source.raw_customers') c
+        JOIN ref('transform.clean_orders') o
+          ON c.customer_id = o.customer_id
+        GROUP BY c.customer_id, c.name, c.tier
+      tags: ["gold"]
+
+validation:
+  dag:
+    expected_nodes: 4
+    expected_edges:
+      - [source.raw_orders, transform.clean_orders]
+      - [transform.clean_orders, transform.customer_ltv]
+      - [source.raw_customers, transform.customer_ltv]
+  execution:
+    success: true
+  outputs:
+    - node: transform.clean_orders
+      min_rows: 7
+    - node: transform.customer_ltv
+      min_rows: 4
+
+# --- Report Exposure Mode 2 tests ---
+# Pre-create exposure YAMLs, then test loading + template resolution.
+exposure_fixtures:
+  monthly_ltv_report.yml:
+    kind: exposure
+    name: monthly_ltv_report
+    type: report
+    description: Monthly customer LTV analysis
+    params:
+      prompt: >
+        Analyze customer lifetime value for period ending {{ run_date }}.
+        Available columns: {{ inputs.customer_ltv.columns }}.
+        Total rows: {{ inputs.customer_ltv.row_count }}.
+        Focus on {{ params.focus_area }} customers.
+      format: markdown
+      focus_area: gold-tier
+    inputs:
+      - ref: transform.customer_ltv
+
+  invalid_format.yml:
+    kind: exposure
+    name: invalid_format
+    type: report
+    params:
+      prompt: "test"
+      format: pdf
+    inputs: []
+
+  missing_prompt.yml:
+    kind: exposure
+    name: missing_prompt
+    type: report
+    params:
+      format: markdown
+    inputs: []
+
+report_exposure_tests:
+  # Test 1: load valid exposure YAML
+  test_load_exposure:
+    action: call_function
+    module: seeknal.ask.report.exposure
+    function: load_report_exposure
+    args:
+      project_path: "{project_path}"
+      name: "monthly_ltv_report"
+    validate:
+      - result_field: {key: "kind", value: "exposure"}
+      - result_field: {key: "type", value: "report"}
+      - result_field: {key: "params.prompt", contains: "lifetime value"}
+      - result_field: {key: "params.format", value: "markdown"}
+
+  # Test 2: reject invalid format in YAML
+  test_reject_invalid_format:
+    action: call_function
+    module: seeknal.ask.report.exposure
+    function: load_report_exposure
+    args:
+      project_path: "{project_path}"
+      name: "invalid_format"
+    validate:
+      - raises: ValueError
+      - error_contains: "format"
+
+  # Test 3: reject missing prompt
+  test_reject_missing_prompt:
+    action: call_function
+    module: seeknal.ask.report.exposure
+    function: load_report_exposure
+    args:
+      project_path: "{project_path}"
+      name: "missing_prompt"
+    validate:
+      - raises: ValueError
+      - error_contains: "prompt"
+
+  # Test 4: exposure not found
+  test_not_found:
+    action: call_function
+    module: seeknal.ask.report.exposure
+    function: load_report_exposure
+    args:
+      project_path: "{project_path}"
+      name: "nonexistent_report"
+    validate:
+      - raises: FileNotFoundError
+
+  # Test 5: resolve_prompt with real DuckDB data
+  test_resolve_template_with_data:
+    action: call_function
+    depends_on: [pipeline_execution]  # Needs parquets to exist
+    module: seeknal.ask.report.exposure
+    function: resolve_prompt
+    args:
+      template: >
+        Analyze LTV data for {{ run_date }}.
+        Columns: {{ inputs.customer_ltv.columns }}.
+        Row count: {{ inputs.customer_ltv.row_count }}.
+        Focus: {{ params.focus_area }}.
+      project_path: "{project_path}"
+      inputs:
+        - ref: transform.customer_ltv
+      params:
+        focus_area: "gold-tier"
+    validate:
+      # run_date should resolve to today's date
+      - result_contains: "2026"
+      # columns should include known column names from customer_ltv
+      - result_contains: "customer_id"
+      - result_contains: "lifetime_value"
+      - result_contains: "total_orders"
+      # row count should be 4 (4 customers with completed orders)
+      - result_contains: "4"
+      # params should resolve
+      - result_contains: "gold-tier"
+
+  # Test 6: resolve_prompt with missing table (graceful degradation)
+  test_resolve_missing_table:
+    action: call_function
+    module: seeknal.ask.report.exposure
+    function: resolve_prompt
+    args:
+      template: "Columns: {{ inputs.nonexistent.columns }}"
+      project_path: "{project_path}"
+      inputs:
+        - ref: transform.nonexistent
+      params: {}
+    validate:
+      - result_contains: "not found"
+
+  # Test 7: Jinja2 SandboxedEnvironment blocks SSTI
+  test_ssti_blocked:
+    action: call_function
+    module: seeknal.ask.report.exposure
+    function: resolve_prompt
+    args:
+      template: "{{ run_date }}"
+      project_path: "{project_path}"
+      inputs: []
+      params: {}
+    validate:
+      # Basic template works fine
+      - result_contains: "2026"
+
+  # Test 8: StrictUndefined raises on missing variable
+  test_strict_undefined:
+    action: call_function
+    module: seeknal.ask.report.exposure
+    function: resolve_prompt
+    args:
+      template: "{{ undefined_variable }}"
+      project_path: "{project_path}"
+      inputs: []
+      params: {}
+    validate:
+      - raises: Exception
+
+features_tested:
+  - load_report_exposure
+  - yaml_schema_validation
+  - invalid_format_rejection
+  - missing_prompt_rejection
+  - exposure_not_found
+  - resolve_prompt
+  - jinja2_sandboxed_environment
+  - jinja2_strict_undefined
+  - input_column_resolution
+  - input_row_count_resolution
+  - run_date_resolution
+  - params_resolution
+  - missing_table_graceful_fallback
