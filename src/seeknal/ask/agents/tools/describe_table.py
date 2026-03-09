@@ -23,7 +23,8 @@ def describe_table(table_name: str) -> str:
         return f"Invalid table name: '{table_name}'"
 
     try:
-        columns, rows = ctx.repl.execute_oneshot(f"DESCRIBE {table_name}")
+        with ctx.db_lock:
+            columns, rows = ctx.repl.execute_oneshot(f"DESCRIBE {table_name}")
     except Exception as e:
         return f"Error describing table '{table_name}': {e}"
 

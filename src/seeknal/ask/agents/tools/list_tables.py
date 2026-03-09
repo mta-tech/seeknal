@@ -15,7 +15,8 @@ def list_tables() -> str:
     ctx = get_tool_context()
 
     try:
-        columns, rows = ctx.repl.execute_oneshot("SHOW TABLES")
+        with ctx.db_lock:
+            columns, rows = ctx.repl.execute_oneshot("SHOW TABLES")
     except Exception as e:
         return f"Error listing tables: {e}"
 

@@ -6,7 +6,8 @@ It's set once at agent initialization and accessed by tools via get_tool_context
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -19,11 +20,16 @@ _tool_context: Optional["ToolContext"] = None
 
 @dataclass
 class ToolContext:
-    """Shared context for all agent tools."""
+    """Shared context for all agent tools.
+
+    Includes a threading lock to protect the DuckDB connection from
+    concurrent access — LangGraph may invoke tools in parallel threads.
+    """
 
     repl: REPL
     artifact_discovery: ArtifactDiscovery
     project_path: Path
+    db_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 def set_tool_context(ctx: ToolContext) -> None:

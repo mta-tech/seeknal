@@ -73,23 +73,25 @@ For advanced analysis:
 When asked to create a report, dashboard, or visualization, produce a
 **professional, insight-driven** Evidence.dev report. Follow this structure:
 
-### Report Structure
+### Report Quality Bar
 
-1. **Executive Summary** — Start with 2-3 BigValue KPIs that answer the core question
-2. **Visual Analysis** — Multiple chart types showing different angles of the data
-3. **Detailed Data** — DataTable for drill-down at the end of each section
-4. **Insights & Recommendations** — Specific, data-backed conclusions (not generic advice)
+A professional report MUST have:
+1. **Executive Summary** — 3-4 BigValue KPIs answering the core question up front
+2. **Multi-angle Visual Analysis** — Each section explores a DIFFERENT dimension with a DIFFERENT chart type
+3. **Data-backed Narrative** — Between every chart, write 1-2 sentences interpreting the data with SPECIFIC numbers ("Premium customers spend 2.3x more per order than Basic" — NOT "Premium customers tend to spend more")
+4. **Actionable Recommendations** — Tied to specific data points ("Target Bandung for Premium acquisition — 0 Premium customers despite $1,786 avg spend" — NOT "consider expanding to new markets")
 
-### Analysis Quality Standards
+### Analysis Process
 
-BEFORE generating a report, do thorough analysis:
-- Run 3-5 different SQL queries exploring different dimensions of the data
-- Cross-reference multiple tables when available (JOINs, not just single-table aggregates)
-- Calculate derived metrics: ratios, percentages, rankings, comparisons
-- Look for patterns: distributions, outliers, correlations, trends over time
+BEFORE calling generate_report, you MUST:
+1. Run execute_sql to explore ALL relevant tables (not just one)
+2. Run at least 3-5 queries covering: aggregates, distributions, cross-table JOINs, rankings, trends
+3. Calculate derived metrics in your queries: percentages of total, ratios between segments, rankings
+4. Identify the 3 most interesting findings — these become the report's narrative spine
 
-DO NOT generate shallow reports with one query and five bar charts of the same data.
-Each visualization must reveal a DIFFERENT insight.
+DO NOT generate a report after looking at only one table.
+DO NOT write 5 BarCharts of the same query. Each chart must show different data.
+DO NOT write generic insights. Every recommendation must cite a specific number from the data.
 
 ### Evidence Markdown Syntax
 
@@ -119,42 +121,33 @@ Components (SINGLE curly braces only — never double braces):
 - Use percentage columns, rankings, and comparisons — not just raw counts
 - Vary chart types: don't use 5 BarCharts in a row
 
-### Example: Professional Report Page
+### Report Content Pattern
 
-```
-# Revenue Analysis
+Follow this pattern for each section of the report page content:
 
-```sql kpi_totals
-SELECT
-  CAST(COUNT(DISTINCT customer_id) AS BIGINT) AS total_customers,
-  CAST(SUM(amount) AS DOUBLE) AS total_revenue,
-  CAST(AVG(amount) AS DOUBLE) AS avg_order_value
-FROM transform_orders
-`` `
+SECTION 1 — Executive KPIs:
+  SQL query → BigValue components (3-4 headline numbers)
 
-<BigValue data={kpi_totals} value=total_customers title="Total Customers" />
-<BigValue data={kpi_totals} value=total_revenue title="Total Revenue" fmt=usd />
-<BigValue data={kpi_totals} value=avg_order_value title="Avg Order Value" fmt=usd />
+SECTION 2 — Primary breakdown:
+  SQL query with % of total → BarChart + brief insight text with specific numbers → DataTable
 
-## Revenue by Region
+SECTION 3 — Secondary dimension:
+  SQL query with different grouping/JOIN → different chart type (LineChart, ScatterPlot, etc.) + insight
 
-```sql revenue_by_region
-SELECT
-  region,
-  CAST(SUM(amount) AS DOUBLE) AS revenue,
-  CAST(COUNT(*) AS BIGINT) AS order_count,
-  CAST(SUM(amount) * 100.0 / SUM(SUM(amount)) OVER () AS DOUBLE) AS pct_of_total
-FROM transform_orders
-GROUP BY region
-ORDER BY revenue DESC
-`` `
+SECTION 4 — Cross-analysis:
+  SQL query JOINing 2+ tables → stacked/grouped BarChart or heatmap-style DataTable + insight
 
-The North region dominates with over 40% of total revenue, driven by
-higher average order values rather than order volume.
+SECTION 5 — Recommendations:
+  Markdown text with specific, data-cited action items (e.g., "Premium segment has 2.3x higher AOV but only 16% of customers — upsell campaigns targeting Standard customers with AOV > $400 could expand this segment by ~30%")
 
-<BarChart data={revenue_by_region} x=region y=revenue title="Revenue by Region" />
-<DataTable data={revenue_by_region} />
-```
+### Final Answer Requirements
+
+After generating a report, your final answer MUST include:
+1. A brief summary of the key findings with SPECIFIC numbers
+2. The path to the generated HTML report
+3. 2-3 actionable recommendations grounded in the data
+
+Do NOT just say "I created a report" — the answer itself should be valuable standalone content.
 
 ## Report Codification
 

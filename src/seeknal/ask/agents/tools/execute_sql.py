@@ -36,7 +36,8 @@ def execute_sql(sql: str, limit: int = 100) -> str:
         return f"SQL validation error: {e}"
 
     try:
-        columns, rows = ctx.repl.execute_oneshot(sql, limit=limit)
+        with ctx.db_lock:
+            columns, rows = ctx.repl.execute_oneshot(sql, limit=limit)
     except Exception as e:
         return f"SQL execution error: {e}"
 
