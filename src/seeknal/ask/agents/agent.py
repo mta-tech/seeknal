@@ -21,6 +21,7 @@ from seeknal.ask.agents.tools.search_pipelines import search_pipelines
 from seeknal.ask.agents.tools.search_project_files import search_project_files
 from seeknal.ask.agents.tools.read_project_file import read_project_file
 from seeknal.ask.agents.tools.execute_python import execute_python
+from seeknal.ask.agents.tools.generate_report import generate_report
 from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
 from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
 
@@ -30,6 +31,7 @@ TOOLS = [
     read_pipeline, search_pipelines,
     search_project_files, read_project_file,
     execute_python,
+    generate_report,
 ]
 
 SYSTEM_PROMPT = """You are Seeknal Ask, an AI data analyst for seeknal projects.
@@ -49,6 +51,7 @@ You can:
 7. Search across all project files (code, configs, YAML) using regex patterns
 8. Read any file in the project to understand custom transforms, configs, or scripts
 9. Execute Python code for advanced analysis (pandas, scipy, matplotlib)
+10. Generate interactive HTML reports with charts and tables using Evidence.dev
 
 ## Tool Selection Guide
 
@@ -60,6 +63,7 @@ You can:
 | "Where is column X defined?" | search_project_files | search_pipelines for pipeline metadata |
 | "How is this pipeline built?" | read_pipeline | read_project_file for non-pipeline files |
 | "Show me a histogram / correlation" | execute_python | — |
+| "Create a report / dashboard" | generate_report | First analyze with execute_sql/execute_python |
 | "What's the data lineage for X?" | search_project_files → read_project_file | — |
 
 ## Workflow
@@ -84,6 +88,33 @@ When a user needs advanced analysis beyond SQL:
 4. Query data with `conn.sql('SELECT ...').df()` to get a DataFrame
 
 For complex multi-step analyses, break your work into clear sub-tasks.
+
+## Report Generation (Evidence.dev)
+
+When generating reports, write Evidence-compatible markdown pages.
+Each page has SQL queries in fenced blocks and component tags.
+
+SQL query syntax (inside markdown):
+```sql query_name
+SELECT ... FROM table_name
+```
+
+Components (use after defining a query):
+- <BarChart data={query_name} x=column y=column />
+- <LineChart data={query_name} x=date_col y=value_col />
+- <AreaChart data={query_name} x=date_col y=value_col />
+- <DataTable data={query_name} />
+- <BigValue data={query_name} value=column_name />
+- <ScatterPlot data={query_name} x=col1 y=col2 />
+- <Histogram data={query_name} x=column bins=20 />
+- <FunnelChart data={query_name} name=stage value=count />
+
+Tips:
+- Name queries descriptively (e.g., revenue_by_month, top_customers)
+- Use markdown headers (##) to structure the page
+- Add brief text explanations between visualizations
+- Keep SQL in the page — do NOT use conn.sql() syntax
+- Use the same table names from list_tables output
 
 ## DuckDB SQL Rules
 

@@ -46,6 +46,8 @@ def _show_tool_start(console: Console, name: str, args: Optional[dict] = None) -
         _show_sql(console, args["sql"])
     elif args and name == "execute_python" and "code" in args:
         _show_python(console, args["code"])
+    elif args and name == "generate_report" and "title" in args:
+        console.print(f"  [dim]Title: {escape(args['title'])}[/dim]")
     elif args:
         # Show truncated args for other tools
         arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
@@ -62,6 +64,8 @@ def _show_tool_end(console: Console, name: str, output: str) -> None:
         _show_sql_result_table(console, output)
     elif name == "execute_python":
         _show_python_output(console, output)
+    elif name == "generate_report":
+        _show_report_output(console, output)
     else:
         summary = output[:200] + "..." if len(output) > 200 else output
         console.print(f"  [dim]Done: {escape(summary)}[/dim]")
@@ -97,6 +101,26 @@ def _show_python_output(console: Console, output: str) -> None:
         # Show full output (not truncated like generic tools)
         display = output[:2000] + "..." if len(output) > 2000 else output
         console.print(f"  [dim]{escape(display)}[/dim]")
+
+
+def _show_report_output(console: Console, output: str) -> None:
+    """Display report generation result."""
+    if not output:
+        console.print("  [dim]Done (no output)[/dim]")
+        return
+
+    if "Report built successfully" in output or output.strip().endswith(".html"):
+        console.print(f"  [bold green]{escape(output.strip())}[/bold green]")
+    elif output.startswith("Error") or "failed" in output.lower():
+        from rich.panel import Panel
+
+        console.print(Panel(
+            escape(output.strip()),
+            title="Report Build Error",
+            border_style="red",
+        ))
+    else:
+        console.print(f"  [dim]{escape(output[:500])}[/dim]")
 
 
 def _show_sql_result_table(console: Console, output: str) -> None:
