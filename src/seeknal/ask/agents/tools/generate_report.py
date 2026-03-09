@@ -6,6 +6,7 @@ builds static HTML, and returns the output path.
 """
 
 import json
+from typing import Union
 
 from langchain_core.tools import tool
 
@@ -29,14 +30,17 @@ def _do_generate(title: str, pages_json: str, project_path) -> str:
     if not title or not title.strip():
         return "Error: Report title cannot be empty."
 
-    # Parse pages JSON
-    try:
-        pages = json.loads(pages_json)
-    except (json.JSONDecodeError, TypeError) as e:
-        return f"Error: Invalid pages JSON — {e}"
+    # Parse pages — accept both list and JSON string
+    if isinstance(pages_json, list):
+        pages = pages_json
+    else:
+        try:
+            pages = json.loads(pages_json)
+        except (json.JSONDecodeError, TypeError) as e:
+            return f"Error: Invalid pages JSON — {e}"
 
     if not isinstance(pages, list) or not pages:
-        return "Error: 'pages' must be a non-empty JSON array of {{name, content}} objects."
+        return "Error: 'pages' must be a non-empty array of {name, content} objects."
 
     for i, page in enumerate(pages):
         if not isinstance(page, dict):
@@ -65,7 +69,7 @@ def _do_generate(title: str, pages_json: str, project_path) -> str:
 
 
 @tool
-def generate_report(title: str, pages: str) -> str:
+def generate_report(title: str, pages: Union[list, str]) -> str:
     """Generate an interactive HTML report with charts and tables.
 
     Creates an Evidence.dev project from markdown pages containing SQL
@@ -79,7 +83,7 @@ def generate_report(title: str, pages: str) -> str:
 
     Args:
         title: Report title (e.g., "Customer Segmentation Analysis").
-        pages: JSON string — array of {name, content} objects.
+        pages: Array of page objects, each with 'name' and 'content' fields.
             Example: [{"name": "overview", "content": "# Overview\\n```sql ..."}]
     """
     from seeknal.ask.agents.tools._context import get_tool_context

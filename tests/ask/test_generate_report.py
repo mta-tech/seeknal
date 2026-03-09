@@ -82,7 +82,7 @@ class TestDoGenerate:
 
         result = _do_generate("Test", '{"name": "test"}', Path("/tmp"))
         assert "Error" in result
-        assert "non-empty JSON array" in result
+        assert "non-empty array" in result
 
     def test_page_not_dict_returns_error(self):
         from seeknal.ask.agents.tools.generate_report import _do_generate
