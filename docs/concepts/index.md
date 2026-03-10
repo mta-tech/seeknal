@@ -77,6 +77,12 @@ Create hierarchical aggregations and multi-level rollups.
 
 [Learn more →](second-order-aggregations.md)
 
+### Exposures
+
+Define how data leaves your pipeline — file exports, API pushes, and automated analysis reports.
+
+[Learn more →](exposures.md)
+
 ---
 
 ## When to Read Concepts

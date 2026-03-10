@@ -19,6 +19,7 @@ The Seeknal CLI (`seeknal`) provides commands for managing data pipelines, featu
 | `run` | Execute YAML/Python pipeline |
 | `plan` | Analyze changes and show execution plan |
 | `repl` | Interactive SQL REPL or one-shot queries |
+| `ask` | AI-powered data analysis, chat, and reports |
 | `list` | List resources in the current project |
 | `show` | Show details of a specific resource |
 | `entity` | Manage consolidated entity feature stores |
@@ -61,9 +62,12 @@ The Seeknal CLI (`seeknal`) provides commands for managing data pipelines, featu
 - `version diff` - Compare versions
 - `clean` - Remove old feature data
 
-### Data Exploration
+### Data Exploration & AI
 
 - `repl` - Start interactive SQL REPL or one-shot queries
+- `ask` - AI-powered natural language data analysis and reports
+- `ask chat` - Interactive multi-turn chat session
+- `ask report` - Generate interactive HTML dashboards
 - `inspect` - Inspect intermediate pipeline output
 - `intervals` - List completed intervals
 - `query` - Query metrics from semantic layer

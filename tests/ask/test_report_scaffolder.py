@@ -107,7 +107,7 @@ class TestScaffoldReport:
         assert (report_dir / "evidence.config.yaml").exists()
         assert (report_dir / "sources" / "seeknal" / "connection.yaml").exists()
         assert (report_dir / "package.json").exists()
-        assert (report_dir / ".report.duckdb").exists()
+        assert (report_dir / "sources" / "seeknal" / ".report.duckdb").exists()
 
     def test_first_page_is_index(self, project_dir):
         from seeknal.ask.report.scaffolder import scaffold_report
@@ -165,7 +165,7 @@ class TestScaffoldReport:
         pages = [{"name": "overview", "content": "# Overview"}]
         report_dir = scaffold_report(project_dir, "Test", pages)
 
-        conn = duckdb.connect(str(report_dir / ".report.duckdb"), read_only=True)
+        conn = duckdb.connect(str(report_dir / "sources" / "seeknal" / ".report.duckdb"), read_only=True)
         tables = conn.execute("SHOW TABLES").fetchall()
         view_names = [t[0] for t in tables]
         conn.close()

@@ -588,6 +588,30 @@ def report_serve_command(
         raise typer.Exit(1)
 
     typer.echo(f"Starting Evidence dev server for '{name}' on port {port}...")
+
+    # Generate source data before starting dev server
+    typer.echo("Generating source data...")
+    try:
+        src_result = subprocess.run(
+            ["npx", "evidence", "sources"],
+            cwd=str(report_dir),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if src_result.returncode != 0:
+            typer.echo(typer.style(
+                f"Warning: source generation had issues: {src_result.stderr.strip()[-500:]}",
+                fg=typer.colors.YELLOW,
+            ))
+    except subprocess.TimeoutExpired:
+        typer.echo(typer.style(
+            "Warning: source generation timed out, continuing anyway...",
+            fg=typer.colors.YELLOW,
+        ))
+    except FileNotFoundError:
+        pass  # npm not found will be caught below
+
     typer.echo("Press Ctrl-C to stop.\n")
 
     webbrowser.open(f"http://localhost:{port}")

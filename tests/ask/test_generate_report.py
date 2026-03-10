@@ -212,7 +212,7 @@ class TestScaffoldAndBuildIntegration:
         assert (report_dir / "evidence.config.yaml").exists()
         assert (report_dir / "sources" / "seeknal" / "connection.yaml").exists()
         assert (report_dir / "package.json").exists()
-        assert (report_dir / ".report.duckdb").exists()
+        assert (report_dir / "sources" / "seeknal" / ".report.duckdb").exists()
 
         # Verify package.json has Evidence dependencies
         import json

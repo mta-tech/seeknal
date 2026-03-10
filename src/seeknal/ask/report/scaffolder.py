@@ -74,14 +74,20 @@ def scaffold_report(
     pages_dir.mkdir()
     _write_pages(pages_dir, pages)
 
-    # Create .duckdb file with views from parquets
-    db_path = report_dir / ".report.duckdb"
-    from seeknal.ask.report.data_bridge import create_duckdb_from_parquets
-    create_duckdb_from_parquets(project_path, db_path)
-
-    # Write Evidence config files
+    # Write Evidence config files (creates sources/seeknal/ directory)
     _write_evidence_config(report_dir)
     _write_connection_yaml(report_dir)
+
+    # Create .duckdb file inside sources/seeknal/ so the relative path
+    # resolves correctly both from sources/seeknal/ and from
+    # .evidence/template/sources/seeknal/ (where Evidence copies it)
+    db_path = report_dir / "sources" / "seeknal" / ".report.duckdb"
+    from seeknal.ask.report.data_bridge import create_duckdb_from_parquets
+    _count, table_names = create_duckdb_from_parquets(project_path, db_path)
+
+    # Create .sql source files so Evidence caches each table for the
+    # browser WASM DuckDB used by inline queries at dev/build time
+    _write_source_sql_files(report_dir, table_names)
     _write_package_json(report_dir, title)
 
     return report_dir
@@ -185,7 +191,13 @@ plugins:
 
 
 def _write_connection_yaml(report_dir: Path) -> None:
-    """Write DuckDB connection config pointing to .report.duckdb."""
+    """Write DuckDB connection config pointing to .report.duckdb.
+
+    The .duckdb file lives in sources/seeknal/ alongside connection.yaml.
+    Using just the filename ensures it resolves correctly both from the
+    original location and from .evidence/template/sources/seeknal/ where
+    Evidence copies it at build/dev time.
+    """
     sources_dir = report_dir / "sources" / "seeknal"
     sources_dir.mkdir(parents=True, exist_ok=True)
 
@@ -193,9 +205,23 @@ def _write_connection_yaml(report_dir: Path) -> None:
 name: seeknal
 type: duckdb
 options:
-  filename: ../../.report.duckdb
+  filename: .report.duckdb
 """
     (sources_dir / "connection.yaml").write_text(connection, encoding="utf-8")
+
+
+def _write_source_sql_files(report_dir: Path, table_names: list[str]) -> None:
+    """Create .sql source files so Evidence pre-caches each table.
+
+    Evidence's inline SQL (in markdown pages) runs in a browser WASM DuckDB
+    that only has access to data pre-loaded from the source manifest.
+    Each .sql file selects all rows from a table so that ``npx evidence sources``
+    (or the build) caches the data for the WASM engine.
+    """
+    sources_dir = report_dir / "sources" / "seeknal"
+    for name in table_names:
+        sql_file = sources_dir / f"{name}.sql"
+        sql_file.write_text(f'SELECT * FROM "{name}"\n', encoding="utf-8")
 
 
 def _write_package_json(report_dir: Path, title: str) -> None:

@@ -75,26 +75,56 @@ seeknal env apply dev
 seeknal run --env dev
 ```
 
-**Feature Store** — Point-in-time joins, automatic versioning, offline and online serving. Powered by DuckDB (single-node, <100M rows) or Apache Spark (distributed).
+**Feature Store** — Define ML features in YAML or Python with entity keys, point-in-time joins, and automatic versioning. Supports offline (batch) and online (real-time) serving.
+
+```yaml
+# seeknal/feature_groups/customer_features.yml
+kind: feature_group
+name: customer_features
+entity:
+  name: customer
+  join_keys: ["customer_id"]
+materialization:
+  event_time_col: latest_order_date
+  offline: { enabled: true, format: parquet }
+  online: { enabled: false, ttl: 7d }
+features:
+  total_orders: { dtype: integer }
+  total_spent: { dtype: float }
+  avg_order_value: { dtype: float }
+inputs:
+  - ref: transform.customer_orders
+```
 
 ```python
-from seeknal.featurestore.duckdbengine.feature_group import FeatureGroupDuckDB, FeatureLookup, Materialization, HistoricalFeaturesDuckDB
-from seeknal.entity import Entity
+# Or use Python decorators
+@feature_group(name="customer_rfm", entity="customer")
+def customer_rfm(ctx):
+    df = ctx.ref("transform.clean_transactions")
+    return ctx.duckdb.sql("""
+        SELECT CustomerID, COUNT(DISTINCT InvoiceNo) as frequency,
+               SUM(TotalAmount) as monetary_value
+        FROM df GROUP BY CustomerID
+    """).df()
+```
 
-fg = FeatureGroupDuckDB(
-    name="user_features",
-    entity=Entity(name="user", join_keys=["user_id"]),
-    materialization=Materialization(event_time_col="event_time"),
-)
-fg.set_dataframe(df).set_features()
-fg.write(feature_start_time=datetime(2024, 1, 1))
-
-# Point-in-time join (prevents data leakage)
-hist = HistoricalFeaturesDuckDB(lookups=[FeatureLookup(source=fg)])
-training_df = hist.to_dataframe(feature_start_time=datetime(2024, 1, 1))
+```bash
+seeknal entity list                           # Cross-feature-group consolidation
+seeknal entity show customer                  # Inspect entity schema and feature groups
 ```
 
 **Interactive SQL REPL** — Auto-registers parquets, PostgreSQL, and Iceberg sources at startup. Query pipeline outputs, explore data, iterate on SQL — all without leaving the terminal.
+
+**AI-Powered Data Agent** — Ask questions in natural language, get SQL-backed answers with actionable insights. 12 built-in tools for data discovery, analysis, Python execution, and report generation:
+
+```bash
+seeknal ask "What are the top 5 customers by revenue?"
+seeknal ask chat                        # Multi-turn interactive session
+seeknal ask report "customer analysis"  # Generate interactive HTML dashboard
+seeknal ask report --exposure monthly_kpis  # Run deterministic report exposure
+```
+
+Supports Google Gemini (default) and Ollama (local) as LLM providers. Use `--provider ollama` for fully local, private analysis.
 
 ## Documentation
 
@@ -104,11 +134,31 @@ training_df = hist.to_dataframe(feature_start_time=datetime(2024, 1, 1))
 | **[CLI Reference](docs/reference/cli.md)** | All commands and flags |
 | **[YAML Schema](docs/reference/yaml-schema.md)** | Pipeline YAML reference |
 | **[CLI Docs Search](docs/cli/docs.md)** | Search documentation from the terminal (`seeknal docs`) |
-| **Tutorials** | [YAML Pipelines](docs/tutorials/yaml-pipeline-tutorial.md) · [Python Pipelines](docs/tutorials/python-pipelines-tutorial.md) · [Mixed](docs/tutorials/mixed-yaml-python-pipelines.md) |
+| **Tutorials** | [YAML Pipelines](docs/tutorials/yaml-pipeline-tutorial.md) · [Python Pipelines](docs/tutorials/python-pipelines-tutorial.md) · [Mixed](docs/tutorials/mixed-yaml-python-pipelines.md) · [Seeknal Ask Agent](docs/tutorials/seeknal-ask-agent.md) · [Report Exposures](docs/tutorials/report-exposures.md) |
 | **Guides** | [Python Pipelines](docs/guides/python-pipelines.md) · [Testing & Audits](docs/guides/testing-and-audits.md) · [Iceberg Materialization](docs/iceberg-materialization.md) · [Training to Serving](docs/guides/training-to-serving.md) |
-| **Concepts** | [Point-in-Time Joins](docs/concepts/point-in-time-joins.md) · [Virtual Environments](docs/concepts/virtual-environments.md) · [Glossary](docs/concepts/glossary.md) |
+| **Concepts** | [Point-in-Time Joins](docs/concepts/point-in-time-joins.md) · [Virtual Environments](docs/concepts/virtual-environments.md) · [Exposures](docs/concepts/exposures.md) · [Glossary](docs/concepts/glossary.md) |
 
 ## Changelog
+
+### v2.4.0 (March 2026)
+
+**Seeknal Ask — AI-Powered Data Agent** — Natural language data analysis with 12 built-in tools:
+
+```bash
+seeknal ask "What are the top 5 customers by revenue?"
+seeknal ask chat                                        # Interactive multi-turn session
+seeknal ask report "customer segmentation"              # AI-guided HTML dashboard
+seeknal ask report --exposure monthly_kpis              # Deterministic report exposure
+seeknal ask report serve my-report                      # Live-preview with Evidence dev server
+```
+
+- **One-shot & chat modes**: Ask questions or start multi-turn sessions with conversation memory
+- **12 agent tools**: Data discovery, SQL execution, Python analysis (pandas/scipy/matplotlib), pipeline inspection, and report generation
+- **Report exposures**: Define repeatable reports in YAML with pinned SQL queries, chart types (BigValue, BarChart, LineChart, AreaChart, DataTable), and LLM-generated narratives
+- **Deterministic reports**: `sections` key pins SQL and charts — LLM only writes commentary
+- **Dual output**: Both interactive HTML dashboards and standalone Markdown reports
+- **LLM providers**: Google Gemini (default) and Ollama (local, no API key)
+- **Subprocess sandbox**: Python execution runs in isolated subprocess with restricted imports
 
 ### v2.3.0 (March 2026)
 

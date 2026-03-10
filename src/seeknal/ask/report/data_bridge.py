@@ -1,28 +1,30 @@
-"""DuckDB view bridge for Evidence reports.
+"""DuckDB data bridge for Evidence reports.
 
-Creates a .duckdb file with all seeknal parquets registered as named views.
-Evidence's DuckDB connector reads this file directly, giving reports access
-to the same table names the agent already knows.
+Creates a .duckdb file with all seeknal parquets materialized as tables.
+Evidence's DuckDB connector (Node.js) reads this file directly, giving
+reports access to the same table names the agent already knows.
 
-This mirrors the pattern in sandbox.py's load_project_data() but runs
-in-process (not in a subprocess) and writes to a persistent .duckdb file.
+Tables are materialized (not views) because Evidence uses a Node.js DuckDB
+binding that cannot resolve ``read_parquet()`` views created by Python DuckDB.
 """
 
 from pathlib import Path
 
 
-def create_duckdb_from_parquets(project_path: Path, db_path: Path) -> int:
-    """Create a DuckDB file with views pointing to project parquets.
+def create_duckdb_from_parquets(
+    project_path: Path, db_path: Path
+) -> tuple[int, list[str]]:
+    """Create a DuckDB file with tables from project parquets.
 
     Scans target/intermediate/, target/cache/, and target/feature_store/
-    for parquet files and registers each as a named view.
+    for parquet files and materializes each as a named table.
 
     Args:
         project_path: Path to the seeknal project root.
         db_path: Where to write the .duckdb file.
 
     Returns:
-        Number of views registered.
+        Tuple of (number of tables registered, list of table names).
     """
     import duckdb
 
@@ -45,16 +47,16 @@ def create_duckdb_from_parquets(project_path: Path, db_path: Path) -> int:
     intermediate = root / "target" / "intermediate"
     if intermediate.exists():
         for pq in sorted(intermediate.rglob("*.parquet")):
-            view_name = pq.stem
-            if view_name in seen_names:
+            table_name = pq.stem
+            if table_name in seen_names:
                 continue
             safe_path = str(pq.resolve()).replace("'", "''")
             try:
                 conn.execute(
-                    f'CREATE VIEW "{view_name}" AS '
+                    f'CREATE TABLE "{table_name}" AS '
                     f"SELECT * FROM read_parquet('{safe_path}')"
                 )
-                seen_names.add(view_name)
+                seen_names.add(table_name)
                 registered += 1
             except Exception:
                 pass
@@ -68,7 +70,7 @@ def create_duckdb_from_parquets(project_path: Path, db_path: Path) -> int:
             safe_path = str(pq.resolve()).replace("'", "''")
             try:
                 conn.execute(
-                    f'CREATE VIEW "{pq.stem}" AS '
+                    f'CREATE TABLE "{pq.stem}" AS '
                     f"SELECT * FROM read_parquet('{safe_path}')"
                 )
                 seen_names.add(pq.stem)
@@ -84,19 +86,19 @@ def create_duckdb_from_parquets(project_path: Path, db_path: Path) -> int:
                 continue
             features_pq = entity_dir / "features.parquet"
             if features_pq.exists():
-                view_name = f"entity_{entity_dir.name}"
-                if view_name in seen_names:
+                table_name = f"entity_{entity_dir.name}"
+                if table_name in seen_names:
                     continue
                 safe_path = str(features_pq.resolve()).replace("'", "''")
                 try:
                     conn.execute(
-                        f'CREATE VIEW "{view_name}" AS '
+                        f'CREATE TABLE "{table_name}" AS '
                         f"SELECT * FROM read_parquet('{safe_path}')"
                     )
-                    seen_names.add(view_name)
+                    seen_names.add(table_name)
                     registered += 1
                 except Exception:
                     pass
 
     conn.close()
-    return registered
+    return registered, sorted(seen_names)
