@@ -18,7 +18,11 @@ _VALID_FORMATS = {"markdown", "html", "both"}
 
 @tool
 def save_report_exposure(
-    name: str, prompt: str, inputs: str, output_format: str = "markdown"
+    name: str,
+    prompt: str,
+    inputs: str,
+    output_format: str = "markdown",
+    schedule: str = "",
 ) -> str:
     """Save the current analysis as a repeatable report exposure YAML.
 
@@ -31,11 +35,14 @@ def save_report_exposure(
         prompt: The analysis prompt distilled from the conversation.
         inputs: JSON array of input refs, e.g. '["transform.monthly_revenue"]'.
         output_format: Output format — "markdown", "html", or "both".
+        schedule: Optional cron schedule (e.g. "0 8 * * MON" for every Monday 8am).
+            When set, the exposure can be deployed to Prefect with:
+            seeknal prefect deploy --exposure {name} --work-pool <pool>
     """
     from seeknal.ask.agents.tools._context import get_tool_context
 
     ctx = get_tool_context()
-    return _do_save(name, prompt, inputs, output_format, ctx.project_path)
+    return _do_save(name, prompt, inputs, output_format, ctx.project_path, schedule)
 
 
 def _do_save(
@@ -44,6 +51,7 @@ def _do_save(
     inputs_json: str,
     output_format: str,
     project_path: Path,
+    schedule: str = "",
 ) -> str:
     """Core logic for saving report exposure YAML.  Separated for testability."""
     # Validate name (snake_case only, no path traversal)
@@ -84,6 +92,17 @@ def _do_save(
         },
         "inputs": [{"ref": ref} for ref in input_refs],
     }
+
+    # Add schedule if provided
+    if schedule and schedule.strip():
+        cron_str = schedule.strip()
+        cron_parts = cron_str.split()
+        if len(cron_parts) != 5:
+            return (
+                f"Error: schedule must be a 5-field cron string "
+                f"(minute hour day month weekday), got '{cron_str}'"
+            )
+        exposure_data["schedule"] = {"cron": cron_str}
 
     # Write YAML
     exposures_dir = project_path / "seeknal" / "exposures"
