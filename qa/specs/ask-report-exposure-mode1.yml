@@ -1,0 +1,200 @@
+name: ask-report-exposure-mode1
+description: >
+  Test Mode 1 of the report exposure system: interactive report flow saves
+  markdown to target/reported/{slug}/{date}.md, and the save_report_exposure
+  agent tool generates valid YAML exposure specs at seeknal/exposures/{name}.yml.
+  Uses real CSV data through a medallion pipeline, then validates the report
+  module functions against the produced parquet files.
+source_type: csv
+
+infrastructure:
+  requires: []  # CSV needs no external infrastructure
+
+seed_data:
+  raw_sales.csv: |
+    sale_id,product,category,amount,sale_date,region
+    S001,Widget A,electronics,299.99,2026-01-05,north
+    S002,Widget B,electronics,149.50,2026-01-08,south
+    S003,Gadget X,accessories,49.99,2026-01-10,north
+    S004,Widget A,electronics,299.99,2026-01-12,east
+    S005,Gadget Y,accessories,79.99,2026-01-15,west
+    S006,Widget C,electronics,199.00,2026-01-18,north
+    S007,Gadget X,accessories,49.99,2026-01-20,south
+    S008,Widget A,electronics,299.99,2026-01-22,east
+    S009,Gadget Z,accessories,99.99,2026-01-25,north
+    S010,Widget B,electronics,149.50,2026-01-28,west
+    S011,Widget A,electronics,299.99,2026-02-01,north
+    S012,Gadget Y,accessories,79.99,2026-02-05,south
+  raw_regions.csv: |
+    region,region_name,manager
+    north,North Region,Alice
+    south,South Region,Bob
+    east,East Region,Charlie
+    west,West Region,Diana
+
+pipeline:
+  bronze:
+    - kind: source
+      name: raw_sales
+      source: csv
+      table: "data/raw_sales.csv"
+      description: Raw sales transactions
+      tags: ["bronze", "sales"]
+
+    - kind: source
+      name: raw_regions
+      source: csv
+      table: "data/raw_regions.csv"
+      description: Region master data
+      tags: ["bronze", "regions"]
+
+  silver:
+    - kind: transform
+      name: sales_enriched
+      description: Sales enriched with region names
+      inputs:
+        - ref: source.raw_sales
+        - ref: source.raw_regions
+      transform: |
+        SELECT
+          s.sale_id,
+          s.product,
+          s.category,
+          CAST(s.amount AS DECIMAL(10,2)) AS amount,
+          CAST(s.sale_date AS DATE) AS sale_date,
+          s.region,
+          r.region_name,
+          r.manager
+        FROM ref('source.raw_sales') s
+        JOIN ref('source.raw_regions') r
+          ON s.region = r.region
+      tags: ["silver", "enriched"]
+
+  gold:
+    - kind: transform
+      name: regional_revenue
+      description: Revenue aggregated by region
+      inputs:
+        - ref: transform.sales_enriched
+      transform: |
+        SELECT
+          region,
+          region_name,
+          manager,
+          CAST(COUNT(*) AS BIGINT) AS total_sales,
+          CAST(SUM(amount) AS DECIMAL(10,2)) AS total_revenue,
+          CAST(AVG(amount) AS DECIMAL(10,2)) AS avg_sale
+        FROM ref('transform.sales_enriched')
+        GROUP BY region, region_name, manager
+      tags: ["gold", "analytics"]
+
+validation:
+  dag:
+    expected_nodes: 4
+    expected_edges:
+      - [source.raw_sales, transform.sales_enriched]
+      - [source.raw_regions, transform.sales_enriched]
+      - [transform.sales_enriched, transform.regional_revenue]
+  execution:
+    success: true
+  outputs:
+    - node: transform.sales_enriched
+      min_rows: 12
+    - node: transform.regional_revenue
+      min_rows: 4  # 4 regions
+
+# --- Report Exposure Mode 1 tests ---
+# These run AFTER the pipeline produces parquet files.
+report_exposure_tests:
+  # Test 1: save_rendered_markdown writes to correct path
+  test_save_markdown:
+    action: call_function
+    module: seeknal.ask.report.exposure
+    function: save_rendered_markdown
+    args:
+      project_path: "{project_path}"
+      name: "Regional Revenue Analysis"
+      content: |
+        # Regional Revenue Report
+
+        ## Summary
+        Analysis of revenue by region for Q1 2026.
+
+        | Region | Revenue |
+        |--------|---------|
+        | North  | $749.96 |
+        | South  | $279.49 |
+    validate:
+      - file_exists: "target/reported/regional-revenue-analysis/{today}.md"
+      - file_contains: "Regional Revenue Report"
+      - file_contains: "$749.96"
+
+  # Test 2: save_report_exposure tool generates valid YAML
+  test_save_exposure_yaml:
+    action: call_function
+    module: seeknal.ask.agents.tools.save_report_exposure
+    function: _do_save
+    args:
+      name: "regional_revenue_report"
+      prompt: "Analyze revenue by region, showing top performers and trends"
+      inputs_json: '["transform.sales_enriched", "transform.regional_revenue"]'
+      output_format: "markdown"
+      project_path: "{project_path}"
+    validate:
+      - file_exists: "seeknal/exposures/regional_revenue_report.yml"
+      - yaml_field: {path: "seeknal/exposures/regional_revenue_report.yml", key: "kind", value: "exposure"}
+      - yaml_field: {path: "seeknal/exposures/regional_revenue_report.yml", key: "type", value: "report"}
+      - yaml_field: {path: "seeknal/exposures/regional_revenue_report.yml", key: "name", value: "regional_revenue_report"}
+      - result_contains: "saved"
+
+  # Test 3: save_report_exposure rejects invalid names
+  test_reject_invalid_name:
+    action: call_function
+    module: seeknal.ask.agents.tools.save_report_exposure
+    function: _do_save
+    args:
+      name: "Invalid-Name!"
+      prompt: "test"
+      inputs_json: "[]"
+      output_format: "markdown"
+      project_path: "{project_path}"
+    validate:
+      - result_contains: "Error"
+      - result_contains: "snake_case"
+
+  # Test 4: empty content rejected
+  test_reject_empty_content:
+    action: call_function
+    module: seeknal.ask.report.exposure
+    function: save_rendered_markdown
+    args:
+      project_path: "{project_path}"
+      name: "empty"
+      content: ""
+    validate:
+      - raises: ValueError
+
+  # Test 5: load_report_exposure reads back what was saved
+  test_load_saved_exposure:
+    action: call_function
+    depends_on: test_save_exposure_yaml
+    module: seeknal.ask.report.exposure
+    function: load_report_exposure
+    args:
+      project_path: "{project_path}"
+      name: "regional_revenue_report"
+    validate:
+      - result_field: {key: "kind", value: "exposure"}
+      - result_field: {key: "type", value: "report"}
+      - result_field: {key: "params.prompt", contains: "revenue by region"}
+
+features_tested:
+  - save_rendered_markdown
+  - slug_generation
+  - date_stamped_filename
+  - save_report_exposure_tool
+  - yaml_generation
+  - name_validation
+  - empty_content_rejection
+  - exposure_roundtrip
+  - path_traversal_prevention

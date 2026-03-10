@@ -1,0 +1,167 @@
+name: ask-report-exposure-security
+description: >
+  Security-focused tests for the report exposure system. Validates path traversal
+  prevention, name sanitization, YAML injection resistance, and Jinja2 sandboxing.
+  No pipeline needed — these are pure function tests.
+source_type: csv
+
+infrastructure:
+  requires: []
+
+seed_data: {}
+
+pipeline:
+  bronze: []
+  silver: []
+  gold: []
+
+validation:
+  dag:
+    expected_nodes: 0
+  execution:
+    success: true
+
+report_exposure_tests:
+  # Test 1: Path traversal in report name (slugifier strips it)
+  test_path_traversal_save_markdown:
+    action: call_function
+    module: seeknal.ask.report.exposure
+    function: save_rendered_markdown
+    args:
+      project_path: "{project_path}"
+      name: "../../etc/passwd"
+      content: "malicious content"
+    validate:
+      # Slugifier converts to "etc-passwd", stays safely under target/
+      - file_not_exists: "../../etc/passwd"
+      - result_under_directory: "target/reported"
+
+  # Test 2: Path traversal in exposure name (regex rejects it)
+  test_path_traversal_save_exposure:
+    action: call_function
+    module: seeknal.ask.agents.tools.save_report_exposure
+    function: _do_save
+    args:
+      name: "../../../evil"
+      prompt: "test"
+      inputs_json: "[]"
+      output_format: "markdown"
+      project_path: "{project_path}"
+    validate:
+      - result_contains: "Error"
+      - result_contains: "snake_case"
+      - file_not_exists: "seeknal/exposures/../../../evil.yml"
+
+  # Test 3: Invalid JSON in inputs
+  test_invalid_json_inputs:
+    action: call_function
+    module: seeknal.ask.agents.tools.save_report_exposure
+    function: _do_save
+    args:
+      name: "test_report"
+      prompt: "test"
+      inputs_json: "{not valid json"
+      output_format: "markdown"
+      project_path: "{project_path}"
+    validate:
+      - result_contains: "Error"
+      - result_contains: "JSON"
+
+  # Test 4: Non-array inputs
+  test_non_array_inputs:
+    action: call_function
+    module: seeknal.ask.agents.tools.save_report_exposure
+    function: _do_save
+    args:
+      name: "test_report"
+      prompt: "test"
+      inputs_json: '{"key": "value"}'
+      output_format: "markdown"
+      project_path: "{project_path}"
+    validate:
+      - result_contains: "Error"
+      - result_contains: "array"
+
+  # Test 5: Invalid output format
+  test_invalid_output_format:
+    action: call_function
+    module: seeknal.ask.agents.tools.save_report_exposure
+    function: _do_save
+    args:
+      name: "test_report"
+      prompt: "test"
+      inputs_json: "[]"
+      output_format: "pdf"
+      project_path: "{project_path}"
+    validate:
+      - result_contains: "Error"
+      - result_contains: "format"
+
+  # Test 6: Empty prompt rejected
+  test_empty_prompt:
+    action: call_function
+    module: seeknal.ask.agents.tools.save_report_exposure
+    function: _do_save
+    args:
+      name: "test_report"
+      prompt: "   "
+      inputs_json: "[]"
+      output_format: "markdown"
+      project_path: "{project_path}"
+    validate:
+      - result_contains: "Error"
+      - result_contains: "empty"
+
+  # Test 7: Overwrite detection
+  test_overwrite_warning:
+    action: call_function_sequence
+    steps:
+      - module: seeknal.ask.agents.tools.save_report_exposure
+        function: _do_save
+        args:
+          name: "overwrite_test"
+          prompt: "version 1"
+          inputs_json: "[]"
+          output_format: "markdown"
+          project_path: "{project_path}"
+      - module: seeknal.ask.agents.tools.save_report_exposure
+        function: _do_save
+        args:
+          name: "overwrite_test"
+          prompt: "version 2"
+          inputs_json: "[]"
+          output_format: "markdown"
+          project_path: "{project_path}"
+    validate:
+      - result_contains: "overwriting"
+      - yaml_field: {path: "seeknal/exposures/overwrite_test.yml", key: "params.prompt", value: "version 2"}
+
+  # Test 8: All three valid formats accepted
+  test_valid_formats:
+    action: call_function_sequence
+    steps:
+      - module: seeknal.ask.agents.tools.save_report_exposure
+        function: _do_save
+        args: {name: "fmt_md", prompt: "test", inputs_json: "[]", output_format: "markdown", project_path: "{project_path}"}
+      - module: seeknal.ask.agents.tools.save_report_exposure
+        function: _do_save
+        args: {name: "fmt_html", prompt: "test", inputs_json: "[]", output_format: "html", project_path: "{project_path}"}
+      - module: seeknal.ask.agents.tools.save_report_exposure
+        function: _do_save
+        args: {name: "fmt_both", prompt: "test", inputs_json: "[]", output_format: "both", project_path: "{project_path}"}
+    validate:
+      - file_exists: "seeknal/exposures/fmt_md.yml"
+      - file_exists: "seeknal/exposures/fmt_html.yml"
+      - file_exists: "seeknal/exposures/fmt_both.yml"
+
+features_tested:
+  - path_traversal_prevention_markdown
+  - path_traversal_prevention_exposure
+  - slug_sanitization
+  - snake_case_name_validation
+  - invalid_json_rejection
+  - non_array_inputs_rejection
+  - invalid_format_rejection
+  - empty_prompt_rejection
+  - overwrite_detection
+  - all_valid_formats

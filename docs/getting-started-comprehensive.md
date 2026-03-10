@@ -575,6 +575,8 @@ IcebergStoreOutput(table="features", mode="overwrite")
 - **[YAML Pipeline Tutorial](./tutorials/yaml-pipeline-tutorial.md)** — Deep dive into the YAML workflow with a complete e-commerce dataset
 - **[Python Pipelines Tutorial](./tutorials/python-pipelines-tutorial.md)** — Build pipelines using Python decorators (`@source`, `@transform`, `@feature_group`)
 - **[E-commerce Workflow Tutorial](./tutorials/workflow-tutorial-ecommerce.md)** — Full draft/dry-run/apply workflow with 5 tables
+- **[Seeknal Ask Agent Tutorial](./tutorials/seeknal-ask-agent.md)** — AI-powered natural language data analysis, interactive chat, and report generation
+- **[Report Exposures Tutorial](./tutorials/report-exposures.md)** — Generate automated analysis reports with charts, tables, and AI narratives
 
 ### Guides
 

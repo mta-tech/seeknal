@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "seeknal"
-version = "2.3.0"
+version = "2.4.0"
 description = "All-in-one platform for data and AI/ML engineering"
 authors = [
     {name = "Fitra Kacamarga"}
@@ -54,6 +54,17 @@ dependencies = [
 #     "atlas-data-platform>=0.1.0",
 #     "uvicorn[standard]>=0.27.0",
 # ]
+
+# Seeknal Ask — NL-to-Analysis Agent
+ask = [
+    "deepagents>=0.4.0",
+    "langchain>=0.3.0",
+    "langgraph>=0.4.0",
+    "langchain-google-genai>=2.0.0",
+    "langchain-ollama>=0.3.0",
+    "rich>=13.0.0",
+    "ruamel.yaml>=0.18.0",
+]
 
 # Development dependencies
 dev = [
