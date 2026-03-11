@@ -253,6 +253,15 @@ class SeeknalPrefectFlow:
         if interval:
             serve_kwargs["interval"] = interval
 
+        # Use module_path entrypoint so Prefect doesn't try to resolve
+        # the source file relative to CWD (fails when flow is in an
+        # installed package and CWD is a project directory).
+        try:
+            from prefect.deployments.runner import EntrypointType
+            serve_kwargs["entrypoint_type"] = EntrypointType.MODULE_PATH
+        except ImportError:
+            pass
+
         logger.info(f"Serving flow '{deploy_name}' (cron={cron}, interval={interval})")
         flow_fn.serve(**serve_kwargs)
 
@@ -283,6 +292,12 @@ class SeeknalPrefectFlow:
             deploy_kwargs["cron"] = cron
         if interval:
             deploy_kwargs["interval"] = interval
+
+        try:
+            from prefect.deployments.runner import EntrypointType
+            deploy_kwargs["entrypoint_type"] = EntrypointType.MODULE_PATH
+        except ImportError:
+            pass
 
         logger.info(f"Deploying flow '{deploy_name}' to work pool '{work_pool}'")
         flow_fn.deploy(**deploy_kwargs)
@@ -328,6 +343,12 @@ class SeeknalPrefectFlow:
         timezone = schedule.get("timezone")
         if timezone:
             deploy_kwargs["timezone"] = timezone
+
+        try:
+            from prefect.deployments.runner import EntrypointType
+            deploy_kwargs["entrypoint_type"] = EntrypointType.MODULE_PATH
+        except ImportError:
+            pass
 
         logger.info(
             f"Deploying report '{exposure_name}' to work pool '{work_pool}' "
