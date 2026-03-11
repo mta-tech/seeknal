@@ -505,7 +505,7 @@ def _execute_report(
 
     if has_sections:
         from seeknal.ask.report.deterministic import render_deterministic_report
-        result = render_deterministic_report(project_path, config)
+        result = render_deterministic_report(config, project_path)
         return {"status": "success", "report": str(result)}
 
     # Prompt-based: use agent
