@@ -576,23 +576,20 @@ class TestLayerExecution:
         edges = [("a", "b"), ("b", "c")]
         runner = _make_runner(nodes, edges)
 
-        # Mock task.submit to return futures
+        # Mock direct task call to track call order
         call_order = []
 
-        def fake_submit(r, nid):
+        def fake_call(r, nid):
             call_order.append(nid)
-            future = MagicMock()
-            future.result.return_value = PrefectNodeResult(nid, "success", 1.0, 100)
-            return future
+            return PrefectNodeResult(nid, "success", 1.0, 100)
 
-        mock_task.submit = fake_submit
+        mock_task.side_effect = fake_call
 
         builder = MagicMock(spec=SeeknalPrefectFlow)
         builder._build_runner.return_value = (runner, Path("/tmp/target"))
         builder.project_path = Path("/tmp/test")
 
-        with patch("seeknal.workflow.prefect_integration.wait"):
-            results = _execute_pipeline(builder, max_workers=4, continue_on_error=False, full_refresh=True)
+        results = _execute_pipeline(builder, max_workers=4, continue_on_error=False, full_refresh=True)
 
         # a runs first, then b, then c
         assert call_order == ["a", "b", "c"]
@@ -603,7 +600,7 @@ class TestLayerExecution:
     @patch("seeknal.workflow.prefect_integration._create_results_artifact")
     @patch("seeknal.workflow.prefect_integration.run_node_task")
     def test_parallel_nodes_in_same_layer(self, mock_task, mock_artifact, mock_update, mock_save):
-        """Independent nodes execute in the same layer (parallel)."""
+        """Independent nodes execute in the same layer."""
         from seeknal.workflow.prefect_integration import (
             _execute_pipeline, SeeknalPrefectFlow, PrefectNodeResult,
             PREFECT_AVAILABLE,
@@ -620,19 +617,16 @@ class TestLayerExecution:
         edges = [("a", "c"), ("b", "c")]
         runner = _make_runner(nodes, edges)
 
-        def fake_submit(r, nid):
-            future = MagicMock()
-            future.result.return_value = PrefectNodeResult(nid, "success", 1.0, 100)
-            return future
+        def fake_call(r, nid):
+            return PrefectNodeResult(nid, "success", 1.0, 100)
 
-        mock_task.submit = fake_submit
+        mock_task.side_effect = fake_call
 
         builder = MagicMock(spec=SeeknalPrefectFlow)
         builder._build_runner.return_value = (runner, Path("/tmp/target"))
         builder.project_path = Path("/tmp/test")
 
-        with patch("seeknal.workflow.prefect_integration.wait"):
-            results = _execute_pipeline(builder, max_workers=4, continue_on_error=False, full_refresh=True)
+        results = _execute_pipeline(builder, max_workers=4, continue_on_error=False, full_refresh=True)
 
         # All 3 nodes should have results
         result_ids = {r.node_id for r in results}
@@ -657,25 +651,22 @@ class TestLayerExecution:
         }
         runner = _make_runner(nodes, [], cached_nodes={"a"})
 
-        submitted = []
+        called = []
 
-        def fake_submit(r, nid):
-            submitted.append(nid)
-            future = MagicMock()
-            future.result.return_value = PrefectNodeResult(nid, "success", 1.0, 100)
-            return future
+        def fake_call(r, nid):
+            called.append(nid)
+            return PrefectNodeResult(nid, "success", 1.0, 100)
 
-        mock_task.submit = fake_submit
+        mock_task.side_effect = fake_call
 
         builder = MagicMock(spec=SeeknalPrefectFlow)
         builder._build_runner.return_value = (runner, Path("/tmp/target"))
         builder.project_path = Path("/tmp/test")
 
-        with patch("seeknal.workflow.prefect_integration.wait"):
-            results = _execute_pipeline(builder, max_workers=4, continue_on_error=False, full_refresh=False)
+        results = _execute_pipeline(builder, max_workers=4, continue_on_error=False, full_refresh=False)
 
-        # Only "b" should be submitted; "a" is cached
-        assert submitted == ["b"]
+        # Only "b" should be called; "a" is cached
+        assert called == ["b"]
         cached_results = [r for r in results if r.status == "cached"]
         assert len(cached_results) == 1
         assert cached_results[0].node_id == "a"
@@ -702,25 +693,21 @@ class TestLayerExecution:
         edges = [("a", "b"), ("b", "c")]
         runner = _make_runner(nodes, edges)
 
-        def fake_submit(r, nid):
-            future = MagicMock()
+        def fake_call(r, nid):
             if nid == "a":
-                future.result.return_value = PrefectNodeResult(nid, "failed", error_message="boom")
-            else:
-                future.result.return_value = PrefectNodeResult(nid, "success", 1.0, 100)
-            return future
+                return PrefectNodeResult(nid, "failed", error_message="boom")
+            return PrefectNodeResult(nid, "success", 1.0, 100)
 
-        mock_task.submit = fake_submit
+        mock_task.side_effect = fake_call
 
         builder = MagicMock(spec=SeeknalPrefectFlow)
         builder._build_runner.return_value = (runner, Path("/tmp/target"))
         builder.project_path = Path("/tmp/test")
 
-        with patch("seeknal.workflow.prefect_integration.wait"):
-            # continue_on_error=False: stops after first failure
-            results = _execute_pipeline(builder, max_workers=4, continue_on_error=False, full_refresh=True)
+        # continue_on_error=False: stops after first failure
+        results = _execute_pipeline(builder, max_workers=4, continue_on_error=False, full_refresh=True)
 
-        # Only "a" was executed (failed), b and c never submitted
+        # Only "a" was executed (failed), b and c never called
         executed = [r for r in results if r.status in ("success", "failed")]
         assert len(executed) == 1
         assert executed[0].node_id == "a"

@@ -29,6 +29,7 @@ PREFECT_AVAILABLE = False
 
 try:
     from prefect import flow, task
+    from prefect.cache_policies import NONE as NO_CACHE
     from prefect.futures import wait
     from prefect.logging import get_run_logger
 
@@ -48,6 +49,8 @@ except ImportError:
         if len(args) == 1 and callable(args[0]):
             return args[0]
         return decorator
+
+    NO_CACHE = None  # type: ignore[assignment]
 
     def wait(futures):  # type: ignore[misc]
         pass
@@ -83,7 +86,7 @@ class PrefectNodeResult:
 # Core Prefect task: execute a single DAG node via internal API
 # ---------------------------------------------------------------------------
 
-@task(name="seeknal-node", retries=2, retry_delay_seconds=30)
+@task(name="seeknal-node", retries=2, retry_delay_seconds=30, cache_policy=NO_CACHE)
 def run_node_task(
     runner: Any,
     node_id: str,
@@ -423,20 +426,15 @@ def _execute_pipeline(
             f"Layer {layer_idx + 1}/{len(layers)}: running {len(executable)} node(s)"
         )
 
-        # Submit all layer nodes in parallel as Prefect tasks
-        futures = {
-            nid: run_node_task.submit(runner, nid)
-            for nid in executable
-        }
-
-        # Barrier: wait for all tasks in this layer
-        wait(list(futures.values()))
-
-        # Collect results
+        # Execute layer nodes as Prefect tasks.
+        # Uses sequential task calls (not .submit()) because DAGRunner
+        # shares a DuckDB connection that isn't thread-safe across
+        # concurrent submit() calls. Each node still appears as a
+        # separate task run in the Prefect UI.
         layer_results: Dict[str, PrefectNodeResult] = {}
-        for nid, future in futures.items():
+        for nid in executable:
             try:
-                layer_results[nid] = future.result()
+                layer_results[nid] = run_node_task(runner, nid)
             except Exception as e:
                 layer_results[nid] = PrefectNodeResult(
                     node_id=nid, status="failed", error_message=str(e)
@@ -653,7 +651,7 @@ def _create_results_artifact(
     # Build markdown table
     lines = [
         "# Seeknal Pipeline Results\n",
-        f"**Project:** {runner.manifest.project}",
+        f"**Project:** {runner.manifest.metadata.project}",
         f"**Run ID:** {runner.run_state.run_id}",
         f"**Time:** {datetime.now().isoformat()}\n",
         "| Node | Status | Duration | Rows |",
