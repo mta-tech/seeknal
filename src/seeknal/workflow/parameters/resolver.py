@@ -150,7 +150,11 @@ class ParameterResolver:
         def replace_match(match):
             expr = match.group(1).strip()
 
-            # Check for context values first (run_id, run_date, etc.)
+            # Check CLI overrides first (highest precedence)
+            if expr in self.cli_overrides:
+                return str(self.cli_overrides[expr])
+
+            # Check for context values (run_id, run_date, etc.)
             if expr in self._context_values:
                 return self._context_values[expr]
 
@@ -389,6 +393,10 @@ class ParameterResolver:
         """
         def replace_match(match):
             expr = match.group(1).strip()
+
+            # Check CLI overrides first (highest precedence)
+            if expr in self.cli_overrides:
+                return str(self.cli_overrides[expr])
 
             if expr in self._context_values:
                 return self._context_values[expr]

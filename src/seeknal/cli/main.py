@@ -295,6 +295,232 @@ def _register_ask_commands():
 _register_ask_commands()
 
 
+# =============================================================================
+# Prefect Orchestration Integration (Optional)
+# =============================================================================
+# Prefect commands are loaded if seeknal[prefect] deps are installed.
+
+prefect_app = typer.Typer(
+    name="prefect",
+    help="Prefect orchestration for scheduled pipeline execution.",
+    no_args_is_help=True,
+)
+
+
+@prefect_app.command("serve")
+def prefect_serve(
+    project_path: Path = typer.Option(
+        ".", "--project-path", "-p", help="Path to seeknal project"
+    ),
+    name: Optional[str] = typer.Option(
+        None, "--name", "-n", help="Deployment name (default: project directory name)"
+    ),
+    cron: Optional[str] = typer.Option(
+        None, "--cron", "-c", help='Cron schedule (e.g., "0 2 * * *")'
+    ),
+    interval: Optional[int] = typer.Option(
+        None, "--interval", "-i", help="Interval in seconds between runs"
+    ),
+    full: bool = typer.Option(
+        False, "--full/--no-full", help="Force full refresh (ignore cache)"
+    ),
+    continue_on_error: bool = typer.Option(
+        False, "--continue-on-error/--no-continue-on-error",
+        help="Continue after node failures"
+    ),
+    max_workers: int = typer.Option(
+        0, "--max-workers", "-w",
+        help="Max parallel tasks per layer (0=auto)"
+    ),
+    env: Optional[str] = typer.Option(
+        None, "--env", "-e", help="Environment name"
+    ),
+    profile: Optional[str] = typer.Option(
+        None, "--profile", help="Profile path"
+    ),
+    start_date: Optional[str] = typer.Option(
+        None, "--start-date",
+        help="Start date for filtering (YYYY-MM-DD). Available as {{ start_date }} in transform SQL"
+    ),
+    end_date: Optional[str] = typer.Option(
+        None, "--end-date",
+        help="End date for filtering (YYYY-MM-DD). Available as {{ end_date }} in transform SQL"
+    ),
+    params: Optional[str] = typer.Option(
+        None, "--params", help="JSON string of parameters"
+    ),
+):
+    """Start a long-running process serving the pipeline as a Prefect flow."""
+    import json as _json
+    from seeknal.workflow.prefect_integration import SeeknalPrefectFlow
+
+    resolved_path = Path(project_path).resolve()
+    parsed_params = _json.loads(params) if params else {}
+    if start_date:
+        parsed_params["start_date"] = start_date
+    if end_date:
+        parsed_params["end_date"] = end_date
+    workers = max_workers if max_workers > 0 else None
+
+    spf = SeeknalPrefectFlow(
+        project_path=resolved_path,
+        max_workers=workers,
+        continue_on_error=continue_on_error,
+        env=env,
+        profile_path=profile,
+        full_refresh=full,
+        params=parsed_params,
+    )
+    spf.serve(name=name, cron=cron, interval=interval)
+
+
+@prefect_app.command("deploy")
+def prefect_deploy(
+    project_path: Path = typer.Option(
+        ".", "--project-path", "-p", help="Path to seeknal project"
+    ),
+    work_pool: str = typer.Option(
+        ..., "--work-pool", help="Prefect work pool name (required)"
+    ),
+    name: Optional[str] = typer.Option(
+        None, "--name", "-n", help="Deployment name"
+    ),
+    cron: Optional[str] = typer.Option(
+        None, "--cron", "-c", help='Cron schedule (e.g., "0 2 * * *")'
+    ),
+    interval: Optional[int] = typer.Option(
+        None, "--interval", "-i", help="Interval in seconds"
+    ),
+    exposure: Optional[str] = typer.Option(
+        None, "--exposure", help="Deploy a report exposure by name"
+    ),
+    full: bool = typer.Option(
+        False, "--full/--no-full", help="Force full refresh"
+    ),
+    continue_on_error: bool = typer.Option(
+        False, "--continue-on-error/--no-continue-on-error",
+        help="Continue after node failures"
+    ),
+    max_workers: int = typer.Option(
+        0, "--max-workers", "-w", help="Max parallel tasks (0=auto)"
+    ),
+    env: Optional[str] = typer.Option(
+        None, "--env", "-e", help="Environment name"
+    ),
+    profile: Optional[str] = typer.Option(
+        None, "--profile", help="Profile path"
+    ),
+    start_date: Optional[str] = typer.Option(
+        None, "--start-date",
+        help="Start date for filtering (YYYY-MM-DD). Available as {{ start_date }} in transform SQL"
+    ),
+    end_date: Optional[str] = typer.Option(
+        None, "--end-date",
+        help="End date for filtering (YYYY-MM-DD). Available as {{ end_date }} in transform SQL"
+    ),
+    params: Optional[str] = typer.Option(
+        None, "--params", help="JSON string of parameters"
+    ),
+):
+    """Deploy the pipeline (or a report exposure) to Prefect Server/Cloud."""
+    import json as _json
+    from seeknal.workflow.prefect_integration import SeeknalPrefectFlow
+
+    resolved_path = Path(project_path).resolve()
+    parsed_params = _json.loads(params) if params else {}
+    if start_date:
+        parsed_params["start_date"] = start_date
+    if end_date:
+        parsed_params["end_date"] = end_date
+    workers = max_workers if max_workers > 0 else None
+
+    spf = SeeknalPrefectFlow(
+        project_path=resolved_path,
+        max_workers=workers,
+        continue_on_error=continue_on_error,
+        env=env,
+        profile_path=profile,
+        full_refresh=full,
+        params=parsed_params,
+    )
+
+    if exposure:
+        spf.deploy_exposure(exposure, work_pool=work_pool)
+        _echo_success(f"Report exposure '{exposure}' deployed to work pool '{work_pool}'")
+    else:
+        spf.deploy(name=name, work_pool=work_pool, cron=cron, interval=interval)
+        _echo_success(f"Pipeline deployed to work pool '{work_pool}'")
+
+
+@prefect_app.command("generate")
+def prefect_generate(
+    project_path: Path = typer.Option(
+        ".", "--project-path", "-p", help="Path to seeknal project"
+    ),
+    max_workers: int = typer.Option(
+        8, "--max-workers", "-w", help="Max parallel tasks"
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o", help="Output path (default: prefect.yaml in project root)"
+    ),
+    docker: bool = typer.Option(
+        False, "--docker", help="Also generate a Dockerfile for remote execution"
+    ),
+):
+    """Generate a prefect.yaml configuration file."""
+    from seeknal.workflow.prefect_integration import SeeknalPrefectFlow
+
+    resolved_path = Path(project_path).resolve()
+
+    # Create a minimal SeeknalPrefectFlow just for YAML generation
+    # (doesn't require Prefect to be installed)
+    spf = SeeknalPrefectFlow.__new__(SeeknalPrefectFlow)
+    spf.project_path = resolved_path
+    spf.max_workers = max_workers
+    spf.continue_on_error = False
+    spf.full_refresh = False
+    spf.env = None
+    spf.profile_path = None
+    spf.params = {}
+
+    yaml_content = spf.generate_prefect_yaml()
+    output_path = output or (resolved_path / "prefect.yaml")
+    output_path.write_text(yaml_content, encoding="utf-8")
+    _echo_success(f"Generated {output_path}")
+
+    if docker:
+        dockerfile_content = spf.generate_dockerfile()
+        dockerfile_path = resolved_path / "Dockerfile"
+        dockerfile_path.write_text(dockerfile_content, encoding="utf-8")
+        _echo_success(f"Generated {dockerfile_path}")
+
+
+def _register_prefect_commands():
+    """Register Prefect commands with optional dependency guard."""
+    try:
+        from seeknal.workflow.prefect_integration import PREFECT_AVAILABLE
+        # Always register the commands — they handle the ImportError themselves
+        app.add_typer(prefect_app, name="prefect")
+    except Exception:
+        @app.command("prefect", hidden=True)
+        def prefect_not_installed():
+            """Prefect orchestration (not installed).
+
+            Install with: pip install seeknal[prefect]
+            """
+            typer.echo(typer.style(
+                "✗ Prefect orchestration is not available.", fg=typer.colors.RED
+            ))
+            typer.echo("")
+            typer.echo("Install with:")
+            typer.echo(typer.style("  pip install seeknal[prefect]", fg=typer.colors.CYAN))
+            raise typer.Exit(1)
+
+
+# Register Prefect commands
+_register_prefect_commands()
+
+
 class OutputFormat(str, Enum):
     """Output format options."""
     TABLE = "table"
@@ -774,6 +1000,14 @@ def run(
         False, "--restate",
         help="Process restatement intervals marked for reprocessing"
     ),
+    start_date: Optional[str] = typer.Option(
+        None, "--start-date",
+        help="Start date for filtering (YYYY-MM-DD). Available as {{ start_date }} in transform SQL"
+    ),
+    end_date: Optional[str] = typer.Option(
+        None, "--end-date",
+        help="End date for filtering (YYYY-MM-DD). Available as {{ end_date }} in transform SQL"
+    ),
     profile: Optional[str] = typer.Option(
         None, "--profile",
         help="Path to profiles.yml for source_defaults and connections (default: ~/.seeknal/profiles.yml)"
@@ -848,6 +1082,13 @@ def run(
 
         # Combine with other flags
         seeknal run --date 2025-01-15 --full
+
+    **Date Range Filtering Examples:**
+        # Filter transforms by date range
+        seeknal run --start-date 2025-01-01 --end-date 2025-01-31
+
+        # Combine with date override
+        seeknal run --date 2025-01-15 --start-date 2025-01-01 --end-date 2025-01-31
     """
     # Environment mode: delegate to shared helper
     if env is not None:
@@ -874,6 +1115,10 @@ def run(
         cli_overrides["today"] = param_date
     if param_run_id:
         cli_overrides["run_id"] = param_run_id
+    if start_date:
+        cli_overrides["start_date"] = start_date
+    if end_date:
+        cli_overrides["end_date"] = end_date
 
     # Execute DAG from seeknal/ directory
     _run_yaml_pipeline(

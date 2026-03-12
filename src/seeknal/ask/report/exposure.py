@@ -195,6 +195,27 @@ def _validate_report_exposure(data: Any, file_path: Path) -> dict[str, Any]:
             f"{sorted(_VALID_FORMATS)}, got '{output_format}'"
         )
 
+    # Validate optional schedule field
+    schedule = data.get("schedule")
+    if schedule is not None:
+        if not isinstance(schedule, dict):
+            raise ValueError(
+                f"{file_path}: schedule must be a mapping with at least a 'cron' key."
+            )
+        cron_str = schedule.get("cron")
+        if not cron_str or not isinstance(cron_str, str):
+            raise ValueError(
+                f"{file_path}: schedule.cron is required and must be a string "
+                '(e.g., "0 8 * * MON").'
+            )
+        # Validate cron format has 5 fields
+        cron_parts = cron_str.strip().split()
+        if len(cron_parts) != 5:
+            raise ValueError(
+                f"{file_path}: schedule.cron must have 5 fields "
+                f"(minute hour day month weekday), got {len(cron_parts)}."
+            )
+
     data["_file_path"] = str(file_path)
     return data
 
