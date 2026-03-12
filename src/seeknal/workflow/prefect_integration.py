@@ -153,7 +153,17 @@ class SeeknalPrefectFlow:
         params: Optional[Dict[str, Any]] = None,
     ):
         _require_prefect()
-        self.project_path = Path(project_path).resolve()
+        # Allow remote workers to override project_path via env var
+        env_override = os.environ.get("SEEKNAL_PROJECT_PATH")
+        resolved = Path(env_override or project_path).resolve()
+        if env_override:
+            from seeknal.utils.path_security import is_insecure_path
+            if is_insecure_path(str(resolved)):
+                raise ValueError(
+                    f"SEEKNAL_PROJECT_PATH points to insecure location: '{resolved}'. "
+                    "Use a secure directory (not /tmp, /var/tmp, etc.)."
+                )
+        self.project_path = resolved
         self.max_workers = max_workers or min(os.cpu_count() or 4, 8)
         self.continue_on_error = continue_on_error
         self.env = env
@@ -172,7 +182,10 @@ class SeeknalPrefectFlow:
         from seeknal.workflow.executors.base import ExecutionContext  # ty: ignore[unresolved-import]
         from seeknal.dag.manifest import Manifest, Node, NodeType  # ty: ignore[unresolved-import]
 
-        dag_builder = DAGBuilder(self.project_path)
+        dag_builder = DAGBuilder(
+            self.project_path,
+            cli_overrides=self.params,
+        )
         dag_builder.build()
 
         target_path = self.project_path / "target"
@@ -215,7 +228,12 @@ class SeeknalPrefectFlow:
         return runner, target_path
 
     def _build_flow(self):
-        """Create and return the Prefect flow function."""
+        """Create and return the Prefect flow function.
+
+        The flow function exposes start_date and end_date as Prefect
+        parameters so they appear in the Prefect UI and can be overridden
+        per-run.  Values provided at serve/deploy time become defaults.
+        """
         _require_prefect()
 
         flow_name = f"seeknal-{self.project_path.name}"
@@ -224,8 +242,23 @@ class SeeknalPrefectFlow:
         full_refresh = self.full_refresh
         builder = self  # capture for closure
 
+        # Extract defaults from params set at serve/deploy time
+        default_start = self.params.get("start_date", "")
+        default_end = self.params.get("end_date", "")
+        default_full = full_refresh
+
         @flow(name=flow_name, log_prints=True)
-        def seeknal_pipeline_flow() -> List[PrefectNodeResult]:
+        def seeknal_pipeline_flow(
+            start_date: str = default_start,
+            end_date: str = default_end,
+            full_refresh: bool = default_full,
+        ) -> List[PrefectNodeResult]:
+            # Merge runtime params back so _build_runner picks them up
+            if start_date:
+                builder.params["start_date"] = start_date
+            if end_date:
+                builder.params["end_date"] = end_date
+            builder.full_refresh = full_refresh
             return _execute_pipeline(builder, max_workers, continue_on_error, full_refresh)
 
         return seeknal_pipeline_flow
@@ -364,23 +397,59 @@ class SeeknalPrefectFlow:
         """
         import yaml
 
+        parameters: Dict[str, Any] = {
+            "project_path": str(self.project_path),
+            "max_workers": self.max_workers,
+            "continue_on_error": self.continue_on_error,
+            "full_refresh": self.full_refresh,
+        }
+        if self.env:
+            parameters["env"] = self.env
+        if self.profile_path:
+            parameters["profile_path"] = self.profile_path
+        if self.params:
+            parameters["params"] = self.params
+
         config = {
             "deployments": [
                 {
                     "name": f"seeknal-{self.project_path.name}",
                     "entrypoint": "seeknal.workflow.prefect_integration:create_pipeline_flow",
-                    "parameters": {
-                        "project_path": str(self.project_path),
-                        "max_workers": self.max_workers,
-                        "continue_on_error": self.continue_on_error,
-                    },
+                    "parameters": parameters,
                     "work_pool": {
                         "name": "default",
                     },
+                    # Hint: On remote workers, set SEEKNAL_PROJECT_PATH env var
+                    # to override project_path at runtime
                 }
             ]
         }
         return yaml.dump(config, default_flow_style=False, sort_keys=False)
+
+    def generate_dockerfile(self) -> str:
+        """Generate a Dockerfile for remote execution via Prefect workers.
+
+        Uses the official seeknal image from ghcr.io which has seeknal
+        and Prefect pre-installed. Only needs to copy project YAML definitions.
+
+        Returns:
+            Dockerfile content as a string.
+        """
+        import importlib.metadata
+        try:
+            version = importlib.metadata.version("seeknal")
+        except importlib.metadata.PackageNotFoundError:
+            version = "latest"
+
+        return f"""\
+FROM ghcr.io/mta-tech/seeknal:{version}
+
+# Copy project YAML definitions
+COPY seeknal/ ./seeknal/
+
+# profiles.yml is volume-mounted at runtime, not baked in
+# Run with: docker run -v /path/to/profiles.yml:/app/profiles.yml ...
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +524,8 @@ def _execute_pipeline(
         layer_results: Dict[str, PrefectNodeResult] = {}
         for nid in executable:
             try:
-                layer_results[nid] = run_node_task(runner, nid)
+                named_task = run_node_task.with_options(name=nid)
+                layer_results[nid] = named_task(runner, nid)
             except Exception as e:
                 layer_results[nid] = PrefectNodeResult(
                     node_id=nid, status="failed", error_message=str(e)
@@ -765,7 +835,15 @@ def seeknal_backfill_flow(
     except Exception:
         run_logger = logger
 
-    project = Path(project_path).resolve()
+    env_override = os.environ.get("SEEKNAL_PROJECT_PATH")
+    project = Path(env_override or project_path).resolve()
+    if env_override:
+        from seeknal.utils.path_security import is_insecure_path
+        if is_insecure_path(str(project)):
+            raise ValueError(
+                f"SEEKNAL_PROJECT_PATH points to insecure location: '{project}'. "
+                "Use a secure directory (not /tmp, /var/tmp, etc.)."
+            )
 
     calc = create_interval_calculator(schedule)
     start_dt = datetime.fromisoformat(f"{start_date}T00:00:00")
@@ -830,8 +908,18 @@ def create_pipeline_flow(
     Creates a SeeknalPrefectFlow and executes the pipeline.
     Can be referenced as: seeknal.workflow.prefect_integration:create_pipeline_flow
     """
+    # Allow remote workers to override project_path via env var
+    env_override = os.environ.get("SEEKNAL_PROJECT_PATH")
+    resolved = Path(env_override or project_path).resolve()
+    if env_override:
+        from seeknal.utils.path_security import is_insecure_path
+        if is_insecure_path(str(resolved)):
+            raise ValueError(
+                f"SEEKNAL_PROJECT_PATH points to insecure location: '{resolved}'. "
+                "Use a secure directory (not /tmp, /var/tmp, etc.)."
+            )
     builder = SeeknalPrefectFlow(
-        project_path=Path(project_path),
+        project_path=resolved,
         max_workers=max_workers,
         continue_on_error=continue_on_error,
         full_refresh=full_refresh,

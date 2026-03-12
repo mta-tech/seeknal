@@ -583,7 +583,8 @@ class TestLayerExecution:
             call_order.append(nid)
             return PrefectNodeResult(nid, "success", 1.0, 100)
 
-        mock_task.side_effect = fake_call
+        # with_options(name=nid) returns a named task; make it callable with fake_call
+        mock_task.with_options.return_value = MagicMock(side_effect=fake_call)
 
         builder = MagicMock(spec=SeeknalPrefectFlow)
         builder._build_runner.return_value = (runner, Path("/tmp/target"))
@@ -620,7 +621,7 @@ class TestLayerExecution:
         def fake_call(r, nid):
             return PrefectNodeResult(nid, "success", 1.0, 100)
 
-        mock_task.side_effect = fake_call
+        mock_task.with_options.return_value = MagicMock(side_effect=fake_call)
 
         builder = MagicMock(spec=SeeknalPrefectFlow)
         builder._build_runner.return_value = (runner, Path("/tmp/target"))
@@ -657,7 +658,7 @@ class TestLayerExecution:
             called.append(nid)
             return PrefectNodeResult(nid, "success", 1.0, 100)
 
-        mock_task.side_effect = fake_call
+        mock_task.with_options.return_value = MagicMock(side_effect=fake_call)
 
         builder = MagicMock(spec=SeeknalPrefectFlow)
         builder._build_runner.return_value = (runner, Path("/tmp/target"))
@@ -698,7 +699,7 @@ class TestLayerExecution:
                 return PrefectNodeResult(nid, "failed", error_message="boom")
             return PrefectNodeResult(nid, "success", 1.0, 100)
 
-        mock_task.side_effect = fake_call
+        mock_task.with_options.return_value = MagicMock(side_effect=fake_call)
 
         builder = MagicMock(spec=SeeknalPrefectFlow)
         builder._build_runner.return_value = (runner, Path("/tmp/target"))

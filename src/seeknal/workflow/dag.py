@@ -594,20 +594,27 @@ class DAGBuilder:
                 return
 
             # Resolve parameters if present
-            if "params" in data and (self.cli_overrides or self.run_id or self._common_config):
+            resolved_params: dict[str, Any] = {}
+            if "params" in data:
                 from seeknal.workflow.parameters.resolver import ParameterResolver  # ty: ignore[unresolved-import]
                 resolver = ParameterResolver(
                     cli_overrides=self.cli_overrides,
                     run_id=self.run_id,
                     common_config=self._common_config,
                 )
-                data["params"] = resolver.resolve(data["params"])
+                resolved_params = resolver.resolve(data["params"])
+                data["params"] = resolved_params
 
-            # Resolve common config expressions in transform SQL
-            if "transform" in data and self._common_config:
+            # Resolve {{ }} expressions in transform SQL using:
+            # 1. CLI overrides (highest precedence)
+            # 2. Resolved params from the node's params: section (defaults)
+            # 3. Common config, functions, env vars
+            if "transform" in data and (self.cli_overrides or self._common_config or resolved_params):
                 from seeknal.workflow.parameters.resolver import ParameterResolver  # ty: ignore[unresolved-import]
+                # Merge resolved params as base, CLI overrides take precedence
+                transform_overrides = {**resolved_params, **self.cli_overrides}
                 resolver = ParameterResolver(
-                    cli_overrides=self.cli_overrides,
+                    cli_overrides=transform_overrides,
                     run_id=self.run_id,
                     common_config=self._common_config,
                 )
