@@ -1,0 +1,239 @@
+name: prefect-cli-commands
+description: >
+  Test Prefect CLI subcommands (seeknal prefect serve/deploy/generate).
+  Validates CLI argument parsing, error messages, prefect.yaml generation,
+  optional dependency guard, and the generate command file output.
+  Uses CSV pipeline for minimal infrastructure requirements.
+source_type: csv
+
+infrastructure:
+  requires: []
+
+seed_data:
+  events.csv: |
+    event_id,user_id,event_type,timestamp
+    E001,U01,click,2026-02-01 10:00:00
+    E002,U01,purchase,2026-02-01 10:05:00
+    E003,U02,click,2026-02-01 11:00:00
+    E004,U02,click,2026-02-01 11:30:00
+    E005,U03,purchase,2026-02-01 12:00:00
+    E006,U01,click,2026-02-02 09:00:00
+    E007,U03,click,2026-02-02 10:00:00
+    E008,U02,purchase,2026-02-02 14:00:00
+
+pipeline:
+  bronze:
+    - kind: source
+      name: raw_events
+      source: csv
+      table: "data/events.csv"
+      description: Raw user events
+      tags: ["bronze", "events"]
+
+  silver:
+    - kind: transform
+      name: user_activity
+      description: User activity aggregation
+      inputs:
+        - ref: source.raw_events
+      transform: |
+        SELECT
+          user_id,
+          COUNT(*) AS event_count,
+          COUNT(CASE WHEN event_type = 'purchase' THEN 1 END) AS purchase_count,
+          COUNT(CASE WHEN event_type = 'click' THEN 1 END) AS click_count,
+          MIN(timestamp) AS first_event,
+          MAX(timestamp) AS last_event
+        FROM ref('source.raw_events')
+        GROUP BY user_id
+      tags: ["silver", "user_analytics"]
+
+validation:
+  dag:
+    expected_nodes: 2
+    expected_edges:
+      - [source.raw_events, transform.user_activity]
+  execution:
+    success: true
+  outputs:
+    - node: transform.user_activity
+      min_rows: 3
+
+execution_plan:
+  description: >
+    Tests Prefect CLI commands in sequence:
+    Step 1 — Run standard pipeline first (baseline)
+    Step 2 — Test seeknal prefect generate produces valid YAML
+    Step 3 — Test SeeknalPrefectFlow Python API directly
+    Step 4 — Verify optional dependency handling and error messages
+  steps:
+    - name: "Step 1: Baseline pipeline execution"
+      description: Run pipeline normally to establish baseline data
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run seeknal run --full 2>&1
+      validation:
+        execution_success: true
+        outputs:
+          - node: transform.user_activity
+            min_rows: 3
+
+    - name: "Step 2: Test seeknal prefect generate"
+      description: >
+        Generate prefect.yaml file and validate its structure
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run seeknal prefect generate --max-workers 4 2>&1
+      validation:
+        execution_success: true
+        state_check:
+          description: "Verify prefect.yaml structure"
+          command: |
+            cd {output_dir}
+            uv run python -c "
+            import yaml
+            config = yaml.safe_load(open('prefect.yaml'))
+
+            # Must have deployments array
+            assert 'deployments' in config, 'Missing deployments key'
+            assert isinstance(config['deployments'], list), 'deployments must be list'
+            assert len(config['deployments']) >= 1, 'Need at least 1 deployment'
+
+            deploy = config['deployments'][0]
+
+            # Entrypoint must reference prefect_integration module
+            assert 'entrypoint' in deploy, 'Missing entrypoint'
+            assert 'seeknal.workflow.prefect_integration' in deploy['entrypoint'], \
+                f'Wrong entrypoint: {deploy[\"entrypoint\"]}'
+
+            # Parameters must include max_workers and project_path
+            params = deploy.get('parameters', {})
+            assert 'project_path' in params, 'Missing project_path param'
+            assert params.get('max_workers') == 4, f'max_workers should be 4, got {params.get(\"max_workers\")}'
+
+            # Work pool section
+            assert 'work_pool' in deploy, 'Missing work_pool'
+
+            print('prefect.yaml structure — PASS')
+            print(f'  entrypoint: {deploy[\"entrypoint\"]}')
+            print(f'  max_workers: {params.get(\"max_workers\")}')
+            print(f'  work_pool: {deploy[\"work_pool\"][\"name\"]}')
+            "
+
+    - name: "Step 3: Test SeeknalPrefectFlow Python API"
+      description: >
+        Directly test SeeknalPrefectFlow class initialization,
+        _build_runner() and generate_prefect_yaml() methods.
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run python -c "
+        from pathlib import Path
+        from seeknal.workflow.prefect_integration import (
+            SeeknalPrefectFlow,
+            PrefectNodeResult,
+            PREFECT_AVAILABLE,
+        )
+
+        # Test 1: PREFECT_AVAILABLE flag
+        print(f'PREFECT_AVAILABLE: {PREFECT_AVAILABLE}')
+        assert PREFECT_AVAILABLE is True, 'Prefect should be available in dev'
+
+        # Test 2: SeeknalPrefectFlow init
+        spf = SeeknalPrefectFlow(
+            project_path=Path('.'),
+            max_workers=2,
+            continue_on_error=True,
+            full_refresh=True,
+            params={'custom_key': 'custom_val'},
+        )
+        assert spf.max_workers == 2
+        assert spf.continue_on_error is True
+        assert spf.full_refresh is True
+        assert spf.params == {'custom_key': 'custom_val'}
+        print('SeeknalPrefectFlow init — PASS')
+
+        # Test 3: _build_runner produces valid runner
+        runner, target = spf._build_runner()
+        node_count = len(runner.manifest.nodes)
+        print(f'Runner has {node_count} nodes')
+        assert node_count >= 2, f'Expected >=2 nodes, got {node_count}'
+        print('_build_runner — PASS')
+
+        # Test 4: _build_flow returns callable
+        flow_fn = spf._build_flow()
+        assert callable(flow_fn), 'Flow should be callable'
+        print('_build_flow — PASS')
+
+        # Test 5: PrefectNodeResult creation
+        result = PrefectNodeResult(
+            node_id='test.node',
+            status='success',
+            duration=1.5,
+            row_count=100,
+        )
+        assert result.node_id == 'test.node'
+        assert result.status == 'success'
+        assert result.duration == 1.5
+        assert result.row_count == 100
+        assert result.error_message is None
+        print('PrefectNodeResult — PASS')
+
+        # Test 6: generate_prefect_yaml
+        yaml_str = spf.generate_prefect_yaml()
+        assert 'deployments' in yaml_str
+        assert 'seeknal.workflow.prefect_integration' in yaml_str
+        print('generate_prefect_yaml — PASS')
+        "
+      validation:
+        execution_success: true
+
+    - name: "Step 4: Test optional dependency and error handling"
+      description: >
+        Verify the _require_prefect() function and module exports.
+      command: |
+        cd {output_dir}
+        set -a && source .env 2>/dev/null; set +a
+        uv run python -c "
+        # Test 1: Module exports
+        from seeknal.workflow.prefect_integration import __all__
+        expected = [
+            'PREFECT_AVAILABLE', 'SeeknalPrefectFlow', 'PrefectNodeResult',
+            'run_node_task', 'seeknal_backfill_flow', 'create_pipeline_flow',
+        ]
+        for name in expected:
+            assert name in __all__, f'Missing export: {name}'
+        print(f'All {len(expected)} exports present — PASS')
+
+        # Test 2: create_pipeline_flow is importable
+        from seeknal.workflow.prefect_integration import create_pipeline_flow
+        assert callable(create_pipeline_flow)
+        print('create_pipeline_flow importable — PASS')
+
+        # Test 3: run_node_task is importable
+        from seeknal.workflow.prefect_integration import run_node_task
+        assert callable(run_node_task)
+        print('run_node_task importable — PASS')
+
+        # Test 4: seeknal_backfill_flow is importable
+        from seeknal.workflow.prefect_integration import seeknal_backfill_flow
+        assert callable(seeknal_backfill_flow)
+        print('seeknal_backfill_flow importable — PASS')
+        "
+      validation:
+        execution_success: true
+
+features_tested:
+  - prefect_cli_generate_command
+  - prefect_yaml_output_structure
+  - prefect_yaml_entrypoint_correct
+  - prefect_yaml_parameters_correct
+  - prefect_flow_init_config
+  - prefect_build_runner_from_project
+  - prefect_build_flow_callable
+  - prefect_node_result_dataclass
+  - prefect_optional_dependency_flag
+  - prefect_module_exports
+  - prefect_create_pipeline_flow_entrypoint

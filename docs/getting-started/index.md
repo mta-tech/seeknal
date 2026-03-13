@@ -79,8 +79,9 @@ After completing a learning path, level up with the **[Advanced Guide](advanced/
 - **Common Configuration** — Shared column mappings, rules, and SQL snippets
 - **Python Pipelines** — Build nodes with Python decorators
 - **Database & External Sources** — Connect to PostgreSQL, StarRocks, and Iceberg
+- **Prefect Remote Execution** — Run pipelines on remote servers via Docker or git-clone
 
-**Time commitment**: 9 chapters (~180 minutes)
+**Time commitment**: 13 chapters (~287 minutes)
 
 [Start Advanced Guide →](advanced/)
 

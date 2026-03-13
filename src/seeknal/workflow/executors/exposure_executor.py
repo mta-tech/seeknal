@@ -50,6 +50,7 @@ class ExposureType(Enum):
     DATABASE = "database"
     NOTIFICATION = "notification"
     STARROCKS_MV = "starrocks_materialized_view"
+    REPORT = "report"
 
 
 class FileFormat(Enum):
@@ -169,6 +170,8 @@ class ExposureExecutor(BaseExecutor):
             self._validate_notification_exposure(config)
         elif exposure_type.lower() == ExposureType.STARROCKS_MV.value:
             self._validate_starrocks_mv_exposure(config)
+        elif exposure_type.lower() == ExposureType.REPORT.value:
+            pass  # Report exposures are rendered externally (seeknal ask)
 
     def _validate_file_exposure(self, config: Dict[str, Any]) -> None:
         """Validate file export configuration."""
@@ -311,6 +314,19 @@ class ExposureExecutor(BaseExecutor):
                 result = self._execute_notification_exposure(data)
             elif exposure_type == ExposureType.STARROCKS_MV.value:
                 result = self._execute_starrocks_mv_exposure(data)
+            elif exposure_type == ExposureType.REPORT.value:
+                # Report exposures are rendered via Prefect deploy_exposure()
+                # or seeknal ask. Skip during normal pipeline runs.
+                duration = time.time() - start_time
+                return ExecutorResult(
+                    node_id=self.node.id,
+                    status=ExecutionStatus.SUCCESS,
+                    duration_seconds=duration,
+                    metadata={
+                        "exposure_type": "report",
+                        "message": "Report exposure — render via 'seeknal prefect deploy --exposure' or 'seeknal ask'",
+                    },
+                )
             else:
                 raise ExecutorExecutionError(
                     self.node.id,
