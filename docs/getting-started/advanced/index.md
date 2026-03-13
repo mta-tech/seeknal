@@ -1,8 +1,8 @@
 # Advanced Guide
 
-**Duration:** ~252 minutes | **Difficulty:** Intermediate | **Format:** YAML, Python & CLI
+**Duration:** ~287 minutes | **Difficulty:** Intermediate | **Format:** YAML, Python & CLI
 
-Go deeper with Seeknal's advanced capabilities: multi-format file sources, data quality rules, pipeline lineage visualization, named references, shared configuration, Python pipelines, database/external source connections with incremental detection, Iceberg incremental processing, custom sources, and pipeline tags.
+Go deeper with Seeknal's advanced capabilities: multi-format file sources, data quality rules, pipeline lineage visualization, named references, shared configuration, Python pipelines, database/external source connections with incremental detection, Iceberg incremental processing, custom sources, pipeline tags, and Prefect remote execution.
 
 ---
 
@@ -22,6 +22,7 @@ Take your Seeknal skills to the next level with advanced features that improve p
 10. **Iceberg Incremental Processing** - Snapshot detection, watermark tracking, and selective cascade
 11. **Custom Sources** - Bring data from REST APIs, cloud storage, and any Python-accessible system
 12. **Pipeline Tags** - Organize nodes with tags and run filtered subsets of your pipeline
+13. **Prefect Remote Execution** - Run pipelines on remote servers via Docker or git-clone with Prefect workers
 
 ---
 
@@ -299,6 +300,27 @@ seeknal run --tags ml --exclude-tags exp →  Include then exclude
 
 ---
 
+### Chapter 13: Prefect Remote Execution (~35 minutes)
+
+Run pipelines on remote servers via Prefect workers with Docker or git-clone:
+
+```
+Your Laptop                        Remote Server
+seeknal prefect deploy  ────────→  Prefect Worker polls & runs pipeline
+seeknal prefect generate --docker  Docker image with seeknal pre-installed
+```
+
+**You'll learn:**
+- Running pipelines as Prefect flows with date parameters in the UI
+- Deploying to Prefect Server for remote execution
+- `SEEKNAL_PROJECT_PATH` env var for remote path resolution
+- Docker deployment with the official `ghcr.io/mta-tech/seeknal` image
+- Volume-mounting `profiles.yml` for credentials
+
+**[Start Chapter 13 →](12-prefect-remote-execution.md)**
+
+---
+
 ## Continue Learning
 
 Explore other persona paths or dive into the reference documentation:
@@ -357,6 +379,11 @@ seeknal run --params events.quantityCol=units_sold
 # Run with connection profile
 seeknal run --profile profiles.yml
 seeknal dry-run draft_source_pg.yml --profile profiles.yml
+
+# Prefect remote execution
+seeknal prefect serve --start-date 2024-01-01
+seeknal prefect deploy --project-path .
+seeknal prefect generate --docker
 ```
 
 ---
