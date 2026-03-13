@@ -18,4 +18,4 @@ RUN mkdir -p target
 #     -v /path/to/seeknal/:/app/seeknal/ \
 #     ghcr.io/mta-tech/seeknal:latest
 
-ENTRYPOINT ["prefect", "worker", "start", "--pool", "default"]
+ENTRYPOINT ["seeknal", "prefect", "serve", "--project-path", "/app"]
