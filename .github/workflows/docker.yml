@@ -30,8 +30,12 @@ jobs:
           ")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          # Check if this image tag already exists in ghcr.io
-          if docker manifest inspect ghcr.io/${{ github.repository }}:$VERSION >/dev/null 2>&1; then
+          # Check if this image tag already exists in ghcr.io with all platforms
+          # Always publish on workflow_dispatch to allow forced rebuilds
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger — force publish"
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          elif docker manifest inspect ghcr.io/${{ github.repository }}:$VERSION >/dev/null 2>&1; then
             echo "Image tag $VERSION already exists, skipping publish"
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
           else
@@ -45,6 +49,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up QEMU (for multi-platform builds)
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -60,6 +67,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
             SEEKNAL_VERSION=${{ needs.check-version.outputs.version }}
