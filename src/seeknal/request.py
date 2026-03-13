@@ -17,7 +17,10 @@ from .db_utils import (
     with_sanitized_exceptions,
     DatabaseSecurityError,
 )
-import libsql_experimental as libsql
+try:
+    import libsql_experimental as libsql
+except ImportError:
+    libsql = None  # type: ignore[assignment]
 from .models import *  # Import metadata first
 
 # Build secure database URL based on configuration

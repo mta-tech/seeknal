@@ -69,8 +69,6 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          build-args: |
-            SEEKNAL_VERSION=${{ needs.check-version.outputs.version }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ needs.check-version.outputs.version }}
             ghcr.io/${{ github.repository }}:latest

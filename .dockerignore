@@ -1,0 +1,13 @@
+.git
+.github
+.claude
+.worktrees
+tests
+docs
+qa
+dist
+*.egg-info
+__pycache__
+.pytest_cache
+.venv
+target
