@@ -13,7 +13,7 @@ RUN uv pip install --system \
     || ( \
       echo "Full install failed (likely arm64), retrying without libsql..." && \
       uv pip install --system --no-deps "seeknal==${SEEKNAL_VERSION}" && \
-      python3 -c "import importlib.metadata, re; deps = importlib.metadata.requires('seeknal') or []; skip = {'libsql-experimental', 'sqlalchemy-libsql'}; lines = [d.split(';')[0].strip() for d in deps if re.split(r'[><=!~\[]', d)[0].strip().lower() not in skip and 'extra ==' not in d]; open('/tmp/deps.txt','w').write(chr(10).join(lines))" && \
+      python3 -c "import importlib.metadata, re; deps = importlib.metadata.requires('seeknal') or []; skip = {'libsql-experimental', 'sqlalchemy-libsql'}; lines = [d.split(';')[0].strip() for d in deps if re.split(r'[><=!~\[]', d)[0].strip().lower() not in skip and 'extra ==' not in d]; open('/tmp/deps.txt','w').write(chr(10).join(lines) + chr(10))" && \
       echo 'prefect>=3.1.10,<4.0' >> /tmp/deps.txt && \
       uv pip install --system -r /tmp/deps.txt \
     )
