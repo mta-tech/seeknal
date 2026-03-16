@@ -1,0 +1,158 @@
+# {{ project_name }} — Seeknal Project
+
+This project uses [Seeknal](https://github.com/mta-tech/seeknal), a data engineering platform for building data pipelines, feature stores, and ML workflows.
+
+## Quick Reference
+
+```bash
+# Core workflow: draft → validate → apply → run
+seeknal draft source my_source          # Generate source template
+seeknal dry-run draft_source_my_source.yml  # Validate before applying
+seeknal apply draft_source_my_source.yml    # Move to project
+seeknal plan                            # Preview execution order
+seeknal run                             # Execute pipeline
+
+# Explore data
+seeknal repl                            # Interactive SQL shell
+seeknal inspect transform.my_node       # Preview node output
+seeknal lineage --ascii                 # Show DAG as ASCII tree
+seeknal lineage transform.X --column Y  # Column-level lineage
+```
+
+## Project Structure
+
+```
+{{ project_name }}/
+├── seeknal_project.yml    # Project configuration
+├── profiles.yml           # Connection credentials (gitignored)
+├── seeknal/
+│   ├── sources/           # Data source definitions (YAML/Python)
+│   ├── transforms/        # SQL/Python transformations
+│   ├── feature_groups/    # Feature group definitions
+│   ├── models/            # ML model definitions
+│   ├── common/            # Shared config (column maps, rules, SQL snippets)
+│   └── templates/         # Custom Jinja2 template overrides
+└── target/
+    ├── intermediate/      # Node output parquet files
+    └── manifest.json      # DAG metadata (auto-generated)
+```
+
+## Node Types
+
+| Type | Draft Command | Purpose |
+|------|--------------|---------|
+| `source` | `seeknal draft source <name>` | Load data from CSV, Parquet, JSONL, database, or Python |
+| `transform` | `seeknal draft transform <name>` | SQL or Python data transformations |
+| `feature_group` | `seeknal draft feature_group <name>` | Feature store with entity, materialization, versioning |
+| `model` | `seeknal draft model <name>` | ML model training and serving |
+| `aggregation` | `seeknal draft aggregation <name>` | Time-windowed feature aggregations |
+| `rule` | `seeknal draft rule <name>` | Data quality checks (not_null, range, freshness, SQL assertion) |
+| `profile` | `seeknal draft profile <name>` | Statistical profiling (14+ metrics per column) |
+| `semantic_model` | `seeknal draft semantic_model <name>` | Semantic layer for analytics (dimensions, measures) |
+| `metric` | `seeknal draft metric <name>` | Business metrics (KPIs, ratios, cumulative) |
+| `exposure` | `seeknal draft exposure <name>` | Reports and dashboards |
+
+Add `--python` to draft Python-based nodes: `seeknal draft transform <name> --python`
+
+## Workflow
+
+### 1. Create Nodes
+
+```bash
+# Generate a template — edit the YAML to match your data
+seeknal draft source customers
+# Edit draft_source_customers.yml with your source config
+```
+
+### 2. Validate
+
+```bash
+seeknal dry-run draft_source_customers.yml
+# Shows: schema validation, SQL preview, dependency checks
+```
+
+### 3. Apply to Project
+
+```bash
+seeknal apply draft_source_customers.yml
+# Moves file to seeknal/sources/customers.yml
+# Auto-regenerates target/manifest.json
+```
+
+### 4. Build & Run
+
+```bash
+seeknal plan          # Shows execution order (topological sort)
+seeknal run           # Executes all nodes
+seeknal run --nodes transform.clean  # Run specific node + upstream
+seeknal run --tags etl               # Run nodes with matching tags
+seeknal run --full                   # Ignore cache, re-run everything
+```
+
+## YAML Schema Discovery
+
+Every `seeknal draft <type> <name>` generates a complete template with all available fields commented. Use this to discover the schema:
+
+```bash
+seeknal draft source example_source
+cat draft_source_example_source.yml   # See all available fields
+rm draft_source_example_source.yml    # Clean up if not needed
+```
+
+## SQL References
+
+Use `ref()` to reference upstream nodes in transform SQL:
+
+```yaml
+# Positional (order matters):
+inputs:
+  - ref: source.customers    # → input_0
+  - ref: source.orders       # → input_1
+transform: |
+  SELECT c.*, o.total
+  FROM input_0 c
+  JOIN input_1 o ON c.id = o.customer_id
+
+# Named (order-safe, self-documenting):
+transform: |
+  SELECT c.*, o.total
+  FROM ref('source.customers') c
+  JOIN ref('source.orders') o ON c.id = o.customer_id
+```
+
+## Common Configuration
+
+Shared column mappings, rules, and SQL snippets in `seeknal/common/`:
+
+```bash
+seeknal draft common-source shared_columns
+seeknal draft common-rule shared_rules
+seeknal draft common-transformation shared_sql
+```
+
+Reference with `{{ "{{" }} dotted.key {{ "}}" }}` syntax in YAML files.
+
+## Environments
+
+```bash
+seeknal env plan dev          # Create dev environment plan
+seeknal env apply dev         # Apply (prefixed tables/schemas)
+seeknal promote dev           # Promote dev → production
+```
+{% if connections %}
+
+## Project Connections
+
+Available connection names in `profiles.yml`:
+{% for conn in connections %}
+- `{{ conn }}`
+{% endfor %}
+{% endif %}
+
+## Key Conventions
+
+- **DuckDB SQL dialect** — No trailing semicolons, use `CAST('...' AS TIMESTAMP)` before INTERVAL arithmetic
+- **Parquet output** — All intermediate results stored as parquet in `target/intermediate/`
+- **Incremental processing** — Sources with `freshness.time_column` support automatic change detection
+- **Never edit `target/`** — This directory is auto-generated; modify `seeknal/` definitions instead
+- **Never commit `profiles.yml`** — Contains credentials; already in `.gitignore`

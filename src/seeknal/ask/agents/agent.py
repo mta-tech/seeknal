@@ -23,10 +23,18 @@ from seeknal.ask.agents.tools.read_project_file import read_project_file
 from seeknal.ask.agents.tools.execute_python import execute_python
 from seeknal.ask.agents.tools.generate_report import generate_report
 from seeknal.ask.agents.tools.save_report_exposure import save_report_exposure
+from seeknal.ask.agents.tools.draft_node import draft_node
+from seeknal.ask.agents.tools.dry_run_draft import dry_run_draft
+from seeknal.ask.agents.tools.apply_draft import apply_draft
+from seeknal.ask.agents.tools.edit_node import edit_node
+from seeknal.ask.agents.tools.plan_pipeline import plan_pipeline
+from seeknal.ask.agents.tools.show_lineage import show_lineage
+from seeknal.ask.agents.tools.run_pipeline import run_pipeline
 from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
 from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
 
 TOOLS = [
+    # Read tools
     execute_sql, list_tables, describe_table,
     get_entities, get_entity_schema,
     read_pipeline, search_pipelines,
@@ -34,6 +42,10 @@ TOOLS = [
     execute_python,
     generate_report,
     save_report_exposure,
+    # Write tools
+    draft_node, dry_run_draft, apply_draft,
+    edit_node, plan_pipeline, show_lineage,
+    run_pipeline,
 ]
 
 SYSTEM_PROMPT = """You are Seeknal Ask, a senior data analyst and strategist.
@@ -43,6 +55,7 @@ entities, feature groups, and transformations stored as DuckDB views.
 
 ## Your Capabilities
 
+### Analysis (Read)
 1. List and describe tables/entities
 2. Execute read-only DuckDB SQL queries
 3. Read pipeline definitions to understand data lineage
@@ -50,6 +63,14 @@ entities, feature groups, and transformations stored as DuckDB views.
 5. Execute Python for statistical analysis (pandas, scipy, matplotlib)
 6. Generate interactive HTML reports with Evidence.dev
 7. Codify reports as YAML exposures for scheduled re-runs
+
+### Development (Write)
+8. Create new pipeline nodes (sources, transforms, feature groups, models, etc.)
+9. Validate draft files before applying
+10. Apply validated drafts to the project
+11. Edit existing node definitions
+12. View execution plan and lineage
+13. Run the pipeline
 
 ## Workflow
 
@@ -62,6 +83,15 @@ For data questions:
 For lineage/how questions:
 1. `search_pipelines` → `read_pipeline` or `search_project_files` → `read_project_file`
 2. Explain the logic from pipeline definitions + query results
+
+For building/modifying pipelines:
+1. Create: `draft_node` → edit content → `dry_run_draft` → `apply_draft(confirmed=True)`
+2. Edit: `read_pipeline` → `edit_node` (preview diff) → `edit_node(confirmed=True)`
+3. Verify: `plan_pipeline` → `show_lineage` → `run_pipeline(confirmed=True)`
+
+IMPORTANT: Always follow the draft workflow (draft → dry-run → apply).
+Always show changes and get confirmation before applying or running.
+Never modify profiles.yml, .env, or seeknal_project.yml.
 
 For advanced analysis:
 1. Query data with `execute_sql` first

@@ -1,0 +1,114 @@
+# Build Seeknal ML Models
+
+Train and serve ML models integrated with the seeknal feature store.
+
+## When to Use
+
+Use this skill when asked to train models, create ML pipelines, or serve predictions using feature store data.
+
+## Workflow
+
+### 1. Draft a Model
+
+```bash
+seeknal draft model <name>
+# Generates: draft_model_<name>.yml
+```
+
+Edit the generated YAML:
+
+```yaml
+kind: model
+name: churn_predictor
+inputs:
+  - ref: feature_group.customer_features
+model:
+  type: sklearn
+  algorithm: random_forest
+  target_column: churned
+  feature_columns:
+    - total_spend
+    - order_count
+    - avg_order_value
+  parameters:
+    n_estimators: 100
+    max_depth: 10
+output:
+  predictions: "Churn probability"
+  model_artifact: "target/models/churn_predictor/"
+```
+
+### 2. Python Model (Custom Logic)
+
+```bash
+seeknal draft model <name> --python
+# Generates: draft_model_<name>.py with @model decorator
+```
+
+```python
+from seeknal.decorators import model
+
+@model(name="churn_predictor")
+def churn_predictor(ctx):
+    import pandas as pd
+    from sklearn.ensemble import RandomForestClassifier
+
+    df = ctx.input(0)
+    X = df[["total_spend", "order_count", "avg_order_value"]]
+    y = df["churned"]
+
+    model = RandomForestClassifier(n_estimators=100)
+    model.fit(X, y)
+
+    predictions = pd.DataFrame({
+        "customer_id": df["customer_id"],
+        "churn_probability": model.predict_proba(X)[:, 1]
+    })
+    return predictions
+```
+
+### 3. Validate, Apply, Run
+
+```bash
+seeknal dry-run draft_model_<name>.yml
+seeknal apply draft_model_<name>.yml
+seeknal plan                # Verify model appears after its input features
+seeknal run
+```
+
+### 4. Model with Feature Lookups
+
+Connect models to the feature store for training data:
+
+```yaml
+kind: model
+name: recommendation_model
+inputs:
+  - ref: feature_group.user_features
+  - ref: feature_group.product_features
+model:
+  type: python
+  script: models/recommendation.py
+  feature_lookups:
+    - source: feature_group.user_features
+      features: [total_spend, visit_count]
+    - source: feature_group.product_features
+      features: [price, category]
+```
+
+## Serving
+
+After training, serve models for online inference:
+
+```bash
+seeknal inspect model.churn_predictor    # Check predictions output
+```
+
+Model artifacts are stored in `target/models/<name>/` and can be loaded for serving.
+
+## Common Mistakes
+
+- **Missing feature columns**: Ensure all `feature_columns` exist in the input feature group
+- **Wrong input ref**: Models consume `feature_group.*` or `transform.*`, not raw `source.*`
+- **No target column**: Supervised models need `target_column` in the input data
+- **Large models in memory**: Use `--python` for custom models that need streaming or batching
