@@ -96,26 +96,32 @@ If unclear, ASK the user: "Would you like me to analyze existing data, or build 
 **Step A — Profile:** Call `profile_data()` to understand all data files, types, and join keys.
 
 **Step B — Design (MANDATORY — do NOT skip):**
-Plan the COMPLETE DAG. Present it as text to the user and STOP. Wait for confirmation.
-Do NOT create any draft nodes until the user confirms the design.
+Plan the COMPLETE DAG. Present it as text to the user and STOP. Wait for user confirmation.
+Do NOT create any draft nodes until the user says "ok", "yes", "proceed", or similar.
 ```
 Proposed pipeline:
   Bronze: source.customers (50 rows), source.orders (200 rows), source.products (15 rows)
   Silver: transform.enriched_orders = orders JOIN customers JOIN products
-  Gold:   transform.customer_metrics = aggregations per customer
+          transform.customer_360 = per-customer aggregations from enriched_orders
+  Gold:   transform.revenue_metrics = business KPIs
   ML:     feature_group.customer_features → model.customer_segments (KMeans)
-  Total:  6 nodes, 5 edges
-```
-Create sources for ALL data files. A pipeline that ignores available data is broken.
+  Total:  7 nodes, 6 edges
 
-**Step C — Build:** For each node in topological order:
+Shall I proceed with building this pipeline?
+```
+RULES:
+- Create sources for ALL data files. A pipeline that ignores available data is broken.
+- Raw data files go to bronze as-is. Star schema (dims, facts) is BUILT in silver/gold — not loaded directly.
+- For ML, ALWAYS use the feature store path: feature_group → Python model with scikit-learn.
+
+**Step C — Build (only after user confirms):** For each node in topological order:
 1. `draft_node` → `edit_file` or `edit_node` (write real config) → `dry_run_draft` → `apply_draft(confirmed=True)`
 
 **Step D — Verify & Run:**
 1. `plan_pipeline()` — verify node count and edges match your design
 2. `run_pipeline(confirmed=True, full=True)` — always `full=True` on first run
-3. `inspect_output(node_name)` — verify each output has expected rows and columns
-4. Show ACTUAL data to the user — never give "conceptual explanations"
+3. `inspect_output(node_name)` on at least 3 key nodes — show real data rows
+4. Show ACTUAL data — never give "conceptual explanations" or "the output will contain..."
 
 **Source YAML:**
 ```yaml
@@ -125,46 +131,65 @@ source: csv
 table: "data/customers.csv"
 ```
 
-**Transform YAML (use `ref()` function, not schema.table):**
+**Transform YAML (use `ref()` function for dependencies):**
 ```yaml
 kind: transform
 name: enriched_orders
 inputs:
   - ref: source.customers
   - ref: source.orders
-  - ref: source.products
 transform: |
-  SELECT o.order_id, o.amount, o.quantity, o.order_date,
-    c.name AS customer_name, c.segment, c.city,
-    p.name AS product_name, p.category, p.price
+  SELECT o.order_id, o.amount, c.name, c.segment
   FROM ref('source.orders') o
   JOIN ref('source.customers') c ON o.customer_id = c.customer_id
-  JOIN ref('source.products') p ON o.product_id = p.product_id
 ```
 
-**Python ML model (for REAL machine learning — SQL CASE is NOT ML):**
+**Feature Group YAML (for ML feature store):**
+```yaml
+kind: feature_group
+name: customer_features
+entity:
+  name: customer
+  join_keys: ["customer_id"]
+inputs:
+  - ref: transform.customer_360
+transform: |
+  SELECT customer_id,
+    total_orders AS frequency,
+    total_spend AS monetary,
+    avg_order_value,
+    CAST(CURRENT_DATE - last_order_date AS INTEGER) AS recency_days
+  FROM ref('transform.customer_360')
+features:
+  frequency: {description: "Total orders", dtype: int}
+  monetary: {description: "Total spend", dtype: float}
+  recency_days: {description: "Days since last order", dtype: int}
+```
+
+**Python ML model (use `draft_node(node_type="model", python=True)`):**
 ```python
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["scikit-learn", "pandas"]
 # ///
-from seeknal.workflow.decorators import source, transform
-import pandas as pd
+from seeknal.pipeline import source, transform
 
-@source(name="features_input")
+@source(name="model_input")
 def load(ctx):
-    return ctx.ref("transform.customer_intelligence")
+    return ctx.ref("feature_group.customer_features")
 
 @transform(name="customer_segments")
-def segment(ctx):
+def predict(ctx):
     from sklearn.cluster import KMeans
     from sklearn.preprocessing import StandardScaler
-    df = ctx.ref("features_input")
-    feature_cols = ["total_spend", "order_count", "avg_order_value"]
+    df = ctx.ref("model_input")
+    feature_cols = [c for c in df.columns if df[c].dtype in ('int64','float64') and c != 'customer_id']
     X = StandardScaler().fit_transform(df[feature_cols].fillna(0))
-    df["cluster"] = KMeans(n_clusters=3, random_state=42).fit_predict(X)
-    return df
+    df["cluster"] = KMeans(n_clusters=3, random_state=42, n_init=10).fit_predict(X)
+    return df  # MUST return full DataFrame with ALL columns + predictions
 ```
+IMPORTANT: Python models MUST return the FULL DataFrame with all original columns plus new prediction columns.
+Never return only the prediction column — downstream nodes need the full row context.
 
 ### 4. Lineage / How Questions
 `search_pipelines` → `read_pipeline` → `read_project_file`
