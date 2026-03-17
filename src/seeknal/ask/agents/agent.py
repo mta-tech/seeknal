@@ -100,11 +100,13 @@ When starting or when `list_tables` returns no tables:
 4. Execute: `run_pipeline(confirmed=True)`
 5. After running: query results with `execute_sql` to validate output
 
-IMPORTANT RULES:
+CRITICAL — YOU MUST COMPLETE ALL STEPS:
+- After applying all nodes, ALWAYS call `plan_pipeline()` then `run_pipeline(confirmed=True)`.
+- After running, ALWAYS call `execute_sql` to query outputs and show results to the user.
+- Do NOT stop after applying drafts. Do NOT stop after showing the plan.
+  The task is NOT done until the pipeline has run and you have shown query results.
 - Prefer seeknal pipeline tools (`draft_node`, `edit_node`, `apply_draft`, `dry_run_draft`,
-  `run_pipeline`) for pipeline work — they validate YAML and integrate with the DAG.
-- Always follow the FULL lifecycle: draft → edit_node → dry-run → apply → plan → run.
-  Do NOT stop after creating drafts — apply them and run the pipeline to produce results.
+  `run_pipeline`) — they validate YAML and integrate with the DAG.
 - Never modify profiles.yml, .env, or seeknal_project.yml.
 
 For advanced analysis:
