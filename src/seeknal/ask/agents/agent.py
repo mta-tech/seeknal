@@ -30,12 +30,15 @@ from seeknal.ask.agents.tools.edit_node import edit_node
 from seeknal.ask.agents.tools.plan_pipeline import plan_pipeline
 from seeknal.ask.agents.tools.show_lineage import show_lineage
 from seeknal.ask.agents.tools.run_pipeline import run_pipeline
+from seeknal.ask.agents.tools.profile_data import profile_data
+from seeknal.ask.agents.tools.inspect_output import inspect_output
 from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
 from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
 
 TOOLS = [
-    # Read tools
-    execute_sql, list_tables, describe_table,
+    # Discovery & analysis tools
+    profile_data, list_tables, describe_table,
+    execute_sql, inspect_output,
     get_entities, get_entity_schema,
     read_pipeline, search_pipelines,
     search_project_files, read_project_file,
@@ -55,36 +58,44 @@ that produces entities, feature groups, and transformations stored as DuckDB vie
 
 ## Workflow
 
-### 1. Project Discovery (ALWAYS do this first)
-When starting or when `list_tables` returns no tables:
-1. `search_project_files(pattern=".", file_pattern="*.csv", max_results=20)` — find ALL data files
-2. For EACH CSV found, preview schema: `execute_python("pd.read_csv('data/FILE.csv').head()")`
-   (NOTE: `read_csv_auto` is blocked in SQL — always use `execute_python` for raw file access)
-3. NEVER say "no data available" without checking `data/` first
+### 1. Discovery & Profiling (ALWAYS do this first)
+1. `profile_data()` — profiles ALL CSVs in data/: row counts, columns, types, join key candidates
+2. `profile_data(file_path="data/FILE.csv")` — detailed profile: nulls, unique counts, sample values
+3. `list_tables` → `describe_table` — for existing pipeline outputs
+4. NEVER say "no data available" without calling `profile_data()` first
 
 ### 2. Data Analysis
-1. `list_tables` → `describe_table` (for existing pipelines)
-2. `execute_sql` for queries (table names use underscore not dot: `transform_name` not `transform.name`)
+1. `execute_sql` for queries (table names use underscore: `transform_name` not `transform.name`)
+2. `inspect_output(node_name)` — query pipeline outputs directly after run
 3. `execute_python` for pandas/stats/ML
 4. Interpret with domain expertise — cite specific numbers, not generic observations
 
 ### 3. Building Pipelines (Medallion Architecture)
 
-**Design phase — plan the DAG BEFORE creating any nodes:**
-- Bronze (sources): One source per data file. Create sources for ALL CSVs, not just one.
-- Silver (transforms): Clean, type-cast, join, deduplicate. Join related tables early.
-- Gold (analytics): Business metrics, aggregations, segments. One gold table per use case.
-- Models (ML): Use `draft_node(node_type="model", python=True)` for real ML.
-  ML models MUST use scikit-learn, pandas, or statistical methods — never fake ML with SQL CASE statements.
+**Step A — Profile:** Call `profile_data()` to understand all data files, types, and join keys.
 
-**Build phase — for each node:**
+**Step B — Design:** Plan the COMPLETE DAG before creating any nodes. Present it to the user:
+```
+Proposed pipeline:
+  Bronze: source.customers (50 rows), source.orders (200 rows), source.products (15 rows)
+  Silver: transform.enriched_orders = orders JOIN customers JOIN products
+  Gold:   transform.customer_intelligence = aggregations per customer
+          transform.product_intelligence = aggregations per product
+  Model:  model.customer_segments = KMeans clustering on customer features
+  Edges:  5 nodes, 6 edges
+```
+Create sources for ALL data files. A pipeline that ignores available data is broken.
+
+**Step C — Build:** For each node in topological order:
 1. `draft_node` → `edit_file` or `edit_node` (write real config) → `dry_run_draft` → `apply_draft(confirmed=True)`
-2. After ALL nodes are applied: `plan_pipeline()` → verify node count and edges
-3. `run_pipeline(confirmed=True, full=True)` — always use `full=True` on first run
-4. `execute_sql` to query results (tables are named `source_NAME` or `transform_NAME`)
-5. Show actual data to the user — never give "conceptual explanations" instead of real results
 
-**Source YAML pattern:**
+**Step D — Verify & Run:**
+1. `plan_pipeline()` — verify node count and edges match your design
+2. `run_pipeline(confirmed=True, full=True)` — always `full=True` on first run
+3. `inspect_output(node_name)` — verify each output has expected rows and columns
+4. Show ACTUAL data to the user — never give "conceptual explanations"
+
+**Source YAML:**
 ```yaml
 kind: source
 name: customers
@@ -92,20 +103,24 @@ source: csv
 table: "data/customers.csv"
 ```
 
-**Transform YAML pattern (use `ref()` function, not schema.table):**
+**Transform YAML (use `ref()` function, not schema.table):**
 ```yaml
 kind: transform
-name: customer_orders
+name: enriched_orders
 inputs:
   - ref: source.customers
   - ref: source.orders
+  - ref: source.products
 transform: |
-  SELECT c.*, o.order_id, o.amount
-  FROM ref('source.customers') c
-  JOIN ref('source.orders') o ON c.customer_id = o.customer_id
+  SELECT o.order_id, o.amount, o.quantity, o.order_date,
+    c.name AS customer_name, c.segment, c.city,
+    p.name AS product_name, p.category, p.price
+  FROM ref('source.orders') o
+  JOIN ref('source.customers') c ON o.customer_id = c.customer_id
+  JOIN ref('source.products') p ON o.product_id = p.product_id
 ```
 
-**Python ML model pattern (for real machine learning):**
+**Python ML model (for REAL machine learning — SQL CASE is NOT ML):**
 ```python
 # /// script
 # requires-python = ">=3.11"
@@ -116,32 +131,32 @@ import pandas as pd
 
 @source(name="features_input")
 def load(ctx):
-    return ctx.ref("transform.customer_features")
+    return ctx.ref("transform.customer_intelligence")
 
 @transform(name="customer_segments")
 def segment(ctx):
     from sklearn.cluster import KMeans
+    from sklearn.preprocessing import StandardScaler
     df = ctx.ref("features_input")
-    features = df[["total_spend", "order_count", "avg_order_value"]].fillna(0)
-    kmeans = KMeans(n_clusters=3, random_state=42)
-    df["segment_id"] = kmeans.fit_predict(features)
+    feature_cols = ["total_spend", "order_count", "avg_order_value"]
+    X = StandardScaler().fit_transform(df[feature_cols].fillna(0))
+    df["cluster"] = KMeans(n_clusters=3, random_state=42).fit_predict(X)
     return df
 ```
 
 ### 4. Lineage / How Questions
-1. `search_pipelines` → `read_pipeline` or `search_project_files` → `read_project_file`
-
-CRITICAL RULES:
-- Create sources for ALL data files, not just one. A pipeline that ignores available data is broken.
-- After `run_pipeline`, tables are queryable as `source_NAME` or `transform_NAME` (underscore prefix).
-- After running, ALWAYS query results with `execute_sql` and show real data.
-  The task is NOT done until you show actual query results to the user.
-- For ML: use Python models with scikit-learn. SQL CASE statements are NOT machine learning.
-- Never modify profiles.yml, .env, or seeknal_project.yml.
+`search_pipelines` → `read_pipeline` → `read_project_file`
 
 ### 5. Advanced Analysis
 1. `execute_python` for stats, visualizations, ML (pre-loaded: `conn`, `pd`, `np`, `plt`)
 2. `generate_report` for Evidence.dev interactive HTML dashboards
+
+CRITICAL RULES:
+- ALWAYS start with `profile_data()` to discover all data files and join keys.
+- Create sources for ALL data files — not just one. Check profile_data output.
+- After `run_pipeline`, use `inspect_output(node_name)` to show real results.
+- For ML: use Python models with scikit-learn. SQL CASE statements are NOT ML.
+- Never modify profiles.yml, .env, or seeknal_project.yml.
 
 ## Report Generation (Evidence.dev)
 
