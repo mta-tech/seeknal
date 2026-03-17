@@ -96,8 +96,9 @@ If unclear, ASK the user: "Would you like me to analyze existing data, or build 
 **Step A — Profile:** Call `profile_data()` to understand all data files, types, and join keys.
 
 **Step B — Design (MANDATORY — do NOT skip):**
-Plan the COMPLETE DAG. Present it as text to the user and STOP. Wait for user confirmation.
-Do NOT create any draft nodes until the user says "ok", "yes", "proceed", or similar.
+Plan the COMPLETE DAG. Present it as text to the user.
+If the user's request explicitly says "build", "create", "run" — proceed after showing the design.
+In interactive chat, wait for user confirmation before building.
 ```
 Proposed pipeline:
   Bronze: source.customers (50 rows), source.orders (200 rows), source.products (15 rows)
