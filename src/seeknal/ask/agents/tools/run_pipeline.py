@@ -66,8 +66,9 @@ def run_pipeline(
         errors = result.stderr.strip()
 
         if result.returncode == 0:
-            # Refresh artifact discovery after run
+            # Refresh artifact discovery and re-register new parquet outputs
             ctx.artifact_discovery.refresh()
+            ctx.repl._auto_register_project()
             return f"Pipeline executed successfully.\n\n{output}"
         else:
             return (
