@@ -53,7 +53,7 @@ def apply_draft(file_path: str, confirmed: bool = False) -> str:
                 capture_output=True,
                 text=True,
                 cwd=str(ctx.project_path),
-                timeout=60,
+                timeout=120,
             )
 
         output = result.stdout.strip()
@@ -71,7 +71,7 @@ def apply_draft(file_path: str, confirmed: bool = False) -> str:
                 f"Run dry_run_draft('{file_path}') to diagnose issues."
             )
     except subprocess.TimeoutExpired:
-        return f"Apply timed out after 60 seconds for {file_path}"
+        return f"Apply timed out after 120 seconds for {file_path}"
     except FileNotFoundError:
         return "seeknal CLI not found. Ensure seeknal is installed and on PATH."
     except Exception as e:
