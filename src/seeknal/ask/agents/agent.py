@@ -274,7 +274,7 @@ def create_agent(
 
     config = {
         "configurable": {"thread_id": "default"},
-        "recursion_limit": 100,
+        "recursion_limit": 500,
     }
     return agent, config
 
