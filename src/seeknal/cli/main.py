@@ -831,7 +831,7 @@ def _generate_skills_force(project_path: Path, project_name: str) -> None:
 
     context = {"project_name": project_name}
     skills = [
-        "pipeline", "feature_group", "model",
+        "pipeline", "pipeline_design", "feature_group", "model",
         "analytics", "rules", "deploy",
         "init", "debug",
     ]
@@ -868,7 +868,7 @@ def _generate_skills(project_path: Path, project_name: str) -> None:
     context = {"project_name": project_name}
 
     skills = [
-        "pipeline", "feature_group", "model",
+        "pipeline", "pipeline_design", "feature_group", "model",
         "analytics", "rules", "deploy",
         "init", "debug",
     ]
