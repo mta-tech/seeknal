@@ -5,6 +5,7 @@ visibility: reasoning panels, tool calls, SQL queries, result tables,
 and the final answer -- all rendered via Rich Console.
 """
 
+import asyncio
 import re
 from typing import Any, Optional
 
@@ -204,13 +205,18 @@ def _show_retry(console: Console, attempt: int, max_retries: int) -> None:
 
 async def _stream_one_pass(
     agent: Any, config: dict, question: str, console: Console
-) -> str:
+) -> tuple[str, bool]:
     """Run a single astream_events pass and render events progressively.
 
-    Returns the final answer text, or empty string if no answer was produced.
+    Returns:
+        A tuple of (answer_text, had_tool_calls).
+        answer_text is empty string if no answer was produced.
+        had_tool_calls indicates whether any tools were invoked.
     """
     text_buffer: list[str] = []
     accumulated = ""  # Cached join to avoid O(n^2) re-joining
+    last_ai_text = ""  # Fallback: capture from on_chat_model_end
+    had_tool_calls = False
 
     async for event in agent.astream_events(
         {"messages": [HumanMessage(content=question)]},
@@ -241,6 +247,18 @@ async def _stream_one_pass(
                 text_buffer.append(token)
                 accumulated += token
 
+        elif kind == "on_chat_model_end":
+            # Fallback: capture the final AI message content.
+            # This fires when the LLM finishes a generation pass.
+            # Gemini sometimes delivers the full answer here without
+            # streaming individual tokens via on_chat_model_stream.
+            output = event.get("data", {}).get("output")
+            if output is not None:
+                content = getattr(output, "content", "")
+                text = _normalize_content(content)
+                if text:
+                    last_ai_text = text
+
         elif kind == "on_tool_start":
             # Flush text buffer as reasoning (if any text accumulated)
             if text_buffer:
@@ -248,6 +266,7 @@ async def _stream_one_pass(
                 text_buffer.clear()
                 accumulated = ""
 
+            had_tool_calls = True
             name = event.get("name", "unknown")
             args = event.get("data", {}).get("input", {})
             _show_tool_start(console, name, args)
@@ -263,9 +282,15 @@ async def _stream_one_pass(
     # Stream ended -- flush remaining buffer as answer
     if text_buffer:
         _show_answer(console, accumulated)
-        return accumulated
+        return accumulated, had_tool_calls
 
-    return ""
+    # Fallback: if streaming didn't capture text but on_chat_model_end did,
+    # use the last AI text (common with Gemini after tool calls).
+    if last_ai_text:
+        _show_answer(console, last_ai_text)
+        return last_ai_text, had_tool_calls
+
+    return "", had_tool_calls
 
 
 async def stream_ask(
@@ -299,14 +324,36 @@ async def stream_ask(
     for attempt in range(_MAX_RALPH_RETRIES + 1):
         if attempt > 0:
             _show_retry(console, attempt, _MAX_RALPH_RETRIES)
+
+        answer, had_tool_calls = await _stream_one_pass(
+            agent, config, current_question, console
+        )
+        if answer:
+            return answer
+
+        # Adapt retry prompt based on what happened:
+        if had_tool_calls:
+            # Tools ran but LLM didn't produce text — nudge it to summarize
             current_question = (
                 "Please summarize your findings from the tool calls above "
                 "and provide your analysis as a text response."
             )
+        else:
+            # LLM returned empty with no tool calls — re-ask with guidance
+            current_question = (
+                f"Start by using list_tables to discover available data, "
+                f"then answer: {question}"
+            )
 
-        answer = await _stream_one_pass(agent, config, current_question, console)
-        if answer:
-            return answer
+    # Last resort: fall back to sync invoke which uses a different code path
+    # and may succeed where astream_events fails (common with Gemini).
+    from seeknal.ask.agents.agent import ask as sync_ask
+
+    console.print("\n[dim]Retrying with sync mode...[/dim]\n")
+    answer = await asyncio.to_thread(sync_ask, agent, config, question)
+    if answer and answer != _NO_RESPONSE:
+        _show_answer(console, answer)
+        return answer
 
     return _NO_RESPONSE
 

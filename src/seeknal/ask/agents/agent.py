@@ -74,24 +74,38 @@ entities, feature groups, and transformations stored as DuckDB views.
 
 ## Workflow
 
-For data questions:
-1. Discover data: `list_tables` → `describe_table`
-2. Query: `execute_sql` (or `execute_python` for statistical modeling)
-3. Interpret results with domain expertise — don't just echo numbers
-4. Suggest actionable follow-up analyses
+### Project Discovery (ALWAYS do this first)
+When starting or when `list_tables` returns no tables:
+1. `search_project_files(pattern=".", file_pattern="*.csv", max_results=20)` — find CSV data files
+2. `search_project_files(pattern=".", file_pattern="*.yml", max_results=20)` — find pipeline definitions
+3. For each CSV found, use `execute_python` to preview: `pd.read_csv('data/filename.csv').head()`
+   (NOTE: `read_csv_auto` is blocked in SQL queries for security — always use `execute_python` for raw file access)
+4. NEVER say "no data available" without first checking the `data/` directory for raw files
 
-For lineage/how questions:
+### Data Analysis
+1. Discover data: `list_tables` → `describe_table`
+2. If no tables: follow Project Discovery above — raw CSV files in `data/` can be queried directly with `read_csv_auto()`
+3. Query: `execute_sql` (or `execute_python` for statistical modeling)
+4. Interpret results with domain expertise — don't just echo numbers
+5. Suggest actionable follow-up analyses
+
+### Lineage / How Questions
 1. `search_pipelines` → `read_pipeline` or `search_project_files` → `read_project_file`
 2. Explain the logic from pipeline definitions + query results
 
-For building/modifying pipelines:
-1. Create: `draft_node` → edit content → `dry_run_draft` → `apply_draft(confirmed=True)`
-2. Edit: `read_pipeline` → `edit_node` (preview diff) → `edit_node(confirmed=True)`
-3. Verify: `plan_pipeline` → `show_lineage` → `run_pipeline(confirmed=True)`
+### Building / Modifying Pipelines
+1. Create: `draft_node` → `edit_node` (write real config) → `dry_run_draft` → `apply_draft(confirmed=True)`
+2. Edit existing: `read_pipeline` → `edit_node` (preview diff) → `edit_node(confirmed=True)`
+3. Verify: `plan_pipeline` → `show_lineage`
+4. Execute: `run_pipeline(confirmed=True)`
+5. After running: query results with `execute_sql` to validate output
 
-IMPORTANT: Always follow the draft workflow (draft → dry-run → apply).
-Always show changes and get confirmation before applying or running.
-Never modify profiles.yml, .env, or seeknal_project.yml.
+IMPORTANT RULES:
+- Prefer seeknal pipeline tools (`draft_node`, `edit_node`, `apply_draft`, `dry_run_draft`,
+  `run_pipeline`) for pipeline work — they validate YAML and integrate with the DAG.
+- Always follow the FULL lifecycle: draft → edit_node → dry-run → apply → plan → run.
+  Do NOT stop after creating drafts — apply them and run the pipeline to produce results.
+- Never modify profiles.yml, .env, or seeknal_project.yml.
 
 For advanced analysis:
 1. Query data with `execute_sql` first
@@ -253,7 +267,7 @@ def create_agent(
     # Create deep agent with planning and auto-summarization
     checkpointer = MemorySaver()
     agent = _create_agent_graph(
-        llm, system_prompt, checkpointer
+        llm, system_prompt, checkpointer, project_path=project_path
     )
 
     config = {
@@ -263,16 +277,28 @@ def create_agent(
     return agent, config
 
 
-def _create_agent_graph(llm, system_prompt: str, checkpointer):
+def _create_agent_graph(llm, system_prompt: str, checkpointer, project_path=None):
     """Create the agent graph, trying deepagents first with ReAct fallback."""
     try:
         from deepagents import create_deep_agent
+        from deepagents.backends.filesystem import FilesystemBackend
+
+        # Use real filesystem backend rooted at project directory.
+        # virtual_mode=True enforces path containment (blocks ../ and
+        # absolute paths outside root_dir).
+        backend = None
+        if project_path is not None:
+            backend = FilesystemBackend(
+                root_dir=str(project_path),
+                virtual_mode=True,
+            )
 
         return create_deep_agent(
             model=llm,
             tools=TOOLS,
             system_prompt=system_prompt,
             checkpointer=checkpointer,
+            backend=backend,
         )
     except ImportError:
         # Fallback to ReAct agent if deepagents not installed
