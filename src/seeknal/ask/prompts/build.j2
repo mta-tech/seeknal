@@ -1,0 +1,107 @@
+### 3. Building Pipelines (BUILD mode only)
+
+**Architecture: Bronze → Silver → Gold → ML**
+- Bronze = raw data ingestion (one source per file, no transformation)
+- Silver = cleaned, typed, joined, deduplicated (star schema is BUILT here, not loaded)
+- Gold = business metrics, aggregations, segments
+- ML = feature engineering → feature store → model training (Python + scikit-learn, never SQL CASE)
+
+**In chat mode — Interactive Design:**
+Follow the pipeline design skill (5 phases):
+1. Profile data with `profile_data()`
+2. Ask user about data scope (which files, which entities)
+3. Ask about pipeline type (analytics / ML / full stack)
+4. Ask about transforms, metrics, ML approach, features
+5. Present complete DAG → wait for user to say "build" → then build all nodes
+6. Run in dev → inspect results → ask to promote to production
+
+Ask ONE question at a time. Wait for user response before next question.
+Do NOT skip the design dialogue — users need to shape their pipeline.
+
+**In one-shot mode — Auto-proceed:**
+Profile → show DAG design → build all nodes → run → inspect results.
+No interactive questions (no way to get responses in one-shot).
+
+RULES:
+- Create sources for ALL data files. A pipeline that ignores available data is broken.
+- Raw data files go to bronze as-is. Star schema (dims, facts) is BUILT in silver/gold.
+- For ML, ALWAYS use the feature store path: feature_group → Python model with scikit-learn.
+
+**Build phase:** For each node in topological order:
+1. `draft_node` → `edit_file` or `edit_node` (write real config) → `dry_run_draft` → `apply_draft(confirmed=True)`
+
+**Verify & Run:**
+1. `plan_pipeline()` — verify node count and edges match your design
+2. `run_pipeline(confirmed=True, full=True)` — always `full=True` on first run
+3. `inspect_output(node_name)` on at least 3 key nodes — show real data rows
+4. Show ACTUAL data — never give "conceptual explanations" or "the output will contain..."
+
+**Source YAML:**
+```yaml
+kind: source
+name: customers
+source: csv
+table: "data/customers.csv"
+```
+
+**Transform YAML (use `ref()` function for dependencies):**
+```yaml
+kind: transform
+name: enriched_orders
+inputs:
+  - ref: source.customers
+  - ref: source.orders
+transform: |
+  SELECT o.order_id, o.amount, c.name, c.segment
+  FROM ref('source.orders') o
+  JOIN ref('source.customers') c ON o.customer_id = c.customer_id
+```
+
+**Feature Group YAML (for ML feature store):**
+```yaml
+kind: feature_group
+name: customer_features
+entity:
+  name: customer
+  join_keys: ["customer_id"]
+inputs:
+  - ref: transform.customer_360
+transform: |
+  SELECT customer_id,
+    total_orders AS frequency,
+    total_spend AS monetary,
+    avg_order_value,
+    CAST(CURRENT_DATE - last_order_date AS INTEGER) AS recency_days
+  FROM ref('transform.customer_360')
+features:
+  frequency: {description: "Total orders", dtype: int}
+  monetary: {description: "Total spend", dtype: float}
+  recency_days: {description: "Days since last order", dtype: int}
+```
+
+**Python ML model (use `draft_node(node_type="model", python=True)`):**
+```python
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["scikit-learn", "pandas"]
+# ///
+from seeknal.pipeline import source, transform
+
+@source(name="model_input")
+def load(ctx):
+    return ctx.ref("feature_group.customer_features")
+
+@transform(name="customer_segments")
+def predict(ctx):
+    from sklearn.cluster import KMeans
+    from sklearn.preprocessing import StandardScaler
+    df = ctx.ref("model_input")
+    feature_cols = [c for c in df.columns if df[c].dtype in ('int64','float64') and c != 'customer_id']
+    X = StandardScaler().fit_transform(df[feature_cols].fillna(0))
+    df["cluster"] = KMeans(n_clusters=3, random_state=42, n_init=10).fit_predict(X)
+    return df  # MUST return full DataFrame with ALL columns + predictions
+```
+IMPORTANT: Python models MUST return the FULL DataFrame with all original columns plus new prediction columns.
+
+### 4. Lineage / How Questions
+`search_pipelines` → `read_pipeline` → `read_project_file`

@@ -1,8 +1,11 @@
-"""Deep agent for Seeknal Ask.
+"""Seeknal Ask agent — modular harness with tool profiles.
 
-Uses deepagents (built on LangGraph) for planning and auto-summarization.
-LLM generates SQL -> execute_sql tool -> error? -> LLM retries.
-For complex analyses, the agent decomposes tasks via the planning tool.
+Architecture inspired by OpenClaw and Anthropic's harness engineering:
+- Modular Jinja2 prompt templates (core, build, report, skills, safety)
+- Tool profiles (analysis, build, full) for structural enforcement
+- Skills-on-demand lazy loading
+- Per-project YAML config
+- deepagents framework for middleware, sub-agents, and summarization
 """
 
 from pathlib import Path
@@ -11,47 +14,15 @@ from typing import Optional
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 
-from seeknal.ask.agents.tools.execute_sql import execute_sql
-from seeknal.ask.agents.tools.list_tables import list_tables
-from seeknal.ask.agents.tools.describe_table import describe_table
-from seeknal.ask.agents.tools.get_entities import get_entities
-from seeknal.ask.agents.tools.get_entity_schema import get_entity_schema
-from seeknal.ask.agents.tools.read_pipeline import read_pipeline
-from seeknal.ask.agents.tools.search_pipelines import search_pipelines
-from seeknal.ask.agents.tools.search_project_files import search_project_files
-from seeknal.ask.agents.tools.read_project_file import read_project_file
-from seeknal.ask.agents.tools.execute_python import execute_python
-from seeknal.ask.agents.tools.generate_report import generate_report
-from seeknal.ask.agents.tools.save_report_exposure import save_report_exposure
-from seeknal.ask.agents.tools.draft_node import draft_node
-from seeknal.ask.agents.tools.dry_run_draft import dry_run_draft
-from seeknal.ask.agents.tools.apply_draft import apply_draft
-from seeknal.ask.agents.tools.edit_node import edit_node
-from seeknal.ask.agents.tools.plan_pipeline import plan_pipeline
-from seeknal.ask.agents.tools.show_lineage import show_lineage
-from seeknal.ask.agents.tools.run_pipeline import run_pipeline
-from seeknal.ask.agents.tools.profile_data import profile_data
-from seeknal.ask.agents.tools.inspect_output import inspect_output
 from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
+from seeknal.ask.agents.profiles import get_tools_for_profile, select_profile
+from seeknal.ask.agents.prompt_builder import PromptBuilder
+from seeknal.ask.config import load_agent_config
 from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
 
-TOOLS = [
-    # Discovery & analysis tools
-    profile_data, list_tables, describe_table,
-    execute_sql, inspect_output,
-    get_entities, get_entity_schema,
-    read_pipeline, search_pipelines,
-    search_project_files, read_project_file,
-    execute_python,
-    generate_report,
-    save_report_exposure,
-    # Write tools
-    draft_node, dry_run_draft, apply_draft,
-    edit_node, plan_pipeline, show_lineage,
-    run_pipeline,
-]
-
-SYSTEM_PROMPT = """You are Seeknal Ask — a principal-level data, ML, and analytics engineer.
+# Legacy monolithic prompt — kept as fallback if prompt templates are missing.
+# New modular templates are in src/seeknal/ask/prompts/*.j2
+_LEGACY_SYSTEM_PROMPT = """You are Seeknal Ask — a principal-level data, ML, and analytics engineer.
 
 You build production-grade data pipelines on seeknal, a data engineering platform
 that produces entities, feature groups, and transformations stored as DuckDB views.
@@ -325,14 +296,19 @@ def create_agent(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     api_key: Optional[str] = None,
+    profile: Optional[str] = None,
+    question: Optional[str] = None,
 ):
-    """Create a Seeknal Ask agent.
+    """Create a Seeknal Ask agent with profile-based tool selection.
 
     Args:
         project_path: Path to the seeknal project root.
         provider: LLM provider ("google" or "ollama").
         model: Model name override.
         api_key: API key override.
+        profile: Tool profile override ("analysis", "build", "full").
+                 Auto-detected from question if not specified.
+        question: User's question (used for profile auto-detection).
 
     Returns:
         A tuple of (agent, config) where agent is a LangGraph compiled graph
@@ -341,6 +317,9 @@ def create_agent(
     from seeknal.ask.agents.providers import get_llm
     from seeknal.ask.security import configure_safe_connection
     from seeknal.cli.repl import REPL
+
+    # Load per-project config
+    agent_config = load_agent_config(project_path)
 
     # Create singleton REPL with safe connection
     repl = REPL(project_path=project_path, skip_history=True)
@@ -357,16 +336,35 @@ def create_agent(
         project_path=project_path,
     ))
 
-    # Create LLM
-    llm = get_llm(provider=provider, model=model, api_key=api_key)
+    # Create LLM (CLI flags > config file > defaults)
+    llm = get_llm(
+        provider=provider,
+        model=model or agent_config.get("model"),
+        api_key=api_key,
+    )
 
-    # Build system prompt with project context
-    system_prompt = SYSTEM_PROMPT.replace("{context}", context)
+    # Select tool profile (CLI flag > auto-detect from question > config > default)
+    active_profile = (
+        profile
+        or (select_profile(question) if question else None)
+        or agent_config.get("default_profile", "full")
+    )
+
+    # Build modular system prompt from templates
+    builder = PromptBuilder()
+    system_prompt = builder.build(active_profile, context=context)
+
+    # Get tools for the active profile
+    tools = get_tools_for_profile(
+        active_profile,
+        disabled_tools=agent_config.get("disabled_tools"),
+    )
 
     # Create deep agent with planning and auto-summarization
     checkpointer = MemorySaver()
     agent = _create_agent_graph(
-        llm, system_prompt, checkpointer, project_path=project_path
+        llm, system_prompt, checkpointer,
+        project_path=project_path, tools=tools,
     )
 
     config = {
@@ -376,8 +374,14 @@ def create_agent(
     return agent, config
 
 
-def _create_agent_graph(llm, system_prompt: str, checkpointer, project_path=None):
+def _create_agent_graph(llm, system_prompt: str, checkpointer,
+                        project_path=None, tools=None):
     """Create the agent graph, trying deepagents first with ReAct fallback."""
+    # Lazy import for backward compat — use full tools if none specified
+    if tools is None:
+        from seeknal.ask.agents.profiles import get_tools_for_profile
+        tools = get_tools_for_profile("full")
+
     try:
         from deepagents import create_deep_agent
         from deepagents.backends.filesystem import FilesystemBackend
@@ -394,7 +398,7 @@ def _create_agent_graph(llm, system_prompt: str, checkpointer, project_path=None
 
         return create_deep_agent(
             model=llm,
-            tools=TOOLS,
+            tools=tools,
             system_prompt=system_prompt,
             checkpointer=checkpointer,
             backend=backend,
@@ -406,7 +410,7 @@ def _create_agent_graph(llm, system_prompt: str, checkpointer, project_path=None
 
         return create_react_agent(
             llm,
-            tools=TOOLS,
+            tools=tools,
             checkpointer=checkpointer,
             prompt=SystemMessage(content=system_prompt),
         )
