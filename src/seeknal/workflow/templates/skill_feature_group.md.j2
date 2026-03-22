@@ -1,0 +1,117 @@
+# Build Seeknal Feature Group
+
+Create feature groups with entities, materialization, and point-in-time joins.
+
+## When to Use
+
+Use this skill when asked to create feature stores, entity-based features, or ML feature engineering pipelines.
+
+## Workflow
+
+### 1. Draft Feature Group
+
+```bash
+seeknal draft feature_group <name>
+```
+
+Edit the generated YAML:
+
+```yaml
+kind: feature_group
+name: customer_features
+entity:
+  name: customer
+  join_keys: [customer_id]
+materialization:
+  event_time_col: event_timestamp
+inputs:
+  - ref: transform.customer_enriched
+transform: |
+  SELECT
+    customer_id,
+    event_timestamp,
+    total_spend,
+    order_count,
+    avg_order_value
+  FROM input_0
+features:
+  total_spend: "Total lifetime spend"
+  order_count: "Number of orders"
+  avg_order_value: "Average order value"
+```
+
+### 2. Validate & Apply
+
+```bash
+seeknal dry-run draft_feature_group_<name>.yml
+seeknal apply draft_feature_group_<name>.yml
+seeknal run
+```
+
+### 3. Aggregations (Time-Windowed Features)
+
+```bash
+seeknal draft aggregation <name>
+```
+
+```yaml
+kind: aggregation
+name: customer_agg
+id_col: customer_id
+feature_date_col: event_timestamp
+inputs:
+  - ref: source.transactions
+features:
+  basic:
+    - column: amount
+      functions: [sum, avg, count]
+  rolling:
+    - column: amount
+      function: sum
+      windows: [7d, 30d, 90d]
+```
+
+### 4. Second-Order Aggregations
+
+```bash
+seeknal draft second-order-aggregation <name>
+```
+
+Features computed over aggregation outputs (trends, ratios over time).
+
+## Multi-Target Materialization
+
+Write to multiple targets from one node:
+
+```yaml
+materializations:
+  - type: postgresql
+    connection: local_pg
+    table: analytics.customer_features
+    mode: upsert_by_key
+    unique_keys: [customer_id]
+  - type: iceberg
+    table: catalog.namespace.customer_features
+```
+
+## Entity Consolidation
+
+After `seeknal run`, per-entity views are auto-generated:
+
+```bash
+seeknal entity list               # List consolidated entities
+seeknal entity show customer      # Show entity schema
+seeknal consolidate               # Force re-consolidation
+```
+
+Access consolidated features:
+```python
+features = ctx.features("customer", ["customer_features.total_spend"])
+```
+
+## Common Mistakes
+
+- **Missing `entity` block**: Feature groups require `entity.name` and `entity.join_keys`
+- **Missing `materialization.event_time_col`**: Required for point-in-time joins
+- **Wrong join key type**: Join keys must be consistent across feature groups sharing an entity
+- **Forgetting upstream nodes**: Create sources/transforms before the feature group

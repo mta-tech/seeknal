@@ -1,35 +1,31 @@
 kind: feature_group
 name: {{ name }}
-description: "{{ description | default('Feature group definition') }}"
+description: "{{ description | default('Feature group for ML models') }}"
 owner: "{{ owner | default('ml-team@example.com') }}"
 tags: {{ tags | default(['features']) | tojson }}
 entity:
-  name: {{ entity_name | default('user') }}
-  join_keys: {{ join_keys | default(['id']) | tojson }}
-materialization:
-  event_time_col: {{ event_time_col | default('event_timestamp') }}
-  offline:
-    enabled: {{ offline_enabled | default(true) }}
-    format: {{ offline_format | default('parquet') }}
-  online:
-    enabled: {{ online_enabled | default(false) }}
-    ttl: {{ online_ttl | default('7d') }}
+  name: {{ entity_name | default('customer') }}
+  join_keys: {{ join_keys | default(['customer_id']) | tojson }}
 inputs:
-  - ref: source.raw_data
+  - ref: transform.customer_360
 transform: |
   SELECT
-    id,
-    COUNT(*) as event_count,
-    AVG(value) as avg_value
-  FROM source_table
-  GROUP BY id
+    customer_id,
+    total_orders AS frequency,
+    total_spend AS monetary,
+    avg_order_value,
+    CAST(CURRENT_DATE - last_order_date AS INTEGER) AS recency_days
+  FROM ref('transform.customer_360')
 features:
-  event_count:
-    description: "Total events"
+  frequency:
+    description: "Total number of orders"
     dtype: int
-  avg_value:
-    description: "Average value"
+  monetary:
+    description: "Total spend amount"
     dtype: float
-tests:
-  - not_null: {{ join_keys | default(['id']) }}
-  - unique: {{ join_keys | default(['id']) }}
+  avg_order_value:
+    description: "Average order value"
+    dtype: float
+  recency_days:
+    description: "Days since last order"
+    dtype: int

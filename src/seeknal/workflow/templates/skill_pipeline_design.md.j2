@@ -1,0 +1,247 @@
+# Design Data Pipeline (Interactive Brainstorm)
+
+Guide the user through designing a data pipeline before building it.
+Ask ONE question at a time. Wait for the user's response before proceeding to the next question.
+
+## When to Use
+
+Use this workflow in **chat mode** when the user asks to build, create, or design a data pipeline.
+Do NOT use in one-shot mode — auto-proceed with the standard build workflow instead.
+
+## Phase 1: Data Scope
+
+### Step 1.1: Profile Data
+
+Call `profile_data()` to discover all data files, schemas, and join keys.
+Present a summary:
+
+```
+I found N data files in your project:
+
+| File | Rows | Columns | Key Fields |
+|------|------|---------|------------|
+| customers.csv | 200 | 8 | customer_id, segment, city |
+| orders.csv | 2,000 | 9 | order_id, customer_id, product_id |
+| ... | ... | ... | ... |
+
+Detected join keys: customer_id (customers ↔ orders), product_id (orders ↔ products)
+```
+
+### Step 1.2: Ask — Data Sources
+
+**Question:** "Which data files should be included in this pipeline?"
+
+Options:
+1. **All of them** (recommended) — include every CSV as a source
+2. **Let me choose** — user specifies which files to include
+3. **I have additional data** — user wants to add files not yet in data/
+
+Wait for user response. Store the selected files.
+
+### Step 1.3: Ask — Key Entities
+
+**Question:** "What are the key business entities in your data?"
+
+Present auto-detected entities from join keys:
+- customer (via customer_id in customers.csv, orders.csv)
+- product (via product_id in orders.csv, products.csv)
+- order (via order_id in orders.csv)
+
+Options:
+1. **These look right** — proceed with detected entities
+2. **Add/modify entities** — user types custom entity names
+3. **I'm not sure** — explain what entities are and help identify them
+
+Wait for user response. Store the confirmed entities.
+
+## Phase 2: Pipeline Architecture
+
+### Step 2.1: Ask — Pipeline Type
+
+**Question:** "What kind of pipeline do you want to build?"
+
+Options:
+1. **Analytics** — sources → transforms → business metrics and dashboards
+2. **ML Pipeline** — sources → feature engineering → model training and predictions
+3. **Full Stack** — analytics + ML + reporting (recommended for comprehensive projects)
+4. **Custom** — describe what you need
+
+Wait for user response. Store the pipeline type.
+
+### Step 2.2: Ask — Silver Layer Transforms
+
+Based on join keys and entities, suggest silver-layer transforms:
+
+**Question:** "I recommend these silver-layer transforms. Add, remove, or modify?"
+
+Suggestions (auto-generated based on data):
+- `enriched_orders` — orders JOIN customers JOIN products (via customer_id, product_id)
+- `customer_360` — per-customer aggregations (total orders, total spend, avg order value, last order date)
+- [other suggestions based on detected join keys]
+
+Options:
+1. **These look good** — proceed with suggestions
+2. **Add more transforms** — user describes additional transforms
+3. **Remove some** — user specifies which to skip
+4. **Let me describe what I need** — free text
+
+Wait for user response. Store the confirmed transforms.
+
+### Step 2.3: Ask — Gold Layer Metrics
+
+**Question:** "What business metrics should the gold layer produce?"
+
+Suggestions based on pipeline type:
+- `revenue_by_segment` — revenue and order count per customer segment
+- `product_performance` — sales, revenue, and rankings per product
+- `monthly_trends` — monthly revenue, order count, and growth trends
+- `channel_attribution` — performance by acquisition channel (if channel data exists)
+
+Options:
+1. **These are good** — proceed with suggestions
+2. **Add custom metrics** — user describes additional metrics
+3. **Skip gold layer** — only need silver transforms
+4. **I have specific KPIs** — user describes exact business metrics
+
+Wait for user response. Store the confirmed gold metrics.
+
+## Phase 3: ML & Features (if ML selected in Phase 2)
+
+### Step 3.1: Ask — ML Approach
+
+**Question:** "What ML approach fits your use case?"
+
+Options:
+1. **Clustering** (KMeans) — segment customers or products into groups
+2. **Classification** — predict binary outcomes (churn, conversion, fraud)
+3. **Regression** — predict continuous values (revenue, lifetime value)
+4. **Skip ML for now** — build analytics only, add ML later
+
+Wait for user response. Store the ML approach.
+
+### Step 3.2: Ask — Feature Engineering
+
+**Question:** "What features should we engineer for the model?"
+
+Suggestions (auto-generated based on entities and data):
+- **Recency** — days since last order/activity
+- **Frequency** — total number of orders/transactions
+- **Monetary** — total spend amount
+- **Avg Order Value** — average transaction size
+- **Engagement Score** — event counts, session duration (if behavioral data exists)
+
+Options:
+1. **Use all suggested features** (recommended)
+2. **Select specific features** — user picks from the list
+3. **Add custom features** — user describes additional features
+4. **Let the model decide** — include all numeric columns as features
+
+Wait for user response. Store the confirmed features.
+
+### Step 3.3: Ask — Feature Store
+
+**Question:** "Should we use the feature store pattern?"
+
+Options:
+1. **Yes, create a feature_group** (recommended) — organized feature management with entity keys
+2. **No, use a transform** — simpler, features as a regular SQL transform
+3. **What's the difference?** — explain feature store benefits
+
+Wait for user response. Store the feature store choice.
+
+## Phase 4: Confirm & Build
+
+### Step 4.1: Present Complete DAG
+
+Compile all decisions into a DAG design:
+
+```
+Pipeline Design for {{ project_name }}:
+
+Bronze (Sources):
+  source.customers (200 rows)
+  source.orders (2,000 rows)
+  source.products (20 rows)
+
+Silver (Transforms):
+  transform.enriched_orders = orders JOIN customers JOIN products
+  transform.customer_360 = per-customer aggregations
+
+Gold (Business Metrics):
+  transform.revenue_by_segment
+  transform.product_performance
+  transform.monthly_trends
+
+ML Layer:
+  feature_group.customer_features (RFM features from customer_360)
+  model.customer_segments (KMeans clustering)
+
+Total: 10 nodes, 9 edges
+```
+
+### Step 4.2: Ask — Confirmation
+
+**Question:** "Ready to build this pipeline?"
+
+Options:
+1. **Yes, build it** — proceed to create all nodes, run pipeline, show results
+2. **Modify** — tell me what to change (loops back to relevant phase)
+3. **Cancel** — abort pipeline design
+
+Wait for user response.
+
+- If **yes**: proceed to Phase 5
+- If **modify**: ask what to change, adjust design, re-present DAG
+- If **cancel**: stop and acknowledge
+
+## Phase 5: Build & Deploy
+
+### Step 5.1: Build All Nodes
+
+For each node in topological order (sources first, then silver, gold, ML):
+1. `draft_node` — create from template
+2. `edit_file` or `edit_node` — write real config/SQL
+3. `dry_run_draft` — validate
+4. `apply_draft(confirmed=True)` — apply to project
+
+### Step 5.2: Verify DAG
+
+Call `plan_pipeline()` and verify:
+- Node count matches design
+- Edges are correct
+- No parse errors
+
+### Step 5.3: Run Pipeline
+
+Call `run_pipeline(confirmed=True, full=True)` — this runs in dev by default.
+
+### Step 5.4: Inspect Results
+
+Call `inspect_output(node_name)` on at least 3 key nodes:
+- One silver node (e.g., enriched_orders)
+- One gold node (e.g., revenue_by_segment)
+- The ML output (if applicable)
+
+Show real data rows to the user.
+
+### Step 5.5: Ask — Promote to Production
+
+**Question:** "Pipeline ran successfully in dev. What would you like to do?"
+
+Options:
+1. **Promote to production** — run with production environment settings
+2. **Iterate** — modify nodes and re-run in dev
+3. **Done** — keep in dev, promote later manually with `seeknal env apply --env prod`
+
+Wait for user response.
+
+## Common Patterns
+
+### Analytics-Only Pipeline
+Bronze → Silver (joins) → Gold (metrics) → Report (Evidence.dev)
+
+### ML Pipeline
+Bronze → Silver (joins + aggregations) → Feature Group (RFM) → Python Model (KMeans/Classification)
+
+### Full Stack
+Bronze → Silver → Gold → ML → Report (combining analytics + predictions)

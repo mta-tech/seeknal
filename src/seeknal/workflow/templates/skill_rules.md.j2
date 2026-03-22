@@ -1,0 +1,118 @@
+# Seeknal Data Quality Rules & Profiling
+
+Add data quality validation and statistical profiling to your pipeline.
+
+## When to Use
+
+Use this skill when asked to validate data quality, add assertions, check freshness, or profile data.
+
+## Rules (Data Quality Checks)
+
+### 1. Draft a Rule
+
+```bash
+seeknal draft rule <name>
+```
+
+```yaml
+kind: rule
+name: orders_quality
+inputs:
+  - ref: source.orders
+rules:
+  - type: not_null
+    columns: [order_id, customer_id, amount]
+  - type: unique
+    columns: [order_id]
+  - type: accepted_values
+    column: status
+    values: [pending, completed, cancelled, refunded]
+  - type: range
+    column: amount
+    min: 0
+    max: 1000000
+  - type: freshness
+    column: created_at
+    warn_after: 24h
+    error_after: 48h
+  - type: sql
+    name: positive_totals
+    assertion: |
+      SELECT COUNT(*) = 0
+      FROM input_0
+      WHERE total_amount < 0
+```
+
+### 2. Rule Types
+
+| Type | Purpose | Required Fields |
+|------|---------|----------------|
+| `not_null` | Columns must not contain NULL | `columns` |
+| `unique` | Column values must be unique | `columns` |
+| `accepted_values` | Column must contain only listed values | `column`, `values` |
+| `range` | Numeric column within bounds | `column`, `min` and/or `max` |
+| `freshness` | Most recent row must be within threshold | `column`, `warn_after` |
+| `sql` | Custom SQL assertion (must return true) | `name`, `assertion` |
+| `row_count` | Table must have min/max rows | `min` and/or `max` |
+| `referential_integrity` | Foreign key must exist in parent | `column`, `parent_ref`, `parent_column` |
+
+### 3. Validate & Apply
+
+```bash
+seeknal dry-run draft_rule_<name>.yml
+seeknal apply draft_rule_<name>.yml
+seeknal run     # Rules execute after their input nodes
+```
+
+## Profiles (Statistical Profiling)
+
+### 1. Draft a Profile
+
+```bash
+seeknal draft profile <name>
+```
+
+```yaml
+kind: profile
+name: customer_profile
+inputs:
+  - ref: source.customers
+columns:
+  - name: age
+    metrics: [min, max, mean, median, stddev, null_count, null_pct]
+  - name: email
+    metrics: [unique_count, null_count, most_common]
+  - name: created_at
+    metrics: [min, max, null_count]
+```
+
+### 2. Available Profile Metrics
+
+14+ built-in metrics per column:
+- **Numeric**: min, max, mean, median, stddev, variance, percentile_25, percentile_75
+- **Categorical**: unique_count, most_common, least_common
+- **General**: null_count, null_pct, row_count, data_type
+
+### 3. Validate & Apply
+
+```bash
+seeknal dry-run draft_profile_<name>.yml
+seeknal apply draft_profile_<name>.yml
+seeknal run
+seeknal inspect profile.customer_profile   # View profiling results
+```
+
+## Pipeline Integration
+
+Rules and profiles run automatically as part of `seeknal run`. They execute after the nodes they depend on.
+
+```bash
+seeknal plan   # Rules and profiles appear in DAG after their inputs
+```
+
+## Common Mistakes
+
+- **SQL assertion returns wrong type**: SQL rules must return a boolean (true/false) or count = 0
+- **Freshness on non-timestamp column**: `freshness` rule requires a timestamp/date column
+- **Rule on missing input**: Ensure the `ref:` input node exists before applying the rule
+- **Trailing semicolons in SQL assertions**: DuckDB rejects them — omit the `;`

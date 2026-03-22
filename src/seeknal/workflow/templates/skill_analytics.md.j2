@@ -1,0 +1,140 @@
+# Build Seeknal Analytics Layer
+
+Create semantic models, metrics, and exposures for analytics and reporting.
+
+## When to Use
+
+Use this skill when asked to create business metrics, dashboards, reports, semantic layers, or KPI definitions.
+
+## Workflow
+
+### 1. Semantic Model (Dimensions + Measures)
+
+```bash
+seeknal draft semantic_model <name>
+```
+
+```yaml
+kind: semantic_model
+name: sales_model
+inputs:
+  - ref: transform.daily_sales
+dimensions:
+  - name: region
+    type: categorical
+    column: region
+    description: "Sales region"
+  - name: sale_date
+    type: time
+    column: sale_date
+    description: "Date of sale"
+measures:
+  - name: total_revenue
+    type: sum
+    column: revenue
+    description: "Sum of revenue"
+  - name: order_count
+    type: count
+    column: order_id
+    description: "Number of orders"
+  - name: avg_order_value
+    type: average
+    column: revenue
+    description: "Average order value"
+```
+
+### 2. Metrics (KPIs, Ratios, Cumulative)
+
+```bash
+seeknal draft metric <name>
+```
+
+**Simple metric:**
+```yaml
+kind: metric
+name: monthly_revenue
+type: simple
+inputs:
+  - ref: semantic_model.sales_model
+measure: total_revenue
+time_dimension: sale_date
+time_grains: [day, week, month]
+filters:
+  - "region IS NOT NULL"
+```
+
+**Derived metric (ratio):**
+```yaml
+kind: metric
+name: revenue_per_order
+type: derived
+inputs:
+  - ref: metric.monthly_revenue
+  - ref: metric.order_count
+expression: "monthly_revenue / NULLIF(order_count, 0)"
+```
+
+**Cumulative metric:**
+```yaml
+kind: metric
+name: cumulative_revenue
+type: cumulative
+inputs:
+  - ref: semantic_model.sales_model
+measure: total_revenue
+time_dimension: sale_date
+window: 90d
+```
+
+### 3. Exposures (Reports + Dashboards)
+
+```bash
+seeknal draft exposure <name>
+```
+
+```yaml
+kind: exposure
+name: sales_dashboard
+type: dashboard
+owner:
+  name: Analytics Team
+  email: analytics@company.com
+description: "Weekly sales performance dashboard"
+depends_on:
+  - ref: metric.monthly_revenue
+  - ref: metric.revenue_per_order
+  - ref: transform.daily_sales
+url: "https://dashboards.company.com/sales"
+maturity: production
+```
+
+### 4. Validate & Apply
+
+```bash
+seeknal dry-run draft_semantic_model_<name>.yml
+seeknal apply draft_semantic_model_<name>.yml
+
+seeknal dry-run draft_metric_<name>.yml
+seeknal apply draft_metric_<name>.yml
+
+seeknal dry-run draft_exposure_<name>.yml
+seeknal apply draft_exposure_<name>.yml
+
+seeknal plan    # Verify analytics layer in DAG
+seeknal run
+```
+
+## Dependency Order
+
+Build analytics nodes in this order:
+1. **Sources/Transforms** — raw and cleaned data
+2. **Semantic Models** — dimensions and measures on top of transforms
+3. **Metrics** — KPIs computed from semantic model measures
+4. **Exposures** — dashboards and reports consuming metrics
+
+## Common Mistakes
+
+- **Metric without semantic model**: Simple metrics need a `semantic_model.*` input with the referenced measure
+- **Circular metric refs**: Derived metrics cannot reference themselves
+- **Missing time dimension**: Cumulative and time-grain metrics require `time_dimension`
+- **Exposure without depends_on**: Always list what the exposure consumes for lineage tracking
