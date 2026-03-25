@@ -62,24 +62,30 @@ def _profile_all(data_dir: Path) -> str:
         except Exception as e:
             lines.append(f"**{csv_path.name}** — Error: {e}\n")
 
-    # Suggest join keys
+    # Suggest join keys with type mismatch detection
     lines.append("---\n**Potential join keys** (columns appearing in 2+ files):\n")
-    col_map: dict[str, list[str]] = {}
+    col_type_map: dict[str, list[tuple[str, str]]] = {}  # col -> [(file, type), ...]
     for csv_path in csvs:
         try:
             safe_path = str(csv_path.resolve()).replace("'", "''")
             cols = con.execute(
                 f"DESCRIBE SELECT * FROM read_csv_auto('{safe_path}')"
             ).fetchall()
-            for col_name, *_ in cols:
-                col_map.setdefault(col_name, []).append(csv_path.name)
+            for col_name, col_type, *_ in cols:
+                col_type_map.setdefault(col_name, []).append((csv_path.name, col_type))
         except Exception:
             pass
 
-    shared = {k: v for k, v in col_map.items() if len(v) > 1}
+    shared = {k: v for k, v in col_type_map.items() if len(v) > 1}
     if shared:
-        for col, files in sorted(shared.items()):
-            lines.append(f"  - `{col}` → {', '.join(files)}")
+        for col, file_types in sorted(shared.items()):
+            files = [f for f, _ in file_types]
+            types = set(t for _, t in file_types)
+            line = f"  - `{col}` → {', '.join(files)}"
+            if len(types) > 1:
+                type_detail = ", ".join(f"{f}: {t}" for f, t in file_types)
+                line += f" ⚠️ TYPE MISMATCH: {type_detail}"
+            lines.append(line)
     else:
         lines.append("  (none detected)")
 

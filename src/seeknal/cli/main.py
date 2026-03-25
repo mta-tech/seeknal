@@ -4161,6 +4161,7 @@ def apply(
             "source": "sources",
             "transform": "transforms",
             "feature_group": "feature_groups",
+            "model": "models",
             "second_order_aggregation": "second_order_aggregations",
         }
         target_dir_name = kind_dir_map.get(node_kind, "pipelines")

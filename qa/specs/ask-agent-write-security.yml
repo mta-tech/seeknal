@@ -1,0 +1,251 @@
+name: ask-agent-write-security
+description: >
+  Security-focused tests for the Ask agent write tools. Validates that
+  _write_security.py blocks path traversal, protects sensitive files
+  (.env, profiles.yml, seeknal_project.yml), restricts writes to WRITABLE_DIRS
+  allowlist, and enforces draft filename patterns. No pipeline needed.
+source_type: csv
+
+infrastructure:
+  requires: []
+
+seed_data: {}
+
+pipeline:
+  bronze: []
+  silver: []
+  gold: []
+
+validation:
+  dag:
+    expected_nodes: 0
+  execution:
+    success: true
+
+report_exposure_tests:
+
+  # ==========================================================
+  # Test 1: validate_write_path blocks .env
+  # ==========================================================
+  test_block_env_write:
+    action: call_function
+    module: seeknal.ask.agents.tools._write_security
+    function: validate_write_path
+    args:
+      path: ".env"
+      project_path: "{project_path}"
+    validate:
+      - raises: ValueError
+      - error_contains: "protected"
+
+  # ==========================================================
+  # Test 2: validate_write_path blocks profiles.yml
+  # ==========================================================
+  test_block_profiles_write:
+    action: call_function
+    module: seeknal.ask.agents.tools._write_security
+    function: validate_write_path
+    args:
+      path: "profiles.yml"
+      project_path: "{project_path}"
+    validate:
+      - raises: ValueError
+      - error_contains: "protected"
+
+  # ==========================================================
+  # Test 3: validate_write_path blocks seeknal_project.yml
+  # ==========================================================
+  test_block_project_yml_write:
+    action: call_function
+    module: seeknal.ask.agents.tools._write_security
+    function: validate_write_path
+    args:
+      path: "seeknal_project.yml"
+      project_path: "{project_path}"
+    validate:
+      - raises: ValueError
+      - error_contains: "protected"
+
+  # ==========================================================
+  # Test 4: validate_write_path blocks target/ directory
+  # ==========================================================
+  test_block_target_write:
+    action: call_function
+    module: seeknal.ask.agents.tools._write_security
+    function: validate_write_path
+    args:
+      path: "target/intermediate/evil.parquet"
+      project_path: "{project_path}"
+    validate:
+      - raises: ValueError
+      - error_contains: "not allowed"
+
+  # ==========================================================
+  # Test 5: validate_write_path blocks .git/ directory
+  # ==========================================================
+  test_block_git_write:
+    action: call_function
+    module: seeknal.ask.agents.tools._write_security
+    function: validate_write_path
+    args:
+      path: ".git/config"
+      project_path: "{project_path}"
+    validate:
+      - raises: ValueError
+      - error_contains: "not allowed"
+
+  # ==========================================================
+  # Test 6: validate_write_path allows seeknal/ directory
+  # ==========================================================
+  test_allow_seeknal_write:
+    action: call_function
+    module: seeknal.ask.agents.tools._write_security
+    function: validate_write_path
+    args:
+      path: "seeknal/sources/test.yml"
+      project_path: "{project_path}"
+    validate:
+      - no_error: true
+
+  # ==========================================================
+  # Test 7: validate_write_path allows data/ directory
+  # ==========================================================
+  test_allow_data_write:
+    action: call_function
+    module: seeknal.ask.agents.tools._write_security
+    function: validate_write_path
+    args:
+      path: "data/test.csv"
+      project_path: "{project_path}"
+    validate:
+      - no_error: true
+
+  # ==========================================================
+  # Test 8: validate_write_path allows draft file at root
+  # ==========================================================
+  test_allow_draft_at_root:
+    action: call_function
+    module: seeknal.ask.agents.tools._write_security
+    function: validate_write_path
+    args:
+      path: "draft_source_test.yml"
+      project_path: "{project_path}"
+    validate:
+      - no_error: true
+
+  # ==========================================================
+  # Test 9: validate_write_path blocks non-draft at root
+  # ==========================================================
+  test_block_non_draft_at_root:
+    action: call_function
+    module: seeknal.ask.agents.tools._write_security
+    function: validate_write_path
+    args:
+      path: "random_file.txt"
+      project_path: "{project_path}"
+    validate:
+      - raises: ValueError
+      - error_contains: "draft"
+
+  # ==========================================================
+  # Test 10: validate_draft_path accepts valid draft
+  # ==========================================================
+  test_valid_draft_path:
+    action: call_function
+    module: seeknal.ask.agents.tools._write_security
+    function: validate_draft_path
+    args:
+      path: "draft_source_customers.yml"
+      project_path: "{project_path}"
+    validate:
+      - no_error: true
+
+  # ==========================================================
+  # Test 11: validate_draft_path rejects non-draft filename
+  # ==========================================================
+  test_invalid_draft_filename:
+    action: call_function
+    module: seeknal.ask.agents.tools._write_security
+    function: validate_draft_path
+    args:
+      path: "not_a_draft.yml"
+      project_path: "{project_path}"
+    validate:
+      - raises: ValueError
+      - error_contains: "Invalid draft filename"
+
+  # ==========================================================
+  # Test 12: validate_draft_path rejects wrong extension
+  # ==========================================================
+  test_invalid_draft_extension:
+    action: call_function
+    module: seeknal.ask.agents.tools._write_security
+    function: validate_draft_path
+    args:
+      path: "draft_source_test.json"
+      project_path: "{project_path}"
+    validate:
+      - raises: ValueError
+      - error_contains: "Invalid draft filename"
+
+  # ==========================================================
+  # Test 13: path traversal in write path (../../../etc/passwd)
+  # ==========================================================
+  test_path_traversal_write:
+    action: call_function
+    module: seeknal.ask.agents.tools._write_security
+    function: validate_write_path
+    args:
+      path: "../../../etc/passwd"
+      project_path: "{project_path}"
+    validate:
+      - raises: ValueError
+
+  # ==========================================================
+  # Test 14: edit_node blocks writing to protected files
+  # ==========================================================
+  test_edit_node_blocks_env:
+    action: call_function
+    module: seeknal.ask.agents.tools.edit_node
+    function: edit_node
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      node_path: ".env"
+      new_content: "EVIL=true"
+      confirmed: false
+    validate:
+      - result_contains: "protected"
+
+  # ==========================================================
+  # Test 15: dry_run_draft rejects non-draft filename
+  # ==========================================================
+  test_dry_run_rejects_non_draft:
+    action: call_function
+    module: seeknal.ask.agents.tools.dry_run_draft
+    function: dry_run_draft
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      file_path: "profiles.yml"
+    validate:
+      - result_contains: "Invalid draft filename"
+
+features_tested:
+  - block_env_write
+  - block_profiles_write
+  - block_project_yml_write
+  - block_target_dir_write
+  - block_git_dir_write
+  - allow_seeknal_dir_write
+  - allow_data_dir_write
+  - allow_draft_at_root
+  - block_non_draft_at_root
+  - valid_draft_path
+  - invalid_draft_filename
+  - invalid_draft_extension
+  - path_traversal_prevention
+  - edit_node_protected_file
+  - dry_run_non_draft_rejection

@@ -1065,7 +1065,8 @@ class SourceExecutor(BaseExecutor):
 
             # Register as DuckDB table then create view
             con.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
-            con.register(f"_sr_temp_{view_name}", df)
+            from seeknal.utils.dataframe import coerce_string_dtype
+            con.register(f"_sr_temp_{view_name}", coerce_string_dtype(df))
             con.execute(
                 f"CREATE OR REPLACE VIEW {schema}.{view_name} AS SELECT * FROM _sr_temp_{view_name}"
             )

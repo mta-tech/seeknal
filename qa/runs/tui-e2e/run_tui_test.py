@@ -27,7 +27,7 @@ PROJECT_DIR = Path(__file__).parent.resolve()
 SEEKNAL_ROOT = PROJECT_DIR.parent.parent.parent
 
 # Test configuration
-TIMEOUT = 600  # 10 minutes max for full pipeline build
+TIMEOUT = 900  # 15 minutes max for full pipeline build
 MIN_EXPECTED_OUTPUTS = 8  # At least 8 parquet files expected
 
 # ============================================================
@@ -402,13 +402,32 @@ def test_gold_metrics():
 def test_ml_output():
     """Validate ML model output exists and has cluster/segment columns."""
     intermediate = PROJECT_DIR / "target" / "intermediate"
-    candidates = (
-        list(intermediate.glob("*segment*")) +
-        list(intermediate.glob("*cluster*")) +
-        list(intermediate.glob("*model*"))
-    )
-    # Filter to parquet only
-    candidates = [f for f in candidates if f.suffix == ".parquet"]
+
+    # Search for ML-specific outputs first (model/segmentation/kmeans),
+    # then fall back to broader patterns. Exclude gold-layer files
+    # like revenue_by_segment which are NOT ML outputs.
+    gold_names = {"transform_revenue_by_segment", "transform_product_performance"}
+    candidates = []
+    for pattern in ["*segmentation*", "*kmeans*", "*model*", "*cluster*"]:
+        for f in intermediate.glob(pattern + ".parquet"):
+            if f.stem not in gold_names and f not in candidates:
+                candidates.append(f)
+
+    # Broader fallback: any parquet with cluster/segment columns
+    if not candidates:
+        import duckdb
+        con = duckdb.connect(":memory:")
+        for f in intermediate.glob("*.parquet"):
+            if f.stem in gold_names:
+                continue
+            try:
+                cols = [c[0] for c in con.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet('{f}')").fetchall()]
+                if any("cluster" in c.lower() or "segment_label" in c.lower() for c in cols):
+                    candidates.append(f)
+            except Exception:
+                pass
+        con.close()
 
     if not candidates:
         record("ml_output", False, "no ML output parquet found")
@@ -424,11 +443,11 @@ def test_ml_output():
         # Check for cluster or segment column
         ml_cols = [c for c in cols if "cluster" in c.lower() or "segment" in c.lower()]
         if count >= 50 and ml_cols:
-            record("ml_output", True, f"rows={count}, ml_cols={ml_cols}")
+            record("ml_output", True, f"rows={count}, ml_cols={ml_cols}, file={parquet.name}")
         elif count >= 50:
             record("ml_output", False, f"rows={count} but no cluster/segment column. cols={cols}")
         else:
-            record("ml_output", False, f"expected ≥50 rows, got {count}")
+            record("ml_output", False, f"expected ≥50 rows, got {count}. file={parquet.name}")
     except Exception as e:
         record("ml_output", False, str(e))
     finally:

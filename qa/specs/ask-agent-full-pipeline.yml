@@ -1,0 +1,403 @@
+name: ask-agent-full-pipeline
+description: >
+  Full end-to-end test: the Ask agent builds a complete CSV medallion pipeline
+  entirely through write tools (draft_node → edit content → dry_run_draft →
+  apply_draft → plan_pipeline → run_pipeline). Validates that a coding agent
+  can create sources, transforms, run the pipeline, and inspect results —
+  the core use case of the agent developer skills feature.
+source_type: csv
+
+infrastructure:
+  requires: []
+
+seed_data:
+  products.csv: |
+    product_id,product_name,category,price,stock
+    P001,Widget A,electronics,29.99,150
+    P002,Widget B,electronics,49.99,80
+    P003,Gadget X,accessories,14.99,300
+    P004,Gadget Y,accessories,24.99,120
+    P005,Tool Z,hardware,99.99,45
+    P006,Widget C,electronics,39.99,200
+    P007,Gadget W,accessories,9.99,500
+    P008,Tool Q,hardware,149.99,25
+  sales.csv: |
+    sale_id,product_id,customer_name,quantity,sale_date
+    S001,P001,Alice,2,2026-01-05
+    S002,P003,Bob,5,2026-01-08
+    S003,P002,Alice,1,2026-01-10
+    S004,P005,Charlie,1,2026-01-12
+    S005,P001,Bob,3,2026-01-15
+    S006,P004,Diana,2,2026-01-18
+    S007,P006,Alice,1,2026-01-20
+    S008,P003,Charlie,10,2026-01-22
+    S009,P007,Eve,4,2026-01-25
+    S010,P008,Bob,1,2026-01-28
+
+# Pipeline is built entirely by agent tools — not pre-defined
+pipeline:
+  bronze: []
+  silver: []
+  gold: []
+
+validation:
+  dag:
+    expected_nodes: 0  # Validated after agent builds pipeline
+  execution:
+    success: true
+
+# --- Full Pipeline Build E2E ---
+# Simulates an agent building a complete pipeline from scratch.
+# Steps: draft → write content → dry-run → apply → for each node → plan → run → inspect
+report_exposure_tests:
+
+  # ============================================================
+  # STEP 1: Create source for products.csv
+  # ============================================================
+  test_create_source_products:
+    action: call_function
+    module: seeknal.ask.agents.tools.draft_node
+    function: draft_node
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      node_type: "source"
+      name: "products"
+    validate:
+      - result_contains: "Created draft"
+      - file_exists: "draft_source_products.yml"
+
+  # ============================================================
+  # STEP 2: Overwrite draft with real source config
+  # ============================================================
+  test_write_source_products:
+    action: write_file
+    depends_on: test_create_source_products
+    path: "draft_source_products.yml"
+    content: |
+      kind: source
+      name: products
+      source: csv
+      table: "data/products.csv"
+      description: Product catalog
+      columns:
+        product_id: "Product identifier"
+        product_name: "Product name"
+        category: "Product category"
+        price: "Unit price"
+        stock: "Current stock"
+    validate:
+      - file_exists: "draft_source_products.yml"
+
+  # ============================================================
+  # STEP 3: Dry-run products source
+  # ============================================================
+  test_dryrun_source_products:
+    action: run_command
+    depends_on: test_write_source_products
+    command: "cd {project_path} && uv run seeknal dry-run draft_source_products.yml"
+    validate:
+      - exit_code: 0
+
+  # ============================================================
+  # STEP 4: Apply products source
+  # ============================================================
+  test_apply_source_products:
+    action: run_command
+    depends_on: test_dryrun_source_products
+    command: "cd {project_path} && uv run seeknal apply draft_source_products.yml"
+    validate:
+      - exit_code: 0
+      - file_exists: "seeknal/sources/products.yml"
+
+  # ============================================================
+  # STEP 5: Create source for sales.csv
+  # ============================================================
+  test_create_source_sales:
+    action: call_function
+    depends_on: test_apply_source_products
+    module: seeknal.ask.agents.tools.draft_node
+    function: draft_node
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      node_type: "source"
+      name: "sales"
+    validate:
+      - result_contains: "Created draft"
+      - file_exists: "draft_source_sales.yml"
+
+  # ============================================================
+  # STEP 6: Overwrite draft with real sales source config
+  # ============================================================
+  test_write_source_sales:
+    action: write_file
+    depends_on: test_create_source_sales
+    path: "draft_source_sales.yml"
+    content: |
+      kind: source
+      name: sales
+      source: csv
+      table: "data/sales.csv"
+      description: Sales transactions
+      columns:
+        sale_id: "Sale identifier"
+        product_id: "Product reference"
+        customer_name: "Customer name"
+        quantity: "Quantity sold"
+        sale_date: "Date of sale"
+    validate:
+      - file_exists: "draft_source_sales.yml"
+
+  # ============================================================
+  # STEP 7: Dry-run and apply sales source
+  # ============================================================
+  test_apply_source_sales:
+    action: run_command
+    depends_on: test_write_source_sales
+    command: "cd {project_path} && uv run seeknal dry-run draft_source_sales.yml && uv run seeknal apply draft_source_sales.yml"
+    validate:
+      - exit_code: 0
+      - file_exists: "seeknal/sources/sales.yml"
+
+  # ============================================================
+  # STEP 8: Create transform — sales enriched with product data
+  # ============================================================
+  test_create_transform:
+    action: call_function
+    depends_on: test_apply_source_sales
+    module: seeknal.ask.agents.tools.draft_node
+    function: draft_node
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      node_type: "transform"
+      name: "sales_enriched"
+    validate:
+      - result_contains: "Created draft"
+      - file_exists: "draft_transform_sales_enriched.yml"
+
+  # ============================================================
+  # STEP 9: Write real transform SQL
+  # ============================================================
+  test_write_transform:
+    action: write_file
+    depends_on: test_create_transform
+    path: "draft_transform_sales_enriched.yml"
+    content: |
+      kind: transform
+      name: sales_enriched
+      description: Sales enriched with product details and revenue
+      inputs:
+        - ref: source.sales
+        - ref: source.products
+      transform: |
+        SELECT
+          s.sale_id,
+          s.customer_name,
+          s.quantity,
+          CAST(s.sale_date AS DATE) AS sale_date,
+          p.product_name,
+          p.category,
+          CAST(p.price AS DECIMAL(10,2)) AS unit_price,
+          CAST(s.quantity * p.price AS DECIMAL(10,2)) AS revenue
+        FROM ref('source.sales') s
+        JOIN ref('source.products') p
+          ON s.product_id = p.product_id
+    validate:
+      - file_exists: "draft_transform_sales_enriched.yml"
+
+  # ============================================================
+  # STEP 10: Dry-run and apply transform
+  # ============================================================
+  test_apply_transform:
+    action: run_command
+    depends_on: test_write_transform
+    command: "cd {project_path} && uv run seeknal dry-run draft_transform_sales_enriched.yml && uv run seeknal apply draft_transform_sales_enriched.yml"
+    validate:
+      - exit_code: 0
+      - file_exists: "seeknal/transforms/sales_enriched.yml"
+
+  # ============================================================
+  # STEP 11: Create gold transform — revenue by category
+  # ============================================================
+  test_create_gold_transform:
+    action: call_function
+    depends_on: test_apply_transform
+    module: seeknal.ask.agents.tools.draft_node
+    function: draft_node
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      node_type: "transform"
+      name: "revenue_by_category"
+    validate:
+      - result_contains: "Created draft"
+
+  # ============================================================
+  # STEP 12: Write gold transform SQL
+  # ============================================================
+  test_write_gold_transform:
+    action: write_file
+    depends_on: test_create_gold_transform
+    path: "draft_transform_revenue_by_category.yml"
+    content: |
+      kind: transform
+      name: revenue_by_category
+      description: Total revenue and orders aggregated by product category
+      inputs:
+        - ref: transform.sales_enriched
+      transform: |
+        SELECT
+          category,
+          CAST(COUNT(*) AS BIGINT) AS total_orders,
+          CAST(SUM(revenue) AS DECIMAL(10,2)) AS total_revenue,
+          CAST(AVG(revenue) AS DECIMAL(10,2)) AS avg_order_revenue,
+          CAST(SUM(quantity) AS BIGINT) AS total_units_sold
+        FROM ref('transform.sales_enriched')
+        GROUP BY category
+    validate:
+      - file_exists: "draft_transform_revenue_by_category.yml"
+
+  # ============================================================
+  # STEP 13: Dry-run and apply gold transform
+  # ============================================================
+  test_apply_gold:
+    action: run_command
+    depends_on: test_write_gold_transform
+    command: "cd {project_path} && uv run seeknal dry-run draft_transform_revenue_by_category.yml && uv run seeknal apply draft_transform_revenue_by_category.yml"
+    validate:
+      - exit_code: 0
+      - file_exists: "seeknal/transforms/revenue_by_category.yml"
+
+  # ============================================================
+  # STEP 14: Verify DAG with seeknal plan
+  # ============================================================
+  test_verify_dag:
+    action: run_command
+    depends_on: test_apply_gold
+    command: "cd {project_path} && uv run seeknal plan"
+    validate:
+      - exit_code: 0
+      - output_contains: "source.products"
+      - output_contains: "source.sales"
+      - output_contains: "transform.sales_enriched"
+      - output_contains: "transform.revenue_by_category"
+
+  # ============================================================
+  # STEP 15: Run the full pipeline
+  # ============================================================
+  test_run_pipeline:
+    action: run_command
+    depends_on: test_verify_dag
+    command: "cd {project_path} && uv run seeknal run --full"
+    timeout: 120
+    validate:
+      - exit_code: 0
+
+  # ============================================================
+  # STEP 16: Validate output row counts
+  # ============================================================
+  test_validate_outputs:
+    action: run_command
+    depends_on: test_run_pipeline
+    command: |
+      cd {project_path} && uv run python -c "
+      import duckdb, glob, sys
+      con = duckdb.connect(':memory:')
+
+      # Check sales_enriched has 10 rows (all sales joined with products)
+      enriched = glob.glob('target/intermediate/transform/sales_enriched/*.parquet')
+      if not enriched:
+          print('FAIL: No sales_enriched parquet found')
+          sys.exit(1)
+      count = con.execute(f\"SELECT COUNT(*) FROM '{enriched[0]}'\").fetchone()[0]
+      print(f'sales_enriched: {count} rows')
+      assert count == 10, f'Expected 10, got {count}'
+
+      # Check revenue_by_category has 3 rows (electronics, accessories, hardware)
+      gold = glob.glob('target/intermediate/transform/revenue_by_category/*.parquet')
+      if not gold:
+          print('FAIL: No revenue_by_category parquet found')
+          sys.exit(1)
+      count = con.execute(f\"SELECT COUNT(*) FROM '{gold[0]}'\").fetchone()[0]
+      print(f'revenue_by_category: {count} rows')
+      assert count == 3, f'Expected 3, got {count}'
+
+      # Verify data correctness: check total revenue
+      total = con.execute(f\"SELECT CAST(SUM(total_revenue) AS DECIMAL(10,2)) FROM '{gold[0]}'\").fetchone()[0]
+      print(f'total_revenue: {total}')
+      assert float(total) > 0, 'Total revenue must be positive'
+
+      print('ALL VALIDATIONS PASSED')
+      "
+    validate:
+      - exit_code: 0
+      - output_contains: "ALL VALIDATIONS PASSED"
+
+  # ============================================================
+  # STEP 17: Verify seeknal inspect works
+  # ============================================================
+  test_inspect_output:
+    action: run_command
+    depends_on: test_run_pipeline
+    command: "cd {project_path} && uv run seeknal inspect transform.revenue_by_category"
+    validate:
+      - exit_code: 0
+      - output_contains: "category"
+
+  # ============================================================
+  # STEP 18: Test edit_node — modify existing transform
+  # ============================================================
+  test_edit_existing_node:
+    action: call_function
+    depends_on: test_run_pipeline
+    module: seeknal.ask.agents.tools.edit_node
+    function: edit_node
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      node_path: "seeknal/transforms/revenue_by_category.yml"
+      new_content: |
+        kind: transform
+        name: revenue_by_category
+        description: Revenue by category with customer count
+        inputs:
+          - ref: transform.sales_enriched
+        transform: |
+          SELECT
+            category,
+            CAST(COUNT(*) AS BIGINT) AS total_orders,
+            CAST(SUM(revenue) AS DECIMAL(10,2)) AS total_revenue,
+            CAST(AVG(revenue) AS DECIMAL(10,2)) AS avg_order_revenue,
+            CAST(SUM(quantity) AS BIGINT) AS total_units_sold,
+            CAST(COUNT(DISTINCT customer_name) AS BIGINT) AS unique_customers
+          FROM ref('transform.sales_enriched')
+          GROUP BY category
+      confirmed: false
+    validate:
+      - result_contains: "diff"
+      - result_contains: "unique_customers"
+      - result_contains: "confirmed=True"
+
+features_tested:
+  - agent_draft_source_csv
+  - agent_draft_transform
+  - agent_write_custom_content
+  - agent_dry_run_validation
+  - agent_apply_to_project
+  - agent_plan_verification
+  - agent_run_pipeline
+  - agent_inspect_output
+  - agent_edit_existing_node
+  - agent_full_pipeline_lifecycle
+  - named_ref_syntax
+  - multi_source_join
+  - aggregation_transform
+  - output_row_count_validation
+  - data_correctness_check
