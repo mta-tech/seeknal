@@ -33,6 +33,27 @@ src/seeknal/
 │   │   └── materializer.py # Iceberg/PostgreSQL materialization
 │   ├── runner.py         # DAGRunner with consolidation phase
 │   └── executors/        # Node executors
+├── ask/                   # AI-powered agent (seeknal ask)
+│   ├── agents/
+│   │   ├── agent.py      # Agent harness with Ralph Loop
+│   │   ├── profiles.py   # Tool profiles (analysis/build/full)
+│   │   ├── providers.py  # LLM provider abstraction (Gemini/Ollama)
+│   │   ├── prompt_builder.py # Jinja2 template composition
+│   │   └── tools/        # 21+ agent tools
+│   │       ├── profile_data.py    # CSV discovery
+│   │       ├── draft_node.py      # Pipeline node drafting
+│   │       ├── dry_run_draft.py   # Validation with ref/input consistency
+│   │       ├── apply_draft.py     # Draft → project structure
+│   │       ├── inspect_output.py  # Parquet querying with fuzzy matching
+│   │       ├── run_pipeline.py    # Pipeline execution
+│   │       └── _write_security.py # Write path validation
+│   ├── prompts/           # Modular Jinja2 templates
+│   │   ├── core.j2       # Base agent behavior
+│   │   ├── build.j2      # Pipeline build workflow
+│   │   ├── report.j2     # Report generation
+│   │   └── safety.j2     # DuckDB rules, security, mandatory behaviors
+│   ├── streaming.py      # Progressive rendering with Rich Console
+│   └── config.py         # Per-project config (seeknal_agent.yml)
 ├── flow.py               # Data pipeline (Flow) orchestration
 ├── entity.py             # Entity definitions (join keys)
 ├── project.py            # Project management
@@ -47,6 +68,14 @@ docs/                      # Comprehensive documentation
 ├── api/                  # API reference docs
 ├── examples/             # Usage examples
 └── getting-started-comprehensive.md
+
+qa/                        # QA test suite
+├── specs/                # YAML spec definitions (20 specs)
+└── runs/                 # E2E test runners
+    ├── tui-e2e/          # Full pipeline build E2E (11 tests)
+    ├── analytics-clv-rfm/ # CLV/CAC/RFM analytics (14 tests)
+    ├── ml-feature-engineering/ # ML pipeline (15 tests)
+    └── multi-source-joins/    # Complex joins (13 tests)
 
 tests/                     # pytest test suite
 ├── cli/                  # CLI command tests
@@ -385,6 +414,55 @@ def _auto_register_project(self) -> None:
 - Mock database operations
 - E2E tests in `tests/e2e/`
 - CLI tests use `typer.testing.CliRunner`
+
+## Ask Agent Architecture (Mar 2026)
+
+### Modular Prompt Architecture
+The agent prompt is built from Jinja2 templates in `src/seeknal/ask/prompts/`:
+- `core.j2` — Base agent behavior, intent detection, workflow rules
+- `build.j2` — Pipeline building workflow, YAML/Python node templates, SQL patterns
+- `report.j2` — Evidence.dev report generation, chart components
+- `safety.j2` — Mandatory behaviors, DuckDB SQL rules, security constraints
+
+Templates are composed by `PromptBuilder` based on the active tool profile.
+
+### Tool Profiles
+Three profiles in `src/seeknal/ask/agents/profiles.py`:
+- **analysis** (10 tools): list_tables, describe_table, execute_sql, execute_python, etc.
+- **build** (17 tools): analysis + draft_node, edit_file, dry_run_draft, apply_draft, run_pipeline, etc.
+- **full** (21+ tools): all tools
+
+Auto-detected from question keywords, overridable via `seeknal_agent.yml`.
+
+### Ralph Loop (One-Shot Build Enforcement)
+In `src/seeknal/ask/agents/agent.py` and `streaming.py`:
+- Detects BUILD requests from keywords ("build", "pipeline", "create")
+- Rejects text-only responses when build tools weren't called
+- Post-profile stall detection: if agent only called `profile_data`/`list_tables`, sends stronger nudge
+- Fast sync fallback: after 1 failed nudge, switches from streaming to sync mode
+- Inspect enforcement: nudges agent to call `inspect_output()` after `run_pipeline()`
+
+### Build Validation
+- `dry_run_draft` runs `seeknal dry-run` subprocess + YAML ref/input consistency check
+- `inspect_output` fuzzy matches node names with `transform_`, `source_`, `feature_group_`, `model_` prefixes
+- Write security blocks writes outside `draft_*.{yml,py}` files
+
+### Key Constants (`agent.py`)
+```python
+_MAX_RALPH_RETRIES = 3
+_BUILD_KEYWORDS = {"build", "pipeline", "bronze", "silver", "gold"}
+_BUILD_TOOL_NAMES = {"draft_node", "apply_draft", "edit_node", "edit_file",
+                     "dry_run_draft", "run_pipeline", "plan_pipeline"}
+```
+
+### QA Test Suite (53 tests, 4 E2E runs)
+Located in `qa/runs/`. Each test:
+1. Cleans project, generates test CSV data with DuckDB
+2. Runs `seeknal ask` via subprocess with a natural language prompt
+3. Validates file outputs (sources, transforms, no remaining drafts)
+4. Validates data quality (row counts, NULL checks, column existence, value ranges)
+
+Run all tests: `uv run python qa/runs/{test}/run_*.py`
 
 ## Recent Major Features (Jan 2026)
 

@@ -733,6 +733,166 @@ def info():
     typer.echo(f"DuckDB version: {duckdb.__version__}")
 
 
+def _generate_agent_docs(project_path: Path, project_name: str) -> None:
+    """Generate CLAUDE.md and AGENTS.md for coding agents."""
+    from jinja2 import Environment, FileSystemLoader
+
+    # Discover connections from profiles.yml (keys only, not values)
+    connections = []
+    profiles_path = project_path / "profiles.yml"
+    if profiles_path.exists():
+        try:
+            import yaml
+            with open(profiles_path) as f:
+                profiles = yaml.safe_load(f) or {}
+            conns = profiles.get("connections", {})
+            if isinstance(conns, dict):
+                connections = [k for k in conns.keys() if not k.startswith("#")]
+        except Exception:
+            pass
+
+    # Load Jinja2 templates from package
+    template_dir = Path(__file__).parent.parent / "workflow" / "templates"
+    env = Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+
+    context = {
+        "project_name": project_name,
+        "connections": connections,
+    }
+
+    # Generate CLAUDE.md
+    claude_md = project_path / "CLAUDE.md"
+    if not claude_md.exists():
+        template = env.get_template("claude_md.j2")
+        claude_md.write_text(template.render(**context))
+        typer.echo("  Created: CLAUDE.md (agent conventions)")
+    else:
+        typer.echo("  Skipped: CLAUDE.md (already exists)")
+
+    # Generate AGENTS.md
+    agents_md = project_path / "AGENTS.md"
+    if not agents_md.exists():
+        template = env.get_template("agents_md.j2")
+        agents_md.write_text(template.render(**context))
+        typer.echo("  Created: AGENTS.md (agent safety rules)")
+    else:
+        typer.echo("  Skipped: AGENTS.md (already exists)")
+
+
+def _generate_agent_docs_force(project_path: Path, project_name: str) -> None:
+    """Regenerate CLAUDE.md and AGENTS.md, overwriting existing files."""
+    from jinja2 import Environment, FileSystemLoader
+
+    connections = []
+    profiles_path = project_path / "profiles.yml"
+    if profiles_path.exists():
+        try:
+            import yaml
+            with open(profiles_path) as f:
+                profiles = yaml.safe_load(f) or {}
+            conns = profiles.get("connections", {})
+            if isinstance(conns, dict):
+                connections = [k for k in conns.keys() if not k.startswith("#")]
+        except Exception:
+            pass
+
+    template_dir = Path(__file__).parent.parent / "workflow" / "templates"
+    env = Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+
+    context = {"project_name": project_name, "connections": connections}
+
+    for filename, template_name, label in [
+        ("CLAUDE.md", "claude_md.j2", "agent conventions"),
+        ("AGENTS.md", "agents_md.j2", "agent safety rules"),
+    ]:
+        template = env.get_template(template_name)
+        (project_path / filename).write_text(template.render(**context))
+        typer.echo(f"  Regenerated: {filename} ({label})")
+
+
+def _generate_skills_force(project_path: Path, project_name: str) -> None:
+    """Regenerate Claude Code skills, overwriting existing files."""
+    from jinja2 import Environment, FileSystemLoader
+
+    template_dir = Path(__file__).parent.parent / "workflow" / "templates"
+    env = Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+
+    context = {"project_name": project_name}
+    skills = [
+        "pipeline", "pipeline_design", "feature_group", "model",
+        "analytics", "rules", "deploy",
+        "init", "debug",
+    ]
+
+    generated = 0
+    for skill_name in skills:
+        template_file = f"skill_{skill_name}.md.j2"
+        try:
+            template = env.get_template(template_file)
+        except Exception:
+            continue
+
+        skill_dir = project_path / ".claude" / "skills" / f"seeknal-{skill_name.replace('_', '-')}"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text(template.render(**context))
+        generated += 1
+
+    if generated > 0:
+        typer.echo(f"  Regenerated: .claude/skills/ ({generated} skills)")
+
+
+def _generate_skills(project_path: Path, project_name: str) -> None:
+    """Generate Claude Code skills in .claude/skills/."""
+    from jinja2 import Environment, FileSystemLoader
+
+    template_dir = Path(__file__).parent.parent / "workflow" / "templates"
+    env = Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+
+    context = {"project_name": project_name}
+
+    skills = [
+        "pipeline", "pipeline_design", "feature_group", "model",
+        "analytics", "rules", "deploy",
+        "init", "debug",
+    ]
+
+    generated = 0
+    for skill_name in skills:
+        template_file = f"skill_{skill_name}.md.j2"
+        try:
+            template = env.get_template(template_file)
+        except Exception:
+            continue  # Template not yet created
+
+        skill_dir = project_path / ".claude" / "skills" / f"seeknal-{skill_name.replace('_', '-')}"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_file = skill_dir / "SKILL.md"
+
+        if not skill_file.exists():
+            skill_file.write_text(template.render(**context))
+            generated += 1
+
+    if generated > 0:
+        typer.echo(f"  Created: .claude/skills/ ({generated} skills)")
+
+
 @app.command()
 def init(
     name: str = typer.Option(
@@ -887,6 +1047,12 @@ __pycache__/
 """
         (project_path / ".gitignore").write_text(gitignore_content)
         typer.echo(f"  Created: .gitignore")
+
+        # Generate CLAUDE.md and AGENTS.md for coding agents
+        _generate_agent_docs(project_path, name)
+
+        # Generate Claude Code skills
+        _generate_skills(project_path, name)
 
         # Also create the legacy Project for database compatibility
         from seeknal.project import Project
@@ -3995,6 +4161,7 @@ def apply(
             "source": "sources",
             "transform": "transforms",
             "feature_group": "feature_groups",
+            "model": "models",
             "second_order_aggregation": "second_order_aggregations",
         }
         target_dir_name = kind_dir_map.get(node_kind, "pipelines")

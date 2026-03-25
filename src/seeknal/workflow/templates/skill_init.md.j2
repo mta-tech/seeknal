@@ -1,0 +1,104 @@
+# Initialize & Set Up Seeknal Projects
+
+Set up new seeknal projects and configure the development environment.
+
+## When to Use
+
+Use this skill when asked to create a new seeknal project, set up connections, or configure the workspace.
+
+## Create a New Project
+
+```bash
+# Initialize in current directory
+seeknal init --name my_project
+
+# This creates:
+# ├── seeknal_project.yml    # Project config
+# ├── profiles.yml           # Connection credentials (gitignored)
+# ├── .gitignore             # Pre-configured ignores
+# ├── CLAUDE.md              # Agent conventions (auto-generated)
+# ├── AGENTS.md              # Agent safety rules (auto-generated)
+# ├── .claude/skills/        # Claude Code skills (auto-generated)
+# └── seeknal/
+#     ├── sources/
+#     ├── transforms/
+#     ├── feature_groups/
+#     ├── models/
+#     └── common/
+```
+
+## Configure Connections
+
+Edit `profiles.yml` (never commit this file):
+
+```yaml
+# PostgreSQL
+local_pg:
+  type: postgresql
+  host: localhost
+  port: 5432
+  database: mydb
+  user: myuser
+  password: mypass
+
+# Iceberg (via Lakekeeper)
+iceberg_catalog:
+  type: iceberg
+  catalog_url: http://localhost:8181
+  warehouse: my-warehouse
+```
+
+## Project Configuration
+
+Edit `seeknal_project.yml`:
+
+```yaml
+name: my_project
+version: "1.0"
+profile: default
+
+# Source defaults (applied to all sources of matching type)
+source_defaults:
+  postgresql:
+    connection: local_pg
+```
+
+## Add Data Files
+
+Place CSV, Parquet, or JSONL files in a `data/` directory:
+
+```bash
+mkdir -p data
+cp customers.csv data/
+```
+
+Then create a source pointing to it:
+
+```bash
+seeknal draft source customers
+# Edit: set source: csv, table: "data/customers.csv"
+seeknal dry-run draft_source_customers.yml
+seeknal apply draft_source_customers.yml
+```
+
+## Verify Setup
+
+```bash
+seeknal plan                    # Should show empty DAG (no nodes yet)
+seeknal repl                    # Interactive SQL shell (verifies DuckDB works)
+```
+
+## Regenerate Agent Docs
+
+If CLAUDE.md or AGENTS.md are outdated:
+
+```bash
+seeknal docs regenerate         # Refresh from current project state
+```
+
+## Common Mistakes
+
+- **Running commands outside project root**: `seeknal` commands must run from the directory containing `seeknal_project.yml`
+- **Missing profiles.yml**: Connection-based sources will fail without credentials
+- **Wrong profile key name**: Use canonical type names (`postgresql` not `postgres`) in `source_defaults:`
+- **Committing secrets**: Ensure `profiles.yml` and `.env` are in `.gitignore`

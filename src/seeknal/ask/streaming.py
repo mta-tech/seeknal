@@ -5,6 +5,7 @@ visibility: reasoning panels, tool calls, SQL queries, result tables,
 and the final answer -- all rendered via Rich Console.
 """
 
+import asyncio
 import re
 from typing import Any, Optional
 
@@ -13,6 +14,8 @@ from rich.console import Console
 from rich.markup import escape
 
 from seeknal.ask.agents.agent import (
+    _BUILD_KEYWORDS,
+    _BUILD_TOOL_NAMES,
     _MAX_RALPH_RETRIES,
     _NO_RESPONSE,
     _normalize_content,
@@ -190,10 +193,12 @@ def _show_answer(console: Console, text: str) -> None:
     console.print(Panel(Markdown(text.strip()), title="Answer", border_style="green"))
 
 
-def _show_retry(console: Console, attempt: int, max_retries: int) -> None:
+def _show_retry(console: Console, attempt: int, max_retries: int,
+                is_build: bool = False) -> None:
     """Display retry separator for Ralph Loop."""
+    label = "Nudging agent to continue building" if is_build else "Requesting summary"
     console.print(
-        f"\n[dim]--- Requesting summary (attempt {attempt}/{max_retries})... ---[/dim]\n"
+        f"\n[dim]--- {label} (attempt {attempt}/{max_retries})... ---[/dim]\n"
     )
 
 
@@ -204,13 +209,20 @@ def _show_retry(console: Console, attempt: int, max_retries: int) -> None:
 
 async def _stream_one_pass(
     agent: Any, config: dict, question: str, console: Console
-) -> str:
+) -> tuple[str, bool, set]:
     """Run a single astream_events pass and render events progressively.
 
-    Returns the final answer text, or empty string if no answer was produced.
+    Returns:
+        A tuple of (answer_text, had_tool_calls, tool_names_called).
+        answer_text is empty string if no answer was produced.
+        had_tool_calls indicates whether any tools were invoked.
+        tool_names_called is the set of tool names that were called.
     """
     text_buffer: list[str] = []
     accumulated = ""  # Cached join to avoid O(n^2) re-joining
+    last_ai_text = ""  # Fallback: capture from on_chat_model_end
+    had_tool_calls = False
+    tool_names_called: set[str] = set()
 
     async for event in agent.astream_events(
         {"messages": [HumanMessage(content=question)]},
@@ -241,6 +253,18 @@ async def _stream_one_pass(
                 text_buffer.append(token)
                 accumulated += token
 
+        elif kind == "on_chat_model_end":
+            # Fallback: capture the final AI message content.
+            # This fires when the LLM finishes a generation pass.
+            # Gemini sometimes delivers the full answer here without
+            # streaming individual tokens via on_chat_model_stream.
+            output = event.get("data", {}).get("output")
+            if output is not None:
+                content = getattr(output, "content", "")
+                text = _normalize_content(content)
+                if text:
+                    last_ai_text = text
+
         elif kind == "on_tool_start":
             # Flush text buffer as reasoning (if any text accumulated)
             if text_buffer:
@@ -248,7 +272,9 @@ async def _stream_one_pass(
                 text_buffer.clear()
                 accumulated = ""
 
+            had_tool_calls = True
             name = event.get("name", "unknown")
+            tool_names_called.add(name)
             args = event.get("data", {}).get("input", {})
             _show_tool_start(console, name, args)
 
@@ -263,9 +289,15 @@ async def _stream_one_pass(
     # Stream ended -- flush remaining buffer as answer
     if text_buffer:
         _show_answer(console, accumulated)
-        return accumulated
+        return accumulated, had_tool_calls, tool_names_called
 
-    return ""
+    # Fallback: if streaming didn't capture text but on_chat_model_end did,
+    # use the last AI text (common with Gemini after tool calls).
+    if last_ai_text:
+        _show_answer(console, last_ai_text)
+        return last_ai_text, had_tool_calls, tool_names_called
+
+    return "", had_tool_calls, tool_names_called
 
 
 async def stream_ask(
@@ -294,19 +326,110 @@ async def stream_ask(
         with console.status("[bold green]Thinking..."):
             return sync_ask(agent, config, question)
 
+    # Detect if this is a BUILD request (one-shot pipeline build)
+    question_lower = question.lower()
+    is_build_request = any(kw in question_lower for kw in _BUILD_KEYWORDS)
+
     # Streaming mode with progressive rendering
     current_question = question
     for attempt in range(_MAX_RALPH_RETRIES + 1):
         if attempt > 0:
-            _show_retry(console, attempt, _MAX_RALPH_RETRIES)
+            _show_retry(console, attempt, _MAX_RALPH_RETRIES, is_build=is_build_request)
+
+        answer, had_tool_calls, tools_called = await _stream_one_pass(
+            agent, config, current_question, console
+        )
+
+        if answer:
+            # Early-exit detection: if this is a BUILD request but the agent
+            # only profiled data without calling any build tools (draft_node,
+            # apply_draft, run_pipeline, etc.), don't accept the answer —
+            # nudge the agent to actually build the pipeline.
+            actually_built = bool(tools_called & _BUILD_TOOL_NAMES)
+            only_profiled = tools_called <= {"profile_data", "list_tables"}
+
+            if is_build_request and not actually_built and attempt < _MAX_RALPH_RETRIES:
+                console.print(
+                    "\n[dim]--- Agent returned text without building. "
+                    "Nudging to continue... ---[/dim]\n"
+                )
+                if only_profiled:
+                    # Fast-path: agent stalled after profiling — use stronger nudge
+                    current_question = (
+                        "You called profile_data but then stopped. In one-shot mode, "
+                        "you must keep going. Call draft_node for each source file now, "
+                        "then build transforms, then run. Do NOT output any text. "
+                        "Do NOT call list_tables or profile_data again — you already have the data profile."
+                    )
+                else:
+                    current_question = (
+                        "You described a pipeline design but did NOT build it. "
+                        "In one-shot BUILD mode you MUST call draft_node, apply_draft, "
+                        "and run_pipeline — not just describe the plan. "
+                        "Start building now: call draft_node for the first source node, "
+                        "then continue with all remaining nodes. Do NOT respond with "
+                        "text until the pipeline is built, run, and inspected. "
+                        "Do NOT call list_tables or profile_data again — you already have the data profile."
+                    )
+                continue
+
+            # Second check: pipeline ran but agent didn't inspect results
+            ran_pipeline = "run_pipeline" in tools_called
+            inspected = "inspect_output" in tools_called
+            if is_build_request and ran_pipeline and not inspected and attempt < _MAX_RALPH_RETRIES:
+                console.print(
+                    "\n[dim]--- Pipeline ran but no inspect_output. "
+                    "Nudging to show data... ---[/dim]\n"
+                )
+                current_question = (
+                    "The pipeline ran successfully but you did not call inspect_output() "
+                    "to show the actual data. Call inspect_output() on 2-3 key nodes "
+                    "to show real data rows, then provide your final summary."
+                )
+                continue
+
+            return answer
+
+        # Fast sync fallback: if we've nudged once and the agent still
+        # hasn't built anything, skip remaining streaming retries.
+        if attempt >= 1 and is_build_request and not bool(tools_called & _BUILD_TOOL_NAMES):
+            console.print(
+                "\n[dim]Agent not responding to nudges — switching to sync mode...[/dim]\n"
+            )
+            break  # Exit loop → falls through to sync fallback
+
+        # Adapt retry prompt based on what happened:
+        if had_tool_calls:
+            # Tools ran but LLM didn't produce text — nudge to continue building
+            if is_build_request:
+                current_question = (
+                    "You have not finished building the pipeline. "
+                    "Continue calling draft_node, apply_draft, and run_pipeline "
+                    "until the pipeline is built, run, and inspected. "
+                    "Do NOT provide a text summary — keep calling tools. "
+                    "Do NOT call list_tables or profile_data again — you already have the data profile."
+                )
+            else:
+                current_question = (
+                    "Please summarize your findings from the tool calls above "
+                    "and provide your analysis as a text response."
+                )
+        else:
+            # LLM returned empty with no tool calls — re-ask with guidance
             current_question = (
-                "Please summarize your findings from the tool calls above "
-                "and provide your analysis as a text response."
+                f"Start by using list_tables to discover available data, "
+                f"then answer: {question}"
             )
 
-        answer = await _stream_one_pass(agent, config, current_question, console)
-        if answer:
-            return answer
+    # Last resort: fall back to sync invoke which uses a different code path
+    # and may succeed where astream_events fails (common with Gemini).
+    from seeknal.ask.agents.agent import ask as sync_ask
+
+    console.print("\n[dim]Retrying with sync mode...[/dim]\n")
+    answer = await asyncio.to_thread(sync_ask, agent, config, question)
+    if answer and answer != _NO_RESPONSE:
+        _show_answer(console, answer)
+        return answer
 
     return _NO_RESPONSE
 

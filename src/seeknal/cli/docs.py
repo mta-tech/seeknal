@@ -517,6 +517,68 @@ def docs_command(
         raise typer.Exit(1)
 
 
+@docs_app.command("regenerate")
+def regenerate_command(
+    path: Optional[str] = typer.Option(
+        None, "--path", "-p", help="Path to seeknal project (defaults to current directory)"
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Overwrite existing files without prompting"
+    ),
+):
+    """Regenerate CLAUDE.md, AGENTS.md, and .claude/skills/ from current project state.
+
+    Re-renders agent documentation and skills using the latest project name,
+    connections from profiles.yml, and updated skill templates.
+
+    Examples:
+        seeknal docs regenerate
+        seeknal docs regenerate --force
+        seeknal docs regenerate --path /my/project
+    """
+    from pathlib import Path as P
+
+    project_path = P(path) if path else P.cwd()
+    project_yml = project_path / "seeknal_project.yml"
+
+    if not project_yml.exists():
+        _echo_error(f"No seeknal project found at {project_path}")
+        _echo_info("Run 'seeknal init' first to create a project.")
+        raise typer.Exit(1)
+
+    # Read project name
+    project_name = project_path.name
+    try:
+        import yaml
+        with open(project_yml) as f:
+            config = yaml.safe_load(f) or {}
+        project_name = config.get("name", project_name)
+    except Exception:
+        pass
+
+    # Check if files exist and prompt if not --force
+    existing = []
+    for f in ["CLAUDE.md", "AGENTS.md"]:
+        if (project_path / f).exists():
+            existing.append(f)
+    skills_dir = project_path / ".claude" / "skills"
+    if skills_dir.exists():
+        existing.append(".claude/skills/")
+
+    if existing and not force:
+        _echo_warning(f"Will overwrite: {', '.join(existing)}")
+        confirm = typer.confirm("Continue?", default=True)
+        if not confirm:
+            raise typer.Exit(0)
+
+    # Import and call the generation functions from main
+    from seeknal.cli.main import _generate_agent_docs_force, _generate_skills_force
+
+    _generate_agent_docs_force(project_path, project_name)
+    _generate_skills_force(project_path, project_name)
+    _echo_success("Agent docs and skills regenerated successfully")
+
+
 @docs_app.command("generate")
 def generate_command(
     project: Optional[str] = typer.Option(

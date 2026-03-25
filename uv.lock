@@ -3871,7 +3871,7 @@ wheels = [
 
 [[package]]
 name = "seeknal"
-version = "2.4.0"
+version = "2.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "croniter" },
@@ -3903,6 +3903,7 @@ dependencies = [
     { name = "sqlmodel" },
     { name = "tabulate" },
     { name = "tenacity" },
+    { name = "toml" },
     { name = "typer" },
 ]
 
@@ -3982,6 +3983,7 @@ requires-dist = [
     { name = "sqlmodel", specifier = ">=0.0.22" },
     { name = "tabulate", specifier = ">=0.9.0" },
     { name = "tenacity", specifier = ">=9.0.0" },
+    { name = "toml", specifier = ">=0.10.0" },
     { name = "typer", specifier = ">=0.13.1" },
 ]
 provides-extras = ["prefect", "ask", "dev", "all"]

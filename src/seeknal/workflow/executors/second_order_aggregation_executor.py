@@ -361,7 +361,8 @@ class SecondOrderAggregationExecutor(BaseExecutor):
 
         # Register result as a view for downstream nodes
         view_name = f"second_order_aggregation.{self.node.name}"
-        con.register(view_name, result_df)
+        from seeknal.utils.dataframe import coerce_string_dtype
+        con.register(view_name, coerce_string_dtype(result_df))
 
         # Save to node-specific output directory for materialization
         output_path = self.context.get_output_path(self.node)

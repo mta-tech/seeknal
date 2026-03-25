@@ -30,6 +30,7 @@ class ToolContext:
     artifact_discovery: ArtifactDiscovery
     project_path: Path
     db_lock: threading.Lock = field(default_factory=threading.Lock)
+    fs_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 def set_tool_context(ctx: ToolContext) -> None:

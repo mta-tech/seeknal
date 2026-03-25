@@ -1,6 +1,6 @@
 # Seeknal Ask: AI-Powered Data Analysis Agent
 
-> **Estimated Time:** 15 minutes | **Difficulty:** Intermediate
+> **Estimated Time:** 20 minutes | **Difficulty:** Intermediate
 >
 > **Prerequisites:** A seeknal project with data materialized (`seeknal run` has been executed). Install with `pip install seeknal[ask]`.
 
@@ -11,16 +11,17 @@
 By completing this tutorial, you will:
 
 1. Ask **one-shot questions** about your data in natural language
-2. Use **interactive chat** for multi-turn exploratory analysis
-3. Understand the **12 built-in tools** the agent uses automatically
-4. Configure **LLM providers** (Google Gemini, Ollama)
-5. Generate **interactive HTML reports** and **deterministic report exposures**
+2. **Build complete pipelines** from natural language descriptions
+3. Use **interactive chat** for multi-turn exploratory analysis
+4. Understand the **21+ built-in tools** the agent uses automatically
+5. Configure **LLM providers** (Google Gemini, Ollama)
+6. Generate **interactive HTML reports** and **deterministic report exposures**
 
 ---
 
 ## Overview
 
-`seeknal ask` is an AI-powered agent that understands your seeknal project — tables, entities, pipelines, and code. You ask questions in plain English, and the agent discovers data, writes SQL, runs analysis, and explains results.
+`seeknal ask` is an AI-powered agent that understands your seeknal project — tables, entities, pipelines, and code. You ask questions in plain English, and the agent discovers data, writes SQL, runs analysis, builds pipelines, and explains results.
 
 ```
 You: "What are the top 5 customers by revenue?"
@@ -37,6 +38,10 @@ Customer C0041 leads with $4,523.80 in total spend across 6 orders...
 ```
 
 The agent works by chaining tools together. It decides which tools to call, interprets results, retries on errors, and provides actionable insights — not just raw numbers.
+
+The agent operates in two primary modes:
+- **Analysis mode** — Read-only queries and exploration (default for "analyze", "show", "query" keywords)
+- **Build mode** — Creates complete data pipelines from natural language (activated by "build", "pipeline", "create" keywords)
 
 ---
 
@@ -89,7 +94,63 @@ seeknal ask -q "Total revenue last quarter"
 
 ---
 
-## Part 2: Interactive Chat (3 minutes)
+## Part 2: Building Pipelines (5 minutes)
+
+The agent can build complete data pipelines from a natural language description. Describe what you want — sources, transforms, feature groups, ML models — and the agent handles everything.
+
+```bash
+seeknal ask "Build a pipeline from CSV files in data/. \
+  Bronze: all CSVs as sources. \
+  Silver: enriched_orders (orders JOIN customers with revenue). \
+  Gold: revenue_by_segment, product_performance. \
+  ML: customer_features (RFM), KMeans segmentation model."
+```
+
+### What happens behind the scenes
+
+The agent follows a strict build workflow:
+
+```
+1. profile_data()        → discover CSV files, columns, types, join keys
+2. draft_node()          → create draft YAML for each node
+3. edit_file()           → write real SQL/config into the draft
+4. dry_run_draft()       → validate syntax, schema, ref/input consistency
+5. apply_draft()         → move to seeknal/ project structure
+6. (repeat 2-5 for each node in topological order)
+7. plan_pipeline()       → verify DAG structure
+8. run_pipeline()        → execute the full pipeline
+9. inspect_output()      → show real data from key nodes
+```
+
+### Build validation
+
+The agent validates every non-source node before applying:
+
+- **YAML syntax** — valid YAML structure
+- **Schema validation** — correct `kind`, required fields
+- **SQL correctness** — DuckDB can parse and preview the query
+- **ref/input consistency** — every `ref()` in SQL is declared in the `inputs:` list
+
+If validation fails, the agent fixes the issue and re-validates before proceeding.
+
+### Node types
+
+| Type | Description | Example |
+|------|-------------|---------|
+| `source` | Raw data ingestion (CSV, Parquet) | `source: csv`, `table: "data/orders.csv"` |
+| `transform` | SQL transformation with `ref()` dependencies | JOINs, aggregations, CTEs |
+| `feature_group` | ML feature store entity | Uses `FROM source` (not `ref()`) |
+| `model` | Python ML model (scikit-learn) | KMeans, RandomForest, predict_proba |
+
+### Inspecting results
+
+After the pipeline runs, the agent calls `inspect_output()` to show actual data rows — not conceptual descriptions. The tool supports fuzzy name matching, so `inspect_output("enriched_orders")` finds `transform_enriched_orders.parquet` automatically.
+
+---
+
+## Part 3: Interactive Chat (3 minutes)
+
+> *Analysis and build are also available in chat mode — the agent detects intent from each message.*
 
 For exploratory analysis where one question leads to the next, use chat mode:
 
@@ -127,9 +188,9 @@ seeknal ask chat --project ./my-project
 
 ---
 
-## Part 3: The Agent's Toolbox (5 minutes)
+## Part 4: The Agent's Toolbox (5 minutes)
 
-The agent has 12 tools it calls automatically based on your question. You never call these directly — the agent decides when and how to use them.
+The agent has 21+ tools organized into three profiles. Tools are loaded based on your question — the agent decides when and how to use them.
 
 ### Data Discovery
 
@@ -139,6 +200,7 @@ The agent has 12 tools it calls automatically based on your question. You never 
 | `describe_table` | Shows columns, types, row count, and sample values for a table |
 | `get_entities` | Lists all entities defined in the project |
 | `get_entity_schema` | Shows the schema for a specific entity |
+| `profile_data` | Discovers CSV files with row counts, column types, and join key candidates |
 
 ### Data Analysis
 
@@ -146,6 +208,19 @@ The agent has 12 tools it calls automatically based on your question. You never 
 |------|-------------|
 | `execute_sql` | Runs read-only DuckDB SQL queries (with auto-retry on errors) |
 | `execute_python` | Runs Python code in a sandboxed subprocess with `pandas`, `numpy`, `scipy`, and `matplotlib` pre-loaded |
+| `inspect_output` | Queries pipeline output parquets directly with fuzzy name matching |
+
+### Pipeline Building
+
+| Tool | What It Does |
+|------|-------------|
+| `draft_node` | Creates a draft YAML/Python template for a pipeline node |
+| `edit_file` | Edits a draft file with string replacement (shows diff preview) |
+| `edit_node` | Replaces entire node content |
+| `dry_run_draft` | Validates YAML syntax, schema, SQL, and ref/input consistency |
+| `apply_draft` | Moves validated draft to `seeknal/` project structure |
+| `plan_pipeline` | Shows DAG node count and dependency edges |
+| `run_pipeline` | Executes the pipeline (requires confirmation) |
 
 ### Project Understanding
 
@@ -165,7 +240,7 @@ The agent has 12 tools it calls automatically based on your question. You never 
 
 ### How tools chain together
 
-For a question like "What's the revenue trend by month?", the agent typically:
+For an **analysis** question like "What's the revenue trend by month?":
 
 ```
 1. list_tables          → discovers available tables
@@ -174,7 +249,20 @@ For a question like "What's the revenue trend by month?", the agent typically:
 4. (interprets)         → provides insight, not just numbers
 ```
 
-For statistical questions, the agent adds Python:
+For a **build** request like "Build a pipeline from CSV files":
+
+```
+1. profile_data         → discovers files, columns, types
+2. draft_node           → creates source/transform templates
+3. edit_file            → writes SQL/config
+4. dry_run_draft        → validates before applying
+5. apply_draft          → moves to project structure
+6. plan_pipeline        → verifies DAG
+7. run_pipeline         → executes everything
+8. inspect_output       → shows real data rows
+```
+
+For **statistical** questions, the agent adds Python:
 
 ```
 1. execute_sql          → pulls raw data
@@ -184,7 +272,7 @@ For statistical questions, the agent adds Python:
 
 ---
 
-## Part 4: LLM Providers (2 minutes)
+## Part 5: LLM Providers (2 minutes)
 
 Seeknal Ask supports two LLM providers:
 
@@ -227,7 +315,7 @@ seeknal ask --provider ollama --model llama3 "Revenue by month"
 
 ---
 
-## Part 5: Report Generation (2 minutes)
+## Part 6: Report Generation (2 minutes)
 
 Beyond one-shot questions, the agent can create full interactive reports.
 
@@ -266,8 +354,11 @@ seeknal ask report serve my-report
 ## Quick Reference
 
 ```bash
-# One-shot question
+# One-shot analysis
 seeknal ask "your question here"
+
+# One-shot pipeline build
+seeknal ask "Build a pipeline from CSV files in data/..."
 
 # Interactive chat
 seeknal ask chat

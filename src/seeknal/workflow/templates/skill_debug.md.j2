@@ -1,0 +1,140 @@
+# Debug Seeknal Pipelines
+
+Troubleshoot and diagnose issues in seeknal data pipelines.
+
+## When to Use
+
+Use this skill when a pipeline fails, produces unexpected results, or needs investigation.
+
+## Diagnostic Commands
+
+```bash
+# Check DAG structure and execution order
+seeknal plan
+
+# Preview node output without running
+seeknal inspect transform.my_node
+
+# View full lineage
+seeknal lineage --ascii
+seeknal lineage transform.my_node --ascii
+
+# Column-level lineage
+seeknal lineage transform.my_node --column my_column
+
+# Compare current vs last run
+seeknal diff
+
+# Interactive SQL on intermediate results
+seeknal repl
+```
+
+## Common Error Patterns
+
+### 1. SQL Execution Error
+
+**Symptom**: `seeknal run` fails with DuckDB SQL error
+
+**Diagnose**:
+```bash
+seeknal dry-run seeknal/transforms/my_transform.yml   # Validates SQL
+seeknal inspect source.my_source                       # Check input data
+```
+
+**Common causes**:
+- Trailing semicolons in SQL (DuckDB rejects them)
+- String used in timestamp arithmetic without CAST: use `CAST('2024-01-01' AS TIMESTAMP)`
+- Missing GROUP BY columns
+- Column name mismatch (check with `seeknal inspect`)
+
+### 2. Unresolved Reference
+
+**Symptom**: `Unresolved reference: source.X`
+
+**Diagnose**:
+```bash
+seeknal plan                    # List all registered nodes
+ls seeknal/sources/             # Check source files exist
+```
+
+**Fix**: Create the missing upstream node first, then apply the dependent node.
+
+### 3. Empty Output
+
+**Symptom**: Node runs but produces 0 rows
+
+**Diagnose**:
+```bash
+seeknal inspect source.my_source        # Check input has data
+seeknal repl
+# Then: SELECT COUNT(*) FROM source__my_source
+```
+
+**Common causes**:
+- Filter too restrictive in WHERE clause
+- JOIN key mismatch between tables
+- Date range excludes all data
+
+### 4. Materialization Failure
+
+**Symptom**: Pipeline runs but external target not updated
+
+**Diagnose**:
+```bash
+# Check connection
+seeknal repl
+# Then: SELECT 1 FROM pg_catalog.pg_tables  (for PostgreSQL)
+```
+
+**Common causes**:
+- Connection name mismatch between YAML and profiles.yml
+- PostgreSQL permission denied (check user grants)
+- Iceberg HUGEINT error: use `CAST(COUNT(*) AS BIGINT)`
+
+### 5. Stale Data / Cache Issues
+
+**Symptom**: Changes not reflected in output
+
+**Fix**:
+```bash
+seeknal run --full              # Ignore cache, re-run everything
+```
+
+### 6. Node Type Error
+
+**Symptom**: `Unknown node type`
+
+**Fix**: Check the `kind:` field in your YAML. Valid types:
+`source`, `transform`, `feature_group`, `model`, `aggregation`, `rule`, `profile`, `exposure`, `semantic_model`, `metric`
+
+## REPL Debugging
+
+The REPL auto-registers intermediate parquets as tables:
+
+```bash
+seeknal repl
+```
+
+```sql
+-- List available tables
+SHOW TABLES;
+
+-- Inspect a node's output
+SELECT * FROM transform__daily_revenue LIMIT 10;
+
+-- Check row counts
+SELECT COUNT(*) FROM source__customers;
+
+-- Compare two nodes
+SELECT a.id, a.value, b.value
+FROM transform__v1 a
+FULL OUTER JOIN transform__v2 b ON a.id = b.id
+WHERE a.value != b.value;
+```
+
+## When to Escalate
+
+If these steps don't resolve the issue:
+1. Check `target/intermediate/` for parquet files — if missing, the node never ran
+2. Check `target/manifest.json` — if the node isn't listed, run `seeknal parse` to rebuild
+3. Run with verbose output: `seeknal run --verbose` (if available)

@@ -26,6 +26,13 @@ class ArtifactDiscovery:
         self._intermediates_cache: Optional[list[str]] = None
         self._pipelines_cache: Optional[list[dict]] = None
 
+    def refresh(self) -> None:
+        """Clear all cached data so the next access re-discovers artifacts."""
+        self._entities_cache = None
+        self._dag_cache = None
+        self._intermediates_cache = None
+        self._pipelines_cache = None
+
     def get_context_for_prompt(self) -> str:
         """Build a complete context string for the LLM system prompt.
 
