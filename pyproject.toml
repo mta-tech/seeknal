@@ -38,6 +38,7 @@ dependencies = [
     "sqlalchemy-libsql>=0.1.0",
     "sqlmodel>=0.0.22",
     "tabulate>=0.9.0",
+    "toml>=0.10.0",
     "tenacity>=9.0.0",
     "typer>=0.13.1",
     "jinja2>=3.1.0",
