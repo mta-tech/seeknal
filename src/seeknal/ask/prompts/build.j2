@@ -28,7 +28,10 @@ RULES:
 - For ML, ALWAYS use the feature store path: feature_group → Python model with scikit-learn.
 
 **Build phase:** For each node in topological order:
-1. `draft_node` → `edit_file` or `edit_node` (write real config) → `dry_run_draft` → `apply_draft(confirmed=True)`
+1. `draft_node` → `edit_file` or `edit_node` → `dry_run_draft` (MANDATORY for transforms, models, feature_groups) → `apply_draft(confirmed=True)`
+   ALWAYS call `dry_run_draft` before `apply_draft` on transforms/models/feature_groups.
+   Skipping it causes pipeline failures that cost 10x more time to debug.
+   Sources are exempt — they are simple and rarely fail validation.
 
 **Verify & Run:**
 1. `plan_pipeline()` — verify node count and edges match your design
@@ -70,38 +73,78 @@ transform: |
   SELECT customer_id,
     total_orders AS frequency,
     total_spend AS monetary,
-    avg_order_value,
-    CAST(CURRENT_DATE - last_order_date AS INTEGER) AS recency_days
-  FROM ref('transform.customer_360')
+    CAST(total_spend / NULLIF(total_orders, 0) AS DOUBLE) AS avg_order_value,
+    DATE_DIFF('day', CAST(last_order_date AS DATE), CURRENT_DATE) AS recency_days
+  FROM source
 features:
   frequency: {description: "Total orders", dtype: int}
   monetary: {description: "Total spend", dtype: float}
   recency_days: {description: "Days since last order", dtype: int}
 ```
+NOTE: In feature_group transforms, upstream data is loaded as the `source` table — do NOT use `ref()`.
+`ref()` only works inside transform nodes (resolved by TransformExecutor), not in feature groups.
 
 **Python ML model (use `draft_node(node_type="model", python=True)`):**
 ```python
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["scikit-learn", "pandas"]
+# dependencies = ["scikit-learn", "pandas", "pyarrow"]
 # ///
-from seeknal.pipeline import source, transform
-
-@source(name="model_input")
-def load(ctx):
-    return ctx.ref("feature_group.customer_features")
+from seeknal.pipeline import transform
 
 @transform(name="customer_segments")
 def predict(ctx):
     from sklearn.cluster import KMeans
     from sklearn.preprocessing import StandardScaler
-    df = ctx.ref("model_input")
+    df = ctx.ref("feature_group.customer_features")  # or ctx.ref("transform.xxx")
     feature_cols = [c for c in df.columns if df[c].dtype in ('int64','float64') and c != 'customer_id']
     X = StandardScaler().fit_transform(df[feature_cols].fillna(0))
     df["cluster"] = KMeans(n_clusters=3, random_state=42, n_init=10).fit_predict(X)
     return df  # MUST return full DataFrame with ALL columns + predictions
 ```
 IMPORTANT: Python models MUST return the FULL DataFrame with all original columns plus new prediction columns.
+IMPORTANT: Do NOT use @source in model files — use ctx.ref() directly in the @transform function.
+IMPORTANT: Python model inline dependencies MUST include "pyarrow" for parquet I/O.
+IMPORTANT: ctx.ref() loading rules:
+  - For transforms: `df = ctx.ref("transform.xxx")` returns a pandas DataFrame
+  - For feature groups: `df = ctx.ref("feature_group.xxx")` returns a FeatureFrame (DataFrame-like)
+    FeatureFrame supports all pandas operations (groupby, sort_values, fillna, etc.) directly.
+    If you need a plain DataFrame: `df = ctx.ref("feature_group.xxx").to_df()`
+  - WRONG: `df = pd.DataFrame(ctx.ref(...))` — wrapping mangles columns into rows
+  - WRONG: `df = ctx.ref(...).data` — FeatureFrame has no .data attribute
+  - WRONG: `df = ctx.duckdb.sql(...)` — DuckDB views don't exist in the model subprocess
+
+**Complex SQL patterns (DuckDB):**
+
+Cohort retention (multi-CTE pattern):
+```sql
+WITH cohorts AS (
+  SELECT customer_id, DATE_TRUNC('month', signup_date) AS cohort_month
+  FROM source
+),
+activity AS (
+  SELECT DISTINCT c.customer_id, c.cohort_month,
+    DATE_DIFF('month', c.cohort_month, DATE_TRUNC('month', t.txn_date)) AS period
+  FROM cohorts c JOIN ref('source.transactions') t ON c.customer_id = t.customer_id
+),
+cohort_size AS (
+  SELECT cohort_month, COUNT(DISTINCT customer_id) AS total FROM cohorts GROUP BY 1
+)
+SELECT a.cohort_month, a.period,
+  COUNT(DISTINCT a.customer_id) AS retained,
+  ROUND(COUNT(DISTINCT a.customer_id)::DOUBLE / cs.total, 4) AS retention_rate
+FROM activity a JOIN cohort_size cs ON a.cohort_month = cs.cohort_month
+GROUP BY 1, 2, cs.total ORDER BY 1, 2
+```
+
+RFM scoring with NTILE:
+```sql
+SELECT customer_id,
+  NTILE(5) OVER (ORDER BY recency ASC) AS r_score,
+  NTILE(5) OVER (ORDER BY frequency DESC) AS f_score,
+  NTILE(5) OVER (ORDER BY monetary DESC) AS m_score
+FROM customer_metrics
+```
 
 ### 4. Lineage / How Questions
 `search_pipelines` → `read_pipeline` → `read_project_file`

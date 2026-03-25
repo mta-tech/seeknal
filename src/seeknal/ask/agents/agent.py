@@ -128,38 +128,46 @@ transform: |
   SELECT customer_id,
     total_orders AS frequency,
     total_spend AS monetary,
-    avg_order_value,
-    CAST(CURRENT_DATE - last_order_date AS INTEGER) AS recency_days
-  FROM ref('transform.customer_360')
+    CAST(total_spend / NULLIF(total_orders, 0) AS DOUBLE) AS avg_order_value,
+    DATE_DIFF('day', CAST(last_order_date AS DATE), CURRENT_DATE) AS recency_days
+  FROM source
 features:
   frequency: {description: "Total orders", dtype: int}
   monetary: {description: "Total spend", dtype: float}
   recency_days: {description: "Days since last order", dtype: int}
 ```
+NOTE: In feature_group transforms, upstream data is loaded as the `source` table — do NOT use `ref()`.
+`ref()` only works inside transform nodes (resolved by TransformExecutor), not in feature groups.
 
 **Python ML model (use `draft_node(node_type="model", python=True)`):**
 ```python
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["scikit-learn", "pandas"]
+# dependencies = ["scikit-learn", "pandas", "pyarrow"]
 # ///
-from seeknal.pipeline import source, transform
-
-@source(name="model_input")
-def load(ctx):
-    return ctx.ref("feature_group.customer_features")
+from seeknal.pipeline import transform
 
 @transform(name="customer_segments")
 def predict(ctx):
     from sklearn.cluster import KMeans
     from sklearn.preprocessing import StandardScaler
-    df = ctx.ref("model_input")
+    df = ctx.ref("feature_group.customer_features")  # or ctx.ref("transform.xxx")
     feature_cols = [c for c in df.columns if df[c].dtype in ('int64','float64') and c != 'customer_id']
     X = StandardScaler().fit_transform(df[feature_cols].fillna(0))
     df["cluster"] = KMeans(n_clusters=3, random_state=42, n_init=10).fit_predict(X)
     return df  # MUST return full DataFrame with ALL columns + predictions
 ```
 IMPORTANT: Python models MUST return the FULL DataFrame with all original columns plus new prediction columns.
+IMPORTANT: Do NOT use @source in model files — use ctx.ref() directly in the @transform function.
+IMPORTANT: Python model inline dependencies MUST include "pyarrow" for parquet I/O.
+IMPORTANT: ctx.ref() loading rules:
+  - For transforms: `df = ctx.ref("transform.xxx")` returns a pandas DataFrame
+  - For feature groups: `df = ctx.ref("feature_group.xxx")` returns a FeatureFrame (DataFrame-like)
+    FeatureFrame supports all pandas operations (groupby, sort_values, fillna, etc.) directly.
+    If you need a plain DataFrame: `df = ctx.ref("feature_group.xxx").to_df()`
+  - WRONG: `df = pd.DataFrame(ctx.ref(...))` — wrapping mangles columns into rows
+  - WRONG: `df = ctx.ref(...).data` — FeatureFrame has no .data attribute
+  - WRONG: `df = ctx.duckdb.sql(...)` — DuckDB views don't exist in the model subprocess
 Never return only the prediction column — downstream nodes need the full row context.
 
 ### 4. Lineage / How Questions
@@ -168,6 +176,19 @@ Never return only the prediction column — downstream nodes need the full row c
 ### 5. Advanced Analysis
 1. `execute_python` for stats, visualizations, ML (pre-loaded: `conn`, `pd`, `np`, `plt`)
 2. `generate_report` for Evidence.dev interactive HTML dashboards
+
+MANDATORY BUILD BEHAVIOR (one-shot mode):
+When you receive a BUILD request in one-shot mode, you MUST follow this sequence:
+1. Call profile_data() to discover data files
+2. Call draft_node + edit_file + dry_run_draft + apply_draft(confirmed=True) for EACH node
+3. Call plan_pipeline() to verify the DAG
+4. Call run_pipeline(confirmed=True, full=True) to execute
+5. Call inspect_output() on 2-3 key nodes to show real data
+6. ONLY THEN provide your final text response
+
+DO NOT respond with text after only calling profile_data().
+DO NOT describe a pipeline design without actually building it.
+A conceptual description without tool calls is a FAILURE. Build the actual pipeline.
 
 CRITICAL RULES:
 - In ANALYSIS mode: NO drafts, NO edits, NO pipeline changes. Query only.
@@ -421,6 +442,25 @@ _NO_RESPONSE = "No response generated."
 # Ralph Loop: max retries when agent returns tool calls but no final text
 _MAX_RALPH_RETRIES = 3
 
+# Keywords indicating a BUILD request (one-shot pipeline build)
+_BUILD_KEYWORDS = {"build", "pipeline", "bronze", "silver", "gold"}
+
+# Tool names that indicate actual pipeline building (not just profiling)
+_BUILD_TOOL_NAMES = {
+    "draft_node", "apply_draft", "edit_node", "edit_file",
+    "dry_run_draft", "run_pipeline", "plan_pipeline",
+}
+
+
+def _has_build_tool_calls(messages: list) -> bool:
+    """Check if any messages contain calls to build tools."""
+    for msg in messages:
+        if hasattr(msg, "tool_calls"):
+            for tc in msg.tool_calls:
+                if tc.get("name") in _BUILD_TOOL_NAMES:
+                    return True
+    return False
+
 
 def _normalize_content(content) -> str:
     """Normalize Gemini's list[dict] content format to plain string.
@@ -469,22 +509,86 @@ def ask(
     Returns:
         The agent's text response.
     """
+    question_lower = question.lower()
+    is_build = any(kw in question_lower for kw in _BUILD_KEYWORDS)
+
     # Initial invocation
     result = agent.invoke(
         {"messages": [HumanMessage(content=question)]},
         config=config,
     )
-    response = _extract_response(result.get("messages", []))
+    messages = result.get("messages", [])
+    response = _extract_response(messages)
+
+    # Early-exit detection: if BUILD request but agent only returned text
+    # without calling build tools, don't accept — nudge to build.
+    # Track whether agent only profiled (for stronger nudge below).
+    only_profiled = False
+    if response and is_build and not _has_build_tool_calls(messages):
+        # Check if agent only called profiling tools
+        all_tool_names = set()
+        for msg in messages:
+            if hasattr(msg, "tool_calls"):
+                for tc in msg.tool_calls:
+                    all_tool_names.add(tc.get("name"))
+        only_profiled = all_tool_names <= {"profile_data", "list_tables"}
+        response = ""  # Reject conceptual-only response
+
+    # Second check: if pipeline ran but no inspect_output, nudge to inspect
+    if response and is_build:
+        has_run = any(
+            tc.get("name") == "run_pipeline"
+            for msg in messages if hasattr(msg, "tool_calls")
+            for tc in msg.tool_calls
+        )
+        has_inspect = any(
+            tc.get("name") == "inspect_output"
+            for msg in messages if hasattr(msg, "tool_calls")
+            for tc in msg.tool_calls
+        )
+        if has_run and not has_inspect:
+            # Nudge once to inspect, then accept whatever comes back
+            inspect_result = agent.invoke(
+                {"messages": [HumanMessage(
+                    content="The pipeline ran but you did not call inspect_output(). "
+                            "Call inspect_output() on 2-3 key nodes to show real data rows."
+                )]},
+                config=config,
+            )
+            inspect_response = _extract_response(inspect_result.get("messages", []))
+            if inspect_response:
+                return inspect_response
+
     if response:
         return response
 
-    # Ralph Loop: nudge the agent to produce a text summary
-    for _ in range(_MAX_RALPH_RETRIES):
+    # Ralph Loop: nudge the agent to continue building or summarize
+    for retry_idx in range(_MAX_RALPH_RETRIES):
+        if is_build:
+            if only_profiled and retry_idx == 0:
+                # Fast-path: agent stalled after profiling — use stronger nudge
+                nudge = (
+                    "You called profile_data but then stopped. In one-shot mode, "
+                    "you must keep going. Call draft_node for each source file now, "
+                    "then build transforms, then run. Do NOT output any text. "
+                    "Do NOT call list_tables or profile_data again — you already have the data profile."
+                )
+            else:
+                nudge = (
+                    "You described a pipeline design but did NOT build it. "
+                    "In one-shot BUILD mode you MUST call draft_node, apply_draft, "
+                    "and run_pipeline — not just describe the plan. "
+                    "Start building now: call draft_node for the first source node, "
+                    "then continue with all remaining nodes. "
+                    "Do NOT call list_tables or profile_data again — you already have the data profile."
+                )
+        else:
+            nudge = (
+                "Please summarize your findings from the tool calls above "
+                "and provide your analysis as a text response."
+            )
         result = agent.invoke(
-            {"messages": [HumanMessage(
-                content="Please summarize your findings from the tool calls above "
-                        "and provide your analysis as a text response."
-            )]},
+            {"messages": [HumanMessage(content=nudge)]},
             config=config,
         )
         response = _extract_response(result.get("messages", []))

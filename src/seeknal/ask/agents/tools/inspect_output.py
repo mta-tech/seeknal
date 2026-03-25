@@ -36,7 +36,16 @@ def inspect_output(node_name: str, sql: str = "", limit: int = 20) -> str:
     parquet_path = intermediate_dir / f"{flat_name}.parquet"
 
     if not parquet_path.exists():
-        # Try listing available outputs
+        # Try common prefixes: transform_, source_, feature_group_, model_
+        for prefix in ["transform_", "source_", "feature_group_", "model_"]:
+            candidate = intermediate_dir / f"{prefix}{flat_name}.parquet"
+            if candidate.exists():
+                parquet_path = candidate
+                flat_name = f"{prefix}{flat_name}"
+                break
+
+    if not parquet_path.exists():
+        # Still not found — show suggestions
         available = sorted(
             f.stem for f in intermediate_dir.glob("*.parquet")
         )
