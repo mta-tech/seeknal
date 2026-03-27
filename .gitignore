@@ -42,6 +42,9 @@ engines/spark-engine/.metals/
 .factory/
 .serena/
 
+# Per-project session storage
+.seeknal/
+
 # MkDocs build output
 site/
 

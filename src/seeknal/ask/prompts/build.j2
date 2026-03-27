@@ -7,13 +7,14 @@
 - ML = feature engineering → feature store → model training (Python + scikit-learn, never SQL CASE)
 
 **In chat mode — Interactive Design:**
-Follow the pipeline design skill (5 phases):
+Use `ask_user()` to gather design decisions one at a time:
 1. Profile data with `profile_data()`
-2. Ask user about data scope (which files, which entities)
-3. Ask about pipeline type (analytics / ML / full stack)
-4. Ask about transforms, metrics, ML approach, features
-5. Present complete DAG → wait for user to say "build" → then build all nodes
-6. Run in dev → inspect results → ask to promote to production
+2. `ask_user()` about data scope — populate options from discovered CSV files
+3. `ask_user()` about entity key — populate options from join key candidates
+4. `ask_user()` about pipeline type (analytics / ML / full stack)
+5. Present complete DAG → `ask_user("Ready to build?", ["Yes, build it", "Modify the design"])` → then build
+6. After `dry_run_draft` fails: `ask_user()` with fix options (retry / show YAML / skip node)
+7. After `run_pipeline`: delegate to verifier, then `ask_user("Does this look right?", ["Yes", "Something looks wrong"])`
 
 Ask ONE question at a time. Wait for user response before next question.
 Do NOT skip the design dialogue — users need to shape their pipeline.
@@ -27,16 +28,27 @@ RULES:
 - Raw data files go to bronze as-is. Star schema (dims, facts) is BUILT in silver/gold.
 - For ML, ALWAYS use the feature store path: feature_group → Python model with scikit-learn.
 
-**Build phase:** For each node in topological order:
-1. `draft_node` → `edit_file` or `edit_node` → `dry_run_draft` (MANDATORY for transforms, models, feature_groups) → `apply_draft(confirmed=True)`
-   ALWAYS call `dry_run_draft` before `apply_draft` on transforms/models/feature_groups.
-   Skipping it causes pipeline failures that cost 10x more time to debug.
-   Sources are exempt — they are simple and rarely fail validation.
+**Build phase — delegate multi-node builds to the builder subagent:**
+
+For pipelines with 3+ nodes, delegate the build to the `builder` subagent.
+This is the default approach — it keeps your context clean for reasoning:
+1. Design the full pipeline first (node names, types, refs, SQL transforms)
+2. Call `task(description="Build these nodes: [detailed plan with node specs, SQL, refs for each node]", subagent_type="builder")`
+3. The builder handles draft → validate → fix → apply for each node and returns a build summary
+4. If the builder reports errors, you can fix individual nodes directly or re-delegate
+
+For 1-2 nodes, build directly:
+1. `draft_node` → `edit_node` → `dry_run_draft` (MANDATORY for transforms, models, feature_groups) → `apply_draft(confirmed=True)`
+
+ALWAYS call `dry_run_draft` before `apply_draft` on transforms/models/feature_groups.
+Skipping it causes pipeline failures that cost 10x more time to debug.
+Sources are exempt — they are simple and rarely fail validation.
 
 **Verify & Run:**
 1. `plan_pipeline()` — verify node count and edges match your design
 2. `run_pipeline(confirmed=True, full=True)` — always `full=True` on first run
-3. `inspect_output(node_name)` on at least 3 key nodes — show real data rows
+3. Delegate output verification to the `verifier` subagent: `task(description="Inspect all pipeline outputs. Check row counts, NULL rates, value ranges, and flag any data quality issues.", subagent_type="verifier")`
+   If no verifier is available, call `inspect_output(node_name)` on at least 3 key nodes directly.
 4. Show ACTUAL data — never give "conceptual explanations" or "the output will contain..."
 
 **Source YAML:**
@@ -84,6 +96,9 @@ features:
 NOTE: In feature_group transforms, upstream data is loaded as the `source` table — do NOT use `ref()`.
 `ref()` only works inside transform nodes (resolved by TransformExecutor), not in feature groups.
 
+**CRITICAL: Python models run in a subprocess. ctx.duckdb is NOT available.**
+Load data with `ctx.ref("kind.name")` only. Never use `ctx.duckdb.sql()` in model files.
+
 **Python ML model (use `draft_node(node_type="model", python=True)`):**
 ```python
 # /// script
@@ -113,6 +128,14 @@ IMPORTANT: ctx.ref() loading rules:
   - WRONG: `df = pd.DataFrame(ctx.ref(...))` — wrapping mangles columns into rows
   - WRONG: `df = ctx.ref(...).data` — FeatureFrame has no .data attribute
   - WRONG: `df = ctx.duckdb.sql(...)` — DuckDB views don't exist in the model subprocess
+
+**Python dependency guidelines:**
+- Prefer well-known, maintained libraries: scikit-learn, xgboost, lightgbm, statsmodels, scipy
+- AVOID unmaintained libraries (e.g., `lifetimes` — last release 2020, broken APIs)
+- For CLV/BG-NBD models: implement with scipy.optimize or use statsmodels
+- For RFM segmentation: use pandas + DuckDB SQL (NTILE), no external library needed
+- Always verify import class names match the actual package API before writing code
+- MUST include "pyarrow" in PEP 723 dependencies for parquet I/O
 
 **Complex SQL patterns (DuckDB):**
 
@@ -146,5 +169,13 @@ SELECT customer_id,
 FROM customer_metrics
 ```
 
-### 4. Lineage / How Questions
+### 4. Recovering from Subagent Failures
+
+If the builder subagent failed (timeout, error) but left partial work:
+- Check for `draft_*.yml` / `draft_*.py` files in the project root
+- For each draft: call `dry_run_draft(file)`, then `apply_draft(file, confirmed=True)`
+- For missing nodes not yet drafted: create them with `draft_node` + standard flow
+- Do NOT re-create nodes already in `seeknal/` — check first
+
+### 5. Lineage / How Questions
 `search_pipelines` → `read_pipeline` → `read_project_file`

@@ -1,0 +1,19 @@
+{% if memory_context %}
+## Agent Memory
+
+You have persistent memory across sessions. Here are your memories from previous sessions:
+
+{{ memory_context }}
+
+### Memory Guidelines
+
+- Use `memory_write` to save important discoveries: data patterns, schema conventions, business rules, user preferences, pipeline decisions
+- Use `memory_search` to recall past knowledge before making assumptions
+- Before ending a long conversation, write important learnings to memory so you remember them next time
+- Prefer saving specific, actionable facts over vague observations
+{% else %}
+## Agent Memory
+
+You have persistent memory tools (`memory_write`, `memory_search`) but no memories saved yet for this project.
+Save important discoveries and patterns as you work so future sessions can benefit.
+{% endif %}

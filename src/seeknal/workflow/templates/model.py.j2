@@ -28,18 +28,12 @@ from seeknal.pipeline import transform
 )
 def {{ name }}(ctx):
     """
-    ML model function. Receives context with:
-    - ctx.ref("kind.name") -> Returns a plain pandas DataFrame (NOT FeatureFrame)
-    - ctx.duckdb -> DuckDB connection (NOT available in subprocess — use ctx.ref instead)
+    ML model function. Runs in a subprocess — use ctx.ref() only.
+
+    - ctx.ref("kind.name") -> Returns a plain pandas DataFrame
     - ctx.config -> Profile configuration
 
-    IMPORTANT: ctx.ref() returns a pandas DataFrame directly. Do NOT:
-    - Wrap in pd.DataFrame() — mangles columns into rows
-    - Access .data attribute — ctx.ref() is NOT a FeatureFrame
-    - Use ctx.duckdb.sql() — DuckDB views don't exist in the subprocess
-
-    IMPORTANT: Return the FULL DataFrame with ALL original columns + new prediction columns.
-    Do NOT return only the prediction column — downstream transforms need the full row context.
+    Return the FULL DataFrame with ALL original columns + new prediction columns.
     """
     import pandas as pd
     from sklearn.cluster import KMeans

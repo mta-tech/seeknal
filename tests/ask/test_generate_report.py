@@ -106,6 +106,101 @@ class TestDoGenerate:
             assert "Report built successfully" in result
 
 
+class TestGenerateReportConfirmation:
+    """Test the confirmed= gate on generate_report."""
+
+    def test_default_returns_confirmation_gate(self):
+        """Calling without confirmed returns gate message."""
+        from seeknal.ask.agents.tools.generate_report import generate_report
+
+        result = generate_report.invoke({"title": "Test", "page_content": "# Test"})
+        assert "requires confirmation" in result
+        assert "confirmed=True" in result
+
+    def test_confirmed_false_returns_gate(self):
+        """Explicit confirmed=False returns gate message."""
+        from seeknal.ask.agents.tools.generate_report import generate_report
+
+        result = generate_report.invoke({
+            "title": "Test", "page_content": "# Test", "confirmed": False,
+        })
+        assert "requires confirmation" in result
+
+    def test_confirmed_true_proceeds_to_generation(self, tmp_path):
+        """confirmed=True proceeds to actual report generation."""
+        from seeknal.ask.agents.tools.generate_report import generate_report
+        from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
+
+        # Set up minimal tool context
+        set_tool_context(ToolContext(
+            repl=MagicMock(),
+            artifact_discovery=MagicMock(),
+            project_path=tmp_path,
+        ))
+
+        with patch("seeknal.ask.report.scaffolder.scaffold_report") as mock_scaffold, \
+             patch("seeknal.ask.report.builder.build_report") as mock_build:
+            mock_scaffold.return_value = tmp_path / "target" / "reports" / "test"
+            mock_build.return_value = str(tmp_path / "build" / "index.html")
+
+            result = generate_report.invoke({
+                "title": "Test", "page_content": "# Test", "confirmed": True,
+            })
+            assert "Report built successfully" in result
+            mock_scaffold.assert_called_once()
+            mock_build.assert_called_once()
+
+    def test_gate_does_not_call_scaffold_or_build(self):
+        """Gate should not invoke scaffold or build."""
+        from seeknal.ask.agents.tools.generate_report import generate_report
+
+        with patch("seeknal.ask.report.scaffolder.scaffold_report") as mock_scaffold, \
+             patch("seeknal.ask.report.builder.build_report") as mock_build:
+            generate_report.invoke({"title": "Test", "page_content": "# Test"})
+            mock_scaffold.assert_not_called()
+            mock_build.assert_not_called()
+
+    def test_exposure_mode_auto_confirms(self, tmp_path):
+        """In exposure mode, confirmed=False is auto-promoted to True."""
+        from seeknal.ask.agents.tools.generate_report import generate_report
+        from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
+
+        set_tool_context(ToolContext(
+            repl=MagicMock(),
+            artifact_discovery=MagicMock(),
+            project_path=tmp_path,
+            exposure_mode=True,
+        ))
+
+        with patch("seeknal.ask.report.scaffolder.scaffold_report") as mock_scaffold, \
+             patch("seeknal.ask.report.builder.build_report") as mock_build:
+            mock_scaffold.return_value = tmp_path / "target" / "reports" / "test"
+            mock_build.return_value = str(tmp_path / "build" / "index.html")
+
+            result = generate_report.invoke({
+                "title": "Test", "page_content": "# Test", "confirmed": False,
+            })
+            assert "Report built successfully" in result
+            mock_scaffold.assert_called_once()
+
+    def test_interactive_mode_still_gates(self, tmp_path):
+        """In interactive mode (exposure_mode=False), gate still works."""
+        from seeknal.ask.agents.tools.generate_report import generate_report
+        from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
+
+        set_tool_context(ToolContext(
+            repl=MagicMock(),
+            artifact_discovery=MagicMock(),
+            project_path=tmp_path,
+            exposure_mode=False,
+        ))
+
+        result = generate_report.invoke({
+            "title": "Test", "page_content": "# Test", "confirmed": False,
+        })
+        assert "requires confirmation" in result
+
+
 class TestFixEvidenceSyntax:
     """Test _fix_evidence_syntax post-processing for LLM output."""
 

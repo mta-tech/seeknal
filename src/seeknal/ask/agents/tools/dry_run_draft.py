@@ -5,6 +5,24 @@ import re
 from langchain_core.tools import tool
 
 
+def _check_python_deps(draft_path) -> str:
+    """Check that PEP 723 dependencies can be resolved by uv."""
+    from pathlib import Path
+
+    if not str(draft_path).endswith(".py"):
+        return ""
+
+    try:
+        from seeknal.workflow.executors.python_executor import check_pep723_deps
+        warnings = check_pep723_deps(Path(draft_path))
+        if warnings:
+            return "WARNING: " + "\n".join(warnings)
+    except Exception:
+        pass  # Graceful degradation
+
+    return ""
+
+
 def _check_yaml_ref_consistency(draft_path) -> str:
     """Check that all ref() calls in SQL match declared inputs."""
     import yaml
@@ -85,9 +103,11 @@ def dry_run_draft(file_path: str) -> str:
         errors = result.stderr.strip()
 
         if result.returncode == 0:
-            # Additional YAML-specific validation: check ref/input consistency
+            # Additional validation checks
             ref_warnings = _check_yaml_ref_consistency(resolved)
-            suffix = f"\n\n{ref_warnings}" if ref_warnings else ""
+            dep_warnings = _check_python_deps(resolved)
+            suffix_parts = [w for w in [ref_warnings, dep_warnings] if w]
+            suffix = "\n\n" + "\n\n".join(suffix_parts) if suffix_parts else ""
             return f"Validation PASSED for {file_path}\n\n{output}{suffix}"
         else:
             return (

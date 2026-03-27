@@ -8,6 +8,7 @@ Architecture inspired by OpenClaw and Anthropic's harness engineering:
 - deepagents framework for middleware, sub-agents, and summarization
 """
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -228,6 +229,10 @@ DO NOT generate a report after looking at only one table.
 DO NOT write 5 BarCharts of the same query. Each chart must show different data.
 DO NOT write generic insights. Every recommendation must cite a specific number from the data.
 
+IMPORTANT: generate_report is slow (npm install + build). ALWAYS present your
+analysis findings first and ask the user for confirmation before calling
+generate_report(confirmed=True). In one-shot mode, present findings as text only.
+
 ### Evidence Markdown Syntax
 
 SQL queries in fenced blocks:
@@ -312,6 +317,65 @@ After completing analysis, if the user wants to save it as a repeatable report:
 """
 
 
+def _load_run_metadata(project_path: Path) -> str:
+    """Load pipeline run metadata from target/run_state.json.
+
+    Returns a concise markdown summary of the last run (timestamp, node count,
+    per-node row counts, failures). Returns empty string if the file doesn't
+    exist or can't be parsed. Best-effort — never raises.
+    """
+    import json
+
+    state_path = project_path / "target" / "run_state.json"
+    if not state_path.exists():
+        return ""
+
+    try:
+        with open(state_path) as f:
+            data = json.load(f)
+    except Exception:
+        return ""
+
+    last_run = data.get("last_run", "unknown")
+    nodes = data.get("nodes", {})
+    if not nodes:
+        return ""
+
+    node_count = len(nodes)
+    succeeded = sum(1 for n in nodes.values() if n.get("status") == "success")
+    failed_nodes = [
+        nid for nid, n in nodes.items() if n.get("status") == "failed"
+    ]
+
+    lines = [
+        f"- **Last run:** {last_run}",
+        f"- **Nodes:** {node_count} total, {succeeded} succeeded, {len(failed_nodes)} failed",
+    ]
+
+    # Per-node row counts (top 10 by most recent run)
+    nodes_with_rows = [
+        (nid, n.get("row_count", 0), n.get("last_run", ""))
+        for nid, n in nodes.items()
+        if n.get("row_count", 0) > 0
+    ]
+    nodes_with_rows.sort(key=lambda x: x[2], reverse=True)
+    top_nodes = nodes_with_rows[:10]
+    if top_nodes:
+        lines.append("- **Row counts:**")
+        for nid, row_count, _ in top_nodes:
+            lines.append(f"  - `{nid}`: {row_count:,} rows")
+
+    # Show failed nodes
+    if failed_nodes:
+        lines.append("- **Failed nodes:**")
+        for nid in failed_nodes[:5]:
+            error = nodes[nid].get("metadata", {}).get("error", "")
+            suffix = f" — {error[:80]}" if error else ""
+            lines.append(f"  - `{nid}`{suffix}")
+
+    return "\n".join(lines)
+
+
 def create_agent(
     project_path: Path,
     provider: Optional[str] = None,
@@ -319,6 +383,9 @@ def create_agent(
     api_key: Optional[str] = None,
     profile: Optional[str] = None,
     question: Optional[str] = None,
+    exposure_mode: bool = False,
+    session_store=None,
+    session_name: Optional[str] = None,
 ):
     """Create a Seeknal Ask agent with profile-based tool selection.
 
@@ -330,6 +397,9 @@ def create_agent(
         profile: Tool profile override ("analysis", "build", "full").
                  Auto-detected from question if not specified.
         question: User's question (used for profile auto-detection).
+        exposure_mode: If True, running non-interactive exposure (skip confirmation gates).
+        session_store: Optional SessionStore for persistent sessions.
+        session_name: Session name used as LangGraph thread_id.
 
     Returns:
         A tuple of (agent, config) where agent is a LangGraph compiled graph
@@ -350,11 +420,21 @@ def create_agent(
     discovery = ArtifactDiscovery(project_path)
     context = discovery.get_context_for_prompt()
 
+    # Create memory store (persistent across sessions)
+    from seeknal.ask.memory.store import MemoryStore
+
+    memory_store = MemoryStore(project_path)
+
     # Set tool context (global, used by all tools)
+    max_q = agent_config.get("max_questions", 5)
     set_tool_context(ToolContext(
         repl=repl,
         artifact_discovery=discovery,
         project_path=project_path,
+        exposure_mode=exposure_mode,
+        max_questions=max_q,
+        questions_remaining=max_q,
+        memory_store=memory_store,
     ))
 
     # Create LLM (CLI flags > config file > defaults)
@@ -371,9 +451,24 @@ def create_agent(
         or agent_config.get("default_profile", "full")
     )
 
+    # Load pipeline run metadata (best-effort)
+    run_metadata = _load_run_metadata(project_path)
+
+    # Load semantic layer context for the prompt (metrics, dimensions, aliases)
+    semantic_context = discovery._discover_semantic_layer()
+
+    # Load memory context for prompt injection
+    memory_context = memory_store.load_context()
+
     # Build modular system prompt from templates
     builder = PromptBuilder()
-    system_prompt = builder.build(active_profile, context=context)
+    defaults = agent_config.get("defaults", {})
+    system_prompt = builder.build(
+        active_profile, context=context, exposure_mode=exposure_mode,
+        defaults=defaults, run_metadata=run_metadata,
+        semantic_context=semantic_context,
+        memory_context=memory_context,
+    )
 
     # Get tools for the active profile
     tools = get_tools_for_profile(
@@ -381,22 +476,50 @@ def create_agent(
         disabled_tools=agent_config.get("disabled_tools"),
     )
 
-    # Create deep agent with planning and auto-summarization
+    # Build subagent specs from the FULL tool list (not profile-filtered).
+    # The profile restricts what the parent can call directly, but subagents
+    # define their own tool sets and should always be available.
+    from seeknal.ask.agents.subagents import get_subagent_specs
+    all_tools_for_subagents = get_tools_for_profile("full")
+    subagent_specs = get_subagent_specs(
+        all_tools=all_tools_for_subagents,
+        config=agent_config,
+        llm=llm,
+    )
+
+    # Create deep agent with planning and auto-summarization.
+    # Always use MemorySaver for async compatibility with astream_events.
+    # Session metadata is tracked separately by SessionStore.
     checkpointer = MemorySaver()
+    thread_id = session_name or "default"
+
     agent = _create_agent_graph(
         llm, system_prompt, checkpointer,
         project_path=project_path, tools=tools,
+        subagents=subagent_specs or None,
     )
 
     config = {
-        "configurable": {"thread_id": "default"},
+        "configurable": {"thread_id": thread_id},
         "recursion_limit": 500,
     }
     return agent, config
 
 
+_SENSITIVE_ENV_PATTERNS = ("api_key", "secret", "token", "password", "credential")
+
+
+def _get_clean_env() -> dict[str, str]:
+    """Return a copy of os.environ with sensitive variables stripped."""
+    env = os.environ.copy()
+    for key in list(env.keys()):
+        if any(s in key.lower() for s in _SENSITIVE_ENV_PATTERNS):
+            del env[key]
+    return env
+
+
 def _create_agent_graph(llm, system_prompt: str, checkpointer,
-                        project_path=None, tools=None):
+                        project_path=None, tools=None, subagents=None):
     """Create the agent graph, trying deepagents first with ReAct fallback."""
     # Lazy import for backward compat — use full tools if none specified
     if tools is None:
@@ -405,17 +528,25 @@ def _create_agent_graph(llm, system_prompt: str, checkpointer,
 
     try:
         from deepagents import create_deep_agent
-        from deepagents.backends.filesystem import FilesystemBackend
+        from deepagents.backends.local_shell import LocalShellBackend
 
-        # Use real filesystem backend rooted at project directory.
-        # virtual_mode=True enforces path containment (blocks ../ and
-        # absolute paths outside root_dir).
+        # Use LocalShellBackend for file ops + shell execution.
+        # virtual_mode=True enforces path containment for file operations.
+        # Shell commands (execute tool) run with sanitized env and timeout.
         backend = None
         if project_path is not None:
-            backend = FilesystemBackend(
+            backend = LocalShellBackend(
                 root_dir=str(project_path),
                 virtual_mode=True,
+                timeout=120,
+                max_output_bytes=100_000,
+                env=_get_clean_env(),
+                inherit_env=False,
             )
+
+        kwargs = {}
+        if subagents:
+            kwargs["subagents"] = subagents
 
         return create_deep_agent(
             model=llm,
@@ -423,6 +554,7 @@ def _create_agent_graph(llm, system_prompt: str, checkpointer,
             system_prompt=system_prompt,
             checkpointer=checkpointer,
             backend=backend,
+            **kwargs,
         )
     except ImportError:
         # Fallback to ReAct agent if deepagents not installed
@@ -442,24 +574,52 @@ _NO_RESPONSE = "No response generated."
 # Ralph Loop: max retries when agent returns tool calls but no final text
 _MAX_RALPH_RETRIES = 3
 
-# Keywords indicating a BUILD request (one-shot pipeline build)
-_BUILD_KEYWORDS = {"build", "pipeline", "bronze", "silver", "gold"}
-
-# Tool names that indicate actual pipeline building (not just profiling)
-_BUILD_TOOL_NAMES = {
-    "draft_node", "apply_draft", "edit_node", "edit_file",
-    "dry_run_draft", "run_pipeline", "plan_pipeline",
-}
+# Transient error patterns worth retrying
+_RETRYABLE_PATTERNS = ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "timed out")
 
 
-def _has_build_tool_calls(messages: list) -> bool:
-    """Check if any messages contain calls to build tools."""
-    for msg in messages:
-        if hasattr(msg, "tool_calls"):
-            for tc in msg.tool_calls:
-                if tc.get("name") in _BUILD_TOOL_NAMES:
-                    return True
-    return False
+def _scan_partial_work(project_path: Path) -> str:
+    """Scan project for draft files left by a failed subagent.
+
+    Returns a human-readable summary of unapplied drafts, or empty string
+    if no partial work is found. Used by Ralph Loop nudges to give the
+    main agent context about what the subagent accomplished before failing.
+    """
+    drafts = sorted(project_path.glob("draft_*.yml")) + sorted(
+        project_path.glob("draft_*.py")
+    )
+    if not drafts:
+        return ""
+    names = [d.name for d in drafts[:10]]
+    suffix = f" (and {len(drafts) - 10} more)" if len(drafts) > 10 else ""
+    return (
+        f"Partial work found: {names}{suffix}. "
+        "Apply remaining drafts with dry_run_draft(file) then "
+        "apply_draft(file, confirmed=True). "
+        "Create any missing nodes with draft_node + edit_node."
+    )
+
+
+def _invoke_with_retry(agent, messages, config, max_retries=3):
+    """Invoke agent with exponential backoff on transient errors."""
+    import time
+
+    for attempt in range(max_retries + 1):
+        try:
+            return agent.invoke(messages, config=config)
+        except Exception as e:
+            msg = str(e).lower()
+            is_retryable = any(kw.lower() in msg for kw in _RETRYABLE_PATTERNS)
+            if is_retryable and attempt < max_retries:
+                wait = min(2 ** attempt * 5, 60)
+                import warnings
+                warnings.warn(
+                    f"LLM error (attempt {attempt + 1}/{max_retries}): {e}. "
+                    f"Retrying in {wait}s..."
+                )
+                time.sleep(wait)
+                continue
+            raise
 
 
 def _normalize_content(content) -> str:
@@ -501,6 +661,11 @@ def ask(
     producing a final text response, nudge it to summarize its findings.
     Retries up to _MAX_RALPH_RETRIES times before giving up.
 
+    The agent decides autonomously what to do (analysis vs build). The harness
+    does NOT use keyword matching for intent detection — the system prompt
+    handles intent. The only quality check: if the agent ran a pipeline
+    without inspecting results, nudge once.
+
     Args:
         agent: The compiled LangGraph agent.
         config: Agent invocation config (with thread_id).
@@ -509,51 +674,44 @@ def ask(
     Returns:
         The agent's text response.
     """
-    question_lower = question.lower()
-    is_build = any(kw in question_lower for kw in _BUILD_KEYWORDS)
-
     # Initial invocation
-    result = agent.invoke(
+    result = _invoke_with_retry(
+        agent,
         {"messages": [HumanMessage(content=question)]},
-        config=config,
+        config,
     )
     messages = result.get("messages", [])
     response = _extract_response(messages)
 
-    # Early-exit detection: if BUILD request but agent only returned text
-    # without calling build tools, don't accept — nudge to build.
-    # Track whether agent only profiled (for stronger nudge below).
-    only_profiled = False
-    if response and is_build and not _has_build_tool_calls(messages):
-        # Check if agent only called profiling tools
-        all_tool_names = set()
+    # Quality check: if agent ran pipeline without verification, nudge once.
+    # Verification = inspect_output directly OR task(subagent_type="verifier").
+    if response:
+        tool_names_called = set()
         for msg in messages:
-            if hasattr(msg, "tool_calls"):
-                for tc in msg.tool_calls:
-                    all_tool_names.add(tc.get("name"))
-        only_profiled = all_tool_names <= {"profile_data", "list_tables"}
-        response = ""  # Reject conceptual-only response
-
-    # Second check: if pipeline ran but no inspect_output, nudge to inspect
-    if response and is_build:
-        has_run = any(
-            tc.get("name") == "run_pipeline"
-            for msg in messages if hasattr(msg, "tool_calls")
-            for tc in msg.tool_calls
+            if not hasattr(msg, "tool_calls"):
+                continue
+            for tc in msg.tool_calls:
+                name = tc.get("name", "")
+                tool_names_called.add(name)
+                # Track subagent type for task() calls
+                if name == "task":
+                    args = tc.get("args", {})
+                    subagent_type = args.get("subagent_type", "")
+                    tool_names_called.add(f"task:{subagent_type}")
+        has_run = "run_pipeline" in tool_names_called
+        has_verified = (
+            "inspect_output" in tool_names_called
+            or "task:verifier" in tool_names_called
         )
-        has_inspect = any(
-            tc.get("name") == "inspect_output"
-            for msg in messages if hasattr(msg, "tool_calls")
-            for tc in msg.tool_calls
-        )
-        if has_run and not has_inspect:
-            # Nudge once to inspect, then accept whatever comes back
-            inspect_result = agent.invoke(
+        if has_run and not has_verified:
+            inspect_result = _invoke_with_retry(
+                agent,
                 {"messages": [HumanMessage(
-                    content="The pipeline ran but you did not call inspect_output(). "
-                            "Call inspect_output() on 2-3 key nodes to show real data rows."
+                    content="The pipeline ran but you did not verify the output. "
+                            "Delegate to the verifier subagent via task(), or call "
+                            "inspect_output() on 2-3 key nodes to show real data rows."
                 )]},
-                config=config,
+                config,
             )
             inspect_response = _extract_response(inspect_result.get("messages", []))
             if inspect_response:
@@ -562,34 +720,24 @@ def ask(
     if response:
         return response
 
-    # Ralph Loop: nudge the agent to continue building or summarize
+    # Ralph Loop: agent returned no text — nudge to continue/summarize
     for retry_idx in range(_MAX_RALPH_RETRIES):
-        if is_build:
-            if only_profiled and retry_idx == 0:
-                # Fast-path: agent stalled after profiling — use stronger nudge
-                nudge = (
-                    "You called profile_data but then stopped. In one-shot mode, "
-                    "you must keep going. Call draft_node for each source file now, "
-                    "then build transforms, then run. Do NOT output any text. "
-                    "Do NOT call list_tables or profile_data again — you already have the data profile."
-                )
-            else:
-                nudge = (
-                    "You described a pipeline design but did NOT build it. "
-                    "In one-shot BUILD mode you MUST call draft_node, apply_draft, "
-                    "and run_pipeline — not just describe the plan. "
-                    "Start building now: call draft_node for the first source node, "
-                    "then continue with all remaining nodes. "
-                    "Do NOT call list_tables or profile_data again — you already have the data profile."
-                )
-        else:
-            nudge = (
-                "Please summarize your findings from the tool calls above "
-                "and provide your analysis as a text response."
-            )
-        result = agent.invoke(
+        partial = ""
+        try:
+            from seeknal.ask.agents.tools._context import get_tool_context
+            partial = _scan_partial_work(get_tool_context().project_path)
+        except RuntimeError:
+            pass
+        base_nudge = (
+            "You have not provided a final response. "
+            "If you were building a pipeline, continue calling tools until done. "
+            "If you were analyzing data, summarize your findings as text."
+        )
+        nudge = f"{base_nudge}\n\n{partial}" if partial else base_nudge
+        result = _invoke_with_retry(
+            agent,
             {"messages": [HumanMessage(content=nudge)]},
-            config=config,
+            config,
         )
         response = _extract_response(result.get("messages", []))
         if response:

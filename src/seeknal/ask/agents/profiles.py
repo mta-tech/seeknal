@@ -12,6 +12,7 @@ Profiles:
 
 # Import all tools
 from seeknal.ask.agents.tools.apply_draft import apply_draft
+from seeknal.ask.agents.tools.ask_user import ask_user
 from seeknal.ask.agents.tools.describe_table import describe_table
 from seeknal.ask.agents.tools.draft_node import draft_node
 from seeknal.ask.agents.tools.dry_run_draft import dry_run_draft
@@ -32,21 +33,30 @@ from seeknal.ask.agents.tools.save_report_exposure import save_report_exposure
 from seeknal.ask.agents.tools.search_pipelines import search_pipelines
 from seeknal.ask.agents.tools.search_project_files import search_project_files
 from seeknal.ask.agents.tools.show_lineage import show_lineage
+from seeknal.ask.agents.tools.submit_plan import submit_plan
+from seeknal.ask.agents.tools.query_metric import query_metric
+from seeknal.ask.agents.tools.save_metric import save_metric
+from seeknal.ask.agents.tools.bootstrap_semantic_model import bootstrap_semantic_model
+from seeknal.ask.agents.tools.memory_write import memory_write
+from seeknal.ask.agents.tools.memory_search import memory_search
 
 # Analysis tools: read-only, no pipeline modifications
 _ANALYSIS_TOOLS = [
+    submit_plan, ask_user,
     profile_data, list_tables, describe_table,
-    execute_sql, inspect_output,
+    execute_sql, query_metric, inspect_output,
     get_entities, get_entity_schema,
     execute_python,
     generate_report, save_report_exposure,
+    memory_write, memory_search,
 ]
 
 # Build tools: analysis + write/execute
 _BUILD_TOOLS = _ANALYSIS_TOOLS + [
     draft_node, dry_run_draft, apply_draft,
     edit_node, plan_pipeline, show_lineage,
-    run_pipeline,
+    run_pipeline, save_metric,
+    bootstrap_semantic_model,
 ]
 
 # Full tools: build + search/exploration
@@ -63,8 +73,7 @@ TOOL_PROFILES = {
 
 # Keywords used to auto-detect profile from user's question
 _BUILD_KEYWORDS = {
-    "build", "create", "add", "design", "pipeline", "draft",
-    "deploy", "run", "transform", "source", "model", "feature",
+    "build", "create", "add", "design", "draft", "deploy",
 }
 _REPORT_KEYWORDS = {
     "report", "dashboard", "visualization", "chart", "evidence",

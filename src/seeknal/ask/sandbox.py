@@ -175,12 +175,48 @@ except ImportError:
     plt = None
     matplotlib = None
 
+try:
+    import sklearn
+except ImportError:
+    sklearn = None
+
+try:
+    import scipy
+except ImportError:
+    scipy = None
+
+try:
+    import seaborn as sns
+except ImportError:
+    sns = None
+
+try:
+    import statsmodels
+except ImportError:
+    statsmodels = None
+
+try:
+    import xgboost
+except ImportError:
+    xgboost = None
+
+try:
+    import lightgbm
+except ImportError:
+    lightgbm = None
+
 namespace = {{
     "conn": conn,
     "pd": pd,
     "np": np,
     "plt": plt,
     "matplotlib": matplotlib,
+    "sklearn": sklearn,
+    "scipy": scipy,
+    "sns": sns,
+    "statsmodels": statsmodels,
+    "xgboost": xgboost,
+    "lightgbm": lightgbm,
 }}
 
 # The agent code to execute

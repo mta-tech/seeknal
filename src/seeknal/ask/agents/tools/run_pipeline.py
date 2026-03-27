@@ -54,18 +54,36 @@ def run_pipeline(
 
     try:
         with ctx.fs_lock:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 cwd=str(ctx.project_path),
-                timeout=_RUN_TIMEOUT,
             )
 
-        output = result.stdout.strip()
-        errors = result.stderr.strip()
+            stdout_lines: list[str] = []
+            console = ctx.console  # May be None (sync/quiet mode)
 
-        if result.returncode == 0:
+            # Read stdout line-by-line for real-time progress
+            for line in proc.stdout:
+                stripped = line.rstrip()
+                stdout_lines.append(stripped)
+                if console and stripped:
+                    try:
+                        from rich.markup import escape
+
+                        console.print(f"  [dim]{escape(stripped)}[/dim]")
+                    except Exception:
+                        pass  # Don't let display errors break the pipeline
+
+            proc.wait(timeout=_RUN_TIMEOUT)
+            stderr_output = proc.stderr.read()
+
+        output = "\n".join(stdout_lines).strip()
+        errors = stderr_output.strip()
+
+        if proc.returncode == 0:
             # Refresh artifact discovery and re-register new parquet outputs
             ctx.artifact_discovery.refresh()
             ctx.repl._auto_register_project()
@@ -118,6 +136,8 @@ def run_pipeline(
                 + f"Full errors:\n{errors}"
             )
     except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
         return f"Pipeline timed out after {_RUN_TIMEOUT} seconds. Set SEEKNAL_RUN_TIMEOUT env var to increase."
     except FileNotFoundError:
         return "seeknal CLI not found. Ensure seeknal is installed and on PATH."

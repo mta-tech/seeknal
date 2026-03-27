@@ -23,6 +23,36 @@ from typing import Optional
 from seeknal.ask.project import find_project_path
 
 
+def _show_banner(
+    console,
+    project_path: Path,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    mode: str = "ask",
+    session_name: Optional[str] = None,
+) -> None:
+    """Show a compact welcome banner with project info."""
+    import os
+
+    from seeknal import __version__
+
+    model_name = model or os.environ.get("SEEKNAL_ASK_MODEL", "") or "N/A"
+
+    project_display = project_path.name or str(project_path)
+
+    console.print()
+    console.print(f"[bold #10b981]Seeknal Ask[/bold #10b981] [dim]v{__version__}[/dim]")
+    console.print(f"[dim]Project:[/dim] {project_display}  [dim]Model:[/dim] {model_name}")
+    if mode == "chat":
+        if session_name:
+            console.print(
+                f"[dim]Session:[/dim] [bold]{session_name}[/bold] "
+                f"[dim](use --session {session_name} to resume)[/dim]"
+            )
+        console.print("[dim]Type 'exit' to quit.[/dim]")
+    console.print()
+
+
 class _AskGroup(typer.core.TyperGroup):
     """Custom TyperGroup that treats unrecognised commands as a question.
 
@@ -110,8 +140,8 @@ def _run_oneshot(
         from rich.console import Console
 
         console = Console()
-        console.print(f"\n[dim]Project: {project_path}[/dim]")
-        console.print(f"[dim]Question: {question}[/dim]\n")
+        _show_banner(console, project_path, provider=provider, model=model, mode="oneshot")
+        console.print(f"[dim]Question:[/dim] {question}\n")
 
         # Create agent (always with spinner -- this part is not streaming)
         with console.status("[bold green]Loading agent..."):
@@ -132,6 +162,9 @@ def _run_oneshot(
         except KeyboardInterrupt:
             console.print("\n[dim]Cancelled.[/dim]")
             raise typer.Exit(0)
+        except Exception as e:
+            console.print(f"\n[red]Error: {e}[/red]")
+            raise typer.Exit(1)
 
         console.print()
 
@@ -163,8 +196,18 @@ def chat_command(
     quiet: bool = typer.Option(
         False, "--quiet", "-q", help="Suppress step-by-step output, show only final answer"
     ),
+    session: Optional[str] = typer.Option(
+        None, "--session", "-s", help="Resume a named session"
+    ),
+    name: Optional[str] = typer.Option(
+        None, "--name", "-n", help="Custom name for a new session"
+    ),
 ):
-    """Start an interactive multi-turn chat session."""
+    """Start an interactive multi-turn chat session.
+
+    Each session is automatically named and persisted. Use --session to
+    resume a previous session, or --name to give a custom name.
+    """
     project_path = project or find_project_path()
 
     try:
@@ -178,6 +221,28 @@ def chat_command(
         ))
         raise typer.Exit(1)
 
+    # Set up session store and resolve session name
+    from seeknal.ask.sessions import SessionStore
+
+    session_store = SessionStore(project_path)
+    if session:
+        # Resume existing session
+        existing = session_store.get(session)
+        if existing is None:
+            typer.echo(typer.style(
+                f"Session '{session}' not found.", fg=typer.colors.RED
+            ))
+            typer.echo("List sessions with: " + typer.style(
+                "seeknal session list", fg=typer.colors.CYAN
+            ))
+            session_store.close()
+            raise typer.Exit(1)
+        session_name = session
+        session_store.update(session_name, status="active")
+    else:
+        # Create new session
+        session_name = session_store.create(name)
+
     try:
         from rich.console import Console
 
@@ -185,38 +250,49 @@ def chat_command(
     except ImportError:
         console = None
 
-    # Create agent (with spinner if Rich available)
+    # Create agent — use MemorySaver for graph checkpointing (async-compatible).
+    # Session metadata (name, status, message_count) is tracked separately by
+    # SessionStore in chat_session(). Thread ID is set from session_name so
+    # conversation history accumulates within a single process lifetime.
     if console:
         with console.status("[bold green]Loading agent..."):
             agent, config = create_agent(
                 project_path,
                 provider=provider,
                 model=model,
+                session_name=session_name,
             )
     else:
         agent, config = create_agent(
             project_path,
             provider=provider,
             model=model,
+            session_name=session_name,
         )
 
     if console:
-        console.print("[bold]Seeknal Ask[/bold] -- Interactive Data Analysis")
-        console.print(f"[dim]Project: {project_path}[/dim]")
-        console.print("[dim]Type 'exit' or 'quit' to end the session.[/dim]\n")
+        _show_banner(
+            console, project_path, provider=provider, model=model,
+            mode="chat", session_name=session_name,
+        )
 
         # Use async chat session with streaming visibility
         import asyncio
         from seeknal.ask.streaming import chat_session
 
         try:
-            asyncio.run(chat_session(agent, config, console, quiet=quiet))
+            asyncio.run(chat_session(
+                agent, config, console, quiet=quiet,
+                session_store=session_store, session_name=session_name,
+            ))
         except KeyboardInterrupt:
             console.print("\nGoodbye!")
     else:
         # Fallback without Rich -- use sync ask()
         typer.echo("Seeknal Ask -- Interactive Data Analysis")
         typer.echo(f"Project: {project_path}")
+        if session_name:
+            typer.echo(f"Session: {session_name} (use --session {session_name} to resume)")
         typer.echo("Type 'exit' or 'quit' to end the session.\n")
 
         while True:
@@ -235,8 +311,16 @@ def chat_command(
             try:
                 answer = agent_ask(agent, config, question)
                 typer.echo(f"\n{answer}\n")
+                # Update session metadata
+                session_store.update(
+                    session_name,
+                    message_count=(session_store.get(session_name) or {}).get("message_count", 0) + 1,
+                    last_question=question[:200],
+                )
             except Exception as e:
                 typer.echo(f"Error: {e}\n")
+
+    session_store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +553,7 @@ def _run_exposure(
         with console.status("[bold green]Loading agent..."):
             agent, config = create_agent(
                 project_path, provider=provider, model=model,
+                exposure_mode=True,
             )
 
         import asyncio
@@ -488,6 +573,7 @@ def _run_exposure(
 
         agent, config = create_agent(
             project_path, provider=provider, model=model,
+            exposure_mode=True,
         )
         answer = agent_ask(agent, config, prompt)
         typer.echo(answer)

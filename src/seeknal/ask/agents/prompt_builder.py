@@ -19,9 +19,9 @@ _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 # Sections loaded per profile
 PROFILE_SECTIONS = {
-    "analysis": ["core", "skills_catalog", "context", "safety"],
-    "build": ["core", "build", "skills_catalog", "context", "safety"],
-    "full": ["core", "build", "report", "skills_catalog", "context", "safety"],
+    "analysis": ["core", "semantic", "memory", "skills_catalog", "context", "safety"],
+    "build": ["core", "build", "semantic", "memory", "skills_catalog", "context", "safety"],
+    "full": ["core", "build", "report", "semantic", "memory", "skills_catalog", "context", "safety"],
 }
 
 

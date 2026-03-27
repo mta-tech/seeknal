@@ -25,6 +25,7 @@ class ArtifactDiscovery:
         self._dag_cache: Optional[dict] = None
         self._intermediates_cache: Optional[list[str]] = None
         self._pipelines_cache: Optional[list[dict]] = None
+        self._semantic_cache: Optional[str] = None
 
     def refresh(self) -> None:
         """Clear all cached data so the next access re-discovers artifacts."""
@@ -32,6 +33,7 @@ class ArtifactDiscovery:
         self._dag_cache = None
         self._intermediates_cache = None
         self._pipelines_cache = None
+        self._semantic_cache = None
 
     def get_context_for_prompt(self) -> str:
         """Build a complete context string for the LLM system prompt.
@@ -59,6 +61,10 @@ class ArtifactDiscovery:
         pipelines = self._discover_source_pipelines()
         if pipelines:
             sections.append(self._format_source_pipelines(pipelines))
+
+        semantic_ctx = self._discover_semantic_layer()
+        if semantic_ctx:
+            sections.append(semantic_ctx)
 
         if not sections:
             return (
@@ -156,10 +162,17 @@ class ArtifactDiscovery:
                 lines.append("- **Feature groups**:")
                 for fg_name, fg_info in feature_groups.items():
                     features = fg_info.get("features", {})
-                    feature_list = [
-                        f"`{fname}` ({ftype})"
-                        for fname, ftype in features.items()
-                    ]
+                    schema = fg_info.get("schema", {})
+                    if isinstance(features, list):
+                        feature_list = [
+                            f"`{fname}` ({schema.get(fname, '?')})"
+                            for fname in features
+                        ]
+                    else:
+                        feature_list = [
+                            f"`{fname}` ({ftype})"
+                            for fname, ftype in features.items()
+                        ]
                     lines.append(
                         f"  - `{fg_name}`: {', '.join(feature_list)}"
                     )
@@ -301,6 +314,84 @@ class ArtifactDiscovery:
     def get_pipelines_summary(self) -> list[dict]:
         """Get a summary list of all pipeline definitions."""
         return self._discover_source_pipelines()
+
+    def _discover_semantic_layer(self) -> str:
+        """Load semantic models and format for prompt injection.
+
+        Returns:
+            Markdown-formatted semantic layer context, or empty string
+            if no semantic models exist.
+        """
+        if self._semantic_cache is not None:
+            return self._semantic_cache
+
+        try:
+            from seeknal.workflow.semantic.loader import load_semantic_layer
+
+            models, metrics = load_semantic_layer(self.project_path)
+        except Exception:
+            self._semantic_cache = ""
+            return ""
+
+        if not models and not metrics:
+            self._semantic_cache = ""
+            return ""
+
+        lines = ["## Semantic Layer\n"]
+        lines.append(
+            "Business metric definitions available for querying via `query_metric`. "
+            "Prefer `query_metric` over raw SQL when a matching metric exists.\n"
+        )
+
+        # Metrics section
+        if metrics:
+            lines.append(f"### Available Metrics ({len(metrics)})\n")
+            for m in metrics:
+                alias_str = f" (aliases: {', '.join(m.aliases)})" if m.aliases else ""
+                desc = f" — {m.description}" if m.description else ""
+                lines.append(f"- `{m.name}`{alias_str}{desc} [{m.type.value}]")
+            lines.append("")
+
+        # Dimensions section (across all models)
+        all_dims: dict[str, list[str]] = {}  # name -> [aliases]
+        dim_meta: dict[str, tuple[str, str]] = {}  # name -> (type, description)
+        for model in models:
+            for dim in model.dimensions:
+                if dim.name not in all_dims:
+                    all_dims[dim.name] = list(dim.aliases)
+                    desc = dim.description or ""
+                    dim_meta[dim.name] = (dim.type.value, desc)
+
+        if all_dims:
+            lines.append(f"### Available Dimensions ({len(all_dims)})\n")
+            for name, aliases in sorted(all_dims.items()):
+                alias_str = f" (aliases: {', '.join(aliases)})" if aliases else ""
+                dtype, desc = dim_meta[name]
+                desc_str = f" — {desc}" if desc else ""
+                lines.append(f"- `{name}`{alias_str}{desc_str} [{dtype}]")
+            lines.append("")
+
+        # Measures section (across all models)
+        all_measures: dict[str, list[str]] = {}
+        measure_meta: dict[str, tuple[str, str]] = {}
+        for model in models:
+            for measure in model.measures:
+                if measure.name not in all_measures:
+                    all_measures[measure.name] = list(measure.aliases)
+                    desc = measure.description or ""
+                    measure_meta[measure.name] = (measure.agg.value, desc)
+
+        if all_measures:
+            lines.append(f"### Available Measures ({len(all_measures)})\n")
+            for name, aliases in sorted(all_measures.items()):
+                alias_str = f" (aliases: {', '.join(aliases)})" if aliases else ""
+                agg, desc = measure_meta[name]
+                desc_str = f" — {desc}" if desc else ""
+                lines.append(f"- `{name}`{alias_str}{desc_str} [{agg}]")
+            lines.append("")
+
+        self._semantic_cache = "\n".join(lines)
+        return self._semantic_cache
 
     def _format_source_pipelines(self, pipelines: list[dict]) -> str:
         lines = ["## Pipeline Definitions\n"]

@@ -1,3 +1,9 @@
 ## Data Context
 
 {{ context }}
+{% if run_metadata %}
+
+## Recent Pipeline Runs
+
+{{ run_metadata }}
+{% endif %}

@@ -295,6 +295,42 @@ def _register_ask_commands():
 _register_ask_commands()
 
 
+def _register_session_commands():
+    """Register Session commands if seeknal[ask] deps are available."""
+    try:
+        from seeknal.cli.session import session_app
+        app.add_typer(session_app, name="session")
+    except ImportError:
+        pass
+
+
+_register_session_commands()
+
+
+def _register_gateway_commands():
+    """Register Gateway commands if seeknal[ask] deps are available."""
+    try:
+        from seeknal.cli.gateway import gateway_app
+        app.add_typer(gateway_app, name="gateway")
+    except ImportError:
+        pass
+
+
+_register_gateway_commands()
+
+
+def _register_heartbeat_commands():
+    """Register Heartbeat commands if seeknal[ask] deps are available."""
+    try:
+        from seeknal.cli.heartbeat import heartbeat_app
+        app.add_typer(heartbeat_app, name="heartbeat")
+    except ImportError:
+        pass
+
+
+_register_heartbeat_commands()
+
+
 # =============================================================================
 # Prefect Orchestration Integration (Optional)
 # =============================================================================
@@ -4394,67 +4430,18 @@ def query(
     import yaml
     from pathlib import Path as P
 
-    from seeknal.workflow.semantic.models import (
-        Metric as MetricModel,
-        MetricQuery,
-        MetricType,
-        SemanticModel,
-    )
+    from seeknal.workflow.semantic.models import MetricQuery
     from seeknal.workflow.semantic.compiler import MetricCompiler
+    from seeknal.workflow.semantic.loader import load_semantic_layer
 
     project = P(project_path)
 
-    # Load semantic models
-    sm_dir = project / "seeknal" / "semantic_models"
-    semantic_models = []
-    if sm_dir.exists():
-        for yml_path in sorted(sm_dir.glob("*.yml")):
-            with open(yml_path, "r") as f:
-                data = yaml.safe_load(f) or {}
-            if data.get("kind") == "semantic_model":
-                semantic_models.append(SemanticModel.from_dict(data))
+    # Load semantic models and metrics via shared loader
+    semantic_models, metric_list = load_semantic_layer(project)
 
     if not semantic_models:
         _echo_error("No semantic models found. Create YAML files in seeknal/semantic_models/")
         raise typer.Exit(code=1)
-
-    # Collect metrics from three sources (in priority order):
-    # 1. Inline metrics defined in semantic model YAML (metrics: section)
-    # 2. Separate metric YAML files in seeknal/metrics/
-    # 3. Auto-generated simple metrics from measures (fallback)
-    metric_list = []
-    seen_names: set[str] = set()
-
-    # Source 1: Inline metrics from semantic models
-    for sm in semantic_models:
-        for m in sm.metrics:
-            if m.name not in seen_names:
-                metric_list.append(m)
-                seen_names.add(m.name)
-
-    # Source 2: Separate metric YAML files
-    metrics_dir = project / "seeknal" / "metrics"
-    if metrics_dir.exists():
-        for yml_path in sorted(metrics_dir.glob("*.yml")):
-            with open(yml_path, "r") as f:
-                for doc in yaml.safe_load_all(f):
-                    if doc and doc.get("kind") == "metric":
-                        m = MetricModel.from_dict(doc)
-                        if m.name not in seen_names:
-                            metric_list.append(m)
-                            seen_names.add(m.name)
-
-    # Source 3: Auto-generate simple metrics from measures (Cube.js-style)
-    for sm in semantic_models:
-        for measure in sm.measures:
-            if measure.name not in seen_names:
-                metric_list.append(MetricModel(
-                    name=measure.name,
-                    type=MetricType.SIMPLE,
-                    description=measure.description,
-                    measure=measure.name,
-                ))
-                seen_names.add(measure.name)
 
     if not metric_list:
         _echo_error("No metrics or measures found. Define measures in seeknal/semantic_models/ or metrics in seeknal/metrics/")
@@ -6261,6 +6248,56 @@ def consolidate(
         _echo_success("Prune completed (stale FG columns removed on re-consolidation)")
 
     _echo_success(f"Consolidation complete: {success_count}/{len(entities)} entities")
+
+
+@app.command("semantic-bootstrap")
+def semantic_bootstrap(
+    project_path: str = typer.Option(".", "--project", help="Path to project directory"),
+):
+    """
+    Bootstrap semantic models from data files.
+
+    Scans data/ CSVs and target/intermediate/ parquets, profiles column types,
+    and generates draft semantic model YAML files in seeknal/semantic_models/.
+
+    Example:
+        seeknal semantic-bootstrap
+        seeknal semantic-bootstrap --project /path/to/project
+    """
+    from pathlib import Path as P
+    from seeknal.workflow.semantic.bootstrap import bootstrap_semantic_models
+
+    project = P(project_path).resolve()
+
+    _echo_info(f"Scanning data files in {project} ...")
+
+    generated = bootstrap_semantic_models(project)
+
+    if not generated:
+        _echo_error(
+            "No data files found to bootstrap.\n"
+            "Place CSV files in data/ or run a pipeline to generate "
+            "parquet files in target/intermediate/."
+        )
+        raise typer.Exit(code=1)
+
+    _echo_success(f"Generated {len(generated)} semantic model(s):\n")
+    sm_dir = project / "seeknal" / "semantic_models"
+    for model in generated:
+        name = model["name"]
+        entities = [e["name"] for e in model.get("entities", [])]
+        measures = [m["name"] for m in model.get("measures", [])]
+        dims = [d["name"] for d in model.get("dimensions", [])]
+        _echo_info(f"  {name}.yml")
+        if entities:
+            typer.echo(f"    Entities:   {', '.join(entities)}")
+        if dims:
+            typer.echo(f"    Dimensions: {', '.join(dims)}")
+        if measures:
+            typer.echo(f"    Measures:   {', '.join(measures)}")
+
+    _echo_info(f"\nFiles written to: {sm_dir}")
+    _echo_info("Review the generated files and adjust as needed.")
 
 
 def main():
