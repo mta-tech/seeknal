@@ -20,6 +20,9 @@ The Seeknal CLI (`seeknal`) provides commands for managing data pipelines, featu
 | `plan` | Analyze changes and show execution plan |
 | `repl` | Interactive SQL REPL or one-shot queries |
 | `ask` | AI-powered data analysis, chat, and reports |
+| `gateway` | Multi-channel gateway server (Telegram, WebSocket, SSE) |
+| `session` | Manage chat sessions |
+| `heartbeat` | HEARTBEAT.md-driven project monitoring |
 | `list` | List resources in the current project |
 | `show` | Show details of a specific resource |
 | `entity` | Manage consolidated entity feature stores |
@@ -68,6 +71,12 @@ The Seeknal CLI (`seeknal`) provides commands for managing data pipelines, featu
 - `ask` - AI-powered natural language data analysis and reports
 - `ask chat` - Interactive multi-turn chat session
 - `ask report` - Generate interactive HTML dashboards
+- `gateway setup` - Interactive gateway configuration wizard
+- `gateway start` - Start multi-channel gateway server (Telegram, WebSocket, SSE)
+- `gateway temporal-worker` - Start Temporal activity worker
+- `session list/show/delete` - Manage chat sessions
+- `heartbeat run` - Manual heartbeat health check
+- `heartbeat status` - Show heartbeat state
 - `inspect` - Inspect intermediate pipeline output
 - `intervals` - List completed intervals
 - `query` - Query metrics from semantic layer
