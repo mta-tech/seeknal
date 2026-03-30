@@ -34,6 +34,8 @@ class SSEBroadcaster:
     def __init__(self) -> None:
         # session_id -> set of asyncio.Queue
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
+        # session_id -> count of dropped events (for log throttling)
+        self._drop_counts: dict[str, int] = {}
 
     def subscribe(self, session_id: str) -> asyncio.Queue:
         """Create and return a bounded queue for a new subscriber.
@@ -68,6 +70,7 @@ class SSEBroadcaster:
         subs.discard(queue)
         if not subs:
             del self._subscribers[session_id]
+            self._drop_counts.pop(session_id, None)
         logger.debug(
             "SSE subscriber removed: session=%s remaining=%d",
             session_id,
@@ -91,9 +94,13 @@ class SSEBroadcaster:
             try:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
-                logger.debug(
-                    "SSE queue full, dropping event for session=%s", session_id
-                )
+                count = self._drop_counts.get(session_id, 0) + 1
+                self._drop_counts[session_id] = count
+                if count == 1 or count % 100 == 0:
+                    logger.warning(
+                        "SSE queue full: dropped %d event(s) for session=%s",
+                        count, session_id,
+                    )
 
     def subscriber_count(self, session_id: str) -> int:
         """Return the number of active subscribers for a session."""

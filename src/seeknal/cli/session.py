@@ -25,13 +25,17 @@ def session_list(
     ),
 ):
     """List all chat sessions for the current project."""
+    from seeknal.utils.path_security import is_insecure_path
+
     project_path = project or find_project_path()
+    if is_insecure_path(str(project_path)):
+        typer.echo(typer.style(f"Insecure project path: {project_path}", fg=typer.colors.RED))
+        raise typer.Exit(1)
 
     from seeknal.ask.sessions import SessionStore
 
-    store = SessionStore(project_path)
-    sessions = store.list()
-    store.close()
+    with SessionStore(project_path) as store:
+        sessions = store.list()
 
     if not sessions:
         typer.echo("No sessions found. Start one with:")
@@ -64,13 +68,17 @@ def session_show(
     ),
 ):
     """Show details for a specific session."""
+    from seeknal.utils.path_security import is_insecure_path
+
     project_path = project or find_project_path()
+    if is_insecure_path(str(project_path)):
+        typer.echo(typer.style(f"Insecure project path: {project_path}", fg=typer.colors.RED))
+        raise typer.Exit(1)
 
     from seeknal.ask.sessions import SessionStore
 
-    store = SessionStore(project_path)
-    session = store.get(name)
-    store.close()
+    with SessionStore(project_path) as store:
+        session = store.get(name)
 
     if session is None:
         typer.echo(typer.style(f"Session '{name}' not found.", fg=typer.colors.RED))
@@ -101,25 +109,27 @@ def session_delete(
     ),
 ):
     """Delete a session and its checkpoint data."""
+    from seeknal.utils.path_security import is_insecure_path
+
     project_path = project or find_project_path()
+    if is_insecure_path(str(project_path)):
+        typer.echo(typer.style(f"Insecure project path: {project_path}", fg=typer.colors.RED))
+        raise typer.Exit(1)
 
     from seeknal.ask.sessions import SessionStore
 
-    store = SessionStore(project_path)
-    session = store.get(name)
+    with SessionStore(project_path) as store:
+        session = store.get(name)
 
-    if session is None:
-        typer.echo(typer.style(f"Session '{name}' not found.", fg=typer.colors.RED))
-        store.close()
-        raise typer.Exit(1)
+        if session is None:
+            typer.echo(typer.style(f"Session '{name}' not found.", fg=typer.colors.RED))
+            raise typer.Exit(1)
 
-    if not force:
-        confirm = typer.confirm(f"Delete session '{name}'?")
-        if not confirm:
-            typer.echo("Cancelled.")
-            store.close()
-            return
+        if not force:
+            confirm = typer.confirm(f"Delete session '{name}'?")
+            if not confirm:
+                typer.echo("Cancelled.")
+                return
 
-    store.delete(name)
-    store.close()
-    typer.echo(f"Session '{name}' deleted.")
+        store.delete(name)
+        typer.echo(f"Session '{name}' deleted.")

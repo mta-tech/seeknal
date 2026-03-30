@@ -29,7 +29,7 @@ class TestHeartbeatStatus:
         from seeknal.cli.heartbeat import heartbeat_app
 
         result = runner.invoke(
-            heartbeat_app, ["status", "--project-path", str(tmp_path)]
+            heartbeat_app, ["status", "--project", str(tmp_path)]
         )
         assert result.exit_code == 0
         assert "Never run" in result.output
@@ -50,7 +50,7 @@ class TestHeartbeatStatus:
         )
 
         result = runner.invoke(
-            heartbeat_app, ["status", "--project-path", str(tmp_path)]
+            heartbeat_app, ["status", "--project", str(tmp_path)]
         )
         assert result.exit_code == 0
         assert "2026-03-27T10:00:00" in result.output
@@ -63,28 +63,31 @@ class TestHeartbeatRun:
 
         result = runner.invoke(heartbeat_app, ["run", "--help"])
         assert result.exit_code == 0
-        assert "--project-path" in result.output
+        assert "--project" in result.output
 
     @patch(
         "seeknal.ask.gateway.heartbeat.runner.HeartbeatRunner.run_once",
         new_callable=AsyncMock,
+        return_value="HEARTBEAT_OK all checks passed",
     )
-    @patch("seeknal.cli.heartbeat.asyncio")
-    def test_run_prints_result(self, mock_asyncio, mock_run_once, tmp_path):
+    def test_run_prints_result(self, mock_run_once, tmp_path):
         from seeknal.cli.heartbeat import heartbeat_app
-
-        mock_asyncio.run = lambda coro: "HEARTBEAT_OK all checks passed"
 
         with patch(
             "seeknal.ask.config.load_agent_config", return_value={}
         ):
             result = runner.invoke(
                 heartbeat_app,
-                ["run", "--project-path", str(tmp_path)],
+                ["run", "--project", str(tmp_path)],
             )
 
         assert result.exit_code == 0
         assert "Running heartbeat" in result.output
+        assert "HEARTBEAT_OK" in result.output
+        mock_run_once.assert_called_once()
+        # Verify project_path was passed
+        call_args = mock_run_once.call_args[0]
+        assert str(call_args[0]) == str(tmp_path)
 
 
 class TestRegisteredInMainApp:
@@ -94,3 +97,28 @@ class TestRegisteredInMainApp:
 
         group_names = [g.name for g in app.registered_groups]
         assert "heartbeat" in group_names
+
+
+# ---------------------------------------------------------------------------
+# Path validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestPathValidation:
+    def test_run_rejects_insecure_path(self):
+        from seeknal.cli.heartbeat import heartbeat_app
+
+        result = runner.invoke(
+            heartbeat_app, ["run", "--project", "/tmp/evil"]
+        )
+        assert result.exit_code != 0
+        assert "Insecure" in result.output
+
+    def test_status_rejects_insecure_path(self):
+        from seeknal.cli.heartbeat import heartbeat_app
+
+        result = runner.invoke(
+            heartbeat_app, ["status", "--project", "/tmp/evil"]
+        )
+        assert result.exit_code != 0
+        assert "Insecure" in result.output

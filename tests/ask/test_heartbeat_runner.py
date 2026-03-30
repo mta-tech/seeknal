@@ -191,6 +191,20 @@ class TestState:
         (seeknal_dir / "heartbeat_state.json").write_text("not json{{{")
         assert _load_state(tmp_path) == {}
 
+    def test_save_leaves_no_tmp_file(self, tmp_path):
+        """Atomic write should not leave a .tmp file behind."""
+        _save_state(tmp_path, {"test": True})
+        seeknal_dir = tmp_path / ".seeknal"
+        assert (seeknal_dir / "heartbeat_state.json").exists()
+        assert not (seeknal_dir / "heartbeat_state.tmp").exists()
+
+    def test_save_overwrites_existing(self, tmp_path):
+        """Second save should overwrite the first state."""
+        _save_state(tmp_path, {"version": 1})
+        _save_state(tmp_path, {"version": 2})
+        loaded = _load_state(tmp_path)
+        assert loaded["version"] == 2
+
 
 # ---------------------------------------------------------------------------
 # HeartbeatRunner.run_once
@@ -334,3 +348,112 @@ class TestHeartbeatRunnerInit:
         ch = {"telegram": MagicMock()}
         runner = HeartbeatRunner(config={}, channels=ch)
         assert runner._channels == ch
+
+
+# ---------------------------------------------------------------------------
+# next_due calculation
+# ---------------------------------------------------------------------------
+
+
+class TestNextDue:
+    @patch("seeknal.ask.gateway.heartbeat.runner.HeartbeatRunner._run_agent")
+    def test_next_due_is_in_the_future(self, mock_agent, tmp_path):
+        """next_due should be last_run + interval, not current time."""
+        from datetime import datetime
+
+        seeknal_dir = tmp_path / ".seeknal"
+        seeknal_dir.mkdir()
+        (seeknal_dir / "HEARTBEAT.md").write_text("Check pipelines")
+
+        mock_agent.return_value = "HEARTBEAT_OK"
+
+        runner = HeartbeatRunner(
+            config={"every": "30m", "target": {"channel": "telegram", "chat_id": "123"}},
+            channels={"telegram": AsyncMock()},
+        )
+        asyncio.run(runner.run_once(tmp_path))
+
+        state = _load_state(tmp_path)
+        last_run = datetime.fromisoformat(state["last_run"])
+        next_due = datetime.fromisoformat(state["next_due"])
+
+        # next_due should be ~30 minutes after last_run
+        diff = (next_due - last_run).total_seconds()
+        assert diff >= 1790  # Allow small timing variance (1800 - 10s tolerance)
+        assert diff <= 1810
+
+
+# ---------------------------------------------------------------------------
+# Overnight active hours
+# ---------------------------------------------------------------------------
+
+
+class TestOvernightActiveHours:
+    def test_overnight_inside_late(self):
+        """23:00 is inside 22:00-06:00 window."""
+        with patch("seeknal.ask.gateway.heartbeat.runner.datetime") as mock_dt:
+            mock_now = MagicMock()
+            mock_now.strftime.return_value = "23:00"
+            mock_dt.now.return_value = mock_now
+            config = {"active_hours": {"start": "22:00", "end": "06:00"}}
+            assert _is_active_hours(config) is True
+
+    def test_overnight_inside_early(self):
+        """03:00 is inside 22:00-06:00 window."""
+        with patch("seeknal.ask.gateway.heartbeat.runner.datetime") as mock_dt:
+            mock_now = MagicMock()
+            mock_now.strftime.return_value = "03:00"
+            mock_dt.now.return_value = mock_now
+            config = {"active_hours": {"start": "22:00", "end": "06:00"}}
+            assert _is_active_hours(config) is True
+
+    def test_overnight_outside(self):
+        """10:00 is outside 22:00-06:00 window."""
+        with patch("seeknal.ask.gateway.heartbeat.runner.datetime") as mock_dt:
+            mock_now = MagicMock()
+            mock_now.strftime.return_value = "10:00"
+            mock_dt.now.return_value = mock_now
+            config = {"active_hours": {"start": "22:00", "end": "06:00"}}
+            assert _is_active_hours(config) is False
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat agent timeout
+# ---------------------------------------------------------------------------
+
+
+class TestHeartbeatAgentTimeout:
+    def test_agent_timeout_returns_error_message(self, tmp_path):
+        """run_once should catch timeout and return error string, not raise."""
+        import time as time_mod
+
+        seeknal_dir = tmp_path / ".seeknal"
+        seeknal_dir.mkdir()
+        (seeknal_dir / "HEARTBEAT.md").write_text("Check pipelines")
+
+        mock_ask = MagicMock(side_effect=lambda *a, **kw: time_mod.sleep(1))
+        mock_agent = MagicMock()
+        mock_config = {"configurable": {"thread_id": "test"}}
+
+        with patch(
+            "seeknal.ask.agents.agent.create_agent",
+            return_value=(mock_agent, mock_config),
+        ), patch(
+            "seeknal.ask.agents.agent.ask",
+            mock_ask,
+        ), patch(
+            "seeknal.ask.gateway.heartbeat.runner._AGENT_TIMEOUT", 0.1,
+        ):
+            runner = HeartbeatRunner(config={}, channels={})
+            start = time_mod.monotonic()
+            result = asyncio.run(runner.run_once(tmp_path))
+            elapsed = time_mod.monotonic() - start
+
+            # Should return error message, not raise
+            assert "timed out" in result.lower()
+            mock_ask.assert_called_once()  # Agent was started
+            assert elapsed < 3.0  # Timeout fired, didn't wait full sleep
+
+            # State should reflect the timeout
+            state = _load_state(tmp_path)
+            assert state["last_result"] == "findings"

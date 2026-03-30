@@ -2,7 +2,8 @@
 
 import asyncio
 import json
-from unittest.mock import MagicMock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -193,6 +194,45 @@ class TestRedisSink:
 
 
 # ---------------------------------------------------------------------------
+# RedisSink close / context manager tests
+# ---------------------------------------------------------------------------
+
+
+class TestRedisSinkClose:
+    def test_close_calls_client_close(self):
+        """close() should call the Redis client's close method."""
+        from seeknal.ask.gateway.temporal.activities import RedisSink
+
+        sink = RedisSink("s1")
+        mock_client = MagicMock()
+        sink._client = mock_client
+
+        sink.close()
+
+        mock_client.close.assert_called_once()
+        assert sink._client is None
+
+    def test_close_without_client_is_noop(self):
+        """close() on a sink that never connected should not raise."""
+        from seeknal.ask.gateway.temporal.activities import RedisSink
+
+        sink = RedisSink("s1")
+        assert sink._client is None
+        sink.close()  # should not raise
+
+    def test_context_manager_calls_close(self):
+        """Using RedisSink as a context manager should call close on exit."""
+        from seeknal.ask.gateway.temporal.activities import RedisSink
+
+        mock_client = MagicMock()
+        with RedisSink("s1") as sink:
+            sink._client = mock_client
+
+        mock_client.close.assert_called_once()
+        assert sink._client is None
+
+
+# ---------------------------------------------------------------------------
 # Workflow class structure tests (mocked temporalio)
 # ---------------------------------------------------------------------------
 
@@ -324,3 +364,154 @@ class TestConstants:
         from seeknal.ask.gateway.temporal.workflows import TASK_QUEUE
 
         assert TASK_QUEUE == "seeknal-ask"
+
+
+# ---------------------------------------------------------------------------
+# Thread-safe activity cache
+# ---------------------------------------------------------------------------
+
+
+class TestActivityCache:
+    def test_get_activity_fn_is_thread_safe(self):
+        """Concurrent calls to get_activity_fn() should return the same function."""
+        import sys
+        import threading
+        from unittest.mock import MagicMock, patch
+
+        mock_activity = MagicMock()
+        mock_activity.defn = lambda fn: fn
+
+        mock_temporal = MagicMock(activity=mock_activity)
+
+        with patch.dict(
+            sys.modules,
+            {
+                "temporalio": mock_temporal,
+                "temporalio.activity": mock_activity,
+            },
+        ):
+            import importlib
+            from seeknal.ask.gateway.temporal import activities
+
+            # Reset the cache
+            activities._activity_fn = None
+
+            results = []
+
+            def call_get():
+                results.append(activities.get_activity_fn())
+
+            threads = [threading.Thread(target=call_get) for _ in range(10)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            # All threads should get the same function object
+            assert len(results) == 10
+            assert all(r is results[0] for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Temporal worker reconnection tests
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerReconnection:
+    def test_retries_on_connect_failure_then_succeeds(self):
+        """Worker retries connection and starts when server becomes available."""
+        import sys
+
+        mock_client = MagicMock()
+        mock_worker_instance = MagicMock()
+        mock_worker_instance.__aenter__ = AsyncMock(return_value=mock_worker_instance)
+        mock_worker_instance.__aexit__ = AsyncMock(return_value=False)
+
+        call_count = 0
+
+        async def mock_connect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise ConnectionError("Temporal unavailable")
+            return mock_client
+
+        mock_Client = MagicMock()
+        mock_Client.connect = mock_connect
+
+        mock_Worker = MagicMock(return_value=mock_worker_instance)
+
+        async def _test():
+            import seeknal.ask.gateway.temporal.worker as worker_mod
+
+            with patch.object(worker_mod, "_MAX_CONNECT_RETRIES", 5), \
+                 patch.object(worker_mod, "_CONNECT_RETRY_BASE_SECONDS", 0.01), \
+                 patch.dict(sys.modules, {
+                     "temporalio": MagicMock(),
+                     "temporalio.client": MagicMock(Client=mock_Client),
+                     "temporalio.worker": MagicMock(Worker=mock_Worker),
+                 }), patch(
+                     "seeknal.ask.gateway.temporal.activities.get_activity_fn",
+                     return_value="fake_fn",
+                 ), patch(
+                     "seeknal.ask.gateway.temporal.workflows.get_workflow_class",
+                     return_value="FakeWorkflow",
+                 ):
+                task = asyncio.create_task(
+                    worker_mod.run_temporal_worker(
+                        project_path=Path("/tmp/test"),
+                        server="localhost:7233",
+                    )
+                )
+                await asyncio.sleep(0.5)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+                assert call_count == 3  # 2 failures + 1 success
+
+        asyncio.run(_test())
+
+    def test_gives_up_after_max_retries(self):
+        """Worker exits after exhausting retry attempts."""
+        import sys
+
+        connect_count = 0
+
+        async def mock_connect(*args, **kwargs):
+            nonlocal connect_count
+            connect_count += 1
+            raise ConnectionError("Temporal unavailable")
+
+        mock_Client = MagicMock()
+        mock_Client.connect = mock_connect
+
+        async def _test():
+            import seeknal.ask.gateway.temporal.worker as worker_mod
+
+            with patch.object(worker_mod, "_MAX_CONNECT_RETRIES", 3), \
+                 patch.object(worker_mod, "_CONNECT_RETRY_BASE_SECONDS", 0.01), \
+                 patch.dict(sys.modules, {
+                     "temporalio": MagicMock(),
+                     "temporalio.client": MagicMock(Client=mock_Client),
+                     "temporalio.worker": MagicMock(),
+                 }), patch(
+                     "seeknal.ask.gateway.temporal.activities.get_activity_fn",
+                     return_value="fake_fn",
+                 ), patch(
+                     "seeknal.ask.gateway.temporal.workflows.get_workflow_class",
+                     return_value="FakeWorkflow",
+                 ):
+                # Should return without hanging (exhausts retries)
+                await asyncio.wait_for(
+                    worker_mod.run_temporal_worker(
+                        project_path=Path("/tmp/test"),
+                        server="localhost:7233",
+                    ),
+                    timeout=5.0,
+                )
+                assert connect_count == 3
+
+        asyncio.run(_test())

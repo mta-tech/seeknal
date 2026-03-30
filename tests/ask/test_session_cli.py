@@ -97,3 +97,31 @@ class TestSessionDelete:
         assert result.exit_code == 0
         assert "Cancelled" in result.output
         assert store.get("keep-me") is not None
+
+
+# ---------------------------------------------------------------------------
+# Path validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestPathValidation:
+    def test_list_rejects_insecure_path(self):
+        from seeknal.cli.session import session_app
+
+        result = runner.invoke(session_app, ["list", "--project", "/tmp/evil"])
+        assert result.exit_code != 0
+        assert "Insecure" in result.output
+
+    def test_show_rejects_insecure_path(self):
+        from seeknal.cli.session import session_app
+
+        result = runner.invoke(session_app, ["show", "test", "--project", "/tmp/evil"])
+        assert result.exit_code != 0
+        assert "Insecure" in result.output
+
+    def test_delete_rejects_insecure_path(self):
+        from seeknal.cli.session import session_app
+
+        result = runner.invoke(session_app, ["delete", "test", "--project", "/tmp/evil", "--force"])
+        assert result.exit_code != 0
+        assert "Insecure" in result.output

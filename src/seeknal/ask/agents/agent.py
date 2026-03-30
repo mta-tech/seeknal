@@ -386,6 +386,7 @@ def create_agent(
     exposure_mode: bool = False,
     session_store=None,
     session_name: Optional[str] = None,
+    output_channel: Optional[str] = None,
 ):
     """Create a Seeknal Ask agent with profile-based tool selection.
 
@@ -468,6 +469,7 @@ def create_agent(
         defaults=defaults, run_metadata=run_metadata,
         semantic_context=semantic_context,
         memory_context=memory_context,
+        output_channel=output_channel,
     )
 
     # Get tools for the active profile
@@ -493,10 +495,14 @@ def create_agent(
     checkpointer = MemorySaver()
     thread_id = session_name or "default"
 
+    # Read compaction config from agent settings
+    compaction_config = agent_config.get("compaction") if agent_config else None
+
     agent = _create_agent_graph(
         llm, system_prompt, checkpointer,
         project_path=project_path, tools=tools,
         subagents=subagent_specs or None,
+        compaction_config=compaction_config,
     )
 
     config = {
@@ -519,7 +525,8 @@ def _get_clean_env() -> dict[str, str]:
 
 
 def _create_agent_graph(llm, system_prompt: str, checkpointer,
-                        project_path=None, tools=None, subagents=None):
+                        project_path=None, tools=None, subagents=None,
+                        compaction_config=None):
     """Create the agent graph, trying deepagents first with ReAct fallback."""
     # Lazy import for backward compat — use full tools if none specified
     if tools is None:
@@ -547,6 +554,32 @@ def _create_agent_graph(llm, system_prompt: str, checkpointer,
         kwargs = {}
         if subagents:
             kwargs["subagents"] = subagents
+
+        # Context window compaction — auto-triggered + agent-callable tool
+        try:
+            from deepagents.middleware.summarization import (
+                SummarizationMiddleware,
+                SummarizationToolMiddleware,
+            )
+
+            comp = compaction_config or {}
+            trigger_tokens = comp.get("trigger_tokens", 50000)
+            keep_messages = comp.get("keep_messages", 10)
+
+            summarization = SummarizationMiddleware(
+                model=llm,
+                backend=backend,
+                trigger=("tokens", trigger_tokens),
+                keep=("messages", keep_messages),
+            )
+            tool_middleware = SummarizationToolMiddleware(summarization)
+            kwargs["middleware"] = [summarization, tool_middleware]
+            logger.info(
+                "Context compaction enabled: trigger=%d tokens, keep=%d messages",
+                trigger_tokens, keep_messages,
+            )
+        except (ImportError, Exception) as exc:
+            logger.debug("Summarization middleware not available: %s", exc)
 
         return create_deep_agent(
             model=llm,

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -25,6 +26,27 @@ from seeknal.ask.event_sink import EventSink
 from seeknal.ask.gateway.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
+
+# Session ID validation: alphanumeric, hyphens, underscores, max 128 chars
+_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+_SESSION_ID_MAX_LEN = 128
+
+# Agent execution timeout (seconds)
+_AGENT_TIMEOUT = 300
+
+# Maximum WebSocket message size (bytes)
+_MAX_WS_MESSAGE_SIZE = 65536  # 64KB
+
+# Heartbeat cancel timeout (seconds)
+_HEARTBEAT_CANCEL_TIMEOUT = 10.0
+
+
+def _validate_session_id(session_id: str) -> bool:
+    """Return True if session_id is safe (alphanumeric, hyphens, underscores)."""
+    return (
+        len(session_id) <= _SESSION_ID_MAX_LEN
+        and bool(_SESSION_ID_RE.match(session_id))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -72,12 +94,14 @@ assert isinstance(WebSocketSink.__new__(WebSocketSink), EventSink)
 def create_app(
     project_path: Path,
     config: Optional[dict] = None,
+    channels_filter: Optional[list[str]] = None,
 ) -> Any:
     """Create a Starlette ASGI application for the gateway.
 
     Args:
         project_path: Path to the seeknal project root.
         config: Agent configuration dict (from ``seeknal_agent.yml``).
+        channels_filter: If provided, only initialize channels in this list.
 
     Returns:
         A Starlette ``Application`` instance.
@@ -93,6 +117,58 @@ def create_app(
     manager = SessionManager()
     broadcaster = SSEBroadcaster()
 
+    # -- Channel initialization -------------------------------------------
+
+    channels: dict[str, Any] = {}
+    extra_routes: list = []
+
+    gw_config = agent_config.get("gateway", {})
+    if not isinstance(gw_config, dict):
+        gw_config = {}
+
+    # Telegram channel
+    tg_config = gw_config.get("telegram", {})
+    tg_enabled = (channels_filter is None or "telegram" in channels_filter)
+    if tg_enabled and isinstance(tg_config, dict) and tg_config.get("token"):
+        import os as _os
+
+        from seeknal.ask.gateway.channels.telegram import TelegramChannel
+
+        # Resolve env var references like ${TELEGRAM_BOT_TOKEN}
+        token = tg_config["token"]
+        if token.startswith("${") and token.endswith("}"):
+            env_name = token[2:-1]
+            token = _os.environ.get(env_name, "")
+            if not token:
+                logger.error(
+                    "Telegram token env var %s is not set. "
+                    "Run: export %s=<your-bot-token>",
+                    env_name, env_name,
+                )
+
+        if not token:
+            logger.error("Telegram bot token is empty, skipping channel")
+        else:
+            tg_polling = tg_config.get("polling", False)
+            tg_channel = TelegramChannel(
+                bot_token=token,
+                project_path=project_path,
+            )
+            channels["telegram"] = tg_channel
+            channels["_telegram_polling"] = tg_polling
+
+            if not tg_polling:
+                async def telegram_webhook(request):
+                    return await tg_channel.webhook_handler(request)
+
+                extra_routes.append(
+                    Route("/telegram/webhook", telegram_webhook, methods=["POST"])
+                )
+            logger.info(
+                "Telegram channel configured (mode=%s)",
+                "polling" if tg_polling else "webhook",
+            )
+
     # -- Lifespan ---------------------------------------------------------
 
     @asynccontextmanager
@@ -102,6 +178,18 @@ def create_app(
         app.state.project_path = project_path
         app.state.agent_config = agent_config
         app.state.sse_broadcaster = broadcaster
+        app.state.channels = channels
+
+        # Start channels
+        for name, channel in channels.items():
+            if name.startswith("_"):
+                continue  # Skip internal metadata keys
+            try:
+                polling = channels.get(f"_{name}_polling", False)
+                await channel.start(polling=polling)
+                logger.info("Channel '%s' started", name)
+            except Exception:
+                logger.exception("Failed to start channel '%s'", name)
 
         # Start HeartbeatRunner if configured
         heartbeat_task = None
@@ -109,7 +197,6 @@ def create_app(
         if isinstance(hb_config, dict) and hb_config:
             from seeknal.ask.gateway.heartbeat.runner import HeartbeatRunner
 
-            channels = app.state.__dict__.get("channels", {})
             runner = HeartbeatRunner(config=hb_config, channels=channels)
             heartbeat_task = asyncio.create_task(runner.run(project_path))
             logger.info("Heartbeat runner started as background task")
@@ -120,10 +207,25 @@ def create_app(
         if heartbeat_task is not None:
             heartbeat_task.cancel()
             try:
-                await heartbeat_task
+                await asyncio.wait_for(heartbeat_task, timeout=_HEARTBEAT_CANCEL_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Heartbeat task did not stop within %.0fs, proceeding with shutdown",
+                    _HEARTBEAT_CANCEL_TIMEOUT,
+                )
             except asyncio.CancelledError:
                 pass
             logger.info("Heartbeat runner stopped")
+
+        # Stop channels
+        for name, channel in channels.items():
+            if name.startswith("_"):
+                continue
+            try:
+                await channel.stop()
+                logger.info("Channel '%s' stopped", name)
+            except Exception:
+                logger.exception("Failed to stop channel '%s'", name)
 
         logger.info("Gateway shutting down")
 
@@ -136,6 +238,9 @@ def create_app(
 
     async def ws_endpoint(websocket: WebSocket):
         session_id = websocket.path_params["session_id"]
+        if not _validate_session_id(session_id):
+            await websocket.close(code=1008, reason="Invalid session_id")
+            return
         await websocket.accept()
         manager.connect(session_id, websocket)
         try:
@@ -150,6 +255,10 @@ def create_app(
 
     async def sse_endpoint(request):
         session_id = request.path_params["session_id"]
+        if not _validate_session_id(session_id):
+            return JSONResponse(
+                {"error": "Invalid session_id"}, status_code=400,
+            )
         return _create_sse_response(broadcaster, session_id)
 
     # -- Routes -----------------------------------------------------------
@@ -158,7 +267,7 @@ def create_app(
         Route("/health", health, methods=["GET"]),
         Route("/events/{session_id}", sse_endpoint, methods=["GET"]),
         WebSocketRoute("/ws/{session_id}", ws_endpoint),
-    ]
+    ] + extra_routes
 
     return Starlette(routes=routes, lifespan=lifespan)
 
@@ -228,8 +337,7 @@ async def _handle_session(
     # Lazy imports for agent machinery
     from seeknal.ask.sessions import SessionStore
 
-    store = SessionStore(project_path)
-    try:
+    with SessionStore(project_path) as store:
         # Ensure session exists in the store
         if store.get(session_id) is None:
             store.create(session_id)
@@ -239,6 +347,13 @@ async def _handle_session(
                 raw = await websocket.receive_text()
             except WebSocketDisconnect:
                 break
+
+            if len(raw) > _MAX_WS_MESSAGE_SIZE:
+                await websocket.send_json({
+                    "type": "error",
+                    "data": f"Message too large ({len(raw)} bytes, max {_MAX_WS_MESSAGE_SIZE})",
+                })
+                continue
 
             try:
                 message = json.loads(raw)
@@ -270,8 +385,6 @@ async def _handle_session(
                 websocket, session_id, text, project_path,
                 agent_config, store,
             )
-    finally:
-        store.close()
 
 
 async def _run_agent_turn(
@@ -300,6 +413,7 @@ async def _run_agent_turn(
             question=question,
             session_store=session_store,
             session_name=session_id,
+            output_channel="websocket",
         )
 
         # Update session metadata
@@ -312,13 +426,21 @@ async def _run_agent_turn(
         # event loop, while streaming events through the WebSocketSink.
         from seeknal.ask.agents.agent import ask as sync_ask
 
-        answer = await asyncio.to_thread(sync_ask, agent, config, question)
+        answer = await asyncio.wait_for(
+            asyncio.to_thread(sync_ask, agent, config, question),
+            timeout=_AGENT_TIMEOUT,
+        )
 
         await sink.on_answer(answer)
 
+    except asyncio.TimeoutError:
+        logger.error(
+            "Agent timed out after %ds: session=%s", _AGENT_TIMEOUT, session_id,
+        )
+        await sink.on_error("Agent execution timed out. Please try a simpler question.")
     except Exception as exc:
         logger.exception("Agent error: session=%s", session_id)
-        await sink.on_error(str(exc))
+        await sink.on_error("An internal error occurred. Please try again.")
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +453,7 @@ async def run_gateway(
     host: str = "127.0.0.1",
     port: int = 18789,
     config: Optional[dict] = None,
+    channels_filter: Optional[list[str]] = None,
 ) -> None:
     """Start the gateway server programmatically with Uvicorn.
 
@@ -339,10 +462,11 @@ async def run_gateway(
         host: Bind address (default: 127.0.0.1).
         port: Listen port (default: 18789).
         config: Agent configuration dict.
+        channels_filter: If provided, only initialize these channels.
     """
     import uvicorn
 
-    app = create_app(project_path, config=config)
+    app = create_app(project_path, config=config, channels_filter=channels_filter)
 
     uvi_config = uvicorn.Config(
         app=app,

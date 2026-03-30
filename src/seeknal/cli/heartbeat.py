@@ -17,17 +17,31 @@ heartbeat_app = typer.Typer(
 )
 
 
+def _resolve_project_path(project_path: str | None) -> Path:
+    """Resolve and validate the project path."""
+    from seeknal.utils.path_security import is_insecure_path
+
+    pp = Path(project_path).resolve() if project_path else Path.cwd()
+    if is_insecure_path(str(pp)):
+        typer.echo(typer.style(f"Insecure project path: {pp}", fg=typer.colors.RED))
+        raise typer.Exit(1)
+    if not pp.is_dir():
+        typer.echo(typer.style(f"Project path not found: {pp}", fg=typer.colors.RED))
+        raise typer.Exit(1)
+    return pp
+
+
 @heartbeat_app.command("run")
 def heartbeat_run(
     project_path: Optional[str] = typer.Option(
-        None, "--project-path", help="Path to seeknal project"
+        None, "--project", help="Path to seeknal project"
     ),
 ):
     """Run a one-off heartbeat check and print the result."""
     from seeknal.ask.config import load_agent_config
     from seeknal.ask.gateway.heartbeat.runner import HeartbeatRunner
 
-    pp = Path(project_path) if project_path else Path.cwd()
+    pp = _resolve_project_path(project_path)
     agent_config = load_agent_config(pp)
     hb_config = agent_config.get("heartbeat", {})
     if not isinstance(hb_config, dict):
@@ -44,13 +58,13 @@ def heartbeat_run(
 @heartbeat_app.command("status")
 def heartbeat_status(
     project_path: Optional[str] = typer.Option(
-        None, "--project-path", help="Path to seeknal project"
+        None, "--project", help="Path to seeknal project"
     ),
 ):
     """Show heartbeat status — last run, result, and next scheduled."""
     from seeknal.ask.gateway.heartbeat.runner import _load_state
 
-    pp = Path(project_path) if project_path else Path.cwd()
+    pp = _resolve_project_path(project_path)
     state = _load_state(pp)
 
     if not state:

@@ -134,3 +134,20 @@ the user — only call `ask_user` when genuinely uncertain and no default covers
 - **{{ key }}**: {{ value }}
 {% endfor %}
 {% endif %}
+
+{% if output_channel == "telegram" %}
+## OUTPUT FORMAT — Telegram
+
+You are responding via Telegram chat. Follow these formatting rules strictly:
+- Use plain text only — NO markdown headers (#), bold (**), italic (*), or code fences (```)
+- Use short paragraphs (2-3 sentences max)
+- Use bullet points with • character
+- For SQL or code, indent with spaces — no triple backticks
+- Keep responses concise — Telegram is a mobile-first medium
+- Use line breaks to separate sections
+- If the conversation is getting long, use the compact_conversation tool to free up context space
+{% elif output_channel == "websocket" %}
+## OUTPUT FORMAT — WebSocket
+
+You are responding via a WebSocket client. Use standard markdown formatting.
+{% endif %}

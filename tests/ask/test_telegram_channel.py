@@ -55,6 +55,57 @@ class TestChannelProtocol:
 # ---------------------------------------------------------------------------
 
 
+class TestStripMarkdown:
+    """Test _strip_markdown converts markdown to plain text."""
+
+    def test_removes_bold(self):
+        from seeknal.ask.gateway.channels.telegram import _strip_markdown
+
+        assert _strip_markdown("**bold text**") == "bold text"
+
+    def test_removes_headers(self):
+        from seeknal.ask.gateway.channels.telegram import _strip_markdown
+
+        assert _strip_markdown("### Header\nContent") == "Header\nContent"
+
+    def test_removes_code_fences(self):
+        from seeknal.ask.gateway.channels.telegram import _strip_markdown
+
+        result = _strip_markdown("```sql\nSELECT 1\n```")
+        assert "```" not in result
+        assert "SELECT 1" in result
+
+    def test_removes_inline_code(self):
+        from seeknal.ask.gateway.channels.telegram import _strip_markdown
+
+        assert _strip_markdown("use `SELECT *`") == "use SELECT *"
+
+    def test_converts_bullets(self):
+        from seeknal.ask.gateway.channels.telegram import _strip_markdown
+
+        result = _strip_markdown("- item one\n- item two")
+        assert "• item one" in result
+        assert "• item two" in result
+
+    def test_converts_links(self):
+        from seeknal.ask.gateway.channels.telegram import _strip_markdown
+
+        result = _strip_markdown("[click here](https://example.com)")
+        assert result == "click here (https://example.com)"
+
+    def test_plain_text_unchanged(self):
+        from seeknal.ask.gateway.channels.telegram import _strip_markdown
+
+        text = "This is plain text with no formatting."
+        assert _strip_markdown(text) == text
+
+    def test_preserves_underscores_in_identifiers(self):
+        from seeknal.ask.gateway.channels.telegram import _strip_markdown
+
+        text = "transform_enriched_orders and source_customers"
+        assert _strip_markdown(text) == text
+
+
 class TestSplitMessage:
     """Test _split_message for Telegram's 4096-char limit."""
 
@@ -141,7 +192,7 @@ class TestSessionResolution:
         # Track what session_id is passed to _run_agent
         captured_session_id = None
 
-        async def mock_run_agent(session_id, question):
+        async def mock_run_agent(session_id, question, chat=None):
             nonlocal captured_session_id
             captured_session_id = session_id
             return "test response"
@@ -189,6 +240,21 @@ class TestStartCommand:
         assert "Seeknal Ask" in welcome_text
         assert "data" in welcome_text.lower()
 
+    def test_start_command_ignores_none_message(self):
+        from seeknal.ask.gateway.channels.telegram import TelegramChannel
+
+        channel = TelegramChannel(
+            bot_token="fake-token",
+            project_path=Path("/tmp/test"),
+        )
+
+        update = MagicMock()
+        update.message = None
+
+        ctx = MagicMock()
+        _run(channel._handle_start(update, ctx))
+        # Should not raise
+
 
 # ---------------------------------------------------------------------------
 # Handle message — typing and reply
@@ -206,7 +272,7 @@ class TestHandleMessage:
             project_path=Path("/tmp/test"),
         )
 
-        async def mock_run_agent(session_id, question):
+        async def mock_run_agent(session_id, question, chat=None):
             return "analysis result"
 
         channel._run_agent = mock_run_agent
@@ -231,7 +297,7 @@ class TestHandleMessage:
             project_path=Path("/tmp/test"),
         )
 
-        async def mock_run_agent(session_id, question):
+        async def mock_run_agent(session_id, question, chat=None):
             return "The average order value is $42.50"
 
         channel._run_agent = mock_run_agent
@@ -260,7 +326,7 @@ class TestHandleMessage:
 
         long_answer = "x" * 5000
 
-        async def mock_run_agent(session_id, question):
+        async def mock_run_agent(session_id, question, chat=None):
             return long_answer
 
         channel._run_agent = mock_run_agent
@@ -285,7 +351,7 @@ class TestHandleMessage:
             project_path=Path("/tmp/test"),
         )
 
-        async def mock_run_agent(session_id, question):
+        async def mock_run_agent(session_id, question, chat=None):
             raise RuntimeError("agent exploded")
 
         channel._run_agent = mock_run_agent
@@ -338,6 +404,46 @@ class TestHandleMessage:
         ctx = MagicMock()
         _run(channel._handle_message(update, ctx))
         # Should not raise
+
+    def test_ignores_none_effective_user(self):
+        from seeknal.ask.gateway.channels.telegram import TelegramChannel
+
+        channel = TelegramChannel(
+            bot_token="fake-token",
+            project_path=Path("/tmp/test"),
+        )
+
+        update = MagicMock()
+        update.message.text = "hello"
+        update.effective_user = None
+        update.effective_chat.id = 42
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock()
+
+        ctx = MagicMock()
+        _run(channel._handle_message(update, ctx))
+
+        update.message.reply_text.assert_not_called()
+
+    def test_ignores_none_effective_chat(self):
+        from seeknal.ask.gateway.channels.telegram import TelegramChannel
+
+        channel = TelegramChannel(
+            bot_token="fake-token",
+            project_path=Path("/tmp/test"),
+        )
+
+        update = MagicMock()
+        update.message.text = "hello"
+        update.effective_user.id = 42
+        update.effective_chat = None
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock()
+
+        ctx = MagicMock()
+        _run(channel._handle_message(update, ctx))
+
+        update.message.reply_text.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -411,3 +517,87 @@ class TestWebhookHandler:
 
         response = _run(channel.webhook_handler(request))
         assert response.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# Safe chat_id parsing tests
+# ---------------------------------------------------------------------------
+
+
+class TestSafeChatIdParsing:
+    """Test deliver() handles malformed session_id gracefully."""
+
+    def test_deliver_handles_malformed_session_id(self):
+        from seeknal.ask.gateway.channels.telegram import TelegramChannel
+
+        channel = TelegramChannel(
+            bot_token="fake-token",
+            project_path=Path("/tmp/test"),
+        )
+        channel._application = MagicMock()
+        channel._application.bot.send_message = AsyncMock()
+
+        # Malformed: "telegram:" with no number
+        _run(channel.deliver("telegram:", "hello"))
+        channel._application.bot.send_message.assert_not_awaited()
+
+    def test_deliver_handles_non_numeric_chat_id(self):
+        from seeknal.ask.gateway.channels.telegram import TelegramChannel
+
+        channel = TelegramChannel(
+            bot_token="fake-token",
+            project_path=Path("/tmp/test"),
+        )
+        channel._application = MagicMock()
+        channel._application.bot.send_message = AsyncMock()
+
+        # Malformed: non-numeric chat_id
+        _run(channel.deliver("telegram:not-a-number", "hello"))
+        channel._application.bot.send_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Agent timeout tests
+# ---------------------------------------------------------------------------
+
+
+class TestAgentTimeout:
+    """Test _run_agent respects timeout."""
+
+    def test_timeout_returns_error_message(self):
+        """Verifies timeout fires and returns error within bounded time."""
+        import time as time_mod
+
+        from seeknal.ask.gateway.channels.telegram import TelegramChannel
+
+        channel = TelegramChannel(
+            bot_token="fake-token",
+            project_path=Path("/tmp/test"),
+        )
+
+        async def slow_stream(*args, **kwargs):
+            """Async generator that hangs."""
+            await asyncio.sleep(10)
+            yield  # Never reached
+
+        async def _test():
+            mock_agent = MagicMock()
+            mock_agent.astream_events = slow_stream
+            mock_config = {"configurable": {"thread_id": "test"}}
+
+            with patch(
+                "seeknal.ask.agents.agent.create_agent",
+                return_value=(mock_agent, mock_config),
+            ), patch(
+                "seeknal.ask.gateway.channels.telegram._AGENT_TIMEOUT", 0.5,
+            ), patch(
+                "seeknal.ask.sessions.SessionStore",
+            ):
+                start = time_mod.monotonic()
+                result = await channel._run_agent("telegram:123", "hello")
+                elapsed = time_mod.monotonic() - start
+
+                assert "timed out" in result
+                assert elapsed < 3.0
+
+        asyncio.run(_test())

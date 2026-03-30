@@ -21,9 +21,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -33,6 +34,9 @@ _HEARTBEAT_OK_PATTERN = re.compile(r"HEARTBEAT_OK", re.IGNORECASE)
 
 _STATE_FILE = "heartbeat_state.json"
 _HEARTBEAT_FILE = "HEARTBEAT.md"
+
+# Agent execution timeout (seconds)
+_AGENT_TIMEOUT = 300
 
 
 def _parse_interval(interval_str: str) -> int:
@@ -86,7 +90,11 @@ def _is_active_hours(config: dict) -> bool:
     now = datetime.now(tz=tz)
     current_time = now.strftime("%H:%M")
 
-    return start_str <= current_time <= end_str
+    if start_str <= end_str:
+        return start_str <= current_time <= end_str
+    else:
+        # Overnight window (e.g., 22:00 → 06:00)
+        return current_time >= start_str or current_time <= end_str
 
 
 def _is_heartbeat_ok(response: str) -> bool:
@@ -115,7 +123,9 @@ def _save_state(project_path: Path, state: dict) -> None:
     seeknal_dir = project_path / ".seeknal"
     seeknal_dir.mkdir(parents=True, exist_ok=True)
     state_path = seeknal_dir / _STATE_FILE
-    state_path.write_text(json.dumps(state, indent=2, default=str))
+    tmp_path = state_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(state, indent=2, default=str))
+    os.replace(str(tmp_path), str(state_path))
 
 
 def _load_state(project_path: Path) -> dict:
@@ -226,9 +236,16 @@ class HeartbeatRunner:
 
         # Create fresh agent with analysis profile, isolated session
         session_name = f"heartbeat-{int(time.time())}"
-        response = await self._run_agent(
-            project_path, heartbeat_content, session_name
-        )
+        try:
+            response = await self._run_agent(
+                project_path, heartbeat_content, session_name
+            )
+        except asyncio.TimeoutError:
+            response = (
+                f"Heartbeat agent timed out after {_AGENT_TIMEOUT}s. "
+                "The check may be too complex or the agent is unresponsive."
+            )
+            logger.error("Heartbeat agent timed out after %ds", _AGENT_TIMEOUT)
 
         # Parse response for HEARTBEAT_OK
         is_ok = _is_heartbeat_ok(response)
@@ -240,8 +257,8 @@ class HeartbeatRunner:
             "last_result": result,
             "last_message": response[:500],
             "next_due": (
-                datetime.now().isoformat()
-            ),
+                datetime.now() + timedelta(seconds=self._interval)
+            ).isoformat(),
         })
 
         # Deliver findings if not OK
@@ -277,7 +294,10 @@ class HeartbeatRunner:
             session_name=session_name,
         )
 
-        return await asyncio.to_thread(sync_ask, agent, config, question)
+        return await asyncio.wait_for(
+            asyncio.to_thread(sync_ask, agent, config, question),
+            timeout=_AGENT_TIMEOUT,
+        )
 
     async def _deliver(self, text: str) -> None:
         """Deliver findings to the configured target channel.

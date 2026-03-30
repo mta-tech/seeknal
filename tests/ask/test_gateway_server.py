@@ -296,7 +296,7 @@ class TestWebSocketEndpoint:
                 ws.send_json({"type": "message", "text": "hello"})
                 resp = ws.receive_json()
                 assert resp["type"] == "error"
-                assert "Agent setup failed" in resp["data"]
+                assert "internal error" in resp["data"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -331,3 +331,178 @@ class TestGatewayConfig:
         cfg = get_gateway_config({"gateway": "invalid"})
         assert cfg["host"] == "127.0.0.1"
         assert cfg["port"] == 18789
+
+
+# ---------------------------------------------------------------------------
+# Session ID validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestSessionIdValidation:
+    def test_valid_session_ids(self):
+        from seeknal.ask.gateway.server import _validate_session_id
+
+        assert _validate_session_id("test-session") is True
+        assert _validate_session_id("calm-river-315") is True
+        assert _validate_session_id("session_1") is True
+        assert _validate_session_id("abc123") is True
+
+    def test_rejects_path_traversal(self):
+        from seeknal.ask.gateway.server import _validate_session_id
+
+        assert _validate_session_id("../../../etc/passwd") is False
+        assert _validate_session_id("session/../../etc") is False
+
+    def test_rejects_special_characters(self):
+        from seeknal.ask.gateway.server import _validate_session_id
+
+        assert _validate_session_id("session id") is False
+        assert _validate_session_id("session;rm -rf") is False
+        assert _validate_session_id("") is False
+
+    def test_rejects_too_long(self):
+        from seeknal.ask.gateway.server import _validate_session_id
+
+        assert _validate_session_id("a" * 129) is False
+        assert _validate_session_id("a" * 128) is True
+
+    def test_ws_rejects_invalid_session_id(self, tmp_path):
+        from starlette.testclient import TestClient
+
+        from seeknal.ask.gateway.server import create_app
+
+        app = create_app(project_path=tmp_path)
+        client = TestClient(app)
+        # Path traversal session_id should be rejected
+        with pytest.raises(Exception):
+            # WebSocket close before accept raises in test client
+            with client.websocket_connect("/ws/../../../etc/passwd"):
+                pass
+
+    def test_sse_rejects_invalid_session_id(self, tmp_path):
+        from starlette.testclient import TestClient
+
+        from seeknal.ask.gateway.server import create_app
+
+        app = create_app(project_path=tmp_path)
+        client = TestClient(app)
+        response = client.get("/events/bad session id!")
+        assert response.status_code == 400
+        assert "Invalid session_id" in response.json()["error"]
+
+
+# ---------------------------------------------------------------------------
+# Agent timeout tests
+# ---------------------------------------------------------------------------
+
+
+class TestAgentTimeout:
+    def test_ws_sends_error_on_agent_timeout(self, tmp_path):
+        """When agent hangs past timeout, WS sends a timeout error.
+
+        Verifies that:
+        1. The mock agent was actually called (agent started)
+        2. The response arrived fast (timeout cut it short, not 10s sleep)
+        3. The error message indicates timeout
+        """
+        import time as time_mod
+
+        from starlette.testclient import TestClient
+
+        from seeknal.ask.gateway.server import create_app
+
+        app = create_app(project_path=tmp_path)
+
+        mock_agent = MagicMock()
+        mock_config = {"configurable": {"thread_id": "test"}}
+        mock_ask = MagicMock(side_effect=lambda *a, **kw: time_mod.sleep(1))
+
+        with patch(
+            "seeknal.ask.agents.agent.create_agent",
+            return_value=(mock_agent, mock_config),
+        ), patch(
+            "seeknal.ask.agents.agent.ask",
+            mock_ask,
+        ), patch(
+            "seeknal.ask.gateway.server._AGENT_TIMEOUT", 0.1,  # 100ms for test
+        ):
+            client = TestClient(app)
+            start = time_mod.monotonic()
+            with client.websocket_connect("/ws/test-session") as ws:
+                ws.send_json({"type": "message", "text": "hello"})
+                resp = ws.receive_json()
+            elapsed = time_mod.monotonic() - start
+
+            assert resp["type"] == "error"
+            assert "timed out" in resp["data"]
+            mock_ask.assert_called_once()  # Agent was started
+            assert elapsed < 3.0  # Timeout fired (0.1s), orphaned thread exits after 1s
+
+
+# ---------------------------------------------------------------------------
+# SSE queue overflow visibility tests
+# ---------------------------------------------------------------------------
+
+
+class TestSSEQueueOverflow:
+    def test_first_drop_logs_warning(self, caplog):
+        """First dropped event should log at WARNING level."""
+        import logging
+
+        from seeknal.ask.gateway.sse import SSEBroadcaster
+
+        broadcaster = SSEBroadcaster()
+        queue = broadcaster.subscribe("s1")
+
+        # Fill the queue (maxsize=100)
+        for i in range(100):
+            broadcaster.publish("s1", {"type": "token", "data": str(i)})
+
+        with caplog.at_level(logging.WARNING, logger="seeknal.ask.gateway.sse"):
+            # This event should be dropped and trigger WARNING
+            broadcaster.publish("s1", {"type": "token", "data": "overflow"})
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1
+        assert "dropped 1 event" in warning_records[0].getMessage()
+
+    def test_drop_count_resets_on_full_unsubscribe(self):
+        """Drop counter should be cleaned up when session has no subscribers."""
+        from seeknal.ask.gateway.sse import SSEBroadcaster
+
+        broadcaster = SSEBroadcaster()
+        queue = broadcaster.subscribe("s1")
+
+        # Fill and overflow
+        for i in range(101):
+            broadcaster.publish("s1", {"type": "token", "data": str(i)})
+
+        assert "s1" in broadcaster._drop_counts
+
+        broadcaster.unsubscribe("s1", queue)
+
+        assert "s1" not in broadcaster._drop_counts
+
+
+# ---------------------------------------------------------------------------
+# WebSocket message size limit tests
+# ---------------------------------------------------------------------------
+
+
+class TestWebSocketMessageSizeLimit:
+    def test_ws_rejects_oversized_message(self, tmp_path):
+        """Messages exceeding the size limit should be rejected."""
+        from starlette.testclient import TestClient
+
+        from seeknal.ask.gateway.server import create_app
+
+        app = create_app(project_path=tmp_path)
+        client = TestClient(app)
+
+        with patch("seeknal.ask.gateway.server._MAX_WS_MESSAGE_SIZE", 100):
+            with client.websocket_connect("/ws/test-session") as ws:
+                # Send a message larger than 100 bytes
+                ws.send_json({"type": "message", "text": "x" * 200})
+                resp = ws.receive_json()
+                assert resp["type"] == "error"
+                assert "too large" in resp["data"].lower()

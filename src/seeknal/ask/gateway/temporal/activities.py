@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -76,6 +77,21 @@ class RedisSink:
 
     async def on_error(self, error: str) -> None:
         self._publish({"type": "error", "data": error})
+
+    def close(self) -> None:
+        """Close the Redis client if it was created."""
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 # Verify protocol conformance at import time
@@ -156,14 +172,16 @@ def _get_activity_fn():
 
 # Module-level accessor used by workflow and worker
 _activity_fn = None
+_activity_lock = threading.Lock()
 
 
 def get_activity_fn():
-    """Return the run_agent_turn activity function (lazily defined)."""
+    """Return the run_agent_turn activity function (lazily defined, thread-safe)."""
     global _activity_fn
-    if _activity_fn is None:
-        _activity_fn = _get_activity_fn()
-    return _activity_fn
+    with _activity_lock:
+        if _activity_fn is None:
+            _activity_fn = _get_activity_fn()
+        return _activity_fn
 
 
 # For direct import by the workflow module — triggers lazy init

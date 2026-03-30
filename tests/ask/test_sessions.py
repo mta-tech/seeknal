@@ -136,3 +136,18 @@ class TestSessionStore:
         session = store.get("test")
         assert "bad_field" not in session
         store.close()
+
+    def test_context_manager_closes_connection(self, tmp_path):
+        """SessionStore used as context manager closes on exit."""
+        from seeknal.ask.sessions import SessionStore
+
+        with SessionStore(tmp_path) as store:
+            store.create("ctx-test")
+            session = store.get("ctx-test")
+            assert session is not None
+
+        # Connection should be closed — operations should fail
+        import sqlite3
+
+        with pytest.raises(sqlite3.ProgrammingError):
+            store._conn.execute("SELECT 1")

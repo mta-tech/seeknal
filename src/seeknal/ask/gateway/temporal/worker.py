@@ -16,6 +16,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+_MAX_CONNECT_RETRIES = 5
+_CONNECT_RETRY_BASE_SECONDS = 2.0
+
 
 async def run_temporal_worker(
     project_path: Path,
@@ -24,6 +27,9 @@ async def run_temporal_worker(
     task_queue: str = "seeknal-ask",
 ) -> None:
     """Start a Temporal worker and run until interrupted.
+
+    Retries the initial connection with exponential backoff if the
+    Temporal server is temporarily unavailable.
 
     Args:
         project_path: Path to the seeknal project root.
@@ -40,15 +46,6 @@ async def run_temporal_worker(
     workflow_class = get_workflow_class()
     activity_fn = get_activity_fn()
 
-    client = await Client.connect(server, namespace=namespace)
-
-    logger.info(
-        "Starting Temporal worker: server=%s namespace=%s queue=%s",
-        server,
-        namespace,
-        task_queue,
-    )
-
     shutdown_event = asyncio.Event()
 
     def _signal_handler():
@@ -58,6 +55,43 @@ async def run_temporal_worker(
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _signal_handler)
+
+    # Connect with retry + exponential backoff
+    client = None
+    attempt = 0
+    while not shutdown_event.is_set():
+        try:
+            client = await Client.connect(server, namespace=namespace)
+            break
+        except Exception as exc:
+            attempt += 1
+            if attempt >= _MAX_CONNECT_RETRIES:
+                logger.error(
+                    "Failed to connect to Temporal after %d attempts: %s",
+                    attempt, exc,
+                )
+                return
+            delay = _CONNECT_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            logger.warning(
+                "Temporal connect attempt %d failed: %s. Retrying in %.1fs...",
+                attempt, exc, delay,
+            )
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=delay)
+                return  # shutdown requested during backoff
+            except asyncio.TimeoutError:
+                continue
+
+    if client is None:
+        logger.info("Shutdown requested before connection established.")
+        return
+
+    logger.info(
+        "Starting Temporal worker: server=%s namespace=%s queue=%s",
+        server,
+        namespace,
+        task_queue,
+    )
 
     async with Worker(
         client,
