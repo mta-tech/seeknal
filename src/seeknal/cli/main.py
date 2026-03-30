@@ -295,6 +295,42 @@ def _register_ask_commands():
 _register_ask_commands()
 
 
+def _register_session_commands():
+    """Register Session commands if seeknal[ask] deps are available."""
+    try:
+        from seeknal.cli.session import session_app
+        app.add_typer(session_app, name="session")
+    except ImportError:
+        pass
+
+
+_register_session_commands()
+
+
+def _register_gateway_commands():
+    """Register Gateway commands if seeknal[ask] deps are available."""
+    try:
+        from seeknal.cli.gateway import gateway_app
+        app.add_typer(gateway_app, name="gateway")
+    except ImportError:
+        pass
+
+
+_register_gateway_commands()
+
+
+def _register_heartbeat_commands():
+    """Register Heartbeat commands if seeknal[ask] deps are available."""
+    try:
+        from seeknal.cli.heartbeat import heartbeat_app
+        app.add_typer(heartbeat_app, name="heartbeat")
+    except ImportError:
+        pass
+
+
+_register_heartbeat_commands()
+
+
 # =============================================================================
 # Prefect Orchestration Integration (Optional)
 # =============================================================================
@@ -733,6 +769,166 @@ def info():
     typer.echo(f"DuckDB version: {duckdb.__version__}")
 
 
+def _generate_agent_docs(project_path: Path, project_name: str) -> None:
+    """Generate CLAUDE.md and AGENTS.md for coding agents."""
+    from jinja2 import Environment, FileSystemLoader
+
+    # Discover connections from profiles.yml (keys only, not values)
+    connections = []
+    profiles_path = project_path / "profiles.yml"
+    if profiles_path.exists():
+        try:
+            import yaml
+            with open(profiles_path) as f:
+                profiles = yaml.safe_load(f) or {}
+            conns = profiles.get("connections", {})
+            if isinstance(conns, dict):
+                connections = [k for k in conns.keys() if not k.startswith("#")]
+        except Exception:
+            pass
+
+    # Load Jinja2 templates from package
+    template_dir = Path(__file__).parent.parent / "workflow" / "templates"
+    env = Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+
+    context = {
+        "project_name": project_name,
+        "connections": connections,
+    }
+
+    # Generate CLAUDE.md
+    claude_md = project_path / "CLAUDE.md"
+    if not claude_md.exists():
+        template = env.get_template("claude_md.j2")
+        claude_md.write_text(template.render(**context))
+        typer.echo("  Created: CLAUDE.md (agent conventions)")
+    else:
+        typer.echo("  Skipped: CLAUDE.md (already exists)")
+
+    # Generate AGENTS.md
+    agents_md = project_path / "AGENTS.md"
+    if not agents_md.exists():
+        template = env.get_template("agents_md.j2")
+        agents_md.write_text(template.render(**context))
+        typer.echo("  Created: AGENTS.md (agent safety rules)")
+    else:
+        typer.echo("  Skipped: AGENTS.md (already exists)")
+
+
+def _generate_agent_docs_force(project_path: Path, project_name: str) -> None:
+    """Regenerate CLAUDE.md and AGENTS.md, overwriting existing files."""
+    from jinja2 import Environment, FileSystemLoader
+
+    connections = []
+    profiles_path = project_path / "profiles.yml"
+    if profiles_path.exists():
+        try:
+            import yaml
+            with open(profiles_path) as f:
+                profiles = yaml.safe_load(f) or {}
+            conns = profiles.get("connections", {})
+            if isinstance(conns, dict):
+                connections = [k for k in conns.keys() if not k.startswith("#")]
+        except Exception:
+            pass
+
+    template_dir = Path(__file__).parent.parent / "workflow" / "templates"
+    env = Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+
+    context = {"project_name": project_name, "connections": connections}
+
+    for filename, template_name, label in [
+        ("CLAUDE.md", "claude_md.j2", "agent conventions"),
+        ("AGENTS.md", "agents_md.j2", "agent safety rules"),
+    ]:
+        template = env.get_template(template_name)
+        (project_path / filename).write_text(template.render(**context))
+        typer.echo(f"  Regenerated: {filename} ({label})")
+
+
+def _generate_skills_force(project_path: Path, project_name: str) -> None:
+    """Regenerate Claude Code skills, overwriting existing files."""
+    from jinja2 import Environment, FileSystemLoader
+
+    template_dir = Path(__file__).parent.parent / "workflow" / "templates"
+    env = Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+
+    context = {"project_name": project_name}
+    skills = [
+        "pipeline", "pipeline_design", "feature_group", "model",
+        "analytics", "rules", "deploy",
+        "init", "debug",
+    ]
+
+    generated = 0
+    for skill_name in skills:
+        template_file = f"skill_{skill_name}.md.j2"
+        try:
+            template = env.get_template(template_file)
+        except Exception:
+            continue
+
+        skill_dir = project_path / ".claude" / "skills" / f"seeknal-{skill_name.replace('_', '-')}"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text(template.render(**context))
+        generated += 1
+
+    if generated > 0:
+        typer.echo(f"  Regenerated: .claude/skills/ ({generated} skills)")
+
+
+def _generate_skills(project_path: Path, project_name: str) -> None:
+    """Generate Claude Code skills in .claude/skills/."""
+    from jinja2 import Environment, FileSystemLoader
+
+    template_dir = Path(__file__).parent.parent / "workflow" / "templates"
+    env = Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+
+    context = {"project_name": project_name}
+
+    skills = [
+        "pipeline", "pipeline_design", "feature_group", "model",
+        "analytics", "rules", "deploy",
+        "init", "debug",
+    ]
+
+    generated = 0
+    for skill_name in skills:
+        template_file = f"skill_{skill_name}.md.j2"
+        try:
+            template = env.get_template(template_file)
+        except Exception:
+            continue  # Template not yet created
+
+        skill_dir = project_path / ".claude" / "skills" / f"seeknal-{skill_name.replace('_', '-')}"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_file = skill_dir / "SKILL.md"
+
+        if not skill_file.exists():
+            skill_file.write_text(template.render(**context))
+            generated += 1
+
+    if generated > 0:
+        typer.echo(f"  Created: .claude/skills/ ({generated} skills)")
+
+
 @app.command()
 def init(
     name: str = typer.Option(
@@ -887,6 +1083,12 @@ __pycache__/
 """
         (project_path / ".gitignore").write_text(gitignore_content)
         typer.echo(f"  Created: .gitignore")
+
+        # Generate CLAUDE.md and AGENTS.md for coding agents
+        _generate_agent_docs(project_path, name)
+
+        # Generate Claude Code skills
+        _generate_skills(project_path, name)
 
         # Also create the legacy Project for database compatibility
         from seeknal.project import Project
@@ -3995,6 +4197,7 @@ def apply(
             "source": "sources",
             "transform": "transforms",
             "feature_group": "feature_groups",
+            "model": "models",
             "second_order_aggregation": "second_order_aggregations",
         }
         target_dir_name = kind_dir_map.get(node_kind, "pipelines")
@@ -4227,67 +4430,18 @@ def query(
     import yaml
     from pathlib import Path as P
 
-    from seeknal.workflow.semantic.models import (
-        Metric as MetricModel,
-        MetricQuery,
-        MetricType,
-        SemanticModel,
-    )
+    from seeknal.workflow.semantic.models import MetricQuery
     from seeknal.workflow.semantic.compiler import MetricCompiler
+    from seeknal.workflow.semantic.loader import load_semantic_layer
 
     project = P(project_path)
 
-    # Load semantic models
-    sm_dir = project / "seeknal" / "semantic_models"
-    semantic_models = []
-    if sm_dir.exists():
-        for yml_path in sorted(sm_dir.glob("*.yml")):
-            with open(yml_path, "r") as f:
-                data = yaml.safe_load(f) or {}
-            if data.get("kind") == "semantic_model":
-                semantic_models.append(SemanticModel.from_dict(data))
+    # Load semantic models and metrics via shared loader
+    semantic_models, metric_list = load_semantic_layer(project)
 
     if not semantic_models:
         _echo_error("No semantic models found. Create YAML files in seeknal/semantic_models/")
         raise typer.Exit(code=1)
-
-    # Collect metrics from three sources (in priority order):
-    # 1. Inline metrics defined in semantic model YAML (metrics: section)
-    # 2. Separate metric YAML files in seeknal/metrics/
-    # 3. Auto-generated simple metrics from measures (fallback)
-    metric_list = []
-    seen_names: set[str] = set()
-
-    # Source 1: Inline metrics from semantic models
-    for sm in semantic_models:
-        for m in sm.metrics:
-            if m.name not in seen_names:
-                metric_list.append(m)
-                seen_names.add(m.name)
-
-    # Source 2: Separate metric YAML files
-    metrics_dir = project / "seeknal" / "metrics"
-    if metrics_dir.exists():
-        for yml_path in sorted(metrics_dir.glob("*.yml")):
-            with open(yml_path, "r") as f:
-                for doc in yaml.safe_load_all(f):
-                    if doc and doc.get("kind") == "metric":
-                        m = MetricModel.from_dict(doc)
-                        if m.name not in seen_names:
-                            metric_list.append(m)
-                            seen_names.add(m.name)
-
-    # Source 3: Auto-generate simple metrics from measures (Cube.js-style)
-    for sm in semantic_models:
-        for measure in sm.measures:
-            if measure.name not in seen_names:
-                metric_list.append(MetricModel(
-                    name=measure.name,
-                    type=MetricType.SIMPLE,
-                    description=measure.description,
-                    measure=measure.name,
-                ))
-                seen_names.add(measure.name)
 
     if not metric_list:
         _echo_error("No metrics or measures found. Define measures in seeknal/semantic_models/ or metrics in seeknal/metrics/")
@@ -6094,6 +6248,56 @@ def consolidate(
         _echo_success("Prune completed (stale FG columns removed on re-consolidation)")
 
     _echo_success(f"Consolidation complete: {success_count}/{len(entities)} entities")
+
+
+@app.command("semantic-bootstrap")
+def semantic_bootstrap(
+    project_path: str = typer.Option(".", "--project", help="Path to project directory"),
+):
+    """
+    Bootstrap semantic models from data files.
+
+    Scans data/ CSVs and target/intermediate/ parquets, profiles column types,
+    and generates draft semantic model YAML files in seeknal/semantic_models/.
+
+    Example:
+        seeknal semantic-bootstrap
+        seeknal semantic-bootstrap --project /path/to/project
+    """
+    from pathlib import Path as P
+    from seeknal.workflow.semantic.bootstrap import bootstrap_semantic_models
+
+    project = P(project_path).resolve()
+
+    _echo_info(f"Scanning data files in {project} ...")
+
+    generated = bootstrap_semantic_models(project)
+
+    if not generated:
+        _echo_error(
+            "No data files found to bootstrap.\n"
+            "Place CSV files in data/ or run a pipeline to generate "
+            "parquet files in target/intermediate/."
+        )
+        raise typer.Exit(code=1)
+
+    _echo_success(f"Generated {len(generated)} semantic model(s):\n")
+    sm_dir = project / "seeknal" / "semantic_models"
+    for model in generated:
+        name = model["name"]
+        entities = [e["name"] for e in model.get("entities", [])]
+        measures = [m["name"] for m in model.get("measures", [])]
+        dims = [d["name"] for d in model.get("dimensions", [])]
+        _echo_info(f"  {name}.yml")
+        if entities:
+            typer.echo(f"    Entities:   {', '.join(entities)}")
+        if dims:
+            typer.echo(f"    Dimensions: {', '.join(dims)}")
+        if measures:
+            typer.echo(f"    Measures:   {', '.join(measures)}")
+
+    _echo_info(f"\nFiles written to: {sm_dir}")
+    _echo_info("Review the generated files and adjust as needed.")
 
 
 def main():

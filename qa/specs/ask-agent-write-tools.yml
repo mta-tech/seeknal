@@ -1,0 +1,221 @@
+name: ask-agent-write-tools
+description: >
+  Test the Ask agent write tools end-to-end: draft_node creates valid YAML drafts,
+  dry_run_draft validates them, apply_draft moves them into the project, edit_node
+  modifies existing nodes with diff preview, plan_pipeline returns execution plan,
+  show_lineage returns ASCII tree, and run_pipeline executes the pipeline.
+  Uses a real CSV dataset through the complete draft -> dry-run -> apply -> run lifecycle.
+source_type: csv
+
+infrastructure:
+  requires: []
+
+seed_data:
+  raw_transactions.csv: |
+    txn_id,customer_id,amount,txn_date,category
+    T001,C001,150.00,2026-01-15,electronics
+    T002,C002,75.50,2026-01-16,books
+    T003,C001,200.00,2026-01-17,electronics
+    T004,C003,50.00,2026-01-18,clothing
+    T005,C002,300.00,2026-01-19,electronics
+    T006,C001,125.75,2026-01-20,books
+    T007,C004,89.99,2026-01-21,clothing
+    T008,C003,175.00,2026-01-22,electronics
+  raw_customers.csv: |
+    customer_id,name,email,tier
+    C001,Alice,alice@example.com,gold
+    C002,Bob,bob@example.com,silver
+    C003,Charlie,charlie@example.com,bronze
+    C004,Diana,diana@example.com,gold
+
+# No pipeline section — we build it entirely via agent tools
+pipeline:
+  bronze: []
+  silver: []
+  gold: []
+
+validation:
+  dag:
+    expected_nodes: 0  # We validate post-tool-execution
+  execution:
+    success: true
+
+# --- Agent Write Tool Tests ---
+# These test each tool function directly via call_function actions.
+report_exposure_tests:
+
+  # ==========================================================
+  # Test 1: draft_node creates a valid source draft file
+  # ==========================================================
+  test_draft_source:
+    action: call_function
+    module: seeknal.ask.agents.tools.draft_node
+    function: draft_node
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      node_type: "source"
+      name: "raw_transactions"
+    validate:
+      - result_contains: "Created draft"
+      - result_contains: "draft_source_raw_transactions.yml"
+      - file_exists: "draft_source_raw_transactions.yml"
+
+  # ==========================================================
+  # Test 2: draft_node rejects invalid node type
+  # ==========================================================
+  test_draft_invalid_type:
+    action: call_function
+    module: seeknal.ask.agents.tools.draft_node
+    function: draft_node
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      node_type: "invalid_type"
+      name: "test"
+    validate:
+      - result_contains: "Invalid node type"
+
+  # ==========================================================
+  # Test 3: draft_node rejects path traversal in name
+  # ==========================================================
+  test_draft_path_traversal_name:
+    action: call_function
+    module: seeknal.ask.agents.tools.draft_node
+    function: draft_node
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      node_type: "source"
+      name: "../evil"
+    validate:
+      - result_contains: "Invalid name"
+
+  # ==========================================================
+  # Test 4: draft_node creates a transform
+  # ==========================================================
+  test_draft_transform:
+    action: call_function
+    module: seeknal.ask.agents.tools.draft_node
+    function: draft_node
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      node_type: "transform"
+      name: "clean_txns"
+    validate:
+      - result_contains: "Created draft"
+      - result_contains: "draft_transform_clean_txns.yml"
+      - file_exists: "draft_transform_clean_txns.yml"
+
+  # ==========================================================
+  # Test 5: draft_node refuses duplicate draft
+  # ==========================================================
+  test_draft_duplicate:
+    action: call_function
+    depends_on: test_draft_source
+    module: seeknal.ask.agents.tools.draft_node
+    function: draft_node
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      node_type: "source"
+      name: "raw_transactions"
+    validate:
+      - result_contains: "already exists"
+
+  # ==========================================================
+  # Test 6: draft_node with feature_group type
+  # ==========================================================
+  test_draft_feature_group:
+    action: call_function
+    module: seeknal.ask.agents.tools.draft_node
+    function: draft_node
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      node_type: "feature_group"
+      name: "customer_features"
+    validate:
+      - result_contains: "Created draft"
+      - file_exists: "draft_feature_group_customer_features.yml"
+
+  # ==========================================================
+  # Test 7: plan_pipeline returns plan output
+  # ==========================================================
+  test_plan_pipeline_empty:
+    action: call_function
+    module: seeknal.ask.agents.tools.plan_pipeline
+    function: plan_pipeline
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args: {}
+    validate:
+      - result_contains: "Plan"
+
+  # ==========================================================
+  # Test 8: show_lineage returns lineage output
+  # ==========================================================
+  test_show_lineage:
+    action: call_function
+    module: seeknal.ask.agents.tools.show_lineage
+    function: show_lineage
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args: {}
+    validate:
+      - result_contains: "Lineage"
+
+  # ==========================================================
+  # Test 9: run_pipeline requires confirmation
+  # ==========================================================
+  test_run_requires_confirmation:
+    action: call_function
+    module: seeknal.ask.agents.tools.run_pipeline
+    function: run_pipeline
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      confirmed: false
+    validate:
+      - result_contains: "confirmed=True"
+      - result_contains: "Ready to execute"
+
+  # ==========================================================
+  # Test 10: apply_draft requires confirmation
+  # ==========================================================
+  test_apply_requires_confirmation:
+    action: call_function
+    depends_on: test_draft_source
+    module: seeknal.ask.agents.tools.apply_draft
+    function: apply_draft
+    setup:
+      tool_context:
+        project_path: "{project_path}"
+    args:
+      file_path: "draft_source_raw_transactions.yml"
+      confirmed: false
+    validate:
+      - result_contains: "confirmed=True"
+      - result_contains: "Ready to apply"
+
+features_tested:
+  - draft_node_source
+  - draft_node_transform
+  - draft_node_feature_group
+  - draft_node_invalid_type_rejection
+  - draft_node_path_traversal_rejection
+  - draft_node_duplicate_rejection
+  - plan_pipeline
+  - show_lineage
+  - run_pipeline_confirmation
+  - apply_draft_confirmation

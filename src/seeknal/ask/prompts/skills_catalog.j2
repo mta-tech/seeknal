@@ -1,0 +1,16 @@
+## Available Skills
+
+Before acting on a BUILD or complex request, scan these skills.
+If one matches the user's request, use `read_project_file` to load the full instructions.
+Only read a skill when the request clearly matches — do not read all skills upfront.
+
+| Skill | Description | Path |
+|-------|------------|------|
+| pipeline | Build data pipelines with draft → dry-run → apply | .claude/skills/seeknal-pipeline/SKILL.md |
+| pipeline-design | Interactive pipeline design brainstorm (chat mode) | .claude/skills/seeknal-pipeline-design/SKILL.md |
+| feature-group | Entity-based features for ML models | .claude/skills/seeknal-feature-group/SKILL.md |
+| model | ML model training and serving with scikit-learn | .claude/skills/seeknal-model/SKILL.md |
+| analytics | Semantic models, metrics, exposures for reporting | .claude/skills/seeknal-analytics/SKILL.md |
+| deploy | Materialization + environment promotion | .claude/skills/seeknal-deploy/SKILL.md |
+| rules | Data quality rules and profiling | .claude/skills/seeknal-rules/SKILL.md |
+| debug | Troubleshooting pipeline failures | .claude/skills/seeknal-debug/SKILL.md |

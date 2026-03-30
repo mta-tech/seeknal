@@ -9,9 +9,20 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 
-def build_report(report_path: Path, timeout: int = 120) -> str:
+def _print_progress(console: Any, line: str) -> None:
+    """Print a subprocess progress line to the Rich console (dim, escaped)."""
+    try:
+        from rich.markup import escape
+
+        console.print(f"  [dim]{escape(line)}[/dim]")
+    except Exception:
+        pass  # Don't let display errors break the build
+
+
+def build_report(report_path: Path, timeout: int = 120, console: Any = None) -> str:
     """Build an Evidence report into static HTML.
 
     Checks for Node.js availability, installs dependencies if needed
@@ -20,6 +31,7 @@ def build_report(report_path: Path, timeout: int = 120) -> str:
     Args:
         report_path: Path to the Evidence project directory.
         timeout: Maximum build time in seconds.
+        console: Optional Rich Console for streaming progress output.
 
     Returns:
         Path to the built index.html on success, or an error message.
@@ -31,13 +43,13 @@ def build_report(report_path: Path, timeout: int = 120) -> str:
 
     # Ensure dependencies are installed (shared cache)
     # First install can take 2-3 minutes; subsequent installs are near-instant via cache
-    install_error = _ensure_node_modules(report_path, timeout=180)
+    install_error = _ensure_node_modules(report_path, timeout=180, console=console)
     if install_error:
         return install_error
 
     # Run evidence build: try npx with scoped name first, fall back to npm run
     env = _get_build_env()
-    result = _run_evidence_build(report_path, env, timeout)
+    result = _run_evidence_build(report_path, env, timeout, console=console)
     if result is None:
         return f"Evidence build timed out after {timeout} seconds."
 
@@ -106,7 +118,7 @@ def _check_node() -> str:
     return ""
 
 
-def _ensure_node_modules(report_path: Path, timeout: int = 60) -> str:
+def _ensure_node_modules(report_path: Path, timeout: int = 60, console: Any = None) -> str:
     """Install npm dependencies using a shared cache.
 
     Uses a shared node_modules at target/reports/.evidence-cache/node_modules/
@@ -150,21 +162,29 @@ def _ensure_node_modules(report_path: Path, timeout: int = 60) -> str:
 
     env = _get_build_env()
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ["npm", "install", "--prefer-offline"],
             cwd=str(cache_dir),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             env=env,
         )
+        for line in proc.stdout:
+            stripped = line.rstrip()
+            if console and stripped:
+                _print_progress(console, stripped)
+        proc.wait(timeout=timeout)
+        stderr_output = proc.stderr.read()
     except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
         return "npm install timed out. Check your network connection."
     except OSError as e:
         return f"Error running npm install: {e}"
 
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
+    if proc.returncode != 0:
+        stderr = stderr_output.strip()
         if len(stderr) > 1000:
             stderr = stderr[-1000:]
         return f"npm install failed:\n{stderr}"
@@ -192,23 +212,52 @@ def _ensure_node_modules(report_path: Path, timeout: int = 60) -> str:
 
 
 def _run_evidence_build(
-    report_path: Path, env: dict[str, str], timeout: int
+    report_path: Path, env: dict[str, str], timeout: int, console: Any = None
 ) -> subprocess.CompletedProcess | None:
     """Run Evidence build, trying npx first then falling back to npm run.
 
     Returns:
         CompletedProcess on success or failure, None on timeout.
     """
-    # Try npx with scoped package name (more direct)
-    try:
-        result = subprocess.run(
-            ["npx", "@evidence-dev/evidence", "build"],
+
+    def _stream_popen(cmd: list[str]) -> subprocess.CompletedProcess | None:
+        """Run a command with Popen, streaming stdout to console.
+
+        Returns CompletedProcess on completion, None on timeout.
+        """
+        proc = subprocess.Popen(
+            cmd,
             cwd=str(report_path),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             env=env,
         )
+        stdout_lines: list[str] = []
+        for line in proc.stdout:
+            stripped = line.rstrip()
+            stdout_lines.append(stripped)
+            if console and stripped:
+                _print_progress(console, stripped)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return None
+        stderr_output = proc.stderr.read()
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=proc.returncode,
+            stdout="\n".join(stdout_lines),
+            stderr=stderr_output,
+        )
+
+    # Try npx with scoped package name (more direct)
+    try:
+        result = _stream_popen(["npx", "@evidence-dev/evidence", "build"])
+        if result is None:
+            return None  # Timeout
         if result.returncode == 0:
             return result
         # If npx failed with "could not determine executable", try npm run
@@ -216,32 +265,20 @@ def _run_evidence_build(
             pass  # Fall through to npm run
         else:
             return result  # Real build error, return as-is
-    except subprocess.TimeoutExpired:
-        return None
     except OSError:
         pass  # npx not available, fall through
 
     # Fallback: npm run build (uses scripts.build from package.json)
     try:
-        return subprocess.run(
-            ["npm", "run", "build"],
-            cwd=str(report_path),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return None
+        return _stream_popen(["npm", "run", "build"])
     except OSError as e:
         # Return a fake failed result with the error
-        result = subprocess.CompletedProcess(
+        return subprocess.CompletedProcess(
             args=["npm", "run", "build"],
             returncode=1,
             stdout="",
             stderr=f"Error launching build: {e}",
         )
-        return result
 
 
 def _get_build_env() -> dict[str, str]:

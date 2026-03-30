@@ -42,6 +42,12 @@ engines/spark-engine/.metals/
 .factory/
 .serena/
 
+# Per-project session storage
+.seeknal/
+
+# Claude Code worktrees
+.claude/worktrees/
+
 # MkDocs build output
 site/
 

@@ -68,6 +68,8 @@ def _create_google(
         model=model,
         google_api_key=api_key,
         temperature=temperature,
+        max_retries=6,
+        timeout=120,
     )
 
 

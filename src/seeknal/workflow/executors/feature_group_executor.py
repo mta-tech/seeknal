@@ -63,6 +63,9 @@ from ...workflow.materialization.yaml_integration import materialize_node_if_ena
 logger = logging.getLogger(__name__)
 
 
+from ...utils.dataframe import coerce_string_dtype as _coerce_string_dtype
+
+
 @register_executor(NodeType.FEATURE_GROUP)
 class FeatureGroupExecutor(BaseExecutor):
     """
@@ -399,6 +402,8 @@ class FeatureGroupExecutor(BaseExecutor):
 
             # Set features
             features = config.get("features")  # None means auto-detect
+            if isinstance(features, dict):
+                features = list(features.keys())
             fg.set_features(features=features)
 
             # Materialize
@@ -429,7 +434,7 @@ class FeatureGroupExecutor(BaseExecutor):
                 # Create a view directly from the DataFrame
                 # We use a unique temp table name to avoid conflicts
                 temp_table = f"_temp_fg_{self.node.name}_{id(self)}"
-                con.register(temp_table, source_df)
+                con.register(temp_table, _coerce_string_dtype(source_df))
                 con.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM {temp_table}")
                 
                 logger.info(f"Created view '{view_name}' for materialization ({len(source_df)} rows)")
@@ -532,6 +537,8 @@ class FeatureGroupExecutor(BaseExecutor):
 
             # Set features
             features = config.get("features")  # None means auto-detect
+            if isinstance(features, dict):
+                features = list(features.keys())
             fg.set_features(features=features)
 
             # Materialize
@@ -592,7 +599,7 @@ class FeatureGroupExecutor(BaseExecutor):
         import duckdb
 
         con = self.context.get_duckdb_connection()
-        con.register("source", df)
+        con.register("source", _coerce_string_dtype(df))
 
         # Execute transform
         result_df = con.execute(transform_sql).df()

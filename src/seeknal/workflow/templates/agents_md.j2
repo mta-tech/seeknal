@@ -1,0 +1,143 @@
+# Agent Instructions for {{ project_name }}
+
+Instructions for AI coding agents (Claude Code, Codex, Cursor, seeknal ask) working in this seeknal project.
+
+## Safety Rules
+
+1. **Always use the draft workflow**: `seeknal draft` → edit → `seeknal dry-run` → `seeknal apply`
+2. **Never modify files in `target/`** — auto-generated outputs, will be overwritten
+3. **Never modify `profiles.yml`** — contains credentials, managed by the user
+4. **Never modify `.env`** — environment secrets, managed by the user
+5. **Never modify `seeknal_project.yml`** — project config, managed by the user
+6. **Always validate before applying**: run `seeknal dry-run <file>` and check for errors
+7. **Show changes to the user** before applying — present YAML content or diffs for confirmation
+
+## Discovering Project State
+
+```bash
+# What nodes exist?
+seeknal plan                            # Execution order + node list
+
+# What does the DAG look like?
+seeknal lineage --ascii                 # Full pipeline as ASCII tree
+seeknal lineage transform.X --ascii     # Focused on one node
+
+# What data is available?
+seeknal repl                            # Interactive SQL on intermediate parquets
+seeknal inspect transform.X             # Preview a node's output
+
+# What changed?
+seeknal diff                            # Compare current vs last run
+```
+
+## Building Pipelines
+
+### Step-by-step for each node:
+
+```bash
+# 1. Scaffold
+seeknal draft <type> <name>
+
+# 2. Edit the generated file (fill in SQL, configure source, etc.)
+# The draft file is at: draft_<type>_<name>.yml
+
+# 3. Validate
+seeknal dry-run draft_<type>_<name>.yml
+
+# 4. Apply (moves to seeknal/<type>s/<name>.yml)
+seeknal apply draft_<type>_<name>.yml
+
+# 5. Verify manifest updated
+seeknal plan
+```
+
+### Dependency order:
+
+Build nodes in this order (upstream first):
+1. **Sources** — external data ingestion
+2. **Transforms** — SQL/Python transformations (reference sources via `ref()`)
+3. **Aggregations** — time-windowed feature computation
+4. **Feature groups** — entity-based feature definitions
+5. **Models** — ML training/serving
+6. **Rules / Profiles** — data quality validation
+7. **Semantic models → Metrics → Exposures** — analytics layer
+
+### Multi-node creation:
+
+When creating multiple nodes:
+1. Present the full plan to the user (list all nodes to create)
+2. Get a single confirmation
+3. Create all drafts in dependency order
+4. Dry-run each draft
+5. Apply each draft
+6. Run `seeknal plan` to verify the DAG
+
+## Validating Work
+
+After creating or modifying nodes:
+
+```bash
+# Check syntax and schema
+seeknal dry-run <file>
+
+# Verify DAG is correct
+seeknal plan
+
+# Run and check output
+seeknal run
+seeknal inspect <node_id>      # e.g., seeknal inspect transform.clean_data
+```
+
+## Common Patterns
+
+### CSV Source
+```yaml
+kind: source
+name: customers
+source: csv
+table: "data/customers.csv"
+columns:
+  id: "Customer ID"
+  name: "Customer name"
+```
+
+### SQL Transform
+```yaml
+kind: transform
+name: active_customers
+inputs:
+  - ref: source.customers
+transform: |
+  SELECT *
+  FROM input_0
+  WHERE status = 'active'
+```
+
+### Feature Group
+```yaml
+kind: feature_group
+name: customer_features
+entity:
+  name: customer
+  join_keys: [customer_id]
+materialization:
+  event_time_col: event_timestamp
+inputs:
+  - ref: transform.active_customers
+transform: |
+  SELECT customer_id, event_timestamp, total_spend, visit_count
+  FROM input_0
+features:
+  total_spend: "Total customer spend"
+  visit_count: "Number of visits"
+```
+
+## Error Handling
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `Unknown node type` | Typo in `kind:` field | Check valid types: source, transform, feature_group, model, aggregation, rule, profile, exposure, semantic_model, metric |
+| `Missing required field` | YAML schema violation | Run `seeknal draft <type> example` to see all required fields |
+| `Unresolved reference` | `ref: source.X` but source.X doesn't exist | Create the upstream node first, then apply |
+| `SQL execution error` | Invalid DuckDB SQL | Check: no semicolons, CAST timestamps, all GROUP BY columns listed |
+| `File already exists` | Applying over existing node | Use `--force` flag or rename the node |

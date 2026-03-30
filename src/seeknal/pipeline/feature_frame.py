@@ -265,3 +265,11 @@ class FeatureFrame:
             join_keys=list(self.join_keys),
             event_time_col=self.event_time_col,
         )
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate any unknown attribute to the inner DataFrame.
+
+        This makes FeatureFrame transparent — any pandas DataFrame method
+        (groupby, sort_values, etc.) works without explicit delegation.
+        """
+        return getattr(self._df, name)

@@ -1,5 +1,6 @@
 """Utility modules for Seeknal."""
 
+from .dataframe import coerce_string_dtype
 from .path_security import (
     is_insecure_path,
     get_secure_default_path,
@@ -18,6 +19,8 @@ from ..core_utils import (
 )
 
 __all__ = [
+    # DataFrame utilities
+    "coerce_string_dtype",
     # Path security
     "is_insecure_path",
     "get_secure_default_path",

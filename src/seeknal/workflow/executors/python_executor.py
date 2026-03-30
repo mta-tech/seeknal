@@ -142,6 +142,105 @@ def check_uv_installed() -> bool:
     return shutil.which("uv") is not None
 
 
+def extract_pep723_deps(content: str) -> list[str]:
+    """Extract dependency names from PEP 723 inline script metadata.
+
+    Args:
+        content: Python file content
+
+    Returns:
+        List of dependency package names (e.g., ["pandas", "scikit-learn"])
+    """
+    import re
+
+    lines = content.split("\n")
+    in_header = False
+    in_deps = False
+    deps: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "# /// script":
+            in_header = True
+            continue
+        if stripped == "# ///" and in_header:
+            break
+        if not in_header:
+            continue
+
+        # Remove leading "# " to get TOML-like content
+        toml_line = line.lstrip("#").strip()
+
+        if toml_line.startswith("dependencies"):
+            in_deps = True
+            continue
+        if in_deps:
+            if toml_line == "]":
+                in_deps = False
+                continue
+            # Extract quoted package name, e.g., '    "pandas",' -> 'pandas'
+            match = re.match(r'["\']([^"\'>=<!\s]+)', toml_line.strip().rstrip(","))
+            if match:
+                deps.append(match.group(1))
+
+    return deps
+
+
+def check_pep723_deps(file_path: Path) -> list[str]:
+    """Validate PEP 723 dependencies can be resolved by uv.
+
+    Runs ``uv pip compile`` on the declared dependencies to verify they
+    exist on PyPI and are compatible with the current Python version.
+
+    Args:
+        file_path: Path to Python file with PEP 723 header
+
+    Returns:
+        List of warning strings (empty if all deps resolve OK)
+    """
+    if not check_uv_installed():
+        return []
+
+    try:
+        content = file_path.read_text()
+    except Exception:
+        return []
+
+    deps = extract_pep723_deps(content)
+    if not deps:
+        return []
+
+    # Filter out local/always-available packages
+    skip = {"seeknal"}
+    deps = [d for d in deps if d not in skip]
+    if not deps:
+        return []
+
+    # Build requirements-style input for uv pip compile
+    requirements_input = "\n".join(deps)
+
+    try:
+        result = subprocess.run(
+            ["uv", "pip", "compile", "-", "--no-header", "--no-annotate", "--quiet"],
+            input=requirements_input,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            return [
+                f"Dependency resolution failed for: {', '.join(deps)}\n"
+                f"uv pip compile error: {stderr}"
+            ]
+    except subprocess.TimeoutExpired:
+        return ["Dependency resolution timed out (30s). Check network connectivity."]
+    except Exception:
+        return []  # Graceful degradation
+
+    return []
+
+
 @register_executor(NodeType.PYTHON)
 class PythonExecutor(BaseExecutor):
     """
@@ -175,7 +274,8 @@ class PythonExecutor(BaseExecutor):
         """Validate Python execution requirements.
 
         Raises:
-            ExecutorValidationError: If uv is not installed or file doesn't exist
+            ExecutorValidationError: If uv is not installed, file doesn't exist,
+                or PEP 723 dependencies cannot be resolved
         """
         if not check_uv_installed():
             raise ExecutorValidationError(
@@ -189,6 +289,14 @@ class PythonExecutor(BaseExecutor):
             raise ExecutorValidationError(
                 self.node.id,
                 f"Pipeline file not found: {file_path}"
+            )
+
+        # Validate PEP 723 dependencies can be resolved
+        dep_warnings = check_pep723_deps(file_path)
+        if dep_warnings:
+            raise ExecutorValidationError(
+                self.node.id,
+                f"PEP 723 dependency validation failed:\n" + "\n".join(dep_warnings)
             )
 
     def execute(self) -> ExecutorResult:

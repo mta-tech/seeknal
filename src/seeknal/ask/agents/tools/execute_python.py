@@ -78,6 +78,42 @@ def _build_namespace(conn: Any) -> dict:
     except ImportError:
         pass
 
+    try:
+        import sklearn
+        ns["sklearn"] = sklearn
+    except ImportError:
+        pass
+
+    try:
+        import scipy
+        ns["scipy"] = scipy
+    except ImportError:
+        pass
+
+    try:
+        import seaborn as sns
+        ns["sns"] = sns
+    except ImportError:
+        pass
+
+    try:
+        import statsmodels
+        ns["statsmodels"] = statsmodels
+    except ImportError:
+        pass
+
+    try:
+        import xgboost
+        ns["xgboost"] = xgboost
+    except ImportError:
+        pass
+
+    try:
+        import lightgbm
+        ns["lightgbm"] = lightgbm
+    except ImportError:
+        pass
+
     return ns
 
 
@@ -171,6 +207,12 @@ def execute_python(code: str) -> str:
     - pd: pandas
     - np: numpy
     - plt: matplotlib.pyplot
+    - sklearn: scikit-learn (e.g., sklearn.linear_model.LinearRegression)
+    - scipy: scientific computing
+    - sns: seaborn (statistical visualization)
+    - statsmodels: statistical models
+    - xgboost: gradient boosting
+    - lightgbm: gradient boosting
 
     Prefer execute_sql for simple data queries. Use this tool only when
     SQL cannot express the analysis (e.g., correlations, histograms,

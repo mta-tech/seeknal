@@ -51,6 +51,7 @@ class Dimension:
     expr: str = ""
     time_granularity: Optional[str] = None  # day, week, month, quarter, year
     description: Optional[str] = None
+    aliases: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Dimension":
@@ -64,6 +65,7 @@ class Dimension:
             expr=data.get("expr", data["name"]),
             time_granularity=data.get("time_granularity"),
             description=data.get("description"),
+            aliases=data.get("aliases", []),
         )
 
 
@@ -88,6 +90,7 @@ class Measure:
     agg: AggregationType
     description: Optional[str] = None
     filters: list[str] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Measure":
@@ -109,6 +112,7 @@ class Measure:
             agg=AggregationType(agg_value),
             description=data.get("description"),
             filters=[f for f in filters if f],
+            aliases=data.get("aliases", []),
         )
 
 
@@ -317,6 +321,9 @@ class Metric:
     expr: Optional[str] = None
     inputs: list[MetricInput] = field(default_factory=list)
 
+    # business glossary: alternative names for this metric
+    aliases: list[str] = field(default_factory=list)
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Metric":
         return cls(
@@ -330,6 +337,7 @@ class Metric:
             grain_to_date=data.get("grain_to_date"),
             expr=data.get("expr"),
             inputs=[MetricInput.from_dict(i) for i in data.get("inputs", [])],
+            aliases=data.get("aliases", []),
         )
 
     def validate(self) -> list[str]:

@@ -347,7 +347,8 @@ class AggregationExecutor(BaseExecutor):
 
             # Register result as a view for downstream nodes (especially second-order aggregations)
             view_name = f"aggregation.{self.node.name}"
-            con.register(view_name, df)
+            from seeknal.utils.dataframe import coerce_string_dtype
+            con.register(view_name, coerce_string_dtype(df))
 
             # Save to intermediate storage for persistence
             output_path = self.context.get_output_path(self.node)

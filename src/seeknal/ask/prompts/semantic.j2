@@ -1,0 +1,21 @@
+{% if semantic_context %}
+## Semantic Layer — Business Metrics
+
+The project has defined business metrics via the semantic layer. When the user asks about
+a term that matches a metric name or alias, prefer `query_metric` over raw `execute_sql`.
+
+`query_metric` compiles metrics through the MetricCompiler with correct aggregation logic,
+automatic joins, and time grain resolution — producing consistent, governed results.
+
+Use `execute_sql` only for ad-hoc exploration where no matching metric exists.
+
+{{ semantic_context }}
+{% else %}
+## Semantic Layer
+
+No semantic models are defined in this project yet. For consistent, governed metric queries:
+- Call `bootstrap_semantic_model` to auto-generate semantic model YAML from the project's data
+- Or ask the user: "Would you like me to set up business metric definitions for consistent queries?"
+
+Once semantic models exist, use `query_metric` instead of raw `execute_sql` for metric-oriented questions.
+{% endif %}

@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-03-25 — Agent Harness & Pipeline Builder
+
+### Added — Ask Agent Pipeline Builder
+
+The `seeknal ask` agent can now build complete data pipelines from natural language, in addition to its existing analysis capabilities.
+
+#### Modular Prompt Architecture
+- **Jinja2 template system**: Replaced 11.7KB monolithic system prompt with modular templates (`core.j2`, `build.j2`, `report.j2`, `safety.j2`, `skills.j2`)
+- **Tool profiles**: Three profiles (`analysis`, `build`, `full`) load only relevant tools per request, reducing prompt size by ~40%
+- **Auto-detection**: Profile auto-selected from question keywords (e.g., "build pipeline" → build profile)
+- **Per-project config**: `seeknal_agent.yml` for model, provider, disabled tools, and default profile
+
+#### Pipeline Build Tools (9 new tools)
+- `profile_data()` — Discover CSV files with row counts, column types, join key candidates
+- `draft_node(node_type, name)` — Create draft YAML/Python templates for sources, transforms, feature groups, models
+- `edit_file(file_path, old_string, new_string)` — Edit draft files with diff preview
+- `edit_node(node_path, new_content)` — Replace entire node content
+- `dry_run_draft(file_path)` — Validate YAML syntax, schema, SQL correctness, and ref/input consistency
+- `apply_draft(file_path, confirmed)` — Move validated draft to `seeknal/` project structure
+- `plan_pipeline()` — Show DAG node count and edges
+- `run_pipeline(confirmed, full)` — Execute the pipeline
+- `inspect_output(node_name, sql, limit)` — Query parquet outputs directly with fuzzy name matching
+
+#### One-Shot Pipeline Building (Ralph Loop)
+- Detects BUILD requests from keywords and enforces the full build workflow
+- Post-profile stall elimination: agent immediately starts `draft_node` after `profile_data()` — no text summaries
+- Fast sync fallback: if streaming agent stalls after 1 nudge, switches to sync mode
+- Build validation: nudges agent to call `inspect_output()` after `run_pipeline()`
+
+#### Build Validation & Safety
+- **Mandatory dry_run_draft**: Required before `apply_draft` on transforms, models, and feature groups (sources exempt)
+- **YAML ref/input consistency check**: Detects `ref()` calls in SQL not declared in `inputs:` list at draft time
+- **Fuzzy name matching in inspect_output**: Tries `transform_`, `source_`, `feature_group_`, `model_` prefixes before returning "not found"
+- **Write path security**: Blocks writes to `.env`, `profiles.yml`, `target/`, `.git/` — only draft files allowed
+- **DuckDB SQL guardrails**: CAST rules, DATE_DIFF guidance, NULLIF for division, no trailing semicolons
+
+#### Streaming Visibility
+- Progressive step-by-step rendering of reasoning, tool calls, SQL queries, and results via Rich Console
+- Syntax-highlighted SQL and Python in tool call output
+- Markdown table rendering for `execute_sql` results
+- Retry visibility with nudge count display
+
+#### QA Test Suite (53 tests across 4 E2E runs)
+- **tui-e2e** (11 tests): Full bronze→silver→gold→ML pipeline from star schema CSVs
+- **analytics-clv-rfm** (14 tests): CLV, CAC, RFM scoring, cohort retention with DATE_DIFF/NTILE/NULLIF
+- **ml-feature-engineering** (15 tests): Feature engineering, feature store, KMeans + RandomForest, predict_proba
+- **multi-source-joins** (13 tests): Type-mismatch casts, LEFT JOINs, COALESCE NULLs, cardinality validation
+
+### Changed
+- `inspect_output` now tries common prefixes (`transform_`, `source_`, etc.) before returning "not found"
+- `dry_run_draft` now includes YAML ref/input consistency warnings in success output
+- Streaming nudge messages suppress redundant `list_tables` and `profile_data` calls
+- Build prompt enforces mandatory `dry_run_draft` for non-source nodes
+
 ## [2.1.0] - 2026-02-10
 
 ### Added - RUN Command Parity with SQLMesh

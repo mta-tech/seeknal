@@ -1,0 +1,126 @@
+# Deploy Seeknal Pipelines
+
+Materialize pipeline outputs to external systems and manage environments.
+
+## When to Use
+
+Use this skill when asked to write data to PostgreSQL, Iceberg, or other targets, or manage dev/staging/production environments.
+
+## Materialization
+
+### Single Target
+
+Add a `materialization:` block to any transform or feature group:
+
+```yaml
+kind: transform
+name: daily_revenue
+inputs:
+  - ref: source.sales
+transform: |
+  SELECT
+    DATE_TRUNC('day', sale_date) AS day,
+    SUM(amount) AS revenue,
+    CAST(COUNT(*) AS BIGINT) AS order_count
+  FROM input_0
+  GROUP BY 1
+materialization:
+  type: postgresql
+  connection: local_pg
+  table: analytics.daily_revenue
+  mode: full
+```
+
+### Multi-Target
+
+Write to multiple targets from one node using `materializations:` (plural):
+
+```yaml
+materializations:
+  - type: postgresql
+    connection: local_pg
+    table: analytics.daily_revenue
+    mode: upsert_by_key
+    unique_keys: [day]
+  - type: iceberg
+    table: catalog.namespace.daily_revenue
+```
+
+### PostgreSQL Modes
+
+| Mode | Behavior |
+|------|----------|
+| `full` | DROP + CREATE — complete table replacement |
+| `incremental_by_time` | DELETE time range + INSERT — append new periods |
+| `upsert_by_key` | Temp table + DELETE USING + INSERT — merge by key |
+
+### Iceberg Targets
+
+```yaml
+materialization:
+  type: iceberg
+  table: catalog.namespace.my_table
+```
+
+**DuckDB HUGEINT warning**: Always cast aggregates for Iceberg:
+```sql
+CAST(COUNT(*) AS BIGINT) AS row_count
+CAST(SUM(amount) AS DOUBLE) AS total
+```
+
+## Environments
+
+### Create Environment
+
+```bash
+seeknal env plan dev            # Create dev environment plan
+seeknal env apply dev           # Apply (prefixes schemas/namespaces)
+```
+
+### Environment Isolation
+
+Environments prefix external targets automatically:
+- PostgreSQL: `schema.table` → `dev_schema.table`
+- Iceberg: `catalog.ns.table` → `catalog.dev_ns.table`
+
+### Per-Environment Profiles
+
+```bash
+# Auto-discovered: profiles-dev.yml, profiles-staging.yml
+seeknal env apply dev --profile profiles-dev.yml
+```
+
+### Promote
+
+```bash
+seeknal promote dev             # Promote dev → production
+```
+
+## Connections
+
+Connections are defined in `profiles.yml` (never commit this file):
+
+```yaml
+local_pg:
+  type: postgresql
+  host: localhost
+  port: 5432
+  database: mydb
+  user: myuser
+  password: mypass
+```
+
+Reference by name in materialization configs:
+
+```yaml
+materialization:
+  connection: local_pg   # ← matches profiles.yml key
+```
+
+## Common Mistakes
+
+- **Missing connection in profiles.yml**: Ensure the connection name matches exactly
+- **DuckDB HUGEINT for Iceberg**: Always `CAST(COUNT(*) AS BIGINT)` — Iceberg has no HUGEINT
+- **Wrong PostgreSQL mode**: Use `upsert_by_key` for idempotent writes, `full` for complete replacement
+- **Schema name in env**: Prefix applies to schema/namespace only, not table name
+- **Committing profiles.yml**: This file contains credentials — keep it in `.gitignore`

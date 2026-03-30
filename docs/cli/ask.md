@@ -24,13 +24,14 @@ seeknal ask report list [OPTIONS]
 
 ## Description
 
-The `ask` command provides an AI agent that understands your seeknal project — tables, entities, pipelines, and code. It uses 12 built-in tools to discover data, write SQL, run Python analysis, and explain results.
+The `ask` command provides an AI agent that understands your seeknal project — tables, entities, pipelines, and code. It uses 21+ built-in tools to discover data, write SQL, run Python analysis, build pipelines, and explain results.
 
-Three modes of operation:
+Four modes of operation:
 
-1. **One-shot** — Pass a question directly, get an answer
-2. **Chat** — Interactive multi-turn session with conversation memory
-3. **Report** — Generate interactive HTML dashboards with charts and narratives
+1. **One-shot analysis** — Pass a question directly, get an answer
+2. **One-shot build** — Describe a pipeline in natural language, agent builds it end-to-end
+3. **Chat** — Interactive multi-turn session with conversation memory
+4. **Report** — Generate interactive HTML dashboards with charts and narratives
 
 ## Prerequisites
 
@@ -78,7 +79,7 @@ Your project must have data materialized (`seeknal run` has been executed).
 
 ## Examples
 
-### One-shot questions
+### One-shot analysis
 
 ```bash
 # Simple aggregation
@@ -95,6 +96,23 @@ seeknal ask -q "Total revenue last quarter"
 
 # Specify project path
 seeknal ask --project /path/to/project "How many orders?"
+```
+
+### One-shot pipeline build
+
+```bash
+# Build a full pipeline from CSV files
+seeknal ask "Build a pipeline from data/. Bronze: all CSVs as sources. \
+  Silver: enriched_orders (orders JOIN customers). \
+  Gold: revenue_by_segment. \
+  ML: customer segmentation with KMeans."
+
+# The agent will:
+# 1. profile_data() — discover CSV files and columns
+# 2. draft_node + edit_file + dry_run_draft + apply_draft — for each node
+# 3. plan_pipeline() — verify DAG structure
+# 4. run_pipeline(confirmed=True, full=True) — execute
+# 5. inspect_output() — show real data from key nodes
 ```
 
 ### Interactive chat
@@ -145,7 +163,9 @@ seeknal ask --provider ollama --model llama3 "Revenue by month"
 
 ## Agent Tools
 
-The agent has 12 tools it calls automatically based on your question:
+The agent has 21+ tools organized into three profiles. The active profile is auto-detected from your question or can be set via `seeknal_agent.yml`.
+
+### Analysis Tools
 
 | Tool | Description |
 |------|-------------|
@@ -159,8 +179,44 @@ The agent has 12 tools it calls automatically based on your question:
 | `search_pipelines` | Search pipeline files by keyword |
 | `search_project_files` | Search all project files |
 | `read_project_file` | Read any project file |
+| `inspect_output` | Query pipeline output parquets directly (with fuzzy name matching) |
+
+### Build Tools
+
+| Tool | Description |
+|------|-------------|
+| `profile_data` | Discover CSV files with row counts, column types, and join key candidates |
+| `draft_node` | Create a draft YAML/Python template for a pipeline node |
+| `edit_file` | Edit a draft file with string replacement (shows diff preview) |
+| `edit_node` | Replace entire node content |
+| `dry_run_draft` | Validate YAML syntax, schema, SQL, and ref/input consistency |
+| `apply_draft` | Move validated draft to `seeknal/` project structure |
+| `plan_pipeline` | Show DAG node count and dependency edges |
+| `run_pipeline` | Execute the pipeline (requires `confirmed=True`) |
+
+### Report Tools
+
+| Tool | Description |
+|------|-------------|
 | `generate_report` | Create an interactive HTML report (Evidence.dev) |
 | `save_report_exposure` | Save a report as a YAML exposure for re-runs |
+
+### Tool Profiles
+
+| Profile | Tools | Auto-detected when |
+|---------|-------|--------------------|
+| `analysis` | Analysis + Report | "analyze", "show", "query", "how many" |
+| `build` | Analysis + Build | "build", "pipeline", "create", "design" |
+| `full` | All tools | Default, or ambiguous requests |
+
+Configure the default profile in `seeknal_agent.yml`:
+
+```yaml
+default_profile: full
+model: gemini-2.0-flash
+disabled_tools:
+  - execute_python  # optional: disable specific tools
+```
 
 ## Report Exposures
 

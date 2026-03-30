@@ -1,0 +1,140 @@
+# Build Seeknal Data Pipeline
+
+Build data pipelines with sources and transforms using the seeknal `draft -> dry-run -> apply` workflow.
+
+## When to Use
+
+Use this skill when asked to create data sources, SQL/Python transforms, or end-to-end ELT pipelines.
+
+## Workflow
+
+### 1. Draft a Source
+
+```bash
+seeknal draft source <name>
+# Generates: draft_source_<name>.yml
+```
+
+Edit the draft file. Common source types:
+
+**CSV file:**
+```yaml
+kind: source
+name: customers
+source: csv
+table: "data/customers.csv"
+columns:
+  id: "Customer ID"
+  name: "Customer name"
+```
+
+**PostgreSQL table:**
+```yaml
+kind: source
+name: pg_customers
+source: postgresql
+connection: local_pg
+table: "public.customers"
+```
+
+**Python custom source:**
+```bash
+seeknal draft source api_data --python
+# Generates: draft_source_api_data.py with @source decorator
+```
+
+### 2. Validate & Apply
+
+```bash
+seeknal dry-run draft_source_<name>.yml   # Validate
+seeknal apply draft_source_<name>.yml     # Move to seeknal/sources/
+```
+
+### 3. Draft Transforms
+
+```bash
+seeknal draft transform <name>
+```
+
+Edit the transform SQL:
+
+```yaml
+kind: transform
+name: active_customers
+inputs:
+  - ref: source.customers
+transform: |
+  SELECT *
+  FROM input_0
+  WHERE status = 'active'
+  AND created_at >= CAST('2024-01-01' AS TIMESTAMP)
+output:
+  columns:
+    id: "Customer ID"
+    name: "Active customer name"
+```
+
+**Named refs (recommended for multi-input):**
+```yaml
+inputs:
+  - ref: source.customers
+  - ref: source.orders
+transform: |
+  SELECT c.id, c.name, SUM(o.amount) as total_spend
+  FROM ref('source.customers') c
+  JOIN ref('source.orders') o ON c.id = o.customer_id
+  GROUP BY c.id, c.name
+```
+
+### 4. Validate, Apply, Run
+
+```bash
+seeknal dry-run draft_transform_<name>.yml
+seeknal apply draft_transform_<name>.yml
+seeknal plan                    # Verify execution order
+seeknal run                     # Execute all nodes
+```
+
+## Complete Example
+
+```bash
+# 1. Create source
+seeknal draft source sales
+# Edit: set source: csv, table: "data/sales.csv"
+seeknal dry-run draft_source_sales.yml
+seeknal apply draft_source_sales.yml
+
+# 2. Create transform
+seeknal draft transform daily_revenue
+# Edit: set inputs to ref: source.sales, write aggregation SQL
+seeknal dry-run draft_transform_daily_revenue.yml
+seeknal apply draft_transform_daily_revenue.yml
+
+# 3. Run
+seeknal plan
+seeknal run
+
+# 4. Inspect results
+seeknal inspect transform.daily_revenue
+```
+
+## Common Mistakes
+
+- **Missing `ref()` prefix**: Use `source.X` or `transform.X` in `inputs[].ref`, not just `X`
+- **Trailing semicolons in SQL**: DuckDB rejects them — omit the `;`
+- **Wrong input alias**: First input is `input_0`, second is `input_1`, etc.
+- **Timestamp arithmetic**: Use `CAST('2024-01-01' AS TIMESTAMP)` before `- INTERVAL '7 days'`
+- **Missing `kind` field**: Every YAML node must have `kind: source` or `kind: transform`
+
+## Incremental Processing
+
+Add `freshness` to sources for automatic change detection:
+
+```yaml
+freshness:
+  time_column: updated_at
+  warn_after: 24h
+  error_after: 48h
+```
+
+Run with `--full` to ignore cache: `seeknal run --full`

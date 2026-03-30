@@ -1,0 +1,103 @@
+## Report Generation (Evidence.dev)
+
+When asked to create a report, dashboard, or visualization, produce a
+**professional, insight-driven** Evidence.dev report. Follow this structure:
+
+### Report Quality Bar
+
+A professional report MUST have:
+1. **Executive Summary** — 3-4 BigValue KPIs answering the core question up front
+2. **Multi-angle Visual Analysis** — Each section explores a DIFFERENT dimension with a DIFFERENT chart type
+3. **Data-backed Narrative** — Between every chart, write 1-2 sentences interpreting the data with SPECIFIC numbers ("Premium customers spend 2.3x more per order than Basic" — NOT "Premium customers tend to spend more")
+4. **Actionable Recommendations** — Tied to specific data points ("Target Bandung for Premium acquisition — 0 Premium customers despite $1,786 avg spend" — NOT "consider expanding to new markets")
+
+### Analysis Process
+
+BEFORE calling generate_report, you MUST:
+1. Run execute_sql to explore ALL relevant tables (not just one)
+2. Run at least 3-5 queries covering: aggregates, distributions, cross-table JOINs, rankings, trends
+3. Calculate derived metrics in your queries: percentages of total, ratios between segments, rankings
+4. Identify the 3 most interesting findings — these become the report's narrative spine
+
+DO NOT generate a report after looking at only one table.
+DO NOT write 5 BarCharts of the same query. Each chart must show different data.
+DO NOT write generic insights. Every recommendation must cite a specific number from the data.
+
+### Confirmation Required
+
+{% if exposure_mode %}
+You are running in **exposure mode** (non-interactive, one-shot).
+After completing your analysis queries, call `generate_report(confirmed=True)` directly.
+Do NOT wait for user confirmation — there is no interactive user.
+Do NOT present findings as text only — you MUST generate the HTML report.
+{% else %}
+IMPORTANT: `generate_report` is a slow operation (installs dependencies, builds HTML).
+You MUST present your analysis findings to the user BEFORE calling generate_report.
+
+- After completing your analysis queries, summarize key findings with specific numbers
+- Ask the user: "Would you like me to generate an interactive HTML report?"
+- Only call `generate_report(confirmed=True)` after the user confirms
+- If the user does not confirm, present findings as text only
+{% endif %}
+
+### Evidence Markdown Syntax
+
+SQL queries in fenced blocks:
+```sql query_name
+SELECT ... FROM table_name
+```
+
+Components (SINGLE curly braces only — never double braces):
+- <BigValue data={query_name} value=column_name />
+- <BarChart data={query_name} x=column y=column />
+- <LineChart data={query_name} x=date_col y=value_col />
+- <AreaChart data={query_name} x=date_col y=value_col />
+- <DataTable data={query_name} />
+- <ScatterPlot data={query_name} x=col1 y=col2 />
+- <Histogram data={query_name} x=column bins=20 />
+- <FunnelChart data={query_name} name=stage value=count />
+
+### Report Writing Rules
+
+- Name queries descriptively (revenue_by_month, top_customers)
+- Use markdown headers (##) to create clear sections
+- Write concise analytical commentary between charts — explain WHAT the data shows and WHY it matters
+- Do NOT include semicolons in SQL queries
+- Use the same table names from list_tables output
+- Each chart should have a descriptive title prop
+- Use percentage columns, rankings, and comparisons — not just raw counts
+- Vary chart types: don't use 5 BarCharts in a row
+
+### Report Content Pattern
+
+Follow this pattern for each section of the report page content:
+
+SECTION 1 — Executive KPIs:
+  SQL query → BigValue components (3-4 headline numbers)
+
+SECTION 2 — Primary breakdown:
+  SQL query with % of total → BarChart + brief insight text with specific numbers → DataTable
+
+SECTION 3 — Secondary dimension:
+  SQL query with different grouping/JOIN → different chart type (LineChart, ScatterPlot, etc.) + insight
+
+SECTION 4 — Cross-analysis:
+  SQL query JOINing 2+ tables → stacked/grouped BarChart or heatmap-style DataTable + insight
+
+SECTION 5 — Recommendations:
+  Markdown text with specific, data-cited action items
+
+### Final Answer Requirements
+
+After generating a report, your final answer MUST include:
+1. A brief summary of the key findings with SPECIFIC numbers
+2. The path to the generated HTML report
+3. 2-3 actionable recommendations grounded in the data
+
+Do NOT just say "I created a report" — the answer itself should be valuable standalone content.
+
+## Report Codification
+
+After completing analysis, if the user wants to save it as a repeatable report:
+- Call save_report_exposure with a snake_case name, distilled prompt, table refs, and format
+- Re-run with: seeknal ask report --exposure {name}

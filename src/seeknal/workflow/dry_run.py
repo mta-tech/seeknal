@@ -146,12 +146,28 @@ def extract_pep723_metadata(content: str) -> dict:
 def extract_decorators(tree: ast.AST) -> dict:
     """Extract pipeline decorator information.
 
+    Collects all pipeline decorators and returns the highest-priority one.
+    Priority: transform > feature_group > second_order_aggregation > source.
+    This ensures model templates (which have both @source and @transform)
+    route to the correct directory.
+
     Args:
         tree: AST tree
 
     Returns:
         Dictionary with decorator info (name, kind, description)
     """
+    # Priority order: higher index = higher priority
+    _DECORATOR_PRIORITY = {
+        "source": 0,
+        "second_order_aggregation": 1,
+        "feature_group": 2,
+        "transform": 3,
+    }
+
+    best = None
+    best_priority = -1
+
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef):
             # Check decorators
@@ -173,16 +189,18 @@ def extract_decorators(tree: ast.AST) -> dict:
                     decorator_name = decorator.id
 
                 # Check if it's a pipeline decorator
-                if decorator_name in ["source", "transform", "feature_group", "second_order_aggregation"]:
+                priority = _DECORATOR_PRIORITY.get(decorator_name, -1)
+                if priority > best_priority:
                     docstring = ast.get_docstring(node)
-                    return {
+                    best = {
                         "kind": decorator_name,
                         "name": decorator_args.get("name", node.name),
                         "description": decorator_args.get("description", docstring or ""),
                         "function_name": node.name
                     }
+                    best_priority = priority
 
-    return {}
+    return best or {}
 
 
 def validate_draft_file(file_path: str) -> Path:
@@ -599,12 +617,31 @@ def dry_run_python(file_path: Path, file_path_str: str, limit: int, timeout: int
             refs = re.findall(r'ctx\.ref\(["\']([^"\']+)["\']\)', content)
             if refs:
                 _echo_info(f"References: {', '.join(refs)}")
+
+                # Resolve project seeknal directory for node existence checks
+                seeknal_dir = Path.cwd() / "seeknal"
+
                 for ref in refs:
                     # Check if it's a valid node reference (kind.name)
                     if '.' in ref:
                         parts = ref.split('.')
                         if len(parts) == 2:
-                            _echo_info(f"  - {ref}: ✓ Valid reference format")
+                            _kind, _name = parts
+                            # Check if ref target exists as a node in the project
+                            found = False
+                            for subdir in ["sources", "transforms", "feature_groups", "models"]:
+                                for ext in [".yml", ".py"]:
+                                    if (seeknal_dir / subdir / f"{_name}{ext}").exists():
+                                        found = True
+                                        break
+                                if found:
+                                    break
+                            if found:
+                                _echo_info(f"  - {ref}: ✓ Found in project")
+                            else:
+                                _echo_warning(
+                                    f"  - {ref}: WARNING — node '{_name}' not found in seeknal/ directory. Check the name."
+                                )
                         else:
                             _echo_warning(f"  - {ref}: Unexpected format")
                     else:
