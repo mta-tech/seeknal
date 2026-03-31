@@ -113,7 +113,6 @@ def create_agent(
     from seeknal.ask.agents.context_toolset import SeeknaContextToolset
     from seeknal.ask.agents.hooks import get_ask_hooks
     from seeknal.ask.agents.providers import get_model_string
-    from seeknal.ask.agents.skills import get_ask_skills
     from seeknal.ask.agents.subagents import get_subagent_configs
     from seeknal.ask.agents.tools.toolset import create_ask_toolset
     from seeknal.ask.processors import MicrocompactProcessor, SqlResultCompactor
@@ -149,9 +148,9 @@ def create_agent(
         instructions=SYSTEM_PROMPT,
         toolsets=[create_ask_toolset(), context_toolset],
         hooks=get_ask_hooks(),
-        # Skills: loaded on demand via load_skill()
+        # Skills: discovered from SKILL.md files in seeknal/skills/ (Claude Code-style)
         include_skills=True,
-        skills=get_ask_skills(),
+        skill_directories=[str(project_path / "seeknal" / "skills")],
         # Enable planning for complex multi-step analyses
         include_todo=True,
         # Auto-summarize when approaching context window limit (Tier 3)

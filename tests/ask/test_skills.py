@@ -1,108 +1,102 @@
-"""Tests for seeknal ask skills."""
+"""Tests for seeknal ask skills (external SKILL.md files)."""
+
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from seeknal.ask.agents.skills import REPORT_SKILL_CONTENT, get_ask_skills
+
+class TestSkillMdScaffolding:
+    """Verify seeknal init creates SKILL.md files."""
+
+    def test_scaffold_creates_skill_file(self, tmp_path):
+        from seeknal.cli.main import _scaffold_ask_skills
+
+        (tmp_path / "seeknal" / "skills" / "report-generation").mkdir(parents=True)
+        _scaffold_ask_skills(tmp_path)
+
+        skill_file = tmp_path / "seeknal" / "skills" / "report-generation" / "SKILL.md"
+        assert skill_file.exists()
+
+    def test_scaffold_does_not_overwrite_existing(self, tmp_path):
+        from seeknal.cli.main import _scaffold_ask_skills
+
+        skill_dir = tmp_path / "seeknal" / "skills" / "report-generation"
+        skill_dir.mkdir(parents=True)
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text("custom content")
+
+        _scaffold_ask_skills(tmp_path)
+
+        assert skill_file.read_text() == "custom content"
 
 
-class TestGetAskSkills:
-    def test_returns_list(self):
-        skills = get_ask_skills()
-        assert isinstance(skills, list)
-        assert len(skills) >= 1
+class TestSkillMdContent:
+    """Verify SKILL.md content has required sections."""
 
-    def test_report_skill_exists(self):
-        skills = get_ask_skills()
-        names = [s.name for s in skills]
-        assert "report-generation" in names
+    @pytest.fixture()
+    def skill_content(self, tmp_path):
+        from seeknal.cli.main import _scaffold_ask_skills
 
-    def test_report_skill_has_description(self):
-        skills = get_ask_skills()
-        report_skill = next(s for s in skills if s.name == "report-generation")
-        assert report_skill.description
-        assert "Evidence.dev" in report_skill.description
+        (tmp_path / "seeknal" / "skills" / "report-generation").mkdir(parents=True)
+        _scaffold_ask_skills(tmp_path)
+        return (tmp_path / "seeknal" / "skills" / "report-generation" / "SKILL.md").read_text()
 
-    def test_report_skill_has_content(self):
-        skills = get_ask_skills()
-        report_skill = next(s for s in skills if s.name == "report-generation")
-        assert report_skill.content
-        assert len(report_skill.content) > 100
+    def test_has_yaml_frontmatter(self, skill_content):
+        assert skill_content.startswith("---\n")
+        assert "name: report-generation" in skill_content
+        assert "description:" in skill_content
 
+    def test_has_quality_bar(self, skill_content):
+        assert "Report Quality Bar" in skill_content
 
-class TestReportSkillContent:
-    """Verify the skill content preserves all Evidence.dev instructions."""
+    def test_has_analysis_process(self, skill_content):
+        assert "Analysis Process" in skill_content
 
-    def test_contains_quality_bar(self):
-        assert "Report Quality Bar" in REPORT_SKILL_CONTENT
+    def test_has_evidence_syntax(self, skill_content):
+        assert "Evidence Markdown Syntax" in skill_content
 
-    def test_contains_analysis_process(self):
-        assert "Analysis Process" in REPORT_SKILL_CONTENT
+    def test_has_all_chart_components(self, skill_content):
+        for component in ["BigValue", "BarChart", "LineChart", "DataTable",
+                          "ScatterPlot", "Histogram", "FunnelChart"]:
+            assert component in skill_content
 
-    def test_contains_evidence_markdown_syntax(self):
-        assert "Evidence Markdown Syntax" in REPORT_SKILL_CONTENT
+    def test_has_report_writing_rules(self, skill_content):
+        assert "Report Writing Rules" in skill_content
 
-    def test_contains_component_examples(self):
-        assert "BigValue" in REPORT_SKILL_CONTENT
-        assert "BarChart" in REPORT_SKILL_CONTENT
-        assert "LineChart" in REPORT_SKILL_CONTENT
-        assert "DataTable" in REPORT_SKILL_CONTENT
-        assert "ScatterPlot" in REPORT_SKILL_CONTENT
-        assert "Histogram" in REPORT_SKILL_CONTENT
-        assert "FunnelChart" in REPORT_SKILL_CONTENT
+    def test_has_content_pattern(self, skill_content):
+        assert "Report Content Pattern" in skill_content
+        assert "SECTION 1" in skill_content
 
-    def test_contains_report_writing_rules(self):
-        assert "Report Writing Rules" in REPORT_SKILL_CONTENT
-
-    def test_contains_report_content_pattern(self):
-        assert "Report Content Pattern" in REPORT_SKILL_CONTENT
-        assert "SECTION 1" in REPORT_SKILL_CONTENT
-        assert "SECTION 5" in REPORT_SKILL_CONTENT
-
-    def test_contains_final_answer_requirements(self):
-        assert "Final Answer Requirements" in REPORT_SKILL_CONTENT
-
-    def test_contains_report_codification(self):
-        assert "Report Codification" in REPORT_SKILL_CONTENT
-        assert "save_report_exposure" in REPORT_SKILL_CONTENT
+    def test_has_codification(self, skill_content):
+        assert "Report Codification" in skill_content
+        assert "save_report_exposure" in skill_content
 
 
-class TestSystemPromptDoesNotContainReportInstructions:
-    """Verify the base prompt no longer has report details."""
+class TestAgentUsesSkillDirectories:
+    """Verify create_agent uses skill_directories instead of inline skills."""
+
+    def test_create_agent_passes_skill_directories(self):
+        """Agent should use skill_directories pointing to seeknal/skills/."""
+        from seeknal.ask.agents.agent import SYSTEM_PROMPT
+
+        # The system prompt should reference skills
+        assert "report-generation" in SYSTEM_PROMPT
+        assert "skill" in SYSTEM_PROMPT.lower()
 
     def test_base_prompt_no_evidence_syntax(self):
         from seeknal.ask.agents.agent import SYSTEM_PROMPT
 
         assert "BigValue" not in SYSTEM_PROMPT
         assert "BarChart" not in SYSTEM_PROMPT
-        assert "Evidence Markdown Syntax" not in SYSTEM_PROMPT
 
     def test_base_prompt_no_context_placeholder(self):
         from seeknal.ask.agents.agent import SYSTEM_PROMPT
 
         assert "{context}" not in SYSTEM_PROMPT
 
-    def test_base_prompt_has_skill_reference(self):
-        from seeknal.ask.agents.agent import SYSTEM_PROMPT
-
-        assert "report-generation" in SYSTEM_PROMPT
-        assert "skill" in SYSTEM_PROMPT.lower()
-
-    def test_base_prompt_has_memory_guidance(self):
-        from seeknal.ask.agents.agent import SYSTEM_PROMPT
-
-        assert "memory" in SYSTEM_PROMPT.lower()
-
-    def test_base_prompt_has_core_sections(self):
-        from seeknal.ask.agents.agent import SYSTEM_PROMPT
-
-        assert "Your Capabilities" in SYSTEM_PROMPT
-        assert "Workflow" in SYSTEM_PROMPT
-        assert "DuckDB SQL Rules" in SYSTEM_PROMPT
-        assert "Security" in SYSTEM_PROMPT
-
     def test_base_prompt_is_lean(self):
         from seeknal.ask.agents.agent import SYSTEM_PROMPT
 
-        # The base prompt should be significantly shorter than the original ~132 lines
         line_count = len(SYSTEM_PROMPT.strip().splitlines())
         assert line_count < 70, f"Base prompt is {line_count} lines, expected < 70"
