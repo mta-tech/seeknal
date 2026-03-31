@@ -46,9 +46,6 @@ For advanced analysis:
 
 For report generation, load the 'report-generation' skill first.
 
-When you discover schema quirks, business definitions, or useful query patterns, \
-save them to memory for future sessions.
-
 ## DuckDB SQL Rules
 
 - Do NOT include trailing semicolons
@@ -70,6 +67,15 @@ save them to memory for future sessions.
 Tool errors include a JSON structure with 'category' and 'retryable' fields.
 For retryable errors, adjust your approach based on the 'hint'.
 For terminal errors, explain the limitation to the user.
+
+## Memory
+
+You have persistent memory across sessions. Use it wisely:
+- Before writing, call `read_memory` to check what's already saved — avoid duplicates
+- Save: table names with column types, row counts, useful join patterns, \
+business definitions, DuckDB syntax you discovered
+- Use `update_memory` to refine existing entries instead of `write_memory` to append duplicates
+- Keep entries concise — one line per fact, grouped by topic
 """
 
 
