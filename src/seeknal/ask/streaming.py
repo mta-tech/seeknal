@@ -255,7 +255,7 @@ async def _stream_one_pass(
                             tool_args = event.part.args_as_dict()
                             _show_tool_start(console, tool_name, tool_args)
                         elif isinstance(event, FunctionToolResultEvent):
-                            tool_name = event.tool_name
+                            tool_name = event.result.tool_name
                             content = event.result.content
                             output = str(content) if content else ""
                             _show_tool_end(console, tool_name, output)
