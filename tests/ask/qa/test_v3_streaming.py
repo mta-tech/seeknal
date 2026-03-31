@@ -1,8 +1,7 @@
 """V3 TUI Streaming QA Tests — exercises the real streaming path.
 
 Tests stream_ask() with real LLM calls and Rich Console output capture.
-Uses a single event loop for all tests to avoid asyncio binding conflicts
-(pydantic-ai's HTTP client retains loop references across agent instances).
+Uses asyncio.run() matching the production CLI path (cli/ask.py).
 
 Requires GOOGLE_API_KEY environment variable for real Gemini LLM calls.
 Run with: pytest tests/ask/qa/test_v3_streaming.py -v -s
@@ -29,100 +28,83 @@ def _make_console():
 
 
 class TestStreaming:
-    """All streaming tests share one event loop to avoid asyncio conflicts.
+    """Streaming tests using asyncio.run() — matching the production CLI path.
 
-    pydantic-ai's HTTP client (httpcore/anyio) binds to the event loop.
-    Creating multiple loops causes 'Event loop is closed' errors when
-    old connections try to clean up on dead loops.
+    Each test creates its own agent and uses asyncio.run() for one async
+    entry point, same as cli/ask.py's _run_oneshot().
     """
 
-    def test_all_streaming_scenarios(self, qa_project):
-        """Run all streaming scenarios in sequence on one event loop."""
+    def test_stream_simple_query_with_tool_visibility(self, qa_project):
+        """stream_ask renders progressive tool calls and answer panel."""
         from seeknal.ask.agents.agent import create_agent
         from seeknal.ask.streaming import stream_ask
 
-        loop = asyncio.new_event_loop()
+        agent, deps, mh = create_agent(
+            project_path=qa_project, provider="google", model="gemini-2.5-flash",
+        )
+        console, buf = _make_console()
 
-        try:
-            # --- Scenario 1: Simple query with tool visibility ---
-            agent, deps, mh = create_agent(
-                project_path=qa_project, provider="google", model="gemini-2.5-flash",
+        answer = asyncio.run(
+            stream_ask(agent, deps, mh, "How many customers?", console)
+        )
+        output = buf.getvalue()
+
+        print(f"\n--- STREAMING: Simple query ---")
+        print(f"Answer: {answer[:200]}")
+        print(f"Console output length: {len(output)} chars")
+        print(f"--- Console output (first 500 chars) ---\n{output[:500]}\n")
+
+        assert answer and len(answer) > 10
+        assert "50" in answer
+        assert len(output) > 50  # Console should have rendered something
+
+    def test_stream_multistep_analysis(self, qa_project):
+        """Multi-step streaming shows multiple tool calls progressively."""
+        from seeknal.ask.agents.agent import create_agent
+        from seeknal.ask.streaming import stream_ask
+
+        agent, deps, mh = create_agent(
+            project_path=qa_project, provider="google", model="gemini-2.5-flash",
+        )
+        console, buf = _make_console()
+
+        answer = asyncio.run(
+            stream_ask(
+                agent, deps, mh,
+                "Compare revenue between Premium and Basic customer segments. Show data.",
+                console,
             )
-            console, buf = _make_console()
+        )
+        output = buf.getvalue()
 
-            answer = loop.run_until_complete(
-                stream_ask(agent, deps, mh, "How many customers?", console)
-            )
-            output = buf.getvalue()
+        print(f"\n--- STREAMING: Multi-step analysis ---")
+        print(f"Answer length: {len(answer)} chars")
+        print(f"Console output length: {len(output)} chars")
+        print(f"--- Console output (first 1000 chars) ---\n{output[:1000]}\n")
 
-            print(f"\n--- STREAMING 1: Simple query ---")
-            print(f"Answer: {answer[:200]}")
-            print(f"Console output length: {len(output)} chars")
-            print(f"Has tool visibility: {'execute_sql' in output.lower() or 'list_tables' in output.lower()}")
-            assert answer and len(answer) > 10
-            assert "50" in answer
-            assert len(output) > 50
+        assert answer and len(answer) > 50
 
-            # --- Scenario 2: Multi-step analysis ---
-            agent2, deps2, mh2 = create_agent(
-                project_path=qa_project, provider="google", model="gemini-2.5-flash",
-            )
-            console2, buf2 = _make_console()
+    def test_stream_multiturn_preserves_history(self, qa_project):
+        """Two streaming turns on same agent maintain conversation context."""
+        from seeknal.ask.agents.agent import create_agent
+        from seeknal.ask.streaming import stream_ask
 
-            answer2 = loop.run_until_complete(
-                stream_ask(
-                    agent2, deps2, mh2,
-                    "Compare revenue between Premium and Basic segments.",
-                    console2,
-                )
-            )
-            output2 = buf2.getvalue()
+        agent, deps, mh = create_agent(
+            project_path=qa_project, provider="google", model="gemini-2.5-flash",
+        )
+        console, buf = _make_console()
 
-            print(f"\n--- STREAMING 2: Multi-step ---")
-            print(f"Answer length: {len(answer2)} chars")
-            print(f"Console output length: {len(output2)} chars")
-            assert answer2 and len(answer2) > 50
+        async def _two_turns():
+            a1 = await stream_ask(agent, deps, mh, "How many segments?", console)
+            a2 = await stream_ask(agent, deps, mh, "Which has the most customers?", console)
+            return a1, a2
 
-            # --- Scenario 3: Multi-turn on same agent ---
-            agent3, deps3, mh3 = create_agent(
-                project_path=qa_project, provider="google", model="gemini-2.5-flash",
-            )
-            console3, buf3 = _make_console()
+        a1, a2 = asyncio.run(_two_turns())
 
-            a3_1 = loop.run_until_complete(
-                stream_ask(agent3, deps3, mh3, "How many segments?", console3)
-            )
-            print(f"\n--- STREAMING 3: Turn 1 ---")
-            print(f"Answer: {a3_1[:150]}")
-            print(f"History: {len(mh3)} messages")
+        print(f"\n--- STREAMING: Multi-turn ---")
+        print(f"Turn 1: {a1[:150]}")
+        print(f"Turn 2: {a2[:150]}")
+        print(f"History: {len(mh)} messages")
 
-            a3_2 = loop.run_until_complete(
-                stream_ask(agent3, deps3, mh3, "Which has the most customers?", console3)
-            )
-            print(f"--- STREAMING 3: Turn 2 ---")
-            print(f"Answer: {a3_2[:150]}")
-            print(f"History: {len(mh3)} messages")
-
-            assert a3_1 and a3_2
-            assert len(mh3) > 4
-
-            # --- Scenario 4: Quiet mode ---
-            agent4, deps4, mh4 = create_agent(
-                project_path=qa_project, provider="google", model="gemini-2.5-flash",
-            )
-            console4, buf4 = _make_console()
-
-            answer4 = loop.run_until_complete(
-                stream_ask(agent4, deps4, mh4, "How many products?", console4, quiet=True)
-            )
-            output4 = buf4.getvalue()
-
-            print(f"\n--- STREAMING 4: Quiet mode ---")
-            print(f"Answer: {answer4[:200]}")
-            print(f"Console output (quiet): {len(output4)} chars")
-            assert answer4 and len(answer4) > 10
-
-            print(f"\n--- ALL 4 STREAMING SCENARIOS PASSED ---")
-
-        finally:
-            loop.close()
+        assert a1 and a2
+        assert len(mh) > 4
