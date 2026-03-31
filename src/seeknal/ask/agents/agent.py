@@ -108,7 +108,7 @@ def create_agent(
         Agent, deps is DeepAgentDeps, and message_history is the initial
         (empty) conversation history list.
     """
-    from pydantic_deep import create_deep_agent, DeepAgentDeps
+    from pydantic_deep import create_deep_agent, DeepAgentDeps, LocalBackend
 
     from seeknal.ask.agents.context_toolset import SeeknaContextToolset
     from seeknal.ask.agents.hooks import get_ask_hooks
@@ -171,7 +171,8 @@ def create_agent(
         include_execute=False,
     )
 
-    deps = DeepAgentDeps()
+    # Use LocalBackend rooted at project path for disk-persistent memory
+    deps = DeepAgentDeps(backend=LocalBackend(root_dir=str(project_path)))
     message_history = []
 
     return agent, deps, message_history
