@@ -35,16 +35,16 @@ class SeeknaContextToolset(FunctionToolset[Any]):
         super().__init__(id="seeknal-context")
         self._discovery = discovery
 
-    def get_instructions(self, ctx: RunContext[Any]) -> str | None:
+    async def get_instructions(self, ctx: RunContext[Any]) -> list[str] | None:
         """Build and return project context for system prompt injection.
 
         Args:
             ctx: The run context (unused — context comes from ArtifactDiscovery).
 
         Returns:
-            Formatted project context string, or None if no context available.
+            List with formatted project context string, or None if no context.
         """
         context = self._discovery.get_context_for_prompt()
         if not context or not context.strip():
             return None
-        return f"## Data Context\n\n{context}"
+        return [f"## Data Context\n\n{context}"]
