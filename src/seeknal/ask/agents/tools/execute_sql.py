@@ -31,7 +31,12 @@ def execute_sql(sql: str, limit: int = 100) -> str:
         with ctx.db_lock:
             columns, rows = ctx.repl.execute_oneshot(sql, limit=limit)
     except Exception as e:
-        return f"SQL execution error: {e}"
+        from seeknal.ask.agents.tools.errors import (
+            classify_duckdb_error,
+            format_tool_error,
+        )
+
+        return format_tool_error(classify_duckdb_error(str(e)), str(e))
 
     if not columns:
         return "Query executed successfully but returned no results."

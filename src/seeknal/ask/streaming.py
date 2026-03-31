@@ -13,7 +13,13 @@ from typing import Any, Optional
 from rich.console import Console
 from rich.markup import escape
 
-from seeknal.ask.agents.agent import _MAX_RALPH_RETRIES, _NO_RESPONSE
+from seeknal.ask.agents.agent import (
+    _DIMINISHING_RETURNS_MSG,
+    _LOW_OUTPUT_RETRIES,
+    _LOW_OUTPUT_THRESHOLD,
+    _MAX_RALPH_RETRIES,
+    _NO_RESPONSE,
+)
 
 # Strip raw ANSI escape sequences from tool output to prevent terminal injection
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -304,6 +310,8 @@ async def stream_ask(
 
     # Streaming mode with progressive rendering
     current_question = question
+    low_output_streak = 0
+
     for attempt in range(_MAX_RALPH_RETRIES + 1):
         if attempt > 0:
             _show_retry(console, attempt, _MAX_RALPH_RETRIES)
@@ -320,9 +328,49 @@ async def stream_ask(
         message_history.extend(updated_history)
 
         if answer:
+            # Quality gate: check and optionally retry once
+            answer = await _stream_quality_gate(
+                agent, deps, message_history, answer, console
+            )
             return answer
 
+        # Diminishing returns: track low-output retries
+        if attempt > 0:
+            output_chars = len(answer)
+            if output_chars < _LOW_OUTPUT_THRESHOLD:
+                low_output_streak += 1
+            else:
+                low_output_streak = 0
+
+            if low_output_streak >= _LOW_OUTPUT_RETRIES:
+                _show_answer(console, _DIMINISHING_RETURNS_MSG)
+                return _DIMINISHING_RETURNS_MSG
+
     return _NO_RESPONSE
+
+
+async def _stream_quality_gate(
+    agent: Any,
+    deps: Any,
+    message_history: list,
+    answer: str,
+    console: Console,
+) -> str:
+    """Check answer quality and retry once via streaming if needed."""
+    from seeknal.ask.agents.quality import check_answer_quality
+
+    passes, reason = check_answer_quality(answer)
+    if passes:
+        return answer
+
+    # One quality retry with guidance
+    retry_answer, updated_history = await _stream_one_pass(
+        agent, deps, message_history, reason, console
+    )
+    message_history.clear()
+    message_history.extend(updated_history)
+
+    return retry_answer if retry_answer else answer
 
 
 async def chat_session(
