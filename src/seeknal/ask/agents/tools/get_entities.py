@@ -1,9 +1,5 @@
 """Get entities tool — lists consolidated entities with metadata."""
 
-from langchain_core.tools import tool
-
-
-@tool
 def get_entities() -> str:
     """List all consolidated entities in the seeknal project.
 

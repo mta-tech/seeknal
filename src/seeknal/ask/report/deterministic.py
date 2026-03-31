@@ -461,8 +461,9 @@ def generate_narratives(
         return {}
 
     try:
-        from seeknal.ask.agents.providers import get_llm
-        llm = get_llm(provider=provider, model=model, api_key=api_key)
+        from pydantic_ai import Agent
+        from seeknal.ask.agents.providers import get_model_string
+        model_string = get_model_string(provider=provider, model=model, api_key=api_key)
     except Exception:
         # LLM unavailable — return placeholders
         return {
@@ -504,8 +505,8 @@ def generate_narratives(
         )
 
         try:
-            response = llm.invoke(prompt)
-            text = response.content if hasattr(response, "content") else str(response)
+            result = Agent(model_string).run_sync(prompt)
+            text = result.output or ""
             text = _sanitize_narrative(text)
             narratives[i] = text
         except Exception:

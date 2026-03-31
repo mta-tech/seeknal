@@ -115,7 +115,7 @@ def _run_oneshot(
 
         # Create agent (always with spinner -- this part is not streaming)
         with console.status("[bold green]Loading agent..."):
-            agent, config = create_agent(
+            agent, deps, message_history = create_agent(
                 project_path,
                 provider=provider,
                 model=model,
@@ -127,7 +127,7 @@ def _run_oneshot(
 
         try:
             answer = asyncio.run(
-                stream_ask(agent, config, question, console, quiet=quiet)
+                stream_ask(agent, deps, message_history, question, console, quiet=quiet)
             )
         except KeyboardInterrupt:
             console.print("\n[dim]Cancelled.[/dim]")
@@ -140,12 +140,12 @@ def _run_oneshot(
         typer.echo(f"Project: {project_path}")
         typer.echo(f"Question: {question}\n")
 
-        agent, config = create_agent(
+        agent, deps, message_history = create_agent(
             project_path,
             provider=provider,
             model=model,
         )
-        answer = agent_ask(agent, config, question)
+        answer = agent_ask(agent, deps, message_history, question)
         typer.echo(answer)
 
 
@@ -188,13 +188,13 @@ def chat_command(
     # Create agent (with spinner if Rich available)
     if console:
         with console.status("[bold green]Loading agent..."):
-            agent, config = create_agent(
+            agent, deps, message_history = create_agent(
                 project_path,
                 provider=provider,
                 model=model,
             )
     else:
-        agent, config = create_agent(
+        agent, deps, message_history = create_agent(
             project_path,
             provider=provider,
             model=model,
@@ -210,7 +210,7 @@ def chat_command(
         from seeknal.ask.streaming import chat_session
 
         try:
-            asyncio.run(chat_session(agent, config, console, quiet=quiet))
+            asyncio.run(chat_session(agent, deps, message_history, console, quiet=quiet))
         except KeyboardInterrupt:
             console.print("\nGoodbye!")
     else:
@@ -233,7 +233,7 @@ def chat_command(
                 break
 
             try:
-                answer = agent_ask(agent, config, question)
+                answer = agent_ask(agent, deps, message_history, question)
                 typer.echo(f"\n{answer}\n")
             except Exception as e:
                 typer.echo(f"Error: {e}\n")
@@ -346,7 +346,7 @@ def _run_report(
         console.print(f"[dim]Topic: {topic}[/dim]\n")
 
         with console.status("[bold green]Loading agent..."):
-            agent, config = create_agent(
+            agent, deps, message_history = create_agent(
                 project_path,
                 provider=provider,
                 model=model,
@@ -356,20 +356,22 @@ def _run_report(
         from seeknal.ask.streaming import chat_session, stream_ask
 
         try:
-            answer = asyncio.run(stream_ask(agent, config, report_prompt, console))
+            answer = asyncio.run(stream_ask(
+                agent, deps, message_history, report_prompt, console
+            ))
             # Save rendered markdown
             if answer and answer.strip():
                 _save_report_markdown(project_path, topic, answer, console)
             # Continue in chat mode for follow-up
-            asyncio.run(chat_session(agent, config, console))
+            asyncio.run(chat_session(agent, deps, message_history, console))
         except KeyboardInterrupt:
             console.print("\n[dim]Cancelled.[/dim]")
     else:
         from seeknal.ask.agents.agent import ask as agent_ask
-        agent, config = create_agent(
+        agent, deps, message_history = create_agent(
             project_path, provider=provider, model=model,
         )
-        answer = agent_ask(agent, config, report_prompt)
+        answer = agent_ask(agent, deps, message_history, report_prompt)
         typer.echo(answer)
         if answer and answer.strip():
             _save_report_markdown(project_path, topic, answer)
@@ -467,7 +469,7 @@ def _run_exposure(
         console.print(f"[dim]Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}[/dim]\n")
 
         with console.status("[bold green]Loading agent..."):
-            agent, config = create_agent(
+            agent, deps, message_history = create_agent(
                 project_path, provider=provider, model=model,
             )
 
@@ -475,7 +477,9 @@ def _run_exposure(
         from seeknal.ask.streaming import stream_ask
 
         try:
-            answer = asyncio.run(stream_ask(agent, config, prompt, console))
+            answer = asyncio.run(stream_ask(
+                agent, deps, message_history, prompt, console
+            ))
             if answer and answer.strip():
                 _save_report_markdown(project_path, name, answer, console)
         except KeyboardInterrupt:
@@ -486,10 +490,10 @@ def _run_exposure(
         typer.echo(f"Running exposure: {name}")
         typer.echo(f"Project: {project_path}\n")
 
-        agent, config = create_agent(
+        agent, deps, message_history = create_agent(
             project_path, provider=provider, model=model,
         )
-        answer = agent_ask(agent, config, prompt)
+        answer = agent_ask(agent, deps, message_history, prompt)
         typer.echo(answer)
         if answer and answer.strip():
             _save_report_markdown(project_path, name, answer)

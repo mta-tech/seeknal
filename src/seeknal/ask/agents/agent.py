@@ -1,40 +1,15 @@
 """Deep agent for Seeknal Ask.
 
-Uses deepagents (built on LangGraph) for planning and auto-summarization.
-LLM generates SQL -> execute_sql tool -> error? -> LLM retries.
+Uses pydantic-deep (built on pydantic-ai) for planning and auto-summarization.
+LLM generates SQL -> execute_sql tool -> hook validates -> error? -> LLM retries.
 For complex analyses, the agent decomposes tasks via the planning tool.
 """
 
 from pathlib import Path
 from typing import Optional
 
-from langchain_core.messages import HumanMessage
-from langgraph.checkpoint.memory import MemorySaver
-
-from seeknal.ask.agents.tools.execute_sql import execute_sql
-from seeknal.ask.agents.tools.list_tables import list_tables
-from seeknal.ask.agents.tools.describe_table import describe_table
-from seeknal.ask.agents.tools.get_entities import get_entities
-from seeknal.ask.agents.tools.get_entity_schema import get_entity_schema
-from seeknal.ask.agents.tools.read_pipeline import read_pipeline
-from seeknal.ask.agents.tools.search_pipelines import search_pipelines
-from seeknal.ask.agents.tools.search_project_files import search_project_files
-from seeknal.ask.agents.tools.read_project_file import read_project_file
-from seeknal.ask.agents.tools.execute_python import execute_python
-from seeknal.ask.agents.tools.generate_report import generate_report
-from seeknal.ask.agents.tools.save_report_exposure import save_report_exposure
 from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
 from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
-
-TOOLS = [
-    execute_sql, list_tables, describe_table,
-    get_entities, get_entity_schema,
-    read_pipeline, search_pipelines,
-    search_project_files, read_project_file,
-    execute_python,
-    generate_report,
-    save_report_exposure,
-]
 
 SYSTEM_PROMPT = """You are Seeknal Ask, a senior data analyst and strategist.
 
@@ -177,6 +152,12 @@ After completing analysis, if the user wants to save it as a repeatable report:
 """
 
 
+_NO_RESPONSE = "No response generated."
+
+# Ralph Loop: max retries when agent returns tool calls but no final text
+_MAX_RALPH_RETRIES = 3
+
+
 def create_agent(
     project_path: Path,
     provider: Optional[str] = None,
@@ -192,10 +173,15 @@ def create_agent(
         api_key: API key override.
 
     Returns:
-        A tuple of (agent, config) where agent is a LangGraph compiled graph
-        and config is the default invocation config.
+        A tuple of (agent, deps, message_history) where agent is a pydantic-ai
+        Agent, deps is DeepAgentDeps, and message_history is the initial
+        (empty) conversation history list.
     """
-    from seeknal.ask.agents.providers import get_llm
+    from pydantic_deep import create_deep_agent, DeepAgentDeps
+
+    from seeknal.ask.agents.hooks import get_security_hooks
+    from seeknal.ask.agents.providers import get_model_string
+    from seeknal.ask.agents.tools.toolset import create_ask_toolset
     from seeknal.ask.security import configure_safe_connection
     from seeknal.cli.repl import REPL
 
@@ -214,121 +200,86 @@ def create_agent(
         project_path=project_path,
     ))
 
-    # Create LLM
-    llm = get_llm(provider=provider, model=model, api_key=api_key)
+    # Resolve model string
+    model_string = get_model_string(provider=provider, model=model, api_key=api_key)
 
     # Build system prompt with project context
     system_prompt = SYSTEM_PROMPT.replace("{context}", context)
 
-    # Create deep agent with planning and auto-summarization
-    checkpointer = MemorySaver()
-    agent = _create_agent_graph(
-        llm, system_prompt, checkpointer
+    # Create pydantic-deep agent
+    agent = create_deep_agent(
+        model=model_string,
+        instructions=system_prompt,
+        toolsets=[create_ask_toolset()],
+        hooks=get_security_hooks(),
+        # Enable planning for complex multi-step analyses
+        include_todo=True,
+        # Auto-summarize when approaching context window limit
+        context_manager=True,
+        # Disable features we don't use
+        include_filesystem=False,
+        include_subagents=False,
+        include_skills=False,
+        include_memory=False,
+        include_plan=False,
+        include_checkpoints=False,
+        include_teams=False,
+        include_web=False,
+        include_execute=False,
     )
 
-    config = {
-        "configurable": {"thread_id": "default"},
-        "recursion_limit": 100,
-    }
-    return agent, config
+    deps = DeepAgentDeps()
+    message_history = []
 
-
-def _create_agent_graph(llm, system_prompt: str, checkpointer):
-    """Create the agent graph, trying deepagents first with ReAct fallback."""
-    try:
-        from deepagents import create_deep_agent
-
-        return create_deep_agent(
-            model=llm,
-            tools=TOOLS,
-            system_prompt=system_prompt,
-            checkpointer=checkpointer,
-        )
-    except ImportError:
-        # Fallback to ReAct agent if deepagents not installed
-        from langchain_core.messages import SystemMessage
-        from langgraph.prebuilt import create_react_agent
-
-        return create_react_agent(
-            llm,
-            tools=TOOLS,
-            checkpointer=checkpointer,
-            prompt=SystemMessage(content=system_prompt),
-        )
-
-
-_NO_RESPONSE = "No response generated."
-
-# Ralph Loop: max retries when agent returns tool calls but no final text
-_MAX_RALPH_RETRIES = 3
-
-
-def _normalize_content(content) -> str:
-    """Normalize Gemini's list[dict] content format to plain string.
-
-    Gemini returns content as [{'type':'text','text':'...'}] or plain str.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict) and "text" in block:
-                parts.append(block["text"])
-            elif isinstance(block, str):
-                parts.append(block)
-        return "".join(parts)
-    return str(content) if content else ""
-
-
-def _extract_response(messages: list) -> str:
-    """Extract the last AI text message from agent output."""
-    for msg in reversed(messages):
-        if hasattr(msg, "content") and msg.type == "ai" and msg.content:
-            text = _normalize_content(msg.content)
-            if text:
-                return text
-    return ""
+    return agent, deps, message_history
 
 
 def ask(
     agent,
-    config: dict,
+    deps,
+    message_history: list,
     question: str,
 ) -> str:
-    """Send a question to the agent and get a response.
+    """Send a question to the agent and get a response (sync).
 
     Uses the Ralph Loop technique: if the agent ends on tool calls without
     producing a final text response, nudge it to summarize its findings.
     Retries up to _MAX_RALPH_RETRIES times before giving up.
 
     Args:
-        agent: The compiled LangGraph agent.
-        config: Agent invocation config (with thread_id).
+        agent: The pydantic-ai Agent.
+        deps: DeepAgentDeps instance.
+        message_history: Conversation history (mutated in place).
         question: User's natural language question.
 
     Returns:
         The agent's text response.
     """
-    # Initial invocation
-    result = agent.invoke(
-        {"messages": [HumanMessage(content=question)]},
-        config=config,
+    result = agent.run_sync(
+        question,
+        deps=deps,
+        message_history=message_history,
     )
-    response = _extract_response(result.get("messages", []))
+    # Update message history for multi-turn
+    message_history.clear()
+    message_history.extend(result.all_messages())
+
+    response = result.output or ""
     if response:
         return response
 
     # Ralph Loop: nudge the agent to produce a text summary
     for _ in range(_MAX_RALPH_RETRIES):
-        result = agent.invoke(
-            {"messages": [HumanMessage(
-                content="Please summarize your findings from the tool calls above "
-                        "and provide your analysis as a text response."
-            )]},
-            config=config,
+        result = agent.run_sync(
+            "Please summarize your findings from the tool calls above "
+            "and provide your analysis as a text response.",
+            deps=deps,
+            message_history=message_history,
         )
-        response = _extract_response(result.get("messages", []))
+        message_history.clear()
+        message_history.extend(result.all_messages())
+
+        response = result.output or ""
         if response:
             return response
 

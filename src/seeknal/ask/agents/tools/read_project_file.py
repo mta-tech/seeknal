@@ -1,7 +1,5 @@
 """Read project file tool — read any file in the project securely."""
 
-from langchain_core.tools import tool
-
 from seeknal.ask.agents.tools._security import MAX_FILE_SIZE, validate_project_path
 
 
@@ -64,7 +62,6 @@ def _do_read(path: str, project_path, start_line: int = 1, max_lines: int = 200)
     return result
 
 
-@tool
 def read_project_file(
     path: str,
     start_line: int = 1,

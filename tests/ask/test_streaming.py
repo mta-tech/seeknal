@@ -1,16 +1,15 @@
 """Tests for seeknal ask streaming module.
 
-Uses synthetic events from mock async generators -- no LLM needed.
+Tests rendering helpers (no LLM needed) and basic function contracts.
+Streaming integration tests require pydantic-ai's agent.iter() which
+needs a real or mocked Agent — those are covered in QA/E2E tests.
 """
 
-import asyncio
 import re
 from io import StringIO
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from seeknal.ask.agents.agent import _normalize_content
 from seeknal.ask.streaming import (
     _sanitize_output,
     _show_reasoning,
@@ -18,8 +17,6 @@ from seeknal.ask.streaming import (
     _show_tool_end,
     _show_answer,
     _show_retry,
-    _stream_one_pass,
-    stream_ask,
 )
 
 
@@ -34,60 +31,6 @@ def make_console():
 
     buf = StringIO()
     return Console(file=buf, force_terminal=False, width=120), buf
-
-
-class MockChunk:
-    """Mock LLM chunk with content attribute."""
-
-    def __init__(self, content):
-        self.content = content
-
-
-async def event_stream(events):
-    """Async generator that yields events from a list."""
-    for event in events:
-        yield event
-
-
-class MockAgent:
-    """Mock agent with astream_events method."""
-
-    def __init__(self, events_per_call=None):
-        # events_per_call: list of event lists (one per invocation)
-        self._events_per_call = events_per_call or [[]]
-        self._call_index = 0
-
-    def astream_events(self, input_dict, config, version):
-        events = (
-            self._events_per_call[self._call_index]
-            if self._call_index < len(self._events_per_call)
-            else []
-        )
-        self._call_index += 1
-        return event_stream(events)
-
-
-# ---------------------------------------------------------------------------
-# _normalize_content tests
-# ---------------------------------------------------------------------------
-
-
-class TestNormalizeContent:
-    def test_plain_string(self):
-        assert _normalize_content("hello") == "hello"
-
-    def test_gemini_list_format(self):
-        content = [{"type": "text", "text": "hello "}, {"type": "text", "text": "world"}]
-        assert _normalize_content(content) == "hello world"
-
-    def test_mixed_list(self):
-        content = [{"type": "text", "text": "hello"}, "world"]
-        assert _normalize_content(content) == "helloworld"
-
-    def test_empty_content(self):
-        assert _normalize_content("") == ""
-        assert _normalize_content(None) == ""
-        assert _normalize_content([]) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +77,20 @@ class TestRenderingHelpers:
         output = buf.getvalue()
         assert "execute_sql" in output
         assert "SELECT" in output
+
+    def test_show_tool_start_execute_python(self):
+        console, buf = make_console()
+        _show_tool_start(console, "execute_python", {"code": "print(1)"})
+        output = buf.getvalue()
+        assert "execute_python" in output
+        assert "print" in output
+
+    def test_show_tool_start_generate_report(self):
+        console, buf = make_console()
+        _show_tool_start(console, "generate_report", {"title": "My Report"})
+        output = buf.getvalue()
+        assert "generate_report" in output
+        assert "My Report" in output
 
     def test_show_tool_end_generic(self):
         console, buf = make_console()
@@ -182,193 +139,26 @@ class TestRenderingHelpers:
         assert "Jakarta" in output
         assert "Bandung" in output
 
-
-# ---------------------------------------------------------------------------
-# Event stream integration tests
-# ---------------------------------------------------------------------------
-
-
-class TestStreamOnePass:
-    def test_text_only_produces_answer(self):
-        """LLM text with no tool calls = answer."""
-        events = [
-            {
-                "event": "on_chat_model_stream",
-                "data": {"chunk": MockChunk("Hello ")},
-            },
-            {
-                "event": "on_chat_model_stream",
-                "data": {"chunk": MockChunk("world")},
-            },
-        ]
-        agent = MockAgent([events])
+    def test_show_tool_end_python_output(self):
         console, buf = make_console()
-        answer = asyncio.run(
-            _stream_one_pass(agent, {"configurable": {"thread_id": "t"}}, "hi", console)
-        )
-        assert answer == "Hello world"
+        _show_tool_end(console, "execute_python", "42")
         output = buf.getvalue()
-        assert "Answer" in output
+        assert "42" in output
 
-    def test_reasoning_then_tool_then_answer(self):
-        """Text -> tool_start flushes text as reasoning, final text = answer."""
-        events = [
-            # Reasoning
-            {
-                "event": "on_chat_model_stream",
-                "data": {"chunk": MockChunk("Let me check")},
-            },
-            # Tool start flushes reasoning
-            {
-                "event": "on_tool_start",
-                "name": "list_tables",
-                "data": {"input": {}},
-            },
-            {
-                "event": "on_tool_end",
-                "name": "list_tables",
-                "data": {"output": "Available tables:\n- customers"},
-            },
-            # Answer
-            {
-                "event": "on_chat_model_stream",
-                "data": {"chunk": MockChunk("Found 1 table")},
-            },
-        ]
-        agent = MockAgent([events])
+    def test_show_tool_end_python_plot(self):
         console, buf = make_console()
-        answer = asyncio.run(
-            _stream_one_pass(agent, {"configurable": {"thread_id": "t"}}, "q", console)
-        )
+        _show_tool_end(console, "execute_python", "Plots saved: /tmp/plot.png")
         output = buf.getvalue()
-        assert "Reasoning" in output
-        assert "Let me check" in output
-        assert "list_tables" in output
-        assert "Answer" in output
-        assert answer == "Found 1 table"
+        assert "Plots saved" in output
 
-    def test_tool_only_no_answer(self):
-        """Tool calls with no final text = empty string (triggers Ralph Loop)."""
-        events = [
-            {
-                "event": "on_tool_start",
-                "name": "list_tables",
-                "data": {"input": {}},
-            },
-            {
-                "event": "on_tool_end",
-                "name": "list_tables",
-                "data": {"output": "tables found"},
-            },
-        ]
-        agent = MockAgent([events])
+    def test_show_tool_end_report_success(self):
         console, buf = make_console()
-        answer = asyncio.run(
-            _stream_one_pass(agent, {"configurable": {"thread_id": "t"}}, "q", console)
-        )
-        assert answer == ""
-
-    def test_gemini_cumulative_dedup(self):
-        """Cumulative content (each chunk = all previous + new) gets deduped."""
-        events = [
-            {
-                "event": "on_chat_model_stream",
-                "data": {"chunk": MockChunk("Hello")},
-            },
-            {
-                "event": "on_chat_model_stream",
-                "data": {"chunk": MockChunk("Hello world")},
-            },
-            {
-                "event": "on_chat_model_stream",
-                "data": {"chunk": MockChunk("Hello world!")},
-            },
-        ]
-        agent = MockAgent([events])
-        console, buf = make_console()
-        answer = asyncio.run(
-            _stream_one_pass(agent, {"configurable": {"thread_id": "t"}}, "q", console)
-        )
-        assert answer == "Hello world!"
-
-    def test_execute_sql_renders_sql_and_table(self):
-        """execute_sql tool shows SQL syntax and result table."""
-        sql = "SELECT city, COUNT(*) FROM customers GROUP BY city"
-        md_result = (
-            "| city | count |\n"
-            "| --- | --- |\n"
-            "| Jakarta | 14 |\n"
-            "\n(1 row)"
-        )
-        events = [
-            {
-                "event": "on_tool_start",
-                "name": "execute_sql",
-                "data": {"input": {"sql": sql}},
-            },
-            {
-                "event": "on_tool_end",
-                "name": "execute_sql",
-                "data": {"output": md_result},
-            },
-            {
-                "event": "on_chat_model_stream",
-                "data": {"chunk": MockChunk("Jakarta has 14 customers")},
-            },
-        ]
-        agent = MockAgent([events])
-        console, buf = make_console()
-        answer = asyncio.run(
-            _stream_one_pass(agent, {"configurable": {"thread_id": "t"}}, "q", console)
-        )
+        _show_tool_end(console, "generate_report", "Report built successfully: /tmp/report.html")
         output = buf.getvalue()
-        assert "execute_sql" in output
-        assert "SELECT" in output
-        assert "Jakarta" in output
-        assert answer == "Jakarta has 14 customers"
+        assert "Report built" in output
 
-
-class TestStreamAsk:
-    def test_ralph_loop_retries_on_no_answer(self):
-        """If first pass returns no text, Ralph Loop sends nudge and retries."""
-        # First pass: tools only, no answer
-        pass1 = [
-            {"event": "on_tool_start", "name": "list_tables", "data": {"input": {}}},
-            {"event": "on_tool_end", "name": "list_tables", "data": {"output": "tables"}},
-        ]
-        # Second pass: answer produced
-        pass2 = [
-            {
-                "event": "on_chat_model_stream",
-                "data": {"chunk": MockChunk("Summary answer")},
-            },
-        ]
-        agent = MockAgent([pass1, pass2])
+    def test_show_tool_end_report_error(self):
         console, buf = make_console()
-        answer = asyncio.run(
-            stream_ask(agent, {"configurable": {"thread_id": "t"}}, "q", console)
-        )
-        assert answer == "Summary answer"
+        _show_tool_end(console, "generate_report", "Error: npm not found")
         output = buf.getvalue()
-        assert "attempt 1/3" in output
-
-    def test_quiet_mode_uses_sync_ask(self):
-        """Quiet mode falls back to sync ask() with spinner."""
-        import unittest.mock as mock
-
-        console, buf = make_console()
-        # Patch the lazy import target
-        with mock.patch(
-            "seeknal.ask.agents.agent.ask", return_value="sync result"
-        ) as m:
-            answer = asyncio.run(
-                stream_ask(
-                    MockAgent([]),
-                    {"configurable": {"thread_id": "t"}},
-                    "q",
-                    console,
-                    quiet=True,
-                )
-            )
-            assert answer == "sync result"
-            m.assert_called_once()
+        assert "Report Build Error" in output

@@ -3,20 +3,17 @@
 Replaces the static "Thinking..." spinner with progressive step-by-step
 visibility: reasoning panels, tool calls, SQL queries, result tables,
 and the final answer -- all rendered via Rich Console.
+
+Uses pydantic-ai's agent.iter() with typed node streaming.
 """
 
 import re
 from typing import Any, Optional
 
-from langchain_core.messages import HumanMessage
 from rich.console import Console
 from rich.markup import escape
 
-from seeknal.ask.agents.agent import (
-    _MAX_RALPH_RETRIES,
-    _NO_RESPONSE,
-    _normalize_content,
-)
+from seeknal.ask.agents.agent import _MAX_RALPH_RETRIES, _NO_RESPONSE
 
 # Strip raw ANSI escape sequences from tool output to prevent terminal injection
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -203,74 +200,84 @@ def _show_retry(console: Console, attempt: int, max_retries: int) -> None:
 
 
 async def _stream_one_pass(
-    agent: Any, config: dict, question: str, console: Console
-) -> str:
-    """Run a single astream_events pass and render events progressively.
+    agent: Any, deps: Any, message_history: list,
+    question: str, console: Console
+) -> tuple[str, list]:
+    """Run a single agent.iter() pass and render events progressively.
 
-    Returns the final answer text, or empty string if no answer was produced.
+    Returns (answer_text, updated_message_history).
     """
+    from pydantic_ai import Agent
+    from pydantic_ai._agent_graph import End, UserPromptNode
+    from pydantic_ai.messages import (
+        FunctionToolCallEvent,
+        FunctionToolResultEvent,
+        PartDeltaEvent,
+        TextPartDelta,
+    )
+
     text_buffer: list[str] = []
-    accumulated = ""  # Cached join to avoid O(n^2) re-joining
 
-    async for event in agent.astream_events(
-        {"messages": [HumanMessage(content=question)]},
-        config=config,
-        version="v2",
-    ):
-        kind = event.get("event", "")
-
-        if kind == "on_chat_model_stream":
-            chunk = event.get("data", {}).get("chunk")
-            if chunk is None:
-                continue
-            content = getattr(chunk, "content", "")
-            token = _normalize_content(content)
-            if not token:
+    async with agent.iter(
+        question,
+        deps=deps,
+        message_history=message_history,
+    ) as run:
+        async for node in run:
+            if isinstance(node, UserPromptNode):
                 continue
 
-            # Gemini cumulative dedup: if the new token contains all
-            # previously buffered text as a prefix, it's cumulative --
-            # replace the buffer. Otherwise it's a delta -- append.
-            if accumulated and token.startswith(accumulated) and len(token) > len(accumulated):
-                # Cumulative mode: token = all previous + new
-                text_buffer.clear()
-                text_buffer.append(token)
-                accumulated = token
-            else:
-                # Delta mode: each chunk is new content
-                text_buffer.append(token)
-                accumulated += token
+            elif Agent.is_model_request_node(node):
+                # Stream text tokens from the model
+                async with node.stream(run.ctx) as request_stream:
+                    async for event in request_stream:
+                        if isinstance(event, PartDeltaEvent):
+                            if isinstance(event.delta, TextPartDelta):
+                                text_buffer.append(event.delta.content_delta)
 
-        elif kind == "on_tool_start":
-            # Flush text buffer as reasoning (if any text accumulated)
-            if text_buffer:
-                _show_reasoning(console, accumulated)
-                text_buffer.clear()
-                accumulated = ""
+            elif Agent.is_call_tools_node(node):
+                # Flush text buffer as reasoning before tool calls
+                if text_buffer:
+                    _show_reasoning(console, "".join(text_buffer))
+                    text_buffer.clear()
 
-            name = event.get("name", "unknown")
-            args = event.get("data", {}).get("input", {})
-            _show_tool_start(console, name, args)
+                # Stream tool call and result events
+                async with node.stream(run.ctx) as handle_stream:
+                    async for event in handle_stream:
+                        if isinstance(event, FunctionToolCallEvent):
+                            tool_name = event.part.tool_name
+                            tool_args = event.part.args_as_dict()
+                            _show_tool_start(console, tool_name, tool_args)
+                        elif isinstance(event, FunctionToolResultEvent):
+                            tool_name = event.tool_name
+                            content = event.result.content
+                            output = str(content) if content else ""
+                            _show_tool_end(console, tool_name, output)
 
-        elif kind == "on_tool_end":
-            name = event.get("name", "unknown")
-            output = event.get("data", {}).get("output", "")
-            if hasattr(output, "content"):
-                output = output.content
-            output = str(output) if output else ""
-            _show_tool_end(console, name, output)
+            elif isinstance(node, End):
+                break
+
+        result = run.result
 
     # Stream ended -- flush remaining buffer as answer
     if text_buffer:
-        _show_answer(console, accumulated)
-        return accumulated
+        answer = "".join(text_buffer)
+        _show_answer(console, answer)
+        return answer, result.all_messages()
 
-    return ""
+    # Check result.output for text that wasn't streamed token-by-token
+    output = result.output or ""
+    if output:
+        _show_answer(console, output)
+        return output, result.all_messages()
+
+    return "", result.all_messages()
 
 
 async def stream_ask(
     agent: Any,
-    config: dict,
+    deps: Any,
+    message_history: list,
     question: str,
     console: Console,
     quiet: bool = False,
@@ -278,8 +285,9 @@ async def stream_ask(
     """Stream agent events with step-by-step visibility and Ralph Loop retry.
 
     Args:
-        agent: The compiled LangGraph agent.
-        config: Agent invocation config (with thread_id).
+        agent: The pydantic-ai Agent.
+        deps: DeepAgentDeps instance.
+        message_history: Conversation history (mutated in place).
         question: User's natural language question.
         console: Rich Console instance for rendering.
         quiet: If True, suppress step-by-step output (only show final answer).
@@ -292,7 +300,7 @@ async def stream_ask(
         from seeknal.ask.agents.agent import ask as sync_ask
 
         with console.status("[bold green]Thinking..."):
-            return sync_ask(agent, config, question)
+            return sync_ask(agent, deps, message_history, question)
 
     # Streaming mode with progressive rendering
     current_question = question
@@ -304,7 +312,13 @@ async def stream_ask(
                 "and provide your analysis as a text response."
             )
 
-        answer = await _stream_one_pass(agent, config, current_question, console)
+        answer, updated_history = await _stream_one_pass(
+            agent, deps, message_history, current_question, console
+        )
+        # Update message history in place
+        message_history.clear()
+        message_history.extend(updated_history)
+
         if answer:
             return answer
 
@@ -313,7 +327,8 @@ async def stream_ask(
 
 async def chat_session(
     agent: Any,
-    config: dict,
+    deps: Any,
+    message_history: list,
     console: Console,
     quiet: bool = False,
 ) -> None:
@@ -338,7 +353,9 @@ async def chat_session(
             break
 
         try:
-            answer = await stream_ask(agent, config, question, console, quiet=quiet)
+            answer = await stream_ask(
+                agent, deps, message_history, question, console, quiet=quiet
+            )
             if not answer or answer == _NO_RESPONSE:
                 console.print(f"[dim]{_NO_RESPONSE}[/dim]")
             console.print()

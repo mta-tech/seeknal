@@ -273,7 +273,7 @@ _register_atlas_commands()
 # The Ask command group is loaded dynamically if seeknal[ask] deps are installed.
 
 def _register_ask_commands():
-    """Register Ask commands if langchain/langgraph are available."""
+    """Register Ask commands if pydantic-deep dependencies are available."""
     try:
         from seeknal.cli.ask import ask_app
         app.add_typer(ask_app, name="ask")

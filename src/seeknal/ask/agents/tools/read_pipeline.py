@@ -1,9 +1,5 @@
 """Read pipeline tool — reads a specific YAML/Python pipeline definition."""
 
-from langchain_core.tools import tool
-
-
-@tool
 def read_pipeline(file_path: str) -> str:
     """Read a seeknal pipeline definition file (YAML or Python).
 

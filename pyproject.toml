@@ -59,13 +59,10 @@ prefect = [
     "prefect>=3.1.10,<4.0",
 ]
 
-# Seeknal Ask — NL-to-Analysis Agent
+# Seeknal Ask — NL-to-Analysis Agent (pydantic-ai based)
 ask = [
-    "deepagents>=0.4.0",
-    "langchain>=0.3.0",
-    "langgraph>=0.4.0",
-    "langchain-google-genai>=2.0.0",
-    "langchain-ollama>=0.3.0",
+    "pydantic-deep>=0.3.0",
+    "pydantic-ai-slim[google]>=1.71.0",
     "rich>=13.0.0",
     "ruamel.yaml>=0.18.0",
 ]

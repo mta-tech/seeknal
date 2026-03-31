@@ -8,9 +8,6 @@ builds static HTML, and returns the output path.
 import json
 import re
 
-from langchain_core.tools import tool
-
-
 def _do_generate(title: str, pages_json, project_path) -> str:
     """Core report generation logic, separated for testability.
 
@@ -70,7 +67,6 @@ def _do_generate(title: str, pages_json, project_path) -> str:
         return result
 
 
-@tool
 def generate_report(title: str, page_content: str) -> str:
     """Generate an interactive HTML report with charts and tables.
 

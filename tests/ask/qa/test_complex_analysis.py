@@ -35,10 +35,10 @@ class TestCohortAnalysisWorkflow:
     def test_rfm_deep_dive(self, qa_project):
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
+        agent, deps, message_history = _fresh_agent(qa_project)
 
         # Turn 1: Segment customers by purchase frequency
-        a1 = ask(agent, config,
+        a1 = ask(agent, deps, message_history,
             "Segment customers into 3 tiers based on their total number of orders: "
             "High (5+ orders), Medium (3-4 orders), Low (1-2 orders). "
             "Show me the count and average total_spent for each tier."
@@ -49,7 +49,7 @@ class TestCohortAnalysisWorkflow:
         assert any(w in a1.lower() for w in ["high", "medium", "low", "tier"])
 
         # Turn 2: Drill into the High tier
-        a2 = ask(agent, config,
+        a2 = ask(agent, deps, message_history,
             "For the High frequency tier, what are their favorite categories? "
             "Show the distribution."
         )
@@ -59,7 +59,7 @@ class TestCohortAnalysisWorkflow:
                     ["electronics", "fashion", "food", "home", "sports", "category"])
 
         # Turn 3: Compare recency across tiers
-        a3 = ask(agent, config,
+        a3 = ask(agent, deps, message_history,
             "Now compare the average days_since_last_purchase across those "
             "3 tiers. Which tier has the most recent activity?"
         )
@@ -68,7 +68,7 @@ class TestCohortAnalysisWorkflow:
         assert "days" in a3.lower() or "recent" in a3.lower()
 
         # Turn 4: Identify at-risk high-value customers
-        a4 = ask(agent, config,
+        a4 = ask(agent, deps, message_history,
             "Find customers who spent more than $2000 total but haven't "
             "purchased in over 100 days. These are at-risk high-value customers. "
             "List their customer_id, city, total_spent, and days_since_last_purchase."
@@ -79,7 +79,7 @@ class TestCohortAnalysisWorkflow:
         assert "C" in a4 or "customer" in a4.lower() or "no " in a4.lower()
 
         # Turn 5: Synthesize the analysis
-        a5 = ask(agent, config,
+        a5 = ask(agent, deps, message_history,
             "Based on everything we've explored, summarize the key findings "
             "about customer behavior patterns. What actionable recommendations "
             "would you give to the business?"
@@ -97,10 +97,10 @@ class TestCrossTableJoinAnalysis:
         """Agent must join customers with orders to build a city x category matrix."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
+        agent, deps, message_history = _fresh_agent(qa_project)
 
         # Turn 1: Build the cross-tabulation
-        a1 = ask(agent, config,
+        a1 = ask(agent, deps, message_history,
             "Create a revenue breakdown by city AND category. "
             "I need a matrix showing total revenue for each city-category pair. "
             "Which city-category combination generates the most revenue?"
@@ -114,7 +114,7 @@ class TestCrossTableJoinAnalysis:
         assert has_city and has_cat, "Missing city or category in cross-tabulation"
 
         # Turn 2: Find concentration risk
-        a2 = ask(agent, config,
+        a2 = ask(agent, deps, message_history,
             "Which city has the most concentrated revenue "
             "(i.e., most revenue comes from a single category)? "
             "Calculate each city's top category as a percentage of that city's total revenue."
@@ -124,7 +124,7 @@ class TestCrossTableJoinAnalysis:
         assert "%" in a2 or "percent" in a2.lower()
 
         # Turn 3: Identify growth opportunities
-        a3 = ask(agent, config,
+        a3 = ask(agent, deps, message_history,
             "Based on the matrix, which city-category pairs have very low "
             "revenue but high customer counts? These could be growth opportunities."
         )
@@ -139,10 +139,10 @@ class TestTimeSeriesAnalysis:
         """Agent must analyze monthly trends and identify patterns."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
+        agent, deps, message_history = _fresh_agent(qa_project)
 
         # Turn 1: Show monthly trend
-        a1 = ask(agent, config,
+        a1 = ask(agent, deps, message_history,
             "Show me the monthly revenue trend for 2024. "
             "Which months had the highest and lowest revenue?"
         )
@@ -151,7 +151,7 @@ class TestTimeSeriesAnalysis:
         assert "2024" in a1 or "month" in a1.lower()
 
         # Turn 2: Month-over-month growth
-        a2 = ask(agent, config,
+        a2 = ask(agent, deps, message_history,
             "Calculate the month-over-month revenue growth rate. "
             "Which month had the biggest spike or drop?"
         )
@@ -161,7 +161,7 @@ class TestTimeSeriesAnalysis:
         assert any(w in a2.lower() for w in ["growth", "change", "increase", "decrease", "drop", "spike", "%"])
 
         # Turn 3: Correlate with order count
-        a3 = ask(agent, config,
+        a3 = ask(agent, deps, message_history,
             "Is the revenue change driven by more orders or higher order values? "
             "Compare the monthly order count trend vs the average order value trend."
         )
@@ -177,10 +177,10 @@ class TestHypothesisTesting:
         """Test: 'Newer customers spend more per order than older ones.'"""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
+        agent, deps, message_history = _fresh_agent(qa_project)
 
         # Turn 1: State hypothesis and get initial data
-        a1 = ask(agent, config,
+        a1 = ask(agent, deps, message_history,
             "I have a hypothesis: customers who joined more recently (2023 H2) "
             "have a higher average order value than those who joined earlier (2023 H1). "
             "Can you test this? Split customers by join_date into two cohorts "
@@ -191,7 +191,7 @@ class TestHypothesisTesting:
         assert any(w in a1.lower() for w in ["cohort", "average", "order", "h1", "h2", "join", "hypothesis"])
 
         # Turn 2: Check if the difference is meaningful
-        a2 = ask(agent, config,
+        a2 = ask(agent, deps, message_history,
             "Is that difference statistically meaningful or just noise? "
             "How many customers and orders are in each cohort? "
             "Show the sample sizes and standard deviation if possible."
@@ -200,7 +200,7 @@ class TestHypothesisTesting:
         assert a2 and len(a2) > 50
 
         # Turn 3: Explore confounding factors
-        a3 = ask(agent, config,
+        a3 = ask(agent, deps, message_history,
             "Could the difference be explained by segment mix? "
             "Check if the newer cohort has more Premium customers than the older one."
         )
@@ -209,7 +209,7 @@ class TestHypothesisTesting:
         assert "premium" in a3.lower() or "segment" in a3.lower()
 
         # Turn 4: Conclude
-        a4 = ask(agent, config,
+        a4 = ask(agent, deps, message_history,
             "Given all the evidence, should we accept or reject the hypothesis "
             "that newer customers spend more per order? Give me your verdict "
             "with supporting data."
@@ -226,9 +226,9 @@ class TestComplexSQLGeneration:
         """Agent must use window functions for percentile ranking."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
+        agent, deps, message_history = _fresh_agent(qa_project)
 
-        a1 = ask(agent, config,
+        a1 = ask(agent, deps, message_history,
             "Rank all customers by total_spent and show their percentile. "
             "Who are the top 10% spenders? Show their customer_id, city, "
             "segment, total_spent, and percentile rank."
@@ -243,9 +243,9 @@ class TestComplexSQLGeneration:
         """Agent must compute a running total of monthly revenue."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
+        agent, deps, message_history = _fresh_agent(qa_project)
 
-        a1 = ask(agent, config,
+        a1 = ask(agent, deps, message_history,
             "Show the cumulative (running total) revenue by month for 2024. "
             "I want to see each month's revenue and the running total up to that month."
         )
@@ -257,9 +257,9 @@ class TestComplexSQLGeneration:
         """Agent must build a retention-style analysis with JOINs and date logic."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
+        agent, deps, message_history = _fresh_agent(qa_project)
 
-        a1 = ask(agent, config,
+        a1 = ask(agent, deps, message_history,
             "For customers who made their first purchase in Q1 2024, how many "
             "of them made a repeat purchase in Q2 2024? What is the retention rate "
             "from Q1 to Q2?"
@@ -269,7 +269,7 @@ class TestComplexSQLGeneration:
         assert any(w in a1.lower() for w in ["retention", "repeat", "q1", "q2", "%", "rate"])
 
         # Follow-up: extend to Q3, Q4
-        a2 = ask(agent, config,
+        a2 = ask(agent, deps, message_history,
             "Extend that to Q3 and Q4 as well. Show the full retention curve "
             "for the Q1 2024 cohort across all quarters."
         )

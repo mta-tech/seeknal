@@ -10,13 +10,11 @@ import re
 from pathlib import Path
 
 import yaml
-from langchain_core.tools import tool
 
 _NAME_RE = re.compile(r"^[a-z0-9_]+$")
 _VALID_FORMATS = {"markdown", "html", "both"}
 
 
-@tool
 def save_report_exposure(
     name: str,
     prompt: str,
