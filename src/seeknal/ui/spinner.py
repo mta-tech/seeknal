@@ -127,7 +127,8 @@ class StalledSpinner:
         """Update the displayed message and check for stall transition."""
         self._message = message
         self._check_stalled()
-        self._spinner.update(text=message)
+        if self._live is not None:
+            self._spinner.update(text=message)
 
     # -- internals ------------------------------------------------------------
 
@@ -136,4 +137,5 @@ class StalledSpinner:
             return
         if self.is_stalled:
             self._stalled = True
-            self._spinner.update(style="spinner.stalled")
+            if self._live is not None:
+                self._spinner.update(style="spinner.stalled")

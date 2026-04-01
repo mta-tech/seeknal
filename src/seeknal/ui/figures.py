@@ -21,17 +21,21 @@ def _detect_glyph_tier() -> str:
     if term == "dumb" or not sys.stdout.isatty():
         return "ascii_only"
 
-    # macOS and known modern terminals get full Unicode
-    if sys.platform == "darwin":
-        return "unicode_full"
-
-    # Known GPU-accelerated / modern terminals
+    # Known GPU-accelerated / modern terminals (cross-platform)
     modern_terminals = {"ghostty", "WezTerm", "kitty", "alacritty"}
     if term_program in modern_terminals:
         return "unicode_full"
 
     # Windows Terminal (modern)
     if os.environ.get("WT_SESSION"):
+        return "unicode_full"
+
+    # macOS: Terminal.app has Unicode rendering quirks (emoji widths,
+    # some combining characters); give it the safe subset.  Other macOS
+    # terminals (iTerm2, Ghostty, etc.) are already caught above.
+    if sys.platform == "darwin":
+        if term_program == "Apple_Terminal":
+            return "unicode_safe"
         return "unicode_full"
 
     # Default to safe subset

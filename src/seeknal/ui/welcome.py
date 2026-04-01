@@ -56,6 +56,12 @@ def show_welcome(version: str = "") -> None:
     # Build the fox mascot renderable.
     fox = render_fox("default")
 
+    # When animations are disabled, show a compact static banner.
+    if not is_animation_enabled():
+        ver_suffix = f" v{ver}" if ver else ""
+        console.print(f"Welcome to Seeknal{ver_suffix}")
+        return
+
     # Build the right-hand text column.
     star_char = get("star")
     sep_char = get("separator")
