@@ -39,6 +39,7 @@ dependencies = [
     "sqlmodel>=0.0.22",
     "tabulate>=0.9.0",
     "tenacity>=9.0.0",
+    "rich>=13.0.0",
     "typer>=0.13.1",
     "jinja2>=3.1.0",
     "pymysql>=1.1.0",
@@ -63,7 +64,6 @@ prefect = [
 ask = [
     "pydantic-deep>=0.3.0",
     "pydantic-ai-slim[google]>=1.71.0",
-    "rich>=13.0.0",
     "ruamel.yaml>=0.18.0",
 ]
 
