@@ -10,3 +10,13 @@ SEEKNAL_USERNAME = "your_username"
 [context.database]
 # SQLite database file (relative to SEEKNAL_BASE_CONFIG_PATH)
 SEEKNAL_DB_PATH = "seeknal.db"
+
+# =============================================================================
+# UI Settings
+# =============================================================================
+[ui]
+# Theme: dark, light, dark-ansi, light-ansi, auto (default: auto)
+# theme = "auto"
+
+# Disable animations (spinners, progress bars)
+# no_animation = false

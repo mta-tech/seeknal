@@ -10,7 +10,7 @@ Uses pydantic-ai's agent.iter() with typed node streaming.
 import re
 from typing import Any, Optional
 
-from rich.console import Console
+from rich.console import Console  # type annotation only
 from rich.markup import escape
 
 from seeknal.ask.agents.agent import (
@@ -73,9 +73,9 @@ def _show_tool_end(console: Console, name: str, output: str) -> None:
         _show_report_output(console, output)
     elif name == "save_report_exposure":
         if output.startswith("Error"):
-            console.print(f"  [red]{escape(output)}[/red]")
+            console.print(f"  [status.error]{escape(output)}[/]")
         else:
-            console.print(f"  [bold green]{escape(output)}[/bold green]")
+            console.print(f"  [status.success]{escape(output)}[/]")
     else:
         summary = output[:200] + "..." if len(output) > 200 else output
         console.print(f"  [dim]Done: {escape(summary)}[/dim]")
@@ -106,7 +106,7 @@ def _show_python_output(console: Console, output: str) -> None:
         parts = output.split("Plots saved:")
         if parts[0].strip():
             console.print(f"  [dim]{escape(parts[0].strip())}[/dim]")
-        console.print(f"  [bold green]Plots saved:{escape(parts[1])}[/bold green]")
+        console.print(f"  [status.success]Plots saved:{escape(parts[1])}[/]")
     else:
         # Show full output (not truncated like generic tools)
         display = output[:2000] + "..." if len(output) > 2000 else output
@@ -120,14 +120,14 @@ def _show_report_output(console: Console, output: str) -> None:
         return
 
     if "Report built successfully" in output or output.strip().endswith(".html"):
-        console.print(f"  [bold green]{escape(output.strip())}[/bold green]")
+        console.print(f"  [status.success]{escape(output.strip())}[/]")
     elif output.startswith("Error") or "failed" in output.lower():
         from rich.panel import Panel
 
         console.print(Panel(
             escape(output.strip()),
             title="Report Build Error",
-            border_style="red",
+            border_style="status.error",
         ))
     else:
         console.print(f"  [dim]{escape(output[:500])}[/dim]")
@@ -157,7 +157,7 @@ def _show_sql_result_table(console: Console, output: str) -> None:
         if not all(c in "|- " for c in ln)
     ]
 
-    table = Table(show_header=True, header_style="bold cyan")
+    table = Table(show_header=True, header_style="table.header")
     for col in columns:
         table.add_column(col)
 
@@ -190,7 +190,7 @@ def _show_answer(console: Console, text: str) -> None:
     from rich.markdown import Markdown
     from rich.panel import Panel
 
-    console.print(Panel(Markdown(text.strip()), title="Answer", border_style="green"))
+    console.print(Panel(Markdown(text.strip()), title="Answer", border_style="status.success"))
 
 
 def _show_retry(console: Console, attempt: int, max_retries: int) -> None:
@@ -305,7 +305,7 @@ async def stream_ask(
         # Quiet mode: use sync ask() with spinner
         from seeknal.ask.agents.agent import ask as sync_ask
 
-        with console.status("[bold green]Thinking..."):
+        with console.status("[spinner.active]Thinking..."):
             return sync_ask(agent, deps, message_history, question)
 
     # Streaming mode with progressive rendering
@@ -410,4 +410,4 @@ async def chat_session(
         except KeyboardInterrupt:
             console.print("\n[dim]Cancelled.[/dim]\n")
         except Exception as e:
-            console.print(f"[red]Error: {e}[/red]\n")
+            console.print(f"[status.error]Error: {e}[/]\n")

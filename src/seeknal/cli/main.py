@@ -143,6 +143,26 @@ app = typer.Typer(
     cls=SuggestGroup,
 )
 
+
+@app.callback()
+def main_callback(
+    no_animation: bool = typer.Option(False, "--no-animation", help="Disable all animations"),
+    theme: str = typer.Option("", "--theme", help="UI theme: dark, light, dark-ansi, light-ansi, auto"),
+):
+    """Seeknal — All-in-one platform for data and AI/ML engineering."""
+    if no_animation:
+        from seeknal.ui.console import disable_animation
+
+        disable_animation()
+    if theme:
+        import os
+
+        os.environ["SEEKNAL_THEME"] = theme
+        from seeknal.ui.console import reset
+
+        reset()
+
+
 # Version command group for feature group version management
 version_app = typer.Typer(
     name="version",
