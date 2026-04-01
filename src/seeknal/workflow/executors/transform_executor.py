@@ -29,7 +29,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from seeknal.cli.main import _echo_error, _echo_info, _echo_warning
+from seeknal.ui.output import echo_error as _echo_error, echo_info as _echo_info, echo_warning as _echo_warning
 from seeknal.dag.manifest import Manifest, Node, NodeType
 
 from .base import (

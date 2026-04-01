@@ -557,24 +557,30 @@ def _get_version() -> str:
         return "1.0.0"
 
 
+from seeknal.ui.output import echo_success as _ui_echo_success
+from seeknal.ui.output import echo_error as _ui_echo_error
+from seeknal.ui.output import echo_warning as _ui_echo_warning
+from seeknal.ui.output import echo_info as _ui_echo_info
+
+
 def _echo_success(message: str):
-    """Print success message in green."""
-    typer.echo(typer.style(f"✓ {message}", fg=typer.colors.GREEN))
+    """Print success message."""
+    _ui_echo_success(message)
 
 
 def _echo_error(message: str):
-    """Print error message in red."""
-    typer.echo(typer.style(f"✗ {message}", fg=typer.colors.RED))
+    """Print error message."""
+    _ui_echo_error(message)
 
 
 def _echo_warning(message: str):
-    """Print warning message in yellow."""
-    typer.echo(typer.style(f"⚠ {message}", fg=typer.colors.YELLOW))
+    """Print warning message."""
+    _ui_echo_warning(message)
 
 
 def _echo_info(message: str):
-    """Print info message in blue."""
-    typer.echo(typer.style(f"ℹ {message}", fg=typer.colors.BLUE))
+    """Print info message."""
+    _ui_echo_info(message)
 
 
 def parse_date_safely(date_str: str, param_name: str = "date") -> datetime:

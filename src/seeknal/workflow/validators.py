@@ -13,7 +13,7 @@ import typer
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from seeknal.cli.main import _echo_error
+from seeknal.ui.output import echo_error as _echo_error
 
 
 # Schema definitions for each node type

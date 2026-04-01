@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from seeknal.cli.main import _echo_info, _echo_success, _echo_error, _echo_warning
+from seeknal.ui.output import echo_success as _echo_success, echo_error as _echo_error, echo_info as _echo_info, echo_warning as _echo_warning
 from seeknal.workflow.runner import DAGRunner, ExecutionStatus, NodeResult
 from seeknal.workflow.state import (
     NodeStatus, update_node_state, save_state, find_downstream_nodes,
@@ -266,3 +266,20 @@ def print_parallel_summary(summary: ParallelExecutionSummary) -> None:
         _echo_error("Failed nodes:")
         for result in failed_results:
             _echo_error(f"  - {result.node_id}: {result.error_message}")
+
+    # Rich summary panel (dual output during migration)
+    try:
+        from seeknal.ui.progress import render_summary
+        from seeknal.ui.console import get_console
+        console = get_console()
+        if console.is_terminal:
+            panel = render_summary({
+                'total': summary.total_nodes,
+                'executed': summary.executed_nodes,
+                'cached': summary.cached_nodes,
+                'failed': summary.failed_nodes,
+                'duration': summary.total_duration,
+            })
+            console.print(panel)
+    except Exception:
+        pass  # Fall back to existing text output
