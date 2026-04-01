@@ -15,9 +15,6 @@ import traceback
 from io import StringIO
 from typing import Any
 
-from langchain_core.tools import tool
-
-
 def _split_last_expression(code: str):
     """Split code into body and optional last expression.
 
@@ -161,7 +158,6 @@ def _do_execute(code: str, conn: Any, timeout: int = 30) -> str:
     return "\n\n".join(parts) if parts else "Code executed successfully (no output)."
 
 
-@tool
 def execute_python(code: str) -> str:
     """Execute Python code for data analysis beyond what SQL can express.
 
@@ -188,4 +184,21 @@ def execute_python(code: str) -> str:
 
     # Use subprocess sandbox for process isolation + killable timeout
     from seeknal.ask.sandbox import execute_in_sandbox
-    return execute_in_sandbox(code, ctx.project_path)
+
+    result = execute_in_sandbox(code, ctx.project_path)
+
+    # Wrap error results in structured error JSON for agent self-correction
+    from seeknal.ask.agents.tools.errors import (
+        RETRYABLE_SYNTAX,
+        TERMINAL_TIMEOUT,
+        format_tool_error,
+    )
+
+    if result.startswith("Execution timed out"):
+        return format_tool_error(TERMINAL_TIMEOUT, result)
+    if result.startswith("Error launching subprocess:"):
+        return format_tool_error(RETRYABLE_SYNTAX, result)
+    if result.startswith("Error:\n") or result.startswith("Process exited with code"):
+        return format_tool_error(RETRYABLE_SYNTAX, result)
+
+    return result

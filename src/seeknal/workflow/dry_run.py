@@ -14,7 +14,7 @@ import ast
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from seeknal.cli.main import _echo_success, _echo_error, _echo_warning, _echo_info
+from seeknal.ui.output import echo_success as _echo_success, echo_error as _echo_error, echo_warning as _echo_warning, echo_info as _echo_info
 from seeknal.workflow.validators import validate_yaml_syntax, validate_schema, validate_dependencies
 from seeknal.workflow.executor import execute_preview
 

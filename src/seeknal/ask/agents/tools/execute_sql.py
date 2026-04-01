@@ -1,9 +1,5 @@
 """Execute SQL tool — runs read-only queries via the seeknal REPL."""
 
-from langchain_core.tools import tool
-
-
-@tool
 def execute_sql(sql: str, limit: int = 100) -> str:
     """Execute a read-only SQL query against seeknal project data.
 
@@ -23,23 +19,24 @@ def execute_sql(sql: str, limit: int = 100) -> str:
         limit: Maximum rows to return (default 100).
     """
     from seeknal.ask.agents.tools._context import get_tool_context
-    from seeknal.ask.security import validate_sql_for_agent
 
     ctx = get_tool_context()
 
     # Strip trailing semicolons — LLMs often include them but DuckDB rejects them
     sql = sql.strip().rstrip(";").strip()
 
-    try:
-        validate_sql_for_agent(sql)
-    except ValueError as e:
-        return f"SQL validation error: {e}"
+    # SQL validation is handled by the PRE_TOOL_USE hook (see hooks.py)
 
     try:
         with ctx.db_lock:
             columns, rows = ctx.repl.execute_oneshot(sql, limit=limit)
     except Exception as e:
-        return f"SQL execution error: {e}"
+        from seeknal.ask.agents.tools.errors import (
+            classify_duckdb_error,
+            format_tool_error,
+        )
+
+        return format_tool_error(classify_duckdb_error(str(e)), str(e))
 
     if not columns:
         return "Query executed successfully but returned no results."

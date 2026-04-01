@@ -1,42 +1,18 @@
 """Deep agent for Seeknal Ask.
 
-Uses deepagents (built on LangGraph) for planning and auto-summarization.
-LLM generates SQL -> execute_sql tool -> error? -> LLM retries.
+Uses pydantic-deep (built on pydantic-ai) for planning and auto-summarization.
+LLM generates SQL -> execute_sql tool -> hook validates -> error? -> LLM retries.
 For complex analyses, the agent decomposes tasks via the planning tool.
 """
 
 from pathlib import Path
 from typing import Optional
 
-from langchain_core.messages import HumanMessage
-from langgraph.checkpoint.memory import MemorySaver
-
-from seeknal.ask.agents.tools.execute_sql import execute_sql
-from seeknal.ask.agents.tools.list_tables import list_tables
-from seeknal.ask.agents.tools.describe_table import describe_table
-from seeknal.ask.agents.tools.get_entities import get_entities
-from seeknal.ask.agents.tools.get_entity_schema import get_entity_schema
-from seeknal.ask.agents.tools.read_pipeline import read_pipeline
-from seeknal.ask.agents.tools.search_pipelines import search_pipelines
-from seeknal.ask.agents.tools.search_project_files import search_project_files
-from seeknal.ask.agents.tools.read_project_file import read_project_file
-from seeknal.ask.agents.tools.execute_python import execute_python
-from seeknal.ask.agents.tools.generate_report import generate_report
-from seeknal.ask.agents.tools.save_report_exposure import save_report_exposure
 from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
 from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
 
-TOOLS = [
-    execute_sql, list_tables, describe_table,
-    get_entities, get_entity_schema,
-    read_pipeline, search_pipelines,
-    search_project_files, read_project_file,
-    execute_python,
-    generate_report,
-    save_report_exposure,
-]
-
-SYSTEM_PROMPT = """You are Seeknal Ask, a senior data analyst and strategist.
+SYSTEM_PROMPT = """\
+You are Seeknal Ask, a senior data analyst and strategist.
 
 You analyze data managed by seeknal — a data engineering platform that produces
 entities, feature groups, and transformations stored as DuckDB views.
@@ -68,92 +44,7 @@ For advanced analysis:
 2. Use `execute_python` for stats, visualizations, complex pandas ops
 3. Pre-loaded: `conn` (DuckDB), `pd`, `np`, `plt`
 
-## Report Generation (Evidence.dev)
-
-When asked to create a report, dashboard, or visualization, produce a
-**professional, insight-driven** Evidence.dev report. Follow this structure:
-
-### Report Quality Bar
-
-A professional report MUST have:
-1. **Executive Summary** — 3-4 BigValue KPIs answering the core question up front
-2. **Multi-angle Visual Analysis** — Each section explores a DIFFERENT dimension with a DIFFERENT chart type
-3. **Data-backed Narrative** — Between every chart, write 1-2 sentences interpreting the data with SPECIFIC numbers ("Premium customers spend 2.3x more per order than Basic" — NOT "Premium customers tend to spend more")
-4. **Actionable Recommendations** — Tied to specific data points ("Target Bandung for Premium acquisition — 0 Premium customers despite $1,786 avg spend" — NOT "consider expanding to new markets")
-
-### Analysis Process
-
-BEFORE calling generate_report, you MUST:
-1. Run execute_sql to explore ALL relevant tables (not just one)
-2. Run at least 3-5 queries covering: aggregates, distributions, cross-table JOINs, rankings, trends
-3. Calculate derived metrics in your queries: percentages of total, ratios between segments, rankings
-4. Identify the 3 most interesting findings — these become the report's narrative spine
-
-DO NOT generate a report after looking at only one table.
-DO NOT write 5 BarCharts of the same query. Each chart must show different data.
-DO NOT write generic insights. Every recommendation must cite a specific number from the data.
-
-### Evidence Markdown Syntax
-
-SQL queries in fenced blocks:
-```sql query_name
-SELECT ... FROM table_name
-```
-
-Components (SINGLE curly braces only — never double braces):
-- <BigValue data={query_name} value=column_name />
-- <BarChart data={query_name} x=column y=column />
-- <LineChart data={query_name} x=date_col y=value_col />
-- <AreaChart data={query_name} x=date_col y=value_col />
-- <DataTable data={query_name} />
-- <ScatterPlot data={query_name} x=col1 y=col2 />
-- <Histogram data={query_name} x=column bins=20 />
-- <FunnelChart data={query_name} name=stage value=count />
-
-### Report Writing Rules
-
-- Name queries descriptively (revenue_by_month, top_customers)
-- Use markdown headers (##) to create clear sections
-- Write concise analytical commentary between charts — explain WHAT the data shows and WHY it matters
-- Do NOT include semicolons in SQL queries
-- Use the same table names from list_tables output
-- Each chart should have a descriptive title prop
-- Use percentage columns, rankings, and comparisons — not just raw counts
-- Vary chart types: don't use 5 BarCharts in a row
-
-### Report Content Pattern
-
-Follow this pattern for each section of the report page content:
-
-SECTION 1 — Executive KPIs:
-  SQL query → BigValue components (3-4 headline numbers)
-
-SECTION 2 — Primary breakdown:
-  SQL query with % of total → BarChart + brief insight text with specific numbers → DataTable
-
-SECTION 3 — Secondary dimension:
-  SQL query with different grouping/JOIN → different chart type (LineChart, ScatterPlot, etc.) + insight
-
-SECTION 4 — Cross-analysis:
-  SQL query JOINing 2+ tables → stacked/grouped BarChart or heatmap-style DataTable + insight
-
-SECTION 5 — Recommendations:
-  Markdown text with specific, data-cited action items (e.g., "Premium segment has 2.3x higher AOV but only 16% of customers — upsell campaigns targeting Standard customers with AOV > $400 could expand this segment by ~30%")
-
-### Final Answer Requirements
-
-After generating a report, your final answer MUST include:
-1. A brief summary of the key findings with SPECIFIC numbers
-2. The path to the generated HTML report
-3. 2-3 actionable recommendations grounded in the data
-
-Do NOT just say "I created a report" — the answer itself should be valuable standalone content.
-
-## Report Codification
-
-After completing analysis, if the user wants to save it as a repeatable report:
-- Call save_report_exposure with a snake_case name, distilled prompt, table refs, and format
-- Re-run with: seeknal ask report --exposure {name}
+For report generation, load the 'report-generation' skill first.
 
 ## DuckDB SQL Rules
 
@@ -171,10 +62,37 @@ After completing analysis, if the user wants to save it as a repeatable report:
 - Never reference file paths in SQL
 - Only query tables from list_tables output
 
-## Data Context
+## Error Handling
 
-{context}
+Tool errors include a JSON structure with 'category' and 'retryable' fields.
+For retryable errors, adjust your approach based on the 'hint'.
+For terminal errors, explain the limitation to the user.
+
+## Memory
+
+You have persistent memory across sessions. Use it wisely:
+- Before writing, call `read_memory` to check what's already saved — avoid duplicates
+- Save: table names with column types, row counts, useful join patterns, \
+business definitions, DuckDB syntax you discovered
+- Use `update_memory` to refine existing entries instead of `write_memory` to append duplicates
+- Keep entries concise — one line per fact, grouped by topic
 """
+
+
+_NO_RESPONSE = "No response generated."
+
+# Ralph Loop: max retries when agent returns tool calls but no final text
+_MAX_RALPH_RETRIES = 3
+
+# Diminishing returns: if this many consecutive retries produce fewer than
+# _LOW_OUTPUT_THRESHOLD chars each, stop the Ralph Loop early.
+_LOW_OUTPUT_RETRIES = 3
+_LOW_OUTPUT_THRESHOLD = 500
+
+_DIMINISHING_RETURNS_MSG = (
+    "I explored the data but couldn't produce a definitive answer. "
+    "Please try rephrasing your question or breaking it into smaller parts."
+)
 
 
 def create_agent(
@@ -192,10 +110,18 @@ def create_agent(
         api_key: API key override.
 
     Returns:
-        A tuple of (agent, config) where agent is a LangGraph compiled graph
-        and config is the default invocation config.
+        A tuple of (agent, deps, message_history) where agent is a pydantic-ai
+        Agent, deps is DeepAgentDeps, and message_history is the initial
+        (empty) conversation history list.
     """
-    from seeknal.ask.agents.providers import get_llm
+    from pydantic_deep import create_deep_agent, DeepAgentDeps, LocalBackend
+
+    from seeknal.ask.agents.context_toolset import SeeknaContextToolset
+    from seeknal.ask.agents.hooks import get_ask_hooks
+    from seeknal.ask.agents.providers import get_model_string
+    from seeknal.ask.agents.subagents import get_subagent_configs
+    from seeknal.ask.agents.tools.toolset import create_ask_toolset
+    from seeknal.ask.processors import MicrocompactProcessor, SqlResultCompactor
     from seeknal.ask.security import configure_safe_connection
     from seeknal.cli.repl import REPL
 
@@ -205,7 +131,6 @@ def create_agent(
 
     # Discover project artifacts for context
     discovery = ArtifactDiscovery(project_path)
-    context = discovery.get_context_for_prompt()
 
     # Set tool context (global, used by all tools)
     set_tool_context(ToolContext(
@@ -214,122 +139,156 @@ def create_agent(
         project_path=project_path,
     ))
 
-    # Create LLM
-    llm = get_llm(provider=provider, model=model, api_key=api_key)
+    # Resolve model string
+    model_string = get_model_string(provider=provider, model=model, api_key=api_key)
 
-    # Build system prompt with project context
-    system_prompt = SYSTEM_PROMPT.replace("{context}", context)
+    # Build toolsets: ask tools + dynamic project context injection
+    context_toolset = SeeknaContextToolset(discovery)
 
-    # Create deep agent with planning and auto-summarization
-    checkpointer = MemorySaver()
-    agent = _create_agent_graph(
-        llm, system_prompt, checkpointer
+    # Ensure .seeknal directory exists for memory storage
+    (project_path / ".seeknal").mkdir(exist_ok=True)
+
+    # Create pydantic-deep agent
+    agent = create_deep_agent(
+        model=model_string,
+        instructions=SYSTEM_PROMPT,
+        toolsets=[create_ask_toolset(), context_toolset],
+        hooks=get_ask_hooks(),
+        # Skills: discovered from SKILL.md files in seeknal/skills/ (Claude Code-style)
+        include_skills=True,
+        skill_directories=[str(project_path / "seeknal" / "skills")],
+        # Enable planning for complex multi-step analyses
+        include_todo=True,
+        # Auto-summarize when approaching context window limit (Tier 3)
+        context_manager=True,
+        # Multi-tier compaction: Tier 1 (microcompact) + Tier 2 (SQL snip)
+        history_processors=[MicrocompactProcessor(), SqlResultCompactor()],
+        # Project memory: persistent schema knowledge across sessions
+        include_memory=True,
+        memory_dir=".seeknal/ask_memory",
+        # Disable features we don't use yet
+        include_filesystem=False,
+        include_subagents=True,
+        subagents=get_subagent_configs(),
+        include_plan=False,
+        include_checkpoints=False,
+        include_teams=False,
+        include_web=False,
+        include_execute=False,
     )
 
-    config = {
-        "configurable": {"thread_id": "default"},
-        "recursion_limit": 100,
-    }
-    return agent, config
+    # Use LocalBackend rooted at project path for disk-persistent memory
+    deps = DeepAgentDeps(backend=LocalBackend(root_dir=str(project_path)))
+    message_history = []
 
-
-def _create_agent_graph(llm, system_prompt: str, checkpointer):
-    """Create the agent graph, trying deepagents first with ReAct fallback."""
-    try:
-        from deepagents import create_deep_agent
-
-        return create_deep_agent(
-            model=llm,
-            tools=TOOLS,
-            system_prompt=system_prompt,
-            checkpointer=checkpointer,
-        )
-    except ImportError:
-        # Fallback to ReAct agent if deepagents not installed
-        from langchain_core.messages import SystemMessage
-        from langgraph.prebuilt import create_react_agent
-
-        return create_react_agent(
-            llm,
-            tools=TOOLS,
-            checkpointer=checkpointer,
-            prompt=SystemMessage(content=system_prompt),
-        )
-
-
-_NO_RESPONSE = "No response generated."
-
-# Ralph Loop: max retries when agent returns tool calls but no final text
-_MAX_RALPH_RETRIES = 3
-
-
-def _normalize_content(content) -> str:
-    """Normalize Gemini's list[dict] content format to plain string.
-
-    Gemini returns content as [{'type':'text','text':'...'}] or plain str.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict) and "text" in block:
-                parts.append(block["text"])
-            elif isinstance(block, str):
-                parts.append(block)
-        return "".join(parts)
-    return str(content) if content else ""
-
-
-def _extract_response(messages: list) -> str:
-    """Extract the last AI text message from agent output."""
-    for msg in reversed(messages):
-        if hasattr(msg, "content") and msg.type == "ai" and msg.content:
-            text = _normalize_content(msg.content)
-            if text:
-                return text
-    return ""
+    return agent, deps, message_history
 
 
 def ask(
     agent,
-    config: dict,
+    deps,
+    message_history: list,
     question: str,
 ) -> str:
-    """Send a question to the agent and get a response.
+    """Send a question to the agent and get a response (sync).
 
     Uses the Ralph Loop technique: if the agent ends on tool calls without
     producing a final text response, nudge it to summarize its findings.
-    Retries up to _MAX_RALPH_RETRIES times before giving up.
+
+    Includes two refinements:
+    - **Diminishing returns detection**: if 3+ consecutive retries each
+      produce fewer than 500 chars, stop early with a graceful message.
+    - **Answer quality gate**: checks the final answer for specific data
+      and does one retry if the answer is too vague.
 
     Args:
-        agent: The compiled LangGraph agent.
-        config: Agent invocation config (with thread_id).
+        agent: The pydantic-ai Agent.
+        deps: DeepAgentDeps instance.
+        message_history: Conversation history (mutated in place).
         question: User's natural language question.
 
     Returns:
         The agent's text response.
     """
-    # Initial invocation
-    result = agent.invoke(
-        {"messages": [HumanMessage(content=question)]},
-        config=config,
+    result = agent.run_sync(
+        question,
+        deps=deps,
+        message_history=message_history,
     )
-    response = _extract_response(result.get("messages", []))
+    # Update message history for multi-turn
+    message_history.clear()
+    message_history.extend(result.all_messages())
+
+    response = result.output or ""
     if response:
-        return response
+        return _quality_gate(agent, deps, message_history, response)
 
     # Ralph Loop: nudge the agent to produce a text summary
+    low_output_streak = 0
+
     for _ in range(_MAX_RALPH_RETRIES):
-        result = agent.invoke(
-            {"messages": [HumanMessage(
-                content="Please summarize your findings from the tool calls above "
-                        "and provide your analysis as a text response."
-            )]},
-            config=config,
+        result = agent.run_sync(
+            "Please summarize your findings from the tool calls above "
+            "and provide your analysis as a text response.",
+            deps=deps,
+            message_history=message_history,
         )
-        response = _extract_response(result.get("messages", []))
+        message_history.clear()
+        message_history.extend(result.all_messages())
+
+        response = result.output or ""
         if response:
-            return response
+            return _quality_gate(agent, deps, message_history, response)
+
+        # Diminishing returns: track low-output retries
+        output_chars = len(response)
+        if output_chars < _LOW_OUTPUT_THRESHOLD:
+            low_output_streak += 1
+        else:
+            low_output_streak = 0
+
+        if low_output_streak >= _LOW_OUTPUT_RETRIES:
+            return _DIMINISHING_RETURNS_MSG
 
     return _NO_RESPONSE
+
+
+def _quality_gate(
+    agent,
+    deps,
+    message_history: list,
+    answer: str,
+) -> str:
+    """Check answer quality and retry once if the answer lacks specific data.
+
+    This is output validation — not intent routing. If the answer contains
+    numbers or is clearly an explanation, it passes. Otherwise, one retry
+    is attempted with guidance to cite data.
+
+    Args:
+        agent: The pydantic-ai Agent.
+        deps: DeepAgentDeps instance.
+        message_history: Conversation history (mutated in place).
+        answer: The agent's answer to validate.
+
+    Returns:
+        The original answer if it passes, or the retry answer (regardless
+        of whether the retry passes — no infinite loop).
+    """
+    from seeknal.ask.agents.quality import check_answer_quality
+
+    passes, reason = check_answer_quality(answer)
+    if passes:
+        return answer
+
+    # One quality retry with guidance
+    result = agent.run_sync(
+        reason,
+        deps=deps,
+        message_history=message_history,
+    )
+    message_history.clear()
+    message_history.extend(result.all_messages())
+
+    retry_answer = result.output or ""
+    return retry_answer if retry_answer else answer

@@ -1,9 +1,5 @@
 """Search pipelines tool — searches across pipeline definitions."""
 
-from langchain_core.tools import tool
-
-
-@tool
 def search_pipelines(query: str) -> str:
     """Search across all seeknal pipeline definitions for matching content.
 

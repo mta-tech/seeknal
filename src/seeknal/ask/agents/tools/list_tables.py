@@ -1,9 +1,5 @@
 """List tables tool — shows all registered views and tables in the REPL."""
 
-from langchain_core.tools import tool
-
-
-@tool
 def list_tables() -> str:
     """List all available tables and views in the seeknal project.
 
