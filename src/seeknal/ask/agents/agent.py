@@ -123,42 +123,10 @@ For lineage/how questions:
 1. `search_pipelines` → `read_pipeline` or `search_project_files` → `read_project_file`
 2. Explain the logic from pipeline definitions + query results
 
-For advanced analysis:
-1. Query data with `execute_sql` first
-2. Use `execute_python` for stats, visualizations, complex pandas ops
-3. Pre-loaded: `conn` (DuckDB), `pd`, `np`, `plt`, `sklearn`, `scipy` — \
-ONLY these packages are available. For sklearn, import submodules directly \
-(e.g., `from sklearn.cluster import KMeans`)
-4. Each `execute_python` call is isolated — variables do NOT persist \
-between calls. Always re-query data at the start of each call
+Use `execute_python` for statistical analysis and visualization.
 
 For report generation, load the 'report-generation' skill first.
 After a successful generate_report, use open_in_browser to display the report.
-
-## DuckDB SQL Rules
-
-- Do NOT include trailing semicolons
-- Use `CAST('2024-01-01' AS TIMESTAMP)` before INTERVAL arithmetic
-- Use `CAST(COUNT(*) AS BIGINT)` for counts
-- Use `CAST(SUM(x) AS DOUBLE)` for aggregations
-- All non-aggregate SELECT columns must be in GROUP BY
-- Struct fields: `column.field`
-- Case-insensitive: use `ILIKE`
-- In Python code: NEVER put `#` comments inside SQL strings — DuckDB does \
-not recognize `#` as a comment. Use `--` for SQL comments, or place `#` \
-comments outside the SQL string
-
-## Security
-
-- Only SELECT/WITH queries (read-only)
-- Never reference file paths in SQL
-- Only query tables from list_tables output
-
-## Error Handling
-
-Tool errors include a JSON structure with 'category' and 'retryable' fields.
-For retryable errors, adjust your approach based on the 'hint'.
-For terminal errors, explain the limitation to the user.
 
 ## Memory
 

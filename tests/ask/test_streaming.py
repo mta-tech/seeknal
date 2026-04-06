@@ -12,13 +12,9 @@ from pathlib import Path
 import pytest
 
 from seeknal.ask.streaming import (
-    _is_strategic_question,
-    _needs_plan_confirmation,
     _extract_report_paths,
-    _prepare_question,
     _tool_spinner_message,
     _sanitize_output,
-    _scope_prompt,
     _show_reasoning,
     _show_tool_start,
     _show_tool_end,

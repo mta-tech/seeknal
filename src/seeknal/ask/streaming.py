@@ -27,41 +27,6 @@ from seeknal.ask.agents.tools._context import reset_report_approval
 
 # Strip raw ANSI escape sequences from tool output to prevent terminal injection
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
-_STRATEGIC_QUESTION = re.compile(
-    r"\b(brainstorm|strategy|strategic|strategize|plan|planning|campaign|explore)\b",
-    re.IGNORECASE,
-)
-_PIPELINE_BUILD_QUESTION = re.compile(
-    r"\b(build|create|design|set up|setup)\b.*\b(pipeline|feature store|semantic layer|project)\b|"
-    r"\bfrom scratch\b",
-    re.IGNORECASE,
-)
-_ASK_USER_DIRECTIVE = (
-    "\n\nBefore doing any analysis or tool calls, first use the ask_user tool to ask "
-    "one scoping multiple-choice question with 2-4 concrete options and one "
-    "recommended choice. Wait for the user's answer, then continue with the "
-    "analysis using their selection."
-)
-_PLAN_CONFIRMATION_DIRECTIVE = (
-    "\n\nThis is a build-planning request. Before drafting YAML, SQL, or implementation "
-    "details, first inspect only the current project skeleton and available sources, "
-    "then present a concise Seeknal-native plan covering sources, transforms, feature "
-    "groups or aggregates, data-quality checks, and execution order. After laying out "
-    "that plan, you must call the ask_user tool and ask for confirmation with exactly "
-    "these options: 'Execute this plan' (recommended), 'Refine this plan', and 'Type "
-    "your own'. Do not proceed into implementation details unless the user selects "
-    "'Execute this plan'."
-)
-_BRAINSTORM_REPORT_GUARDRAIL = (
-    "\n\nThis is a brainstorming or strategy request. Persistent memory, existing "
-    "reports, and saved exposures are context only — they are not approval to reuse "
-    "or extend a prior strategy. After the minimum analysis needed to orient yourself, "
-    "summarize the current findings and proposed next step in concise bullets. Before "
-    "calling generate_report or save_report_exposure, you must call the ask_user tool "
-    "and ask what to do next with exactly these options: 'Continue analysis' "
-    "(recommended), 'Generate report now', 'Done for now', and 'Type your own'. Do not print those choices as plain text, bullets, or numbered lists — use ask_user directly for the interactive menu. Only generate or save "
-    "a report if the user explicitly asks for one or selects 'Generate report now'."
-)
 
 
 def _sanitize_output(text: str) -> str:
@@ -69,106 +34,6 @@ def _sanitize_output(text: str) -> str:
     return _ANSI_ESCAPE.sub("", text)
 
 
-def _is_strategic_question(question: str) -> bool:
-    """Return True when a prompt should be scoped before analysis."""
-    return bool(_STRATEGIC_QUESTION.search(question.strip()))
-
-
-def _needs_plan_confirmation(question: str) -> bool:
-    """Return True when a strategic prompt should require plan confirmation."""
-    return bool(_PIPELINE_BUILD_QUESTION.search(question.strip()))
-
-
-def _scope_prompt(question: str) -> tuple[str, list[dict[str, str]]] | None:
-    """Return a deterministic scoping prompt for strategic questions."""
-    stripped = question.strip()
-    if not stripped:
-        return None
-    lower = stripped.lower()
-    if not _is_strategic_question(stripped):
-        return None
-
-    if any(word in lower for word in ("retention", "retain", "churn", "win back", "win-back")):
-        return (
-            "Which retention angle should I prioritize first?",
-            [
-                {
-                    "label": "Protect VIPs",
-                    "description": "Focus on high-value customers most at risk of churning",
-                    "recommended": "true",
-                },
-                {
-                    "label": "Increase frequency",
-                    "description": "Drive more repeat purchases from active customers this month",
-                },
-                {
-                    "label": "Win back lapsed customers",
-                    "description": "Target previously active customers who have gone quiet",
-                },
-                {
-                    "label": "Let the data decide",
-                    "description": "Start broad, then narrow to the strongest opportunity in the project data",
-                },
-            ],
-        )
-
-    return (
-        "Which direction should I prioritize for this brainstorm?",
-        [
-            {
-                "label": "Recommend a default path",
-                "description": "Start with the highest-leverage direction and explain why",
-                "recommended": "true",
-            },
-            {
-                "label": "Compare options first",
-                "description": "Lay out multiple paths and their tradeoffs before analysis",
-            },
-            {
-                "label": "Go broad first",
-                "description": "Survey the data quickly before committing to one direction",
-            },
-            {
-                "label": "Focus on execution",
-                "description": "Bias toward concrete next steps rather than open-ended exploration",
-            },
-        ],
-    )
-
-
-async def _maybe_scope_question(question: str) -> str:
-    """Ask one deterministic scoping question for strategic prompts."""
-    if "user-selected direction:" in question.lower():
-        return question
-
-    scoped = _scope_prompt(question)
-    if scoped is None:
-        return question
-
-    from seeknal.ask.agents.tools.ask_user import interactive_ask_user
-
-    prompt, options = scoped
-    selection = await interactive_ask_user(prompt, options)
-    return f"{question.strip()}\n\nUser-selected direction: {selection}"
-
-
-def _prepare_question(question: str) -> str:
-    """Add deterministic ask_user guidance for strategic prompts."""
-    stripped = question.strip()
-    if not stripped:
-        return question
-
-    directives: list[str] = []
-    lowered = stripped.lower()
-    if _is_strategic_question(stripped) and "ask_user tool" not in lowered:
-        directives.append(_ASK_USER_DIRECTIVE.strip())
-    if _is_strategic_question(stripped) and "generate report now" not in lowered:
-        directives.append(_BRAINSTORM_REPORT_GUARDRAIL.strip())
-    if _needs_plan_confirmation(stripped) and "execute this plan" not in lowered:
-        directives.append(_PLAN_CONFIRMATION_DIRECTIVE.strip())
-    if not directives:
-        return question
-    return stripped + "\n\n" + "\n\n".join(directives)
 
 
 # ---------------------------------------------------------------------------
@@ -177,11 +42,15 @@ def _prepare_question(question: str) -> str:
 
 
 def _show_reasoning(console: Console, text: str) -> None:
-    """Display intermediate LLM analysis as Markdown."""
-    from rich.markdown import Markdown
-
+    """Display intermediate LLM reasoning in subordinate style."""
+    stripped = text.strip()
+    if not stripped:
+        return
+    lines = stripped.split('\n')
     console.print()
-    console.print(Markdown(text.strip()))
+    console.print(f"[grey62]⎿  {escape(lines[0])}[/]")
+    for line in lines[1:]:
+        console.print(f"[grey62]   {escape(line)}[/]")
 
 
 def _show_tool_start(console: Console, name: str, args: Optional[dict] = None) -> None:
@@ -629,8 +498,7 @@ async def stream_ask(
     Returns:
         The agent's text response.
     """
-    reset_report_approval(_is_strategic_question(question))
-    question = await _maybe_scope_question(question)
+    reset_report_approval()
 
     if quiet:
         # Quiet mode: use sync ask() with spinner
@@ -640,7 +508,7 @@ async def stream_ask(
             return sync_ask(agent, deps, message_history, question)
 
     # Streaming mode with progressive rendering
-    current_question = _prepare_question(question)
+    current_question = question.strip()
     low_output_streak = 0
 
     for attempt in range(_MAX_RALPH_RETRIES + 1):

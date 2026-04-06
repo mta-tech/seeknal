@@ -110,6 +110,11 @@ class AskSpinner:
         with self._lock:
             self._tokens += n
 
+    def set_tokens(self, n: int) -> None:
+        """Set the absolute token count (e.g. from usage API)."""
+        with self._lock:
+            self._tokens = n
+
     def increment_tool_uses(self) -> None:
         """Increment tool use counter."""
         with self._lock:

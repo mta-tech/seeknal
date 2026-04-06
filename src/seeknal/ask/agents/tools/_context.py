@@ -44,7 +44,7 @@ class ToolContext:
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     db_lock: threading.Lock = field(default_factory=threading.Lock)
     fs_lock: threading.Lock = field(default_factory=threading.Lock)
-    require_report_approval: bool = False
+    require_report_approval: bool = True
     report_approval_granted: bool = False
     background_registry: BackgroundRegistry = field(default_factory=lambda: _make_registry())
     console: Any = None
@@ -86,10 +86,14 @@ _REPORT_APPROVAL_OPTIONS = frozenset({
 })
 
 
-def reset_report_approval(required: bool) -> None:
-    """Reset per-turn report approval state."""
+def reset_report_approval() -> None:
+    """Reset per-turn report approval state.
+
+    Always requires approval — the agent must ask the user before generating
+    reports (per agent autonomy constraint: no keyword-based intent routing).
+    """
     ctx = get_tool_context()
-    ctx.require_report_approval = required
+    ctx.require_report_approval = True
     ctx.report_approval_granted = False
 
 
