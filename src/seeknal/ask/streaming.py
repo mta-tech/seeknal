@@ -177,10 +177,11 @@ def _prepare_question(question: str) -> str:
 
 
 def _show_reasoning(console: Console, text: str) -> None:
-    """Display LLM reasoning text in a dim Panel."""
-    from rich.panel import Panel
+    """Display intermediate LLM analysis as Markdown."""
+    from rich.markdown import Markdown
 
-    console.print(Panel(text.strip(), title="Reasoning", border_style="dim"))
+    console.print()
+    console.print(Markdown(text.strip()))
 
 
 def _show_tool_start(console: Console, name: str, args: Optional[dict] = None) -> None:
@@ -448,27 +449,29 @@ def _show_retry(console: Console, attempt: int, max_retries: int) -> None:
     )
 
 
-def _show_turn_stats(console: Console, spinner) -> None:
+def _show_turn_stats(console: Console, spinner, usage=None) -> None:
     """Display a compact stats line after each agent turn.
 
-    Shows token usage, elapsed time, and tool call count in dim text:
+    Shows token usage, elapsed time, and tool call count:
       ↓ 1.4k tokens · 12s · 3 tool calls
-    """
-    parts = []
-    if spinner.tokens > 0:
-        from seeknal.ui.ask_spinner import _format_tokens
 
-        parts.append(f"↓ {_format_tokens(spinner.tokens)} tokens")
+    Args:
+        usage: Optional pydantic-ai RunUsage for real token/tool counts.
+    """
+    from seeknal.ui.ask_spinner import _format_tokens, _format_elapsed
+
+    parts = []
+    tokens = usage.total_tokens if usage else spinner.tokens
+    if tokens > 0:
+        parts.append(f"↓ {_format_tokens(tokens)} tokens")
     elapsed = spinner.elapsed
     if elapsed >= 1.0:
-        from seeknal.ui.ask_spinner import _format_elapsed
-
         parts.append(_format_elapsed(elapsed))
-    if spinner.tool_uses > 0:
-        n = spinner.tool_uses
-        parts.append(f"{n} tool call{'s' if n != 1 else ''}")
+    tool_calls = usage.tool_calls if usage else spinner.tool_uses
+    if tool_calls > 0:
+        parts.append(f"{tool_calls} tool call{'s' if tool_calls != 1 else ''}")
     if parts:
-        console.print(f"[text.dim]  {' · '.join(parts)}[/]")
+        console.print(f"\n[grey62]  {' · '.join(parts)}[/]")
 
 
 # ---------------------------------------------------------------------------
@@ -518,10 +521,10 @@ async def _stream_one_pass(
                     async for event in request_stream:
                         if isinstance(event, PartDeltaEvent):
                             if isinstance(event.delta, TextPartDelta):
-                                content_delta = event.delta.content_delta
-                                spinner.add_tokens(len(content_delta))
                                 spinner.stop()
-                                text_buffer.append(content_delta)
+                                text_buffer.append(event.delta.content_delta)
+                # Update spinner with real token count from usage API
+                spinner.set_tokens(run.usage().total_tokens)
 
             elif Agent.is_call_tools_node(node):
                 spinner.stop()
@@ -583,6 +586,7 @@ async def _stream_one_pass(
                 break
 
         result = run.result
+        usage = run.usage()
 
     spinner.stop()
 
@@ -590,17 +594,17 @@ async def _stream_one_pass(
     if text_buffer:
         answer = "".join(text_buffer)
         _show_answer(console, answer)
-        _show_turn_stats(console, spinner)
+        _show_turn_stats(console, spinner, usage)
         return answer, result.all_messages()
 
     # Check result.output for text that wasn't streamed token-by-token
     output = result.output or ""
     if output:
         _show_answer(console, output)
-        _show_turn_stats(console, spinner)
+        _show_turn_stats(console, spinner, usage)
         return output, result.all_messages()
 
-    _show_turn_stats(console, spinner)
+    _show_turn_stats(console, spinner, usage)
     return "", result.all_messages()
 
 

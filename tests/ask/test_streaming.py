@@ -70,7 +70,6 @@ class TestRenderingHelpers:
         console, buf = make_console()
         _show_reasoning(console, "I need to find the table")
         output = buf.getvalue()
-        assert "Reasoning" in output
         assert "I need to find the table" in output
 
     def test_show_tool_start_generic(self):
