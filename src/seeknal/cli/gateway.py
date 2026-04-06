@@ -1,8 +1,12 @@
 """Gateway CLI — seeknal gateway start.
 
-Starts the seeknal ask HTTP gateway (WebSocket + SSE + REST + Telegram).
+Starts the seeknal ask HTTP gateway (WebSocket + SSE + REST + Telegram + Temporal).
 """
 
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +35,9 @@ def gateway_start(
     telegram: bool = typer.Option(
         False, "--telegram", help="Enable Telegram bot channel"
     ),
+    temporal: bool = typer.Option(
+        False, "--temporal", help="Enable Temporal worker for durable agent execution"
+    ),
 ):
     """Start the seeknal ask gateway server."""
     project_path = project or find_project_path()
@@ -48,25 +55,14 @@ def gateway_start(
 
     import uvicorn
 
-    app = create_gateway_app(project_path)
+    # --- Resolve optional channels/integrations ---
 
-    # Wire Telegram if requested
+    telegram_channel = None
     if telegram:
         try:
             from seeknal.ask.gateway.channels.telegram import TelegramChannel
 
-            channel = TelegramChannel(project_path)
-            # Store for startup/shutdown hooks
-            app.state.telegram_channel = channel
-
-            @app.on_event("startup")
-            async def _start_telegram():
-                await channel.start()
-
-            @app.on_event("shutdown")
-            async def _stop_telegram():
-                await channel.stop()
-
+            telegram_channel = TelegramChannel(project_path)
             typer.echo(typer.style("Telegram channel enabled", fg=typer.colors.GREEN))
         except ImportError:
             typer.echo(typer.style(
@@ -74,12 +70,90 @@ def gateway_start(
                 fg=typer.colors.YELLOW,
             ))
 
+    temporal_enabled = False
+    temporal_address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    temporal_namespace = os.environ.get("TEMPORAL_NAMESPACE", "default")
+    temporal_task_queue = os.environ.get("TEMPORAL_TASK_QUEUE", "seeknal-ask")
+
+    if temporal:
+        try:
+            from seeknal.ask.gateway.temporal import (
+                TEMPORAL_AVAILABLE,
+                _require_temporal,
+            )
+            _require_temporal()
+            temporal_enabled = True
+        except ImportError:
+            typer.echo(typer.style(
+                "Temporal requires: pip install seeknal[temporal]",
+                fg=typer.colors.YELLOW,
+            ))
+
+    # --- Build lifespan ---
+
+    temporal_client_holder: list = []  # mutable container for closure
+
+    @asynccontextmanager
+    async def lifespan(app):
+        # Startup: Telegram
+        if telegram_channel is not None:
+            app.state.telegram_channel = telegram_channel
+            await telegram_channel.start()
+
+        # Startup: Temporal
+        worker_task = None
+        if temporal_enabled:
+            from seeknal.ask.gateway.temporal import (
+                connect_temporal_client,
+                create_temporal_worker,
+            )
+
+            client = await connect_temporal_client(
+                address=temporal_address,
+                namespace=temporal_namespace,
+            )
+            if client is not None:
+                temporal_client_holder.append(client)
+                app.state.temporal_client = client
+                app.state.temporal_task_queue = temporal_task_queue
+
+                import asyncio
+
+                worker = create_temporal_worker(client, task_queue=temporal_task_queue)
+                worker_task = asyncio.create_task(worker.run())
+                typer.echo(typer.style(
+                    f"Temporal worker enabled (queue={temporal_task_queue})",
+                    fg=typer.colors.GREEN,
+                ))
+            else:
+                typer.echo(typer.style(
+                    "Temporal unavailable — running in degraded mode",
+                    fg=typer.colors.YELLOW,
+                ))
+
+        try:
+            yield
+        finally:
+            # Shutdown: Temporal worker
+            if worker_task is not None:
+                await worker.shutdown()
+                await worker_task
+
+            # Shutdown: Telegram
+            if telegram_channel is not None:
+                await telegram_channel.stop()
+
+    # Pass temporal_client if already connected (for sync startup path)
+    # The lifespan will also set it on app.state for the async path
+    app = create_gateway_app(project_path, lifespan=lifespan)
+
     typer.echo(f"Starting gateway on {host}:{port}")
     typer.echo(f"Project: {project_path}")
     typer.echo(f"Endpoints:")
     typer.echo(f"  GET  /health")
     typer.echo(f"  GET  /sessions")
     typer.echo(f"  POST /ask")
+    typer.echo(f"  POST /temporal/start")
     typer.echo(f"  WS   /ws/{{session_id}}")
     typer.echo(f"  GET  /events/{{session_id}}")
 

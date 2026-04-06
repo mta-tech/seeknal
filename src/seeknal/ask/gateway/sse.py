@@ -37,3 +37,16 @@ class SSEBroadcaster:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
                 pass  # Drop events for slow consumers
+
+    def publish_sync(self, session_id: str, event: str) -> None:
+        """Publish an event synchronously (uses put_nowait only).
+
+        Safe to call from sync code within an async context since
+        ``put_nowait`` never blocks. Cost is negligible when no
+        subscribers exist (~100ns dict lookup returning empty list).
+        """
+        for queue in self._subscribers.get(session_id, []):
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                pass  # Drop events for slow consumers
