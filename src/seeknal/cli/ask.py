@@ -479,6 +479,7 @@ def _run_exposure(
     with console.status("[spinner.active]Loading agent..."):
         agent, deps, message_history, _cost_info = create_agent(
             project_path, provider=provider, model=model,
+            environment="exposure",
         )
 
     import asyncio

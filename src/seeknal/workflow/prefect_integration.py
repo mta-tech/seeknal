@@ -604,8 +604,10 @@ def _execute_report(
         return {"status": "failed", "error": "No prompt or sections in exposure"}
 
     from seeknal.ask.agents.agent import create_agent, ask as ask_agent
-    agent, agent_config = create_agent(project_path)
-    response = ask_agent(agent, agent_config, prompt)
+    agent, deps, message_history, _cost_info = create_agent(
+        project_path, environment="exposure",
+    )
+    response = ask_agent(agent, deps, message_history, prompt)
     return {"status": "success", "response": response}
 
 

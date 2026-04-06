@@ -69,6 +69,7 @@ async def _run_agent_streaming(
 
     agent, deps, _, _ = create_agent(
         project_path, provider=provider, model=model,
+        environment="gateway",
     )
 
     text_buffer: list[str] = []

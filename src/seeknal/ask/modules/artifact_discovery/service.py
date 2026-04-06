@@ -26,32 +26,51 @@ class ArtifactDiscovery:
         self._intermediates_cache: Optional[list[str]] = None
         self._pipelines_cache: Optional[list[dict]] = None
 
-    def get_context_for_prompt(self) -> str:
+    def get_context_for_prompt(self, max_chars: int = 8000) -> str:
         """Build a complete context string for the LLM system prompt.
 
         Includes: entity list with schemas, DAG overview, available tables,
-        and a summary of source pipeline definitions.
+        and a summary of source pipeline definitions.  Sections are assembled
+        in priority order and trimmed when approaching *max_chars*.
+
+        Args:
+            max_chars: Soft character budget for the output (default 8000,
+                approximately 2000 tokens).
 
         Returns:
             Markdown-formatted context string.
         """
-        sections = []
+        remaining = max_chars
+        sections: list[str] = []
 
+        # Priority 1: Entities (most valuable — always included)
         entities = self._discover_entities()
         if entities:
-            sections.append(self._format_entities(entities))
+            text = self._format_entities(entities)
+            sections.append(text)
+            remaining -= len(text)
 
+        # Priority 2: DAG overview
         dag = self._discover_dag()
-        if dag:
-            sections.append(self._format_dag(dag))
+        if dag and remaining > 200:
+            dag_limit = max(5, min(20, remaining // 100))
+            text = self._format_dag(dag, limit=dag_limit)
+            sections.append(text)
+            remaining -= len(text)
 
+        # Priority 3: Intermediate tables
         intermediates = self._discover_intermediates()
-        if intermediates:
-            sections.append(self._format_intermediates(intermediates))
+        if intermediates and remaining > 200:
+            int_limit = max(5, min(30, remaining // 60))
+            text = self._format_intermediates(intermediates, limit=int_limit)
+            sections.append(text)
+            remaining -= len(text)
 
+        # Priority 4: Pipeline definitions (lowest priority)
         pipelines = self._discover_source_pipelines()
-        if pipelines:
-            sections.append(self._format_source_pipelines(pipelines))
+        if pipelines and remaining > 300:
+            text = self._format_source_pipelines(pipelines, max_chars=remaining)
+            sections.append(text)
 
         if not sections:
             return (
@@ -159,7 +178,7 @@ class ArtifactDiscovery:
             lines.append("")
         return "\n".join(lines)
 
-    def _format_dag(self, dag: dict) -> str:
+    def _format_dag(self, dag: dict, limit: int = 20) -> str:
         lines = ["## DAG Overview\n"]
         nodes_raw = dag.get("nodes", {})
         # nodes can be a dict (keyed by node id) or a list
@@ -169,20 +188,24 @@ class ArtifactDiscovery:
             nodes = nodes_raw
         if nodes:
             lines.append(f"Total nodes: {len(nodes)}\n")
-            for node in nodes[:20]:  # Limit to 20 nodes for prompt size
+            for node in nodes[:limit]:
                 node_name = node.get("name", "unknown")
                 node_type = node.get("type", "unknown")
                 lines.append(f"- `{node_name}` ({node_type})")
+            if len(nodes) > limit:
+                lines.append(f"  ... and {len(nodes) - limit} more")
         return "\n".join(lines)
 
-    def _format_intermediates(self, intermediates: list[str]) -> str:
+    def _format_intermediates(self, intermediates: list[str], limit: int = 30) -> str:
         lines = ["## Intermediate Tables\n"]
         lines.append(
             "These are intermediate transformation outputs, "
             "registered as DuckDB views:\n"
         )
-        for name in intermediates[:30]:  # Limit for prompt size
+        for name in intermediates[:limit]:
             lines.append(f"- `{name}`")
+        if len(intermediates) > limit:
+            lines.append(f"  ... and {len(intermediates) - limit} more")
         return "\n".join(lines)
 
     # --- Source pipeline discovery ---
@@ -295,7 +318,9 @@ class ArtifactDiscovery:
         """Get a summary list of all pipeline definitions."""
         return self._discover_source_pipelines()
 
-    def _format_source_pipelines(self, pipelines: list[dict]) -> str:
+    def _format_source_pipelines(
+        self, pipelines: list[dict], max_chars: int | None = None,
+    ) -> str:
         lines = ["## Pipeline Definitions\n"]
         lines.append(
             "Source pipeline files that define how data is produced. "
@@ -304,14 +329,27 @@ class ArtifactDiscovery:
         by_kind: dict[str, list[dict]] = {}
         for p in pipelines:
             by_kind.setdefault(p["kind"], []).append(p)
+
+        chars_used = sum(len(ln) for ln in lines)
         for kind, items in sorted(by_kind.items()):
             lines.append(f"### {kind} ({len(items)} nodes)")
-            for item in items[:20]:
+            per_kind_limit = 20
+            if max_chars is not None:
+                per_kind_limit = max(3, min(20, (max_chars - chars_used) // 80))
+            for item in items[:per_kind_limit]:
                 desc = f" — {item['description']}" if item["description"] else ""
-                lines.append(f"- `{item['name']}`{desc} (`{item['file_path']}`)")
+                line = f"- `{item['name']}`{desc} (`{item['file_path']}`)"
+                lines.append(line)
+                chars_used += len(line)
                 col_descs = item.get("column_descriptions", {})
                 if col_descs:
                     for col_name, col_desc in col_descs.items():
-                        lines.append(f"  - `{col_name}`: {col_desc}")
+                        col_line = f"  - `{col_name}`: {col_desc}"
+                        lines.append(col_line)
+                        chars_used += len(col_line)
+            if len(items) > per_kind_limit:
+                lines.append(f"  ... and {len(items) - per_kind_limit} more")
             lines.append("")
+            if max_chars is not None and chars_used >= max_chars:
+                break
         return "\n".join(lines)
