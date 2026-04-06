@@ -1049,7 +1049,13 @@ class TestGenerateNarratives:
         mock_result = MagicMock()
         mock_result.output = "Premium segment leads with $5,000 in revenue."
 
-        with patch("pydantic_ai.Agent") as MockAgent:
+        with (
+            patch("pydantic_ai.Agent") as MockAgent,
+            patch(
+                "seeknal.ask.agents.providers.get_model_string",
+                return_value="test:model",
+            ),
+        ):
             MockAgent.return_value.run_sync.return_value = mock_result
 
             narratives = generate_narratives(sections, query_results)
@@ -1091,7 +1097,13 @@ class TestGenerateNarratives:
         mock_result = MagicMock()
         mock_result.output = "Based on the data, we recommend action."
 
-        with patch("pydantic_ai.Agent") as MockAgent:
+        with (
+            patch("pydantic_ai.Agent") as MockAgent,
+            patch(
+                "seeknal.ask.agents.providers.get_model_string",
+                return_value="test:model",
+            ),
+        ):
             MockAgent.return_value.run_sync.return_value = mock_result
 
             narratives = generate_narratives(sections, query_results)
@@ -1121,7 +1133,13 @@ class TestGenerateNarratives:
 
         sections = [SectionConfig(title="Test", narrative=True)]
 
-        with patch("pydantic_ai.Agent") as MockAgent:
+        with (
+            patch("pydantic_ai.Agent") as MockAgent,
+            patch(
+                "seeknal.ask.agents.providers.get_model_string",
+                return_value="test:model",
+            ),
+        ):
             MockAgent.return_value.run_sync.side_effect = RuntimeError("API error")
 
             narratives = generate_narratives(sections, {})
@@ -1150,7 +1168,13 @@ class TestGenerateNarratives:
             '<BarChart data={x} />\nMore text.'
         )
 
-        with patch("pydantic_ai.Agent") as MockAgent:
+        with (
+            patch("pydantic_ai.Agent") as MockAgent,
+            patch(
+                "seeknal.ask.agents.providers.get_model_string",
+                return_value="test:model",
+            ),
+        ):
             MockAgent.return_value.run_sync.return_value = mock_result
 
             narratives = generate_narratives(sections, {})
@@ -1332,6 +1356,10 @@ class TestRenderDeterministicReport:
             patch("seeknal.ask.report.scaffolder.scaffold_report") as mock_scaffold,
             patch("seeknal.ask.report.builder.build_report") as mock_build,
             patch("pydantic_ai.Agent") as MockAgent,
+            patch(
+                "seeknal.ask.agents.providers.get_model_string",
+                return_value="test:model",
+            ),
         ):
             mock_scaffold.return_value = tmp_path / "target" / "reports" / "test"
             mock_build.return_value = "/path/to/report.html"
