@@ -14,7 +14,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -31,9 +31,26 @@ _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
 session_manager = SessionManager()
 sse_broadcaster = SSEBroadcaster()
 
+# Per-session locks to serialize concurrent runs on the same session_id.
+# Prevents message history corruption (last-writer-wins on JSON files)
+# and garbled SSE event streams from interleaved responses.
+_session_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_session_lock(session_id: str) -> asyncio.Lock:
+    """Get or create an asyncio.Lock for a session_id."""
+    if session_id not in _session_locks:
+        _session_locks[session_id] = asyncio.Lock()
+    return _session_locks[session_id]
+
 
 def _validate_session_id(session_id: str) -> bool:
     return bool(_SESSION_ID_RE.match(session_id))
+
+
+def _publish_event(session_id: str, event: dict) -> None:
+    """Publish an event to all SSE subscribers for this session."""
+    sse_broadcaster.publish_sync(session_id, json.dumps(event))
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +65,42 @@ async def _run_agent_streaming(
     provider: str | None = None,
     model: str | None = None,
 ):
-    """Run agent and yield JSON event dicts as they occur."""
+    """Run agent and yield JSON event dicts as they occur.
+
+    This generator is the sole owner of SSE broadcast — every event
+    yielded is also published to ``sse_broadcaster`` so that SSE
+    subscribers on ``/events/{session_id}`` receive events in real-time.
+
+    A per-session ``asyncio.Lock`` serializes concurrent runs on the
+    same ``session_id`` to prevent message history corruption.
+    """
+    lock = _get_session_lock(session_id)
+    async with lock:
+        try:
+            async for event in _run_agent_inner(
+                project_path, session_id, question, provider, model,
+            ):
+                _publish_event(session_id, event)
+                yield event
+        except Exception as exc:
+            error_event = {"type": "error", "data": str(exc)}
+            _publish_event(session_id, error_event)
+            yield error_event
+            raise
+        finally:
+            done_event = {"type": "done", "data": ""}
+            _publish_event(session_id, done_event)
+            yield done_event
+
+
+async def _run_agent_inner(
+    project_path: Path,
+    session_id: str,
+    question: str,
+    provider: str | None = None,
+    model: str | None = None,
+):
+    """Inner agent execution without locking or SSE publishing."""
     from pydantic_ai import Agent
     from pydantic_ai._agent_graph import End, UserPromptNode
     from pydantic_ai.messages import (
@@ -220,20 +272,57 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
 
 async def sse_endpoint(request: Request) -> StreamingResponse:
-    """SSE event stream for a session."""
+    """SSE event stream for a session.
+
+    Sends keepalive events every 30 seconds during idle periods.
+    Terminates when a ``done`` event is received, the client
+    disconnects, or the safety-valve maximum timeout (10 minutes)
+    is reached.
+    """
     session_id = request.path_params["session_id"]
     if not _validate_session_id(session_id):
         return JSONResponse({"error": "invalid session_id"}, status_code=400)
 
     queue = sse_broadcaster.subscribe(session_id)
 
+    # Safety-valve: max 10 minutes total to prevent infinite hangs
+    _MAX_SSE_DURATION = 600  # seconds
+    _KEEPALIVE_INTERVAL = 30  # seconds
+
     async def event_generator():
+        import time
+
+        start = time.monotonic()
         try:
             while True:
-                event = await asyncio.wait_for(queue.get(), timeout=30)
-                yield f"data: {event}\n\n"
-        except asyncio.TimeoutError:
-            yield "data: {\"type\": \"keepalive\"}\n\n"
+                # Check safety-valve timeout
+                elapsed = time.monotonic() - start
+                if elapsed >= _MAX_SSE_DURATION:
+                    yield 'data: {"type": "keepalive"}\n\n'
+                    break
+
+                # Check client disconnect
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    event = await asyncio.wait_for(
+                        queue.get(), timeout=_KEEPALIVE_INTERVAL,
+                    )
+                    yield f"data: {event}\n\n"
+
+                    # Check for done event — stream is complete
+                    try:
+                        parsed = json.loads(event)
+                        if parsed.get("type") == "done":
+                            break
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                except asyncio.TimeoutError:
+                    # Send keepalive and continue loop
+                    yield 'data: {"type": "keepalive"}\n\n'
+
         except asyncio.CancelledError:
             pass
         finally:
@@ -247,19 +336,85 @@ async def sse_endpoint(request: Request) -> StreamingResponse:
 
 
 # ---------------------------------------------------------------------------
+# Temporal endpoint
+# ---------------------------------------------------------------------------
+
+
+async def temporal_start(request: Request) -> JSONResponse:
+    """Start an agent workflow via Temporal.
+
+    Requires the gateway to have been started with ``--temporal``.
+    Returns 503 if Temporal is not enabled or connected.
+    """
+    if not hasattr(request.app.state, "temporal_client") or not request.app.state.temporal_client:
+        return JSONResponse(
+            {"error": "Temporal not enabled. Start gateway with --temporal"},
+            status_code=503,
+        )
+
+    body = await request.json()
+    question = body.get("question", "")
+    session_id = body.get("session_id", "default")
+    if not question:
+        return JSONResponse({"error": "question is required"}, status_code=400)
+    if not _validate_session_id(session_id):
+        return JSONResponse({"error": "invalid session_id"}, status_code=400)
+
+    from seeknal.ask.gateway.temporal import AgentWorkflowInput, AgentWorkflow
+
+    import time
+
+    project_path = str(request.app.state.project_path)
+    task_queue = getattr(request.app.state, "temporal_task_queue", "seeknal-ask")
+    workflow_id = f"ask-{session_id}-{int(time.time())}"
+
+    client = request.app.state.temporal_client
+    handle = await client.start_workflow(
+        AgentWorkflow.run,
+        AgentWorkflowInput(
+            session_id=session_id,
+            question=question,
+            project_path=project_path,
+        ),
+        id=workflow_id,
+        task_queue=task_queue,
+    )
+
+    return JSONResponse({
+        "workflow_id": handle.id,
+        "session_id": session_id,
+    })
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
 
-def create_gateway_app(project_path: str | Path) -> Starlette:
-    """Create the Starlette ASGI application."""
+def create_gateway_app(
+    project_path: str | Path,
+    lifespan: Callable | None = None,
+    temporal_client: Any = None,
+) -> Starlette:
+    """Create the Starlette ASGI application.
+
+    Args:
+        project_path: Path to the seeknal project directory.
+        lifespan: Optional async context manager for startup/shutdown hooks.
+            Receives the ``Starlette`` app instance as its argument.
+        temporal_client: Optional connected Temporal client for workflow
+            submission via ``POST /temporal/start``.
+    """
     routes = [
         Route("/health", health),
         Route("/sessions", list_sessions),
         Route("/ask", ask_oneshot, methods=["POST"]),
+        Route("/temporal/start", temporal_start, methods=["POST"]),
         WebSocketRoute("/ws/{session_id}", websocket_endpoint),
         Route("/events/{session_id}", sse_endpoint),
     ]
-    app = Starlette(routes=routes)
+    app = Starlette(routes=routes, lifespan=lifespan)
     app.state.project_path = str(project_path)
+    if temporal_client is not None:
+        app.state.temporal_client = temporal_client
     return app

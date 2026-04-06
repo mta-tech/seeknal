@@ -83,6 +83,11 @@ telegram = [
     "python-telegram-bot>=21.0",
 ]
 
+# Temporal durable execution for gateway agent work
+temporal = [
+    "temporalio>=1.9.0",
+]
+
 # Development dependencies
 dev = [
     "black>=26.3.1",
@@ -94,6 +99,7 @@ dev = [
 all = [
     "seeknal[dev]",
     "seeknal[prefect]",
+    "seeknal[temporal]",
     # Note: atlas requires internal package atlas-data-platform, install separately with:
     # uv pip install -e ".[atlas]" when the package is available
 ]
