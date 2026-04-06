@@ -18,6 +18,11 @@ from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
 
 import pytest
+
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("SPARK_HOME"),
+    reason="Iceberg Feature Group E2E tests require Spark (SPARK_HOME not set)"
+)
 from typer.testing import CliRunner
 
 from seeknal.cli.main import app
