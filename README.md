@@ -115,16 +115,17 @@ seeknal entity show customer                  # Inspect entity schema and featur
 
 **Interactive SQL REPL** — Auto-registers parquets, PostgreSQL, and Iceberg sources at startup. Query pipeline outputs, explore data, iterate on SQL — all without leaving the terminal.
 
-**AI-Powered Data Agent** — Ask questions in natural language, get SQL-backed answers with actionable insights. 12 built-in tools for data discovery, analysis, Python execution, and report generation:
+**AI-Powered Thinking Partner** — `seeknal ask chat` is your collaborative partner for data work. Brainstorm strategies, build pipelines, or train ML models through conversation — it always asks for confirmation before taking action, so you stay in control:
 
 ```bash
-seeknal ask "What are the top 5 customers by revenue?"
-seeknal ask chat                        # Multi-turn interactive session
+seeknal ask chat                        # Start a brainstorm / build session
+seeknal ask "What are the top 5 customers by revenue?"  # Quick one-shot question
 seeknal ask report "customer analysis"  # Generate interactive HTML dashboard
-seeknal ask report --exposure monthly_kpis  # Run deterministic report exposure
 ```
 
-Supports Google Gemini (default) and Ollama (local) as LLM providers. Use `--provider ollama` for fully local, private analysis.
+Ask it to build a pipeline from scratch, and it will draft a plan, walk you through the design, and wait for your go-ahead before generating code. Ask it to explore your data, and it will propose analysis directions for you to choose from. Think of it as a senior colleague who checks in before committing to a path.
+
+Supports Google Gemini (default) and Ollama (local). Use `--provider ollama` for fully local, private analysis.
 
 ## Documentation
 
@@ -142,15 +143,15 @@ Supports Google Gemini (default) and Ollama (local) as LLM providers. Use `--pro
 
 ### v2.5.0 (April 2026)
 
-**Interactive Chat, Sessions, No-Auth Iceberg, and Gateway Server**
+**Seeknal as Your Thinking Partner** — `seeknal ask chat` is now a collaborative partner that brainstorms, builds pipelines, and trains models with you through conversation. It always asks for confirmation before acting — you stay in control.
 
-- **Interactive chat mode** (`seeknal ask chat`): multi-turn conversation with persistent sessions, auto-backgrounding for long tasks, and streaming UI with progressive rendering
+- **Interactive chat mode** (`seeknal ask chat`): multi-turn brainstorm and build sessions with persistent history, streaming UI with Claude Code-inspired visual hierarchy
+- **Confirmation-first workflow**: the agent proposes plans and analysis directions, then waits for your go-ahead via interactive menus before executing
+- **Pipeline and ML building**: describe what you want to build in plain language — the agent drafts YAML pipelines, feature groups, or model training code and checks in before generating
 - **Session management**: create, resume, list, and delete sessions with full message persistence (`seeknal session list/show/delete`)
-- **Gateway server**: WebSocket, SSE, and REST endpoints for web clients; optional Telegram bot integration
 - **No-auth Iceberg support**: Lakekeeper catalogs with `allowall` auth work without Keycloak/OAuth2 credentials
-- **ask_user tool**: interactive arrow-key menus for clarifying questions before analysis
-- **open_in_browser tool**: open generated reports directly in the user's browser
-- **UI components**: animated fox mascot, interactive menus, ask spinner, keyreader
+- **Gateway server**: WebSocket, SSE, and REST endpoints for web clients; optional Telegram bot integration
+- **UI refresh**: animated fox mascot, interactive arrow-key menus, real token/tool counters, subordinate reasoning display
 
 ### v2.4.0 (March 2026)
 
