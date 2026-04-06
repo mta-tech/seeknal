@@ -149,7 +149,7 @@ Supports Google Gemini (default) and Ollama (local). Use `--provider ollama` for
 - **Confirmation-first workflow**: the agent proposes plans and analysis directions, then waits for your go-ahead via interactive menus before executing
 - **Pipeline and ML building**: describe what you want to build in plain language — the agent drafts YAML pipelines, feature groups, or model training code and checks in before generating
 - **Session management**: create, resume, list, and delete sessions with full message persistence (`seeknal session list/show/delete`)
-- **No-auth Iceberg support**: Lakekeeper catalogs with `allowall` auth work without Keycloak/OAuth2 credentials
+- **Iceberg REST catalog support**: integrates with any Iceberg REST catalog provider (Lakekeeper, Tabular, Polaris, etc.)
 - **Gateway server**: WebSocket, SSE, and REST endpoints for web clients; optional Telegram bot integration
 - **UI refresh**: animated fox mascot, interactive arrow-key menus, real token/tool counters, subordinate reasoning display
 
