@@ -143,6 +143,26 @@ app = typer.Typer(
     cls=SuggestGroup,
 )
 
+
+@app.callback()
+def main_callback(
+    no_animation: bool = typer.Option(False, "--no-animation", help="Disable all animations"),
+    theme: str = typer.Option("", "--theme", help="UI theme: dark, light, dark-ansi, light-ansi, auto"),
+):
+    """Seeknal — All-in-one platform for data and AI/ML engineering."""
+    if no_animation:
+        from seeknal.ui.console import disable_animation
+
+        disable_animation()
+    if theme:
+        import os
+
+        os.environ["SEEKNAL_THEME"] = theme
+        from seeknal.ui.console import reset
+
+        reset()
+
+
 # Version command group for feature group version management
 version_app = typer.Typer(
     name="version",
@@ -169,6 +189,16 @@ app.add_typer(version_app, name="version")
 from seeknal.cli.source import app as source_app  # ty: ignore[unresolved-import]
 
 app.add_typer(source_app, name="source")
+
+# Session management for seeknal ask
+from seeknal.cli.session import session_app  # ty: ignore[unresolved-import]
+
+app.add_typer(session_app, name="session")
+
+# Gateway server for seeknal ask
+from seeknal.cli.gateway import gateway_app  # ty: ignore[unresolved-import]
+
+app.add_typer(gateway_app, name="gateway")
 
 # Iceberg materialization commands
 from seeknal.cli.materialization_cli import app as iceberg_app  # ty: ignore[unresolved-import]
@@ -273,7 +303,7 @@ _register_atlas_commands()
 # The Ask command group is loaded dynamically if seeknal[ask] deps are installed.
 
 def _register_ask_commands():
-    """Register Ask commands if langchain/langgraph are available."""
+    """Register Ask commands if pydantic-deep dependencies are available."""
     try:
         from seeknal.cli.ask import ask_app
         app.add_typer(ask_app, name="ask")
@@ -557,24 +587,30 @@ def _get_version() -> str:
         return "1.0.0"
 
 
+from seeknal.ui.output import echo_success as _ui_echo_success
+from seeknal.ui.output import echo_error as _ui_echo_error
+from seeknal.ui.output import echo_warning as _ui_echo_warning
+from seeknal.ui.output import echo_info as _ui_echo_info
+
+
 def _echo_success(message: str):
-    """Print success message in green."""
-    typer.echo(typer.style(f"✓ {message}", fg=typer.colors.GREEN))
+    """Print success message."""
+    _ui_echo_success(message)
 
 
 def _echo_error(message: str):
-    """Print error message in red."""
-    typer.echo(typer.style(f"✗ {message}", fg=typer.colors.RED))
+    """Print error message."""
+    _ui_echo_error(message)
 
 
 def _echo_warning(message: str):
-    """Print warning message in yellow."""
-    typer.echo(typer.style(f"⚠ {message}", fg=typer.colors.YELLOW))
+    """Print warning message."""
+    _ui_echo_warning(message)
 
 
 def _echo_info(message: str):
-    """Print info message in blue."""
-    typer.echo(typer.style(f"ℹ {message}", fg=typer.colors.BLUE))
+    """Print info message."""
+    _ui_echo_info(message)
 
 
 def parse_date_safely(date_str: str, param_name: str = "date") -> datetime:
@@ -733,6 +769,117 @@ def info():
     typer.echo(f"DuckDB version: {duckdb.__version__}")
 
 
+def _scaffold_ask_skills(project_path: Path) -> None:
+    """Generate default ask skill files (SKILL.md) in the project.
+
+    Creates Claude Code-style skill directories under seeknal/skills/.
+    Each skill is a directory with a SKILL.md file containing YAML
+    frontmatter and markdown instructions.
+    """
+    skill_dir = project_path / "seeknal" / "skills" / "report-generation"
+    skill_file = skill_dir / "SKILL.md"
+    if skill_file.exists():
+        return  # Don't overwrite existing skill
+
+    skill_content = """\
+---
+name: report-generation
+description: "Evidence.dev report generation — chart syntax, quality bar, section patterns, and codification as YAML exposures"
+tags: [reporting, evidence, visualization]
+version: "1.0.0"
+---
+
+# Report Generation
+
+When asked to create a report, dashboard, or visualization, produce a
+**professional, insight-driven** Evidence.dev report. Follow this structure:
+
+## Report Quality Bar
+
+A professional report MUST have:
+1. **Executive Summary** — 3-4 BigValue KPIs answering the core question up front
+2. **Multi-angle Visual Analysis** — Each section explores a DIFFERENT dimension with a DIFFERENT chart type
+3. **Data-backed Narrative** — Between every chart, write 1-2 sentences interpreting the data with SPECIFIC numbers ("Premium customers spend 2.3x more per order than Basic" — NOT "Premium customers tend to spend more")
+4. **Actionable Recommendations** — Tied to specific data points ("Target Bandung for Premium acquisition — 0 Premium customers despite $1,786 avg spend" — NOT "consider expanding to new markets")
+
+## Analysis Process
+
+BEFORE calling generate_report, you MUST:
+1. Run execute_sql to explore ALL relevant tables (not just one)
+2. Run at least 3-5 queries covering: aggregates, distributions, cross-table JOINs, rankings, trends
+3. Calculate derived metrics in your queries: percentages of total, ratios between segments, rankings
+4. Identify the 3 most interesting findings — these become the report's narrative spine
+
+DO NOT generate a report after looking at only one table.
+DO NOT write 5 BarCharts of the same query. Each chart must show different data.
+DO NOT write generic insights. Every recommendation must cite a specific number from the data.
+
+## Evidence Markdown Syntax
+
+SQL queries in fenced blocks:
+```sql query_name
+SELECT ... FROM table_name
+```
+
+Components (SINGLE curly braces only — never double braces):
+- <BigValue data={query_name} value=column_name />
+- <BarChart data={query_name} x=column y=column />
+- <LineChart data={query_name} x=date_col y=value_col />
+- <AreaChart data={query_name} x=date_col y=value_col />
+- <DataTable data={query_name} />
+- <ScatterPlot data={query_name} x=col1 y=col2 />
+- <Histogram data={query_name} x=column bins=20 />
+- <FunnelChart data={query_name} name=stage value=count />
+
+## Report Writing Rules
+
+- Name queries descriptively (revenue_by_month, top_customers)
+- Use markdown headers (##) to create clear sections
+- Write concise analytical commentary between charts — explain WHAT the data shows and WHY it matters
+- Do NOT include semicolons in SQL queries
+- Use the same table names from list_tables output
+- Each chart should have a descriptive title prop
+- Use percentage columns, rankings, and comparisons — not just raw counts
+- Vary chart types: don't use 5 BarCharts in a row
+
+## Report Content Pattern
+
+Follow this pattern for each section of the report page content:
+
+SECTION 1 — Executive KPIs:
+  SQL query → BigValue components (3-4 headline numbers)
+
+SECTION 2 — Primary breakdown:
+  SQL query with % of total → BarChart + brief insight text with specific numbers → DataTable
+
+SECTION 3 — Secondary dimension:
+  SQL query with different grouping/JOIN → different chart type (LineChart, ScatterPlot, etc.) + insight
+
+SECTION 4 — Cross-analysis:
+  SQL query JOINing 2+ tables → stacked/grouped BarChart or heatmap-style DataTable + insight
+
+SECTION 5 — Recommendations:
+  Markdown text with specific, data-cited action items
+
+## Final Answer Requirements
+
+After generating a report, your final answer MUST include:
+1. A brief summary of the key findings with SPECIFIC numbers
+2. The path to the generated HTML report
+3. 2-3 actionable recommendations grounded in the data
+
+Do NOT just say "I created a report" — the answer itself should be valuable standalone content.
+
+## Report Codification
+
+After completing analysis, if the user wants to save it as a repeatable report:
+- Call save_report_exposure with a snake_case name, distilled prompt, table refs, and format
+- Re-run with: seeknal ask report --exposure {name}
+"""
+    skill_file.write_text(skill_content)
+    typer.echo(f"  Created: seeknal/skills/report-generation/SKILL.md")
+
+
 @app.command()
 def init(
     name: str = typer.Option(
@@ -812,6 +959,7 @@ def init(
             "seeknal/pipelines",
             "seeknal/templates",
             "seeknal/common",
+            "seeknal/skills/report-generation",
             "target/intermediate",
         ]
 
@@ -887,6 +1035,9 @@ __pycache__/
 """
         (project_path / ".gitignore").write_text(gitignore_content)
         typer.echo(f"  Created: .gitignore")
+
+        # Generate default ask skills (SKILL.md files, Claude Code-style)
+        _scaffold_ask_skills(project_path)
 
         # Also create the legacy Project for database compatibility
         from seeknal.project import Project

@@ -32,7 +32,7 @@ class _FakeRunState:
         self.nodes = nodes or {}
         self.run_id = "test-run-001"
         self.schema_version = "1.0"
-        self.seeknal_version = "2.4.0"
+        self.seeknal_version = "2.5.0"
         self.last_run = ""
         self.config = {}
 

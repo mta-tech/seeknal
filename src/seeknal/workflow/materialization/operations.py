@@ -339,10 +339,7 @@ class DuckDBIcebergExtension:
         client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET", "")
 
         if not (token_url and client_id and client_secret):
-            raise MaterializationOperationError(
-                "Iceberg materialization requires OAuth2 credentials: "
-                "KEYCLOAK_TOKEN_URL, KEYCLOAK_CLIENT_ID, KEYCLOAK_CLIENT_SECRET"
-            )
+            return None  # No OAuth2 credentials — use AUTHORIZATION_TYPE 'none'
 
         try:
             token_data = (
@@ -404,7 +401,8 @@ class DuckDBIcebergExtension:
                 sql = (
                     f"ATTACH '{warehouse_path}' AS {catalog_name} ("
                     f"TYPE ICEBERG, "
-                    f"ENDPOINT '{catalog_url}'"
+                    f"ENDPOINT '{catalog_url}', "
+                    f"AUTHORIZATION_TYPE 'none'"
                     f")"
                 )
 

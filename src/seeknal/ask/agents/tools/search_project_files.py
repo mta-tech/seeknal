@@ -6,8 +6,6 @@ import re
 from pathlib import Path
 from typing import Iterator
 
-from langchain_core.tools import tool
-
 from seeknal.ask.agents.tools._security import (
     BLOCKED_FILES,
     EXCLUDED_DIRS,
@@ -101,7 +99,6 @@ def _do_search(
     return header + "\n".join(f"- `{m}`" for m in matches)
 
 
-@tool
 def search_project_files(
     pattern: str,
     file_pattern: str = "",

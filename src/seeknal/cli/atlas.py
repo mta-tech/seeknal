@@ -82,24 +82,12 @@ def _check_atlas_installed() -> bool:
         return False
 
 
-def _echo_error(message: str):
-    """Print error message in red."""
-    typer.echo(typer.style(f"✗ {message}", fg=typer.colors.RED))
-
-
-def _echo_success(message: str):
-    """Print success message in green."""
-    typer.echo(typer.style(f"✓ {message}", fg=typer.colors.GREEN))
-
-
-def _echo_info(message: str):
-    """Print info message in blue."""
-    typer.echo(typer.style(f"ℹ {message}", fg=typer.colors.BLUE))
-
-
-def _echo_warning(message: str):
-    """Print warning message in yellow."""
-    typer.echo(typer.style(f"⚠ {message}", fg=typer.colors.YELLOW))
+from seeknal.ui.output import (
+    echo_success as _echo_success,
+    echo_error as _echo_error,
+    echo_warning as _echo_warning,
+    echo_info as _echo_info,
+)
 
 
 def _require_atlas():

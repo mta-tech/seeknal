@@ -1,9 +1,5 @@
 """Describe table tool — shows column names and types for a table."""
 
-from langchain_core.tools import tool
-
-
-@tool
 def describe_table(table_name: str) -> str:
     """Get the schema (column names and types) for a specific table or view.
 

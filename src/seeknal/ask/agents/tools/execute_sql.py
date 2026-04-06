@@ -1,14 +1,12 @@
 """Execute SQL tool — runs read-only queries via the seeknal REPL."""
 
-from langchain_core.tools import tool
-
-
-@tool
 def execute_sql(sql: str, limit: int = 100) -> str:
     """Execute a read-only SQL query against seeknal project data.
 
     Use this to query entities, feature groups, and intermediate tables.
-    Only SELECT queries are allowed. Results are returned as a formatted table.
+    Only SELECT/WITH queries are allowed (read-only). Only query tables shown
+    in list_tables output. Never reference file paths in SQL.
+    Results are returned as a formatted table.
 
     DuckDB SQL dialect notes:
     - Do NOT include trailing semicolons in queries
@@ -17,29 +15,37 @@ def execute_sql(sql: str, limit: int = 100) -> str:
     - Use CAST(SUM(x) AS DOUBLE) for numeric aggregations
     - All non-aggregate SELECT columns must appear in GROUP BY
     - Access struct fields with dot notation: column_name.field_name
+    - Use ILIKE for case-insensitive matching
+    - In Python code: NEVER put # comments inside SQL strings — DuckDB does
+      not recognize # as a comment. Use -- for SQL comments
+
+    Tool errors include a JSON structure with 'category' and 'retryable' fields.
+    For retryable errors, adjust your approach based on the 'hint'.
+    For terminal errors, explain the limitation to the user.
 
     Args:
         sql: A DuckDB-compatible SELECT query.
         limit: Maximum rows to return (default 100).
     """
     from seeknal.ask.agents.tools._context import get_tool_context
-    from seeknal.ask.security import validate_sql_for_agent
 
     ctx = get_tool_context()
 
     # Strip trailing semicolons — LLMs often include them but DuckDB rejects them
     sql = sql.strip().rstrip(";").strip()
 
-    try:
-        validate_sql_for_agent(sql)
-    except ValueError as e:
-        return f"SQL validation error: {e}"
+    # SQL validation is handled by the PRE_TOOL_USE hook (see hooks.py)
 
     try:
         with ctx.db_lock:
             columns, rows = ctx.repl.execute_oneshot(sql, limit=limit)
     except Exception as e:
-        return f"SQL execution error: {e}"
+        from seeknal.ask.agents.tools.errors import (
+            classify_duckdb_error,
+            format_tool_error,
+        )
+
+        return format_tool_error(classify_duckdb_error(str(e)), str(e))
 
     if not columns:
         return "Query executed successfully but returned no results."

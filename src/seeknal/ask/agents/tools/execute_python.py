@@ -15,9 +15,6 @@ import traceback
 from io import StringIO
 from typing import Any
 
-from langchain_core.tools import tool
-
-
 def _split_last_expression(code: str):
     """Split code into body and optional last expression.
 
@@ -75,6 +72,18 @@ def _build_namespace(conn: Any) -> dict:
         import matplotlib.pyplot as plt
         ns["plt"] = plt
         ns["matplotlib"] = matplotlib
+    except ImportError:
+        pass
+
+    try:
+        import sklearn
+        ns["sklearn"] = sklearn
+    except ImportError:
+        pass
+
+    try:
+        import scipy
+        ns["scipy"] = scipy
     except ImportError:
         pass
 
@@ -161,20 +170,55 @@ def _do_execute(code: str, conn: Any, timeout: int = 30) -> str:
     return "\n\n".join(parts) if parts else "Code executed successfully (no output)."
 
 
-@tool
-def execute_python(code: str) -> str:
+def _infer_error_hint(result: str, code: str) -> str | None:
+    """Return a targeted hint based on common sandbox errors."""
+    if "ModuleNotFoundError" in result:
+        return (
+            "Only pandas, numpy, matplotlib, scikit-learn, and scipy are "
+            "available in the sandbox. Do NOT import statsmodels, xgboost, "
+            "lightgbm, or other packages."
+        )
+    if "NameError" in result:
+        return (
+            "Each execute_python call runs in a fresh subprocess — variables "
+            "from previous calls do not persist. Re-query the data with "
+            "conn.sql('SELECT ...').df() at the start of this call."
+        )
+    if "ParserException" in result and "#" in code:
+        return (
+            "You likely put a Python # comment inside a SQL string. "
+            "DuckDB does not recognize # as a comment. Remove all # comments "
+            "from inside SQL strings, or use -- for SQL comments."
+        )
+    return None
+
+
+async def execute_python(code: str) -> str:
     """Execute Python code for data analysis beyond what SQL can express.
 
     Use this for statistical modeling, visualization, pandas operations,
-    and custom algorithms. Pre-loaded variables:
+    machine learning, and custom algorithms. Pre-loaded variables:
     - conn: DuckDB connection (query with conn.sql('SELECT ...').df())
     - pd: pandas
     - np: numpy
     - plt: matplotlib.pyplot
+    - sklearn: scikit-learn (import submodules like sklearn.cluster, sklearn.preprocessing)
+    - scipy: scipy (import submodules like scipy.stats, scipy.spatial)
+
+    ONLY these packages are available. Do NOT import statsmodels,
+    xgboost, lightgbm, or other packages — they are not installed.
 
     Prefer execute_sql for simple data queries. Use this tool only when
     SQL cannot express the analysis (e.g., correlations, histograms,
     statistical tests, complex pandas operations).
+
+    Each call runs in an isolated subprocess — variables from previous calls
+    do NOT persist. Always re-query data with conn.sql() at the start of
+    every call.
+
+    IMPORTANT: Never put Python-style # comments inside SQL strings.
+    DuckDB does not recognize # as a comment — it causes a ParserException.
+    Use -- for SQL comments, or place # comments outside the SQL string.
 
     The last expression's value is captured and returned (like Jupyter).
     Use print() for intermediate output.
@@ -183,9 +227,29 @@ def execute_python(code: str) -> str:
         code: Python code to execute. Multi-line supported.
     """
     from seeknal.ask.agents.tools._context import get_tool_context
+    from seeknal.ask.sandbox import async_execute_in_sandbox
 
     ctx = get_tool_context()
+    result = await async_execute_in_sandbox(code, ctx.project_path)
 
-    # Use subprocess sandbox for process isolation + killable timeout
-    from seeknal.ask.sandbox import execute_in_sandbox
-    return execute_in_sandbox(code, ctx.project_path)
+    # Backgrounded results pass through directly
+    from seeknal.ask.background import _BACKGROUNDED_PREFIX
+    if result.startswith(_BACKGROUNDED_PREFIX):
+        return result
+
+    # Wrap error results in structured error JSON for agent self-correction
+    from seeknal.ask.agents.tools.errors import (
+        RETRYABLE_SYNTAX,
+        TERMINAL_TIMEOUT,
+        format_tool_error,
+    )
+
+    if result.startswith("Execution timed out"):
+        return format_tool_error(TERMINAL_TIMEOUT, result)
+    if result.startswith("Error launching subprocess:"):
+        return format_tool_error(RETRYABLE_SYNTAX, result)
+    if result.startswith("Error:\n") or result.startswith("Process exited with code"):
+        hint = _infer_error_hint(result, code)
+        return format_tool_error(RETRYABLE_SYNTAX, result, hint=hint)
+
+    return result

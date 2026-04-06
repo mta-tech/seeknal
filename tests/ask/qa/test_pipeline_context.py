@@ -32,8 +32,8 @@ class TestPipelineAwareness:
         """Agent should know what pipeline files exist."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "What pipeline definitions exist in this project? "
             "List the sources, transforms, and feature groups."
         )
@@ -48,8 +48,8 @@ class TestPipelineAwareness:
         """Agent should read pipeline YAML to explain how revenue is calculated."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "How is revenue calculated in the orders_cleaned transform? "
             "Read the pipeline definition and explain the SQL logic."
         )
@@ -64,8 +64,8 @@ class TestPipelineAwareness:
         """Agent should use search_pipelines to find where revenue is defined."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "Which pipeline defines the 'revenue' column? "
             "Search through the pipeline files to find it."
         )
@@ -77,17 +77,17 @@ class TestPipelineAwareness:
         """Agent should combine pipeline knowledge with data query results."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
+        agent, deps, message_history = _fresh_agent(qa_project)
 
         # Turn 1: Ask about data
-        a1 = ask(agent, config,
+        a1 = ask(agent, deps, message_history,
             "What is the total revenue across all orders?"
         )
         print(f"\n{'='*60}\nTurn 1 — Total Revenue\n{'='*60}\n{a1}\n")
         assert a1 and len(a1) > 20
 
         # Turn 2: Ask about the pipeline logic
-        a2 = ask(agent, config,
+        a2 = ask(agent, deps, message_history,
             "Now explain how that revenue number was calculated. "
             "Read the pipeline definition that produces the orders_cleaned table."
         )

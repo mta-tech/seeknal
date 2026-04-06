@@ -245,4 +245,38 @@ def qa_project(tmp_path_factory):
         "  - ref: source.raw_customers\n"
     )
 
+    # ── Skills directory (for pydantic-deep SkillsToolset) ─────────
+    skills_dir = seeknal_dir / "skills" / "report-generation"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: report-generation\n"
+        'description: "Evidence.dev report generation — chart syntax, quality bar, section patterns"\n'
+        "tags: [reporting, evidence]\n"
+        'version: "1.0.0"\n'
+        "---\n\n"
+        "# Report Generation\n\n"
+        "When asked to create a report, produce an Evidence.dev report.\n\n"
+        "## Evidence Markdown Syntax\n\n"
+        "SQL queries in fenced blocks:\n"
+        "```sql query_name\n"
+        "SELECT ... FROM table_name\n"
+        "```\n\n"
+        "Components (SINGLE curly braces only):\n"
+        "- <BigValue data={query_name} value=column_name />\n"
+        "- <BarChart data={query_name} x=column y=column />\n"
+        "- <LineChart data={query_name} x=date_col y=value_col />\n"
+        "- <DataTable data={query_name} />\n"
+    )
+
+    # ── .seeknal directory (for memory) ──────────────────────────
+    (project / ".seeknal").mkdir(exist_ok=True)
+
+    # ── Project config ───────────────────────────────────────────
+    (project / "seeknal_project.yml").write_text(
+        "name: ecommerce_demo\n"
+        "version: 1.0.0\n"
+        "profile: default\n"
+    )
+
     return project

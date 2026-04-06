@@ -1,9 +1,5 @@
 """Get entity schema tool — detailed EntityCatalog for an entity."""
 
-from langchain_core.tools import tool
-
-
-@tool
 def get_entity_schema(entity_name: str) -> str:
     """Get detailed schema for a consolidated entity.
 

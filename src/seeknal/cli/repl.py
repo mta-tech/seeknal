@@ -434,14 +434,14 @@ class REPL:
         except Exception:
             pass
 
-    def run(self) -> None:
-        """Main REPL loop."""
-        print("Seeknal SQL REPL (DuckDB + StarRocks)")
-        print("Commands: .connect <url>, .tables, .schema <table>, .quit")
-        print("Example: .connect postgres://user:pass@host/db")
-        print("         .connect starrocks://user:pass@host:9030/db")
+    def _build_banner_lines(self) -> list[str]:
+        """Build the banner content lines (shared by Rich and plain renderers)."""
+        lines = [
+            "Commands: .connect <url>, .tables, .schema <table>, .quit",
+            "Example: .connect postgres://user:pass@host/db",
+            "         .connect starrocks://user:pass@host:9030/db",
+        ]
         if self.project_path:
-            # Build project header with node count and last run
             header = f"Project: {self.project_path.name}"
             if self.env_name:
                 header += f" [env: {self.env_name}]"
@@ -449,27 +449,59 @@ class REPL:
             if self._node_count:
                 meta_parts.append(f"{self._node_count} nodes")
             if self._last_run:
-                # Show date portion only (e.g., "2026-02-21 10:38")
                 last_run_display = self._last_run[:16].replace("T", " ")
                 meta_parts.append(f"last run: {last_run_display}")
             if meta_parts:
                 header += f" ({', '.join(meta_parts)})"
-            print(header)
+            lines.append("")
+            lines.append(header)
 
-            # Show registration details
-            parts = []
+            reg_parts = []
             if self._registered_parquets:
-                parts.append(f"  Intermediate outputs: {self._registered_parquets} tables registered")
+                reg_parts.append(f"  Intermediate outputs: {self._registered_parquets} tables registered")
             if self._registered_pg:
-                parts.append(f"  PostgreSQL: {self._registered_pg} connection(s) attached (read-only)")
+                reg_parts.append(f"  PostgreSQL: {self._registered_pg} connection(s) attached (read-only)")
             if self._registered_iceberg:
-                parts.append(f"  Iceberg: {self._registered_iceberg} catalog(s) attached")
-            if parts:
-                for part in parts:
-                    print(part)
+                reg_parts.append(f"  Iceberg: {self._registered_iceberg} catalog(s) attached")
+            if reg_parts:
+                lines.extend(reg_parts)
             elif not self._node_count:
-                print("  (no data registered)")
+                lines.append("  (no data registered)")
+        return lines
+
+    def _print_plain_banner(self) -> None:
+        """Print the REPL banner using plain print()."""
+        print("Seeknal SQL REPL (DuckDB + StarRocks)")
+        for line in self._build_banner_lines():
+            print(line)
         print()
+
+    def run(self) -> None:
+        """Main REPL loop."""
+        try:
+            from seeknal.ui.console import get_console
+            from seeknal.ui.panels import info_panel
+            from rich.text import Text
+
+            console = get_console()
+            if console.is_terminal:
+                banner_lines = self._build_banner_lines()
+                content = Text()
+                for i, line in enumerate(banner_lines):
+                    if i > 0:
+                        content.append("\n")
+                    content.append(line)
+                panel = info_panel(
+                    content,
+                    title="Seeknal SQL REPL",
+                )
+                # Override title style to use brand.primary
+                panel.title = Text("Seeknal SQL REPL", style="brand.primary")
+                console.print(panel)
+            else:
+                self._print_plain_banner()
+        except Exception:
+            self._print_plain_banner()
 
         try:
             while True:

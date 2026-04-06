@@ -290,7 +290,11 @@ def user_features(ctx):
             node = builder.nodes[node_id]
 
             # Verify feature group properties
-            assert node.yaml_data.get("entity") == "user"
+            entity = node.yaml_data.get("entity")
+            if isinstance(entity, dict):
+                assert entity.get("name") == "user"
+            else:
+                assert entity == "user"
             assert node.yaml_data.get("features") == {"user_id": "int", "total_events": "int"}
 
             # Verify materialization config

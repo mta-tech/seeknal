@@ -10,13 +10,11 @@ import re
 from pathlib import Path
 
 import yaml
-from langchain_core.tools import tool
 
 _NAME_RE = re.compile(r"^[a-z0-9_]+$")
 _VALID_FORMATS = {"markdown", "html", "both"}
 
 
-@tool
 def save_report_exposure(
     name: str,
     prompt: str,
@@ -39,7 +37,11 @@ def save_report_exposure(
             When set, the exposure can be deployed to Prefect with:
             seeknal prefect deploy --exposure {name} --work-pool <pool>
     """
-    from seeknal.ask.agents.tools._context import get_tool_context
+    from seeknal.ask.agents.tools._context import get_tool_context, require_report_approval
+
+    guard_error = require_report_approval("save_report_exposure")
+    if guard_error:
+        return guard_error
 
     ctx = get_tool_context()
     return _do_save(name, prompt, inputs, output_format, ctx.project_path, schedule)

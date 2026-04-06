@@ -76,3 +76,39 @@ def validate_project_path(path: str, project_path: Path) -> Path:
         raise ValueError(f"Access to sensitive file blocked: {resolved.name}")
 
     return resolved
+
+
+def validate_report_path(path: str, project_path: Path) -> Path:
+    """Validate and resolve a path within ``target/reports/``.
+
+    Uses the same 4-layer defense as :func:`validate_project_path` but
+    restricts containment to ``target/reports/`` only.
+
+    Returns:
+        Resolved absolute Path.
+
+    Raises:
+        ValueError: If the path fails any validation layer.
+    """
+    # Layer 1: Sanitize
+    sanitized = _PATH_TRAVERSAL_RE.sub("", path)
+    sanitized = _BACKSLASH_RE.sub("/", sanitized)
+    sanitized = _DOUBLE_DOT_RE.sub("", sanitized)
+
+    # Layer 2: Resolve to absolute
+    resolved = (project_path / sanitized).resolve()
+    reports_root = (project_path / "target" / "reports").resolve()
+
+    # Layer 3: Containment — must be within target/reports/
+    if not resolved.is_relative_to(reports_root):
+        raise ValueError(
+            f"Path must be within target/reports/: {path}"
+        )
+
+    # Layer 4: Symlink check
+    if resolved.is_symlink():
+        real = resolved.resolve(strict=True)
+        if not real.is_relative_to(reports_root):
+            raise ValueError(f"Symlink escapes reports directory: {path}")
+
+    return resolved

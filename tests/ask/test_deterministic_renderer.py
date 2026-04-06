@@ -1046,12 +1046,17 @@ class TestGenerateNarratives:
         }
 
         mock_response = MagicMock()
-        mock_response.content = "Premium segment leads with $5,000 in revenue."
+        mock_result = MagicMock()
+        mock_result.output = "Premium segment leads with $5,000 in revenue."
 
-        with patch("seeknal.ask.agents.providers.get_llm") as mock_get_llm:
-            mock_llm = MagicMock()
-            mock_llm.invoke.return_value = mock_response
-            mock_get_llm.return_value = mock_llm
+        with (
+            patch("pydantic_ai.Agent") as MockAgent,
+            patch(
+                "seeknal.ask.agents.providers.get_model_string",
+                return_value="test:model",
+            ),
+        ):
+            MockAgent.return_value.run_sync.return_value = mock_result
 
             narratives = generate_narratives(sections, query_results)
 
@@ -1089,17 +1094,22 @@ class TestGenerateNarratives:
         }
 
         mock_response = MagicMock()
-        mock_response.content = "Based on the data, we recommend action."
+        mock_result = MagicMock()
+        mock_result.output = "Based on the data, we recommend action."
 
-        with patch("seeknal.ask.agents.providers.get_llm") as mock_get_llm:
-            mock_llm = MagicMock()
-            mock_llm.invoke.return_value = mock_response
-            mock_get_llm.return_value = mock_llm
+        with (
+            patch("pydantic_ai.Agent") as MockAgent,
+            patch(
+                "seeknal.ask.agents.providers.get_model_string",
+                return_value="test:model",
+            ),
+        ):
+            MockAgent.return_value.run_sync.return_value = mock_result
 
             narratives = generate_narratives(sections, query_results)
 
             # The LLM should have been called with data_q results as context
-            call_args = mock_llm.invoke.call_args[0][0]
+            call_args = MockAgent.return_value.run_sync.call_args[0][0]
             assert "data_q" in call_args or "42" in call_args
 
         assert 1 in narratives
@@ -1110,7 +1120,7 @@ class TestGenerateNarratives:
         sections = [SectionConfig(title="Test", narrative=True)]
 
         with patch(
-            "seeknal.ask.agents.providers.get_llm",
+            "seeknal.ask.agents.providers.get_model_string",
             side_effect=ImportError("no provider"),
         ):
             narratives = generate_narratives(sections, {})
@@ -1123,10 +1133,14 @@ class TestGenerateNarratives:
 
         sections = [SectionConfig(title="Test", narrative=True)]
 
-        with patch("seeknal.ask.agents.providers.get_llm") as mock_get_llm:
-            mock_llm = MagicMock()
-            mock_llm.invoke.side_effect = RuntimeError("API error")
-            mock_get_llm.return_value = mock_llm
+        with (
+            patch("pydantic_ai.Agent") as MockAgent,
+            patch(
+                "seeknal.ask.agents.providers.get_model_string",
+                return_value="test:model",
+            ),
+        ):
+            MockAgent.return_value.run_sync.side_effect = RuntimeError("API error")
 
             narratives = generate_narratives(sections, {})
 
@@ -1148,16 +1162,20 @@ class TestGenerateNarratives:
 
         sections = [SectionConfig(title="Test", narrative=True)]
 
-        mock_response = MagicMock()
-        mock_response.content = (
+        mock_result = MagicMock()
+        mock_result.output = (
             "Great insight.\n```sql\nSELECT 1\n```\n"
             '<BarChart data={x} />\nMore text.'
         )
 
-        with patch("seeknal.ask.agents.providers.get_llm") as mock_get_llm:
-            mock_llm = MagicMock()
-            mock_llm.invoke.return_value = mock_response
-            mock_get_llm.return_value = mock_llm
+        with (
+            patch("pydantic_ai.Agent") as MockAgent,
+            patch(
+                "seeknal.ask.agents.providers.get_model_string",
+                return_value="test:model",
+            ),
+        ):
+            MockAgent.return_value.run_sync.return_value = mock_result
 
             narratives = generate_narratives(sections, {})
 
@@ -1331,19 +1349,21 @@ class TestRenderDeterministicReport:
             ],
         }
 
-        mock_response = MagicMock()
-        mock_response.content = "User count stands at 500, showing strong growth."
+        mock_result = MagicMock()
+        mock_result.output = "User count stands at 500, showing strong growth."
 
         with (
             patch("seeknal.ask.report.scaffolder.scaffold_report") as mock_scaffold,
             patch("seeknal.ask.report.builder.build_report") as mock_build,
-            patch("seeknal.ask.agents.providers.get_llm") as mock_get_llm,
+            patch("pydantic_ai.Agent") as MockAgent,
+            patch(
+                "seeknal.ask.agents.providers.get_model_string",
+                return_value="test:model",
+            ),
         ):
             mock_scaffold.return_value = tmp_path / "target" / "reports" / "test"
             mock_build.return_value = "/path/to/report.html"
-            mock_llm = MagicMock()
-            mock_llm.invoke.return_value = mock_response
-            mock_get_llm.return_value = mock_llm
+            MockAgent.return_value.run_sync.return_value = mock_result
 
             html_path, markdown = render_deterministic_report(exposure, tmp_path)
 

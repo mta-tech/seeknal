@@ -14,7 +14,7 @@ import yaml
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from seeknal.cli.main import _echo_info, _echo_error, _echo_warning
+from seeknal.ui.output import echo_error as _echo_error, echo_info as _echo_info, echo_warning as _echo_warning
 from seeknal.utils.path_security import is_insecure_path
 from tabulate import tabulate
 import typer

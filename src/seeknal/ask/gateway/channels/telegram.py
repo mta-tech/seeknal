@@ -1,0 +1,193 @@
+"""Telegram channel for seeknal ask gateway.
+
+Receives messages from Telegram users, runs the seeknal ask agent,
+and streams responses back. Uses pydantic-ai's agent.iter() for
+step-by-step event streaming.
+
+Requires: python-telegram-bot>=21.0
+Configure: TELEGRAM_BOT_TOKEN environment variable
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Telegram message size limit
+_MAX_MESSAGE_LENGTH = 4096
+
+# Strip markdown that Telegram can't render
+_MD_STRIP_RE = re.compile(r"```\w*\n?|^#{1,6}\s", re.MULTILINE)
+
+
+def _strip_markdown(text: str) -> str:
+    """Strip markdown syntax that Telegram doesn't support well."""
+    text = _MD_STRIP_RE.sub("", text)
+    return text.strip()
+
+
+def _split_message(text: str, max_len: int = _MAX_MESSAGE_LENGTH) -> list[str]:
+    """Split long text into Telegram-safe chunks."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        # Try to split at newline
+        idx = text.rfind("\n", 0, max_len)
+        if idx == -1:
+            idx = max_len
+        chunks.append(text[:idx])
+        text = text[idx:].lstrip("\n")
+    return chunks
+
+
+class TelegramChannel:
+    """Telegram bot integration for seeknal ask.
+
+    Uses manual lifecycle management (no run_polling) so the gateway
+    server controls startup and shutdown.
+    """
+
+    def __init__(self, project_path: Path, token: str | None = None) -> None:
+        self._project_path = project_path
+        self._token = token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        self._app: Any = None
+
+    async def start(self) -> None:
+        """Initialize the Telegram bot application."""
+        if not self._token:
+            raise ValueError(
+                "TELEGRAM_BOT_TOKEN not set. "
+                "Set it in your environment or pass token= to TelegramChannel."
+            )
+
+        from telegram.ext import (
+            ApplicationBuilder,
+            CommandHandler,
+            MessageHandler,
+            filters,
+        )
+
+        self._app = (
+            ApplicationBuilder()
+            .token(self._token)
+            .build()
+        )
+
+        self._app.add_handler(CommandHandler("start", self._handle_start))
+        self._app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
+        )
+
+        await self._app.initialize()
+        await self._app.start()
+        logger.info("Telegram channel started")
+
+    async def stop(self) -> None:
+        """Shut down the Telegram bot."""
+        if self._app:
+            await self._app.stop()
+            await self._app.shutdown()
+            logger.info("Telegram channel stopped")
+
+    async def _handle_start(self, update: Any, context: Any) -> None:
+        """Handle /start command."""
+        await update.message.reply_text(
+            "Welcome to Seeknal Ask! Send me a question about your data "
+            "and I'll analyze it for you.\n\n"
+            "Examples:\n"
+            "• What are the top products by revenue?\n"
+            "• Show me customer churn trends\n"
+            "• Compare our AOV to industry benchmarks"
+        )
+
+    async def _handle_message(self, update: Any, context: Any) -> None:
+        """Handle incoming text messages — run agent and stream response."""
+        question = update.message.text.strip()
+        if not question:
+            return
+
+        chat_id = str(update.effective_chat.id)
+        session_id = f"telegram-{chat_id}"
+
+        # Send "thinking" indicator
+        thinking_msg = await update.message.reply_text("🔍 Analyzing...")
+
+        try:
+            answer = await self._run_agent(session_id, question, update)
+
+            # Delete thinking message
+            try:
+                await thinking_msg.delete()
+            except Exception:
+                pass
+
+            # Send answer in chunks
+            if answer:
+                clean = _strip_markdown(answer)
+                for chunk in _split_message(clean):
+                    await update.message.reply_text(chunk)
+            else:
+                await update.message.reply_text(
+                    "I couldn't generate a response. Please try rephrasing."
+                )
+
+        except Exception as e:
+            logger.exception("Error processing Telegram message")
+            try:
+                await thinking_msg.edit_text(f"❌ Error: {e}")
+            except Exception:
+                await update.message.reply_text(f"❌ Error: {e}")
+
+    async def _run_agent(
+        self, session_id: str, question: str, update: Any
+    ) -> str:
+        """Run the seeknal ask agent and return the answer."""
+        from seeknal.ask.gateway.server import _run_agent_streaming
+
+        text_parts: list[str] = []
+        tool_count = 0
+
+        async for event in _run_agent_streaming(
+            self._project_path, session_id, question,
+        ):
+            if event["type"] == "token":
+                text_parts.append(event["data"])
+            elif event["type"] == "tool_start":
+                tool_count += 1
+                tool_name = event["data"]["name"]
+                # Send periodic status updates (every 3 tools)
+                if tool_count % 3 == 1:
+                    try:
+                        await update.message.reply_text(
+                            f"🔧 Running {tool_name}... ({tool_count} tools used)"
+                        )
+                    except Exception:
+                        pass
+            elif event["type"] == "answer":
+                return event["data"]
+
+        # If no explicit answer event, use accumulated text
+        return "".join(text_parts) if text_parts else ""
+
+    async def deliver(self, session_id: str, question: str) -> str:
+        """Deliver a question programmatically (for gateway integration)."""
+        from seeknal.ask.gateway.server import _run_agent_streaming
+
+        text_parts: list[str] = []
+        async for event in _run_agent_streaming(
+            self._project_path, session_id, question,
+        ):
+            if event["type"] == "answer":
+                return event["data"]
+            elif event["type"] == "token":
+                text_parts.append(event["data"])
+        return "".join(text_parts)

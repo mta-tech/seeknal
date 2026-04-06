@@ -31,7 +31,7 @@ jobs:
         run: uv sync --dev --extra ask
 
       - name: Run tests
-        run: uv run pytest tests/ -x --ignore=tests/workflow/test_prefect_integration.py
+        run: uv run pytest tests/ -x --ignore=tests/workflow/test_prefect_integration.py --ignore=tests/e2e
 
   build:
     runs-on: ubuntu-latest

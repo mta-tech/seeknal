@@ -298,7 +298,7 @@ class ModelExecutor(BaseExecutor):
             model = self._create_model(algorithm_config)
 
             # Step 4: Train model
-            from seeknal.cli.main import _echo_info
+            from seeknal.ui.output import echo_info as _echo_info
             _echo_info(f"Training {algorithm_config['type']} model: {algorithm_config['algorithm']}")
             model.fit(X_train, y_train)
 

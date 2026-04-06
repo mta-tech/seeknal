@@ -36,8 +36,8 @@ class TestWhatQuestions:
         """Agent should count customers and return ~50."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config, "How many customers are in the dataset?")
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history, "How many customers are in the dataset?")
 
         print(f"\n--- WHAT: How many customers? ---\n{answer}\n")
         assert answer and len(answer) > 10
@@ -48,8 +48,8 @@ class TestWhatQuestions:
         """Agent should list product/order categories."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config, "What product categories exist in the orders data?")
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history, "What product categories exist in the orders data?")
 
         print(f"\n--- WHAT: Categories? ---\n{answer}\n")
         assert answer and len(answer) > 10
@@ -64,8 +64,8 @@ class TestWhatQuestions:
         """Agent should identify cities with most customers."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "What are the top 3 cities by number of customers?"
         )
 
@@ -86,8 +86,8 @@ class TestWhyQuestions:
         """Agent should analyze why some categories perform better."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "Why do some product categories generate more revenue than others? "
             "Show me the data and explain."
         )
@@ -103,8 +103,8 @@ class TestWhyQuestions:
         """Agent should compare customer segments and explain differences."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "Why might Premium customers behave differently from Basic customers? "
             "Look at spending patterns and order frequency."
         )
@@ -122,8 +122,8 @@ class TestHowQuestions:
         """Agent should explain how revenue is computed from the data."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "How is revenue calculated in this dataset? "
             "What columns contribute to it?"
         )
@@ -139,8 +139,8 @@ class TestHowQuestions:
         """Agent should find cancelled orders and explain the rate."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "How many orders were cancelled vs completed? "
             "What is the cancellation rate?"
         )
@@ -154,8 +154,8 @@ class TestHowQuestions:
         """Agent should describe the available data tables and entities."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "How is this data pipeline structured? "
             "What tables and entities are available for analysis?"
         )
@@ -175,22 +175,22 @@ class TestMultiTurnConversation:
         """Agent should remember context from previous question."""
         from seeknal.ask.agents.agent import create_agent, ask
 
-        # Create fresh agent for this test (own thread)
-        agent, config = create_agent(
+        # Create fresh agent for this test
+        agent, deps, message_history = create_agent(
             project_path=qa_project,
             provider="google",
             model="gemini-2.5-flash",
         )
 
         # First question
-        answer1 = ask(agent, config,
+        answer1 = ask(agent, deps, message_history,
             "What is the total revenue from Electronics orders?"
         )
         print(f"\n--- MULTI-TURN Q1 ---\n{answer1}\n")
         assert answer1 and len(answer1) > 10
 
         # Follow-up referencing previous context
-        answer2 = ask(agent, config,
+        answer2 = ask(agent, deps, message_history,
             "How does that compare to Fashion?"
         )
         print(f"\n--- MULTI-TURN Q2 (follow-up) ---\n{answer2}\n")
@@ -206,8 +206,8 @@ class TestEdgeCases:
         """Agent should gracefully handle questions about missing data."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "What is the average delivery time for orders?"
         )
         print(f"\n--- EDGE: Missing data ---\n{answer}\n")
@@ -219,8 +219,8 @@ class TestEdgeCases:
         """Agent should handle ambiguous questions sensibly."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "Show me the top performers"
         )
         print(f"\n--- EDGE: Ambiguous ---\n{answer}\n")

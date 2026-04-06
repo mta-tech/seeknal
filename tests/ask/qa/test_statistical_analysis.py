@@ -33,8 +33,8 @@ class TestDistributionAnalysis:
         """Agent should compute mean, median, stddev, skewness of revenue."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "Analyze the distribution of revenue in orders_cleaned. "
             "Calculate the mean, median, standard deviation, and skewness. "
             "Is the distribution skewed? Use DuckDB statistical functions."
@@ -50,8 +50,8 @@ class TestDistributionAnalysis:
         """Agent should compute percentiles and interpret them."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "Calculate the 10th, 25th, 50th, 75th, 90th, and 99th percentiles "
             "of order revenue in orders_cleaned. "
             "What does the spread between p50 and p90 tell us about the distribution?"
@@ -70,8 +70,8 @@ class TestConcentrationAnalysis:
         """Agent should identify if 80/20 rule applies to customer revenue."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "Perform a Pareto analysis on customer spending. "
             "What percentage of customers account for 80% of total revenue? "
             "Does the 80/20 rule apply here? "
@@ -87,8 +87,8 @@ class TestConcentrationAnalysis:
         """Agent should compute a Gini-like concentration metric."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "Calculate a Gini coefficient (or similar concentration metric) "
             "for total customer spending. A Gini of 0 means perfect equality, "
             "1 means one customer has all revenue. "
@@ -109,8 +109,8 @@ class TestOutlierDetection:
         """Agent should detect outliers using Z-scores on order amounts."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "Detect outlier orders using Z-scores on the revenue column "
             "in orders_cleaned. An outlier has |Z-score| > 2. "
             "How many outliers are there? What are their characteristics? "
@@ -126,8 +126,8 @@ class TestOutlierDetection:
         """Agent should detect outliers using IQR method."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "Use the IQR (interquartile range) method to detect outlier orders "
             "by revenue in orders_cleaned. "
             "Calculate Q1, Q3, IQR, then find orders below Q1-1.5*IQR "
@@ -147,8 +147,8 @@ class TestCorrelationAnalysis:
         """Agent should analyze correlation between order count and total spent."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "Is there a correlation between how many orders a customer places "
             "and their average order value? Calculate the Pearson correlation "
             "coefficient between total_orders and avg_order_value from "
@@ -165,8 +165,8 @@ class TestCorrelationAnalysis:
         """Agent should compare statistical measures across customer segments."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
-        answer = ask(agent, config,
+        agent, deps, message_history = _fresh_agent(qa_project)
+        answer = ask(agent, deps, message_history,
             "Compare the Premium, Standard, and Basic customer segments. "
             "For each segment, calculate: count, mean total_spent, "
             "standard deviation of total_spent, and coefficient of variation "
@@ -189,10 +189,10 @@ class TestMultiTurnStatisticalWorkflow:
         """Agent builds up a statistical profile of customers over 3 turns."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
+        agent, deps, message_history = _fresh_agent(qa_project)
 
         # Turn 1: Basic distribution
-        a1 = ask(agent, config,
+        a1 = ask(agent, deps, message_history,
             "Give me the basic descriptive statistics for customer total_spent: "
             "count, mean, median, min, max, stddev, and the ratio of stddev to mean."
         )
@@ -201,7 +201,7 @@ class TestMultiTurnStatisticalWorkflow:
         assert any(w in a1.lower() for w in ["mean", "median", "average"])
 
         # Turn 2: Segmented analysis
-        a2 = ask(agent, config,
+        a2 = ask(agent, deps, message_history,
             "Now break that down by city. Which city has the highest median "
             "total_spent? Which city has the widest spread (largest IQR or stddev)?"
         )
@@ -212,7 +212,7 @@ class TestMultiTurnStatisticalWorkflow:
         ])
 
         # Turn 3: Combine with pipeline context
-        a3 = ask(agent, config,
+        a3 = ask(agent, deps, message_history,
             "Based on these statistics, which customers would you flag as "
             "high-value outliers (spending > mean + 2*stddev)? "
             "List their IDs and how the revenue they generated was calculated. "
@@ -228,10 +228,10 @@ class TestMultiTurnStatisticalWorkflow:
         """Multi-turn: category performance with advanced statistics."""
         from seeknal.ask.agents.agent import ask
 
-        agent, config = _fresh_agent(qa_project)
+        agent, deps, message_history = _fresh_agent(qa_project)
 
         # Turn 1: Rank categories
-        a1 = ask(agent, config,
+        a1 = ask(agent, deps, message_history,
             "Rank the product categories by total revenue. "
             "Also compute each category's share of total revenue as a percentage "
             "and the cumulative percentage (running total of share). "
@@ -244,7 +244,7 @@ class TestMultiTurnStatisticalWorkflow:
         ])
 
         # Turn 2: Within-category variance
-        a2 = ask(agent, config,
+        a2 = ask(agent, deps, message_history,
             "For the top 2 categories by revenue, analyze the within-category "
             "order size distribution. Calculate skewness and kurtosis if possible, "
             "or at least the ratio of mean to median (a skewness proxy). "

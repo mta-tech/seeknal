@@ -19,24 +19,12 @@ from seeknal.workflow.materialization.profile_loader import ProfileLoader, Crede
 from seeknal.workflow.materialization.operations import SnapshotManager, DuckDBIcebergExtension
 
 
-def _echo_success(message: str):
-    """Print success message in green."""
-    typer.echo(typer.style(f"✓ {message}", fg=typer.colors.GREEN))
-
-
-def _echo_error(message: str):
-    """Print error message in red."""
-    typer.echo(typer.style(f"✗ {message}", fg=typer.colors.RED))
-
-
-def _echo_warning(message: str):
-    """Print warning message in yellow."""
-    typer.echo(typer.style(f"⚠ {message}", fg=typer.colors.YELLOW))
-
-
-def _echo_info(message: str):
-    """Print info message in blue."""
-    typer.echo(typer.style(f"ℹ {message}", fg=typer.colors.BLUE))
+from seeknal.ui.output import (
+    echo_success as _echo_success,
+    echo_error as _echo_error,
+    echo_warning as _echo_warning,
+    echo_info as _echo_info,
+)
 
 app = typer.Typer(help="Iceberg materialization commands")
 

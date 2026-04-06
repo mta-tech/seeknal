@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
-from seeknal.cli.main import _echo_success, _echo_error, _echo_info, _echo_warning  # ty: ignore[unresolved-import]
+from seeknal.ui.output import echo_success as _echo_success, echo_error as _echo_error, echo_info as _echo_info, echo_warning as _echo_warning
 from seeknal.dag.manifest import Manifest, Node, NodeType  # ty: ignore[unresolved-import]
 from seeknal.dag.diff import ManifestDiff  # ty: ignore[unresolved-import]
 from seeknal.workflow.state import (  # ty: ignore[unresolved-import]
@@ -1244,6 +1244,23 @@ def print_summary(summary: ExecutionSummary) -> None:
                         _echo_warning(f"  - {r.node_id}: {c['message']}")
                 else:
                     _echo_warning(f"  - {r.node_id}: {m.get('message', '')}")
+
+    # Rich summary panel (dual output during migration)
+    try:
+        from seeknal.ui.progress import render_summary
+        from seeknal.ui.console import get_console
+        console = get_console()
+        if console.is_terminal:
+            panel = render_summary({
+                'total': summary.total_nodes,
+                'executed': summary.changed_nodes,
+                'cached': summary.cached_nodes,
+                'failed': summary.failed_nodes,
+                'duration': summary.total_duration,
+            })
+            console.print(panel)
+    except Exception:
+        pass  # Fall back to existing text output
 
 
 # Import typer for styling

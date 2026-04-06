@@ -63,6 +63,9 @@ def ask_callback(
     quiet: bool = typer.Option(
         False, "--quiet", "-q", help="Suppress step-by-step output, show only final answer"
     ),
+    web: bool = typer.Option(
+        False, "--web", help="Enable web search tools"
+    ),
 ):
     """Ask questions about your seeknal project data using natural language.
 
@@ -72,6 +75,7 @@ def ask_callback(
         seeknal ask chat                               Interactive chat
         seeknal ask chat --project path                Chat with project
         seeknal ask -q "How many?"                     Quiet mode (no steps)
+        seeknal ask --web "Compare AOV to benchmarks"  With web search
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -82,7 +86,7 @@ def ask_callback(
 
     # One-shot mode — question comes from extra args
     question = " ".join(ctx.args)
-    _run_oneshot(question, provider=provider, model=model, project=project, quiet=quiet)
+    _run_oneshot(question, provider=provider, model=model, project=project, quiet=quiet, include_web=web)
 
 
 def _run_oneshot(
@@ -91,6 +95,7 @@ def _run_oneshot(
     model: Optional[str] = None,
     project: Optional[Path] = None,
     quiet: bool = False,
+    include_web: bool = False,
 ):
     """Execute a one-shot question and print the answer."""
     project_path = project or find_project_path()
@@ -106,47 +111,34 @@ def _run_oneshot(
         ))
         raise typer.Exit(1)
 
-    try:
-        from rich.console import Console
+    from seeknal.ui.console import get_console
 
-        console = Console()
-        console.print(f"\n[dim]Project: {project_path}[/dim]")
-        console.print(f"[dim]Question: {question}[/dim]\n")
+    console = get_console()
+    console.print(f"\n[text.dim]Project: {project_path}[/]")
+    console.print(f"[text.dim]Question: {question}[/]\n")
 
-        # Create agent (always with spinner -- this part is not streaming)
-        with console.status("[bold green]Loading agent..."):
-            agent, config = create_agent(
-                project_path,
-                provider=provider,
-                model=model,
-            )
-
-        # Stream the answer with step-by-step visibility
-        import asyncio
-        from seeknal.ask.streaming import stream_ask
-
-        try:
-            answer = asyncio.run(
-                stream_ask(agent, config, question, console, quiet=quiet)
-            )
-        except KeyboardInterrupt:
-            console.print("\n[dim]Cancelled.[/dim]")
-            raise typer.Exit(0)
-
-        console.print()
-
-    except ImportError:
-        # Fallback without rich -- use sync ask()
-        typer.echo(f"Project: {project_path}")
-        typer.echo(f"Question: {question}\n")
-
-        agent, config = create_agent(
+    # Create agent (always with spinner -- this part is not streaming)
+    with console.status("[spinner.active]Loading agent..."):
+        agent, deps, message_history, _cost_info = create_agent(
             project_path,
             provider=provider,
             model=model,
+            include_web=include_web,
         )
-        answer = agent_ask(agent, config, question)
-        typer.echo(answer)
+
+    # Stream the answer with step-by-step visibility
+    import asyncio
+    from seeknal.ask.streaming import stream_ask
+
+    try:
+        answer = asyncio.run(
+            stream_ask(agent, deps, message_history, question, console, quiet=quiet)
+        )
+    except KeyboardInterrupt:
+        console.print("\n[text.dim]Cancelled.[/]")
+        raise typer.Exit(0)
+
+    console.print()
 
 
 @ask_app.command("chat")
@@ -163,6 +155,21 @@ def chat_command(
     quiet: bool = typer.Option(
         False, "--quiet", "-q", help="Suppress step-by-step output, show only final answer"
     ),
+    style: Optional[str] = typer.Option(
+        None, "--style", "-s", help="Output style: concise, explanatory, formal, conversational"
+    ),
+    budget: Optional[float] = typer.Option(
+        None, "--budget", help="Max USD budget for this session"
+    ),
+    web: bool = typer.Option(
+        False, "--web", help="Enable web search/fetch tools"
+    ),
+    session: Optional[str] = typer.Option(
+        None, "--session", help="Resume an existing named session"
+    ),
+    name: Optional[str] = typer.Option(
+        None, "--name", help="Create a session with this name"
+    ),
 ):
     """Start an interactive multi-turn chat session."""
     project_path = project or find_project_path()
@@ -178,65 +185,81 @@ def chat_command(
         ))
         raise typer.Exit(1)
 
-    try:
-        from rich.console import Console
+    from seeknal.ask.sessions import SessionStore
+    from seeknal.ui.console import get_console
 
-        console = Console()
-    except ImportError:
-        console = None
+    console = get_console()
 
-    # Create agent (with spinner if Rich available)
-    if console:
-        with console.status("[bold green]Loading agent..."):
-            agent, config = create_agent(
-                project_path,
-                provider=provider,
-                model=model,
-            )
+    # Session management: resume or create
+    store = SessionStore(project_path)
+    session_name: str
+
+    if session:
+        # Resume existing session
+        if store.get(session) is None:
+            console.print(f"[status.error]Session '{session}' not found.[/]")
+            console.print("[text.dim]List sessions with: seeknal session list[/]")
+            raise typer.Exit(1)
+        session_name = session
     else:
-        agent, config = create_agent(
+        session_name = store.create(name=name)
+
+    # Load existing message history (empty for new sessions)
+    message_history = store.load_messages(session_name)
+
+    # Create agent with spinner
+    with console.status("[spinner.active]Loading agent..."):
+        agent, deps, _, _cost_info = create_agent(
             project_path,
             provider=provider,
             model=model,
+            style=style,
+            budget=budget,
+            include_web=web,
         )
 
-    if console:
-        console.print("[bold]Seeknal Ask[/bold] -- Interactive Data Analysis")
-        console.print(f"[dim]Project: {project_path}[/dim]")
-        console.print("[dim]Type 'exit' or 'quit' to end the session.[/dim]\n")
+    # Branded animated header with bird mascot
+    from rich.text import Text
 
-        # Use async chat session with streaming visibility
-        import asyncio
-        from seeknal.ask.streaming import chat_session
+    right = Text()
+    right.append("Seeknal Ask", style="brand.primary")
+    right.append(" — ", style="text.dim")
+    right.append("All-in-One Data Agent", style="text.muted")
+    right.append(f"\nProject: {project_path}", style="text.dim")
+    right.append(f"\nSession: {session_name}", style="text.dim")
+    right.append("\nType 'exit' or 'quit' to end the session.", style="text.dim")
 
-        try:
-            asyncio.run(chat_session(agent, config, console, quiet=quiet))
-        except KeyboardInterrupt:
-            console.print("\nGoodbye!")
+    if console.is_terminal:
+        from seeknal.ui.animate import animated_header
+        from seeknal.ui.fox import render_animated_fox
+
+        animated_header(render_animated_fox(), right)
     else:
-        # Fallback without Rich -- use sync ask()
-        typer.echo("Seeknal Ask -- Interactive Data Analysis")
-        typer.echo(f"Project: {project_path}")
-        typer.echo("Type 'exit' or 'quit' to end the session.\n")
+        console.print("Seeknal Ask — All-in-One Data Agent")
+        console.print(f"Project: {project_path}")
+        console.print(f"Session: {session_name}")
+        console.print("Type 'exit' or 'quit' to end the session.\n")
 
-        while True:
-            try:
-                question = input("You: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                typer.echo("\nGoodbye!")
-                break
+    if session and message_history:
+        msg_count = len([m for m in message_history if hasattr(m, 'parts')])
+        console.print(f"[text.dim]Resumed session with {msg_count} messages.[/]\n")
 
-            if not question:
-                continue
-            if question.lower() in ("exit", "quit", "q"):
-                typer.echo("Goodbye!")
-                break
+    # Use async chat session with streaming visibility
+    import asyncio
+    from seeknal.ask.streaming import chat_session
 
-            try:
-                answer = agent_ask(agent, config, question)
-                typer.echo(f"\n{answer}\n")
-            except Exception as e:
-                typer.echo(f"Error: {e}\n")
+    try:
+        asyncio.run(chat_session(
+            agent, deps, message_history, console,
+            quiet=quiet, cost_info=_cost_info,
+            session_store=store, session_name=session_name,
+        ))
+    except KeyboardInterrupt:
+        # Save on interrupt
+        store.save_messages(session_name, message_history)
+        store.update(session_name, status="paused")
+        console.print(f"\nSession saved: [brand.primary]{session_name}[/]")
+        console.print(f"[text.dim]Resume with: seeknal ask chat --session {session_name}[/]")
 
 
 # ---------------------------------------------------------------------------
@@ -325,11 +348,9 @@ def _run_report(
         ))
         raise typer.Exit(1)
 
-    try:
-        from rich.console import Console
-        console = Console()
-    except ImportError:
-        console = None
+    from seeknal.ui.console import get_console
+
+    console = get_console()
 
     report_prompt = (
         f"Generate an interactive report about: {topic}\n\n"
@@ -340,39 +361,31 @@ def _run_report(
         "markdown pages containing SQL queries and chart components"
     )
 
-    if console:
-        console.print(f"\n[bold]Seeknal Report Generator[/bold]")
-        console.print(f"[dim]Project: {project_path}[/dim]")
-        console.print(f"[dim]Topic: {topic}[/dim]\n")
+    console.print(f"\n[brand.primary]Seeknal Report Generator[/]")
+    console.print(f"[text.dim]Project: {project_path}[/]")
+    console.print(f"[text.dim]Topic: {topic}[/]\n")
 
-        with console.status("[bold green]Loading agent..."):
-            agent, config = create_agent(
-                project_path,
-                provider=provider,
-                model=model,
-            )
-
-        import asyncio
-        from seeknal.ask.streaming import chat_session, stream_ask
-
-        try:
-            answer = asyncio.run(stream_ask(agent, config, report_prompt, console))
-            # Save rendered markdown
-            if answer and answer.strip():
-                _save_report_markdown(project_path, topic, answer, console)
-            # Continue in chat mode for follow-up
-            asyncio.run(chat_session(agent, config, console))
-        except KeyboardInterrupt:
-            console.print("\n[dim]Cancelled.[/dim]")
-    else:
-        from seeknal.ask.agents.agent import ask as agent_ask
-        agent, config = create_agent(
-            project_path, provider=provider, model=model,
+    with console.status("[spinner.active]Loading agent..."):
+        agent, deps, message_history, _cost_info = create_agent(
+            project_path,
+            provider=provider,
+            model=model,
         )
-        answer = agent_ask(agent, config, report_prompt)
-        typer.echo(answer)
+
+    import asyncio
+    from seeknal.ask.streaming import chat_session, stream_ask
+
+    try:
+        answer = asyncio.run(stream_ask(
+            agent, deps, message_history, report_prompt, console
+        ))
+        # Save rendered markdown
         if answer and answer.strip():
-            _save_report_markdown(project_path, topic, answer)
+            _save_report_markdown(project_path, topic, answer, console)
+        # Continue in chat mode for follow-up
+        asyncio.run(chat_session(agent, deps, message_history, console))
+    except KeyboardInterrupt:
+        console.print("\n[text.dim]Cancelled.[/]")
 
 
 def _save_report_markdown(
@@ -387,12 +400,12 @@ def _save_report_markdown(
     try:
         output_path = save_rendered_markdown(project_path, topic, content)
         if console:
-            console.print(f"\n[bold green]Report saved:[/bold green] {output_path}")
+            console.print(f"\n[status.success]Report saved:[/] {output_path}")
         else:
             typer.echo(f"\nReport saved: {output_path}")
     except ValueError as e:
         if console:
-            console.print(f"[red]Failed to save report: {e}[/red]")
+            console.print(f"[status.error]Failed to save report: {e}[/]")
         else:
             typer.echo(f"Failed to save report: {e}")
 
@@ -455,44 +468,30 @@ def _run_exposure(
         ))
         raise typer.Exit(1)
 
-    try:
-        from rich.console import Console
-        console = Console()
-    except ImportError:
-        console = None
+    from seeknal.ui.console import get_console
 
-    if console:
-        console.print(f"\n[bold]Running exposure:[/bold] {name}")
-        console.print(f"[dim]Project: {project_path}[/dim]")
-        console.print(f"[dim]Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}[/dim]\n")
+    console = get_console()
 
-        with console.status("[bold green]Loading agent..."):
-            agent, config = create_agent(
-                project_path, provider=provider, model=model,
-            )
+    console.print(f"\n[brand.primary]Running exposure:[/] {name}")
+    console.print(f"[text.dim]Project: {project_path}[/]")
+    console.print(f"[text.dim]Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}[/]\n")
 
-        import asyncio
-        from seeknal.ask.streaming import stream_ask
-
-        try:
-            answer = asyncio.run(stream_ask(agent, config, prompt, console))
-            if answer and answer.strip():
-                _save_report_markdown(project_path, name, answer, console)
-        except KeyboardInterrupt:
-            console.print("\n[dim]Cancelled.[/dim]")
-    else:
-        from seeknal.ask.agents.agent import ask as agent_ask
-
-        typer.echo(f"Running exposure: {name}")
-        typer.echo(f"Project: {project_path}\n")
-
-        agent, config = create_agent(
+    with console.status("[spinner.active]Loading agent..."):
+        agent, deps, message_history, _cost_info = create_agent(
             project_path, provider=provider, model=model,
         )
-        answer = agent_ask(agent, config, prompt)
-        typer.echo(answer)
+
+    import asyncio
+    from seeknal.ask.streaming import stream_ask
+
+    try:
+        answer = asyncio.run(stream_ask(
+            agent, deps, message_history, prompt, console
+        ))
         if answer and answer.strip():
-            _save_report_markdown(project_path, name, answer)
+            _save_report_markdown(project_path, name, answer, console)
+    except KeyboardInterrupt:
+        console.print("\n[text.dim]Cancelled.[/]")
 
 
 def _run_deterministic_exposure(
@@ -503,35 +502,26 @@ def _run_deterministic_exposure(
     model: Optional[str] = None,
 ):
     """Run the deterministic report path for exposures with sections."""
-    try:
-        from rich.console import Console
-        console = Console()
-    except ImportError:
-        console = None
+    from seeknal.ui.console import get_console
 
-    if console:
-        console.print(f"\n[bold]Running exposure:[/bold] {name}")
-        console.print(f"[dim]Project: {project_path}[/dim]")
-        section_count = len(exposure["sections"])
-        console.print(f"[dim]Sections: {section_count}[/dim]\n")
+    console = get_console()
+
+    console.print(f"\n[brand.primary]Running exposure:[/] {name}")
+    console.print(f"[text.dim]Project: {project_path}[/]")
+    section_count = len(exposure["sections"])
+    console.print(f"[text.dim]Sections: {section_count}[/]\n")
 
     try:
         from seeknal.ask.report.deterministic import render_deterministic_report
 
-        if console:
-            with console.status("") as status:
-                def _on_progress(msg: str) -> None:
-                    status.update(f"[bold green]{msg}")
+        with console.status("") as status:
+            def _on_progress(msg: str) -> None:
+                status.update(f"[spinner.active]{msg}")
 
-                html_path, markdown = render_deterministic_report(
-                    exposure, project_path,
-                    provider=provider, model=model,
-                    on_progress=_on_progress,
-                )
-        else:
             html_path, markdown = render_deterministic_report(
                 exposure, project_path,
                 provider=provider, model=model,
+                on_progress=_on_progress,
             )
 
         # Save rendered markdown
@@ -539,29 +529,20 @@ def _run_deterministic_exposure(
             _save_report_markdown(project_path, name, markdown, console)
 
         # Report success
-        if console:
-            if html_path.endswith(".html"):
-                console.print(
-                    f"\n[bold green]Report built:[/bold green] {html_path}"
-                )
-            else:
-                console.print(f"\n[yellow]{html_path}[/yellow]")
+        if html_path.endswith(".html"):
+            console.print(
+                f"\n[status.success]Report built:[/] {html_path}"
+            )
         else:
-            typer.echo(f"\nReport: {html_path}")
+            console.print(f"\n[status.warning]{html_path}[/]")
 
     except ValueError as e:
         msg = f"Deterministic report failed: {e}"
-        if console:
-            console.print(f"[red]{msg}[/red]")
-        else:
-            typer.echo(msg)
+        console.print(f"[status.error]{msg}[/]")
         raise typer.Exit(1)
     except Exception as e:
         msg = f"Unexpected error: {e}"
-        if console:
-            console.print(f"[red]{msg}[/red]")
-        else:
-            typer.echo(msg)
+        console.print(f"[status.error]{msg}[/]")
         raise typer.Exit(1)
 
 
