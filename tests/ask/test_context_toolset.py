@@ -1,6 +1,6 @@
 """Tests for SeeknaContextToolset."""
 
-from pathlib import Path
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -36,23 +36,25 @@ def mock_ctx():
 class TestSeeknaContextToolset:
     def test_get_instructions_returns_context(self, mock_discovery, mock_ctx):
         toolset = SeeknaContextToolset(mock_discovery)
-        result = toolset.get_instructions(mock_ctx)
+        result = asyncio.run(toolset.get_instructions(mock_ctx))
 
         assert result is not None
-        assert "## Data Context" in result
-        assert "Entities" in result
-        assert "user" in result
-        assert "transactions" in result
+        assert len(result) == 1
+        text = result[0]
+        assert "## Data Context" in text
+        assert "Entities" in text
+        assert "user" in text
+        assert "transactions" in text
 
     def test_get_instructions_calls_discovery(self, mock_discovery, mock_ctx):
         toolset = SeeknaContextToolset(mock_discovery)
-        toolset.get_instructions(mock_ctx)
+        asyncio.run(toolset.get_instructions(mock_ctx))
 
         mock_discovery.get_context_for_prompt.assert_called_once()
 
     def test_get_instructions_returns_none_for_empty_context(self, empty_discovery, mock_ctx):
         toolset = SeeknaContextToolset(empty_discovery)
-        result = toolset.get_instructions(mock_ctx)
+        result = asyncio.run(toolset.get_instructions(mock_ctx))
 
         assert result is None
 
@@ -60,7 +62,7 @@ class TestSeeknaContextToolset:
         discovery = MagicMock()
         discovery.get_context_for_prompt.return_value = "   \n  "
         toolset = SeeknaContextToolset(discovery)
-        result = toolset.get_instructions(mock_ctx)
+        result = asyncio.run(toolset.get_instructions(mock_ctx))
 
         assert result is None
 

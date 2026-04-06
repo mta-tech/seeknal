@@ -12,7 +12,7 @@ class TestMemorySystemPromptGuidance:
         assert "memory" in SYSTEM_PROMPT.lower()
 
     def test_has_save_to_memory_guidance(self):
-        assert "save them to memory" in SYSTEM_PROMPT
+        assert "read_memory" in SYSTEM_PROMPT
 
 
 class TestMemoryAgentConfiguration:

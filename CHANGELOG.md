@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-04-06
+
+### Added
+- **Interactive chat mode** (`seeknal ask chat`) with multi-turn conversation, streaming UI, and auto-backgrounding for long tasks
+- **Session management** (`seeknal session list/show/delete`) with persistent message history and named sessions
+- **Gateway server** with WebSocket, SSE, and REST endpoints for web clients; optional Telegram bot integration
+- **ask_user tool** for interactive arrow-key menus that clarify user intent before analysis
+- **open_in_browser tool** to open generated reports directly in the browser
+- **UI components**: animated fox mascot, interactive menus, ask spinner, keyreader
+
+### Changed
+- Iceberg source executor and materialization now support no-auth Lakekeeper catalogs (`AUTHORIZATION_TYPE 'none'` fallback when OAuth2 credentials are absent)
+
 ## [2.1.0] - 2026-02-10
 
 ### Added - RUN Command Parity with SQLMesh

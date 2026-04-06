@@ -140,6 +140,18 @@ Supports Google Gemini (default) and Ollama (local) as LLM providers. Use `--pro
 
 ## Changelog
 
+### v2.5.0 (April 2026)
+
+**Interactive Chat, Sessions, No-Auth Iceberg, and Gateway Server**
+
+- **Interactive chat mode** (`seeknal ask chat`): multi-turn conversation with persistent sessions, auto-backgrounding for long tasks, and streaming UI with progressive rendering
+- **Session management**: create, resume, list, and delete sessions with full message persistence (`seeknal session list/show/delete`)
+- **Gateway server**: WebSocket, SSE, and REST endpoints for web clients; optional Telegram bot integration
+- **No-auth Iceberg support**: Lakekeeper catalogs with `allowall` auth work without Keycloak/OAuth2 credentials
+- **ask_user tool**: interactive arrow-key menus for clarifying questions before analysis
+- **open_in_browser tool**: open generated reports directly in the user's browser
+- **UI components**: animated fox mascot, interactive menus, ask spinner, keyreader
+
 ### v2.4.0 (March 2026)
 
 **Seeknal Ask — AI-Powered Data Agent** — Natural language data analysis with 12 built-in tools:

@@ -278,7 +278,7 @@ This creates two files:
 **`Dockerfile`** — Project image definition:
 
 ```dockerfile
-FROM ghcr.io/mta-tech/seeknal:2.4.0
+FROM ghcr.io/mta-tech/seeknal:2.5.0
 
 # Copy project YAML definitions
 COPY seeknal/ ./seeknal/

@@ -374,6 +374,7 @@ class TestGenerateReportApprovalGate:
             lambda: ctx,
         )
 
-        result = generate_report('VIP Report', '# Findings')
+        import asyncio
+        result = asyncio.run(generate_report('VIP Report', '# Findings'))
         assert 'Approval required before generate_report' in result
         assert 'Generate report now' in result
