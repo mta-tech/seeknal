@@ -43,9 +43,13 @@ class ToolContext:
     project_path: Path
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     db_lock: threading.Lock = field(default_factory=threading.Lock)
+    fs_lock: threading.Lock = field(default_factory=threading.Lock)
     require_report_approval: bool = False
     report_approval_granted: bool = False
     background_registry: BackgroundRegistry = field(default_factory=lambda: _make_registry())
+    console: Any = None
+    plan_steps: list[str] = field(default_factory=list)
+    plan_step_index: int = 0
 
 
 def _make_registry():
