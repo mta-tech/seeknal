@@ -164,3 +164,24 @@ class TestDoSave:
         assert len(data["inputs"]) == 2
         assert data["inputs"][0]["ref"] == "transform.revenue"
         assert data["inputs"][1]["ref"] == "transform.customers"
+
+
+class TestSaveReportExposureApprovalGate:
+    def test_save_report_exposure_requires_approval(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from seeknal.ask.agents.tools.save_report_exposure import save_report_exposure
+
+        ctx = SimpleNamespace(
+            project_path=Path('/tmp/test'),
+            require_report_approval=True,
+            report_approval_granted=False,
+        )
+        monkeypatch.setattr(
+            'seeknal.ask.agents.tools._context.get_tool_context',
+            lambda: ctx,
+        )
+
+        result = save_report_exposure('vip_report', 'prompt', '[]')
+        assert 'Approval required before save_report_exposure' in result
+        assert 'Generate report now' in result

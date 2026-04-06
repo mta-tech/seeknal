@@ -2,6 +2,7 @@ import datetime
 import os
 import re
 import collections
+from pathlib import Path
 from collections.abc import MutableMapping
 from ast import literal_eval
 from typing import (
@@ -16,7 +17,7 @@ from typing import (
     Type,
 )
 
-import toml
+import tomllib
 from box import Box
 
 
@@ -417,7 +418,9 @@ def load_toml(path: str) -> dict:
     """
     return {
         key: value
-        for key, value in toml.load(cast(str, interpolate_env_vars(path))).items()
+        for key, value in tomllib.loads(
+            Path(cast(str, interpolate_env_vars(path))).read_text()
+        ).items()
     }
 
 

@@ -5,6 +5,7 @@ LLM generates SQL -> execute_sql tool -> hook validates -> error? -> LLM retries
 For complex analyses, the agent decomposes tasks via the planning tool.
 """
 
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -26,8 +27,52 @@ entities, feature groups, and transformations stored as DuckDB views.
 5. Execute Python for statistical analysis (pandas, scipy, matplotlib)
 6. Generate interactive HTML reports with Evidence.dev
 7. Codify reports as YAML exposures for scheduled re-runs
+8. Open generated reports in the user's browser
+
+## Asking Questions
+
+You have an `ask_user` tool that presents interactive options the user can \
+select with arrow keys. Use it proactively — don't make assumptions the user \
+should make.
+
+**When to ask:** Use `ask_user` when you encounter any of these situations:
+- The task is strategic, exploratory, or has multiple valid directions \
+(e.g., "brainstorm retention strategies", "analyze churn", "plan a campaign")
+- The user's request is ambiguous and could be interpreted in different ways
+- There are meaningful tradeoffs the user should weigh \
+(e.g., which customer segment to focus on, which metric matters most)
+- You need to scope a broad request before diving into analysis
+- The user asks you to brainstorm, plan, strategize, or explore options
+
+**How to ask well:**
+- Ask BEFORE doing heavy analysis, not after — scope first, then execute
+- Focus on things only the user can answer: priorities, preferences, scope, \
+constraints, which direction to take
+- Never ask what you could find out by querying the data yourself
+- Provide 2-4 concrete options with clear descriptions, not vague choices
+- Mark your recommended option with `"recommended": "true"`
+- One question at a time, most important first
+- After the user answers, proceed with the analysis using their direction
+
+**When NOT to ask:** Skip `ask_user` and proceed directly when:
+- The question has a clear, unambiguous answer from the data
+- The user gave a specific, well-scoped request (e.g., "how many customers?")
+- You're in the middle of executing an agreed-upon analysis plan
 
 ## Workflow
+
+For strategic/exploratory tasks (brainstorming, planning, strategy):
+1. Ask scoping questions with `ask_user` — understand priorities and constraints
+2. Treat persistent memory, existing reports, and saved exposures as context only, never as approval to reuse or extend a prior strategy
+3. If the user is designing or building a pipeline/project from scratch, inspect only the current project skeleton and available sources first
+4. Lay out a concise Seeknal-native plan before drafting YAML or SQL
+5. Ask for confirmation with `ask_user` using these exact options: `Execute this plan`, `Refine this plan`, `Type your own`
+6. Only proceed into implementation details after the user selects `Execute this plan`
+7. Query with the user's confirmed direction in mind
+8. Summarize the current findings and proposed next step in concise bullets before creating any artifact
+9. Before calling `generate_report` or `save_report_exposure`, use `ask_user` with exactly these options: `Continue analysis`, `Generate report now`, `Done for now`, `Type your own`
+10. Do not render those follow-up options as plain text, bullets, or numbered lists in your answer — call `ask_user` directly for the interactive menu
+11. Only generate or save a report if the user explicitly asks for one or selects `Generate report now`
 
 For data questions:
 1. Discover data: `list_tables` → `describe_table`
@@ -42,9 +87,14 @@ For lineage/how questions:
 For advanced analysis:
 1. Query data with `execute_sql` first
 2. Use `execute_python` for stats, visualizations, complex pandas ops
-3. Pre-loaded: `conn` (DuckDB), `pd`, `np`, `plt`
+3. Pre-loaded: `conn` (DuckDB), `pd`, `np`, `plt`, `sklearn`, `scipy` — \
+ONLY these packages are available. For sklearn, import submodules directly \
+(e.g., `from sklearn.cluster import KMeans`)
+4. Each `execute_python` call is isolated — variables do NOT persist \
+between calls. Always re-query data at the start of each call
 
 For report generation, load the 'report-generation' skill first.
+After a successful generate_report, use open_in_browser to display the report.
 
 ## DuckDB SQL Rules
 
@@ -55,6 +105,9 @@ For report generation, load the 'report-generation' skill first.
 - All non-aggregate SELECT columns must be in GROUP BY
 - Struct fields: `column.field`
 - Case-insensitive: use `ILIKE`
+- In Python code: NEVER put `#` comments inside SQL strings — DuckDB does \
+not recognize `#` as a comment. Use `--` for SQL comments, or place `#` \
+comments outside the SQL string
 
 ## Security
 
@@ -100,6 +153,9 @@ def create_agent(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     api_key: Optional[str] = None,
+    style: Optional[str] = None,
+    budget: Optional[float] = None,
+    include_web: bool = False,
 ):
     """Create a Seeknal Ask agent.
 
@@ -108,6 +164,9 @@ def create_agent(
         provider: LLM provider ("google" or "ollama").
         model: Model name override.
         api_key: API key override.
+        style: Output style name (concise, explanatory, formal, conversational).
+        budget: Max USD budget for the session (None = unlimited).
+        include_web: Enable web search/fetch tools.
 
     Returns:
         A tuple of (agent, deps, message_history) where agent is a pydantic-ai
@@ -120,6 +179,7 @@ def create_agent(
     from seeknal.ask.agents.hooks import get_ask_hooks
     from seeknal.ask.agents.providers import get_model_string
     from seeknal.ask.agents.subagents import get_subagent_configs
+    from seeknal.ask.agents.tools.ask_user import interactive_ask_user
     from seeknal.ask.agents.tools.toolset import create_ask_toolset
     from seeknal.ask.processors import MicrocompactProcessor, SqlResultCompactor
     from seeknal.ask.security import configure_safe_connection
@@ -132,56 +192,127 @@ def create_agent(
     # Discover project artifacts for context
     discovery = ArtifactDiscovery(project_path)
 
-    # Set tool context (global, used by all tools)
+    # Set tool context (per-session via ContextVar — safe for concurrent sessions)
+    session_id = uuid.uuid4().hex[:8]
     set_tool_context(ToolContext(
         repl=repl,
         artifact_discovery=discovery,
         project_path=project_path,
+        session_id=session_id,
     ))
+
+    # Load project-level agent config (seeknal_agent.yml)
+    import seeknal.ask.config as _ask_config
+    from seeknal.ask.config import (
+        load_agent_config, get_locale_instructions, get_request_limit,
+        get_background_threshold,
+    )
+
+    agent_config = load_agent_config(project_path)
+
+    # Set request limit (read by streaming.py at each agent.iter() call)
+    _ask_config._active_request_limit = get_request_limit(agent_config)
+    # Set background threshold (read by tool functions)
+    _ask_config._active_background_threshold = get_background_threshold(agent_config)
+
+    # Build final system prompt: base + locale (if configured)
+    instructions = SYSTEM_PROMPT
+    locale_snippet = get_locale_instructions(agent_config)
+    if locale_snippet:
+        instructions = instructions + locale_snippet
 
     # Resolve model string
     model_string = get_model_string(provider=provider, model=model, api_key=api_key)
 
     # Build toolsets: ask tools + dynamic project context injection
     context_toolset = SeeknaContextToolset(discovery)
+    toolsets_list = [create_ask_toolset(), context_toolset]
 
-    # Ensure .seeknal directory exists for memory storage
-    (project_path / ".seeknal").mkdir(exist_ok=True)
+    # Add web search toolset if requested (local DuckDuckGo, avoids Gemini builtin conflict)
+    if include_web:
+        try:
+            from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
+            from pydantic_ai.toolsets import FunctionToolset
 
-    # Create pydantic-deep agent
+            toolsets_list.append(FunctionToolset(
+                tools=[duckduckgo_search_tool()],
+                id="seeknal-web",
+            ))
+        except ImportError:
+            import warnings
+            warnings.warn(
+                "Web search requires 'duckduckgo-search' package. "
+                "Install with: pip install duckduckgo-search"
+            )
+
+    # Ensure .seeknal directories exist (checkpoints scoped per session)
+    seeknal_dir = project_path / ".seeknal"
+    seeknal_dir.mkdir(exist_ok=True)
+    (seeknal_dir / "plans").mkdir(exist_ok=True)
+    checkpoint_dir = seeknal_dir / "checkpoints" / session_id
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Context files: auto-discover SEEKNAL_ASK.md for user-provided instructions
+    context_files = []
+    ask_md = project_path / "SEEKNAL_ASK.md"
+    if ask_md.exists():
+        context_files.append(str(ask_md))
+
+    # Cost tracking callback
+    _cost_info = {}
+
+    def _on_cost_update(cost_info):
+        _cost_info["latest"] = cost_info
+
+    # Create pydantic-deep agent with full feature set
     agent = create_deep_agent(
         model=model_string,
-        instructions=SYSTEM_PROMPT,
-        toolsets=[create_ask_toolset(), context_toolset],
+        instructions=instructions,
+        toolsets=toolsets_list,
         hooks=get_ask_hooks(),
-        # Skills: discovered from SKILL.md files in seeknal/skills/ (Claude Code-style)
+        # Skills
         include_skills=True,
         skill_directories=[str(project_path / "seeknal" / "skills")],
-        # Enable planning for complex multi-step analyses
+        # Planning: todo checklist + interactive ask_user via planner subagent
         include_todo=True,
-        # Auto-summarize when approaching context window limit (Tier 3)
+        include_plan=True,
+        plans_dir=".seeknal/plans",
+        # Context management: 3-tier compaction + user context files
         context_manager=True,
-        # Multi-tier compaction: Tier 1 (microcompact) + Tier 2 (SQL snip)
         history_processors=[MicrocompactProcessor(), SqlResultCompactor()],
-        # Project memory: persistent schema knowledge across sessions
+        context_files=context_files,
+        # Memory: persistent schema knowledge across sessions
         include_memory=True,
         memory_dir=".seeknal/ask_memory",
-        # Disable features we don't use yet
-        include_filesystem=False,
+        # Checkpoints: save/rewind in long chat sessions
+        include_checkpoints=True,
+        checkpoint_frequency="every_turn",
+        max_checkpoints=20,
+        # Cost tracking
+        cost_tracking=True,
+        cost_budget_usd=budget,
+        on_cost_update=_on_cost_update,
+        # Output style
+        output_style=style or "concise",
+        # Subagents
         include_subagents=True,
         subagents=get_subagent_configs(),
-        include_plan=False,
-        include_checkpoints=False,
-        include_teams=False,
+        # Web search: use local DuckDuckGo fallback (not builtin google_search)
+        # because Gemini can't mix builtin tools with function tools.
         include_web=False,
+        # Disabled: seeknal has domain-specific alternatives
+        include_filesystem=False,
         include_execute=False,
     )
 
-    # Use LocalBackend rooted at project path for disk-persistent memory
-    deps = DeepAgentDeps(backend=LocalBackend(root_dir=str(project_path)))
+    # Use LocalBackend with interactive ask_user callback
+    deps = DeepAgentDeps(
+        backend=LocalBackend(root_dir=str(project_path)),
+        ask_user=interactive_ask_user,
+    )
     message_history = []
 
-    return agent, deps, message_history
+    return agent, deps, message_history, _cost_info
 
 
 def ask(
@@ -210,10 +341,16 @@ def ask(
     Returns:
         The agent's text response.
     """
+    from pydantic_ai.usage import UsageLimits
+    from seeknal.ask.config import _active_request_limit
+
+    _usage_limits = UsageLimits(request_limit=_active_request_limit)
+
     result = agent.run_sync(
         question,
         deps=deps,
         message_history=message_history,
+        usage_limits=_usage_limits,
     )
     # Update message history for multi-turn
     message_history.clear()
@@ -232,6 +369,7 @@ def ask(
             "and provide your analysis as a text response.",
             deps=deps,
             message_history=message_history,
+            usage_limits=_usage_limits,
         )
         message_history.clear()
         message_history.extend(result.all_messages())
@@ -282,10 +420,14 @@ def _quality_gate(
         return answer
 
     # One quality retry with guidance
+    from pydantic_ai.usage import UsageLimits
+    from seeknal.ask.config import _active_request_limit
+
     result = agent.run_sync(
         reason,
         deps=deps,
         message_history=message_history,
+        usage_limits=UsageLimits(request_limit=_active_request_limit),
     )
     message_history.clear()
     message_history.extend(result.all_messages())

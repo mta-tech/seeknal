@@ -13,12 +13,10 @@ from __future__ import annotations
 
 import os
 
-from rich.table import Table
 from rich.text import Text
 
 from seeknal.ui.console import get_console, is_animation_enabled
 from seeknal.ui.figures import get
-from seeknal.ui.fox import render_fox
 
 # Module-level flag to track whether the banner has been shown.
 _shown = False
@@ -53,9 +51,6 @@ def show_welcome(version: str = "") -> None:
         except Exception:
             ver = ""
 
-    # Build the fox mascot renderable.
-    fox = render_fox("default")
-
     # When animations are disabled, show a compact static banner.
     if not is_animation_enabled():
         ver_suffix = f" v{ver}" if ver else ""
@@ -75,15 +70,11 @@ def show_welcome(version: str = "") -> None:
         right.append("\n")
     right.append(f"    {sep_char * 24}", style="welcome.separator")
 
-    # Layout: fox | text, side by side.
-    grid = Table.grid(padding=(0, 2))
-    grid.add_column(justify="left")  # fox
-    grid.add_column(justify="left")  # text
-    grid.add_row(fox, right)
+    # Animated bird mascot beside welcome text.
+    from seeknal.ui.animate import animated_header
+    from seeknal.ui.fox import render_animated_fox
 
-    console.print()
-    console.print(grid)
-    console.print()
+    animated_header(render_animated_fox(), right)
 
 
 def reset_welcome() -> None:

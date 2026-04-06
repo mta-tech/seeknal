@@ -68,12 +68,12 @@ def _resolve_theme_name() -> str:
     # 2. config.toml (best-effort — don't crash if config unavailable)
     try:
         from seeknal.configuration import DotDict
-        import toml
+        import tomllib
         from pathlib import Path
 
         config_path = Path("config.toml")
         if config_path.exists():
-            cfg = toml.load(config_path)
+            cfg = tomllib.loads(config_path.read_text())
             theme_name = cfg.get("ui", {}).get("theme", "").strip().lower()
             if theme_name and theme_name in THEMES:
                 return theme_name

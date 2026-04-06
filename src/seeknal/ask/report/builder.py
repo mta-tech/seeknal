@@ -258,3 +258,200 @@ def _get_build_env() -> dict[str, str]:
         ):
             del env[key]
     return env
+
+
+# ---------------------------------------------------------------------------
+# Async variant with auto-background support
+# ---------------------------------------------------------------------------
+
+async def async_build_report(report_path: Path, timeout: int = 120) -> str:
+    """Async version of :func:`build_report` with auto-background.
+
+    Long-running steps (npm install, evidence build) are run via
+    :func:`run_with_auto_background` so they auto-background if they
+    exceed the configured threshold.
+    """
+    node_error = _check_node()
+    if node_error:
+        return node_error
+
+    # npm install (can take 2-3 minutes first time)
+    install_error = await _async_ensure_node_modules(report_path, timeout=180)
+    if install_error:
+        return install_error
+
+    # Evidence build
+    env = _get_build_env()
+    build_result = await _async_run_evidence_build(report_path, env, timeout)
+    if build_result is None:
+        return f"Evidence build timed out after {timeout} seconds."
+
+    if isinstance(build_result, str):
+        # Backgrounded placeholder or error
+        return build_result
+
+    stdout, stderr, returncode = build_result
+    if returncode != 0:
+        stderr_trimmed = stderr.strip()
+        if len(stderr_trimmed) > 2000:
+            stderr_trimmed = stderr_trimmed[-2000:]
+        return (
+            f"Evidence build failed:\n{stderr_trimmed}\n\n"
+            "Fix the page content and try again."
+        )
+
+    # Find build output
+    build_dir = report_path / "build"
+    index_html = build_dir / "index.html"
+    if index_html.exists():
+        return str(index_html)
+
+    alt_index = report_path / ".evidence" / "build" / "index.html"
+    if alt_index.exists():
+        return str(alt_index)
+
+    return f"Build completed but index.html not found in {build_dir}"
+
+
+async def _async_ensure_node_modules(report_path: Path, timeout: int = 60) -> str:
+    """Async npm install with auto-background."""
+    report_path = report_path.resolve()
+    node_modules = report_path / "node_modules"
+
+    if node_modules.is_symlink() and not node_modules.exists():
+        node_modules.unlink()
+
+    if node_modules.exists():
+        return ""
+
+    # Shared cache
+    cache_dir = report_path.parent / ".evidence-cache"
+    cache_modules = cache_dir / "node_modules"
+
+    if cache_modules.exists() and cache_modules.is_dir():
+        try:
+            rel_target = os.path.relpath(cache_modules, report_path)
+            node_modules.symlink_to(rel_target)
+            return ""
+        except OSError:
+            pass
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    pkg_json = report_path / "package.json"
+    cache_pkg = cache_dir / "package.json"
+    if pkg_json.exists():
+        shutil.copy2(str(pkg_json), str(cache_pkg))
+
+    env = _get_build_env()
+    npm = shutil.which("npm")
+    if not npm:
+        return "npm not found. Install Node.js 18+."
+
+    from seeknal.ask.agents.tools._context import get_tool_context
+    from seeknal.ask.background import run_with_auto_background
+    import seeknal.ask.config as _ask_config
+
+    try:
+        registry = get_tool_context().background_registry
+    except RuntimeError:
+        registry = None
+
+    if registry is not None:
+        result = await run_with_auto_background(
+            [npm, "install", "--prefer-offline"],
+            tool_name="generate_report",
+            description="npm install (Evidence dependencies)",
+            registry=registry,
+            cwd=str(cache_dir),
+            env=env,
+            timeout=timeout,
+            background_threshold=_ask_config._active_background_threshold,
+        )
+        if isinstance(result, str):
+            return result  # Backgrounded placeholder
+        _, stderr, returncode = result
+    else:
+        try:
+            proc = subprocess.run(
+                [npm, "install", "--prefer-offline"],
+                cwd=str(cache_dir), capture_output=True, text=True,
+                timeout=timeout, env=env,
+            )
+            stderr, returncode = proc.stderr, proc.returncode
+        except subprocess.TimeoutExpired:
+            return "npm install timed out."
+        except OSError as e:
+            return f"Error running npm install: {e}"
+
+    if returncode != 0:
+        stderr_trimmed = stderr.strip()
+        if len(stderr_trimmed) > 1000:
+            stderr_trimmed = stderr_trimmed[-1000:]
+        return f"npm install failed:\n{stderr_trimmed}"
+
+    # Symlink into report dir
+    if cache_modules.exists():
+        try:
+            rel_target = os.path.relpath(cache_modules, report_path)
+            node_modules.symlink_to(rel_target)
+        except OSError:
+            pass
+
+    return ""
+
+
+async def _async_run_evidence_build(
+    report_path: Path, env: dict[str, str], timeout: int,
+) -> tuple[str, str, int] | str | None:
+    """Async Evidence build with auto-background."""
+    npx = shutil.which("npx")
+    npm = shutil.which("npm")
+
+    from seeknal.ask.agents.tools._context import get_tool_context
+    from seeknal.ask.background import run_with_auto_background
+    import seeknal.ask.config as _ask_config
+
+    try:
+        registry = get_tool_context().background_registry
+    except RuntimeError:
+        registry = None
+
+    # Try npx first
+    if npx and registry:
+        result = await run_with_auto_background(
+            [npx, "@evidence-dev/evidence", "build"],
+            tool_name="generate_report",
+            description="Evidence build (HTML generation)",
+            registry=registry,
+            cwd=str(report_path),
+            env=env,
+            timeout=timeout,
+            background_threshold=_ask_config._active_background_threshold,
+        )
+        if isinstance(result, str):
+            return result  # Backgrounded
+        stdout, stderr, returncode = result
+        if returncode == 0:
+            return (stdout, stderr, returncode)
+        if "could not determine executable" not in stderr:
+            return (stdout, stderr, returncode)
+        # Fall through to npm run
+
+    # Fallback: npm run build
+    if npm and registry:
+        result = await run_with_auto_background(
+            [npm, "run", "build"],
+            tool_name="generate_report",
+            description="Evidence build (npm run build)",
+            registry=registry,
+            cwd=str(report_path),
+            env=env,
+            timeout=timeout,
+            background_threshold=_ask_config._active_background_threshold,
+        )
+        if isinstance(result, str):
+            return result
+        return result
+
+    # No registry — sync fallback
+    return _run_evidence_build(report_path, env, timeout) and None

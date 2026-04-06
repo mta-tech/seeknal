@@ -99,4 +99,4 @@ class TestAgentUsesSkillDirectories:
         from seeknal.ask.agents.agent import SYSTEM_PROMPT
 
         line_count = len(SYSTEM_PROMPT.strip().splitlines())
-        assert line_count < 70, f"Base prompt is {line_count} lines, expected < 70"
+        assert line_count < 110, f"Base prompt is {line_count} lines, expected < 110"

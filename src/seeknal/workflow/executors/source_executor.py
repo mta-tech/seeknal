@@ -1183,7 +1183,8 @@ class SourceExecutor(BaseExecutor):
                 con.execute(f"SET s3_access_key_id = '{s3_access_key}'")
                 con.execute(f"SET s3_secret_access_key = '{s3_secret_key}'")
 
-            # Get OAuth2 token
+            # Get OAuth2 token (optional — skip if no Keycloak credentials)
+            token = None
             if token_url and client_id and client_secret:
                 token_data = (
                     f"grant_type=client_credentials"
@@ -1195,12 +1196,6 @@ class SourceExecutor(BaseExecutor):
                     urllib.request.urlopen(req).read()
                 )
                 token = token_response["access_token"]
-            else:
-                raise ExecutorExecutionError(
-                    self.node.id,
-                    "Iceberg source requires OAuth2 credentials: "
-                    "KEYCLOAK_TOKEN_URL, KEYCLOAK_CLIENT_ID, KEYCLOAK_CLIENT_SECRET"
-                )
 
             # Build catalog URL
             base_url = catalog_uri.rstrip("/")
@@ -1211,14 +1206,23 @@ class SourceExecutor(BaseExecutor):
 
             # Attach Lakekeeper catalog (skip if already attached)
             try:
-                con.execute(f"""
-                    ATTACH '{warehouse}' AS {catalog_alias} (
-                        TYPE ICEBERG,
-                        ENDPOINT '{catalog_url}',
-                        AUTHORIZATION_TYPE 'oauth2',
-                        TOKEN '{token}'
-                    )
-                """)
+                if token:
+                    con.execute(f"""
+                        ATTACH '{warehouse}' AS {catalog_alias} (
+                            TYPE ICEBERG,
+                            ENDPOINT '{catalog_url}',
+                            AUTHORIZATION_TYPE 'oauth2',
+                            TOKEN '{token}'
+                        )
+                    """)
+                else:
+                    con.execute(f"""
+                        ATTACH '{warehouse}' AS {catalog_alias} (
+                            TYPE ICEBERG,
+                            ENDPOINT '{catalog_url}',
+                            AUTHORIZATION_TYPE 'none'
+                        )
+                    """)
             except Exception as attach_err:
                 # Catalog may already be attached from a previous source
                 if "already exists" not in str(attach_err).lower():

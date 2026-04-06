@@ -43,14 +43,25 @@ class TestDoGenerate:
         from seeknal.ask.agents.tools.generate_report import _do_generate
 
         pages = json.dumps([{"name": "overview", "content": "# Test"}])
+        report_dir = tmp_path / "target" / "reports" / "test"
+        report_dir.mkdir(parents=True)
+        build_dir = report_dir / "build"
+        build_dir.mkdir(parents=True)
+        index_path = build_dir / "index.html"
+        index_path.write_text("<html></html>", encoding="utf-8")
 
         with patch("seeknal.ask.report.scaffolder.scaffold_report") as mock_scaffold, \
              patch("seeknal.ask.report.builder.build_report") as mock_build:
-            mock_scaffold.return_value = tmp_path / "target" / "reports" / "test"
-            mock_build.return_value = str(tmp_path / "build" / "index.html")
+            mock_scaffold.return_value = report_dir
+            mock_build.return_value = str(index_path)
 
             result = _do_generate("Test", pages, tmp_path)
             assert "Report built successfully" in result
+            assert f"Open: {index_path.resolve()}" in result
+            assert f"Open in browser: {(report_dir / 'open_report.sh').resolve()}" in result
+            assert f"python3 {(report_dir / 'open_report.py').resolve()}" in result
+            assert (report_dir / "open_report.py").exists()
+            assert (report_dir / "open_report.sh").exists()
 
     def test_scaffold_error_returns_error_string(self, tmp_path):
         from seeknal.ask.agents.tools.generate_report import _do_generate
@@ -345,3 +356,24 @@ class TestCLIExposureOption:
             spec["params"]["prompt"], tmp_path, [], spec["params"]
         )
         assert date.today().isoformat() in prompt
+
+
+class TestGenerateReportApprovalGate:
+    def test_generate_report_requires_approval(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from seeknal.ask.agents.tools.generate_report import generate_report
+
+        ctx = SimpleNamespace(
+            project_path=Path('/tmp/test'),
+            require_report_approval=True,
+            report_approval_granted=False,
+        )
+        monkeypatch.setattr(
+            'seeknal.ask.agents.tools._context.get_tool_context',
+            lambda: ctx,
+        )
+
+        result = generate_report('VIP Report', '# Findings')
+        assert 'Approval required before generate_report' in result
+        assert 'Generate report now' in result

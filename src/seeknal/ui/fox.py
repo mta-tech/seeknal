@@ -1,189 +1,161 @@
 """
-Seeknal fox mascot rendered in Unicode half-block art.
+Seeknal bird mascot — Claude Code buddy sprite style.
 
-Uses upper/lower half-block characters with fg+bg Rich colors
-to achieve 2x vertical resolution. Provides three poses:
-  - "default": facing forward
-  - "look_left": head turned left
-  - "look_right": head turned right
+A seeknal-branded duck rendered in colored ASCII art with Rich styles.
+Uses {E} eye placeholders, 3 animation frames, and an idle fidget sequence
+matching Claude Code's companion sprite system.
 
-Falls back to ASCII art when TERM=dumb or non-interactive.
+Provides:
+  - render_fox(frame, eyes) → Rich Text (backward-compat function name)
+  - render_animated_fox(eyes) → Iterator[Text] (yields frames per idle tick)
+  - IDLE_SEQUENCE, TICK_MS for animation timing
+
+Falls back to uncolored ASCII when TERM=dumb or non-interactive.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+import itertools
+from typing import Iterator, Literal
 
 from rich.text import Text
 
 from seeknal.ui.figures import get_tier
 
-# -- Color tokens --------------------------------------------------------------
-
-_TEAL = "#00BCB4"
-_ORANGE = "#FFA53C"
+# -- Constants -----------------------------------------------------------------
 
 Pose = Literal["default", "look_left", "look_right"]
 
-# ==============================================================================
-# Half-block art
-# ==============================================================================
-#
-# Each line uses (text, style) segments.  The ▀/▄ characters with fg+bg
-# colors encode two pixel rows per character row (2x vertical resolution).
-#
-#   ▀ = fg color on top half, bg color on bottom half
-#   ▄ = bg color on top half, fg color on bottom half
-#   █ = solid fg color both halves
-#   (space with bg) = solid bg color both halves
-#
-# Shorthand:
-#   T = teal body, O = orange accent, W = bold white
-
-T = _TEAL
-O = _ORANGE
-
-
-def _default_rows() -> list[list[tuple[str, str]]]:
-    """Fox facing forward, ears up, tail curling right."""
-    return [
-        # Row 0: ear tips
-        [("  ", ""), ("▄", O), ("      ", ""), ("▄", O)],
-        # Row 1: ears merging into head
-        [(" ", ""), ("▄", f"{O} on {T}"), ("▄▀▀▀▀▄", T),
-         ("▄", f"{O} on {T}")],
-        # Row 2: face — eyes
-        [(" ", ""), ("█", T), (" ", f"bold white on {T}"),
-         ("▄▄", T), (" ", f"bold white on {T}"), ("█", T)],
-        # Row 3: muzzle — nose
-        [(" ", ""), (" ", f"on {T}"), ("▀", T), ("▄", O),
-         ("▀", T), (" ", f"on {T}")],
-        # Row 4: body widens, tail starts
-        [("  ", ""), ("▄", T), ("████", T), ("▄", T), ("▄▄", O)],
-        # Row 5: lower body, tail curves
-        [("  ", ""), (" ", f"on {T}"), ("▄▄▄▄", T),
-         (" ", f"on {T}"), (" ▄", O)],
-        # Row 6: feet + tail tip
-        [("  ", ""), ("▀", T), ("▀  ▀", ""), ("▀", T), ("  ▀", O)],
-    ]
-
-
-def _look_left_rows() -> list[list[tuple[str, str]]]:
-    """Fox looking left — eyes and nose shifted left."""
-    return [
-        # Row 0: ear tips
-        [("  ", ""), ("▄", O), ("      ", ""), ("▄", O)],
-        # Row 1: ears + head
-        [(" ", ""), ("▄", f"{O} on {T}"), ("▄▀▀▀▀▄", T),
-         ("▄", f"{O} on {T}")],
-        # Row 2: eyes shifted left
-        [(" ", ""), ("█", T), (" ", f"bold white on {T}"),
-         ("▄", T), (" ", f"bold white on {T}"), ("▄█", T)],
-        # Row 3: nose shifted left
-        [(" ", ""), ("▄", O), ("▀▀▀", T), ("▀", T), (" ", f"on {T}")],
-        # Row 4: body + tail
-        [("  ", ""), ("▄", T), ("████", T), ("▄", T), ("▄▄", O)],
-        # Row 5: lower body
-        [("  ", ""), (" ", f"on {T}"), ("▄▄▄▄", T),
-         (" ", f"on {T}"), (" ▄", O)],
-        # Row 6: feet + tail
-        [("  ", ""), ("▀", T), ("▀  ▀", ""), ("▀", T), ("  ▀", O)],
-    ]
-
-
-def _look_right_rows() -> list[list[tuple[str, str]]]:
-    """Fox looking right — eyes and nose shifted right."""
-    return [
-        # Row 0: ear tips
-        [("  ", ""), ("▄", O), ("      ", ""), ("▄", O)],
-        # Row 1: ears + head
-        [(" ", ""), ("▄", f"{O} on {T}"), ("▄▀▀▀▀▄", T),
-         ("▄", f"{O} on {T}")],
-        # Row 2: eyes shifted right
-        [(" ", ""), ("█▄", T), (" ", f"bold white on {T}"),
-         ("▄", T), (" ", f"bold white on {T}"), ("█", T)],
-        # Row 3: nose shifted right
-        [(" ", ""), (" ", f"on {T}"), ("▀", T), ("▀▀▀", T), ("▄", O)],
-        # Row 4: body + tail
-        [("  ", ""), ("▄", T), ("████", T), ("▄", T), ("▄▄", O)],
-        # Row 5: lower body
-        [("  ", ""), (" ", f"on {T}"), ("▄▄▄▄", T),
-         (" ", f"on {T}"), (" ▄", O)],
-        # Row 6: feet + tail
-        [("  ", ""), ("▀", T), ("▀  ▀", ""), ("▀", T), ("  ▀", O)],
-    ]
-
-
-_POSE_BUILDERS = {
-    "default": _default_rows,
-    "look_left": _look_left_rows,
-    "look_right": _look_right_rows,
+EYES: dict[str, str] = {
+    "default": "°",
+    "sparkle": "✦",
+    "dot": "·",
+    "wide": "◉",
+    "closed": "-",
 }
 
-# ==============================================================================
-# ASCII fallback
-# ==============================================================================
+# Animation timing (matches Claude Code exactly)
+IDLE_SEQUENCE: list[int] = [0, 0, 0, 0, 1, 0, 0, 0, -1, 0, 0, 2, 0, 0, 0]
+TICK_MS: int = 500
 
-_ASCII_DEFAULT = r"""
-  /\_/\
- ( o.o )
-  > ^ <
- /|   |\~
-(_|   |_)
-""".strip("\n")
+# -- Color tokens --------------------------------------------------------------
 
-_ASCII_LOOK_LEFT = r"""
-  /\_/\
- (o.o  )
-  > ^ <
- /|   |\~
-(_|   |_)
-""".strip("\n")
+T = "#00BCB4"   # teal (brand.primary)
+O = "#FFA53C"   # orange (brand.accent)
+W = "bold white"  # eyes
 
-_ASCII_LOOK_RIGHT = r"""
-  /\_/\
- (  o.o)
-  > ^ <
- /|   |\~
-(_|   |_)
-""".strip("\n")
+# -- Sprite frames -------------------------------------------------------------
+#
+# 3 frames, each 4 lines (no blank hat line).  12 chars wide.
+# {E} is replaced with the eye character at render time.
+#
+# Frame 0 (neutral):
+#     __
+#   <({E} )___
+#    (  ._>
+#     `--'
+#
+# Frame 1 (tail splash):
+#     __
+#   <({E} )___
+#    (  ._>
+#     `--'~
+#
+# Frame 2 (beak move):
+#     __
+#   <({E} )___
+#    (  .__>
+#     `--'
 
-_ASCII_POSES = {
-    "default": _ASCII_DEFAULT,
-    "look_left": _ASCII_LOOK_LEFT,
-    "look_right": _ASCII_LOOK_RIGHT,
-}
+
+def _frame0() -> list[list[tuple[str, str]]]:
+    return [
+        [("    ", ""), ("__", O), ("      ", "")],
+        [("  ", ""), ("<(", O), ("{E}", W), (" )", O), ("___", O), ("  ", "")],
+        [("   ", ""), ("(  ._>", T), ("   ", "")],
+        [("    ", ""), ("`--'", T), ("    ", "")],
+    ]
+
+
+def _frame1() -> list[list[tuple[str, str]]]:
+    return [
+        [("    ", ""), ("__", O), ("      ", "")],
+        [("  ", ""), ("<(", O), ("{E}", W), (" )", O), ("___", O), ("  ", "")],
+        [("   ", ""), ("(  ._>", T), ("   ", "")],
+        [("    ", ""), ("`--'", T), ("~", O), ("   ", "")],
+    ]
+
+
+def _frame2() -> list[list[tuple[str, str]]]:
+    return [
+        [("    ", ""), ("__", O), ("      ", "")],
+        [("  ", ""), ("<(", O), ("{E}", W), (" )", O), ("___", O), ("  ", "")],
+        [("   ", ""), ("(  .__>", T), ("  ", "")],
+        [("    ", ""), ("`--'", T), ("    ", "")],
+    ]
+
+
+_FRAMES = [_frame0, _frame1, _frame2]
 
 # ==============================================================================
 # Public API
 # ==============================================================================
 
 
-def render_fox(pose: Pose = "default") -> Text:
-    """Render the seeknal fox mascot as a Rich ``Text`` renderable.
+def render_fox(
+    pose: Pose = "default",
+    frame: int = 0,
+    eyes: str = "default",
+) -> Text:
+    """Render the seeknal bird mascot as a Rich ``Text`` renderable.
 
     Parameters
     ----------
     pose:
-        One of ``"default"``, ``"look_left"``, ``"look_right"``.
+        Kept for backward compatibility. Ignored (bird has one orientation).
+    frame:
+        Animation frame index (0, 1, or 2).
+    eyes:
+        Eye style name from ``EYES`` dict, or a single character.
 
     Returns
     -------
     Rich ``Text`` object suitable for ``console.print()``.
     """
     tier = get_tier()
-
     if tier == "ascii_only":
-        return Text(_ASCII_POSES.get(pose, _ASCII_DEFAULT))
+        # Use ASCII-safe eye characters
+        ascii_eyes = {"default": "o", "sparkle": "*", "dot": ".", "wide": "O", "closed": "-"}
+        eye_char = ascii_eyes.get(eyes, "o")
+    else:
+        eye_char = EYES.get(eyes, eyes[0] if eyes else "°")
 
-    builder = _POSE_BUILDERS.get(pose, _default_rows)
+    builder = _FRAMES[frame % len(_FRAMES)]
     rows = builder()
 
     text = Text()
     for i, row in enumerate(rows):
         for segment_text, style in row:
-            text.append(segment_text, style=style if style else None)
+            resolved = segment_text.replace("{E}", eye_char)
+            if tier == "ascii_only":
+                text.append(resolved)
+            else:
+                text.append(resolved, style=style if style else None)
         if i < len(rows) - 1:
             text.append("\n")
 
     return text
+
+
+def render_animated_fox(eyes: str = "default") -> Iterator[Text]:
+    """Yield frames following the idle sequence.
+
+    Each yielded ``Text`` corresponds to one animation tick (500ms).
+    The sequence cycles indefinitely. Frame index ``-1`` triggers a blink
+    (eyes replaced with ``-``).
+    """
+    for step in itertools.cycle(IDLE_SEQUENCE):
+        if step == -1:
+            yield render_fox(frame=0, eyes="closed")
+        else:
+            yield render_fox(frame=step, eyes=eyes)

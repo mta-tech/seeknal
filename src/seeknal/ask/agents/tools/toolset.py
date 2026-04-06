@@ -2,11 +2,13 @@
 
 from pydantic_ai.toolsets import FunctionToolset
 
+from seeknal.ask.agents.tools.ask_user_tool import ask_user
 from seeknal.ask.agents.tools.describe_table import describe_table
 from seeknal.ask.agents.tools.execute_python import execute_python
 from seeknal.ask.agents.tools.execute_sql import execute_sql
 from seeknal.ask.agents.tools.generate_report import generate_report
 from seeknal.ask.agents.tools.get_entities import get_entities
+from seeknal.ask.agents.tools.open_in_browser import open_in_browser
 from seeknal.ask.agents.tools.get_entity_schema import get_entity_schema
 from seeknal.ask.agents.tools.list_tables import list_tables
 from seeknal.ask.agents.tools.read_pipeline import read_pipeline
@@ -17,7 +19,7 @@ from seeknal.ask.agents.tools.search_project_files import search_project_files
 
 
 def create_ask_toolset() -> FunctionToolset:
-    """Create the seeknal-ask toolset with all 12 tools registered."""
+    """Create the seeknal-ask toolset with all tools registered."""
     return FunctionToolset(
         tools=[
             execute_sql,
@@ -31,7 +33,9 @@ def create_ask_toolset() -> FunctionToolset:
             read_project_file,
             execute_python,
             generate_report,
+            open_in_browser,
             save_report_exposure,
+            ask_user,
         ],
         id="seeknal-ask",
     )

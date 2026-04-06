@@ -63,6 +63,9 @@ def ask_callback(
     quiet: bool = typer.Option(
         False, "--quiet", "-q", help="Suppress step-by-step output, show only final answer"
     ),
+    web: bool = typer.Option(
+        False, "--web", help="Enable web search tools"
+    ),
 ):
     """Ask questions about your seeknal project data using natural language.
 
@@ -72,6 +75,7 @@ def ask_callback(
         seeknal ask chat                               Interactive chat
         seeknal ask chat --project path                Chat with project
         seeknal ask -q "How many?"                     Quiet mode (no steps)
+        seeknal ask --web "Compare AOV to benchmarks"  With web search
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -82,7 +86,7 @@ def ask_callback(
 
     # One-shot mode — question comes from extra args
     question = " ".join(ctx.args)
-    _run_oneshot(question, provider=provider, model=model, project=project, quiet=quiet)
+    _run_oneshot(question, provider=provider, model=model, project=project, quiet=quiet, include_web=web)
 
 
 def _run_oneshot(
@@ -91,6 +95,7 @@ def _run_oneshot(
     model: Optional[str] = None,
     project: Optional[Path] = None,
     quiet: bool = False,
+    include_web: bool = False,
 ):
     """Execute a one-shot question and print the answer."""
     project_path = project or find_project_path()
@@ -114,10 +119,11 @@ def _run_oneshot(
 
     # Create agent (always with spinner -- this part is not streaming)
     with console.status("[spinner.active]Loading agent..."):
-        agent, deps, message_history = create_agent(
+        agent, deps, message_history, _cost_info = create_agent(
             project_path,
             provider=provider,
             model=model,
+            include_web=include_web,
         )
 
     # Stream the answer with step-by-step visibility
@@ -149,6 +155,21 @@ def chat_command(
     quiet: bool = typer.Option(
         False, "--quiet", "-q", help="Suppress step-by-step output, show only final answer"
     ),
+    style: Optional[str] = typer.Option(
+        None, "--style", "-s", help="Output style: concise, explanatory, formal, conversational"
+    ),
+    budget: Optional[float] = typer.Option(
+        None, "--budget", help="Max USD budget for this session"
+    ),
+    web: bool = typer.Option(
+        False, "--web", help="Enable web search/fetch tools"
+    ),
+    session: Optional[str] = typer.Option(
+        None, "--session", help="Resume an existing named session"
+    ),
+    name: Optional[str] = typer.Option(
+        None, "--name", help="Create a session with this name"
+    ),
 ):
     """Start an interactive multi-turn chat session."""
     project_path = project or find_project_path()
@@ -164,30 +185,81 @@ def chat_command(
         ))
         raise typer.Exit(1)
 
+    from seeknal.ask.sessions import SessionStore
     from seeknal.ui.console import get_console
 
     console = get_console()
 
+    # Session management: resume or create
+    store = SessionStore(project_path)
+    session_name: str
+
+    if session:
+        # Resume existing session
+        if store.get(session) is None:
+            console.print(f"[status.error]Session '{session}' not found.[/]")
+            console.print("[text.dim]List sessions with: seeknal session list[/]")
+            raise typer.Exit(1)
+        session_name = session
+    else:
+        session_name = store.create(name=name)
+
+    # Load existing message history (empty for new sessions)
+    message_history = store.load_messages(session_name)
+
     # Create agent with spinner
     with console.status("[spinner.active]Loading agent..."):
-        agent, deps, message_history = create_agent(
+        agent, deps, _, _cost_info = create_agent(
             project_path,
             provider=provider,
             model=model,
+            style=style,
+            budget=budget,
+            include_web=web,
         )
 
-    console.print("[brand.primary]Seeknal Ask[/] — [text.muted]Interactive Data Analysis[/]")
-    console.print(f"[text.dim]Project: {project_path}[/]")
-    console.print("[text.dim]Type 'exit' or 'quit' to end the session.[/]\n")
+    # Branded animated header with bird mascot
+    from rich.text import Text
+
+    right = Text()
+    right.append("Seeknal Ask", style="brand.primary")
+    right.append(" — ", style="text.dim")
+    right.append("All-in-One Data Agent", style="text.muted")
+    right.append(f"\nProject: {project_path}", style="text.dim")
+    right.append(f"\nSession: {session_name}", style="text.dim")
+    right.append("\nType 'exit' or 'quit' to end the session.", style="text.dim")
+
+    if console.is_terminal:
+        from seeknal.ui.animate import animated_header
+        from seeknal.ui.fox import render_animated_fox
+
+        animated_header(render_animated_fox(), right)
+    else:
+        console.print("Seeknal Ask — All-in-One Data Agent")
+        console.print(f"Project: {project_path}")
+        console.print(f"Session: {session_name}")
+        console.print("Type 'exit' or 'quit' to end the session.\n")
+
+    if session and message_history:
+        msg_count = len([m for m in message_history if hasattr(m, 'parts')])
+        console.print(f"[text.dim]Resumed session with {msg_count} messages.[/]\n")
 
     # Use async chat session with streaming visibility
     import asyncio
     from seeknal.ask.streaming import chat_session
 
     try:
-        asyncio.run(chat_session(agent, deps, message_history, console, quiet=quiet))
+        asyncio.run(chat_session(
+            agent, deps, message_history, console,
+            quiet=quiet, cost_info=_cost_info,
+            session_store=store, session_name=session_name,
+        ))
     except KeyboardInterrupt:
-        console.print("\nGoodbye!")
+        # Save on interrupt
+        store.save_messages(session_name, message_history)
+        store.update(session_name, status="paused")
+        console.print(f"\nSession saved: [brand.primary]{session_name}[/]")
+        console.print(f"[text.dim]Resume with: seeknal ask chat --session {session_name}[/]")
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +366,7 @@ def _run_report(
     console.print(f"[text.dim]Topic: {topic}[/]\n")
 
     with console.status("[spinner.active]Loading agent..."):
-        agent, deps, message_history = create_agent(
+        agent, deps, message_history, _cost_info = create_agent(
             project_path,
             provider=provider,
             model=model,
@@ -405,7 +477,7 @@ def _run_exposure(
     console.print(f"[text.dim]Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}[/]\n")
 
     with console.status("[spinner.active]Loading agent..."):
-        agent, deps, message_history = create_agent(
+        agent, deps, message_history, _cost_info = create_agent(
             project_path, provider=provider, model=model,
         )
 

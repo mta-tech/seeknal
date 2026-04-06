@@ -1,4 +1,4 @@
-"""Tests for the seeknal fox mascot renderer."""
+"""Tests for the seeknal bird mascot renderer (fox.py)."""
 
 from __future__ import annotations
 
@@ -6,13 +6,18 @@ import pytest
 from rich.text import Text
 
 from seeknal.ui import figures
-from seeknal.ui.fox import render_fox
+from seeknal.ui.fox import (
+    EYES,
+    IDLE_SEQUENCE,
+    render_animated_fox,
+    render_fox,
+)
 
 # -- Helpers -------------------------------------------------------------------
 
-_MAX_WIDTH = 22
-_MAX_LINES = 8
-_POSES = ["default", "look_left", "look_right"]
+_MAX_WIDTH = 12
+_MAX_LINES = 5
+_FRAMES = [0, 1, 2]
 
 
 @pytest.fixture(autouse=True)
@@ -29,139 +34,187 @@ def _force_tier(tier: str):
     figures._current_glyphs = figures._GLYPH_SETS[tier]
 
 
-# -- Tests: all poses render without errors ------------------------------------
+# -- Tests: all frames render without errors -----------------------------------
 
 
-@pytest.mark.parametrize("pose", _POSES)
-def test_render_returns_rich_text(pose: str):
-    """render_fox() returns a Rich Text object for every pose."""
+@pytest.mark.parametrize("frame", _FRAMES)
+def test_render_returns_rich_text(frame: int):
+    """render_fox() returns a Rich Text object for every frame."""
     _force_tier("unicode_full")
-    result = render_fox(pose)
+    result = render_fox(frame=frame)
     assert isinstance(result, Text)
 
 
-@pytest.mark.parametrize("pose", _POSES)
-def test_render_ascii_returns_rich_text(pose: str):
+@pytest.mark.parametrize("frame", _FRAMES)
+def test_render_ascii_returns_rich_text(frame: int):
     """render_fox() returns a Rich Text object in ASCII mode."""
     _force_tier("ascii_only")
-    result = render_fox(pose)
+    result = render_fox(frame=frame)
     assert isinstance(result, Text)
 
 
 # -- Tests: dimension constraints ----------------------------------------------
 
 
-@pytest.mark.parametrize("pose", _POSES)
-def test_unicode_fox_within_width(pose: str):
-    """Unicode fox fits within the maximum character width."""
+@pytest.mark.parametrize("frame", _FRAMES)
+def test_within_width(frame: int):
+    """Bird sprite fits within the maximum character width."""
     _force_tier("unicode_full")
-    text = render_fox(pose)
+    text = render_fox(frame=frame)
     lines = text.plain.split("\n")
     for i, line in enumerate(lines):
         assert len(line) <= _MAX_WIDTH, (
-            f"Pose '{pose}' line {i} is {len(line)} chars wide "
+            f"Frame {frame} line {i} is {len(line)} chars wide "
             f"(max {_MAX_WIDTH}): {line!r}"
         )
 
 
-@pytest.mark.parametrize("pose", _POSES)
-def test_unicode_fox_within_height(pose: str):
-    """Unicode fox fits within the maximum line count."""
+@pytest.mark.parametrize("frame", _FRAMES)
+def test_within_height(frame: int):
+    """Bird sprite fits within the maximum line count."""
     _force_tier("unicode_full")
-    text = render_fox(pose)
+    text = render_fox(frame=frame)
     lines = text.plain.split("\n")
     assert len(lines) <= _MAX_LINES, (
-        f"Pose '{pose}' has {len(lines)} lines (max {_MAX_LINES})"
+        f"Frame {frame} has {len(lines)} lines (max {_MAX_LINES})"
     )
 
 
-@pytest.mark.parametrize("pose", _POSES)
-def test_ascii_fox_within_width(pose: str):
-    """ASCII fox fits within the maximum character width."""
+@pytest.mark.parametrize("frame", _FRAMES)
+def test_ascii_within_width(frame: int):
+    """ASCII bird sprite fits within the maximum character width."""
     _force_tier("ascii_only")
-    text = render_fox(pose)
+    text = render_fox(frame=frame)
     lines = text.plain.split("\n")
     for i, line in enumerate(lines):
         assert len(line) <= _MAX_WIDTH, (
-            f"ASCII pose '{pose}' line {i} is {len(line)} chars wide: {line!r}"
+            f"ASCII frame {frame} line {i} is {len(line)} chars wide: {line!r}"
         )
 
 
-@pytest.mark.parametrize("pose", _POSES)
-def test_ascii_fox_within_height(pose: str):
-    """ASCII fox fits within the maximum line count."""
+@pytest.mark.parametrize("frame", _FRAMES)
+def test_ascii_within_height(frame: int):
+    """ASCII bird sprite fits within the maximum line count."""
     _force_tier("ascii_only")
-    text = render_fox(pose)
+    text = render_fox(frame=frame)
     lines = text.plain.split("\n")
     assert len(lines) <= _MAX_LINES, (
-        f"ASCII pose '{pose}' has {len(lines)} lines (max {_MAX_LINES})"
+        f"ASCII frame {frame} has {len(lines)} lines (max {_MAX_LINES})"
     )
 
 
 # -- Tests: ASCII fallback uses only printable ASCII ---------------------------
 
 
-@pytest.mark.parametrize("pose", _POSES)
-def test_ascii_fallback_printable_only(pose: str):
+@pytest.mark.parametrize("frame", _FRAMES)
+def test_ascii_fallback_printable_only(frame: int):
     """ASCII fallback contains only printable ASCII characters (0x20-0x7E + newline)."""
     _force_tier("ascii_only")
-    text = render_fox(pose)
+    text = render_fox(frame=frame)
     plain = text.plain
     for ch in plain:
         if ch == "\n":
             continue
         assert 0x20 <= ord(ch) <= 0x7E, (
-            f"Non-printable-ASCII char {ch!r} (ord {ord(ch)}) in pose '{pose}'"
+            f"Non-printable-ASCII char {ch!r} (ord {ord(ch)}) in frame {frame}"
         )
 
 
-# -- Tests: unicode poses have content ----------------------------------------
+# -- Tests: sprite contains recognizable characters ----------------------------
 
 
-@pytest.mark.parametrize("pose", _POSES)
-def test_unicode_fox_not_empty(pose: str):
-    """Unicode fox contains visible block characters."""
+@pytest.mark.parametrize("frame", _FRAMES)
+def test_sprite_has_duck_chars(frame: int):
+    """Sprite contains recognizable duck characters."""
     _force_tier("unicode_full")
-    text = render_fox(pose)
+    text = render_fox(frame=frame)
     plain = text.plain
-    block_chars = set("▀▄█░▒▓▌▐")
-    has_blocks = any(ch in block_chars for ch in plain)
-    assert has_blocks, f"Pose '{pose}' has no block characters"
+    duck_chars = set("<>_()`")
+    has_duck = any(ch in duck_chars for ch in plain)
+    assert has_duck, f"Frame {frame} has no duck characters"
 
 
-# -- Tests: invalid pose falls back to default ---------------------------------
+# -- Tests: eye placeholder resolved -------------------------------------------
 
 
-def test_invalid_pose_falls_back():
-    """An unrecognized pose name falls back to the default pose."""
+@pytest.mark.parametrize("frame", _FRAMES)
+@pytest.mark.parametrize("eyes", list(EYES.keys()))
+def test_eye_placeholder_resolved(frame: int, eyes: str):
+    """No {E} placeholder remains in rendered text."""
     _force_tier("unicode_full")
-    default_text = render_fox("default")
-    fallback_text = render_fox("nonexistent_pose")
-    assert default_text.plain == fallback_text.plain
+    text = render_fox(frame=frame, eyes=eyes)
+    assert "{E}" not in text.plain, (
+        f"Unresolved {{E}} in frame {frame}, eyes={eyes}"
+    )
 
 
-def test_invalid_pose_ascii_falls_back():
-    """An unrecognized pose name falls back to default in ASCII mode."""
-    _force_tier("ascii_only")
-    default_text = render_fox("default")
-    fallback_text = render_fox("nonexistent_pose")
-    assert default_text.plain == fallback_text.plain
+# -- Tests: frames differ (animation has visible deltas) -----------------------
 
 
-# -- Tests: poses are visually distinct ----------------------------------------
-
-
-def test_poses_differ():
-    """The three poses produce distinct output."""
+def test_frames_differ():
+    """The three animation frames produce distinct output."""
     _force_tier("unicode_full")
-    plains = {pose: render_fox(pose).plain for pose in _POSES}
-    # At least the look_left and look_right should differ from default
-    assert plains["look_left"] != plains["default"], (
-        "look_left should differ from default"
+    plains = [render_fox(frame=f).plain for f in _FRAMES]
+    # At least two frames should differ (frame 1 has ~, frame 2 has .__>)
+    unique = set(plains)
+    assert len(unique) >= 2, (
+        "Animation frames should produce distinct output"
     )
-    assert plains["look_right"] != plains["default"], (
-        "look_right should differ from default"
-    )
-    assert plains["look_left"] != plains["look_right"], (
-        "look_left should differ from look_right"
-    )
+
+
+# -- Tests: blink replaces eyes ------------------------------------------------
+
+
+def test_blink_replaces_eyes():
+    """Blink eye style uses '-' character."""
+    _force_tier("unicode_full")
+    normal = render_fox(frame=0, eyes="default")
+    blink = render_fox(frame=0, eyes="closed")
+    assert "°" in normal.plain
+    assert "-" in blink.plain
+    assert "°" not in blink.plain
+
+
+# -- Tests: eye styles differ --------------------------------------------------
+
+
+def test_eye_styles_differ():
+    """Different eye styles produce different output."""
+    _force_tier("unicode_full")
+    default_plain = render_fox(eyes="default").plain
+    sparkle_plain = render_fox(eyes="sparkle").plain
+    assert default_plain != sparkle_plain
+
+
+# -- Tests: idle sequence valid ------------------------------------------------
+
+
+def test_idle_sequence_valid():
+    """All idle sequence indices are valid frame indices or -1 (blink)."""
+    for step in IDLE_SEQUENCE:
+        assert step == -1 or 0 <= step < 3, (
+            f"Invalid idle sequence step: {step}"
+        )
+
+
+# -- Tests: animated generator yields frames -----------------------------------
+
+
+def test_animated_generator_yields():
+    """render_animated_fox() yields Text objects."""
+    _force_tier("unicode_full")
+    gen = render_animated_fox()
+    frames = [next(gen) for _ in range(5)]
+    assert all(isinstance(f, Text) for f in frames)
+
+
+# -- Tests: backward compatibility (pose param ignored) ------------------------
+
+
+def test_pose_param_backward_compat():
+    """Pose parameter is accepted but ignored (all poses produce same output)."""
+    _force_tier("unicode_full")
+    default = render_fox("default").plain
+    left = render_fox("look_left").plain
+    right = render_fox("look_right").plain
+    assert default == left == right

@@ -175,12 +175,24 @@ except ImportError:
     plt = None
     matplotlib = None
 
+try:
+    import sklearn
+except ImportError:
+    sklearn = None
+
+try:
+    import scipy
+except ImportError:
+    scipy = None
+
 namespace = {{
     "conn": conn,
     "pd": pd,
     "np": np,
     "plt": plt,
     "matplotlib": matplotlib,
+    "sklearn": sklearn,
+    "scipy": scipy,
 }}
 
 # The agent code to execute
@@ -256,11 +268,18 @@ def execute_in_sandbox(
     # Resolve to absolute so paths work correctly with cwd
     project_path = project_path.resolve()
 
-    # Set up paths
+    # Set up session-scoped paths (avoids conflicts between concurrent sessions)
+    from seeknal.ask.agents.tools._context import get_tool_context
+
+    try:
+        session_id = get_tool_context().session_id
+    except RuntimeError:
+        session_id = "default"
+
     target_dir = project_path / "target"
-    runner_dir = target_dir / ".ask_sandbox"
+    runner_dir = target_dir / f".ask_sandbox_{session_id}"
     runner_dir.mkdir(parents=True, exist_ok=True)
-    plot_dir = str(target_dir / ".ask_plots")
+    plot_dir = str(target_dir / f".ask_plots_{session_id}")
 
     # Generate runner script
     runner_path = runner_dir / "_runner.py"
@@ -349,3 +368,104 @@ def _get_sandbox_env() -> dict[str, str]:
         if any(s in key_lower for s in ("api_key", "secret", "token", "password", "credential")):
             del env[key]
     return env
+
+
+# ---------------------------------------------------------------------------
+# Async variant with auto-background support
+# ---------------------------------------------------------------------------
+
+async def async_execute_in_sandbox(
+    code: str,
+    project_path: Path,
+    timeout: int = 30,
+) -> str:
+    """Async version of :func:`execute_in_sandbox` with auto-background.
+
+    If the subprocess runs longer than the configured background threshold,
+    it is moved to a background task and the tool returns immediately.
+    """
+    if not code or not code.strip():
+        return "No code provided."
+
+    project_path = project_path.resolve()
+
+    from seeknal.ask.agents.tools._context import get_tool_context
+
+    try:
+        ctx = get_tool_context()
+        session_id = ctx.session_id
+        registry = ctx.background_registry
+    except RuntimeError:
+        session_id = "default"
+        registry = None
+
+    target_dir = project_path / "target"
+    runner_dir = target_dir / f".ask_sandbox_{session_id}"
+    runner_dir.mkdir(parents=True, exist_ok=True)
+    plot_dir = str(target_dir / f".ask_plots_{session_id}")
+
+    # Generate runner script (same as sync version)
+    runner_path = runner_dir / "_runner.py"
+    script_content = _RUNNER_TEMPLATE.format(
+        seeknal_src=_find_seeknal_src(),
+        project_path=str(project_path),
+        plot_dir=plot_dir,
+        agent_code=code,
+    )
+    runner_path.write_text(script_content, encoding="utf-8")
+
+    cmd = [sys.executable, str(runner_path)]
+    env = _get_sandbox_env()
+
+    # Use auto-background if registry is available
+    if registry is not None:
+        import seeknal.ask.config as _ask_config
+        from seeknal.ask.background import run_with_auto_background
+
+        result = await run_with_auto_background(
+            cmd,
+            tool_name="execute_python",
+            description=f"Python code ({len(code)} chars)",
+            registry=registry,
+            cwd=str(project_path),
+            env=env,
+            timeout=timeout,
+            background_threshold=_ask_config._active_background_threshold,
+        )
+        if isinstance(result, str):
+            # Backgrounded — return the placeholder
+            return result
+        stdout, stderr, returncode = result
+    else:
+        # Fallback: sync-style (no registry)
+        try:
+            result = subprocess.run(
+                cmd, cwd=str(project_path), capture_output=True,
+                text=True, timeout=timeout, env=env,
+            )
+            stdout, stderr, returncode = result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return f"Execution timed out after {timeout} seconds."
+        except OSError as e:
+            return f"Error launching subprocess: {e}"
+
+    # Parse output (same logic as sync version)
+    if returncode != 0:
+        if stdout.strip():
+            try:
+                data = json.loads(stdout)
+                if data.get("error"):
+                    return _format_output(data)
+            except json.JSONDecodeError:
+                pass
+        stderr_trimmed = stderr.strip()
+        if len(stderr_trimmed) > 2000:
+            stderr_trimmed = stderr_trimmed[-2000:]
+        return f"Error:\n{stderr_trimmed}" if stderr_trimmed else f"Process exited with code {returncode}"
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return stdout[:5000] if stdout else "Code executed (no output)."
+
+    return _format_output(data)

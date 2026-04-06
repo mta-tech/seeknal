@@ -190,6 +190,16 @@ from seeknal.cli.source import app as source_app  # ty: ignore[unresolved-import
 
 app.add_typer(source_app, name="source")
 
+# Session management for seeknal ask
+from seeknal.cli.session import session_app  # ty: ignore[unresolved-import]
+
+app.add_typer(session_app, name="session")
+
+# Gateway server for seeknal ask
+from seeknal.cli.gateway import gateway_app  # ty: ignore[unresolved-import]
+
+app.add_typer(gateway_app, name="gateway")
+
 # Iceberg materialization commands
 from seeknal.cli.materialization_cli import app as iceberg_app  # ty: ignore[unresolved-import]
 
