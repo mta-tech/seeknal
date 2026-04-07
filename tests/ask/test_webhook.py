@@ -330,6 +330,114 @@ class TestAskStreamEndpoint:
         assert resp.status_code == 400
 
 
+# ===================================================================
+# E2E tests — gateway → background task → real HTTP webhook delivery
+# ===================================================================
+
+
+class TestE2E:
+    """End-to-end: POST /ask/stream → background task → real HTTP webhook delivery.
+
+    Uses an aiohttp TCP server as the webhook receiver and httpx.AsyncClient
+    with ASGITransport to call the gateway in-process.  _run_agent_streaming
+    is patched to yield deterministic events without a real LLM.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_deps(self):
+        pytest.importorskip("starlette")
+        pytest.importorskip("aiohttp")
+        pytest.importorskip("httpx")
+
+    def test_full_webhook_delivery(self, tmp_path, monkeypatch):
+        """POST /ask/stream → events arrive at real webhook via HTTP."""
+        import asyncio
+
+        import seeknal.ask.gateway.server as server_mod
+        from httpx import ASGITransport, AsyncClient
+        from aiohttp import web
+
+        raw_events = [
+            {"type": "reasoning", "data": "Let me think..."},
+            {
+                "type": "tool_start",
+                "data": {"name": "execute_sql", "args": {"query": "SELECT 1"}},
+            },
+            {"type": "tool_end", "data": {"name": "execute_sql", "output": "1 row"}},
+            {"type": "answer", "data": "The answer is 1."},
+        ]
+
+        # --- Set up real aiohttp webhook receiver on random port ---
+        received: list[dict] = []
+
+        async def handle_post(request: web.Request) -> web.Response:
+            body = await request.json()
+            received.append(body)
+            return web.json_response({"ok": True})
+
+        hook_app = web.Application()
+        hook_app.router.add_post("/hook", handle_post)
+
+        async def _run() -> None:
+            runner = web.AppRunner(hook_app)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            port = site._server.sockets[0].getsockname()[1]
+            base_url = f"http://127.0.0.1:{port}"
+
+            monkeypatch.setenv("SEEKNAL_WEBHOOK_BASE_URL", base_url)
+
+            gateway_app = server_mod.create_gateway_app(str(tmp_path))
+
+            with patch.object(
+                server_mod,
+                "_run_agent_streaming",
+                return_value=_async_iter(raw_events),
+            ):
+                transport = ASGITransport(app=gateway_app)
+                async with AsyncClient(
+                    transport=transport, base_url="http://test",
+                ) as http:
+                    resp = await http.post(
+                        "/ask/stream",
+                        json={
+                            "question": "What is 1?",
+                            "message_id": "e2e-001",
+                            "webhook_path": "/hook",
+                        },
+                    )
+                    assert resp.status_code == 201
+
+                    # Wait for all 6 events to arrive at the webhook receiver
+                    for _ in range(50):
+                        if len(received) >= 6:
+                            break
+                        await asyncio.sleep(0.1)
+
+            await runner.cleanup()
+
+        asyncio.run(_run())
+
+        # Verify the full event sequence
+        event_names = [e["event"] for e in received]
+        assert event_names == [
+            "start",
+            "message",      # reasoning
+            "tool_call",
+            "tool_result",
+            "message",      # answer
+            "done",
+        ]
+
+        # Verify envelope fields are present on every event
+        for evt in received:
+            assert evt["message_id"] == "e2e-001"
+            assert evt["conversation_id"] == "default"
+            assert "created_at" in evt
+            assert "payload" in evt
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
