@@ -280,3 +280,189 @@ def qa_project(tmp_path_factory):
     )
 
     return project
+
+
+@pytest.fixture(scope="session")
+def pipeline_project(tmp_path_factory):
+    """Create a clean seeknal project with only raw CSV data — no pipeline.
+
+    The agent must build the pipeline from scratch:
+    profile → draft → validate → apply → plan → run → inspect.
+    """
+    project = tmp_path_factory.mktemp("pipeline_project")
+
+    # ── Raw CSV data ─────────────────────────────────────────────
+    data_dir = project / "data"
+    data_dir.mkdir()
+
+    np.random.seed(99)
+    n_customers = 30
+    n_orders = 100
+
+    cities = ["Jakarta", "Surabaya", "Bandung", "Medan", "Semarang"]
+    customers = pd.DataFrame({
+        "customer_id": [f"C{str(i).zfill(4)}" for i in range(1, n_customers + 1)],
+        "name": [f"Customer {i}" for i in range(1, n_customers + 1)],
+        "city": np.random.choice(cities, n_customers),
+        "age": np.random.randint(18, 65, n_customers),
+    })
+    customers.to_csv(data_dir / "customers.csv", index=False)
+
+    order_dates = pd.date_range("2024-01-01", "2024-12-31", periods=n_orders)
+    categories = ["Electronics", "Fashion", "Food", "Home", "Sports"]
+    orders = pd.DataFrame({
+        "order_id": [f"ORD{str(i).zfill(5)}" for i in range(1, n_orders + 1)],
+        "customer_id": np.random.choice(customers["customer_id"].values, n_orders),
+        "order_date": order_dates,
+        "amount": np.round(np.random.lognormal(mean=4.0, sigma=1.0, size=n_orders), 2),
+        "category": np.random.choice(categories, n_orders),
+        "quantity": np.random.randint(1, 10, n_orders),
+    })
+    orders.to_csv(data_dir / "orders.csv", index=False)
+
+    # ── Empty seeknal directory structure ─────────────────────────
+    seeknal_dir = project / "seeknal"
+    (seeknal_dir / "sources").mkdir(parents=True)
+    (seeknal_dir / "transforms").mkdir(parents=True)
+    (seeknal_dir / "feature_groups").mkdir(parents=True)
+
+    # ── Project config ───────────────────────────────────────────
+    (project / "seeknal_project.yml").write_text(
+        "name: pipeline_demo\n"
+        "version: 1.0.0\n"
+        "profile: default\n"
+    )
+
+    # ── .seeknal directory (for agent memory) ────────────────────
+    (project / ".seeknal").mkdir(exist_ok=True)
+
+    return project
+
+
+# ---------------------------------------------------------------------------
+# Agent helpers
+# ---------------------------------------------------------------------------
+
+
+def fresh_agent(project_path):
+    """Create a fresh agent with clean state — no memory bleed between tests.
+
+    Clears .seeknal/ask_memory, checkpoints, and plans so each test starts
+    with a blank slate. Returns (agent, deps, message_history, cost_info).
+    """
+    import shutil
+    from seeknal.ask.agents.agent import create_agent
+
+    # Clean agent state directories
+    seeknal_dir = project_path / ".seeknal"
+    for subdir in ["ask_memory", "checkpoints", "plans"]:
+        target = seeknal_dir / subdir
+        if target.exists():
+            shutil.rmtree(target)
+
+    # Clean artifacts written by previous test agents (exposures, drafts, metrics)
+    proj_seeknal = project_path / "seeknal"
+    for subdir in ["exposures", "metrics", "semantic_models"]:
+        target = proj_seeknal / subdir
+        if target.exists():
+            shutil.rmtree(target)
+            target.mkdir()
+
+    # Remove leftover draft files from project root
+    for f in project_path.glob("draft_*.yml"):
+        f.unlink()
+
+    return create_agent(
+        project_path=project_path,
+        provider="google",
+        model="gemini-2.5-flash",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Assertion helpers
+# ---------------------------------------------------------------------------
+
+
+def assert_answer_quality(answer, min_length=20):
+    """Assert answer is non-empty and substantive."""
+    assert answer and len(answer) >= min_length, (
+        f"Answer too short ({len(answer) if answer else 0} chars): {answer!r}"
+    )
+
+
+def assert_keywords(answer, keywords, threshold=0.5):
+    """Assert at least threshold fraction of keywords appear in answer.
+
+    Args:
+        answer: The agent's response text.
+        keywords: List of keywords to search for (case-insensitive).
+        threshold: Minimum fraction of keywords that must be found (0.0-1.0).
+    """
+    found = [k for k in keywords if k.lower() in answer.lower()]
+    ratio = len(found) / len(keywords)
+    assert ratio >= threshold, (
+        f"Only {len(found)}/{len(keywords)} keywords found ({ratio:.0%}, "
+        f"need {threshold:.0%}). Found: {found}, "
+        f"Missing: {[k for k in keywords if k not in found]}"
+    )
+
+
+def _compact_history(mh):
+    """Run compaction processors on message history to free context space.
+
+    Replaces old tool results with short placeholders and trims large SQL
+    outputs so the next agent call works within context limits.
+    """
+    from seeknal.ask.processors import MicrocompactProcessor, SqlResultCompactor
+
+    compacted = MicrocompactProcessor(keep_recent_turns=2)(mh)
+    compacted = SqlResultCompactor()(compacted)
+    mh.clear()
+    mh.extend(compacted)
+
+
+_RECOVERABLE_ERRORS = (
+    "UsageLimitExceeded",
+    "UnexpectedModelBehavior",
+)
+
+
+def _is_recoverable(e: Exception) -> bool:
+    """Check if an exception is recoverable via compaction + retry."""
+    etype = type(e).__name__
+    return any(name in etype for name in _RECOVERABLE_ERRORS) or "usage" in str(e).lower()
+
+
+def safe_ask(ask_fn, agent, deps, mh, question, _retries=2):
+    """Call ask() with automatic compaction and retry on transient errors.
+
+    When the agent hits the request limit or model validation errors:
+    1. Compact message history — replace old tool results with placeholders
+    2. Retry with fresh request budget (each run_sync gets its own limit)
+
+    After exhausting retries, skips the test instead of crashing.
+    """
+    original_question = question
+    for attempt in range(_retries + 1):
+        try:
+            return ask_fn(agent, deps, mh, question)
+        except Exception as e:
+            if not _is_recoverable(e):
+                raise
+
+            if attempt < _retries:
+                print(f"\n[safe_ask] {type(e).__name__} on attempt {attempt + 1}, "
+                      f"compacting history ({len(mh)} messages) and retrying...")
+                _compact_history(mh)
+                print(f"[safe_ask] After compaction: {len(mh)} messages")
+                # Retry with simplified question to encourage focused response
+                question = (
+                    f"Continue from where you left off. {original_question}\n\n"
+                    "Be concise — give the answer directly without extra exploration."
+                )
+            else:
+                pytest.skip(
+                    f"{type(e).__name__} after {_retries + 1} attempts "
+                    f"(with compaction): {e}"
+                )

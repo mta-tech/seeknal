@@ -26,14 +26,18 @@ class SeeknaContextToolset(FunctionToolset[Any]):
     string containing entities, DAG, intermediates, and pipelines.
     """
 
-    def __init__(self, discovery: ArtifactDiscovery) -> None:
+    def __init__(
+        self, discovery: ArtifactDiscovery, context_budget: int = 8000,
+    ) -> None:
         """Initialize the context toolset.
 
         Args:
             discovery: ArtifactDiscovery instance for the current project.
+            context_budget: Max characters for context injection (default 8000).
         """
         super().__init__(id="seeknal-context")
         self._discovery = discovery
+        self._context_budget = context_budget
 
     async def get_instructions(self, ctx: RunContext[Any]) -> list[str] | None:
         """Build and return project context for system prompt injection.
@@ -44,7 +48,9 @@ class SeeknaContextToolset(FunctionToolset[Any]):
         Returns:
             List with formatted project context string, or None if no context.
         """
-        context = self._discovery.get_context_for_prompt()
+        context = self._discovery.get_context_for_prompt(
+            max_chars=self._context_budget,
+        )
         if not context or not context.strip():
             return None
         return [f"## Data Context\n\n{context}"]

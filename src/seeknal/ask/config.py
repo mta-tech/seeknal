@@ -124,6 +124,33 @@ def get_request_limit(config: dict[str, Any]) -> int:
 # Background threshold
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Context budget
+# ---------------------------------------------------------------------------
+
+_DEFAULT_CONTEXT_BUDGET = 8000  # chars ≈ 2000 tokens
+
+
+def get_context_budget(config: dict[str, Any]) -> int:
+    """Return the ``context_budget`` from config, or the default (8000 chars).
+
+    Controls the maximum character size of the project context injected
+    into the agent's system prompt per turn.  Approximately 4 chars per token.
+    """
+    value = config.get("context_budget")
+    if value is None:
+        return _DEFAULT_CONTEXT_BUDGET
+    try:
+        budget = int(value)
+        return budget if budget > 0 else _DEFAULT_CONTEXT_BUDGET
+    except (TypeError, ValueError):
+        return _DEFAULT_CONTEXT_BUDGET
+
+
+# ---------------------------------------------------------------------------
+# Background threshold
+# ---------------------------------------------------------------------------
+
 _DEFAULT_BACKGROUND_THRESHOLD = 60  # seconds
 
 # Module-level holder — set by create_agent(), read by tool functions.

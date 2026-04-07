@@ -40,7 +40,7 @@ class TestBasicAnalysis:
         """Agent should count customers correctly with minimal prompt."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(agent, deps, message_history, "How many customers are in the dataset?")
 
         print(f"\n--- BASIC: Customer count ---\n{answer}\n")
@@ -51,7 +51,7 @@ class TestBasicAnalysis:
         """Agent should break down revenue by customer segment."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(
             agent, deps, message_history,
             "What is the total revenue by customer segment (Premium, Standard, Basic)?"
@@ -67,7 +67,7 @@ class TestBasicAnalysis:
         """Agent should do multi-step analysis (join + aggregate + reason)."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(
             agent, deps, message_history,
             "Which city has the highest average order value? Show me the data."
@@ -94,7 +94,7 @@ class TestSkillLoading:
         """
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(
             agent, deps, message_history,
             "Generate a brief customer revenue analysis report."
@@ -109,7 +109,7 @@ class TestSkillLoading:
         """Simple questions should NOT require skill loading."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(
             agent, deps, message_history,
             "How many orders are in the completed orders table?"
@@ -135,7 +135,7 @@ class TestErrorRecovery:
         """
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(
             agent, deps, message_history,
             "Query the customer_stats table to find the top 5 spenders."
@@ -152,7 +152,7 @@ class TestErrorRecovery:
         """
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(
             agent, deps, message_history,
             "What is the average total_revenue per customer from the customer purchase stats?"
@@ -168,7 +168,7 @@ class TestErrorRecovery:
         """
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(
             agent, deps, message_history,
             "Show orders from 30 days before the last order date. "
@@ -195,7 +195,7 @@ class TestProjectMemory:
         """
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         # First do some analysis
         ask(agent, deps, message_history, "How many customer segments are there and what are they?")
@@ -256,7 +256,7 @@ class TestLineageInvestigation:
         """
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(
             agent, deps, message_history,
             "How is the monthly_revenue table calculated? Trace the full data lineage "
@@ -273,7 +273,7 @@ class TestLineageInvestigation:
         """Agent should identify downstream impact of a source change."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(
             agent, deps, message_history,
             "If the raw_orders source data changes, which downstream tables would be affected?"
@@ -298,7 +298,7 @@ class TestLongSession:
         """
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         questions = [
             "List all available tables.",
@@ -341,7 +341,7 @@ class TestQualityGate:
         """Normal data question should pass quality gate without retry."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(agent, deps, message_history, "What is the total number of completed orders?")
 
         print(f"\n--- QUALITY: Data-backed answer ---\n{answer}\n")
@@ -353,7 +353,7 @@ class TestQualityGate:
         """Explanation/lineage answers should pass quality gate (no numbers needed)."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(
             agent, deps, message_history,
             "Explain how the orders_cleaned transform works based on its pipeline definition."
@@ -384,7 +384,7 @@ class TestIntegrationWorkflow:
         """
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         # Phase 1: Discovery
         a1 = ask(agent, deps, message_history,

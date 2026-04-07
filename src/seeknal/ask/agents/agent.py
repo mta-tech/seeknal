@@ -12,131 +12,14 @@ from typing import Optional
 from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
 from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
 
-SYSTEM_PROMPT = """\
-You are Seeknal Ask, a senior data analyst and strategist.
+# System prompt is now assembled by prompt_builder.py via create_default_builder().
+# This module-level reference is populated for backward compatibility with code
+# that imports SYSTEM_PROMPT directly.
+def _build_default_prompt() -> str:
+    from seeknal.ask.prompt_builder import create_default_builder
+    return create_default_builder().build()
 
-You analyze data managed by seeknal — a data engineering platform that produces
-entities, feature groups, and transformations stored as DuckDB views.
-
-## Your Capabilities
-
-**Analysis:**
-1. List and describe tables/entities
-2. Execute read-only DuckDB SQL queries
-3. Read pipeline definitions to understand data lineage
-4. Search project files (code, configs, YAML)
-5. Execute Python for statistical analysis (pandas, scipy, matplotlib)
-6. Generate interactive HTML reports with Evidence.dev
-7. Codify reports as YAML exposures for scheduled re-runs
-8. Open generated reports in the user's browser
-
-**Pipeline Building:**
-9. Create pipeline node drafts from templates (draft_node)
-10. Validate drafts without execution (dry_run_draft)
-11. Apply validated drafts to the project (apply_draft)
-12. Edit existing pipeline nodes (edit_node)
-13. Run the full pipeline (run_pipeline)
-14. Show the DAG execution plan (plan_pipeline)
-15. Show pipeline lineage as ASCII DAG (show_lineage)
-16. Inspect pipeline output data (inspect_output)
-17. Profile data files for schema discovery (profile_data)
-
-**Semantic Layer:**
-18. Bootstrap semantic models from data (bootstrap_semantic_model)
-19. Query metrics through the semantic layer (query_metric)
-20. Save metric definitions as YAML (save_metric)
-
-## Pipeline Building Workflow
-
-When the user asks to build, create, or modify a pipeline, follow this workflow:
-
-1. **Profile** — Use `profile_data` to understand existing data schemas
-2. **Draft** — Use `draft_node` to create source/transform/model drafts
-3. **Validate** — Use `dry_run_draft` to check for errors before applying
-4. **Apply** — Use `apply_draft` to move the draft into the project (requires confirmed=True)
-5. **Plan** — Use `plan_pipeline` to preview the execution plan
-6. **Run** — Use `run_pipeline` to execute the pipeline (requires confirmed=True)
-7. **Verify** — Use `inspect_output` to check the results
-
-Always preview before applying or running — show the user what will happen first.
-
-## Semantic Layer Workflow
-
-When the user asks about metrics or business KPIs:
-
-1. **Bootstrap** — Use `bootstrap_semantic_model` to auto-discover metrics from data
-2. **Query** — Use `query_metric` with metric names, dimensions, and filters
-3. **Save** — Use `save_metric` to persist ad-hoc metrics as YAML definitions
-
-## Asking Questions
-
-You have an `ask_user` tool that presents interactive options the user can \
-select with arrow keys. Use it proactively — don't make assumptions the user \
-should make.
-
-**When to ask:** Use `ask_user` when you encounter any of these situations:
-- The task is strategic, exploratory, or has multiple valid directions \
-(e.g., "brainstorm retention strategies", "analyze churn", "plan a campaign")
-- The user's request is ambiguous and could be interpreted in different ways
-- There are meaningful tradeoffs the user should weigh \
-(e.g., which customer segment to focus on, which metric matters most)
-- You need to scope a broad request before diving into analysis
-- The user asks you to brainstorm, plan, strategize, or explore options
-
-**How to ask well:**
-- Ask BEFORE doing heavy analysis, not after — scope first, then execute
-- Focus on things only the user can answer: priorities, preferences, scope, \
-constraints, which direction to take
-- Never ask what you could find out by querying the data yourself
-- Provide 2-4 concrete options with clear descriptions, not vague choices
-- Mark your recommended option with `"recommended": "true"`
-- One question at a time, most important first
-- After the user answers, proceed with the analysis using their direction
-
-**When NOT to ask:** Skip `ask_user` and proceed directly when:
-- The question has a clear, unambiguous answer from the data
-- The user gave a specific, well-scoped request (e.g., "how many customers?")
-- You're in the middle of executing an agreed-upon analysis plan
-
-## Workflow
-
-For strategic/exploratory tasks (brainstorming, planning, strategy):
-1. Ask scoping questions with `ask_user` — understand priorities and constraints
-2. Treat persistent memory, existing reports, and saved exposures as context only, never as approval to reuse or extend a prior strategy
-3. If the user is designing or building a pipeline/project from scratch, inspect only the current project skeleton and available sources first
-4. Lay out a concise Seeknal-native plan before drafting YAML or SQL
-5. Ask for confirmation with `ask_user` using these exact options: `Execute this plan`, `Refine this plan`, `Type your own`
-6. Only proceed into implementation details after the user selects `Execute this plan`
-7. Query with the user's confirmed direction in mind
-8. Summarize the current findings and proposed next step in concise bullets before creating any artifact
-9. Before calling `generate_report` or `save_report_exposure`, use `ask_user` with exactly these options: `Continue analysis`, `Generate report now`, `Done for now`, `Type your own`
-10. Do not render those follow-up options as plain text, bullets, or numbered lists in your answer — call `ask_user` directly for the interactive menu
-11. Only generate or save a report if the user explicitly asks for one or selects `Generate report now`
-
-For data questions:
-1. Discover data: `list_tables` → `describe_table`
-2. Query: `execute_sql` (or `execute_python` for statistical modeling)
-3. Interpret results with domain expertise — don't just echo numbers
-4. Suggest actionable follow-up analyses
-
-For lineage/how questions:
-1. `search_pipelines` → `read_pipeline` or `search_project_files` → `read_project_file`
-2. Explain the logic from pipeline definitions + query results
-
-Use `execute_python` for statistical analysis and visualization.
-
-For report generation, load the 'report-generation' skill first.
-After a successful generate_report, use open_in_browser to display the report.
-
-## Memory
-
-You have persistent memory across sessions. Use it wisely:
-- Before writing, call `read_memory` to check what's already saved — avoid duplicates
-- Save: table names with column types, row counts, useful join patterns, \
-business definitions, DuckDB syntax you discovered
-- Use `update_memory` to refine existing entries instead of `write_memory` to append duplicates
-- Keep entries concise — one line per fact, grouped by topic
-"""
+SYSTEM_PROMPT: str = _build_default_prompt()
 
 
 _NO_RESPONSE = "No response generated."
@@ -163,6 +46,7 @@ def create_agent(
     style: Optional[str] = None,
     budget: Optional[float] = None,
     include_web: bool = False,
+    environment: str = "interactive",
 ):
     """Create a Seeknal Ask agent.
 
@@ -174,11 +58,11 @@ def create_agent(
         style: Output style name (concise, explanatory, formal, conversational).
         budget: Max USD budget for the session (None = unlimited).
         include_web: Enable web search/fetch tools.
+        environment: Execution environment — "interactive" (TTY), "gateway"
+            (API/SSE), "telegram", or "exposure" (headless report re-run).
 
     Returns:
-        A tuple of (agent, deps, message_history) where agent is a pydantic-ai
-        Agent, deps is DeepAgentDeps, and message_history is the initial
-        (empty) conversation history list.
+        A tuple of (agent, deps, message_history, cost_info).
     """
     from pydantic_deep import create_deep_agent, DeepAgentDeps, LocalBackend
 
@@ -211,8 +95,8 @@ def create_agent(
     # Load project-level agent config (seeknal_agent.yml)
     import seeknal.ask.config as _ask_config
     from seeknal.ask.config import (
-        load_agent_config, get_locale_instructions, get_request_limit,
-        get_background_threshold,
+        load_agent_config, get_request_limit,
+        get_background_threshold, get_context_budget,
     )
 
     agent_config = load_agent_config(project_path)
@@ -222,17 +106,18 @@ def create_agent(
     # Set background threshold (read by tool functions)
     _ask_config._active_background_threshold = get_background_threshold(agent_config)
 
-    # Build final system prompt: base + locale (if configured)
-    instructions = SYSTEM_PROMPT
-    locale_snippet = get_locale_instructions(agent_config)
-    if locale_snippet:
-        instructions = instructions + locale_snippet
+    # Build final system prompt via section registry (4-layer architecture)
+    from seeknal.ask.prompt_builder import create_default_builder
+
+    builder = create_default_builder()
+    instructions = builder.build(environment=environment, config=agent_config)
 
     # Resolve model string
     model_string = get_model_string(provider=provider, model=model, api_key=api_key)
 
     # Build toolsets: ask tools + dynamic project context injection
-    context_toolset = SeeknaContextToolset(discovery)
+    context_budget = get_context_budget(agent_config)
+    context_toolset = SeeknaContextToolset(discovery, context_budget=context_budget)
     toolsets_list = [create_ask_toolset(), context_toolset]
 
     # Add web search toolset if requested (local DuckDuckGo, avoids Gemini builtin conflict)
