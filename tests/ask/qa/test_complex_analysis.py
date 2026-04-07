@@ -35,7 +35,7 @@ class TestCohortAnalysisWorkflow:
     def test_rfm_deep_dive(self, qa_project):
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         # Turn 1: Segment customers by purchase frequency
         a1 = ask(agent, deps, message_history,
@@ -97,7 +97,7 @@ class TestCrossTableJoinAnalysis:
         """Agent must join customers with orders to build a city x category matrix."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         # Turn 1: Build the cross-tabulation
         a1 = ask(agent, deps, message_history,
@@ -139,7 +139,7 @@ class TestTimeSeriesAnalysis:
         """Agent must analyze monthly trends and identify patterns."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         # Turn 1: Show monthly trend
         a1 = ask(agent, deps, message_history,
@@ -177,7 +177,7 @@ class TestHypothesisTesting:
         """Test: 'Newer customers spend more per order than older ones.'"""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         # Turn 1: State hypothesis and get initial data
         a1 = ask(agent, deps, message_history,
@@ -226,7 +226,7 @@ class TestComplexSQLGeneration:
         """Agent must use window functions for percentile ranking."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         a1 = ask(agent, deps, message_history,
             "Rank all customers by total_spent and show their percentile. "
@@ -243,7 +243,7 @@ class TestComplexSQLGeneration:
         """Agent must compute a running total of monthly revenue."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         a1 = ask(agent, deps, message_history,
             "Show the cumulative (running total) revenue by month for 2024. "
@@ -257,7 +257,7 @@ class TestComplexSQLGeneration:
         """Agent must build a retention-style analysis with JOINs and date logic."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         a1 = ask(agent, deps, message_history,
             "For customers who made their first purchase in Q1 2024, how many "

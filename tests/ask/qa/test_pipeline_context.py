@@ -32,7 +32,7 @@ class TestPipelineAwareness:
         """Agent should know what pipeline files exist."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(agent, deps, message_history,
             "What pipeline definitions exist in this project? "
             "List the sources, transforms, and feature groups."
@@ -48,7 +48,7 @@ class TestPipelineAwareness:
         """Agent should read pipeline YAML to explain how revenue is calculated."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(agent, deps, message_history,
             "How is revenue calculated in the orders_cleaned transform? "
             "Read the pipeline definition and explain the SQL logic."
@@ -64,7 +64,7 @@ class TestPipelineAwareness:
         """Agent should use search_pipelines to find where revenue is defined."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(agent, deps, message_history,
             "Which pipeline defines the 'revenue' column? "
             "Search through the pipeline files to find it."
@@ -77,7 +77,7 @@ class TestPipelineAwareness:
         """Agent should combine pipeline knowledge with data query results."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         # Turn 1: Ask about data
         a1 = ask(agent, deps, message_history,

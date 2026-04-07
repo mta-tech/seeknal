@@ -154,45 +154,87 @@ def execute_source(
         except Exception as e:
             _echo_warning(f"Could not load intermediate parquet: {e}")
 
-    # Priority 2: Load original source file (CSV, JSONL, Parquet)
+    # Priority 2: Dispatch by source type
+    _FILE_SOURCES = {"csv", "parquet", "json", "jsonl", "ndjson", "excel", "hive"}
+    _REMOTE_SOURCES = {"iceberg", "postgresql", "postgres", "starrocks", "mysql", "sqlite"}
+
     if not data_loaded and table and table != "unknown":
-        try:
-            table_path = Path(table)
-            if not table_path.is_absolute():
-                table_path = Path.cwd() / table
+        if source_type.lower() in _REMOTE_SOURCES:
+            # Remote/database sources — use dedicated loaders from dry_run module
+            try:
+                from seeknal.workflow.dry_run import (
+                    _load_iceberg_source,
+                    _load_postgresql_source,
+                    _load_sqlite_source,
+                    _load_starrocks_source,
+                )
 
-            if table_path.exists():
-                safe_path = str(table_path.resolve()).replace("'", "''")
-                suffix = table_path.suffix.lower()
+                params = yaml_data.get("params", {})
+                df = None
+                st = source_type.lower()
 
-                if suffix == ".csv":
-                    read_fn = f"read_csv_auto('{safe_path}')"
-                elif suffix in (".jsonl", ".json", ".ndjson"):
-                    read_fn = f"read_json_auto('{safe_path}')"
-                elif suffix == ".parquet":
-                    read_fn = f"read_parquet('{safe_path}')"
-                else:
-                    read_fn = None
+                if st == "iceberg":
+                    df = _load_iceberg_source(table, params)
+                elif st in ("postgresql", "postgres"):
+                    df = _load_postgresql_source(table, params, Path.cwd())
+                elif st == "sqlite":
+                    df = _load_sqlite_source(table, params, Path.cwd())
+                elif st == "starrocks":
+                    df = _load_starrocks_source(table, params)
 
-                if read_fn:
-                    query = f"SELECT * FROM {read_fn} LIMIT {limit}"
-                    result = con.execute(query)
-                    rows = result.fetchall()
-                    columns = [desc[0] for desc in result.description]
+                if df is not None and len(df) > 0:
+                    preview = df.head(limit)
+                    _echo_info(f"Data preview ({len(preview)} rows from {source_type} source):")
+                    print(tabulate(
+                        preview.values.tolist(),
+                        headers=preview.columns.tolist(),
+                        tablefmt="psql",
+                    ))
+                    row_count = len(preview)
+                    data_loaded = True
+            except ImportError:
+                _echo_warning(f"Loader for {source_type} sources not available")
+            except Exception as e:
+                _echo_warning(f"Could not preview {source_type} source: {e}")
+        else:
+            # File-based sources — try loading from filesystem
+            try:
+                table_path = Path(table)
+                if not table_path.is_absolute():
+                    table_path = Path.cwd() / table
 
-                    if rows:
-                        _echo_info(f"Data preview ({len(rows)} rows):")
-                        print(tabulate(rows, headers=columns, tablefmt="psql"))
-                        row_count = len(rows)
-                        data_loaded = True
+                if table_path.exists():
+                    safe_path = str(table_path.resolve()).replace("'", "''")
+                    suffix = table_path.suffix.lower()
+
+                    if suffix == ".csv":
+                        read_fn = f"read_csv_auto('{safe_path}')"
+                    elif suffix in (".jsonl", ".json", ".ndjson"):
+                        read_fn = f"read_json_auto('{safe_path}')"
+                    elif suffix == ".parquet":
+                        read_fn = f"read_parquet('{safe_path}')"
                     else:
-                        _echo_info(f"No data found in source: {name}")
-            else:
-                _echo_warning(f"Source file not found: {table_path}")
-        except ValueError as e:
-            _echo_warning(f"Security validation failed: {e}")
-        except Exception as e:
-            _echo_warning(f"Could not preview source data: {e}")
+                        read_fn = None
+
+                    if read_fn:
+                        query = f"SELECT * FROM {read_fn} LIMIT {limit}"
+                        result = con.execute(query)
+                        rows = result.fetchall()
+                        columns = [desc[0] for desc in result.description]
+
+                        if rows:
+                            _echo_info(f"Data preview ({len(rows)} rows):")
+                            print(tabulate(rows, headers=columns, tablefmt="psql"))
+                            row_count = len(rows)
+                            data_loaded = True
+                        else:
+                            _echo_info(f"No data found in source: {name}")
+                else:
+                    _echo_warning(f"Source file not found: {table_path}")
+            except ValueError as e:
+                _echo_warning(f"Security validation failed: {e}")
+            except Exception as e:
+                _echo_warning(f"Could not preview source data: {e}")
 
     # Fallback: schema-only display
     if not data_loaded:

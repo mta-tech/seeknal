@@ -40,7 +40,7 @@ class TestSubagentDelegation:
         """
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(
             agent, deps, message_history,
             "Use your lineage investigator to trace how the monthly_revenue "
@@ -61,7 +61,7 @@ class TestSubagentDelegation:
         """
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(
             agent, deps, message_history,
             "I need a comprehensive lineage audit of this project. For EVERY "
@@ -89,7 +89,7 @@ class TestSubagentDelegation:
         """
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         # Turn 1: Data question (handled directly)
         a1 = ask(agent, deps, message_history, "What is the total revenue across all orders?")
@@ -124,7 +124,7 @@ class TestSubagentDelegation:
         """
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
         answer = ask(
             agent, deps, message_history,
             "Delegate to the lineage investigator and ask it to run "
@@ -148,7 +148,7 @@ class TestSubagentContextIsolation:
         """
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         # Ask a question that requires reading multiple pipeline files
         answer = ask(
@@ -167,7 +167,7 @@ class TestSubagentContextIsolation:
         """After subagent delegation, main agent should still know prior context."""
         from seeknal.ask.agents.agent import ask
 
-        agent, deps, message_history = _fresh_agent(qa_project)
+        agent, deps, message_history, _cost = _fresh_agent(qa_project)
 
         # Establish context
         a1 = ask(agent, deps, message_history, "How many customers are there?")
