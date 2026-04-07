@@ -24,6 +24,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from seeknal.ask.gateway.session_manager import SessionManager
 from seeknal.ask.gateway.sse import SSEBroadcaster
+from seeknal.ask.gateway.webhook import WebhookClient, WebhookConfig
 
 # Validate session IDs: alphanumeric, hyphens, underscores, max 128 chars
 _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
@@ -186,6 +187,41 @@ async def ask_oneshot(request: Request) -> JSONResponse:
     return JSONResponse({"answer": answer, "events": events})
 
 
+async def ask_stream(request: Request) -> JSONResponse:
+    """Webhook-based streaming: POST a question, get 201, receive events via callback."""
+    body = await request.json()
+    question = body.get("question", "")
+    session_id = body.get("session_id", "default")
+    message_id = body.get("message_id", "")
+    webhook_path = body.get("webhook_path", "")
+
+    if not question:
+        return JSONResponse({"error": "question is required"}, status_code=400)
+    if not message_id:
+        return JSONResponse({"error": "message_id is required"}, status_code=400)
+    if not webhook_path:
+        return JSONResponse({"error": "webhook_path is required"}, status_code=400)
+    if not _validate_session_id(session_id):
+        return JSONResponse({"error": "invalid session_id"}, status_code=400)
+
+    try:
+        webhook_url = WebhookClient.build_webhook_url(webhook_path)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    config = WebhookConfig(
+        message_id=message_id,
+        session_id=session_id,
+        webhook_url=webhook_url,
+    )
+    client = WebhookClient(config)
+
+    project_path = Path(request.app.state.project_path)
+    asyncio.create_task(client.run_and_deliver(project_path, session_id, question))
+
+    return JSONResponse({"message_id": message_id}, status_code=201)
+
+
 async def websocket_endpoint(websocket: WebSocket) -> None:
     """WebSocket streaming per session."""
     session_id = websocket.path_params["session_id"]
@@ -257,6 +293,7 @@ def create_gateway_app(project_path: str | Path) -> Starlette:
         Route("/health", health),
         Route("/sessions", list_sessions),
         Route("/ask", ask_oneshot, methods=["POST"]),
+        Route("/ask/stream", ask_stream, methods=["POST"]),
         WebSocketRoute("/ws/{session_id}", websocket_endpoint),
         Route("/events/{session_id}", sse_endpoint),
     ]

@@ -80,6 +80,7 @@ def gateway_start(
     typer.echo(f"  GET  /health")
     typer.echo(f"  GET  /sessions")
     typer.echo(f"  POST /ask")
+    typer.echo(f"  POST /ask/stream  (webhook streaming)")
     typer.echo(f"  WS   /ws/{{session_id}}")
     typer.echo(f"  GET  /events/{{session_id}}")
 
