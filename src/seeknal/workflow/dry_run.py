@@ -510,8 +510,39 @@ def _load_starrocks_source(table: str, params: dict):
         return None
 
 
+def _get_iceberg_token() -> str | None:
+    """Get OAuth2 bearer token from Keycloak if credentials are configured."""
+    import json
+    import os
+    import urllib.request
+
+    token_url = os.getenv("KEYCLOAK_TOKEN_URL", "")
+    client_id = os.getenv("KEYCLOAK_CLIENT_ID", "")
+    client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET", "")
+
+    if not (token_url and client_id and client_secret):
+        return None
+
+    try:
+        token_data = (
+            f"grant_type=client_credentials"
+            f"&client_id={client_id}"
+            f"&client_secret={client_secret}"
+        ).encode()
+        req = urllib.request.Request(token_url, data=token_data)
+        resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        return resp["access_token"]
+    except Exception:
+        return None
+
+
 def _load_iceberg_source(table: str, params: dict):
-    """Load Iceberg source data using DuckDB iceberg extension."""
+    """Load Iceberg source data using DuckDB iceberg extension.
+
+    S3 credentials are configured via SET statements (the canonical DuckDB
+    pattern used by DuckDBIcebergExtension.configure_s3), NOT via the ATTACH
+    SECRET keyword which references named secret objects.
+    """
     import duckdb
     import os
 
@@ -525,26 +556,64 @@ def _load_iceberg_source(table: str, params: dict):
 
     con = duckdb.connect()
     try:
+        con.execute("INSTALL httpfs; LOAD httpfs;")
         con.execute("INSTALL iceberg; LOAD iceberg;")
 
-        # Build ATTACH command with REST catalog
-        attach_opts = f"TYPE ICEBERG, ENDPOINT '{catalog_uri}'"
-        if warehouse:
-            attach_opts += f", WAREHOUSE '{warehouse}'"
+        # Configure S3 credentials via SET (same pattern as DuckDBIcebergExtension)
+        s3_endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
+        s3_region = os.environ.get("AWS_REGION", "us-east-1")
+        s3_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
+        s3_secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 
-        # Add S3/OAuth2 config from environment
-        for env_key, duck_key in [
-            ("AWS_ENDPOINT_URL", "ENDPOINT"),
-            ("AWS_REGION", "REGION"),
-            ("AWS_ACCESS_KEY_ID", "KEY_ID"),
-            ("AWS_SECRET_ACCESS_KEY", "SECRET"),
-        ]:
-            val = os.environ.get(env_key, "")
-            if val:
-                attach_opts += f", {duck_key} '{val}'"
+        if s3_endpoint:
+            endpoint = s3_endpoint.replace("https://", "").replace("http://", "")
+            con.execute(f"SET s3_endpoint = '{endpoint}'")
+            con.execute("SET s3_url_style = 'path'")
+            if s3_endpoint.startswith("http://"):
+                con.execute("SET s3_use_ssl = false")
+        if s3_region:
+            con.execute(f"SET s3_region = '{s3_region}'")
+        if s3_key:
+            con.execute(f"SET s3_access_key_id = '{s3_key}'")
+        if s3_secret:
+            con.execute(f"SET s3_secret_access_key = '{s3_secret}'")
 
-        con.execute(f"ATTACH '' AS iceberg_cat ({attach_opts})")
-        df = con.execute(f"SELECT * FROM iceberg_cat.{table}").df()
+        # Get OAuth2 token if Keycloak credentials are available
+        bearer_token = _get_iceberg_token()
+
+        # Build catalog endpoint URL (add /catalog if not present)
+        catalog_url = catalog_uri.rstrip("/")
+        if "/catalog" not in catalog_url:
+            catalog_url = f"{catalog_url}/catalog"
+
+        # ATTACH catalog with auth (OAuth2 token or none)
+        if bearer_token:
+            auth_opts = f"AUTHORIZATION_TYPE 'oauth2', TOKEN '{bearer_token}'"
+        else:
+            auth_opts = "AUTHORIZATION_TYPE 'none'"
+
+        attach_name = warehouse if warehouse else "iceberg_cat"
+        attach_sql = (
+            f"ATTACH '{warehouse}' AS iceberg_cat ("
+            f"TYPE ICEBERG, ENDPOINT '{catalog_url}', {auth_opts})"
+        ) if warehouse else (
+            f"ATTACH '' AS iceberg_cat ("
+            f"TYPE ICEBERG, ENDPOINT '{catalog_url}', {auth_opts})"
+        )
+
+        con.execute(attach_sql)
+
+        # Normalize table name: if 3-part (catalog.namespace.table), strip
+        # the catalog prefix since we've attached our own catalog alias.
+        parts = table.split(".")
+        if len(parts) == 3:
+            query_table = f"iceberg_cat.{parts[1]}.{parts[2]}"
+        elif len(parts) == 2:
+            query_table = f"iceberg_cat.{parts[0]}.{parts[1]}"
+        else:
+            query_table = f"iceberg_cat.{table}"
+
+        df = con.execute(f"SELECT * FROM {query_table}").df()
         con.close()
         return df
     except Exception as e:
