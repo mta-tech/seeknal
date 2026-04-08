@@ -1,0 +1,25 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy seeknal source and install
+COPY seeknal-src/ /app/seeknal-src/
+RUN pip install --no-cache-dir /app/seeknal-src[ask,temporal]
+
+# Copy project
+COPY ecommerce/ /app/project/
+
+# Expose gateway port
+EXPOSE 8000
+
+# Start gateway with Temporal enabled
+CMD ["python", "-m", "seeknal.cli.main", "gateway", "start", \
+     "--project", "/app/project", \
+     "--port", "8000", \
+     "--host", "0.0.0.0", \
+     "--temporal"]

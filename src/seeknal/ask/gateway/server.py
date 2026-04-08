@@ -18,8 +18,9 @@ from typing import Any, Callable
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
-from starlette.routing import Route, WebSocketRoute
+from starlette.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.routing import Mount, Route, WebSocketRoute
+from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from seeknal.ask.gateway.session_manager import SessionManager
@@ -391,6 +392,12 @@ async def temporal_start(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+async def chat_ui(request: Request) -> FileResponse:
+    """Serve the chat UI HTML file."""
+    static_dir = Path(__file__).parent / "static"
+    return FileResponse(static_dir / "chat.html", media_type="text/html")
+
+
 def create_gateway_app(
     project_path: str | Path,
     lifespan: Callable | None = None,
@@ -406,6 +413,7 @@ def create_gateway_app(
             submission via ``POST /temporal/start``.
     """
     routes = [
+        Route("/", chat_ui),
         Route("/health", health),
         Route("/sessions", list_sessions),
         Route("/ask", ask_oneshot, methods=["POST"]),
@@ -413,6 +421,12 @@ def create_gateway_app(
         WebSocketRoute("/ws/{session_id}", websocket_endpoint),
         Route("/events/{session_id}", sse_endpoint),
     ]
+
+    # Mount static files if directory exists
+    static_dir = Path(__file__).parent / "static"
+    if static_dir.is_dir():
+        routes.append(Mount("/static", StaticFiles(directory=str(static_dir)), name="static"))
+
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.project_path = str(project_path)
     if temporal_client is not None:
