@@ -1,0 +1,1316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Seeknal Ask — Chat</title>
+  <style>
+    /* ------------------------------------------------------------------ */
+    /* Reset & base                                                          */
+    /* ------------------------------------------------------------------ */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:          #0d1117;
+      --surface:     #161b22;
+      --surface2:    #21262d;
+      --surface3:    #30363d;
+      --border:      #30363d;
+      --text:        #e6edf3;
+      --text-muted:  #8b949e;
+      --text-dim:    #6e7681;
+      --accent:      #58a6ff;
+      --accent-dim:  #1f6feb;
+      --green:       #3fb950;
+      --red:         #f85149;
+      --yellow:      #d29922;
+      --orange:      #e3b341;
+      --purple:      #bc8cff;
+      --user-bubble: #1f6feb;
+      --radius:      10px;
+      --radius-sm:   6px;
+      --font-mono:   "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+      --font-sans:   -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      --transition:  0.15s ease;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.6;
+      overflow: hidden;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Layout shell                                                          */
+    /* ------------------------------------------------------------------ */
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Top bar                                                              */
+    /* ------------------------------------------------------------------ */
+    #topbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+    }
+
+    #topbar .logo {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+      font-size: 15px;
+      color: var(--text);
+      letter-spacing: -0.01em;
+    }
+
+    #topbar .logo svg {
+      color: var(--accent);
+    }
+
+    #topbar .spacer { flex: 1; }
+
+    #status-indicator {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    #status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      transition: background var(--transition);
+      flex-shrink: 0;
+    }
+
+    #status-dot.connected    { background: var(--green); }
+    #status-dot.connecting   { background: var(--yellow); animation: pulse 1s infinite; }
+    #status-dot.error        { background: var(--red); }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    #btn-new-session {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: var(--radius-sm);
+      padding: 5px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background var(--transition), color var(--transition);
+      white-space: nowrap;
+    }
+
+    #btn-new-session:hover {
+      background: var(--surface3);
+      color: var(--text);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Messages area                                                         */
+    /* ------------------------------------------------------------------ */
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      scroll-behavior: smooth;
+    }
+
+    #messages::-webkit-scrollbar { width: 6px; }
+    #messages::-webkit-scrollbar-track { background: transparent; }
+    #messages::-webkit-scrollbar-thumb { background: var(--surface3); border-radius: 3px; }
+
+    /* Empty state */
+    #empty-state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      color: var(--text-muted);
+      padding: 40px 20px;
+      text-align: center;
+    }
+
+    #empty-state svg { color: var(--text-dim); opacity: 0.5; }
+
+    #empty-state h2 {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    #empty-state p {
+      font-size: 13px;
+      max-width: 320px;
+    }
+
+    /* Message rows */
+    .msg-row {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      animation: fadeIn 0.15s ease;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .msg-row.user { align-items: flex-end; }
+    .msg-row.assistant { align-items: flex-start; }
+
+    .msg-label {
+      font-size: 11px;
+      color: var(--text-dim);
+      padding: 0 4px;
+    }
+
+    /* Bubbles */
+    .bubble {
+      max-width: 78%;
+      padding: 10px 14px;
+      border-radius: var(--radius);
+      line-height: 1.65;
+      word-break: break-word;
+    }
+
+    .msg-row.user .bubble {
+      background: var(--user-bubble);
+      color: #fff;
+      border-bottom-right-radius: 3px;
+    }
+
+    .msg-row.assistant .bubble {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 3px;
+      color: var(--text);
+    }
+
+    /* Streaming cursor */
+    .stream-cursor::after {
+      content: "▋";
+      animation: blink 0.7s steps(1) infinite;
+      font-size: 0.85em;
+      opacity: 0.8;
+    }
+
+    @keyframes blink {
+      0%, 100% { opacity: 0.8; }
+      50%       { opacity: 0; }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Thinking indicator                                                    */
+    /* ------------------------------------------------------------------ */
+    #thinking {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 0;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+
+    #thinking.visible { display: flex; }
+
+    .thinking-dots {
+      display: flex;
+      gap: 4px;
+    }
+
+    .thinking-dots span {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+      animation: bounce 1.2s ease infinite;
+    }
+
+    .thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
+    .thinking-dots span:nth-child(3) { animation-delay: 0.3s; }
+
+    @keyframes bounce {
+      0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+      40%            { transform: translateY(-5px); opacity: 1; }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Workflow badge                                                        */
+    /* ------------------------------------------------------------------ */
+    .workflow-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      color: var(--text-dim);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 2px 8px;
+      margin-top: 4px;
+      font-family: var(--font-mono);
+    }
+
+    .workflow-badge svg { color: var(--purple); flex-shrink: 0; }
+
+    /* ------------------------------------------------------------------ */
+    /* Reasoning block                                                       */
+    /* ------------------------------------------------------------------ */
+    .reasoning-block {
+      background: var(--surface2);
+      border-left: 3px solid var(--surface3);
+      border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+      padding: 8px 12px;
+      margin: 6px 0;
+      font-size: 12px;
+      font-style: italic;
+      color: var(--text-muted);
+      line-height: 1.55;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Tool cards                                                            */
+    /* ------------------------------------------------------------------ */
+    .tool-card {
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+      margin: 6px 0;
+      font-size: 12px;
+    }
+
+    .tool-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      background: var(--surface2);
+      cursor: pointer;
+      user-select: none;
+      transition: background var(--transition);
+    }
+
+    .tool-header:hover { background: var(--surface3); }
+
+    .tool-status {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .tool-status.running { background: var(--yellow); animation: pulse 1s infinite; }
+    .tool-status.done    { background: var(--green); }
+    .tool-status.error   { background: var(--red); }
+
+    .tool-name {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    .tool-chevron {
+      margin-left: auto;
+      color: var(--text-dim);
+      transition: transform var(--transition);
+      font-size: 10px;
+    }
+
+    .tool-card.open .tool-chevron { transform: rotate(90deg); }
+
+    .tool-body {
+      display: none;
+      padding: 8px 10px;
+      background: var(--bg);
+      border-top: 1px solid var(--border);
+    }
+
+    .tool-card.open .tool-body { display: block; }
+
+    .tool-section-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+      margin-bottom: 4px;
+      margin-top: 6px;
+    }
+
+    .tool-section-label:first-child { margin-top: 0; }
+
+    .tool-code {
+      background: var(--surface2);
+      border-radius: var(--radius-sm);
+      padding: 6px 8px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text);
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Error block                                                           */
+    /* ------------------------------------------------------------------ */
+    .error-block {
+      background: rgba(248, 81, 73, 0.1);
+      border: 1px solid rgba(248, 81, 73, 0.4);
+      border-radius: var(--radius-sm);
+      padding: 8px 12px;
+      color: var(--red);
+      font-size: 13px;
+      margin: 4px 0;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Markdown rendering                                                    */
+    /* ------------------------------------------------------------------ */
+    .md-content code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1px 5px;
+    }
+
+    .md-content pre {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 12px;
+      overflow-x: auto;
+      margin: 8px 0;
+    }
+
+    .md-content pre code {
+      background: none;
+      border: none;
+      padding: 0;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .md-content h1, .md-content h2, .md-content h3,
+    .md-content h4, .md-content h5, .md-content h6 {
+      font-weight: 600;
+      margin: 10px 0 4px;
+      line-height: 1.3;
+    }
+
+    .md-content h1 { font-size: 1.3em; }
+    .md-content h2 { font-size: 1.15em; }
+    .md-content h3 { font-size: 1.05em; }
+
+    .md-content p { margin: 4px 0; }
+
+    .md-content ul, .md-content ol {
+      padding-left: 20px;
+      margin: 4px 0;
+    }
+
+    .md-content li { margin: 2px 0; }
+
+    .md-content blockquote {
+      border-left: 3px solid var(--accent-dim);
+      padding-left: 10px;
+      color: var(--text-muted);
+      margin: 6px 0;
+    }
+
+    .md-content table {
+      border-collapse: collapse;
+      font-size: 12px;
+      margin: 8px 0;
+      width: 100%;
+    }
+
+    .md-content th, .md-content td {
+      border: 1px solid var(--border);
+      padding: 5px 10px;
+      text-align: left;
+    }
+
+    .md-content th {
+      background: var(--surface2);
+      font-weight: 600;
+    }
+
+    .md-content hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 10px 0;
+    }
+
+    .md-content strong { font-weight: 600; }
+    .md-content em     { font-style: italic; }
+
+    /* ------------------------------------------------------------------ */
+    /* Input area                                                            */
+    /* ------------------------------------------------------------------ */
+    #inputbar {
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+      padding: 12px 16px;
+      flex-shrink: 0;
+    }
+
+    #input-wrap {
+      display: flex;
+      align-items: flex-end;
+      gap: 8px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 8px 8px 8px 12px;
+      transition: border-color var(--transition);
+    }
+
+    #input-wrap:focus-within {
+      border-color: var(--accent-dim);
+    }
+
+    #question {
+      flex: 1;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: var(--text);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.5;
+      resize: none;
+      max-height: 180px;
+      min-height: 22px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+    }
+
+    #question::placeholder { color: var(--text-dim); }
+
+    #question::-webkit-scrollbar { width: 4px; }
+    #question::-webkit-scrollbar-thumb { background: var(--surface3); border-radius: 2px; }
+
+    #btn-send {
+      background: var(--accent-dim);
+      border: none;
+      border-radius: var(--radius-sm);
+      color: #fff;
+      width: 32px;
+      height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: background var(--transition), opacity var(--transition);
+      flex-shrink: 0;
+    }
+
+    #btn-send:hover:not(:disabled) { background: var(--accent); }
+    #btn-send:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    #input-hint {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 6px;
+      text-align: right;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Responsive                                                            */
+    /* ------------------------------------------------------------------ */
+    @media (max-width: 600px) {
+      #app { max-width: 100%; }
+
+      .bubble { max-width: 92%; }
+
+      #topbar { padding: 10px 12px; }
+
+      #messages { padding: 14px 12px; }
+
+      #inputbar { padding: 10px 12px; }
+
+      #status-label { display: none; }
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- Top bar -->
+  <header id="topbar">
+    <div class="logo">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+      </svg>
+      Seeknal Ask
+    </div>
+
+    <div class="spacer"></div>
+
+    <div id="status-indicator" title="Gateway connection status">
+      <div id="status-dot"></div>
+      <span id="status-label">Ready</span>
+    </div>
+
+    <button id="btn-new-session" title="Start a new conversation">New Session</button>
+  </header>
+
+  <!-- Messages -->
+  <main id="messages">
+    <div id="empty-state">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+      </svg>
+      <h2>Seeknal Ask</h2>
+      <p>Ask questions about your data, features, and pipelines. Powered by Temporal workflows.</p>
+    </div>
+  </main>
+
+  <!-- Thinking indicator (lives outside message list so it sticks) -->
+  <div id="thinking">
+    <div class="thinking-dots">
+      <span></span><span></span><span></span>
+    </div>
+    <span>Thinking…</span>
+  </div>
+
+  <!-- Input bar -->
+  <footer id="inputbar">
+    <div id="input-wrap">
+      <textarea id="question" rows="1" placeholder="Ask anything about your data…" autocomplete="off" spellcheck="true"></textarea>
+      <button id="btn-send" disabled title="Send (Enter)">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+        </svg>
+      </button>
+    </div>
+    <div id="input-hint">Enter to send &nbsp;·&nbsp; Shift+Enter for newline</div>
+  </footer>
+
+</div>
+
+<script>
+/* ============================================================
+   Configuration
+   ============================================================ */
+const GATEWAY_URL = window.location.origin; // same-origin default
+
+/* ============================================================
+   State
+   ============================================================ */
+let sessionId = newUUID();
+let isStreaming = false;
+let currentAssistantRow = null;
+let currentBubble = null;
+let currentStreamText = "";
+let activeToolCards = {}; // toolCallId -> element refs
+let sseSource = null;
+
+/* ============================================================
+   UUID generation (RFC 4122 v4, alphanumeric+hyphens only)
+   ============================================================ */
+function newUUID() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  // Fallback
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === "x" ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
+/* ============================================================
+   Minimal Markdown renderer (no dependencies)
+   ============================================================ */
+function renderMarkdown(text) {
+  // Escape HTML in raw text first, then carefully re-allow our tags.
+  // We process block elements top-down.
+
+  // Protect code blocks from further processing
+  const codeBlocks = [];
+  text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const idx = codeBlocks.length;
+    const escaped = escapeHtml(code.replace(/\n$/, ""));
+    codeBlocks.push(`<pre><code class="lang-${escapeHtml(lang)}">${escaped}</code></pre>`);
+    return `\x00CODE${idx}\x00`;
+  });
+
+  // Inline code
+  const inlineCodes = [];
+  text = text.replace(/`([^`\n]+)`/g, (_, code) => {
+    const idx = inlineCodes.length;
+    inlineCodes.push(`<code>${escapeHtml(code)}</code>`);
+    return `\x00INLINE${idx}\x00`;
+  });
+
+  // Escape remaining HTML
+  text = escapeHtml(text);
+
+  // Headings
+  text = text.replace(/^######\s+(.+)$/gm, "<h6>$1</h6>");
+  text = text.replace(/^#####\s+(.+)$/gm, "<h5>$1</h5>");
+  text = text.replace(/^####\s+(.+)$/gm, "<h4>$1</h4>");
+  text = text.replace(/^###\s+(.+)$/gm, "<h3>$1</h3>");
+  text = text.replace(/^##\s+(.+)$/gm, "<h2>$1</h2>");
+  text = text.replace(/^#\s+(.+)$/gm, "<h1>$1</h1>");
+
+  // Horizontal rule
+  text = text.replace(/^(-{3,}|\*{3,}|_{3,})$/gm, "<hr>");
+
+  // Blockquotes
+  text = text.replace(/^&gt;\s?(.+)$/gm, "<blockquote>$1</blockquote>");
+
+  // Tables (simple: | col | col |)
+  text = text.replace(/((?:^\|.+\|\n?)+)/gm, tableBlock => {
+    const rows = tableBlock.trim().split("\n");
+    let html = "<table>";
+    rows.forEach((row, i) => {
+      if (/^\|[-:| ]+\|$/.test(row.trim())) return; // separator row
+      const cells = row.replace(/^\||\|$/g, "").split("|");
+      const tag = i === 0 ? "th" : "td";
+      html += "<tr>" + cells.map(c => `<${tag}>${c.trim()}</${tag}>`).join("") + "</tr>";
+    });
+    html += "</table>";
+    return html;
+  });
+
+  // Unordered lists
+  text = text.replace(/((?:^[-*+]\s+.+\n?)+)/gm, block => {
+    const items = block.trim().split("\n").map(l => `<li>${l.replace(/^[-*+]\s+/, "")}</li>`).join("");
+    return `<ul>${items}</ul>`;
+  });
+
+  // Ordered lists
+  text = text.replace(/((?:^\d+\.\s+.+\n?)+)/gm, block => {
+    const items = block.trim().split("\n").map(l => `<li>${l.replace(/^\d+\.\s+/, "")}</li>`).join("");
+    return `<ol>${items}</ol>`;
+  });
+
+  // Bold + italic
+  text = text.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
+  text = text.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  text = text.replace(/\*(.+?)\*/g, "<em>$1</em>");
+  text = text.replace(/___(.+?)___/g, "<strong><em>$1</em></strong>");
+  text = text.replace(/__(.+?)__/g, "<strong>$1</strong>");
+  text = text.replace(/_([^_\n]+)_/g, "<em>$1</em>");
+
+  // Paragraph wrapping (lines not already wrapped in block tags)
+  text = text.split("\n\n").map(para => {
+    para = para.trim();
+    if (!para) return "";
+    if (/^<(h[1-6]|ul|ol|pre|blockquote|table|hr)/.test(para)) return para;
+    if (/^\x00CODE/.test(para)) return para;
+    return `<p>${para.replace(/\n/g, "<br>")}</p>`;
+  }).join("\n");
+
+  // Restore code blocks
+  codeBlocks.forEach((block, i) => {
+    text = text.replace(`\x00CODE${i}\x00`, block);
+  });
+
+  // Restore inline codes
+  inlineCodes.forEach((code, i) => {
+    text = text.replace(`\x00INLINE${i}\x00`, code);
+  });
+
+  return text;
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/* ============================================================
+   DOM helpers
+   ============================================================ */
+const messagesEl  = document.getElementById("messages");
+const emptyState  = document.getElementById("empty-state");
+const thinkingEl  = document.getElementById("thinking");
+const questionEl  = document.getElementById("question");
+const btnSend     = document.getElementById("btn-send");
+const btnNew      = document.getElementById("btn-new-session");
+const statusDot   = document.getElementById("status-dot");
+const statusLabel = document.getElementById("status-label");
+
+function hideEmpty() {
+  if (emptyState) emptyState.style.display = "none";
+}
+
+function scrollToBottom(force = false) {
+  const el = messagesEl;
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+  if (force || nearBottom) {
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+function setStatus(state, label) {
+  statusDot.className = state;
+  statusLabel.textContent = label;
+}
+
+function showThinking() {
+  thinkingEl.classList.add("visible");
+  scrollToBottom(true);
+}
+
+function hideThinking() {
+  thinkingEl.classList.remove("visible");
+}
+
+/* ============================================================
+   Message row creation
+   ============================================================ */
+function createMsgRow(role) {
+  const row = document.createElement("div");
+  row.className = `msg-row ${role}`;
+
+  const label = document.createElement("div");
+  label.className = "msg-label";
+  label.textContent = role === "user" ? "You" : "Seeknal";
+  row.appendChild(label);
+
+  return row;
+}
+
+function appendUserMessage(text) {
+  hideEmpty();
+  const row = createMsgRow("user");
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.textContent = text;
+  row.appendChild(bubble);
+  messagesEl.appendChild(row);
+  scrollToBottom(true);
+}
+
+function startAssistantMessage() {
+  hideEmpty();
+  currentAssistantRow = createMsgRow("assistant");
+  currentBubble = document.createElement("div");
+  currentBubble.className = "bubble";
+  currentAssistantRow.appendChild(currentBubble);
+  messagesEl.appendChild(currentAssistantRow);
+  currentStreamText = "";
+  activeToolCards = {};
+  scrollToBottom(true);
+  return currentBubble;
+}
+
+function appendWorkflowBadge(row, workflowId) {
+  const badge = document.createElement("div");
+  badge.className = "workflow-badge";
+  badge.innerHTML = `
+    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+    </svg>
+    ${escapeHtml(workflowId)}
+  `;
+  row.appendChild(badge);
+}
+
+/* ============================================================
+   Token streaming — appends to current bubble with cursor
+   ============================================================ */
+function appendToken(token) {
+  if (!currentBubble) startAssistantMessage();
+  hideThinking();
+  currentStreamText += token;
+  // Show raw streaming text (markdown rendered on answer event)
+  currentBubble.textContent = currentStreamText;
+  currentBubble.classList.add("stream-cursor");
+  scrollToBottom();
+}
+
+function finalizeStreamText() {
+  if (currentBubble) {
+    currentBubble.classList.remove("stream-cursor");
+  }
+}
+
+/* ============================================================
+   Reasoning block
+   ============================================================ */
+function appendReasoning(text) {
+  if (!currentBubble) startAssistantMessage();
+  hideThinking();
+  const block = document.createElement("div");
+  block.className = "reasoning-block";
+  block.textContent = text;
+  currentBubble.classList.remove("stream-cursor");
+  currentBubble.appendChild(block);
+  currentStreamText = ""; // reset stream buffer after reasoning flush
+  scrollToBottom();
+}
+
+/* ============================================================
+   Tool cards
+   ============================================================ */
+function getToolKey(name, args) {
+  // Use name+JSON to deduplicate start/end pairing
+  return `${name}::${JSON.stringify(args || {})}`;
+}
+
+function appendToolStart(name, args) {
+  if (!currentBubble) startAssistantMessage();
+  hideThinking();
+  currentBubble.classList.remove("stream-cursor");
+
+  const card = document.createElement("div");
+  card.className = "tool-card";
+
+  const header = document.createElement("div");
+  header.className = "tool-header";
+  header.innerHTML = `
+    <div class="tool-status running"></div>
+    <span class="tool-name">${escapeHtml(name)}</span>
+    <span class="tool-chevron">&#9654;</span>
+  `;
+
+  const body = document.createElement("div");
+  body.className = "tool-body";
+
+  const argsStr = typeof args === "object" ? JSON.stringify(args, null, 2) : String(args || "");
+  if (argsStr && argsStr !== "{}") {
+    const argsLabel = document.createElement("div");
+    argsLabel.className = "tool-section-label";
+    argsLabel.textContent = "Arguments";
+    body.appendChild(argsLabel);
+
+    const argsCode = document.createElement("div");
+    argsCode.className = "tool-code";
+    argsCode.textContent = argsStr;
+    body.appendChild(argsCode);
+  }
+
+  header.addEventListener("click", () => card.classList.toggle("open"));
+
+  card.appendChild(header);
+  card.appendChild(body);
+  currentBubble.appendChild(card);
+
+  const key = getToolKey(name, args);
+  activeToolCards[key] = { card, body, header };
+
+  scrollToBottom();
+}
+
+function appendToolEnd(name, output) {
+  // Find matching tool card by name (best-effort; args not always available on end)
+  let found = null;
+  for (const key of Object.keys(activeToolCards)) {
+    if (key.startsWith(name + "::")) {
+      found = activeToolCards[key];
+      break;
+    }
+  }
+
+  if (found) {
+    // Update status dot to done
+    const dot = found.header.querySelector(".tool-status");
+    if (dot) { dot.className = "tool-status done"; }
+
+    // Append output section
+    if (output) {
+      const outLabel = document.createElement("div");
+      outLabel.className = "tool-section-label";
+      outLabel.textContent = "Output";
+      found.body.appendChild(outLabel);
+
+      const outCode = document.createElement("div");
+      outCode.className = "tool-code";
+      outCode.textContent = output;
+      found.body.appendChild(outCode);
+    }
+  }
+
+  scrollToBottom();
+}
+
+/* ============================================================
+   Answer — replace streaming text with rendered markdown
+   ============================================================ */
+function appendAnswer(text) {
+  if (!currentBubble) startAssistantMessage();
+  finalizeStreamText();
+
+  // Remove any streaming text node (first child if it's a text node)
+  if (currentStreamText && currentBubble.firstChild &&
+      currentBubble.firstChild.nodeType === Node.TEXT_NODE) {
+    currentBubble.removeChild(currentBubble.firstChild);
+  }
+  currentStreamText = "";
+
+  const mdDiv = document.createElement("div");
+  mdDiv.className = "md-content";
+  mdDiv.innerHTML = renderMarkdown(text);
+  currentBubble.appendChild(mdDiv);
+
+  scrollToBottom(true);
+}
+
+/* ============================================================
+   Error block
+   ============================================================ */
+function appendError(message) {
+  if (!currentBubble) startAssistantMessage();
+  hideThinking();
+  finalizeStreamText();
+
+  const block = document.createElement("div");
+  block.className = "error-block";
+  block.textContent = "Error: " + message;
+
+  // If current bubble has only a text node from streaming, clear it
+  if (currentStreamText && currentBubble.firstChild &&
+      currentBubble.firstChild.nodeType === Node.TEXT_NODE) {
+    currentBubble.removeChild(currentBubble.firstChild);
+    currentStreamText = "";
+  }
+  currentBubble.appendChild(block);
+
+  scrollToBottom(true);
+}
+
+/* ============================================================
+   SSE subscription
+   ============================================================ */
+function subscribeSSE(sid) {
+  if (sseSource) {
+    sseSource.close();
+    sseSource = null;
+  }
+
+  const url = `${GATEWAY_URL}/events/${encodeURIComponent(sid)}`;
+  const src = new EventSource(url);
+  sseSource = src;
+
+  setStatus("connecting", "Connecting…");
+
+  src.onopen = () => {
+    setStatus("connected", "Connected");
+  };
+
+  src.onerror = () => {
+    setStatus("error", "Disconnected");
+    // EventSource auto-reconnects; just update UI
+  };
+
+  src.onmessage = (evt) => {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch { return; }
+    handleEvent(msg);
+  };
+
+  return src;
+}
+
+function closeSSE() {
+  if (sseSource) {
+    sseSource.close();
+    sseSource = null;
+  }
+  setStatus("", "Ready");
+}
+
+/* ============================================================
+   Event handler (shared for SSE and fallback)
+   ============================================================ */
+function handleEvent(msg) {
+  switch (msg.type) {
+    case "token":
+      appendToken(msg.data || "");
+      break;
+
+    case "reasoning":
+      appendReasoning(msg.data || "");
+      break;
+
+    case "tool_start": {
+      const d = msg.data || {};
+      appendToolStart(d.name || "tool", d.args);
+      break;
+    }
+
+    case "tool_end": {
+      const d = msg.data || {};
+      appendToolEnd(d.name || "tool", d.output || "");
+      break;
+    }
+
+    case "answer":
+      appendAnswer(msg.data || "");
+      break;
+
+    case "error":
+      appendError(msg.data || "Unknown error");
+      finishStreaming();
+      break;
+
+    case "done":
+      finalizeStreamText();
+      hideThinking();
+      finishStreaming();
+      break;
+
+    case "keepalive":
+      // No-op — just keeps connection alive
+      break;
+
+    default:
+      break;
+  }
+}
+
+/* ============================================================
+   Finish streaming — re-enable input
+   ============================================================ */
+function finishStreaming() {
+  isStreaming = false;
+  currentAssistantRow = null;
+  currentBubble = null;
+  currentStreamText = "";
+  activeToolCards = {};
+  setInputDisabled(false);
+  hideThinking();
+  closeSSE();
+}
+
+/* ============================================================
+   Input control
+   ============================================================ */
+function setInputDisabled(disabled) {
+  questionEl.disabled = disabled;
+  btnSend.disabled = disabled || !questionEl.value.trim();
+}
+
+/* ============================================================
+   Send message
+   ============================================================ */
+async function sendMessage() {
+  const question = questionEl.value.trim();
+  if (!question || isStreaming) return;
+
+  isStreaming = true;
+  questionEl.value = "";
+  autoResizeTextarea();
+  setInputDisabled(true);
+
+  appendUserMessage(question);
+  showThinking();
+
+  // Start SSE subscription BEFORE posting to Temporal
+  subscribeSSE(sessionId);
+
+  // Small wait to ensure SSE connection opens before the workflow starts posting events
+  await delay(80);
+
+  let workflowId = null;
+  let usedTemporal = false;
+
+  try {
+    const resp = await fetch(`${GATEWAY_URL}/temporal/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, session_id: sessionId }),
+    });
+
+    if (resp.ok) {
+      const data = await resp.json();
+      workflowId = data.workflow_id || null;
+      usedTemporal = true;
+    } else if (resp.status === 503) {
+      // Temporal not available — fall back to /ask
+      usedTemporal = false;
+    } else {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || `HTTP ${resp.status}`);
+    }
+  } catch (err) {
+    usedTemporal = false;
+  }
+
+  if (!usedTemporal) {
+    // Close SSE (not needed for oneshot), run /ask
+    closeSSE();
+
+    try {
+      const resp = await fetch(`${GATEWAY_URL}/ask`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, session_id: sessionId }),
+      });
+
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${resp.status}`);
+      }
+
+      const data = await resp.json();
+      startAssistantMessage();
+      hideThinking();
+
+      // Replay events from oneshot response
+      if (Array.isArray(data.events)) {
+        for (const ev of data.events) handleEvent(ev);
+      } else if (data.answer) {
+        appendAnswer(data.answer);
+      }
+
+      finishStreaming();
+    } catch (err) {
+      startAssistantMessage();
+      appendError(err.message || "Request failed");
+      finishStreaming();
+    }
+    return;
+  }
+
+  // Temporal path — SSE is running, show workflow badge when first event arrives
+  if (workflowId) {
+    // Badge will be attached when the assistant row is created by first event
+    // We store it to attach after startAssistantMessage is called
+    const attachBadge = () => {
+      if (currentAssistantRow) {
+        appendWorkflowBadge(currentAssistantRow, workflowId);
+        workflowId = null; // only attach once
+      }
+    };
+
+    // Poll until the row exists (first event creates it)
+    const poll = setInterval(() => {
+      if (currentAssistantRow && workflowId) {
+        attachBadge();
+        clearInterval(poll);
+      } else if (!isStreaming) {
+        clearInterval(poll);
+      }
+    }, 100);
+  }
+
+  // SSE will drive the UI from here; finishStreaming() is called on "done" or "error"
+}
+
+/* ============================================================
+   New session
+   ============================================================ */
+function newSession() {
+  if (isStreaming) {
+    closeSSE();
+    finishStreaming();
+  }
+
+  sessionId = newUUID();
+
+  // Clear messages
+  messagesEl.innerHTML = "";
+  // Re-add empty state
+  const es = document.createElement("div");
+  es.id = "empty-state";
+  es.innerHTML = `
+    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+    </svg>
+    <h2>Seeknal Ask</h2>
+    <p>Ask questions about your data, features, and pipelines. Powered by Temporal workflows.</p>
+  `;
+  messagesEl.appendChild(es);
+
+  questionEl.value = "";
+  autoResizeTextarea();
+  setInputDisabled(false);
+  questionEl.focus();
+  setStatus("", "Ready");
+}
+
+/* ============================================================
+   Textarea auto-resize
+   ============================================================ */
+function autoResizeTextarea() {
+  questionEl.style.height = "auto";
+  questionEl.style.height = Math.min(questionEl.scrollHeight, 180) + "px";
+}
+
+/* ============================================================
+   Utility
+   ============================================================ */
+function delay(ms) {
+  return new Promise(res => setTimeout(res, ms));
+}
+
+/* ============================================================
+   Event listeners
+   ============================================================ */
+questionEl.addEventListener("input", () => {
+  autoResizeTextarea();
+  btnSend.disabled = isStreaming || !questionEl.value.trim();
+});
+
+questionEl.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    if (!btnSend.disabled) sendMessage();
+  }
+});
+
+btnSend.addEventListener("click", sendMessage);
+btnNew.addEventListener("click", newSession);
+
+// Initial focus
+questionEl.focus();
+
+// Initial health check — update status dot
+(async () => {
+  try {
+    const resp = await fetch(`${GATEWAY_URL}/health`, { method: "GET" });
+    if (resp.ok) {
+      setStatus("connected", "Gateway OK");
+      setTimeout(() => setStatus("", "Ready"), 2000);
+    } else {
+      setStatus("error", "Gateway error");
+    }
+  } catch {
+    setStatus("error", "Unreachable");
+  }
+})();
+</script>
+</body>
+</html>
