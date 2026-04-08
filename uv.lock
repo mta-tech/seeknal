@@ -4001,7 +4001,7 @@ wheels = [
 
 [[package]]
 name = "seeknal"
-version = "2.5.1"
+version = "2.5.2"
 source = { editable = "." }
 dependencies = [
     { name = "croniter" },

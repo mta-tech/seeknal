@@ -23,9 +23,17 @@ Key Components:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+
+def _qi(name: str) -> str:
+    """Quote a DuckDB identifier if it contains special characters (e.g. hyphens)."""
+    if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
+        return name
+    return f'"{name}"'
 
 from seeknal.dag.manifest import Node, NodeType  # ty: ignore[unresolved-import]
 from seeknal.validation import validate_file_path  # ty: ignore[unresolved-import]
@@ -1128,7 +1136,9 @@ class SourceExecutor(BaseExecutor):
                 f"got '{table}' ({len(parts)} parts)"
             )
 
-        catalog_alias, namespace, table_name = parts
+        catalog_alias_raw, namespace_raw, table_name = parts
+        catalog_alias = _qi(catalog_alias_raw)
+        namespace = _qi(namespace_raw)
 
         # Get connection config from params or env vars
         catalog_uri = params.get(
@@ -1223,6 +1233,7 @@ class SourceExecutor(BaseExecutor):
                             AUTHORIZATION_TYPE 'none'
                         )
                     """)
+                logger.info(f"Attached Iceberg catalog: {catalog_alias}")
             except Exception as attach_err:
                 # Catalog may already be attached from a previous source
                 if "already exists" not in str(attach_err).lower():
@@ -1286,7 +1297,7 @@ class SourceExecutor(BaseExecutor):
             snapshot_id = None
             try:
                 snap_result = con.execute(
-                    f"SELECT snapshot_id FROM iceberg_snapshots('{catalog_alias}.{namespace}.{table_name}') "
+                    f"SELECT snapshot_id FROM iceberg_snapshots('{catalog_alias_raw}.{namespace_raw}.{table_name}') "
                     f"ORDER BY timestamp_ms DESC LIMIT 1"
                 ).fetchone()
                 if snap_result:

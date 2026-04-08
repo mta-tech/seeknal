@@ -605,13 +605,18 @@ def _load_iceberg_source(table: str, params: dict):
 
         # Normalize table name: if 3-part (catalog.namespace.table), strip
         # the catalog prefix since we've attached our own catalog alias.
+        # Quote identifiers that contain hyphens for DuckDB compatibility.
+        import re as _re
+        def _qi(n):
+            return n if _re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', n) else f'"{n}"'
+
         parts = table.split(".")
         if len(parts) == 3:
-            query_table = f"iceberg_cat.{parts[1]}.{parts[2]}"
+            query_table = f"iceberg_cat.{_qi(parts[1])}.{_qi(parts[2])}"
         elif len(parts) == 2:
-            query_table = f"iceberg_cat.{parts[0]}.{parts[1]}"
+            query_table = f"iceberg_cat.{_qi(parts[0])}.{_qi(parts[1])}"
         else:
-            query_table = f"iceberg_cat.{table}"
+            query_table = f"iceberg_cat.{_qi(table)}"
 
         df = con.execute(f"SELECT * FROM {query_table}").df()
         con.close()
