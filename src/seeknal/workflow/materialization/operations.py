@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 import threading
 import time
 import uuid
@@ -53,6 +54,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
+
+
+def _qi(name: str) -> str:
+    """Quote a DuckDB identifier if it contains special characters (e.g. hyphens)."""
+    if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
+        return name
+    return f'"{name}"'
 
 from seeknal.workflow.materialization.config import (
     MaterializationConfig,
@@ -388,9 +396,11 @@ class DuckDBIcebergExtension:
                 catalog_url = base_url
 
             # Build ATTACH SQL with inline token auth
+            # Quote catalog_name for identifiers with hyphens (e.g. prod-dwa-hot-bronze)
+            quoted_name = _qi(catalog_name)
             if bearer_token:
                 sql = (
-                    f"ATTACH '{warehouse_path}' AS {catalog_name} ("
+                    f"ATTACH '{warehouse_path}' AS {quoted_name} ("
                     f"TYPE ICEBERG, "
                     f"ENDPOINT '{catalog_url}', "
                     f"AUTHORIZATION_TYPE 'oauth2', "
@@ -399,7 +409,7 @@ class DuckDBIcebergExtension:
                 )
             else:
                 sql = (
-                    f"ATTACH '{warehouse_path}' AS {catalog_name} ("
+                    f"ATTACH '{warehouse_path}' AS {quoted_name} ("
                     f"TYPE ICEBERG, "
                     f"ENDPOINT '{catalog_url}', "
                     f"AUTHORIZATION_TYPE 'none'"
@@ -683,11 +693,13 @@ def create_iceberg_table(
     # Build SQL
     # When table_name is 3-part (catalog.namespace.table), strip the
     # catalog prefix since ATTACH already provides it as catalog_name.
+    # Quote identifiers that contain hyphens for DuckDB compatibility.
+    _qcat = _qi(catalog_name)
     _parts = table_name.split(".")
     if len(_parts) == 3:
-        full_table_name = f"{catalog_name}.{_parts[1]}.{_parts[2]}"
+        full_table_name = f"{_qcat}.{_qi(_parts[1])}.{_qi(_parts[2])}"
     else:
-        full_table_name = f"{catalog_name}.{table_name}"
+        full_table_name = f"{_qcat}.{_qi(table_name)}"
     sql = f"""
         CREATE TABLE IF NOT EXISTS {full_table_name} (
             {', '.join(column_defs)}
@@ -763,15 +775,16 @@ def write_to_iceberg(
 
     # When table_name is 3-part (catalog.namespace.table), strip the
     # catalog prefix since ATTACH already provides it as catalog_name.
+    _qcat = _qi(catalog_name)
     _parts = table_name.split(".")
     if len(_parts) == 3:
-        full_table_name = f"{catalog_name}.{_parts[1]}.{_parts[2]}"
+        full_table_name = f"{_qcat}.{_qi(_parts[1])}.{_qi(_parts[2])}"
         namespace = _parts[1]
     elif len(_parts) == 2:
-        full_table_name = f"{catalog_name}.{table_name}"
+        full_table_name = f"{_qcat}.{_qi(_parts[0])}.{_qi(_parts[1])}"
         namespace = _parts[0]
     else:
-        full_table_name = f"{catalog_name}.{table_name}"
+        full_table_name = f"{_qcat}.{_qi(table_name)}"
         namespace = None
 
     # Auto-create namespace and table if they don't exist
@@ -887,7 +900,7 @@ def _ensure_table_exists(
     # Create namespace if provided
     if namespace:
         try:
-            con.execute(f"CREATE SCHEMA IF NOT EXISTS {catalog_name}.{namespace}")
+            con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qi(catalog_name)}.{_qi(namespace)}")
             logger.info(f"Created namespace: {catalog_name}.{namespace}")
         except Exception as exc:
             # Schema may already exist; log and continue
