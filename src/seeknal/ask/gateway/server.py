@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -35,14 +36,36 @@ sse_broadcaster = SSEBroadcaster()
 # Per-session locks to serialize concurrent runs on the same session_id.
 # Prevents message history corruption (last-writer-wins on JSON files)
 # and garbled SSE event streams from interleaved responses.
-_session_locks: dict[str, asyncio.Lock] = {}
+# Uses LRU eviction to prevent unbounded memory growth.
+_session_locks: dict[str, tuple[asyncio.Lock, float]] = {}
+_LOCK_IDLE_TTL = 1800  # 30 minutes
 
 
 def _get_session_lock(session_id: str) -> asyncio.Lock:
-    """Get or create an asyncio.Lock for a session_id."""
-    if session_id not in _session_locks:
-        _session_locks[session_id] = asyncio.Lock()
-    return _session_locks[session_id]
+    """Get or create an asyncio.Lock for a session_id with LRU tracking."""
+    now = time.monotonic()
+    if session_id in _session_locks:
+        lock, _ = _session_locks[session_id]
+        _session_locks[session_id] = (lock, now)
+        return lock
+    lock = asyncio.Lock()
+    _session_locks[session_id] = (lock, now)
+    return lock
+
+
+def _evict_idle_locks() -> int:
+    """Remove locks that have been idle for longer than _LOCK_IDLE_TTL.
+
+    Returns the number of evicted entries.
+    """
+    now = time.monotonic()
+    stale = [
+        sid for sid, (lock, last_access) in _session_locks.items()
+        if now - last_access > _LOCK_IDLE_TTL and not lock.locked()
+    ]
+    for sid in stale:
+        del _session_locks[sid]
+    return len(stale)
 
 
 def _validate_session_id(session_id: str) -> bool:
@@ -276,9 +299,8 @@ async def sse_endpoint(request: Request) -> StreamingResponse:
     """SSE event stream for a session.
 
     Sends keepalive events every 30 seconds during idle periods.
-    Terminates when a ``done`` event is received, the client
-    disconnects, or the safety-valve maximum timeout (10 minutes)
-    is reached.
+    Stays open across multiple turns — client decides when to close.
+    Safety-valve timeout (10 minutes idle) prevents infinite hangs.
     """
     session_id = request.path_params["session_id"]
     if not _validate_session_id(session_id):
@@ -312,13 +334,8 @@ async def sse_endpoint(request: Request) -> StreamingResponse:
                     )
                     yield f"data: {event}\n\n"
 
-                    # Check for done event — stream is complete
-                    try:
-                        parsed = json.loads(event)
-                        if parsed.get("type") == "done":
-                            break
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                    # Reset safety-valve timer on each event (idle timeout, not total)
+                    start = time.monotonic()
 
                 except asyncio.TimeoutError:
                     # Send keepalive and continue loop
@@ -334,6 +351,79 @@ async def sse_endpoint(request: Request) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Session history endpoint
+# ---------------------------------------------------------------------------
+
+
+async def session_history(request: Request) -> JSONResponse:
+    """Return conversation history as raw SSE-format events for UI replay.
+
+    Converts pydantic-ai message objects into the same event format
+    that ``_run_agent_inner`` yields during live streaming.
+    """
+    session_id = request.path_params["session_id"]
+    if not _validate_session_id(session_id):
+        return JSONResponse({"error": "invalid session_id"}, status_code=400)
+
+    project_path = Path(request.app.state.project_path)
+
+    from seeknal.ask.sessions import SessionStore
+
+    store = SessionStore(project_path)
+    if store.get(session_id) is None:
+        return JSONResponse([])
+
+    messages = store.load_messages(session_id)
+    if not messages:
+        return JSONResponse([])
+
+    events = _messages_to_events(messages)
+    return JSONResponse(events)
+
+
+def _messages_to_events(messages: list) -> list[dict]:
+    """Convert pydantic-ai message history to SSE event format."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        ToolCallPart,
+        ToolReturnPart,
+        UserPromptPart,
+    )
+
+    events: list[dict] = []
+
+    for msg in messages:
+        if isinstance(msg, ModelRequest):
+            for part in msg.parts:
+                if isinstance(part, UserPromptPart):
+                    events.append({"type": "user_message", "data": part.content})
+                elif isinstance(part, ToolReturnPart):
+                    events.append({
+                        "type": "tool_end",
+                        "data": {
+                            "name": part.tool_name,
+                            "output": str(part.content)[:2000] if part.content else "",
+                        },
+                    })
+        elif isinstance(msg, ModelResponse):
+            for part in msg.parts:
+                if isinstance(part, TextPart):
+                    events.append({"type": "answer", "data": part.content})
+                elif isinstance(part, ToolCallPart):
+                    events.append({
+                        "type": "tool_start",
+                        "data": {
+                            "name": part.tool_name,
+                            "args": part.args_as_dict() if hasattr(part, 'args_as_dict') else {},
+                        },
+                    })
+
+    return events
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +506,7 @@ def create_gateway_app(
         Route("/", chat_ui),
         Route("/health", health),
         Route("/sessions", list_sessions),
+        Route("/sessions/{session_id}/history", session_history),
         Route("/ask", ask_oneshot, methods=["POST"]),
         Route("/temporal/start", temporal_start, methods=["POST"]),
         WebSocketRoute("/ws/{session_id}", websocket_endpoint),
@@ -427,7 +518,31 @@ def create_gateway_app(
     if static_dir.is_dir():
         routes.append(Mount("/static", StaticFiles(directory=str(static_dir)), name="static"))
 
-    app = Starlette(routes=routes, lifespan=lifespan)
+    # Wrap user lifespan to include lock eviction task
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _lifespan(app):
+        async def _eviction_loop():
+            while True:
+                await asyncio.sleep(300)  # every 5 minutes
+                _evict_idle_locks()
+
+        eviction_task = asyncio.create_task(_eviction_loop())
+        try:
+            if lifespan is not None:
+                async with lifespan(app):
+                    yield
+            else:
+                yield
+        finally:
+            eviction_task.cancel()
+            try:
+                await eviction_task
+            except asyncio.CancelledError:
+                pass
+
+    app = Starlette(routes=routes, lifespan=_lifespan)
     app.state.project_path = str(project_path)
     if temporal_client is not None:
         app.state.temporal_client = temporal_client
