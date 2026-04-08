@@ -191,8 +191,8 @@ def create_agent(
         subagents=get_subagent_configs(),
         # Web search disabled: seeknal has domain-specific DuckDuckGo toolset
         # added via toolsets_list when include_web=True.
-        web_search=False,
-        web_fetch=False,
+        # NOTE: web_search/web_fetch kwargs removed — pydantic-ai >=1.74
+        # no longer accepts them on Agent().
         # Disabled: seeknal has domain-specific alternatives
         include_filesystem=False,
         include_execute=False,

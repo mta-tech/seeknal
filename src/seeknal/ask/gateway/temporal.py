@@ -59,6 +59,10 @@ class AgentWorkflowInput:
     project_path: str
     provider: str | None = None
     model: str | None = None
+    # External push — when set, the activity POSTs events to this URL
+    # instead of (or in addition to) the local SSE broadcaster.
+    push_url: str | None = None
+    api_key: str | None = None
 
 
 @dataclass
@@ -89,14 +93,44 @@ if TEMPORAL_AVAILABLE:
         """Run the seeknal ask agent as a Temporal activity.
 
         Iterates ``_run_agent_streaming()`` from the gateway server,
-        which handles SSE broadcast internally. This activity only
-        tracks events for the workflow return value and sends periodic
-        heartbeats.
-
-        Does NOT call ``sse_broadcaster.publish()`` — that is handled
-        inside ``_run_agent_streaming()`` (single SSE publish owner).
+        which handles SSE broadcast internally. When ``push_url`` is
+        set on the input, events are also POSTed to that external URL
+        so consumers like kc-service can receive them via their own
+        SSE endpoint.
         """
         from seeknal.ask.gateway.server import _run_agent_streaming
+
+        # Set up external push if configured
+        push_client = None
+        push_headers: dict[str, str] = {}
+        if input.push_url:
+            import httpx
+
+            push_url = input.push_url
+            if not push_url.startswith("http"):
+                push_url = f"http://localhost:8000{push_url}"
+            push_client = httpx.AsyncClient(timeout=10)
+            push_headers["Content-Type"] = "application/json"
+            if input.api_key:
+                push_headers["X-API-Key"] = input.api_key
+
+        async def _push_event(event_type: str, **payload: object) -> None:
+            """POST a single event to the external push URL."""
+            if push_client is None:
+                return
+            try:
+                await push_client.post(
+                    push_url,  # type: ignore[possibly-undefined]
+                    json={
+                        "event": event_type,
+                        "message_id": input.session_id,
+                        "conversation_id": input.session_id,
+                        "payload": payload,
+                    },
+                    headers=push_headers,
+                )
+            except Exception:
+                activity.logger.warning("Failed to push event to %s", push_url)
 
         # Background heartbeat coroutine
         async def _heartbeat_loop():
@@ -111,6 +145,9 @@ if TEMPORAL_AVAILABLE:
         event_count = 0
 
         try:
+            await _push_event("start")
+            event_count += 1
+
             async for event in _run_agent_streaming(
                 Path(input.project_path),
                 input.session_id,
@@ -121,22 +158,48 @@ if TEMPORAL_AVAILABLE:
                 event_count += 1
                 event_type = event.get("type")
 
-                if event_type == "answer":
+                if event_type == "token":
+                    await _push_event("message", answer=event.get("data", ""))
+                elif event_type == "answer":
                     answer = event.get("data", "")
+                    await _push_event("message", answer=answer)
+                elif event_type == "tool_start":
+                    data = event.get("data", {})
+                    await _push_event(
+                        "tool_call",
+                        tool_name=data.get("name", ""),
+                        tool_args=data.get("args", {}),
+                    )
+                elif event_type == "tool_end":
+                    data = event.get("data", {})
+                    await _push_event(
+                        "tool_result",
+                        tool_name=data.get("name", ""),
+                        tool_result=data.get("output", ""),
+                    )
+                elif event_type == "reasoning":
+                    await _push_event("reasoning", answer=event.get("data", ""))
                 elif event_type == "error":
                     error = event.get("data", "")
+                    await _push_event("error", error_message=error)
                 elif event_type == "done":
                     break
+
+            await _push_event("done")
+            event_count += 1
 
         except Exception as exc:
             if not error:
                 error = str(exc)
+            await _push_event("error", error_message=str(exc))
         finally:
             heartbeat_task.cancel()
             try:
                 await heartbeat_task
             except asyncio.CancelledError:
                 pass
+            if push_client is not None:
+                await push_client.aclose()
 
         return AgentWorkflowOutput(
             answer=answer,
