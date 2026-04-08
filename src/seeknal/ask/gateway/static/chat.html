@@ -630,7 +630,8 @@ const GATEWAY_URL = window.location.origin; // same-origin default
 /* ============================================================
    State
    ============================================================ */
-let sessionId = newUUID();
+let sessionId = localStorage.getItem("seeknal_session_id") || newUUID();
+localStorage.setItem("seeknal_session_id", sessionId);
 let isStreaming = false;
 let currentAssistantRow = null;
 let currentBubble = null;
@@ -1091,6 +1092,17 @@ function handleEvent(msg) {
       finishStreaming();
       break;
 
+    case "queued": {
+      const pos = (msg.data && msg.data.position) || "?";
+      showQueueStatus(pos);
+      break;
+    }
+
+    case "started":
+      hideQueueStatus();
+      showThinking();
+      break;
+
     case "keepalive":
       // No-op — just keeps connection alive
       break;
@@ -1111,7 +1123,7 @@ function finishStreaming() {
   activeToolCards = {};
   setInputDisabled(false);
   hideThinking();
-  closeSSE();
+  // SSE stays open for multi-turn — don't close
 }
 
 /* ============================================================
@@ -1120,6 +1132,80 @@ function finishStreaming() {
 function setInputDisabled(disabled) {
   questionEl.disabled = disabled;
   btnSend.disabled = disabled || !questionEl.value.trim();
+}
+
+/* ============================================================
+   Queue status helpers
+   ============================================================ */
+function showQueueStatus(position) {
+  hideThinking();
+  let el = document.getElementById("queue-indicator");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "queue-indicator";
+    el.style.cssText = "text-align:center;padding:12px;color:var(--yellow);font-size:13px;";
+    messagesEl.appendChild(el);
+  }
+  el.textContent = `Queued \u2014 position ${position}. Waiting for available slot\u2026`;
+  scrollToBottom();
+}
+
+function hideQueueStatus() {
+  const el = document.getElementById("queue-indicator");
+  if (el) el.remove();
+}
+
+/* ============================================================
+   Session history restore
+   ============================================================ */
+async function restoreSessionHistory() {
+  try {
+    const resp = await fetch(`${GATEWAY_URL}/sessions/${encodeURIComponent(sessionId)}/history`);
+    if (!resp.ok) return;
+    const events = await resp.json();
+    if (!events || events.length === 0) return;
+
+    // Remove empty state
+    const es = document.getElementById("empty-state");
+    if (es) es.remove();
+
+    // Render history events instantly
+    let currentRole = null;
+    for (const evt of events) {
+      if (evt.type === "user_message") {
+        appendUserMessage(evt.data || "");
+        currentRole = "user";
+      } else if (evt.type === "answer") {
+        startAssistantMessage();
+        appendAnswer(evt.data || "");
+        finalizeStreamText();
+        currentAssistantRow = null;
+        currentBubble = null;
+        currentStreamText = "";
+        currentRole = "assistant";
+      } else if (evt.type === "tool_start") {
+        if (!currentAssistantRow) startAssistantMessage();
+        const d = evt.data || {};
+        appendToolStart(d.name || "tool", d.args);
+      } else if (evt.type === "tool_end") {
+        const d = evt.data || {};
+        appendToolEnd(d.name || "tool", d.output || "");
+      }
+    }
+
+    // Add separator
+    const sep = document.createElement("div");
+    sep.style.cssText = "text-align:center;padding:8px 0;margin:12px 0;border-top:1px solid var(--border);color:var(--text-dim);font-size:12px;";
+    sep.textContent = "Session restored \u2014 previous conversation above";
+    messagesEl.appendChild(sep);
+
+    scrollToBottom();
+
+    // Open persistent SSE connection for this session
+    subscribeSSE(sessionId);
+  } catch {
+    // Silently fail — session may not exist on server
+  }
 }
 
 /* ============================================================
@@ -1137,11 +1223,12 @@ async function sendMessage() {
   appendUserMessage(question);
   showThinking();
 
-  // Start SSE subscription BEFORE posting to Temporal
-  subscribeSSE(sessionId);
-
-  // Small wait to ensure SSE connection opens before the workflow starts posting events
-  await delay(80);
+  // Ensure SSE is connected (reuse if already open from restore or prior turn)
+  if (!sseSource || sseSource.readyState === EventSource.CLOSED) {
+    subscribeSSE(sessionId);
+    // Small wait to ensure SSE connection opens before the workflow starts posting events
+    await delay(80);
+  }
 
   let workflowId = null;
   let usedTemporal = false;
@@ -1239,6 +1326,7 @@ function newSession() {
   }
 
   sessionId = newUUID();
+  localStorage.setItem("seeknal_session_id", sessionId);
 
   // Clear messages
   messagesEl.innerHTML = "";
@@ -1297,13 +1385,15 @@ btnNew.addEventListener("click", newSession);
 // Initial focus
 questionEl.focus();
 
-// Initial health check — update status dot
+// Initial health check + session restore
 (async () => {
   try {
     const resp = await fetch(`${GATEWAY_URL}/health`, { method: "GET" });
     if (resp.ok) {
       setStatus("connected", "Gateway OK");
-      setTimeout(() => setStatus("", "Ready"), 2000);
+      // Restore session history if we have a saved session_id
+      await restoreSessionHistory();
+      setTimeout(() => setStatus("", "Ready"), 1000);
     } else {
       setStatus("error", "Gateway error");
     }

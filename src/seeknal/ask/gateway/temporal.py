@@ -252,6 +252,6 @@ if TEMPORAL_AVAILABLE:
             task_queue=task_queue,
             workflows=[AgentWorkflow],
             activities=[run_agent_activity],
-            max_concurrent_activities=3,
+            max_concurrent_activities=15,
             graceful_shutdown_timeout=timedelta(minutes=5),
         )
