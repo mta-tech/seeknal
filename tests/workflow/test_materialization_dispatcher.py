@@ -553,3 +553,118 @@ class TestIcebergCatalogFallback:
         assert call_kwargs["warehouse_path"] == "catalog-warehouse"
         # source_defaults should NOT be consulted
         loader.load_source_defaults.assert_not_called()
+
+    def test_target_config_overrides_profile_catalog(self, mock_con, monkeypatch):
+        """Per-YAML target catalog_uri/warehouse override profile catalog config."""
+        monkeypatch.setenv("LAKEKEEPER_URI", "http://from-env:8181")
+
+        loader = MagicMock()
+        loader.load_profile.return_value = self._make_profile_config(
+            uri="http://from-catalog:8181", warehouse="catalog-warehouse"
+        )
+        dispatcher = MaterializationDispatcher(profile_loader=loader)
+
+        mock_ext = MagicMock()
+        mock_ext.get_oauth2_token.return_value = "token123"
+        mock_write = MagicMock(return_value=_ok_result(5))
+
+        with patch.dict("sys.modules", {
+            "seeknal.workflow.materialization.operations": MagicMock(
+                DuckDBIcebergExtension=mock_ext,
+                write_to_iceberg=mock_write,
+            ),
+        }):
+            dispatcher._materialize_iceberg(
+                mock_con,
+                "my_view",
+                {
+                    "table": "atlas.ns.tbl",
+                    "mode": "append",
+                    "catalog_uri": "http://per-node:8181",
+                    "warehouse": "s3://per-node-bucket",
+                },
+            )
+
+        call_kwargs = mock_ext.attach_rest_catalog.call_args[1]
+        assert call_kwargs["uri"] == "http://per-node:8181"
+        assert call_kwargs["warehouse_path"] == "s3://per-node-bucket"
+        # source_defaults should NOT be consulted
+        loader.load_source_defaults.assert_not_called()
+
+    def test_target_config_partial_override(self, mock_con, monkeypatch):
+        """Per-YAML target can override only catalog_uri; warehouse falls back."""
+        loader = MagicMock()
+        loader.load_profile.return_value = self._make_profile_config(
+            uri="http://from-catalog:8181", warehouse="catalog-warehouse"
+        )
+        dispatcher = MaterializationDispatcher(profile_loader=loader)
+
+        mock_ext = MagicMock()
+        mock_ext.get_oauth2_token.return_value = "token123"
+        mock_write = MagicMock(return_value=_ok_result(5))
+
+        with patch.dict("sys.modules", {
+            "seeknal.workflow.materialization.operations": MagicMock(
+                DuckDBIcebergExtension=mock_ext,
+                write_to_iceberg=mock_write,
+            ),
+        }):
+            dispatcher._materialize_iceberg(
+                mock_con,
+                "my_view",
+                {
+                    "table": "atlas.ns.tbl",
+                    "mode": "append",
+                    "catalog_uri": "http://per-node:8181",
+                    # warehouse NOT set → falls back to profile
+                },
+            )
+
+        call_kwargs = mock_ext.attach_rest_catalog.call_args[1]
+        assert call_kwargs["uri"] == "http://per-node:8181"
+        assert call_kwargs["warehouse_path"] == "catalog-warehouse"
+
+
+# ---------------------------------------------------------------------------
+# YAMLMaterializationConfig extraction tests
+# ---------------------------------------------------------------------------
+
+class TestYAMLMaterializationConfigExtraction:
+    """Tests for IcebergMaterializationHelper.extract_materialization_config."""
+
+    def test_extract_catalog_uri_and_warehouse(self):
+        """catalog_uri and warehouse are extracted from YAML node config."""
+        from seeknal.workflow.materialization.yaml_integration import (
+            IcebergMaterializationHelper,
+        )
+
+        node_config = {
+            "materialization": {
+                "enabled": True,
+                "table": "atlas.ns.my_table",
+                "mode": "append",
+                "catalog_uri": "http://custom:8181",
+                "warehouse": "s3://custom-bucket",
+            }
+        }
+        config = IcebergMaterializationHelper.extract_materialization_config(node_config)
+        assert config.enabled is True
+        assert config.catalog_uri == "http://custom:8181"
+        assert config.warehouse == "s3://custom-bucket"
+
+    def test_extract_without_catalog_overrides(self):
+        """catalog_uri and warehouse default to None when not specified."""
+        from seeknal.workflow.materialization.yaml_integration import (
+            IcebergMaterializationHelper,
+        )
+
+        node_config = {
+            "materialization": {
+                "enabled": True,
+                "table": "atlas.ns.my_table",
+            }
+        }
+        config = IcebergMaterializationHelper.extract_materialization_config(node_config)
+        assert config.enabled is True
+        assert config.catalog_uri is None
+        assert config.warehouse is None

@@ -85,11 +85,15 @@ class YAMLMaterializationConfig:
         table: Fully qualified Iceberg table name (e.g., "warehouse.db.table")
         mode: Write mode (append or overwrite)
         create_table: Whether to create table if it doesn't exist
+        catalog_uri: Optional per-node catalog URI override (e.g., Lakekeeper endpoint)
+        warehouse: Optional per-node warehouse path override (e.g., S3 bucket)
     """
     enabled: bool = False
     table: Optional[str] = None
     mode: MaterializationMode = MaterializationMode.APPEND
     create_table: bool = True
+    catalog_uri: Optional[str] = None
+    warehouse: Optional[str] = None
 
 
 class IcebergMaterializationError(Exception):
@@ -338,11 +342,17 @@ class IcebergMaterializationHelper:
                 "Materialization 'create_table' must be a boolean"
             )
 
+        # Extract optional per-node catalog overrides
+        catalog_uri = mat_config.get("catalog_uri")
+        warehouse = mat_config.get("warehouse")
+
         return YAMLMaterializationConfig(
             enabled=True,
             table=table,
             mode=mode,
             create_table=create_table,
+            catalog_uri=catalog_uri,
+            warehouse=warehouse,
         )
 
     @classmethod
