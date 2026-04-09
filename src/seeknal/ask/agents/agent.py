@@ -77,7 +77,9 @@ def create_agent(
     from seeknal.cli.repl import REPL
 
     # Create singleton REPL with safe connection
-    repl = REPL(project_path=project_path, skip_history=True)
+    # Resolve profile_path: use project_path/profiles.yml if it exists
+    profile_path = project_path / "profiles.yml" if (project_path / "profiles.yml").exists() else None
+    repl = REPL(project_path=project_path, profile_path=profile_path, skip_history=True)
     configure_safe_connection(repl.conn)
 
     # Discover project artifacts for context

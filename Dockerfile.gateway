@@ -1,0 +1,32 @@
+FROM python:3.11-slim
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /app
+
+# Install system dependencies for DuckDB postgres/mysql scanners
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies (cached layer — changes only when deps change)
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project --extra ask --extra temporal
+
+# Install seeknal source
+COPY src/ src/
+COPY README.md LICENSE ./
+RUN uv sync --frozen --no-dev --extra ask --extra temporal
+
+# Seeknal project directory — mount at runtime via volume.
+# Only profiles.yml is required; everything else is auto-created.
+WORKDIR /project
+
+EXPOSE 8000
+
+CMD ["uv", "run", "--directory", "/app", "seeknal", "gateway", "start", \
+     "--project", "/project", \
+     "--port", "8000", \
+     "--host", "0.0.0.0", \
+     "--temporal"]
