@@ -115,10 +115,22 @@ def _enrich_missing_ref_hint(message: str, existing_hint: str) -> str:
         from seeknal.ask.agents.tools._context import get_tool_context
 
         ctx = get_tool_context()
+        table_names: list[str] = []
         with ctx.db_lock:
-            columns, rows = ctx.repl.execute_oneshot("SHOW TABLES")
-        if rows:
-            table_names = [str(row[0]) for row in rows]
+            _, rows = ctx.repl.execute_oneshot("SHOW TABLES")
+            for row in rows:
+                table_names.append(str(row[0]))
+            for attached in sorted(ctx.repl.attached):
+                try:
+                    _, att_rows = ctx.repl.execute_oneshot(
+                        f"SELECT table_name FROM information_schema.tables "
+                        f"WHERE table_catalog = '{attached}'"
+                    )
+                    for row in att_rows:
+                        table_names.append(f"{attached}.{row[0]}")
+                except Exception:
+                    pass
+        if table_names:
             tables_str = ", ".join(table_names)
             suffix = f"Available tables: {tables_str}"
             if existing_hint:

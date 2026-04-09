@@ -108,7 +108,9 @@ if TEMPORAL_AVAILABLE:
 
             push_url = input.push_url
             if not push_url.startswith("http"):
-                push_url = f"http://localhost:8000{push_url}"
+                import os
+                base = os.getenv("SEEKNAL_KC_SERVICE_URL", "http://localhost:8000")
+                push_url = f"{base}{push_url}"
             push_client = httpx.AsyncClient(timeout=10)
             push_headers["Content-Type"] = "application/json"
             if input.api_key:

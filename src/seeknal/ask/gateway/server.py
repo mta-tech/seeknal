@@ -228,7 +228,9 @@ async def ask_oneshot(request: Request) -> JSONResponse:
     if not _validate_session_id(session_id):
         return JSONResponse({"error": "invalid session_id"}, status_code=400)
 
-    project_path = Path(request.app.state.project_path)
+    project_path = Path(
+        body.get("project_path") or request.app.state.project_path
+    )
     events = []
     answer = ""
     async for event in _run_agent_streaming(project_path, session_id, question):
