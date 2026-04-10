@@ -355,6 +355,10 @@ def gateway_worker(
         None, "--callback-auth-token", envvar="CALLBACK_AUTH_TOKEN",
         help="Shared secret for authenticating callback POSTs"
     ),
+    tenant: Optional[str] = typer.Option(
+        None, "--tenant", envvar="SEEKNAL_TENANT",
+        help="Tenant ID this worker serves (maps to task queue seeknal-ask-{tenant}; 'default' uses legacy seeknal-ask queue). Overrides TEMPORAL_TASK_QUEUE."
+    ),
 ):
     """Start a standalone Temporal worker (no HTTP server).
 
@@ -382,9 +386,15 @@ def gateway_worker(
         ))
         raise typer.Exit(1)
 
+    from seeknal.ask.gateway.tenant import task_queue_for_tenant
+
     temporal_address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
     temporal_namespace = os.environ.get("TEMPORAL_NAMESPACE", "default")
-    temporal_task_queue = os.environ.get("TEMPORAL_TASK_QUEUE", "seeknal-ask")
+    # Task queue resolution: --tenant > TEMPORAL_TASK_QUEUE env var > legacy default
+    if tenant:
+        temporal_task_queue = task_queue_for_tenant(tenant)
+    else:
+        temporal_task_queue = os.environ.get("TEMPORAL_TASK_QUEUE", "seeknal-ask")
 
     async def _run_worker():
         client = await connect_temporal_client(

@@ -4,9 +4,9 @@ Provides Redis-backed implementations of session storage, SSE pub/sub
 broadcasting, and distributed session locks — replacing the in-process
 singletons in server.py for horizontal scaling.
 
-Follows the same interface as the local components (SSEBroadcaster,
-SessionStore) so the gateway can switch between local and Redis mode
-at startup via create_gateway_app(redis_url=...).
+Multi-tenant: all keys and channels are tenant-prefixed so two tenants
+using the same ``session_id`` never collide. Default tenant uses legacy
+unprefixed keys for backward compatibility.
 """
 
 from __future__ import annotations
@@ -19,7 +19,17 @@ from typing import Any, Protocol
 
 from redis.asyncio import Redis
 
+from seeknal.ask.gateway.tenant import DEFAULT_TENANT
+
 logger = logging.getLogger(__name__)
+
+
+def _tenant_segment(tenant_id: str) -> str:
+    """Return a Redis key segment for a tenant. Empty string for default."""
+    if tenant_id == DEFAULT_TENANT:
+        return ""
+    return f"{tenant_id}:"
+
 
 # ---------------------------------------------------------------------------
 # Broadcaster Protocol — shared interface for local and Redis SSE
@@ -29,9 +39,18 @@ logger = logging.getLogger(__name__)
 class Broadcaster(Protocol):
     """Protocol for SSE event broadcasting (local or Redis-backed)."""
 
-    async def publish(self, session_id: str, event: str) -> None: ...
-    def subscribe(self, session_id: str) -> asyncio.Queue: ...
-    def unsubscribe(self, session_id: str, queue: asyncio.Queue) -> None: ...
+    async def publish(
+        self, session_id: str, event: str, tenant_id: str = DEFAULT_TENANT
+    ) -> None: ...
+    def subscribe(
+        self, session_id: str, tenant_id: str = DEFAULT_TENANT
+    ) -> asyncio.Queue: ...
+    def unsubscribe(
+        self,
+        session_id: str,
+        queue: asyncio.Queue,
+        tenant_id: str = DEFAULT_TENANT,
+    ) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -42,9 +61,9 @@ class Broadcaster(Protocol):
 class RedisSSEBroadcaster:
     """Redis pub/sub based SSE event broadcaster.
 
-    Publishes events to a Redis channel per session. Each gateway replica
-    subscribes to active session channels and relays events to locally
-    connected SSE clients.
+    Publishes events to a Redis channel per tenant + session. Each
+    gateway replica subscribes to active session channels and relays
+    events to locally connected SSE clients.
     """
 
     CHANNEL_PREFIX = "seeknal:sse:"
@@ -52,39 +71,54 @@ class RedisSSEBroadcaster:
     def __init__(self, redis: Redis, maxsize: int = 100) -> None:
         self._redis = redis
         self._maxsize = maxsize
+        # Keyed by composite "{tenant}:{session}" (or "{session}" for default)
         self._local_subscribers: dict[str, list[asyncio.Queue]] = {}
         self._pubsub = redis.pubsub()
         self._listener_task: asyncio.Task | None = None
 
-    def subscribe(self, session_id: str) -> asyncio.Queue:
+    def _channel(self, tenant_id: str, session_id: str) -> str:
+        return f"{self.CHANNEL_PREFIX}{_tenant_segment(tenant_id)}{session_id}"
+
+    def subscribe(
+        self, session_id: str, tenant_id: str = DEFAULT_TENANT
+    ) -> asyncio.Queue:
         """Create a local subscriber queue and subscribe to Redis channel."""
+        channel = self._channel(tenant_id, session_id)
         queue: asyncio.Queue = asyncio.Queue(maxsize=self._maxsize)
-        if session_id not in self._local_subscribers:
-            self._local_subscribers[session_id] = []
-            # Subscribe to Redis channel in background
-            asyncio.ensure_future(
-                self._pubsub.subscribe(f"{self.CHANNEL_PREFIX}{session_id}")
-            )
-        self._local_subscribers[session_id].append(queue)
+        if channel not in self._local_subscribers:
+            self._local_subscribers[channel] = []
+            asyncio.ensure_future(self._pubsub.subscribe(channel))
+        self._local_subscribers[channel].append(queue)
         return queue
 
-    def unsubscribe(self, session_id: str, queue: asyncio.Queue) -> None:
+    def unsubscribe(
+        self,
+        session_id: str,
+        queue: asyncio.Queue,
+        tenant_id: str = DEFAULT_TENANT,
+    ) -> None:
         """Remove a local subscriber queue."""
-        subs = self._local_subscribers.get(session_id, [])
+        channel = self._channel(tenant_id, session_id)
+        subs = self._local_subscribers.get(channel, [])
         if queue in subs:
             subs.remove(queue)
-        if not subs and session_id in self._local_subscribers:
-            del self._local_subscribers[session_id]
-            asyncio.ensure_future(
-                self._pubsub.unsubscribe(f"{self.CHANNEL_PREFIX}{session_id}")
-            )
+        if not subs and channel in self._local_subscribers:
+            del self._local_subscribers[channel]
+            asyncio.ensure_future(self._pubsub.unsubscribe(channel))
 
-    async def publish(self, session_id: str, event: str) -> None:
-        """Publish an event to Redis channel (fans out to all replicas)."""
+    async def publish(
+        self, session_id: str, event: str, tenant_id: str = DEFAULT_TENANT
+    ) -> None:
+        """Publish an event to the Redis channel (fans out to all replicas)."""
+        channel = self._channel(tenant_id, session_id)
         try:
-            await self._redis.publish(f"{self.CHANNEL_PREFIX}{session_id}", event)
+            await self._redis.publish(channel, event)
         except Exception:
-            logger.warning("Redis publish failed for session %s", session_id)
+            logger.warning(
+                "Redis publish failed for tenant=%s session=%s",
+                tenant_id,
+                session_id,
+            )
 
     async def start_listener(self) -> None:
         """Start background task that relays Redis messages to local queues."""
@@ -109,16 +143,14 @@ class RedisSSEBroadcaster:
                 channel = message["channel"]
                 if isinstance(channel, bytes):
                     channel = channel.decode()
-                session_id = channel.removeprefix(self.CHANNEL_PREFIX)
                 data = message["data"]
                 if isinstance(data, bytes):
                     data = data.decode()
-
-                for queue in self._local_subscribers.get(session_id, []):
+                for queue in self._local_subscribers.get(channel, []):
                     try:
                         queue.put_nowait(data)
                     except asyncio.QueueFull:
-                        pass  # Drop events for slow consumers
+                        pass
         except asyncio.CancelledError:
             return
         except Exception:
@@ -135,18 +167,32 @@ class RedisSessionStore:
 
     Replaces the filesystem-based SessionStore for multi-replica deployments.
     Session metadata and messages are stored as Redis keys with optional TTL.
+    Tenant-scoped: keys include a tenant segment so the same session_id
+    across tenants is isolated. Default tenant uses legacy unprefixed keys
+    for backward compatibility.
     """
 
     META_PREFIX = "seeknal:session:"
     MSG_PREFIX = "seeknal:messages:"
-    INDEX_KEY = "seeknal:sessions"
+    INDEX_PREFIX = "seeknal:sessions"  # + ":{tenant}" for non-default
     DEFAULT_TTL = 86400 * 7  # 7 days
 
     def __init__(self, redis: Redis, ttl: int | None = None) -> None:
         self._redis = redis
         self._ttl = ttl or self.DEFAULT_TTL
 
-    async def create(self, name: str) -> str:
+    def _meta_key(self, tenant_id: str, name: str) -> str:
+        return f"{self.META_PREFIX}{_tenant_segment(tenant_id)}{name}"
+
+    def _msg_key(self, tenant_id: str, name: str) -> str:
+        return f"{self.MSG_PREFIX}{_tenant_segment(tenant_id)}{name}"
+
+    def _index_key(self, tenant_id: str) -> str:
+        if tenant_id == DEFAULT_TENANT:
+            return self.INDEX_PREFIX
+        return f"{self.INDEX_PREFIX}:{tenant_id}"
+
+    async def create(self, name: str, tenant_id: str = DEFAULT_TENANT) -> str:
         """Create a new session."""
         now = datetime.now(timezone.utc).isoformat()
         metadata = {
@@ -157,34 +203,39 @@ class RedisSessionStore:
             "message_count": 0,
             "last_question": None,
         }
-        key = f"{self.META_PREFIX}{name}"
-        await self._redis.set(key, json.dumps(metadata), ex=self._ttl)
-        await self._redis.sadd(self.INDEX_KEY, name)
+        await self._redis.set(
+            self._meta_key(tenant_id, name), json.dumps(metadata), ex=self._ttl
+        )
+        await self._redis.sadd(self._index_key(tenant_id), name)
         return name
 
-    async def get(self, name: str) -> dict | None:
+    async def get(
+        self, name: str, tenant_id: str = DEFAULT_TENANT
+    ) -> dict | None:
         """Fetch session metadata."""
-        data = await self._redis.get(f"{self.META_PREFIX}{name}")
+        data = await self._redis.get(self._meta_key(tenant_id, name))
         if data is None:
             return None
         return json.loads(data)
 
-    async def list(self) -> list[dict]:
-        """List all sessions."""
-        names = await self._redis.smembers(self.INDEX_KEY)
+    async def list(self, tenant_id: str = DEFAULT_TENANT) -> list[dict]:
+        """List all sessions for a tenant."""
+        names = await self._redis.smembers(self._index_key(tenant_id))
         sessions = []
         for name in names:
             if isinstance(name, bytes):
                 name = name.decode()
-            meta = await self.get(name)
+            meta = await self.get(name, tenant_id=tenant_id)
             if meta:
                 sessions.append(meta)
         sessions.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
         return sessions
 
-    async def update(self, name: str, **kwargs: Any) -> None:
+    async def update(
+        self, name: str, *, tenant_id: str = DEFAULT_TENANT, **kwargs: Any
+    ) -> None:
         """Update session metadata fields."""
-        meta = await self.get(name)
+        meta = await self.get(name, tenant_id=tenant_id)
         if meta is None:
             return
         allowed = {"status", "message_count", "last_question", "updated_at"}
@@ -193,25 +244,34 @@ class RedisSessionStore:
                 meta[k] = v
         if "updated_at" not in kwargs:
             meta["updated_at"] = datetime.now(timezone.utc).isoformat()
-        key = f"{self.META_PREFIX}{name}"
-        await self._redis.set(key, json.dumps(meta), ex=self._ttl)
+        await self._redis.set(
+            self._meta_key(tenant_id, name), json.dumps(meta), ex=self._ttl
+        )
 
-    async def delete(self, name: str) -> bool:
+    async def delete(self, name: str, tenant_id: str = DEFAULT_TENANT) -> bool:
         """Delete a session."""
-        key = f"{self.META_PREFIX}{name}"
-        msg_key = f"{self.MSG_PREFIX}{name}"
-        result = await self._redis.delete(key, msg_key)
-        await self._redis.srem(self.INDEX_KEY, name)
+        result = await self._redis.delete(
+            self._meta_key(tenant_id, name), self._msg_key(tenant_id, name)
+        )
+        await self._redis.srem(self._index_key(tenant_id), name)
         return result > 0
 
-    async def save_messages(self, name: str, messages_json: bytes) -> None:
+    async def save_messages(
+        self,
+        name: str,
+        messages_json: bytes,
+        tenant_id: str = DEFAULT_TENANT,
+    ) -> None:
         """Save serialized conversation history."""
-        key = f"{self.MSG_PREFIX}{name}"
-        await self._redis.set(key, messages_json, ex=self._ttl)
+        await self._redis.set(
+            self._msg_key(tenant_id, name), messages_json, ex=self._ttl
+        )
 
-    async def load_messages(self, name: str) -> bytes | None:
+    async def load_messages(
+        self, name: str, tenant_id: str = DEFAULT_TENANT
+    ) -> bytes | None:
         """Load serialized conversation history."""
-        return await self._redis.get(f"{self.MSG_PREFIX}{name}")
+        return await self._redis.get(self._msg_key(tenant_id, name))
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +284,8 @@ class RedisSessionLock:
 
     Replaces the per-process asyncio.Lock dict for multi-replica
     session serialization. Uses Redis SETNX with auto-expiry.
+    Tenant-scoped so the same session_id across tenants has independent
+    locks.
     """
 
     LOCK_PREFIX = "seeknal:lock:"
@@ -233,10 +295,15 @@ class RedisSessionLock:
         self._redis = redis
         self._timeout = timeout or self.DEFAULT_TIMEOUT
 
-    async def acquire(self, session_id: str) -> Any:
-        """Acquire a distributed lock for a session. Returns the lock object."""
+    def _key(self, tenant_id: str, session_id: str) -> str:
+        return f"{self.LOCK_PREFIX}{_tenant_segment(tenant_id)}{session_id}"
+
+    async def acquire(
+        self, session_id: str, tenant_id: str = DEFAULT_TENANT
+    ) -> Any:
+        """Acquire a distributed lock for a tenant's session."""
         lock = self._redis.lock(
-            f"{self.LOCK_PREFIX}{session_id}",
+            self._key(tenant_id, session_id),
             timeout=self._timeout,
             blocking_timeout=self._timeout,
         )

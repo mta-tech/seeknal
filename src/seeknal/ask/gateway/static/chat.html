@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="seeknal-tenant" content="default" />
   <title>Seeknal Ask — Chat</title>
   <style>
     /* ------------------------------------------------------------------ */
@@ -627,6 +628,28 @@
    ============================================================ */
 const GATEWAY_URL = window.location.origin; // same-origin default
 
+// Tenant — read from <meta name="seeknal-tenant"> or ?tenant= URL param.
+// The URL param wins so individual tenants can access a shared gateway via
+// shareable links without changing the page. Default falls back to "default"
+// which maps to the legacy task queue for backward compatibility.
+const TENANT = (() => {
+  const urlParam = new URLSearchParams(window.location.search).get("tenant");
+  if (urlParam) return urlParam;
+  const meta = document.querySelector('meta[name="seeknal-tenant"]');
+  return (meta && meta.getAttribute("content")) || "default";
+})();
+
+// Helper: build headers with X-Tenant-ID for fetch() calls.
+function tenantHeaders(extra) {
+  return { "X-Tenant-ID": TENANT, ...(extra || {}) };
+}
+
+// Helper: append ?tenant=X to a URL (EventSource can't set custom headers).
+function withTenantParam(url) {
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}tenant=${encodeURIComponent(TENANT)}`;
+}
+
 /* ============================================================
    State
    ============================================================ */
@@ -1029,7 +1052,7 @@ function subscribeSSE(sid) {
     sseSource = null;
   }
 
-  const url = `${GATEWAY_URL}/events/${encodeURIComponent(sid)}`;
+  const url = withTenantParam(`${GATEWAY_URL}/events/${encodeURIComponent(sid)}`);
   const src = new EventSource(url);
   sseSource = src;
 
@@ -1170,7 +1193,9 @@ function hideQueueStatus() {
    ============================================================ */
 async function restoreSessionHistory() {
   try {
-    const resp = await fetch(`${GATEWAY_URL}/sessions/${encodeURIComponent(sessionId)}/history`);
+    const resp = await fetch(`${GATEWAY_URL}/sessions/${encodeURIComponent(sessionId)}/history`, {
+      headers: tenantHeaders(),
+    });
     if (!resp.ok) return;
     const events = await resp.json();
     if (!events || events.length === 0) return;
@@ -1247,7 +1272,7 @@ async function sendMessage() {
   try {
     const resp = await fetch(`${GATEWAY_URL}/temporal/start`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: tenantHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ question, session_id: sessionId }),
     });
 
@@ -1273,7 +1298,7 @@ async function sendMessage() {
     try {
       const resp = await fetch(`${GATEWAY_URL}/ask`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: tenantHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ question, session_id: sessionId }),
       });
 

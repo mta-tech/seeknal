@@ -61,6 +61,7 @@ class AgentWorkflowInput:
     model: str | None = None
     callback_url: str | None = None
     callback_auth_token: str | None = None
+    tenant_id: str = "default"
 
 
 @dataclass
@@ -111,6 +112,9 @@ if TEMPORAL_AVAILABLE:
                 http_session = aiohttp.ClientSession()
                 if input.callback_auth_token:
                     callback_headers["Authorization"] = f"Bearer {input.callback_auth_token}"
+                # Include tenant_id so the backend routes the event to the
+                # right tenant-scoped SSE channel and session store.
+                callback_headers["X-Tenant-ID"] = input.tenant_id
             except ImportError:
                 logger.warning("aiohttp not installed — callback streaming disabled")
 
@@ -139,6 +143,7 @@ if TEMPORAL_AVAILABLE:
                 input.question,
                 provider=input.provider,
                 model=input.model,
+                tenant_id=input.tenant_id,
             ):
                 event_count += 1
                 event_type = event.get("type")

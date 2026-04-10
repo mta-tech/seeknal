@@ -26,6 +26,15 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from seeknal.ask.gateway.session_manager import SessionManager
 from seeknal.ask.gateway.sse import SSEBroadcaster
+from seeknal.ask.gateway.tenant import (
+    DEFAULT_TENANT,
+    InvalidTenantError,
+    make_workflow_id,
+    resolve_tenant,
+    resolve_tenant_ws,
+    scoped_key,
+    task_queue_for_tenant,
+)
 
 # Validate session IDs: alphanumeric, hyphens, underscores, max 128 chars
 _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
@@ -33,7 +42,7 @@ _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
 session_manager = SessionManager()
 sse_broadcaster = SSEBroadcaster()
 
-# Per-session locks to serialize concurrent runs on the same session_id.
+# Per-session locks to serialize concurrent runs on the same (tenant, session_id).
 # Prevents message history corruption (last-writer-wins on JSON files)
 # and garbled SSE event streams from interleaved responses.
 # Uses LRU eviction to prevent unbounded memory growth.
@@ -41,15 +50,18 @@ _session_locks: dict[str, tuple[asyncio.Lock, float]] = {}
 _LOCK_IDLE_TTL = 1800  # 30 minutes
 
 
-def _get_session_lock(session_id: str) -> asyncio.Lock:
-    """Get or create an asyncio.Lock for a session_id with LRU tracking."""
+def _get_session_lock(
+    session_id: str, tenant_id: str = DEFAULT_TENANT
+) -> asyncio.Lock:
+    """Get or create an asyncio.Lock for a (tenant, session_id) with LRU tracking."""
+    key = scoped_key(tenant_id, session_id)
     now = time.monotonic()
-    if session_id in _session_locks:
-        lock, _ = _session_locks[session_id]
-        _session_locks[session_id] = (lock, now)
+    if key in _session_locks:
+        lock, _ = _session_locks[key]
+        _session_locks[key] = (lock, now)
         return lock
     lock = asyncio.Lock()
-    _session_locks[session_id] = (lock, now)
+    _session_locks[key] = (lock, now)
     return lock
 
 
@@ -60,11 +72,11 @@ def _evict_idle_locks() -> int:
     """
     now = time.monotonic()
     stale = [
-        sid for sid, (lock, last_access) in _session_locks.items()
+        key for key, (lock, last_access) in _session_locks.items()
         if now - last_access > _LOCK_IDLE_TTL and not lock.locked()
     ]
-    for sid in stale:
-        del _session_locks[sid]
+    for key in stale:
+        del _session_locks[key]
     return len(stale)
 
 
@@ -72,9 +84,24 @@ def _validate_session_id(session_id: str) -> bool:
     return bool(_SESSION_ID_RE.match(session_id))
 
 
-def _publish_event(session_id: str, event: dict) -> None:
-    """Publish an event to all SSE subscribers for this session."""
-    sse_broadcaster.publish_sync(session_id, json.dumps(event))
+def _publish_event(
+    session_id: str, event: dict, tenant_id: str = DEFAULT_TENANT
+) -> None:
+    """Publish an event to all SSE subscribers for this (tenant, session_id)."""
+    sse_broadcaster.publish_sync(session_id, json.dumps(event), tenant_id=tenant_id)
+
+
+def _safe_resolve_tenant(request: Request) -> tuple[str, JSONResponse | None]:
+    """Resolve tenant from a request, returning (tenant_id, error_response).
+
+    On success: ``(tenant_id, None)``.
+    On invalid format: ``(DEFAULT_TENANT, 400 JSONResponse)`` — callers
+    must check the error response before using the tenant_id.
+    """
+    try:
+        return resolve_tenant(request), None
+    except InvalidTenantError as exc:
+        return DEFAULT_TENANT, JSONResponse({"error": str(exc)}, status_code=400)
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +115,7 @@ async def _run_agent_streaming(
     question: str,
     provider: str | None = None,
     model: str | None = None,
+    tenant_id: str = DEFAULT_TENANT,
 ):
     """Run agent and yield JSON event dicts as they occur.
 
@@ -95,25 +123,26 @@ async def _run_agent_streaming(
     yielded is also published to ``sse_broadcaster`` so that SSE
     subscribers on ``/events/{session_id}`` receive events in real-time.
 
-    A per-session ``asyncio.Lock`` serializes concurrent runs on the
-    same ``session_id`` to prevent message history corruption.
+    A per-(tenant, session) ``asyncio.Lock`` serializes concurrent runs
+    to prevent message history corruption.
     """
-    lock = _get_session_lock(session_id)
+    lock = _get_session_lock(session_id, tenant_id=tenant_id)
     async with lock:
         try:
             async for event in _run_agent_inner(
                 project_path, session_id, question, provider, model,
+                tenant_id=tenant_id,
             ):
-                _publish_event(session_id, event)
+                _publish_event(session_id, event, tenant_id=tenant_id)
                 yield event
         except Exception as exc:
             error_event = {"type": "error", "data": str(exc)}
-            _publish_event(session_id, error_event)
+            _publish_event(session_id, error_event, tenant_id=tenant_id)
             yield error_event
             raise
         finally:
             done_event = {"type": "done", "data": ""}
-            _publish_event(session_id, done_event)
+            _publish_event(session_id, done_event, tenant_id=tenant_id)
             yield done_event
 
 
@@ -123,6 +152,7 @@ async def _run_agent_inner(
     question: str,
     provider: str | None = None,
     model: str | None = None,
+    tenant_id: str = DEFAULT_TENANT,
 ):
     """Inner agent execution without locking or SSE publishing."""
     from pydantic_ai import Agent
@@ -137,7 +167,7 @@ async def _run_agent_inner(
     from seeknal.ask.agents.agent import create_agent
     from seeknal.ask.sessions import SessionStore
 
-    store = SessionStore(project_path)
+    store = SessionStore(project_path, tenant_id=tenant_id)
     if store.get(session_id) is None:
         store.create(name=session_id)
 
@@ -232,27 +262,35 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "service": "seeknal-ask-gateway"})
 
 
-def _make_session_store(app_state) -> "SessionStore":  # noqa: F821
-    """Construct a SessionStore from app.state, supporting backend-only mode."""
+def _make_session_store(
+    app_state, tenant_id: str = DEFAULT_TENANT
+) -> "SessionStore":  # noqa: F821
+    """Construct a tenant-scoped SessionStore from app.state."""
     from seeknal.ask.sessions import SessionStore
 
     sessions_dir = getattr(app_state, "sessions_dir", None)
     if sessions_dir:
-        return SessionStore(sessions_dir=Path(sessions_dir))
+        return SessionStore(sessions_dir=Path(sessions_dir), tenant_id=tenant_id)
     project_path = getattr(app_state, "project_path", None)
     if project_path:
-        return SessionStore(Path(project_path))
+        return SessionStore(Path(project_path), tenant_id=tenant_id)
     raise RuntimeError("SessionStore requires project_path or sessions_dir")
 
 
 async def list_sessions(request: Request) -> JSONResponse:
-    store = _make_session_store(request.app.state)
+    tenant_id, err = _safe_resolve_tenant(request)
+    if err:
+        return err
+    store = _make_session_store(request.app.state, tenant_id=tenant_id)
     sessions = store.list()
     return JSONResponse(sessions)
 
 
 async def ask_oneshot(request: Request) -> JSONResponse:
     """One-shot question → JSON response."""
+    tenant_id, err = _safe_resolve_tenant(request)
+    if err:
+        return err
     body = await request.json()
     question = body.get("question", "")
     session_id = body.get("session_id", "default")
@@ -264,7 +302,9 @@ async def ask_oneshot(request: Request) -> JSONResponse:
     project_path = Path(request.app.state.project_path)
     events = []
     answer = ""
-    async for event in _run_agent_streaming(project_path, session_id, question):
+    async for event in _run_agent_streaming(
+        project_path, session_id, question, tenant_id=tenant_id,
+    ):
         events.append(event)
         if event["type"] == "answer":
             answer = event["data"]
@@ -277,6 +317,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     session_id = websocket.path_params["session_id"]
     if not _validate_session_id(session_id):
         await websocket.close(code=4000, reason="invalid session_id")
+        return
+
+    try:
+        tenant_id = resolve_tenant_ws(websocket)
+    except InvalidTenantError as exc:
+        await websocket.close(code=4001, reason=str(exc))
         return
 
     await websocket.accept()
@@ -295,7 +341,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
 
             async for event in _run_agent_streaming(
-                project_path, session_id, question,
+                project_path, session_id, question, tenant_id=tenant_id,
             ):
                 await websocket.send_text(json.dumps(event))
 
@@ -316,7 +362,11 @@ async def sse_endpoint(request: Request) -> StreamingResponse:
     if not _validate_session_id(session_id):
         return JSONResponse({"error": "invalid session_id"}, status_code=400)
 
-    queue = sse_broadcaster.subscribe(session_id)
+    tenant_id, err = _safe_resolve_tenant(request)
+    if err:
+        return err
+
+    queue = sse_broadcaster.subscribe(session_id, tenant_id=tenant_id)
 
     # Safety-valve: max 10 minutes total to prevent infinite hangs
     _MAX_SSE_DURATION = 600  # seconds
@@ -354,7 +404,7 @@ async def sse_endpoint(request: Request) -> StreamingResponse:
         except asyncio.CancelledError:
             pass
         finally:
-            sse_broadcaster.unsubscribe(session_id, queue)
+            sse_broadcaster.unsubscribe(session_id, queue, tenant_id=tenant_id)
 
     return StreamingResponse(
         event_generator(),
@@ -378,7 +428,11 @@ async def session_history(request: Request) -> JSONResponse:
     if not _validate_session_id(session_id):
         return JSONResponse({"error": "invalid session_id"}, status_code=400)
 
-    store = _make_session_store(request.app.state)
+    tenant_id, err = _safe_resolve_tenant(request)
+    if err:
+        return err
+
+    store = _make_session_store(request.app.state, tenant_id=tenant_id)
     if store.get(session_id) is None:
         return JSONResponse([])
 
@@ -449,6 +503,10 @@ async def temporal_start(request: Request) -> JSONResponse:
             status_code=503,
         )
 
+    tenant_id, err = _safe_resolve_tenant(request)
+    if err:
+        return err
+
     body = await request.json()
     question = body.get("question", "")
     session_id = body.get("session_id", "default")
@@ -458,8 +516,6 @@ async def temporal_start(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid session_id"}, status_code=400)
 
     from seeknal.ask.gateway.temporal import AgentWorkflowInput, AgentWorkflow
-
-    import time
 
     # Project path: request body > worker_project_path > app config
     project_path = str(
@@ -478,8 +534,14 @@ async def temporal_start(request: Request) -> JSONResponse:
         or getattr(request.app.state, "callback_auth_token", None)
     )
 
-    task_queue = body.get("task_queue") or getattr(request.app.state, "temporal_task_queue", "seeknal-ask")
-    workflow_id = f"ask-{session_id}-{int(time.time())}"
+    # Task queue: request body override > tenant-derived > app config fallback.
+    # Tenant routing is the normal path; the body.task_queue override is an
+    # escape hatch for internal clients that want to bypass it.
+    task_queue = (
+        body.get("task_queue")
+        or task_queue_for_tenant(tenant_id)
+    )
+    workflow_id = make_workflow_id(tenant_id, session_id)
 
     client = request.app.state.temporal_client
     handle = await client.start_workflow(
@@ -490,6 +552,7 @@ async def temporal_start(request: Request) -> JSONResponse:
             project_path=project_path,
             callback_url=push_url,
             callback_auth_token=api_key,
+            tenant_id=tenant_id,
         ),
         id=workflow_id,
         task_queue=task_queue,
@@ -518,6 +581,8 @@ async def publish_event_callback(request: Request) -> JSONResponse:
     Called by the on-prem Temporal worker via HTTP POST for each streaming
     event (token, tool_start, tool_end, answer, done).
     Authenticated via shared secret (CALLBACK_AUTH_TOKEN env var).
+    The worker sets ``X-Tenant-ID`` so events route to the right
+    tenant-scoped subscribers.
     """
     # Authenticate callback request
     expected_token = getattr(request.app.state, "callback_auth_token", None)
@@ -530,11 +595,15 @@ async def publish_event_callback(request: Request) -> JSONResponse:
     if not _validate_session_id(session_id):
         return JSONResponse({"error": "invalid session_id"}, status_code=400)
 
+    tenant_id, err = _safe_resolve_tenant(request)
+    if err:
+        return err
+
     body = await request.json()
     event_json = json.dumps(body)
 
     broadcaster = request.app.state.broadcaster
-    await broadcaster.publish(session_id, event_json)
+    await broadcaster.publish(session_id, event_json, tenant_id=tenant_id)
 
     return JSONResponse({"status": "published"})
 
