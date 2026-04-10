@@ -74,6 +74,7 @@ def gateway_start(
     temporal_address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
     temporal_namespace = os.environ.get("TEMPORAL_NAMESPACE", "default")
     temporal_task_queue = os.environ.get("TEMPORAL_TASK_QUEUE", "seeknal-ask")
+    temporal_tls = os.environ.get("TEMPORAL_TLS", "false").lower() in ("true", "1", "yes")
 
     if temporal:
         try:
@@ -111,6 +112,7 @@ def gateway_start(
             client = await connect_temporal_client(
                 address=temporal_address,
                 namespace=temporal_namespace,
+                tls=temporal_tls,
             )
             if client is not None:
                 temporal_client_holder.append(client)

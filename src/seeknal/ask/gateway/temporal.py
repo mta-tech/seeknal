@@ -268,6 +268,7 @@ if TEMPORAL_AVAILABLE:
     async def connect_temporal_client(
         address: str = "localhost:7233",
         namespace: str = "default",
+        tls: bool = False,
     ) -> Client | None:
         """Connect to a Temporal server with a 10-second timeout.
 
@@ -278,10 +279,13 @@ if TEMPORAL_AVAILABLE:
 
         try:
             client = await asyncio.wait_for(
-                Client.connect(address, namespace=namespace),
+                Client.connect(address, namespace=namespace, tls=tls),
                 timeout=10.0,
             )
-            logger.info("Connected to Temporal at %s (namespace=%s)", address, namespace)
+            logger.info(
+                "Connected to Temporal at %s (namespace=%s, tls=%s)",
+                address, namespace, tls,
+            )
             return client
         except asyncio.TimeoutError:
             warnings.warn(
