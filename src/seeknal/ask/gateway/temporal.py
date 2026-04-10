@@ -126,9 +126,15 @@ if TEMPORAL_AVAILABLE:
         error = None
         event_count = 0
 
+        # Worker override: SEEKNAL_PROJECT_PATH env var takes precedence over
+        # input.project_path. This lets a standalone worker use its own local
+        # project path instead of the gateway's (for split topologies).
+        import os as _os
+        effective_project_path = _os.environ.get("SEEKNAL_PROJECT_PATH") or input.project_path
+
         try:
             async for event in _run_agent_streaming(
-                Path(input.project_path),
+                Path(effective_project_path),
                 input.session_id,
                 input.question,
                 provider=input.provider,
