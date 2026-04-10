@@ -216,6 +216,128 @@ def gateway_start(
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
+@gateway_app.command("backend")
+def gateway_backend(
+    port: int = typer.Option(
+        8000, "--port", help="Port to listen on"
+    ),
+    host: str = typer.Option(
+        "0.0.0.0", "--host", help="Host to bind to"
+    ),
+    redis: Optional[str] = typer.Option(
+        None, "--redis", help="Redis URL for multi-replica mode (e.g. redis://localhost:6379)"
+    ),
+    callback_url: Optional[str] = typer.Option(
+        None, "--callback-url",
+        help="Public URL workers should POST streaming events to (defaults to http://{host}:{port})"
+    ),
+    callback_auth_token: Optional[str] = typer.Option(
+        None, "--callback-auth-token", envvar="CALLBACK_AUTH_TOKEN",
+        help="Shared secret for authenticating worker callback POSTs"
+    ),
+    worker_project_path: Optional[str] = typer.Option(
+        None, "--worker-project-path", envvar="WORKER_PROJECT_PATH",
+        help="Default project path to pass to remote workers via Temporal workflow input"
+    ),
+    sessions_dir: Optional[Path] = typer.Option(
+        None, "--sessions-dir",
+        help="Gateway-local sessions directory (default: ~/.seeknal/gateway-sessions/)"
+    ),
+):
+    """Start the seeknal ask gateway in backend-only mode.
+
+    This mode serves the web UI, SSE streams, and Temporal dispatch but
+    does NOT run agents in-process. All queries are dispatched to remote
+    workers via Temporal. Use this for cloud deployments where compute
+    lives on separate on-prem machines.
+
+    The /ask and /ws routes are disabled — clients must use /temporal/start.
+    """
+    try:
+        from seeknal.ask.gateway.server import create_gateway_app
+    except ImportError:
+        typer.echo(typer.style(
+            "Gateway dependencies not installed.", fg=typer.colors.RED
+        ))
+        typer.echo("Install with: " + typer.style(
+            "pip install seeknal[ask,temporal]", fg=typer.colors.CYAN
+        ))
+        raise typer.Exit(1)
+
+    import uvicorn
+
+    temporal_address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    temporal_namespace = os.environ.get("TEMPORAL_NAMESPACE", "default")
+    temporal_task_queue = os.environ.get("TEMPORAL_TASK_QUEUE", "seeknal-ask")
+
+    try:
+        from seeknal.ask.gateway.temporal import _require_temporal
+        _require_temporal()
+    except ImportError:
+        typer.echo(typer.style(
+            "Backend mode requires: pip install seeknal[temporal]",
+            fg=typer.colors.RED,
+        ))
+        raise typer.Exit(1)
+
+    temporal_client_holder: list = []
+
+    @asynccontextmanager
+    async def lifespan(app):
+        from seeknal.ask.gateway.temporal import connect_temporal_client
+
+        client = await connect_temporal_client(
+            address=temporal_address,
+            namespace=temporal_namespace,
+        )
+        if client is not None:
+            temporal_client_holder.append(client)
+            app.state.temporal_client = client
+            app.state.temporal_task_queue = temporal_task_queue
+            typer.echo(typer.style(
+                f"Temporal client connected (queue={temporal_task_queue})",
+                fg=typer.colors.GREEN,
+            ))
+        else:
+            typer.echo(typer.style(
+                f"Failed to connect to Temporal at {temporal_address}",
+                fg=typer.colors.RED,
+            ))
+            raise typer.Exit(1)
+
+        yield
+
+    effective_callback_url = callback_url or f"http://{host}:{port}"
+
+    app = create_gateway_app(
+        project_path=None,  # backend-only: no local project
+        lifespan=lifespan,
+        redis_url=redis,
+        callback_base_url=effective_callback_url,
+        callback_auth_token=callback_auth_token,
+        sessions_dir=sessions_dir,
+    )
+    if worker_project_path:
+        app.state.worker_project_path = worker_project_path
+
+    typer.echo(f"Starting gateway backend on {host}:{port}")
+    typer.echo(f"Mode: {typer.style('backend-only', fg=typer.colors.CYAN)} (no in-process agent execution)")
+    typer.echo(f"Temporal: {temporal_address}")
+    typer.echo(f"Callback: {effective_callback_url}")
+    if redis:
+        typer.echo(typer.style(f"Redis: {redis}", fg=typer.colors.GREEN))
+    typer.echo(f"Sessions: {app.state.sessions_dir}")
+    typer.echo("Endpoints:")
+    typer.echo("  GET  /health")
+    typer.echo("  GET  /sessions")
+    typer.echo("  POST /temporal/start")
+    typer.echo("  POST /internal/events/{session_id}/publish")
+    typer.echo("  GET  /events/{session_id}")
+    typer.echo(typer.style("  (no /ask, no /ws — backend mode)", fg=typer.colors.YELLOW))
+
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
 @gateway_app.command("worker")
 def gateway_worker(
     project: Optional[Path] = typer.Option(

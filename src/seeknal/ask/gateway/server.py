@@ -232,12 +232,22 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "service": "seeknal-ask-gateway"})
 
 
-async def list_sessions(request: Request) -> JSONResponse:
-    project_path = Path(request.app.state.project_path)
+def _make_session_store(app_state) -> "SessionStore":  # noqa: F821
+    """Construct a SessionStore from app.state, supporting backend-only mode."""
     from seeknal.ask.sessions import SessionStore
 
-    with SessionStore(project_path) as store:
-        sessions = store.list()
+    sessions_dir = getattr(app_state, "sessions_dir", None)
+    if sessions_dir:
+        return SessionStore(sessions_dir=Path(sessions_dir))
+    project_path = getattr(app_state, "project_path", None)
+    if project_path:
+        return SessionStore(Path(project_path))
+    raise RuntimeError("SessionStore requires project_path or sessions_dir")
+
+
+async def list_sessions(request: Request) -> JSONResponse:
+    store = _make_session_store(request.app.state)
+    sessions = store.list()
     return JSONResponse(sessions)
 
 
@@ -368,11 +378,7 @@ async def session_history(request: Request) -> JSONResponse:
     if not _validate_session_id(session_id):
         return JSONResponse({"error": "invalid session_id"}, status_code=400)
 
-    project_path = Path(request.app.state.project_path)
-
-    from seeknal.ask.sessions import SessionStore
-
-    store = SessionStore(project_path)
+    store = _make_session_store(request.app.state)
     if store.get(session_id) is None:
         return JSONResponse([])
 
@@ -534,34 +540,40 @@ async def publish_event_callback(request: Request) -> JSONResponse:
 
 
 def create_gateway_app(
-    project_path: str | Path,
+    project_path: str | Path | None = None,
     lifespan: Callable | None = None,
     temporal_client: Any = None,
     redis_url: str | None = None,
     callback_base_url: str | None = None,
     callback_auth_token: str | None = None,
+    sessions_dir: str | Path | None = None,
 ) -> Starlette:
     """Create the Starlette ASGI application.
 
     Args:
-        project_path: Path to the seeknal project directory.
+        project_path: Path to the seeknal project directory. Required for
+            in-process agent execution (``/ask``, ``/ws``, Telegram). Pass
+            ``None`` for backend-only mode (Temporal-only dispatch).
         lifespan: Optional async context manager for startup/shutdown hooks.
-            Receives the ``Starlette`` app instance as its argument.
         temporal_client: Optional connected Temporal client for workflow
             submission via ``POST /temporal/start``.
-        redis_url: Optional Redis URL for multi-replica mode. When set,
-            uses Redis-backed session store, SSE broadcaster, and locks.
+        redis_url: Optional Redis URL for multi-replica mode.
         callback_base_url: Base URL for on-prem worker event callbacks.
         callback_auth_token: Shared secret for authenticating callback POSTs.
+        sessions_dir: Optional direct path for session storage. When set,
+            session files go here instead of ``<project>/.seeknal/sessions/``.
+            Used in backend mode where no project is available.
     """
+    # Backend-only mode: no project_path means no in-process agent execution.
+    # Only Temporal dispatch, SSE fan-out, and session listing work.
+    backend_only = project_path is None
+
     routes = [
         Route("/", chat_ui),
         Route("/health", health),
         Route("/sessions", list_sessions),
         Route("/sessions/{session_id}/history", session_history),
-        Route("/ask", ask_oneshot, methods=["POST"]),
         Route("/temporal/start", temporal_start, methods=["POST"]),
-        WebSocketRoute("/ws/{session_id}", websocket_endpoint),
         Route("/events/{session_id}", sse_endpoint),
         # Internal callback for on-prem worker to push streaming events
         Route(
@@ -570,6 +582,12 @@ def create_gateway_app(
             methods=["POST"],
         ),
     ]
+
+    # In-process agent execution routes are only available when a project
+    # is configured. In backend-only mode the client must use /temporal/start.
+    if not backend_only:
+        routes.insert(4, Route("/ask", ask_oneshot, methods=["POST"]))
+        routes.append(WebSocketRoute("/ws/{session_id}", websocket_endpoint))
 
     # Mount static files if directory exists
     static_dir = Path(__file__).parent / "static"
@@ -625,7 +643,17 @@ def create_gateway_app(
                 await app.state.redis_client.close()
 
     app = Starlette(routes=routes, lifespan=_lifespan)
-    app.state.project_path = str(project_path)
+    app.state.project_path = str(project_path) if project_path is not None else None
+    app.state.backend_only = backend_only
+    # Resolve sessions dir for backend-only mode (no project path available).
+    if sessions_dir is not None:
+        app.state.sessions_dir = str(sessions_dir)
+    elif backend_only:
+        default_dir = Path.home() / ".seeknal" / "gateway-sessions"
+        default_dir.mkdir(parents=True, exist_ok=True)
+        app.state.sessions_dir = str(default_dir)
+    else:
+        app.state.sessions_dir = None
     app.state.callback_base_url = callback_base_url
     app.state.callback_auth_token = callback_auth_token
     if temporal_client is not None:
