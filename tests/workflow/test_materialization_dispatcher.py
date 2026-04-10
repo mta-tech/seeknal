@@ -624,6 +624,42 @@ class TestIcebergCatalogFallback:
         assert call_kwargs["uri"] == "http://per-node:8181"
         assert call_kwargs["warehouse_path"] == "catalog-warehouse"
 
+    def test_target_config_reads_from_params_key(self, mock_con, monkeypatch):
+        """Per-YAML catalog_uri/warehouse under params: nested key are resolved."""
+        loader = MagicMock()
+        loader.load_profile.return_value = self._make_profile_config(
+            uri="http://from-catalog:8181", warehouse="catalog-warehouse"
+        )
+        dispatcher = MaterializationDispatcher(profile_loader=loader)
+
+        mock_ext = MagicMock()
+        mock_ext.get_oauth2_token.return_value = "token123"
+        mock_write = MagicMock(return_value=_ok_result(5))
+
+        with patch.dict("sys.modules", {
+            "seeknal.workflow.materialization.operations": MagicMock(
+                DuckDBIcebergExtension=mock_ext,
+                write_to_iceberg=mock_write,
+            ),
+        }):
+            dispatcher._materialize_iceberg(
+                mock_con,
+                "my_view",
+                {
+                    "table": "dev_gold.master.sales",
+                    "mode": "overwrite",
+                    "params": {
+                        "catalog_uri": "http://10.24.114.70:8181",
+                        "warehouse": "dev_gold",
+                    },
+                },
+            )
+
+        call_kwargs = mock_ext.attach_rest_catalog.call_args[1]
+        assert call_kwargs["uri"] == "http://10.24.114.70:8181"
+        assert call_kwargs["warehouse_path"] == "dev_gold"
+        loader.load_source_defaults.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # YAMLMaterializationConfig extraction tests
@@ -668,3 +704,24 @@ class TestYAMLMaterializationConfigExtraction:
         assert config.enabled is True
         assert config.catalog_uri is None
         assert config.warehouse is None
+
+    def test_extract_catalog_overrides_from_params(self):
+        """catalog_uri and warehouse are extracted from nested params: key."""
+        from seeknal.workflow.materialization.yaml_integration import (
+            IcebergMaterializationHelper,
+        )
+
+        node_config = {
+            "materialization": {
+                "enabled": True,
+                "table": "atlas.ns.my_table",
+                "mode": "overwrite",
+                "params": {
+                    "catalog_uri": "http://10.24.114.70:8181",
+                    "warehouse": "dev_gold",
+                },
+            }
+        }
+        config = IcebergMaterializationHelper.extract_materialization_config(node_config)
+        assert config.catalog_uri == "http://10.24.114.70:8181"
+        assert config.warehouse == "dev_gold"

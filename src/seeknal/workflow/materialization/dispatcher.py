@@ -279,11 +279,13 @@ class MaterializationDispatcher:
 
         # Resolve catalog URI and warehouse with fallback chain:
         # 1. target_config overrides (per-materialization YAML) — highest priority
+        #    Supports both top-level keys and nested under params:
         # 2. materialization.catalog section (from profile_config / profiles.yml)
         # 3. source_defaults.iceberg section
         # 4. environment variables (LAKEKEEPER_URI, LAKEKEEPER_WAREHOUSE)
-        uri = target_config.get("catalog_uri", "")
-        warehouse_path = target_config.get("warehouse", "")
+        params = target_config.get("params", {}) or {}
+        uri = target_config.get("catalog_uri", "") or params.get("catalog_uri", "")
+        warehouse_path = target_config.get("warehouse", "") or params.get("warehouse", "")
 
         # Fall back to profile catalog config
         if not uri:

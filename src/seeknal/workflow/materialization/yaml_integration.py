@@ -342,9 +342,10 @@ class IcebergMaterializationHelper:
                 "Materialization 'create_table' must be a boolean"
             )
 
-        # Extract optional per-node catalog overrides
-        catalog_uri = mat_config.get("catalog_uri")
-        warehouse = mat_config.get("warehouse")
+        # Extract optional per-node catalog overrides (top-level or under params:)
+        params = mat_config.get("params", {}) or {}
+        catalog_uri = mat_config.get("catalog_uri") or params.get("catalog_uri")
+        warehouse = mat_config.get("warehouse") or params.get("warehouse")
 
         return YAMLMaterializationConfig(
             enabled=True,
