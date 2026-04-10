@@ -636,6 +636,7 @@ let isStreaming = false;
 let currentAssistantRow = null;
 let currentBubble = null;
 let currentStreamText = "";
+let currentStreamNode = null; // dedicated text node for streaming tokens
 let activeToolCards = {}; // toolCallId -> element refs
 let sseSource = null;
 
@@ -831,6 +832,7 @@ function startAssistantMessage() {
   currentAssistantRow.appendChild(currentBubble);
   messagesEl.appendChild(currentAssistantRow);
   currentStreamText = "";
+  currentStreamNode = null;
   activeToolCards = {};
   scrollToBottom(true);
   return currentBubble;
@@ -855,8 +857,13 @@ function appendToken(token) {
   if (!currentBubble) startAssistantMessage();
   hideThinking();
   currentStreamText += token;
-  // Show raw streaming text (markdown rendered on answer event)
-  currentBubble.textContent = currentStreamText;
+  // Use a dedicated text node so we don't wipe sibling elements
+  // (tool cards, reasoning blocks) when streaming updates.
+  if (!currentStreamNode) {
+    currentStreamNode = document.createTextNode("");
+    currentBubble.appendChild(currentStreamNode);
+  }
+  currentStreamNode.nodeValue = currentStreamText;
   currentBubble.classList.add("stream-cursor");
   scrollToBottom();
 }
@@ -867,18 +874,27 @@ function finalizeStreamText() {
   }
 }
 
+function removeStreamNode() {
+  if (currentStreamNode && currentStreamNode.parentNode) {
+    currentStreamNode.parentNode.removeChild(currentStreamNode);
+  }
+  currentStreamNode = null;
+  currentStreamText = "";
+}
+
 /* ============================================================
    Reasoning block
    ============================================================ */
 function appendReasoning(text) {
   if (!currentBubble) startAssistantMessage();
   hideThinking();
+  // Remove pending stream text — reasoning is a formal flush of those tokens
+  removeStreamNode();
   const block = document.createElement("div");
   block.className = "reasoning-block";
   block.textContent = text;
   currentBubble.classList.remove("stream-cursor");
   currentBubble.appendChild(block);
-  currentStreamText = ""; // reset stream buffer after reasoning flush
   scrollToBottom();
 }
 
@@ -973,12 +989,9 @@ function appendAnswer(text) {
   if (!currentBubble) startAssistantMessage();
   finalizeStreamText();
 
-  // Remove any streaming text node (first child if it's a text node)
-  if (currentStreamText && currentBubble.firstChild &&
-      currentBubble.firstChild.nodeType === Node.TEXT_NODE) {
-    currentBubble.removeChild(currentBubble.firstChild);
-  }
-  currentStreamText = "";
+  // Remove the streaming text node (tokens already accumulated) —
+  // the answer replaces them with a markdown-rendered version.
+  removeStreamNode();
 
   const mdDiv = document.createElement("div");
   mdDiv.className = "md-content";
@@ -1000,12 +1013,8 @@ function appendError(message) {
   block.className = "error-block";
   block.textContent = "Error: " + message;
 
-  // If current bubble has only a text node from streaming, clear it
-  if (currentStreamText && currentBubble.firstChild &&
-      currentBubble.firstChild.nodeType === Node.TEXT_NODE) {
-    currentBubble.removeChild(currentBubble.firstChild);
-    currentStreamText = "";
-  }
+  // Remove any streaming text so the error is the final content
+  removeStreamNode();
   currentBubble.appendChild(block);
 
   scrollToBottom(true);
@@ -1120,6 +1129,7 @@ function finishStreaming() {
   currentAssistantRow = null;
   currentBubble = null;
   currentStreamText = "";
+  currentStreamNode = null;
   activeToolCards = {};
   setInputDisabled(false);
   hideThinking();
@@ -1182,6 +1192,7 @@ async function restoreSessionHistory() {
         currentAssistantRow = null;
         currentBubble = null;
         currentStreamText = "";
+        currentStreamNode = null;
         currentRole = "assistant";
       } else if (evt.type === "tool_start") {
         if (!currentAssistantRow) startAssistantMessage();
@@ -1321,9 +1332,12 @@ async function sendMessage() {
    ============================================================ */
 function newSession() {
   if (isStreaming) {
-    closeSSE();
     finishStreaming();
   }
+  // Always close SSE — the next send will subscribe to the new session_id.
+  // Otherwise events from the new session go to the old subscription and never
+  // reach the UI, leaving "Thinking..." stuck forever.
+  closeSSE();
 
   sessionId = newUUID();
   localStorage.setItem("seeknal_session_id", sessionId);

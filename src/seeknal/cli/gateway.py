@@ -177,11 +177,24 @@ def gateway_start(
 
     # Pass temporal_client if already connected (for sync startup path)
     # The lifespan will also set it on app.state for the async path
+    # Default callback_url to self when Temporal is enabled and not specified.
+    # This lets workers POST streaming events back to the gateway without
+    # requiring the operator to explicitly pass --callback-url for single-host
+    # or locally reachable deployments. For cross-machine deployments, the
+    # operator should still set --callback-url to the externally reachable URL.
+    effective_callback_url = callback_url
+    if temporal_enabled and not effective_callback_url:
+        effective_callback_url = f"http://{host}:{port}"
+        typer.echo(typer.style(
+            f"Callback URL defaulted to {effective_callback_url} (for worker event delivery)",
+            fg=typer.colors.CYAN,
+        ))
+
     app = create_gateway_app(
         project_path,
         lifespan=lifespan,
         redis_url=redis,
-        callback_base_url=callback_url,
+        callback_base_url=effective_callback_url,
         callback_auth_token=callback_auth_token,
     )
     if worker_project_path:
