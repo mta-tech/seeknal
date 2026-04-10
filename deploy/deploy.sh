@@ -38,7 +38,9 @@ scp -r $SSH_OPTS "$REPO_ROOT/qa/runs/ecommerce/." "$REMOTE_HOST:$REMOTE_DIR/ecom
 echo "[4/5] Copying deployment configs..."
 scp $SSH_OPTS \
     "$SCRIPT_DIR/docker-compose.yml" \
+    "$SCRIPT_DIR/docker-compose.worker.yml" \
     "$SCRIPT_DIR/Dockerfile.gateway" \
+    "$SCRIPT_DIR/Dockerfile.worker" \
     "$SCRIPT_DIR/nginx.conf" \
     "$REMOTE_HOST:$REMOTE_DIR/"
 

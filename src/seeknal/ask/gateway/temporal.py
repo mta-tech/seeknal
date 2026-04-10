@@ -59,6 +59,8 @@ class AgentWorkflowInput:
     project_path: str
     provider: str | None = None
     model: str | None = None
+    callback_url: str | None = None
+    callback_auth_token: str | None = None
 
 
 @dataclass
@@ -89,14 +91,28 @@ if TEMPORAL_AVAILABLE:
         """Run the seeknal ask agent as a Temporal activity.
 
         Iterates ``_run_agent_streaming()`` from the gateway server,
-        which handles SSE broadcast internally. This activity only
-        tracks events for the workflow return value and sends periodic
-        heartbeats.
+        which handles SSE broadcast internally. When a ``callback_url``
+        is provided (on-prem worker mode), events are also POSTed to
+        the cloud SSE endpoint for cross-replica fan-out.
 
         Does NOT call ``sse_broadcaster.publish()`` — that is handled
         inside ``_run_agent_streaming()`` (single SSE publish owner).
         """
+        import json as _json
+
         from seeknal.ask.gateway.server import _run_agent_streaming
+
+        # Set up HTTP client for callback if URL provided (on-prem worker mode)
+        http_session = None
+        callback_headers: dict[str, str] = {}
+        if input.callback_url:
+            try:
+                import aiohttp
+                http_session = aiohttp.ClientSession()
+                if input.callback_auth_token:
+                    callback_headers["Authorization"] = f"Bearer {input.callback_auth_token}"
+            except ImportError:
+                logger.warning("aiohttp not installed — callback streaming disabled")
 
         # Background heartbeat coroutine
         async def _heartbeat_loop():
@@ -121,6 +137,20 @@ if TEMPORAL_AVAILABLE:
                 event_count += 1
                 event_type = event.get("type")
 
+                # POST event to cloud callback URL (best-effort)
+                if http_session and input.callback_url:
+                    try:
+                        import aiohttp
+                        url = f"{input.callback_url}/internal/events/{input.session_id}/publish"
+                        await http_session.post(
+                            url,
+                            data=_json.dumps(event),
+                            headers={**callback_headers, "Content-Type": "application/json"},
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        )
+                    except Exception:
+                        pass  # Best-effort delivery
+
                 if event_type == "answer":
                     answer = event.get("data", "")
                 elif event_type == "error":
@@ -137,6 +167,8 @@ if TEMPORAL_AVAILABLE:
                 await heartbeat_task
             except asyncio.CancelledError:
                 pass
+            if http_session:
+                await http_session.close()
 
         return AgentWorkflowOutput(
             answer=answer,
@@ -236,22 +268,33 @@ if TEMPORAL_AVAILABLE:
     def create_temporal_worker(
         client: Client,
         task_queue: str = "seeknal-ask",
+        max_concurrent_activities: int | None = None,
     ) -> Worker:
         """Create a Temporal worker configured for agent execution.
 
         Args:
             client: Connected Temporal client.
             task_queue: Temporal task queue name.
+            max_concurrent_activities: Max parallel agent executions.
+                Falls back to ``TEMPORAL_MAX_CONCURRENT_ACTIVITIES`` env var,
+                then default of 15.
 
         Returns:
             Configured ``Worker`` instance. Call ``worker.run()`` to
             start polling.
         """
+        import os
+
+        if max_concurrent_activities is None:
+            max_concurrent_activities = int(
+                os.environ.get("TEMPORAL_MAX_CONCURRENT_ACTIVITIES", "15")
+            )
+
         return Worker(
             client,
             task_queue=task_queue,
             workflows=[AgentWorkflow],
             activities=[run_agent_activity],
-            max_concurrent_activities=15,
+            max_concurrent_activities=max_concurrent_activities,
             graceful_shutdown_timeout=timedelta(minutes=5),
         )

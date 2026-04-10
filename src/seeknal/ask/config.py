@@ -99,10 +99,6 @@ def get_locale_instructions(config: dict[str, Any]) -> Optional[str]:
 
 _DEFAULT_REQUEST_LIMIT = 100
 
-# Module-level holder so streaming.py can read it without threading config
-# through every function signature.  Set by create_agent(), read by stream_ask().
-_active_request_limit: int = _DEFAULT_REQUEST_LIMIT
-
 
 def get_request_limit(config: dict[str, Any]) -> int:
     """Return the ``request_limit`` from config, or the default (100).
@@ -152,9 +148,6 @@ def get_context_budget(config: dict[str, Any]) -> int:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_BACKGROUND_THRESHOLD = 60  # seconds
-
-# Module-level holder — set by create_agent(), read by tool functions.
-_active_background_threshold: int = _DEFAULT_BACKGROUND_THRESHOLD
 
 
 def get_background_threshold(config: dict[str, Any]) -> int:

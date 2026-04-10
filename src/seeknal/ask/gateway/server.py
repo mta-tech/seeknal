@@ -455,8 +455,24 @@ async def temporal_start(request: Request) -> JSONResponse:
 
     import time
 
-    project_path = str(request.app.state.project_path)
-    task_queue = getattr(request.app.state, "temporal_task_queue", "seeknal-ask")
+    # Project path: request body > worker_project_path > app config
+    project_path = str(
+        body.get("project_path")
+        or getattr(request.app.state, "worker_project_path", None)
+        or request.app.state.project_path
+    )
+
+    # Push URL: request body > app config (allows external services to override SSE delivery)
+    push_url = (
+        body.get("push_url")
+        or getattr(request.app.state, "callback_base_url", None)
+    )
+    api_key = (
+        body.get("api_key")
+        or getattr(request.app.state, "callback_auth_token", None)
+    )
+
+    task_queue = body.get("task_queue") or getattr(request.app.state, "temporal_task_queue", "seeknal-ask")
     workflow_id = f"ask-{session_id}-{int(time.time())}"
 
     client = request.app.state.temporal_client
@@ -466,6 +482,8 @@ async def temporal_start(request: Request) -> JSONResponse:
             session_id=session_id,
             question=question,
             project_path=project_path,
+            callback_url=push_url,
+            callback_auth_token=api_key,
         ),
         id=workflow_id,
         task_queue=task_queue,
@@ -488,10 +506,40 @@ async def chat_ui(request: Request) -> FileResponse:
     return FileResponse(static_dir / "chat.html", media_type="text/html")
 
 
+async def publish_event_callback(request: Request) -> JSONResponse:
+    """Receive streaming chunk from on-prem worker and publish to SSE.
+
+    Called by the on-prem Temporal worker via HTTP POST for each streaming
+    event (token, tool_start, tool_end, answer, done).
+    Authenticated via shared secret (CALLBACK_AUTH_TOKEN env var).
+    """
+    # Authenticate callback request
+    expected_token = getattr(request.app.state, "callback_auth_token", None)
+    if expected_token:
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer ") or auth_header[7:] != expected_token:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    session_id = request.path_params["session_id"]
+    if not _validate_session_id(session_id):
+        return JSONResponse({"error": "invalid session_id"}, status_code=400)
+
+    body = await request.json()
+    event_json = json.dumps(body)
+
+    broadcaster = request.app.state.broadcaster
+    await broadcaster.publish(session_id, event_json)
+
+    return JSONResponse({"status": "published"})
+
+
 def create_gateway_app(
     project_path: str | Path,
     lifespan: Callable | None = None,
     temporal_client: Any = None,
+    redis_url: str | None = None,
+    callback_base_url: str | None = None,
+    callback_auth_token: str | None = None,
 ) -> Starlette:
     """Create the Starlette ASGI application.
 
@@ -501,6 +549,10 @@ def create_gateway_app(
             Receives the ``Starlette`` app instance as its argument.
         temporal_client: Optional connected Temporal client for workflow
             submission via ``POST /temporal/start``.
+        redis_url: Optional Redis URL for multi-replica mode. When set,
+            uses Redis-backed session store, SSE broadcaster, and locks.
+        callback_base_url: Base URL for on-prem worker event callbacks.
+        callback_auth_token: Shared secret for authenticating callback POSTs.
     """
     routes = [
         Route("/", chat_ui),
@@ -511,6 +563,12 @@ def create_gateway_app(
         Route("/temporal/start", temporal_start, methods=["POST"]),
         WebSocketRoute("/ws/{session_id}", websocket_endpoint),
         Route("/events/{session_id}", sse_endpoint),
+        # Internal callback for on-prem worker to push streaming events
+        Route(
+            "/internal/events/{session_id}/publish",
+            publish_event_callback,
+            methods=["POST"],
+        ),
     ]
 
     # Mount static files if directory exists
@@ -518,11 +576,31 @@ def create_gateway_app(
     if static_dir.is_dir():
         routes.append(Mount("/static", StaticFiles(directory=str(static_dir)), name="static"))
 
-    # Wrap user lifespan to include lock eviction task
+    # Wrap user lifespan to include lock eviction task and Redis setup
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
     async def _lifespan(app):
+        redis_broadcaster = None
+
+        # Initialize Redis-backed components if redis_url is set
+        if redis_url:
+            from redis.asyncio import Redis
+            from seeknal.ask.gateway.redis_backend import (
+                RedisSSEBroadcaster,
+            )
+
+            redis_client = Redis.from_url(redis_url)
+            redis_broadcaster = RedisSSEBroadcaster(redis_client)
+            app.state.broadcaster = redis_broadcaster
+            app.state.redis_client = redis_client
+            app.state.redis_enabled = True
+            await redis_broadcaster.start_listener()
+        else:
+            app.state.broadcaster = sse_broadcaster
+            app.state.redis_client = None
+            app.state.redis_enabled = False
+
         async def _eviction_loop():
             while True:
                 await asyncio.sleep(300)  # every 5 minutes
@@ -541,9 +619,15 @@ def create_gateway_app(
                 await eviction_task
             except asyncio.CancelledError:
                 pass
+            if redis_broadcaster:
+                await redis_broadcaster.stop_listener()
+            if app.state.redis_client:
+                await app.state.redis_client.close()
 
     app = Starlette(routes=routes, lifespan=_lifespan)
     app.state.project_path = str(project_path)
+    app.state.callback_base_url = callback_base_url
+    app.state.callback_auth_token = callback_auth_token
     if temporal_client is not None:
         app.state.temporal_client = temporal_client
     return app

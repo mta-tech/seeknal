@@ -13,13 +13,8 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 COPY seeknal-src/ /app/seeknal-src/
 RUN uv pip install --system --no-cache /app/seeknal-src[ask,temporal]
 
-EXPOSE 8000
-
-# Gateway mode: SSE endpoint with Temporal client (--no-worker)
-# Receives callback POSTs from remote workers
-# Override CMD in docker-compose to change flags
-CMD ["python", "-m", "seeknal.cli.main", "gateway", "start", \
-     "--project", "/app/project", \
-     "--port", "8000", \
-     "--host", "0.0.0.0", \
-     "--temporal", "--no-worker"]
+# Worker mode: standalone Temporal worker, no HTTP server
+# Polls Temporal task queue and executes agent activities locally
+# POSTs streaming events to the gateway callback URL
+CMD ["python", "-m", "seeknal.cli.main", "gateway", "worker", \
+     "--project", "/app/project"]

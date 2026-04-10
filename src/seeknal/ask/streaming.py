@@ -367,18 +367,19 @@ async def _stream_one_pass(
 
     from pydantic_ai.usage import UsageLimits
 
-    import seeknal.ask.config as _ask_config
+    from seeknal.ask.agents.tools._context import get_tool_context
     from seeknal.ui.ask_spinner import AskSpinner
 
     text_buffer: list[str] = []
     spinner = AskSpinner("Thinking")
     spinner.start()
 
+    ctx = get_tool_context()
     async with agent.iter(
         question,
         deps=deps,
         message_history=message_history,
-        usage_limits=UsageLimits(request_limit=_ask_config._active_request_limit),
+        usage_limits=UsageLimits(request_limit=ctx.request_limit),
     ) as run:
         async for node in run:
             if isinstance(node, UserPromptNode):

@@ -25,23 +25,37 @@ services:
       - temporal
     restart: unless-stopped
 
+  redis:
+    image: redis:7-alpine
+    container_name: seeknal-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
   seeknal-gateway:
     build:
       context: .
       dockerfile: Dockerfile.gateway
-    container_name: seeknal-gateway
+    deploy:
+      replicas: ${GATEWAY_REPLICAS:-1}
     ports:
-      - "8000:8000"
+      - "8000-8004:8000"
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
       - TEMPORAL_NAMESPACE=default
       - TEMPORAL_TASK_QUEUE=seeknal-ask
+      - REDIS_URL=redis://redis:6379
+      - CALLBACK_BASE_URL=http://seeknal-gateway:8000
+      - CALLBACK_AUTH_TOKEN=${CALLBACK_AUTH_TOKEN:-}
     env_file:
       - .env
     volumes:
       - ./ecommerce:/app/project
     depends_on:
       - temporal
+      - redis
     restart: unless-stopped
 
   chat-web:
@@ -58,3 +72,4 @@ services:
 
 volumes:
   temporal-data:
+  redis-data:

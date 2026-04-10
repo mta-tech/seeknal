@@ -349,7 +349,6 @@ async def _async_ensure_node_modules(report_path: Path, timeout: int = 60) -> st
 
     from seeknal.ask.agents.tools._context import get_tool_context
     from seeknal.ask.background import run_with_auto_background
-    import seeknal.ask.config as _ask_config
 
     try:
         registry = get_tool_context().background_registry
@@ -365,7 +364,7 @@ async def _async_ensure_node_modules(report_path: Path, timeout: int = 60) -> st
             cwd=str(cache_dir),
             env=env,
             timeout=timeout,
-            background_threshold=_ask_config._active_background_threshold,
+            background_threshold=get_tool_context().background_threshold,
         )
         if isinstance(result, str):
             return result  # Backgrounded placeholder
@@ -409,7 +408,6 @@ async def _async_run_evidence_build(
 
     from seeknal.ask.agents.tools._context import get_tool_context
     from seeknal.ask.background import run_with_auto_background
-    import seeknal.ask.config as _ask_config
 
     try:
         registry = get_tool_context().background_registry
@@ -426,7 +424,7 @@ async def _async_run_evidence_build(
             cwd=str(report_path),
             env=env,
             timeout=timeout,
-            background_threshold=_ask_config._active_background_threshold,
+            background_threshold=get_tool_context().background_threshold,
         )
         if isinstance(result, str):
             return result  # Backgrounded
@@ -447,7 +445,7 @@ async def _async_run_evidence_build(
             cwd=str(report_path),
             env=env,
             timeout=timeout,
-            background_threshold=_ask_config._active_background_threshold,
+            background_threshold=get_tool_context().background_threshold,
         )
         if isinstance(result, str):
             return result

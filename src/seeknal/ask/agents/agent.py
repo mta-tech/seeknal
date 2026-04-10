@@ -93,7 +93,6 @@ def create_agent(
     ))
 
     # Load project-level agent config (seeknal_agent.yml)
-    import seeknal.ask.config as _ask_config
     from seeknal.ask.config import (
         load_agent_config, get_request_limit,
         get_background_threshold, get_context_budget,
@@ -101,10 +100,12 @@ def create_agent(
 
     agent_config = load_agent_config(project_path)
 
-    # Set request limit (read by streaming.py at each agent.iter() call)
-    _ask_config._active_request_limit = get_request_limit(agent_config)
-    # Set background threshold (read by tool functions)
-    _ask_config._active_background_threshold = get_background_threshold(agent_config)
+    # Set request limit and background threshold on the per-session ToolContext
+    # (NOT on module-level globals — avoids race conditions across concurrent sessions)
+    from seeknal.ask.agents.tools._context import get_tool_context
+    tool_ctx = get_tool_context()
+    tool_ctx.request_limit = get_request_limit(agent_config)
+    tool_ctx.background_threshold = get_background_threshold(agent_config)
 
     # Build final system prompt via section registry (4-layer architecture)
     from seeknal.ask.prompt_builder import create_default_builder
@@ -167,7 +168,7 @@ def create_agent(
         skill_directories=[str(project_path / "seeknal" / "skills")],
         # Planning: todo checklist + interactive ask_user via planner subagent
         include_todo=True,
-        include_plan=True,
+        include_plan=(environment == "interactive"),
         plans_dir=".seeknal/plans",
         # Context management: 3-tier compaction + user context files
         context_manager=True,
@@ -198,10 +199,14 @@ def create_agent(
         include_execute=False,
     )
 
-    # Use LocalBackend with interactive ask_user callback
+    # Use LocalBackend with interactive ask_user callback.
+    # Gateway/headless environments have no TTY — pass ask_user=None so the
+    # planner subagent auto-selects the recommended option instead of calling
+    # input() on a non-TTY stdin (which blocks or raises EOFError).
+    _ask_user_cb = interactive_ask_user if environment == "interactive" else None
     deps = DeepAgentDeps(
         backend=LocalBackend(root_dir=str(project_path)),
-        ask_user=interactive_ask_user,
+        ask_user=_ask_user_cb,
     )
     message_history = []
 
@@ -235,9 +240,10 @@ def ask(
         The agent's text response.
     """
     from pydantic_ai.usage import UsageLimits
-    from seeknal.ask.config import _active_request_limit
+    from seeknal.ask.agents.tools._context import get_tool_context
 
-    _usage_limits = UsageLimits(request_limit=_active_request_limit)
+    ctx = get_tool_context()
+    _usage_limits = UsageLimits(request_limit=ctx.request_limit)
 
     result = agent.run_sync(
         question,
@@ -314,13 +320,14 @@ def _quality_gate(
 
     # One quality retry with guidance
     from pydantic_ai.usage import UsageLimits
-    from seeknal.ask.config import _active_request_limit
+    from seeknal.ask.agents.tools._context import get_tool_context
 
+    ctx = get_tool_context()
     result = agent.run_sync(
         reason,
         deps=deps,
         message_history=message_history,
-        usage_limits=UsageLimits(request_limit=_active_request_limit),
+        usage_limits=UsageLimits(request_limit=ctx.request_limit),
     )
     message_history.clear()
     message_history.extend(result.all_messages())

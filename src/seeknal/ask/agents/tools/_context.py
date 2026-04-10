@@ -44,6 +44,8 @@ class ToolContext:
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     db_lock: threading.Lock = field(default_factory=threading.Lock)
     fs_lock: threading.Lock = field(default_factory=threading.Lock)
+    request_limit: int = 100
+    background_threshold: int = 60
     require_report_approval: bool = True
     report_approval_granted: bool = False
     background_registry: BackgroundRegistry = field(default_factory=lambda: _make_registry())

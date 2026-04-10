@@ -419,7 +419,7 @@ async def async_execute_in_sandbox(
 
     # Use auto-background if registry is available
     if registry is not None:
-        import seeknal.ask.config as _ask_config
+        from seeknal.ask.agents.tools._context import get_tool_context
         from seeknal.ask.background import run_with_auto_background
 
         result = await run_with_auto_background(
@@ -430,7 +430,7 @@ async def async_execute_in_sandbox(
             cwd=str(project_path),
             env=env,
             timeout=timeout,
-            background_threshold=_ask_config._active_background_threshold,
+            background_threshold=get_tool_context().background_threshold,
         )
         if isinstance(result, str):
             # Backgrounded — return the placeholder

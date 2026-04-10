@@ -76,6 +76,7 @@ ask = [
     "uvicorn>=0.30.0",
     "scikit-learn>=1.5.0",
     "scipy>=1.14.0",
+    "redis>=4.5.0",
 ]
 
 # Telegram bot integration (optional, on top of ask)
@@ -86,6 +87,7 @@ telegram = [
 # Temporal durable execution for gateway agent work
 temporal = [
     "temporalio>=1.9.0",
+    "aiohttp>=3.9.0",
 ]
 
 # Development dependencies

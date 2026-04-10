@@ -36,7 +36,28 @@ def gateway_start(
         False, "--telegram", help="Enable Telegram bot channel"
     ),
     temporal: bool = typer.Option(
-        False, "--temporal", help="Enable Temporal worker for durable agent execution"
+        False, "--temporal", help="Enable Temporal client for durable agent execution"
+    ),
+    no_worker: bool = typer.Option(
+        False, "--no-worker", help="Connect to Temporal as client only (no local worker). Use for cloud/gateway-only mode."
+    ),
+    max_activities: int = typer.Option(
+        15, "--max-activities", envvar="TEMPORAL_MAX_CONCURRENT_ACTIVITIES",
+        help="Maximum concurrent Temporal activities (agent executions per worker)"
+    ),
+    redis: Optional[str] = typer.Option(
+        None, "--redis", help="Redis URL for multi-replica mode (e.g. redis://localhost:6379)"
+    ),
+    callback_url: Optional[str] = typer.Option(
+        None, "--callback-url", help="Base URL for on-prem worker event callbacks"
+    ),
+    callback_auth_token: Optional[str] = typer.Option(
+        None, "--callback-auth-token", envvar="CALLBACK_AUTH_TOKEN",
+        help="Shared secret for authenticating worker callback POSTs"
+    ),
+    worker_project_path: Optional[str] = typer.Option(
+        None, "--worker-project-path", envvar="WORKER_PROJECT_PATH",
+        help="Project path on the remote worker (for split topology where gateway and worker are on different machines)"
     ),
 ):
     """Start the seeknal ask gateway server."""
@@ -101,6 +122,7 @@ def gateway_start(
             await telegram_channel.start()
 
         # Startup: Temporal
+        worker = None
         worker_task = None
         if temporal_enabled:
             from seeknal.ask.gateway.temporal import (
@@ -117,14 +139,24 @@ def gateway_start(
                 app.state.temporal_client = client
                 app.state.temporal_task_queue = temporal_task_queue
 
-                import asyncio
+                if not no_worker:
+                    import asyncio
 
-                worker = create_temporal_worker(client, task_queue=temporal_task_queue)
-                worker_task = asyncio.create_task(worker.run())
-                typer.echo(typer.style(
-                    f"Temporal worker enabled (queue={temporal_task_queue})",
-                    fg=typer.colors.GREEN,
-                ))
+                    worker = create_temporal_worker(
+                        client,
+                        task_queue=temporal_task_queue,
+                        max_concurrent_activities=max_activities,
+                    )
+                    worker_task = asyncio.create_task(worker.run())
+                    typer.echo(typer.style(
+                        f"Temporal worker enabled (queue={temporal_task_queue}, max_activities={max_activities})",
+                        fg=typer.colors.GREEN,
+                    ))
+                else:
+                    typer.echo(typer.style(
+                        f"Temporal client-only mode (no local worker)",
+                        fg=typer.colors.GREEN,
+                    ))
             else:
                 typer.echo(typer.style(
                     "Temporal unavailable — running in degraded mode",
@@ -135,7 +167,7 @@ def gateway_start(
             yield
         finally:
             # Shutdown: Temporal worker
-            if worker_task is not None:
+            if worker_task is not None and worker is not None:
                 await worker.shutdown()
                 await worker_task
 
@@ -145,16 +177,116 @@ def gateway_start(
 
     # Pass temporal_client if already connected (for sync startup path)
     # The lifespan will also set it on app.state for the async path
-    app = create_gateway_app(project_path, lifespan=lifespan)
+    app = create_gateway_app(
+        project_path,
+        lifespan=lifespan,
+        redis_url=redis,
+        callback_base_url=callback_url,
+        callback_auth_token=callback_auth_token,
+    )
+    if worker_project_path:
+        app.state.worker_project_path = worker_project_path
 
     typer.echo(f"Starting gateway on {host}:{port}")
     typer.echo(f"Project: {project_path}")
+    if redis:
+        typer.echo(typer.style(f"Redis: {redis}", fg=typer.colors.GREEN))
     typer.echo(f"Endpoints:")
     typer.echo(f"  GET  /health")
     typer.echo(f"  GET  /sessions")
     typer.echo(f"  POST /ask")
     typer.echo(f"  POST /temporal/start")
+    typer.echo(f"  POST /internal/events/{{session_id}}/publish")
     typer.echo(f"  WS   /ws/{{session_id}}")
     typer.echo(f"  GET  /events/{{session_id}}")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+@gateway_app.command("worker")
+def gateway_worker(
+    project: Optional[Path] = typer.Option(
+        None, "--project", help="Project path (auto-detected if not set)"
+    ),
+    max_activities: int = typer.Option(
+        15, "--max-activities", envvar="TEMPORAL_MAX_CONCURRENT_ACTIVITIES",
+        help="Maximum concurrent Temporal activities (agent executions per worker)"
+    ),
+    callback_url: Optional[str] = typer.Option(
+        None, "--callback-url", envvar="CALLBACK_BASE_URL",
+        help="Gateway URL for streaming event callbacks"
+    ),
+    callback_auth_token: Optional[str] = typer.Option(
+        None, "--callback-auth-token", envvar="CALLBACK_AUTH_TOKEN",
+        help="Shared secret for authenticating callback POSTs"
+    ),
+):
+    """Start a standalone Temporal worker (no HTTP server).
+
+    Connects to Temporal, polls the task queue, and executes agent
+    activities locally. Use this for on-prem worker deployments where
+    the gateway runs elsewhere.
+
+    Streaming events are POSTed to the gateway's callback URL.
+    """
+    import asyncio
+
+    project_path = project or find_project_path()
+
+    try:
+        from seeknal.ask.gateway.temporal import (
+            _require_temporal,
+            connect_temporal_client,
+            create_temporal_worker,
+        )
+        _require_temporal()
+    except ImportError:
+        typer.echo(typer.style(
+            "Temporal requires: pip install seeknal[temporal]",
+            fg=typer.colors.RED,
+        ))
+        raise typer.Exit(1)
+
+    temporal_address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    temporal_namespace = os.environ.get("TEMPORAL_NAMESPACE", "default")
+    temporal_task_queue = os.environ.get("TEMPORAL_TASK_QUEUE", "seeknal-ask")
+
+    async def _run_worker():
+        client = await connect_temporal_client(
+            address=temporal_address,
+            namespace=temporal_namespace,
+        )
+        if client is None:
+            typer.echo(typer.style(
+                f"Failed to connect to Temporal at {temporal_address}",
+                fg=typer.colors.RED,
+            ))
+            raise typer.Exit(1)
+
+        worker = create_temporal_worker(
+            client,
+            task_queue=temporal_task_queue,
+            max_concurrent_activities=max_activities,
+        )
+
+        typer.echo(f"Seeknal worker started")
+        typer.echo(f"  Project: {project_path}")
+        typer.echo(f"  Temporal: {temporal_address}")
+        typer.echo(f"  Queue: {temporal_task_queue}")
+        typer.echo(f"  Max activities: {max_activities}")
+        if callback_url:
+            typer.echo(f"  Callback: {callback_url}")
+
+        # Set environment for the worker activity to find
+        os.environ["SEEKNAL_PROJECT_PATH"] = str(project_path)
+        if callback_url:
+            os.environ["CALLBACK_BASE_URL"] = callback_url
+        if callback_auth_token:
+            os.environ["CALLBACK_AUTH_TOKEN"] = callback_auth_token
+
+        await worker.run()
+
+    try:
+        asyncio.run(_run_worker())
+    except KeyboardInterrupt:
+        typer.echo("\nWorker stopped.")
