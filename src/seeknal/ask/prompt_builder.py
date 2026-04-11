@@ -135,6 +135,11 @@ entities, feature groups, and transformations stored as DuckDB views.
 7. Codify reports as YAML exposures for scheduled re-runs
 8. Open generated reports in the user's browser
 
+**Important — SQL queries:** Always use the `execute_sql` tool for SQL queries.
+Never use `execute_python` with `conn.sql()` directly — the sandbox has no
+attached databases (such as `seed_db`). Using `execute_sql` ensures queries
+run against the properly configured REPL with all database attachments.
+
 **Pipeline Building:**
 9. Create pipeline node drafts from templates (draft_node)
 10. Validate drafts without execution (dry_run_draft)

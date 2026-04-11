@@ -150,47 +150,52 @@ if TEMPORAL_AVAILABLE:
             await _push_event("start")
             event_count += 1
 
-            async for event in _run_agent_streaming(
-                Path(input.project_path),
-                input.session_id,
-                input.question,
+            from seeknal.ask.agents.agent import create_agent
+            from seeknal.ask.sessions import SessionStore
+            from pathlib import Path as _Path
+            from pydantic_ai.usage import UsageLimits
+            from seeknal.ask.config import _active_request_limit
+
+            # Load conversation history for this session
+            store = SessionStore(_Path(input.project_path))
+            if store.get(input.session_id) is None:
+                store.create(name=input.session_id)
+            _history = store.load_messages(input.session_id)
+
+            _agent, _deps, _, _ = create_agent(
+                _Path(input.project_path),
                 provider=input.provider,
                 model=input.model,
-            ):
-                event_count += 1
-                event_type = event.get("type")
+                environment="gateway",
+            )
+            # Run the agent directly on the Temporal main event loop.
+            # DuckDB tool calls (execute_sql, list_tables, describe_table) are
+            # individually offloaded to a thread pool via asyncio.to_thread()
+            # inside each tool, so they do not block the heartbeat or other awaits.
+            result = await _agent.run(
+                input.question,
+                deps=_deps,
+                message_history=_history,
+                usage_limits=UsageLimits(request_limit=_active_request_limit),
+            )
+            # Persist conversation history for future turns
+            store.save_messages(input.session_id, result.all_messages())
+            answer = result.output or ""
+            event_count += 1
 
-                if event_type == "token":
-                    await _push_event("message", answer=event.get("data", ""))
-                elif event_type == "answer":
-                    answer = event.get("data", "")
-                    await _push_event("message", answer=answer)
-                elif event_type == "tool_start":
-                    data = event.get("data", {})
-                    await _push_event(
-                        "tool_call",
-                        tool_name=data.get("name", ""),
-                        tool_args=data.get("args", {}),
-                    )
-                elif event_type == "tool_end":
-                    data = event.get("data", {})
-                    await _push_event(
-                        "tool_result",
-                        tool_name=data.get("name", ""),
-                        tool_result=data.get("output", ""),
-                    )
-                elif event_type == "reasoning":
-                    await _push_event("reasoning", answer=event.get("data", ""))
-                elif event_type == "error":
-                    error = event.get("data", "")
-                    await _push_event("error", error_message=error)
-                elif event_type == "done":
-                    break
+            if answer:
+                await _push_event("message", answer=answer)
+                event_count += 1
 
             await _push_event("done")
             event_count += 1
 
         except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            activity.logger.error(
+                "run_agent_activity failed: %s\n%s", exc, tb
+            )
             if not error:
                 error = str(exc)
             await _push_event("error", error_message=str(exc))
@@ -316,11 +321,16 @@ if TEMPORAL_AVAILABLE:
             Configured ``Worker`` instance. Call ``worker.run()`` to
             start polling.
         """
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+        
+        _max_concurrent = int(os.environ.get("MAX_CONCURRENT_ACTIVITIES", "5"))
         return Worker(
             client,
             task_queue=task_queue,
             workflows=[AgentWorkflow],
             activities=[run_agent_activity],
-            max_concurrent_activities=3,
+            max_concurrent_activities=_max_concurrent,
+            activity_executor=ThreadPoolExecutor(max_workers=_max_concurrent),
             graceful_shutdown_timeout=timedelta(minutes=5),
         )
