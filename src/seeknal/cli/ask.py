@@ -31,11 +31,14 @@ class _AskGroup(typer.core.TyperGroup):
     """
 
     def invoke(self, ctx):
-        if ctx._protected_args:
-            first_arg = ctx._protected_args[0]
+        # Click renamed `protected_args` to `_protected_args` in 8.2. Support both.
+        attr = "_protected_args" if hasattr(ctx, "_protected_args") else "protected_args"
+        protected = getattr(ctx, attr, None) or []
+        if protected:
+            first_arg = protected[0]
             if first_arg not in self.commands:
-                ctx.args = [*ctx._protected_args, *ctx.args]
-                ctx._protected_args = []
+                ctx.args = [*protected, *ctx.args]
+                setattr(ctx, attr, [])
         return super().invoke(ctx)
 
 

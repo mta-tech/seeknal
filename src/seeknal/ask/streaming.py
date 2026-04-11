@@ -34,6 +34,46 @@ def _sanitize_output(text: str) -> str:
     return _ANSI_ESCAPE.sub("", text)
 
 
+def _extract_tool_result_text(result: Any) -> str:
+    """Get a plain-text view of a pydantic-ai tool result.
+
+    ``ToolReturnPart.content`` may be a string, a list of content parts
+    (TextPart / MultiModalContent), or an arbitrary Python object. Calling
+    ``str()`` on a list produces the Python repr, not the joined text, which
+    breaks the downstream ``'|' in output`` SQL-table guard. Prefer the
+    ``model_response_str`` helper when available, then fall through.
+    """
+    if result is None:
+        return ""
+    # Preferred: pydantic-ai's own text-serialization helper
+    model_str = getattr(result, "model_response_str", None)
+    if callable(model_str):
+        try:
+            rendered = model_str()
+        except Exception:
+            rendered = None
+        if isinstance(rendered, str):
+            return rendered
+    content = getattr(result, "content", result)
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            inner = getattr(part, "content", None)
+            if isinstance(inner, str):
+                parts.append(inner)
+            else:
+                parts.append(str(part))
+        return "".join(parts)
+    return str(content)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +111,29 @@ def _show_tool_start(console: Console, name: str, args: Optional[dict] = None) -
         task_id = args.get("task_id", "")
         console.print(f"\n[dim]> check_task({escape(str(task_id))})[/dim]")
         return
+    # submit_plan: render the plan as a titled panel so the user can see
+    # what the agent is about to do. Without this branch the plan is dumped
+    # as a dim one-liner and easily missed.
+    if name == "submit_plan" and args and "steps" in args:
+        from rich.panel import Panel
+        from rich.text import Text
+
+        raw_steps = args.get("steps") or []
+        if isinstance(raw_steps, list) and raw_steps:
+            body = Text()
+            for i, step in enumerate(raw_steps, 1):
+                body.append(f"{i}. ", style="bold")
+                body.append(f"{step}\n")
+            console.print()
+            console.print(
+                Panel(
+                    body,
+                    title="Plan",
+                    border_style="brand.accent",
+                    padding=(0, 1),
+                )
+            )
+            return
     console.print(f"\n[bold]> {escape(name)}[/bold]")
     if args and name == "execute_sql" and "sql" in args:
         _show_sql(console, args["sql"])
@@ -80,6 +143,12 @@ def _show_tool_start(console: Console, name: str, args: Optional[dict] = None) -
         console.print(f"  [dim]Title: {escape(args['title'])}[/dim]")
     elif args and name == "save_report_exposure" and "name" in args:
         console.print(f"  [dim]Name: {escape(args['name'])}[/dim]")
+    elif args and name == "publish_to_proof" and "title" in args:
+        console.print(f"  [dim]Title: {escape(args['title'])}[/dim]")
+    elif args and name == "read_proof_document" and "url" in args:
+        console.print(f"  [dim]URL: {escape(str(args['url']))}[/dim]")
+    elif args and name == "edit_proof_document" and "url" in args:
+        console.print(f"  [dim]URL: {escape(str(args['url']))}[/dim]")
     elif args:
         # Show truncated args for other tools
         arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
@@ -108,6 +177,11 @@ def _show_tool_end(console: Console, name: str, output: str) -> None:
         console.print(f"  [dim]{escape(summary)}[/dim]")
         return
 
+    # Suppress the trailing "Done: Plan submitted with N steps..." line for
+    # submit_plan — the plan panel rendered by _show_tool_start is the only
+    # visible surface the user needs.
+    if name == "submit_plan":
+        return
     if name == "execute_sql" and "|" in output:
         _show_sql_result_table(console, output)
     elif name == "execute_python":
@@ -119,6 +193,18 @@ def _show_tool_end(console: Console, name: str, output: str) -> None:
             console.print(f"  [status.error]{escape(output)}[/]")
         else:
             console.print(f"  [status.success]{escape(output)}[/]")
+    elif name == "publish_to_proof":
+        if output.startswith("Error"):
+            console.print(f"  [status.error]{escape(output)}[/]")
+        else:
+            console.print(f"  [status.success]{escape(output)}[/]")
+    elif name in ("read_proof_document", "edit_proof_document"):
+        if output.startswith("Error"):
+            console.print(f"  [status.error]{escape(output)}[/]")
+        else:
+            console.print(f"  [status.success]{escape(output[:500])}[/]")
+            if len(output) > 500:
+                console.print(f"  [dim]... ({len(output) - 500} more chars)[/dim]")
     else:
         summary = output[:200] + "..." if len(output) > 200 else output
         console.print(f"  [dim]Done: {escape(summary)}[/dim]")
@@ -362,6 +448,8 @@ async def _stream_one_pass(
         FunctionToolCallEvent,
         FunctionToolResultEvent,
         PartDeltaEvent,
+        PartStartEvent,
+        TextPart,
         TextPartDelta,
     )
 
@@ -386,10 +474,21 @@ async def _stream_one_pass(
                 continue
 
             elif Agent.is_model_request_node(node):
-                # Stream text tokens from the model
+                # Stream text tokens from the model. We must handle
+                # PartStartEvent as well as PartDeltaEvent: when a new text
+                # part starts, its initial `content` arrives inside the
+                # start event's `part`, and subsequent chunks arrive as
+                # TextPartDelta. Dropping PartStartEvent silently loses
+                # the first characters of the model's answer (e.g. the
+                # final answer appearing as "...ai ini dihitung..." with
+                # the leading "Nil" missing).
                 async with node.stream(run.ctx) as request_stream:
                     async for event in request_stream:
-                        if isinstance(event, PartDeltaEvent):
+                        if isinstance(event, PartStartEvent):
+                            if isinstance(event.part, TextPart) and event.part.content:
+                                spinner.stop()
+                                text_buffer.append(event.part.content)
+                        elif isinstance(event, PartDeltaEvent):
                             if isinstance(event.delta, TextPartDelta):
                                 spinner.stop()
                                 text_buffer.append(event.delta.content_delta)
@@ -398,17 +497,28 @@ async def _stream_one_pass(
 
             elif Agent.is_call_tools_node(node):
                 spinner.stop()
-                # Flush text buffer as reasoning before tool calls
-                if text_buffer:
-                    _show_reasoning(console, "".join(text_buffer))
-                    text_buffer.clear()
-
-                # Stream tool call and result events
+                # Stream tool call and result events. Flush any buffered
+                # model text as an Answer panel on the FIRST tool call in
+                # this node — the text that arrives before bookkeeping
+                # tools (update_todo_status, ask_user) is substantive prose
+                # that the user needs to see prominently, not dim reasoning.
+                # Pydantic-ai always visits a call_tools node after every
+                # model_request node, even when the model produced a final
+                # answer with zero tool calls; in that case no tool event
+                # fires, the buffer survives to the end-of-stream branch,
+                # and _show_answer renders it there instead.
                 subagent_spinner: AskSpinner | None = None
                 tool_spinner: AskSpinner | None = None
+                saw_tool_call = False
                 async with node.stream(run.ctx) as handle_stream:
                     async for event in handle_stream:
                         if isinstance(event, FunctionToolCallEvent):
+                            if not saw_tool_call and text_buffer:
+                                flushed = "".join(text_buffer).strip()
+                                if flushed:
+                                    _show_answer(console, flushed)
+                                text_buffer.clear()
+                            saw_tool_call = True
                             tool_name = event.part.tool_name
                             tool_args = event.part.args_as_dict()
                             spinner.increment_tool_uses()
@@ -433,8 +543,7 @@ async def _stream_one_pass(
                                 tool_spinner.stop()
                                 tool_spinner = None
                             tool_name = event.result.tool_name
-                            content = event.result.content
-                            output = str(content) if content else ""
+                            output = _extract_tool_result_text(event.result)
                             from seeknal.ask.background import _BACKGROUNDED_PREFIX
                             if output.startswith(_BACKGROUNDED_PREFIX):
                                 console.print(
@@ -562,6 +671,12 @@ async def _stream_quality_gate(
     passes, reason = check_answer_quality(answer)
     if passes:
         return answer
+
+    # Tell the user why the agent is running again — otherwise the silent
+    # second pass looks like random churn on screen.
+    console.print(
+        f"\n[dim]--- Quality gate: {escape(reason)} — requesting a richer answer... ---[/dim]\n"
+    )
 
     # One quality retry with guidance
     retry_answer, updated_history = await _stream_one_pass(

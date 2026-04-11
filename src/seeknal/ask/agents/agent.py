@@ -134,8 +134,8 @@ def create_agent(
         except ImportError:
             import warnings
             warnings.warn(
-                "Web search requires 'duckduckgo-search' package. "
-                "Install with: pip install duckduckgo-search"
+                "Web search requires 'ddgs' package. "
+                "Install with: pip install ddgs"
             )
 
     # Ensure .seeknal directories exist (checkpoints scoped per session)

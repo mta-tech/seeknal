@@ -9,6 +9,7 @@ from seeknal.ask.agents.tools.describe_table import describe_table
 from seeknal.ask.agents.tools.draft_node import draft_node
 from seeknal.ask.agents.tools.dry_run_draft import dry_run_draft
 from seeknal.ask.agents.tools.edit_node import edit_node
+from seeknal.ask.agents.tools.edit_proof_document import edit_proof_document
 from seeknal.ask.agents.tools.execute_python import execute_python
 from seeknal.ask.agents.tools.execute_sql import execute_sql
 from seeknal.ask.agents.tools.generate_report import generate_report
@@ -19,8 +20,10 @@ from seeknal.ask.agents.tools.list_tables import list_tables
 from seeknal.ask.agents.tools.open_in_browser import open_in_browser
 from seeknal.ask.agents.tools.plan_pipeline import plan_pipeline
 from seeknal.ask.agents.tools.profile_data import profile_data
+from seeknal.ask.agents.tools.publish_to_proof import publish_to_proof
 from seeknal.ask.agents.tools.query_metric import query_metric
 from seeknal.ask.agents.tools.read_pipeline import read_pipeline
+from seeknal.ask.agents.tools.read_proof_document import read_proof_document
 from seeknal.ask.agents.tools.read_project_file import read_project_file
 from seeknal.ask.agents.tools.run_pipeline import run_pipeline
 from seeknal.ask.agents.tools.save_metric import save_metric
@@ -51,6 +54,9 @@ def create_ask_toolset() -> FunctionToolset:
             generate_report,
             open_in_browser,
             save_report_exposure,
+            publish_to_proof,
+            read_proof_document,
+            edit_proof_document,
             # Pipeline building
             draft_node,
             dry_run_draft,

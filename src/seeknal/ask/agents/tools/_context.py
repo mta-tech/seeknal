@@ -48,6 +48,10 @@ class ToolContext:
     background_threshold: int = 60
     require_report_approval: bool = True
     report_approval_granted: bool = False
+    require_proof_publish_approval: bool = True
+    proof_publish_approval_granted: bool = False
+    require_proof_edit_approval: bool = True
+    proof_edit_approval_granted: bool = False
     background_registry: BackgroundRegistry = field(default_factory=lambda: _make_registry())
     console: Any = None
     plan_steps: list[str] = field(default_factory=list)
@@ -80,38 +84,87 @@ def get_tool_context() -> ToolContext:
         )
 
 
-_REPORT_APPROVAL_OPTIONS = frozenset({
-    "continue analysis",
-    "generate report now",
-    "done for now",
-    "type your own",
-})
+# Unique discriminator labels — each approval is keyed off a single unique
+# option label. The agent must present a menu with the discriminator as one
+# of the options AND the user must explicitly select it. We deliberately do
+# NOT require a strict superset of 4 exact labels, because the model
+# frequently paraphrases one of them (e.g. "Just done" vs "Done for now"),
+# which silently dropped approval even when the user clearly picked the
+# discriminator. See the last ask session bug report.
+_REPORT_APPROVAL_DISCRIMINATOR = "generate report now"
+_PROOF_PUBLISH_APPROVAL_DISCRIMINATOR = "publish memo to proof"
+_PROOF_EDIT_APPROVAL_DISCRIMINATOR = "apply edit to proof"
 
 
 def reset_report_approval() -> None:
-    """Reset per-turn report approval state.
+    """Reset per-turn approval state for report AND proof tools.
 
-    Always requires approval — the agent must ask the user before generating
-    reports (per agent autonomy constraint: no keyword-based intent routing).
+    The agent must re-ask the user every turn before generating reports, or
+    publishing/editing documents on Proof — no approval carries across turns.
     """
     ctx = get_tool_context()
     ctx.require_report_approval = True
     ctx.report_approval_granted = False
+    ctx.require_proof_publish_approval = True
+    ctx.proof_publish_approval_granted = False
+    ctx.require_proof_edit_approval = True
+    ctx.proof_edit_approval_granted = False
 
 
 def record_ask_user_response(options: list[dict[str, Any]], answer: str) -> None:
-    """Persist explicit report approval when the user grants it."""
+    """Persist explicit report or proof-publish approval when the user grants it.
+
+    Each approval is keyed off a single unique discriminator label:
+      - `generate report now`  → grants report generation
+      - `publish memo to proof` → grants publishing to Proof / memokami
+      - `apply edit to proof`  → grants editing an existing Proof doc
+
+    Grant conditions (all must hold):
+      1. The discriminator label appears as one of the options shown.
+      2. The user's selected answer equals that discriminator (case/whitespace
+         insensitive).
+      3. The corresponding `require_*_approval` flag is still enabled.
+
+    Previously this also required a strict 4-element subset of exact labels,
+    which silently dropped approval whenever the LLM paraphrased even one of
+    them. That strictness was removed after a repeated session-level lockout
+    where the user selected `Publish memo to Proof` three times and the tool
+    kept returning "Approval required". The discriminator is unique enough
+    that a false grant would require the agent to deliberately reuse the
+    same discriminator label for an unrelated menu.
+    """
     ctx = get_tool_context()
-    if not ctx.require_report_approval:
-        return
 
     labels = {
         str(option.get("label", "")).strip().lower()
         for option in options
         if option.get("label")
     }
-    if _REPORT_APPROVAL_OPTIONS.issubset(labels):
-        ctx.report_approval_granted = answer.strip().lower() == "generate report now"
+    normalized_answer = answer.strip().lower()
+
+    if (
+        getattr(ctx, "require_report_approval", False)
+        and _REPORT_APPROVAL_DISCRIMINATOR in labels
+    ):
+        ctx.report_approval_granted = (
+            normalized_answer == _REPORT_APPROVAL_DISCRIMINATOR
+        )
+
+    if (
+        getattr(ctx, "require_proof_publish_approval", False)
+        and _PROOF_PUBLISH_APPROVAL_DISCRIMINATOR in labels
+    ):
+        ctx.proof_publish_approval_granted = (
+            normalized_answer == _PROOF_PUBLISH_APPROVAL_DISCRIMINATOR
+        )
+
+    if (
+        getattr(ctx, "require_proof_edit_approval", False)
+        and _PROOF_EDIT_APPROVAL_DISCRIMINATOR in labels
+    ):
+        ctx.proof_edit_approval_granted = (
+            normalized_answer == _PROOF_EDIT_APPROVAL_DISCRIMINATOR
+        )
 
 
 def require_report_approval(tool_name: str) -> str | None:
@@ -121,4 +174,37 @@ def require_report_approval(tool_name: str) -> str | None:
         return None
     return (
         f"Approval required before {tool_name}. Summarize the current findings and proposed next step, then use ask_user with exactly these options: 'Continue analysis', 'Generate report now', 'Done for now', and 'Type your own'. Do not print those choices as plain text, bullets, or numbered lists. Only call {tool_name} after the user explicitly chooses 'Generate report now'."
+    )
+
+
+def require_proof_publish_approval(tool_name: str) -> str | None:
+    """Return an actionable error when publish_to_proof is used without approval."""
+    ctx = get_tool_context()
+    if (
+        not getattr(ctx, "require_proof_publish_approval", True)
+        or getattr(ctx, "proof_publish_approval_granted", False)
+    ):
+        return None
+    return (
+        f"Approval required before {tool_name}. Summarize the memo content and its intended audience, "
+        "then use ask_user with exactly these options: 'Continue analysis', 'Publish memo to Proof', "
+        "'Done for now', and 'Type your own'. Do not print those choices as plain text, bullets, or "
+        f"numbered lists. Only call {tool_name} after the user explicitly chooses 'Publish memo to Proof'."
+    )
+
+
+def require_proof_edit_approval(tool_name: str) -> str | None:
+    """Return an actionable error when edit_proof_document is used without approval."""
+    ctx = get_tool_context()
+    if (
+        not getattr(ctx, "require_proof_edit_approval", True)
+        or getattr(ctx, "proof_edit_approval_granted", False)
+    ):
+        return None
+    return (
+        f"Approval required before {tool_name}. Summarize the proposed edit (which "
+        "document, what changes) and then use ask_user with exactly these options: "
+        "'Continue analysis', 'Apply edit to Proof', 'Done for now', and 'Type your own'. "
+        "Do not print those choices as plain text, bullets, or numbered lists. Only call "
+        f"{tool_name} after the user explicitly chooses 'Apply edit to Proof'."
     )
