@@ -12,9 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, Callable
+
+# Module logger for verbose debugging
+logger = logging.getLogger("seeknal.gateway")
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -84,6 +88,23 @@ async def _run_agent_streaming(
                 _publish_event(session_id, event)
                 yield event
         except Exception as exc:
+            # Log verbose error details
+            logger.error(
+                "[%s] _run_agent_inner exception: %s",
+                session_id, type(exc).__name__,
+            )
+            logger.error(
+                "[%s] Exception details: %s",
+                session_id, str(exc),
+            )
+            # Try to get inner cause for UnexpectedModelBehavior
+            if hasattr(exc, "__cause__") and exc.__cause__:
+                logger.error(
+                    "[%s] Inner cause: %s: %s",
+                    session_id,
+                    type(exc.__cause__).__name__,
+                    str(exc.__cause__),
+                )
             error_event = {"type": "error", "data": str(exc)}
             _publish_event(session_id, error_event)
             yield error_event
@@ -127,57 +148,87 @@ async def _run_agent_inner(
 
     text_buffer: list[str] = []
 
-    async with agent.iter(
-        question, deps=deps, message_history=message_history,
-    ) as run:
-        async for node in run:
-            if isinstance(node, UserPromptNode):
-                continue
+    logger.info(
+        "[%s] Starting agent.iter() for question: %.50s",
+        session_id, question,
+    )
 
-            elif Agent.is_model_request_node(node):
-                async with node.stream(run.ctx) as stream:
-                    async for event in stream:
-                        if isinstance(event, PartDeltaEvent):
-                            if isinstance(event.delta, TextPartDelta):
-                                text_buffer.append(event.delta.content_delta)
+    try:
+        async with agent.iter(
+            question, deps=deps, message_history=message_history,
+        ) as run:
+            async for node in run:
+                if isinstance(node, UserPromptNode):
+                    continue
+
+                elif Agent.is_model_request_node(node):
+                    async with node.stream(run.ctx) as stream:
+                        async for event in stream:
+                            if isinstance(event, PartDeltaEvent):
+                                if isinstance(event.delta, TextPartDelta):
+                                    text_buffer.append(event.delta.content_delta)
+                                    yield {
+                                        "type": "token",
+                                        "data": event.delta.content_delta,
+                                    }
+
+                elif Agent.is_call_tools_node(node):
+                    # Flush reasoning
+                    if text_buffer:
+                        yield {
+                            "type": "reasoning",
+                            "data": "".join(text_buffer),
+                        }
+                        text_buffer.clear()
+
+                    logger.info(
+                        "[%s] Tool node detected, streaming tool calls...",
+                        session_id,
+                    )
+                    async with node.stream(run.ctx) as handle_stream:
+                        async for event in handle_stream:
+                            if isinstance(event, FunctionToolCallEvent):
                                 yield {
-                                    "type": "token",
-                                    "data": event.delta.content_delta,
+                                    "type": "tool_start",
+                                    "data": {
+                                        "name": event.part.tool_name,
+                                        "args": event.part.args_as_dict(),
+                                    },
                                 }
+                                logger.info(
+                                    "[%s] Tool call: %s(%s)",
+                                    session_id,
+                                    event.part.tool_name,
+                                    event.part.args_as_dict(),
+                                )
+                            elif isinstance(event, FunctionToolResultEvent):
+                                content = event.result.content
+                                yield {
+                                    "type": "tool_end",
+                                    "data": {
+                                        "name": event.result.tool_name,
+                                        "output": str(content)[:2000] if content else "",
+                                    },
+                                }
+                                logger.info(
+                                    "[%s] Tool result: %s -> %.100s",
+                                    session_id,
+                                    event.result.tool_name,
+                                    str(content)[:100],
+                                )
 
-            elif Agent.is_call_tools_node(node):
-                # Flush reasoning
-                if text_buffer:
-                    yield {
-                        "type": "reasoning",
-                        "data": "".join(text_buffer),
-                    }
-                    text_buffer.clear()
+                elif isinstance(node, End):
+                    break
 
-                async with node.stream(run.ctx) as handle_stream:
-                    async for event in handle_stream:
-                        if isinstance(event, FunctionToolCallEvent):
-                            yield {
-                                "type": "tool_start",
-                                "data": {
-                                    "name": event.part.tool_name,
-                                    "args": event.part.args_as_dict(),
-                                },
-                            }
-                        elif isinstance(event, FunctionToolResultEvent):
-                            content = event.result.content
-                            yield {
-                                "type": "tool_end",
-                                "data": {
-                                    "name": event.result.tool_name,
-                                    "output": str(content)[:2000] if content else "",
-                                },
-                            }
+            result = run.result
 
-            elif isinstance(node, End):
-                break
-
-        result = run.result
+    except Exception as exc:
+        logger.error(
+            "[%s] agent.iter() failed: %s: %s",
+            session_id, type(exc).__name__, exc,
+        )
+        # Re-raise to let the original error handling deal with it
+        raise
 
     # Final answer
     if text_buffer:
