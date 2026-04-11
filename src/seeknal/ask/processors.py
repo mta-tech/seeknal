@@ -10,6 +10,7 @@ Both processors implement the HistoryProcessor protocol:
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 
@@ -245,7 +246,7 @@ class SqlResultCompactor:
     before/after the table.
     """
 
-    min_chars: int = 500
+    min_chars: int = int(os.environ.get("SEEKNAL_SQL_RESULT_COMPACT_MIN_CHARS", "10000"))
 
     def __call__(self, messages: list[ModelMessage]) -> list[ModelMessage]:
         result: list[ModelMessage] = []

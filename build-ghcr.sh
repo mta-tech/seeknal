@@ -6,7 +6,7 @@ set -euo pipefail
 registry='ghcr.io'
 owner='mta-tech'
 image='seeknal'
-tag='nightly-gateway'
+tag='dev-gateway'
 full_tag="$registry/$owner/$image:$tag"
 
 echo "Building $full_tag ..."
