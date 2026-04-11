@@ -1,6 +1,9 @@
 """Describe table tool — shows column names and types for a table."""
 
-def describe_table(table_name: str) -> str:
+import asyncio
+
+
+async def describe_table(table_name: str) -> str:
     """Get the schema (column names and types) for a specific table or view.
 
     Use this before writing SQL queries to understand the available columns.
@@ -18,9 +21,12 @@ def describe_table(table_name: str) -> str:
     if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_.]*$", table_name):
         return f"Invalid table name: '{table_name}'"
 
-    try:
+    def _run() -> tuple:
         with ctx.db_lock:
-            columns, rows = ctx.repl.execute_oneshot(f"DESCRIBE {table_name}")
+            return ctx.repl.execute_oneshot(f"DESCRIBE {table_name}")
+
+    try:
+        columns, rows = await asyncio.to_thread(_run)
     except Exception as e:
         return f"Error describing table '{table_name}': {e}"
 

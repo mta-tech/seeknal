@@ -1,7 +1,9 @@
 """List tables tool — shows all registered views and tables in the REPL."""
 
+import asyncio
 
-def list_tables() -> str:
+
+async def list_tables() -> str:
     """List all available tables and views in the seeknal project.
 
     Returns table names that can be queried with execute_sql.
@@ -11,10 +13,9 @@ def list_tables() -> str:
 
     ctx = get_tool_context()
 
-    try:
+    def _run() -> list[str]:
+        lines: list[str] = []
         with ctx.db_lock:
-            lines: list[str] = []
-
             # Tables in the default (main) catalog
             _, rows = ctx.repl.execute_oneshot("SHOW TABLES")
             for row in rows:
@@ -25,13 +26,19 @@ def list_tables() -> str:
                 try:
                     _, attached_rows = ctx.repl.execute_oneshot(
                         f'SELECT table_name FROM information_schema.tables '
-                        f"WHERE table_catalog = '{name}'"
+                        f"WHERE table_catalog = '{name}' "
+                        f"AND table_schema NOT IN "
+                        f"('information_schema', 'pg_catalog', 'pg_toast', 'pg_internal') "
+                        f"ORDER BY table_schema, table_name"
                     )
                     for row in attached_rows:
                         lines.append(f"- {name}.{row[0]}")
                 except Exception:
                     pass
+        return lines
 
+    try:
+        lines = await asyncio.to_thread(_run)
     except Exception as e:
         return f"Error listing tables: {e}"
 

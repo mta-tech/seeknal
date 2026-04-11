@@ -1,6 +1,9 @@
 """Execute SQL tool — runs read-only queries via the seeknal REPL."""
 
-def execute_sql(sql: str, limit: int = 100) -> str:
+import asyncio
+
+
+async def execute_sql(sql: str, limit: int = 100) -> str:
     """Execute a read-only SQL query against seeknal project data.
 
     Use this to query entities, feature groups, and intermediate tables.
@@ -36,9 +39,12 @@ def execute_sql(sql: str, limit: int = 100) -> str:
 
     # SQL validation is handled by the PRE_TOOL_USE hook (see hooks.py)
 
-    try:
+    def _run() -> tuple:
         with ctx.db_lock:
-            columns, rows = ctx.repl.execute_oneshot(sql, limit=limit)
+            return ctx.repl.execute_oneshot(sql, limit=limit)
+
+    try:
+        columns, rows = await asyncio.to_thread(_run)
     except Exception as e:
         from seeknal.ask.agents.tools.errors import (
             classify_duckdb_error,

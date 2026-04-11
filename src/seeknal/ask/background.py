@@ -44,7 +44,12 @@ class BackgroundRegistry:
 
     def __init__(self) -> None:
         self._tasks: dict[str, BackgroundTask] = {}
-        self._notifications: asyncio.Queue[BackgroundTask] = asyncio.Queue()
+        self._notifications: asyncio.Queue[BackgroundTask] | None = None
+
+    def _get_queue(self) -> asyncio.Queue[BackgroundTask]:
+        if self._notifications is None:
+            self._notifications = asyncio.Queue()
+        return self._notifications
 
     # -- submit ---------------------------------------------------------------
 
@@ -81,7 +86,7 @@ class BackgroundRegistry:
             except Exception as exc:
                 bg.status = "failed"
                 bg.result = f"Background task failed: {exc}"
-            await self._notifications.put(bg)
+            await self._get_queue().put(bg)
 
         bg.asyncio_task = asyncio.create_task(_run())
         return task_id
@@ -91,6 +96,9 @@ class BackgroundRegistry:
     async def drain_notifications(self) -> list[BackgroundTask]:
         """Non-blocking drain of all completed task notifications."""
         completed: list[BackgroundTask] = []
+        if self._notifications is None:
+            return completed
+            
         while True:
             try:
                 task = self._notifications.get_nowait()
