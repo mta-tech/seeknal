@@ -15,6 +15,7 @@ from seeknal.ask.agents.tools.generate_report import generate_report
 from seeknal.ask.agents.tools.get_entities import get_entities
 from seeknal.ask.agents.tools.get_entity_schema import get_entity_schema
 from seeknal.ask.agents.tools.inspect_output import inspect_output
+from seeknal.ask.agents.tools.list_context_files import list_context_files
 from seeknal.ask.agents.tools.list_tables import list_tables
 from seeknal.ask.agents.tools.open_in_browser import open_in_browser
 from seeknal.ask.agents.tools.plan_pipeline import plan_pipeline
@@ -41,6 +42,7 @@ def create_ask_toolset() -> FunctionToolset:
             describe_table,
             get_entities,
             get_entity_schema,
+            list_context_files,
             # Pipeline reading
             read_pipeline,
             search_pipelines,
