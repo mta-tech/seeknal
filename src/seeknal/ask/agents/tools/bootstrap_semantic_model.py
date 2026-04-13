@@ -15,6 +15,7 @@ async def bootstrap_semantic_model(table_name: str = "") -> str:
         Summary of generated models, or guidance if no data found.
     """
     from seeknal.ask.agents.tools._context import get_tool_context
+    from seeknal.ask.agents.tools._write_security import get_drafts_dir
     from seeknal.workflow.semantic.bootstrap import (
         _build_semantic_model_dict,
         _discover_tables,
@@ -22,6 +23,7 @@ async def bootstrap_semantic_model(table_name: str = "") -> str:
     )
 
     ctx = get_tool_context()
+    drafts_dir = get_drafts_dir(ctx.project_path)
 
     tables = _discover_tables(ctx.project_path)
 
@@ -65,7 +67,7 @@ async def bootstrap_semantic_model(table_name: str = "") -> str:
                 )
 
                 draft_name = f"draft_semantic_model_{tbl_name}.yml"
-                draft_path = ctx.project_path / draft_name
+                draft_path = drafts_dir / draft_name
 
                 with ctx.fs_lock:
                     draft_path.write_text(content)

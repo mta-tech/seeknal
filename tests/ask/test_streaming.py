@@ -5,16 +5,15 @@ Streaming integration tests require pydantic-ai's agent.iter() which
 needs a real or mocked Agent — those are covered in QA/E2E tests.
 """
 
-import re
 from io import StringIO
 from pathlib import Path
 
-import pytest
 
 from seeknal.ask.streaming import (
     _extract_report_paths,
     _tool_spinner_message,
     _sanitize_output,
+    _sanitize_user_input,
     _show_reasoning,
     _show_tool_start,
     _show_tool_end,
@@ -54,6 +53,88 @@ class TestSanitizeOutput:
     def test_preserves_clean_text(self):
         text = "clean text with no escapes"
         assert _sanitize_output(text) == text
+
+
+class TestSanitizeUserInput:
+    """Guard against terminal escape sequences leaking into chat questions.
+
+    The production bug: IDE shortcuts (e.g. VS Code's 'Developer: Reload
+    Window') and bracketed-paste wrapping got into ``input("You: ")`` as
+    literal characters, so the agent saw 'giDeveloper: Reload Window'
+    instead of 'gimana bisnis saya'. Sanitizer must drop all CSI sequences.
+    """
+
+    def test_strips_bracketed_paste_markers(self):
+        text = "\x1b[200~hello world\x1b[201~"
+        assert _sanitize_user_input(text) == "hello world"
+
+    def test_strips_function_key_sequences(self):
+        text = "gi\x1b[15~Developer: Reload Window"
+        assert _sanitize_user_input(text) == "giDeveloper: Reload Window"
+
+    def test_strips_sgr_color_codes(self):
+        text = "hello \x1b[31mred\x1b[0m world"
+        assert _sanitize_user_input(text) == "hello red world"
+
+    def test_preserves_clean_text(self):
+        text = "how many customers?"
+        assert _sanitize_user_input(text) == text
+
+    def test_handles_empty_string(self):
+        assert _sanitize_user_input("") == ""
+
+    def test_strips_cursor_movement(self):
+        # \x1b[2A = move cursor up 2 lines
+        text = "foo\x1b[2Abar"
+        assert _sanitize_user_input(text) == "foobar"
+
+
+class TestPublishToSeeknalReportActionRespectsProjectPath:
+    """Regression: post-build publish action used Path.cwd() instead of
+    ctx.project_path, so ``seeknal ask chat --project <elsewhere>`` looked
+    up the build dir under the shell's cwd and always failed.
+    """
+
+    def test_uses_tool_context_project_path(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+        from seeknal.ask.streaming import _publish_to_seeknal_report_action
+        from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
+
+        # Point cwd at a DIFFERENT dir — the bug was that the action
+        # resolved the build dir from cwd, so without the fix the test
+        # would look at tmp_path/other instead of project_path.
+        other_dir = tmp_path / "other"
+        project_path = tmp_path / "project"
+        build_dir = project_path / "target" / "reports" / "my-report" / "build"
+        build_dir.mkdir(parents=True)
+        (build_dir / "index.html").write_text("<html></html>")
+        other_dir.mkdir()
+
+        monkeypatch.chdir(other_dir)
+
+        # Seed the tool context with the real project path
+        ctx = ToolContext(
+            repl=MagicMock(),
+            artifact_discovery=MagicMock(),
+            project_path=project_path,
+        )
+        set_tool_context(ctx)
+
+        # Force "no server configured" so the action exits before the
+        # network call, but only AFTER the build_dir resolution which
+        # is what we want to test.
+        monkeypatch.delenv("SEEKNAL_PUBLISH_SERVER", raising=False)
+        monkeypatch.delenv("SEEKNAL_PUBLISH_TOKEN", raising=False)
+
+        buf_console, out = make_console()
+        _publish_to_seeknal_report_action(buf_console, "my-report")
+        rendered = out.getvalue()
+
+        # Should NOT print "Build directory not found" — i.e. the fix
+        # resolved the path under project_path, not cwd.
+        assert "Build directory not found" not in rendered, (
+            f"Still using cwd instead of ctx.project_path:\n{rendered}"
+        )
 
 
 # ---------------------------------------------------------------------------

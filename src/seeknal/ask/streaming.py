@@ -28,10 +28,34 @@ from seeknal.ask.agents.tools._context import reset_report_approval
 # Strip raw ANSI escape sequences from tool output to prevent terminal injection
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
+# Broader CSI family — catches function keys (\x1b[15~ for F5), bracketed-
+# paste markers (\x1b[200~ … \x1b[201~), and any other escape that leaks
+# into Python's input() from IDE shortcut passthrough. Covers both the
+# a-zA-Z SGR terminator and the ~ terminator used for non-alphabetic
+# sequences like F1-F12.
+_CSI_ANY = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z~]")
+
 
 def _sanitize_output(text: str) -> str:
     """Strip raw ANSI escape codes from tool output before rendering."""
     return _ANSI_ESCAPE.sub("", text)
+
+
+def _sanitize_user_input(text: str) -> str:
+    """Strip ANSI/CSI escape sequences from user input.
+
+    Terminal escape sequences leak into Python's ``input()`` from:
+    1. IDE keyboard shortcuts (e.g. VS Code's "Developer: Reload Window"
+       which arrives as a pasted multi-line block wrapped in bracketed-
+       paste markers).
+    2. Function keys (F1-F12) passed through by unusual tmux bindings.
+    3. Mouse/cursor sequences when the terminal is misconfigured.
+
+    Dropping all of these keeps the agent's question clean.
+    """
+    if not text:
+        return text
+    return _CSI_ANY.sub("", text)
 
 
 def _extract_tool_result_text(result: Any) -> str:
@@ -164,7 +188,7 @@ def _show_tool_end(console: Console, name: str, output: str) -> None:
     # Subagent task result: compact summary
     if name == "task":
         summary = output[:300] + "..." if len(output) > 300 else output
-        console.print(f"  [status.success]⎿ Done[/]")
+        console.print("  [status.success]⎿ Done[/]")
         if summary.strip():
             # Show first 2 lines of result
             lines = summary.strip().split("\n")[:2]
@@ -285,34 +309,170 @@ def _launch_report_action(console: Console, launcher_path: Path) -> None:
 
 
 def _maybe_offer_report_action(console: Console, output: str) -> None:
-    """Offer a direct TUI action to open a freshly built report."""
+    """Offer a direct TUI action on a freshly built report.
+
+    Options include opening the local build in a browser, publishing the
+    build to a Seeknal Report Server (returns a shareable URL), or hinting
+    the Proof memo path. The Seeknal publish action runs entirely in-process
+    — it packages the build tree, POSTs to the configured server, and prints
+    the share URL + owner secret.
+    """
     if not sys.stdout.isatty():
         return
 
-    _html_path, browser_path = _extract_report_paths(output)
+    html_path, browser_path = _extract_report_paths(output)
     if browser_path is None or not browser_path.exists():
         return
 
+    # Extract report slug from the build path (target/reports/{slug}/build/index.html)
+    report_slug: Optional[str] = None
+    if html_path is not None:
+        try:
+            parts = html_path.parts
+            idx = parts.index("reports")
+            report_slug = parts[idx + 1]
+        except (ValueError, IndexError):
+            report_slug = None
+
     from seeknal.ui.interactive_menu import InteractiveMenu
+
+    options = [
+        {
+            "label": "Open in browser",
+            "description": "Launch the generated report from this TUI session",
+            "recommended": "true",
+        },
+    ]
+    if report_slug:
+        options.append({
+            "label": "Publish to Seeknal Report Server",
+            "description": "Upload the built report and get a shareable URL from a Seeknal Report Server",
+        })
+    options.extend([
+        {
+            "label": "Publish memo to Proof",
+            "description": "Draft and publish a markdown summary to Proof (ask the agent in the next turn)",
+        },
+        {
+            "label": "Continue",
+            "description": "Keep working without opening the report right now",
+        },
+    ])
 
     menu = InteractiveMenu(
         question="Report ready. What do you want to do next?",
-        options=[
-            {
-                "label": "Open in browser",
-                "description": "Launch the generated report from this TUI session",
-                "recommended": "true",
-            },
-            {
-                "label": "Continue",
-                "description": "Keep working without opening the report right now",
-            },
-        ],
+        options=options,
         console=console,
     )
     answer = menu.run()
     if answer == "Open in browser":
         _launch_report_action(console, browser_path)
+    elif answer == "Publish to Seeknal Report Server" and report_slug:
+        _publish_to_seeknal_report_action(console, report_slug)
+    elif answer == "Publish memo to Proof":
+        console.print(
+            "  [dim]Type your next message: 'publish this as a memo to Proof' — "
+            "the agent will compose the markdown and upload it.[/]"
+        )
+
+
+def _publish_to_seeknal_report_action(console: Console, report_slug: str) -> None:
+    """Package and POST the built report to the Seeknal Report Server.
+
+    Resolves server + api_key from env vars (SEEKNAL_PUBLISH_SERVER /
+    SEEKNAL_PUBLISH_TOKEN) first, then falls back to the `publish.default`
+    section of the project's profiles.yml. Prints the share URL + owner
+    secret on success.
+    """
+    import os
+    from pathlib import Path
+
+    # Use the ask agent's tool context so `--project` (or auto-detected
+    # project path) is respected. Falling back to Path.cwd() broke users
+    # running `seeknal ask chat --project <elsewhere>` from the seeknal
+    # repo itself.
+    try:
+        from seeknal.ask.agents.tools._context import get_tool_context
+        project_path = get_tool_context().project_path
+    except RuntimeError:
+        project_path = Path.cwd()
+
+    build_dir = project_path / "target" / "reports" / report_slug / "build"
+    if not build_dir.is_dir():
+        console.print(f"  [status.error]Build directory not found: {build_dir}[/]")
+        return
+
+    server = os.environ.get("SEEKNAL_PUBLISH_SERVER")
+    api_key = os.environ.get("SEEKNAL_PUBLISH_TOKEN")
+    if not server:
+        try:
+            from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+            # Prefer the project's local profiles.yml over ~/.seeknal/profiles.yml
+            # so publish config lives next to the project it publishes.
+            local_profiles = project_path / "profiles.yml"
+            loader = (
+                ProfileLoader(profile_path=local_profiles)
+                if local_profiles.exists()
+                else ProfileLoader()
+            )
+            profile = loader.load_publish_profile("default")
+            server = profile.get("server")
+            if not api_key:
+                api_key = profile.get("api_key")
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"  [status.error]Could not load publish profile: {escape(str(exc))}[/]")
+            return
+    if not server:
+        console.print(
+            "  [status.error]No publish server configured. Set SEEKNAL_PUBLISH_SERVER or "
+            "add publish.default.server to profiles.yml.[/]"
+        )
+        return
+
+    try:
+        from seeknal.publish.client import PublishClient
+        from seeknal.publish.ledger import LedgerEntry, append_entry
+        from seeknal.publish.packager import package_build
+
+        try:
+            rel = build_dir.relative_to(project_path)
+        except ValueError:
+            rel = build_dir
+        console.print(f"  [dim]Packaging {rel}...[/]")
+        tarball = package_build(build_dir)
+        try:
+            console.print(f"  [dim]Publishing to {server}...[/]")
+            client = PublishClient(server, api_key)
+            response = client.publish(tarball, report_slug, report_slug)
+        finally:
+            tarball.unlink(missing_ok=True)
+
+        try:
+            append_entry(
+                LedgerEntry(
+                    slug=response.slug,
+                    server=server,
+                    share_url=response.share_url,
+                    report_name=report_slug,
+                    published_at=response.created_at,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        full_url = (
+            response.share_url
+            if response.share_url.startswith("http")
+            else f"{server.rstrip('/')}{response.share_url}"
+        )
+        console.print(f"  [status.success]Published: {escape(full_url)}[/]")
+        console.print(
+            f"  [dim]Owner secret (save this — it is not retrievable later): "
+            f"{escape(response.owner_secret)}[/]"
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"  [status.error]Publish failed: {escape(str(exc))}[/]")
 
 
 
@@ -730,7 +890,7 @@ async def chat_session(
                 console.print("\nGoodbye!")
             break
 
-        question = question.strip()
+        question = _sanitize_user_input(question).strip()
         if not question:
             continue
         if question.lower() in ("exit", "quit", "q"):

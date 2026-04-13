@@ -4127,6 +4127,10 @@ prefect = [
     { name = "prefect" },
     { name = "tornado" },
 ]
+report-server = [
+    { name = "starlette" },
+    { name = "uvicorn" },
+]
 telegram = [
     { name = "python-telegram-bot" },
 ]
@@ -4195,14 +4199,16 @@ requires-dist = [
     { name = "sqlglot", specifier = "~=25.0.0" },
     { name = "sqlmodel", specifier = ">=0.0.22" },
     { name = "starlette", marker = "extra == 'ask'", specifier = ">=0.40.0" },
+    { name = "starlette", marker = "extra == 'report-server'", specifier = ">=0.40.0" },
     { name = "tabulate", specifier = ">=0.9.0" },
     { name = "temporalio", marker = "extra == 'temporal'", specifier = ">=1.9.0" },
     { name = "tenacity", specifier = ">=9.0.0" },
     { name = "tornado", marker = "extra == 'prefect'", specifier = ">=6.5.5" },
     { name = "typer", specifier = ">=0.13.1" },
     { name = "uvicorn", marker = "extra == 'ask'", specifier = ">=0.30.0" },
+    { name = "uvicorn", marker = "extra == 'report-server'", specifier = ">=0.30.0" },
 ]
-provides-extras = ["prefect", "ask", "telegram", "temporal", "dev", "all"]
+provides-extras = ["prefect", "ask", "telegram", "temporal", "report-server", "dev", "all"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -7,8 +7,24 @@ Evidence build execution via subprocess (npx → npm run fallback).
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
+
+
+def _copy_npmrc_to_cache(report_path: Path, cache_dir: Path) -> None:
+    """Mirror the scaffolded .npmrc into the shared cache dir.
+
+    The scaffolder writes ``.npmrc`` (with ``legacy-peer-deps=true``) into
+    the report directory, but ``npm install`` runs inside the shared
+    ``.evidence-cache`` dir — so without this copy, npm ignores the flag
+    and aborts on Evidence v40's svelte-preprocess/stylus peer conflict.
+    """
+    src = report_path / ".npmrc"
+    if not src.exists():
+        # Fallback: synthesize a minimal .npmrc so install still succeeds
+        # even when the scaffolder didn't run (e.g. external callers).
+        (cache_dir / ".npmrc").write_text("legacy-peer-deps=true\n", encoding="utf-8")
+        return
+    shutil.copy2(str(src), str(cache_dir / ".npmrc"))
 
 
 def build_report(report_path: Path, timeout: int = 120) -> str:
@@ -142,16 +158,19 @@ def _ensure_node_modules(report_path: Path, timeout: int = 60) -> str:
     # First time: install into cache, then symlink
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy package.json to cache dir for install
+    # Copy package.json + .npmrc to cache dir for install. The .npmrc is
+    # what enables legacy-peer-deps for Evidence v40's svelte-preprocess /
+    # stylus peerOptional conflict — without it, fresh installs abort.
     pkg_json = report_path / "package.json"
     cache_pkg = cache_dir / "package.json"
     if pkg_json.exists():
         shutil.copy2(str(pkg_json), str(cache_pkg))
+    _copy_npmrc_to_cache(report_path, cache_dir)
 
     env = _get_build_env()
     try:
         result = subprocess.run(
-            ["npm", "install", "--prefer-offline"],
+            ["npm", "install", "--prefer-offline", "--legacy-peer-deps"],
             cwd=str(cache_dir),
             capture_output=True,
             text=True,
@@ -341,6 +360,7 @@ async def _async_ensure_node_modules(report_path: Path, timeout: int = 60) -> st
     cache_pkg = cache_dir / "package.json"
     if pkg_json.exists():
         shutil.copy2(str(pkg_json), str(cache_pkg))
+    _copy_npmrc_to_cache(report_path, cache_dir)
 
     env = _get_build_env()
     npm = shutil.which("npm")
@@ -355,9 +375,11 @@ async def _async_ensure_node_modules(report_path: Path, timeout: int = 60) -> st
     except RuntimeError:
         registry = None
 
+    npm_install_cmd = [npm, "install", "--prefer-offline", "--legacy-peer-deps"]
+
     if registry is not None:
         result = await run_with_auto_background(
-            [npm, "install", "--prefer-offline"],
+            npm_install_cmd,
             tool_name="generate_report",
             description="npm install (Evidence dependencies)",
             registry=registry,
@@ -372,7 +394,7 @@ async def _async_ensure_node_modules(report_path: Path, timeout: int = 60) -> st
     else:
         try:
             proc = subprocess.run(
-                [npm, "install", "--prefer-offline"],
+                npm_install_cmd,
                 cwd=str(cache_dir), capture_output=True, text=True,
                 timeout=timeout, env=env,
             )

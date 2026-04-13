@@ -205,6 +205,16 @@ from seeknal.cli.materialization_cli import app as iceberg_app  # ty: ignore[unr
 
 app.add_typer(iceberg_app, name="iceberg")
 
+# Publish commands for Evidence.dev report publishing
+from seeknal.cli.publish import publish_app  # ty: ignore[unresolved-import]
+
+app.add_typer(publish_app, name="publish")
+
+# Report server for hosting published reports
+from seeknal.cli.report_server import report_server_app  # ty: ignore[unresolved-import]
+
+app.add_typer(report_server_app, name="report-server")
+
 # Documentation search commands
 from seeknal.cli.docs import docs_app  # ty: ignore[unresolved-import]
 
@@ -770,114 +780,32 @@ def info():
 
 
 def _scaffold_ask_skills(project_path: Path) -> None:
-    """Generate default ask skill files (SKILL.md) in the project.
+    """Copy bundled ask skills into the project.
 
-    Creates Claude Code-style skill directories under seeknal/skills/.
-    Each skill is a directory with a SKILL.md file containing YAML
-    frontmatter and markdown instructions.
+    The canonical skill content lives under
+    ``src/seeknal/ask/builtin_skills/`` and is also the directory the
+    ask agent loads from at runtime. ``seeknal init`` copies each
+    bundled ``SKILL.md`` into ``<project>/seeknal/skills/`` so users
+    can edit/extend them per-project without touching the package.
     """
-    skill_dir = project_path / "seeknal" / "skills" / "report-generation"
-    skill_file = skill_dir / "SKILL.md"
-    if skill_file.exists():
-        return  # Don't overwrite existing skill
+    builtin_root = (
+        Path(__file__).resolve().parent.parent / "ask" / "builtin_skills"
+    )
+    if not builtin_root.is_dir():
+        return  # No built-ins shipped (unexpected, but don't fail init)
 
-    skill_content = """\
----
-name: report-generation
-description: "Evidence.dev report generation — chart syntax, quality bar, section patterns, and codification as YAML exposures"
-tags: [reporting, evidence, visualization]
-version: "1.0.0"
----
-
-# Report Generation
-
-When asked to create a report, dashboard, or visualization, produce a
-**professional, insight-driven** Evidence.dev report. Follow this structure:
-
-## Report Quality Bar
-
-A professional report MUST have:
-1. **Executive Summary** — 3-4 BigValue KPIs answering the core question up front
-2. **Multi-angle Visual Analysis** — Each section explores a DIFFERENT dimension with a DIFFERENT chart type
-3. **Data-backed Narrative** — Between every chart, write 1-2 sentences interpreting the data with SPECIFIC numbers ("Premium customers spend 2.3x more per order than Basic" — NOT "Premium customers tend to spend more")
-4. **Actionable Recommendations** — Tied to specific data points ("Target Bandung for Premium acquisition — 0 Premium customers despite $1,786 avg spend" — NOT "consider expanding to new markets")
-
-## Analysis Process
-
-BEFORE calling generate_report, you MUST:
-1. Run execute_sql to explore ALL relevant tables (not just one)
-2. Run at least 3-5 queries covering: aggregates, distributions, cross-table JOINs, rankings, trends
-3. Calculate derived metrics in your queries: percentages of total, ratios between segments, rankings
-4. Identify the 3 most interesting findings — these become the report's narrative spine
-
-DO NOT generate a report after looking at only one table.
-DO NOT write 5 BarCharts of the same query. Each chart must show different data.
-DO NOT write generic insights. Every recommendation must cite a specific number from the data.
-
-## Evidence Markdown Syntax
-
-SQL queries in fenced blocks:
-```sql query_name
-SELECT ... FROM table_name
-```
-
-Components (SINGLE curly braces only — never double braces):
-- <BigValue data={query_name} value=column_name />
-- <BarChart data={query_name} x=column y=column />
-- <LineChart data={query_name} x=date_col y=value_col />
-- <AreaChart data={query_name} x=date_col y=value_col />
-- <DataTable data={query_name} />
-- <ScatterPlot data={query_name} x=col1 y=col2 />
-- <Histogram data={query_name} x=column bins=20 />
-- <FunnelChart data={query_name} name=stage value=count />
-
-## Report Writing Rules
-
-- Name queries descriptively (revenue_by_month, top_customers)
-- Use markdown headers (##) to create clear sections
-- Write concise analytical commentary between charts — explain WHAT the data shows and WHY it matters
-- Do NOT include semicolons in SQL queries
-- Use the same table names from list_tables output
-- Each chart should have a descriptive title prop
-- Use percentage columns, rankings, and comparisons — not just raw counts
-- Vary chart types: don't use 5 BarCharts in a row
-
-## Report Content Pattern
-
-Follow this pattern for each section of the report page content:
-
-SECTION 1 — Executive KPIs:
-  SQL query → BigValue components (3-4 headline numbers)
-
-SECTION 2 — Primary breakdown:
-  SQL query with % of total → BarChart + brief insight text with specific numbers → DataTable
-
-SECTION 3 — Secondary dimension:
-  SQL query with different grouping/JOIN → different chart type (LineChart, ScatterPlot, etc.) + insight
-
-SECTION 4 — Cross-analysis:
-  SQL query JOINing 2+ tables → stacked/grouped BarChart or heatmap-style DataTable + insight
-
-SECTION 5 — Recommendations:
-  Markdown text with specific, data-cited action items
-
-## Final Answer Requirements
-
-After generating a report, your final answer MUST include:
-1. A brief summary of the key findings with SPECIFIC numbers
-2. The path to the generated HTML report
-3. 2-3 actionable recommendations grounded in the data
-
-Do NOT just say "I created a report" — the answer itself should be valuable standalone content.
-
-## Report Codification
-
-After completing analysis, if the user wants to save it as a repeatable report:
-- Call save_report_exposure with a snake_case name, distilled prompt, table refs, and format
-- Re-run with: seeknal ask report --exposure {name}
-"""
-    skill_file.write_text(skill_content)
-    typer.echo(f"  Created: seeknal/skills/report-generation/SKILL.md")
+    target_root = project_path / "seeknal" / "skills"
+    for skill_dir in sorted(builtin_root.iterdir()):
+        src_file = skill_dir / "SKILL.md"
+        if not src_file.is_file():
+            continue
+        dest_dir = target_root / skill_dir.name
+        dest_file = dest_dir / "SKILL.md"
+        if dest_file.exists():
+            continue  # Don't overwrite user-customized skills
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_file.write_text(src_file.read_text())
+        typer.echo(f"  Created: seeknal/skills/{skill_dir.name}/SKILL.md")
 
 
 @app.command()

@@ -90,6 +90,12 @@ temporal = [
     "aiohttp>=3.9.0",
 ]
 
+# Report server for publishing interactive Evidence.dev reports
+report-server = [
+    "starlette>=0.40.0",
+    "uvicorn>=0.30.0",
+]
+
 # Development dependencies
 dev = [
     "black>=26.3.1",

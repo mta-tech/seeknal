@@ -52,6 +52,8 @@ class ToolContext:
     proof_publish_approval_granted: bool = False
     require_proof_edit_approval: bool = True
     proof_edit_approval_granted: bool = False
+    require_seeknal_report_publish_approval: bool = True
+    seeknal_report_publish_approval_granted: bool = False
     background_registry: BackgroundRegistry = field(default_factory=lambda: _make_registry())
     console: Any = None
     plan_steps: list[str] = field(default_factory=list)
@@ -94,6 +96,7 @@ def get_tool_context() -> ToolContext:
 _REPORT_APPROVAL_DISCRIMINATOR = "generate report now"
 _PROOF_PUBLISH_APPROVAL_DISCRIMINATOR = "publish memo to proof"
 _PROOF_EDIT_APPROVAL_DISCRIMINATOR = "apply edit to proof"
+_SEEKNAL_REPORT_PUBLISH_DISCRIMINATOR = "publish to seeknal report server"
 
 
 def reset_report_approval() -> None:
@@ -109,6 +112,8 @@ def reset_report_approval() -> None:
     ctx.proof_publish_approval_granted = False
     ctx.require_proof_edit_approval = True
     ctx.proof_edit_approval_granted = False
+    ctx.require_seeknal_report_publish_approval = True
+    ctx.seeknal_report_publish_approval_granted = False
 
 
 def record_ask_user_response(options: list[dict[str, Any]], answer: str) -> None:
@@ -166,6 +171,14 @@ def record_ask_user_response(options: list[dict[str, Any]], answer: str) -> None
             normalized_answer == _PROOF_EDIT_APPROVAL_DISCRIMINATOR
         )
 
+    if (
+        getattr(ctx, "require_seeknal_report_publish_approval", False)
+        and _SEEKNAL_REPORT_PUBLISH_DISCRIMINATOR in labels
+    ):
+        ctx.seeknal_report_publish_approval_granted = (
+            normalized_answer == _SEEKNAL_REPORT_PUBLISH_DISCRIMINATOR
+        )
+
 
 def require_report_approval(tool_name: str) -> str | None:
     """Return an actionable error when a report tool is used without approval."""
@@ -190,6 +203,23 @@ def require_proof_publish_approval(tool_name: str) -> str | None:
         "then use ask_user with exactly these options: 'Continue analysis', 'Publish memo to Proof', "
         "'Done for now', and 'Type your own'. Do not print those choices as plain text, bullets, or "
         f"numbered lists. Only call {tool_name} after the user explicitly chooses 'Publish memo to Proof'."
+    )
+
+
+def require_seeknal_report_publish_approval(tool_name: str) -> str | None:
+    """Return an actionable error when publish_to_seeknal_report is used without approval."""
+    ctx = get_tool_context()
+    if (
+        not getattr(ctx, "require_seeknal_report_publish_approval", True)
+        or getattr(ctx, "seeknal_report_publish_approval_granted", False)
+    ):
+        return None
+    return (
+        f"Approval required before {tool_name}. Summarize what will be published and to which server, "
+        "then use ask_user with exactly these options: 'Continue analysis', 'Publish to Seeknal Report Server', "
+        "'Publish memo to Proof', 'Done for now', and 'Type your own'. Do not print those choices as plain text, "
+        "bullets, or numbered lists. Only call "
+        f"{tool_name} after the user explicitly chooses 'Publish to Seeknal Report Server'."
     )
 
 

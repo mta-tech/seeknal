@@ -37,6 +37,23 @@ _DIMINISHING_RETURNS_MSG = (
     "Please try rephrasing your question or breaking it into smaller parts."
 )
 
+# Shipped alongside the package — each subdirectory here is a SKILL.md
+# bundle that pydantic-deep's SkillsToolset will auto-discover.
+_BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "builtin_skills"
+
+
+def _resolve_skill_directories(project_path: Path) -> list[str]:
+    """Return the ordered skill search path for the ask agent.
+
+    Built-ins come first so they're always discoverable; project-local
+    skills are appended so users can extend or override.
+    """
+    dirs: list[str] = []
+    if _BUILTIN_SKILLS_DIR.exists():
+        dirs.append(str(_BUILTIN_SKILLS_DIR))
+    dirs.append(str(project_path / "seeknal" / "skills"))
+    return dirs
+
 
 def create_agent(
     project_path: Path,
@@ -163,9 +180,12 @@ def create_agent(
         instructions=instructions,
         toolsets=toolsets_list,
         hooks=get_ask_hooks(),
-        # Skills
+        # Skills: bundled built-ins (report-generation, etc.) + per-project
+        # user skills. Built-ins ship as SKILL.md files under
+        # src/seeknal/ask/builtin_skills/ so `load_skill(...)` resolves
+        # even in projects that have no local seeknal/skills/ dir.
         include_skills=True,
-        skill_directories=[str(project_path / "seeknal" / "skills")],
+        skill_directories=_resolve_skill_directories(project_path),
         # Planning: todo checklist + interactive ask_user via planner subagent
         include_todo=True,
         include_plan=(environment == "interactive"),

@@ -21,6 +21,7 @@ from seeknal.ask.agents.tools.open_in_browser import open_in_browser
 from seeknal.ask.agents.tools.plan_pipeline import plan_pipeline
 from seeknal.ask.agents.tools.profile_data import profile_data
 from seeknal.ask.agents.tools.publish_to_proof import publish_to_proof
+from seeknal.ask.agents.tools.publish_to_seeknal_report import publish_to_seeknal_report
 from seeknal.ask.agents.tools.query_metric import query_metric
 from seeknal.ask.agents.tools.read_pipeline import read_pipeline
 from seeknal.ask.agents.tools.read_proof_document import read_proof_document
@@ -55,6 +56,7 @@ def create_ask_toolset() -> FunctionToolset:
             open_in_browser,
             save_report_exposure,
             publish_to_proof,
+            publish_to_seeknal_report,
             read_proof_document,
             edit_proof_document,
             # Pipeline building

@@ -16,12 +16,14 @@ async def draft_node(node_type: str, name: str, python: bool = False) -> str:
         python: If True, generate a Python file instead of YAML.
     """
     from seeknal.ask.agents.tools._context import get_tool_context
+    from seeknal.ask.agents.tools._write_security import get_drafts_dir
     from seeknal.workflow.draft import (
         NODE_TYPES, TEMPLATE_FILES, PYTHON_TEMPLATE_FILES,
         get_template_env, generate_filename, render_template,
     )
 
     ctx = get_tool_context()
+    drafts_dir = get_drafts_dir(ctx.project_path)
 
     # Validate node type
     if node_type not in NODE_TYPES:
@@ -44,7 +46,7 @@ async def draft_node(node_type: str, name: str, python: bool = False) -> str:
 
     # Generate draft file
     filename = generate_filename(normalized, name, python=python)
-    filepath = ctx.project_path / filename
+    filepath = drafts_dir / filename
 
     if filepath.exists():
         return f"Draft file already exists: {filename}. Edit it or remove it first."
