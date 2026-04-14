@@ -39,6 +39,42 @@ DO NOT use `execute_python` for:
 Each `execute_python` call runs in a FRESH isolated subprocess. This has
 implications you MUST account for:
 
+### The `conn` object is ALREADY connected to your project
+
+**CRITICAL — do NOT create your own DuckDB connection.** The sandbox
+pre-loads a `conn` object (a `SafeConnection` wrapper around the real
+project DuckDB) with EVERY project table/view already registered. It is
+ready to use on the first line.
+
+❌ **WRONG** — creates a new empty DB, loses all project data:
+```python
+import duckdb
+conn = duckdb.connect(':memory:')        # shadows the sandbox conn
+df = conn.execute("SELECT * FROM transform_daily_revenue").df()
+# → CatalogException: Table with name transform_daily_revenue does not exist!
+```
+
+✅ **RIGHT** — use the pre-loaded `conn` directly, no imports:
+```python
+df = conn.sql("SELECT * FROM transform_daily_revenue").df()
+df.head(10)
+```
+
+The pre-loaded `conn` has:
+- Every source/transform/feature_group/model registered as a view, using the
+  kind-prefixed naming (`source_customers`, `transform_daily_revenue`,
+  `feature_group_customer_features`, etc.)
+- All project intermediate parquets from `target/intermediate/` mounted
+
+Do NOT `import duckdb` — the sandbox does not expect you to instantiate one.
+If you're unsure what tables exist, run `SHOW TABLES`:
+```python
+tables = conn.sql("SHOW TABLES").df()
+print(tables)
+```
+
+### Other sandbox properties
+
 1. **No persistence between calls.** Variables from a previous call do NOT
    exist in the next call. Re-query data at the start of every call:
    ```python
@@ -46,7 +82,7 @@ implications you MUST account for:
    ```
 
 2. **Limited package set.** Only these packages are pre-imported:
-   - `conn` — DuckDB connection (use `conn.sql('SELECT...').df()`)
+   - `conn` — **pre-loaded DuckDB SafeConnection** (see above, do not re-create)
    - `pd` — pandas
    - `np` — numpy
    - `plt` — matplotlib.pyplot (Agg backend)

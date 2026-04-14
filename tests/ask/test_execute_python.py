@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 from seeknal.ask.agents.tools.execute_python import (
     _do_execute,
+    _infer_error_hint,
     _split_last_expression,
 )
 from seeknal.ask.agents.tools._safe_connection import SafeConnection
@@ -134,3 +135,56 @@ class TestSafeConnection:
         safe = SafeConnection(mock_inner)
 
         assert safe.description == [("col1", "INT")]
+
+
+class TestInferErrorHint:
+    """Regression tests for the error-hint classifier."""
+
+    def test_module_not_found_hint(self):
+        hint = _infer_error_hint("ModuleNotFoundError: No module named 'xgboost'", "")
+        assert hint is not None
+        assert "statsmodels" in hint or "xgboost" in hint
+
+    def test_name_error_hint(self):
+        hint = _infer_error_hint("NameError: name 'df' is not defined", "print(df)")
+        assert hint is not None
+        assert "previous calls" in hint
+
+    def test_sql_hash_comment_hint(self):
+        code = 'conn.sql("SELECT * # bad FROM t").df()'
+        hint = _infer_error_hint("ParserException: syntax error near #", code)
+        assert hint is not None
+        assert "# comment" in hint or "-- for SQL" in hint
+
+    def test_catalog_exception_with_duckdb_connect_hint(self):
+        """Regression: live verification caught the agent creating a new
+        `duckdb.connect(':memory:')` connection that shadowed the sandbox's
+        pre-loaded `conn` — leading to CatalogException on every query.
+        The hint must tell the agent to remove its own connect() call.
+        """
+        code = (
+            "import duckdb\n"
+            "conn = duckdb.connect(':memory:')\n"
+            "df = conn.execute('SELECT * FROM transform_daily_revenue').df()"
+        )
+        result = (
+            "_duckdb.CatalogException: Catalog Error: Table with name "
+            "transform_daily_revenue does not exist!"
+        )
+        hint = _infer_error_hint(result, code)
+        assert hint is not None
+        assert "duckdb.connect" in hint
+        assert "pre-loaded" in hint or "ALREADY provides" in hint or "already provides" in hint.lower()
+
+    def test_catalog_exception_without_duckdb_connect_hint(self):
+        """If the agent DIDN'T call duckdb.connect, it's a stale table name —
+        hint should point at SHOW TABLES / list_tables instead."""
+        code = "df = conn.sql('SELECT * FROM transform_missing').df()"
+        result = "CatalogException: Table with name transform_missing does not exist!"
+        hint = _infer_error_hint(result, code)
+        assert hint is not None
+        assert "SHOW TABLES" in hint or "list_tables" in hint
+
+    def test_unrelated_error_returns_none(self):
+        hint = _infer_error_hint("IndexError: list out of range", "xs[99]")
+        assert hint is None

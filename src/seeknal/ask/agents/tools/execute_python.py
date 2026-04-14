@@ -178,6 +178,24 @@ def _infer_error_hint(result: str, code: str) -> str | None:
             "available in the sandbox. Do NOT import statsmodels, xgboost, "
             "lightgbm, or other packages."
         )
+    if "CatalogException" in result and "does not exist" in result:
+        if "duckdb.connect" in code:
+            return (
+                "You called `duckdb.connect()` yourself — that creates a "
+                "NEW empty in-memory database without your project's tables. "
+                "The sandbox ALREADY provides a `conn` object with every "
+                "project table registered as a view. Remove `import duckdb` "
+                "and `conn = duckdb.connect(...)` entirely — the pre-loaded "
+                "`conn` is ready to use: "
+                "`df = conn.sql('SELECT * FROM transform_daily_revenue').df()`."
+            )
+        return (
+            "The table name doesn't exist in the sandbox's `conn`. Run "
+            "`list_tables` (via a separate tool call or `conn.sql(\"SHOW "
+            "TABLES\").df()` inside execute_python) to see what's available. "
+            "Views are registered by their full kind-prefixed name "
+            "(e.g. `transform_daily_revenue`, `source_customers`)."
+        )
     if "NameError" in result:
         return (
             "Each execute_python call runs in a fresh subprocess — variables "
