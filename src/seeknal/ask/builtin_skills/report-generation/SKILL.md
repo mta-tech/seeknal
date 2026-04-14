@@ -75,6 +75,38 @@ Components (SINGLE curly braces only — never double braces):
 - `<Histogram data={query_name} x=column bins=20 />`
 - `<FunnelChart data={query_name} name=stage value=count />`
 
+### Common Svelte parse errors
+
+Evidence reports compile through Svelte after `generate_report` returns the
+scaffold path, so parse errors surface during the build phase — not when
+the tool first returns. The following patterns cause cryptic `Parser.error`
+traces and `Build failed` exits:
+
+- **Unescaped `<` and `>` in narrative text.** Write `&lt;` / `&gt;` for
+  literal angle brackets in markdown prose. Svelte sees `<` as the start of
+  a component tag and chokes if no valid tag name follows.
+
+- **Double curly braces in component props.** `<BarChart data={{query}} />`
+  is wrong — Evidence wants single braces `<BarChart data={query} />`. The
+  `_fix_evidence_syntax` helper auto-fixes the common `data={{...}}` case,
+  but it does NOT cover other props (`x={{col}}`, `y={{col}}`).
+
+- **Template literals or JSX expressions inside components.** Don't write
+  `` <BigValue value={`prefix-${var}`} /> ``. Evidence components only
+  accept identifier references, not arbitrary expressions.
+
+- **Unclosed component tags.** Every `<DataTable data={x}>` needs a closing
+  `</DataTable>` OR self-close as `<DataTable data={x} />`. Svelte does NOT
+  forgive missing closers.
+
+- **HTML tags inside SQL fenced blocks.** Don't put `<br>`, `<i>`, or
+  similar inside a ```` ```sql ... ``` ```` block. The Svelte parser still
+  scans for tags inside fenced code and breaks on partial matches.
+
+If `generate_report` returns a "Build failed" / "Parser.error" message,
+inspect the rendered `page_content` for one of the patterns above, fix it,
+and call `generate_report` again with the corrected content.
+
 ### Report Quality Bar
 
 A professional report MUST have:

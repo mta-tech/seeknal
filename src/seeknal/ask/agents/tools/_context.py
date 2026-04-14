@@ -186,7 +186,7 @@ def require_report_approval(tool_name: str) -> str | None:
     if not ctx.require_report_approval or ctx.report_approval_granted:
         return None
     return (
-        f"Approval required before {tool_name}. Summarize the current findings and proposed next step, then use ask_user with exactly these options: 'Continue analysis', 'Generate report now', 'Done for now', and 'Type your own'. Do not print those choices as plain text, bullets, or numbered lists. Only call {tool_name} after the user explicitly chooses 'Generate report now'."
+        f"Approval required before {tool_name}. Load the 'report-generation' skill (or 'save-report-exposure' for codification) via load_skill() for the full workflow. Then summarize the current findings and proposed next step, then use ask_user with exactly these options: 'Continue analysis', 'Generate report now', 'Done for now', and 'Type your own'. Do not print those choices as plain text, bullets, or numbered lists. Only call {tool_name} after the user explicitly chooses 'Generate report now'."
     )
 
 
@@ -199,10 +199,12 @@ def require_proof_publish_approval(tool_name: str) -> str | None:
     ):
         return None
     return (
-        f"Approval required before {tool_name}. Summarize the memo content and its intended audience, "
-        "then use ask_user with exactly these options: 'Continue analysis', 'Publish memo to Proof', "
-        "'Done for now', and 'Type your own'. Do not print those choices as plain text, bullets, or "
-        f"numbered lists. Only call {tool_name} after the user explicitly chooses 'Publish memo to Proof'."
+        f"Approval required before {tool_name}. Load the 'publish-memo-to-proof' skill via "
+        "load_skill() for the full workflow. Then summarize the memo content and its intended "
+        "audience, then use ask_user with exactly these options: 'Continue analysis', 'Publish "
+        "memo to Proof', 'Done for now', and 'Type your own'. Do not print those choices as plain "
+        f"text, bullets, or numbered lists. Only call {tool_name} after the user explicitly "
+        "chooses 'Publish memo to Proof'."
     )
 
 
@@ -215,10 +217,11 @@ def require_seeknal_report_publish_approval(tool_name: str) -> str | None:
     ):
         return None
     return (
-        f"Approval required before {tool_name}. Summarize what will be published and to which server, "
-        "then use ask_user with exactly these options: 'Continue analysis', 'Publish to Seeknal Report Server', "
-        "'Publish memo to Proof', 'Done for now', and 'Type your own'. Do not print those choices as plain text, "
-        "bullets, or numbered lists. Only call "
+        f"Approval required before {tool_name}. Load the 'publish-to-seeknal-report' skill via "
+        "load_skill() for the full workflow. Then summarize what will be published and to which "
+        "server, then use ask_user with exactly these options: 'Continue analysis', 'Publish to "
+        "Seeknal Report Server', 'Publish memo to Proof', 'Done for now', and 'Type your own'. "
+        "Do not print those choices as plain text, bullets, or numbered lists. Only call "
         f"{tool_name} after the user explicitly chooses 'Publish to Seeknal Report Server'."
     )
 
@@ -232,9 +235,10 @@ def require_proof_edit_approval(tool_name: str) -> str | None:
     ):
         return None
     return (
-        f"Approval required before {tool_name}. Summarize the proposed edit (which "
-        "document, what changes) and then use ask_user with exactly these options: "
-        "'Continue analysis', 'Apply edit to Proof', 'Done for now', and 'Type your own'. "
-        "Do not print those choices as plain text, bullets, or numbered lists. Only call "
+        f"Approval required before {tool_name}. Load the 'edit-proof-document' skill via "
+        "load_skill() for the full workflow (read → diff → ask → edit). Then summarize the "
+        "proposed edit (which document, what changes) and use ask_user with exactly these "
+        "options: 'Continue analysis', 'Apply edit to Proof', 'Done for now', and 'Type your "
+        "own'. Do not print those choices as plain text, bullets, or numbered lists. Only call "
         f"{tool_name} after the user explicitly chooses 'Apply edit to Proof'."
     )

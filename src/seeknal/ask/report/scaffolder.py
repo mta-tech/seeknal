@@ -93,12 +93,15 @@ def scaffold_report(
     slug = _slugify(title)
     report_dir = project_path / "target" / "reports" / slug
 
-    # Overwrite existing report with warning
+    # Overwrite existing report. Only warn if a real built artifact would be
+    # lost — retries after a failed Evidence build leave a scaffold dir behind
+    # with no `build/index.html`, and warning on those retries is just noise.
     if report_dir.exists():
-        warnings.warn(
-            f"Report '{slug}' already exists and will be overwritten.",
-            stacklevel=2,
-        )
+        if (report_dir / "build" / "index.html").exists():
+            warnings.warn(
+                f"Report '{slug}' already exists and will be overwritten.",
+                stacklevel=2,
+            )
         shutil.rmtree(report_dir)
 
     report_dir.mkdir(parents=True, exist_ok=True)

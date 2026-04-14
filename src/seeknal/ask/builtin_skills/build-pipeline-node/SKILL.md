@@ -39,6 +39,37 @@ Each gets a different YAML or Python template + lands in a different subdirector
 - `second_order_aggregation` → `seeknal/second_order_aggregations/<name>.yml`
 - (Other kinds follow the same `<kind>s/` pattern.)
 
+## When to use Python vs YAML transforms
+
+The same `draft_node` tool handles both formats — pass `python=True` for a
+Python file (`.py`) or `python=False` (default) for YAML.
+
+**Use YAML transforms when:**
+
+- The transform is a single SQL aggregation, JOIN, window function, or
+  filtered query
+- The output schema can be inferred from the SQL
+- The transform doesn't need `pandas`, `numpy`, `scipy`, or `sklearn`
+- You want the transform to be readable by non-Python users
+- Performance matters (DuckDB SQL is consistently faster than Python+pandas
+  for the same operation on the same data)
+
+**Use Python transforms when:**
+
+- You need vectorized math: normalization, z-scores, RFM scoring,
+  rolling-window analytics, statistical aggregates DuckDB doesn't expose
+- The transform calls `scikit-learn`, `scipy`, or other ML/stats libraries
+- The logic is too branch-heavy to express cleanly in SQL `CASE` statements
+- You need to call an external library (custom geocoder, ML model, API client)
+
+**Common pattern: YAML feeder + Python scorer.** For complex analyses,
+draft a YAML transform that produces the input metrics (e.g.
+`rfm_metrics.yml` that aggregates customers + orders), then draft a Python
+transform that reads the YAML transform's output and computes the derived
+score (e.g. `churn_risk_analysis.py` that normalizes and scores). Apply both.
+This keeps the heavy SQL aggregation in DuckDB and the per-row math in
+pandas where it belongs.
+
 ## Phase 1 — Discover existing structure
 
 BEFORE drafting a new node, you MUST understand what already exists:
