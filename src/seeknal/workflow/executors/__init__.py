@@ -148,4 +148,4 @@ __all__ = [
 ]
 
 # Version info
-__version__ = "2.5.0"
+__version__ = "26.3.0"

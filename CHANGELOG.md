@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [26.3.0] - 2026-04-14
+
+### Added
+- **Per-node Iceberg overrides**: `catalog_uri` and `warehouse` can now be overridden per materialization node, allowing a single pipeline to write to multiple Iceberg catalogs/warehouses (#38)
+- **Seeknal Ask QA test suite**: full end-to-end QA coverage for the Ask agent, including Iceberg and remote source dry-runs (#29)
+
+### Fixed
+- **Iceberg identifier quoting**: DuckDB identifiers in warehouse/catalog names are now quoted when they contain hyphens, preventing SQL parse errors (#33)
+- **Iceberg dry-run auth**: dry-run now uses `SET`-based S3 auth instead of `ATTACH SECRET`, fixing credential leakage during planning (#31)
+
+### Changed
+- **Version bump**: 2.5.x → 26.3.0
+
 ## [2.5.0] - 2026-04-06
 
 ### Added
