@@ -11,20 +11,15 @@ async def run_pipeline(
     full: bool = False,
     confirmed: bool = False,
 ) -> str:
-    """Execute the seeknal pipeline.
+    """Execute the seeknal pipeline (or a subset of nodes) via `seeknal run`.
 
-    Runs all nodes (or a subset) in topological order. This executes
-    real data transformations and may take time.
-
-    IMPORTANT: You must set confirmed=True to proceed. Running a pipeline
-    modifies output files and may write to external systems.
+    See the `build-pipeline-node` skill for the run phase and node-targeting
+    conventions. Default timeout 300s (override via SEEKNAL_RUN_TIMEOUT).
 
     Args:
-        nodes: Optional comma-separated node IDs to run
-               (e.g., 'transform.clean,transform.enrich').
-               If empty, runs all nodes.
-        full: If True, ignore cache and re-run everything.
-        confirmed: Must be True to actually run. Set to False to preview.
+        nodes: Comma-separated node IDs (e.g. 'transform.clean'). Empty = all.
+        full: True to ignore cache and re-run everything.
+        confirmed: Must be True to actually run. False returns a preview.
     """
     from seeknal.ask.agents.tools._context import get_tool_context
 

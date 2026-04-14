@@ -4,17 +4,14 @@ from pathlib import Path
 
 
 async def profile_data(file_path: str = "") -> str:
-    """Profile data files in the project's data/ directory.
+    """Profile CSV files in data/ — schema, nulls, uniques, sample values, join-key candidates.
 
-    Without arguments, lists all CSV files with row counts and column summaries.
-    With a file_path, provides detailed profiling: types, nulls, unique counts,
-    sample values, and potential join key candidates.
-
-    Use this BEFORE building transforms to understand data quality and relationships.
+    Two modes: empty = overview of all CSVs + join-key detection; specific
+    file = per-column detail. See the `profile-data` skill for how to
+    interpret join-key type-mismatch warnings and null-density flags.
 
     Args:
-        file_path: Optional path to a specific CSV (e.g., 'data/customers.csv').
-                   If empty, profiles all CSVs in data/.
+        file_path: Optional path to a specific CSV. Empty = profile all CSVs in data/.
     """
     from seeknal.ask.agents.tools._context import get_tool_context
 

@@ -167,34 +167,16 @@ async def publish_to_seeknal_report(
 ) -> str:
     """Publish a built Evidence.dev report to a Seeknal Report Server.
 
-    Use this tool AFTER a successful `generate_report` call, when the user
-    wants a shareable URL hosted on a Seeknal Report Server. The tool packages
-    the existing `target/reports/{slug}/build/` tree and uploads it. Recipients
-    open the returned share URL in any browser — no account required.
-
-    The tool requires explicit user confirmation — mirroring `publish_to_proof`
-    and `generate_report`. Before calling this tool you MUST use `ask_user`
-    with these exact options: `Continue analysis`, `Publish to Seeknal Report Server`,
-    `Publish memo to Proof`, `Done for now`, `Type your own`. Only call
-    `publish_to_seeknal_report` after the user explicitly selects
-    `Publish to Seeknal Report Server`.
-
-    Environment / configuration precedence (first match wins):
-      1. The `server` / `api_key` arguments passed directly.
-      2. `SEEKNAL_PUBLISH_SERVER` and `SEEKNAL_PUBLISH_TOKEN` env vars.
-      3. The `publish.default.server` / `publish.default.api_key` section in
-         the project's `profiles.yml`.
+    See the `publish-to-seeknal-report` skill for when to use, the approval-
+    gate menu (discriminator: "Publish to Seeknal Report Server"), the
+    SEEKNAL_PUBLISH_SERVER / SEEKNAL_PUBLISH_TOKEN environment variables, the
+    profiles.yml fallback, and error paths.
 
     Args:
-        report_name: The report name (or slug) used in the prior
-            `generate_report` call. The tool looks up
-            `target/reports/<slug>/build/` to find what to publish.
-        report_title: Optional human-readable title sent as the
-            `X-Seeknal-Report-Title` header. Defaults to report_name.
-        server: Optional per-call override for the Seeknal Report Server
-            base URL. Takes precedence over env + profile.
-        api_key: Optional per-call override for the Seeknal Report Server
-            API key. Takes precedence over env + profile.
+        report_name: The report name (or slug) used in the prior generate_report call.
+        report_title: Optional human-readable title sent as X-Seeknal-Report-Title.
+        server: Optional per-call override for the Seeknal Report Server URL.
+        api_key: Optional per-call override for the API key.
     """
     guard = require_seeknal_report_publish_approval("publish_to_seeknal_report")
     if guard:

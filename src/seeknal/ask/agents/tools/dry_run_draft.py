@@ -62,13 +62,14 @@ def _check_yaml_ref_consistency(draft_path) -> str:
 
 
 async def dry_run_draft(file_path: str) -> str:
-    """Validate a draft file by running seeknal dry-run.
+    """Validate a pipeline-node draft (YAML/Python) without modifying the project.
 
-    Checks YAML syntax, schema validity, and SQL correctness without
-    modifying the project. Always run this before apply_draft.
+    Runs `seeknal dry-run`, checks SQL ref() / inputs: consistency, and PEP 723
+    deps for Python drafts. Always call this before `apply_draft`. See the
+    `build-pipeline-node` skill for the full workflow.
 
     Args:
-        file_path: Path to the draft file (e.g., 'draft_source_customers.yml').
+        file_path: Path to the draft (e.g. '.seeknal/drafts/draft_source_customers.yml').
     """
     import subprocess
 

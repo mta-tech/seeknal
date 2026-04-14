@@ -135,26 +135,11 @@ def _format_success_message(index_path, python_launcher, shell_launcher):
 
 
 async def generate_report(title: str, page_content: str) -> str:
-    """Generate an interactive HTML report with charts and tables.
+    """Build an Evidence.dev report from markdown content and return the HTML path.
 
-    Creates an Evidence.dev project from markdown content containing SQL
-    queries and visualization components, then builds it into a static
-    HTML dashboard.
-
-    Write Evidence-compatible markdown content. The content should include:
-    - SQL queries in fenced blocks: ```sql query_name
-      SELECT ... FROM table_name
-      ```
-    - Chart components referencing queries: <BarChart data={query_name} x="col" y="col" />
-    - Table components: <DataTable data={query_name} />
-    - Markdown text for explanations and section headers
-
-    Example content:
-      # Sales Overview
-      ```sql total_sales
-      SELECT region, SUM(amount) as total FROM sales GROUP BY region
-      ```
-      <BarChart data={total_sales} x="region" y="total" />
+    See the `report-generation` skill for the full workflow: table exploration,
+    content drafting, the approval-gate menu (discriminator: "Generate report
+    now"), the post-build menu, Evidence syntax, and the report quality bar.
 
     Args:
         title: Report title (e.g., "Customer Segmentation Analysis").

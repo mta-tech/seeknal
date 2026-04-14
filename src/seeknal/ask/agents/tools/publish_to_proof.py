@@ -216,33 +216,18 @@ async def publish_to_proof(
     role: str = "commenter",
     base_url: str | None = None,
 ) -> str:
-    """Publish a markdown memo to a Proof Editor server and return a shareable URL.
+    """Publish a Markdown memo to a Proof Editor server and return a shareable URL.
 
-    Use this tool when the user wants to share a memo, summary, or write-up with
-    other people. The output is a public link that recipients can open in any
-    browser — no account required on their end.
-
-    The tool requires explicit user confirmation — just like `generate_report`.
-    Before calling this tool you MUST use `ask_user` with these exact options:
-    `Continue analysis`, `Publish memo to Proof`, `Done for now`, `Type your own`.
-    Only call `publish_to_proof` after the user explicitly selects `Publish memo to Proof`.
-
-    Environment:
-        PROOF_BASE_URL: Proof Editor base URL. Default:
-            https://memokami.exe.xyz. Override for other deployments such as
-            https://proofeditor.ai or http://localhost:4000.
-        PROOF_API_KEY: Bearer token, only required if the target server is
-            configured with PROOF_SHARE_MARKDOWN_AUTH_MODE=api_key.
+    See the `publish-memo-to-proof` skill for when to use, the content
+    drafting phase, the approval-gate menu (discriminator: "Publish memo to
+    Proof"), the PROOF_BASE_URL / PROOF_API_KEY environment variables, and
+    error paths.
 
     Args:
         title: Memo title shown at the top of the Proof document.
-        content: The memo body as Markdown. Headings, lists, tables, and
-            fenced code blocks are all rendered natively by Proof.
-        role: Access role granted to anyone with the link —
-            `viewer`, `commenter`, or `editor`. Defaults to `commenter`.
-        base_url: Optional per-call override for the Proof base URL. Takes
-            precedence over PROOF_BASE_URL. Pass this when the user explicitly
-            specifies a different Proof host for a single publish.
+        content: The memo body as Markdown.
+        role: Access role — "viewer", "commenter", or "editor". Defaults to "commenter".
+        base_url: Optional per-call override for the Proof base URL.
     """
     from seeknal.ask.agents.tools._context import require_proof_publish_approval
 

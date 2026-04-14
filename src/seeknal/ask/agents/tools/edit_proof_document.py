@@ -193,31 +193,13 @@ async def edit_proof_document(
 ) -> str:
     """Rewrite the full markdown body of an existing Proof Editor document.
 
-    Applies a `rewrite.apply` op to the document identified by `url` — the full
-    share link (preferred, with ?token=) or a bare slug. The new markdown
-    completely replaces the existing body. Comments and marks are preserved
-    server-side when their anchors can still be matched.
+    See the `edit-proof-document` skill for the read→diff→ask→edit flow, the
+    approval-gate menu (discriminator: "Apply edit to Proof"), the
+    PROOF_BASE_URL / PROOF_API_KEY environment variables, and the
+    LIVE_CLIENTS_PRESENT / PROJECTION_STALE / 409 CONFLICT error paths.
 
-    CAUTION — `rewrite.apply` is disruptive. Hosted Proof servers REJECT the
-    rewrite if live collaborators currently have the document open; you'll see
-    a 409 LIVE_CLIENTS_PRESENT response in that case. For incremental edits
-    prefer reading, diffing, and applying the full rewrite only when safe.
-
-    The tool requires explicit user confirmation. Before calling this tool you
-    MUST use `ask_user` with these exact options: `Continue analysis`,
-    `Apply edit to Proof`, `Done for now`, `Type your own`. Only call
-    `edit_proof_document` after the user explicitly selects
-    `Apply edit to Proof`.
-
-    Typical flow:
-      1. Call `read_proof_document(url)` to fetch the current markdown.
-      2. Modify the markdown.
-      3. Ask for confirmation via `ask_user`.
-      4. Call `edit_proof_document(url, new_markdown=...)`.
-
-    Environment:
-        PROOF_BASE_URL: Fallback base URL when `url` is a bare slug.
-        PROOF_API_KEY: Fallback bearer token when `url` has no ?token=...
+    CAUTION: `rewrite.apply` is disruptive. Hosted Proof rejects when live
+    collaborators are present.
 
     Args:
         url: Proof share URL (preferred, includes ?token=...) or bare slug.

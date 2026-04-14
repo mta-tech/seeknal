@@ -2,17 +2,13 @@
 
 
 async def bootstrap_semantic_model(table_name: str = "") -> str:
-    """Profile data files and generate draft semantic model YAML.
+    """Auto-generate draft semantic model YAML from profiled data files.
 
-    Scans data/ CSVs and target/intermediate/ parquets, classifies columns
-    (entities, dimensions, measures), and writes draft YAML files.
+    See the `bootstrap-semantic-model` skill for when to use, the draft
+    review/apply flow, and the classification heuristics.
 
     Args:
-        table_name: Optional. If provided, bootstrap only this table.
-                    If empty, bootstrap all discovered tables.
-
-    Returns:
-        Summary of generated models, or guidance if no data found.
+        table_name: Optional table name. Empty = bootstrap all discovered tables.
     """
     from seeknal.ask.agents.tools._context import get_tool_context
     from seeknal.ask.agents.tools._write_security import get_drafts_dir

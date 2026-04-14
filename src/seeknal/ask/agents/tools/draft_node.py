@@ -2,18 +2,16 @@
 
 
 async def draft_node(node_type: str, name: str, python: bool = False) -> str:
-    """Create a draft YAML or Python file for a new pipeline node.
+    """Generate a pipeline-node draft template under .seeknal/drafts/.
 
-    Generates a template file in the project root that can be edited,
-    validated with dry_run_draft, and applied with apply_draft.
+    See the `build-pipeline-node` skill for the full draft → validate → apply
+    → run workflow and the supported node types.
 
     Args:
-        node_type: Type of node to create. Valid types: source, transform,
-                   feature_group (or feature-group), model, aggregation,
-                   rule, profile, exposure, semantic_model (or semantic-model),
-                   metric.
-        name: Name for the new node (alphanumeric and underscores only).
-        python: If True, generate a Python file instead of YAML.
+        node_type: source, transform, feature_group, model, aggregation, rule,
+            profile, exposure, semantic_model, metric (snake_case or hyphen).
+        name: Alphanumeric + underscores only, ≤128 chars.
+        python: True for a Python file template, False for YAML.
     """
     from seeknal.ask.agents.tools._context import get_tool_context
     from seeknal.ask.agents.tools._write_security import get_drafts_dir
