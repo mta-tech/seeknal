@@ -23,6 +23,28 @@ from typing import Optional
 from seeknal.ask.project import find_project_path
 
 
+def _load_project_env(project_path: Path) -> None:
+    """Load `<project>/.env` into the process environment if present.
+
+    Existing shell env vars win (`override=False`) — this only fills gaps so
+    users can point `seeknal ask --project <elsewhere>` from any cwd without
+    manually sourcing the project's .env. Project-local secrets like
+    `SEEKNAL_PUBLISH_TOKEN`, `GOOGLE_API_KEY`, `PROOF_API_KEY`, and the
+    `SEEKNAL_ASK_MODEL` / `SEEKNAL_ASK_LLM_PROVIDER` overrides resolve
+    automatically without touching the user's shell.
+
+    Silently no-ops if python-dotenv isn't installed or `.env` doesn't exist.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+
+    env_file = project_path / ".env"
+    if env_file.exists():
+        load_dotenv(env_file, override=False)
+
+
 class _AskGroup(typer.core.TyperGroup):
     """Custom TyperGroup that treats unrecognised commands as a question.
 
@@ -102,6 +124,7 @@ def _run_oneshot(
 ):
     """Execute a one-shot question and print the answer."""
     project_path = project or find_project_path()
+    _load_project_env(project_path)
 
     try:
         from seeknal.ask.agents.agent import create_agent, ask as agent_ask
@@ -176,6 +199,7 @@ def chat_command(
 ):
     """Start an interactive multi-turn chat session."""
     project_path = project or find_project_path()
+    _load_project_env(project_path)
 
     try:
         from seeknal.ask.agents.agent import create_agent, ask as agent_ask
@@ -327,6 +351,7 @@ def _run_report(
 ):
     """Run the interactive report generation workflow."""
     project_path = project or find_project_path()
+    _load_project_env(project_path)
 
     # Check for data
     has_data = (
@@ -421,6 +446,7 @@ def _run_exposure(
 ):
     """Execute a predefined report exposure by name (Mode 2)."""
     project_path = project or find_project_path()
+    _load_project_env(project_path)
 
     try:
         from seeknal.ask.report.exposure import load_report_exposure, resolve_prompt
