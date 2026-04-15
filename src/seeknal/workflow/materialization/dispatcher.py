@@ -278,18 +278,18 @@ class MaterializationDispatcher:
             token = DuckDBIcebergExtension.get_oauth2_token()
 
         # Resolve catalog URI and warehouse with fallback chain:
-        # 1. materialization.catalog section (from profile_config above)
-        # 2. target_config overrides (per-materialization YAML)
+        # 1. target_config overrides (per-materialization YAML) — highest priority
+        # 2. materialization.catalog section (from profile_config / profiles.yml)
         # 3. source_defaults.iceberg section
         # 4. environment variables (LAKEKEEPER_URI, LAKEKEEPER_WAREHOUSE)
-        uri = catalog.uri
-        warehouse_path = catalog.warehouse
+        uri = target_config.get("catalog_uri", "")
+        warehouse_path = target_config.get("warehouse", "")
 
-        # Target-level overrides
+        # Fall back to profile catalog config
         if not uri:
-            uri = target_config.get("catalog_uri", "")
+            uri = catalog.uri
         if not warehouse_path:
-            warehouse_path = target_config.get("warehouse", "")
+            warehouse_path = catalog.warehouse
 
         # Fall back to source_defaults.iceberg
         if not uri or not warehouse_path:
