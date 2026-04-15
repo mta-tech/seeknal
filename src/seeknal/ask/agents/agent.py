@@ -262,8 +262,15 @@ def ask(
     from pydantic_ai.usage import UsageLimits
     from seeknal.ask.agents.tools._context import get_tool_context
 
-    ctx = get_tool_context()
-    _usage_limits = UsageLimits(request_limit=ctx.request_limit)
+    # Prefer per-session limits from the tool context; fall back to the
+    # ToolContext default (100) when no context is set — typical for unit
+    # tests that mock the agent without constructing a full session.
+    try:
+        ctx = get_tool_context()
+        _request_limit = ctx.request_limit
+    except RuntimeError:
+        _request_limit = 100
+    _usage_limits = UsageLimits(request_limit=_request_limit)
 
     result = agent.run_sync(
         question,
@@ -342,12 +349,18 @@ def _quality_gate(
     from pydantic_ai.usage import UsageLimits
     from seeknal.ask.agents.tools._context import get_tool_context
 
-    ctx = get_tool_context()
+    # Same fallback as `ask()` — support unit tests that mock the agent
+    # without constructing a full session + ToolContext.
+    try:
+        ctx = get_tool_context()
+        _request_limit = ctx.request_limit
+    except RuntimeError:
+        _request_limit = 100
     result = agent.run_sync(
         reason,
         deps=deps,
         message_history=message_history,
-        usage_limits=UsageLimits(request_limit=ctx.request_limit),
+        usage_limits=UsageLimits(request_limit=_request_limit),
     )
     message_history.clear()
     message_history.extend(result.all_messages())

@@ -119,6 +119,7 @@ dev = [
     "pexpect>=4.9",
     "pyte>=0.8.2",
     "pytest>=8.3.4",
+    "pytest-asyncio>=0.24.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -132,6 +133,11 @@ include = ["src/seeknal", "LICENSE", "README.md", "pyproject.toml"]
 # Test paths and discovery
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+# Auto-convert `async def test_*` to asyncio tests without needing
+# `@pytest.mark.asyncio` on every function. Required for async tests
+# added by the temporal worker feature (test_temporal_integration.py).
+asyncio_mode = "auto"
 
 # Test output options
 addopts = [
