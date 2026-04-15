@@ -11,6 +11,8 @@ from pathlib import Path
 
 from seeknal.ask.streaming import (
     _extract_report_paths,
+    _format_chat_loop_error,
+    _save_chat_error_log,
     _tool_spinner_message,
     _sanitize_output,
     _sanitize_user_input,
@@ -303,5 +305,135 @@ class TestRenderingHelpers:
         assert popen_calls
         assert popen_calls[0][0] == [str(launcher)]
         assert "Opened in browser via" in output
+
+
+class TestFormatChatLoopError:
+    """Regression tests for the chat-loop error formatter.
+
+    Live verification caught an opaque `Error: [Errno 8] nodename nor servname
+    provided, or not known` dump with no actionable context. The formatter
+    now classifies network/DNS/timeout errors and emits structured hints.
+    """
+
+    def test_dns_error_macos_message_format(self):
+        """The macOS gaierror string is the exact pattern from the bug
+        report: '[Errno 8] nodename nor servname provided, or not known'."""
+        import socket
+        e = socket.gaierror(8, "nodename nor servname provided, or not known")
+        msg = _format_chat_loop_error(e)
+        assert "Network/DNS error" in msg
+        assert "LLM provider" in msg
+        assert "PROOF_BASE_URL" in msg or "SEEKNAL_PUBLISH_SERVER" in msg
+        assert "gaierror" in msg
+
+    def test_dns_error_linux_message_format(self):
+        """Linux variant — 'Name or service not known'."""
+        e = OSError("[Errno -2] Name or service not known")
+        msg = _format_chat_loop_error(e)
+        assert "Network/DNS error" in msg
+        assert "Name or service not known" in msg
+
+    def test_dns_error_via_string_match(self):
+        """Even if the exception class is generic, string-match the
+        platform-specific wording."""
+        e = RuntimeError("[Errno 8] nodename nor servname provided, or not known")
+        msg = _format_chat_loop_error(e)
+        assert "Network/DNS error" in msg
+
+    def test_connection_error_no_dns_match(self):
+        """Plain ConnectionError that isn't a name-resolution failure."""
+        e = ConnectionRefusedError("Connection refused")
+        msg = _format_chat_loop_error(e)
+        assert "Connection error" in msg
+        assert "Network/DNS error" not in msg
+        assert "host unreachable" in msg or "port closed" in msg
+
+    def test_unknown_error_falls_back_to_raw(self):
+        """Errors that don't match any classifier fall back to the raw
+        string with the standard `Error:` prefix."""
+        e = ValueError("Some unrelated value error from the agent")
+        msg = _format_chat_loop_error(e)
+        assert "Error: Some unrelated value error" in msg
+        assert "Network/DNS error" not in msg
+        assert "Connection error" not in msg
+
+    def test_includes_log_path_when_provided(self):
+        """If the caller passes a log path, the message points the user
+        at it for the full traceback."""
+        e = RuntimeError("boom")
+        msg = _format_chat_loop_error(e, log_path=Path("/tmp/test-error.log"))
+        assert "/tmp/test-error.log" in msg
+        assert "Full traceback saved to" in msg
+
+    def test_omits_log_path_when_none(self):
+        e = RuntimeError("boom")
+        msg = _format_chat_loop_error(e, log_path=None)
+        assert "Full traceback" not in msg
+
+    def test_dns_error_shows_raw_for_diagnosis(self):
+        """Even when classified, the raw error text MUST appear so the
+        user can copy-paste it for debugging."""
+        import socket
+        e = socket.gaierror(8, "nodename nor servname provided, or not known")
+        msg = _format_chat_loop_error(e)
+        assert "[Errno 8]" in msg or "nodename" in msg
+
+
+class TestSaveChatErrorLog:
+    """Regression tests for the chat error-log saver."""
+
+    def test_writes_traceback_to_file(self, tmp_path, monkeypatch):
+        """The saver writes type, str, and full traceback to the log."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        try:
+            raise RuntimeError("test boom")
+        except RuntimeError as e:
+            log_path = _save_chat_error_log(e)
+
+        assert log_path is not None
+        assert log_path.exists()
+        content = log_path.read_text()
+        assert "RuntimeError: test boom" in content
+        assert "test_writes_traceback_to_file" in content  # frame name
+        assert "Traceback" in content
+
+    def test_appends_multiple_errors_in_one_session(self, tmp_path, monkeypatch):
+        """Multiple errors in a single session all get captured (append, not overwrite)."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        try:
+            raise ValueError("first error")
+        except ValueError as e:
+            _save_chat_error_log(e)
+        try:
+            raise KeyError("second error")
+        except KeyError as e:
+            log_path = _save_chat_error_log(e)
+
+        content = log_path.read_text()
+        assert "ValueError: first error" in content
+        assert "KeyError: 'second error'" in content
+
+    def test_returns_none_silently_on_write_failure(self, tmp_path, monkeypatch):
+        """If the log dir can't be created (e.g. read-only HOME), the saver
+        returns None instead of crashing the chat loop."""
+        # Point HOME at a path we can't write to.
+        bad_home = tmp_path / "nope" / "deeper"
+        bad_home.parent.mkdir()
+        bad_home.parent.chmod(0o500)  # read+execute, no write
+        monkeypatch.setenv("HOME", str(bad_home))
+
+        try:
+            raise RuntimeError("can't log this")
+        except RuntimeError as e:
+            log_path = _save_chat_error_log(e)
+
+        # Best-effort: returns None on failure, no exception raised.
+        # On some platforms the read-only chmod won't actually block the
+        # write (e.g. running as root in CI), so we accept either outcome.
+        assert log_path is None or log_path.exists()
+        # Restore perms so pytest can clean up
+        bad_home.parent.chmod(0o700)
 
 

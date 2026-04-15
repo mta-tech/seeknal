@@ -848,6 +848,116 @@ async def _stream_quality_gate(
     return retry_answer if retry_answer else answer
 
 
+def _save_chat_error_log(e: Exception) -> Optional[Path]:
+    """Save a full traceback for a chat-loop exception to ~/.seeknal/last-chat-error.log.
+
+    Best-effort: returns the path on success, None if the log itself failed
+    (we never want a logging failure to crash the chat loop). Appends rather
+    than overwrites so multiple errors in one session are all captured.
+    """
+    import os
+    import traceback
+    from datetime import datetime
+
+    try:
+        log_dir = Path(os.path.expanduser("~/.seeknal"))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "last-chat-error.log"
+
+        ts = datetime.now().isoformat(timespec="seconds")
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(f"\n=== {ts} {type(e).__name__}: {e} ===\n")
+            f.write(traceback.format_exc())
+            f.write("\n")
+        return log_path
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _format_chat_loop_error(
+    e: Exception, log_path: Optional[Path] = None
+) -> str:
+    """Format a chat-loop exception into a structured user-facing message.
+
+    Detects common categories (network/DNS, connection, timeout, auth) and
+    emits actionable hints. Falls back to the raw `str(e)` for unrecognized
+    errors. The opaque `[Errno 8] nodename nor servname provided, or not
+    known` from socket.gaierror — which previously dumped through the chat
+    loop with no context — now becomes a multi-line breakdown of likely
+    causes.
+    """
+    import socket
+
+    err_type = type(e).__name__
+    err_msg = str(e)
+
+    # DNS / name-resolution errors. The macOS "nodename nor servname" wording
+    # and the Linux "Name or service not known" / "Temporary failure in name
+    # resolution" all map to socket.gaierror but can also appear wrapped in
+    # OSError or httpx ConnectError, so we string-match too.
+    is_dns = (
+        isinstance(e, socket.gaierror)
+        or "[Errno 8]" in err_msg
+        or "nodename nor servname" in err_msg
+        or "Name or service not known" in err_msg
+        or "Temporary failure in name resolution" in err_msg
+    )
+
+    # Pull the failing request URL from httpx exceptions when available —
+    # this is the single most useful diagnostic for "which call broke".
+    httpx_url: Optional[str] = None
+    is_connect_error = False
+    is_timeout = False
+    try:
+        import httpx
+        if isinstance(e, httpx.HTTPError):
+            req = getattr(e, "request", None)
+            if req is not None:
+                try:
+                    httpx_url = str(req.url)
+                except Exception:  # noqa: BLE001
+                    httpx_url = None
+        if isinstance(e, (httpx.ConnectError, getattr(httpx, "RemoteProtocolError", type(None)))):
+            is_connect_error = True
+        if isinstance(e, (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout)):
+            is_timeout = True
+    except ImportError:
+        pass
+
+    # Generic connection error fallback (non-httpx, non-DNS)
+    if not is_connect_error and not is_dns and isinstance(e, (ConnectionError, OSError)):
+        is_connect_error = True
+
+    parts: list[str] = []
+
+    if is_dns:
+        parts.append("[status.error]Network/DNS error during agent call.[/]")
+        parts.append("")
+        parts.append("[text.dim]Most common causes:[/]")
+        parts.append("  • LLM provider host unreachable (Gemini / OpenAI / Ollama) — check internet")
+        parts.append("  • A tool's HTTP backend is unreachable — Proof Editor, Seeknal Report Server")
+        parts.append("  • Empty/malformed env var: PROOF_BASE_URL, SEEKNAL_PUBLISH_SERVER, HTTP_PROXY, HTTPS_PROXY")
+        parts.append("  • Custom model endpoint configured but invalid (check SEEKNAL_ASK_MODEL)")
+    elif is_timeout:
+        parts.append("[status.error]Timeout during agent call.[/]")
+        parts.append("[text.dim]The remote host accepted the connection but didn't respond in time.[/]")
+    elif is_connect_error:
+        parts.append("[status.error]Connection error during agent call.[/]")
+        parts.append("[text.dim]Could not establish a network connection — host unreachable, port closed, or interrupted.[/]")
+    else:
+        parts.append(f"[status.error]Error: {err_msg}[/]")
+
+    if (is_dns or is_timeout or is_connect_error) and httpx_url:
+        parts.append(f"\n[text.dim]Failing request URL: {httpx_url}[/]")
+    if is_dns or is_timeout or is_connect_error:
+        parts.append(f"[text.dim]Raw error ({err_type}): {err_msg}[/]")
+
+    if log_path:
+        parts.append(f"[text.dim]Full traceback saved to: {log_path}[/]")
+
+    return "\n".join(parts)
+
+
 async def chat_session(
     agent: Any,
     deps: Any,
@@ -951,4 +1061,5 @@ async def chat_session(
                 message_history.extend(e.messages)
                 console.print(f"\n[brand.primary]Rewound to:[/] [dim]{e.label}[/]\n")
                 continue
-            console.print(f"[status.error]Error: {e}[/]\n")
+            log_path = _save_chat_error_log(e)
+            console.print(_format_chat_loop_error(e, log_path) + "\n")
