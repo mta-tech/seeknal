@@ -104,20 +104,23 @@ class TelegramChannel:
     async def _handle_start(self, update: Any, context: Any) -> None:
         """Handle /start command — LLM-generated welcome respecting SEEKNAL_ASK.md."""
         chat_id = str(update.effective_chat.id)
-        session_id = f"telegram-{chat_id}"
+        session_id = f"telegram-start-{chat_id}"
 
         try:
             answer = await self._run_agent(
                 session_id,
-                "Greet the user briefly. List 3 example questions they can ask. "
-                "Do not mention your name or role. Keep it under 400 characters.",
+                "A new user just opened this chat. Write a short welcome message. "
+                "Based on your knowledge of this project, suggest 3 specific "
+                "questions they could ask. Format as a bulleted list. "
+                "Do not state your name or role.",
                 update,
             )
-            if answer:
+            if answer and len(answer.strip()) > 20:
                 clean = _strip_markdown(answer)
                 for chunk in _split_message(clean):
                     await update.message.reply_text(chunk)
                 return
+            logger.warning("LLM welcome was empty or too short: %r", answer)
         except Exception:
             logger.exception("Failed to generate welcome via LLM")
 
