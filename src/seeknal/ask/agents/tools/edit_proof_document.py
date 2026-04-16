@@ -214,9 +214,21 @@ async def edit_proof_document(
     fallback_base = resolve_proof_base_url(None)
     api_key = os.environ.get("PROOF_API_KEY") or None
 
-    return _do_edit(
+    # Retry once on transient errors (PROJECTION_STALE, 409 CONFLICT)
+    # which are common right after publishing a new document.
+    import asyncio
+    result = _do_edit(
         url_or_slug=url,
         new_markdown=new_markdown,
         fallback_base=fallback_base,
         api_key=api_key,
     )
+    if "PROJECTION_STALE" in result or "409 CONFLICT" in result:
+        await asyncio.sleep(3)
+        result = _do_edit(
+            url_or_slug=url,
+            new_markdown=new_markdown,
+            fallback_base=fallback_base,
+            api_key=api_key,
+        )
+    return result
