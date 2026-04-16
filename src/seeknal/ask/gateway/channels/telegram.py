@@ -260,7 +260,7 @@ class TelegramChannel:
                             f"🔍 Starting... ({tool_count} steps)")
                     elif tool_count <= 10:
                         await _update_status(
-                            f"🔧 Running {tool_name}... ({tool_count} steps)")
+                            f"🔧 Running... ({tool_count} steps)")
                     else:
                         await _update_status(
                             f"📊 Analyzing... ({tool_count} steps)")
