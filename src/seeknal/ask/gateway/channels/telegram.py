@@ -109,9 +109,8 @@ class TelegramChannel:
         try:
             answer = await self._run_agent(
                 session_id,
-                "Introduce yourself briefly. Explain what you can help with "
-                "and give 3 short example questions the user can ask. "
-                "Keep it under 500 characters.",
+                "Greet the user briefly. List 3 example questions they can ask. "
+                "Do not mention your name or role. Keep it under 400 characters.",
                 update,
             )
             if answer:
