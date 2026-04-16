@@ -155,19 +155,19 @@ class TelegramChannel:
         session_id = f"telegram-{chat_id}"
         logger.info("[telegram] message from chat_id=%s: %s", chat_id, question[:80])
 
-        # Show typing indicator and "thinking" message
+        # Show typing indicator and a single status message (edited in-place)
         await update.effective_chat.send_action(ChatAction.TYPING)
-        thinking_msg = await update.message.reply_text("🔍 Analyzing...")
+        status_msg = await update.message.reply_text("🔍 Analyzing...")
 
         try:
             logger.info("[telegram] running agent for session=%s", session_id)
-            answer = await self._run_agent(session_id, question, update)
+            answer = await self._run_agent(session_id, question, update, status_msg)
             logger.info("[telegram] agent done for session=%s, answer_len=%d",
                         session_id, len(answer) if answer else 0)
 
-            # Delete thinking message
+            # Delete status message
             try:
-                await thinking_msg.delete()
+                await status_msg.delete()
             except Exception:
                 pass
 
@@ -186,12 +186,16 @@ class TelegramChannel:
         except Exception as e:
             logger.exception("[telegram] error processing message from chat_id=%s", chat_id)
             try:
-                await thinking_msg.edit_text(f"❌ Error: {e}")
+                await status_msg.edit_text(f"❌ Error: {e}")
             except Exception:
                 await update.message.reply_text(f"❌ Error: {e}")
 
+    # Max tool calls before forcing early return with accumulated text
+    _MAX_TOOLS = 30
+
     async def _run_agent(
-        self, session_id: str, question: str, update: Any
+        self, session_id: str, question: str, update: Any,
+        status_msg: Any = None,
     ) -> str:
         """Run the seeknal ask agent and return the answer."""
         from seeknal.ask.gateway.server import _run_agent_streaming
@@ -216,20 +220,26 @@ class TelegramChannel:
                     tool_name = event["data"]["name"]
                     logger.info("[telegram] tool #%d: %s (session=%s)",
                                 tool_count, tool_name, session_id)
-                    # Refresh typing indicator on each tool call
+                    # Refresh typing indicator
                     try:
                         from telegram.constants import ChatAction
                         await update.effective_chat.send_action(ChatAction.TYPING)
                     except Exception:
                         pass
-                    # Send periodic status updates (every 3 tools)
-                    if tool_count % 3 == 1:
+                    # Edit status message in-place (no new messages)
+                    if status_msg and tool_count % 5 == 1:
                         try:
-                            await update.message.reply_text(
-                                f"🔧 Running {tool_name}... ({tool_count} tools used)"
+                            await status_msg.edit_text(
+                                f"🔍 Analyzing... ({tool_count} steps)"
                             )
                         except Exception:
                             pass
+                    # Safety: break if too many tools
+                    if tool_count >= self._MAX_TOOLS:
+                        logger.warning(
+                            "[telegram] tool limit reached (%d), returning partial",
+                            self._MAX_TOOLS)
+                        break
                 elif etype == "tool_end":
                     logger.info("[telegram] tool done (session=%s, total=%d)",
                                 session_id, tool_count)
