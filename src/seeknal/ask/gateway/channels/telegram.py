@@ -105,6 +105,7 @@ class TelegramChannel:
         """Handle /start command — LLM-generated welcome respecting SEEKNAL_ASK.md."""
         chat_id = str(update.effective_chat.id)
         session_id = f"telegram-start-{chat_id}"
+        logger.info("[telegram] /start from chat_id=%s", chat_id)
 
         try:
             answer = await self._run_agent(
@@ -139,13 +140,17 @@ class TelegramChannel:
 
         chat_id = str(update.effective_chat.id)
         session_id = f"telegram-{chat_id}"
+        logger.info("[telegram] message from chat_id=%s: %s", chat_id, question[:80])
 
         # Show typing indicator and "thinking" message
         await update.effective_chat.send_action(ChatAction.TYPING)
         thinking_msg = await update.message.reply_text("🔍 Analyzing...")
 
         try:
+            logger.info("[telegram] running agent for session=%s", session_id)
             answer = await self._run_agent(session_id, question, update)
+            logger.info("[telegram] agent done for session=%s, answer_len=%d",
+                        session_id, len(answer) if answer else 0)
 
             # Delete thinking message
             try:
@@ -158,13 +163,15 @@ class TelegramChannel:
                 clean = _strip_markdown(answer)
                 for chunk in _split_message(clean):
                     await update.message.reply_text(chunk)
+                logger.info("[telegram] reply sent to chat_id=%s", chat_id)
             else:
                 await update.message.reply_text(
                     "I couldn't generate a response. Please try rephrasing."
                 )
+                logger.warning("[telegram] empty answer for chat_id=%s", chat_id)
 
         except Exception as e:
-            logger.exception("Error processing Telegram message")
+            logger.exception("[telegram] error processing message from chat_id=%s", chat_id)
             try:
                 await thinking_msg.edit_text(f"❌ Error: {e}")
             except Exception:
@@ -180,16 +187,20 @@ class TelegramChannel:
         tool_count = 0
         answer: str | None = None
 
+        logger.info("[telegram] agent stream starting session=%s", session_id)
         stream = _run_agent_streaming(
             self._project_path, session_id, question,
         )
         try:
             async for event in stream:
-                if event["type"] == "token":
+                etype = event["type"]
+                if etype == "token":
                     text_parts.append(event["data"])
-                elif event["type"] == "tool_start":
+                elif etype == "tool_start":
                     tool_count += 1
                     tool_name = event["data"]["name"]
+                    logger.info("[telegram] tool #%d: %s (session=%s)",
+                                tool_count, tool_name, session_id)
                     # Refresh typing indicator on each tool call
                     try:
                         from telegram.constants import ChatAction
@@ -204,7 +215,12 @@ class TelegramChannel:
                             )
                         except Exception:
                             pass
-                elif event["type"] == "answer":
+                elif etype == "tool_end":
+                    logger.info("[telegram] tool done (session=%s, total=%d)",
+                                session_id, tool_count)
+                elif etype == "answer":
+                    logger.info("[telegram] answer received (session=%s, len=%d)",
+                                session_id, len(event["data"]))
                     answer = event["data"]
                     break
         finally:
