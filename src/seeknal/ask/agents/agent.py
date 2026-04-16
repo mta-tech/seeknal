@@ -210,10 +210,6 @@ def create_agent(
         # Subagents
         include_subagents=True,
         subagents=get_subagent_configs(),
-        # Web search disabled: seeknal has domain-specific DuckDuckGo toolset
-        # added via toolsets_list when include_web=True.
-        web_search=False,
-        web_fetch=False,
         # Disabled: seeknal has domain-specific alternatives
         include_filesystem=False,
         include_execute=False,
