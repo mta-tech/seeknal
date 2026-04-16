@@ -177,13 +177,12 @@ def gateway_start(
 
     # Pass temporal_client if already connected (for sync startup path)
     # The lifespan will also set it on app.state for the async path
-    # Default callback_url to self when Temporal is enabled and not specified.
-    # This lets workers POST streaming events back to the gateway without
-    # requiring the operator to explicitly pass --callback-url for single-host
-    # or locally reachable deployments. For cross-machine deployments, the
-    # operator should still set --callback-url to the externally reachable URL.
+    # Default callback_url to self ONLY in --no-worker mode (gateway-only).
+    # When the worker is embedded (default), _run_agent_streaming() already
+    # publishes to SSE directly — adding a callback to self would double-publish.
+    # For remote/split workers, the callback lets them POST events back.
     effective_callback_url = callback_url
-    if temporal_enabled and not effective_callback_url:
+    if temporal_enabled and no_worker and not effective_callback_url:
         effective_callback_url = f"http://{host}:{port}"
         typer.echo(typer.style(
             f"Callback URL defaulted to {effective_callback_url} (for worker event delivery)",
