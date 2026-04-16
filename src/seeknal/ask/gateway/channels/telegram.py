@@ -29,7 +29,9 @@ _TELEGRAM_FORMAT_HINT = (
     "[Context: This is a Telegram channel. When the user asks to add, edit, "
     "or modify content in a previously published Proof document, use "
     "read_proof_document to fetch it, then edit_proof_document to update it. "
-    "Do not create seeknal pipeline nodes unless explicitly asked.]\n\n"
+    "Do not create seeknal pipeline nodes unless explicitly asked.]\n"
+    "[After answering, always suggest 2-3 short follow-up questions the user "
+    "could ask next, based on your answer. Write them as a simple list.]\n\n"
 )
 
 
