@@ -117,6 +117,7 @@ async def _run_agent_streaming(
     model: str | None = None,
     tenant_id: str = DEFAULT_TENANT,
     auto_approve: bool = False,
+    include_web: bool = False,
 ):
     """Run agent and yield JSON event dicts as they occur.
 
@@ -133,6 +134,7 @@ async def _run_agent_streaming(
             async for event in _run_agent_inner(
                 project_path, session_id, question, provider, model,
                 tenant_id=tenant_id, auto_approve=auto_approve,
+                include_web=include_web,
             ):
                 _publish_event(session_id, event, tenant_id=tenant_id)
                 yield event
@@ -155,6 +157,7 @@ async def _run_agent_inner(
     model: str | None = None,
     tenant_id: str = DEFAULT_TENANT,
     auto_approve: bool = False,
+    include_web: bool = False,
 ):
     """Inner agent execution without locking or SSE publishing."""
     from pydantic_ai import Agent
@@ -177,7 +180,7 @@ async def _run_agent_inner(
 
     agent, deps, _, _ = create_agent(
         project_path, provider=provider, model=model,
-        environment="gateway",
+        environment="gateway", include_web=include_web,
     )
 
     # Auto-grant all approval gates (for Telegram and other headless channels)
