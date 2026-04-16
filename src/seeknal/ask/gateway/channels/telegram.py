@@ -131,6 +131,8 @@ class TelegramChannel:
 
     async def _handle_message(self, update: Any, context: Any) -> None:
         """Handle incoming text messages — run agent and stream response."""
+        from telegram.constants import ChatAction
+
         question = update.message.text.strip()
         if not question:
             return
@@ -138,7 +140,8 @@ class TelegramChannel:
         chat_id = str(update.effective_chat.id)
         session_id = f"telegram-{chat_id}"
 
-        # Send "thinking" indicator
+        # Show typing indicator and "thinking" message
+        await update.effective_chat.send_action(ChatAction.TYPING)
         thinking_msg = await update.message.reply_text("🔍 Analyzing...")
 
         try:
@@ -187,6 +190,12 @@ class TelegramChannel:
                 elif event["type"] == "tool_start":
                     tool_count += 1
                     tool_name = event["data"]["name"]
+                    # Refresh typing indicator on each tool call
+                    try:
+                        from telegram.constants import ChatAction
+                        await update.effective_chat.send_action(ChatAction.TYPING)
+                    except Exception:
+                        pass
                     # Send periodic status updates (every 3 tools)
                     if tool_count % 3 == 1:
                         try:
@@ -199,7 +208,10 @@ class TelegramChannel:
                     answer = event["data"]
                     break
         finally:
-            await stream.aclose()
+            try:
+                await stream.aclose()
+            except RuntimeError:
+                pass  # upstream generator doesn't handle GeneratorExit
 
         if answer is not None:
             return answer
@@ -222,7 +234,10 @@ class TelegramChannel:
                 elif event["type"] == "token":
                     text_parts.append(event["data"])
         finally:
-            await stream.aclose()
+            try:
+                await stream.aclose()
+            except RuntimeError:
+                pass
 
         if answer is not None:
             return answer
