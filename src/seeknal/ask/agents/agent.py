@@ -138,22 +138,33 @@ def create_agent(
     context_toolset = SeeknaContextToolset(discovery, context_budget=context_budget)
     toolsets_list = [create_ask_toolset(), context_toolset]
 
-    # Add web search toolset if requested (local DuckDuckGo, avoids Gemini builtin conflict)
+    # Add web tools if requested. Prefers Firecrawl (search + scrape) when
+    # FIRECRAWL_API_KEY is set, otherwise falls back to DuckDuckGo search-only.
     if include_web:
-        try:
-            from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
-            from pydantic_ai.toolsets import FunctionToolset
+        import os
+        from pydantic_ai.toolsets import FunctionToolset
+
+        if os.environ.get("FIRECRAWL_API_KEY"):
+            from seeknal.ask.agents.tools.web_firecrawl import web_scrape, web_search
 
             toolsets_list.append(FunctionToolset(
-                tools=[duckduckgo_search_tool()],
+                tools=[web_search, web_scrape],
                 id="seeknal-web",
             ))
-        except ImportError:
-            import warnings
-            warnings.warn(
-                "Web search requires 'ddgs' package. "
-                "Install with: pip install ddgs"
-            )
+        else:
+            try:
+                from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
+
+                toolsets_list.append(FunctionToolset(
+                    tools=[duckduckgo_search_tool()],
+                    id="seeknal-web",
+                ))
+            except ImportError:
+                import warnings
+                warnings.warn(
+                    "Web search requires 'ddgs' package or FIRECRAWL_API_KEY. "
+                    "Install with: pip install ddgs"
+                )
 
     # Ensure .seeknal directories exist (checkpoints scoped per session)
     seeknal_dir = project_path / ".seeknal"
