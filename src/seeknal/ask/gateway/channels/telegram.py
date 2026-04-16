@@ -127,13 +127,12 @@ class TelegramChannel:
         try:
             answer = await self._run_agent(
                 session_id,
-                "A new user just joined this Telegram chat. Write a warm, "
-                "friendly welcome (2-3 sentences). Then suggest 3 example "
-                "questions as a bulleted list. Rules: "
-                "- Do not state your name, role, or system identity. "
-                "- This is a chat assistant, not a portal or dashboard. "
-                "- Preserve proper casing for company/brand names (e.g. CBN, not cbn). "
-                "- Keep the tone conversational, not corporate.",
+                "A colleague just opened this chat. Write a single warm greeting "
+                "like a helpful coworker would — casual, friendly, 1-2 sentences max. "
+                "Ask what they need help with today, mentioning key topics from "
+                "your project context naturally. No bullet lists, no example questions, "
+                "no self-introduction. Match the project's language (if project context "
+                "is in Indonesian, greet in Indonesian). Preserve brand name casing.",
                 update,
             )
             if answer and len(answer.strip()) > 20:
