@@ -174,12 +174,20 @@ def create_agent(
     def _on_cost_update(cost_info):
         _cost_info["latest"] = cost_info
 
+    # Google/Gemini cannot mix function tools with built-in tools (WebSearch,
+    # WebFetch, Thinking). Disable built-in capabilities for Google provider.
+    _is_google = model_string.startswith("google-gla:")
+
     # Create pydantic-deep agent with full feature set
     agent = create_deep_agent(
         model=model_string,
         instructions=instructions,
         toolsets=toolsets_list,
         hooks=get_ask_hooks(),
+        # Built-in capabilities: disabled for Google (conflicts with function tools)
+        web_search=not _is_google,
+        web_fetch=not _is_google,
+        thinking=False if _is_google else "high",
         # Skills: bundled built-ins (report-generation, etc.) + per-project
         # user skills. Built-ins ship as SKILL.md files under
         # src/seeknal/ask/builtin_skills/ so `load_skill(...)` resolves
