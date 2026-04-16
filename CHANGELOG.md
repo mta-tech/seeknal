@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-04-16
+
+### Added
+- **Thin tools + fat skills architecture** for the ask agent: 16 thin tools provide fast schema discovery and execution; 11 built-in skills deliver multi-step workflows (report generation, pipeline building, data profiling, semantic modeling, metric codification, Python analysis, publishing) via progressive disclosure — skills are loaded on demand, keeping the agent's context lean
+- **Seeknal Report Server** (`seeknal report-server start`): self-hosted server for publishing and sharing Evidence.dev reports via unique URLs with token-based authentication
+- **Report publishing**: publish reports from the chat TUI menu or via the `publish_to_seeknal_report` agent tool — both paths write to the Report Server and return a shareable URL
+- **Chat session options**: `--style` (concise, explanatory, formal, conversational), `--budget` (max USD per session), `--web` (enable DuckDuckGo web search), `--session` (resume named session), `--name` (create named session)
+- **Gateway improvements**: `seeknal gateway backend` for cloud-only mode (no local project), `seeknal gateway worker` for standalone Temporal workers, `--redis` for multi-replica scaling, split topology support with `--callback-url` and `--worker-project-path`
+- **Auto-load project `.env`**: `seeknal ask --project <path>` now loads `<path>/.env` automatically — no manual `source .env` needed
+- **Network error classification**: chat loop errors are classified into DNS, connection, timeout, and unknown categories with actionable hints instead of raw tracebacks
+- **Error log persistence**: chat errors are saved to `~/.seeknal/logs/` with full tracebacks for debugging
+- **Background task messaging**: backgrounded tool messages no longer leak internal `task_id` values
+- **`execute_python` sandbox guard**: detects `duckdb.connect()` calls that shadow the sandbox connection and returns a helpful hint
+- **Built-in skills**: `profile-data`, `report-generation`, `build-pipeline-node`, `execute-python-analysis`, `query-metric`, `save-metric`, `save-report-exposure`, `bootstrap-semantic-model`, `publish-memo-to-proof`, `publish-to-seeknal-report`, `edit-proof-document`
+
+### Changed
+- Ask agent tool count reduced from 34 to 16 thin tools; complex multi-step workflows moved to 11 progressively-disclosed skills
+- System prompt streamlined — workflow instructions moved from prompt to skills, reducing baseline token usage
+- `request_limit` moved from module-level global to per-session `ToolContext` for concurrent session safety
+
+### Fixed
+- `seeknal ask --project <path>` now resolves `.env` from the project directory, not the shell's cwd
+- Chat loop no longer dumps raw `OSError` / `gaierror` — shows classified error with provider/DNS hints
+- `generate_report` overwrite warning only shown when target directory already contains built files
+- `ask()` and `_quality_gate()` gracefully handle missing `ToolContext` in unit tests (fallback to default request limit)
+- `pytest-asyncio` added to dev dependencies for async temporal integration tests
+
 ## [2.5.0] - 2026-04-06
 
 ### Added

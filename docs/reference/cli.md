@@ -72,6 +72,11 @@ Complete reference for all Seeknal CLI commands. Commands are organized by categ
   - [connection-test](#seeknal-connection-test) - Test StarRocks connectivity
 - [Atlas Integration](#atlas-integration)
   - [atlas](#seeknal-atlas) - Atlas Data Platform commands
+- [Servers & APIs](#servers--apis)
+  - [gateway start](#seeknal-gateway-start) - HTTP gateway for seeknal ask
+  - [gateway backend](#seeknal-gateway-backend) - Cloud-only gateway
+  - [gateway worker](#seeknal-gateway-worker) - Standalone Temporal worker
+  - [report-server start](#seeknal-report-server-start) - Host published reports
 
 ---
 
@@ -112,6 +117,8 @@ Complete reference for all Seeknal CLI commands. Commands are organized by categ
 | `seeknal entity` | Manage consolidated entity feature stores |
 | `seeknal consolidate` | Manually trigger entity consolidation |
 | `seeknal atlas` | Atlas Data Platform integration |
+| `seeknal gateway` | HTTP gateway server (WebSocket, SSE, REST) |
+| `seeknal report-server` | Host published Evidence.dev reports |
 
 ---
 
@@ -2065,6 +2072,98 @@ seeknal consolidate --path /my/project
 ```
 
 > **Note:** Consolidation runs automatically after `seeknal run`. Use this command when you need to manually trigger consolidation, for example after running individual nodes with `seeknal run --nodes feature_group.customer_features`.
+
+---
+
+# Servers & APIs
+
+## seeknal gateway start
+
+Start the seeknal ask HTTP gateway server.
+
+Exposes the ask agent via WebSocket, SSE, and REST endpoints for web clients, mobile apps, and bots. Optionally enables Telegram bot and Temporal durable execution.
+
+```bash
+seeknal gateway start [OPTIONS]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--project` | PATH | Auto-detected | Project path |
+| `--port` | INT | `8000` | Port to listen on |
+| `--host` | TEXT | `0.0.0.0` | Host to bind to |
+| `--telegram` | FLAG | False | Enable Telegram bot channel |
+| `--temporal` | FLAG | False | Enable Temporal durable execution |
+| `--no-worker` | FLAG | False | Gateway-only mode (no local worker) |
+| `--max-activities` | INT | `15` | Max concurrent Temporal activities |
+| `--redis` | TEXT | None | Redis URL for multi-replica mode |
+
+```bash
+# Basic local gateway
+seeknal gateway start --project ./my-project
+
+# With Telegram bot
+seeknal gateway start --telegram
+
+# Multi-replica with Redis
+seeknal gateway start --redis redis://localhost:6379
+```
+
+## seeknal gateway backend
+
+Start a cloud-only gateway without a local project. Use when the gateway runs on a separate machine from the data.
+
+```bash
+seeknal gateway backend [OPTIONS]
+```
+
+## seeknal gateway worker
+
+Start a standalone Temporal worker that connects to an existing gateway. Use in split topologies.
+
+```bash
+seeknal gateway worker [OPTIONS]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--project` | PATH | Auto-detected | Project path |
+| `--callback-url` | TEXT | None | Gateway URL for event callbacks |
+| `--callback-auth-token` | TEXT | None | Shared secret for callback auth |
+
+See [seeknal gateway CLI docs](../cli/gateway.md) for full details.
+
+---
+
+## seeknal report-server start
+
+Start the Seeknal Report Server for hosting published Evidence.dev reports.
+
+```bash
+seeknal report-server start [OPTIONS]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--host` | TEXT | `127.0.0.1` | Host to bind to |
+| `--port` | INT | `8787` | Port to listen on |
+| `--data-dir` | PATH | None | Directory for storing published reports |
+
+```bash
+# Start locally
+seeknal report-server start
+
+# Custom port, exposed to network
+seeknal report-server start --host 0.0.0.0 --port 9000
+```
+
+**Prerequisites:** `pip install seeknal[report-server]`
+
+**Auth modes:** Set `SEEKNAL_REPORT_SERVER_AUTH_MODE` to `token` (default, requires `SEEKNAL_REPORT_SERVER_KEYS`) or `open` (development only).
+
+**Publishing:** After building a report with `seeknal ask report`, publish via the chat TUI menu or the `publish_to_seeknal_report` agent tool. Set `SEEKNAL_PUBLISH_SERVER` and `SEEKNAL_PUBLISH_TOKEN` in your project `.env`.
+
+See [seeknal report-server CLI docs](../cli/report-server.md) for full details.
 
 ---
 

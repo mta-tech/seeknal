@@ -148,6 +148,8 @@ Lookup documentation for commands, schemas, and configuration.
 - [Configuration](reference/configuration.md) — Project files, profiles, and environment variables
 - [Python API](api/index.md) — Module reference
 - [CLI Docs Search](cli/docs.md) — Search documentation from the terminal (`seeknal docs`)
+- [Gateway Server](cli/gateway.md) — HTTP API for web clients and bots
+- [Report Server](cli/report-server.md) — Host and share published reports
 
 ## Tutorials
 
@@ -158,6 +160,8 @@ Step-by-step learning paths with copy-pasteable code.
 - [Environment Management](tutorials/environment-management.md) — Safe development with environments (45 min)
 - [Parallel Execution](tutorials/parallel-execution.md) — Speed up large pipelines (45 min)
 - [Change Categorization](tutorials/metrics-change-tracking.md) — Understand change impact (20 min)
+- [Seeknal Ask Agent](tutorials/seeknal-ask-agent.md) — AI-powered data analysis (15 min)
+- [Report Exposures](tutorials/report-exposures.md) — Deterministic dashboards (20 min)
 - [E-Commerce Walkthrough](tutorials/workflow-tutorial-ecommerce.md) — Real-world example
 
 ## Additional Resources
