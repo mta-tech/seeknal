@@ -124,8 +124,7 @@ class TelegramChannel:
 
         # Fallback if LLM fails
         await update.message.reply_text(
-            "Welcome to Seeknal Ask! Send me a question about your data "
-            "and I'll analyze it for you."
+            "Hi! Send me a question and I'll analyze it for you."
         )
 
     async def _handle_message(self, update: Any, context: Any) -> None:
