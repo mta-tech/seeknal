@@ -21,13 +21,25 @@ logger = logging.getLogger(__name__)
 # Telegram message size limit
 _MAX_MESSAGE_LENGTH = 4096
 
-# Strip markdown that Telegram can't render
-_MD_STRIP_RE = re.compile(r"```\w*\n?|^#{1,6}\s", re.MULTILINE)
+# Telegram formatting instruction prepended to user messages
+_TELEGRAM_FORMAT_HINT = (
+    "[Format: plain text for Telegram. No markdown. Use dashes for bullets, "
+    "CAPS for emphasis, and simple indentation. No **bold**, *italic*, or ```code``` blocks.]\n\n"
+)
 
 
 def _strip_markdown(text: str) -> str:
-    """Strip markdown syntax that Telegram doesn't support well."""
-    text = _MD_STRIP_RE.sub("", text)
+    """Convert markdown to plain text suitable for Telegram."""
+    # Remove code fences
+    text = re.sub(r"```\w*\n?", "", text)
+    # Convert **bold** and __bold__ to UPPERCASE or just strip
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    # Convert *italic* and _italic_ to plain
+    text = re.sub(r"\*(.+?)\*", r"\1", text)
+    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)
+    # Strip heading markers
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
     return text.strip()
 
 
@@ -187,9 +199,10 @@ class TelegramChannel:
         tool_count = 0
         answer: str | None = None
 
+        formatted_question = _TELEGRAM_FORMAT_HINT + question
         logger.info("[telegram] agent stream starting session=%s", session_id)
         stream = _run_agent_streaming(
-            self._project_path, session_id, question,
+            self._project_path, session_id, formatted_question,
         )
         try:
             async for event in stream:
@@ -239,8 +252,9 @@ class TelegramChannel:
 
         text_parts: list[str] = []
         answer: str | None = None
+        formatted_question = _TELEGRAM_FORMAT_HINT + question
         stream = _run_agent_streaming(
-            self._project_path, session_id, question,
+            self._project_path, session_id, formatted_question,
         )
         try:
             async for event in stream:
