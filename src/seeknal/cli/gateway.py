@@ -63,6 +63,10 @@ def gateway_start(
     """Start the seeknal ask gateway server."""
     project_path = project or find_project_path()
 
+    # Load project .env (FIRECRAWL_API_KEY, GOOGLE_API_KEY, etc.)
+    from seeknal.cli.ask import _load_project_env
+    _load_project_env(project_path)
+
     try:
         from seeknal.ask.gateway.server import create_gateway_app
     except ImportError:
