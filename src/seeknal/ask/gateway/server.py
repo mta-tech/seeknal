@@ -193,78 +193,90 @@ async def _run_agent_inner(
         ctx.require_seeknal_report_publish_approval = False
 
     text_buffer: list[str] = []
+    result = None
 
-    async with agent.iter(
-        question, deps=deps, message_history=message_history,
-    ) as run:
-        async for node in run:
-            if isinstance(node, UserPromptNode):
-                continue
+    try:
+        async with agent.iter(
+            question, deps=deps, message_history=message_history,
+        ) as run:
+            async for node in run:
+                if isinstance(node, UserPromptNode):
+                    continue
 
-            elif Agent.is_model_request_node(node):
-                async with node.stream(run.ctx) as stream:
-                    async for event in stream:
-                        if isinstance(event, PartDeltaEvent):
-                            if isinstance(event.delta, TextPartDelta):
-                                text_buffer.append(event.delta.content_delta)
+                elif Agent.is_model_request_node(node):
+                    async with node.stream(run.ctx) as stream:
+                        async for event in stream:
+                            if isinstance(event, PartDeltaEvent):
+                                if isinstance(event.delta, TextPartDelta):
+                                    text_buffer.append(event.delta.content_delta)
+                                    yield {
+                                        "type": "token",
+                                        "data": event.delta.content_delta,
+                                    }
+
+                elif Agent.is_call_tools_node(node):
+                    # Flush reasoning
+                    if text_buffer:
+                        yield {
+                            "type": "reasoning",
+                            "data": "".join(text_buffer),
+                        }
+                        text_buffer.clear()
+
+                    async with node.stream(run.ctx) as handle_stream:
+                        async for event in handle_stream:
+                            if isinstance(event, FunctionToolCallEvent):
                                 yield {
-                                    "type": "token",
-                                    "data": event.delta.content_delta,
+                                    "type": "tool_start",
+                                    "data": {
+                                        "name": event.part.tool_name,
+                                        "args": event.part.args_as_dict(),
+                                    },
+                                }
+                            elif isinstance(event, FunctionToolResultEvent):
+                                content = event.result.content
+                                yield {
+                                    "type": "tool_end",
+                                    "data": {
+                                        "name": event.result.tool_name,
+                                        "output": str(content)[:2000] if content else "",
+                                    },
                                 }
 
-            elif Agent.is_call_tools_node(node):
-                # Flush reasoning
-                if text_buffer:
-                    yield {
-                        "type": "reasoning",
-                        "data": "".join(text_buffer),
-                    }
-                    text_buffer.clear()
+                elif isinstance(node, End):
+                    break
 
-                async with node.stream(run.ctx) as handle_stream:
-                    async for event in handle_stream:
-                        if isinstance(event, FunctionToolCallEvent):
-                            yield {
-                                "type": "tool_start",
-                                "data": {
-                                    "name": event.part.tool_name,
-                                    "args": event.part.args_as_dict(),
-                                },
-                            }
-                        elif isinstance(event, FunctionToolResultEvent):
-                            content = event.result.content
-                            yield {
-                                "type": "tool_end",
-                                "data": {
-                                    "name": event.result.tool_name,
-                                    "output": str(content)[:2000] if content else "",
-                                },
-                            }
+            result = run.result
 
-            elif isinstance(node, End):
-                break
+        # Final answer
+        if text_buffer:
+            answer = "".join(text_buffer)
+        else:
+            answer = result.output or ""
 
-        result = run.result
+        if answer:
+            yield {"type": "answer", "data": answer}
 
-    # Final answer
-    if text_buffer:
-        answer = "".join(text_buffer)
-    else:
-        answer = result.output or ""
-
-    if answer:
-        yield {"type": "answer", "data": answer}
-
-    # Save conversation
-    all_messages = result.all_messages()
-    store.save_messages(session_id, all_messages)
-    msg_count = len([m for m in all_messages if hasattr(m, 'parts')])
-    store.update(
-        session_id,
-        message_count=msg_count,
-        last_question=question[:200],
-        status="active",
-    )
+    finally:
+        # Always save conversation — even when the consumer closes the generator
+        # early (e.g. Telegram breaking on answer event). Without this, session
+        # history is lost and the agent can't reference prior messages.
+        if result is not None:
+            try:
+                all_messages = result.all_messages()
+                store.save_messages(session_id, all_messages)
+                msg_count = len([m for m in all_messages if hasattr(m, 'parts')])
+                store.update(
+                    session_id,
+                    message_count=msg_count,
+                    last_question=question[:200],
+                    status="active",
+                )
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception(
+                    "[gateway] failed to save session %s", session_id
+                )
 
 
 # ---------------------------------------------------------------------------
