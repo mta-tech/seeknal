@@ -30,6 +30,9 @@ _TELEGRAM_FORMAT_HINT = (
     "or modify content in a previously published Proof document, use "
     "read_proof_document to fetch it, then edit_proof_document to update it. "
     "Do not create seeknal pipeline nodes unless explicitly asked.]\n"
+    "[Always include the full answer in your response. Never say 'as mentioned "
+    "above' or 'already provided' — the user only sees your current message. "
+    "If data was gathered via tools, present the actual findings.]\n"
     "[After answering, always suggest 2-3 short follow-up questions the user "
     "could ask next, based on your answer. Write them as a simple list.]\n\n"
 )
