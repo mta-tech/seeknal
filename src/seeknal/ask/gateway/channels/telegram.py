@@ -102,14 +102,30 @@ class TelegramChannel:
             logger.info("Telegram channel stopped")
 
     async def _handle_start(self, update: Any, context: Any) -> None:
-        """Handle /start command."""
+        """Handle /start command — LLM-generated welcome respecting SEEKNAL_ASK.md."""
+        chat_id = str(update.effective_chat.id)
+        session_id = f"telegram-{chat_id}"
+
+        try:
+            answer = await self._run_agent(
+                session_id,
+                "Introduce yourself briefly. Explain what you can help with "
+                "and give 3 short example questions the user can ask. "
+                "Keep it under 500 characters.",
+                update,
+            )
+            if answer:
+                clean = _strip_markdown(answer)
+                for chunk in _split_message(clean):
+                    await update.message.reply_text(chunk)
+                return
+        except Exception:
+            logger.exception("Failed to generate welcome via LLM")
+
+        # Fallback if LLM fails
         await update.message.reply_text(
             "Welcome to Seeknal Ask! Send me a question about your data "
-            "and I'll analyze it for you.\n\n"
-            "Examples:\n"
-            "• What are the top products by revenue?\n"
-            "• Show me customer churn trends\n"
-            "• Compare our AOV to industry benchmarks"
+            "and I'll analyze it for you."
         )
 
     async def _handle_message(self, update: Any, context: Any) -> None:
