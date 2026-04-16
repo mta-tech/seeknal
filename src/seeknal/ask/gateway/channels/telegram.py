@@ -172,27 +172,34 @@ class TelegramChannel:
 
         text_parts: list[str] = []
         tool_count = 0
+        answer: str | None = None
 
-        async for event in _run_agent_streaming(
+        stream = _run_agent_streaming(
             self._project_path, session_id, question,
-        ):
-            if event["type"] == "token":
-                text_parts.append(event["data"])
-            elif event["type"] == "tool_start":
-                tool_count += 1
-                tool_name = event["data"]["name"]
-                # Send periodic status updates (every 3 tools)
-                if tool_count % 3 == 1:
-                    try:
-                        await update.message.reply_text(
-                            f"🔧 Running {tool_name}... ({tool_count} tools used)"
-                        )
-                    except Exception:
-                        pass
-            elif event["type"] == "answer":
-                return event["data"]
+        )
+        try:
+            async for event in stream:
+                if event["type"] == "token":
+                    text_parts.append(event["data"])
+                elif event["type"] == "tool_start":
+                    tool_count += 1
+                    tool_name = event["data"]["name"]
+                    # Send periodic status updates (every 3 tools)
+                    if tool_count % 3 == 1:
+                        try:
+                            await update.message.reply_text(
+                                f"🔧 Running {tool_name}... ({tool_count} tools used)"
+                            )
+                        except Exception:
+                            pass
+                elif event["type"] == "answer":
+                    answer = event["data"]
+                    break
+        finally:
+            await stream.aclose()
 
-        # If no explicit answer event, use accumulated text
+        if answer is not None:
+            return answer
         return "".join(text_parts) if text_parts else ""
 
     async def deliver(self, session_id: str, question: str) -> str:
@@ -200,11 +207,20 @@ class TelegramChannel:
         from seeknal.ask.gateway.server import _run_agent_streaming
 
         text_parts: list[str] = []
-        async for event in _run_agent_streaming(
+        answer: str | None = None
+        stream = _run_agent_streaming(
             self._project_path, session_id, question,
-        ):
-            if event["type"] == "answer":
-                return event["data"]
-            elif event["type"] == "token":
-                text_parts.append(event["data"])
+        )
+        try:
+            async for event in stream:
+                if event["type"] == "answer":
+                    answer = event["data"]
+                    break
+                elif event["type"] == "token":
+                    text_parts.append(event["data"])
+        finally:
+            await stream.aclose()
+
+        if answer is not None:
+            return answer
         return "".join(text_parts)
