@@ -25,7 +25,11 @@ _MAX_MESSAGE_LENGTH = 4096
 _TELEGRAM_FORMAT_HINT = (
     "[Format: plain text for Telegram. No markdown syntax. "
     "Use dashes for bullets. Write in normal sentence case. "
-    "No **bold**, *italic*, ```code``` blocks, or ALL CAPS.]\n\n"
+    "No **bold**, *italic*, ```code``` blocks, or ALL CAPS.]\n"
+    "[Context: This is a Telegram channel. When the user asks to add, edit, "
+    "or modify content in a previously published Proof document, use "
+    "read_proof_document to fetch it, then edit_proof_document to update it. "
+    "Do not create seeknal pipeline nodes unless explicitly asked.]\n\n"
 )
 
 
@@ -251,8 +255,8 @@ class TelegramChannel:
         finally:
             try:
                 await stream.aclose()
-            except RuntimeError:
-                pass  # upstream generator doesn't handle GeneratorExit
+            except (RuntimeError, GeneratorExit):
+                pass  # upstream generator doesn't handle cleanup gracefully
 
         if answer is not None:
             return answer
@@ -279,7 +283,7 @@ class TelegramChannel:
         finally:
             try:
                 await stream.aclose()
-            except RuntimeError:
+            except (RuntimeError, GeneratorExit):
                 pass
 
         if answer is not None:
