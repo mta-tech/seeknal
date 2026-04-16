@@ -169,7 +169,7 @@ class TelegramChannel:
 
         # Show typing indicator and a single status message (edited in-place)
         await update.effective_chat.send_action(ChatAction.TYPING)
-        status_msg = await update.message.reply_text("🔍 Analyzing...")
+        status_msg = await update.message.reply_text("🔍 Starting...")
 
         try:
             logger.info("[telegram] running agent for session=%s", session_id)
@@ -215,6 +215,18 @@ class TelegramChannel:
         text_parts: list[str] = []
         tool_count = 0
         answer: str | None = None
+        writing_started = False
+        last_status = ""
+
+        async def _update_status(text: str) -> None:
+            nonlocal last_status
+            if not status_msg or text == last_status:
+                return
+            try:
+                await status_msg.edit_text(text)
+                last_status = text
+            except Exception:
+                pass
 
         formatted_question = _TELEGRAM_FORMAT_HINT + question
         logger.info("[telegram] agent stream starting session=%s", session_id)
@@ -227,6 +239,10 @@ class TelegramChannel:
                 etype = event["type"]
                 if etype == "token":
                     text_parts.append(event["data"])
+                    if not writing_started:
+                        writing_started = True
+                        await _update_status(
+                            f"✍️ Writing response... ({tool_count} steps)")
                 elif etype == "tool_start":
                     tool_count += 1
                     tool_name = event["data"]["name"]
@@ -238,14 +254,16 @@ class TelegramChannel:
                         await update.effective_chat.send_action(ChatAction.TYPING)
                     except Exception:
                         pass
-                    # Edit status message in-place (no new messages)
-                    if status_msg and tool_count % 5 == 1:
-                        try:
-                            await status_msg.edit_text(
-                                f"🔍 Analyzing... ({tool_count} steps)"
-                            )
-                        except Exception:
-                            pass
+                    # Cycle status phases based on tool count
+                    if tool_count <= 2:
+                        await _update_status(
+                            f"🔍 Starting... ({tool_count} steps)")
+                    elif tool_count <= 10:
+                        await _update_status(
+                            f"🔧 Running {tool_name}... ({tool_count} steps)")
+                    else:
+                        await _update_status(
+                            f"📊 Analyzing... ({tool_count} steps)")
                     # Safety: break if too many tools
                     if tool_count >= self._MAX_TOOLS:
                         logger.warning(
