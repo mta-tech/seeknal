@@ -130,8 +130,9 @@ class TelegramChannel:
                 "A colleague just opened this chat. Write a single warm greeting "
                 "like a helpful coworker would — casual, friendly, 1-2 sentences max. "
                 "Ask what they need help with today, mentioning key topics from "
-                "your project context naturally. No bullet lists, no example questions, "
-                "no self-introduction. Match the project's language (if project context "
+                "your project context naturally. Then suggest 3 example questions "
+                "as a bulleted list. "
+                "No self-introduction. Match the project's language (if project context "
                 "is in Indonesian, greet in Indonesian). Preserve brand name casing.",
                 update,
             )
