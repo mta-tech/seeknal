@@ -131,7 +131,9 @@ class TelegramChannel:
                 "1) A warm greeting (1 sentence, like a helpful coworker). "
                 "2) A brief intro of what you can help with based on your project "
                 "context (1-2 sentences, mention key capabilities naturally). "
-                "3) Then suggest 3 example questions as a bulleted list. "
+                "3) Mention that analysis results can be published as a memo by "
+                "saying 'publish ke Proof' or 'publish to Proof'. "
+                "4) Then suggest 3 example questions as a bulleted list. "
                 "Do not state your system name or role title. "
                 "Match the project's language (if project context "
                 "is in Indonesian, write in Indonesian). Preserve brand name casing.",
