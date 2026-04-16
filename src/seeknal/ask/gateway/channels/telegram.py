@@ -203,6 +203,7 @@ class TelegramChannel:
         logger.info("[telegram] agent stream starting session=%s", session_id)
         stream = _run_agent_streaming(
             self._project_path, session_id, formatted_question,
+            auto_approve=True,
         )
         try:
             async for event in stream:
@@ -255,6 +256,7 @@ class TelegramChannel:
         formatted_question = _TELEGRAM_FORMAT_HINT + question
         stream = _run_agent_streaming(
             self._project_path, session_id, formatted_question,
+            auto_approve=True,
         )
         try:
             async for event in stream:

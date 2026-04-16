@@ -116,6 +116,7 @@ async def _run_agent_streaming(
     provider: str | None = None,
     model: str | None = None,
     tenant_id: str = DEFAULT_TENANT,
+    auto_approve: bool = False,
 ):
     """Run agent and yield JSON event dicts as they occur.
 
@@ -131,7 +132,7 @@ async def _run_agent_streaming(
         try:
             async for event in _run_agent_inner(
                 project_path, session_id, question, provider, model,
-                tenant_id=tenant_id,
+                tenant_id=tenant_id, auto_approve=auto_approve,
             ):
                 _publish_event(session_id, event, tenant_id=tenant_id)
                 yield event
@@ -153,6 +154,7 @@ async def _run_agent_inner(
     provider: str | None = None,
     model: str | None = None,
     tenant_id: str = DEFAULT_TENANT,
+    auto_approve: bool = False,
 ):
     """Inner agent execution without locking or SSE publishing."""
     from pydantic_ai import Agent
@@ -177,6 +179,15 @@ async def _run_agent_inner(
         project_path, provider=provider, model=model,
         environment="gateway",
     )
+
+    # Auto-grant all approval gates (for Telegram and other headless channels)
+    if auto_approve:
+        from seeknal.ask.agents.tools._context import get_tool_context
+        ctx = get_tool_context()
+        ctx.require_report_approval = False
+        ctx.require_proof_publish_approval = False
+        ctx.require_proof_edit_approval = False
+        ctx.require_seeknal_report_publish_approval = False
 
     text_buffer: list[str] = []
 
