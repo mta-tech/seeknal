@@ -174,12 +174,24 @@ def create_agent(
     def _on_cost_update(cost_info):
         _cost_info["latest"] = cost_info
 
+    # Detect pydantic-deep API version for web/thinking capability params.
+    # v0.3.1 uses `include_web` (default False).
+    # v0.3.4+ uses `web_search`, `web_fetch`, `thinking` (default True).
+    # Google cannot mix function tools with built-in tools, so disable them.
+    import inspect
+    _sig = inspect.signature(create_deep_agent)
+    _web_kwargs: dict = {}
+    if "web_search" in _sig.parameters:
+        # v0.3.4+: disable built-in capabilities (breaks Google provider)
+        _web_kwargs = {"web_search": False, "web_fetch": False, "thinking": False}
+
     # Create pydantic-deep agent with full feature set
     agent = create_deep_agent(
         model=model_string,
         instructions=instructions,
         toolsets=toolsets_list,
         hooks=get_ask_hooks(),
+        **_web_kwargs,
         # Skills: bundled built-ins (report-generation, etc.) + per-project
         # user skills. Built-ins ship as SKILL.md files under
         # src/seeknal/ask/builtin_skills/ so `load_skill(...)` resolves
