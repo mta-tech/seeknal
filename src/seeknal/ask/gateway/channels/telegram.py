@@ -23,8 +23,9 @@ _MAX_MESSAGE_LENGTH = 4096
 
 # Telegram formatting instruction prepended to user messages
 _TELEGRAM_FORMAT_HINT = (
-    "[Format: plain text for Telegram. No markdown. Use dashes for bullets, "
-    "CAPS for emphasis, and simple indentation. No **bold**, *italic*, or ```code``` blocks.]\n\n"
+    "[Format: plain text for Telegram. No markdown syntax. "
+    "Use dashes for bullets. Write in normal sentence case. "
+    "No **bold**, *italic*, ```code``` blocks, or ALL CAPS.]\n\n"
 )
 
 
