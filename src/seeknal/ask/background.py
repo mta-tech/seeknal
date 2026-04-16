@@ -190,10 +190,24 @@ async def run_with_auto_background(
                 proc.kill()
                 return f"Background task timed out after {timeout}s total."
 
-        task_id = registry.submit(tool_name, description, _continuation())
+        # The internal task_id is used by drain_notifications + format_notification
+        # to route the completion message; the agent never sees it. DO NOT put the
+        # task_id into the user-facing message — the `task`/`check_task`/`list_active_tasks`
+        # tools come from subagents_pydantic_ai and track subagent delegations, NOT
+        # these backgrounded subprocess tool calls. A leaked task_id caused the
+        # agent to call check_task('<our id>') and get "Task not found" from the
+        # subagent registry, then retry the tool under a different title (creating
+        # a duplicate report). See `test_background_message_no_task_id_leak`.
+        registry.submit(tool_name, description, _continuation())
         return (
-            f"{_BACKGROUNDED_PREFIX} This operation is taking longer than "
-            f"{background_threshold}s. It will continue in the background "
-            f"(task_id: {task_id}). You will be notified when it completes — "
-            f"continue with other work or answer the user."
+            f"{_BACKGROUNDED_PREFIX} This operation is still running after "
+            f"{background_threshold}s and has been moved to the background. "
+            f"The result will be delivered automatically as a "
+            f"<background_task_result> message on the next agent turn — you "
+            f"do NOT need to poll for it. Do NOT call check_task() or "
+            f"list_active_tasks() on this operation; those tools belong to "
+            f"subagents_pydantic_ai's delegation toolset and track spawned "
+            f"subagents, not backgrounded subprocess tool calls like this "
+            f"one. Continue with other work or answer the user while it "
+            f"finishes."
         )

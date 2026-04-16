@@ -145,8 +145,12 @@ class TestSectionBuilders:
 
     def test_workflow_returns_content(self):
         result = _build_workflow()
-        assert "Pipeline Building" in result
-        assert "Semantic Layer" in result
+        # v2: workflow prose moved into builtin_skills/. The remaining
+        # workflow section is a thin pointer + discriminator quick reference.
+        assert "Workflow" in result
+        assert "load_skill" in result
+        assert "Generate report now" in result
+        assert "Publish to Seeknal Report Server" in result
 
     def test_memory_returns_content(self):
         result = _build_memory()
@@ -211,7 +215,8 @@ class TestDefaultBuilder:
     def test_identity_before_workflow(self):
         builder = create_default_builder()
         result = builder.build()
-        assert result.index("Seeknal Ask") < result.index("Pipeline Building")
+        # v2: workflow header is now "## Workflow" not "Pipeline Building"
+        assert result.index("Seeknal Ask") < result.index("## Workflow")
 
     def test_memory_section_after_boundary(self):
         builder = create_default_builder()

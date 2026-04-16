@@ -87,18 +87,15 @@ def _resolve_python_target(
 
 
 async def apply_draft(file_path: str, confirmed: bool = False) -> str:
-    """Apply a draft file to the seeknal project.
+    """Move a validated draft into the project's seeknal/<subdir>/ directory.
 
-    Moves the draft file from the project root into the appropriate
-    seeknal/ subdirectory. Manifest regeneration is deferred to
-    plan_pipeline / run_pipeline.
-
-    IMPORTANT: You must set confirmed=True to proceed. Show the user
-    what will be applied and get their confirmation first.
+    See the `build-pipeline-node` skill for the full workflow including the
+    mandatory dry_run_draft before apply, the user-confirmation gate, and the
+    target-path resolution from kind/name (YAML) or decorators (Python).
 
     Args:
-        file_path: Path to the draft file (e.g., 'draft_source_customers.yml').
-        confirmed: Must be True to actually apply. Set to False to preview.
+        file_path: Path to the draft (e.g. '.seeknal/drafts/draft_source_customers.yml').
+        confirmed: Must be True to actually apply. False returns a preview.
     """
     from seeknal.ask.agents.tools._context import get_tool_context
     from seeknal.ask.agents.tools._write_security import validate_draft_path

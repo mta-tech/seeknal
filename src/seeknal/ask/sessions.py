@@ -58,14 +58,41 @@ def generate_session_name() -> str:
 class SessionStore:
     """Manages session metadata and conversation history.
 
-    Each session is a directory under `<project>/.seeknal/sessions/`
-    containing:
+    Each session is a directory under ``<base>/.seeknal/sessions/{tenant_id}/``
+    (when constructed from a project path) or ``<sessions_dir>/{tenant_id}/``
+    (when constructed from a sessions_dir).
+
+    Contains:
     - ``metadata.json`` — name, status, timestamps, message count
     - ``messages.json`` — pydantic-ai conversation history
+
+    The ``tenant_id`` parameter scopes session storage so two tenants
+    using the same ``session_id`` never collide on disk. Defaults to
+    ``"default"`` for backward compatibility with single-tenant layouts.
     """
 
-    def __init__(self, project_path: Path) -> None:
-        self._base = project_path / ".seeknal" / "sessions"
+    def __init__(
+        self,
+        project_path: Path | None = None,
+        *,
+        sessions_dir: Path | None = None,
+        tenant_id: str = "default",
+    ) -> None:
+        if sessions_dir is not None:
+            base = sessions_dir
+        elif project_path is not None:
+            base = project_path / ".seeknal" / "sessions"
+        else:
+            raise ValueError("SessionStore requires project_path or sessions_dir")
+
+        # Tenant sub-directory. Default tenant uses the base directly to
+        # stay backward compatible with pre-multi-tenant layouts where
+        # sessions lived directly at `.seeknal/sessions/{session_id}/`.
+        if tenant_id == "default":
+            self._base = base
+        else:
+            self._base = base / tenant_id
+        self._tenant_id = tenant_id
         self._base.mkdir(parents=True, exist_ok=True)
 
     def _session_dir(self, name: str) -> Path:

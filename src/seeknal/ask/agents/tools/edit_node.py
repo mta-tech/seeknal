@@ -6,16 +6,15 @@ async def edit_node(
     new_content: str,
     confirmed: bool = False,
 ) -> str:
-    """Edit an existing pipeline node definition file.
+    """Replace an existing pipeline node file's content (YAML or Python).
 
-    Replaces the content of a YAML or Python file in the seeknal/ directory.
-    Shows a diff before applying and requires confirmation.
+    Shows a unified diff in preview mode. See the `build-pipeline-node` skill
+    for when to use this vs `apply_draft`.
 
     Args:
-        node_path: Relative path to the node file
-                   (e.g., 'seeknal/transforms/clean_orders.yml').
-        new_content: The complete new file content to write.
-        confirmed: Must be True to actually write. Set to False to preview diff.
+        node_path: Relative path (e.g. 'seeknal/transforms/clean_orders.yml').
+        new_content: The complete new file content.
+        confirmed: Must be True to write. False returns a diff preview.
     """
     import difflib
 

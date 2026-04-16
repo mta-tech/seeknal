@@ -1,0 +1,75 @@
+version: "3.8"
+
+services:
+  temporal:
+    image: temporalio/auto-setup:latest
+    container_name: seeknal-temporal
+    ports:
+      - "7233:7233"
+    environment:
+      - DB=sqlite
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+    volumes:
+      - temporal-data:/var/lib/temporal
+    restart: unless-stopped
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    container_name: seeknal-temporal-ui
+    ports:
+      - "8233:8080"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    depends_on:
+      - temporal
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: seeknal-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  seeknal-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    deploy:
+      replicas: ${GATEWAY_REPLICAS:-1}
+    ports:
+      - "8000-8004:8000"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=default
+      - TEMPORAL_TASK_QUEUE=seeknal-ask
+      - REDIS_URL=redis://redis:6379
+      - CALLBACK_BASE_URL=http://seeknal-gateway:8000
+      - CALLBACK_AUTH_TOKEN=${CALLBACK_AUTH_TOKEN:-}
+    env_file:
+      - .env
+    volumes:
+      - ./ecommerce:/app/project
+    depends_on:
+      - temporal
+      - redis
+    restart: unless-stopped
+
+  chat-web:
+    image: nginx:alpine
+    container_name: seeknal-chat-web
+    ports:
+      - "3000:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./static:/usr/share/nginx/html:ro
+    depends_on:
+      - seeknal-gateway
+    restart: unless-stopped
+
+volumes:
+  temporal-data:
+  redis-data:

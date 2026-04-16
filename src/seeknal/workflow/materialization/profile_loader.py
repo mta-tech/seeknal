@@ -657,6 +657,50 @@ class ProfileLoader:
             memory_limit=duckdb_data.get("memory_limit", "1GB"),
         )
 
+    def load_publish_profile(self, name: str = "default") -> Dict[str, Any]:
+        """Load a publish profile from the ``publish:`` section of profiles.yml.
+
+        Profile structure::
+
+            publish:
+              default:
+                server: https://reports.example.com
+                api_key: ${SEEKNAL_REPORT_API_KEY}
+
+        Args:
+            name: Profile name (default: "default")
+
+        Returns:
+            Dict with publish config, env vars interpolated
+
+        Raises:
+            ConfigurationError: If profile file missing, no publish section, or name not found
+        """
+        profile_data = self._load_profile_data()
+
+        if not profile_data:
+            raise ConfigurationError(
+                f"Profile file not found: {self.profile_path}. "
+                f"Create it with a 'publish:' section."
+            )
+
+        publish_section = profile_data.get("publish", {})
+        if not publish_section:
+            raise ConfigurationError(
+                "No 'publish' section in profiles.yml. "
+                "Add one with server and optional api_key."
+            )
+
+        profile = publish_section.get(name)
+        if not profile:
+            available = list(publish_section.keys())
+            raise ConfigurationError(
+                f"Publish profile '{name}' not found. "
+                f"Available profiles: {available}"
+            )
+
+        return interpolate_env_vars_in_dict(dict(profile))
+
     def load_starrocks_profile(self, name: str = "default") -> Dict[str, Any]:
         """
         Load a StarRocks connection profile from profiles.yml.

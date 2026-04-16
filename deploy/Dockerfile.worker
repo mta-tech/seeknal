@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv for fast dependency resolution
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Copy seeknal source and install with ask + temporal extras
+COPY seeknal-src/ /app/seeknal-src/
+RUN uv pip install --system --no-cache /app/seeknal-src[ask,temporal]
+
+# Worker mode: standalone Temporal worker, no HTTP server
+# Polls Temporal task queue and executes agent activities locally
+# POSTs streaming events to the gateway callback URL
+CMD ["python", "-m", "seeknal.cli.main", "gateway", "worker", \
+     "--project", "/app/project"]

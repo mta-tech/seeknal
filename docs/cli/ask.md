@@ -24,7 +24,7 @@ seeknal ask report list [OPTIONS]
 
 ## Description
 
-The `ask` command provides an AI agent that understands your seeknal project — tables, entities, pipelines, and code. It uses 12 built-in tools to discover data, write SQL, run Python analysis, and explain results.
+The `ask` command provides an AI agent that understands your seeknal project — tables, entities, pipelines, and code. It uses 16 thin tools for fast data access and 11 built-in skills for multi-step workflows like report generation, pipeline building, and data profiling. Skills load on demand via progressive disclosure, keeping the agent's context lean.
 
 Three modes of operation:
 
@@ -60,8 +60,18 @@ Your project must have data materialized (`seeknal run` has been executed).
 |------|------|---------|-------------|
 | `--provider`, `-p` | TEXT | `google` | LLM provider: `google`, `ollama` |
 | `--model`, `-m` | TEXT | None | Model name override (e.g., `gemini-2.5-pro`, `llama3`) |
-| `--project` | PATH | Auto-detected | Project path |
+| `--project` | PATH | Auto-detected | Project path (auto-loads `<path>/.env`) |
 | `--quiet`, `-q` | FLAG | False | Suppress step-by-step output, show only final answer |
+| `--web` | FLAG | False | Enable DuckDuckGo web search tools |
+
+### Chat Options
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--style`, `-s` | TEXT | `concise` | Output style: `concise`, `explanatory`, `formal`, `conversational` |
+| `--budget` | FLOAT | None | Max USD budget for this session |
+| `--session` | TEXT | None | Resume an existing named session |
+| `--name` | TEXT | None | Create a session with this name |
 
 ### Report Options
 
@@ -106,6 +116,18 @@ seeknal ask chat
 # Chat with a specific provider
 seeknal ask chat --provider ollama --model llama3
 
+# Chat with named session
+seeknal ask chat --name "q1-revenue-analysis"
+
+# Resume a session
+seeknal ask chat --session "q1-revenue-analysis"
+
+# Chat with output style and budget cap
+seeknal ask chat --style explanatory --budget 5.0
+
+# Enable web search for benchmarks
+seeknal ask chat --web
+
 # Chat with quiet mode
 seeknal ask chat -q
 ```
@@ -145,7 +167,7 @@ seeknal ask --provider ollama --model llama3 "Revenue by month"
 
 ## Agent Tools
 
-The agent has 12 tools it calls automatically based on your question:
+The agent has 16 thin tools for fast data access:
 
 | Tool | Description |
 |------|-------------|
@@ -161,6 +183,28 @@ The agent has 12 tools it calls automatically based on your question:
 | `read_project_file` | Read any project file |
 | `generate_report` | Create an interactive HTML report (Evidence.dev) |
 | `save_report_exposure` | Save a report as a YAML exposure for re-runs |
+| `profile_data` | Profile CSV/parquet files for schema and quality |
+| `query_metric` | Query business metrics from the semantic layer |
+| `publish_to_seeknal_report` | Publish a report to the Seeknal Report Server |
+| `open_in_browser` | Open a generated report in the browser |
+
+## Built-in Skills
+
+The agent also has 11 built-in skills for multi-step workflows. Skills are loaded on demand — the agent discovers them from frontmatter and loads the full instructions only when needed, keeping context lean:
+
+| Skill | Description |
+|-------|-------------|
+| `report-generation` | End-to-end Evidence.dev report: exploration, approval gate, build, codification |
+| `build-pipeline-node` | Scaffold, validate, apply, and run a new pipeline node |
+| `profile-data` | Profile data files for schema, nulls, uniques, join-key candidates |
+| `execute-python-analysis` | Statistical/ML/visualization work beyond SQL |
+| `query-metric` | Query metrics with automatic joins and time grain resolution |
+| `save-metric` | Codify ad-hoc metrics as permanent YAML definitions |
+| `save-report-exposure` | Codify analysis as repeatable YAML exposure specs |
+| `bootstrap-semantic-model` | Auto-generate semantic model YAML from data files |
+| `publish-to-seeknal-report` | Publish reports to the Seeknal Report Server |
+| `publish-memo-to-proof` | Publish markdown memos to Proof Editor |
+| `edit-proof-document` | Apply rewrites to Proof Editor documents |
 
 ## Report Exposures
 
@@ -200,4 +244,6 @@ Reports without `sections` run in **AI-guided mode** — the LLM explores data a
 - [Seeknal Ask Tutorial](../tutorials/seeknal-ask-agent.md) - Complete tutorial with examples
 - [Report Exposures Tutorial](../tutorials/report-exposures.md) - Build deterministic reports
 - [Exposures Concept](../concepts/exposures.md) - How exposures connect to the DAG
+- [seeknal gateway](gateway.md) - HTTP gateway for web clients and bots
+- [seeknal report-server](report-server.md) - Host and share published reports
 - [seeknal repl](repl.md) - Interactive SQL REPL

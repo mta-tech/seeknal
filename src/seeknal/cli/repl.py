@@ -331,7 +331,18 @@ class REPL:
         """Phase 3: Attach Iceberg catalogs via DuckDB Iceberg extension."""
         from seeknal.workflow.materialization.profile_loader import ProfileLoader
 
-        loader = ProfileLoader(profile_path=self.profile_path)
+        # Only auto-attach Iceberg catalogs that the PROJECT explicitly declares.
+        # Falling back to ~/.seeknal/profiles.yml would force every REPL session to
+        # connect to whatever global infra the user set up previously, even if this
+        # project has nothing to do with Iceberg.
+        resolved_profile = self.profile_path
+        if resolved_profile is None:
+            local_profile = self.project_path / "profiles.yml"
+            if not local_profile.exists():
+                return  # no project-local Iceberg config → skip silently
+            resolved_profile = local_profile
+
+        loader = ProfileLoader(profile_path=resolved_profile)
         profile_data = loader._load_profile_data()
         mat_config = profile_data.get("materialization", {})
         catalog_data = mat_config.get("catalog", {})

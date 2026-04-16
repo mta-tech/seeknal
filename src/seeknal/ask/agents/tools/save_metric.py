@@ -40,22 +40,19 @@ async def save_metric(
     denominator: str = "",
     confirmed: bool = False,
 ) -> str:
-    """Save an ad-hoc metric query as a permanent YAML metric definition.
+    """Persist an ad-hoc metric definition to seeknal/metrics/{name}.yml.
 
-    Creates a metric YAML file in seeknal/metrics/ that can be queried
-    via query_metric in future sessions.
-
-    IMPORTANT: You must set confirmed=True to proceed. Show the user
-    what will be saved and get their confirmation first.
+    See the `save-metric` skill for the simple/ratio type choice, the
+    preview→confirm flow, and error paths.
 
     Args:
-        name: Metric name (alphanumeric and underscores only).
-        measure: Measure name for simple metrics (e.g. 'total_revenue').
-        description: Human-readable description of the metric.
-        metric_type: Metric type: 'simple' or 'ratio'. Default 'simple'.
-        numerator: Numerator measure name (required for ratio metrics).
-        denominator: Denominator measure name (required for ratio metrics).
-        confirmed: Must be True to actually write. Set to False to preview.
+        name: Metric identifier (Python-identifier rules).
+        measure: Measure name (required for simple metrics).
+        description: Human-readable description.
+        metric_type: 'simple' or 'ratio' (default 'simple').
+        numerator: Required for ratio metrics.
+        denominator: Required for ratio metrics.
+        confirmed: Must be True to write. False returns a preview.
     """
     import yaml
 

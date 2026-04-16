@@ -14,11 +14,24 @@ _DATA_PATTERN = re.compile(
     r'|\b\d+\.\d+\b'
 )
 
-# Explanation context keywords -- answers about lineage/methodology don't need numbers
+# Explanation context keywords — answers about lineage/methodology don't need
+# numbers. Keep English + Indonesian so localized prose answers aren't
+# rejected as "low quality".
 _EXPLANATION_KEYWORDS = {
+    # English
     "pipeline", "transform", "lineage", "defined", "calculated",
     "produced", "flow",
+    # Indonesian / Bahasa (seeknal ask is used in ID contexts)
+    "pipeline", "transformasi", "alur", "dihitung", "dihasilkan",
+    "pendapatan", "penjualan", "pelanggan", "produk", "kategori",
+    "bisnis", "analisis", "tren", "pertumbuhan", "penurunan",
+    "segmen", "retensi", "pesanan",
 }
+
+# Any answer longer than this word count is presumed substantive and bypasses
+# the keyword/digit heuristics. The heuristics are useful for one-liners but
+# actively harmful on long-form prose where they trigger silent retries.
+_LONG_ANSWER_WORDS = 80
 
 
 def check_answer_quality(answer: str) -> tuple[bool, str]:
@@ -30,6 +43,11 @@ def check_answer_quality(answer: str) -> tuple[bool, str]:
     """
     if not answer or len(answer) < 50:
         return False, "Answer is too short to be useful"
+
+    # Long-form prose is presumed substantive. Keyword/digit heuristics are
+    # too brittle to reject an 80-word answer.
+    if len(answer.split()) >= _LONG_ANSWER_WORDS:
+        return True, ""
 
     # Check for numeric data
     if _DATA_PATTERN.search(answer):

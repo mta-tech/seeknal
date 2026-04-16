@@ -22,20 +22,18 @@ def save_report_exposure(
     output_format: str = "markdown",
     schedule: str = "",
 ) -> str:
-    """Save the current analysis as a repeatable report exposure YAML.
+    """Save the current analysis as a repeatable seeknal/exposures/{name}.yml spec.
 
-    Call this when the user wants to save an analysis as a regular scheduled
-    report.  The YAML file is written to seeknal/exposures/{name}.yml and can
-    be re-run with: seeknal ask report --exposure {name}
+    See the `save-report-exposure` skill for when to call this, the prompt
+    distillation phase, the snake_case naming rule, and the optional cron
+    schedule format. Re-run with `seeknal ask report --exposure {name}`.
 
     Args:
         name: Report name in snake_case (e.g. "monthly_revenue_report").
         prompt: The analysis prompt distilled from the conversation.
         inputs: JSON array of input refs, e.g. '["transform.monthly_revenue"]'.
-        output_format: Output format — "markdown", "html", or "both".
-        schedule: Optional cron schedule (e.g. "0 8 * * MON" for every Monday 8am).
-            When set, the exposure can be deployed to Prefect with:
-            seeknal prefect deploy --exposure {name} --work-pool <pool>
+        output_format: "markdown", "html", or "both".
+        schedule: Optional 5-field cron string (e.g. "0 8 * * MON").
     """
     from seeknal.ask.agents.tools._context import get_tool_context, require_report_approval
 

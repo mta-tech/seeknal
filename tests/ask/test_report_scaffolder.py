@@ -147,15 +147,40 @@ class TestScaffoldReport:
             scaffold_report(project_dir, "Test", [{"name": "a", "content": ""}])
 
     def test_overwrite_existing_warns(self, project_dir):
+        """v2: warning fires when overwriting a successfully-built report."""
         from seeknal.ask.report.scaffolder import scaffold_report
 
         pages = [{"name": "overview", "content": "# V1"}]
-        scaffold_report(project_dir, "Test", pages)
+        report_dir = scaffold_report(project_dir, "Test", pages)
+        # Simulate a successful build by creating the build artifact.
+        # The v2 warning fires only when a real built report would be lost.
+        (report_dir / "build").mkdir(parents=True, exist_ok=True)
+        (report_dir / "build" / "index.html").write_text("<html></html>")
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             scaffold_report(project_dir, "Test", [{"name": "overview", "content": "# V2"}])
             assert any("already exists" in str(warning.message) for warning in w)
+
+    def test_overwrite_after_failed_build_is_silent(self, project_dir):
+        """v2: scaffold-only retry (no build/index.html) should NOT warn.
+
+        Retries after Evidence build failures leave a scaffold dir behind
+        with no `build/index.html`. Warning on those retries was the noise
+        the post-refactor verification flagged.
+        """
+        from seeknal.ask.report.scaffolder import scaffold_report
+
+        pages = [{"name": "overview", "content": "# V1"}]
+        scaffold_report(project_dir, "Test", pages)
+        # Note: no build/index.html created — simulates a failed first build.
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            scaffold_report(project_dir, "Test", [{"name": "overview", "content": "# V2"}])
+            assert not any(
+                "already exists" in str(warning.message) for warning in w
+            ), "v2 should NOT warn when overwriting a failed-build scaffold"
 
     def test_duckdb_has_views(self, project_dir):
         from seeknal.ask.report.scaffolder import scaffold_report

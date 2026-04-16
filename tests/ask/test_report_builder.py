@@ -2,7 +2,6 @@
 
 import os
 import shutil
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -165,3 +164,54 @@ class TestBuildIntegration:
     """Integration tests that require Node.js."""
 
     pass  # Placeholder for actual integration tests
+
+
+class TestCopyNpmrcToCache:
+    """Regression: .npmrc lives in the report dir but npm install runs in
+    the shared cache dir. Without mirroring the .npmrc, the legacy-peer-deps
+    flag is lost and Evidence v40's svelte-preprocess/stylus conflict
+    aborts every fresh install.
+    """
+
+    def test_copies_existing_npmrc(self, tmp_path):
+        from seeknal.ask.report.builder import _copy_npmrc_to_cache
+
+        report = tmp_path / "report"
+        cache = tmp_path / ".evidence-cache"
+        report.mkdir()
+        cache.mkdir()
+        (report / ".npmrc").write_text("legacy-peer-deps=true\n")
+
+        _copy_npmrc_to_cache(report, cache)
+
+        assert (cache / ".npmrc").is_file()
+        assert "legacy-peer-deps=true" in (cache / ".npmrc").read_text()
+
+    def test_synthesizes_fallback_when_scaffolder_did_not_run(self, tmp_path):
+        from seeknal.ask.report.builder import _copy_npmrc_to_cache
+
+        report = tmp_path / "report"
+        cache = tmp_path / ".evidence-cache"
+        report.mkdir()
+        cache.mkdir()
+        # No .npmrc in report dir
+
+        _copy_npmrc_to_cache(report, cache)
+
+        assert (cache / ".npmrc").is_file()
+        assert "legacy-peer-deps=true" in (cache / ".npmrc").read_text()
+
+    def test_install_command_includes_legacy_peer_deps_flag(self):
+        """Defense-in-depth: both sync and async paths pass the flag explicitly.
+
+        The .npmrc is the primary mechanism; the CLI flag is a belt-and-
+        suspenders guarantee in case the .npmrc write fails or a custom
+        caller skips it.
+        """
+        import inspect
+        from seeknal.ask.report import builder
+
+        sync_src = inspect.getsource(builder._ensure_node_modules)
+        async_src = inspect.getsource(builder._async_ensure_node_modules)
+        assert "--legacy-peer-deps" in sync_src
+        assert "--legacy-peer-deps" in async_src

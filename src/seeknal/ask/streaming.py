@@ -28,10 +28,74 @@ from seeknal.ask.agents.tools._context import reset_report_approval
 # Strip raw ANSI escape sequences from tool output to prevent terminal injection
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
+# Broader CSI family — catches function keys (\x1b[15~ for F5), bracketed-
+# paste markers (\x1b[200~ … \x1b[201~), and any other escape that leaks
+# into Python's input() from IDE shortcut passthrough. Covers both the
+# a-zA-Z SGR terminator and the ~ terminator used for non-alphabetic
+# sequences like F1-F12.
+_CSI_ANY = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z~]")
+
 
 def _sanitize_output(text: str) -> str:
     """Strip raw ANSI escape codes from tool output before rendering."""
     return _ANSI_ESCAPE.sub("", text)
+
+
+def _sanitize_user_input(text: str) -> str:
+    """Strip ANSI/CSI escape sequences from user input.
+
+    Terminal escape sequences leak into Python's ``input()`` from:
+    1. IDE keyboard shortcuts (e.g. VS Code's "Developer: Reload Window"
+       which arrives as a pasted multi-line block wrapped in bracketed-
+       paste markers).
+    2. Function keys (F1-F12) passed through by unusual tmux bindings.
+    3. Mouse/cursor sequences when the terminal is misconfigured.
+
+    Dropping all of these keeps the agent's question clean.
+    """
+    if not text:
+        return text
+    return _CSI_ANY.sub("", text)
+
+
+def _extract_tool_result_text(result: Any) -> str:
+    """Get a plain-text view of a pydantic-ai tool result.
+
+    ``ToolReturnPart.content`` may be a string, a list of content parts
+    (TextPart / MultiModalContent), or an arbitrary Python object. Calling
+    ``str()`` on a list produces the Python repr, not the joined text, which
+    breaks the downstream ``'|' in output`` SQL-table guard. Prefer the
+    ``model_response_str`` helper when available, then fall through.
+    """
+    if result is None:
+        return ""
+    # Preferred: pydantic-ai's own text-serialization helper
+    model_str = getattr(result, "model_response_str", None)
+    if callable(model_str):
+        try:
+            rendered = model_str()
+        except Exception:
+            rendered = None
+        if isinstance(rendered, str):
+            return rendered
+    content = getattr(result, "content", result)
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            inner = getattr(part, "content", None)
+            if isinstance(inner, str):
+                parts.append(inner)
+            else:
+                parts.append(str(part))
+        return "".join(parts)
+    return str(content)
 
 
 
@@ -71,6 +135,29 @@ def _show_tool_start(console: Console, name: str, args: Optional[dict] = None) -
         task_id = args.get("task_id", "")
         console.print(f"\n[dim]> check_task({escape(str(task_id))})[/dim]")
         return
+    # submit_plan: render the plan as a titled panel so the user can see
+    # what the agent is about to do. Without this branch the plan is dumped
+    # as a dim one-liner and easily missed.
+    if name == "submit_plan" and args and "steps" in args:
+        from rich.panel import Panel
+        from rich.text import Text
+
+        raw_steps = args.get("steps") or []
+        if isinstance(raw_steps, list) and raw_steps:
+            body = Text()
+            for i, step in enumerate(raw_steps, 1):
+                body.append(f"{i}. ", style="bold")
+                body.append(f"{step}\n")
+            console.print()
+            console.print(
+                Panel(
+                    body,
+                    title="Plan",
+                    border_style="brand.accent",
+                    padding=(0, 1),
+                )
+            )
+            return
     console.print(f"\n[bold]> {escape(name)}[/bold]")
     if args and name == "execute_sql" and "sql" in args:
         _show_sql(console, args["sql"])
@@ -80,6 +167,12 @@ def _show_tool_start(console: Console, name: str, args: Optional[dict] = None) -
         console.print(f"  [dim]Title: {escape(args['title'])}[/dim]")
     elif args and name == "save_report_exposure" and "name" in args:
         console.print(f"  [dim]Name: {escape(args['name'])}[/dim]")
+    elif args and name == "publish_to_proof" and "title" in args:
+        console.print(f"  [dim]Title: {escape(args['title'])}[/dim]")
+    elif args and name == "read_proof_document" and "url" in args:
+        console.print(f"  [dim]URL: {escape(str(args['url']))}[/dim]")
+    elif args and name == "edit_proof_document" and "url" in args:
+        console.print(f"  [dim]URL: {escape(str(args['url']))}[/dim]")
     elif args:
         # Show truncated args for other tools
         arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
@@ -95,7 +188,7 @@ def _show_tool_end(console: Console, name: str, output: str) -> None:
     # Subagent task result: compact summary
     if name == "task":
         summary = output[:300] + "..." if len(output) > 300 else output
-        console.print(f"  [status.success]⎿ Done[/]")
+        console.print("  [status.success]⎿ Done[/]")
         if summary.strip():
             # Show first 2 lines of result
             lines = summary.strip().split("\n")[:2]
@@ -108,6 +201,11 @@ def _show_tool_end(console: Console, name: str, output: str) -> None:
         console.print(f"  [dim]{escape(summary)}[/dim]")
         return
 
+    # Suppress the trailing "Done: Plan submitted with N steps..." line for
+    # submit_plan — the plan panel rendered by _show_tool_start is the only
+    # visible surface the user needs.
+    if name == "submit_plan":
+        return
     if name == "execute_sql" and "|" in output:
         _show_sql_result_table(console, output)
     elif name == "execute_python":
@@ -119,6 +217,18 @@ def _show_tool_end(console: Console, name: str, output: str) -> None:
             console.print(f"  [status.error]{escape(output)}[/]")
         else:
             console.print(f"  [status.success]{escape(output)}[/]")
+    elif name == "publish_to_proof":
+        if output.startswith("Error"):
+            console.print(f"  [status.error]{escape(output)}[/]")
+        else:
+            console.print(f"  [status.success]{escape(output)}[/]")
+    elif name in ("read_proof_document", "edit_proof_document"):
+        if output.startswith("Error"):
+            console.print(f"  [status.error]{escape(output)}[/]")
+        else:
+            console.print(f"  [status.success]{escape(output[:500])}[/]")
+            if len(output) > 500:
+                console.print(f"  [dim]... ({len(output) - 500} more chars)[/dim]")
     else:
         summary = output[:200] + "..." if len(output) > 200 else output
         console.print(f"  [dim]Done: {escape(summary)}[/dim]")
@@ -199,34 +309,170 @@ def _launch_report_action(console: Console, launcher_path: Path) -> None:
 
 
 def _maybe_offer_report_action(console: Console, output: str) -> None:
-    """Offer a direct TUI action to open a freshly built report."""
+    """Offer a direct TUI action on a freshly built report.
+
+    Options include opening the local build in a browser, publishing the
+    build to a Seeknal Report Server (returns a shareable URL), or hinting
+    the Proof memo path. The Seeknal publish action runs entirely in-process
+    — it packages the build tree, POSTs to the configured server, and prints
+    the share URL + owner secret.
+    """
     if not sys.stdout.isatty():
         return
 
-    _html_path, browser_path = _extract_report_paths(output)
+    html_path, browser_path = _extract_report_paths(output)
     if browser_path is None or not browser_path.exists():
         return
 
+    # Extract report slug from the build path (target/reports/{slug}/build/index.html)
+    report_slug: Optional[str] = None
+    if html_path is not None:
+        try:
+            parts = html_path.parts
+            idx = parts.index("reports")
+            report_slug = parts[idx + 1]
+        except (ValueError, IndexError):
+            report_slug = None
+
     from seeknal.ui.interactive_menu import InteractiveMenu
+
+    options = [
+        {
+            "label": "Open in browser",
+            "description": "Launch the generated report from this TUI session",
+            "recommended": "true",
+        },
+    ]
+    if report_slug:
+        options.append({
+            "label": "Publish to Seeknal Report Server",
+            "description": "Upload the built report and get a shareable URL from a Seeknal Report Server",
+        })
+    options.extend([
+        {
+            "label": "Publish memo to Proof",
+            "description": "Draft and publish a markdown summary to Proof (ask the agent in the next turn)",
+        },
+        {
+            "label": "Continue",
+            "description": "Keep working without opening the report right now",
+        },
+    ])
 
     menu = InteractiveMenu(
         question="Report ready. What do you want to do next?",
-        options=[
-            {
-                "label": "Open in browser",
-                "description": "Launch the generated report from this TUI session",
-                "recommended": "true",
-            },
-            {
-                "label": "Continue",
-                "description": "Keep working without opening the report right now",
-            },
-        ],
+        options=options,
         console=console,
     )
     answer = menu.run()
     if answer == "Open in browser":
         _launch_report_action(console, browser_path)
+    elif answer == "Publish to Seeknal Report Server" and report_slug:
+        _publish_to_seeknal_report_action(console, report_slug)
+    elif answer == "Publish memo to Proof":
+        console.print(
+            "  [dim]Type your next message: 'publish this as a memo to Proof' — "
+            "the agent will compose the markdown and upload it.[/]"
+        )
+
+
+def _publish_to_seeknal_report_action(console: Console, report_slug: str) -> None:
+    """Package and POST the built report to the Seeknal Report Server.
+
+    Resolves server + api_key from env vars (SEEKNAL_PUBLISH_SERVER /
+    SEEKNAL_PUBLISH_TOKEN) first, then falls back to the `publish.default`
+    section of the project's profiles.yml. Prints the share URL + owner
+    secret on success.
+    """
+    import os
+    from pathlib import Path
+
+    # Use the ask agent's tool context so `--project` (or auto-detected
+    # project path) is respected. Falling back to Path.cwd() broke users
+    # running `seeknal ask chat --project <elsewhere>` from the seeknal
+    # repo itself.
+    try:
+        from seeknal.ask.agents.tools._context import get_tool_context
+        project_path = get_tool_context().project_path
+    except RuntimeError:
+        project_path = Path.cwd()
+
+    build_dir = project_path / "target" / "reports" / report_slug / "build"
+    if not build_dir.is_dir():
+        console.print(f"  [status.error]Build directory not found: {build_dir}[/]")
+        return
+
+    server = os.environ.get("SEEKNAL_PUBLISH_SERVER")
+    api_key = os.environ.get("SEEKNAL_PUBLISH_TOKEN")
+    if not server:
+        try:
+            from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+            # Prefer the project's local profiles.yml over ~/.seeknal/profiles.yml
+            # so publish config lives next to the project it publishes.
+            local_profiles = project_path / "profiles.yml"
+            loader = (
+                ProfileLoader(profile_path=local_profiles)
+                if local_profiles.exists()
+                else ProfileLoader()
+            )
+            profile = loader.load_publish_profile("default")
+            server = profile.get("server")
+            if not api_key:
+                api_key = profile.get("api_key")
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"  [status.error]Could not load publish profile: {escape(str(exc))}[/]")
+            return
+    if not server:
+        console.print(
+            "  [status.error]No publish server configured. Set SEEKNAL_PUBLISH_SERVER or "
+            "add publish.default.server to profiles.yml.[/]"
+        )
+        return
+
+    try:
+        from seeknal.publish.client import PublishClient
+        from seeknal.publish.ledger import LedgerEntry, append_entry
+        from seeknal.publish.packager import package_build
+
+        try:
+            rel = build_dir.relative_to(project_path)
+        except ValueError:
+            rel = build_dir
+        console.print(f"  [dim]Packaging {rel}...[/]")
+        tarball = package_build(build_dir)
+        try:
+            console.print(f"  [dim]Publishing to {server}...[/]")
+            client = PublishClient(server, api_key)
+            response = client.publish(tarball, report_slug, report_slug)
+        finally:
+            tarball.unlink(missing_ok=True)
+
+        try:
+            append_entry(
+                LedgerEntry(
+                    slug=response.slug,
+                    server=server,
+                    share_url=response.share_url,
+                    report_name=report_slug,
+                    published_at=response.created_at,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        full_url = (
+            response.share_url
+            if response.share_url.startswith("http")
+            else f"{server.rstrip('/')}{response.share_url}"
+        )
+        console.print(f"  [status.success]Published: {escape(full_url)}[/]")
+        console.print(
+            f"  [dim]Owner secret (save this — it is not retrievable later): "
+            f"{escape(response.owner_secret)}[/]"
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"  [status.error]Publish failed: {escape(str(exc))}[/]")
 
 
 
@@ -362,33 +608,47 @@ async def _stream_one_pass(
         FunctionToolCallEvent,
         FunctionToolResultEvent,
         PartDeltaEvent,
+        PartStartEvent,
+        TextPart,
         TextPartDelta,
     )
 
     from pydantic_ai.usage import UsageLimits
 
-    import seeknal.ask.config as _ask_config
+    from seeknal.ask.agents.tools._context import get_tool_context
     from seeknal.ui.ask_spinner import AskSpinner
 
     text_buffer: list[str] = []
     spinner = AskSpinner("Thinking")
     spinner.start()
 
+    ctx = get_tool_context()
     async with agent.iter(
         question,
         deps=deps,
         message_history=message_history,
-        usage_limits=UsageLimits(request_limit=_ask_config._active_request_limit),
+        usage_limits=UsageLimits(request_limit=ctx.request_limit),
     ) as run:
         async for node in run:
             if isinstance(node, UserPromptNode):
                 continue
 
             elif Agent.is_model_request_node(node):
-                # Stream text tokens from the model
+                # Stream text tokens from the model. We must handle
+                # PartStartEvent as well as PartDeltaEvent: when a new text
+                # part starts, its initial `content` arrives inside the
+                # start event's `part`, and subsequent chunks arrive as
+                # TextPartDelta. Dropping PartStartEvent silently loses
+                # the first characters of the model's answer (e.g. the
+                # final answer appearing as "...ai ini dihitung..." with
+                # the leading "Nil" missing).
                 async with node.stream(run.ctx) as request_stream:
                     async for event in request_stream:
-                        if isinstance(event, PartDeltaEvent):
+                        if isinstance(event, PartStartEvent):
+                            if isinstance(event.part, TextPart) and event.part.content:
+                                spinner.stop()
+                                text_buffer.append(event.part.content)
+                        elif isinstance(event, PartDeltaEvent):
                             if isinstance(event.delta, TextPartDelta):
                                 spinner.stop()
                                 text_buffer.append(event.delta.content_delta)
@@ -397,17 +657,28 @@ async def _stream_one_pass(
 
             elif Agent.is_call_tools_node(node):
                 spinner.stop()
-                # Flush text buffer as reasoning before tool calls
-                if text_buffer:
-                    _show_reasoning(console, "".join(text_buffer))
-                    text_buffer.clear()
-
-                # Stream tool call and result events
+                # Stream tool call and result events. Flush any buffered
+                # model text as an Answer panel on the FIRST tool call in
+                # this node — the text that arrives before bookkeeping
+                # tools (update_todo_status, ask_user) is substantive prose
+                # that the user needs to see prominently, not dim reasoning.
+                # Pydantic-ai always visits a call_tools node after every
+                # model_request node, even when the model produced a final
+                # answer with zero tool calls; in that case no tool event
+                # fires, the buffer survives to the end-of-stream branch,
+                # and _show_answer renders it there instead.
                 subagent_spinner: AskSpinner | None = None
                 tool_spinner: AskSpinner | None = None
+                saw_tool_call = False
                 async with node.stream(run.ctx) as handle_stream:
                     async for event in handle_stream:
                         if isinstance(event, FunctionToolCallEvent):
+                            if not saw_tool_call and text_buffer:
+                                flushed = "".join(text_buffer).strip()
+                                if flushed:
+                                    _show_answer(console, flushed)
+                                text_buffer.clear()
+                            saw_tool_call = True
                             tool_name = event.part.tool_name
                             tool_args = event.part.args_as_dict()
                             spinner.increment_tool_uses()
@@ -432,8 +703,7 @@ async def _stream_one_pass(
                                 tool_spinner.stop()
                                 tool_spinner = None
                             tool_name = event.result.tool_name
-                            content = event.result.content
-                            output = str(content) if content else ""
+                            output = _extract_tool_result_text(event.result)
                             from seeknal.ask.background import _BACKGROUNDED_PREFIX
                             if output.startswith(_BACKGROUNDED_PREFIX):
                                 console.print(
@@ -562,6 +832,12 @@ async def _stream_quality_gate(
     if passes:
         return answer
 
+    # Tell the user why the agent is running again — otherwise the silent
+    # second pass looks like random churn on screen.
+    console.print(
+        f"\n[dim]--- Quality gate: {escape(reason)} — requesting a richer answer... ---[/dim]\n"
+    )
+
     # One quality retry with guidance
     retry_answer, updated_history = await _stream_one_pass(
         agent, deps, message_history, reason, console
@@ -570,6 +846,116 @@ async def _stream_quality_gate(
     message_history.extend(updated_history)
 
     return retry_answer if retry_answer else answer
+
+
+def _save_chat_error_log(e: Exception) -> Optional[Path]:
+    """Save a full traceback for a chat-loop exception to ~/.seeknal/last-chat-error.log.
+
+    Best-effort: returns the path on success, None if the log itself failed
+    (we never want a logging failure to crash the chat loop). Appends rather
+    than overwrites so multiple errors in one session are all captured.
+    """
+    import os
+    import traceback
+    from datetime import datetime
+
+    try:
+        log_dir = Path(os.path.expanduser("~/.seeknal"))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "last-chat-error.log"
+
+        ts = datetime.now().isoformat(timespec="seconds")
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(f"\n=== {ts} {type(e).__name__}: {e} ===\n")
+            f.write(traceback.format_exc())
+            f.write("\n")
+        return log_path
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _format_chat_loop_error(
+    e: Exception, log_path: Optional[Path] = None
+) -> str:
+    """Format a chat-loop exception into a structured user-facing message.
+
+    Detects common categories (network/DNS, connection, timeout, auth) and
+    emits actionable hints. Falls back to the raw `str(e)` for unrecognized
+    errors. The opaque `[Errno 8] nodename nor servname provided, or not
+    known` from socket.gaierror — which previously dumped through the chat
+    loop with no context — now becomes a multi-line breakdown of likely
+    causes.
+    """
+    import socket
+
+    err_type = type(e).__name__
+    err_msg = str(e)
+
+    # DNS / name-resolution errors. The macOS "nodename nor servname" wording
+    # and the Linux "Name or service not known" / "Temporary failure in name
+    # resolution" all map to socket.gaierror but can also appear wrapped in
+    # OSError or httpx ConnectError, so we string-match too.
+    is_dns = (
+        isinstance(e, socket.gaierror)
+        or "[Errno 8]" in err_msg
+        or "nodename nor servname" in err_msg
+        or "Name or service not known" in err_msg
+        or "Temporary failure in name resolution" in err_msg
+    )
+
+    # Pull the failing request URL from httpx exceptions when available —
+    # this is the single most useful diagnostic for "which call broke".
+    httpx_url: Optional[str] = None
+    is_connect_error = False
+    is_timeout = False
+    try:
+        import httpx
+        if isinstance(e, httpx.HTTPError):
+            req = getattr(e, "request", None)
+            if req is not None:
+                try:
+                    httpx_url = str(req.url)
+                except Exception:  # noqa: BLE001
+                    httpx_url = None
+        if isinstance(e, (httpx.ConnectError, getattr(httpx, "RemoteProtocolError", type(None)))):
+            is_connect_error = True
+        if isinstance(e, (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout)):
+            is_timeout = True
+    except ImportError:
+        pass
+
+    # Generic connection error fallback (non-httpx, non-DNS)
+    if not is_connect_error and not is_dns and isinstance(e, (ConnectionError, OSError)):
+        is_connect_error = True
+
+    parts: list[str] = []
+
+    if is_dns:
+        parts.append("[status.error]Network/DNS error during agent call.[/]")
+        parts.append("")
+        parts.append("[text.dim]Most common causes:[/]")
+        parts.append("  • LLM provider host unreachable (Gemini / OpenAI / Ollama) — check internet")
+        parts.append("  • A tool's HTTP backend is unreachable — Proof Editor, Seeknal Report Server")
+        parts.append("  • Empty/malformed env var: PROOF_BASE_URL, SEEKNAL_PUBLISH_SERVER, HTTP_PROXY, HTTPS_PROXY")
+        parts.append("  • Custom model endpoint configured but invalid (check SEEKNAL_ASK_MODEL)")
+    elif is_timeout:
+        parts.append("[status.error]Timeout during agent call.[/]")
+        parts.append("[text.dim]The remote host accepted the connection but didn't respond in time.[/]")
+    elif is_connect_error:
+        parts.append("[status.error]Connection error during agent call.[/]")
+        parts.append("[text.dim]Could not establish a network connection — host unreachable, port closed, or interrupted.[/]")
+    else:
+        parts.append(f"[status.error]Error: {err_msg}[/]")
+
+    if (is_dns or is_timeout or is_connect_error) and httpx_url:
+        parts.append(f"\n[text.dim]Failing request URL: {httpx_url}[/]")
+    if is_dns or is_timeout or is_connect_error:
+        parts.append(f"[text.dim]Raw error ({err_type}): {err_msg}[/]")
+
+    if log_path:
+        parts.append(f"[text.dim]Full traceback saved to: {log_path}[/]")
+
+    return "\n".join(parts)
 
 
 async def chat_session(
@@ -614,7 +1000,7 @@ async def chat_session(
                 console.print("\nGoodbye!")
             break
 
-        question = question.strip()
+        question = _sanitize_user_input(question).strip()
         if not question:
             continue
         if question.lower() in ("exit", "quit", "q"):
@@ -675,4 +1061,5 @@ async def chat_session(
                 message_history.extend(e.messages)
                 console.print(f"\n[brand.primary]Rewound to:[/] [dim]{e.label}[/]\n")
                 continue
-            console.print(f"[status.error]Error: {e}[/]\n")
+            log_path = _save_chat_error_log(e)
+            console.print(_format_chat_loop_error(e, log_path) + "\n")

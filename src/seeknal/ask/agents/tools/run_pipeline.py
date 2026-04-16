@@ -11,23 +11,16 @@ async def run_pipeline(
     full: bool = False,
     confirmed: bool = False,
 ) -> str:
-    """Execute the seeknal pipeline.
+    """Execute the seeknal pipeline (or a subset of nodes) via `seeknal run`.
 
-    Runs all nodes (or a subset) in topological order. This executes
-    real data transformations and may take time.
-
-    IMPORTANT: You must set confirmed=True to proceed. Running a pipeline
-    modifies output files and may write to external systems.
+    See the `build-pipeline-node` skill for the run phase and node-targeting
+    conventions. Default timeout 300s (override via SEEKNAL_RUN_TIMEOUT).
 
     Args:
-        nodes: Optional comma-separated node IDs to run
-               (e.g., 'transform.clean,transform.enrich').
-               If empty, runs all nodes.
-        full: If True, ignore cache and re-run everything.
-        confirmed: Must be True to actually run. Set to False to preview.
+        nodes: Comma-separated node IDs (e.g. 'transform.clean'). Empty = all.
+        full: True to ignore cache and re-run everything.
+        confirmed: Must be True to actually run. False returns a preview.
     """
-    import subprocess
-
     from seeknal.ask.agents.tools._context import get_tool_context
 
     ctx = get_tool_context()
@@ -49,22 +42,26 @@ async def run_pipeline(
             f"Call run_pipeline({_format_args(nodes, full)}, confirmed=True) to proceed."
         )
 
+    import asyncio
+
+    proc: asyncio.subprocess.Process | None = None
     try:
-        with ctx.fs_lock:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=str(ctx.project_path),
-            )
+        # Use async subprocess to avoid blocking the event loop
+        # (critical for multi-user gateway concurrency)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(ctx.project_path),
+        )
 
-            stdout_lines: list[str] = []
-            console = ctx.console  # May be None (sync/quiet mode)
+        stdout_lines: list[str] = []
+        console = ctx.console  # May be None (sync/quiet mode)
 
-            # Read stdout line-by-line for real-time progress
-            for line in proc.stdout:
-                stripped = line.rstrip()
+        # Read stdout line-by-line for real-time progress (non-blocking)
+        if proc.stdout:
+            async for line_bytes in proc.stdout:
+                stripped = line_bytes.decode().rstrip()
                 stdout_lines.append(stripped)
                 if console and stripped:
                     try:
@@ -74,8 +71,11 @@ async def run_pipeline(
                     except Exception:
                         pass  # Don't let display errors break the pipeline
 
-            proc.wait(timeout=_RUN_TIMEOUT)
-            stderr_output = proc.stderr.read()
+        await asyncio.wait_for(proc.wait(), timeout=_RUN_TIMEOUT)
+        stderr_output = ""
+        if proc.stderr:
+            stderr_bytes = await proc.stderr.read()
+            stderr_output = stderr_bytes.decode()
 
         output = "\n".join(stdout_lines).strip()
         errors = stderr_output.strip()
@@ -132,9 +132,10 @@ async def run_pipeline(
                 + (f"Failed model source:\n```python\n{model_source}\n```\n\n" if model_source else "")
                 + f"Full errors:\n{errors}"
             )
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+    except asyncio.TimeoutError:
+        if proc is not None:
+            proc.kill()
+            await proc.wait()
         return f"Pipeline timed out after {_RUN_TIMEOUT} seconds. Set SEEKNAL_RUN_TIMEOUT env var to increase."
     except FileNotFoundError:
         return "seeknal CLI not found. Ensure seeknal is installed and on PATH."

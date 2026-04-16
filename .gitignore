@@ -90,3 +90,4 @@ trees/
 .auto-claude-status
 .claude/specs/task-analysis.json
 /specs/
+.gstack/

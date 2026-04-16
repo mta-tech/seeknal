@@ -12,15 +12,16 @@ By completing this tutorial, you will:
 
 1. Ask **one-shot questions** about your data in natural language
 2. Use **interactive chat** for multi-turn exploratory analysis
-3. Understand the **12 built-in tools** the agent uses automatically
+3. Understand the **16 tools + 11 skills** the agent uses automatically
 4. Configure **LLM providers** (Google Gemini, Ollama)
 5. Generate **interactive HTML reports** and **deterministic report exposures**
+6. **Publish reports** to the Seeknal Report Server for sharing
 
 ---
 
 ## Overview
 
-`seeknal ask` is an AI-powered agent that understands your seeknal project — tables, entities, pipelines, and code. You ask questions in plain English, and the agent discovers data, writes SQL, runs analysis, and explains results.
+`seeknal ask` is an AI-powered agent that understands your seeknal project — tables, entities, pipelines, and code. It uses 16 thin tools for fast data access and 11 built-in skills for multi-step workflows. You ask questions in plain English, and the agent discovers data, writes SQL, runs analysis, and explains results.
 
 ```
 You: "What are the top 5 customers by revenue?"
@@ -118,6 +119,16 @@ Type `exit`, `quit`, or press `Ctrl-C` to end the session.
 # Use a specific provider
 seeknal ask chat --provider ollama --model llama3
 
+# Named sessions — resume later
+seeknal ask chat --name "q1-analysis"
+seeknal ask chat --session "q1-analysis"
+
+# Output style and budget cap
+seeknal ask chat --style explanatory --budget 5.0
+
+# Enable web search
+seeknal ask chat --web
+
 # With quiet mode
 seeknal ask chat -q
 
@@ -129,9 +140,11 @@ seeknal ask chat --project ./my-project
 
 ## Part 3: The Agent's Toolbox (5 minutes)
 
-The agent has 12 tools it calls automatically based on your question. You never call these directly — the agent decides when and how to use them.
+The agent uses a **thin tools + fat skills** architecture. 16 thin tools handle fast, atomic operations. 11 built-in skills provide multi-step workflows that load on demand. You never call these directly — the agent decides when and how to use them.
 
-### Data Discovery
+### Thin Tools (always available)
+
+#### Data Discovery
 
 | Tool | What It Does |
 |------|-------------|
@@ -139,15 +152,17 @@ The agent has 12 tools it calls automatically based on your question. You never 
 | `describe_table` | Shows columns, types, row count, and sample values for a table |
 | `get_entities` | Lists all entities defined in the project |
 | `get_entity_schema` | Shows the schema for a specific entity |
+| `profile_data` | Profiles CSV/parquet files for schema, nulls, uniques, and join-key candidates |
 
-### Data Analysis
+#### Data Analysis
 
 | Tool | What It Does |
 |------|-------------|
 | `execute_sql` | Runs read-only DuckDB SQL queries (with auto-retry on errors) |
 | `execute_python` | Runs Python code in a sandboxed subprocess with `pandas`, `numpy`, `scipy`, and `matplotlib` pre-loaded |
+| `query_metric` | Queries business metrics from the semantic layer |
 
-### Project Understanding
+#### Project Understanding
 
 | Tool | What It Does |
 |------|-------------|
@@ -156,12 +171,32 @@ The agent has 12 tools it calls automatically based on your question. You never 
 | `search_project_files` | Searches all project files (code, configs, YAML) |
 | `read_project_file` | Reads any file in the project directory |
 
-### Report Generation
+#### Reporting & Publishing
 
 | Tool | What It Does |
 |------|-------------|
 | `generate_report` | Creates an interactive HTML report using Evidence.dev |
 | `save_report_exposure` | Saves a report as a YAML exposure for scheduled re-runs |
+| `publish_to_seeknal_report` | Publishes a built report to the Seeknal Report Server |
+| `open_in_browser` | Opens a generated report in the browser |
+
+### Built-in Skills (loaded on demand)
+
+Skills are multi-step workflows that the agent discovers and loads when needed. They provide detailed instructions for complex tasks while keeping the agent's baseline context lean:
+
+| Skill | What It Does |
+|-------|-------------|
+| `report-generation` | End-to-end Evidence.dev report: data exploration, draft approval, build, and codification |
+| `build-pipeline-node` | Scaffold, validate, apply, and run a new pipeline node from natural language |
+| `profile-data` | Comprehensive data profiling with quality assessment and join-key detection |
+| `execute-python-analysis` | Guided statistical/ML/visualization work in the Python sandbox |
+| `query-metric` | Semantic layer metric queries with automatic joins and time grain resolution |
+| `save-metric` | Codify ad-hoc metric queries as permanent YAML definitions |
+| `save-report-exposure` | Codify completed analyses as repeatable YAML exposure specs |
+| `bootstrap-semantic-model` | Auto-generate semantic model YAML from CSV/parquet files |
+| `publish-to-seeknal-report` | Guided publishing workflow to the Seeknal Report Server |
+| `publish-memo-to-proof` | Publish markdown memos to Proof Editor with shareable URLs |
+| `edit-proof-document` | Apply full-document rewrites to Proof Editor documents |
 
 ### How tools chain together
 
@@ -263,6 +298,46 @@ seeknal ask report serve my-report
 
 ---
 
+## Part 6: Publishing Reports (2 minutes)
+
+After generating a report, you can publish it to a **Seeknal Report Server** and share the URL with your team.
+
+### Start the Report Server
+
+```bash
+pip install seeknal[report-server]
+seeknal report-server start
+```
+
+### Configure your project
+
+Add to your project's `.env`:
+
+```bash
+SEEKNAL_PUBLISH_SERVER=http://localhost:8787
+SEEKNAL_PUBLISH_TOKEN=your-server-key
+```
+
+### Publish from chat
+
+After a report is built, the chat TUI offers a "Publish to Seeknal Report Server" menu option. You can also ask the agent directly:
+
+```
+You: publish this report to the report server
+Agent: [publish_to_seeknal_report] → Published! URL: http://localhost:8787/r/abc123
+```
+
+### Expose as an API
+
+For web clients and bots, use the gateway:
+
+```bash
+seeknal gateway start                    # WebSocket + SSE + REST
+seeknal gateway start --telegram         # With Telegram bot
+```
+
+---
+
 ## Quick Reference
 
 ```bash
@@ -271,6 +346,13 @@ seeknal ask "your question here"
 
 # Interactive chat
 seeknal ask chat
+
+# Named sessions
+seeknal ask chat --name "my-analysis"
+seeknal ask chat --session "my-analysis"
+
+# Chat options
+seeknal ask chat --style explanatory --budget 5.0 --web
 
 # Quiet mode (final answer only)
 seeknal ask -q "your question"
@@ -287,6 +369,12 @@ seeknal ask report --exposure exposure_name
 # List and serve reports
 seeknal ask report list
 seeknal ask report serve report-name
+
+# Report Server
+seeknal report-server start
+
+# Gateway (API)
+seeknal gateway start
 ```
 
 ---
@@ -295,8 +383,10 @@ seeknal ask report serve report-name
 
 - [Report Exposures Tutorial](report-exposures.md) — Build deterministic reports with pinned SQL and charts
 - [Exposures Concept](../concepts/exposures.md) — Understand how exposures connect to the DAG
+- [Gateway CLI](../cli/gateway.md) — HTTP gateway for web clients and bots
+- [Report Server CLI](../cli/report-server.md) — Host and share published reports
 - [CLI Reference](../reference/cli.md) — All commands and flags
 
 ---
 
-*Last updated: March 2026 | Seeknal Documentation*
+*Last updated: April 2026 | Seeknal Documentation*

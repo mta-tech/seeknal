@@ -20,6 +20,8 @@ The Seeknal CLI (`seeknal`) provides commands for managing data pipelines, featu
 | `plan` | Analyze changes and show execution plan |
 | `repl` | Interactive SQL REPL or one-shot queries |
 | `ask` | AI-powered data analysis, chat, and reports |
+| `gateway` | HTTP gateway server (WebSocket, SSE, REST, Telegram) |
+| `report-server` | Host published Evidence.dev reports |
 | `list` | List resources in the current project |
 | `show` | Show details of a specific resource |
 | `entity` | Manage consolidated entity feature stores |
@@ -71,6 +73,13 @@ The Seeknal CLI (`seeknal`) provides commands for managing data pipelines, featu
 - `inspect` - Inspect intermediate pipeline output
 - `intervals` - List completed intervals
 - `query` - Query metrics from semantic layer
+
+### Servers & APIs
+
+- `gateway start` - HTTP gateway for seeknal ask (WebSocket, SSE, REST, Telegram)
+- `gateway backend` - Cloud-only gateway (no local project)
+- `gateway worker` - Standalone Temporal worker
+- `report-server start` - Host published Evidence.dev reports
 
 ### Visualization & Quality
 

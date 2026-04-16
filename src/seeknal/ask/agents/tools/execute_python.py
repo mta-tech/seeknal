@@ -178,6 +178,24 @@ def _infer_error_hint(result: str, code: str) -> str | None:
             "available in the sandbox. Do NOT import statsmodels, xgboost, "
             "lightgbm, or other packages."
         )
+    if "CatalogException" in result and "does not exist" in result:
+        if "duckdb.connect" in code:
+            return (
+                "You called `duckdb.connect()` yourself — that creates a "
+                "NEW empty in-memory database without your project's tables. "
+                "The sandbox ALREADY provides a `conn` object with every "
+                "project table registered as a view. Remove `import duckdb` "
+                "and `conn = duckdb.connect(...)` entirely — the pre-loaded "
+                "`conn` is ready to use: "
+                "`df = conn.sql('SELECT * FROM transform_daily_revenue').df()`."
+            )
+        return (
+            "The table name doesn't exist in the sandbox's `conn`. Run "
+            "`list_tables` (via a separate tool call or `conn.sql(\"SHOW "
+            "TABLES\").df()` inside execute_python) to see what's available. "
+            "Views are registered by their full kind-prefixed name "
+            "(e.g. `transform_daily_revenue`, `source_customers`)."
+        )
     if "NameError" in result:
         return (
             "Each execute_python call runs in a fresh subprocess — variables "
@@ -194,37 +212,15 @@ def _infer_error_hint(result: str, code: str) -> str | None:
 
 
 async def execute_python(code: str) -> str:
-    """Execute Python code for data analysis beyond what SQL can express.
+    """Run Python in an isolated subprocess sandbox. Prefer execute_sql for simple queries.
 
-    Use this for statistical modeling, visualization, pandas operations,
-    machine learning, and custom algorithms. Pre-loaded variables:
-    - conn: DuckDB connection (query with conn.sql('SELECT ...').df())
-    - pd: pandas
-    - np: numpy
-    - plt: matplotlib.pyplot
-    - sklearn: scikit-learn (import submodules like sklearn.cluster, sklearn.preprocessing)
-    - scipy: scipy (import submodules like scipy.stats, scipy.spatial)
-
-    ONLY these packages are available. Do NOT import statsmodels,
-    xgboost, lightgbm, or other packages — they are not installed.
-
-    Prefer execute_sql for simple data queries. Use this tool only when
-    SQL cannot express the analysis (e.g., correlations, histograms,
-    statistical tests, complex pandas operations).
-
-    Each call runs in an isolated subprocess — variables from previous calls
-    do NOT persist. Always re-query data with conn.sql() at the start of
-    every call.
-
-    IMPORTANT: Never put Python-style # comments inside SQL strings.
-    DuckDB does not recognize # as a comment — it causes a ParserException.
-    Use -- for SQL comments, or place # comments outside the SQL string.
-
-    The last expression's value is captured and returned (like Jupyter).
-    Use print() for intermediate output.
+    See the `execute-python-analysis` skill for the sandbox semantics (no
+    cross-call persistence, limited package set), the available libs (conn,
+    pd, np, plt, sklearn, scipy), the SQL-comment gotcha (`#` is not a DuckDB
+    comment), plot capture, and error recovery.
 
     Args:
-        code: Python code to execute. Multi-line supported.
+        code: Python code to execute. Last expression is captured Jupyter-style.
     """
     from seeknal.ask.agents.tools._context import get_tool_context
     from seeknal.ask.sandbox import async_execute_in_sandbox

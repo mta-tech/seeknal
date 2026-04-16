@@ -1,0 +1,35 @@
+version: "3.8"
+
+# On-prem worker deployment — runs near the data
+# Connects to cloud Temporal and POSTs streaming events to cloud gateway
+#
+# Scaling:
+#   Vertical: increase MAX_CONCURRENT_ACTIVITIES (e.g., 30, 50)
+#     Each activity = one agent turn (~200MB RAM for DuckDB + LLM session)
+#   Horizontal: docker compose up --scale seeknal-worker=3
+#     Each worker polls the same Temporal queue — auto load-balanced
+#     Careful with DuckDB file locking if multiple workers write to same DB
+
+services:
+  seeknal-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      - TEMPORAL_ADDRESS=${CLOUD_TEMPORAL_ADDRESS:?Set CLOUD_TEMPORAL_ADDRESS}
+      - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
+      - TEMPORAL_TASK_QUEUE=${TEMPORAL_TASK_QUEUE:-seeknal-ask}
+      - TEMPORAL_MAX_CONCURRENT_ACTIVITIES=${MAX_CONCURRENT_ACTIVITIES:-15}
+      - CALLBACK_BASE_URL=${CLOUD_GATEWAY_URL:?Set CLOUD_GATEWAY_URL}
+      - CALLBACK_AUTH_TOKEN=${CALLBACK_AUTH_TOKEN:-}
+    env_file:
+      - .env
+    volumes:
+      - ${PROJECT_PATH:-.}/:/app/project
+    restart: unless-stopped
+    command: >
+      python -m seeknal.cli.main gateway worker
+      --project /app/project
+      --max-activities ${MAX_CONCURRENT_ACTIVITIES:-15}
+      --callback-url ${CLOUD_GATEWAY_URL}
+      --callback-auth-token ${CALLBACK_AUTH_TOKEN:-}

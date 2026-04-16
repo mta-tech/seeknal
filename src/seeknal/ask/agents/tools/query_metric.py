@@ -46,26 +46,18 @@ async def query_metric(
     order_by: str = "",
     limit: int = 100,
 ) -> str:
-    """Query business metrics through the semantic layer.
+    """Compile + execute a semantic-layer metric query through the MetricCompiler.
 
-    Compiles metric definitions into SQL with correct aggregation,
-    automatic joins, and time grain resolution. Use this instead of
-    execute_sql when a matching metric exists in the semantic layer.
-
-    Metrics are defined in seeknal/semantic_models/*.yml and
-    seeknal/metrics/*.yml. Check the system prompt for available
-    metrics and their aliases.
+    See the `query-metric` skill for when to prefer this over execute_sql,
+    alias resolution rules, time-grain syntax (`col__day`, `col__month`, etc),
+    and error paths.
 
     Args:
-        metrics: Comma-separated metric names (e.g., 'total_revenue,order_count').
-        dimensions: Comma-separated dimensions to group by
-                    (e.g., 'region,ordered_at__month'). Use __grain suffix
-                    for time dimensions (day, week, month, quarter, year).
-        filters: Comma-separated SQL filter expressions
-                 (e.g., 'region = \\'US\\',order_date >= \\'2025-01-01\\'').
-        order_by: Comma-separated order columns. Prefix '-' for DESC
-                  (e.g., '-total_revenue').
-        limit: Maximum rows to return (default 100).
+        metrics: Comma-separated metric names or aliases.
+        dimensions: Comma-separated group-by columns. Use `__<grain>` for time.
+        filters: Comma-separated SQL filter expressions (AND-joined).
+        order_by: Comma-separated order columns; prefix `-` for DESC.
+        limit: Max rows to return (default 100).
     """
     from seeknal.ask.agents.tools._context import get_tool_context
 
