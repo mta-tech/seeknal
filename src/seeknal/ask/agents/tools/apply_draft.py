@@ -10,7 +10,13 @@ _KIND_DIR_MAP = {
     "transform": "transforms",
     "feature_group": "feature_groups",
     "model": "models",
+    "aggregation": "aggregations",
     "second_order_aggregation": "second_order_aggregations",
+    "rule": "rules",
+    "profile": "profiles",
+    "exposure": "exposures",
+    "semantic_model": "semantic_models",
+    "metric": "metrics",
 }
 
 

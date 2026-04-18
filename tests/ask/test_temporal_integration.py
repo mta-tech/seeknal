@@ -9,11 +9,9 @@ dev server (``temporal server start-dev``).
 
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import asdict
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -22,7 +20,6 @@ from seeknal.ask.gateway.server import (
     _publish_event,
     _run_agent_streaming,
     create_gateway_app,
-    sse_broadcaster,
 )
 from seeknal.ask.gateway.sse import SSEBroadcaster
 from seeknal.ask.gateway.temporal import (
@@ -287,15 +284,16 @@ class TestTemporalWorkerFactory:
         )
 
         mock_client = MagicMock()
+        expected_worker = MagicMock()
         with patch(
-            "seeknal.ask.gateway.temporal.Worker"
-        ) as mock_worker_cls:
-            mock_worker_cls.return_value = MagicMock(name="worker")
+            "seeknal.ask.gateway.temporal.Worker",
+            return_value=expected_worker,
+        ) as worker_cls:
             worker = create_temporal_worker(mock_client, task_queue="test-queue")
 
-        assert worker is not None
-        mock_worker_cls.assert_called_once()
-        _, kwargs = mock_worker_cls.call_args
+        assert worker is expected_worker
+        worker_cls.assert_called_once()
+        _, kwargs = worker_cls.call_args
         assert kwargs["task_queue"] == "test-queue"
         assert AgentWorkflow in kwargs["workflows"]
         assert run_agent_activity in kwargs["activities"]

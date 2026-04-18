@@ -379,6 +379,14 @@ class PythonExecutor(BaseExecutor):
 
         file_path = Path(self.node.file_path)
         func_name = self.node.name
+        node_kind = (
+            self.node.node_type.value
+            if hasattr(self.node.node_type, "value")
+            else str(self.node.node_type)
+        )
+        node_params = dict(self.node.config.get("params", {}))
+        if self.context.params:
+            node_params = {**node_params, **self.context.params}
 
         # Read original file to preserve PEP 723 header, but remove seeknal from deps
         # since we're adding sys.path and seeknal is a local package
@@ -407,6 +415,10 @@ ctx = PipelineContext(
     project_path=Path("{self.context.workspace_path}"),
     target_dir=Path("{self.context.target_path}"),
     config={self.node.config.get("profile_config", {})},
+    params={node_params!r},
+    node_id="{self.node.id}",
+    node_kind="{node_kind}",
+    node_meta={self.node.config!r},
 )
 
 try:

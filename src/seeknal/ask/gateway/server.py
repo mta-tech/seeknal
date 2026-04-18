@@ -24,6 +24,11 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from seeknal.ask.gateway.pairing import (
+    FilePairingStore,
+    PublicSessionStore,
+    TelegramLinkStore,
+)
 from seeknal.ask.gateway.session_manager import SessionManager
 from seeknal.ask.gateway.sse import SSEBroadcaster
 from seeknal.ask.gateway.tenant import (
@@ -884,16 +889,35 @@ def create_gateway_app(
             app.state.broadcaster = redis_broadcaster
             app.state.redis_client = redis_client
             app.state.redis_enabled = True
+            if project_path is not None:
+                app.state.pairing_store = FilePairingStore(Path(project_path).resolve())
+                app.state.telegram_link_store = TelegramLinkStore(Path(project_path).resolve())
+                app.state.public_session_store = PublicSessionStore(Path(project_path).resolve())
+            else:
+                pair_base = Path(app.state.sessions_dir).resolve().parent
+                app.state.pairing_store = FilePairingStore(base_dir=pair_base)
+                app.state.telegram_link_store = TelegramLinkStore(base_dir=pair_base)
+                app.state.public_session_store = PublicSessionStore(base_dir=pair_base)
             await redis_broadcaster.start_listener()
         else:
             app.state.broadcaster = sse_broadcaster
             app.state.redis_client = None
             app.state.redis_enabled = False
+            if project_path is not None:
+                app.state.pairing_store = FilePairingStore(Path(project_path).resolve())
+                app.state.telegram_link_store = TelegramLinkStore(Path(project_path).resolve())
+                app.state.public_session_store = PublicSessionStore(Path(project_path).resolve())
+            else:
+                pair_base = Path(app.state.sessions_dir).resolve().parent
+                app.state.pairing_store = FilePairingStore(base_dir=pair_base)
+                app.state.telegram_link_store = TelegramLinkStore(base_dir=pair_base)
+                app.state.public_session_store = PublicSessionStore(base_dir=pair_base)
 
         async def _eviction_loop():
             while True:
                 await asyncio.sleep(300)  # every 5 minutes
                 _evict_idle_locks()
+                await app.state.pairing_store.cleanup_expired_codes()
 
         eviction_task = asyncio.create_task(_eviction_loop())
         try:

@@ -1156,7 +1156,15 @@ class TransformExecutor(BaseExecutor):
             ctx = PipelineContext(
                 project_path=project_path,
                 target_dir=target_path,
-                config={}
+                config={},
+                params=dict(self.node.config.get("params", {})),
+                node_id=self.node.id,
+                node_kind=(
+                    self.node.node_type.value
+                    if hasattr(self.node.node_type, "value")
+                    else str(self.node.node_type)
+                ),
+                node_meta=dict(self.node.config),
             )
 
             # Execute the function

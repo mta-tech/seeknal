@@ -30,6 +30,10 @@ class PipelineContext:
         project_path: Path to the project root directory
         target_dir: Path to the target directory for outputs
         config: Profile configuration dict (from profiles.yml)
+        params: Resolved node parameters
+        node_id: Current node id
+        node_kind: Current node kind
+        node_meta: Current node metadata/config
         _duckdb_con: Internal DuckDB connection (lazy initialization)
         _node_outputs: Internal cache of node outputs
 
@@ -43,8 +47,14 @@ class PipelineContext:
     project_path: Path
     target_dir: Path
     config: dict
+    params: dict[str, Any] = field(default_factory=dict)
+    node_id: Optional[str] = None
+    node_kind: Optional[str] = None
+    node_meta: dict[str, Any] = field(default_factory=dict)
     _duckdb_con: Optional[Any] = field(default=None, repr=False)
     _node_outputs: dict = field(default_factory=dict, repr=False)
+    _state: Optional[Any] = field(default=None, repr=False)
+    _llm: Optional[Any] = field(default=None, repr=False)
 
     @property
     def duckdb(self) -> Any:
@@ -66,6 +76,31 @@ class PipelineContext:
             db_path = self.config.get("path", ":memory:")
             self._duckdb_con = duckdb.connect(db_path)
         return self._duckdb_con
+
+    @property
+    def state(self) -> Any:
+        """Return a per-node persistent JSON-backed state helper."""
+        if self._state is None:
+            from seeknal.pipeline.state import PipelineState
+
+            self._state = PipelineState(
+                target_dir=self.target_dir,
+                node_id=self.node_id,
+            )
+        return self._state
+
+    @property
+    def llm(self) -> Any:
+        """Return a lazily initialized Ask-aligned LLM helper."""
+        if self._llm is None:
+            from seeknal.pipeline.llm import PipelineLLM
+
+            self._llm = PipelineLLM.from_context(self)
+        return self._llm
+
+    def get_param(self, name: str, default: Any = None) -> Any:
+        """Return a node parameter with a default."""
+        return self.params.get(name, default)
 
     def ref(self, node_id: str) -> Any:
         """Reference another node's output.

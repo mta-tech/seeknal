@@ -1,7 +1,12 @@
 """Draft node tool — creates a new pipeline node draft file."""
 
 
-async def draft_node(node_type: str, name: str, python: bool = False) -> str:
+async def draft_node(
+    node_type: str,
+    name: str,
+    python: bool = False,
+    deps: list[str] | None = None,
+) -> str:
     """Generate a pipeline-node draft template under .seeknal/drafts/.
 
     See the `build-pipeline-node` skill for the full draft → validate → apply
@@ -12,6 +17,7 @@ async def draft_node(node_type: str, name: str, python: bool = False) -> str:
             profile, exposure, semantic_model, metric (snake_case or hyphen).
         name: Alphanumeric + underscores only, ≤128 chars.
         python: True for a Python file template, False for YAML.
+        deps: Optional Python dependencies for PEP 723 metadata.
     """
     from seeknal.ask.agents.tools._context import get_tool_context
     from seeknal.ask.agents.tools._write_security import get_drafts_dir
@@ -51,7 +57,14 @@ async def draft_node(node_type: str, name: str, python: bool = False) -> str:
 
     try:
         env = get_template_env()
-        content = render_template(env, normalized, name, description=None, python=python)
+        content = render_template(
+            env,
+            normalized,
+            name,
+            description=None,
+            python=python,
+            deps=deps,
+        )
 
         with ctx.fs_lock:
             filepath.write_text(content)

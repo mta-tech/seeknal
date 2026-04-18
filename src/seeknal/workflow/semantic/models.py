@@ -88,6 +88,7 @@ class Measure:
     agg: AggregationType
     description: Optional[str] = None
     filters: list[str] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Measure":
@@ -109,6 +110,7 @@ class Measure:
             agg=AggregationType(agg_value),
             description=data.get("description"),
             filters=[f for f in filters if f],
+            aliases=[str(alias) for alias in data.get("aliases", []) if str(alias)],
         )
 
 
@@ -302,6 +304,7 @@ class Metric:
     type: MetricType
     description: Optional[str] = None
     filter: Optional[str] = None
+    aliases: list[str] = field(default_factory=list)
 
     # simple / cumulative
     measure: Optional[str] = None
@@ -324,6 +327,7 @@ class Metric:
             type=MetricType(data["type"]),
             description=data.get("description"),
             filter=data.get("filter"),
+            aliases=[str(alias) for alias in data.get("aliases", []) if str(alias)],
             measure=data.get("measure"),
             numerator=data.get("numerator"),
             denominator=data.get("denominator"),

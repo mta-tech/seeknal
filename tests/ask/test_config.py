@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from seeknal.ask.config import get_locale_instructions, load_agent_config
+from seeknal.ask.config import (
+    find_agent_config_path,
+    get_agent_profile_instructions,
+    get_locale_instructions,
+    load_agent_config,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +34,25 @@ def test_load_valid_yaml(tmp_path: Path):
     config = load_agent_config(tmp_path)
     assert config["model"] == "gemini-3-flash-preview"
     assert config["locale"]["currency"] == "IDR"
+
+
+def test_load_nested_seeknal_yaml(tmp_path: Path):
+    nested = tmp_path / "seeknal"
+    nested.mkdir()
+    (nested / "seeknal_agent.yml").write_text("agent:\n  name: Nested config\n")
+
+    config = load_agent_config(tmp_path)
+    assert config["agent"]["name"] == "Nested config"
+
+
+def test_root_config_precedence_over_nested(tmp_path: Path):
+    (tmp_path / "seeknal_agent.yml").write_text("agent:\n  name: Root config\n")
+    nested = tmp_path / "seeknal"
+    nested.mkdir()
+    (nested / "seeknal_agent.yml").write_text("agent:\n  name: Nested config\n")
+
+    assert find_agent_config_path(tmp_path) == tmp_path / "seeknal_agent.yml"
+    assert load_agent_config(tmp_path)["agent"]["name"] == "Root config"
 
 
 def test_load_empty_yaml(tmp_path: Path):
@@ -99,3 +123,24 @@ def test_locale_full_config():
     assert "Indonesian" in result
     assert "id_ID" in result
     assert "Asia/Jakarta" in result
+
+
+def test_agent_profile_none_when_missing():
+    assert get_agent_profile_instructions({}) is None
+
+
+def test_agent_profile_instructions_from_agent_section():
+    config = {
+        "agent": {
+            "name": "CBN CI",
+            "description": "Competitive analyst",
+            "skills": ["competitive_intel"],
+            "system_prompt": "Lead with the threat matrix.",
+        }
+    }
+    result = get_agent_profile_instructions(config)
+    assert result is not None
+    assert "CBN CI" in result
+    assert "Competitive analyst" in result
+    assert "competitive_intel" in result
+    assert "Lead with the threat matrix." in result

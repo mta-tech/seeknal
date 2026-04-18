@@ -16,6 +16,13 @@ import re
 from pathlib import Path
 from typing import Any
 
+from seeknal.ask.gateway.pairing import (
+    PairCodeExpiredError,
+    PairCodeInvalidError,
+    PairCodeUsedError,
+)
+from seeknal.ask.gateway.tenant import DEFAULT_TENANT
+
 logger = logging.getLogger(__name__)
 
 # Telegram message size limit
@@ -101,6 +108,21 @@ class TelegramChannel:
         self._project_path = project_path
         self._token = token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
         self._app: Any = None
+        self._pairing_store: Any = None
+        self._link_store: Any = None
+        self._public_session_store: Any = None
+
+    def set_pairing_store(self, pairing_store: Any) -> None:
+        """Inject a pairing store shared with the gateway app."""
+        self._pairing_store = pairing_store
+
+    def set_link_store(self, link_store: Any) -> None:
+        """Inject a Telegram chat -> session mapping store."""
+        self._link_store = link_store
+
+    def set_public_session_store(self, public_session_store: Any) -> None:
+        """Inject a public-session store for unpaired Telegram access."""
+        self._public_session_store = public_session_store
 
     async def start(self) -> None:
         """Initialize the Telegram bot application."""
@@ -124,6 +146,7 @@ class TelegramChannel:
         )
 
         self._app.add_handler(CommandHandler("start", self._handle_start))
+        self._app.add_handler(CommandHandler("pair", self._handle_pair))
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
         )
@@ -188,6 +211,57 @@ class TelegramChannel:
             "Hi! Send me a question and I'll analyze it for you."
         )
 
+    async def _handle_pair(self, update: Any, context: Any) -> None:
+        """Redeem an admin-generated one-time pair code."""
+        if self._pairing_store is None or self._link_store is None:
+            await update.message.reply_text(
+                "Pairing is not available right now. Please try again later."
+            )
+            return
+
+        chat_id = str(update.effective_chat.id)
+        args = list(getattr(context, "args", []) or [])
+        if not args:
+            await update.message.reply_text(
+                "Ask the admin for a pair code, then send it here as /pair <code>."
+            )
+            return
+
+        try:
+            record = await self._pairing_store.redeem_pair_code(
+                " ".join(args),
+                tenant_id=DEFAULT_TENANT,
+            )
+        except (PairCodeInvalidError, PairCodeExpiredError, PairCodeUsedError) as exc:
+            await update.message.reply_text(str(exc))
+            return
+        self._link_store.link_chat(
+            chat_id,
+            record.session_id,
+            tenant_id=DEFAULT_TENANT,
+        )
+
+        await update.message.reply_text(
+            "Paired successfully. This Telegram chat is now connected to session "
+            f"{record.session_id}."
+        )
+
+    def _session_id_for_chat(self, chat_id: str) -> str | None:
+        if self._link_store is not None:
+            linked_session = self._link_store.get_session_id(
+                chat_id,
+                tenant_id=DEFAULT_TENANT,
+            )
+            if linked_session:
+                return linked_session
+        if self._public_session_store is not None:
+            public_session = self._public_session_store.get_session_id(
+                tenant_id=DEFAULT_TENANT,
+            )
+            if public_session:
+                return public_session
+        return None
+
     async def _handle_message(self, update: Any, context: Any) -> None:
         """Handle incoming text messages — run agent and stream response."""
         from telegram.constants import ChatAction
@@ -197,7 +271,13 @@ class TelegramChannel:
             return
 
         chat_id = str(update.effective_chat.id)
-        session_id = f"telegram-{chat_id}"
+        session_id = self._session_id_for_chat(chat_id)
+        if not session_id:
+            await update.message.reply_text(
+                "This Telegram chat is not paired yet. Ask the admin for a pair code, "
+                "then send /pair <code> first."
+            )
+            return
         logger.info("[telegram] message from chat_id=%s: %s", chat_id, question[:80])
 
         # Show typing indicator and a single status message (edited in-place)

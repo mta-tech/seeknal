@@ -787,7 +787,6 @@ function escapeHtml(str) {
    DOM helpers
    ============================================================ */
 const messagesEl  = document.getElementById("messages");
-const emptyState  = document.getElementById("empty-state");
 const thinkingEl  = document.getElementById("thinking");
 const questionEl  = document.getElementById("question");
 const btnSend     = document.getElementById("btn-send");
@@ -796,6 +795,7 @@ const statusDot   = document.getElementById("status-dot");
 const statusLabel = document.getElementById("status-label");
 
 function hideEmpty() {
+  const emptyState = document.getElementById("empty-state");
   if (emptyState) emptyState.style.display = "none";
 }
 

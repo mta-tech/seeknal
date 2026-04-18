@@ -165,6 +165,29 @@ def generate_filename(node_type: str, name: str, python: bool = False) -> str:
     return f"draft_{node_type}_{name}.{ext}"
 
 
+def normalize_python_deps(deps: Optional[list[str]] = None) -> list[str]:
+    """Normalize Python draft dependencies.
+
+    Rules:
+    - Preserve user order
+    - Remove blanks
+    - Deduplicate case-sensitively
+    - Ensure ``seeknal`` is present first so generated drafts can import the
+      local package when executed via ``uv run``
+    """
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for dep in ["seeknal", *(deps or [])]:
+        value = dep.strip()
+        if not value or value in seen:
+            continue
+        normalized.append(value)
+        seen.add(value)
+
+    return normalized
+
+
 def render_template(template_env: Environment, node_type: str, name: str, description: Optional[str], python: bool = False, deps: Optional[list[str]] = None) -> str:
     """Render Jinja2 template.
 
@@ -193,7 +216,7 @@ def render_template(template_env: Environment, node_type: str, name: str, descri
     context = {
         "name": name,
         "description": description or f"{node_type.replace('_', ' ')} node",
-        "deps": deps or [],
+        "deps": normalize_python_deps(deps) if python else [],
     }
 
     return template.render(**context)

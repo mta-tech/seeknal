@@ -9,6 +9,37 @@ import os
 from typing import Optional
 
 
+def resolve_provider_config(
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> dict[str, Optional[str]]:
+    """Resolve provider/model credentials using Seeknal Ask defaults."""
+    resolved_provider = provider or os.environ.get("SEEKNAL_ASK_LLM_PROVIDER", "google")
+
+    if resolved_provider == "google":
+        return {
+            "provider": resolved_provider,
+            "model": model or os.environ.get("SEEKNAL_ASK_MODEL", "gemini-2.5-flash"),
+            "api_key": api_key or os.environ.get("GOOGLE_API_KEY"),
+            "base_url": None,
+        }
+
+    if resolved_provider == "ollama":
+        return {
+            "provider": resolved_provider,
+            "model": model or os.environ.get("SEEKNAL_ASK_MODEL", "llama3.1"),
+            "api_key": None,
+            "base_url": base_url or os.environ.get("SEEKNAL_ASK_OLLAMA_URL"),
+        }
+
+    raise ValueError(
+        f"Unsupported LLM provider: '{resolved_provider}'. "
+        f"Supported: 'google', 'ollama'."
+    )
+
+
 def get_model_string(
     provider: Optional[str] = None,
     model: Optional[str] = None,
@@ -34,17 +65,16 @@ def get_model_string(
     Raises:
         ValueError: If provider is unsupported or required config is missing.
     """
-    provider = provider or os.environ.get("SEEKNAL_ASK_LLM_PROVIDER", "google")
+    resolved = resolve_provider_config(
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+    )
 
-    if provider == "google":
-        return _google_model_string(model, api_key)
-    elif provider == "ollama":
-        return _ollama_model_string(model, base_url)
-    else:
-        raise ValueError(
-            f"Unsupported LLM provider: '{provider}'. "
-            f"Supported: 'google', 'ollama'."
-        )
+    if resolved["provider"] == "google":
+        return _google_model_string(resolved["model"], resolved["api_key"])
+    return _ollama_model_string(resolved["model"], resolved["base_url"])
 
 
 def _google_model_string(

@@ -25,6 +25,10 @@ You will also use the THIN primitives `read_pipeline`, `search_pipelines`,
 `search_project_files`, `read_project_file`, `inspect_output`, and `plan_pipeline`
 to discover existing structure and verify outputs.
 
+For Python-heavy ingestion/transformation work, you may first prototype code
+with `execute_uv_script(code=..., deps=[...])` before committing it to a
+drafted node.
+
 ## Supported node types
 
 `source`, `transform`, `feature_group` (alias `feature-group`), `model`,
@@ -90,6 +94,7 @@ Call `draft_node(node_type=..., name=..., python=False)`:
 - `node_type`: one of the supported types above (snake_case or hyphen)
 - `name`: alphanumeric + underscores only, ≤128 chars
 - `python`: `True` for a Python file (transforms / models only), `False` for YAML
+- `deps`: optional Python dependency list for PEP 723 metadata when `python=True`
 
 The draft is written to `.seeknal/drafts/draft_<type>_<name>.{yml|py}`. The
 tool returns the rendered template content for you to inspect.

@@ -161,7 +161,7 @@ def _show_tool_start(console: Console, name: str, args: Optional[dict] = None) -
     console.print(f"\n[bold]> {escape(name)}[/bold]")
     if args and name == "execute_sql" and "sql" in args:
         _show_sql(console, args["sql"])
-    elif args and name == "execute_python" and "code" in args:
+    elif args and name in ("execute_python", "execute_uv_script") and "code" in args:
         _show_python(console, args["code"])
     elif args and name == "generate_report" and "title" in args:
         console.print(f"  [dim]Title: {escape(args['title'])}[/dim]")
@@ -208,7 +208,7 @@ def _show_tool_end(console: Console, name: str, output: str) -> None:
         return
     if name == "execute_sql" and "|" in output:
         _show_sql_result_table(console, output)
-    elif name == "execute_python":
+    elif name in ("execute_python", "execute_uv_script"):
         _show_python_output(console, output)
     elif name == "generate_report":
         _show_report_output(console, output)

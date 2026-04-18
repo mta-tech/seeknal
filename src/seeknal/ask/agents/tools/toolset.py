@@ -12,6 +12,7 @@ from seeknal.ask.agents.tools.dry_run_draft import dry_run_draft
 from seeknal.ask.agents.tools.edit_node import edit_node
 from seeknal.ask.agents.tools.edit_proof_document import edit_proof_document
 from seeknal.ask.agents.tools.execute_python import execute_python
+from seeknal.ask.agents.tools.execute_uv_script import execute_uv_script
 from seeknal.ask.agents.tools.execute_sql import execute_sql
 from seeknal.ask.agents.tools.extract_from_image import extract_from_image
 from seeknal.ask.agents.tools.generate_report import generate_report
@@ -59,6 +60,7 @@ def create_ask_toolset() -> FunctionToolset:
             read_project_file,
             # Analysis & reporting
             execute_python,
+            execute_uv_script,
             generate_report,
             open_in_browser,
             save_report_exposure,

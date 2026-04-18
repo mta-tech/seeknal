@@ -1,4 +1,6 @@
 """Tests for semantic layer models, parsing, and validation."""
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -18,6 +20,7 @@ from seeknal.workflow.semantic.models import (
     parse_metric_yaml,
     parse_semantic_model_yaml,
 )
+from seeknal.workflow.semantic.loader import load_semantic_layer
 from seeknal.dag.manifest import NodeType
 from seeknal.dag.parser import ProjectParser
 
@@ -85,6 +88,14 @@ class TestMeasure:
     def test_default_expr(self):
         m = Measure.from_dict({"name": "total", "agg": "sum"})
         assert m.expr == "total"  # defaults to name
+
+    def test_measure_aliases(self):
+        m = Measure.from_dict({
+            "name": "signal_count",
+            "agg": "count",
+            "aliases": ["Signals", "Total Signals"],
+        })
+        assert m.aliases == ["Signals", "Total Signals"]
 
 
 # ── SemanticModel Tests ─────────────────────────────────────────────────────
@@ -199,10 +210,12 @@ class TestMetric:
             "type": "simple",
             "measure": "revenue",
             "filter": "status != 'refunded'",
+            "aliases": ["Revenue"],
         })
         assert m.type == MetricType.SIMPLE
         assert m.measure == "revenue"
         assert m.filter == "status != 'refunded'"
+        assert m.aliases == ["Revenue"]
 
     def test_ratio_metric(self):
         m = Metric.from_dict({
@@ -516,6 +529,47 @@ class TestYamlParsingHelpers:
         })
         assert m.name == "total_revenue"
         assert m.type == MetricType.SIMPLE
+
+
+class TestSemanticLayerLoader:
+    def test_auto_generated_metrics_handle_missing_measure_aliases(self, tmp_path: Path):
+        semantic_dir = tmp_path / "seeknal" / "semantic_models"
+        semantic_dir.mkdir(parents=True)
+        (semantic_dir / "orders.yml").write_text(yaml.safe_dump({
+            "kind": "semantic_model",
+            "name": "orders",
+            "model": "ref('transform.orders')",
+            "entities": [{"name": "order_id", "type": "primary"}],
+            "dimensions": [{"name": "region", "type": "categorical"}],
+            "measures": [{"name": "signal_count", "expr": "1", "agg": "count"}],
+        }, sort_keys=False))
+
+        models, metrics = load_semantic_layer(tmp_path)
+
+        assert len(models) == 1
+        assert len(metrics) == 1
+        assert metrics[0].name == "signal_count"
+        assert metrics[0].aliases == []
+
+    def test_auto_generated_metrics_copy_measure_aliases(self, tmp_path: Path):
+        semantic_dir = tmp_path / "seeknal" / "semantic_models"
+        semantic_dir.mkdir(parents=True)
+        (semantic_dir / "orders.yml").write_text(yaml.safe_dump({
+            "kind": "semantic_model",
+            "name": "orders",
+            "model": "ref('transform.orders')",
+            "entities": [{"name": "order_id", "type": "primary"}],
+            "dimensions": [{"name": "region", "type": "categorical"}],
+            "measures": [{
+                "name": "signal_count",
+                "expr": "1",
+                "agg": "count",
+                "aliases": ["Signals"],
+            }],
+        }, sort_keys=False))
+
+        _models, metrics = load_semantic_layer(tmp_path)
+        assert metrics[0].aliases == ["Signals"]
 
 
 # ── ProjectParser Integration Tests ────────────────────────────────────────

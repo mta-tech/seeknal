@@ -13,6 +13,7 @@ from seeknal.ask.prompt_builder import (
     _build_workflow,
     _build_memory,
     _build_locale,
+    _build_agent_profile,
     _build_environment,
 )
 
@@ -166,6 +167,20 @@ class TestSectionBuilders:
         assert result is not None
         assert "IDR" in result
 
+    def test_agent_profile_returns_content_with_agent_config(self):
+        config = {
+            "agent": {
+                "name": "CBN Competitive Intelligence",
+                "skills": ["competitive_intel"],
+                "system_prompt": "Focus on actionable threats.",
+            }
+        }
+        result = _build_agent_profile(config=config)
+        assert result is not None
+        assert "CBN Competitive Intelligence" in result
+        assert "competitive_intel" in result
+        assert "Focus on actionable threats." in result
+
     def test_environment_interactive(self):
         result = _build_environment(environment="interactive")
         assert "Interactive terminal" in result
@@ -193,7 +208,7 @@ class TestSectionBuilders:
 class TestDefaultBuilder:
     def test_creates_builder_with_all_sections(self):
         builder = create_default_builder()
-        assert len(builder._sections) == 6
+        assert len(builder._sections) == 7
 
     def test_interactive_includes_asking_questions(self):
         builder = create_default_builder()
@@ -226,3 +241,16 @@ class TestDefaultBuilder:
         # occurrence which is the dedicated section, not inline mentions.
         memory_section_pos = result.rindex("## Memory")
         assert memory_section_pos > boundary_pos
+
+    def test_agent_profile_section_included_when_configured(self):
+        builder = create_default_builder()
+        result = builder.build(
+            config={
+                "agent": {
+                    "name": "Custom Analyst",
+                    "system_prompt": "Prioritize pricing changes.",
+                }
+            }
+        )
+        assert "Custom Analyst" in result
+        assert "Prioritize pricing changes." in result
