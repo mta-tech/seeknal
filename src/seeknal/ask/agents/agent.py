@@ -130,6 +130,19 @@ def create_agent(
     builder = create_default_builder()
     instructions = builder.build(environment=environment, config=agent_config)
 
+    # Inject persistent user preferences from preferences.yml (if present)
+    # so they carry across sessions. See save_preference tool for writes.
+    from seeknal.ask.agents.tools.save_preference import load_preferences
+    _prefs = load_preferences(project_path)
+    if _prefs:
+        _pref_block = "\n\n## User preferences (persistent)\n\n" + "\n".join(
+            f"- {p}" for p in _prefs
+        ) + (
+            "\n\nThese were saved via save_preference in earlier sessions. "
+            "Apply them unless the user overrides in this session."
+        )
+        instructions = instructions + _pref_block
+
     # Resolve model string
     model_string = get_model_string(provider=provider, model=model, api_key=api_key)
 

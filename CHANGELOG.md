@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] - 2026-04-18
+
+Ask agent improvements batch — addresses open issues #23, #24, #25, #26, #27.
+
+### Added
+
+- **OpenAI + Anthropic provider support** (#23) — `get_model_string()` now resolves `openai` and `anthropic` providers alongside Google and Ollama, using pydantic-ai's native `openai:<model>` / `anthropic:<model>` strings (not langchain). Custom base URLs honoured via `SEEKNAL_ASK_OPENAI_BASE_URL` and `SEEKNAL_ASK_ANTHROPIC_BASE_URL`, bridged to pydantic-ai's `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` at factory time. Enables Azure OpenAI, Together, Groq, vLLM, LM Studio, enterprise Anthropic proxies, MiniMax — anything API-compatible.
+- **Pre-execution query safety hooks** (#27) — new `preview_query` tool runs four cheap diagnostic probes against a SELECT before `execute_sql` touches data:
+  - **Row count pre-check** — warns at ≥10k rows, blocks at ≥100k
+  - **Column count pre-check** — warns when projection exceeds 50 columns
+  - **Fan-out detection** — after a JOIN, warns when result rows exceed the primary table by ≥3×
+  - **Reachability dry-run** — surfaces unreachable tables with the set of accessible schemas before the real query runs
+
+  Pure aggregations and `LIMIT 1` queries auto-skip the probes. Callers can pass `run_hooks=False` for known-small queries.
+- **Context files + durable preferences** (#24, #25) — three new tools:
+  - `list_context_files` — scans `{project}/context/` for `.md / .yml / .yaml / .txt` files with first-line hints so the agent can pick what to load via `read_project_file`
+  - `write_project_file` — path-safe writes into `context/` with traversal/absolute-path/extension guards and a 100 KB per-file cap
+  - `save_preference` — appends durable one-line rules to `{project}/preferences.yml`; deduplicates, escapes YAML specials, and caps at 500 chars per entry
+
+  Preferences are auto-loaded and injected into the system prompt on every session start (see `load_preferences` in `agent.py`).
+
+### Changed
+
+- **`execute_sql` context-window guards** (#26) — results are now capped to prevent LLM context bloat:
+  - Row count hard cap at 500 regardless of caller's `limit` argument
+  - Column count hard cap at 50
+  - Per-cell length cap at 200 chars (with `…` ellipsis)
+  - 50 KB markdown byte budget — trailing rows dropped to fit
+  - Pipe and newline characters in cell values are now escaped so table rows stay aligned
+
+  Every truncation emits a `⚠ Result truncated:` notice explaining the cause and suggested remediation (WHERE, GROUP BY, narrower SELECT). When the hard cap clamps, a COUNT(*) round-trip populates the accurate total in the footer (`12 of 4,823 rows shown`).
+
+### Tests
+
+65 new tests across four files. 874/874 passed in 59s (up from 809/809).
+- `test_providers.py` — 21 tests (4 providers × env var resolution × happy path × failures)
+- `test_execute_sql.py` — 11 tests (hard caps, truncation notices, caller-limit pagination, SQL error passthrough)
+- `test_preview_query.py` — 12 tests (OK / WARN / BLOCK transitions, fan-out, reachability error, identifier guard)
+- `test_context_preferences.py` — 21 tests (context discovery, path-traversal / oversize / extension rejection, preferences dedup + YAML escape round-trip, malformed-file tolerance)
+
 ## [2.7.1] - 2026-04-18
 
 Combined parallel session work with 2.7.0 — additive merge, two aligned conflicts.
