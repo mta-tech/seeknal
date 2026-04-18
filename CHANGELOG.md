@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-04-18
+
+### Added
+
+- **Conversational data ingestion** — drop an `.xlsx / .csv / .tsv / .json` file or a direct-download URL into chat and the `data-ingest` built-in skill walks the user through schema preview → business key → append-or-create → reusable SKILL.md. Re-runs surface a self-defending drift/dedup report before any append write.
+  - New tools: `read_tabular`, `write_ingested_table`, `save_ingestion_skill`, `check_ingestion_drift`
+  - Every write emits a provenance JSON sidecar with SHA-256 of the source, row counts, and drift decisions
+- **Record entry from text or image** — `/record fitra, 1 mie ayam, 1 mineral water` or a BCA/Mandiri/GoPay/OVO/DANA fund-transfer screenshot becomes one row in a kind-appropriate `ingest_*` table. The `record-entry` skill classifies across `transfer`, `order`, `expense`, `activity`, `meeting`, `health`, `note`, and custom kinds, and asks for clarification until every required field is resolved.
+  - New tools: `parse_record` (kind-aware hint extractor), `extract_from_image` (Gemini vision via pydantic-ai `BinaryContent`), `propose_record_table` (table-aware schema router with per-kind templates + agent-supplied `_columns` override)
+- **Gateway endpoints**
+  - `POST /upload` — accepts tabular and image uploads with a shared body, returns `kind` (`"tabular"` | `"image"`) and a `next` hint. Tenant-scoped staging under `target/ask_ingest/_staging/{tenant}/{uuid}/`
+  - `POST /record` — runs the record-entry skill on free-form text via the streaming runner
+- **Telegram channel**
+  - `filters.Document.ALL` handler routes file uploads into `data-ingest`
+  - `filters.PHOTO` handler routes screenshots into `record-entry` with live status edits
+- **REPL Phase 1c** — on startup, `target/ask_ingest/*.parquet` files auto-register as `ingest_{stem}` DuckDB views (non-recursive `glob` deliberately excludes `_staging/` subdirectories)
+- **Built-in skills**: `data-ingest`, `record-entry`
+- **Dependency**: `openpyxl>=3.1` added to `seeknal[ask]` extras for `.xlsx` parsing
+
+### Changed
+
+- `WRITABLE_DIRS` in the ask agent's write-security allowlist now includes `target/` (canonical pipeline output scope)
+- `ToolContext` gained `last_read_staging_path` for tool-to-tool handoff of parsed file locations
+- Gateway startup banner now lists `/upload` and `/record` alongside the existing endpoints
+
+### Security
+
+- **SSRF** — `read_tabular` blocks private / loopback / link-local / reserved IP ranges (incl. `169.254.169.254` cloud metadata) and disables HTTP redirect following so a public URL cannot bounce into an internal host
+- **Content-Disposition traversal** — attacker-controlled filenames from HTTP responses normalised via `Path(...).name` before joining to the staging root
+- **Tenant isolation** — `POST /upload` resolves tenant via `X-Tenant-ID` and stages under per-tenant UUID directories
+- **fs_lock** — `write_ingested_table`'s parquet swap + provenance write are now serialised against sibling filesystem tools (`draft_node`, `apply_draft`, `save_ingestion_skill`)
+- **Self-defending write** — `write_ingested_table(mode='append', user_confirmed=False)` returns the drift report without touching disk, eliminating any reliance on the per-turn `reset_report_approval()` flag reset
+
+### Fixed
+
+- `TestTemporalWorkerFactory::test_create_worker` now patches `Worker` at the call site instead of passing a `MagicMock` to the constructor (newer `temporalio` versions enforce that the client argument is a real bridge client)
+
 ## [2.6.0] - 2026-04-16
 
 ### Added

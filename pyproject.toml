@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "seeknal"
-version = "2.6.3"
+version = "2.7.0"
 description = "All-in-one platform for data and AI/ML engineering"
 authors = [
     {name = "Fitra Kacamarga"}
@@ -77,6 +77,8 @@ ask = [
     "scikit-learn>=1.5.0",
     "scipy>=1.14.0",
     "redis>=4.5.0",
+    "openpyxl>=3.1",
+    "python-multipart>=0.0.9",
 ]
 
 # Telegram bot integration (optional, on top of ask)

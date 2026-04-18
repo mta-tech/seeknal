@@ -39,6 +39,12 @@ from seeknal.ask.gateway.tenant import (
 # Validate session IDs: alphanumeric, hyphens, underscores, max 128 chars
 _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
 
+# Upload constraints (kept here so they're easy to surface in error responses)
+_UPLOAD_MAX_BYTES = 200 * 1024 * 1024  # 200 MB
+_UPLOAD_ALLOWED_SUFFIXES = {".xlsx", ".csv", ".tsv", ".json"}
+_UPLOAD_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+_IMAGE_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
+
 session_manager = SessionManager()
 sse_broadcaster = SSEBroadcaster()
 
@@ -601,6 +607,174 @@ async def chat_ui(request: Request) -> FileResponse:
     return FileResponse(static_dir / "chat.html", media_type="text/html")
 
 
+async def upload_file(request: Request) -> JSONResponse:
+    """Accept a multipart file upload, stage it on disk, return a reference path.
+
+    The staged file is written under
+    ``{project}/target/ask_ingest/_staging/{tenant}/{uuid}/{filename}`` and
+    the returned ``path`` can be passed directly to the ``read_tabular``
+    tool. Tenant is resolved via the standard ``X-Tenant-ID`` header path
+    so uploads from different tenants stay isolated on disk.
+    """
+    import uuid as _uuid
+
+    tenant_id, err = _safe_resolve_tenant(request)
+    if err:
+        return err
+
+    project_path_raw = getattr(request.app.state, "project_path", None)
+    if not project_path_raw:
+        return JSONResponse(
+            {"error": "upload requires gateway to be started with --project"},
+            status_code=503,
+        )
+    project_path = Path(project_path_raw)
+
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" not in content_type.lower():
+        return JSONResponse(
+            {"error": "content-type must be multipart/form-data"},
+            status_code=400,
+        )
+
+    try:
+        form = await request.form()
+    except Exception as exc:
+        return JSONResponse({"error": f"invalid form data: {exc}"}, status_code=400)
+
+    upload = form.get("file")
+    if upload is None or not hasattr(upload, "read") or not hasattr(upload, "filename"):
+        return JSONResponse(
+            {"error": "no 'file' field in multipart form"},
+            status_code=400,
+        )
+
+    original_name = Path(upload.filename or "upload").name
+    suffix = Path(original_name).suffix.lower()
+    is_image = suffix in _UPLOAD_IMAGE_SUFFIXES
+    if suffix not in _UPLOAD_ALLOWED_SUFFIXES and not is_image:
+        return JSONResponse(
+            {
+                "error": (
+                    f"unsupported file extension '{suffix}'. "
+                    f"Allowed: "
+                    f"{', '.join(sorted(_UPLOAD_ALLOWED_SUFFIXES | _UPLOAD_IMAGE_SUFFIXES))}"
+                ),
+            },
+            status_code=400,
+        )
+
+    # Images get a tighter size cap because Gemini vision rejects very large
+    # payloads and it keeps us honest about phone-camera screenshots.
+    size_cap = _IMAGE_MAX_BYTES if is_image else _UPLOAD_MAX_BYTES
+
+    staging_dir = (
+        project_path
+        / "target"
+        / "ask_ingest"
+        / "_staging"
+        / tenant_id
+        / _uuid.uuid4().hex[:12]
+    )
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staged_path = staging_dir / original_name
+
+    total = 0
+    try:
+        with staged_path.open("wb") as fh:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > size_cap:
+                    fh.close()
+                    staged_path.unlink(missing_ok=True)
+                    cap_mb = size_cap / 1024 / 1024
+                    return JSONResponse(
+                        {"error": f"file exceeds {cap_mb:.0f} MB limit"},
+                        status_code=413,
+                    )
+                fh.write(chunk)
+    except Exception as exc:
+        staged_path.unlink(missing_ok=True)
+        return JSONResponse({"error": f"failed to stage upload: {exc}"}, status_code=500)
+    finally:
+        try:
+            await upload.close()
+        except Exception:
+            pass
+
+    return JSONResponse(
+        {
+            "path": str(staged_path),
+            "filename": original_name,
+            "size": total,
+            "kind": "image" if is_image else "tabular",
+            "next": (
+                "POST /record with {\"text\": \"ingest the image at "
+                f"{staged_path}\"}} to route into the record-entry skill."
+                if is_image
+                else "Pass the path to read_tabular / write_ingested_table via "
+                "the ask agent."
+            ),
+        }
+    )
+
+
+async def post_record(request: Request) -> JSONResponse:
+    """Accept a free-form record text (or image-path prompt) and run the agent.
+
+    Payload: {"text": "/record fitra, 1 mie ayam", "session_id": "..."}
+
+    The agent will route the request through the ``record-entry`` skill —
+    parsing the text with ``parse_record`` or reading any image path via
+    ``extract_from_image``, then asking the user until the draft is
+    complete, then writing via ``write_ingested_table``.
+    """
+    tenant_id, err = _safe_resolve_tenant(request)
+    if err:
+        return err
+
+    project_path_raw = getattr(request.app.state, "project_path", None)
+    if not project_path_raw:
+        return JSONResponse(
+            {"error": "record requires gateway started with --project"},
+            status_code=503,
+        )
+
+    try:
+        body = await request.json()
+    except Exception as exc:
+        return JSONResponse({"error": f"invalid JSON: {exc}"}, status_code=400)
+
+    text = (body.get("text") or "").strip()
+    session_id = body.get("session_id", "default")
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    if not _validate_session_id(session_id):
+        return JSONResponse({"error": "invalid session_id"}, status_code=400)
+
+    project_path = Path(project_path_raw)
+    prompt = (
+        "The user wants to record an event. Load the 'record-entry' skill "
+        "and walk through parse → propose_record_table → ask_user (strict) "
+        "→ write_ingested_table.\n\nUser input:\n"
+        f"{text}"
+    )
+
+    events: list = []
+    answer = ""
+    async for event in _run_agent_streaming(
+        project_path, session_id, prompt, tenant_id=tenant_id,
+    ):
+        events.append(event)
+        if event["type"] == "answer":
+            answer = event["data"]
+
+    return JSONResponse({"answer": answer, "events": events})
+
+
 async def publish_event_callback(request: Request) -> JSONResponse:
     """Receive streaming chunk from on-prem worker and publish to SSE.
 
@@ -682,6 +856,8 @@ def create_gateway_app(
     # is configured. In backend-only mode the client must use /temporal/start.
     if not backend_only:
         routes.insert(4, Route("/ask", ask_oneshot, methods=["POST"]))
+        routes.append(Route("/upload", upload_file, methods=["POST"]))
+        routes.append(Route("/record", post_record, methods=["POST"]))
         routes.append(WebSocketRoute("/ws/{session_id}", websocket_endpoint))
 
     # Mount static files if directory exists
