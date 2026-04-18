@@ -707,7 +707,11 @@ def dry_run_python(file_path: Path, file_path_str: str, limit: int, timeout: int
             ctx = PipelineContext(
                 project_path=project_path,
                 target_dir=target_path,
-                config={}
+                config={},
+                params=dict(metadata.get("params", {}) or {}),
+                node_id=metadata.get("id"),
+                node_kind=metadata.get("kind"),
+                node_meta=dict(metadata),
             )
 
             # Import and execute the pipeline function

@@ -103,7 +103,6 @@ def gateway_start(
     if temporal:
         try:
             from seeknal.ask.gateway.temporal import (
-                TEMPORAL_AVAILABLE,
                 _require_temporal,
             )
             _require_temporal()
@@ -122,6 +121,9 @@ def gateway_start(
     async def lifespan(app):
         # Startup: Telegram
         if telegram_channel is not None:
+            telegram_channel.set_pairing_store(app.state.pairing_store)
+            telegram_channel.set_link_store(app.state.telegram_link_store)
+            telegram_channel.set_public_session_store(app.state.public_session_store)
             app.state.telegram_channel = telegram_channel
             await telegram_channel.start()
 
@@ -158,7 +160,7 @@ def gateway_start(
                     ))
                 else:
                     typer.echo(typer.style(
-                        f"Temporal client-only mode (no local worker)",
+                        "Temporal client-only mode (no local worker)",
                         fg=typer.colors.GREEN,
                     ))
             else:
@@ -207,16 +209,16 @@ def gateway_start(
     typer.echo(f"Project: {project_path}")
     if redis:
         typer.echo(typer.style(f"Redis: {redis}", fg=typer.colors.GREEN))
-    typer.echo(f"Endpoints:")
-    typer.echo(f"  GET  /health")
-    typer.echo(f"  GET  /sessions")
-    typer.echo(f"  POST /ask")
-    typer.echo(f"  POST /upload")
-    typer.echo(f"  POST /record")
-    typer.echo(f"  POST /temporal/start")
-    typer.echo(f"  POST /internal/events/{{session_id}}/publish")
-    typer.echo(f"  WS   /ws/{{session_id}}")
-    typer.echo(f"  GET  /events/{{session_id}}")
+    typer.echo("Endpoints:")
+    typer.echo("  GET  /health")
+    typer.echo("  GET  /sessions")
+    typer.echo("  POST /ask")
+    typer.echo("  POST /upload")
+    typer.echo("  POST /record")
+    typer.echo("  POST /temporal/start")
+    typer.echo("  POST /internal/events/{session_id}/publish")
+    typer.echo("  WS   /ws/{session_id}")
+    typer.echo("  GET  /events/{session_id}")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 
@@ -419,7 +421,7 @@ def gateway_worker(
             max_concurrent_activities=max_activities,
         )
 
-        typer.echo(f"Seeknal worker started")
+        typer.echo("Seeknal worker started")
         typer.echo(f"  Project: {project_path}")
         typer.echo(f"  Temporal: {temporal_address}")
         typer.echo(f"  Queue: {temporal_task_queue}")

@@ -12,6 +12,19 @@ from pathlib import Path
 from typing import Any, Optional
 
 _CONFIG_FILENAME = "seeknal_agent.yml"
+_CONFIG_CANDIDATES = (
+    Path(_CONFIG_FILENAME),
+    Path("seeknal") / _CONFIG_FILENAME,
+)
+
+
+def find_agent_config_path(project_path: Path) -> Optional[Path]:
+    """Return the first existing ask config path for a project."""
+    for candidate in _CONFIG_CANDIDATES:
+        config_path = project_path / candidate
+        if config_path.exists():
+            return config_path
+    return None
 
 
 def load_agent_config(project_path: Path) -> dict[str, Any]:
@@ -19,8 +32,8 @@ def load_agent_config(project_path: Path) -> dict[str, Any]:
 
     Returns an empty dict when the file does not exist.
     """
-    config_path = project_path / _CONFIG_FILENAME
-    if not config_path.exists():
+    config_path = find_agent_config_path(project_path)
+    if config_path is None:
         return {}
 
     try:
@@ -36,6 +49,45 @@ def load_agent_config(project_path: Path) -> dict[str, Any]:
         data = yaml.safe_load(f)
 
     return data if isinstance(data, dict) else {}
+
+
+def get_agent_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the nested ``agent`` settings map, if present."""
+    agent = config.get("agent", {})
+    return agent if isinstance(agent, dict) else {}
+
+
+def get_agent_profile_instructions(config: dict[str, Any]) -> Optional[str]:
+    """Build dynamic prompt instructions from the ``agent`` section."""
+    agent = get_agent_settings(config)
+    if not agent:
+        return None
+
+    lines: list[str] = []
+
+    name = agent.get("name")
+    if name:
+        lines.append(f"## Project Agent Profile\n\n- Agent name: **{name}**")
+
+    description = agent.get("description")
+    if description:
+        if not lines:
+            lines.append("## Project Agent Profile")
+        lines.append(f"- Description: {str(description).strip()}")
+
+    skills = agent.get("skills")
+    if isinstance(skills, list) and skills:
+        if not lines:
+            lines.append("## Project Agent Profile")
+        skill_list = ", ".join(f"`{skill}`" for skill in skills)
+        lines.append(f"- Preferred project skills: {skill_list}")
+
+    system_prompt = agent.get("system_prompt")
+    if system_prompt:
+        lines.append("\n## Project-Specific Instructions\n")
+        lines.append(str(system_prompt).strip())
+
+    return "\n".join(lines).strip() or None
 
 
 # ---------------------------------------------------------------------------

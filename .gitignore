@@ -91,3 +91,4 @@ trees/
 .claude/specs/task-analysis.json
 /specs/
 .gstack/
+.omx/

@@ -160,6 +160,7 @@ The agent uses a **thin tools + fat skills** architecture. 16 thin tools handle 
 |------|-------------|
 | `execute_sql` | Runs read-only DuckDB SQL queries (with auto-retry on errors) |
 | `execute_python` | Runs Python code in a sandboxed subprocess with `pandas`, `numpy`, `scipy`, and `matplotlib` pre-loaded |
+| `execute_uv_script` | Runs prototype Python scripts through `uv run` with custom PEP 723 dependencies |
 | `query_metric` | Queries business metrics from the semantic layer |
 
 #### Project Understanding

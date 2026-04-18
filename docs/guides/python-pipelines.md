@@ -590,6 +590,12 @@ def regional_user_metrics(ctx, df: pd.DataFrame) -> pd.DataFrame:
 
 The `PipelineContext` object (`ctx`) is passed to all decorated functions (except sources) and provides access to:
 
+- `ctx.ref(...)` for upstream outputs
+- `ctx.duckdb` for DuckDB SQL
+- `ctx.params` / `ctx.get_param(...)` for resolved node parameters
+- `ctx.state` for lightweight per-node persistent state
+- `ctx.llm` for Ask-aligned text/JSON generation
+
 ### ctx.ref(node_reference)
 
 Reference upstream node outputs.
@@ -638,6 +644,47 @@ def duckdb -> duckdb.DuckDBPyConnection
 ```
 
 **Returns:**
+
+---
+
+### ctx.params / ctx.get_param(name, default=None)
+
+Access resolved node parameters at runtime.
+
+```python
+@transform(
+    name="fetch_pages",
+    params={"timeout_seconds": 20},
+)
+def fetch_pages(ctx):
+    timeout_seconds = ctx.get_param("timeout_seconds", 10)
+    return pd.DataFrame([{"timeout_seconds": timeout_seconds}])
+```
+
+---
+
+### ctx.state
+
+Access a tiny JSON-backed per-node state store under `target/pipeline_state/`.
+
+```python
+etag = ctx.state.get("etag")
+ctx.state.set("etag", "abc123")
+```
+
+---
+
+### ctx.llm
+
+Use the same provider/model defaults as Seeknal Ask for LLM-backed transforms.
+
+```python
+summary = ctx.llm.generate_text("Summarize the latest pricing changes.")
+payload = ctx.llm.generate_json(
+    "Return a JSON summary of this signal.",
+    {"type": "object"},
+)
+```
 - DuckDB connection object
 
 **Examples:**

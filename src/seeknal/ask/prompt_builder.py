@@ -127,7 +127,8 @@ You have a small set of THIN data-access tools (execute_sql, list_tables,
 describe_table, get_entities, get_entity_schema, search_pipelines,
 read_pipeline, read_project_file, search_project_files, inspect_output,
 plan_pipeline, show_lineage, open_in_browser, read_proof_document, ask_user,
-submit_plan) plus a set of FAT skills loaded on demand via `load_skill`.
+submit_plan, execute_uv_script) plus a set of FAT skills loaded on demand via
+`load_skill`.
 
 When you start a multi-step workflow — generating a report, building a
 pipeline node, querying or saving a metric, publishing to Proof or to a
@@ -257,6 +258,13 @@ def _build_locale(config: dict[str, Any] | None = None, **kwargs: Any) -> str | 
     return get_locale_instructions(config)
 
 
+def _build_agent_profile(config: dict[str, Any] | None = None, **kwargs: Any) -> str | None:
+    if not config:
+        return None
+    from seeknal.ask.config import get_agent_profile_instructions
+    return get_agent_profile_instructions(config)
+
+
 def _build_environment(environment: str = "interactive", **kwargs: Any) -> str:
     lines = ["## Session Context", f"- Date: {datetime.now().strftime('%Y-%m-%d')}"]
 
@@ -316,6 +324,10 @@ def create_default_builder() -> PromptBuilder:
     builder.register(PromptSection(
         id="locale", tier=PromptTier.DYNAMIC, priority=60,
         builder=_build_locale,
+    ))
+    builder.register(PromptSection(
+        id="agent_profile", tier=PromptTier.DYNAMIC, priority=65,
+        builder=_build_agent_profile,
     ))
     builder.register(PromptSection(
         id="environment", tier=PromptTier.DYNAMIC, priority=70,
