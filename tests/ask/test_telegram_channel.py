@@ -6,6 +6,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+# Skip when python-telegram-bot isn't installed (seeknal[telegram] extra).
+# The handler methods under test call `from telegram.constants import ChatAction`
+# at runtime, so without the extra the tests fail mid-execution.
+pytest.importorskip("telegram")
+
 from seeknal.ask.gateway.pairing import PublicSessionStore, TelegramLinkStore
 from seeknal.ask.gateway.channels.telegram import TelegramChannel
 from seeknal.ask.gateway.tenant import DEFAULT_TENANT
