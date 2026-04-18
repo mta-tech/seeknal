@@ -19,10 +19,12 @@ from seeknal.ask.agents.tools.generate_report import generate_report
 from seeknal.ask.agents.tools.get_entities import get_entities
 from seeknal.ask.agents.tools.get_entity_schema import get_entity_schema
 from seeknal.ask.agents.tools.inspect_output import inspect_output
+from seeknal.ask.agents.tools.list_context_files import list_context_files
 from seeknal.ask.agents.tools.list_tables import list_tables
 from seeknal.ask.agents.tools.open_in_browser import open_in_browser
 from seeknal.ask.agents.tools.parse_record import parse_record
 from seeknal.ask.agents.tools.plan_pipeline import plan_pipeline
+from seeknal.ask.agents.tools.preview_query import preview_query
 from seeknal.ask.agents.tools.profile_data import profile_data
 from seeknal.ask.agents.tools.propose_record_table import propose_record_table
 from seeknal.ask.agents.tools.publish_to_proof import publish_to_proof
@@ -35,12 +37,14 @@ from seeknal.ask.agents.tools.read_project_file import read_project_file
 from seeknal.ask.agents.tools.run_pipeline import run_pipeline
 from seeknal.ask.agents.tools.save_ingestion_skill import save_ingestion_skill
 from seeknal.ask.agents.tools.save_metric import save_metric
+from seeknal.ask.agents.tools.save_preference import save_preference
 from seeknal.ask.agents.tools.save_report_exposure import save_report_exposure
 from seeknal.ask.agents.tools.search_pipelines import search_pipelines
 from seeknal.ask.agents.tools.search_project_files import search_project_files
 from seeknal.ask.agents.tools.show_lineage import show_lineage
 from seeknal.ask.agents.tools.submit_plan import submit_plan
 from seeknal.ask.agents.tools.write_ingested_table import write_ingested_table
+from seeknal.ask.agents.tools.write_project_file import write_project_file
 
 
 def create_ask_toolset() -> FunctionToolset:
@@ -49,6 +53,7 @@ def create_ask_toolset() -> FunctionToolset:
         tools=[
             # Data discovery & querying
             execute_sql,
+            preview_query,
             list_tables,
             describe_table,
             get_entities,
@@ -58,6 +63,10 @@ def create_ask_toolset() -> FunctionToolset:
             search_pipelines,
             search_project_files,
             read_project_file,
+            # Context files & durable preferences
+            list_context_files,
+            write_project_file,
+            save_preference,
             # Analysis & reporting
             execute_python,
             execute_uv_script,
