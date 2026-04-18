@@ -275,9 +275,27 @@ class TestTemporalWorkerFactory:
     """Test worker and client factory functions."""
 
     def test_create_worker(self):
-        from seeknal.ask.gateway.temporal import create_temporal_worker
+        # Newer temporalio versions reject non-bridge clients in the Worker
+        # constructor, so patch Worker to capture the factory's argument
+        # wiring without constructing a real Worker.
+        from unittest.mock import patch
+
+        from seeknal.ask.gateway.temporal import (
+            AgentWorkflow,
+            create_temporal_worker,
+            run_agent_activity,
+        )
 
         mock_client = MagicMock()
-        worker = create_temporal_worker(mock_client, task_queue="test-queue")
-        # Worker should be created without error
+        with patch(
+            "seeknal.ask.gateway.temporal.Worker"
+        ) as mock_worker_cls:
+            mock_worker_cls.return_value = MagicMock(name="worker")
+            worker = create_temporal_worker(mock_client, task_queue="test-queue")
+
         assert worker is not None
+        mock_worker_cls.assert_called_once()
+        _, kwargs = mock_worker_cls.call_args
+        assert kwargs["task_queue"] == "test-queue"
+        assert AgentWorkflow in kwargs["workflows"]
+        assert run_agent_activity in kwargs["activities"]

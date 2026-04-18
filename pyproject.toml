@@ -77,6 +77,7 @@ ask = [
     "scikit-learn>=1.5.0",
     "scipy>=1.14.0",
     "redis>=4.5.0",
+    "openpyxl>=3.1",
 ]
 
 # Telegram bot integration (optional, on top of ask)

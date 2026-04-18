@@ -211,6 +211,8 @@ def gateway_start(
     typer.echo(f"  GET  /health")
     typer.echo(f"  GET  /sessions")
     typer.echo(f"  POST /ask")
+    typer.echo(f"  POST /upload")
+    typer.echo(f"  POST /record")
     typer.echo(f"  POST /temporal/start")
     typer.echo(f"  POST /internal/events/{{session_id}}/publish")
     typer.echo(f"  WS   /ws/{{session_id}}")

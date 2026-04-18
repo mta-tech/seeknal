@@ -18,6 +18,7 @@ WRITABLE_DIRS = {
     "seeknal",        # Pipeline definitions
     "data",           # Data files
     ".seeknal",       # Internal state (drafts, plans, checkpoints)
+    "target",         # Pipeline outputs (intermediate, cache, ask_ingest)
 }
 
 # Files that must never be written by the agent

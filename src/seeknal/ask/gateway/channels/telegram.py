@@ -21,6 +21,21 @@ logger = logging.getLogger(__name__)
 # Telegram message size limit
 _MAX_MESSAGE_LENGTH = 4096
 
+# Document upload constraints (match the gateway /upload endpoint)
+_UPLOAD_MAX_BYTES = 200 * 1024 * 1024  # 200 MB
+_UPLOAD_ALLOWED_SUFFIXES = {".xlsx", ".csv", ".tsv", ".json"}
+
+# Image upload constraints (routed into record-entry skill)
+_IMAGE_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
+_IMAGE_SUFFIX_FOR_MIME = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+}
+
 # Telegram formatting instruction prepended to user messages
 _TELEGRAM_FORMAT_HINT = (
     "[Format: plain text for Telegram. No markdown syntax. "
@@ -111,6 +126,17 @@ class TelegramChannel:
         self._app.add_handler(CommandHandler("start", self._handle_start))
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
+        )
+        # Document uploads (xlsx/csv/tsv/json) are routed into the data-ingest
+        # workflow so the user can converse with the ingested data.
+        self._app.add_handler(
+            MessageHandler(filters.Document.ALL, self._handle_document)
+        )
+        # Photo uploads (receipt / transfer-proof images) are routed into the
+        # record-entry workflow: download -> Gemini vision -> ask_user ->
+        # write_ingested_table.
+        self._app.add_handler(
+            MessageHandler(filters.PHOTO, self._handle_photo)
         )
 
         await self._app.initialize()
@@ -208,6 +234,221 @@ class TelegramChannel:
                 await status_msg.edit_text(f"❌ Error: {e}")
             except Exception:
                 await update.message.reply_text(f"❌ Error: {e}")
+
+    async def _handle_photo(self, update: Any, context: Any) -> None:
+        """Handle photo uploads — stage and route into record-entry skill."""
+        from telegram.constants import ChatAction
+
+        photos = update.message.photo
+        if not photos:
+            return
+
+        # Telegram serves multiple sizes; the largest is the last element.
+        photo = photos[-1]
+
+        chat_id = str(update.effective_chat.id)
+        session_id = f"telegram-{chat_id}"
+        logger.info(
+            "[telegram] photo from chat_id=%s: file_id=%s size=%s",
+            chat_id, photo.file_id, photo.file_size,
+        )
+
+        if photo.file_size and photo.file_size > _IMAGE_MAX_BYTES:
+            await update.message.reply_text(
+                f"Image too large ({photo.file_size / 1024 / 1024:.1f} MB). "
+                f"Limit is {_IMAGE_MAX_BYTES / 1024 / 1024:.0f} MB."
+            )
+            return
+
+        staging_dir = (
+            self._project_path / "target" / "ask_ingest" / "_staging"
+            / f"telegram-{chat_id}"
+        )
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        staged_path = staging_dir / f"{photo.file_unique_id}.jpg"
+
+        await update.effective_chat.send_action(ChatAction.TYPING)
+        status_msg = await update.message.reply_text(
+            "📷 Received image. Downloading..."
+        )
+
+        try:
+            tg_file = await context.bot.get_file(photo.file_id)
+            await tg_file.download_to_drive(custom_path=str(staged_path))
+            logger.info(
+                "[telegram] photo staged: %s (%d bytes)",
+                staged_path, staged_path.stat().st_size,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[telegram] photo download failed for chat_id=%s", chat_id
+            )
+            try:
+                await status_msg.edit_text(f"❌ Download failed: {exc}")
+            except Exception:
+                await update.message.reply_text(f"❌ Download failed: {exc}")
+            return
+
+        caption = (update.message.caption or "").strip()
+        user_prompt = (
+            "The user sent a photo via Telegram — most likely a fund-transfer "
+            "proof (BCA/Mandiri/BNI/BRI/GoPay/OVO/DANA/QRIS), a shop receipt, "
+            "or an order photo. Load the 'record-entry' skill and walk through "
+            f"the full workflow on this image:\n\n"
+            f"Absolute image path: {staged_path}\n"
+        )
+        if caption:
+            user_prompt += f"User caption / hint: {caption}\n"
+        user_prompt += (
+            "\nStart with `extract_from_image(image_path=<path>, hint=<caption "
+            "if any>)`, then `list_tables` + `propose_record_table`, then "
+            "`ask_user` until every required field is resolved, then "
+            "`write_ingested_table`. Strict clarification — do not record "
+            "until the draft is fully confirmed."
+        )
+
+        try:
+            await status_msg.edit_text("🧐 Reading the image...")
+        except Exception:
+            pass
+
+        try:
+            answer = await self._run_agent(session_id, user_prompt, update, status_msg)
+            logger.info(
+                "[telegram] record-entry agent done for session=%s, answer_len=%d",
+                session_id, len(answer) if answer else 0,
+            )
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            if answer:
+                clean = _strip_markdown(answer)
+                for chunk in _split_message(clean):
+                    await update.message.reply_text(chunk)
+                logger.info(
+                    "[telegram] record-entry reply sent to chat_id=%s", chat_id
+                )
+            else:
+                await update.message.reply_text(
+                    "I could read the image but didn't produce a reply. "
+                    "Ask me 'what did you extract?' to recover."
+                )
+        except Exception as exc:
+            logger.exception(
+                "[telegram] error on photo from chat_id=%s", chat_id
+            )
+            try:
+                await status_msg.edit_text(f"❌ Error: {exc}")
+            except Exception:
+                await update.message.reply_text(f"❌ Error: {exc}")
+
+    async def _handle_document(self, update: Any, context: Any) -> None:
+        """Handle document uploads — stage file and trigger data-ingest skill."""
+        from telegram.constants import ChatAction
+
+        doc = update.message.document
+        if doc is None:
+            return
+
+        chat_id = str(update.effective_chat.id)
+        session_id = f"telegram-{chat_id}"
+        original_name = Path(doc.file_name or "upload").name
+        suffix = Path(original_name).suffix.lower()
+        logger.info(
+            "[telegram] document from chat_id=%s: %s (size=%s)",
+            chat_id, original_name, doc.file_size,
+        )
+
+        if suffix not in _UPLOAD_ALLOWED_SUFFIXES:
+            await update.message.reply_text(
+                f"Sorry, I can't ingest '{suffix}' files. "
+                f"Supported: {', '.join(sorted(_UPLOAD_ALLOWED_SUFFIXES))}."
+            )
+            return
+
+        if doc.file_size and doc.file_size > _UPLOAD_MAX_BYTES:
+            await update.message.reply_text(
+                f"File too large ({doc.file_size / 1024 / 1024:.1f} MB). "
+                f"Limit is 200 MB."
+            )
+            return
+
+        staging_dir = (
+            self._project_path / "target" / "ask_ingest" / "_staging"
+            / f"telegram-{chat_id}"
+        )
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        staged_path = staging_dir / original_name
+
+        await update.effective_chat.send_action(ChatAction.TYPING)
+        status_msg = await update.message.reply_text(
+            f"📥 Downloading {original_name}..."
+        )
+
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            await tg_file.download_to_drive(custom_path=str(staged_path))
+            logger.info(
+                "[telegram] document staged: %s (%d bytes)",
+                staged_path, staged_path.stat().st_size,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[telegram] download failed for chat_id=%s", chat_id
+            )
+            try:
+                await status_msg.edit_text(f"❌ Download failed: {exc}")
+            except Exception:
+                await update.message.reply_text(f"❌ Download failed: {exc}")
+            return
+
+        caption = (update.message.caption or "").strip()
+        user_prompt = (
+            f"The user uploaded a tabular file via Telegram. "
+            f"Absolute file path: {staged_path}. "
+            f"Please load the 'data-ingest' skill and walk through the ingestion "
+            f"workflow: use read_tabular to preview the file, propose a table "
+            f"name and business key via ask_user, write it via "
+            f"write_ingested_table, and save a reusable skill via "
+            f"save_ingestion_skill. "
+        )
+        if caption:
+            user_prompt += f"User note: {caption}"
+
+        try:
+            await status_msg.edit_text(f"🔍 Inspecting {original_name}...")
+        except Exception:
+            pass
+
+        try:
+            answer = await self._run_agent(session_id, user_prompt, update, status_msg)
+            logger.info(
+                "[telegram] ingest agent done for session=%s, answer_len=%d",
+                session_id, len(answer) if answer else 0,
+            )
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            if answer:
+                clean = _strip_markdown(answer)
+                for chunk in _split_message(clean):
+                    await update.message.reply_text(chunk)
+                logger.info("[telegram] ingest reply sent to chat_id=%s", chat_id)
+            else:
+                await update.message.reply_text(
+                    f"Staged {original_name}, but the agent didn't respond. "
+                    f"Try asking: 'ingest the file at {staged_path}'."
+                )
+        except Exception as exc:
+            logger.exception(
+                "[telegram] error ingesting document from chat_id=%s", chat_id
+            )
+            try:
+                await status_msg.edit_text(f"❌ Error: {exc}")
+            except Exception:
+                await update.message.reply_text(f"❌ Error: {exc}")
 
     # Max tool calls before forcing early return with accumulated text
     _MAX_TOOLS = 30

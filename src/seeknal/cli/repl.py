@@ -196,6 +196,12 @@ class REPL:
         except Exception as e:
             warnings.warn(f"REPL: Failed to attach Iceberg catalogs: {e}")
 
+        # Phase 1c: Register ask-ingested parquets
+        try:
+            self._register_ask_ingest()
+        except Exception as e:
+            warnings.warn(f"REPL: Failed to register ask-ingested tables: {e}")
+
     def _register_parquets(self) -> None:
         """Phase 1: Register intermediate parquets as DuckDB views.
 
@@ -260,6 +266,30 @@ class REPL:
                 registered_names.add(view_name)
             except Exception:
                 pass  # Skip files that can't be read
+
+    def _register_ask_ingest(self) -> None:
+        """Phase 1c: Register ask-ingested parquets as DuckDB views.
+
+        Scans target/ask_ingest/ for parquet files and registers each as
+        'ingest_{stem}' view. Uses glob() (non-recursive) to deliberately
+        exclude the _staging/ subdirectory from auto-registration.
+        """
+        if not self.project_path:
+            return
+        ingest_dir = self.project_path / "target" / "ask_ingest"
+        if not ingest_dir.exists():
+            return
+        for parquet_file in ingest_dir.glob("*.parquet"):
+            view_name = f"ingest_{parquet_file.stem}"
+            safe_path = str(parquet_file.resolve()).replace("'", "''")
+            try:
+                self.conn.execute(
+                    f'CREATE OR REPLACE VIEW "{view_name}" AS '
+                    f"SELECT * FROM read_parquet('{safe_path}')"
+                )
+                self._registered_parquets += 1
+            except Exception:
+                pass
 
     def _register_consolidated_entities(self) -> None:
         """Phase 1b: Register consolidated entity parquets as DuckDB views.

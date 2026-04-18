@@ -58,6 +58,7 @@ class ToolContext:
     console: Any = None
     plan_steps: list[str] = field(default_factory=list)
     plan_step_index: int = 0
+    last_read_staging_path: str | None = None
 
 
 def _make_registry():
