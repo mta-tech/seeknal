@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.1] - 2026-04-18
+
+Combined parallel session work with 2.7.0 — additive merge, two aligned conflicts.
+
+### Added
+
+- **Gateway pairing** — `FilePairingStore`, `TelegramLinkStore`, `PublicSessionStore` wired into the app lifespan. New Telegram `/pair` command redeems admin-generated one-time codes; expired-code cleanup runs on the eviction loop.
+- **`execute_uv_script`** — Ask tool to run uv-managed Python scripts from the agent.
+- **Pipeline runtime helpers**:
+  - `ctx.llm` — Ask-aligned text/JSON generation inside `@transform` functions
+  - `ctx.state` — lightweight per-node persistent state keyed to the run
+- **Config discovery** — `find_agent_config_path()` locates `seeknal_agent.yml` under both project root and `seeknal/`.
+- **Draft normalisation** — `normalize_python_deps()` preserves user order, deduplicates, and ensures `seeknal` is present first so generated Python drafts can import the local package when executed via `uv run`.
+- Tests: `test_gateway_pairing`, `test_telegram_channel`, `test_execute_uv_script`, `test_apply_draft`, `test_draft_node`, `test_session_cli`, `test_pipeline_runtime_helpers`, `test_python_executor_runtime_context`.
+
+### Changed
+
+- Gateway startup banner prints plain-string endpoints (no unnecessary f-strings).
+- `test_create_worker` consolidates both fix styles: compact `return_value=` patch plus full-kwargs assertions against `task_queue`, `workflows`, and `activities`.
+
 ## [2.7.0] - 2026-04-18
 
 ### Added
