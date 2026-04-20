@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 48" fill="none" width="200" height="48">
+  <!-- White background -->
+  <rect width="200" height="48" fill="#ffffff"/>
+
+  <!-- Brand Mark (scaled to 34x34, centered vertically at y=7) -->
+  <g transform="translate(7, 7)">
+    <rect x="1.5" y="1.5" width="31" height="31" rx="6" stroke="#00CBA8" stroke-width="2"/>
+    <circle cx="12" cy="12" r="3.2" fill="#00CBA8"/>
+    <circle cx="22" cy="17" r="3.2" fill="#00CBA8" opacity="0.6"/>
+    <circle cx="15" cy="24" r="3.2" fill="#FF6430"/>
+    <line x1="12" y1="12" x2="22" y2="17" stroke="#00CBA8" stroke-width="1.3" opacity="0.5"/>
+    <line x1="22" y1="17" x2="15" y2="24" stroke="#FF6430" stroke-width="1.3" opacity="0.5"/>
+  </g>
+
+  <!-- Brand Name: seeknal. -->
+  <text
+    x="52"
+    y="31"
+    font-family="Space Grotesk, system-ui, sans-serif"
+    font-weight="700"
+    font-size="22"
+    letter-spacing="-0.5"
+    fill="#0a1a15"
+  >seeknal<tspan fill="#00CBA8">.</tspan></text>
+</svg>

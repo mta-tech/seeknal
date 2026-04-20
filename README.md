@@ -1,4 +1,9 @@
 <div align="center">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logos/seeknal-mark-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="docs/assets/logos/seeknal-mark.svg">
+      <img src="docs/assets/logos/seeknal-mark-dark.svg" alt="Seeknal" width="96" height="96">
+    </picture>
     <h1>Seeknal</h1>
     <p><strong>Transform data with SQL and Python. Build ML features with point-in-time joins. Materialize to PostgreSQL and Iceberg — all from one CLI.</strong></p>
     <p>
