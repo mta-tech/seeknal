@@ -1,4 +1,4 @@
-"""Tests for the seeknal bird mascot renderer (fox.py)."""
+"""Tests for the seeknal signal-graph brand-mark renderer (fox.py)."""
 
 from __future__ import annotations
 
@@ -120,18 +120,22 @@ def test_ascii_fallback_printable_only(frame: int):
         )
 
 
-# -- Tests: sprite contains recognizable characters ----------------------------
+# -- Tests: sprite contains recognizable brand-mark characters -----------------
 
 
 @pytest.mark.parametrize("frame", _FRAMES)
-def test_sprite_has_duck_chars(frame: int):
-    """Sprite contains recognizable duck characters."""
+def test_sprite_has_brand_mark_chars(frame: int):
+    """Sprite contains the Seeknal brand-mark glyphs (framed graph)."""
     _force_tier("unicode_full")
     text = render_fox(frame=frame)
     plain = text.plain
-    duck_chars = set("<>_()`")
-    has_duck = any(ch in duck_chars for ch in plain)
-    assert has_duck, f"Frame {frame} has no duck characters"
+    # Rounded-frame border + at least one node glyph must be present.
+    assert "╭" in plain and "╮" in plain and "╰" in plain and "╯" in plain, (
+        f"Frame {frame} missing rounded-frame border"
+    )
+    node_chars = set("●◐◉")
+    has_node = any(ch in node_chars for ch in plain)
+    assert has_node, f"Frame {frame} missing brand-mark node glyphs"
 
 
 # -- Tests: eye placeholder resolved -------------------------------------------
@@ -152,47 +156,37 @@ def test_eye_placeholder_resolved(frame: int, eyes: str):
 
 
 def test_frames_differ():
-    """The three animation frames produce distinct output."""
+    """The three animation frames produce distinct output (pulse cycles)."""
     _force_tier("unicode_full")
     plains = [render_fox(frame=f).plain for f in _FRAMES]
-    # At least two frames should differ (frame 1 has ~, frame 2 has .__>)
+    # Frame 1 highlights the source node (◉ at top); frame 2 highlights the
+    # destination node (◉ at bottom); frame 0 shows neither.
     unique = set(plains)
     assert len(unique) >= 2, (
         "Animation frames should produce distinct output"
     )
 
 
-# -- Tests: blink replaces eyes ------------------------------------------------
+# -- Tests: eyes parameter is accepted for backward-compat --------------------
 
 
-def test_blink_replaces_eyes():
-    """Blink eye style uses '-' character."""
-    _force_tier("unicode_full")
-    normal = render_fox(frame=0, eyes="default")
-    blink = render_fox(frame=0, eyes="closed")
-    assert "°" in normal.plain
-    assert "-" in blink.plain
-    assert "°" not in blink.plain
-
-
-# -- Tests: eye styles differ --------------------------------------------------
-
-
-def test_eye_styles_differ():
-    """Different eye styles produce different output."""
+def test_eyes_param_backward_compat():
+    """Eyes parameter is accepted but ignored (mark has no eyes)."""
     _force_tier("unicode_full")
     default_plain = render_fox(eyes="default").plain
     sparkle_plain = render_fox(eyes="sparkle").plain
-    assert default_plain != sparkle_plain
+    closed_plain = render_fox(eyes="closed").plain
+    # All produce identical output — the graph mark has no eye region.
+    assert default_plain == sparkle_plain == closed_plain
 
 
 # -- Tests: idle sequence valid ------------------------------------------------
 
 
 def test_idle_sequence_valid():
-    """All idle sequence indices are valid frame indices or -1 (blink)."""
+    """All idle sequence indices are valid frame indices (0..2)."""
     for step in IDLE_SEQUENCE:
-        assert step == -1 or 0 <= step < 3, (
+        assert 0 <= step < 3, (
             f"Invalid idle sequence step: {step}"
         )
 

@@ -12,6 +12,8 @@ repo_url: https://github.com/mta-tech/seeknal
 # Theme configuration
 theme:
   name: material
+  logo: assets/logos/seeknal-mark-dark.svg
+  favicon: assets/logos/seeknal-mark-dark.svg
   palette:
     # Light mode
     - media: "(prefers-color-scheme: light)"

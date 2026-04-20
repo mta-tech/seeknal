@@ -1,14 +1,14 @@
 """
-Seeknal bird mascot — Claude Code buddy sprite style.
+Seeknal brand mark — animated signal-graph mascot.
 
-A seeknal-branded duck rendered in colored ASCII art with Rich styles.
-Uses {E} eye placeholders, 3 animation frames, and an idle fidget sequence
-matching Claude Code's companion sprite system.
+Renders the Seeknal logo as Rich-styled Unicode: a rounded frame
+containing three connected nodes (two teal, one orange) with a
+"signal pulse" idle animation cycling between the source and the
+destination node.
 
-Provides:
-  - render_fox(frame, eyes) → Rich Text (backward-compat function name)
-  - render_animated_fox(eyes) → Iterator[Text] (yields frames per idle tick)
-  - IDLE_SEQUENCE, TICK_MS for animation timing
+The module filename and public API (``render_fox``,
+``render_animated_fox``, ``IDLE_SEQUENCE``, ``TICK_MS``, ``EYES``)
+are retained so existing imports keep working.
 
 Falls back to uncolored ASCII when TERM=dumb or non-interactive.
 """
@@ -26,6 +26,8 @@ from seeknal.ui.figures import get_tier
 
 Pose = Literal["default", "look_left", "look_right"]
 
+# Retained for backward-compat. The signal-graph mark doesn't have eyes,
+# so the ``eyes`` parameter is accepted but ignored during rendering.
 EYES: dict[str, str] = {
     "default": "°",
     "sparkle": "✦",
@@ -34,68 +36,87 @@ EYES: dict[str, str] = {
     "closed": "-",
 }
 
-# Animation timing (matches Claude Code exactly)
-IDLE_SEQUENCE: list[int] = [0, 0, 0, 0, 1, 0, 0, 0, -1, 0, 0, 2, 0, 0, 0]
+# Animation timing
+IDLE_SEQUENCE: list[int] = [0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0]
 TICK_MS: int = 500
 
-# -- Color tokens --------------------------------------------------------------
+# -- Brand palette (matches docs/assets/logos/seeknal-mark-dark.svg) ----------
 
-T = "#00BCB4"   # teal (brand.primary)
-O = "#FFA53C"   # orange (brand.accent)
-W = "bold white"  # eyes
+_TEAL = "#00CBA8"
+_ORANGE = "#FF6430"
+
+T = _TEAL                  # node A (source, teal)
+Td = f"dim {_TEAL}"        # node B + A→B line (secondary teal)
+O = _ORANGE                # node C (destination, orange)
+Od = f"dim {_ORANGE}"      # B→C line (secondary orange)
+B = _TEAL                  # border
+Hi_T = f"bold {_TEAL}"     # pulse highlight (teal)
+Hi_O = f"bold {_ORANGE}"   # pulse highlight (orange)
 
 # -- Sprite frames -------------------------------------------------------------
 #
-# 3 frames, each 4 lines (no blank hat line).  12 chars wide.
-# {E} is replaced with the eye character at render time.
+# Three 5-line × 10-char frames.  Layout mirrors the SVG mark:
 #
-# Frame 0 (neutral):
-#     __
-#   <({E} )___
-#    (  ._>
-#     `--'
+#     ╭──────╮      border          (teal)
+#     │ ●──◐ │      A───B           (teal → dim teal)
+#     │   ╱  │      diagonal B→C    (dim orange)
+#     │  ●   │      C (orange node)
+#     ╰──────╯
 #
-# Frame 1 (tail splash):
-#     __
-#   <({E} )___
-#    (  ._>
-#     `--'~
-#
-# Frame 2 (beak move):
-#     __
-#   <({E} )___
-#    (  .__>
-#     `--'
+# Animation:  frame 0 = rest, frame 1 = source pulse, frame 2 = dest pulse.
 
 
 def _frame0() -> list[list[tuple[str, str]]]:
+    """Rest state — all nodes at normal intensity."""
     return [
-        [("    ", ""), ("__", O), ("      ", "")],
-        [("  ", ""), ("<(", O), ("{E}", W), (" )", O), ("___", O), ("  ", "")],
-        [("   ", ""), ("(  ._>", T), ("   ", "")],
-        [("    ", ""), ("`--'", T), ("    ", "")],
+        [(" ", ""), ("╭──────╮", B), (" ", "")],
+        [(" ", ""), ("│", B), (" ", ""), ("●", T), ("──", Td), ("◐", Td), (" ", ""), ("│", B), (" ", "")],
+        [(" ", ""), ("│", B), ("   ", ""), ("╱", Od), ("  ", ""), ("│", B), (" ", "")],
+        [(" ", ""), ("│", B), ("  ", ""), ("●", O), ("   ", ""), ("│", B), (" ", "")],
+        [(" ", ""), ("╰──────╯", B), (" ", "")],
     ]
 
 
 def _frame1() -> list[list[tuple[str, str]]]:
+    """Source node pulses — signal origin."""
     return [
-        [("    ", ""), ("__", O), ("      ", "")],
-        [("  ", ""), ("<(", O), ("{E}", W), (" )", O), ("___", O), ("  ", "")],
-        [("   ", ""), ("(  ._>", T), ("   ", "")],
-        [("    ", ""), ("`--'", T), ("~", O), ("   ", "")],
+        [(" ", ""), ("╭──────╮", B), (" ", "")],
+        [(" ", ""), ("│", B), (" ", ""), ("◉", Hi_T), ("──", T), ("◐", Td), (" ", ""), ("│", B), (" ", "")],
+        [(" ", ""), ("│", B), ("   ", ""), ("╱", Od), ("  ", ""), ("│", B), (" ", "")],
+        [(" ", ""), ("│", B), ("  ", ""), ("●", O), ("   ", ""), ("│", B), (" ", "")],
+        [(" ", ""), ("╰──────╯", B), (" ", "")],
     ]
 
 
 def _frame2() -> list[list[tuple[str, str]]]:
+    """Destination node pulses — signal arrives."""
     return [
-        [("    ", ""), ("__", O), ("      ", "")],
-        [("  ", ""), ("<(", O), ("{E}", W), (" )", O), ("___", O), ("  ", "")],
-        [("   ", ""), ("(  .__>", T), ("  ", "")],
-        [("    ", ""), ("`--'", T), ("    ", "")],
+        [(" ", ""), ("╭──────╮", B), (" ", "")],
+        [(" ", ""), ("│", B), (" ", ""), ("●", T), ("──", Td), ("◐", Td), (" ", ""), ("│", B), (" ", "")],
+        [(" ", ""), ("│", B), ("   ", ""), ("╱", O), ("  ", ""), ("│", B), (" ", "")],
+        [(" ", ""), ("│", B), ("  ", ""), ("◉", Hi_O), ("   ", ""), ("│", B), (" ", "")],
+        [(" ", ""), ("╰──────╯", B), (" ", "")],
     ]
 
 
 _FRAMES = [_frame0, _frame1, _frame2]
+
+
+# -- ASCII-only frames ---------------------------------------------------------
+
+
+def _ascii_frame(highlight: str = "none") -> list[list[tuple[str, str]]]:
+    """ASCII fallback for TERM=dumb and legacy terminals."""
+    src = "@" if highlight == "source" else "*"
+    dst = "@" if highlight == "dest" else "o"
+    return [
+        [(" +------+ ", "")],
+        [(" | " + src + "--. | ", "")],
+        [(" |   /  | ", "")],
+        [(" |  " + dst + "   | ", "")],
+        [(" +------+ ", "")],
+    ]
+
 
 # ==============================================================================
 # Public API
@@ -107,40 +128,32 @@ def render_fox(
     frame: int = 0,
     eyes: str = "default",
 ) -> Text:
-    """Render the seeknal bird mascot as a Rich ``Text`` renderable.
+    """Render the Seeknal signal-graph mark as a Rich ``Text`` renderable.
 
     Parameters
     ----------
     pose:
-        Kept for backward compatibility. Ignored (bird has one orientation).
+        Retained for backward-compatibility; ignored.
     frame:
         Animation frame index (0, 1, or 2).
     eyes:
-        Eye style name from ``EYES`` dict, or a single character.
-
-    Returns
-    -------
-    Rich ``Text`` object suitable for ``console.print()``.
+        Retained for backward-compatibility; ignored.
     """
     tier = get_tier()
-    if tier == "ascii_only":
-        # Use ASCII-safe eye characters
-        ascii_eyes = {"default": "o", "sparkle": "*", "dot": ".", "wide": "O", "closed": "-"}
-        eye_char = ascii_eyes.get(eyes, "o")
-    else:
-        eye_char = EYES.get(eyes, eyes[0] if eyes else "°")
 
-    builder = _FRAMES[frame % len(_FRAMES)]
-    rows = builder()
+    if tier == "ascii_only":
+        highlight = {0: "none", 1: "source", 2: "dest"}.get(frame % 3, "none")
+        rows = _ascii_frame(highlight)
+    else:
+        rows = _FRAMES[frame % len(_FRAMES)]()
 
     text = Text()
     for i, row in enumerate(rows):
         for segment_text, style in row:
-            resolved = segment_text.replace("{E}", eye_char)
             if tier == "ascii_only":
-                text.append(resolved)
+                text.append(segment_text)
             else:
-                text.append(resolved, style=style if style else None)
+                text.append(segment_text, style=style if style else None)
         if i < len(rows) - 1:
             text.append("\n")
 
@@ -151,11 +164,7 @@ def render_animated_fox(eyes: str = "default") -> Iterator[Text]:
     """Yield frames following the idle sequence.
 
     Each yielded ``Text`` corresponds to one animation tick (500ms).
-    The sequence cycles indefinitely. Frame index ``-1`` triggers a blink
-    (eyes replaced with ``-``).
+    The sequence cycles indefinitely.
     """
     for step in itertools.cycle(IDLE_SEQUENCE):
-        if step == -1:
-            yield render_fox(frame=0, eyes="closed")
-        else:
-            yield render_fox(frame=step, eyes=eyes)
+        yield render_fox(frame=max(0, step), eyes=eyes)
