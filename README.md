@@ -153,6 +153,25 @@ Supports Google Gemini (default) and Ollama (local). Use `--provider ollama` for
 
 ## Changelog
 
+### v2.8.0 (April 2026)
+
+**OpenAI/Anthropic providers + SQL safety + context files** — Adds two new LLM provider families, execution guards on `execute_sql`, a pre-execution `preview_query` tool, persistent context files, and durable preferences.
+
+- **OpenAI + Anthropic support**: `gpt-4o`, `claude-*`, Azure OpenAI, Together, Groq, vLLM, LM Studio, and any OpenAI-compatible proxy via `SEEKNAL_ASK_OPENAI_BASE_URL` / `SEEKNAL_ASK_ANTHROPIC_BASE_URL`
+- **`execute_sql` guards**: rows capped at 500, columns at 50, per-cell length at 200 chars, 50 KB markdown budget — every truncation emits an actionable notice with accurate total row count
+- **`preview_query` tool**: four pre-execution safety probes (row count, column count, JOIN fan-out, dry-run reachability) — blocks queries returning ≥100k rows; pure aggregations auto-skip
+- **Context files**: `list_context_files` and `write_project_file` tools scan/write `{project}/context/` with path-traversal guards
+- **Durable preferences**: `save_preference` appends to `preferences.yml`; preferences are injected into the system prompt on every session
+
+### v2.7.1 (April 2026)
+
+**Gateway pairing + `execute_uv_script` + pipeline runtime helpers** — Additive batch combining gateway Telegram pairing, a new agent tool for running uv-managed scripts, and lightweight per-node runtime helpers.
+
+- **Gateway pairing**: `FilePairingStore`, `TelegramLinkStore`, `PublicSessionStore` wired into lifespan; `/pair` Telegram command for admin-generated codes
+- **`execute_uv_script` tool**: run arbitrary uv-managed Python scripts from the agent with full dependency isolation
+- **Pipeline runtime**: `ctx.llm` (Ask-aligned text/JSON generation) and `ctx.state` (lightweight per-node persistent state) helpers available inside `@transform` functions
+- **Config discovery**: `find_agent_config_path()` locates `seeknal_agent.yml` under project root or `seeknal/` directory
+
 ### v2.6.0 (April 2026)
 
 **Skills-Powered Agent + Report Server** — The ask agent now uses a thin-tools/fat-skills architecture: 16 lean tools for fast data access, 11 built-in skills for multi-step workflows (reports, pipelines, profiling, metrics, publishing). Skills load on demand via progressive disclosure, keeping the agent's context lean.
@@ -163,71 +182,6 @@ Supports Google Gemini (default) and Ollama (local). Use `--provider ollama` for
 - **Gateway improvements**: cloud-only backend mode, standalone workers, Redis multi-replica, split topology
 - **Auto `.env` loading**: `--project <path>` loads `<path>/.env` automatically
 - **Error UX**: network errors classified with actionable hints; error logs saved to `~/.seeknal/logs/`
-
-### v2.5.0 (April 2026)
-
-**Seeknal as Your Thinking Partner** — `seeknal ask chat` is now a collaborative partner that brainstorms, builds pipelines, and trains models with you through conversation. It always asks for confirmation before acting — you stay in control.
-
-- **Interactive chat mode** (`seeknal ask chat`): multi-turn brainstorm and build sessions with persistent history, streaming UI with Claude Code-inspired visual hierarchy
-- **Confirmation-first workflow**: the agent proposes plans and analysis directions, then waits for your go-ahead via interactive menus before executing
-- **Pipeline and ML building**: describe what you want to build in plain language — the agent drafts YAML pipelines, feature groups, or model training code and checks in before generating
-- **Session management**: create, resume, list, and delete sessions with full message persistence (`seeknal session list/show/delete`)
-- **Iceberg REST catalog support**: integrates with any Iceberg REST catalog provider (Lakekeeper, Tabular, Polaris, etc.)
-- **Gateway server**: WebSocket, SSE, and REST endpoints for web clients; optional Telegram bot integration
-- **UI refresh**: animated fox mascot, interactive arrow-key menus, real token/tool counters, subordinate reasoning display
-
-### v2.4.0 (March 2026)
-
-**Seeknal Ask — AI-Powered Data Agent** — Natural language data analysis with 12 built-in tools:
-
-```bash
-seeknal ask "What are the top 5 customers by revenue?"
-seeknal ask chat                                        # Interactive multi-turn session
-seeknal ask report "customer segmentation"              # AI-guided HTML dashboard
-seeknal ask report --exposure monthly_kpis              # Deterministic report exposure
-seeknal ask report serve my-report                      # Live-preview with Evidence dev server
-```
-
-- **One-shot & chat modes**: Ask questions or start multi-turn sessions with conversation memory
-- **12 agent tools**: Data discovery, SQL execution, Python analysis (pandas/scipy/matplotlib), pipeline inspection, and report generation
-- **Report exposures**: Define repeatable reports in YAML with pinned SQL queries, chart types (BigValue, BarChart, LineChart, AreaChart, DataTable), and LLM-generated narratives
-- **Deterministic reports**: `sections` key pins SQL and charts — LLM only writes commentary
-- **Dual output**: Both interactive HTML dashboards and standalone Markdown reports
-- **LLM providers**: Google Gemini (default) and Ollama (local, no API key)
-- **Subprocess sandbox**: Python execution runs in isolated subprocess with restricted imports
-
-### v2.3.0 (March 2026)
-
-**Incremental Detection** — Automatically skip unchanged data sources and process only new data:
-
-```yaml
-# PostgreSQL watermark-based incremental detection
-- kind: source
-  name: events
-  source: postgresql
-  table: public.events
-  freshness:
-    time_column: created_at  # Tracks MAX(created_at) watermark
-  params:
-    connection: my_pg
-```
-
-- **PostgreSQL Incremental**: Watermark-based detection using `MAX(time_column)` comparison. Automatically generates `WHERE time_col > 'watermark' OR time_col IS NULL` for incremental reads.
-- **Iceberg Incremental**: Snapshot-based detection comparing current snapshot ID. Supports partition pruning for time-partitioned tables.
-- **Skip Optimization**: If fingerprint and watermark match, source execution is skipped entirely.
-- **Cascade Invalidation**: Dependent nodes are automatically invalidated when source data changes.
-- **Full Refresh**: Use `--full` flag to ignore stored watermarks and reload all data.
-
-**Other Changes**:
-- Enhanced QA automation with multi-spec execution support
-- Pipeline error logging with `--verbose` mode
-- Security fix: Updated `cryptography` to 46.0.5 (CVE-2026-26007)
-
-### v2.2.2 (February 2026)
-
-- Entity consolidation for per-entity feature views
-- Multi-target materialization (PostgreSQL + Iceberg from single node)
-- Environment-aware execution with namespace prefixing
 
 ## Install from Source
 
