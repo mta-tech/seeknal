@@ -29,7 +29,7 @@ def get_entity_schema(entity_name: str) -> str:
 
     feature_groups = catalog.get("feature_groups", {})
     for fg_name, fg_info in feature_groups.items():
-        features = fg_info.get("features", {})
+        features = ctx.artifact_discovery.get_feature_types(fg_info)
         lines.append(f"### Feature Group: `{fg_name}`")
         for fname, ftype in features.items():
             lines.append(f"  - `{fg_name}.{fname}` ({ftype})")

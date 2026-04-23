@@ -101,6 +101,35 @@ class TestArtifactDiscovery:
         assert "demographics" in context
         assert "clean_orders" in context
 
+    def test_get_context_for_prompt_supports_list_backed_features(self, tmp_path):
+        target = tmp_path / "target"
+        fs = target / "feature_store" / "customer"
+        fs.mkdir(parents=True)
+        catalog = {
+            "entity_name": "customer",
+            "join_keys": ["customer_id"],
+            "feature_groups": {
+                "customer_features": {
+                    "name": "customer_features",
+                    "features": ["total_orders", "total_revenue"],
+                    "schema": {
+                        "customer_id": "VARCHAR",
+                        "total_orders": "BIGINT",
+                        "total_revenue": "DOUBLE",
+                    },
+                }
+            },
+        }
+        (fs / "_entity_catalog.json").write_text(json.dumps(catalog))
+
+        discovery = ArtifactDiscovery(tmp_path)
+
+        context = discovery.get_context_for_prompt()
+
+        assert "customer_features" in context
+        assert "`total_orders` (BIGINT)" in context
+        assert "`total_revenue` (DOUBLE)" in context
+
     def test_no_artifacts(self, tmp_path):
         discovery = ArtifactDiscovery(tmp_path)
         context = discovery.get_context_for_prompt()
@@ -114,6 +143,30 @@ class TestArtifactDiscovery:
         discovery = ArtifactDiscovery(tmp_path)
         entities = discovery._discover_entities()
         assert len(entities) == 0
+
+    def test_get_feature_types_supports_both_catalog_shapes(self):
+        dict_backed = {
+            "features": {
+                "age": "INTEGER",
+                "city": "VARCHAR",
+            }
+        }
+        list_backed = {
+            "features": ["total_orders", "total_revenue"],
+            "schema": {
+                "total_orders": "BIGINT",
+                "total_revenue": "DOUBLE",
+            },
+        }
+
+        assert ArtifactDiscovery.get_feature_types(dict_backed) == {
+            "age": "INTEGER",
+            "city": "VARCHAR",
+        }
+        assert ArtifactDiscovery.get_feature_types(list_backed) == {
+            "total_orders": "BIGINT",
+            "total_revenue": "DOUBLE",
+        }
 
 
 @pytest.fixture

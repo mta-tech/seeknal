@@ -7,7 +7,7 @@ the agent's system prompt.
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import yaml
 
@@ -161,6 +161,32 @@ class ArtifactDiscovery:
                 return entity
         return None
 
+    @staticmethod
+    def get_feature_types(fg_info: dict[str, Any]) -> dict[str, str]:
+        """Normalize feature metadata from an entity catalog entry.
+
+        Older test fixtures stored ``features`` as a ``{name: type}`` map.
+        Real consolidated catalogs store ``features`` as a list of names and
+        keep types in ``schema``. Support both shapes so prompt construction
+        and agent tools don't crash on real projects.
+        """
+        features = fg_info.get("features", {})
+        schema = fg_info.get("schema", {}) or {}
+
+        if isinstance(features, dict):
+            return {
+                str(name): str(ftype)
+                for name, ftype in features.items()
+            }
+
+        if isinstance(features, list):
+            return {
+                str(name): str(schema.get(name, "unknown"))
+                for name in features
+            }
+
+        return {}
+
     def _format_entities(self, entities: list[dict]) -> str:
         lines = ["## Available Entities\n"]
         for entity in entities:
@@ -174,7 +200,7 @@ class ArtifactDiscovery:
             if feature_groups:
                 lines.append("- **Feature groups**:")
                 for fg_name, fg_info in feature_groups.items():
-                    features = fg_info.get("features", {})
+                    features = self.get_feature_types(fg_info)
                     feature_list = [
                         f"`{fname}` ({ftype})"
                         for fname, ftype in features.items()
