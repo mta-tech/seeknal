@@ -135,6 +135,12 @@ class TestDryRunWorkflow:
 class TestVersionWorkflow:
     """E2E tests for version information workflows."""
 
+    def test_global_version_flag(self):
+        """Test that the global version flag works without a subcommand."""
+        result = runner.invoke(app, ["--version"])
+        assert result.exit_code == 0
+        assert result.stdout.strip()
+
     def test_version_shows_all_components(self):
         """Test that version shows all component versions."""
         result = runner.invoke(app, ["info"])

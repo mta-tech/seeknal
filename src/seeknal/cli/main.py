@@ -93,6 +93,7 @@ from datetime import datetime, timedelta
 from difflib import get_close_matches
 from enum import Enum
 from functools import wraps
+from importlib.metadata import PackageNotFoundError, version as package_version
 import os
 import sys
 from pathlib import Path
@@ -146,6 +147,13 @@ app = typer.Typer(
 
 @app.callback()
 def main_callback(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        help="Show the Seeknal version and exit",
+        callback=lambda value: _show_version(value),
+        is_eager=True,
+    ),
     no_animation: bool = typer.Option(False, "--no-animation", help="Disable all animations"),
     theme: str = typer.Option("", "--theme", help="UI theme: dark, light, dark-ansi, light-ansi, auto"),
 ):
@@ -591,10 +599,24 @@ class ValidationModeChoice(str, Enum):
 def _get_version() -> str:
     """Get package version."""
     try:
+        return package_version("seeknal")
+    except PackageNotFoundError:
+        pass
+
+    try:
         from seeknal import __version__
         return __version__
     except ImportError:
         return "1.0.0"
+
+
+def _show_version(value: bool) -> None:
+    """Print the installed Seeknal version and exit early."""
+    if not value:
+        return
+
+    typer.echo(_get_version())
+    raise typer.Exit()
 
 
 from seeknal.ui.output import echo_success as _ui_echo_success
