@@ -35,6 +35,12 @@ runner = CliRunner()
 class TestVersionCommand:
     """Tests for the info command (displays version information)."""
 
+    def test_global_version_flag_displays_version(self):
+        """Global --version flag should print the CLI version."""
+        result = runner.invoke(app, ["--version"])
+        assert result.exit_code == 0
+        assert result.stdout.strip() == _get_version()
+
     def test_version_displays_seeknal_version(self):
         """Info command should display Seeknal version."""
         result = runner.invoke(app, ["info"])
