@@ -62,6 +62,10 @@ class AgentWorkflowInput:
     callback_url: str | None = None
     callback_auth_token: str | None = None
     tenant_id: str = "default"
+    # For v6: kc-service passes message_id as the workflow identifier.
+    # seeknal activity reads SEEKNAL_CALLBACK_URL from env var and constructs:
+    #   {SEEKNAL_CALLBACK_URL}/internal/events/{message_id}/publish
+    message_id: str | None = None
 
 
 @dataclass
@@ -92,26 +96,42 @@ if TEMPORAL_AVAILABLE:
         """Run the seeknal ask agent as a Temporal activity.
 
         Iterates ``_run_agent_streaming()`` from the gateway server,
-        which handles SSE broadcast internally. When a ``callback_url``
-        is provided (on-prem worker mode), events are also POSTed to
-        the cloud SSE endpoint for cross-replica fan-out.
+        which handles SSE broadcast internally. For kc-service v6
+        integration, push config comes from environment variables:
+        - SEEKNAL_CALLBACK_URL: base URL (e.g. "http://kc-service:8000/v6")
+          The activity appends /internal/events/{message_id}/publish.
+        - SEEKNAL_PUSH_API_KEY: API key for callback authentication.
 
         Does NOT call ``sse_broadcaster.publish()`` — that is handled
         inside ``_run_agent_streaming()`` (single SSE publish owner).
         """
         import json as _json
+        import os as _os
 
         from seeknal.ask.gateway.server import _run_agent_streaming
 
-        # Set up HTTP client for callback if URL provided (on-prem worker mode)
+        # Push config: env vars take precedence over input fields.
+        # SEEKNAL_CALLBACK_URL = base URL (e.g. "http://kc-service:8000/services/kcenter/v6")
+        # The activity appends /internal/events/{message_id}/publish to this base.
+        # message_id from kc-service = session_id in seeknal workflow input.
+        _callback_base = (
+            _os.environ.get("SEEKNAL_CALLBACK_URL")
+            or input.callback_url
+        )
+        _callback_token = (
+            _os.environ.get("SEEKNAL_PUSH_API_KEY")
+            or input.callback_auth_token
+            or ""
+        )
+
         http_session = None
         callback_headers: dict[str, str] = {}
-        if input.callback_url:
+        if _callback_base:
             try:
                 import aiohttp
                 http_session = aiohttp.ClientSession()
-                if input.callback_auth_token:
-                    callback_headers["Authorization"] = f"Bearer {input.callback_auth_token}"
+                if _callback_token:
+                    callback_headers["Authorization"] = f"Bearer {_callback_token}"
                 # Include tenant_id so the backend routes the event to the
                 # right tenant-scoped SSE channel and session store.
                 callback_headers["X-Tenant-ID"] = input.tenant_id
@@ -133,8 +153,11 @@ if TEMPORAL_AVAILABLE:
         # Worker override: SEEKNAL_PROJECT_PATH env var takes precedence over
         # input.project_path. This lets a standalone worker use its own local
         # project path instead of the gateway's (for split topologies).
-        import os as _os
         effective_project_path = _os.environ.get("SEEKNAL_PROJECT_PATH") or input.project_path
+
+        # Use message_id if provided (v6 kc-service), fall back to session_id.
+        # kc-service v6 sets session_id = message_id in the workflow input.
+        _message_id = input.message_id or input.session_id
 
         try:
             async for event in _run_agent_streaming(
@@ -149,10 +172,11 @@ if TEMPORAL_AVAILABLE:
                 event_type = event.get("type")
 
                 # POST event to cloud callback URL (best-effort)
-                if http_session and input.callback_url:
+                if http_session and _callback_base:
                     try:
                         import aiohttp
-                        url = f"{input.callback_url}/internal/events/{input.session_id}/publish"
+                        # URL: {SEEKNAL_CALLBACK_URL}/internal/events/{message_id}/publish
+                        url = f"{_callback_base}/internal/events/{_message_id}/publish"
                         await http_session.post(
                             url,
                             data=_json.dumps(event),
@@ -246,20 +270,28 @@ if TEMPORAL_AVAILABLE:
     async def connect_temporal_client(
         address: str = "localhost:7233",
         namespace: str = "default",
+        tls: bool | None = None,
     ) -> Client | None:
         """Connect to a Temporal server with a 10-second timeout.
 
         Returns ``None`` on connection failure (degraded mode) instead
         of crashing the gateway.
+
+        TLS is enabled via the ``TEMPORAL_TLS`` environment variable
+        (set to ``true`` for Temporal Cloud and other TLS-enabled hosts).
         """
         import warnings
 
+        # Resolve TLS from env var if not explicitly passed
+        if tls is None:
+            tls = _os.environ.get("TEMPORAL_TLS", "").lower() == "true"
+
         try:
             client = await asyncio.wait_for(
-                Client.connect(address, namespace=namespace),
+                Client.connect(address, namespace=namespace, tls=tls),
                 timeout=10.0,
             )
-            logger.info("Connected to Temporal at %s (namespace=%s)", address, namespace)
+            logger.info("Connected to Temporal at %s (namespace=%s, tls=%s)", address, namespace, tls)
             return client
         except asyncio.TimeoutError:
             warnings.warn(

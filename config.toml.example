@@ -20,3 +20,28 @@ SEEKNAL_DB_PATH = "seeknal.db"
 
 # Disable animations (spinners, progress bars)
 # no_animation = false
+
+# =============================================================================
+# Temporal / kc-service v6 Integration
+# =============================================================================
+[gateway]
+
+# Base URL of the kc-service instance (no trailing slash).
+# The Temporal activity appends /internal/events/{message_id}/publish
+# to construct the full push URL.
+# Example: SEEKNAL_CALLBACK_URL = "http://kc-service:8000/services/kcenter/v6"
+SEEKNAL_CALLBACK_URL = ""
+
+# API key for authenticating push requests to kc-service.
+# Must match one of the comma-separated keys in kc-service's SEEKNAL_PUSH_API_KEYS.
+SEEKNAL_PUSH_API_KEY = ""
+
+# Local project path override for Temporal workers.
+# When set, the worker uses this path instead of the gateway's project_path.
+# Useful for split topologies where worker and gateway have different project dirs.
+SEEKNAL_PROJECT_PATH = ""
+
+# Temporal connection
+# Set to "true" when connecting to Temporal Cloud or any TLS-enabled Temporal host.
+# Respected by connect_temporal_client() when called without explicit tls argument.
+TEMPORAL_TLS = "false"
