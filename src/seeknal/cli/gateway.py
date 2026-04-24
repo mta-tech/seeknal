@@ -429,8 +429,11 @@ def gateway_worker(
         if callback_url:
             typer.echo(f"  Callback: {callback_url}")
 
-        # Set environment for the worker activity to find
-        os.environ["SEEKNAL_PROJECT_PATH"] = str(project_path)
+        # Set environment for the worker activity to find.
+        # Only set when --project was explicitly passed — otherwise each workflow
+        # uses its own input.project_path (multi-project routing).
+        if project:
+            os.environ["SEEKNAL_PROJECT_PATH"] = str(project_path)
         if callback_url:
             os.environ["CALLBACK_BASE_URL"] = callback_url
         if callback_auth_token:
