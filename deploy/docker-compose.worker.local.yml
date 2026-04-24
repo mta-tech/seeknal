@@ -1,0 +1,14 @@
+services:
+  seeknal-worker:
+    build:
+      context: ..                          # seeknal repo root
+      dockerfile: deploy/Dockerfile.worker.local
+    container_name: seeknal-worker-local
+    env_file:
+      - .env.worker.local
+    volumes:
+      # Mount the whole IBA directory so all seeknal projects are accessible
+      - /home/edi/Documents/exploration-hub/iba:/projects
+      # Global profiles.yml with all named connections
+      - /home/edi/Documents/exploration-hub/iba/seeknal-test-project/profiles.yml:/root/.seeknal/profiles.yml:ro
+    restart: unless-stopped

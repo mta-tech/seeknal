@@ -280,11 +280,12 @@ if TEMPORAL_AVAILABLE:
         TLS is enabled via the ``TEMPORAL_TLS`` environment variable
         (set to ``true`` for Temporal Cloud and other TLS-enabled hosts).
         """
+        import os
         import warnings
 
         # Resolve TLS from env var if not explicitly passed
         if tls is None:
-            tls = _os.environ.get("TEMPORAL_TLS", "").lower() == "true"
+            tls = os.environ.get("TEMPORAL_TLS", "").lower() == "true"
 
         try:
             client = await asyncio.wait_for(

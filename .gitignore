@@ -9,6 +9,10 @@ wheels/
 # Virtual environments
 .venv
 .vscode
+
+# Local deployment secrets (never commit)
+deploy/.env.worker.local
+deploy/.env.*.local
 .metals
 .idea
 lib
