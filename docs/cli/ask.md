@@ -34,13 +34,7 @@ Three modes of operation:
 
 ## Prerequisites
 
-Install the ask dependencies:
-
-```bash
-pip install seeknal[ask]
-```
-
-Set up an LLM provider:
+Ask is included in the default seeknal installation. Set up an LLM provider:
 
 ```bash
 # Google Gemini (default)

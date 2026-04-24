@@ -20,6 +20,8 @@ Seeknal is an all-in-one platform for data and AI/ML engineering. Define pipelin
 
 ```bash
 pip install seeknal
+# Optional, only for distributed Spark execution:
+# pip install "seeknal[spark]"
 
 seeknal init --name my_project
 seeknal draft --name my_pipeline --type transform

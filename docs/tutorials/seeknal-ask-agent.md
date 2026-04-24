@@ -2,7 +2,7 @@
 
 > **Estimated Time:** 15 minutes | **Difficulty:** Intermediate
 >
-> **Prerequisites:** A seeknal project with data materialized (`seeknal run` has been executed). Install with `pip install seeknal[ask]`.
+> **Prerequisites:** A seeknal project with data materialized (`seeknal run` has been executed). Ask is included in the default seeknal installation.
 
 ---
 

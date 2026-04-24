@@ -1,9 +1,13 @@
-from typing import List, Optional, Union
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, List, Optional, Union
 from abc import ABC, abstractmethod
 
-from pyspark.sql import DataFrame, SparkSession
 from dataclasses import dataclass
 from pyarrow import Table
+
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame, SparkSession
 
 
 @dataclass

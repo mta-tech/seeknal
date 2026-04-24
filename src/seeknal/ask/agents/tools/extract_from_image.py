@@ -20,7 +20,7 @@ from pathlib import Path
 # `extract_from_image.BinaryContent` without triggering the deferred import.
 try:
     from pydantic_ai import Agent, BinaryContent  # type: ignore[import]
-except ImportError:  # pragma: no cover — pydantic_ai is a hard dep of seeknal[ask]
+except ImportError:  # pragma: no cover — pydantic_ai is a hard dependency
     Agent = None  # type: ignore[assignment]
     BinaryContent = None  # type: ignore[assignment]
 
@@ -160,7 +160,7 @@ def _call_gemini(path: Path, mime: str, hint: str) -> dict:
 
     if Agent is None or BinaryContent is None:
         raise RuntimeError(
-            "pydantic_ai is required for image extraction; install seeknal[ask]."
+            "pydantic_ai is required for image extraction; install or upgrade seeknal."
         )
 
     image_bytes = path.read_bytes()

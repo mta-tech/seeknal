@@ -545,7 +545,7 @@ def generate_command(
             fg=typer.colors.RED,
         ))
         typer.echo("Install with: " + typer.style(
-            "pip install seeknal[ask]", fg=typer.colors.CYAN
+            "pip install --upgrade seeknal", fg=typer.colors.CYAN
         ))
         raise typer.Exit(1)
 

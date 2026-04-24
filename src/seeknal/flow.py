@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 import importlib
 import json
@@ -10,19 +12,48 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import typer
 import yaml
-from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
 from tabulate import tabulate
 
-from .common_artifact import Common, Source
 from .context import check_project_id, context, logger, require_project
 from .request import FlowRequest
 from .tasks.base import Task
 from .tasks.duckdb import DuckDBTask
-from .tasks.sparkengine import SparkEngineTask
-from .tasks.sparkengine.py_impl.base import BaseExtractorPySpark as Extractor
 from .utils import to_snake
-from .workspace import require_workspace
+
+_SPARK_EXTRA_MESSAGE = "Spark support is optional; install with `pip install seeknal[spark]`."
+
+try:  # Spark is optional; DuckDB is the default local engine.
+    from pyspark.sql import DataFrame, SparkSession
+    from pyspark.sql import functions as F
+    from .common_artifact import Common, Source
+    from .tasks.sparkengine import SparkEngineTask
+    from .tasks.sparkengine.py_impl.base import BaseExtractorPySpark as Extractor
+    from .workspace import require_workspace
+except ImportError:  # pragma: no cover - exercised in no-spark install smoke tests
+    class DataFrame:  # type: ignore[no-redef]
+        pass
+
+    SparkSession = None  # type: ignore[assignment]
+    F = None  # type: ignore[assignment]
+    SparkEngineTask = None  # type: ignore[assignment]
+
+    class Extractor:  # type: ignore[no-redef]
+        pass
+
+    class Source:  # type: ignore[no-redef]
+        pass
+
+    class Common:  # type: ignore[no-redef]
+        def as_yaml(self):
+            raise ImportError(_SPARK_EXTRA_MESSAGE)
+
+    def require_workspace(func):  # type: ignore[no-redef]
+        return func
+
+
+def _require_spark():
+    if SparkSession is None or SparkEngineTask is None:
+        raise ImportError(_SPARK_EXTRA_MESSAGE)
 
 
 class FlowOutputEnum(str, Enum):
@@ -124,10 +155,12 @@ class FlowInput:
                 else:
                     return pq.read_table(self.value)
             case FlowInputEnum.EXTRACTOR:
+                _require_spark()
                 if not isinstance(self.value, Extractor):
                     raise ValueError("Extractor input must be a Extractor class")
                 return SparkEngineTask().add_input(extractor=self.value).transform()
             case FlowInputEnum.SOURCE:
+                _require_spark()
                 if isinstance(self.value, str):
                     source_id = self.value
                 elif isinstance(self.value, Source):
@@ -205,6 +238,7 @@ class FlowOutput:
 
     def _write_with_loader(self, result: Union[DataFrame, pa.Table], spark: SparkSession, loader) -> None:
         """Write result using a custom loader."""
+        _require_spark()
         from .tasks.sparkengine import SparkEngineTask
         df = self._to_spark_dataframe(result, spark) if spark else result
         SparkEngineTask().add_input(dataframe=df).add_output(loader=loader).transform(materialize=True)
@@ -378,11 +412,16 @@ class Flow:
             >>> # Run with parameters
             >>> result = flow.run(params={"threshold": 0.5})
         """
-        spark = SparkSession.builder.getOrCreate() if self._requires_spark() else None
+        if self._requires_spark():
+            _require_spark()
+            spark = SparkSession.builder.getOrCreate()
+        else:
+            spark = None
         # taking care the input
         # load data and applying filters
         flow_input = self.input(spark)
         if isinstance(flow_input, DataFrame):
+            _require_spark()
             pre_filter = (
                 SparkEngineTask()
                 .add_input(dataframe=flow_input)

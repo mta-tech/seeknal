@@ -612,8 +612,8 @@ AnalysisException: Delta Lake not found
 **Solutions:**
 
 ```bash
-# Install delta-spark
-pip install delta-spark
+# Install Seeknal Spark support
+pip install "seeknal[spark]"
 
 # Configure Spark to use Delta Lake
 from delta import configure_spark_with_delta_pip

@@ -213,9 +213,9 @@ def generate_docs(
         from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
     except ImportError:
         typer.echo(typer.style(
-            "seeknal[ask] dependencies not installed.", fg=typer.colors.RED
+            "Seeknal Ask dependencies are missing from this environment.", fg=typer.colors.RED
         ))
-        typer.echo("Install with: pip install seeknal[ask]")
+        typer.echo("Install with: pip install --upgrade seeknal")
         raise typer.Exit(1)
 
     # Discover pipelines

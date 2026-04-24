@@ -130,10 +130,10 @@ def _run_oneshot(
         from seeknal.ask.agents.agent import create_agent, ask as agent_ask
     except ImportError:
         typer.echo(typer.style(
-            "Seeknal Ask dependencies not installed.", fg=typer.colors.RED
+            "Seeknal Ask dependencies are missing from this environment.", fg=typer.colors.RED
         ))
         typer.echo("Install with: " + typer.style(
-            "pip install seeknal[ask]", fg=typer.colors.CYAN
+            "pip install --upgrade seeknal", fg=typer.colors.CYAN
         ))
         raise typer.Exit(1)
 
@@ -205,10 +205,10 @@ def chat_command(
         from seeknal.ask.agents.agent import create_agent, ask as agent_ask
     except ImportError:
         typer.echo(typer.style(
-            "Seeknal Ask dependencies not installed.", fg=typer.colors.RED
+            "Seeknal Ask dependencies are missing from this environment.", fg=typer.colors.RED
         ))
         typer.echo("Install with: " + typer.style(
-            "pip install seeknal[ask]", fg=typer.colors.CYAN
+            "pip install --upgrade seeknal", fg=typer.colors.CYAN
         ))
         raise typer.Exit(1)
 
@@ -369,10 +369,10 @@ def _run_report(
         from seeknal.ask.agents.agent import create_agent
     except ImportError:
         typer.echo(typer.style(
-            "Seeknal Ask dependencies not installed.", fg=typer.colors.RED
+            "Seeknal Ask dependencies are missing from this environment.", fg=typer.colors.RED
         ))
         typer.echo("Install with: " + typer.style(
-            "pip install seeknal[ask]", fg=typer.colors.CYAN
+            "pip install --upgrade seeknal", fg=typer.colors.CYAN
         ))
         raise typer.Exit(1)
 
@@ -452,10 +452,10 @@ def _run_exposure(
         from seeknal.ask.report.exposure import load_report_exposure, resolve_prompt
     except ImportError:
         typer.echo(typer.style(
-            "Seeknal Ask dependencies not installed.", fg=typer.colors.RED
+            "Seeknal Ask dependencies are missing from this environment.", fg=typer.colors.RED
         ))
         typer.echo("Install with: " + typer.style(
-            "pip install seeknal[ask]", fg=typer.colors.CYAN
+            "pip install --upgrade seeknal", fg=typer.colors.CYAN
         ))
         raise typer.Exit(1)
 
@@ -493,7 +493,7 @@ def _run_exposure(
         from seeknal.ask.agents.agent import create_agent
     except ImportError:
         typer.echo(typer.style(
-            "Seeknal Ask dependencies not installed.", fg=typer.colors.RED
+            "Seeknal Ask dependencies are missing from this environment.", fg=typer.colors.RED
         ))
         raise typer.Exit(1)
 

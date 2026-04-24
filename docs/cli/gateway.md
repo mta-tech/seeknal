@@ -30,11 +30,7 @@ The gateway server wraps the seeknal ask agent behind HTTP endpoints so web clie
 
 ## Prerequisites
 
-Install the ask dependencies:
-
-```bash
-pip install seeknal[ask]
-```
+The Ask gateway and Telegram channel are included in the default seeknal installation.
 
 For Temporal support:
 
@@ -42,11 +38,6 @@ For Temporal support:
 pip install seeknal[temporal]
 ```
 
-For Telegram bot:
-
-```bash
-pip install seeknal[telegram]
-```
 
 ## Commands
 

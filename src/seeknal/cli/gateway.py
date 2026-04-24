@@ -71,10 +71,10 @@ def gateway_start(
         from seeknal.ask.gateway.server import create_gateway_app
     except ImportError:
         typer.echo(typer.style(
-            "Gateway dependencies not installed.", fg=typer.colors.RED
+            "Gateway dependencies are missing from this environment.", fg=typer.colors.RED
         ))
         typer.echo("Install with: " + typer.style(
-            "pip install seeknal[ask]", fg=typer.colors.CYAN
+            "pip install --upgrade seeknal", fg=typer.colors.CYAN
         ))
         raise typer.Exit(1)
 
@@ -91,7 +91,7 @@ def gateway_start(
             typer.echo(typer.style("Telegram channel enabled", fg=typer.colors.GREEN))
         except ImportError:
             typer.echo(typer.style(
-                "Telegram requires: pip install seeknal[telegram]",
+                "Telegram dependencies are missing; install or upgrade seeknal.",
                 fg=typer.colors.YELLOW,
             ))
 
@@ -264,10 +264,10 @@ def gateway_backend(
         from seeknal.ask.gateway.server import create_gateway_app
     except ImportError:
         typer.echo(typer.style(
-            "Gateway dependencies not installed.", fg=typer.colors.RED
+            "Gateway dependencies are missing from this environment.", fg=typer.colors.RED
         ))
         typer.echo("Install with: " + typer.style(
-            "pip install seeknal[ask,temporal]", fg=typer.colors.CYAN
+            "pip install seeknal[temporal]", fg=typer.colors.CYAN
         ))
         raise typer.Exit(1)
 

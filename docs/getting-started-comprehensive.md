@@ -92,7 +92,11 @@ Choose your preferred installation method based on your operating system.
 pip install seeknal
 ```
 
-This installs Seeknal and all required dependencies (DuckDB, pandas, pyarrow, etc.).
+This installs Seeknal and all default dependencies (DuckDB, pandas, pyarrow, Ask, Telegram, etc.). Spark is optional because DuckDB is the primary local engine; install it only when you need distributed processing:
+
+```bash
+pip install "seeknal[spark]"
+```
 
 ### Verify Installation
 

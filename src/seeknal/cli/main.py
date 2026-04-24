@@ -316,9 +316,9 @@ _register_atlas_commands()
 
 
 # =============================================================================
-# Seeknal Ask Integration (Optional)
+# Seeknal Ask Integration
 # =============================================================================
-# The Ask command group is loaded dynamically if seeknal[ask] deps are installed.
+# The Ask command group is loaded dynamically so broken/minimal environments get a useful error.
 
 def _register_ask_commands():
     """Register Ask commands if pydantic-deep dependencies are available."""
@@ -330,12 +330,12 @@ def _register_ask_commands():
         def ask_not_installed():
             """AI-powered data analysis (not installed).
 
-            Install with: pip install seeknal[ask]
+            Install with: pip install --upgrade seeknal
             """
-            typer.echo(typer.style("✗ Seeknal Ask is not installed.", fg=typer.colors.RED))
+            typer.echo(typer.style("✗ Seeknal Ask dependencies are missing from this environment.", fg=typer.colors.RED))
             typer.echo("")
             typer.echo("Install with:")
-            typer.echo(typer.style("  pip install seeknal[ask]", fg=typer.colors.CYAN))
+            typer.echo(typer.style("  pip install --upgrade seeknal", fg=typer.colors.CYAN))
             raise typer.Exit(1)
 
 
@@ -792,12 +792,16 @@ def _build_manifest_from_dag(dag_builder, project_name: str):
 @app.command()
 def info():
     """Show version information for Seeknal and its dependencies."""
-    import pyspark
     import duckdb
 
     typer.echo(f"Seeknal version: {_get_version()}")
     typer.echo(f"Python version: {sys.version.split()[0]}")
-    typer.echo(f"PySpark version: {pyspark.__version__}")
+    try:
+        import pyspark
+        pyspark_version = pyspark.__version__
+    except ImportError:
+        pyspark_version = "not installed (optional; install seeknal[spark])"
+    typer.echo(f"PySpark version: {pyspark_version}")
     typer.echo(f"DuckDB version: {duckdb.__version__}")
 
 

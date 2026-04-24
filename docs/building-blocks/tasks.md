@@ -29,6 +29,12 @@ result = task.execute()
 
 ### Spark Tasks
 
+Spark support is optional because DuckDB is the default engine. Install Spark dependencies before using Spark tasks:
+
+```bash
+pip install "seeknal[spark]"
+```
+
 Use Spark for distributed processing of large datasets:
 
 ```python

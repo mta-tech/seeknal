@@ -49,10 +49,8 @@ from seeknal.workflow.executors.source_executor import SourceExecutor  # ty: ign
 from seeknal.workflow.executors.transform_executor import TransformExecutor  # ty: ignore[unresolved-import]
 from seeknal.workflow.executors.aggregation_executor import AggregationExecutor  # ty: ignore[unresolved-import]
 from seeknal.workflow.executors.second_order_aggregation_executor import SecondOrderAggregationExecutor  # ty: ignore[unresolved-import]
-from seeknal.workflow.executors.feature_group_executor import FeatureGroupExecutor  # ty: ignore[unresolved-import]
 from seeknal.workflow.executors.model_executor import ModelExecutor  # ty: ignore[unresolved-import]
 from seeknal.workflow.executors.profile_executor import ProfileExecutor  # ty: ignore[unresolved-import]
-from seeknal.workflow.executors.rule_executor import RuleExecutor  # ty: ignore[unresolved-import]
 from seeknal.workflow.executors.exposure_executor import (  # ty: ignore[unresolved-import]
     ExposureExecutor,
     ExposureType,
@@ -67,6 +65,31 @@ from seeknal.workflow.executors.semantic_model_executor import (  # ty: ignore[u
     SemanticModelExecutor,
     MetricExecutor,
 )
+
+
+_LAZY_EXECUTOR_MODULES = {
+    "FEATURE_GROUP": "seeknal.workflow.executors.feature_group_executor",
+    "RULE": "seeknal.workflow.executors.rule_executor",
+}
+
+_LAZY_EXPORTS = {
+    "FeatureGroupExecutor": "seeknal.workflow.executors.feature_group_executor",
+    "RuleExecutor": "seeknal.workflow.executors.rule_executor",
+}
+
+
+def _load_lazy_executor_for(node_type) -> None:
+    module_name = _LAZY_EXECUTOR_MODULES.get(getattr(node_type, "name", ""))
+    if module_name:
+        __import__(module_name)
+
+
+def __getattr__(name: str):
+    module_name = _LAZY_EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = __import__(module_name, fromlist=[name])
+    return getattr(module, name)
 
 # Type checking imports to avoid circular imports
 if TYPE_CHECKING:
@@ -103,7 +126,9 @@ def get_executor(node: "Node", context: ExecutionContext) -> BaseExecutor:
         if node.node_type not in (NT.SOURCE, NT.SECOND_ORDER_AGGREGATION):
             return PythonExecutor(node, context)
 
-    # Use registry for standard YAML executors
+    # Use registry for standard YAML executors. Spark/validation-heavy executors
+    # are loaded lazily so the default DuckDB install does not require Spark.
+    _load_lazy_executor_for(node.node_type)
     registry = ExecutorRegistry.get_instance()
     return registry.create_executor(node, context)
 
