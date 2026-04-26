@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  report-server:
+    build:
+      context: ./seeknal-src
+      dockerfile: docker/report-server/Dockerfile
+    container_name: seeknal-report-server
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - report-data:/data
+    environment:
+      - SEEKNAL_REPORT_SERVER_AUTH_MODE=${SEEKNAL_REPORT_SERVER_AUTH_MODE:-open}
+      - SEEKNAL_REPORT_SERVER_KEYS=${SEEKNAL_REPORT_SERVER_KEYS:-}
+      - SEEKNAL_REPORT_SERVER_MAX_UPLOAD_BYTES=${SEEKNAL_REPORT_SERVER_MAX_UPLOAD_BYTES:-104857600}
+      - SEEKNAL_REPORT_SERVER_CORS_ORIGINS=${SEEKNAL_REPORT_SERVER_CORS_ORIGINS:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  report-data:

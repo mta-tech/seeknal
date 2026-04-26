@@ -9,10 +9,41 @@ or *"from now on, prefer GROUP BY over DISTINCT"*.
 from __future__ import annotations
 
 import re
+from urllib.parse import urlparse
 
 _PREF_MAX_LEN = 500
 _PREF_MIN_LEN = 4
 _PREFERENCES_FILENAME = "preferences.yml"
+_SECRET_KEY_RE = re.compile(
+    r"(?i)(api[_-]?key|secret|token|password|passwd|pwd|dsn|database[_-]?url)\s*[:=]"
+)
+_BEARER_RE = re.compile(r"(?i)bearer\s+[a-z0-9._~+/=-]{12,}")
+_URL_RE = re.compile(r"[a-z][a-z0-9+.-]*://[^\s'\"]+")
+
+
+def _looks_like_secret(text: str) -> bool:
+    if _SECRET_KEY_RE.search(text) or _BEARER_RE.search(text):
+        return True
+    for match in _URL_RE.finditer(text):
+        parsed = urlparse(match.group(0))
+        if (
+            parsed.password
+            or parsed.username
+            and parsed.scheme
+            in {
+                "postgres",
+                "postgresql",
+                "mysql",
+                "mariadb",
+                "redshift",
+                "snowflake",
+                "clickhouse",
+                "mongodb",
+                "redis",
+            }
+        ):
+            return True
+    return False
 
 
 def save_preference(preference: str) -> str:
@@ -42,6 +73,11 @@ def save_preference(preference: str) -> str:
             f"Error: preference is {len(cleaned)} chars, exceeds "
             f"{_PREF_MAX_LEN} limit. Write a focused domain rule, not a "
             "conversation summary."
+        )
+    if _looks_like_secret(cleaned):
+        return (
+            "Error: preference appears to contain a secret or connection string. "
+            "Do not save passwords, API keys, tokens, DSNs, or DATABASE_URL values."
         )
 
     # YAML safety: escape backslashes and quotes; strip newlines.

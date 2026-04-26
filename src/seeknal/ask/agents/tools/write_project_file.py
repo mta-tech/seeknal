@@ -11,10 +11,16 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 _SUPPORTED_SUFFIXES = {".md", ".yml", ".yaml", ".txt"}
 _MAX_CONTENT_BYTES = 100 * 1024  # 100 KB per file
 _SAFE_SEGMENT_RE = re.compile(r"^[a-zA-Z0-9_\-. ]+$")
+_SECRET_KEY_RE = re.compile(
+    r"(?i)(api[_-]?key|secret|token|password|passwd|pwd|dsn|database[_-]?url)\s*[:=]"
+)
+_BEARER_RE = re.compile(r"(?i)bearer\s+[a-z0-9._~+/=-]{12,}")
+_URL_RE = re.compile(r"[a-z][a-z0-9+.-]*://[^\s'\"]+")
 
 
 def write_project_file(path: str, content: str) -> str:
@@ -86,8 +92,14 @@ def write_project_file(path: str, content: str) -> str:
             f"Error: content is {len(body)} bytes, exceeds "
             f"{_MAX_CONTENT_BYTES} byte limit."
         )
+    if _looks_like_secret(content):
+        return (
+            "Error: content appears to contain a secret or connection string. "
+            "Do not save passwords, API keys, tokens, DSNs, or DATABASE_URL values."
+        )
 
-    context_root = ctx.project_path / "context"
+    project_root = ctx.project_path.resolve()
+    context_root = project_root / "context"
     try:
         context_root.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
@@ -104,12 +116,37 @@ def write_project_file(path: str, content: str) -> str:
     with ctx.fs_lock:
         target.write_text(content, encoding="utf-8")
 
-    rel = target.relative_to(ctx.project_path)
+    rel = target.relative_to(project_root)
     return (
         f"Wrote `{rel}` ({len(body):,} bytes). "
         "Available to future sessions via `list_context_files` and "
         "`read_project_file`."
     )
+
+
+def _looks_like_secret(text: str) -> bool:
+    if _SECRET_KEY_RE.search(text) or _BEARER_RE.search(text):
+        return True
+    for match in _URL_RE.finditer(text):
+        parsed = urlparse(match.group(0))
+        if (
+            parsed.password
+            or parsed.username
+            and parsed.scheme
+            in {
+                "postgres",
+                "postgresql",
+                "mysql",
+                "mariadb",
+                "redshift",
+                "snowflake",
+                "clickhouse",
+                "mongodb",
+                "redis",
+            }
+        ):
+            return True
+    return False
 
 
 __all__ = ["write_project_file"]

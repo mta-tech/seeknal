@@ -37,65 +37,88 @@ from pathlib import Path
 # Add seeknal to sys.path so we can import helpers
 sys.path.insert(0, {seeknal_src!r})
 
+
+def _strip_sensitive_env():
+    """Remove secrets that imports/config loaders may have introduced."""
+    for key in list(os.environ.keys()):
+        key_lower = key.lower()
+        if any(
+            marker in key_lower
+            for marker in ("api_key", "secret", "token", "password", "credential")
+        ):
+            del os.environ[key]
+
 # --- Data loading ---
 
 def load_project_data(project_path: str):
     """Create a DuckDB connection with all project data registered."""
-    import duckdb
-
-    conn = duckdb.connect(":memory:")
-    conn.execute("SET memory_limit='256MB'")
-    conn.execute("SET threads=2")
-
     root = Path(project_path)
+    try:
+        # Use the same REPL auto-registration path as execute_sql so Python
+        # analysis sees both Seeknal-managed parquet outputs and read-only
+        # attached database sources (for example warehouse.analytics.orders).
+        from seeknal.cli.repl import REPL
+        from seeknal.ask.security import configure_safe_connection
 
-    # Register intermediate parquets (transform_*, source_*, etc.)
-    intermediate = root / "target" / "intermediate"
-    if intermediate.exists():
-        for pq in intermediate.rglob("*.parquet"):
-            view_name = pq.stem
-            safe_path = str(pq.resolve()).replace("'", "''")
-            try:
-                conn.execute(
-                    f'CREATE VIEW "{{view_name}}" AS '
-                    f"SELECT * FROM read_parquet('{{safe_path}}')"
-                )
-            except Exception:
-                pass
+        repl = REPL(project_path=root, skip_history=True)
+        configure_safe_connection(repl.conn)
+        return repl.conn
+    except Exception:
+        # Fallback keeps the sandbox useful even if a project profile points at
+        # an unavailable external service.
+        import duckdb
 
-    # Register legacy cache parquets
-    cache = root / "target" / "cache"
-    if cache.exists():
-        registered = {{pq.stem for pq in intermediate.rglob("*.parquet")}} if intermediate.exists() else set()
-        for pq in cache.rglob("*.parquet"):
-            if pq.stem not in registered:
+        conn = duckdb.connect(":memory:")
+        conn.execute("SET memory_limit='256MB'")
+        conn.execute("SET threads=2")
+
+        # Register intermediate parquets (transform_*, source_*, etc.)
+        intermediate = root / "target" / "intermediate"
+        if intermediate.exists():
+            for pq in intermediate.rglob("*.parquet"):
+                view_name = pq.stem
                 safe_path = str(pq.resolve()).replace("'", "''")
                 try:
                     conn.execute(
-                        f'CREATE VIEW "{{pq.stem}}" AS '
+                        f'CREATE VIEW "{{view_name}}" AS '
                         f"SELECT * FROM read_parquet('{{safe_path}}')"
                     )
                 except Exception:
                     pass
 
-    # Register consolidated entity parquets
-    feature_store = root / "target" / "feature_store"
-    if feature_store.exists():
-        for entity_dir in feature_store.iterdir():
-            if entity_dir.is_dir():
-                features_pq = entity_dir / "features.parquet"
-                if features_pq.exists():
-                    view_name = f"entity_{{entity_dir.name}}"
-                    safe_path = str(features_pq.resolve()).replace("'", "''")
+        # Register legacy cache parquets
+        cache = root / "target" / "cache"
+        if cache.exists():
+            registered = {{pq.stem for pq in intermediate.rglob("*.parquet")}} if intermediate.exists() else set()
+            for pq in cache.rglob("*.parquet"):
+                if pq.stem not in registered:
+                    safe_path = str(pq.resolve()).replace("'", "''")
                     try:
                         conn.execute(
-                            f'CREATE VIEW "{{view_name}}" AS '
+                            f'CREATE VIEW "{{pq.stem}}" AS '
                             f"SELECT * FROM read_parquet('{{safe_path}}')"
                         )
                     except Exception:
                         pass
 
-    return conn
+        # Register consolidated entity parquets
+        feature_store = root / "target" / "feature_store"
+        if feature_store.exists():
+            for entity_dir in feature_store.iterdir():
+                if entity_dir.is_dir():
+                    features_pq = entity_dir / "features.parquet"
+                    if features_pq.exists():
+                        view_name = f"entity_{{entity_dir.name}}"
+                        safe_path = str(features_pq.resolve()).replace("'", "''")
+                        try:
+                            conn.execute(
+                                f'CREATE VIEW "{{view_name}}" AS '
+                                f"SELECT * FROM read_parquet('{{safe_path}}')"
+                            )
+                        except Exception:
+                            pass
+
+        return conn
 
 
 def _split_last_expression(code):
@@ -155,7 +178,10 @@ plot_dir = {plot_dir!r}
 os.makedirs(plot_dir, exist_ok=True)
 
 # Set up namespace
-conn = load_project_data(project_path)
+_raw_conn = load_project_data(project_path)
+_strip_sensitive_env()
+from seeknal.ask.agents.tools._safe_connection import SafeConnection
+conn = SafeConnection(_raw_conn)
 
 try:
     import pandas as pd

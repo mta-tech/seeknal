@@ -2,7 +2,8 @@
 
 Renders the agent's clarifying question + options as an arrow-key
 navigable terminal menu using Rich Live + tty/termios. Falls back to
-numbered input() when not in a TTY.
+numbered input() only when stdin can accept input; headless channels
+auto-select the recommended/default option instead of blocking.
 
 Wired into DeepAgentDeps.ask_user so the planner subagent's ask_user
 tool triggers this UI.
@@ -74,7 +75,7 @@ def _blocking_menu(
 
 
 def _fallback_numbered(question: str, options: list[dict[str, Any]]) -> str:
-    """Non-TTY fallback: numbered list with input() selection."""
+    """Non-TTY fallback: numbered list with safe non-blocking behavior."""
     from seeknal.ui.console import get_console
 
     console = get_console()
@@ -98,6 +99,14 @@ def _fallback_numbered(question: str, options: list[dict[str, Any]]) -> str:
         console.print(f"  [text.dim]{i}.[/] {label}")
     console.print()
 
+    if not sys.stdin.isatty():
+        selected = _recommended_or_first(options)
+        console.print(
+            "[text.dim]Non-interactive stdin detected; "
+            f"auto-selecting: {selected}[/]"
+        )
+        return selected
+
     try:
         choice = input(f"Select [1-{len(labels)}]: ").strip()
         idx = int(choice) - 1
@@ -112,3 +121,11 @@ def _fallback_numbered(question: str, options: list[dict[str, Any]]) -> str:
 
     # Default: first option
     return options[0].get("label", "") if options else ""
+
+
+def _recommended_or_first(options: list[dict[str, Any]]) -> str:
+    """Return the recommended option label, or the first label."""
+    for opt in options:
+        if str(opt.get("recommended", "")).lower() == "true":
+            return str(opt.get("label", ""))
+    return str(options[0].get("label", "")) if options else ""

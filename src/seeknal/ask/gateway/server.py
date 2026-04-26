@@ -180,7 +180,7 @@ async def _run_agent_inner(
         TextPartDelta,
     )
 
-    from seeknal.ask.agents.agent import create_agent
+    from seeknal.ask.agents.agent import compact_history_for_analysis_mode, create_agent
     from seeknal.ask.sessions import SessionStore
 
     store = SessionStore(project_path, tenant_id=tenant_id)
@@ -193,6 +193,8 @@ async def _run_agent_inner(
         project_path, provider=provider, model=model,
         environment="gateway", include_web=include_web,
     )
+    from seeknal.ask.agents.tools._context import reset_turn_governor
+    reset_turn_governor(question)
 
     # Auto-grant all approval gates (for Telegram and other headless channels)
     if auto_approve:
@@ -207,8 +209,19 @@ async def _run_agent_inner(
     result = None
 
     try:
+        from pydantic_ai.exceptions import UsageLimitExceeded
+        from pydantic_ai.usage import UsageLimits
+        from seeknal.ask.agents.tools._context import get_tool_context
+        ctx = get_tool_context()
+        compact_history_for_analysis_mode(message_history)
         async with agent.iter(
-            question, deps=deps, message_history=message_history,
+            question,
+            deps=deps,
+            message_history=message_history,
+            usage_limits=UsageLimits(
+                request_limit=ctx.request_limit,
+                tool_calls_limit=ctx.tool_call_limit,
+            ),
         ) as run:
             async for node in run:
                 if isinstance(node, UserPromptNode):
@@ -246,6 +259,12 @@ async def _run_agent_inner(
                                 }
                             elif isinstance(event, FunctionToolResultEvent):
                                 content = event.result.content
+                                if event.result.tool_name not in {"execute_sql", "execute_python"}:
+                                    from seeknal.ask.agents.tools._context import record_tool_result
+                                    record_tool_result(
+                                        event.result.tool_name,
+                                        str(content) if content else "",
+                                    )
                                 yield {
                                     "type": "tool_end",
                                     "data": {
@@ -253,6 +272,15 @@ async def _run_agent_inner(
                                         "output": str(content)[:2000] if content else "",
                                     },
                                 }
+                                if event.result.tool_name == "execute_sql_pair":
+                                    from seeknal.ask.agents.tools._context import (
+                                        should_synthesize_after_authoritative_sql_pair,
+                                    )
+
+                                    if should_synthesize_after_authoritative_sql_pair():
+                                        raise UsageLimitExceeded(
+                                            "authoritative sql pair result"
+                                        )
 
                 elif isinstance(node, End):
                     break
@@ -267,6 +295,43 @@ async def _run_agent_inner(
 
         if answer:
             yield {"type": "answer", "data": answer}
+
+    except UsageLimitExceeded as exc:
+        from pydantic_ai.usage import UsageLimits
+        from seeknal.ask.agents.tools._context import (
+            build_evidence_synthesis_prompt,
+            get_tool_context,
+            synthesize_evidence_fallback,
+        )
+
+        if "authoritative sql pair" in str(exc):
+            reason = (
+                "authoritative SQL pair produced the answer for this "
+                "business question"
+            )
+        elif "terminal tool error" in str(exc):
+            reason = "terminal tool error after sufficient evidence"
+        else:
+            reason = (
+                "tool-call budget reached before the model produced a final answer"
+            )
+        prompt = build_evidence_synthesis_prompt(reason)
+        deterministic = synthesize_evidence_fallback(reason)
+        try:
+            ctx = get_tool_context()
+            result = await agent.run(
+                prompt,
+                deps=deps,
+                message_history=message_history,
+                usage_limits=UsageLimits(
+                    request_limit=ctx.request_limit,
+                    tool_calls_limit=0,
+                ),
+            )
+            answer = result.output or deterministic
+        except UsageLimitExceeded:
+            answer = deterministic
+        yield {"type": "answer", "data": answer}
 
     finally:
         # Always save conversation — even when the consumer closes the generator

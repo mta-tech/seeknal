@@ -81,9 +81,25 @@ class TestInitCommand:
         os.chdir(tmp_path)
         result = runner.invoke(app, ["init", "--name", "test_project_dirs"])
         assert result.exit_code == 0
-        assert (tmp_path / "flows").exists()
-        assert (tmp_path / "entities").exists()
-        assert (tmp_path / "feature_groups").exists()
+        assert (tmp_path / "seeknal" / "sources").exists()
+        assert (tmp_path / "seeknal" / "transforms").exists()
+        assert (tmp_path / "seeknal" / "feature_groups").exists()
+        assert (tmp_path / "seeknal" / "models").exists()
+        assert (tmp_path / "seeknal" / "pipelines").exists()
+        assert (tmp_path / "seeknal" / "sql_pairs").exists()
+        assert (tmp_path / "seeknal" / "tests").exists()
+
+    def test_init_creates_agent_guidance(self, tmp_path):
+        """Init command should create AGENTS.md and CLAUDE.md guidance."""
+        os.chdir(tmp_path)
+        result = runner.invoke(app, ["init", "--name", "test_project_agents"])
+        assert result.exit_code == 0
+        agents = tmp_path / "AGENTS.md"
+        claude = tmp_path / "CLAUDE.md"
+        assert agents.exists()
+        assert claude.exists()
+        assert "seeknal/sql_pairs" in agents.read_text()
+        assert "seeknal ask test" in claude.read_text()
 
     def test_init_with_description(self, tmp_path):
         """Init command should accept description option."""

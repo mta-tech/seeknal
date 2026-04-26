@@ -215,3 +215,109 @@ def get_background_threshold(config: dict[str, Any]) -> int:
         return threshold if threshold > 0 else _DEFAULT_BACKGROUND_THRESHOLD
     except (TypeError, ValueError):
         return _DEFAULT_BACKGROUND_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Source registry prompt helpers
+# ---------------------------------------------------------------------------
+
+def get_source_registry_instructions(config: dict[str, Any]) -> Optional[str]:
+    """Build dynamic prompt guidance from ``sources`` config and sync state.
+
+    ``create_agent`` injects ``__project_path`` into the config copy before
+    calling the prompt builder. Tests or callers that build prompts directly
+    can still pass plain config; in that case the section renders without sync
+    state and uses the current directory only as a fallback.
+    """
+    if not config:
+        return None
+
+    # Avoid rendering an implicit source section for projects with no explicit
+    # registry when callers build a generic prompt outside a Seeknal project.
+    has_sources = isinstance(config.get("sources"), dict) and bool(config.get("sources"))
+    has_mode = "mode" in config
+    if not has_sources and not has_mode:
+        return None
+
+    try:
+        from seeknal.sources.config import (
+            SourceConfigError,
+            SourceRegistry,
+            read_sync_state,
+        )
+    except ImportError:
+        return None
+
+    project_value = config.get("__project_path")
+    project_path = Path(project_value) if project_value else Path.cwd()
+
+    try:
+        registry = SourceRegistry.from_agent_config(config, project_path=project_path)
+        sync_state = read_sync_state(project_path)
+    except SourceConfigError as exc:
+        return (
+            "## Data Sources & Mode Policy\n"
+            f"- Source registry config is invalid: {exc}\n"
+            "- Proceed conservatively with read-only project tables only; do not "
+            "elevate to build/pipeline actions from this config."
+        )
+
+    if not registry.explicit and not has_mode:
+        return None
+    return registry.to_prompt_context(sync_state)
+
+
+# ---------------------------------------------------------------------------
+# Toolset routing
+# ---------------------------------------------------------------------------
+
+_READ_ONLY_ANALYST_MODES = {
+    "analyst",
+    "explore",
+    "validate",
+    "connected_analyst",
+    "pipeline_analyst",
+    "hybrid_analyst",
+}
+
+
+def get_ask_toolset_mode(config: dict[str, Any]) -> str:
+    """Return the concrete Ask toolset mode for an agent config.
+
+    ``full`` is the legacy default for projects without an explicit source
+    registry or for build/pipeline modes. ``analysis`` is a physically narrower
+    tool surface for read-only business-question users: query/discovery plus
+    Python analysis, with build/publish/write/ingest tools omitted.
+    """
+    if not config:
+        return "full"
+
+    try:
+        from seeknal.sources.config import SourceConfigError, SourceRegistry
+
+        registry = SourceRegistry.from_agent_config(config)
+    except (ImportError, SourceConfigError):
+        return "full"
+
+    mode = registry.default_mode
+    if mode in {"build", "pipeline"}:
+        return "full"
+
+    if not registry.explicit:
+        return "full"
+
+    sources = list(registry.sources.values())
+    has_read_only_connected = any(
+        source.source_kind == "connected" and source.access == "read_only"
+        for source in sources
+    )
+    has_managed_read_only = any(
+        source.source_kind == "managed" and source.access == "read_only"
+        for source in sources
+    )
+
+    if mode == "auto":
+        return "analysis" if (has_read_only_connected or has_managed_read_only) else "full"
+    if mode in _READ_ONLY_ANALYST_MODES:
+        return "analysis"
+    return "full"

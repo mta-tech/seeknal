@@ -380,6 +380,8 @@ After running `seeknal init`, your project has this structure:
 my-project/
 ├── seeknal_project.yml        # Project configuration
 ├── profiles.yml                # Credentials and connections (gitignored)
+├── AGENTS.md                   # Agent/coding assistant project guide
+├── CLAUDE.md                   # Claude Code compatibility guide
 ├── .gitignore                  # Auto-generated
 ├── seeknal/                    # YAML and Python pipelines
 │   ├── sources/               # Source definitions (*.yml)
@@ -387,6 +389,9 @@ my-project/
 │   ├── feature_groups/        # Feature group definitions (*.yml)
 │   ├── models/                # Model definitions (*.yml)
 │   ├── pipelines/             # Python pipeline scripts (*.py)
+│   ├── sql_pairs/             # Ask context examples (prompt -> SQL)
+│   ├── tests/                 # Ask SQL QA tests
+│   ├── skills/                # Project-local Ask skills
 │   └── templates/             # Custom Jinja templates (optional)
 └── target/                     # Output directory (gitignored)
     ├── intermediate/          # Node output storage for cross-references
@@ -410,6 +415,10 @@ my-project/
 | `seeknal/feature_groups/` | Feature group definitions | No |
 | `seeknal/models/` | Model definitions | No |
 | `seeknal/pipelines/` | Python pipeline scripts | No |
+| `seeknal/sql_pairs/` | Prompt-to-SQL examples used as Ask context | No |
+| `seeknal/tests/` | Executable Ask SQL QA cases | No |
+| `seeknal/skills/` | Project-local Ask workflow skills | No |
+| `.seeknal/context/sources/` | Generated connected-source context | Yes |
 | `seeknal/templates/` | Custom Jinja templates | No |
 | `target/` | All build outputs | Yes |
 | `target/intermediate/` | Cross-node references | Yes |
@@ -605,4 +614,3 @@ Error: Permission denied: /mnt/data/seeknal
 - [Migration Guides](migration.md) - Migrate from other platforms
 - [Troubleshooting Guide](troubleshooting.md) - Debug common issues
 - [Getting Started Guide](../getting-started-comprehensive.md) - Tutorial
-

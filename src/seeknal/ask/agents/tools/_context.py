@@ -12,6 +12,8 @@ DuckDB connections or project artifacts.
 from __future__ import annotations
 
 import contextvars
+import hashlib
+import json
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -59,6 +61,19 @@ class ToolContext:
     plan_steps: list[str] = field(default_factory=list)
     plan_step_index: int = 0
     last_read_staging_path: str | None = None
+    disable_quality_gate: bool = False
+    unavailable_python_modules: set[str] = field(default_factory=set)
+    current_question: str | None = None
+    tool_call_limit: int | None = None
+    tool_calls_this_turn: int = 0
+    successful_sql_results_this_turn: int = 0
+    evidence_snippets_this_turn: list[str] = field(default_factory=list)
+    terminal_tool_errors_this_turn: list[str] = field(default_factory=list)
+    failed_tool_signatures: dict[str, str] = field(default_factory=dict)
+    successful_sql_cache: dict[str, str] = field(default_factory=dict)
+    loaded_sql_pairs_this_turn: dict[str, str] = field(default_factory=dict)
+    sql_pairs_checked_this_turn: bool = False
+    authoritative_sql_pair_result_this_turn: dict[str, str] | None = None
 
 
 def _make_registry():
@@ -85,6 +100,376 @@ def get_tool_context() -> ToolContext:
             "Tool context not initialized. "
             "Call set_tool_context() before using agent tools."
         )
+
+
+def get_successful_sql_cache(ctx: ToolContext | None = None) -> dict[str, str]:
+    """Return session SQL-result cache attached to the durable REPL object.
+
+    Some agent runtimes may invoke tools through copied contextvars. The REPL
+    instance is the durable per-session object, so mirror cache state there to
+    keep successful-query reuse reliable across tool-call threads.
+    """
+    ctx = ctx or get_tool_context()
+    cache = getattr(ctx.repl, "_seeknal_successful_sql_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(ctx.repl, "_seeknal_successful_sql_cache", cache)
+    ctx.successful_sql_cache = cache
+    return cache
+
+
+def get_loaded_sql_pairs(ctx: ToolContext | None = None) -> dict[str, str]:
+    """Return same-turn loaded SQL-pair memory attached to the REPL object."""
+    ctx = ctx or get_tool_context()
+    pairs = getattr(ctx.repl, "_seeknal_loaded_sql_pairs_this_turn", None)
+    if not isinstance(pairs, dict):
+        pairs = {}
+        setattr(ctx.repl, "_seeknal_loaded_sql_pairs_this_turn", pairs)
+    ctx.loaded_sql_pairs_this_turn = pairs
+    return pairs
+
+
+def mark_sql_pairs_checked(ctx: ToolContext | None = None) -> None:
+    """Record that SQL-pair context was consulted this turn."""
+    ctx = ctx or get_tool_context()
+    ctx.sql_pairs_checked_this_turn = True
+    setattr(ctx.repl, "_seeknal_sql_pairs_checked_this_turn", True)
+
+
+def sql_pairs_checked(ctx: ToolContext | None = None) -> bool:
+    """Return whether SQL-pair context was consulted this turn."""
+    ctx = ctx or get_tool_context()
+    checked = bool(getattr(ctx.repl, "_seeknal_sql_pairs_checked_this_turn", False))
+    ctx.sql_pairs_checked_this_turn = checked
+    return checked
+
+
+def get_authoritative_sql_pair_result(
+    ctx: ToolContext | None = None,
+) -> dict[str, str] | None:
+    """Return the successful SQL-pair result for the current user turn."""
+    ctx = ctx or get_tool_context()
+    result = getattr(ctx.repl, "_seeknal_authoritative_sql_pair_result_this_turn", None)
+    if not isinstance(result, dict):
+        result = None
+    ctx.authoritative_sql_pair_result_this_turn = result
+    return result
+
+
+def record_authoritative_sql_pair_result(
+    *,
+    name: str,
+    path: str,
+    result: str,
+    ctx: ToolContext | None = None,
+) -> None:
+    """Record that a project-owned SQL pair produced usable evidence."""
+    ctx = ctx or get_tool_context()
+    payload = {"name": name, "path": path, "result": result}
+    ctx.authoritative_sql_pair_result_this_turn = payload
+    setattr(ctx.repl, "_seeknal_authoritative_sql_pair_result_this_turn", payload)
+
+    ctx.evidence_snippets_this_turn.append(
+        _compact_evidence(
+            f"execute_sql_pair:{name}",
+            f"# Executed SQL pair: {path}\n\n{result}",
+        )
+    )
+    if len(ctx.evidence_snippets_this_turn) > 8:
+        del ctx.evidence_snippets_this_turn[:-8]
+
+
+def should_synthesize_after_authoritative_sql_pair(
+    ctx: ToolContext | None = None,
+) -> bool:
+    """Return True when the harness should stop tool use and answer.
+
+    A matched SQL pair is an authoritative project memory item for ordinary
+    business questions. Advanced analysis requests (forecasting, modeling,
+    correlations, charts, etc.) may legitimately need Python or follow-up
+    queries after the pair result, so those remain agent-directed.
+    """
+    ctx = ctx or get_tool_context()
+    if get_authoritative_sql_pair_result(ctx) is None:
+        return False
+    return not _question_requests_post_sql_analysis(ctx.current_question)
+
+
+def reset_turn_governor(question: str | None = None) -> None:
+    """Reset per-user-turn harness state.
+
+    The governor is intentionally core behavior, not project configuration:
+    it tracks evidence, tool budget, and repeated failures so read-only
+    analyst sessions stop after enough useful work instead of looping.
+    """
+    ctx = get_tool_context()
+    ctx.current_question = question
+    ctx.tool_calls_this_turn = 0
+    ctx.successful_sql_results_this_turn = 0
+    ctx.evidence_snippets_this_turn.clear()
+    ctx.terminal_tool_errors_this_turn.clear()
+    ctx.loaded_sql_pairs_this_turn.clear()
+    get_loaded_sql_pairs(ctx).clear()
+    ctx.sql_pairs_checked_this_turn = False
+    setattr(ctx.repl, "_seeknal_sql_pairs_checked_this_turn", False)
+    ctx.authoritative_sql_pair_result_this_turn = None
+    setattr(ctx.repl, "_seeknal_authoritative_sql_pair_result_this_turn", None)
+
+
+def make_tool_signature(tool_name: str, args: dict[str, Any] | None = None) -> str:
+    """Return a stable, low-cardinality signature for a tool call."""
+    args = args or {}
+    normalized: dict[str, Any] = {}
+    for key, value in sorted(args.items()):
+        text = str(value)
+        if key in {"sql", "query", "code"}:
+            text = " ".join(text.split())
+            if len(text) > 500:
+                text = text[:500]
+        normalized[key] = text
+    payload = json.dumps(normalized, sort_keys=True, default=str)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+    return f"{tool_name}:{digest}"
+
+
+def repeated_failure_message(tool_name: str, args: dict[str, Any] | None = None) -> str | None:
+    """Return a prior failure explanation if this exact tool path failed."""
+    ctx = get_tool_context()
+    return ctx.failed_tool_signatures.get(make_tool_signature(tool_name, args))
+
+
+def record_tool_result(
+    tool_name: str,
+    output: str,
+    *,
+    args: dict[str, Any] | None = None,
+) -> None:
+    """Record success/failure evidence for harness-level stopping behavior."""
+    ctx = get_tool_context()
+    ctx.tool_calls_this_turn += 1
+    text = output or ""
+    error_payload = _parse_tool_error(text)
+    if error_payload is not None:
+        category = str(error_payload.get("category", "tool_error"))
+        retryable = bool(error_payload.get("retryable", False))
+        message = str(error_payload.get("message", ""))[:500]
+        signature = make_tool_signature(tool_name, args)
+        ctx.failed_tool_signatures[signature] = (
+            f"{tool_name} already failed with {category}: {message}"
+        )
+        if not retryable or category.startswith("terminal_"):
+            ctx.terminal_tool_errors_this_turn.append(
+                f"{tool_name}: {category} — {message}"
+            )
+        return
+
+    if tool_name == "execute_sql" and "|" in text and " rows" in text:
+        ctx.successful_sql_results_this_turn += 1
+        ctx.evidence_snippets_this_turn.append(_compact_evidence(tool_name, text))
+    elif tool_name == "execute_python" and text.strip() and not text.startswith("Error"):
+        ctx.evidence_snippets_this_turn.append(_compact_evidence(tool_name, text))
+
+    # Keep memory bounded even in long sessions.
+    if len(ctx.evidence_snippets_this_turn) > 8:
+        del ctx.evidence_snippets_this_turn[:-8]
+
+
+def has_sufficient_evidence() -> bool:
+    """Return True once a business answer can be grounded in collected data."""
+    ctx = get_tool_context()
+    if get_authoritative_sql_pair_result(ctx) is not None and ctx.evidence_snippets_this_turn:
+        return True
+    if ctx.successful_sql_results_this_turn < 1 or not ctx.evidence_snippets_this_turn:
+        return False
+    joined = "\n".join(ctx.evidence_snippets_this_turn).lower()
+    metric_markers = (
+        "jumlah",
+        "total",
+        "count",
+        "revenue",
+        "orders",
+        "rate",
+        "avg",
+        "sum",
+    )
+    grain_markers = (
+        "tahun",
+        "year",
+        "bulan",
+        "month",
+        "tanggal",
+        "date",
+        "skala",
+        "segment",
+        "category",
+        "kategori",
+    )
+    return any(marker in joined for marker in metric_markers) and any(
+        marker in joined for marker in grain_markers
+    )
+
+
+def synthesize_evidence_fallback(reason: str) -> str:
+    """Create a deterministic final answer from collected evidence snippets."""
+    ctx = get_tool_context()
+    snippets = ctx.evidence_snippets_this_turn[-4:]
+    errors = ctx.terminal_tool_errors_this_turn[-2:]
+    lines = [
+        "I am stopping further tool use to keep this answer bounded.",
+        f"Stop reason: {reason}",
+        "",
+    ]
+    if snippets:
+        lines.append("Evidence collected:")
+        lines.extend(f"\n{snippet}" for snippet in snippets)
+    if errors:
+        lines.append("\nLimitations / failed paths:")
+        lines.extend(f"- {error}" for error in errors)
+    lines.append(
+        "\nUse these results as the grounded answer, with the noted caveats. "
+        "If you want a polished report or chart, ask for that explicitly."
+    )
+    return "\n".join(lines).strip()
+
+
+def build_evidence_synthesis_prompt(reason: str) -> str:
+    """Build a no-tool final-answer prompt from the turn governor evidence.
+
+    This is a safety valve for bounded read-only analysis sessions. If the
+    model keeps exploring until the harness budget is reached, we give it the
+    already-collected evidence and explicitly prohibit more tools so the user
+    gets a natural-language answer instead of raw harness diagnostics.
+    """
+    ctx = get_tool_context()
+    question = (ctx.current_question or "").strip()
+    snippets = "\n\n".join(ctx.evidence_snippets_this_turn[-6:]).strip()
+    errors = "\n".join(f"- {error}" for error in ctx.terminal_tool_errors_this_turn[-3:])
+    authoritative_pair = get_authoritative_sql_pair_result(ctx)
+    if not snippets:
+        return synthesize_evidence_fallback(reason)
+
+    parts = [
+        "You are writing the final answer for a read-only data-analysis turn.",
+        "Do not call any tools. Do not ask for more context.",
+        "Use only the evidence below; if it is incomplete, say what is missing as a caveat.",
+        "Do not infer labels for coded dimensions unless the evidence includes the mapping.",
+        "If a label mapping is missing, keep the raw code and state that the label was not found.",
+        "A mapping is valid only when it belongs to the exact field/category being analyzed.",
+        "Respond in the user's language and include concrete values from the evidence.",
+        "",
+        f"Original user question: {question or '(not available)'}",
+        f"Stop reason: {reason}",
+    ]
+    if authoritative_pair is not None:
+        parts.extend(
+            [
+                "",
+                "Authoritative SQL pair executed:",
+                f"- name: {authoritative_pair.get('name', '')}",
+                f"- path: {authoritative_pair.get('path', '')}",
+                "Treat that SQL-pair result as the preferred evidence. Do not "
+                "replace its logic with an alternate query.",
+            ]
+        )
+    parts.extend(["", "Evidence:", snippets])
+    if errors:
+        parts.extend(["", "Failed/limited paths:", errors])
+    parts.extend([
+        "",
+        "Write a concise, polished business answer with:",
+        "1. direct answer / key trend",
+        "2. supporting numbers",
+        "3. caveats about evidence coverage",
+        "Do not mention internal tool-call budgets unless needed as a caveat.",
+    ])
+    return "\n".join(parts).strip()
+
+
+def visualization_requested(question: str | None) -> bool:
+    """Return whether the user explicitly asked for visual output."""
+    if not question:
+        return False
+    lowered = question.lower()
+    triggers = (
+        "visual",
+        "visualisasi",
+        "chart",
+        "grafik",
+        "plot",
+        "diagram",
+        "dashboard",
+        "report",
+        "laporan",
+        "gambar",
+    )
+    return any(trigger in lowered for trigger in triggers)
+
+
+def _question_requests_post_sql_analysis(question: str | None) -> bool:
+    """Detect generic requests that need work after a matched SQL pair.
+
+    This is deliberately domain-agnostic. It avoids hardcoding table or
+    business concepts while preserving Seeknal's ability to take initiative
+    for modeling, forecasting, charts, deeper comparisons, and similar
+    analytical work.
+    """
+    if not question:
+        return False
+    lowered = question.lower()
+    triggers = (
+        "forecast",
+        "predict",
+        "prediction",
+        "projection",
+        "machine learning",
+        "model",
+        "regression",
+        "correlation",
+        "korelasi",
+        "cluster",
+        "segmentasi",
+        "anomaly",
+        "anomal",
+        "root cause",
+        "why",
+        "kenapa",
+        "mengapa",
+        "compare",
+        "comparison",
+        "bandingkan",
+        "visual",
+        "visualisasi",
+        "chart",
+        "grafik",
+        "plot",
+        "dashboard",
+        "report",
+        "laporan",
+        "python",
+        "statistical",
+        "statistik",
+    )
+    return any(trigger in lowered for trigger in triggers)
+
+
+def _parse_tool_error(text: str) -> dict[str, Any] | None:
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict) and "category" in data:
+        return data
+    return None
+
+
+def _compact_evidence(tool_name: str, text: str) -> str:
+    stripped = text.strip()
+    if len(stripped) > 1800:
+        stripped = stripped[:1800] + "\n... (truncated)"
+    return f"[{tool_name}]\n{stripped}"
 
 
 # Unique discriminator labels — each approval is keyed off a single unique

@@ -6,8 +6,12 @@ from unittest.mock import MagicMock
 from seeknal.ask.agents.tools.execute_python import (
     _do_execute,
     _infer_error_hint,
+    _imported_top_level_modules,
+    _missing_module_from_error,
+    execute_python,
     _split_last_expression,
 )
+from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
 from seeknal.ask.agents.tools._safe_connection import SafeConnection
 
 
@@ -143,7 +147,20 @@ class TestInferErrorHint:
     def test_module_not_found_hint(self):
         hint = _infer_error_hint("ModuleNotFoundError: No module named 'xgboost'", "")
         assert hint is not None
-        assert "statsmodels" in hint or "xgboost" in hint
+        assert "xgboost" in hint
+        assert "retry" in hint.lower()
+
+    def test_missing_module_parser(self):
+        assert (
+            _missing_module_from_error(
+                "ModuleNotFoundError: No module named 'matplotlib.pyplot'"
+            )
+            == "matplotlib"
+        )
+
+    def test_imported_top_level_modules(self):
+        code = "import matplotlib.pyplot as plt\nfrom sklearn.cluster import KMeans"
+        assert _imported_top_level_modules(code) == {"matplotlib", "sklearn"}
 
     def test_name_error_hint(self):
         hint = _infer_error_hint("NameError: name 'df' is not defined", "print(df)")
@@ -188,3 +205,77 @@ class TestInferErrorHint:
     def test_unrelated_error_returns_none(self):
         hint = _infer_error_hint("IndexError: list out of range", "xs[99]")
         assert hint is None
+
+
+@pytest.mark.asyncio
+async def test_execute_python_marks_missing_module_terminal(tmp_path, monkeypatch):
+    """Unavailable optional packages should not invite repeated retries."""
+
+    async def fake_sandbox(code, project_path):
+        return "Error:\nModuleNotFoundError: No module named 'matplotlib'"
+
+    monkeypatch.setattr(
+        "seeknal.ask.sandbox.async_execute_in_sandbox",
+        fake_sandbox,
+    )
+    ctx = ToolContext(
+        repl=MagicMock(),
+        artifact_discovery=MagicMock(),
+        project_path=tmp_path,
+        current_question="please plot the trend",
+    )
+    set_tool_context(ctx)
+
+    out = await execute_python("import matplotlib\nprint('plot')")
+
+    assert "terminal_dependency_unavailable" in out
+    assert "retryable" in out
+    assert "false" in out.lower()
+    assert "matplotlib" in ctx.unavailable_python_modules
+
+
+@pytest.mark.asyncio
+async def test_execute_python_prevents_repeated_unavailable_import(tmp_path, monkeypatch):
+    async def fake_sandbox(code, project_path):  # pragma: no cover - should not run
+        raise AssertionError("sandbox should not be called for repeated import")
+
+    monkeypatch.setattr(
+        "seeknal.ask.sandbox.async_execute_in_sandbox",
+        fake_sandbox,
+    )
+    ctx = ToolContext(
+        repl=MagicMock(),
+        artifact_discovery=MagicMock(),
+        project_path=tmp_path,
+        unavailable_python_modules={"matplotlib"},
+        current_question="please plot the trend",
+    )
+    set_tool_context(ctx)
+
+    out = await execute_python("import matplotlib.pyplot as plt")
+
+    assert "terminal_dependency_unavailable" in out
+    assert "already failed" in out
+
+
+@pytest.mark.asyncio
+async def test_execute_python_blocks_unrequested_visualization(tmp_path, monkeypatch):
+    async def fake_sandbox(code, project_path):  # pragma: no cover - should not run
+        raise AssertionError("sandbox should not run for unrequested visualization")
+
+    monkeypatch.setattr(
+        "seeknal.ask.sandbox.async_execute_in_sandbox",
+        fake_sandbox,
+    )
+    ctx = ToolContext(
+        repl=MagicMock(),
+        artifact_discovery=MagicMock(),
+        project_path=tmp_path,
+        current_question="show the trend by segment",
+    )
+    set_tool_context(ctx)
+
+    out = await execute_python("import matplotlib.pyplot as plt\nplt.plot([1, 2])")
+
+    assert "terminal_dependency_unavailable" in out
+    assert "Visualization was not explicitly requested" in out

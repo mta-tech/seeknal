@@ -13,6 +13,7 @@ def describe_table(table_name: str) -> str:
     from seeknal.ask.agents.tools._context import get_tool_context
 
     ctx = get_tool_context()
+    table_name = _normalize_attached_table_name(str(table_name), ctx)
 
     # Validate table name to prevent injection
     if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_.]*$", table_name):
@@ -35,3 +36,51 @@ def describe_table(table_name: str) -> str:
         lines.append(f"- `{col_name}` ({col_type}){' NULL' if nullable == 'YES' else ''}")
 
     return "\n".join(lines)
+
+
+def _normalize_attached_table_name(table_name: str, ctx) -> str:
+    """Repair a common weak-model typo for attached catalog names.
+
+    Small local models sometimes collapse the separator after a short catalog
+    alias, e.g. ``whanalytics.monthly_revenue`` instead of
+    ``wh.analytics.monthly_revenue``.  If the prefix matches an attached
+    source, insert the missing dot.  This keeps the tool thin and deterministic
+    while reducing avoidable validation/error-retry loops.
+    """
+    stripped = table_name.strip()
+    if "." not in stripped:
+        match = _find_unique_attached_table(stripped, ctx)
+        if match:
+            return match
+
+    attached = sorted(getattr(ctx.repl, "attached", set()) or [], key=len, reverse=True)
+    for source_name in attached:
+        if stripped.startswith(f"{source_name}."):
+            return stripped
+        if stripped.startswith(source_name) and len(stripped) > len(source_name):
+            rest = stripped[len(source_name):]
+            if rest and rest[0].isalpha() and "." in rest:
+                return f"{source_name}.{rest}"
+    return stripped
+
+
+def _find_unique_attached_table(table_name: str, ctx) -> str | None:
+    """Resolve an unqualified table name to a unique attached table."""
+    matches: list[str] = []
+    attached = sorted(getattr(ctx.repl, "attached", set()) or [])
+    for source_name in attached:
+        try:
+            sql = f"""
+                SELECT table_schema, table_name
+                FROM "{source_name}".information_schema.tables
+                WHERE lower(table_name) = lower('{table_name.replace("'", "''")}')
+                  AND table_schema NOT IN ('information_schema', 'pg_catalog')
+                ORDER BY table_schema, table_name
+            """
+            with ctx.db_lock:
+                _columns, rows = ctx.repl.execute_oneshot(sql, limit=2)
+        except Exception:  # noqa: BLE001 - best-effort name repair
+            continue
+        matches.extend(f"{source_name}.{schema}.{table}" for schema, table in rows)
+
+    return matches[0] if len(matches) == 1 else None

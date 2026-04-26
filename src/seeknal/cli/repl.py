@@ -322,10 +322,71 @@ class REPL:
     def _register_postgresql_connections(self) -> None:
         """Phase 2: Attach PostgreSQL connections read-only via DuckDB ATTACH."""
         from seeknal.workflow.materialization.profile_loader import ProfileLoader
+        from seeknal.connections.postgresql import (
+            build_attach_string,
+            parse_postgresql_config,
+            parse_postgresql_url,
+        )
 
-        loader = ProfileLoader(profile_path=self.profile_path)
+        profile_path = self.profile_path
+        if profile_path is None and self.project_path is not None:
+            local_profile = self.project_path / "profiles.yml"
+            if local_profile.exists():
+                profile_path = local_profile
+
+        loader = ProfileLoader(profile_path=profile_path)
         profile_data = loader._load_profile_data()
         connections = profile_data.get("connections", {})
+
+        # If the project has an explicit Ask source registry, treat it as the
+        # allow-list and namespace authority for connected read-only databases.
+        # Credentials may still come from profiles.yml or an env var, but the
+        # attached DuckDB catalog name is the registry namespace the agent sees.
+        registry = None
+        if self.project_path is not None:
+            try:
+                from seeknal.sources.config import load_source_registry
+
+                registry = load_source_registry(self.project_path)
+            except Exception:
+                registry = None
+
+        if registry is not None and getattr(registry, "explicit", False):
+            for source in registry.sources.values():
+                if (
+                    source.source_kind != "connected"
+                    or source.source_type != "database"
+                    or source.connector not in ("postgresql", "postgres")
+                    or not source.is_read_only
+                ):
+                    continue
+
+                try:
+                    pg_config = None
+                    if source.dsn_env:
+                        dsn = os.environ.get(source.dsn_env, "").strip()
+                        if dsn:
+                            pg_config = parse_postgresql_url(dsn)
+
+                    if pg_config is None:
+                        raw_config = (
+                            connections.get(source.name)
+                            or connections.get(source.namespace)
+                        )
+                        if not raw_config:
+                            continue
+                        pg_config = parse_postgresql_config(raw_config)
+
+                    conn_str = build_attach_string(pg_config)
+                    self.conn.execute(
+                        f"ATTACH '{conn_str}' AS \"{source.namespace}\" "
+                        "(TYPE postgres, READ_ONLY)"
+                    )
+                    self.attached.add(source.namespace)
+                    self._registered_pg += 1
+                except Exception:
+                    pass  # Best-effort: skip connections that fail
+            return
 
         for name, config in connections.items():
             conn_type = config.get("type", "")
@@ -333,22 +394,9 @@ class REPL:
                 continue
 
             try:
-                from seeknal.workflow.materialization.profile_loader import (
-                    interpolate_env_vars_in_dict,
-                )
-
-                resolved = interpolate_env_vars_in_dict(config)
-                host = resolved.get("host", "localhost")
-                port = resolved.get("port", 5432)
-                user = resolved.get("user", "")
-                password = resolved.get("password", "")
-                database = resolved.get("database", "")
-
-                conn_str = (
-                    f"host={host} port={port} dbname={database} "
-                    f"user={user} password={password} "
-                    f"connect_timeout=5"
-                )
+                pg_config = parse_postgresql_config(config)
+                pg_config.connect_timeout = min(pg_config.connect_timeout, 5)
+                conn_str = build_attach_string(pg_config)
                 self.conn.execute(
                     f"ATTACH '{conn_str}' AS \"{name}\" (TYPE postgres, READ_ONLY)"
                 )

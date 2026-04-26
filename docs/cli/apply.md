@@ -28,13 +28,41 @@ conventions.
 Files are copied to the appropriate subdirectory under `seeknal/` based on their
 node type (sources/, transforms/, feature_groups/, models/, etc.).
 
+When `ATLAS_API_URL` is set, `seeknal apply` also dual-writes metadata to Atlas.
+Atlas becomes the control plane for policy checks, asset registration, lineage,
+and run reporting, while the local `seeknal/` artifact remains in place as cache
+and compatibility state.
+
 ## Options
 
 | Option | Description |
 |--------|-------------|
 | `FILE_PATH` | Path to the YAML or Python file to apply |
 | `--force`, `-f` | Overwrite existing file without confirmation |
-| `--dry-run` | Validate and show what would be applied without making changes |
+| `--no-parse` | Skip manifest regeneration after the file is applied |
+
+## Atlas contract sync
+
+Set these environment variables to enable Phase 1 Atlas integration:
+
+```bash
+export ATLAS_API_URL="http://atlas-dev-server:8000"
+export ATLAS_API_TOKEN="<optional bearer token>"
+export SEEKNAL_PROJECT_NAME="my_project"
+export ATLAS_ENVIRONMENT="dev"
+```
+
+With Atlas sync enabled, `seeknal apply` performs this sequence:
+
+1. Ask Atlas for a policy decision before mutating local files.
+2. Move or update the local artifact in `seeknal/`.
+3. Register the asset in Atlas.
+4. Publish upstream lineage to Atlas.
+5. Report the apply run outcome back to Atlas.
+
+If Atlas denies the policy check, the local file is not moved. If Atlas fails
+after the local write, the local artifact remains in place and `seeknal apply`
+exits with an error so the sync issue is visible.
 
 ## Examples
 
@@ -50,10 +78,19 @@ seeknal apply draft_source_customers.yml
 seeknal apply draft_transform_clean_data.yml --force
 ```
 
-### Dry run to preview changes
+### Apply without manifest regeneration
 
 ```bash
-seeknal apply draft_feature_group_user_behavior.yml --dry-run
+seeknal apply draft_feature_group_user_behavior.yml --no-parse
+```
+
+### Apply with Atlas contract sync enabled
+
+```bash
+ATLAS_API_URL=http://atlas-dev-server:8000 \
+SEEKNAL_PROJECT_NAME=retail \
+ATLAS_ENVIRONMENT=dev \
+seeknal apply draft_transform_orders_enriched.yml
 ```
 
 ## See Also

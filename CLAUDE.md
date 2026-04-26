@@ -94,6 +94,14 @@ tests/                     # pytest test suite
 - External materialization: Iceberg (native struct), PostgreSQL (flattened `fg__feature` columns)
 - CLI: `seeknal entity list`, `seeknal entity show <name>`, `seeknal consolidate`
 
+### 7. **Seeknal Ask Agent Harness**
+- `seeknal_agent.yml` configures Ask mode and read-only connected sources
+- `seeknal source connect/status/inspect/sync/test` supports users who already have analytical database tables and do not need a Seeknal pipeline
+- `seeknal/sql_pairs/` contains prompt-to-SQL examples the Ask agent can read as context
+- `seeknal/tests/` contains executable Ask SQL QA cases for `seeknal ask test`
+- TUI/chat can inspect and run tests with `list_ask_tests`, `read_ask_test`, `run_ask_test`, `list_ask_test_results`, and `read_ask_test_result`
+- Keep domain-specific SQL in project assets; do not hardcode business logic in the agent harness
+
 ## Important Patterns & Conventions
 
 ### Decorators
@@ -153,6 +161,16 @@ def _get_run_state_path(self, run_id: str) -> Path:
 ```
 
 **Rationale:** Prevents attackers from escaping the base directory using `../` sequences.
+
+### Ask Harness Patterns
+- Keep the foundation thin: deterministic tools for discovery, SQL execution, context reading, and QA; richer behavior belongs in skills and project files.
+- SQL pairs are context examples, not tests. Store them in `seeknal/sql_pairs/*.yml`.
+- Ask SQL tests are executable regression oracles. Store them in `seeknal/tests/*.yml` and run `seeknal ask test --project .`.
+- Use `assert.compare: dataframe` in Ask tests when the agent should return a markdown/JSON table comparable to expected SQL rows.
+- Generated source context under `.seeknal/context/sources/` is derived state from `seeknal source sync`; refresh it rather than hand-editing.
+- Tap-in teach mode may persist explicit user teaching as local project memory (`preferences.yml`, `context/`, `context/sql_pairs/`) while keeping connected data sources read-only.
+- Never commit database DSNs; store secrets in `.env` and reference them with `dsn_env` in `seeknal_agent.yml`.
+- Do not save secrets, DSNs, API keys, tokens, or one-off temporary filters into project memory.
 
 ### Validation Patterns
 

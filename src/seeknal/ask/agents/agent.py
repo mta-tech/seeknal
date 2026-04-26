@@ -12,12 +12,15 @@ from typing import Optional
 from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
 from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
 
+
 # System prompt is now assembled by prompt_builder.py via create_default_builder().
 # This module-level reference is populated for backward compatibility with code
 # that imports SYSTEM_PROMPT directly.
 def _build_default_prompt() -> str:
     from seeknal.ask.prompt_builder import create_default_builder
+
     return create_default_builder().build()
+
 
 SYSTEM_PROMPT: str = _build_default_prompt()
 
@@ -53,6 +56,122 @@ def _resolve_skill_directories(project_path: Path) -> list[str]:
         dirs.append(str(_BUILTIN_SKILLS_DIR))
     dirs.append(str(project_path / "seeknal" / "skills"))
     return dirs
+
+
+def _build_connected_source_context(
+    repl,
+    *,
+    max_tables: int = 20,
+    max_columns: int = 16,
+) -> str | None:
+    """Return a compact attached-source schema snapshot for analyst mode.
+
+    This is not a separate data pipeline or materialized context-sync step. It
+    is a per-session read-only schema hint so the model starts with the same
+    basic database awareness a human analyst would get from a catalog browser.
+    """
+    attached = sorted(getattr(repl, "attached", set()) or [])
+    if not attached:
+        return None
+
+    lines: list[str] = [
+        "## Connected Source Schema Snapshot",
+        "",
+        "Queryable attached database tables discovered at session start:",
+    ]
+    tables_seen = 0
+
+    for source_name in attached:
+        try:
+            sql = f"""
+                SELECT table_schema, table_name, table_type
+                FROM "{source_name}".information_schema.tables
+                WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+                ORDER BY table_schema, table_name
+            """
+            _columns, rows = repl.execute_oneshot(sql, limit=max_tables + 1)
+        except Exception as exc:  # noqa: BLE001 - prompt context is best-effort
+            lines.append(f"- {source_name}: schema discovery failed ({exc})")
+            continue
+
+        for schema, table, table_type in rows:
+            if tables_seen >= max_tables:
+                lines.append(f"- ... ({max_tables} table context limit reached)")
+                return "\n".join(lines)
+
+            qualified = f"{source_name}.{schema}.{table}"
+            tables_seen += 1
+            lines.append(f"- `{qualified}` ({table_type or 'table'})")
+
+            try:
+                col_sql = f"""
+                    SELECT column_name, data_type
+                    FROM "{source_name}".information_schema.columns
+                    WHERE table_schema = '{str(schema).replace("'", "''")}'
+                      AND table_name = '{str(table).replace("'", "''")}'
+                    ORDER BY ordinal_position
+                """
+                _col_headers, col_rows = repl.execute_oneshot(
+                    col_sql,
+                    limit=max_columns + 1,
+                )
+            except Exception:  # noqa: BLE001 - skip per-table detail on failure
+                continue
+
+            rendered_cols = [
+                f"{col_name} {data_type}"
+                for col_name, data_type in col_rows[:max_columns]
+            ]
+            if rendered_cols:
+                suffix = " ..." if len(col_rows) > max_columns else ""
+                lines.append(f"  columns: {', '.join(rendered_cols)}{suffix}")
+
+    if tables_seen == 0:
+        return None
+    return "\n".join(lines)
+
+
+def _build_generated_source_context_index(
+    project_path: Path,
+    *,
+    max_files: int = 60,
+) -> str | None:
+    """Return a compact index of generated source-context files."""
+    root = project_path / ".seeknal" / "context" / "sources"
+    if not root.exists():
+        return None
+
+    supported = {".md", ".yml", ".yaml", ".jsonl", ".txt"}
+    priority = {
+        "SOURCE.md": 0,
+        "relationships.md": 1,
+        "overview.md": 2,
+        "columns.md": 3,
+        "profiling.md": 4,
+        "preview.md": 5,
+    }
+    files = [
+        path
+        for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() in supported
+    ]
+    if not files:
+        return None
+
+    files.sort(key=lambda p: (priority.get(p.name, 9), p.relative_to(root).as_posix()))
+    lines = [
+        "## Generated Source Context Index",
+        "",
+        "Use these files before ad-hoc schema probing when answering connected-source questions:",
+    ]
+    for path in files[:max_files]:
+        rel = path.relative_to(root).as_posix()
+        lines.append(f"- `{rel}`")
+    if len(files) > max_files:
+        lines.append(
+            f"- ... {len(files) - max_files} more files; use `list_source_context` to narrow"
+        )
+    return "\n".join(lines)
 
 
 def create_agent(
@@ -92,6 +211,20 @@ def create_agent(
     from seeknal.ask.processors import MicrocompactProcessor, SqlResultCompactor
     from seeknal.ask.security import configure_safe_connection
     from seeknal.cli.repl import REPL
+    from seeknal.ask.config import (
+        load_agent_config,
+        get_request_limit,
+        get_background_threshold,
+        get_context_budget,
+        get_ask_toolset_mode,
+    )
+
+    # Load project-level agent config (seeknal_agent.yml)
+    agent_config = load_agent_config(project_path)
+    # Internal-only prompt helper metadata. The key is deliberately namespaced
+    # to avoid conflicting with user-facing seeknal_agent.yml fields.
+    agent_config = dict(agent_config)
+    agent_config["__project_path"] = str(project_path)
 
     # Create singleton REPL with safe connection
     repl = REPL(project_path=project_path, skip_history=True)
@@ -102,44 +235,126 @@ def create_agent(
 
     # Set tool context (per-session via ContextVar — safe for concurrent sessions)
     session_id = uuid.uuid4().hex[:8]
-    set_tool_context(ToolContext(
-        repl=repl,
-        artifact_discovery=discovery,
-        project_path=project_path,
-        session_id=session_id,
-    ))
+    ask_toolset_mode = get_ask_toolset_mode(agent_config)
+    analysis_toolset = ask_toolset_mode == "analysis"
 
-    # Load project-level agent config (seeknal_agent.yml)
-    from seeknal.ask.config import (
-        load_agent_config, get_request_limit,
-        get_background_threshold, get_context_budget,
+    set_tool_context(
+        ToolContext(
+            repl=repl,
+            artifact_discovery=discovery,
+            project_path=project_path,
+            session_id=session_id,
+            disable_quality_gate=analysis_toolset,
+        )
     )
-
-    agent_config = load_agent_config(project_path)
 
     # Set request limit and background threshold on the per-session ToolContext
     # (NOT on module-level globals — avoids race conditions across concurrent sessions)
     from seeknal.ask.agents.tools._context import get_tool_context
+
     tool_ctx = get_tool_context()
     tool_ctx.request_limit = get_request_limit(agent_config)
     tool_ctx.background_threshold = get_background_threshold(agent_config)
+    if analysis_toolset:
+        tool_ctx.tool_call_limit = 24
 
     # Build final system prompt via section registry (4-layer architecture)
     from seeknal.ask.prompt_builder import create_default_builder
 
     builder = create_default_builder()
     instructions = builder.build(environment=environment, config=agent_config)
+    if analysis_toolset:
+        instructions += """
+
+## Read-only connected-source mode
+
+This session is optimized for an existing read-only database source. The
+available Seeknal Ask tools are deliberately narrow: `list_tables`,
+`describe_table`, `execute_sql`, `preview_query`, generated source-context
+read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
+
+- Do not look for pipeline-building, publishing, semantic-artifact, external-write,
+  or database-write tools in this mode. The only write tools intentionally
+  available are project-local memory tools (`save_preference` and
+  `write_project_file`) for explicit user teaching.
+- Do not ask the user to correct tool arguments. If a table/query fails, use
+  `list_tables`/`describe_table` or the database error suggestion and retry.
+- For domain-specific SQL patterns, relationships, profiling, or generated
+  table docs, use `list_source_context`/`read_source_context`,
+  `list_context_files`/`read_project_file`, and `list_sql_pairs`/
+  `execute_sql_pair`/`read_sql_pair` instead of guessing or hardcoding.
+- Teach mode: when the user explicitly says "remember", "write this down",
+  "save this", "use this from now on", or "save as a SQL pair", persist that
+  instruction as project-local memory. Use `save_preference` for one-sentence
+  rules; use `write_project_file` under `context/` for longer notes, glossaries,
+  join patterns, or `context/sql_pairs/<slug>.yml` reusable SQL examples. Do
+  not save secrets, passwords, DSNs, API keys, tokens, or temporary one-off
+  instructions.
+- When saving a SQL pair, validate the supplied SQL with `preview_query` or
+  `execute_sql` when practical, include the prompt/intent/sql/notes fields,
+  and tell the user the exact file path.
+- For project QA, use `list_ask_tests`/`read_ask_test` and `run_ask_test`
+  before inventing validation logic. Ask tests are executable QA oracles;
+  SQL pairs are examples for steering, not regression tests.
+- For business questions over a connected source, prefer the context-first
+  path: `list_source_context(query='<business term or table clue>')` and
+  `list_sql_pairs(query='<business term>')`, execute the relevant SQL pair
+  with `execute_sql_pair` when the pair directly matches the question, and
+  read the relevant `SOURCE.md`,
+  `relationships.md`, `columns.md`, `profiling.md`, context note, or SQL pair,
+  then use `list_tables`/`describe_table` only for gaps or verification. Do not
+  brute-force unrelated tables when generated or user-taught context already
+  narrows the surface.
+- Treat project-owned SQL pairs as authoritative examples: execute a matching
+  pair as-is first, do not rewrite it unless execution fails or the user asks
+  for a different filter/grain, and reuse successful query results instead of
+  rerunning the same or near-identical SQL.
+- DuckDB dialect: use `col ILIKE '%text%'`, not `ILIKE(col, '%text%')`.
+  For text dimensions that may contain blanks, normalize with
+  `NULLIF(TRIM(CAST(col AS VARCHAR)), '')` before `COALESCE`, grouping, or
+  labeling.
+- Treat opaque coded dimensions as codes unless a data dictionary, source
+  context file, or query result provides the mapping. Do not infer human labels
+  for numeric/string codes from general domain knowledge; answer with
+  `code=<value>` and note that the label mapping was not found. A code label
+  is valid only when the dictionary category/source matches the exact field
+  being analyzed; do not reuse labels from another category that happens to
+  share the same code value.
+- If a tool reports a terminal/unavailable dependency, do not retry the same
+  failed tool path. Fall back to a text/table answer using the evidence already
+  collected.
+- Keep read-only business answers bounded: after roughly 12-20 useful discovery/
+  SQL/Python tool calls, stop exploring and answer with caveats. Do not create
+  charts or run Python unless the user asks for modeling/visualization or SQL
+  cannot express the needed analysis. A request for a "trend" is a table/text
+  analysis request, not an implicit chart request; do not announce or attempt a
+  visualization unless the user explicitly asks for a chart, plot, dashboard,
+  report, or visual.
+- After a tool result, answer in natural language with concrete values. Do not
+  output raw JSON tool-call text as the final answer.
+- For direct tool-call requests, copy the supplied SQL/table/code exactly
+  unless the tool error proves it needs correction.
+"""
+        connected_context = _build_connected_source_context(repl)
+        if connected_context:
+            instructions += f"\n\n{connected_context}"
+        generated_context_index = _build_generated_source_context_index(project_path)
+        if generated_context_index:
+            instructions += f"\n\n{generated_context_index}"
 
     # Inject persistent user preferences from preferences.yml (if present)
     # so they carry across sessions. See save_preference tool for writes.
     from seeknal.ask.agents.tools.save_preference import load_preferences
+
     _prefs = load_preferences(project_path)
     if _prefs:
-        _pref_block = "\n\n## User preferences (persistent)\n\n" + "\n".join(
-            f"- {p}" for p in _prefs
-        ) + (
-            "\n\nThese were saved via save_preference in earlier sessions. "
-            "Apply them unless the user overrides in this session."
+        _pref_block = (
+            "\n\n## User preferences (persistent)\n\n"
+            + "\n".join(f"- {p}" for p in _prefs)
+            + (
+                "\n\nThese were saved via save_preference in earlier sessions. "
+                "Apply them unless the user overrides in this session."
+            )
         )
         instructions = instructions + _pref_block
 
@@ -149,7 +364,13 @@ def create_agent(
     # Build toolsets: ask tools + dynamic project context injection
     context_budget = get_context_budget(agent_config)
     context_toolset = SeeknaContextToolset(discovery, context_budget=context_budget)
-    toolsets_list = [create_ask_toolset(), context_toolset]
+    toolsets_list = [
+        create_ask_toolset(
+            mode=ask_toolset_mode,
+            include_ask_user=(environment == "interactive" and not analysis_toolset),
+        ),
+        context_toolset,
+    ]
 
     # Add web tools if requested. Prefers Firecrawl (search + scrape) when
     # FIRECRAWL_API_KEY is set, otherwise falls back to DuckDuckGo search-only.
@@ -160,20 +381,25 @@ def create_agent(
         if os.environ.get("FIRECRAWL_API_KEY"):
             from seeknal.ask.agents.tools.web_firecrawl import web_scrape, web_search
 
-            toolsets_list.append(FunctionToolset(
-                tools=[web_search, web_scrape],
-                id="seeknal-web",
-            ))
+            toolsets_list.append(
+                FunctionToolset(
+                    tools=[web_search, web_scrape],
+                    id="seeknal-web",
+                )
+            )
         else:
             try:
                 from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
 
-                toolsets_list.append(FunctionToolset(
-                    tools=[duckduckgo_search_tool()],
-                    id="seeknal-web",
-                ))
+                toolsets_list.append(
+                    FunctionToolset(
+                        tools=[duckduckgo_search_tool()],
+                        id="seeknal-web",
+                    )
+                )
             except ImportError:
                 import warnings
+
                 warnings.warn(
                     "Web search requires 'ddgs' package or FIRECRAWL_API_KEY. "
                     "Install with: pip install ddgs"
@@ -203,6 +429,7 @@ def create_agent(
     # v0.3.4+ uses `web_search`, `web_fetch`, `thinking` (default True).
     # Google cannot mix function tools with built-in tools, so disable them.
     import inspect
+
     _sig = inspect.signature(create_deep_agent)
     _web_kwargs: dict = {}
     if "web_search" in _sig.parameters:
@@ -215,6 +442,11 @@ def create_agent(
         instructions=instructions,
         toolsets=toolsets_list,
         hooks=get_ask_hooks(),
+        # Connected-source analysis is safer and more user-legible when tool
+        # calls are sequential. It lets harness state from an authoritative
+        # SQL pair stop follow-up drift before sibling tool calls run, while
+        # leaving the full/default Seeknal Ask mode unchanged.
+        max_concurrency=1 if analysis_toolset else None,
         **_web_kwargs,
         # Skills: bundled built-ins (report-generation, etc.) + per-project
         # user skills. Built-ins ship as SKILL.md files under
@@ -223,18 +455,30 @@ def create_agent(
         include_skills=True,
         skill_directories=_resolve_skill_directories(project_path),
         # Planning: todo checklist + interactive ask_user via planner subagent
-        include_todo=True,
-        include_plan=(environment == "interactive"),
+        include_todo=not analysis_toolset,
+        include_plan=(environment == "interactive" and not analysis_toolset),
         plans_dir=".seeknal/plans",
         # Context management: 3-tier compaction + user context files
-        context_manager=True,
-        history_processors=[MicrocompactProcessor(), SqlResultCompactor()],
+        context_manager=not analysis_toolset,
+        # Keep zero-cost history compaction active in read-only analysis mode
+        # too. Connected-source chats often accumulate many SQL result tables;
+        # without compaction, a simple follow-up can resend the full previous
+        # exploration transcript and explode token usage. Context-manager,
+        # memory, and subagents stay disabled for analysis mode, but these
+        # deterministic processors are safe and preserve the final answer plus
+        # compact SQL digests for multi-turn continuity.
+        history_processors=(
+            [
+                MicrocompactProcessor(keep_recent_turns=2 if analysis_toolset else 3),
+                SqlResultCompactor(min_chars=250 if analysis_toolset else 500),
+            ]
+        ),
         context_files=context_files,
         # Memory: persistent schema knowledge across sessions
-        include_memory=True,
+        include_memory=not analysis_toolset,
         memory_dir=".seeknal/ask_memory",
         # Checkpoints: save/rewind in long chat sessions
-        include_checkpoints=True,
+        include_checkpoints=not analysis_toolset,
         checkpoint_frequency="every_turn",
         max_checkpoints=20,
         # Cost tracking
@@ -244,8 +488,8 @@ def create_agent(
         # Output style
         output_style=style or "concise",
         # Subagents
-        include_subagents=True,
-        subagents=get_subagent_configs(),
+        include_subagents=not analysis_toolset,
+        subagents=[] if analysis_toolset else get_subagent_configs(),
         # Disabled: seeknal has domain-specific alternatives
         include_filesystem=False,
         include_execute=False,
@@ -255,7 +499,11 @@ def create_agent(
     # Gateway/headless environments have no TTY — pass ask_user=None so the
     # planner subagent auto-selects the recommended option instead of calling
     # input() on a non-TTY stdin (which blocks or raises EOFError).
-    _ask_user_cb = interactive_ask_user if environment == "interactive" else None
+    _ask_user_cb = (
+        interactive_ask_user
+        if environment == "interactive" and not analysis_toolset
+        else None
+    )
     deps = DeepAgentDeps(
         backend=LocalBackend(root_dir=str(project_path)),
         ask_user=_ask_user_cb,
@@ -263,6 +511,32 @@ def create_agent(
     message_history = []
 
     return agent, deps, message_history, _cost_info
+
+
+def compact_history_for_analysis_mode(message_history: list) -> None:
+    """Apply deterministic history compaction for read-only analysis sessions.
+
+    pydantic-deep receives the same processors at agent construction time, but
+    the Seeknal streaming/gateway harness can call pydantic-ai directly. Run the
+    zero-cost processors here as a harness-level guard so multi-turn connected
+    database chats do not resend every prior SQL table verbatim.
+    """
+    if not message_history:
+        return
+    try:
+        from seeknal.ask.agents.tools._context import get_tool_context
+
+        if not getattr(get_tool_context(), "disable_quality_gate", False):
+            return
+    except RuntimeError:
+        return
+
+    from seeknal.ask.processors import MicrocompactProcessor, SqlResultCompactor
+
+    compacted = MicrocompactProcessor(keep_recent_turns=1)(message_history)
+    compacted = SqlResultCompactor(min_chars=250)(compacted)
+    message_history.clear()
+    message_history.extend(compacted)
 
 
 def ask(
@@ -302,6 +576,7 @@ def ask(
         _request_limit = ctx.request_limit
     except RuntimeError:
         _request_limit = 100
+    compact_history_for_analysis_mode(message_history)
     _usage_limits = UsageLimits(request_limit=_request_limit)
 
     result = agent.run_sync(
@@ -371,6 +646,14 @@ def _quality_gate(
         The original answer if it passes, or the retry answer (regardless
         of whether the retry passes — no infinite loop).
     """
+    from seeknal.ask.agents.tools._context import get_tool_context
+
+    try:
+        if getattr(get_tool_context(), "disable_quality_gate", False):
+            return answer
+    except RuntimeError:
+        pass
+
     from seeknal.ask.agents.quality import check_answer_quality
 
     passes, reason = check_answer_quality(answer)
@@ -379,7 +662,6 @@ def _quality_gate(
 
     # One quality retry with guidance
     from pydantic_ai.usage import UsageLimits
-    from seeknal.ask.agents.tools._context import get_tool_context
 
     # Same fallback as `ask()` — support unit tests that mock the agent
     # without constructing a full session + ToolContext.

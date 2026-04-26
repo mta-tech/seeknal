@@ -8,6 +8,9 @@ knows to narrow its next query.
 
 from __future__ import annotations
 
+import re
+import hashlib
+
 # Hard caps — not overridable from the agent. Tune here if needed.
 _ROW_HARD_CAP = 500
 _COLUMN_HARD_CAP = 50
@@ -15,7 +18,13 @@ _CELL_MAX_LEN = 200
 _BYTE_BUDGET = 50 * 1024  # 50 KB of markdown table (roughly ~12k tokens)
 
 
-def execute_sql(sql: str, limit: int = 100) -> str:
+def execute_sql(
+    sql: str | None = None,
+    limit: int = 100,
+    query: str | None = None,
+    refresh: bool = False,
+    allow_sql_pair_drift: bool = False,
+) -> str:
     """Execute a read-only SQL query against seeknal project data.
 
     Use this to query entities, feature groups, and intermediate tables.
@@ -49,17 +58,121 @@ def execute_sql(sql: str, limit: int = 100) -> str:
     For terminal errors, explain the limitation to the user.
 
     Args:
-        sql: A DuckDB-compatible SELECT query.
+        sql: A DuckDB-compatible SELECT query. This is the preferred argument.
+        query: Compatibility alias for ``sql``. Some local tool-call models
+            naturally emit ``query=...``; accepting the alias keeps the tool
+            thin and deterministic while reducing brittle schema failures.
         limit: Maximum rows to return (default 100). Capped at 500
             regardless of what is passed — use WHERE/GROUP BY to narrow
             beyond that, not a larger limit.
+        refresh: Re-run the SQL even if the same normalized query already
+            succeeded in this session. Defaults to False so repeated successful
+            queries reuse the prior result instead of burning more tool calls.
+        allow_sql_pair_drift: Compatibility escape hatch for SQL that differs
+            from a SQL pair loaded earlier in the turn. Defaults to False.
+            This is ignored after a successful authoritative SQL-pair result
+            for an ordinary business question; the harness will stop and
+            synthesize an answer instead of allowing query drift.
     """
-    from seeknal.ask.agents.tools._context import get_tool_context
+    from seeknal.ask.agents.tools._context import (
+        get_authoritative_sql_pair_result,
+        get_tool_context,
+        get_successful_sql_cache,
+        record_tool_result,
+        repeated_failure_message,
+        should_synthesize_after_authoritative_sql_pair,
+        sql_pairs_checked,
+    )
+    from seeknal.ask.agents.tools.errors import (
+        RETRYABLE_SYNTAX,
+        TERMINAL_BOUNDED_EVIDENCE,
+        format_tool_error,
+    )
 
     ctx = get_tool_context()
+    success_cache = get_successful_sql_cache(ctx)
+
+    if sql is None:
+        sql = query
+    if sql is None or not str(sql).strip():
+        return format_tool_error(
+            RETRYABLE_SYNTAX,
+            "Missing SQL query. Call execute_sql with sql='SELECT ...'.",
+            hint=(
+                "Use the `sql` argument for execute_sql. The `query` argument "
+                "is accepted as a compatibility alias, but one of them must "
+                "contain a read-only SELECT/WITH/DESCRIBE/SHOW statement."
+            ),
+        )
 
     # Strip trailing semicolons — LLMs often include them but DuckDB rejects them
-    sql = sql.strip().rstrip(";").strip()
+    sql = str(sql).strip().rstrip(";").strip()
+    sql, lint_notices = _repair_common_sql_before_execution(sql)
+
+    if _should_require_sql_pair_lookup(ctx, sql, sql_pairs_checked(ctx)):
+        return format_tool_error(
+            RETRYABLE_SYNTAX,
+            "Project SQL pairs exist and should be checked before ad-hoc SQL.",
+            hint=(
+                "Call list_sql_pairs(query='<business terms from the user question>') "
+                "and execute a direct match with execute_sql_pair. If no relevant "
+                "pair is found, then continue with execute_sql."
+            ),
+        )
+
+    prior_failure = repeated_failure_message("execute_sql", {"sql": sql})
+    if prior_failure:
+        result = format_tool_error(
+            RETRYABLE_SYNTAX,
+            prior_failure,
+            hint=(
+                "Do not retry the same SQL. Use generated source context, "
+                "list_tables/describe_table, or answer with caveats from "
+                "already collected evidence."
+            ),
+        )
+        record_tool_result("execute_sql", result, args={"sql": sql})
+        return result
+
+    cache_key = _sql_cache_key(sql)
+    if not refresh and cache_key in success_cache:
+        result = (
+            "Reusing prior successful SQL result for the same normalized query. "
+            "Pass refresh=True only when you intentionally need a fresh database read.\n\n"
+            + success_cache[cache_key]
+        )
+        record_tool_result("execute_sql", result, args={"sql": sql})
+        return result
+
+    drift_notice = _sql_pair_drift_notice(ctx, sql)
+    if (
+        drift_notice
+        and get_authoritative_sql_pair_result(ctx) is not None
+        and should_synthesize_after_authoritative_sql_pair(ctx)
+    ):
+        result = format_tool_error(
+            TERMINAL_BOUNDED_EVIDENCE,
+            "A matching SQL pair already executed successfully for this turn.",
+            hint=(
+                "Stop tool use and answer from the AUTHORITATIVE_RESULT. "
+                "Only ask a new user turn for changed filters, grain, or "
+                "deeper post-query analysis."
+            ),
+        )
+        record_tool_result("execute_sql", result, args={"sql": sql})
+        return result
+    if drift_notice and not allow_sql_pair_drift:
+        result = format_tool_error(
+            RETRYABLE_SYNTAX,
+            "SQL differs from the SQL pair loaded earlier this turn.",
+            hint=(
+                "Use the execute_sql_pair result as authoritative. Only retry "
+                "execute_sql with allow_sql_pair_drift=True if the user asked "
+                "for a different filter/grain or the SQL pair failed."
+            ),
+        )
+        record_tool_result("execute_sql", result, args={"sql": sql})
+        return result
 
     # SQL validation is handled by the PRE_TOOL_USE hook (see hooks.py)
 
@@ -81,10 +194,36 @@ def execute_sql(sql: str, limit: int = 100) -> str:
             format_tool_error,
         )
 
-        return format_tool_error(classify_duckdb_error(str(e)), str(e))
+        repaired_sql = _repair_sql_from_duckdb_suggestion(sql, str(e))
+        if repaired_sql and repaired_sql != sql:
+            try:
+                with ctx.db_lock:
+                    columns, rows = ctx.repl.execute_oneshot(
+                        repaired_sql,
+                        limit=fetch_limit,
+                    )
+                sql = repaired_sql
+            except Exception as retry_error:
+                result = format_tool_error(
+                    classify_duckdb_error(str(retry_error)),
+                    str(retry_error),
+                    hint=(
+                        "A table-name suggestion was attempted but the query "
+                        "still failed. Run list_tables and describe_table, then "
+                        "retry with a fully qualified table name."
+                    ),
+                )
+                record_tool_result("execute_sql", result, args={"sql": sql})
+                return result
+        else:
+            result = format_tool_error(classify_duckdb_error(str(e)), str(e))
+            record_tool_result("execute_sql", result, args={"sql": sql})
+            return result
 
     if not columns:
-        return "Query executed successfully but returned no results."
+        result = "Query executed successfully but returned no results."
+        record_tool_result("execute_sql", result, args={"sql": sql})
+        return result
 
     has_more_rows = len(rows) > effective_limit
     trimmed_rows = rows[:effective_limit]
@@ -98,18 +237,147 @@ def execute_sql(sql: str, limit: int = 100) -> str:
         except Exception:
             total_rows = None
 
-    return _format_table(
+    result = _format_table(
         columns=columns,
         rows=trimmed_rows,
         total_rows=total_rows,
         has_more_rows=has_more_rows,
         requested_limit=asked,
     )
+    if lint_notices:
+        result += "\n\n" + "\n".join(f"ℹ SQL lint: {notice}" for notice in lint_notices)
+    if drift_notice:
+        result += "\n\n" + drift_notice
+    success_cache[cache_key] = result
+    record_tool_result("execute_sql", result, args={"sql": sql})
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _repair_common_sql_before_execution(sql: str) -> tuple[str, list[str]]:
+    """Apply safe DuckDB-dialect repairs before executing agent SQL."""
+    notices: list[str] = []
+
+    repaired = re.sub(
+        r"\bILIKE\s*\(\s*([A-Za-z_][A-Za-z0-9_\\.\" ]*)\s*,\s*('(?:''|[^'])*')\s*\)",
+        lambda m: f"{m.group(1).strip()} ILIKE {m.group(2)}",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    if repaired != sql:
+        notices.append("rewrote function-style ILIKE(...) to DuckDB infix ILIKE syntax.")
+        sql = repaired
+
+    # ORDER BY CAST(label AS INTEGER) often fails after the agent has already
+    # labeled blanks/unknowns. TRY_CAST preserves numeric ordering while making
+    # non-numeric labels sortable instead of crashing the query.
+    order_by_pos = re.search(r"\bORDER\s+BY\b", sql, flags=re.IGNORECASE)
+    if order_by_pos:
+        prefix = sql[: order_by_pos.start()]
+        order_clause = sql[order_by_pos.start():]
+        repaired_order = re.sub(
+            r"\bCAST\s*\(\s*([A-Za-z_][A-Za-z0-9_\\.]*)\s+AS\s+(INTEGER|INT|BIGINT)\s*\)",
+            r"TRY_CAST(\1 AS \2)",
+            order_clause,
+            flags=re.IGNORECASE,
+        )
+        if repaired_order != order_clause:
+            notices.append("rewrote ORDER BY CAST(... AS integer) to TRY_CAST to tolerate non-numeric labels.")
+            sql = prefix + repaired_order
+
+    return sql, notices
+
+
+def _sql_cache_key(sql: str) -> str:
+    normalized = _normalize_sql(sql)
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+
+
+def _normalize_sql(sql: str) -> str:
+    return " ".join(str(sql).strip().rstrip(";").lower().split())
+
+
+def _sql_pair_drift_notice(ctx, sql: str) -> str | None:
+    """Warn when executing SQL differs from a SQL pair loaded this turn.
+
+    SQL pairs are project-owned examples. They are not mandatory for every
+    query, so this notice is intentionally advisory and never blocks execution.
+    It gives the model a chance to stop after the authoritative pair result
+    instead of silently drifting into a plausible but different query.
+    """
+    from seeknal.ask.agents.tools._context import get_loaded_sql_pairs
+
+    loaded_pairs = get_loaded_sql_pairs(ctx)
+    if not loaded_pairs:
+        return None
+    normalized = _normalize_sql(sql)
+    for pair_sql in loaded_pairs.values():
+        if normalized == _normalize_sql(pair_sql):
+            return None
+    names = ", ".join(sorted(loaded_pairs)[:3])
+    if len(loaded_pairs) > 3:
+        names += ", ..."
+    return (
+        "⚠ SQL pair drift: this SQL differs from the SQL pair loaded earlier "
+        f"this turn ({names}). Prefer the SQL pair result as authoritative "
+        "unless a tool error or user request requires a changed grain/filter."
+    )
+
+
+def _should_require_sql_pair_lookup(ctx, sql: str, checked: bool) -> bool:
+    """Require SQL-pair lookup before ad-hoc business SQL when pairs exist."""
+    if checked or not (getattr(ctx, "current_question", None) or "").strip():
+        return False
+    if _looks_like_direct_sql_request(ctx.current_question):
+        return False
+    if _is_metadata_or_healthcheck_sql(sql):
+        return False
+    roots = [ctx.project_path.resolve() / "seeknal" / "sql_pairs", ctx.project_path.resolve() / "context" / "sql_pairs"]
+    return any(
+        root.exists()
+        and any(path.is_file() and path.suffix.lower() in {".yml", ".yaml"} for path in root.rglob("*"))
+        for root in roots
+    )
+
+
+def _looks_like_direct_sql_request(question: str | None) -> bool:
+    if not question:
+        return False
+    lowered = question.lower()
+    return "execute_sql" in lowered or "run this sql" in lowered or "jalankan sql" in lowered
+
+
+def _is_metadata_or_healthcheck_sql(sql: str) -> bool:
+    normalized = _normalize_sql(sql)
+    metadata_markers = (
+        "information_schema",
+        "pg_catalog",
+        "show ",
+        "describe ",
+        "pragma ",
+    )
+    return any(marker in normalized for marker in metadata_markers)
+
+
+def _repair_sql_from_duckdb_suggestion(sql: str, error: str) -> str | None:
+    """Retry a missing-table query with DuckDB's fully-qualified suggestion."""
+    suggestion_match = re.search(r'Did you mean "([A-Za-z_][A-Za-z0-9_.]*)"', error)
+    missing_match = re.search(r"Table with name ([A-Za-z_][A-Za-z0-9_]*) does not exist", error)
+    if not suggestion_match or not missing_match:
+        return None
+
+    missing = missing_match.group(1)
+    suggested = suggestion_match.group(1)
+    if suggested.split(".")[-1].lower() != missing.lower():
+        return None
+    # Replace only standalone unqualified relation tokens. This intentionally
+    # avoids fuzzy SQL rewriting; it only accepts the fully-qualified table
+    # name surfaced by DuckDB itself.
+    return re.sub(rf"\b{re.escape(missing)}\b", suggested, sql, count=1)
 
 
 def _count_total(ctx, sql: str) -> int | None:
@@ -134,6 +402,12 @@ def _truncate_cell(value) -> tuple[str, bool]:
     if value is None:
         return "NULL", False
     text = str(value)
+    if text.strip() == "":
+        # Markdown tables and Rich rendering both collapse empty/whitespace-only
+        # cells in ways that can visually shift columns. Surface the value as a
+        # label so the agent and user can distinguish "blank string" from NULL
+        # without losing column alignment.
+        return "[blank]", False
     truncated = False
     if len(text) > _CELL_MAX_LEN:
         text = text[: _CELL_MAX_LEN - 1] + "…"
@@ -144,7 +418,6 @@ def _truncate_cell(value) -> tuple[str, bool]:
     if "\n" in text:
         text = text.replace("\n", " ")
     return text, truncated
-
 
 def _format_table(
     columns: list[str],

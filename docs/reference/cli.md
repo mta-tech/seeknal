@@ -36,6 +36,9 @@ Complete reference for all Seeknal CLI commands. Commands are organized by categ
   - [query](#seeknal-query) - Query metrics
   - [deploy-metrics](#seeknal-deploy-metrics) - Deploy metrics as materialized views
   - [repl](#seeknal-repl) - Interactive SQL REPL
+  - [ask](#seeknal-ask) - AI-powered data analysis
+  - [ask chat](#seeknal-ask-chat) - Interactive Ask chat
+  - [ask test](#seeknal-ask-test) - Run Ask SQL QA tests
 - [Version Management](#version-management)
   - [version list](#seeknal-version-list) - List versions
   - [version show](#seeknal-version-show) - Show version details
@@ -46,8 +49,13 @@ Complete reference for all Seeknal CLI commands. Commands are organized by categ
   - [env promote](#seeknal-env-promote) - Promote environment
   - [env list](#seeknal-env-list) - List environments
   - [env delete](#seeknal-env-delete) - Delete environment
-- [Data Sources (REPL)](#data-sources-repl)
-  - [source add](#seeknal-source-add) - Add data source
+- [Data Sources (REPL and Ask)](#data-sources-repl-and-ask)
+  - [source connect](#seeknal-source-connect) - Configure read-only Ask source
+  - [source status](#seeknal-source-status) - Show source registry status
+  - [source inspect](#seeknal-source-inspect) - Inspect a source declaration
+  - [source sync](#seeknal-source-sync) - Generate source context
+  - [source test](#seeknal-source-test) - Verify source attachment
+  - [source add](#seeknal-source-add) - Add legacy REPL data source
   - [source list](#seeknal-source-list) - List data sources
   - [source remove](#seeknal-source-remove) - Remove data source
 - [Interval Management](#interval-management)
@@ -99,6 +107,7 @@ Complete reference for all Seeknal CLI commands. Commands are organized by categ
 | `seeknal plan` | Analyze changes and show execution plan |
 | `seeknal promote` | Promote environment changes |
 | `seeknal repl` | Start interactive SQL REPL |
+| `seeknal ask` | Ask natural-language data questions, chat, report, and test |
 | `seeknal draft` | Generate template |
 | `seeknal dry-run` | Validate and preview execution |
 | `seeknal apply` | Apply file to production |
@@ -109,7 +118,7 @@ Complete reference for all Seeknal CLI commands. Commands are organized by categ
 | `seeknal connection-test` | Test StarRocks connectivity |
 | `seeknal info` | Show version information |
 | `seeknal version` | Manage feature group versions |
-| `seeknal source` | Manage data sources for REPL |
+| `seeknal source` | Manage data sources for REPL and Ask |
 | `seeknal iceberg` | Iceberg materialization commands |
 | `seeknal diff` | Show pipeline changes since last apply |
 | `seeknal intervals` | Manage execution intervals and backfill |
@@ -131,8 +140,9 @@ Initialize a new Seeknal project with dbt-style structure.
 Creates a complete project structure with:
 - `seeknal_project.yml`: Project configuration (name, version, profile)
 - `profiles.yml`: Credentials and engine config (gitignored)
-- `.gitignore`: Auto-generated with profiles.yml and target/
-- `seeknal/`: Directory for YAML and Python pipeline definitions
+- `.gitignore`: Auto-generated with profiles.yml, target/, and `.seeknal/`
+- `AGENTS.md` / `CLAUDE.md`: Project-local assistant guidance
+- `seeknal/`: YAML/Python definitions, Ask skills, SQL pairs, and Ask tests
 - `target/`: Output directory for compiled artifacts
 
 **Usage:**
@@ -156,7 +166,11 @@ seeknal/
 ├── feature_groups/  # YAML feature groups
 ├── models/          # YAML models
 ├── pipelines/       # Python pipeline scripts (*.py)
-└── templates/       # Custom Jinja templates (optional)
+├── templates/       # Custom Jinja templates (optional)
+├── common/          # Shared Python helpers
+├── sql_pairs/       # Ask context examples: prompt -> SQL
+├── tests/           # Ask SQL QA tests
+└── skills/          # Project-local Ask skills
 target/
 └── intermediate/    # Node output storage for cross-references
 ```
@@ -179,7 +193,7 @@ seeknal init --path /path/to/project
 seeknal init --force
 ```
 
-**See Also:** [Project Configuration](configuration.md)
+**See Also:** [Project Configuration](configuration.md), [Data Sources](#data-sources-repl-and-ask), [Ask](#seeknal-ask)
 
 ---
 
@@ -1122,7 +1136,92 @@ seeknal source list
 seeknal source remove mydb
 ```
 
-**See Also:** [Data Sources](#data-sources-repl)
+**See Also:** [Data Sources](#data-sources-repl-and-ask)
+
+---
+
+## seeknal ask
+
+Ask natural-language questions about project data, connected read-only sources,
+SQL pairs, and source context. With no subcommand, `seeknal ask` treats the
+remaining arguments as a one-shot question.
+
+**Usage:**
+```bash
+seeknal ask [OPTIONS] [QUESTION...]
+```
+
+**Options:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--project` | PATH | Auto-detected | Seeknal project path |
+| `--provider`, `-p` | TEXT | Environment/default | LLM provider override |
+| `--model`, `-m` | TEXT | Environment/default | Model override |
+| `--quiet`, `-q` | FLAG | False | Suppress step-by-step output |
+| `--web` | FLAG | False | Enable web search tools |
+
+**Examples:**
+```bash
+seeknal ask --project . "What drove revenue last month?"
+seeknal ask --project . --quiet "Show top product categories"
+```
+
+---
+
+## seeknal ask chat
+
+Start an interactive multi-turn Ask TUI/chat session. The agent can inspect
+source context, SQL pairs, project schemas, and Ask test definitions while it
+answers.
+
+**Usage:**
+```bash
+seeknal ask chat [OPTIONS]
+```
+
+**Options:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--project` | PATH | Auto-detected | Seeknal project path |
+| `--provider`, `-p` | TEXT | Environment/default | LLM provider override |
+| `--model`, `-m` | TEXT | Environment/default | Model override |
+| `--quiet`, `-q` | FLAG | False | Suppress step-by-step output |
+| `--style`, `-s` | TEXT | None | Output style hint |
+| `--budget` | FLOAT | None | Max USD budget for the session |
+| `--web` | FLAG | False | Enable web search/fetch tools |
+| `--session` | TEXT | None | Resume a named session |
+| `--name` | TEXT | None | Create a named session |
+
+---
+
+## seeknal ask test
+
+Run project-local Ask SQL tests from `seeknal/tests/`, `context/tests/`, or
+top-level `tests/`. SQL pairs are context examples; Ask tests are executable
+QA oracles.
+
+**Usage:**
+```bash
+seeknal ask test [OPTIONS]
+```
+
+**Options:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--project` | PATH | Auto-detected | Seeknal project path |
+| `--select`, `-s` | TEXT | None | Run one test by name or YAML filename |
+| `--sql-only` | FLAG | False | Execute expected SQL only; skip the agent |
+| `--output-dir` | PATH | Default result dir | Directory for JSON result artifacts |
+| `--json` | FLAG | False | Print full JSON result |
+| `--provider`, `-p` | TEXT | Environment/default | LLM provider for agent mode |
+| `--model`, `-m` | TEXT | Environment/default | Model override for agent mode |
+
+**Examples:**
+```bash
+seeknal ask test --project . --sql-only
+seeknal ask test --project . --select total_revenue
+seeknal ask test --project . --json
+```
 
 ---
 
@@ -1402,11 +1501,129 @@ seeknal env delete dev
 
 ---
 
-# Data Sources (REPL)
+# Data Sources (REPL and Ask)
+
+`seeknal source` manages both legacy saved REPL sources and project-local
+read-only sources for Seeknal Ask. For new Ask projects that point at an
+existing analytical database, prefer `seeknal source connect` so credentials
+stay in environment variables and `seeknal_agent.yml` stores only metadata.
+
+Typical connected-source workflow:
+
+```bash
+export WAREHOUSE_URL="postgresql://user:pass@host/db?sslmode=require"
+seeknal source connect warehouse --connector postgresql --namespace warehouse --dsn-env WAREHOUSE_URL
+seeknal source sync warehouse --project .
+seeknal source test warehouse --project .
+seeknal ask chat --project .
+```
+
+---
+
+## seeknal source connect
+
+Create or update a read-only Ask source registry entry in `seeknal_agent.yml`.
+This command never stores the DSN secret; it stores the name of the environment
+variable that contains the DSN.
+
+**Usage:**
+```bash
+seeknal source connect NAME [OPTIONS]
+```
+
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | TEXT | Yes | Source registry name |
+
+**Options:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--connector` | TEXT | Required | Connector type, e.g. `postgresql` |
+| `--namespace` | TEXT | Source name | Queryable namespace/catalog exposed to Ask |
+| `--dsn-env` | TEXT | None | Environment variable containing the DSN |
+| `--access` | TEXT | `read_only` | Access policy |
+| `--role` | TEXT | `business_source_of_truth` | Agent steering role |
+| `--mode` | TEXT | `auto` | Default Ask mode |
+| `--description` | TEXT | None | Human-readable source description |
+| `--project` | PATH | Auto-detected | Seeknal project path |
+| `--force` | FLAG | False | Replace an existing source entry |
+
+**Examples:**
+```bash
+seeknal source connect warehouse \
+  --connector postgresql \
+  --namespace warehouse \
+  --dsn-env WAREHOUSE_URL \
+  --description "Production analytics warehouse"
+```
+
+---
+
+## seeknal source status
+
+Show Ask source registry and context-sync status.
+
+**Usage:**
+```bash
+seeknal source status [OPTIONS]
+```
+
+**Options:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--project` | PATH | Auto-detected | Seeknal project path |
+
+---
+
+## seeknal source inspect
+
+Inspect one Ask source declaration.
+
+**Usage:**
+```bash
+seeknal source inspect NAME [OPTIONS]
+```
+
+---
+
+## seeknal source sync
+
+Write metadata-only context artifacts for Ask source steering under
+`.seeknal/context/sources/`.
+
+**Usage:**
+```bash
+seeknal source sync [NAME...] [OPTIONS]
+```
+
+**Examples:**
+```bash
+seeknal source sync --project .
+seeknal source sync warehouse --project .
+```
+
+---
+
+## seeknal source test
+
+Test a configured Ask source using read-only discovery queries.
+
+**Usage:**
+```bash
+seeknal source test NAME [OPTIONS]
+```
+
+**Examples:**
+```bash
+seeknal source test warehouse --project .
+```
+
+---
 
 ## seeknal source add
 
-Add a new data source with encrypted credentials.
+Add a new legacy REPL data source with encrypted credentials.
 
 **Usage:**
 ```bash
