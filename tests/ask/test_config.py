@@ -8,7 +8,9 @@ import pytest
 from seeknal.ask.config import (
     find_agent_config_path,
     get_agent_profile_instructions,
+    get_discovery_cache_ttl_seconds,
     get_locale_instructions,
+    get_sql_timeout_seconds,
     load_agent_config,
 )
 
@@ -144,3 +146,13 @@ def test_agent_profile_instructions_from_agent_section():
     assert "Competitive analyst" in result
     assert "competitive_intel" in result
     assert "Lead with the threat matrix." in result
+
+
+def test_performance_defaults_and_overrides():
+    assert get_sql_timeout_seconds({}) == 60
+    assert get_discovery_cache_ttl_seconds({}) == 300
+    assert get_sql_timeout_seconds({"sql_timeout_seconds": 0}) == 0
+    assert get_sql_timeout_seconds({"sql_timeout_seconds": "12"}) == 12
+    assert get_discovery_cache_ttl_seconds(
+        {"discovery_cache_ttl_seconds": "15"}
+    ) == 15

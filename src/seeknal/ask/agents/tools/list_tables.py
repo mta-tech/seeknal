@@ -14,10 +14,58 @@ def list_tables(query: str | None = None) -> str:
     """
     from fnmatch import fnmatchcase
 
-    from seeknal.ask.agents.tools._context import get_tool_context
+    from seeknal.ask.agents.tools._context import (
+        get_discovery_cache_value,
+        get_tool_context,
+        set_discovery_cache_value,
+    )
 
     ctx = get_tool_context()
+    cache_key = "list_tables:all"
+    cached = get_discovery_cache_value(cache_key)
+    if cached is None:
+        entries, errors = _discover_tables(ctx)
+        set_discovery_cache_value(cache_key, (entries, errors))
+    else:
+        entries, errors = cached
 
+    unique_entries = _dedupe_entries(entries)
+    if query:
+        normalized_query = str(query).strip().lower()
+        has_glob = "*" in normalized_query or "?" in normalized_query
+
+        def matches(name: str) -> bool:
+            normalized_name = name.lower()
+            if has_glob:
+                return fnmatchcase(normalized_name, normalized_query)
+            return normalized_query in normalized_name
+
+        unique_entries = [(name, kind) for name, kind in unique_entries if matches(name)]
+
+    if not unique_entries:
+        if errors:
+            prefix = f"No tables found matching '{query}'." if query else "No tables found."
+            return prefix + " Discovery errors:\n" + "\n".join(f"- {err}" for err in errors)
+        if query:
+            return f"No tables found matching '{query}'."
+        return "No tables found. The project may not have been run yet."
+
+    if query:
+        lines = [f"Available tables and views matching '{query}':"]
+    else:
+        lines = ["Available tables and views:"]
+    for name, kind in unique_entries:
+        lines.append(f"- {name} ({kind})")
+
+    if errors:
+        lines.append("\nPartial discovery warnings:")
+        lines.extend(f"- {err}" for err in errors)
+
+    return "\n".join(lines)
+
+
+def _discover_tables(ctx) -> tuple[list[tuple[str, str]], list[str]]:
+    """Discover project and attached-source tables once per cache window."""
     entries: list[tuple[str, str]] = []
     errors: list[str] = []
 
@@ -61,36 +109,16 @@ def list_tables(query: str | None = None) -> str:
             continue
         seen.add(name)
         unique_entries.append((name, kind))
+    return unique_entries, errors
 
-    if query:
-        normalized_query = str(query).strip().lower()
-        has_glob = "*" in normalized_query or "?" in normalized_query
 
-        def matches(name: str) -> bool:
-            normalized_name = name.lower()
-            if has_glob:
-                return fnmatchcase(normalized_name, normalized_query)
-            return normalized_query in normalized_name
-
-        unique_entries = [(name, kind) for name, kind in unique_entries if matches(name)]
-
-    if not unique_entries:
-        if errors:
-            prefix = f"No tables found matching '{query}'." if query else "No tables found."
-            return prefix + " Discovery errors:\n" + "\n".join(f"- {err}" for err in errors)
-        if query:
-            return f"No tables found matching '{query}'."
-        return "No tables found. The project may not have been run yet."
-
-    if query:
-        lines = [f"Available tables and views matching '{query}':"]
-    else:
-        lines = ["Available tables and views:"]
-    for name, kind in unique_entries:
-        lines.append(f"- {name} ({kind})")
-
-    if errors:
-        lines.append("\nPartial discovery warnings:")
-        lines.extend(f"- {err}" for err in errors)
-
-    return "\n".join(lines)
+def _dedupe_entries(entries: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Preserve order while removing duplicate table names."""
+    seen: set[str] = set()
+    unique_entries: list[tuple[str, str]] = []
+    for name, kind in entries:
+        if name in seen:
+            continue
+        seen.add(name)
+        unique_entries.append((name, kind))
+    return unique_entries

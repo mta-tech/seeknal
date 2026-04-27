@@ -150,6 +150,8 @@ def get_locale_instructions(config: dict[str, Any]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_REQUEST_LIMIT = 100
+_DEFAULT_SQL_TIMEOUT_SECONDS = 60
+_DEFAULT_DISCOVERY_CACHE_TTL_SECONDS = 300
 
 
 def get_request_limit(config: dict[str, Any]) -> int:
@@ -166,6 +168,38 @@ def get_request_limit(config: dict[str, Any]) -> int:
         return limit if limit > 0 else _DEFAULT_REQUEST_LIMIT
     except (TypeError, ValueError):
         return _DEFAULT_REQUEST_LIMIT
+
+
+def get_sql_timeout_seconds(config: dict[str, Any]) -> int:
+    """Return the per-query SQL timeout in seconds.
+
+    This protects read-only tap-in sessions from accidental long scans against
+    attached databases. Set ``sql_timeout_seconds: 0`` to disable the timeout.
+    """
+    value = config.get("sql_timeout_seconds")
+    if value is None:
+        return _DEFAULT_SQL_TIMEOUT_SECONDS
+    try:
+        timeout = int(value)
+        return timeout if timeout >= 0 else _DEFAULT_SQL_TIMEOUT_SECONDS
+    except (TypeError, ValueError):
+        return _DEFAULT_SQL_TIMEOUT_SECONDS
+
+
+def get_discovery_cache_ttl_seconds(config: dict[str, Any]) -> int:
+    """Return the table/schema discovery cache TTL in seconds.
+
+    Set ``discovery_cache_ttl_seconds: 0`` to disable in-session discovery
+    caching. The cache is per Ask session and never shared across projects.
+    """
+    value = config.get("discovery_cache_ttl_seconds")
+    if value is None:
+        return _DEFAULT_DISCOVERY_CACHE_TTL_SECONDS
+    try:
+        ttl = int(value)
+        return ttl if ttl >= 0 else _DEFAULT_DISCOVERY_CACHE_TTL_SECONDS
+    except (TypeError, ValueError):
+        return _DEFAULT_DISCOVERY_CACHE_TTL_SECONDS
 
 
 # ---------------------------------------------------------------------------

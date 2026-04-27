@@ -88,6 +88,9 @@ class TestInitCommand:
         assert (tmp_path / "seeknal" / "pipelines").exists()
         assert (tmp_path / "seeknal" / "sql_pairs").exists()
         assert (tmp_path / "seeknal" / "tests").exists()
+        assert (tmp_path / "context").exists()
+        assert (tmp_path / "context" / "sql_pairs").exists()
+        assert (tmp_path / "context" / "tests").exists()
 
     def test_init_creates_agent_guidance(self, tmp_path):
         """Init command should create AGENTS.md and CLAUDE.md guidance."""
@@ -98,8 +101,49 @@ class TestInitCommand:
         claude = tmp_path / "CLAUDE.md"
         assert agents.exists()
         assert claude.exists()
-        assert "seeknal/sql_pairs" in agents.read_text()
-        assert "seeknal ask test" in claude.read_text()
+        agents_text = agents.read_text()
+        claude_text = claude.read_text()
+        assert "SEEKNAL_ASK.md" in agents_text
+        assert "Tap-in / read-only connected-source analyst" in agents_text
+        assert "Data pipeline builder" in agents_text
+        assert "Hybrid" in agents_text
+        assert "seeknal docs --list" in agents_text
+        assert "seeknal docs ask" in agents_text
+        assert "seeknal/sql_pairs" in agents_text
+        assert "seeknal/tests" in agents_text
+        assert "Do not hardcode" in agents_text
+        assert "seeknal ask test" in claude_text
+        assert "seeknal docs --json <topic>" in claude_text
+        assert "Mode setup quick reference" in claude_text
+        assert "Data pipeline builder" in claude_text
+        assert "source sync" in claude_text
+
+    def test_init_creates_ask_context_scaffold(self, tmp_path):
+        """Init should create generic Ask context files without domain hardcoding."""
+        os.chdir(tmp_path)
+        result = runner.invoke(app, ["init", "--name", "test_project_context"])
+        assert result.exit_code == 0
+
+        agent_config = tmp_path / "seeknal_agent.yml"
+        ask_context = tmp_path / "SEEKNAL_ASK.md"
+        env_example = tmp_path / ".env.example"
+        gitignore = tmp_path / ".gitignore"
+
+        assert agent_config.exists()
+        assert ask_context.exists()
+        assert env_example.exists()
+        assert "default: auto" in agent_config.read_text()
+        assert "sources: {}" in agent_config.read_text()
+        assert "dsn_env: WAREHOUSE_URL" in agent_config.read_text()
+        assert "Required SQL patterns" in ask_context.read_text()
+        assert "Ask QA workflow" in ask_context.read_text()
+        assert "WAREHOUSE_URL=" in env_example.read_text()
+        assert ".env" in gitignore.read_text()
+
+        combined = "\n".join(
+            [agent_config.read_text(), ask_context.read_text(), env_example.read_text()]
+        ).lower()
+        assert "bpom" not in combined
 
     def test_init_with_description(self, tmp_path):
         """Init command should accept description option."""

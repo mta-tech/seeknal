@@ -380,9 +380,15 @@ After running `seeknal init`, your project has this structure:
 my-project/
 ├── seeknal_project.yml        # Project configuration
 ├── profiles.yml                # Credentials and connections (gitignored)
+├── seeknal_agent.yml           # Ask mode/source registry scaffold
+├── SEEKNAL_ASK.md              # Durable Ask project instructions
+├── .env.example                # Safe placeholder environment variables
 ├── AGENTS.md                   # Agent/coding assistant project guide
 ├── CLAUDE.md                   # Claude Code compatibility guide
 ├── .gitignore                  # Auto-generated
+├── context/                    # User-taught Ask memory and examples
+│   ├── sql_pairs/              # Agent/user-taught SQL examples
+│   └── tests/                  # Optional context-local Ask tests
 ├── seeknal/                    # YAML and Python pipelines
 │   ├── sources/               # Source definitions (*.yml)
 │   ├── transforms/            # Transform definitions (*.yml)
@@ -418,12 +424,51 @@ my-project/
 | `seeknal/sql_pairs/` | Prompt-to-SQL examples used as Ask context | No |
 | `seeknal/tests/` | Executable Ask SQL QA cases | No |
 | `seeknal/skills/` | Project-local Ask workflow skills | No |
+| `context/` | Durable human/agent-taught Ask context | No |
+| `context/sql_pairs/` | Agent/user-taught prompt-to-SQL examples | No |
+| `SEEKNAL_ASK.md` | Ask project instructions loaded into sessions | No |
+| `seeknal_agent.yml` | Ask mode and source registry metadata | No |
+| `.env.example` | Safe placeholder env vars | No |
 | `.seeknal/context/sources/` | Generated connected-source context | Yes |
 | `seeknal/templates/` | Custom Jinja templates | No |
 | `target/` | All build outputs | Yes |
 | `target/intermediate/` | Cross-node references | Yes |
 | `target/cache/` | Incremental execution cache | Yes |
 | `target/environments/` | Virtual environment outputs | Yes |
+
+## Ask Agent Configuration (`seeknal_agent.yml`)
+
+`seeknal_agent.yml` controls Seeknal Ask behavior for interactive TUI,
+gateway/headless, and connected-source analyst projects.
+
+Performance and safety-related fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `request_limit` | integer | `100` | Maximum LLM requests in one Ask turn |
+| `background_threshold` | integer | `60` | Seconds before eligible long-running tools are backgrounded |
+| `context_budget` | integer | `8000` | Character budget for injected project context |
+| `sql_timeout_seconds` | integer | `60` | Hard timeout for `execute_sql`; use `0` to disable |
+| `discovery_cache_ttl_seconds` | integer | `300` | Per-session TTL for table/schema discovery cache; use `0` to disable |
+
+Example:
+
+```yaml
+mode:
+  default: auto
+
+sql_timeout_seconds: 60
+discovery_cache_ttl_seconds: 300
+
+sources:
+  warehouse:
+    source_kind: connected
+    source_type: database
+    connector: postgresql
+    namespace: wh
+    access: read_only
+    role: business_source_of_truth
+```
 
 ## Variable Interpolation
 

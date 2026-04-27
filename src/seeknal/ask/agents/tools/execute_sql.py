@@ -186,26 +186,33 @@ def execute_sql(
     fetch_limit = effective_limit + 1
 
     try:
-        with ctx.db_lock:
-            columns, rows = ctx.repl.execute_oneshot(sql, limit=fetch_limit)
+        columns, rows = _execute_oneshot_with_timeout(ctx, sql, limit=fetch_limit)
     except Exception as e:
         from seeknal.ask.agents.tools.errors import (
             classify_duckdb_error,
             format_tool_error,
+            TERMINAL_TIMEOUT,
         )
+
+        if isinstance(e, TimeoutError):
+            result = format_tool_error(TERMINAL_TIMEOUT, str(e))
+            record_tool_result("execute_sql", result, args={"sql": sql})
+            return result
 
         repaired_sql = _repair_sql_from_duckdb_suggestion(sql, str(e))
         if repaired_sql and repaired_sql != sql:
             try:
-                with ctx.db_lock:
-                    columns, rows = ctx.repl.execute_oneshot(
-                        repaired_sql,
-                        limit=fetch_limit,
-                    )
+                columns, rows = _execute_oneshot_with_timeout(
+                    ctx,
+                    repaired_sql,
+                    limit=fetch_limit,
+                )
                 sql = repaired_sql
             except Exception as retry_error:
                 result = format_tool_error(
-                    classify_duckdb_error(str(retry_error)),
+                    TERMINAL_TIMEOUT
+                    if isinstance(retry_error, TimeoutError)
+                    else classify_duckdb_error(str(retry_error)),
                     str(retry_error),
                     hint=(
                         "A table-name suggestion was attempted but the query "
@@ -387,14 +394,49 @@ def _count_total(ctx, sql: str) -> int | None:
     back to ``"many rows"`` without crashing the tool.
     """
     wrapped = f"SELECT CAST(COUNT(*) AS BIGINT) AS c FROM ({sql}) AS _seek_q"
-    with ctx.db_lock:
-        _cols, rows = ctx.repl.execute_oneshot(wrapped, limit=1)
+    _cols, rows = _execute_oneshot_with_timeout(ctx, wrapped, limit=1)
     if rows and rows[0] and rows[0][0] is not None:
         try:
             return int(rows[0][0])
         except (TypeError, ValueError):
             return None
     return None
+
+
+def _execute_oneshot_with_timeout(ctx, sql: str, limit: int | None = None):
+    """Execute REPL SQL with the session db lock and optional hard timeout."""
+    import concurrent.futures
+    import time
+
+    from seeknal.ask.agents.tools._context import record_timing_event
+
+    timeout = int(getattr(ctx, "sql_timeout_seconds", 0) or 0)
+    started = time.monotonic()
+    with ctx.db_lock:
+        if timeout <= 0:
+            try:
+                return ctx.repl.execute_oneshot(sql, limit=limit)
+            finally:
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                record_timing_event("execute_sql", elapsed_ms)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(ctx.repl.execute_oneshot, sql, limit)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            interrupt = getattr(getattr(ctx.repl, "conn", None), "interrupt", None)
+            if callable(interrupt):
+                try:
+                    interrupt()
+                except Exception:  # noqa: BLE001 - best-effort cancellation
+                    pass
+            future.cancel()
+            raise TimeoutError(f"SQL execution timed out after {timeout} seconds") from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            record_timing_event("execute_sql", elapsed_ms)
 
 
 def _truncate_cell(value) -> tuple[str, bool]:

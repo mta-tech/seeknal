@@ -10,7 +10,11 @@ def describe_table(table_name: str) -> str:
     """
     import re
 
-    from seeknal.ask.agents.tools._context import get_tool_context
+    from seeknal.ask.agents.tools._context import (
+        get_discovery_cache_value,
+        get_tool_context,
+        set_discovery_cache_value,
+    )
 
     ctx = get_tool_context()
     table_name = _normalize_attached_table_name(str(table_name), ctx)
@@ -18,6 +22,11 @@ def describe_table(table_name: str) -> str:
     # Validate table name to prevent injection
     if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_.]*$", table_name):
         return f"Invalid table name: '{table_name}'"
+
+    cache_key = f"describe_table:{table_name.lower()}"
+    cached = get_discovery_cache_value(cache_key)
+    if cached is not None:
+        return cached
 
     try:
         with ctx.db_lock:
@@ -35,7 +44,9 @@ def describe_table(table_name: str) -> str:
         nullable = row[2] if len(row) > 2 else ""
         lines.append(f"- `{col_name}` ({col_type}){' NULL' if nullable == 'YES' else ''}")
 
-    return "\n".join(lines)
+    output = "\n".join(lines)
+    set_discovery_cache_value(cache_key, output)
+    return output
 
 
 def _normalize_attached_table_name(table_name: str, ctx) -> str:
@@ -66,6 +77,16 @@ def _normalize_attached_table_name(table_name: str, ctx) -> str:
 
 def _find_unique_attached_table(table_name: str, ctx) -> str | None:
     """Resolve an unqualified table name to a unique attached table."""
+    from seeknal.ask.agents.tools._context import (
+        get_discovery_cache_value,
+        set_discovery_cache_value,
+    )
+
+    cache_key = f"find_attached_table:{table_name.lower()}"
+    cached = get_discovery_cache_value(cache_key)
+    if cached is not None:
+        return cached or None
+
     matches: list[str] = []
     attached = sorted(getattr(ctx.repl, "attached", set()) or [])
     for source_name in attached:
@@ -83,4 +104,6 @@ def _find_unique_attached_table(table_name: str, ctx) -> str | None:
             continue
         matches.extend(f"{source_name}.{schema}.{table}" for schema, table in rows)
 
-    return matches[0] if len(matches) == 1 else None
+    result = matches[0] if len(matches) == 1 else None
+    set_discovery_cache_value(cache_key, result or "")
+    return result

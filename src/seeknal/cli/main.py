@@ -834,6 +834,49 @@ def _scaffold_ask_skills(project_path: Path) -> None:
         typer.echo(f"  Created: seeknal/skills/{skill_dir.name}/SKILL.md")
 
 
+def _write_project_scaffold_file(
+    project_path: Path,
+    filename: str,
+    content: str,
+    *,
+    force: bool = False,
+) -> None:
+    """Write a generated project file without clobbering user edits."""
+    path = project_path / filename
+    if path.exists() and not force:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    typer.echo(f"  Created: {filename}")
+
+
+def _scaffold_ask_context_files(
+    project_path: Path,
+    project_name: str,
+    *,
+    force: bool = False,
+) -> None:
+    """Create generic Ask context starter files.
+
+    These files intentionally contain no domain/customer-specific logic. They
+    give humans and coding agents the right places to put business context,
+    SQL pairs, and QA tests so Seeknal Ask can learn a project like BPOM RPO
+    from local project assets instead of hardcoded harness branches.
+    """
+    files = {
+        "seeknal_agent.yml": _project_seeknal_agent_yml(project_name),
+        "SEEKNAL_ASK.md": _project_seeknal_ask_md(project_name),
+        ".env.example": _project_env_example(),
+    }
+    for filename, content in files.items():
+        _write_project_scaffold_file(
+            project_path,
+            filename,
+            content,
+            force=force,
+        )
+
+
 def _scaffold_agent_guidance(
     project_path: Path,
     project_name: str,
@@ -846,43 +889,242 @@ def _scaffold_agent_guidance(
         "CLAUDE.md": _project_claude_md(project_name),
     }
     for filename, content in files.items():
-        path = project_path / filename
-        if path.exists() and not force:
-            continue
-        path.write_text(content, encoding="utf-8")
-        typer.echo(f"  Created: {filename}")
+        _write_project_scaffold_file(
+            project_path,
+            filename,
+            content,
+            force=force,
+        )
+
+
+def _project_seeknal_agent_yml(project_name: str) -> str:
+    return f"""# Seeknal Ask agent configuration for {project_name}.
+# This file is safe to commit because it stores source metadata only.
+# Store real DSNs, passwords, and API keys in .env or the process environment.
+
+mode:
+  # auto keeps normal pipeline-building behavior when no read-only source is
+  # configured, and switches Ask to the narrower connected-source analyst
+  # harness when read-only connected sources are declared.
+  default: auto
+
+# Optional response/localization defaults. Fill only when the project needs it.
+locale: {{}}
+# Example:
+# locale:
+#   language: Indonesian
+#   number_format: id_ID
+#   timezone: Asia/Jakarta
+
+# Optional performance guardrails for connected-source analysis.
+# sql_timeout_seconds bounds accidental long scans; set to 0 to disable.
+# discovery_cache_ttl_seconds caches table/schema discovery per Ask session.
+sql_timeout_seconds: 60
+discovery_cache_ttl_seconds: 300
+
+# Optional agent profile. Prefer durable business rules in SEEKNAL_ASK.md,
+# context/*.md, seeknal/sql_pairs/*.yml, and seeknal/tests/*.yml.
+agent: {{}}
+# Example:
+# agent:
+#   name: {project_name} Analyst
+#   description: Answers business questions from project data and read-only sources.
+
+# Registered data sources. Use `seeknal source connect ...` to add entries
+# instead of hand-writing secrets here.
+sources: {{}}
+# Example read-only external database source:
+# sources:
+#   warehouse:
+#     source_kind: connected
+#     source_type: database
+#     connector: postgresql
+#     namespace: warehouse
+#     access: read_only
+#     role: business_source_of_truth
+#     priority: 100
+#     dsn_env: WAREHOUSE_URL
+#     description: Existing analytical database for business questions.
+#     context_sync:
+#       enabled: true
+#       refresh_policy: manual
+#       stale_after_hours: 24
+#       templates: [overview, columns, relationships, profiling]
+
+# If your project has both Seeknal pipelines and read-only connected sources,
+# keep mode.default = auto. Ask will use project SQL pairs/context first, query
+# connected sources for source-of-truth analytics, and use managed pipeline
+# outputs when the question is about derived Seeknal artifacts.
+"""
+
+
+def _project_seeknal_ask_md(project_name: str) -> str:
+    return f"""# {project_name} Ask Context
+
+This file is loaded into Seeknal Ask sessions. Keep it concise, durable, and
+business-specific. It should teach the Ask agent how to reason about this
+project without hardcoding project logic into Seeknal itself.
+
+## Business purpose
+
+- Describe what this project/source represents.
+- List the main business users and the kinds of questions they ask.
+- State whether the source of truth is a read-only database, Seeknal pipeline
+  outputs, semantic metrics, or a hybrid of these.
+
+## Vocabulary and business definitions
+
+- Define domain terms, abbreviations, KPIs, statuses, and coded dimensions.
+- Map user language to database concepts, but do not paste secrets or DSNs.
+- If labels/codes are unknown, say so; do not invent mappings.
+
+## Required SQL patterns
+
+Use `seeknal/sql_pairs/*.yml` for reusable prompt-to-SQL examples. Each pair
+should include:
+
+```yaml
+name: example_metric
+prompt: Natural-language question users ask
+intent: What business definition this query implements
+sql: |
+  SELECT ...
+notes:
+  - Explain filters, date fields, deduplication keys, and caveats.
+```
+
+When a SQL pair directly matches a user question, the Ask agent should execute
+that pair as the authoritative business definition before trying ad-hoc SQL.
+
+## Source context workflow
+
+1. Configure sources with `seeknal source connect`.
+2. Refresh generated database context with `seeknal source sync <source> --project .`.
+3. Keep generated files under `.seeknal/context/sources/` as derived metadata.
+4. Put human business context in this file or under `context/*.md`.
+
+## Ask QA workflow
+
+Use `seeknal/tests/*.yml` for executable regression cases. A good test captures:
+
+- user prompt
+- expected SQL or SQL result
+- expected values when the business answer is known
+- notes explaining why the query is correct
+
+Run:
+
+```bash
+seeknal ask test --project . --sql-only
+seeknal ask test --project .
+```
+
+## Guardrails
+
+- Never save passwords, DSNs, API keys, bearer tokens, or private credentials.
+- Keep one-off filters in the chat turn; save only reusable business logic.
+- Prefer SQL pairs and source context before broad table discovery.
+- For unknown or advanced questions, the agent may use `execute_sql`,
+  `execute_python`, statistics, and modeling, but conclusions must cite data.
+"""
+
+
+def _project_env_example() -> str:
+    return """# Copy to .env for local development. Do not commit .env.
+
+# LLM provider/model examples:
+# SEEKNAL_ASK_LLM_PROVIDER=openai
+# SEEKNAL_ASK_MODEL=gpt-4o-mini
+# OPENAI_API_KEY=...
+
+# Read-only connected source DSN examples:
+# WAREHOUSE_URL=postgresql://user:password@host:5432/database?sslmode=require
+# ANALYTICS_DUCKDB_PATH=/absolute/path/to/analytics.duckdb
+"""
 
 
 def _project_agents_md(project_name: str) -> str:
     return f"""# {project_name} Agent Guide
 
 This file is generated by `seeknal init` and gives coding/assistant agents the
-project-local Seeknal conventions.
+project-local Seeknal conventions. Keep this generic: customer/domain logic
+belongs in project context, SQL pairs, tests, and skills — not in Seeknal core.
 
 ## Project shape
 
 - `seeknal_project.yml` is the project manifest.
-- `profiles.yml` and `.env` hold local credentials and are not business logic.
+- `seeknal_agent.yml` configures Ask mode and source registry metadata.
+- `.env` holds local secrets and is gitignored; `.env.example` documents safe
+  variable names only.
+- `profiles.yml` holds local pipeline credentials and is gitignored.
+- `SEEKNAL_ASK.md` is loaded into Ask sessions as durable project instructions.
 - `seeknal/` contains durable project definitions, skills, SQL examples, and
   Ask QA tests.
 - `context/` contains user-taught project memory such as glossaries, join
   patterns, caveats, and agent-authored SQL pairs.
 - `target/` and `.seeknal/` are generated/runtime state.
 
-## Seeknal Ask
+## Docs-first workflow for coding agents
 
-- Put broad natural-language instructions in `SEEKNAL_ASK.md` when you want
-  the Ask agent to load them in every session.
-- Configure read-only connected sources in `seeknal_agent.yml`; store secrets
-  in `.env` and reference them with `dsn_env`.
-- Use `seeknal source status`, `seeknal source sync`, and `seeknal source test`
-  to inspect, refresh, and verify connected-source context.
-- Generated source context lives under `.seeknal/context/sources/` and should
-  be treated as derived metadata.
-- In tap-in/read-only mode, the database remains read-only, but the agent may
-  save explicit user teaching as local project memory via `preferences.yml` or
-  files under `context/`. Never save secrets, DSNs, API keys, or temporary
-  one-off filters.
+Before guessing Seeknal CLI syntax or project conventions, use the built-in
+documentation search:
+
+```bash
+seeknal docs --list
+seeknal docs init
+seeknal docs source
+seeknal docs ask
+seeknal docs --json "read-only source"
+```
+
+Use `seeknal docs <topic>` to inspect CLI behavior, examples, and expected
+files before editing project assets. Prefer `--json` when another coding agent
+needs machine-readable guidance.
+
+## Choose the project mode
+
+Seeknal projects commonly start in one of three modes. Keep the mode explicit
+in project files and tests so future coding agents do not guess.
+
+### Mode 1: Tap-in / read-only connected-source analyst
+
+Use this when the customer already has the final analytical tables in an
+existing database and does not need Seeknal to build a pipeline.
+
+Create the same asset types for any customer/project; do not hardcode the
+customer in Python code:
+
+1. Put the secret DSN in `.env` and a safe placeholder in `.env.example`.
+2. Register the source with `seeknal source connect <name> --connector <type> --dsn-env <ENV_VAR> --project .`.
+3. Refresh generated context with `seeknal source sync <name> --project .`.
+4. Write durable human context in `SEEKNAL_ASK.md` and `context/*.md`:
+   vocabulary, code meanings, metric definitions, joins, caveats, date fields.
+5. Convert reusable SME query notes into `seeknal/sql_pairs/*.yml`.
+6. Convert trusted question/SQL/result examples into `seeknal/tests/*.yml`.
+7. Validate with `seeknal ask test --project . --sql-only`, then with full
+   agent tests when an LLM is configured.
+8. Smoke test in TUI: `seeknal ask chat --project .`.
+
+### Mode 2: Data pipeline builder
+
+Use this when Seeknal should create or run managed data assets.
+
+1. Configure local pipeline credentials in `profiles.yml` or environment vars.
+2. Create source/transform/feature-group/model YAML under `seeknal/` using
+   `seeknal draft ...` or by editing files directly.
+3. Validate drafts with `seeknal dry-run <draft.yml>`.
+4. Apply definitions with `seeknal apply <draft.yml>`.
+5. Plan and run with `seeknal plan` and `seeknal run`.
+6. Use `target/` only as generated output; do not hand-edit it.
+7. Add pipeline-focused tests/validation for managed outputs.
+
+### Mode 3: Hybrid
+
+Use this when the project has both managed Seeknal pipelines and an existing
+read-only source-of-truth database. Keep `mode.default: auto` in
+`seeknal_agent.yml`. Register connected sources for direct analytics, keep
+pipeline definitions under `seeknal/`, and use SQL pairs/tests to teach which
+source should answer each business question.
 
 ## SQL pairs vs Ask tests
 
@@ -892,13 +1134,42 @@ project-local Seeknal conventions.
 - `context/sql_pairs/*.yml` are agent/user-taught SQL examples saved from chat.
 - `seeknal/tests/*.yml` are executable Ask SQL QA oracles. Run them with
   `seeknal ask test --project .` or `seeknal ask test --project . --sql-only`.
-- Do not hardcode domain-specific shortcuts in code. Put reusable business SQL
-  in `sql_pairs/` and regression checks in `tests/`.
+- A SQL pair teaches the agent; an Ask test protects behavior from regression.
+  It is fine for the same business question to exist in both places.
+
+## How to encode SME notes
+
+For messy business notes, extract reusable facts into project assets:
+
+- Business definitions and terminology → `SEEKNAL_ASK.md` or `context/*.md`
+- Prompt-to-SQL examples → `seeknal/sql_pairs/<slug>.yml`
+- Regression or acceptance checks → `seeknal/tests/<slug>.yml`
+- Short remembered preferences → `preferences.yml` via Ask chat teach mode
+
+Each SQL pair/test should explain filters, date columns, deduplication keys,
+status/code meanings, grain, and known caveats. Use fully qualified table names
+when the connected source namespace requires them.
+
+## Seeknal Ask behavior to preserve
+
+- Prefer source context, project memory, and SQL pairs before ad-hoc table probing.
+- When a SQL pair directly matches a simple known business question, execute it
+  as the authoritative definition and answer from that result.
+- Continue beyond a SQL pair only when the user asks for changed filters/grain,
+  comparison, forecasting, visualization, Python/statistics, or modeling.
+- Unknown questions may use `list_tables`, `describe_table`, `execute_sql`, and
+  `execute_python`, but conclusions must be grounded in tool evidence.
+- In read-only connected-source mode, the database remains read-only. Do not
+  create pipelines unless the user explicitly asks for a build/pipeline task.
 
 ## Safety
 
+- Do not hardcode customer/domain shortcuts in Seeknal core; encode them in
+  `SEEKNAL_ASK.md`, `context/`, SQL pairs, Ask tests, or project skills.
 - Prefer read-only SQL for exploration.
 - Never commit secrets from `.env` or `profiles.yml`.
+- Never persist DSNs, API keys, passwords, bearer tokens, or one-off temporary
+  filters into `SEEKNAL_ASK.md`, `context/`, SQL pairs, tests, or preferences.
 - Keep project instructions and tests generic enough for future schema changes.
 """
 
@@ -912,28 +1183,97 @@ Code and tools that look for `CLAUDE.md`.
 ## Common commands
 
 ```bash
-seeknal source status --project .
-seeknal source sync --project .
+seeknal docs --list
+seeknal docs init
+seeknal docs source
+seeknal docs ask
+seeknal source list --project .
+seeknal source inspect <source> --project .
+seeknal source sync <source> --project .
 seeknal source test <source> --project .
 seeknal ask chat --project .
 seeknal ask test --project . --sql-only
 seeknal ask test --project .
 ```
 
+Before guessing CLI syntax, run `seeknal docs <topic>` or
+`seeknal docs --json <topic>` and use the local documentation as the source of
+truth for commands, generated files, and workflow examples.
+
+## Mode setup quick reference
+
+### Tap-in / read-only connected-source analyst
+
+Use this when the project should ask questions against an existing database:
+
+```bash
+cp .env.example .env
+# edit .env and set WAREHOUSE_URL
+seeknal source connect warehouse --connector postgresql --dsn-env WAREHOUSE_URL --project .
+seeknal source sync warehouse --project .
+seeknal source test warehouse --project .
+seeknal ask chat --project .
+```
+
+Then fill `SEEKNAL_ASK.md`, `context/*.md`, `seeknal/sql_pairs/*.yml`, and
+`seeknal/tests/*.yml` with reusable business definitions and QA cases.
+
+### Data pipeline builder
+
+Use this when Seeknal should build managed data assets:
+
+```bash
+# edit profiles.yml for pipeline credentials
+seeknal draft source <name>
+seeknal dry-run draft_source_<name>.yml
+seeknal apply draft_source_<name>.yml
+seeknal plan
+seeknal run
+```
+
+Keep source/transform/feature-group/model definitions under `seeknal/`, and
+keep `target/` as generated output only.
+
+### Hybrid
+
+Use this when both are present. Keep `mode.default: auto` in
+`seeknal_agent.yml`; register read-only connected sources with `seeknal source
+connect`, and keep managed pipeline definitions under `seeknal/`. Use SQL
+pairs and Ask tests to make source selection explicit for important business
+questions.
+
 ## Ask project assets
 
 - `seeknal_agent.yml` steers Ask mode and connected read-only sources.
-- `SEEKNAL_ASK.md` is loaded into Ask sessions as project instructions.
-- `seeknal/sql_pairs/` contains human-curated examples the agent can read as context.
+- `.env` stores source DSNs and LLM keys locally; `.env.example` stores only
+  safe placeholder variable names.
+- `SEEKNAL_ASK.md` is loaded into Ask sessions as durable project instructions.
+- `.seeknal/context/sources/` contains generated source context from
+  `seeknal source sync`; do not hand-edit it.
 - `context/` contains user-taught memory saved from chat; `context/sql_pairs/`
   is for reusable SQL examples the agent saves when instructed.
+- `seeknal/sql_pairs/` contains human-curated examples the agent can read as context.
 - `preferences.yml` contains short remembered rules saved from chat.
 - `seeknal/tests/` contains executable prompt-to-SQL QA cases.
 
+## Setup checklist for a connected-source project
+
+1. Put secrets in `.env`; keep only placeholder names in committed files.
+2. Run `seeknal source connect ... --dsn-env <ENV_VAR> --project .`.
+3. Run `seeknal source sync <source> --project .` to generate table context.
+4. Fill `SEEKNAL_ASK.md`/`context/*.md` with business vocabulary and caveats.
+5. Add reusable SQL examples to `seeknal/sql_pairs/*.yml`.
+6. Add executable QA cases to `seeknal/tests/*.yml`.
+7. Run `seeknal ask test --project . --sql-only`.
+8. Run `seeknal ask chat --project .` for a real multi-turn smoke test.
+
 When answering data questions, prefer source context, project memory, and SQL
-pairs before ad-hoc schema probing. When the user says "remember" or "save this",
-persist only non-secret project knowledge. When validating behavior, run Ask
-tests rather than inventing one-off checks.
+pairs before ad-hoc schema probing. When a stored SQL pair directly matches a
+simple known business question, execute it as authoritative and answer from the
+result. Continue with SQL/Python/modeling only when the user asks for deeper or
+changed analysis. When the user says "remember" or "save this", persist only
+non-secret reusable project knowledge. When validating behavior, run Ask tests
+rather than inventing one-off checks.
 """
 
 
@@ -961,8 +1301,11 @@ def init(
     Creates a complete project structure with:
     - seeknal_project.yml: Project configuration (name, version, profile)
     - profiles.yml: Credentials and engine config (gitignored)
+    - seeknal_agent.yml / SEEKNAL_ASK.md: Ask source registry and context
     - AGENTS.md / CLAUDE.md: Project-local assistant guidance
-    - .gitignore: Auto-generated with profiles.yml and target/
+    - .env.example: Safe placeholder environment variables
+    - .gitignore: Auto-generated with profiles.yml, .env, and target/
+    - context/: User-taught Ask memory and SQL examples
     - seeknal/: YAML/Python definitions, Ask skills, SQL pairs, and Ask tests
     - target/: Output directory for compiled artifacts
 
@@ -976,6 +1319,9 @@ def init(
         ├── sql_pairs/       # Ask context examples
         ├── tests/           # Ask SQL QA tests
         └── templates/       # Custom Jinja templates (optional)
+        context/
+        ├── sql_pairs/       # User/agent-taught Ask SQL examples
+        └── tests/           # Optional context-local Ask tests
         target/
         └── intermediate/    # Node output storage for cross-references
 
@@ -1022,6 +1368,9 @@ def init(
             "seeknal/sql_pairs",
             "seeknal/tests",
             "seeknal/skills/report-generation",
+            "context",
+            "context/sql_pairs",
+            "context/tests",
             "target/intermediate",
         ]
 
@@ -1085,6 +1434,8 @@ target:
         # Generate .gitignore
         gitignore_content = """# Seeknal
 profiles.yml
+.env
+.env.backup-*
 target/
 .seeknal/
 *.duckdb
@@ -1101,6 +1452,7 @@ __pycache__/
 
         # Generate default ask skills (SKILL.md files, Claude Code-style)
         _scaffold_ask_skills(project_path)
+        _scaffold_ask_context_files(project_path, name, force=force)
         _scaffold_agent_guidance(project_path, name, force=force)
 
         # Also create the legacy Project for database compatibility

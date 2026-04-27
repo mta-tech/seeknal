@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import re
 import time
@@ -59,6 +60,7 @@ sse_broadcaster = SSEBroadcaster()
 # Uses LRU eviction to prevent unbounded memory growth.
 _session_locks: dict[str, tuple[asyncio.Lock, float]] = {}
 _LOCK_IDLE_TTL = 1800  # 30 minutes
+_session_cancellations: set[str] = set()
 
 
 def _get_session_lock(
@@ -91,6 +93,42 @@ def _evict_idle_locks() -> int:
     return len(stale)
 
 
+def _cancel_key(session_id: str, tenant_id: str = DEFAULT_TENANT) -> str:
+    return scoped_key(tenant_id, session_id)
+
+
+def _request_cancel(session_id: str, tenant_id: str = DEFAULT_TENANT) -> None:
+    _session_cancellations.add(_cancel_key(session_id, tenant_id))
+
+
+def _clear_cancel(session_id: str, tenant_id: str = DEFAULT_TENANT) -> None:
+    _session_cancellations.discard(_cancel_key(session_id, tenant_id))
+
+
+def _is_cancelled(session_id: str, tenant_id: str = DEFAULT_TENANT) -> bool:
+    return _cancel_key(session_id, tenant_id) in _session_cancellations
+
+
+@asynccontextmanager
+async def _session_lock_context(
+    session_id: str,
+    tenant_id: str = DEFAULT_TENANT,
+    lock_backend: Any = None,
+):
+    """Acquire the configured distributed/session lock for one run."""
+    if lock_backend is not None:
+        lock = await lock_backend.acquire(session_id, tenant_id=tenant_id)
+        try:
+            yield
+        finally:
+            await lock_backend.release(lock)
+        return
+
+    lock = _get_session_lock(session_id, tenant_id=tenant_id)
+    async with lock:
+        yield
+
+
 def _validate_session_id(session_id: str) -> bool:
     return bool(_SESSION_ID_RE.match(session_id))
 
@@ -100,6 +138,84 @@ def _publish_event(
 ) -> None:
     """Publish an event to all SSE subscribers for this (tenant, session_id)."""
     sse_broadcaster.publish_sync(session_id, json.dumps(event), tenant_id=tenant_id)
+
+
+async def _publish_event_async(
+    session_id: str,
+    event: dict,
+    tenant_id: str = DEFAULT_TENANT,
+    broadcaster: Any = None,
+) -> None:
+    """Publish an event through the configured broadcaster."""
+    if broadcaster is not None:
+        await broadcaster.publish(session_id, json.dumps(event), tenant_id=tenant_id)
+        return
+    _publish_event(session_id, event, tenant_id=tenant_id)
+
+
+def _extract_gateway_tool_result_text(result: Any) -> str:
+    """Get a plain-text view of a pydantic-ai tool result."""
+    if result is None:
+        return ""
+    model_str = getattr(result, "model_response_str", None)
+    if callable(model_str):
+        try:
+            rendered = model_str()
+        except Exception:
+            rendered = None
+        if isinstance(rendered, str):
+            return rendered
+    content = getattr(result, "content", result)
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            inner = getattr(part, "content", None)
+            parts.append(inner if isinstance(inner, str) else str(part))
+        return "".join(parts)
+    return str(content)
+
+
+def _record_gateway_tool_result(
+    tool_name: str,
+    output: str,
+    args: dict[str, Any] | None = None,
+) -> None:
+    """Record gateway tool results with the same signatures as the TUI path."""
+    if tool_name in {"execute_sql", "execute_python"}:
+        return
+    from seeknal.ask.agents.tools._context import record_tool_result
+
+    record_tool_result(tool_name, output, args=args or {})
+
+
+def _gateway_tool_stop_reason(tool_name: str) -> str | None:
+    """Return a stop reason when a tool result should end the gateway turn."""
+    from seeknal.ask.agents.tools._context import (
+        get_tool_context,
+        has_sufficient_evidence,
+        should_synthesize_after_authoritative_sql_pair,
+    )
+
+    if (
+        tool_name == "execute_sql_pair"
+        and should_synthesize_after_authoritative_sql_pair()
+    ):
+        return "authoritative sql pair result"
+    ctx = get_tool_context()
+    if (
+        getattr(ctx, "disable_quality_gate", False)
+        and has_sufficient_evidence()
+        and ctx.terminal_tool_errors_this_turn
+    ):
+        return "terminal tool error after sufficient evidence"
+    return None
 
 
 def _safe_resolve_tenant(request: Request) -> tuple[str, JSONResponse | None]:
@@ -129,6 +245,8 @@ async def _run_agent_streaming(
     tenant_id: str = DEFAULT_TENANT,
     auto_approve: bool = False,
     include_web: bool = False,
+    lock_backend: Any = None,
+    broadcaster: Any = None,
 ):
     """Run agent and yield JSON event dicts as they occur.
 
@@ -139,24 +257,62 @@ async def _run_agent_streaming(
     A per-(tenant, session) ``asyncio.Lock`` serializes concurrent runs
     to prevent message history corruption.
     """
-    lock = _get_session_lock(session_id, tenant_id=tenant_id)
-    async with lock:
+    turn_started = time.monotonic()
+    _clear_cancel(session_id, tenant_id=tenant_id)
+    async with _session_lock_context(
+        session_id,
+        tenant_id=tenant_id,
+        lock_backend=lock_backend,
+    ):
         try:
             async for event in _run_agent_inner(
                 project_path, session_id, question, provider, model,
                 tenant_id=tenant_id, auto_approve=auto_approve,
                 include_web=include_web,
             ):
-                _publish_event(session_id, event, tenant_id=tenant_id)
+                if _is_cancelled(session_id, tenant_id=tenant_id):
+                    cancel_event = {
+                        "type": "cancelled",
+                        "data": "Run cancelled by user.",
+                    }
+                    await _publish_event_async(
+                        session_id,
+                        cancel_event,
+                        tenant_id=tenant_id,
+                        broadcaster=broadcaster,
+                    )
+                    yield cancel_event
+                    break
+                await _publish_event_async(
+                    session_id,
+                    event,
+                    tenant_id=tenant_id,
+                    broadcaster=broadcaster,
+                )
                 yield event
         except Exception as exc:
             error_event = {"type": "error", "data": str(exc)}
-            _publish_event(session_id, error_event, tenant_id=tenant_id)
+            await _publish_event_async(
+                session_id,
+                error_event,
+                tenant_id=tenant_id,
+                broadcaster=broadcaster,
+            )
             yield error_event
             raise
         finally:
-            done_event = {"type": "done", "data": ""}
-            _publish_event(session_id, done_event, tenant_id=tenant_id)
+            _clear_cancel(session_id, tenant_id=tenant_id)
+            done_event = {
+                "type": "done",
+                "data": "",
+                "elapsed_ms": int((time.monotonic() - turn_started) * 1000),
+            }
+            await _publish_event_async(
+                session_id,
+                done_event,
+                tenant_id=tenant_id,
+                broadcaster=broadcaster,
+            )
             yield done_event
 
 
@@ -177,6 +333,8 @@ async def _run_agent_inner(
         FunctionToolCallEvent,
         FunctionToolResultEvent,
         PartDeltaEvent,
+        PartStartEvent,
+        TextPart,
         TextPartDelta,
     )
 
@@ -193,7 +351,12 @@ async def _run_agent_inner(
         project_path, provider=provider, model=model,
         environment="gateway", include_web=include_web,
     )
-    from seeknal.ask.agents.tools._context import reset_turn_governor
+    from seeknal.ask.agents.tools._context import (
+        reset_report_approval,
+        reset_turn_governor,
+    )
+
+    reset_report_approval()
     reset_turn_governor(question)
 
     # Auto-grant all approval gates (for Telegram and other headless channels)
@@ -204,6 +367,35 @@ async def _run_agent_inner(
         ctx.require_proof_publish_approval = False
         ctx.require_proof_edit_approval = False
         ctx.require_seeknal_report_publish_approval = False
+
+    from seeknal.ask.directives import try_direct_tool_directive
+
+    direct_result = await try_direct_tool_directive(question)
+    if direct_result is not None:
+        for direct_event in direct_result.events:
+            tool_started = time.monotonic()
+            yield {
+                "type": "tool_start",
+                "data": {
+                    "name": direct_event.name,
+                    "args": direct_event.args,
+                },
+            }
+            yield {
+                "type": "tool_end",
+                "data": {
+                    "name": direct_event.name,
+                    "output": direct_event.output[:2000],
+                    "elapsed_ms": int((time.monotonic() - tool_started) * 1000),
+                },
+            }
+        yield {"type": "answer", "data": direct_result.answer}
+        store.update(
+            session_id,
+            last_question=question[:200],
+            status="active",
+        )
+        return
 
     text_buffer: list[str] = []
     result = None
@@ -230,7 +422,17 @@ async def _run_agent_inner(
                 elif Agent.is_model_request_node(node):
                     async with node.stream(run.ctx) as stream:
                         async for event in stream:
-                            if isinstance(event, PartDeltaEvent):
+                            if isinstance(event, PartStartEvent):
+                                if (
+                                    isinstance(event.part, TextPart)
+                                    and event.part.content
+                                ):
+                                    text_buffer.append(event.part.content)
+                                    yield {
+                                        "type": "token",
+                                        "data": event.part.content,
+                                    }
+                            elif isinstance(event, PartDeltaEvent):
                                 if isinstance(event.delta, TextPartDelta):
                                     text_buffer.append(event.delta.content_delta)
                                     yield {
@@ -247,40 +449,63 @@ async def _run_agent_inner(
                         }
                         text_buffer.clear()
 
+                    active_tool_args: dict[str, tuple[str, dict[str, Any]]] = {}
+                    active_tool_started: dict[str, float] = {}
                     async with node.stream(run.ctx) as handle_stream:
                         async for event in handle_stream:
                             if isinstance(event, FunctionToolCallEvent):
+                                tool_name = event.part.tool_name
+                                tool_args = event.part.args_as_dict()
+                                call_id = (
+                                    str(getattr(event.part, "tool_call_id", ""))
+                                    or f"{tool_name}:{len(active_tool_args)}"
+                                )
+                                active_tool_args[call_id] = (tool_name, tool_args)
+                                active_tool_started[call_id] = time.monotonic()
                                 yield {
                                     "type": "tool_start",
                                     "data": {
-                                        "name": event.part.tool_name,
-                                        "args": event.part.args_as_dict(),
+                                        "name": tool_name,
+                                        "args": tool_args,
                                     },
                                 }
                             elif isinstance(event, FunctionToolResultEvent):
-                                content = event.result.content
-                                if event.result.tool_name not in {"execute_sql", "execute_python"}:
-                                    from seeknal.ask.agents.tools._context import record_tool_result
-                                    record_tool_result(
-                                        event.result.tool_name,
-                                        str(content) if content else "",
+                                tool_name = event.result.tool_name
+                                content = _extract_gateway_tool_result_text(event.result)
+                                result_call_id = (
+                                    str(getattr(event.result, "tool_call_id", ""))
+                                    or ""
+                                )
+                                recorded_args: dict[str, Any] = {}
+                                elapsed_ms = 0
+                                if result_call_id in active_tool_args:
+                                    _recorded_name, recorded_args = active_tool_args.pop(
+                                        result_call_id
                                     )
+                                    started_at = active_tool_started.pop(
+                                        result_call_id,
+                                        None,
+                                    )
+                                    if started_at is not None:
+                                        elapsed_ms = int(
+                                            (time.monotonic() - started_at) * 1000
+                                        )
+                                _record_gateway_tool_result(
+                                    tool_name,
+                                    content,
+                                    args=recorded_args,
+                                )
                                 yield {
                                     "type": "tool_end",
                                     "data": {
-                                        "name": event.result.tool_name,
-                                        "output": str(content)[:2000] if content else "",
+                                        "name": tool_name,
+                                        "output": content[:2000] if content else "",
+                                        "elapsed_ms": elapsed_ms,
                                     },
                                 }
-                                if event.result.tool_name == "execute_sql_pair":
-                                    from seeknal.ask.agents.tools._context import (
-                                        should_synthesize_after_authoritative_sql_pair,
-                                    )
-
-                                    if should_synthesize_after_authoritative_sql_pair():
-                                        raise UsageLimitExceeded(
-                                            "authoritative sql pair result"
-                                        )
+                                stop_reason = _gateway_tool_stop_reason(tool_name)
+                                if stop_reason:
+                                    raise UsageLimitExceeded(stop_reason)
 
                 elif isinstance(node, End):
                     break
@@ -292,6 +517,31 @@ async def _run_agent_inner(
             answer = "".join(text_buffer)
         else:
             answer = result.output or ""
+
+        if not answer:
+            from seeknal.ask.agents.agent import _NO_RESPONSE
+
+            retry_prompt = (
+                "Please summarize your findings from the tool calls above "
+                "and provide your analysis as a text response. Do not call tools."
+            )
+            try:
+                retry_history = (
+                    result.all_messages() if result is not None else message_history
+                )
+                retry = await agent.run(
+                    retry_prompt,
+                    deps=deps,
+                    message_history=retry_history,
+                    usage_limits=UsageLimits(
+                        request_limit=ctx.request_limit,
+                        tool_calls_limit=0,
+                    ),
+                )
+                result = retry
+                answer = retry.output or _NO_RESPONSE
+            except UsageLimitExceeded:
+                answer = _NO_RESPONSE
 
         if answer:
             yield {"type": "answer", "data": answer}
@@ -405,13 +655,56 @@ async def ask_oneshot(request: Request) -> JSONResponse:
     events = []
     answer = ""
     async for event in _run_agent_streaming(
-        project_path, session_id, question, tenant_id=tenant_id,
+        project_path,
+        session_id,
+        question,
+        tenant_id=tenant_id,
+        lock_backend=getattr(request.app.state, "session_lock", None),
+        broadcaster=getattr(request.app.state, "broadcaster", None),
     ):
         events.append(event)
         if event["type"] == "answer":
             answer = event["data"]
 
     return JSONResponse({"answer": answer, "events": events})
+
+
+async def cancel_session_run(request: Request) -> JSONResponse:
+    """Request cancellation for the currently running turn in a session."""
+    tenant_id, err = _safe_resolve_tenant(request)
+    if err:
+        return err
+    session_id = request.path_params["session_id"]
+    if not _validate_session_id(session_id):
+        return JSONResponse({"error": "invalid session_id"}, status_code=400)
+    _request_cancel(session_id, tenant_id=tenant_id)
+    event = {"type": "cancel_requested", "data": "Cancellation requested."}
+    await _publish_event_async(
+        session_id,
+        event,
+        tenant_id=tenant_id,
+        broadcaster=getattr(request.app.state, "broadcaster", None),
+    )
+    return JSONResponse({"status": "cancel_requested", "session_id": session_id})
+
+
+async def _send_websocket_run_events(
+    websocket: WebSocket,
+    project_path: Path,
+    session_id: str,
+    question: str,
+    tenant_id: str,
+) -> None:
+    """Run one agent turn and send events to a WebSocket client."""
+    async for event in _run_agent_streaming(
+        project_path,
+        session_id,
+        question,
+        tenant_id=tenant_id,
+        lock_backend=getattr(websocket.app.state, "session_lock", None),
+        broadcaster=getattr(websocket.app.state, "broadcaster", None),
+    ):
+        await websocket.send_text(json.dumps(event))
 
 
 async def websocket_endpoint(websocket: WebSocket) -> None:
@@ -430,6 +723,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     project_path = Path(websocket.app.state.project_path)
     await session_manager.connect(session_id, websocket)
+    run_task: asyncio.Task | None = None
 
     try:
         while True:
@@ -442,13 +736,49 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 )
                 continue
 
-            async for event in _run_agent_streaming(
-                project_path, session_id, question, tenant_id=tenant_id,
-            ):
-                await websocket.send_text(json.dumps(event))
+            run_task = asyncio.create_task(
+                _send_websocket_run_events(
+                    websocket,
+                    project_path,
+                    session_id,
+                    question,
+                    tenant_id,
+                )
+            )
+            while not run_task.done():
+                receive_task = asyncio.create_task(websocket.receive_text())
+                done, pending = await asyncio.wait(
+                    {run_task, receive_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if receive_task in done:
+                    try:
+                        followup = json.loads(receive_task.result())
+                    except json.JSONDecodeError:
+                        followup = {}
+                    if followup.get("type") == "cancel":
+                        _request_cancel(session_id, tenant_id=tenant_id)
+                    else:
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "type": "error",
+                                    "data": "wait for current run or send type=cancel",
+                                }
+                            )
+                        )
+                else:
+                    receive_task.cancel()
+                for task in pending:
+                    if task is not run_task:
+                        task.cancel()
+            await run_task
+            run_task = None
 
     except WebSocketDisconnect:
-        pass
+        _request_cancel(session_id, tenant_id=tenant_id)
+        if run_task is not None and not run_task.done():
+            run_task.cancel()
     finally:
         await session_manager.disconnect(session_id, websocket)
 
@@ -836,7 +1166,12 @@ async def post_record(request: Request) -> JSONResponse:
     events: list = []
     answer = ""
     async for event in _run_agent_streaming(
-        project_path, session_id, prompt, tenant_id=tenant_id,
+        project_path,
+        session_id,
+        prompt,
+        tenant_id=tenant_id,
+        lock_backend=getattr(request.app.state, "session_lock", None),
+        broadcaster=getattr(request.app.state, "broadcaster", None),
     ):
         events.append(event)
         if event["type"] == "answer":
@@ -911,6 +1246,7 @@ def create_gateway_app(
         Route("/", chat_ui),
         Route("/health", health),
         Route("/sessions", list_sessions),
+        Route("/sessions/{session_id}/cancel", cancel_session_run, methods=["POST"]),
         Route("/sessions/{session_id}/history", session_history),
         Route("/temporal/start", temporal_start, methods=["POST"]),
         Route("/events/{session_id}", sse_endpoint),
@@ -936,8 +1272,6 @@ def create_gateway_app(
         routes.append(Mount("/static", StaticFiles(directory=str(static_dir)), name="static"))
 
     # Wrap user lifespan to include lock eviction task and Redis setup
-    from contextlib import asynccontextmanager
-
     @asynccontextmanager
     async def _lifespan(app):
         redis_broadcaster = None
@@ -947,11 +1281,13 @@ def create_gateway_app(
             from redis.asyncio import Redis
             from seeknal.ask.gateway.redis_backend import (
                 RedisSSEBroadcaster,
+                RedisSessionLock,
             )
 
             redis_client = Redis.from_url(redis_url)
             redis_broadcaster = RedisSSEBroadcaster(redis_client)
             app.state.broadcaster = redis_broadcaster
+            app.state.session_lock = RedisSessionLock(redis_client)
             app.state.redis_client = redis_client
             app.state.redis_enabled = True
             if project_path is not None:
@@ -966,6 +1302,7 @@ def create_gateway_app(
             await redis_broadcaster.start_listener()
         else:
             app.state.broadcaster = sse_broadcaster
+            app.state.session_lock = None
             app.state.redis_client = None
             app.state.redis_enabled = False
             if project_path is not None:

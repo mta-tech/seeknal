@@ -13,7 +13,11 @@ from seeknal.ask.agents.tools.list_tables import list_tables
 class _ReplWithAttached:
     attached = {"warehouse"}
 
+    def __init__(self):
+        self.calls = 0
+
     def execute_oneshot(self, sql: str, limit=None):
+        self.calls += 1
         normalized = " ".join(sql.split()).lower()
         if normalized == "show tables":
             return ["name"], [("local_customers",)]
@@ -28,7 +32,11 @@ class _ReplWithAttached:
 class _DescribeRepl:
     attached = {"wh"}
 
+    def __init__(self):
+        self.calls = 0
+
     def execute_oneshot(self, sql: str, limit=None):
+        self.calls += 1
         normalized = " ".join(sql.split()).lower()
         if '"wh".information_schema.tables' in normalized:
             return ["table_schema", "table_name"], [("analytics", "monthly_revenue")]
@@ -98,3 +106,43 @@ def test_describe_table_resolves_unique_unqualified_attached_table(tmp_path: Pat
     out = describe_table("monthly_revenue")
 
     assert "Schema for `wh.analytics.monthly_revenue`" in out
+
+
+def test_list_tables_reuses_session_discovery_cache(tmp_path: Path):
+    repl = _ReplWithAttached()
+    set_tool_context(
+        ToolContext(
+            repl=repl,
+            artifact_discovery=MagicMock(),
+            project_path=tmp_path,
+            discovery_cache_ttl_seconds=300,
+        )
+    )
+
+    first = list_tables()
+    second = list_tables(query="orders")
+
+    assert "warehouse.mart.orders" in first
+    assert "warehouse.mart.orders" in second
+    # SHOW TABLES + one attached information_schema query only once.
+    assert repl.calls == 2
+
+
+def test_describe_table_reuses_session_discovery_cache(tmp_path: Path):
+    repl = _DescribeRepl()
+    set_tool_context(
+        ToolContext(
+            repl=repl,
+            artifact_discovery=MagicMock(),
+            project_path=tmp_path,
+            discovery_cache_ttl_seconds=300,
+        )
+    )
+
+    first = describe_table("monthly_revenue")
+    second = describe_table("monthly_revenue")
+
+    assert first == second
+    # First call resolves the unqualified name and describes it; second call
+    # hits both session caches.
+    assert repl.calls == 2

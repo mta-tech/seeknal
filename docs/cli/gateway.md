@@ -98,8 +98,9 @@ Client (browser/app/bot)
 │  (Starlette) │
 ├──────────────┤
 │ WebSocket    │  /ws/{session_id}
-│ SSE          │  /sse/{session_id}
-│ REST         │  /api/ask
+│ SSE          │  /events/{session_id}
+│ REST         │  /ask
+│ Cancel       │  /sessions/{session_id}/cancel
 │ Telegram     │  (webhook)
 └──────┬───────┘
        │
@@ -109,6 +110,18 @@ Client (browser/app/bot)
 │  (per-session)│
 └──────────────┘
 ```
+
+## Runtime behavior
+
+- Runs for the same tenant/session are serialized to protect conversation
+  history and DuckDB state.
+- `POST /sessions/{session_id}/cancel` requests cancellation of the active
+  run. WebSocket clients can also send `{"type":"cancel"}` while a run is
+  streaming.
+- Tool result events include `elapsed_ms` when timing is available; `done`
+  events include total turn `elapsed_ms`.
+- When `--redis` is configured, SSE fan-out and session locks use Redis so
+  multi-replica gateway deployments preserve per-session serialization.
 
 ## Environment Variables
 

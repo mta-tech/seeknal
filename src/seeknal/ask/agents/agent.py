@@ -214,6 +214,8 @@ def create_agent(
     from seeknal.ask.config import (
         load_agent_config,
         get_request_limit,
+        get_sql_timeout_seconds,
+        get_discovery_cache_ttl_seconds,
         get_background_threshold,
         get_context_budget,
         get_ask_toolset_mode,
@@ -254,6 +256,8 @@ def create_agent(
 
     tool_ctx = get_tool_context()
     tool_ctx.request_limit = get_request_limit(agent_config)
+    tool_ctx.sql_timeout_seconds = get_sql_timeout_seconds(agent_config)
+    tool_ctx.discovery_cache_ttl_seconds = get_discovery_cache_ttl_seconds(agent_config)
     tool_ctx.background_threshold = get_background_threshold(agent_config)
     if analysis_toolset:
         tool_ctx.tool_call_limit = 24

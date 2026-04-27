@@ -125,14 +125,18 @@ seeknal entity show customer                  # Inspect entity schema and featur
 **AI-Powered Thinking Partner** — `seeknal ask chat` is your collaborative partner for data work. The agent uses thin tools for fast data access and fat skills for multi-step workflows like report generation, pipeline building, database analysis, and data profiling — all loaded on demand to keep responses fast:
 
 ```bash
-seeknal ask chat                        # Start a brainstorm / build session
+seeknal ask chat                        # Start a brainstorm / build session (interactive TUI)
 seeknal ask "What are the top 5 customers by revenue?"  # Quick one-shot question
 seeknal ask report "customer analysis"  # Generate interactive HTML dashboard
 seeknal ask test --project . --sql-only # Validate project prompt-to-SQL tests
 seeknal ask chat --web                  # Enable web search for benchmarks
 ```
 
+`seeknal ask chat` launches an interactive terminal UI (Bun + React + Ink) with streaming tokens, tool visualization, and arrow-key `ask_user` picker for approval gates. The TUI is bundled inside the wheel; end users do not need Bun or Node. One-shot (`seeknal ask "..."`) and report (`seeknal ask report`) commands use Python-only rendering with no TUI.
+
 Ask it to answer questions against existing read-only databases with `seeknal source connect`, reuse project SQL examples from `seeknal/sql_pairs/`, and validate important questions with executable `seeknal/tests/` QA oracles. Ask it to build a pipeline from scratch, and it will draft a plan, walk you through the design, and wait for your go-ahead before generating code. Publish reports to a self-hosted **Seeknal Report Server** and share them with your team via a URL.
+
+For editable installs (`pip install -e .`), set `SEEKNAL_TUI_BINARY_PATH` to your local TUI build. See `src/seeknal/ask/tui/README.md` for full TypeScript contributing guide and development workflow.
 
 ```bash
 seeknal report-server start             # Host published reports

@@ -26,6 +26,20 @@ src/seeknal/
 ├── feature_validation/    # Feature validation framework
 │   ├── validators.py     # Validation logic
 │   └── models.py         # Validation configuration models
+├── ask/
+│   ├── tui/                # TypeScript Bun+Ink terminal UI (claude-code-style)
+│   │   ├── package.json
+│   │   ├── build.ts
+│   │   ├── src/
+│   │   │   ├── index.tsx
+│   │   │   ├── components/   # Ink components (Picker, Stream, etc.)
+│   │   │   └── lib/gateway.ts
+│   │   └── README.md
+│   ├── _tui_bin/           # Platform-specific compiled binaries (built into wheel)
+│   ├── gateway/
+│   │   ├── server.py
+│   │   └── _ask_rendezvous.py  # AskRendezvous: per-WS Future-based ask_user pairing
+│   └── ...
 ├── workflow/
 │   ├── consolidation/    # Entity-level feature consolidation
 │   │   ├── catalog.py    # EntityCatalog dataclass + JSON I/O
@@ -96,11 +110,17 @@ tests/                     # pytest test suite
 
 ### 7. **Seeknal Ask Agent Harness**
 - `seeknal_agent.yml` configures Ask mode and read-only connected sources
+- Coding agents should use the local docs CLI before guessing commands:
+  `seeknal docs --list`, `seeknal docs <topic>`, and `seeknal docs --json <topic>`
 - `seeknal source connect/status/inspect/sync/test` supports users who already have analytical database tables and do not need a Seeknal pipeline
 - `seeknal/sql_pairs/` contains prompt-to-SQL examples the Ask agent can read as context
 - `seeknal/tests/` contains executable Ask SQL QA cases for `seeknal ask test`
 - TUI/chat can inspect and run tests with `list_ask_tests`, `read_ask_test`, `run_ask_test`, `list_ask_test_results`, and `read_ask_test_result`
 - Keep domain-specific SQL in project assets; do not hardcode business logic in the agent harness
+- `seeknal init` generated guidance must explain three setup modes:
+  - **Tap-in / read-only connected-source analyst**: existing final tables; configure `.env`, `seeknal_agent.yml`, source sync, `SEEKNAL_ASK.md`, SQL pairs, and Ask tests.
+  - **Data pipeline builder**: managed Seeknal assets; configure `profiles.yml`, create YAML under `seeknal/`, then `dry-run`/`apply`/`plan`/`run`.
+  - **Hybrid**: both paths; keep `mode.default: auto` and make source choice explicit with context, SQL pairs, and tests.
 
 ## Important Patterns & Conventions
 
@@ -404,6 +424,17 @@ def _auto_register_project(self) -> None:
 - E2E tests in `tests/e2e/`
 - CLI tests use `typer.testing.CliRunner`
 
+## Recent Major Features (April 2026)
+
+1. **TypeScript Terminal UI for `seeknal ask`** (`src/seeknal/ask/tui/`)
+   - Bun + React + Ink stack, claude-code-style UX
+   - Concurrent WebSocket handler (`asyncio.TaskGroup` send+receive)
+   - Interactive `ask_user` picker with arrow-key navigation + free-text fallback
+   - `report_ready` event replaces the old Rich `_maybe_offer_report_action` menu
+   - Background daemon-thread gateway in `seeknal ask chat`
+   - `SEEKNAL_TUI_BINARY_PATH` env-var escape hatch for editable installs
+   - Platform-specific wheels via `hatch_build.py` custom hook
+
 ## Recent Major Features (Jan 2026)
 
 1. **Feature Group Versioning** (#1405, #1407)
@@ -621,6 +652,9 @@ Based on real dataset (73,194 rows × 35 columns):
 13. **source_defaults alias normalization**: Profile YAML dict keys are NOT normalized at load time — use the canonical type name (`postgresql` not `postgres`) as the key in the `source_defaults:` section of `profiles.yml`
 14. **Entity Consolidation**: Runs automatically after `seeknal run` as best-effort (never fails the pipeline). Uses `getattr(node.node_type, 'value', ...)` for enum comparison to handle stub nodes in tests. Consolidated parquets at `target/feature_store/{entity}/features.parquet`
 15. **PostgreSQL 63-char identifier limit**: Entity materialization flattens struct columns to `{fg_name}__{feature_name}` — when this exceeds 63 chars, it's truncated with CRC32 hash suffix. See `consolidation/materializer.py`
+16. **TUI binary required for `seeknal ask chat`**: The interactive chat path needs the bundled Bun binary. For editable installs (`pip install -e .`), set `SEEKNAL_TUI_BINARY_PATH` to a locally-built binary. The error message in `_resolve.py` provides exact instructions.
+17. **Gateway in-process thread**: `seeknal ask chat` starts the gateway in a background daemon thread (uvicorn with `install_signal_handlers=False` removed in uvicorn 0.40+). This shares `ToolContext`/`ContextVar` state with the chat session.
+18. **`stream_ask` and `_stream_one_pass` are kept** despite the Rich-UI deletion: they are used by `_run_oneshot` (one-shot ask) and `_run_report` (report command), neither of which uses the TUI.
 
 ## Testing Before Commit
 

@@ -18,6 +18,9 @@ Seeknal is an all-in-one data and AI/ML engineering platform. It includes:
 
 - Keep tools thin and deterministic. Put workflow and domain behavior in skills,
   generated source context, SQL pairs, tests, and documentation.
+- Before guessing Seeknal CLI syntax or generated-file conventions, use the
+  local docs CLI: `seeknal docs --list`, `seeknal docs <topic>`, and
+  `seeknal docs --json <topic>` for machine-readable guidance.
 - `seeknal_agent.yml` configures Ask mode and read-only connected sources.
 - `seeknal source connect/status/inspect/sync/test` manages existing databases
   that Ask can query without a pipeline.
@@ -31,6 +34,24 @@ Seeknal is an all-in-one data and AI/ML engineering platform. It includes:
 - Generated source context under `.seeknal/context/sources/` is derived state;
   refresh it with `seeknal source sync` rather than hand-editing.
 - Never hardcode customer/domain SQL in the agent harness.
+
+## Init-generated project modes
+
+`seeknal init` must give downstream coding agents enough guidance to initialize
+different project types without hardcoding customer logic:
+
+- **Tap-in / read-only connected-source analyst**: use when final analytical
+  tables already exist. Scaffold `.env.example`, `seeknal_agent.yml`,
+  `SEEKNAL_ASK.md`, `context/`, `seeknal/sql_pairs/`, and `seeknal/tests/`.
+  Guide agents to run `seeknal source connect`, `seeknal source sync`,
+  `seeknal ask test`, and a TUI smoke test.
+- **Data pipeline builder**: use when Seeknal should create managed data assets.
+  Guide agents to configure `profiles.yml`, create `seeknal/sources`,
+  `seeknal/transforms`, `seeknal/feature_groups`, `seeknal/models`, then run
+  `seeknal dry-run`, `seeknal apply`, `seeknal plan`, and `seeknal run`.
+- **Hybrid**: use when both managed pipelines and read-only connected sources
+  exist. Keep `mode.default: auto`; use SQL pairs/tests/context to make source
+  selection explicit for important business questions.
 
 ## Safety
 

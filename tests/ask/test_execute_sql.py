@@ -375,3 +375,29 @@ def test_ad_hoc_sql_allowed_after_sql_pair_lookup(ctx, tmp_path):
     out = execute_sql("SELECT COUNT(*) AS total FROM small")
 
     assert "| total |" in out
+class _SlowRepl:
+    def execute_oneshot(self, sql: str, limit=None):
+        import time
+
+        time.sleep(2)
+        return ["n"], [(1,)]
+
+
+def test_execute_sql_returns_terminal_timeout(tmp_path):
+    from unittest.mock import MagicMock
+
+    from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
+
+    set_tool_context(
+        ToolContext(
+            repl=_SlowRepl(),
+            artifact_discovery=MagicMock(),
+            project_path=tmp_path,
+            sql_timeout_seconds=1,
+        )
+    )
+
+    out = execute_sql(sql="SELECT 1")
+
+    assert "terminal_timeout" in out
+    assert "SQL execution timed out after 1 seconds" in out

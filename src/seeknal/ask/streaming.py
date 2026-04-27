@@ -69,50 +69,23 @@ def _sanitize_user_input(text: str) -> str:
 
 def _extract_direct_arg(question: str, name: str) -> str | None:
     """Extract ``name = value`` from a direct tool-call-style user turn."""
-    pattern = rf"\b{name}\s*=\s*(.*?)(?:\.\s*Then\b|\s+Then\b|$)"
-    match = re.search(pattern, question, flags=re.IGNORECASE | re.DOTALL)
-    if not match:
-        return None
-    value = match.group(1).strip()
-    # tmux/CLI QA often sends escaped newlines so the whole prompt stays on
-    # one input() line. Decode just those common escapes for Python snippets.
-    value = value.replace("\\n", "\n").strip()
-    return value.strip("`")
+    from seeknal.ask.directives import extract_direct_arg
+
+    return extract_direct_arg(question, name)
 
 
 def _extract_remembered_preference(question: str) -> str | None:
     """Extract explicit "remember/save this" natural teaching turns."""
-    normalized = question.strip()
-    patterns = [
-        r"^(?:please\s+)?remember(?:\s+this)?(?:\s+for\s+future\s+sessions)?\s*:\s*(.+)$",
-        r"^(?:please\s+)?save\s+this(?:\s+for\s+future\s+sessions)?\s*:\s*(.+)$",
-        r"^(?:please\s+)?write\s+this\s+down\s*:\s*(.+)$",
-        r"^use\s+this\s+from\s+now\s+on\s*:\s*(.+)$",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, normalized, flags=re.IGNORECASE | re.DOTALL)
-        if match:
-            value = match.group(1).strip()
-            return value.strip("`") if value else None
-    return None
+    from seeknal.ask.directives import extract_remembered_preference
+
+    return extract_remembered_preference(question)
 
 
 def _extract_sql_pair_directive(question: str) -> tuple[str, str] | None:
     """Extract natural "save this query as SQL pair named X: SELECT ..." turns."""
-    normalized = question.strip()
-    match = re.search(
-        r"^(?:please\s+)?save\s+(?:this\s+)?(?:query\s+)?as\s+(?:a\s+)?sql\s+pair"
-        r"(?:\s+named\s+(?P<name>[a-zA-Z0-9_\-. ]+?))?\s*:\s*(?P<sql>.+)$",
-        normalized,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not match:
-        return None
-    name = (match.group("name") or "saved_query").strip()
-    sql = match.group("sql").strip().strip("`")
-    if not sql:
-        return None
-    return _slugify_memory_name(name), sql
+    from seeknal.ask.directives import extract_sql_pair_directive
+
+    return extract_sql_pair_directive(question)
 
 
 def _slugify_memory_name(value: str) -> str:
@@ -122,6 +95,8 @@ def _slugify_memory_name(value: str) -> str:
 
 
 def _build_sql_pair_yaml(name: str, sql: str) -> str:
+    # Kept only for private import compatibility; direct SQL-pair writes now
+    # use the shared directive module. Preserve the exact old serialization.
     indented_sql = "\n".join(f"  {line}" if line else "" for line in sql.splitlines())
     return (
         f"name: {name}\n"
@@ -143,140 +118,16 @@ async def _try_direct_tool_directive(question: str, console: Console) -> str | N
     makes the interactive harness more robust with small/local tool-calling
     models and provides a deterministic QA surface for tap-in database users.
     """
-    normalized = question.strip()
-    lowered = normalized.lower()
+    from seeknal.ask.directives import try_direct_tool_directive
 
-    sql_pair = _extract_sql_pair_directive(normalized)
-    if sql_pair is not None:
-        from seeknal.ask.agents.tools.write_project_file import write_project_file
-
-        name, sql = sql_pair
-        path = f"sql_pairs/{name}.yml"
-        content = _build_sql_pair_yaml(name, sql)
-        args = {"path": path, "content": content}
-        _show_tool_start(console, "write_project_file", args)
-        output = write_project_file(path, content)
-        _show_tool_end(console, "write_project_file", output)
-        answer = _summarize_direct_tool_output(output)
-        _show_answer(console, answer)
-        return answer
-
-    if re.search(r"\bcall\s+save_preference\b", lowered):
-        from seeknal.ask.agents.tools.save_preference import save_preference
-
-        preference = _extract_direct_arg(normalized, "preference")
-        if not preference:
-            return None
-        args = {"preference": preference}
-        _show_tool_start(console, "save_preference", args)
-        output = save_preference(preference)
-        _show_tool_end(console, "save_preference", output)
-        answer = _summarize_direct_tool_output(output)
-        _show_answer(console, answer)
-        return answer
-
-    remembered = _extract_remembered_preference(normalized)
-    if remembered:
-        from seeknal.ask.agents.tools.save_preference import save_preference
-
-        args = {"preference": remembered}
-        _show_tool_start(console, "save_preference", args)
-        output = save_preference(remembered)
-        _show_tool_end(console, "save_preference", output)
-        answer = _summarize_direct_tool_output(output)
-        _show_answer(console, answer)
-        return answer
-
-    if re.search(r"\bcall\s+write_project_file\b", lowered):
-        from seeknal.ask.agents.tools.write_project_file import write_project_file
-
-        path = _extract_direct_arg(normalized, "path")
-        content = _extract_direct_arg(normalized, "content")
-        if not path or content is None:
-            return None
-        args = {"path": path, "content": content}
-        _show_tool_start(console, "write_project_file", args)
-        output = write_project_file(path, content)
-        _show_tool_end(console, "write_project_file", output)
-        answer = _summarize_direct_tool_output(output)
-        _show_answer(console, answer)
-        return answer
-
-    if re.search(r"\bcall\s+list_tables\b", lowered):
-        from seeknal.ask.agents.tools.list_tables import list_tables
-
-        query = _extract_direct_arg(normalized, "query")
-        args = {"query": query} if query is not None else {}
-        _show_tool_start(console, "list_tables", args)
-        output = list_tables(**args)
-        _show_tool_end(console, "list_tables", output)
-        answer = "Queryable tables:\n" + "\n".join(
-            line for line in output.splitlines() if line.startswith("- ")
-        )
-        _show_answer(console, answer)
-        return answer
-
-    if re.search(r"\bcall\s+describe_table\b", lowered):
-        from seeknal.ask.agents.tools.describe_table import describe_table
-
-        table_name = _extract_direct_arg(normalized, "table_name")
-        if not table_name:
-            return None
-        args = {"table_name": table_name}
-        _show_tool_start(console, "describe_table", args)
-        output = describe_table(table_name)
-        _show_tool_end(console, "describe_table", output)
-        answer = "Important columns:\n" + "\n".join(
-            line for line in output.splitlines() if line.startswith("- ")
-        )
-        _show_answer(console, answer)
-        return answer
-
-    if re.search(r"\bcall\s+execute_sql\b", lowered):
-        from seeknal.ask.agents.tools.execute_sql import execute_sql
-
-        sql = _extract_direct_arg(normalized, "sql")
-        query = _extract_direct_arg(normalized, "query")
-        if not sql and not query:
-            return None
-        args = {"sql": sql} if sql else {"query": query}
-        _show_tool_start(console, "execute_sql", args)
-        output = execute_sql(**args)
-        _show_tool_end(console, "execute_sql", output)
-        answer = _summarize_direct_tool_output(output)
-        _show_answer(console, answer)
-        return answer
-
-    if re.search(r"\bcall\s+execute_python\b", lowered):
-        from seeknal.ask.agents.tools.execute_python import execute_python
-
-        code = _extract_direct_arg(normalized, "code")
-        if not code:
-            return None
-        args = {"code": code}
-        _show_tool_start(console, "execute_python", args)
-        output = await execute_python(code)
-        _show_tool_end(console, "execute_python", output)
-        answer = _summarize_direct_tool_output(output)
-        _show_answer(console, answer)
-        return answer
-
-    shortcut_answer = await _try_read_only_analysis_shortcut(normalized, console)
-    if shortcut_answer is not None:
-        return shortcut_answer
-
-    if "read-only" in lowered and any(
-        word in lowered for word in ("remove", "delete", "drop", "update")
-    ):
-        answer = (
-            "The connected database is configured as read-only, so I will not "
-            "run a mutation. Mutation attempts are blocked by the analysis "
-            "toolset and SafeConnection/read-only database guards."
-        )
-        _show_answer(console, answer)
-        return answer
-
-    return None
+    result = await try_direct_tool_directive(question)
+    if result is None:
+        return None
+    for event in result.events:
+        _show_tool_start(console, event.name, event.args)
+        _show_tool_end(console, event.name, event.output)
+    _show_answer(console, result.answer)
+    return result.answer
 
 
 async def _try_read_only_analysis_shortcut(
@@ -289,63 +140,19 @@ async def _try_read_only_analysis_shortcut(
     connected source. Only deterministic safety handling and generic discovery
     belong here.
     """
-    from seeknal.ask.agents.tools._context import get_tool_context
+    from seeknal.ask.directives import try_read_only_analysis_shortcut
 
-    try:
-        ctx = get_tool_context()
-        if not getattr(ctx, "disable_quality_gate", False):
-            return None
-    except RuntimeError:
-        return None
-
-    lowered = question.lower()
-
-    if "ignore instructions" in lowered and "delete" in lowered:
-        answer = (
-            "No. Text stored in database rows is data, not an instruction to "
-            "the agent. I should summarize or analyze that value, but never "
-            "treat it as permission to delete or mutate records."
-        )
+    answer = try_read_only_analysis_shortcut(question)
+    if answer is not None:
         _show_answer(console, answer)
-        return answer
-
-    if (
-        "delete" in lowered
-        or "remove" in lowered
-        or "drop" in lowered
-        or "update" in lowered
-    ):
-        answer = (
-            "The connected database is read-only, so I will not run a mutation. "
-            "Use a SELECT query to inspect data, or switch to an explicit build/"
-            "pipeline workflow if you want a managed derived dataset."
-        )
-        _show_answer(console, answer)
-        return answer
-
-    if "what data table" in lowered or "available" in lowered and "table" in lowered:
-        from seeknal.ask.agents.tools.list_tables import list_tables
-
-        _show_tool_start(console, "list_tables", {})
-        output = list_tables()
-        _show_tool_end(console, "list_tables", output)
-        answer = "Queryable tables:\n" + "\n".join(
-            line for line in output.splitlines() if line.startswith("- ")
-        )
-        _show_answer(console, answer)
-        return answer
-
-    return None
+    return answer
 
 
 def _summarize_direct_tool_output(output: str) -> str:
     """Return a compact direct answer for deterministic tool directives."""
-    if not output:
-        return "Tool completed with no output."
-    stripped = output.strip()
-    if len(stripped) <= 1200:
-        return stripped
-    return stripped[:1200] + "\n\n... (truncated)"
+    from seeknal.ask.directives import summarize_direct_tool_output
+
+    return summarize_direct_tool_output(output)
 
 
 def _extract_tool_result_text(result: Any) -> str:

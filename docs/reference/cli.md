@@ -140,8 +140,12 @@ Initialize a new Seeknal project with dbt-style structure.
 Creates a complete project structure with:
 - `seeknal_project.yml`: Project configuration (name, version, profile)
 - `profiles.yml`: Credentials and engine config (gitignored)
-- `.gitignore`: Auto-generated with profiles.yml, target/, and `.seeknal/`
+- `seeknal_agent.yml`: Ask mode/source registry scaffold
+- `SEEKNAL_ASK.md`: Ask project instructions loaded into sessions
+- `.env.example`: Safe environment-variable placeholders
+- `.gitignore`: Auto-generated with profiles.yml, `.env`, target/, and `.seeknal/`
 - `AGENTS.md` / `CLAUDE.md`: Project-local assistant guidance
+- `context/`: User-taught Ask memory, SQL pairs, and tests
 - `seeknal/`: YAML/Python definitions, Ask skills, SQL pairs, and Ask tests
 - `target/`: Output directory for compiled artifacts
 
@@ -160,6 +164,12 @@ seeknal init [OPTIONS]
 
 **Directory Structure Created:**
 ```
+seeknal_agent.yml      # Ask mode/source registry scaffold
+SEEKNAL_ASK.md         # durable project context for Ask
+AGENTS.md / CLAUDE.md  # coding-agent guidance
+context/
+├── sql_pairs/       # agent/user-taught SQL examples
+└── tests/           # optional context-local Ask tests
 seeknal/
 ├── sources/         # YAML source definitions
 ├── transforms/      # YAML transforms
@@ -2325,6 +2335,14 @@ seeknal gateway start --telegram
 # Multi-replica with Redis
 seeknal gateway start --redis redis://localhost:6379
 ```
+
+Runtime notes:
+
+- Same-session runs are serialized to protect message history and DuckDB state.
+- Cancel the active run with `POST /sessions/{session_id}/cancel`; WebSocket
+  clients may send `{"type":"cancel"}` while a run is streaming.
+- Gateway events may include `elapsed_ms` on tool and done events for
+  lightweight performance diagnostics.
 
 ## seeknal gateway backend
 

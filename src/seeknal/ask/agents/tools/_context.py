@@ -74,6 +74,10 @@ class ToolContext:
     loaded_sql_pairs_this_turn: dict[str, str] = field(default_factory=dict)
     sql_pairs_checked_this_turn: bool = False
     authoritative_sql_pair_result_this_turn: dict[str, str] | None = None
+    sql_timeout_seconds: int = 60
+    discovery_cache_ttl_seconds: int = 300
+    discovery_cache: dict[str, tuple[float, Any]] = field(default_factory=dict)
+    timing_events_this_turn: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _make_registry():
@@ -214,6 +218,45 @@ def reset_turn_governor(question: str | None = None) -> None:
     setattr(ctx.repl, "_seeknal_sql_pairs_checked_this_turn", False)
     ctx.authoritative_sql_pair_result_this_turn = None
     setattr(ctx.repl, "_seeknal_authoritative_sql_pair_result_this_turn", None)
+    ctx.timing_events_this_turn.clear()
+
+
+def get_discovery_cache_value(key: str) -> Any | None:
+    """Return a non-expired per-session discovery cache value."""
+    import time
+
+    ctx = get_tool_context()
+    ttl = int(getattr(ctx, "discovery_cache_ttl_seconds", 0) or 0)
+    if ttl <= 0:
+        return None
+    cached = ctx.discovery_cache.get(key)
+    if cached is None:
+        return None
+    created_at, value = cached
+    if time.monotonic() - created_at > ttl:
+        ctx.discovery_cache.pop(key, None)
+        return None
+    return value
+
+
+def set_discovery_cache_value(key: str, value: Any) -> None:
+    """Store a per-session discovery cache value."""
+    import time
+
+    ctx = get_tool_context()
+    ttl = int(getattr(ctx, "discovery_cache_ttl_seconds", 0) or 0)
+    if ttl <= 0:
+        return
+    ctx.discovery_cache[key] = (time.monotonic(), value)
+
+
+def record_timing_event(name: str, elapsed_ms: int, **extra: Any) -> None:
+    """Record bounded timing data for diagnostics and gateway events."""
+    ctx = get_tool_context()
+    payload = {"name": name, "elapsed_ms": int(elapsed_ms), **extra}
+    ctx.timing_events_this_turn.append(payload)
+    if len(ctx.timing_events_this_turn) > 20:
+        del ctx.timing_events_this_turn[:-20]
 
 
 def make_tool_signature(tool_name: str, args: dict[str, Any] | None = None) -> str:
