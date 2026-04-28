@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
@@ -28,6 +29,15 @@ from seeknal.workflow.state import RunState, NodeState, NodeStatus  # ty: ignore
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _project_tempdir():
+    """Create a temporary directory under the project for secure output-path tests."""
+    base_dir = Path.cwd() / ".seeknal" / "test-tmp"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=base_dir) as tmpdir:
+        yield tmpdir
 
 
 def _make_manifest_with_profile_and_rules() -> Manifest:
@@ -785,7 +795,7 @@ class TestGenerateDQHtml:
             profiles=[sample_profile_summary],
             rules=sample_rules,
         )
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "dq_report.html"
             result = generate_dq_html(data, output, open_browser=False)
 
@@ -800,7 +810,7 @@ class TestGenerateDQHtml:
             profiles=[sample_profile_summary],
             rules=sample_rules,
         )
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "dq_report.html"
             generate_dq_html(data, output, open_browser=False)
 
@@ -821,7 +831,7 @@ class TestGenerateDQHtml:
         )]
         data = _make_dq_data(rules=rules)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "dq_report.html"
             generate_dq_html(data, output, open_browser=False)
 
@@ -841,7 +851,7 @@ class TestGenerateDQHtml:
         """Creates parent directories if they don't exist."""
         data = _make_dq_data(rules=sample_rules)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "nested" / "dir" / "dq_report.html"
             generate_dq_html(data, output, open_browser=False)
 
@@ -851,7 +861,7 @@ class TestGenerateDQHtml:
         """Browser does not open when open_browser=False."""
         data = _make_dq_data(rules=sample_rules)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "dq_report.html"
             with patch("seeknal.dag.dq.webbrowser.open") as mock_open:
                 generate_dq_html(data, output, open_browser=False)
@@ -861,7 +871,7 @@ class TestGenerateDQHtml:
         """SSH session detection skips browser open."""
         data = _make_dq_data(rules=sample_rules)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "dq_report.html"
             with patch.dict(os.environ, {"SSH_CONNECTION": "1.2.3.4 5678 9.10.11.12 22"}):
                 with patch("seeknal.dag.dq.webbrowser.open") as mock_open:
@@ -872,7 +882,7 @@ class TestGenerateDQHtml:
         """Browser opens when not in SSH session and open_browser=True."""
         data = _make_dq_data(rules=sample_rules)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "dq_report.html"
             env = os.environ.copy()
             env.pop("SSH_CONNECTION", None)
@@ -885,7 +895,7 @@ class TestGenerateDQHtml:
         """HTML includes Chart.js CDN reference."""
         data = _make_dq_data(rules=sample_rules)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "dq_report.html"
             generate_dq_html(data, output, open_browser=False)
 
@@ -896,7 +906,7 @@ class TestGenerateDQHtml:
         """HTML generated even with empty DQData."""
         data = _make_dq_data()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "dq_report.html"
             result = generate_dq_html(data, output, open_browser=False)
             assert result.exists()
