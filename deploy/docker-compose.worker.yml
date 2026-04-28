@@ -11,8 +11,8 @@
 services:
   seeknal-worker:
     build:
-      context: ..
-      dockerfile: Dockerfile.worker
+      context: ${SEEKNAL_BUILD_CONTEXT:-..}
+      dockerfile: docker/Dockerfile.worker
     image: seeknal-worker:local
     environment:
       - TEMPORAL_ADDRESS=${TEMPORAL_ADDRESS:-localhost:7233}

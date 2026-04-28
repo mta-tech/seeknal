@@ -1,13 +1,13 @@
 # syntax=docker/dockerfile:1.7
-# Seeknal Ask Temporal worker image.
+# Seeknal Ask HTTP gateway image.
 #
 # Build from repository root:
-#   docker build -f Dockerfile.worker -t seeknal-worker:local .
+#   docker build -f docker/Dockerfile.gateway -t seeknal-gateway:local .
 #
 # Run with a mounted Seeknal project:
-#   docker run --rm -v "$PWD:/app/project" --env-file .env \
+#   docker run --rm -p 8000:8000 -v "$PWD:/app/project" --env-file .env \
 #     -e TEMPORAL_ADDRESS=host.docker.internal:7233 \
-#     seeknal-worker:local --project /app/project
+#     seeknal-gateway:local
 
 FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim AS runtime
 
@@ -17,8 +17,7 @@ ENV PYTHONUNBUFFERED=1 \
     SEEKNAL_PROJECT_PATH=/app/project \
     TEMPORAL_ADDRESS=localhost:7233 \
     TEMPORAL_NAMESPACE=default \
-    TEMPORAL_TASK_QUEUE=seeknal-ask \
-    TEMPORAL_MAX_CONCURRENT_ACTIVITIES=15
+    TEMPORAL_TASK_QUEUE=seeknal-ask
 
 WORKDIR /opt/seeknal
 
@@ -26,22 +25,19 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
-        git \
         libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 
-# Install Seeknal with Temporal support. Some platforms (notably linux/arm64)
-# may not have libsql wheels available; worker deployments primarily use
-# network databases, so retry without libsql-only dependencies when needed.
-RUN <<'EOF'
+# Install Seeknal with Temporal support. Gateway deployments primarily use
+# network databases, so the image intentionally skips libsql-only dependencies
+# that often require platform-specific Rust builds.
+RUN <<'EOF_INSTALL'
 set -eux
-uv pip install --system ".[temporal]" || {
-  echo "Full install failed (likely missing libsql wheel), retrying without libsql..."
-  uv pip install --system --no-deps .
-  python - <<'PY'
+uv pip install --system --no-deps .
+python - <<'PY'
 import importlib.metadata
 import re
 
@@ -56,20 +52,22 @@ for dep in deps:
     lines.append(requirement)
 
 lines.extend(["temporalio>=1.9.0", "aiohttp>=3.9.0"])
-with open("/tmp/seeknal-worker-deps.txt", "w", encoding="utf-8") as fh:
+with open("/tmp/seeknal-gateway-deps.txt", "w", encoding="utf-8") as fh:
     fh.write("\n".join(lines) + "\n")
 PY
-  uv pip install --system -r /tmp/seeknal-worker-deps.txt
-}
-EOF
+uv pip install --system -r /tmp/seeknal-gateway-deps.txt
+rm -rf /root/.cache /tmp/*
+EOF_INSTALL
 
 RUN mkdir -p /app/project
 WORKDIR /app/project
 
+EXPOSE 8000
+
 # The project is normally mounted at /app/project. Additional flags can be
 # supplied after the image name, or by environment variables supported by the CLI:
-# TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, TEMPORAL_TASK_QUEUE,
-# TEMPORAL_MAX_CONCURRENT_ACTIVITIES, CALLBACK_BASE_URL, CALLBACK_AUTH_TOKEN,
-# SEEKNAL_GATEWAY_URL, and SEEKNAL_API_TOKEN.
-ENTRYPOINT ["seeknal", "gateway", "worker"]
-CMD []
+# TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, TEMPORAL_TASK_QUEUE, REDIS_URL,
+# CALLBACK_BASE_URL, CALLBACK_AUTH_TOKEN, SEEKNAL_TOKEN_CONFIG, and
+# SEEKNAL_API_TOKENS.
+ENTRYPOINT ["seeknal", "gateway", "start"]
+CMD ["--project", "/app/project", "--port", "8000", "--host", "0.0.0.0", "--temporal", "--no-worker"]

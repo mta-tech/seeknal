@@ -90,12 +90,21 @@ seeknal gateway backend --token-config ./gateway-tokens.yml --port 8000
 seeknal gateway worker --project ./my-project --gateway-url http://gateway:8000 --api-token "$SEEKNAL_API_TOKEN"
 
 # Docker worker image
-docker build -f Dockerfile.worker -t seeknal-worker:local .
+docker build -f docker/Dockerfile.worker -t seeknal-worker:local .
 docker run --rm \
   -v "$PWD/my-project:/app/project" \
   --env-file "$PWD/my-project/.env" \
   -e TEMPORAL_ADDRESS=host.docker.internal:7233 \
   seeknal-worker:local --project /app/project
+
+# Docker gateway image
+docker build -f docker/Dockerfile.gateway -t seeknal-gateway:local .
+docker run --rm \
+  -p 8000:8000 \
+  -v "$PWD/my-project:/app/project" \
+  --env-file "$PWD/my-project/.env" \
+  -e TEMPORAL_ADDRESS=host.docker.internal:7233 \
+  seeknal-gateway:local
 
 # Docker worker with token-derived tenant routing
 docker run --rm \
@@ -184,16 +193,19 @@ Client (browser/app/bot)
 | `SEEKNAL_GATEWAY_URL` | Gateway URL used by `seeknal gateway worker` bootstrap |
 | `SEEKNAL_API_TOKEN` | Worker/client API token used for token-derived routing |
 
-## Docker worker image
+## Docker images
 
-`Dockerfile.worker` builds a container that runs `seeknal gateway worker`.
+`docker/Dockerfile.gateway` builds a container that runs `seeknal gateway
+start`, and `docker/Dockerfile.worker` builds a container that runs `seeknal
+gateway worker`.
 Mount a Seeknal project at `/app/project`, pass project secrets through an
 environment file or secret manager, and configure Temporal either directly with
 `TEMPORAL_ADDRESS`/`TEMPORAL_TASK_QUEUE` or indirectly with
 `SEEKNAL_GATEWAY_URL`/`SEEKNAL_API_TOKEN` in token-routed deployments.
 
 ```bash
-docker build -f Dockerfile.worker -t seeknal-worker:local .
+docker build -f docker/Dockerfile.gateway -t seeknal-gateway:local .
+docker build -f docker/Dockerfile.worker -t seeknal-worker:local .
 docker compose -f deploy/docker-compose.worker.yml up --build
 ```
 

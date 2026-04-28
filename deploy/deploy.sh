@@ -39,8 +39,6 @@ echo "[4/5] Copying deployment configs..."
 scp $SSH_OPTS \
     "$SCRIPT_DIR/docker-compose.yml" \
     "$SCRIPT_DIR/docker-compose.worker.yml" \
-    "$SCRIPT_DIR/Dockerfile.gateway" \
-    "$SCRIPT_DIR/Dockerfile.worker" \
     "$SCRIPT_DIR/nginx.conf" \
     "$REMOTE_HOST:$REMOTE_DIR/"
 
@@ -52,7 +50,7 @@ scp $SSH_OPTS "$REPO_ROOT/src/seeknal/ask/gateway/static/chat.html" "$REMOTE_HOS
 
 # 5. Build and start services
 echo "[5/5] Building and starting services..."
-ssh $SSH_OPTS "$REMOTE_HOST" "cd $REMOTE_DIR && docker compose down --remove-orphans 2>/dev/null; docker compose up -d --build"
+ssh $SSH_OPTS "$REMOTE_HOST" "cd $REMOTE_DIR && docker compose down --remove-orphans 2>/dev/null; SEEKNAL_BUILD_CONTEXT=./seeknal-src docker compose up -d --build"
 
 echo ""
 echo "=== Deployment Complete ==="
