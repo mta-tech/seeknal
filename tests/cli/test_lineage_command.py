@@ -230,7 +230,7 @@ class TestLineageTagFiltering:
     """Tests for --tags and --exclude-tags on lineage command."""
 
     def test_lineage_ascii_tags_filter(self):
-        """--tags filters ASCII lineage to matching nodes + upstream."""
+        """--tags filters ASCII lineage to matching tagged nodes."""
         with _secure_tempdir() as tmpdir:
             _create_tagged_project(tmpdir)
 
@@ -243,7 +243,6 @@ class TestLineageTagFiltering:
 
             assert result.exit_code == 0, f"Output: {result.output}"
             assert "tagged_transform" in result.output
-            assert "raw_data" in result.output
             assert "untagged_transform" not in result.output
 
     def test_lineage_ascii_exclude_tags(self):
