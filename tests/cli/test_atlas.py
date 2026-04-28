@@ -4,6 +4,8 @@ This module tests the Atlas Data Platform CLI commands that are
 integrated into the Seeknal CLI.
 """
 
+import re
+
 import pytest
 from typer.testing import CliRunner
 from unittest.mock import patch, MagicMock
@@ -59,9 +61,9 @@ class TestAtlasApiCommands:
         """Test 'seeknal atlas api start --help' shows options."""
         result = runner.invoke(app, ["atlas", "api", "start", "--help"])
         assert result.exit_code == 0
-        assert "--host" in result.output
-        assert "--port" in result.output
-        assert "--reload" in result.output
+        assert re.search(r"-+host\b", result.output)
+        assert re.search(r"-+port\b", result.output)
+        assert re.search(r"-+reload\b", result.output)
 
     @patch("httpx.get")
     def test_api_status_connection_error(self, mock_get):
