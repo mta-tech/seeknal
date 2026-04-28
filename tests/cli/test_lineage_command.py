@@ -1,5 +1,6 @@
 """Tests for the seeknal lineage CLI command."""
 import re
+from contextlib import contextmanager
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -8,6 +9,14 @@ from seeknal.cli.main import app
 
 
 runner = CliRunner()
+
+
+@contextmanager
+def _secure_tempdir():
+    base_dir = Path.home() / ".seeknal" / "test-tmp"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=base_dir) as tmpdir:
+        yield tmpdir
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -59,7 +68,7 @@ class TestLineageCommand:
     @patch("seeknal.dag.visualize.webbrowser")
     def test_lineage_generates_html(self, mock_browser):
         """lineage command generates HTML file."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _secure_tempdir() as tmpdir:
             _create_sample_project(tmpdir)
 
             output_path = Path(tmpdir) / "output" / "lineage.html"
@@ -79,7 +88,7 @@ class TestLineageCommand:
     @patch("seeknal.dag.visualize.webbrowser")
     def test_lineage_with_focus_node(self, mock_browser):
         """lineage command with a valid focus node."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _secure_tempdir() as tmpdir:
             _create_sample_project(tmpdir)
 
             output_path = Path(tmpdir) / "output" / "lineage.html"
@@ -97,7 +106,7 @@ class TestLineageCommand:
 
     def test_lineage_nonexistent_node(self):
         """lineage command with nonexistent node shows error."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _secure_tempdir() as tmpdir:
             _create_sample_project(tmpdir)
 
             output_path = Path(tmpdir) / "output" / "lineage.html"
@@ -115,7 +124,7 @@ class TestLineageCommand:
 
     def test_lineage_insecure_output(self):
         """lineage command rejects insecure output path."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _secure_tempdir() as tmpdir:
             _create_sample_project(tmpdir)
 
             result = runner.invoke(app, [
@@ -131,7 +140,7 @@ class TestLineageCommand:
 
     def test_lineage_empty_project(self):
         """lineage command with empty project shows error."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _secure_tempdir() as tmpdir:
             # No seeknal/ directory at all -> DAGBuilder raises ValueError
             result = runner.invoke(app, [
                 "lineage",
@@ -145,7 +154,7 @@ class TestLineageCommand:
     @patch("seeknal.dag.visualize.webbrowser")
     def test_lineage_no_open(self, mock_browser):
         """lineage command with --no-open does not open browser."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _secure_tempdir() as tmpdir:
             _create_sample_project(tmpdir)
 
             output_path = Path(tmpdir) / "output" / "lineage.html"
@@ -163,7 +172,7 @@ class TestLineageCommand:
     @patch("seeknal.dag.visualize.webbrowser")
     def test_lineage_default_output_path(self, mock_browser):
         """lineage command uses target/lineage.html as default output."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _secure_tempdir() as tmpdir:
             _create_sample_project(tmpdir)
 
             result = runner.invoke(app, [
@@ -222,7 +231,7 @@ class TestLineageTagFiltering:
 
     def test_lineage_ascii_tags_filter(self):
         """--tags filters ASCII lineage to matching nodes + upstream."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _secure_tempdir() as tmpdir:
             _create_tagged_project(tmpdir)
 
             result = runner.invoke(app, [
@@ -239,7 +248,7 @@ class TestLineageTagFiltering:
 
     def test_lineage_ascii_exclude_tags(self):
         """--exclude-tags hides matching nodes from ASCII lineage."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _secure_tempdir() as tmpdir:
             _create_tagged_project(tmpdir)
 
             result = runner.invoke(app, [
@@ -256,7 +265,7 @@ class TestLineageTagFiltering:
 
     def test_lineage_tags_and_node_id_conflict(self):
         """--tags + node_id should error."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _secure_tempdir() as tmpdir:
             _create_tagged_project(tmpdir)
 
             result = runner.invoke(app, [
