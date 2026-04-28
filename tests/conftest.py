@@ -13,6 +13,13 @@ from typing import Any, Generator, TYPE_CHECKING
 import numpy
 import pytest
 
+# Keep Typer/Rich CLI snapshots stable in CI. GitHub Actions may set
+# FORCE_COLOR, which causes Rich to split long options (for example ``--prune``)
+# across ANSI-styled spans and makes plain substring assertions flaky.
+os.environ.pop("FORCE_COLOR", None)
+os.environ.setdefault("NO_COLOR", "1")
+os.environ.setdefault("CLICOLOR", "0")
+
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
