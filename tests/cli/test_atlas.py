@@ -17,8 +17,17 @@ from seeknal.cli.atlas import atlas_app
 runner = CliRunner()
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def _assert_help_option(output: str, name: str) -> None:
-    assert re.search(rf"-+{re.escape(name)}\b", output)
+    # Rich/Typer may split long option names across separately styled ANSI spans
+    # in CI output (for example ``--run-id`` as ``-`` + ``-run`` + ``-id``).
+    # Strip styling and compare a compact form so assertions stay focused on
+    # whether the option is present rather than terminal rendering details.
+    plain = _ANSI_ESCAPE_RE.sub("", output)
+    compact = re.sub(r"[\s-]+", "", plain)
+    assert name.replace("-", "") in compact
 
 
 class TestAtlasCliIntegration:
