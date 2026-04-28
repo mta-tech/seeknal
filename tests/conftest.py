@@ -5,7 +5,9 @@ import os
 import tempfile
 import stat
 import shutil
+import importlib.util
 from builtins import str
+from pathlib import Path
 from typing import Any, Generator, TYPE_CHECKING
 
 import numpy
@@ -19,6 +21,32 @@ cur_dir = os.path.dirname(os.path.realpath(__file__))
 # workaround to use locally downloaded spark
 default_spark_home = os.path.join(cur_dir, os.pardir, os.pardir, os.pardir, "spark")
 default_mlflow_tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///{}")
+
+
+_SPARK_REQUIRED_COLLECTIONS = {
+    Path("tests/sparkengine"),
+    Path("tests/featurestore/test_offline_store_iceberg.py"),
+    Path("tests/integration/test_iceberg_real_infra.py"),
+    Path("tests/test_cli_validate_features_e2e.py"),
+    Path("tests/test_feature_validation_integration.py"),
+    Path("tests/test_feature_validators.py"),
+}
+
+
+def _pyspark_available() -> bool:
+    return importlib.util.find_spec("pyspark") is not None
+
+
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool:
+    """Skip Spark-only test modules when the spark extra is not installed."""
+    if _pyspark_available():
+        return False
+
+    rel_path = Path(os.path.relpath(collection_path, Path(__file__).parent.parent))
+    return any(
+        rel_path == spark_path or spark_path in rel_path.parents
+        for spark_path in _SPARK_REQUIRED_COLLECTIONS
+    )
 
 
 def quiet():
