@@ -7,6 +7,7 @@ Tests cover:
 """
 
 import json
+import re
 from unittest import mock
 
 import pytest
@@ -16,6 +17,14 @@ from seeknal.cli.main import app, OutputFormat
 
 
 runner = CliRunner()
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _assert_help_option(output: str, name: str) -> None:
+    plain = _ANSI_ESCAPE_RE.sub("", output)
+    compact = re.sub(r"[\s-]+", "", plain)
+    assert name.replace("-", "") in compact
 
 
 class TestVersionListCommand:
@@ -31,8 +40,8 @@ class TestVersionListCommand:
         result = runner.invoke(app, ["version", "list", "--help"])
         assert result.exit_code == 0
         assert "FEATURE_GROUP" in result.stdout
-        assert "--format" in result.stdout
-        assert "--limit" in result.stdout
+        _assert_help_option(result.stdout, "--format")
+        _assert_help_option(result.stdout, "--limit")
 
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_table_format(self, mock_fg_class):
@@ -136,8 +145,8 @@ class TestVersionShowCommand:
         result = runner.invoke(app, ["version", "show", "--help"])
         assert result.exit_code == 0
         assert "FEATURE_GROUP" in result.stdout
-        assert "--version" in result.stdout
-        assert "--format" in result.stdout
+        _assert_help_option(result.stdout, "--version")
+        _assert_help_option(result.stdout, "--format")
 
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_show_displays_version_details(self, mock_fg_class):
@@ -307,9 +316,9 @@ class TestVersionDiffCommand:
         result = runner.invoke(app, ["version", "diff", "--help"])
         assert result.exit_code == 0
         assert "FEATURE_GROUP" in result.stdout
-        assert "--from" in result.stdout
-        assert "--to" in result.stdout
-        assert "--format" in result.stdout
+        _assert_help_option(result.stdout, "--from")
+        _assert_help_option(result.stdout, "--to")
+        _assert_help_option(result.stdout, "--format")
 
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_shows_no_changes(self, mock_fg_class):
