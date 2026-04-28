@@ -72,7 +72,8 @@ def _write_draft(tmp_path: Path) -> Path:
 
 
 def _secure_project_dir(tmp_path: Path) -> Path:
-    project_dir = Path.cwd() / ".seeknal" / "test-tmp" / tmp_path.name
+    repo_root = Path(__file__).resolve().parents[2]
+    project_dir = repo_root / ".seeknal" / "test-tmp" / tmp_path.name
     shutil.rmtree(project_dir, ignore_errors=True)
     project_dir.mkdir(parents=True, exist_ok=True)
     return project_dir
