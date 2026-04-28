@@ -4,6 +4,7 @@ import os
 import json
 import tempfile
 import shutil
+import re
 from datetime import datetime
 from unittest import mock
 from pathlib import Path
@@ -30,6 +31,14 @@ if "seeknal.featurestore.feature_group" not in sys.modules:
 
 
 runner = CliRunner()
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _assert_help_option(output: str, name: str) -> None:
+    plain = _ANSI_ESCAPE_RE.sub("", output)
+    compact = re.sub(r"[\s-]+", "", plain)
+    assert name.replace("-", "") in compact
 
 
 class TestVersionCommand:
@@ -348,8 +357,8 @@ class TestHelpCommand:
         """Init command help should display options."""
         result = runner.invoke(app, ["init", "--help"])
         assert result.exit_code == 0
-        assert "--name" in result.stdout
-        assert "--description" in result.stdout
+        _assert_help_option(result.stdout, "--name")
+        _assert_help_option(result.stdout, "--description")
 
     def test_list_help(self):
         """List command help should display resource types."""
@@ -364,8 +373,8 @@ class TestValidateFeaturesCommand:
         """validate-features command help should display options."""
         result = runner.invoke(app, ["validate-features", "--help"])
         assert result.exit_code == 0
-        assert "--mode" in result.stdout
-        assert "--verbose" in result.stdout
+        _assert_help_option(result.stdout, "--mode")
+        _assert_help_option(result.stdout, "--verbose")
         assert "FEATURE_GROUP" in result.stdout
 
     def test_validate_features_requires_feature_group(self):
@@ -385,7 +394,7 @@ class TestValidateFeaturesCommand:
         result = runner.invoke(app, ["validate-features", "--help"])
         assert result.exit_code == 0
         assert "-v" in result.stdout
-        assert "--verbose" in result.stdout
+        _assert_help_option(result.stdout, "--verbose")
 
 
 class TestDebugCommand:
@@ -424,7 +433,7 @@ class TestDeleteCommand:
         result = runner.invoke(app, ["delete", "--help"])
         assert result.exit_code == 0
         assert "feature-group" in result.stdout
-        assert "--force" in result.stdout
+        _assert_help_option(result.stdout, "--force")
 
     def test_delete_feature_group_success(self):
         """Delete command should successfully delete a feature group with --force."""
