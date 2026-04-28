@@ -283,5 +283,5 @@ class TestLineageTagFiltering:
         result = runner.invoke(app, ["lineage", "--help"])
 
         assert result.exit_code == 0
-        assert "--tags" in result.output
-        assert "--exclude-tags" in result.output
+        _assert_help_option(result.output, "tags")
+        _assert_help_option(result.output, "exclude-tags")
