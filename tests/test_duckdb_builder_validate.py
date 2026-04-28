@@ -9,6 +9,7 @@ def input_data():
         (1, "2019-01-10", "2019-01-20", 100),
     ]
     df = pd.DataFrame(data, columns=["id", "f_date", "a_date", "amount"])
+    df[["f_date", "a_date"]] = df[["f_date", "a_date"]].astype(object)
     return df
 
 @pytest.fixture

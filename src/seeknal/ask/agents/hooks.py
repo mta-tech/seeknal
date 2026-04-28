@@ -150,25 +150,35 @@ def _enrich_syntax_hint(message: str, existing_hint: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def get_ask_hooks() -> list[Hook]:
+def get_ask_hooks(config: dict | None = None) -> list[Hook]:
     """Return all hooks for the seeknal ask agent.
 
     Includes:
     - PRE_TOOL_USE: SQL security validation
     - POST_TOOL_USE: SQL self-correction hints
     """
-    return [
-        Hook(
-            event=HookEvent.PRE_TOOL_USE,
-            handler=_sql_security_handler,
-            matcher="execute_sql",
-        ),
-        Hook(
-            event=HookEvent.POST_TOOL_USE,
-            handler=_sql_self_correction_handler,
-            matcher="execute_sql",
-        ),
-    ]
+    cfg = config or {}
+    if cfg.get("enabled", True) is False:
+        return []
+
+    hooks: list[Hook] = []
+    if cfg.get("sql_security", True):
+        hooks.append(
+            Hook(
+                event=HookEvent.PRE_TOOL_USE,
+                handler=_sql_security_handler,
+                matcher="execute_sql",
+            )
+        )
+    if cfg.get("sql_self_correction", True):
+        hooks.append(
+            Hook(
+                event=HookEvent.POST_TOOL_USE,
+                handler=_sql_self_correction_handler,
+                matcher="execute_sql",
+            )
+        )
+    return hooks
 
 
 # Backward-compatible alias

@@ -1,14 +1,12 @@
 import shutil
 from dataclasses import dataclass, asdict, field
 from enum import Enum
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, TYPE_CHECKING, Union
 from abc import ABC, abstractmethod
 import pandas as pd
 from pydantic import BaseModel
-from pyspark.sql import DataFrame, SparkSession
 from datetime import datetime
 import pendulum
-from delta.tables import *
 import typer
 import pyarrow as pa
 from tabulate import tabulate
@@ -25,6 +23,23 @@ from ..validation import (
     validate_sql_value,
 )
 from ..utils.path_security import warn_if_insecure_path
+
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame, SparkSession
+    from delta.tables import DeltaTable
+else:
+    try:
+        from pyspark.sql import DataFrame, SparkSession
+    except ImportError:
+        class DataFrame:  # type: ignore[no-redef]
+            """Placeholder used when PySpark is not installed."""
+
+        SparkSession = None  # type: ignore[assignment]
+
+    try:
+        from delta.tables import DeltaTable
+    except ImportError:
+        DeltaTable = None  # type: ignore[assignment]
 
 
 class OfflineStoreEnum(str, Enum):

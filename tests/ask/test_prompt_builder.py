@@ -14,6 +14,7 @@ from seeknal.ask.prompt_builder import (
     _build_memory,
     _build_locale,
     _build_agent_profile,
+    _build_source_registry,
     _build_environment,
 )
 
@@ -181,6 +182,30 @@ class TestSectionBuilders:
         assert "competitive_intel" in result
         assert "Focus on actionable threats." in result
 
+    def test_source_registry_none_without_config(self):
+        assert _build_source_registry(config=None) is None
+        assert _build_source_registry(config={}) is None
+
+    def test_source_registry_returns_content_with_sources(self):
+        config = {
+            "sources": {
+                "warehouse": {
+                    "source_kind": "connected",
+                    "source_type": "database",
+                    "connector": "postgresql",
+                    "namespace": "wh",
+                    "access": "read_only",
+                    "role": "business_source_of_truth",
+                    "description": "Analytics warehouse",
+                }
+            }
+        }
+        result = _build_source_registry(config=config)
+        assert result is not None
+        assert "Data Sources & Mode Policy" in result
+        assert "warehouse" in result
+        assert "read_only" in result
+
     def test_environment_interactive(self):
         result = _build_environment(environment="interactive")
         assert "Interactive terminal" in result
@@ -208,7 +233,7 @@ class TestSectionBuilders:
 class TestDefaultBuilder:
     def test_creates_builder_with_all_sections(self):
         builder = create_default_builder()
-        assert len(builder._sections) == 7
+        assert len(builder._sections) == 8
 
     def test_interactive_includes_asking_questions(self):
         builder = create_default_builder()

@@ -24,6 +24,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -88,16 +89,37 @@ def parse_threshold(expr: str) -> ThresholdExpr:
     raise ValueError(f"Invalid threshold expression: {expr!r}")
 
 from seeknal.dag.manifest import Node, NodeType  # ty: ignore[unresolved-import]
-from seeknal.feature_validation.validators import (  # ty: ignore[unresolved-import]
-    BaseValidator,
-    NullValidator,
-    RangeValidator,
-    UniquenessValidator,
-    FreshnessValidator,
-    CustomValidator,
-    ValidationRunner,
-)
-from seeknal.feature_validation.models import ValidationMode, ValidationResult  # ty: ignore[unresolved-import]
+try:
+    from seeknal.feature_validation.validators import (  # ty: ignore[unresolved-import]
+        BaseValidator,
+        NullValidator,
+        RangeValidator,
+        UniquenessValidator,
+        FreshnessValidator,
+        CustomValidator,
+        ValidationRunner,
+    )
+    from seeknal.feature_validation.models import ValidationMode, ValidationResult  # ty: ignore[unresolved-import]
+except ImportError:
+    class ValidationMode(Enum):
+        WARN = "warn"
+        FAIL = "fail"
+
+    class _MissingSparkValidator:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise ImportError(
+                "Spark feature validators require the optional spark extra. "
+                "Install with `seeknal[spark]`."
+            )
+
+    BaseValidator = _MissingSparkValidator  # type: ignore[assignment,misc]
+    NullValidator = _MissingSparkValidator  # type: ignore[assignment,misc]
+    RangeValidator = _MissingSparkValidator  # type: ignore[assignment,misc]
+    UniquenessValidator = _MissingSparkValidator  # type: ignore[assignment,misc]
+    FreshnessValidator = _MissingSparkValidator  # type: ignore[assignment,misc]
+    CustomValidator = _MissingSparkValidator  # type: ignore[assignment,misc]
+    ValidationRunner = _MissingSparkValidator  # type: ignore[assignment,misc]
+    ValidationResult = Any  # type: ignore[assignment]
 
 from .base import (
     BaseExecutor,

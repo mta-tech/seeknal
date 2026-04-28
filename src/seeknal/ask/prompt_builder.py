@@ -21,7 +21,7 @@ from typing import Any, Callable, Optional
 class PromptTier(Enum):
     """Section cache tier — determines placement relative to the boundary."""
 
-    STATIC = "static"    # Never changes — cacheable across all turns
+    STATIC = "static"  # Never changes — cacheable across all turns
     DYNAMIC = "dynamic"  # Changes per-session or on config change
 
 
@@ -71,7 +71,8 @@ class PromptBuilder:
         overrides = config.get("prompt", {}) or {}
 
         sorted_sections = sorted(
-            self._sections.values(), key=lambda s: s.priority,
+            self._sections.values(),
+            key=lambda s: s.priority,
         )
 
         static_parts: list[str] = []
@@ -87,7 +88,8 @@ class PromptBuilder:
                 content = override
             else:
                 content = section.builder(
-                    environment=environment, config=config,
+                    environment=environment,
+                    config=config,
                 )
 
             if not content:
@@ -125,9 +127,12 @@ entities, feature groups, and transformations stored as DuckDB views.
 
 You have a small set of THIN data-access tools (execute_sql, list_tables,
 describe_table, get_entities, get_entity_schema, search_pipelines,
-read_pipeline, read_project_file, search_project_files, inspect_output,
-plan_pipeline, show_lineage, open_in_browser, read_proof_document, ask_user,
-submit_plan, execute_uv_script) plus a set of FAT skills loaded on demand via
+read_pipeline, search_project_files, inspect_output,
+plan_pipeline, show_lineage, open_in_browser, read_proof_document,
+list_source_context, read_source_context, list_context_files, read_project_file,
+list_sql_pairs, execute_sql_pair, read_sql_pair, list_ask_tests, read_ask_test, run_ask_test,
+list_ask_test_results, read_ask_test_result, save_preference,
+write_project_file, ask_user, submit_plan, execute_uv_script) plus a set of FAT skills loaded on demand via
 `load_skill`.
 
 When you start a multi-step workflow — generating a report, building a
@@ -138,23 +143,20 @@ contains the exact sequence of tool calls, approval discriminators, and
 output requirements for that workflow.
 
 Available skills:
-- `report-generation` — Evidence.dev report (uses generate_report)
-- `save-report-exposure` — codify a report as YAML exposure
-- `publish-memo-to-proof` — share memo on Proof Editor (approval-gated)
-- `publish-to-seeknal-report` — host built report on Seeknal Report Server (approval-gated)
-- `edit-proof-document` — rewrite an existing Proof doc (approval-gated)
-- `build-pipeline-node` — draft → validate → apply → run a new pipeline node
-- `bootstrap-semantic-model` — auto-generate semantic model from data
-- `query-metric` — query the semantic layer
-- `save-metric` — codify an ad-hoc metric
-- `execute-python-analysis` — Python sandbox for stats/ML/viz
-- `profile-data` — profile CSVs for schema + join keys
+- Reports/publishing: `report-generation`, `save-report-exposure`,
+  `publish-memo-to-proof`, `publish-to-seeknal-report`, `edit-proof-document`
+- Pipelines/semantic layer: `build-pipeline-node`, `bootstrap-semantic-model`,
+  `query-metric`, `save-metric`
+- Analysis/data: `database-analyst`, `business-question-answering`,
+  `complex-analysis`, `execute-python-analysis`, `profile-data`
 
 Skipping the relevant skill at the start of a workflow means you will miss
 the approval gate or get the discriminator wrong."""
 
 
-def _build_asking_questions(environment: str = "interactive", **kwargs: Any) -> str | None:
+def _build_asking_questions(
+    environment: str = "interactive", **kwargs: Any
+) -> str | None:
     if environment in ("gateway", "telegram", "exposure"):
         return None
     return """\
@@ -179,9 +181,8 @@ should make.
 constraints, which direction to take
 - Never ask what you could find out by querying the data yourself
 - Provide 2-4 concrete options with clear descriptions, not vague choices
-- Mark your recommended option with `"recommended": "true"`
-- One question at a time, most important first
-- After the user answers, proceed with the analysis using their direction
+- Mark your recommended option with `"recommended": "true"` (string), not boolean `true`
+- One question at a time, then proceed with the chosen direction
 
 **When NOT to ask:** Skip `ask_user` and proceed directly when:
 - The question has a clear, unambiguous answer from the data
@@ -221,10 +222,49 @@ For strategic / exploratory tasks (brainstorming, planning, scoping):
    approval to reuse a prior strategy
 
 For data questions:
-1. Discover: `list_tables` → `describe_table`
-2. Query: `execute_sql` (or load `query-metric` skill if a semantic metric exists)
-3. Interpret with domain expertise — never just echo numbers
-4. Suggest actionable follow-ups
+1. If the question is about a read-only connected database or an unknown
+   business schema, first `load_skill('database-analyst')`.
+2. For connected sources, use source context and SQL pairs before ad-hoc table
+   probing. Exact full grain/filter/dimension match:
+   `execute_sql_pair(authoritative=true)`. Partial match: run the pair only as
+   an example, then adapt SQL or inspect another pair.
+3. If the user explicitly teaches you a rule or query ("remember", "save this",
+   "write this down", "use this from now on", "save as SQL pair"), persist it:
+   `save_preference` for short rules; `write_project_file` under `context/` for
+   longer notes or `context/sql_pairs/<slug>.yml` for reusable SQL examples.
+   Never persist secrets, DSNs, API keys, tokens, or one-off temporary filters.
+4. For project QA or regression questions, use `list_ask_tests`,
+   `read_ask_test`, `run_ask_test`, and saved result tools instead of
+   inventing validation logic.
+5. Verify gaps/exact columns with `list_tables` → `describe_table`.
+6. Query: `execute_sql` using the `sql` argument exactly. The compatibility
+   alias `query` may work, but `sql` is the canonical schema.
+7. Interpret with domain expertise — never just echo numbers
+8. Suggest actionable follow-ups
+
+Broad executive prompts like "apa yang perlu diperhatikan?" mean "find the
+important insights." Run evidence queries; summarize priorities, risks,
+anomalies, opportunities, and next checks — not setup or developer context.
+
+For quantitative business questions, do not answer from schema guesses when
+SQL tools are available. Run at least one `execute_sql` query first. If a
+query fails, read the error and retry with corrected SQL before asking the
+user for schema details.
+
+SQL hygiene: use DuckDB `column ILIKE '%term%'`; label blank text dimensions
+with `COALESCE(NULLIF(TRIM(CAST(column AS VARCHAR)), ''), 'Unknown')`; inspect
+context/columns before querying unfamiliar fields; don't retry terminal tool
+failures such as unavailable Python packages.
+
+For complex analysis / modeling:
+1. Use SQL to extract the smallest useful dataset
+2. Then `load_skill('complex-analysis')` or `load_skill('execute-python-analysis')`
+   before `execute_python`
+3. Use the sandbox's pre-loaded `conn`; do not create a new DuckDB connection
+4. Keep conclusions tied to the SQL/Python evidence
+
+For semantic metrics: query with `execute_sql` or `query-metric`, interpret
+with domain expertise, and suggest actionable follow-ups.
 
 For lineage / "how does X work" questions:
 1. `search_pipelines` → `read_pipeline` or `search_project_files` → `read_project_file`
@@ -255,14 +295,28 @@ def _build_locale(config: dict[str, Any] | None = None, **kwargs: Any) -> str | 
     if not config:
         return None
     from seeknal.ask.config import get_locale_instructions
+
     return get_locale_instructions(config)
 
 
-def _build_agent_profile(config: dict[str, Any] | None = None, **kwargs: Any) -> str | None:
+def _build_agent_profile(
+    config: dict[str, Any] | None = None, **kwargs: Any
+) -> str | None:
     if not config:
         return None
     from seeknal.ask.config import get_agent_profile_instructions
+
     return get_agent_profile_instructions(config)
+
+
+def _build_source_registry(
+    config: dict[str, Any] | None = None, **kwargs: Any
+) -> str | None:
+    if not config:
+        return None
+    from seeknal.ask.config import get_source_registry_instructions
+
+    return get_source_registry_instructions(config)
 
 
 def _build_environment(environment: str = "interactive", **kwargs: Any) -> str:
@@ -272,7 +326,9 @@ def _build_environment(environment: str = "interactive", **kwargs: Any) -> str:
         lines.append("- Channel: Interactive terminal (TUI)")
     elif environment == "gateway":
         lines.append("- Channel: API gateway (headless)")
-        lines.append("- Do NOT use ask_user — the channel has no interactive menu support")
+        lines.append(
+            "- Do NOT use ask_user — the channel has no interactive menu support"
+        )
         lines.append("- Keep responses self-contained and concise")
     elif environment == "telegram":
         lines.append("- Channel: Telegram bot")
@@ -298,40 +354,76 @@ def create_default_builder() -> PromptBuilder:
         identity, asking_questions, workflow
 
     Layer 2 — Dynamic Sections (priorities 50-70):
-        memory, locale, environment
+        memory, locale, source_registry, environment
     """
     builder = PromptBuilder()
 
     # Layer 1: Static Core
-    builder.register(PromptSection(
-        id="identity", tier=PromptTier.STATIC, priority=10,
-        builder=_build_identity,
-    ))
-    builder.register(PromptSection(
-        id="asking_questions", tier=PromptTier.STATIC, priority=20,
-        builder=_build_asking_questions,
-    ))
-    builder.register(PromptSection(
-        id="workflow", tier=PromptTier.STATIC, priority=30,
-        builder=_build_workflow,
-    ))
+    builder.register(
+        PromptSection(
+            id="identity",
+            tier=PromptTier.STATIC,
+            priority=10,
+            builder=_build_identity,
+        )
+    )
+    builder.register(
+        PromptSection(
+            id="asking_questions",
+            tier=PromptTier.STATIC,
+            priority=20,
+            builder=_build_asking_questions,
+        )
+    )
+    builder.register(
+        PromptSection(
+            id="workflow",
+            tier=PromptTier.STATIC,
+            priority=30,
+            builder=_build_workflow,
+        )
+    )
 
     # Layer 2: Dynamic Sections
-    builder.register(PromptSection(
-        id="memory", tier=PromptTier.DYNAMIC, priority=50,
-        builder=_build_memory,
-    ))
-    builder.register(PromptSection(
-        id="locale", tier=PromptTier.DYNAMIC, priority=60,
-        builder=_build_locale,
-    ))
-    builder.register(PromptSection(
-        id="agent_profile", tier=PromptTier.DYNAMIC, priority=65,
-        builder=_build_agent_profile,
-    ))
-    builder.register(PromptSection(
-        id="environment", tier=PromptTier.DYNAMIC, priority=70,
-        builder=_build_environment,
-    ))
+    builder.register(
+        PromptSection(
+            id="memory",
+            tier=PromptTier.DYNAMIC,
+            priority=50,
+            builder=_build_memory,
+        )
+    )
+    builder.register(
+        PromptSection(
+            id="locale",
+            tier=PromptTier.DYNAMIC,
+            priority=60,
+            builder=_build_locale,
+        )
+    )
+    builder.register(
+        PromptSection(
+            id="agent_profile",
+            tier=PromptTier.DYNAMIC,
+            priority=65,
+            builder=_build_agent_profile,
+        )
+    )
+    builder.register(
+        PromptSection(
+            id="source_registry",
+            tier=PromptTier.DYNAMIC,
+            priority=68,
+            builder=_build_source_registry,
+        )
+    )
+    builder.register(
+        PromptSection(
+            id="environment",
+            tier=PromptTier.DYNAMIC,
+            priority=70,
+            builder=_build_environment,
+        )
+    )
 
     return builder

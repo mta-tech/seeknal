@@ -9,6 +9,7 @@ Falls back to in-process threading if subprocess execution fails.
 
 import ast
 import os
+import re
 import tempfile
 import threading
 import traceback
@@ -173,10 +174,26 @@ def _do_execute(code: str, conn: Any, timeout: int = 30) -> str:
 def _infer_error_hint(result: str, code: str) -> str | None:
     """Return a targeted hint based on common sandbox errors."""
     if "ModuleNotFoundError" in result:
+        missing = _missing_module_from_error(result)
+        if missing:
+            return (
+                f"`{missing}` is not installed in this Seeknal Python sandbox. "
+                "Do not retry the same import. Continue with the pre-loaded "
+                "libraries that are actually available, use SQL/pandas/numpy "
+                "where possible, or provide a text/table answer when plotting "
+                "is unavailable."
+            )
         return (
-            "Only pandas, numpy, matplotlib, scikit-learn, and scipy are "
-            "available in the sandbox. Do NOT import statsmodels, xgboost, "
-            "lightgbm, or other packages."
+            "The requested package is not installed in this Seeknal Python "
+            "sandbox. Do NOT retry the same import; use SQL/pandas/numpy/"
+            "scipy/sklearn if available, or provide a text/table answer."
+        )
+    if "'NoneType' object has no attribute" in result and re.search(r"\bplt\b|\bmatplotlib\b", code):
+        return (
+            "`plt`/`matplotlib` is not available in this Seeknal Python "
+            "sandbox. Do not retry chart generation in this session; provide "
+            "a text/table answer or use SQL/Python to compute non-visual "
+            "statistics."
         )
     if "CatalogException" in result and "does not exist" in result:
         if "duckdb.connect" in code:
@@ -211,6 +228,31 @@ def _infer_error_hint(result: str, code: str) -> str | None:
     return None
 
 
+def _missing_module_from_error(result: str) -> str | None:
+    """Extract the missing top-level module from a ModuleNotFoundError."""
+    match = re.search(r"No module named ['\"]([^'\"]+)['\"]", result)
+    if not match:
+        return None
+    return match.group(1).split(".")[0]
+
+
+def _imported_top_level_modules(code: str) -> set[str]:
+    """Return top-level module names imported by agent code."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set()
+
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modules.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module.split(".")[0])
+    return modules
+
+
 async def execute_python(code: str) -> str:
     """Run Python in an isolated subprocess sandbox. Prefer execute_sql for simple queries.
 
@@ -222,30 +264,114 @@ async def execute_python(code: str) -> str:
     Args:
         code: Python code to execute. Last expression is captured Jupyter-style.
     """
-    from seeknal.ask.agents.tools._context import get_tool_context
+    from seeknal.ask.agents.tools._context import (
+        get_tool_context,
+        record_tool_result,
+        repeated_failure_message,
+        visualization_requested,
+    )
     from seeknal.ask.sandbox import async_execute_in_sandbox
 
     ctx = get_tool_context()
-    result = await async_execute_in_sandbox(code, ctx.project_path)
-
-    # Backgrounded results pass through directly
-    from seeknal.ask.background import _BACKGROUNDED_PREFIX
-    if result.startswith(_BACKGROUNDED_PREFIX):
-        return result
+    prior_failure = repeated_failure_message("execute_python", {"code": code})
 
     # Wrap error results in structured error JSON for agent self-correction
     from seeknal.ask.agents.tools.errors import (
+        TERMINAL_DEPENDENCY_UNAVAILABLE,
         RETRYABLE_SYNTAX,
         TERMINAL_TIMEOUT,
         format_tool_error,
     )
 
+    if prior_failure:
+        result = format_tool_error(
+            TERMINAL_DEPENDENCY_UNAVAILABLE,
+            prior_failure,
+            hint=(
+                "Do not retry the same Python path. Use SQL or a text/table "
+                "answer from existing evidence."
+            ),
+        )
+        record_tool_result("execute_python", result, args={"code": code})
+        return result
+
+    imported = _imported_top_level_modules(code)
+    uses_plotting = bool({"matplotlib", "seaborn", "plotly"} & imported) or re.search(
+        r"\bplt\.",
+        code,
+    )
+    if uses_plotting and not visualization_requested(getattr(ctx, "current_question", None)):
+        result = format_tool_error(
+            TERMINAL_DEPENDENCY_UNAVAILABLE,
+            "Visualization was not explicitly requested for this turn.",
+            hint=(
+                "Do not create charts by default for business trend questions. "
+                "Use SQL/pandas for calculations and provide a text/table "
+                "answer unless the user asks for a chart, plot, dashboard, or report."
+            ),
+        )
+        record_tool_result("execute_python", result, args={"code": code})
+        return result
+
+    unavailable = getattr(ctx, "unavailable_python_modules", set())
+    repeated_unavailable = sorted(imported & unavailable)
+    if repeated_unavailable:
+        module = repeated_unavailable[0]
+        result = format_tool_error(
+            TERMINAL_DEPENDENCY_UNAVAILABLE,
+            f"Python module `{module}` is unavailable in this session.",
+            hint=(
+                f"`{module}` already failed to import. Do not retry the same "
+                "library or plotting path; fall back to SQL/text tables or "
+                "use another available pre-loaded library."
+            ),
+        )
+        record_tool_result("execute_python", result, args={"code": code})
+        return result
+
+    result = await async_execute_in_sandbox(code, ctx.project_path)
+
+    # Backgrounded results pass through directly
+    from seeknal.ask.background import _BACKGROUNDED_PREFIX
+    if result.startswith(_BACKGROUNDED_PREFIX):
+        record_tool_result("execute_python", result, args={"code": code})
+        return result
+
+    missing_module = _missing_module_from_error(result)
+    if missing_module:
+        unavailable.add(missing_module)
+        ctx.unavailable_python_modules = unavailable
+        result = format_tool_error(
+            TERMINAL_DEPENDENCY_UNAVAILABLE,
+            result,
+            hint=_infer_error_hint(result, code),
+        )
+        record_tool_result("execute_python", result, args={"code": code})
+        return result
+    if "'NoneType' object has no attribute" in result and re.search(r"\bplt\b|\bmatplotlib\b", code):
+        unavailable.add("matplotlib")
+        ctx.unavailable_python_modules = unavailable
+        result = format_tool_error(
+            TERMINAL_DEPENDENCY_UNAVAILABLE,
+            result,
+            hint=_infer_error_hint(result, code),
+        )
+        record_tool_result("execute_python", result, args={"code": code})
+        return result
+
     if result.startswith("Execution timed out"):
-        return format_tool_error(TERMINAL_TIMEOUT, result)
+        result = format_tool_error(TERMINAL_TIMEOUT, result)
+        record_tool_result("execute_python", result, args={"code": code})
+        return result
     if result.startswith("Error launching subprocess:"):
-        return format_tool_error(RETRYABLE_SYNTAX, result)
+        result = format_tool_error(RETRYABLE_SYNTAX, result)
+        record_tool_result("execute_python", result, args={"code": code})
+        return result
     if result.startswith("Error:\n") or result.startswith("Process exited with code"):
         hint = _infer_error_hint(result, code)
-        return format_tool_error(RETRYABLE_SYNTAX, result, hint=hint)
+        result = format_tool_error(RETRYABLE_SYNTAX, result, hint=hint)
+        record_tool_result("execute_python", result, args={"code": code})
+        return result
 
+    record_tool_result("execute_python", result, args={"code": code})
     return result

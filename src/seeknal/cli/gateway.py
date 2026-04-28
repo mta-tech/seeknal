@@ -59,6 +59,10 @@ def gateway_start(
         None, "--worker-project-path", envvar="WORKER_PROJECT_PATH",
         help="Project path on the remote worker (for split topology where gateway and worker are on different machines)"
     ),
+    token_config: Optional[Path] = typer.Option(
+        None, "--token-config", envvar="SEEKNAL_TOKEN_CONFIG",
+        help="JSON/YAML API token registry for tenant-scoped worker routing"
+    ),
 ):
     """Start the seeknal ask gateway server."""
     project_path = project or find_project_path()
@@ -201,6 +205,9 @@ def gateway_start(
         redis_url=redis,
         callback_base_url=effective_callback_url,
         callback_auth_token=callback_auth_token,
+        token_config=token_config,
+        temporal_address=temporal_address,
+        temporal_namespace=temporal_namespace,
     )
     if worker_project_path:
         app.state.worker_project_path = worker_project_path
@@ -217,6 +224,7 @@ def gateway_start(
     typer.echo("  POST /record")
     typer.echo("  POST /temporal/start")
     typer.echo("  POST /internal/events/{session_id}/publish")
+    typer.echo("  GET  /internal/worker/config")
     typer.echo("  WS   /ws/{session_id}")
     typer.echo("  GET  /events/{session_id}")
 
@@ -249,6 +257,10 @@ def gateway_backend(
     sessions_dir: Optional[Path] = typer.Option(
         None, "--sessions-dir",
         help="Gateway-local sessions directory (default: ~/.seeknal/gateway-sessions/)"
+    ),
+    token_config: Optional[Path] = typer.Option(
+        None, "--token-config", envvar="SEEKNAL_TOKEN_CONFIG",
+        help="JSON/YAML API token registry for tenant-scoped worker routing"
     ),
 ):
     """Start the seeknal ask gateway in backend-only mode.
@@ -323,6 +335,9 @@ def gateway_backend(
         callback_base_url=effective_callback_url,
         callback_auth_token=callback_auth_token,
         sessions_dir=sessions_dir,
+        token_config=token_config,
+        temporal_address=temporal_address,
+        temporal_namespace=temporal_namespace,
     )
     if worker_project_path:
         app.state.worker_project_path = worker_project_path
@@ -339,6 +354,7 @@ def gateway_backend(
     typer.echo("  GET  /sessions")
     typer.echo("  POST /temporal/start")
     typer.echo("  POST /internal/events/{session_id}/publish")
+    typer.echo("  GET  /internal/worker/config")
     typer.echo("  GET  /events/{session_id}")
     typer.echo(typer.style("  (no /ask, no /ws — backend mode)", fg=typer.colors.YELLOW))
 
@@ -365,6 +381,14 @@ def gateway_worker(
     tenant: Optional[str] = typer.Option(
         None, "--tenant", envvar="SEEKNAL_TENANT",
         help="Tenant ID this worker serves (maps to task queue seeknal-ask-{tenant}; 'default' uses legacy seeknal-ask queue). Overrides TEMPORAL_TASK_QUEUE."
+    ),
+    gateway_url: Optional[str] = typer.Option(
+        None, "--gateway-url", envvar="SEEKNAL_GATEWAY_URL",
+        help="Gateway URL to fetch token-derived worker runtime config"
+    ),
+    api_token: Optional[str] = typer.Option(
+        None, "--api-token", envvar="SEEKNAL_API_TOKEN",
+        help="Worker API token used to fetch tenant queue/callback config from the gateway"
     ),
 ):
     """Start a standalone Temporal worker (no HTTP server).
@@ -397,11 +421,46 @@ def gateway_worker(
 
     temporal_address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
     temporal_namespace = os.environ.get("TEMPORAL_NAMESPACE", "default")
-    # Task queue resolution: --tenant > TEMPORAL_TASK_QUEUE env var > legacy default
+    # Task queue resolution in compatibility mode:
+    # --tenant > TEMPORAL_TASK_QUEUE env var > legacy default.
     if tenant:
         temporal_task_queue = task_queue_for_tenant(tenant)
     else:
         temporal_task_queue = os.environ.get("TEMPORAL_TASK_QUEUE", "seeknal-ask")
+
+    if gateway_url or api_token:
+        if not gateway_url or not api_token:
+            typer.echo(typer.style(
+                "--gateway-url and --api-token must be provided together",
+                fg=typer.colors.RED,
+            ))
+            raise typer.Exit(1)
+        try:
+            import httpx
+
+            config_url = gateway_url.rstrip("/") + "/internal/worker/config"
+            response = httpx.get(
+                config_url,
+                headers={"Authorization": f"Bearer {api_token}"},
+                timeout=15.0,
+            )
+            response.raise_for_status()
+            runtime_config = response.json()
+        except Exception as exc:
+            typer.echo(typer.style(
+                f"Failed to fetch worker config from gateway: {exc}",
+                fg=typer.colors.RED,
+            ))
+            raise typer.Exit(1)
+
+        temporal_task_queue = runtime_config.get("task_queue") or temporal_task_queue
+        temporal_address = runtime_config.get("temporal_address") or temporal_address
+        temporal_namespace = runtime_config.get("temporal_namespace") or temporal_namespace
+        callback_url = runtime_config.get("callback_url") or callback_url
+        callback_auth_token = runtime_config.get("callback_auth_token") or callback_auth_token
+        if project is None and runtime_config.get("project_path"):
+            project_path = Path(runtime_config["project_path"])
+        tenant = runtime_config.get("tenant_id") or tenant
 
     async def _run_worker():
         client = await connect_temporal_client(

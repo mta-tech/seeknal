@@ -1,3 +1,4 @@
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from seeknal.tasks.duckdb import DuckDBTask
@@ -7,7 +8,11 @@ import os
 
 def test_duckdb_task():
 
-    arrow_df = pq.read_table("tests/data/poi_sample.parquet")
+    arrow_df = pa.table({
+        "poi_name": ["Alpha", "Beta"],
+        "lat": [1.0, 2.0],
+        "long": [100.0, 101.0],
+    })
     my_duckdb = (
         DuckDBTask()
         .add_input(dataframe=arrow_df)
@@ -19,11 +24,21 @@ def test_duckdb_task():
     assert res is not None
 
 
-def test_duckdb_task_with_path():
+def test_duckdb_task_with_path(tmp_path):
+
+    parquet_path = tmp_path / "poi_sample.parquet"
+    pq.write_table(
+        pa.table({
+            "poi_name": ["Alpha", "Beta"],
+            "lat": [1.0, 2.0],
+            "long": [100.0, 101.0],
+        }),
+        parquet_path,
+    )
 
     my_duckdb = (
         DuckDBTask()
-        .add_input(path="tests/data/poi_sample.parquet/part-00000-9590699e-c6c2-4709-b2e4-9b37e7d544d6-c000.parquet")
+        .add_input(path=str(parquet_path))
         .add_sql("SELECT poi_name, lat, long FROM __THIS__")
         .add_sql("SELECT poi_name, lat FROM __THIS__")
     )
@@ -188,7 +203,7 @@ class TestDuckDBPathValidation:
     # Dataframe input should work regardless
     def test_dataframe_input_bypasses_path_validation(self):
         """Test that dataframe input doesn't trigger path validation."""
-        arrow_df = pq.read_table("tests/data/poi_sample.parquet")
+        arrow_df = pa.table({"poi_name": ["Alpha"], "lat": [1.0], "long": [100.0]})
         task = DuckDBTask()
         task.add_input(dataframe=arrow_df)
         assert "dataframe" in task.input

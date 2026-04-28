@@ -17,6 +17,8 @@ RETRYABLE_TYPE = "retryable_type"
 TERMINAL_SECURITY = "terminal_security"
 TERMINAL_CRASH = "terminal_crash"
 TERMINAL_TIMEOUT = "terminal_timeout"
+TERMINAL_DEPENDENCY_UNAVAILABLE = "terminal_dependency_unavailable"
+TERMINAL_BOUNDED_EVIDENCE = "terminal_bounded_evidence"
 
 _RETRYABLE_CATEGORIES = frozenset({
     RETRYABLE_SYNTAX,

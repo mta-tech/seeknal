@@ -289,6 +289,88 @@ def chat_command(
         console.print(f"[text.dim]Resume with: seeknal ask chat --session {session_name}[/]")
 
 
+@ask_app.command("test")
+def test_command(
+    provider: Optional[str] = typer.Option(
+        None,
+        "--provider",
+        "-p",
+        help="LLM provider for agent mode: google, ollama, openai, anthropic",
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m", help="Model name override for agent mode"
+    ),
+    project: Optional[Path] = typer.Option(
+        None, "--project", help="Project path (auto-detected if not set)"
+    ),
+    select: Optional[str] = typer.Option(
+        None, "--select", "-s", help="Run one test by name or YAML filename"
+    ),
+    sql_only: bool = typer.Option(
+        False,
+        "--sql-only",
+        help="Only execute expected SQL oracles; do not run the Ask agent",
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None, "--output-dir", help="Directory for JSON result artifacts"
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Print the full result JSON instead of a compact summary"
+    ),
+):
+    """Run project-local Ask SQL tests.
+
+    Test files live in `seeknal/tests/`, `context/tests/`, or top-level
+    `tests/`. Each YAML file should define `name`, `prompt`/`question`, and
+    `sql`/`expected_sql`. SQL pairs remain examples for agent steering; Ask
+    tests are executable QA oracles.
+    """
+    project_path = project or find_project_path()
+    _load_project_env(project_path)
+
+    from seeknal.ask.testing import run_ask_sql_tests
+
+    suite = run_ask_sql_tests(
+        project_path,
+        select=select,
+        provider=provider,
+        model=model,
+        sql_only=sql_only,
+        output_dir=output_dir,
+    )
+
+    if json_output:
+        import json
+
+        typer.echo(json.dumps(suite.to_dict(), indent=2, default=str))
+    else:
+        mode = "SQL-only" if sql_only else "Agent"
+        typer.echo(f"Seeknal Ask tests ({mode})")
+        typer.echo(f"Project: {suite.project_path}")
+        typer.echo(
+            f"Summary: {suite.passed}/{suite.total} passed, "
+            f"{suite.failed} failed, {suite.skipped} skipped"
+        )
+        if suite.output_file:
+            typer.echo(f"Results: {suite.output_file}")
+        typer.echo("")
+        for result in suite.results:
+            if result.skipped:
+                status = "SKIP"
+            elif result.passed:
+                status = "PASS"
+            else:
+                status = "FAIL"
+            typer.echo(f"[{status}] {result.name} — {result.message}")
+            if result.sql_error:
+                typer.echo(f"  SQL error: {result.sql_error}")
+            for missing in result.missing_assertions[:5]:
+                typer.echo(f"  - {missing}")
+
+    if suite.failed:
+        raise typer.Exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Report sub-app
 # ---------------------------------------------------------------------------

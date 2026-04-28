@@ -99,7 +99,7 @@ class TestDataTypes:
 
     def test_user_id_is_string(self, sample_data):
         """Verify user_id column contains string values."""
-        assert sample_data["user_id"].dtype == object, (
+        assert pd.api.types.is_string_dtype(sample_data["user_id"]) or sample_data["user_id"].dtype == object, (
             f"user_id should be string type, got {sample_data['user_id'].dtype}"
         )
 

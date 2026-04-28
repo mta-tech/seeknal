@@ -1,6 +1,7 @@
 """Tests for entity consolidation CLI commands (Phase 4)."""
 
 import json
+import re
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -11,6 +12,15 @@ from typer.testing import CliRunner
 from seeknal.cli.main import app
 
 runner = CliRunner()
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _assert_help_option(output: str, name: str) -> None:
+    plain = _ANSI_ESCAPE_RE.sub("", output)
+    compact = re.sub(r"[\s-]+", "", plain)
+    assert name.replace("-", "") in compact
 
 
 def _create_entity_store(tmpdir: str, entity_name: str = "customer") -> Path:
@@ -149,7 +159,7 @@ class TestConsolidateCommand:
         result = runner.invoke(app, ["consolidate", "--help"])
         assert result.exit_code == 0
         assert "consolidate" in result.output.lower()
-        assert "--prune" in result.output
+        _assert_help_option(result.output, "prune")
 
     @patch("seeknal.workflow.dag.DAGBuilder")
     def test_consolidate_no_fg_nodes(self, mock_builder_class):

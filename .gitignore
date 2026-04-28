@@ -13,6 +13,7 @@ wheels/
 .idea
 lib
 .env
+.env.backup-*
 config.toml
 .claude_settings.json
 seeknal.db

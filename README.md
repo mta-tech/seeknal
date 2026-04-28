@@ -122,23 +122,29 @@ seeknal entity show customer                  # Inspect entity schema and featur
 
 **Interactive SQL REPL** — Auto-registers parquets, PostgreSQL, and Iceberg sources at startup. Query pipeline outputs, explore data, iterate on SQL — all without leaving the terminal.
 
-**AI-Powered Thinking Partner** — `seeknal ask chat` is your collaborative partner for data work. The agent uses 16 tools for fast data access and 11 built-in skills for multi-step workflows like report generation, pipeline building, and data profiling — all loaded on demand to keep responses fast:
+**AI-Powered Thinking Partner** — `seeknal ask chat` is your collaborative partner for data work. The agent uses thin tools for fast data access and fat skills for multi-step workflows like report generation, pipeline building, database analysis, and data profiling — all loaded on demand to keep responses fast:
 
 ```bash
-seeknal ask chat                        # Start a brainstorm / build session
+seeknal ask chat                        # Start a brainstorm / build session (interactive TUI)
 seeknal ask "What are the top 5 customers by revenue?"  # Quick one-shot question
 seeknal ask report "customer analysis"  # Generate interactive HTML dashboard
+seeknal ask test --project . --sql-only # Validate project prompt-to-SQL tests
 seeknal ask chat --web                  # Enable web search for benchmarks
 ```
 
-Ask it to build a pipeline from scratch, and it will draft a plan, walk you through the design, and wait for your go-ahead before generating code. Publish reports to a self-hosted **Seeknal Report Server** and share them with your team via a URL.
+`seeknal ask chat` launches an interactive terminal UI (Bun + React + Ink) with streaming tokens, tool visualization, and arrow-key `ask_user` picker for approval gates. The TUI is bundled inside the wheel; end users do not need Bun or Node. One-shot (`seeknal ask "..."`) and report (`seeknal ask report`) commands use Python-only rendering with no TUI.
+
+Ask it to answer questions against existing read-only databases with `seeknal source connect`, reuse project SQL examples from `seeknal/sql_pairs/`, and validate important questions with executable `seeknal/tests/` QA oracles. Ask it to build a pipeline from scratch, and it will draft a plan, walk you through the design, and wait for your go-ahead before generating code. Publish reports to a self-hosted **Seeknal Report Server** and share them with your team via a URL.
+
+For editable installs (`pip install -e .`), set `SEEKNAL_TUI_BINARY_PATH` to your local TUI build. See `src/seeknal/ask/tui/README.md` for full TypeScript contributing guide and development workflow.
 
 ```bash
 seeknal report-server start             # Host published reports
 seeknal gateway start                   # Expose ask as an API (WebSocket/SSE/REST)
+seeknal gateway worker --gateway-url http://gateway:8000 --api-token "$SEEKNAL_API_TOKEN"  # Token-routed Temporal worker
 ```
 
-Supports Google Gemini (default) and Ollama (local). Use `--provider ollama` for fully local, private analysis.
+Supports Google Gemini (default), OpenAI-compatible providers, Anthropic-compatible providers, and Ollama (local). Use `--provider ollama` for fully local, private analysis.
 
 ## Documentation
 
@@ -154,6 +160,17 @@ Supports Google Gemini (default) and Ollama (local). Use `--provider ollama` for
 | **Concepts** | [Point-in-Time Joins](docs/concepts/point-in-time-joins.md) · [Virtual Environments](docs/concepts/virtual-environments.md) · [Exposures](docs/concepts/exposures.md) · [Glossary](docs/concepts/glossary.md) |
 
 ## Changelog
+
+### v2.9.0 (April 2026)
+
+**Read-only Ask source harness + project SQL QA** — Adds a TUI-first workflow for users who already have analytical tables in a database and want Seeknal Ask to answer business questions without building a pipeline.
+
+- **Connected-source registry**: `seeknal source connect/status/inspect/sync/test` writes `seeknal_agent.yml`, generates `.seeknal/context/sources/` metadata, and verifies read-only database attachments.
+- **SQL pairs for context**: `seeknal/sql_pairs/*.yml` stores prompt-to-SQL examples the Ask agent can discover with `list_sql_pairs` / `read_sql_pair`.
+- **Ask SQL tests**: `seeknal ask test` runs project-local prompt-to-SQL QA cases from `seeknal/tests/`, including SQL-only oracle checks and agent-answer checks.
+- **TUI QA cockpit**: Ask chat can list, read, run, and inspect Ask tests via thin tools over the same test engine.
+- **Structured grading**: Ask tests support `assert.compare: dataframe` for markdown/JSON table comparison against expected SQL rows.
+- **Init guidance**: `seeknal init` now scaffolds `AGENTS.md`, `CLAUDE.md`, `seeknal/sql_pairs/`, and `seeknal/tests/` for project-local agent conventions.
 
 ### v2.8.0 (April 2026)
 
@@ -173,17 +190,6 @@ Supports Google Gemini (default) and Ollama (local). Use `--provider ollama` for
 - **`execute_uv_script` tool**: run arbitrary uv-managed Python scripts from the agent with full dependency isolation
 - **Pipeline runtime**: `ctx.llm` (Ask-aligned text/JSON generation) and `ctx.state` (lightweight per-node persistent state) helpers available inside `@transform` functions
 - **Config discovery**: `find_agent_config_path()` locates `seeknal_agent.yml` under project root or `seeknal/` directory
-
-### v2.6.0 (April 2026)
-
-**Skills-Powered Agent + Report Server** — The ask agent now uses a thin-tools/fat-skills architecture: 16 lean tools for fast data access, 11 built-in skills for multi-step workflows (reports, pipelines, profiling, metrics, publishing). Skills load on demand via progressive disclosure, keeping the agent's context lean.
-
-- **Seeknal Report Server** (`seeknal report-server start`): self-hosted server for publishing and sharing reports via unique URLs — publish from the chat TUI or the agent tool
-- **11 built-in skills**: report generation, pipeline building, data profiling, Python analysis, semantic model bootstrap, metric query/save, report exposure codification, Proof Editor publishing
-- **Chat enhancements**: `--style` (concise/explanatory/formal/conversational), `--budget` (USD cap), `--web` (DuckDuckGo search), `--session`/`--name` (named session resume)
-- **Gateway improvements**: cloud-only backend mode, standalone workers, Redis multi-replica, split topology
-- **Auto `.env` loading**: `--project <path>` loads `<path>/.env` automatically
-- **Error UX**: network errors classified with actionable hints; error logs saved to `~/.seeknal/logs/`
 
 ## Install from Source
 

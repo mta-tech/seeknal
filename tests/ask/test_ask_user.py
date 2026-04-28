@@ -61,6 +61,15 @@ class TestNonTTYFallback:
                 result = asyncio.run(interactive_ask_user("Pick?", OPTIONS))
                 assert result == "Alpha"
 
+    def test_headless_stdin_auto_selects_recommended_without_input(self):
+        with patch("seeknal.ask.agents.tools.ask_user.sys") as mock_sys:
+            mock_sys.stdout.isatty.return_value = False
+            mock_sys.stdin.isatty.return_value = False
+            with patch("builtins.input") as mock_input:
+                result = asyncio.run(interactive_ask_user("Pick?", OPTIONS))
+                assert result == "Beta"
+                mock_input.assert_not_called()
+
 
 class TestEdgeCases:
     def test_empty_options_returns_empty(self):

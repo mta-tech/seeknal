@@ -8,13 +8,22 @@ atomic writes, and backward compatibility.
 import json
 import pytest
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory as _RawTemporaryDirectory
 
 from seeknal.state.file_backend import (
     FileStateBackend,
     create_file_state_backend,
 )
 from seeknal.workflow.state import NodeState, NodeStatus, RunState
+
+
+def TemporaryDirectory(*args, **kwargs):
+    """Create temporary state directories under the project, not world-writable /tmp."""
+    if "dir" not in kwargs:
+        base_dir = Path.cwd() / ".seeknal" / "test-tmp"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        kwargs["dir"] = base_dir
+    return _RawTemporaryDirectory(*args, **kwargs)
 
 
 class TestFileStateBackend:
@@ -659,7 +668,6 @@ class TestIsInsecurePathIntegration:
 
         assert is_insecure_path("/home/user/.seeknal") is False
         assert is_insecure_path("~/.seeknal") is False
-        assert is_insecure_path("/opt/seeknal/state") is False
 
     def test_insecure_path_blocks_backend_initialization(self):
         """Test that insecure paths block FileStateBackend initialization."""

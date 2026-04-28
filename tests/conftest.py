@@ -5,16 +5,50 @@ import os
 import tempfile
 import stat
 import shutil
+import importlib.util
 from builtins import str
+from pathlib import Path
+from typing import Any, Generator, TYPE_CHECKING
 
 import numpy
 import pytest
+
+if TYPE_CHECKING:
+    from pyspark.sql import SparkSession
 
 # current is ./spark/tests
 cur_dir = os.path.dirname(os.path.realpath(__file__))
 # workaround to use locally downloaded spark
 default_spark_home = os.path.join(cur_dir, os.pardir, os.pardir, os.pardir, "spark")
 default_mlflow_tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///{}")
+
+
+_SPARK_REQUIRED_COLLECTIONS = {
+    Path("tests/sparkengine"),
+    Path("tests/featurestore/test_offline_store_iceberg.py"),
+    Path("tests/integration/test_iceberg_real_infra.py"),
+    Path("tests/test_cli_validate_features_e2e.py"),
+    Path("tests/test_feature_validation_integration.py"),
+    Path("tests/test_feature_validators.py"),
+}
+
+
+def _pyspark_available() -> bool:
+    return importlib.util.find_spec("pyspark") is not None
+
+
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+    """Skip Spark-only test modules when the spark extra is not installed."""
+    if _pyspark_available():
+        return None
+
+    rel_path = Path(os.path.relpath(collection_path, Path(__file__).parent.parent))
+    if any(
+        rel_path == spark_path or spark_path in rel_path.parents
+        for spark_path in _SPARK_REQUIRED_COLLECTIONS
+    ):
+        return True
+    return None
 
 
 def quiet():
@@ -68,8 +102,15 @@ def spark(request, spark_temp_dirs):
         pytest.skip(f"Spark not available: {e}")
         return None
 
-    # Import SparkSession only after findspark is initialized
-    from pyspark.sql import SparkSession
+    # Import SparkSession only after findspark is initialized.  The default CI
+    # install path runs Ask-only tests without the opt-in `spark` extra, so this
+    # fixture must skip gracefully instead of making tests/conftest.py import
+    # pyspark globally.
+    try:
+        from pyspark.sql import SparkSession
+    except ImportError:
+        pytest.skip("pyspark not installed - skipping Spark tests")
+        return None
 
     spark_warehouse_dir, meta_dir = spark_temp_dirs
     # current is ./tests
@@ -258,15 +299,23 @@ def spark_noseeknal(spark):
 
 
 # Phase 2: Add Spark cleanup fixture with comprehensive state management
-from typing import Generator
-from pyspark.sql import SparkSession
-from pyspark.errors import PySparkException
 
-# Define specific exceptions to catch (not bare except)
-SPARK_CLEANUP_EXCEPTIONS = (PySparkException, AttributeError, RuntimeError, ConnectionError)
+# Define specific exceptions to catch (not bare except).  Import PySpark lazily
+# so non-Spark test runs do not require the opt-in `spark` extra.
+try:
+    from pyspark.errors import PySparkException
+except ImportError:  # pragma: no cover - exercised in CI without spark extra
+    PySparkException = RuntimeError  # type: ignore[assignment]
+
+SPARK_CLEANUP_EXCEPTIONS = (
+    PySparkException,
+    AttributeError,
+    RuntimeError,
+    ConnectionError,
+)
 
 
-def _safe_drop_temp_views(spark: SparkSession) -> int:
+def _safe_drop_temp_views(spark: Any) -> int:
     """
     Safely drop temporary views with validation.
 
@@ -302,7 +351,7 @@ def _safe_drop_temp_views(spark: SparkSession) -> int:
     return dropped
 
 
-def _safe_drop_global_temp_views(spark: SparkSession) -> int:
+def _safe_drop_global_temp_views(spark: Any) -> int:
     """
     Safely drop global temporary views.
 
@@ -332,7 +381,7 @@ def _safe_drop_global_temp_views(spark: SparkSession) -> int:
     return dropped
 
 
-def _safe_clear_cache(spark: SparkSession) -> bool:
+def _safe_clear_cache(spark: Any) -> bool:
     """
     Safely clear Spark cache.
 
@@ -352,7 +401,7 @@ def _safe_clear_cache(spark: SparkSession) -> bool:
 
 @pytest.fixture(autouse=True)
 def clean_spark_state_between_tests(
-    spark: SparkSession,
+    request: pytest.FixtureRequest,
 ) -> Generator[None, None, None]:
     """
     Automatically clean Spark state between every test.
@@ -371,8 +420,23 @@ def clean_spark_state_between_tests(
     """
     yield
 
+    # Do not depend on the `spark` fixture from an autouse fixture.  CI installs
+    # the default + Ask dependencies, while Spark is intentionally optional; a
+    # global autouse dependency would force every test collection to require
+    # pyspark.  Only clean Spark state for tests that actually requested Spark
+    # or a fixture built on top of it.
+    if not {
+        "spark",
+        "spark_noseeknal",
+        "daily_features_1",
+        "seed",
+    }.intersection(request.fixturenames):
+        return
+
     # Cleanup after each test (only if spark session exists and is active)
     try:
+        spark = request.getfixturevalue("spark")
+
         # Check if spark session is still active
         if spark is None or spark._jvm is None:
             return

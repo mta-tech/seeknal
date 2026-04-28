@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import shutil
 import tarfile
 from pathlib import Path
 
@@ -16,8 +17,11 @@ from seeknal.report_server.storage import LocalFilesystemStorage
 
 @pytest.fixture()
 def test_config(tmp_path: Path) -> ServerConfig:
+    data_dir = Path.cwd() / ".seeknal" / "test-tmp" / tmp_path.name
+    shutil.rmtree(data_dir, ignore_errors=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
     return ServerConfig(
-        data_dir=tmp_path,
+        data_dir=data_dir,
         auth_mode="api_key",
         api_keys=["test-key-123"],
     )

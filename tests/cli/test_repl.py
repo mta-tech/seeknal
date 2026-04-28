@@ -36,14 +36,16 @@ def test_connect_mysql(repl):
     assert "db0" in r.attached
 
 
-def test_connect_sqlite(repl):
+def test_connect_sqlite(repl, tmp_path):
     """SQLite URLs are attached correctly."""
     r, mock_conn = repl
+    db_path = tmp_path / "db.sqlite"
+    db_path.touch()
     with patch("seeknal.cli.repl.is_insecure_path", return_value=False):
-        r._connect("sqlite:///path/to/db.sqlite")
+        r._connect(f"sqlite://{db_path}")
 
     mock_conn.execute.assert_called()
-    call_args = str(mock_conn.execute.call_args)
+    call_args = " ".join(str(call) for call in mock_conn.execute.call_args_list)
     assert "TYPE sqlite" in call_args
 
 

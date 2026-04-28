@@ -90,10 +90,7 @@ def test_write_project_file_happy_path(tmp_path, ctx):
     out = write_project_file("glossary.md", "# Glossary\n\nRevenue = gmv.\n")
     assert "Wrote `context/glossary.md`" in out
     assert (tmp_path / "context" / "glossary.md").exists()
-    assert (
-        "Revenue = gmv"
-        in (tmp_path / "context" / "glossary.md").read_text()
-    )
+    assert "Revenue = gmv" in (tmp_path / "context" / "glossary.md").read_text()
 
 
 def test_write_project_file_nested_path(tmp_path, ctx):
@@ -102,6 +99,26 @@ def test_write_project_file_nested_path(tmp_path, ctx):
     )
     assert "Wrote" in out
     assert (tmp_path / "context" / "metric_definitions" / "revenue.md").exists()
+
+
+def test_write_project_file_handles_relative_project_path(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+
+    from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
+
+    monkeypatch.chdir(tmp_path)
+    set_tool_context(
+        ToolContext(
+            repl=MagicMock(),
+            artifact_discovery=MagicMock(),
+            project_path=Path("."),
+        )
+    )
+
+    out = write_project_file("sql_pairs/revenue.yml", "name: revenue\n")
+
+    assert "Wrote `context/sql_pairs/revenue.yml`" in out
+    assert (tmp_path / "context" / "sql_pairs" / "revenue.yml").exists()
 
 
 def test_write_project_file_rejects_path_traversal(tmp_path, ctx):
@@ -138,6 +155,15 @@ def test_write_project_file_rejects_oversized_content(tmp_path, ctx, monkeypatch
 def test_write_project_file_rejects_empty_content(tmp_path, ctx):
     assert write_project_file("x.md", "").startswith("Error:")
     assert write_project_file("x.md", "   \n  \n").startswith("Error:")
+
+
+def test_write_project_file_rejects_secrets(tmp_path, ctx):
+    out = write_project_file(
+        "sql_pairs/warehouse.yml",
+        "dsn: postgresql://user:pass@example.com/db\n",
+    )
+    assert out.startswith("Error:")
+    assert "secret" in out.lower() or "connection string" in out.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -180,11 +206,15 @@ def test_save_preference_rejects_empty(ctx):
 
 
 def test_save_preference_rejects_oversized(ctx, monkeypatch):
-    monkeypatch.setattr(
-        "seeknal.ask.agents.tools.save_preference._PREF_MAX_LEN", 20
-    )
+    monkeypatch.setattr("seeknal.ask.agents.tools.save_preference._PREF_MAX_LEN", 20)
     out = save_preference("This is a very long preference that exceeds the limit")
     assert out.startswith("Error:")
+
+
+def test_save_preference_rejects_secrets(ctx):
+    out = save_preference("Remember API_KEY=sk-secret-value")
+    assert out.startswith("Error:")
+    assert "secret" in out.lower()
 
 
 def test_save_preference_escapes_yaml_specials(tmp_path, ctx):

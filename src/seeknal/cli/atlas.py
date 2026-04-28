@@ -694,13 +694,13 @@ def lineage_publish(
             --inputs raw.orders,raw.customers \\
             --outputs clean.orders
     """
-    _require_atlas()
-
-    import uuid
-
     if not inputs or not outputs:
         _echo_error("Both --inputs and --outputs are required")
         raise typer.Exit(1)
+
+    _require_atlas()
+
+    import uuid
 
     final_run_id = run_id or str(uuid.uuid4())
     input_list = [i.strip() for i in inputs.split(",")]

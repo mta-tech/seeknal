@@ -11,6 +11,7 @@ import os
 import json
 import tempfile
 import shutil
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -21,6 +22,14 @@ from seeknal.cli.main import app
 
 
 runner = CliRunner()
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _assert_help_option(output: str, name: str) -> None:
+    plain = _ANSI_ESCAPE_RE.sub("", output)
+    compact = re.sub(r"[\s-]+", "", plain)
+    assert name.replace("-", "") in compact
 
 
 @pytest.fixture(scope="function")
@@ -48,9 +57,9 @@ class TestProjectWorkflow:
         assert "initialized successfully" in result.stdout
 
         # Step 2: Verify directories were created
-        assert (tmp_path / "flows").exists()
-        assert (tmp_path / "entities").exists()
-        assert (tmp_path / "feature_groups").exists()
+        assert (tmp_path / "seeknal" / "sources").exists()
+        assert (tmp_path / "seeknal" / "transforms").exists()
+        assert (tmp_path / "seeknal" / "feature_groups").exists()
 
         # Step 3: Validate the setup
         result = runner.invoke(app, ["validate"])
@@ -290,8 +299,8 @@ class TestValidateFeaturesWorkflow:
         result = runner.invoke(app, ["validate-features", "--help"])
         assert result.exit_code == 0
         assert "Validate feature group data quality" in result.stdout
-        assert "--mode" in result.stdout
-        assert "--verbose" in result.stdout
+        _assert_help_option(result.stdout, "--mode")
+        _assert_help_option(result.stdout, "--verbose")
 
     def test_validate_features_mode_options(self):
         """Test that validate-features accepts both mode options."""
@@ -305,7 +314,7 @@ class TestValidateFeaturesWorkflow:
         result = runner.invoke(app, ["validate-features"])
         # Should fail due to missing argument
         assert result.exit_code != 0
-        assert "Missing argument" in result.stdout or "FEATURE_GROUP" in result.stdout
+        assert "Missing argument" in result.output or "FEATURE_GROUP" in result.output
 
     def test_validate_features_appears_in_main_help(self):
         """Test that validate-features command appears in main help."""

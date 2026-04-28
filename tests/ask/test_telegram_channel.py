@@ -17,6 +17,71 @@ from seeknal.ask.gateway.tenant import DEFAULT_TENANT
 
 
 @pytest.mark.asyncio
+async def test_start_uses_polling_error_callback(monkeypatch, tmp_path):
+    from telegram.ext import ApplicationBuilder
+
+    captured: dict[str, object] = {}
+
+    class FakeUpdater:
+        running = True
+
+        async def start_polling(self, **kwargs):
+            captured.update(kwargs)
+
+        async def stop(self):
+            self.running = False
+
+    class FakeApp:
+        def __init__(self):
+            self.updater = FakeUpdater()
+            self.handlers = []
+
+        def add_handler(self, handler):
+            self.handlers.append(handler)
+
+        async def initialize(self):
+            return None
+
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+        async def shutdown(self):
+            return None
+
+    class FakeBuilder:
+        def token(self, token):
+            captured["token"] = token
+            return self
+
+        def build(self):
+            return FakeApp()
+
+    monkeypatch.setattr(ApplicationBuilder, "__new__", lambda cls: FakeBuilder())
+
+    channel = TelegramChannel(Path(tmp_path), token="token")
+    await channel.start()
+
+    assert captured["token"] == "token"
+    assert captured["error_callback"] == channel._handle_polling_error
+    await channel.stop()
+
+
+def test_polling_conflict_logs_concise_warning(caplog, tmp_path):
+    from telegram.error import Conflict
+
+    channel = TelegramChannel(Path(tmp_path), token="token")
+
+    with caplog.at_level("WARNING"):
+        channel._handle_polling_error(Conflict("terminated by other getUpdates request"))
+
+    assert "Telegram polling conflict" in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_handle_pair_redeems_code_and_links_chat(tmp_path):
     channel = TelegramChannel(Path(tmp_path), token="token")
     pairing_store = AsyncMock()

@@ -76,6 +76,13 @@ tests/                     # pytest test suite
 - CLI commands: `version list`, `version show`, `version diff`
 - Can materialize specific versions (rollback capability)
 
+### 6. **Seeknal Ask Agent Harness**
+- `seeknal_agent.yml` configures Ask mode and read-only connected sources
+- `seeknal source connect/status/sync/test` manages existing databases that Ask can query without building a pipeline
+- `seeknal/sql_pairs/` contains prompt-to-SQL examples used as agent context
+- `seeknal/tests/` contains executable Ask SQL QA tests for `seeknal ask test`
+- Keep business/domain SQL in project files, not hardcoded in agent tools
+
 ## Important Patterns & Conventions
 
 ### Decorators
@@ -101,6 +108,14 @@ tests/                     # pytest test suite
 - **Path Security**: Use `path_security.py` to validate file paths
 - Never use `/tmp` or world-writable directories
 - Default secure path: `~/.seeknal/`
+- Never commit connected-source DSNs; use `.env` plus `dsn_env` in `seeknal_agent.yml`
+
+### Ask Harness Patterns
+- Keep tools thin and deterministic; put workflow/domain behavior in skills, source context, SQL pairs, and tests
+- SQL pairs (`seeknal/sql_pairs/*.yml`) are examples for normal answering
+- Ask tests (`seeknal/tests/*.yml`) are regression oracles with optional dataframe comparison
+- Generated source context under `.seeknal/context/sources/` is derived state and should be refreshed with `seeknal source sync`
+- Tap-in teach mode may persist explicit user teaching as local project memory (`preferences.yml`, `context/`, `context/sql_pairs/`) while keeping connected data sources read-only
 
 ### Testing Patterns
 - Use pytest fixtures from `conftest.py`

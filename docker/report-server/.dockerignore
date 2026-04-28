@@ -1,0 +1,9 @@
+tests/
+.omc/
+target/
+.worktrees/
+_bmad/
+docs/
+*.pyc
+__pycache__
+.git

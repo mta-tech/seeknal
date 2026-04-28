@@ -380,13 +380,24 @@ After running `seeknal init`, your project has this structure:
 my-project/
 ├── seeknal_project.yml        # Project configuration
 ├── profiles.yml                # Credentials and connections (gitignored)
+├── seeknal_agent.yml           # Ask mode/source registry scaffold
+├── SEEKNAL_ASK.md              # Durable Ask project instructions
+├── .env.example                # Safe placeholder environment variables
+├── AGENTS.md                   # Agent/coding assistant project guide
+├── CLAUDE.md                   # Claude Code compatibility guide
 ├── .gitignore                  # Auto-generated
+├── context/                    # User-taught Ask memory and examples
+│   ├── sql_pairs/              # Agent/user-taught SQL examples
+│   └── tests/                  # Optional context-local Ask tests
 ├── seeknal/                    # YAML and Python pipelines
 │   ├── sources/               # Source definitions (*.yml)
 │   ├── transforms/            # Transform definitions (*.yml)
 │   ├── feature_groups/        # Feature group definitions (*.yml)
 │   ├── models/                # Model definitions (*.yml)
 │   ├── pipelines/             # Python pipeline scripts (*.py)
+│   ├── sql_pairs/             # Ask context examples (prompt -> SQL)
+│   ├── tests/                 # Ask SQL QA tests
+│   ├── skills/                # Project-local Ask skills
 │   └── templates/             # Custom Jinja templates (optional)
 └── target/                     # Output directory (gitignored)
     ├── intermediate/          # Node output storage for cross-references
@@ -410,11 +421,92 @@ my-project/
 | `seeknal/feature_groups/` | Feature group definitions | No |
 | `seeknal/models/` | Model definitions | No |
 | `seeknal/pipelines/` | Python pipeline scripts | No |
+| `seeknal/sql_pairs/` | Prompt-to-SQL examples used as Ask context | No |
+| `seeknal/tests/` | Executable Ask SQL QA cases | No |
+| `seeknal/skills/` | Project-local Ask workflow skills | No |
+| `context/` | Durable human/agent-taught Ask context | No |
+| `context/sql_pairs/` | Agent/user-taught prompt-to-SQL examples | No |
+| `SEEKNAL_ASK.md` | Ask project instructions loaded into sessions | No |
+| `seeknal_agent.yml` | Ask mode and source registry metadata | No |
+| `.env.example` | Safe placeholder env vars | No |
+| `.seeknal/context/sources/` | Generated connected-source context | Yes |
 | `seeknal/templates/` | Custom Jinja templates | No |
 | `target/` | All build outputs | Yes |
 | `target/intermediate/` | Cross-node references | Yes |
 | `target/cache/` | Incremental execution cache | Yes |
 | `target/environments/` | Virtual environment outputs | Yes |
+
+## Ask Agent Configuration (`seeknal_agent.yml`)
+
+`seeknal_agent.yml` controls Seeknal Ask behavior for interactive TUI,
+gateway/headless, and connected-source analyst projects.
+
+Performance and safety-related fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `request_limit` | integer | `100` | Maximum LLM requests in one Ask turn |
+| `background_threshold` | integer | `60` | Seconds before eligible long-running tools are backgrounded |
+| `context_budget` | integer | `8000` | Character budget for injected project context |
+| `sql_timeout_seconds` | integer | `60` | Hard timeout for `execute_sql`; use `0` to disable |
+| `discovery_cache_ttl_seconds` | integer | `300` | Per-session TTL for table/schema discovery cache; use `0` to disable |
+
+Advanced agent-runtime fields live under `agent_harness`. They map to
+pydantic-deep features and are optional; omit the section unless a project
+needs to tune context, cost, hooks, planning, or delegation behavior.
+
+Example:
+
+```yaml
+mode:
+  default: auto
+
+sql_timeout_seconds: 60
+discovery_cache_ttl_seconds: 300
+
+agent_harness:
+  auto_summarization:
+    enabled: true
+    context_manager: auto      # auto = full mode on, read-only analysis mode off
+    context_manager_max_tokens: 128000
+    eviction_token_limit: 20000
+    patch_tool_calls: true
+    microcompact:
+      enabled: true
+      keep_recent_turns_analysis: 2
+      keep_recent_turns_full: 3
+    sql_result_compactor:
+      enabled: true
+      min_chars_analysis: 250
+      min_chars_full: 500
+  cost_tracking:
+    enabled: true
+    budget_usd: null
+  hooks:
+    enabled: true
+    sql_security: true
+    sql_self_correction: true
+  plan:
+    enabled: auto              # auto = interactive full mode only
+    plans_dir: .seeknal/plans
+  stuck_loop_detection:
+    enabled: true
+  subagents:
+    enabled: auto              # auto = full mode on, read-only analysis mode off
+    include_builtin: true
+    lineage_investigator: true
+  teams:
+    enabled: false             # opt-in; higher cost/concurrency surface
+
+sources:
+  warehouse:
+    source_kind: connected
+    source_type: database
+    connector: postgresql
+    namespace: wh
+    access: read_only
+    role: business_source_of_truth
+```
 
 ## Variable Interpolation
 
@@ -605,4 +697,3 @@ Error: Permission denied: /mnt/data/seeknal
 - [Migration Guides](migration.md) - Migrate from other platforms
 - [Troubleshooting Guide](troubleshooting.md) - Debug common issues
 - [Getting Started Guide](../getting-started-comprehensive.md) - Tutorial
-

@@ -22,8 +22,17 @@ from seeknal.ask.agents.agent import (
     _LOW_OUTPUT_THRESHOLD,
     _MAX_RALPH_RETRIES,
     _NO_RESPONSE,
+    compact_history_for_analysis_mode,
 )
-from seeknal.ask.agents.tools._context import reset_report_approval
+from seeknal.ask.agents.tools._context import (
+    build_evidence_synthesis_prompt,
+    has_sufficient_evidence,
+    record_tool_result,
+    reset_report_approval,
+    reset_turn_governor,
+    should_synthesize_after_authoritative_sql_pair,
+    synthesize_evidence_fallback,
+)
 
 # Strip raw ANSI escape sequences from tool output to prevent terminal injection
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -56,6 +65,94 @@ def _sanitize_user_input(text: str) -> str:
     if not text:
         return text
     return _CSI_ANY.sub("", text)
+
+
+def _extract_direct_arg(question: str, name: str) -> str | None:
+    """Extract ``name = value`` from a direct tool-call-style user turn."""
+    from seeknal.ask.directives import extract_direct_arg
+
+    return extract_direct_arg(question, name)
+
+
+def _extract_remembered_preference(question: str) -> str | None:
+    """Extract explicit "remember/save this" natural teaching turns."""
+    from seeknal.ask.directives import extract_remembered_preference
+
+    return extract_remembered_preference(question)
+
+
+def _extract_sql_pair_directive(question: str) -> tuple[str, str] | None:
+    """Extract natural "save this query as SQL pair named X: SELECT ..." turns."""
+    from seeknal.ask.directives import extract_sql_pair_directive
+
+    return extract_sql_pair_directive(question)
+
+
+def _slugify_memory_name(value: str) -> str:
+    """Create a conservative filename stem for remembered SQL pairs."""
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", value.strip().lower()).strip("_-")
+    return slug or "saved_query"
+
+
+def _build_sql_pair_yaml(name: str, sql: str) -> str:
+    # Kept only for private import compatibility; direct SQL-pair writes now
+    # use the shared directive module. Preserve the exact old serialization.
+    indented_sql = "\n".join(f"  {line}" if line else "" for line in sql.splitlines())
+    return (
+        f"name: {name}\n"
+        f"prompt: {name.replace('_', ' ')}\n"
+        "intent: Reusable SQL example saved from Seeknal Ask chat\n"
+        "sql: |\n"
+        f"{indented_sql}\n"
+        "notes: |\n"
+        "  Saved from tap-in teach mode. Validate against the current schema before reuse.\n"
+    )
+
+
+async def _try_direct_tool_directive(question: str, console: Console) -> str | None:
+    """Execute explicit "Call <tool> with ..." turns without an LLM hop.
+
+    This is intentionally narrow: it only catches command-shaped prompts where
+    the user explicitly names an existing read-only analysis tool. Natural
+    business questions still go through the agent and its skills. The fast path
+    makes the interactive harness more robust with small/local tool-calling
+    models and provides a deterministic QA surface for tap-in database users.
+    """
+    from seeknal.ask.directives import try_direct_tool_directive
+
+    result = await try_direct_tool_directive(question)
+    if result is None:
+        return None
+    for event in result.events:
+        _show_tool_start(console, event.name, event.args)
+        _show_tool_end(console, event.name, event.output)
+    _show_answer(console, result.answer)
+    return result.answer
+
+
+async def _try_read_only_analysis_shortcut(
+    question: str, console: Console
+) -> str | None:
+    """Handle generic read-only safety turns with thin tools, no write path.
+
+    Keep this deliberately schema-agnostic. Natural business questions must go
+    through the agent and its skills so the harness stays general for any
+    connected source. Only deterministic safety handling and generic discovery
+    belong here.
+    """
+    from seeknal.ask.directives import try_read_only_analysis_shortcut
+
+    answer = try_read_only_analysis_shortcut(question)
+    if answer is not None:
+        _show_answer(console, answer)
+    return answer
+
+
+def _summarize_direct_tool_output(output: str) -> str:
+    """Return a compact direct answer for deterministic tool directives."""
+    from seeknal.ask.directives import summarize_direct_tool_output
+
+    return summarize_direct_tool_output(output)
 
 
 def _extract_tool_result_text(result: Any) -> str:
@@ -98,8 +195,6 @@ def _extract_tool_result_text(result: Any) -> str:
     return str(content)
 
 
-
-
 # ---------------------------------------------------------------------------
 # Rendering helpers -- thin wrappers around Rich Console
 # ---------------------------------------------------------------------------
@@ -110,7 +205,7 @@ def _show_reasoning(console: Console, text: str) -> None:
     stripped = text.strip()
     if not stripped:
         return
-    lines = stripped.split('\n')
+    lines = stripped.split("\n")
     console.print()
     console.print(f"[grey62]⎿  {escape(lines[0])}[/]")
     for line in lines[1:]:
@@ -217,6 +312,11 @@ def _show_tool_end(console: Console, name: str, output: str) -> None:
             console.print(f"  [status.error]{escape(output)}[/]")
         else:
             console.print(f"  [status.success]{escape(output)}[/]")
+    elif name in ("save_preference", "write_project_file"):
+        if output.startswith("Error"):
+            console.print(f"  [status.error]{escape(output)}[/]")
+        else:
+            console.print(f"  [status.success]{escape(output)}[/]")
     elif name == "publish_to_proof":
         if output.startswith("Error"):
             console.print(f"  [status.error]{escape(output)}[/]")
@@ -234,9 +334,9 @@ def _show_tool_end(console: Console, name: str, output: str) -> None:
         console.print(f"  [dim]Done: {escape(summary)}[/dim]")
 
 
-
-
-def _tool_spinner_message(tool_name: str, args: Optional[dict[str, Any]] = None) -> str | None:
+def _tool_spinner_message(
+    tool_name: str, args: Optional[dict[str, Any]] = None
+) -> str | None:
     """Return a spinner message for long-running tool calls."""
     if tool_name == "generate_report":
         title = ""
@@ -244,6 +344,7 @@ def _tool_spinner_message(tool_name: str, args: Optional[dict[str, Any]] = None)
             title = str(args.get("title", "")).strip()
         return f"Generating report: {title}" if title else "Generating report"
     return None
+
 
 def _show_sql(console: Console, sql: str) -> None:
     """Display syntax-highlighted SQL."""
@@ -302,10 +403,11 @@ def _launch_report_action(console: Console, launcher_path: Path) -> None:
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
-        console.print(f"  [status.success]Opened in browser via {escape(str(launcher_path))}[/]")
+        console.print(
+            f"  [status.success]Opened in browser via {escape(str(launcher_path))}[/]"
+        )
     except OSError as exc:
         console.print(f"  [status.error]Failed to open report: {escape(str(exc))}[/]")
-
 
 
 def _maybe_offer_report_action(console: Console, output: str) -> None:
@@ -344,20 +446,24 @@ def _maybe_offer_report_action(console: Console, output: str) -> None:
         },
     ]
     if report_slug:
-        options.append({
-            "label": "Publish to Seeknal Report Server",
-            "description": "Upload the built report and get a shareable URL from a Seeknal Report Server",
-        })
-    options.extend([
-        {
-            "label": "Publish memo to Proof",
-            "description": "Draft and publish a markdown summary to Proof (ask the agent in the next turn)",
-        },
-        {
-            "label": "Continue",
-            "description": "Keep working without opening the report right now",
-        },
-    ])
+        options.append(
+            {
+                "label": "Publish to Seeknal Report Server",
+                "description": "Upload the built report and get a shareable URL from a Seeknal Report Server",
+            }
+        )
+    options.extend(
+        [
+            {
+                "label": "Publish memo to Proof",
+                "description": "Draft and publish a markdown summary to Proof (ask the agent in the next turn)",
+            },
+            {
+                "label": "Continue",
+                "description": "Keep working without opening the report right now",
+            },
+        ]
+    )
 
     menu = InteractiveMenu(
         question="Report ready. What do you want to do next?",
@@ -393,6 +499,7 @@ def _publish_to_seeknal_report_action(console: Console, report_slug: str) -> Non
     # repo itself.
     try:
         from seeknal.ask.agents.tools._context import get_tool_context
+
         project_path = get_tool_context().project_path
     except RuntimeError:
         project_path = Path.cwd()
@@ -421,7 +528,9 @@ def _publish_to_seeknal_report_action(console: Console, report_slug: str) -> Non
             if not api_key:
                 api_key = profile.get("api_key")
         except Exception as exc:  # noqa: BLE001
-            console.print(f"  [status.error]Could not load publish profile: {escape(str(exc))}[/]")
+            console.print(
+                f"  [status.error]Could not load publish profile: {escape(str(exc))}[/]"
+            )
             return
     if not server:
         console.print(
@@ -475,7 +584,6 @@ def _publish_to_seeknal_report_action(console: Console, report_slug: str) -> Non
         console.print(f"  [status.error]Publish failed: {escape(str(exc))}[/]")
 
 
-
 def _show_report_output(console: Console, output: str) -> None:
     """Display report generation result."""
     if not output:
@@ -488,11 +596,13 @@ def _show_report_output(console: Console, output: str) -> None:
     elif output.startswith("Error") or "failed" in output.lower():
         from rich.panel import Panel
 
-        console.print(Panel(
-            escape(output.strip()),
-            title="Report Build Error",
-            border_style="status.error",
-        ))
+        console.print(
+            Panel(
+                escape(output.strip()),
+                title="Report Build Error",
+                border_style="status.error",
+            )
+        )
     else:
         console.print(f"  [dim]{escape(output[:500])}[/dim]")
 
@@ -511,15 +621,13 @@ def _show_sql_result_table(console: Console, output: str) -> None:
         console.print(f"  [dim]Done: {summary}[/dim]")
         return
 
-    # Parse header
-    header = table_lines[0]
-    columns = [c.strip() for c in header.split("|") if c.strip()]
+    # Parse header/cells without dropping blank cells. The old parser filtered
+    # out empty strings, which shifted every subsequent value left when the
+    # first column was an empty/whitespace-only database value.
+    columns = _parse_markdown_table_row(table_lines[0])
 
     # Parse data rows (skip separator which is table_lines[1])
-    data_lines = [
-        ln for ln in table_lines[1:]
-        if not all(c in "|- " for c in ln)
-    ]
+    data_lines = [ln for ln in table_lines[1:] if not all(c in "|- " for c in ln)]
 
     table = Table(show_header=True, header_style="table.header")
     for col in columns:
@@ -530,9 +638,13 @@ def _show_sql_result_table(console: Console, output: str) -> None:
     for line in data_lines:
         if shown >= 10:
             break
-        cells = [c.strip() for c in line.split("|") if c.strip()]
+        cells = _parse_markdown_table_row(line)
         if cells:
-            table.add_row(*cells)
+            if len(cells) < len(columns):
+                cells.extend("" for _ in range(len(columns) - len(cells)))
+            elif len(cells) > len(columns):
+                cells = cells[: len(columns)]
+            table.add_row(*(escape(cell) for cell in cells))
             shown += 1
 
     console.print(table)
@@ -549,12 +661,32 @@ def _show_sql_result_table(console: Console, output: str) -> None:
         console.print(f"  [dim]({remaining} more rows)[/dim]")
 
 
+def _parse_markdown_table_row(line: str) -> list[str]:
+    """Parse a simple pipe-delimited markdown table row preserving blanks."""
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    cells: list[str] = []
+    for raw in stripped.split("|"):
+        cell = raw.strip()
+        cells.append(cell if cell else "[blank]")
+    return cells
+
+
 def _show_answer(console: Console, text: str) -> None:
     """Display final answer as Markdown in a Panel."""
     from rich.markdown import Markdown
     from rich.panel import Panel
 
-    console.print(Panel(Markdown(text.strip()), title="Answer", border_style="status.success"))
+    console.print(
+        Panel(
+            Markdown(text.strip()),
+            title="Answer",
+            border_style=console.get_style("status.success"),
+        )
+    )
 
 
 def _show_retry(console: Console, attempt: int, max_retries: int) -> None:
@@ -595,8 +727,13 @@ def _show_turn_stats(console: Console, spinner, usage=None) -> None:
 
 
 async def _stream_one_pass(
-    agent: Any, deps: Any, message_history: list,
-    question: str, console: Console
+    agent: Any,
+    deps: Any,
+    message_history: list,
+    question: str,
+    console: Console,
+    *,
+    tool_calls_limit_override: int | None = None,
 ) -> tuple[str, list]:
     """Run a single agent.iter() pass and render events progressively.
 
@@ -623,11 +760,20 @@ async def _stream_one_pass(
     spinner.start()
 
     ctx = get_tool_context()
+    compact_history_for_analysis_mode(message_history)
+    tool_calls_limit = (
+        tool_calls_limit_override
+        if tool_calls_limit_override is not None
+        else ctx.tool_call_limit
+    )
     async with agent.iter(
         question,
         deps=deps,
         message_history=message_history,
-        usage_limits=UsageLimits(request_limit=ctx.request_limit),
+        usage_limits=UsageLimits(
+            request_limit=ctx.request_limit,
+            tool_calls_limit=tool_calls_limit,
+        ),
     ) as run:
         async for node in run:
             if isinstance(node, UserPromptNode):
@@ -670,6 +816,7 @@ async def _stream_one_pass(
                 subagent_spinner: AskSpinner | None = None
                 tool_spinner: AskSpinner | None = None
                 saw_tool_call = False
+                active_tool_args: dict[str, tuple[str, dict[str, Any]]] = {}
                 async with node.stream(run.ctx) as handle_stream:
                     async for event in handle_stream:
                         if isinstance(event, FunctionToolCallEvent):
@@ -681,6 +828,11 @@ async def _stream_one_pass(
                             saw_tool_call = True
                             tool_name = event.part.tool_name
                             tool_args = event.part.args_as_dict()
+                            call_id = (
+                                str(getattr(event.part, "tool_call_id", ""))
+                                or f"{tool_name}:{spinner.tool_uses}"
+                            )
+                            active_tool_args[call_id] = (tool_name, tool_args)
                             spinner.increment_tool_uses()
                             _show_tool_start(console, tool_name, tool_args)
                             # Start a spinner while subagent runs
@@ -690,7 +842,9 @@ async def _stream_one_pass(
                                     f"Running {subagent_name}"
                                 )
                                 subagent_spinner.start()
-                            spinner_message = _tool_spinner_message(tool_name, tool_args)
+                            spinner_message = _tool_spinner_message(
+                                tool_name, tool_args
+                            )
                             if spinner_message:
                                 tool_spinner = AskSpinner(spinner_message)
                                 tool_spinner.start()
@@ -704,13 +858,49 @@ async def _stream_one_pass(
                                 tool_spinner = None
                             tool_name = event.result.tool_name
                             output = _extract_tool_result_text(event.result)
+                            result_call_id = (
+                                str(getattr(event.result, "tool_call_id", "")) or ""
+                            )
+                            recorded_args: dict[str, Any] = {}
+                            if result_call_id in active_tool_args:
+                                _recorded_name, recorded_args = active_tool_args.pop(
+                                    result_call_id
+                                )
+                            if tool_name not in {"execute_sql", "execute_python"}:
+                                record_tool_result(
+                                    tool_name, output, args=recorded_args
+                                )
                             from seeknal.ask.background import _BACKGROUNDED_PREFIX
+
                             if output.startswith(_BACKGROUNDED_PREFIX):
                                 console.print(
                                     "  [brand.accent]Task moved to background — "
                                     "will notify when done[/]"
                                 )
                             _show_tool_end(console, tool_name, output)
+                            if (
+                                tool_name == "execute_sql_pair"
+                                and should_synthesize_after_authoritative_sql_pair()
+                            ):
+                                from pydantic_ai.exceptions import (
+                                    UsageLimitExceeded,
+                                )
+
+                                raise UsageLimitExceeded(
+                                    "authoritative sql pair result"
+                                )
+                            if (
+                                getattr(
+                                    get_tool_context(), "disable_quality_gate", False
+                                )
+                                and has_sufficient_evidence()
+                                and get_tool_context().terminal_tool_errors_this_turn
+                            ):
+                                from pydantic_ai.exceptions import UsageLimitExceeded
+
+                                raise UsageLimitExceeded(
+                                    "terminal tool error after sufficient evidence"
+                                )
                 # Clean up any lingering tool spinners
                 if subagent_spinner is not None:
                     subagent_spinner.stop()
@@ -769,13 +959,35 @@ async def stream_ask(
         The agent's text response.
     """
     reset_report_approval()
+    reset_turn_governor(question)
 
     if quiet:
-        # Quiet mode: use sync ask() with spinner
-        from seeknal.ask.agents.agent import ask as sync_ask
+        # Quiet mode still runs inside this async function, so call the
+        # pydantic-ai async API directly instead of nesting run_sync inside an
+        # already-running event loop.
+        from pydantic_ai.usage import UsageLimits
+        from seeknal.ask.agents.tools._context import get_tool_context
+        from seeknal.ask.agents.agent import compact_history_for_analysis_mode
+
+        try:
+            request_limit = get_tool_context().request_limit
+        except RuntimeError:
+            request_limit = 100
+        compact_history_for_analysis_mode(message_history)
 
         with console.status("[spinner.active]Thinking..."):
-            return sync_ask(agent, deps, message_history, question)
+            result = await agent.run(
+                question,
+                deps=deps,
+                message_history=message_history,
+                usage_limits=UsageLimits(request_limit=request_limit),
+            )
+        message_history.clear()
+        message_history.extend(result.all_messages())
+        output = result.output or ""
+        if output:
+            console.print(output)
+        return output
 
     # Streaming mode with progressive rendering
     current_question = question.strip()
@@ -789,9 +1001,35 @@ async def stream_ask(
                 "and provide your analysis as a text response."
             )
 
-        answer, updated_history = await _stream_one_pass(
-            agent, deps, message_history, current_question, console
-        )
+        try:
+            answer, updated_history = await _stream_one_pass(
+                agent, deps, message_history, current_question, console
+            )
+        except Exception as exc:
+            from pydantic_ai.exceptions import UsageLimitExceeded
+
+            if isinstance(exc, UsageLimitExceeded):
+                if "authoritative sql pair" in str(exc):
+                    reason = (
+                        "authoritative SQL pair produced the answer for this "
+                        "business question"
+                    )
+                elif "terminal tool error" in str(exc):
+                    reason = "terminal tool error after sufficient evidence"
+                else:
+                    reason = (
+                        "tool-call budget reached before the model produced "
+                        "a final answer"
+                    )
+                fallback = await _stream_evidence_synthesis(
+                    agent,
+                    deps,
+                    message_history,
+                    reason,
+                    console,
+                )
+                return fallback
+            raise
         # Update message history in place
         message_history.clear()
         message_history.extend(updated_history)
@@ -818,6 +1056,52 @@ async def stream_ask(
     return _NO_RESPONSE
 
 
+async def _stream_evidence_synthesis(
+    agent: Any,
+    deps: Any,
+    message_history: list,
+    reason: str,
+    console: Console,
+) -> str:
+    """Ask the model for a final no-tool answer from recorded evidence.
+
+    The hard tool budget exists to stop runaway exploration, but users should
+    still receive a normal answer whenever the harness has evidence. This pass
+    supplies compact evidence as plain prompt text and sets the per-pass tool
+    limit to zero. If the model still attempts tools or cannot answer, fall
+    back to deterministic evidence text.
+    """
+    prompt = build_evidence_synthesis_prompt(reason)
+    deterministic = synthesize_evidence_fallback(reason)
+    if prompt == deterministic:
+        _show_answer(console, deterministic)
+        return deterministic
+
+    try:
+        answer, updated_history = await _stream_one_pass(
+            agent,
+            deps,
+            message_history,
+            prompt,
+            console,
+            tool_calls_limit_override=0,
+        )
+    except Exception as exc:
+        from pydantic_ai.exceptions import UsageLimitExceeded
+
+        if not isinstance(exc, UsageLimitExceeded):
+            raise
+        _show_answer(console, deterministic)
+        return deterministic
+
+    if answer.strip():
+        message_history.clear()
+        message_history.extend(updated_history)
+        return answer
+    _show_answer(console, deterministic)
+    return deterministic
+
+
 async def _stream_quality_gate(
     agent: Any,
     deps: Any,
@@ -826,6 +1110,14 @@ async def _stream_quality_gate(
     console: Console,
 ) -> str:
     """Check answer quality and retry once via streaming if needed."""
+    from seeknal.ask.agents.tools._context import get_tool_context
+
+    try:
+        if getattr(get_tool_context(), "disable_quality_gate", False):
+            return answer
+    except RuntimeError:
+        pass
+
     from seeknal.ask.agents.quality import check_answer_quality
 
     passes, reason = check_answer_quality(answer)
@@ -874,9 +1166,7 @@ def _save_chat_error_log(e: Exception) -> Optional[Path]:
         return None
 
 
-def _format_chat_loop_error(
-    e: Exception, log_path: Optional[Path] = None
-) -> str:
+def _format_chat_loop_error(e: Exception, log_path: Optional[Path] = None) -> str:
     """Format a chat-loop exception into a structured user-facing message.
 
     Detects common categories (network/DNS, connection, timeout, auth) and
@@ -910,6 +1200,7 @@ def _format_chat_loop_error(
     is_timeout = False
     try:
         import httpx
+
         if isinstance(e, httpx.HTTPError):
             req = getattr(e, "request", None)
             if req is not None:
@@ -917,15 +1208,29 @@ def _format_chat_loop_error(
                     httpx_url = str(req.url)
                 except Exception:  # noqa: BLE001
                     httpx_url = None
-        if isinstance(e, (httpx.ConnectError, getattr(httpx, "RemoteProtocolError", type(None)))):
+        if isinstance(
+            e, (httpx.ConnectError, getattr(httpx, "RemoteProtocolError", type(None)))
+        ):
             is_connect_error = True
-        if isinstance(e, (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout)):
+        if isinstance(
+            e,
+            (
+                httpx.ReadTimeout,
+                httpx.ConnectTimeout,
+                httpx.WriteTimeout,
+                httpx.PoolTimeout,
+            ),
+        ):
             is_timeout = True
     except ImportError:
         pass
 
     # Generic connection error fallback (non-httpx, non-DNS)
-    if not is_connect_error and not is_dns and isinstance(e, (ConnectionError, OSError)):
+    if (
+        not is_connect_error
+        and not is_dns
+        and isinstance(e, (ConnectionError, OSError))
+    ):
         is_connect_error = True
 
     parts: list[str] = []
@@ -934,16 +1239,28 @@ def _format_chat_loop_error(
         parts.append("[status.error]Network/DNS error during agent call.[/]")
         parts.append("")
         parts.append("[text.dim]Most common causes:[/]")
-        parts.append("  • LLM provider host unreachable (Gemini / OpenAI / Ollama) — check internet")
-        parts.append("  • A tool's HTTP backend is unreachable — Proof Editor, Seeknal Report Server")
-        parts.append("  • Empty/malformed env var: PROOF_BASE_URL, SEEKNAL_PUBLISH_SERVER, HTTP_PROXY, HTTPS_PROXY")
-        parts.append("  • Custom model endpoint configured but invalid (check SEEKNAL_ASK_MODEL)")
+        parts.append(
+            "  • LLM provider host unreachable (Gemini / OpenAI / Ollama) — check internet"
+        )
+        parts.append(
+            "  • A tool's HTTP backend is unreachable — Proof Editor, Seeknal Report Server"
+        )
+        parts.append(
+            "  • Empty/malformed env var: PROOF_BASE_URL, SEEKNAL_PUBLISH_SERVER, HTTP_PROXY, HTTPS_PROXY"
+        )
+        parts.append(
+            "  • Custom model endpoint configured but invalid (check SEEKNAL_ASK_MODEL)"
+        )
     elif is_timeout:
         parts.append("[status.error]Timeout during agent call.[/]")
-        parts.append("[text.dim]The remote host accepted the connection but didn't respond in time.[/]")
+        parts.append(
+            "[text.dim]The remote host accepted the connection but didn't respond in time.[/]"
+        )
     elif is_connect_error:
         parts.append("[status.error]Connection error during agent call.[/]")
-        parts.append("[text.dim]Could not establish a network connection — host unreachable, port closed, or interrupted.[/]")
+        parts.append(
+            "[text.dim]Could not establish a network connection — host unreachable, port closed, or interrupted.[/]"
+        )
     else:
         parts.append(f"[status.error]Error: {err_msg}[/]")
 
@@ -980,7 +1297,7 @@ async def chat_session(
         if session_store and session_name:
             try:
                 session_store.save_messages(session_name, message_history)
-                msg_count = len([m for m in message_history if hasattr(m, 'parts')])
+                msg_count = len([m for m in message_history if hasattr(m, "parts")])
                 session_store.update(
                     session_name,
                     message_count=msg_count,
@@ -1015,9 +1332,22 @@ async def chat_session(
         if session_store and session_name:
             session_store.update(session_name, last_question=question[:200])
 
+        # Deterministic fast path for command-shaped QA / power-user turns.
+        # Natural-language business questions still flow through the agent.
+        try:
+            direct_answer = await _try_direct_tool_directive(question, console)
+        except Exception as e:
+            direct_answer = None
+            console.print(_format_chat_loop_error(e, _save_chat_error_log(e)) + "\n")
+        if direct_answer is not None:
+            _save_session()
+            console.print()
+            continue
+
         # Drain background task notifications and prepend to question
         try:
             from seeknal.ask.agents.tools._context import get_tool_context
+
             ctx = get_tool_context()
             completed = await ctx.background_registry.drain_notifications()
             if completed:
@@ -1056,6 +1386,7 @@ async def chat_session(
         except Exception as e:
             # Handle checkpoint rewind
             from pydantic_deep import RewindRequested
+
             if isinstance(e, RewindRequested):
                 message_history.clear()
                 message_history.extend(e.messages)
@@ -1063,3 +1394,8 @@ async def chat_session(
                 continue
             log_path = _save_chat_error_log(e)
             console.print(_format_chat_loop_error(e, log_path) + "\n")
+            if "invalid message content type: <nil>" in str(e):
+                message_history.clear()
+                console.print(
+                    "[dim]Recovered by clearing malformed provider history for the next turn.[/dim]\n"
+                )

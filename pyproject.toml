@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "seeknal"
-version = "2.8.2"
+version = "2.9.0"
 description = "All-in-one platform for data and AI/ML engineering"
 authors = [
     {name = "Fitra Kacamarga"}
@@ -46,7 +46,7 @@ dependencies = [
     "orjson>=3.11.6",
     "pygments>=2.20.0",
     # Core AI features shipped by default
-    "pydantic-deep>=0.3.0",
+    "pydantic-deep>=0.3.17,<0.4.0",
     "pydantic-ai-slim[google,openai]>=1.71.0",
     "ruamel.yaml>=0.18.0",
     "ddgs>=9.0",
@@ -87,7 +87,7 @@ spark = [
 # Seeknal Ask — NL-to-Analysis Agent (pydantic-ai based)
 # Kept as an extra for backwards-compatible `seeknal[ask]` installs.
 ask = [
-    "pydantic-deep>=0.3.0",
+    "pydantic-deep>=0.3.17,<0.4.0",
     "pydantic-ai-slim[google,openai]>=1.71.0",
     "ruamel.yaml>=0.18.0",
     "ddgs>=9.0",

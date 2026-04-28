@@ -17,7 +17,7 @@ runner = CliRunner()
 class TestPrefectServe:
     """Test seeknal prefect serve command."""
 
-    @patch("seeknal.cli.main.SeeknalPrefectFlow")
+    @patch("seeknal.workflow.prefect_integration.SeeknalPrefectFlow")
     def test_serve_basic(self, mock_spf_cls):
         """Basic serve command creates flow and calls serve()."""
         mock_spf = MagicMock()
@@ -35,7 +35,7 @@ class TestPrefectServe:
         call_kwargs = mock_spf.serve.call_args[1]
         assert call_kwargs["cron"] == "0 2 * * *"
 
-    @patch("seeknal.cli.main.SeeknalPrefectFlow")
+    @patch("seeknal.workflow.prefect_integration.SeeknalPrefectFlow")
     def test_serve_with_all_options(self, mock_spf_cls):
         """Serve command passes all options correctly."""
         mock_spf = MagicMock()
@@ -72,7 +72,7 @@ class TestPrefectServe:
         assert serve_kwargs["cron"] == "0 2 * * *"
         assert serve_kwargs["interval"] == 3600
 
-    @patch("seeknal.cli.main.SeeknalPrefectFlow")
+    @patch("seeknal.workflow.prefect_integration.SeeknalPrefectFlow")
     def test_serve_prefect_not_installed(self, mock_spf_cls):
         """Serve shows error when Prefect is not installed."""
         mock_spf_cls.side_effect = ImportError(
@@ -90,7 +90,7 @@ class TestPrefectServe:
 class TestPrefectDeploy:
     """Test seeknal prefect deploy command."""
 
-    @patch("seeknal.cli.main.SeeknalPrefectFlow")
+    @patch("seeknal.workflow.prefect_integration.SeeknalPrefectFlow")
     def test_deploy_basic(self, mock_spf_cls):
         """Basic deploy command creates flow and calls deploy()."""
         mock_spf = MagicMock()
@@ -107,7 +107,7 @@ class TestPrefectDeploy:
         call_kwargs = mock_spf.deploy.call_args[1]
         assert call_kwargs["work_pool"] == "my-pool"
 
-    @patch("seeknal.cli.main.SeeknalPrefectFlow")
+    @patch("seeknal.workflow.prefect_integration.SeeknalPrefectFlow")
     def test_deploy_exposure(self, mock_spf_cls):
         """Deploy with --exposure flag calls deploy_exposure()."""
         mock_spf = MagicMock()
@@ -124,7 +124,7 @@ class TestPrefectDeploy:
         mock_spf.deploy_exposure.assert_called_once_with("weekly_kpis", work_pool="my-pool")
         mock_spf.deploy.assert_not_called()
 
-    @patch("seeknal.cli.main.SeeknalPrefectFlow")
+    @patch("seeknal.workflow.prefect_integration.SeeknalPrefectFlow")
     def test_deploy_with_schedule(self, mock_spf_cls):
         """Deploy with cron schedule passes it through."""
         mock_spf = MagicMock()
@@ -145,8 +145,7 @@ class TestPrefectDeploy:
 class TestPrefectGenerate:
     """Test seeknal prefect generate command."""
 
-    @patch("seeknal.workflow.prefect_integration.SeeknalPrefectFlow")
-    def test_generate_writes_yaml(self, mock_spf_cls, tmp_path):
+    def test_generate_writes_yaml(self, tmp_path):
         """Generate command writes a prefect.yaml file."""
         output_path = tmp_path / "prefect.yaml"
 

@@ -12,7 +12,7 @@ from typing import Any
 
 async def ask_user(
     question: str,
-    options: list[dict[str, str]],
+    options: list[dict[str, Any]],
 ) -> str:
     """Ask the user a question with interactive selectable options.
 
@@ -27,7 +27,7 @@ async def ask_user(
 
     Guidelines:
     - Provide 2-4 concrete options with clear descriptions
-    - Mark your recommended option with recommended=true
+    - Mark your recommended option with recommended="true" (string), not boolean true
     - Focus on things only the user can decide (not data lookups)
     - Ask BEFORE heavy analysis, not after
 

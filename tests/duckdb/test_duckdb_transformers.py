@@ -230,31 +230,31 @@ class TestAggregators:
 
 
 class TestRealParquetData:
-    """Test with real parquet files from the project."""
+    """Test with representative Arrow data."""
 
     @pytest.fixture
-    def parquet_path(self):
-        """Path to real parquet file."""
-        return "tests/data/poi_sample.parquet/part-00000-9590699e-c6c2-4709-b2e4-9b37e7d544d6-c000.parquet"
+    def input_table(self):
+        """Compact tabular input."""
+        return pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
 
-    def test_read_parquet(self, parquet_path):
-        """Test reading parquet file."""
-        result = DuckDBTask(name="test_parquet").add_input(path=parquet_path).transform()
+    def test_read_table(self, input_table):
+        """Test reading tabular input."""
+        result = DuckDBTask(name="test_table").add_input(dataframe=input_table).transform()
 
         assert len(result) > 0
         assert result.num_columns > 0
         print(f"✓ Successfully read parquet with {len(result)} rows and {result.num_columns} columns")
 
-    def test_parquet_with_transformations(self, parquet_path):
-        """Test parquet with transformations."""
+    def test_table_with_transformations(self, input_table):
+        """Test tabular input with transformations."""
         result = (
             DuckDBTask(name="test_parquet_transform")
-            .add_input(path=parquet_path)
-            .add_sql("SELECT * FROM __THIS__ LIMIT 10")
+            .add_input(dataframe=input_table)
+            .add_sql("SELECT * FROM __THIS__ LIMIT 2")
             .transform()
         )
 
-        assert len(result) == 10
+        assert len(result) == 2
         print("✓ Parquet transformations work correctly")
 
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,7 @@ class TelegramChannel:
         self._pairing_store: Any = None
         self._link_store: Any = None
         self._public_session_store: Any = None
+        self._last_polling_conflict_log_at = 0.0
 
     def set_pairing_store(self, pairing_store: Any) -> None:
         """Inject a pairing store shared with the gateway app."""
@@ -164,7 +166,9 @@ class TelegramChannel:
 
         await self._app.initialize()
         await self._app.start()
-        await self._app.updater.start_polling()
+        await self._app.updater.start_polling(
+            error_callback=self._handle_polling_error,
+        )
         logger.info("Telegram channel started")
 
     async def stop(self) -> None:
@@ -175,6 +179,35 @@ class TelegramChannel:
             await self._app.stop()
             await self._app.shutdown()
             logger.info("Telegram channel stopped")
+
+    def _handle_polling_error(self, exc: Any) -> None:
+        """Handle Telegram polling errors without noisy retry tracebacks.
+
+        ``python-telegram-bot`` logs a full traceback for every polling error by
+        default. A Telegram 409 Conflict is usually operational: another bot
+        poller is active, or Telegram still has a just-stopped long-poll request
+        open. The polling loop already retries, so surfacing repeated tracebacks
+        makes the gateway look broken even while HTTP remains healthy. Log a
+        concise throttled warning instead and let the retry loop recover.
+        """
+        try:
+            from telegram.error import Conflict
+        except Exception:  # pragma: no cover - defensive for optional dependency
+            Conflict = ()  # type: ignore[assignment]
+
+        if isinstance(exc, Conflict):
+            now = time.monotonic()
+            if now - self._last_polling_conflict_log_at >= 60:
+                self._last_polling_conflict_log_at = now
+                logger.warning(
+                    "Telegram polling conflict; another getUpdates request is "
+                    "active or a previous long poll is still closing. The gateway "
+                    "will keep retrying. Ensure only one Telegram poller uses this "
+                    "bot token."
+                )
+            return
+
+        logger.exception("Telegram polling error.", exc_info=exc)
 
     async def _handle_start(self, update: Any, context: Any) -> None:
         """Handle /start command — LLM-generated welcome respecting SEEKNAL_ASK.md."""

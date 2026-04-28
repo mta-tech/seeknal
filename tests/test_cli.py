@@ -4,6 +4,7 @@ import os
 import json
 import tempfile
 import shutil
+import re
 from datetime import datetime
 from unittest import mock
 from pathlib import Path
@@ -30,6 +31,14 @@ if "seeknal.featurestore.feature_group" not in sys.modules:
 
 
 runner = CliRunner()
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _assert_help_option(output: str, name: str) -> None:
+    plain = _ANSI_ESCAPE_RE.sub("", output)
+    compact = re.sub(r"[\s-]+", "", plain)
+    assert name.replace("-", "") in compact
 
 
 class TestVersionCommand:
@@ -81,9 +90,69 @@ class TestInitCommand:
         os.chdir(tmp_path)
         result = runner.invoke(app, ["init", "--name", "test_project_dirs"])
         assert result.exit_code == 0
-        assert (tmp_path / "flows").exists()
-        assert (tmp_path / "entities").exists()
-        assert (tmp_path / "feature_groups").exists()
+        assert (tmp_path / "seeknal" / "sources").exists()
+        assert (tmp_path / "seeknal" / "transforms").exists()
+        assert (tmp_path / "seeknal" / "feature_groups").exists()
+        assert (tmp_path / "seeknal" / "models").exists()
+        assert (tmp_path / "seeknal" / "pipelines").exists()
+        assert (tmp_path / "seeknal" / "sql_pairs").exists()
+        assert (tmp_path / "seeknal" / "tests").exists()
+        assert (tmp_path / "context").exists()
+        assert (tmp_path / "context" / "sql_pairs").exists()
+        assert (tmp_path / "context" / "tests").exists()
+
+    def test_init_creates_agent_guidance(self, tmp_path):
+        """Init command should create AGENTS.md and CLAUDE.md guidance."""
+        os.chdir(tmp_path)
+        result = runner.invoke(app, ["init", "--name", "test_project_agents"])
+        assert result.exit_code == 0
+        agents = tmp_path / "AGENTS.md"
+        claude = tmp_path / "CLAUDE.md"
+        assert agents.exists()
+        assert claude.exists()
+        agents_text = agents.read_text()
+        claude_text = claude.read_text()
+        assert "SEEKNAL_ASK.md" in agents_text
+        assert "Tap-in / read-only connected-source analyst" in agents_text
+        assert "Data pipeline builder" in agents_text
+        assert "Hybrid" in agents_text
+        assert "seeknal docs --list" in agents_text
+        assert "seeknal docs ask" in agents_text
+        assert "seeknal/sql_pairs" in agents_text
+        assert "seeknal/tests" in agents_text
+        assert "Do not hardcode" in agents_text
+        assert "seeknal ask test" in claude_text
+        assert "seeknal docs --json <topic>" in claude_text
+        assert "Mode setup quick reference" in claude_text
+        assert "Data pipeline builder" in claude_text
+        assert "source sync" in claude_text
+
+    def test_init_creates_ask_context_scaffold(self, tmp_path):
+        """Init should create generic Ask context files without domain hardcoding."""
+        os.chdir(tmp_path)
+        result = runner.invoke(app, ["init", "--name", "test_project_context"])
+        assert result.exit_code == 0
+
+        agent_config = tmp_path / "seeknal_agent.yml"
+        ask_context = tmp_path / "SEEKNAL_ASK.md"
+        env_example = tmp_path / ".env.example"
+        gitignore = tmp_path / ".gitignore"
+
+        assert agent_config.exists()
+        assert ask_context.exists()
+        assert env_example.exists()
+        assert "default: auto" in agent_config.read_text()
+        assert "sources: {}" in agent_config.read_text()
+        assert "dsn_env: WAREHOUSE_URL" in agent_config.read_text()
+        assert "Required SQL patterns" in ask_context.read_text()
+        assert "Ask QA workflow" in ask_context.read_text()
+        assert "WAREHOUSE_URL=" in env_example.read_text()
+        assert ".env" in gitignore.read_text()
+
+        combined = "\n".join(
+            [agent_config.read_text(), ask_context.read_text(), env_example.read_text()]
+        ).lower()
+        assert "bpom" not in combined
 
     def test_init_with_description(self, tmp_path):
         """Init command should accept description option."""
@@ -219,7 +288,7 @@ class TestCleanCommand:
             app, ["clean", "test_fg", "--before", "invalid"]
         )
         assert result.exit_code == 1
-        assert "Invalid date format" in result.stdout
+        assert "Invalid before date" in result.stdout
 
 
 class TestOutputFormatEnum:
@@ -288,8 +357,8 @@ class TestHelpCommand:
         """Init command help should display options."""
         result = runner.invoke(app, ["init", "--help"])
         assert result.exit_code == 0
-        assert "--name" in result.stdout
-        assert "--description" in result.stdout
+        _assert_help_option(result.stdout, "--name")
+        _assert_help_option(result.stdout, "--description")
 
     def test_list_help(self):
         """List command help should display resource types."""
@@ -304,8 +373,8 @@ class TestValidateFeaturesCommand:
         """validate-features command help should display options."""
         result = runner.invoke(app, ["validate-features", "--help"])
         assert result.exit_code == 0
-        assert "--mode" in result.stdout
-        assert "--verbose" in result.stdout
+        _assert_help_option(result.stdout, "--mode")
+        _assert_help_option(result.stdout, "--verbose")
         assert "FEATURE_GROUP" in result.stdout
 
     def test_validate_features_requires_feature_group(self):
@@ -325,7 +394,7 @@ class TestValidateFeaturesCommand:
         result = runner.invoke(app, ["validate-features", "--help"])
         assert result.exit_code == 0
         assert "-v" in result.stdout
-        assert "--verbose" in result.stdout
+        _assert_help_option(result.stdout, "--verbose")
 
 
 class TestDebugCommand:
@@ -364,7 +433,7 @@ class TestDeleteCommand:
         result = runner.invoke(app, ["delete", "--help"])
         assert result.exit_code == 0
         assert "feature-group" in result.stdout
-        assert "--force" in result.stdout
+        _assert_help_option(result.stdout, "--force")
 
     def test_delete_feature_group_success(self):
         """Delete command should successfully delete a feature group with --force."""

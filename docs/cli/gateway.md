@@ -58,14 +58,19 @@ Start the full gateway server (API + optional worker).
 | `--callback-url` | TEXT | None | Base URL for worker event callbacks |
 | `--callback-auth-token` | TEXT | None | Shared secret for callback POST auth |
 | `--worker-project-path` | TEXT | None | Project path on the remote worker (split topology) |
+| `--token-config` | PATH | `SEEKNAL_TOKEN_CONFIG` | JSON/YAML API token registry for tenant-scoped worker routing |
 
 ### `seeknal gateway backend`
 
 Start a cloud-only gateway (no local project or worker). Useful when the gateway runs on a separate machine from the data.
 
+Supports `--token-config` so `/temporal/start`, `/events/{session_id}`, `/sessions`, and worker callbacks derive tenant identity from bearer tokens instead of caller-provided tenant headers.
+
 ### `seeknal gateway worker`
 
 Start a standalone Temporal worker that connects to an existing gateway. Use in split topologies where the gateway and worker run on different machines.
+
+For secure multi-tenant deployments, start the worker with `--gateway-url` and `--api-token`. The worker fetches `/internal/worker/config`, then uses the token-derived tenant queue, callback bearer token, and optional Temporal address/namespace. Existing local workers can still use `--tenant` or `TEMPORAL_TASK_QUEUE` when token mode is not configured.
 
 ## Examples
 
@@ -80,12 +85,36 @@ seeknal gateway start --telegram
 seeknal gateway backend --port 8000
 seeknal gateway worker --project ./my-project --callback-url http://gateway:8000
 
+# Multi-tenant token mode: queue/callback config is derived from the token
+seeknal gateway backend --token-config ./gateway-tokens.yml --port 8000
+seeknal gateway worker --project ./my-project --gateway-url http://gateway:8000 --api-token "$SEEKNAL_API_TOKEN"
+
 # Multi-replica with Redis
 seeknal gateway start --redis redis://localhost:6379
 
 # Temporal durable execution
 seeknal gateway start --temporal --max-activities 20
 ```
+
+## Multi-tenant token registry
+
+When a token registry is configured, tenant identity is authenticated instead of trusted from `X-Tenant-ID` or `?tenant=`. The gateway derives the Temporal task queue, callback token, and tenant-scoped session/event access from the bearer token. Request body overrides such as `task_queue`, `project_path`, `push_url`, and `api_key` are rejected in token mode.
+
+Example `gateway-tokens.yml`:
+
+```yaml
+tokens:
+  - token: <random-worker-or-client-token>
+    tenant_id: acme
+    task_queue: seeknal-ask-acme
+    callback_token: <random-callback-token>
+    callback_url: https://gateway.example.com
+    temporal_address: temporal.example.com:7233
+    temporal_namespace: default
+    project_path: /srv/seeknal/acme
+```
+
+Do not commit token files with real secrets; provision them from your secret manager or deployment environment. Use `Authorization: Bearer <token>` for HTTP clients. Browser SSE/WebSocket clients that cannot set headers may pass a short-lived `api_token` or `access_token` query parameter. If no token registry is configured, Seeknal keeps the previous single-tenant/local behavior.
 
 ## Architecture
 
@@ -98,8 +127,9 @@ Client (browser/app/bot)
 │  (Starlette) │
 ├──────────────┤
 │ WebSocket    │  /ws/{session_id}
-│ SSE          │  /sse/{session_id}
-│ REST         │  /api/ask
+│ SSE          │  /events/{session_id}
+│ REST         │  /ask
+│ Cancel       │  /sessions/{session_id}/cancel
 │ Telegram     │  (webhook)
 └──────┬───────┘
        │
@@ -110,6 +140,18 @@ Client (browser/app/bot)
 └──────────────┘
 ```
 
+## Runtime behavior
+
+- Runs for the same tenant/session are serialized to protect conversation
+  history and DuckDB state.
+- `POST /sessions/{session_id}/cancel` requests cancellation of the active
+  run. WebSocket clients can also send `{"type":"cancel"}` while a run is
+  streaming.
+- Tool result events include `elapsed_ms` when timing is available; `done`
+  events include total turn `elapsed_ms`.
+- When `--redis` is configured, SSE fan-out and session locks use Redis so
+  multi-replica gateway deployments preserve per-session serialization.
+
 ## Environment Variables
 
 | Variable | Description |
@@ -119,8 +161,12 @@ Client (browser/app/bot)
 | `TEMPORAL_ADDRESS` | Temporal server address (with `--temporal`) |
 | `TEMPORAL_NAMESPACE` | Temporal namespace |
 | `TEMPORAL_MAX_CONCURRENT_ACTIVITIES` | Max concurrent activities |
-| `CALLBACK_AUTH_TOKEN` | Worker callback auth secret |
+| `CALLBACK_AUTH_TOKEN` | Worker callback auth secret (legacy compatibility mode) |
 | `WORKER_PROJECT_PATH` | Remote worker project path |
+| `SEEKNAL_TOKEN_CONFIG` | JSON/YAML API token registry path |
+| `SEEKNAL_API_TOKENS` | Inline JSON token registry for tests/small deployments |
+| `SEEKNAL_GATEWAY_URL` | Gateway URL used by `seeknal gateway worker` bootstrap |
+| `SEEKNAL_API_TOKEN` | Worker/client API token used for token-derived routing |
 
 ## See Also
 

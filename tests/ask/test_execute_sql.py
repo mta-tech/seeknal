@@ -8,7 +8,14 @@ from unittest.mock import MagicMock
 import duckdb
 import pytest
 
-from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
+from seeknal.ask.agents.tools._context import (
+    ToolContext,
+    get_loaded_sql_pairs,
+    mark_sql_pairs_checked,
+    record_authoritative_sql_pair_result,
+    reset_turn_governor,
+    set_tool_context,
+)
 from seeknal.ask.agents.tools.execute_sql import execute_sql
 
 
@@ -17,8 +24,10 @@ class _REPLStub:
 
     def __init__(self) -> None:
         self.conn = duckdb.connect(":memory:")
+        self.calls: list[str] = []
 
     def execute_oneshot(self, sql: str, limit=None):
+        self.calls.append(sql)
         if limit is not None:
             sql = f"SELECT * FROM ({sql}) AS _q LIMIT {int(limit)}"
         result = self.conn.execute(sql)
@@ -174,7 +183,221 @@ def test_pipes_in_cells_are_escaped(ctx):
     assert "a\\|b\\|c" in out
 
 
+def test_blank_string_cells_are_labeled(ctx):
+    ctx.repl.conn.execute(
+        "CREATE TABLE blanks AS SELECT ' ' AS scale, 54 AS products"
+    )
+    out = execute_sql("SELECT * FROM blanks")
+
+    assert "| [blank] | 54 |" in out
+
+
 def test_sql_error_returns_tool_error(ctx):
     out = execute_sql("SELECT * FROM table_that_doesnt_exist")
     # The tool's error formatter returns a JSON blob. Check the substring.
     assert "retryable" in out or "category" in out
+
+
+def test_missing_table_suggestion_is_retried(tmp_path: Path):
+    class ReplWithSuggestion:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def execute_oneshot(self, sql: str, limit=None):
+            self.calls.append(sql)
+            if " monthly_revenue" in sql:
+                raise Exception(
+                    'Catalog Error: Table with name monthly_revenue does not exist!\n'
+                    'Did you mean "wh.analytics.monthly_revenue"?'
+                )
+            assert "wh.analytics.monthly_revenue" in sql
+            return ["revenue"], [(123.0,)]
+
+    repl = ReplWithSuggestion()
+    set_tool_context(
+        ToolContext(
+            repl=repl,
+            artifact_discovery=MagicMock(),
+            project_path=tmp_path,
+        )
+    )
+
+    out = execute_sql("SELECT SUM(revenue) AS revenue FROM monthly_revenue")
+
+    assert "| revenue |" in out
+    assert "123.0" in out
+    assert any("wh.analytics.monthly_revenue" in call for call in repl.calls)
+
+
+def test_query_alias_executes(ctx):
+    out = execute_sql(query="SELECT * FROM small ORDER BY id", limit=2)
+    assert "| id | v |" in out
+    assert "2 of 3 rows shown" in out
+
+
+def test_missing_sql_returns_retryable_hint(ctx):
+    out = execute_sql()
+    assert "Missing SQL query" in out
+    assert "retryable" in out
+    assert "sql" in out
+
+
+def test_function_style_ilike_is_repaired(ctx):
+    ctx.repl.conn.execute("CREATE TABLE names AS SELECT 'Air Mineral' AS name")
+
+    out = execute_sql("SELECT name FROM names WHERE ILIKE(name, '%air%')")
+
+    assert "Air Mineral" in out
+    assert "rewrote function-style ILIKE" in out
+
+
+def test_order_by_integer_cast_is_repaired_to_try_cast(ctx):
+    ctx.repl.conn.execute(
+        "CREATE TABLE labels AS SELECT 'Tidak Diketahui' AS label UNION ALL SELECT '2' AS label"
+    )
+    out = execute_sql("SELECT label FROM labels ORDER BY CAST(label AS INTEGER)")
+
+    assert "Tidak Diketahui" in out
+    assert "TRY_CAST" in out or "rewrote ORDER BY CAST" in out
+
+
+def test_repeated_failed_sql_is_blocked_by_failure_memory(ctx):
+    first = execute_sql("SELECT * FROM table_that_doesnt_exist")
+    second = execute_sql("SELECT * FROM table_that_doesnt_exist")
+
+    assert "retryable" in first
+    assert "already failed" in second
+
+
+def test_repeated_successful_sql_reuses_cached_result(ctx):
+    first = execute_sql("SELECT * FROM small ORDER BY id")
+    calls_after_first = len(ctx.repl.calls)
+
+    second = execute_sql("  SELECT   * FROM small ORDER BY id ; ")
+
+    assert "| id | v |" in first
+    assert "Reusing prior successful SQL result" in second
+    assert "| id | v |" in second
+    assert len(ctx.repl.calls) == calls_after_first
+
+
+def test_refresh_bypasses_successful_sql_cache(ctx):
+    execute_sql("SELECT * FROM small ORDER BY id")
+    calls_after_first = len(ctx.repl.calls)
+
+    second = execute_sql("SELECT * FROM small ORDER BY id", refresh=True)
+
+    assert "| id | v |" in second
+    assert len(ctx.repl.calls) > calls_after_first
+
+
+def test_loaded_sql_pair_drift_is_warned_without_blocking(ctx):
+    get_loaded_sql_pairs(ctx)["canonical"] = (
+        "SELECT id, v FROM small ORDER BY id"
+    )
+
+    out = execute_sql("SELECT COUNT(*) AS total FROM small", allow_sql_pair_drift=True)
+
+    assert "| total |" in out
+    assert "SQL pair drift" in out
+
+
+def test_loaded_sql_pair_drift_is_blocked_by_default(ctx):
+    get_loaded_sql_pairs(ctx)["canonical"] = (
+        "SELECT id, v FROM small ORDER BY id"
+    )
+
+    out = execute_sql("SELECT COUNT(*) AS total FROM small")
+
+    assert "SQL differs from the SQL pair" in out
+    assert not any("COUNT(*) AS total" in call for call in ctx.repl.calls)
+
+
+def test_authoritative_sql_pair_blocks_drift_override_for_simple_question(ctx):
+    get_loaded_sql_pairs(ctx)["canonical"] = "SELECT id, v FROM small ORDER BY id"
+    reset_turn_governor("How many records are there by month?")
+    get_loaded_sql_pairs(ctx)["canonical"] = "SELECT id, v FROM small ORDER BY id"
+    record_authoritative_sql_pair_result(
+        name="canonical",
+        path="seeknal/sql_pairs/canonical.yml",
+        result="| month | count |\n| --- | --- |\n| 2025-01 | 3 |\n\n(1 row)",
+        ctx=ctx,
+    )
+
+    out = execute_sql(
+        "SELECT COUNT(*) AS total FROM small",
+        allow_sql_pair_drift=True,
+    )
+
+    assert "matching SQL pair already executed successfully" in out
+    assert "terminal_bounded_evidence" in out
+    assert not any("COUNT(*) AS total" in call for call in ctx.repl.calls)
+
+
+def test_authoritative_sql_pair_allows_drift_for_advanced_question(ctx):
+    reset_turn_governor("Model the correlation after getting the base query")
+    get_loaded_sql_pairs(ctx)["canonical"] = "SELECT id, v FROM small ORDER BY id"
+    record_authoritative_sql_pair_result(
+        name="canonical",
+        path="seeknal/sql_pairs/canonical.yml",
+        result="| id | v |\n| --- | --- |\n| 1 | hi |\n\n(1 row)",
+        ctx=ctx,
+    )
+
+    out = execute_sql(
+        "SELECT COUNT(*) AS total FROM small",
+        allow_sql_pair_drift=True,
+    )
+
+    assert "| total |" in out
+    assert "SQL pair drift" in out
+
+
+def test_ad_hoc_business_sql_requires_sql_pair_lookup_when_pairs_exist(ctx, tmp_path):
+    pair = tmp_path / "seeknal" / "sql_pairs" / "answer.yml"
+    pair.parent.mkdir(parents=True)
+    pair.write_text("name: answer\nprompt: answer\nsql: SELECT 42 AS answer\n")
+    reset_turn_governor("What is the answer?")
+
+    out = execute_sql("SELECT COUNT(*) AS total FROM small")
+
+    assert "Project SQL pairs exist" in out
+    assert not any("COUNT(*) AS total" in call for call in ctx.repl.calls)
+
+
+def test_ad_hoc_sql_allowed_after_sql_pair_lookup(ctx, tmp_path):
+    pair = tmp_path / "seeknal" / "sql_pairs" / "answer.yml"
+    pair.parent.mkdir(parents=True)
+    pair.write_text("name: answer\nprompt: answer\nsql: SELECT 42 AS answer\n")
+    reset_turn_governor("What is the answer?")
+    mark_sql_pairs_checked(ctx)
+
+    out = execute_sql("SELECT COUNT(*) AS total FROM small")
+
+    assert "| total |" in out
+class _SlowRepl:
+    def execute_oneshot(self, sql: str, limit=None):
+        import time
+
+        time.sleep(2)
+        return ["n"], [(1,)]
+
+
+def test_execute_sql_returns_terminal_timeout(tmp_path):
+    from unittest.mock import MagicMock
+
+    from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
+
+    set_tool_context(
+        ToolContext(
+            repl=_SlowRepl(),
+            artifact_discovery=MagicMock(),
+            project_path=tmp_path,
+            sql_timeout_seconds=1,
+        )
+    )
+
+    out = execute_sql(sql="SELECT 1")
+
+    assert "terminal_timeout" in out
+    assert "SQL execution timed out after 1 seconds" in out

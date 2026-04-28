@@ -19,6 +19,11 @@ import subprocess
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from seeknal.ui.output import echo_success as _echo_success, echo_error as _echo_error, echo_warning as _echo_warning, echo_info as _echo_info
+from seeknal.integrations.atlas_client import (
+    AtlasContractError,
+    AtlasPolicyDenied,
+    create_atlas_contract_client_from_env,
+)
 from seeknal.utils.path_security import warn_if_insecure_path
 
 # Common config kind → target file mapping
@@ -725,12 +730,50 @@ def apply_command(
         _echo_warning(f"Using secure alternative: {secure_alt}")
         target_path = Path(secure_alt)
 
+    project_path = Path.cwd()
+    atlas_client = create_atlas_contract_client_from_env()
+    atlas_context = None
+
+    def report_failed_local_exit(error_message: str, *, phase: str) -> None:
+        if atlas_client is None or atlas_context is None:
+            return
+        atlas_client.report_local_failure(
+            atlas_context,
+            error_message=error_message,
+            local_apply_completed=target_path.exists(),
+            details={
+                "phase": phase,
+                "target_path": str(target_path),
+            },
+        )
+
+    if atlas_client is not None:
+        try:
+            atlas_context = atlas_client.preflight_apply(
+                node_type=node_type,
+                name=name,
+                yaml_data=yaml_data,
+                target_path=target_path,
+                project_path=project_path,
+            )
+        except AtlasPolicyDenied as exc:
+            _echo_error(str(exc))
+            raise typer.Exit(1)
+        except AtlasContractError as exc:
+            _echo_error(f"Atlas preflight failed: {exc}")
+            raise typer.Exit(1)
+
     # Check for conflicts and get existing data
     try:
         should_proceed, existing_data, is_same_file = check_conflict(
             draft_path, target_path, force, yaml_data
         )
-    except typer.Exit:
+    except typer.Exit as exc:
+        if getattr(exc, "exit_code", 1) not in (None, 0):
+            report_failed_local_exit(
+                "Local apply failed during conflict checks",
+                phase="conflict-check",
+            )
         raise
 
     if not should_proceed:
@@ -738,40 +781,68 @@ def apply_command(
 
     _echo_success("All checks passed")
 
-    # Move file (skip if source == target)
-    if is_same_file:
-        _echo_info("File already in correct location")
-    else:
-        _echo_info("Moving file...")
-        _echo_info(f"  FROM: {draft_path}")
-        _echo_info(f"  TO:   {target_path}")
+    manifest_updated = True
+    local_failure_message = "Local apply failed before Atlas sync completed"
 
-        try:
-            move_draft_file(draft_path, target_path)
-        except OSError as e:
-            _echo_error(f"Failed to move file: {e}")
-            raise typer.Exit(1)
-
-    # Update manifest
-    if not no_parse:
-        _echo_info("Updating manifest...")
-
-        if update_manifest(target_path):
-            _echo_success("Manifest regenerated")
-        else:
-            _echo_warning("Manifest update failed, but file was moved")
-
-    # Save applied state snapshot for diff baseline
     try:
-        from seeknal.workflow.diff_engine import write_applied_state_entry
+        # Move file (skip if source == target)
+        if is_same_file:
+            _echo_info("File already in correct location")
+        else:
+            _echo_info("Moving file...")
+            _echo_info(f"  FROM: {draft_path}")
+            _echo_info(f"  TO:   {target_path}")
 
-        project_path = Path.cwd()
-        node_id = f"{node_type}.{name}"
-        yaml_content = target_path.read_text(encoding="utf-8")
-        rel_path = str(target_path.relative_to(project_path))
-        write_applied_state_entry(project_path, node_id, rel_path, yaml_content)
-    except Exception:
-        pass  # Non-critical: don't fail apply if snapshot fails
+            try:
+                move_draft_file(draft_path, target_path)
+            except OSError as e:
+                local_failure_message = f"Failed to move file: {e}"
+                _echo_error(local_failure_message)
+                raise typer.Exit(1)
+
+        # Update manifest
+        if not no_parse:
+            _echo_info("Updating manifest...")
+            manifest_updated = update_manifest(target_path)
+
+            if manifest_updated:
+                _echo_success("Manifest regenerated")
+            else:
+                _echo_warning("Manifest update failed, but file was moved")
+
+        # Save applied state snapshot for diff baseline
+        try:
+            from seeknal.workflow.diff_engine import write_applied_state_entry
+
+            node_id = f"{node_type}.{name}"
+            yaml_content = target_path.read_text(encoding="utf-8")
+            rel_path = str(target_path.relative_to(project_path))
+            write_applied_state_entry(project_path, node_id, rel_path, yaml_content)
+        except Exception:
+            pass  # Non-critical: don't fail apply if snapshot fails
+    except typer.Exit:
+        report_failed_local_exit(local_failure_message, phase="local-apply")
+        raise
+    except Exception as exc:
+        report_failed_local_exit(
+            f"Unhandled local apply error: {exc}",
+            phase="local-apply",
+        )
+        raise
+
+    if atlas_client is not None and atlas_context is not None:
+        try:
+            atlas_client.complete_apply(
+                atlas_context,
+                manifest_updated=manifest_updated,
+                no_parse=no_parse,
+            )
+        except AtlasContractError as exc:
+            _echo_error(
+                "Atlas sync failed after local apply completed. "
+                f"Local artifact remains in place: {exc}"
+            )
+            raise typer.Exit(1)
 
     # Show diff if this was an update
     if existing_data:

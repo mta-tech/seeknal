@@ -81,12 +81,13 @@ print(tables)
    df = conn.sql("SELECT * FROM customers").df()
    ```
 
-2. **Limited package set.** Only these packages are pre-imported:
+2. **Limited package set.** These names may be pre-imported when installed in
+   the current Seeknal environment:
    - `conn` — **pre-loaded DuckDB SafeConnection** (see above, do not re-create)
    - `pd` — pandas
    - `np` — numpy
-   - `plt` — matplotlib.pyplot (Agg backend)
-   - `matplotlib` — the full matplotlib package
+   - `plt` — matplotlib.pyplot (Agg backend), or `None` if unavailable
+   - `matplotlib` — the full matplotlib package, or `None` if unavailable
    - `sklearn` — scikit-learn (import submodules like `sklearn.cluster`)
    - `scipy` — scipy (import submodules like `scipy.stats`)
 
@@ -133,7 +134,21 @@ conn.sql("""
 
 ## Phase 3 — Plots
 
-Plots are captured automatically at the end of the call. Just use `plt`:
+Plots are captured automatically at the end of the call when matplotlib is
+available. Check `plt is not None` before plotting. If it is `None`, do not
+try to install/import matplotlib; provide a text/table answer or non-visual
+statistics instead.
+
+```python
+if plt is None:
+    print("Plotting unavailable in this environment; returning table summary.")
+else:
+    plt.figure(figsize=(10, 6))
+    plt.hist(df['age'], bins=20)
+    plt.title('Age Distribution')
+```
+
+When plotting is available, just use `plt`:
 
 ```python
 plt.figure(figsize=(10, 6))
@@ -149,7 +164,9 @@ these paths when building reports.
 
 When `execute_python` returns an error, read the error type and retry:
 
-- `ModuleNotFoundError` → the package isn't available; use a different library
+- `ModuleNotFoundError` or `terminal_dependency_unavailable` → the package
+  isn't available; do not retry the same import/charting path. Use another
+  available library or return a text/table answer.
 - `NameError` → a variable from a previous call; re-query at the start
 - `ParserException` with `#` → Python comment inside a SQL string (see Phase 2)
 - `Execution timed out` → simplify the query or break into smaller steps
