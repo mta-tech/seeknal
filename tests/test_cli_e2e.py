@@ -11,6 +11,7 @@ import os
 import json
 import tempfile
 import shutil
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -21,6 +22,14 @@ from seeknal.cli.main import app
 
 
 runner = CliRunner()
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _assert_help_option(output: str, name: str) -> None:
+    plain = _ANSI_ESCAPE_RE.sub("", output)
+    compact = re.sub(r"[\s-]+", "", plain)
+    assert name.replace("-", "") in compact
 
 
 @pytest.fixture(scope="function")
@@ -290,8 +299,8 @@ class TestValidateFeaturesWorkflow:
         result = runner.invoke(app, ["validate-features", "--help"])
         assert result.exit_code == 0
         assert "Validate feature group data quality" in result.stdout
-        assert "--mode" in result.stdout
-        assert "--verbose" in result.stdout
+        _assert_help_option(result.stdout, "--mode")
+        _assert_help_option(result.stdout, "--verbose")
 
     def test_validate_features_mode_options(self):
         """Test that validate-features accepts both mode options."""
