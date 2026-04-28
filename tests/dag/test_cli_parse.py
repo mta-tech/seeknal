@@ -10,6 +10,21 @@ from seeknal.cli.main import app
 runner = CliRunner()
 
 
+def _write_source(project_dir: str | Path, name: str, table: str) -> None:
+    """Write a minimal project-layout source node for parse tests."""
+    sources_dir = Path(project_dir) / "seeknal" / "sources"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+    (sources_dir / f"{name}.yml").write_text(
+        f"""
+kind: source
+name: {name}
+description: Source {name}
+source: hive
+table: {table}
+"""
+    )
+
+
 class TestParseCommand:
     """Test the parse CLI command."""
 
@@ -22,14 +37,7 @@ class TestParseCommand:
     def test_parse_generates_manifest(self):
         """parse command generates manifest.json."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create a minimal common.yml
-            common_yml = Path(tmpdir) / "common.yml"
-            common_yml.write_text("""
-sources:
-  - id: traffic_day
-    source: hive
-    table: db.traffic
-""")
+            _write_source(tmpdir, "traffic_day", "db.traffic")
             result = runner.invoke(app, [
                 "parse",
                 "--project", "test_project",
@@ -46,13 +54,7 @@ sources:
     def test_parse_validates_dag(self):
         """parse command validates the DAG."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            common_yml = Path(tmpdir) / "common.yml"
-            common_yml.write_text("""
-sources:
-  - id: traffic_day
-    source: hive
-    table: db.traffic
-""")
+            _write_source(tmpdir, "traffic_day", "db.traffic")
             result = runner.invoke(app, [
                 "parse",
                 "--project", "test_project",
@@ -65,13 +67,7 @@ sources:
     def test_parse_outputs_json_format(self):
         """parse command can output JSON format."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            common_yml = Path(tmpdir) / "common.yml"
-            common_yml.write_text("""
-sources:
-  - id: traffic_day
-    source: hive
-    table: db.traffic
-""")
+            _write_source(tmpdir, "traffic_day", "db.traffic")
             result = runner.invoke(app, [
                 "parse",
                 "--project", "test_project",
@@ -84,16 +80,8 @@ sources:
     def test_parse_shows_node_count(self):
         """parse command shows the node count."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            common_yml = Path(tmpdir) / "common.yml"
-            common_yml.write_text("""
-sources:
-  - id: traffic_day
-    source: hive
-    table: db.traffic
-  - id: user_events
-    source: hive
-    table: db.events
-""")
+            _write_source(tmpdir, "traffic_day", "db.traffic")
+            _write_source(tmpdir, "user_events", "db.events")
             result = runner.invoke(app, [
                 "parse",
                 "--project", "test_project",
@@ -107,14 +95,7 @@ sources:
     def test_parse_shows_diff_when_manifest_exists(self):
         """parse command shows diff when previous manifest exists."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create initial common.yml with one source
-            common_yml = Path(tmpdir) / "common.yml"
-            common_yml.write_text("""
-sources:
-  - id: traffic_day
-    source: hive
-    table: db.traffic
-""")
+            _write_source(tmpdir, "traffic_day", "db.traffic")
             # First parse
             result1 = runner.invoke(app, [
                 "parse",
@@ -123,16 +104,8 @@ sources:
             ])
             assert result1.exit_code == 0
 
-            # Update common.yml with additional source
-            common_yml.write_text("""
-sources:
-  - id: traffic_day
-    source: hive
-    table: db.traffic
-  - id: user_events
-    source: hive
-    table: db.events
-""")
+            # Add another source for the second parse
+            _write_source(tmpdir, "user_events", "db.events")
             # Second parse - should show diff
             result2 = runner.invoke(app, [
                 "parse",
@@ -147,13 +120,7 @@ sources:
     def test_parse_no_diff_option_skips_comparison(self):
         """parse command with --no-diff skips manifest comparison."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            common_yml = Path(tmpdir) / "common.yml"
-            common_yml.write_text("""
-sources:
-  - id: traffic_day
-    source: hive
-    table: db.traffic
-""")
+            _write_source(tmpdir, "traffic_day", "db.traffic")
             # First parse
             runner.invoke(app, [
                 "parse",
@@ -162,15 +129,7 @@ sources:
             ])
 
             # Update and parse with --no-diff
-            common_yml.write_text("""
-sources:
-  - id: traffic_day
-    source: hive
-    table: db.traffic
-  - id: user_events
-    source: hive
-    table: db.events
-""")
+            _write_source(tmpdir, "user_events", "db.events")
             result = runner.invoke(app, [
                 "parse",
                 "--project", "test_project",

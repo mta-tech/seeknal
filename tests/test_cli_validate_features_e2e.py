@@ -522,7 +522,7 @@ class TestValidateFeaturesErrorHandling:
 
         # Should fail due to missing required argument
         assert result.exit_code != 0
-        assert "Missing argument" in result.stdout or "FEATURE_GROUP" in result.stdout
+        assert "Missing argument" in result.output or "FEATURE_GROUP" in result.output
 
 
 # =============================================================================

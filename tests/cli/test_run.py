@@ -369,8 +369,8 @@ inputs:
         result = runner.invoke(app, ["run"])
 
         assert result.exit_code == 1
-        # Missing dependencies trigger cycle detection during topological sort
-        assert "Cycle detected" in result.stdout or "cycle" in result.stdout.lower()
+        assert "non_existent" in result.stdout
+        assert "Failed" in result.stdout or "failed" in result.stdout.lower()
 
 
 class TestSeeknalRunProgressReporting:

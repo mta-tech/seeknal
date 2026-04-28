@@ -393,13 +393,13 @@ class DuckDBTask(Task):
             # Load from path and register as table
             table_name = "_input_table"
             rel = self.conn.sql(f"SELECT * FROM '{self.input['path']}'")
-            self.conn.register(table_name, rel.arrow())
+            self.conn.register(table_name, rel.arrow().read_all())
             return self.conn.table(table_name)
         elif "sql" in self.input:
             # Execute SQL and register as table
             table_name = "_input_table"
             rel = self.conn.sql(self.input["sql"])
-            self.conn.register(table_name, rel.arrow())
+            self.conn.register(table_name, rel.arrow().read_all())
             return self.conn.table(table_name)
         else:
             raise ValueError("Invalid input configuration")

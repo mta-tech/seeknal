@@ -22,6 +22,25 @@ except ImportError:
 # to avoid top-level import errors when seeknal is imported from system path
 
 
+def _duckdb_registerable_frame(df: Any) -> Any:
+    """Return a DuckDB-registerable DataFrame without changing values.
+
+    Pandas 3 can infer extension string dtypes named ``string``/``str``.
+    Older DuckDB registration paths used by the test matrix do not recognize
+    those dtype names, while plain object columns with the same values work.
+    """
+    if not hasattr(df, "dtypes"):
+        return df
+
+    converted = df
+    for col, dtype in df.dtypes.items():
+        if str(dtype) in {"string", "str"}:
+            if converted is df:
+                converted = df.copy()
+            converted[col] = converted[col].astype(object)
+    return converted
+
+
 @dataclass
 class PipelineContext:
     """Execution context passed to decorated pipeline functions.
@@ -296,6 +315,7 @@ class PipelineContext:
                 spine_copy = spine.copy()
                 if date_col in spine_copy.columns:
                     spine_copy[date_col] = _pd.to_datetime(spine_copy[date_col])
+                spine_copy = _duckdb_registerable_frame(spine_copy)
                 con.register("_pit_spine", spine_copy)
                 con.execute(
                     f"CREATE OR REPLACE VIEW _pit_features "

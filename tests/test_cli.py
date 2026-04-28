@@ -279,7 +279,7 @@ class TestCleanCommand:
             app, ["clean", "test_fg", "--before", "invalid"]
         )
         assert result.exit_code == 1
-        assert "Invalid date format" in result.stdout
+        assert "Invalid before date" in result.stdout
 
 
 class TestOutputFormatEnum:

@@ -75,12 +75,31 @@ class FeatureFrame:
         import duckdb
         import pandas as pd
 
+        def _duckdb_registerable(df: Any) -> Any:
+            """Normalize pandas extension string dtypes for DuckDB registration.
+
+            Pandas 3 can infer ``StringDtype``/``str`` columns that older DuckDB
+            registration paths do not recognize.  Converting those columns to
+            plain object keeps values unchanged and preserves compatibility.
+            """
+            if not hasattr(df, "dtypes"):
+                return df
+            converted = df
+            for col, dtype in df.dtypes.items():
+                dtype_name = str(dtype)
+                if dtype_name in {"string", "str"}:
+                    if converted is df:
+                        converted = df.copy()
+                    converted[col] = converted[col].astype(object)
+            return converted
+
         conn = duckdb.connect()
         try:
             # Prepare spine
             spine_copy = spine.copy()
             if date_col in spine_copy.columns:
                 spine_copy[date_col] = pd.to_datetime(spine_copy[date_col])
+            spine_copy = _duckdb_registerable(spine_copy)
             conn.register("spine", spine_copy)
 
             # Prepare features
@@ -89,6 +108,7 @@ class FeatureFrame:
                 features[self.event_time_col] = pd.to_datetime(
                     features[self.event_time_col]
                 )
+            features = _duckdb_registerable(features)
             conn.register("features", features)
 
             # Build PIT join SQL
@@ -152,10 +172,27 @@ class FeatureFrame:
             A plain pandas DataFrame with the latest feature row per entity key.
         """
         import duckdb
+        import pandas as pd
+
+        def _duckdb_registerable(df: Any) -> Any:
+            if not hasattr(df, "dtypes"):
+                return df
+            converted = df
+            for col, dtype in df.dtypes.items():
+                if str(dtype) in {"string", "str"}:
+                    if converted is df:
+                        converted = df.copy()
+                    converted[col] = converted[col].astype(object)
+            return converted
 
         conn = duckdb.connect()
         try:
-            conn.register("features", self._df)
+            features = self._df.copy()
+            if self.event_time_col in features.columns:
+                features[self.event_time_col] = pd.to_datetime(
+                    features[self.event_time_col]
+                )
+            conn.register("features", _duckdb_registerable(features))
             partition_cols = ", ".join(self.join_keys)
             query = f"""
             SELECT * FROM (

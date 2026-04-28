@@ -48,9 +48,9 @@ class TestProjectWorkflow:
         assert "initialized successfully" in result.stdout
 
         # Step 2: Verify directories were created
-        assert (tmp_path / "flows").exists()
-        assert (tmp_path / "entities").exists()
-        assert (tmp_path / "feature_groups").exists()
+        assert (tmp_path / "seeknal" / "sources").exists()
+        assert (tmp_path / "seeknal" / "transforms").exists()
+        assert (tmp_path / "seeknal" / "feature_groups").exists()
 
         # Step 3: Validate the setup
         result = runner.invoke(app, ["validate"])
@@ -305,7 +305,7 @@ class TestValidateFeaturesWorkflow:
         result = runner.invoke(app, ["validate-features"])
         # Should fail due to missing argument
         assert result.exit_code != 0
-        assert "Missing argument" in result.stdout or "FEATURE_GROUP" in result.stdout
+        assert "Missing argument" in result.output or "FEATURE_GROUP" in result.output
 
     def test_validate_features_appears_in_main_help(self):
         """Test that validate-features command appears in main help."""

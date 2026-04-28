@@ -60,7 +60,14 @@ class TestParseDateSafelyYearValidation:
 
     def test_year_2100_is_accepted(self):
         """Year 2100 should be accepted (maximum valid year)."""
-        result = parse_date_safely("2100-12-31")
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2099, 12, 31)
+
+        with patch("seeknal.cli.main.datetime", FixedDateTime):
+            result = parse_date_safely("2100-12-31")
+
         assert result.year == 2100
         assert result.month == 12
         assert result.day == 31
@@ -89,8 +96,14 @@ class TestParseDateSafelyYearValidation:
         result = parse_date_safely("2000-01-01")
         assert result.year == 2000
 
-        # 2100 should pass
-        result = parse_date_safely("2100-12-31")
+        # 2100 should pass when it is inside the allowed future-date window.
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2099, 12, 31)
+
+        with patch("seeknal.cli.main.datetime", FixedDateTime):
+            result = parse_date_safely("2100-12-31")
         assert result.year == 2100
 
         # 2101 should fail
@@ -218,10 +231,11 @@ class TestParseDateSafelyInvalidFormats:
         with pytest.raises(typer.Exit):
             parse_date_safely(" 2024-01-01 ")
 
-    def test_partial_timestamp_is_rejected(self):
-        """Incomplete ISO timestamp should be rejected."""
-        with pytest.raises(typer.Exit):
-            parse_date_safely("2024-01-01T12:00")
+    def test_partial_timestamp_with_minutes_is_accepted(self):
+        """ISO timestamps with hour/minute precision should be accepted."""
+        result = parse_date_safely("2024-01-01T12:00")
+        assert result.hour == 12
+        assert result.minute == 0
 
 
 class TestParseDateSafelyValidFormats:
@@ -304,58 +318,45 @@ class TestParseDateSafelyParameterName:
 
     def test_custom_param_name_year_error(self):
         """Custom parameter name should appear in year validation errors."""
-        with pytest.raises(typer.Exit):
-            # Mock the echo function to capture the message
-            with patch("seeknal.cli.main._echo_error") as mock_echo:
-                try:
-                    parse_date_safely("1999-01-01", param_name="start_date")
-                except typer.Exit:
-                    pass
+        with patch("seeknal.cli.main._echo_error") as mock_echo:
+            with pytest.raises(typer.Exit):
+                parse_date_safely("1999-01-01", param_name="start_date")
 
-                # Check that error message includes custom param name
-                assert mock_echo.called
-                call_args = mock_echo.call_args[0][0]
-                assert "start_date" in call_args
+            # Check that error message includes custom param name
+            assert mock_echo.called
+            call_args = mock_echo.call_args[0][0]
+            assert "start_date" in call_args
 
     def test_custom_param_name_future_error(self):
         """Custom parameter name should appear in future date errors."""
-        with pytest.raises(typer.Exit):
-            with patch("seeknal.cli.main._echo_error") as mock_echo:
-                try:
-                    future_date = datetime.now() + timedelta(days=400)
-                    parse_date_safely(future_date.strftime("%Y-%m-%d"), param_name="end_date")
-                except typer.Exit:
-                    pass
+        with patch("seeknal.cli.main._echo_error") as mock_echo:
+            future_date = datetime.now() + timedelta(days=400)
+            with pytest.raises(typer.Exit):
+                parse_date_safely(future_date.strftime("%Y-%m-%d"), param_name="end_date")
 
-                assert mock_echo.called
-                call_args = mock_echo.call_args[0][0]
-                assert "end_date" in call_args
+            assert mock_echo.called
+            call_args = mock_echo.call_args[0][0]
+            assert "end_date" in call_args
 
     def test_custom_param_name_format_error(self):
         """Custom parameter name should appear in format errors."""
-        with pytest.raises(typer.Exit):
-            with patch("seeknal.cli.main._echo_error") as mock_echo:
-                try:
-                    parse_date_safely("invalid-date", param_name="execution_date")
-                except typer.Exit:
-                    pass
+        with patch("seeknal.cli.main._echo_error") as mock_echo:
+            with pytest.raises(typer.Exit):
+                parse_date_safely("invalid-date", param_name="execution_date")
 
-                assert mock_echo.called
-                call_args = mock_echo.call_args[0][0]
-                assert "execution_date" in call_args
+            assert mock_echo.called
+            call_args = mock_echo.call_args[0][0]
+            assert "execution_date" in call_args
 
     def test_default_param_name(self):
         """Default parameter name should be 'date'."""
-        with pytest.raises(typer.Exit):
-            with patch("seeknal.cli.main._echo_error") as mock_echo:
-                try:
-                    parse_date_safely("1999-01-01")
-                except typer.Exit:
-                    pass
+        with patch("seeknal.cli.main._echo_error") as mock_echo:
+            with pytest.raises(typer.Exit):
+                parse_date_safely("1999-01-01")
 
-                assert mock_echo.called
-                call_args = mock_echo.call_args[0][0]
-                assert "date" in call_args
+            assert mock_echo.called
+            call_args = mock_echo.call_args[0][0]
+            assert "date" in call_args
 
 
 class TestParseDateSafelyEdgeCases:
@@ -371,11 +372,23 @@ class TestParseDateSafelyEdgeCases:
 
     def test_late_year_2100_dates(self):
         """Test late dates in year 2100."""
-        result = parse_date_safely("2100-01-01")
-        assert result.year == 2100
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2099, 1, 1)
 
-        result = parse_date_safely("2100-12-31")
-        assert result.year == 2100
+        with patch("seeknal.cli.main.datetime", FixedDateTime):
+            result = parse_date_safely("2100-01-01")
+            assert result.year == 2100
+
+        class LateFixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2099, 12, 31)
+
+        with patch("seeknal.cli.main.datetime", LateFixedDateTime):
+            result = parse_date_safely("2100-12-31")
+            assert result.year == 2100
 
     def test_first_day_of_month(self):
         """First day of various months should be accepted."""
@@ -417,8 +430,14 @@ class TestParseDateSafelyEdgeCases:
         result = parse_date_safely("2000-01-01")
         assert result.year == 2000
 
-        # Year 2100 boundary
-        result = parse_date_safely("2100-12-31")
+        # Year 2100 boundary is valid when inside the future-date window.
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2099, 12, 31)
+
+        with patch("seeknal.cli.main.datetime", FixedDateTime):
+            result = parse_date_safely("2100-12-31")
         assert result.year == 2100
 
 

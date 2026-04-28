@@ -146,8 +146,17 @@ class TestAtlasModuleAvailability:
     def test_check_atlas_installed(self):
         """Test that _check_atlas_installed returns correct status."""
         from seeknal.cli.atlas import _check_atlas_installed
-        # Since Atlas is installed in test env, should return True
-        assert _check_atlas_installed() == True
+        # Atlas is an optional integration; the default CI environment does not
+        # install the private atlas-data-platform package.  The helper should
+        # report the actual import availability instead of forcing the default
+        # test environment to include that extra.
+        try:
+            import atlas.seeknal  # noqa: F401
+            expected = True
+        except ImportError:
+            expected = False
+
+        assert _check_atlas_installed() is expected
 
     def test_helper_functions_exist(self):
         """Test that helper functions exist in atlas module."""

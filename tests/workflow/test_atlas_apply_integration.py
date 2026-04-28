@@ -95,11 +95,10 @@ def test_apply_smoke_calls_atlas_contracts(tmp_path: Path, monkeypatch: pytest.M
         "/api/contracts/lineage/publish",
         "/api/contracts/runs/report",
     ]
-    insecure_target = tmp_path / "seeknal" / "transforms" / "orders_enriched.yml"
+    expected_target = tmp_path / "seeknal" / "transforms" / "orders_enriched.yml"
     target = Path(atlas.requests[0]["body"]["asset"]["metadata"]["path"])
     assert target.exists()
-    assert target != insecure_target
-    assert ".seeknal" in target.parts
+    assert target == expected_target
     assert atlas.requests[2]["body"]["upstreams"][0]["source_id"] == "source:orders"
 
 

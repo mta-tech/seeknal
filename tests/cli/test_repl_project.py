@@ -253,6 +253,7 @@ def test_register_postgresql_no_profile(tmp_path, mock_duckdb):
 def test_register_iceberg_catalog(tmp_path, mock_duckdb):
     """Phase 3: Iceberg catalog from profiles.yml is attached."""
     from seeknal.cli.repl import REPL
+    (tmp_path / "profiles.yml").write_text("materialization: {}\n")
 
     profile_data = {
         "materialization": {
@@ -299,6 +300,7 @@ def test_register_iceberg_catalog(tmp_path, mock_duckdb):
 def test_register_iceberg_no_oauth2(tmp_path, mock_duckdb):
     """Phase 3: Iceberg attaches without OAuth2 token when not configured."""
     from seeknal.cli.repl import REPL
+    (tmp_path / "profiles.yml").write_text("materialization: {}\n")
 
     profile_data = {
         "materialization": {
@@ -358,6 +360,7 @@ def test_register_iceberg_attach_failure(tmp_path, mock_duckdb):
     """Phase 3: Iceberg attach failure is caught as warning."""
     import warnings
     from seeknal.cli.repl import REPL
+    (tmp_path / "profiles.yml").write_text("materialization: {}\n")
 
     profile_data = {
         "materialization": {

@@ -2613,7 +2613,7 @@ def list_resources(
                     typer.echo("No feature groups found.")
                 else:
                     headers = ["Name", "Description", "Version"]
-                    data = [[fg.name, fg.description or "", fg.version or 1]
+                    data = [[fg.name, fg.description or "", getattr(fg, "version", 1) or 1]
                             for fg in feature_groups]
                     typer.echo(tabulate(data, headers=headers, tablefmt="simple"))
             case ResourceType.OFFLINE_STORES:

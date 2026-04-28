@@ -19,7 +19,7 @@ def _make_request(auth_header: str | None = None) -> MagicMock:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def test_open_mode_allows_missing_header() -> None:

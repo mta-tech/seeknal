@@ -202,32 +202,28 @@ def test_phase_6():
 
 
 def test_complete_pipeline():
-    """Test complete pipeline with real project data."""
+    """Test complete pipeline with compact deterministic data."""
     print("\n" + "=" * 60)
     print("TESTING COMPLETE PIPELINE (ALL PHASES)")
     print("=" * 60)
 
-    parquet_path = "tests/data/poi_sample.parquet/part-00000-9590699e-c6c2-4709-b2e4-9b37e7d544d6-c000.parquet"
-
-    print(f"\nTesting with real data: {parquet_path}")
-    import os
-    if not os.path.exists(parquet_path):
-        print(f"⚠  File not found: {parquet_path}")
-        return
-
-    # Load data info
-    conn = duckdb.connect()
-    info = conn.sql(f"SELECT COUNT(*) as row_count FROM '{parquet}'").fetchone()
-    print(f"  Real data has {info[0]:,} rows")
+    input_table = pa.table(
+        {
+            "poi_name": ["alpha", "beta", None],
+            "latitude": [-6.2, -6.3, -6.4],
+            "longitude": ["106.8", "106.9", "107.0"],
+        }
+    )
+    print(f"\nTesting with {input_table.num_rows} in-memory rows")
 
     # Test with subset and multiple operations
     result = (
         DuckDBTask(name="complete_pipeline")
-        .add_input(path=parquet_path)
+        .add_input(dataframe=input_table)
         .add_sql("SELECT * FROM __THIS__ WHERE poi_name IS NOT NULL LIMIT 50")
         .add_filter_by_expr("latitude IS NOT NULL")
-        .add_new_column("CAST(longitude AS DOUBLE) AS lon_double", "longitude_db")
-        .select_columns(["poi_name", "latitude_db", "longitude_db", "lon_double"])
+        .add_new_column("CAST(longitude AS DOUBLE)", "longitude_db")
+        .select_columns(["poi_name", "latitude", "longitude_db"])
         .transform()
     )
 

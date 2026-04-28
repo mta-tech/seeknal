@@ -681,7 +681,11 @@ def _show_answer(console: Console, text: str) -> None:
     from rich.panel import Panel
 
     console.print(
-        Panel(Markdown(text.strip()), title="Answer", border_style="status.success")
+        Panel(
+            Markdown(text.strip()),
+            title="Answer",
+            border_style=console.get_style("status.success"),
+        )
     )
 
 

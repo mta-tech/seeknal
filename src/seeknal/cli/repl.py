@@ -895,7 +895,7 @@ Manage sources:
         has_content = False
 
         # Show auto-registered parquet views (in default catalog)
-        if self._registered_parquets > 0:
+        if getattr(self, "_registered_parquets", 0) > 0:
             try:
                 result = self.conn.execute(
                     "SELECT table_name FROM information_schema.tables "

@@ -294,27 +294,25 @@ def test_complete_pipeline():
 
     # Complex pipeline with real-world data
     import duckdb
+    from seeknal.tasks.duckdb import DuckDBTask
 
-    # Load existing project data
-    parquet_path = "tests/data/poi_sample.parquet/part-00000-9590699e-c6c2-4709-b2e4-9b37e7d544d6-c000.parquet"
-
-    if not Path(parquet_path).exists():
-        print("⚠  Skipping real data test (file not found)")
-        return
-
-    print(f"\nTesting with real data: {parquet_path}")
-    print(f"File size: {Path(parquet_path).stat().st_size / 1024:.1f} KB")
-
-    # Load and examine data
-    conn = duckdb.connect()
-    conn.sql(f"SELECT COUNT(*) as row_count, STRING_AGG(*, ', ') as columns FROM '{parquet_path}'").show()
+    # Use a compact in-memory dataset so the CI smoke test stays deterministic
+    # across DuckDB versions and does not depend on optional fixture files.
+    input_df = pa.table(
+        {
+            "poi_name": ["alpha", "beta", None],
+            "latitude": ["-6.2", "-6.3", "-6.4"],
+            "longitude_db": [106.8, 106.9, 107.0],
+        }
+    )
+    print(f"\nTesting with {len(input_df)} in-memory rows")
 
     result = (
         DuckDBTask(name="complete_pipeline")
-        .add_input(path=parquet_path)
+        .add_input(dataframe=input_df)
         .add_sql("SELECT * FROM __THIS__ LIMIT 100")
         .add_filter_by_expr("poi_name IS NOT NULL")
-        .add_new_column("CAST(latitude AS DOUBLE) AS lat_double", "latitude_db")
+        .add_new_column("CAST(latitude AS DOUBLE)", "latitude_db")
         .select_columns(["poi_name", "latitude_db", "longitude_db"])
         .transform()
     )
