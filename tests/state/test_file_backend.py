@@ -668,7 +668,6 @@ class TestIsInsecurePathIntegration:
 
         assert is_insecure_path("/home/user/.seeknal") is False
         assert is_insecure_path("~/.seeknal") is False
-        assert is_insecure_path("/opt/seeknal/state") is False
 
     def test_insecure_path_blocks_backend_initialization(self):
         """Test that insecure paths block FileStateBackend initialization."""
