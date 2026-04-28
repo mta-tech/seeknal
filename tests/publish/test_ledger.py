@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+import shutil
 from pathlib import Path
 
 import pytest
@@ -8,9 +9,13 @@ import pytest
 from seeknal.publish.ledger import LedgerEntry, append_entry, find_by_report_name, list_entries
 
 
-def _monkeypatch_ledger_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Redirect the ledger path to tmp_path by patching XDG_DATA_HOME."""
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+def _monkeypatch_ledger_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect the ledger path to a secure project-scoped temp directory."""
+    ledger_home = Path.cwd() / ".seeknal" / "test-tmp" / tmp_path.name
+    shutil.rmtree(ledger_home, ignore_errors=True)
+    ledger_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(ledger_home))
+    return ledger_home
 
 
 def _make_entry(
@@ -126,10 +131,10 @@ class TestCorruptLedger:
     def test_corrupt_ledger_returns_empty_with_warning(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        _monkeypatch_ledger_home(tmp_path, monkeypatch)
+        ledger_home = _monkeypatch_ledger_home(tmp_path, monkeypatch)
 
         # Write garbage YAML that cannot be parsed as a list
-        ledger_file = tmp_path / "seeknal" / "published_reports.yml"
+        ledger_file = ledger_home / "seeknal" / "published_reports.yml"
         ledger_file.parent.mkdir(parents=True, exist_ok=True)
         ledger_file.write_text(":::not valid yaml:::\n\t\t\tbad indent")
 
@@ -144,9 +149,9 @@ class TestCorruptLedger:
         assert any("ledger" in msg.lower() or "published_reports" in msg.lower() for msg in warning_messages)
 
     def test_non_list_yaml_returns_empty(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        _monkeypatch_ledger_home(tmp_path, monkeypatch)
+        ledger_home = _monkeypatch_ledger_home(tmp_path, monkeypatch)
 
-        ledger_file = tmp_path / "seeknal" / "published_reports.yml"
+        ledger_file = ledger_home / "seeknal" / "published_reports.yml"
         ledger_file.parent.mkdir(parents=True, exist_ok=True)
         # Valid YAML but not a list — _load_raw returns []
         ledger_file.write_text("key: value\nother: stuff\n")
