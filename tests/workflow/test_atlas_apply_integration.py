@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -70,9 +71,17 @@ def _write_draft(tmp_path: Path) -> Path:
     return draft
 
 
+def _secure_project_dir(tmp_path: Path) -> Path:
+    project_dir = Path.cwd() / ".seeknal" / "test-tmp" / tmp_path.name
+    shutil.rmtree(project_dir, ignore_errors=True)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    return project_dir
+
+
 def test_apply_smoke_calls_atlas_contracts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    draft = _write_draft(tmp_path)
-    monkeypatch.chdir(tmp_path)
+    project_dir = _secure_project_dir(tmp_path)
+    draft = _write_draft(project_dir)
+    monkeypatch.chdir(project_dir)
     monkeypatch.setattr("seeknal.workflow.apply.update_manifest", lambda _: True)
 
     with _atlas_stub(
@@ -95,7 +104,7 @@ def test_apply_smoke_calls_atlas_contracts(tmp_path: Path, monkeypatch: pytest.M
         "/api/contracts/lineage/publish",
         "/api/contracts/runs/report",
     ]
-    expected_target = tmp_path / "seeknal" / "transforms" / "orders_enriched.yml"
+    expected_target = project_dir / "seeknal" / "transforms" / "orders_enriched.yml"
     target = Path(atlas.requests[0]["body"]["asset"]["metadata"]["path"])
     assert target.exists()
     assert target == expected_target
@@ -103,8 +112,9 @@ def test_apply_smoke_calls_atlas_contracts(tmp_path: Path, monkeypatch: pytest.M
 
 
 def test_apply_stops_when_atlas_policy_denies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    draft = _write_draft(tmp_path)
-    monkeypatch.chdir(tmp_path)
+    project_dir = _secure_project_dir(tmp_path)
+    draft = _write_draft(project_dir)
+    monkeypatch.chdir(project_dir)
     monkeypatch.setattr("seeknal.workflow.apply.update_manifest", lambda _: True)
 
     with _atlas_stub(
@@ -119,7 +129,7 @@ def test_apply_stops_when_atlas_policy_denies(tmp_path: Path, monkeypatch: pytes
             apply_command(str(draft), force=False, no_parse=False)
 
     assert exc_info.value.exit_code == 1
-    assert not (tmp_path / "seeknal" / "transforms" / "orders_enriched.yml").exists()
+    assert not (project_dir / "seeknal" / "transforms" / "orders_enriched.yml").exists()
     assert [request["path"] for request in atlas.requests] == [
         "/api/contracts/policy-check",
         "/api/contracts/runs/report",
@@ -131,8 +141,9 @@ def test_apply_reports_failure_when_atlas_sync_breaks_after_local_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    draft = _write_draft(tmp_path)
-    monkeypatch.chdir(tmp_path)
+    project_dir = _secure_project_dir(tmp_path)
+    draft = _write_draft(project_dir)
+    monkeypatch.chdir(project_dir)
     monkeypatch.setattr("seeknal.workflow.apply.update_manifest", lambda _: True)
 
     with _atlas_stub(
@@ -162,8 +173,9 @@ def test_apply_reports_local_failure_after_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    draft = _write_draft(tmp_path)
-    monkeypatch.chdir(tmp_path)
+    project_dir = _secure_project_dir(tmp_path)
+    draft = _write_draft(project_dir)
+    monkeypatch.chdir(project_dir)
     monkeypatch.setattr("seeknal.workflow.apply.update_manifest", lambda _: True)
 
     def fail_move(*_args: Any, **_kwargs: Any) -> None:
