@@ -21,6 +21,21 @@ docker build -f docker/Dockerfile.worker -t seeknal-worker:local .
 docker build -f docker/Dockerfile.prefect -t seeknal-prefect:local .
 ```
 
+## Published images
+
+GitHub Actions publishes the worker image to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/<owner>/<repo>-worker:latest
+docker pull ghcr.io/<owner>/<repo>-worker:<seeknal-version>
+```
+
+For this repository, that resolves to:
+
+```bash
+docker pull ghcr.io/mta-tech/seeknal-worker:latest
+```
+
 ## Run gateway locally
 
 ```bash
