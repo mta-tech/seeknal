@@ -11,6 +11,7 @@ Tests the following new/updated commands:
 """
 
 import json
+import re
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -18,6 +19,14 @@ from typer.testing import CliRunner
 from seeknal.cli.main import app
 
 runner = CliRunner()
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _assert_help_option(output: str, name: str) -> None:
+    plain = _ANSI_ESCAPE_RE.sub("", output)
+    compact = re.sub(r"[\s-]+", "", plain)
+    assert name.replace("-", "") in compact
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +463,7 @@ class TestRunWithoutEnv:
         result = runner.invoke(app, ["run", "--help"])
 
         assert result.exit_code == 0
-        assert "--env" in result.output
+        _assert_help_option(result.output, "--env")
 
 
 # ---------------------------------------------------------------------------
