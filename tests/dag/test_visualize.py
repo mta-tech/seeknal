@@ -3,6 +3,7 @@
 import logging
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +23,15 @@ from seeknal.dag.visualize import (
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _project_tempdir():
+    """Create a temporary directory under the project for secure output-path tests."""
+    base_dir = Path.cwd() / ".seeknal" / "test-tmp"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=base_dir) as tmpdir:
+        yield tmpdir
 
 
 @pytest.fixture
@@ -601,7 +611,7 @@ class TestGenerateLineageHtml:
 
     def test_end_to_end(self, simple_manifest):
         """Full pipeline generates HTML file."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "target" / "lineage.html"
             result = generate_lineage_html(
                 manifest=simple_manifest,
@@ -625,7 +635,7 @@ class TestGenerateLineageHtml:
 
     def test_rejects_nonexistent_node(self, simple_manifest):
         """Raises error when focus_node not found in manifest."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             with pytest.raises(LineageVisualizationError, match="not found"):
                 generate_lineage_html(
                     manifest=simple_manifest,
@@ -636,7 +646,7 @@ class TestGenerateLineageHtml:
 
     def test_rejects_invalid_column(self, simple_manifest):
         """Raises error when focus_column not found on node."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             with pytest.raises(LineageVisualizationError, match="Column.*not found"):
                 generate_lineage_html(
                     manifest=simple_manifest,
@@ -648,7 +658,7 @@ class TestGenerateLineageHtml:
 
     def test_column_requires_node(self, simple_manifest):
         """Raises error when --column specified without node."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             with pytest.raises(LineageVisualizationError, match="requires a node"):
                 generate_lineage_html(
                     manifest=simple_manifest,
@@ -665,7 +675,7 @@ class TestGenerateLineageHtml:
                 id=f"node.n{i}", name=f"n{i}", node_type=NodeType.SOURCE,
             ))
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             with caplog.at_level(logging.WARNING):
                 generate_lineage_html(
                     manifest=m,
@@ -683,7 +693,7 @@ class TestGenerateLineageHtml:
                 id=f"node.n{i}", name=f"n{i}", node_type=NodeType.SOURCE,
             ))
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             with pytest.raises(LineageVisualizationError, match="limit: 500"):
                 generate_lineage_html(
                     manifest=m,
@@ -693,7 +703,7 @@ class TestGenerateLineageHtml:
 
     def test_ssh_skips_browser(self, simple_manifest):
         """SSH session detection skips browser open."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "lineage.html"
             with patch.dict(os.environ, {"SSH_CONNECTION": "1.2.3.4 5678 9.10.11.12 22"}):
                 with patch("seeknal.dag.visualize.webbrowser.open") as mock_open:
@@ -706,7 +716,7 @@ class TestGenerateLineageHtml:
 
     def test_opens_browser_when_not_ssh(self, simple_manifest):
         """Browser opens when not in SSH session and open_browser=True."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "lineage.html"
             env = os.environ.copy()
             env.pop("SSH_CONNECTION", None)
@@ -721,7 +731,7 @@ class TestGenerateLineageHtml:
 
     def test_no_browser_when_disabled(self, simple_manifest):
         """Browser does not open when open_browser=False."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "lineage.html"
             with patch("seeknal.dag.visualize.webbrowser.open") as mock_open:
                 generate_lineage_html(
@@ -733,7 +743,7 @@ class TestGenerateLineageHtml:
 
     def test_focus_node_filters_output(self, simple_manifest):
         """Focus node produces filtered output with only connected nodes."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "lineage.html"
             generate_lineage_html(
                 manifest=simple_manifest,
@@ -747,7 +757,7 @@ class TestGenerateLineageHtml:
 
     def test_valid_column_accepted(self, simple_manifest):
         """Valid column on node is accepted without error."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             output = Path(tmpdir) / "lineage.html"
             # source.orders has "order_id" column
             result = generate_lineage_html(
@@ -761,7 +771,7 @@ class TestGenerateLineageHtml:
 
     def test_error_message_includes_available_nodes(self, simple_manifest):
         """Error for nonexistent node lists available nodes."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             with pytest.raises(LineageVisualizationError) as exc_info:
                 generate_lineage_html(
                     manifest=simple_manifest,
@@ -774,7 +784,7 @@ class TestGenerateLineageHtml:
 
     def test_error_message_includes_available_columns(self, simple_manifest):
         """Error for nonexistent column lists available columns."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _project_tempdir() as tmpdir:
             with pytest.raises(LineageVisualizationError) as exc_info:
                 generate_lineage_html(
                     manifest=simple_manifest,
