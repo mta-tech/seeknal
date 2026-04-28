@@ -10,6 +10,7 @@ Tests the YAML pipeline execution functionality including:
 """
 
 import json
+import re
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, Mock
@@ -17,6 +18,15 @@ from typer.testing import CliRunner
 from seeknal.cli.main import app
 
 runner = CliRunner()
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _assert_help_option(output: str, name: str) -> None:
+    plain = _ANSI_ESCAPE_RE.sub("", output)
+    compact = re.sub(r"[\s-]+", "", plain)
+    assert name.replace("-", "") in compact
 
 
 @pytest.fixture
@@ -506,13 +516,13 @@ class TestSeeknalRunHelp:
         result = runner.invoke(app, ["run", "--help"])
 
         assert result.exit_code == 0
-        assert "--full" in result.stdout
-        assert "--nodes" in result.stdout
-        assert "--types" in result.stdout
-        assert "--show-plan" in result.stdout
-        assert "--dry-run" in result.stdout
-        assert "--continue-on-error" in result.stdout
-        assert "--retry" in result.stdout
+        _assert_help_option(result.stdout, "full")
+        _assert_help_option(result.stdout, "nodes")
+        _assert_help_option(result.stdout, "types")
+        _assert_help_option(result.stdout, "show-plan")
+        _assert_help_option(result.stdout, "dry-run")
+        _assert_help_option(result.stdout, "continue-on-error")
+        _assert_help_option(result.stdout, "retry")
 
     def test_run_help_shows_examples(self):
         """Test --help shows usage examples."""
