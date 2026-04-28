@@ -5,11 +5,22 @@ Tests the --tags and --exclude-tags options on the plan command
 (production diff mode only).
 """
 
+import re
+
 import pytest
 from typer.testing import CliRunner
 from seeknal.cli.main import app
 
 runner = CliRunner()
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _assert_help_option(output: str, name: str) -> None:
+    plain = _ANSI_ESCAPE_RE.sub("", output)
+    compact = re.sub(r"[\s-]+", "", plain)
+    assert name.replace("-", "") in compact
 
 
 @pytest.fixture
@@ -157,5 +168,5 @@ params:
         result = runner.invoke(app, ["plan", "--help"])
 
         assert result.exit_code == 0
-        assert "--tags" in result.stdout
-        assert "--exclude-tags" in result.stdout
+        _assert_help_option(result.stdout, "tags")
+        _assert_help_option(result.stdout, "exclude-tags")
