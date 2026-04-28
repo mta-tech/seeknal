@@ -37,16 +37,18 @@ def _pyspark_available() -> bool:
     return importlib.util.find_spec("pyspark") is not None
 
 
-def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool:
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
     """Skip Spark-only test modules when the spark extra is not installed."""
     if _pyspark_available():
-        return False
+        return None
 
     rel_path = Path(os.path.relpath(collection_path, Path(__file__).parent.parent))
-    return any(
+    if any(
         rel_path == spark_path or spark_path in rel_path.parents
         for spark_path in _SPARK_REQUIRED_COLLECTIONS
-    )
+    ):
+        return True
+    return None
 
 
 def quiet():
