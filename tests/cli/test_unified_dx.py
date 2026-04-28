@@ -783,7 +783,7 @@ class TestAutoParallelHint:
 
         assert result.exit_code == 0
         assert "Tip" in result.output
-        assert "--parallel" in result.output
+        _assert_help_option(result.output, "--parallel")
 
     def test_parallel_hint_not_shown_when_parallel_flag_set(self, tmp_path, monkeypatch):
         """When --parallel is already set, no hint should appear."""
@@ -880,7 +880,7 @@ class TestInitOutput:
         result = runner.invoke(app, ["init", "--name", "test_proj"])
 
         assert result.exit_code == 0
-        assert "--parallel" in result.output
+        _assert_help_option(result.output, "--parallel")
 
 
 # ---------------------------------------------------------------------------
@@ -978,4 +978,4 @@ class TestHelpDocumentation:
         result = runner.invoke(app, ["run", "--help"])
 
         assert result.exit_code == 0
-        assert "--env" in result.output
+        _assert_help_option(result.output, "--env")
