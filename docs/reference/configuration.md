@@ -451,6 +451,10 @@ Performance and safety-related fields:
 | `sql_timeout_seconds` | integer | `60` | Hard timeout for `execute_sql`; use `0` to disable |
 | `discovery_cache_ttl_seconds` | integer | `300` | Per-session TTL for table/schema discovery cache; use `0` to disable |
 
+Advanced agent-runtime fields live under `agent_harness`. They map to
+pydantic-deep features and are optional; omit the section unless a project
+needs to tune context, cost, hooks, planning, or delegation behavior.
+
 Example:
 
 ```yaml
@@ -459,6 +463,40 @@ mode:
 
 sql_timeout_seconds: 60
 discovery_cache_ttl_seconds: 300
+
+agent_harness:
+  auto_summarization:
+    enabled: true
+    context_manager: auto      # auto = full mode on, read-only analysis mode off
+    context_manager_max_tokens: 128000
+    eviction_token_limit: 20000
+    patch_tool_calls: true
+    microcompact:
+      enabled: true
+      keep_recent_turns_analysis: 2
+      keep_recent_turns_full: 3
+    sql_result_compactor:
+      enabled: true
+      min_chars_analysis: 250
+      min_chars_full: 500
+  cost_tracking:
+    enabled: true
+    budget_usd: null
+  hooks:
+    enabled: true
+    sql_security: true
+    sql_self_correction: true
+  plan:
+    enabled: auto              # auto = interactive full mode only
+    plans_dir: .seeknal/plans
+  stuck_loop_detection:
+    enabled: true
+  subagents:
+    enabled: auto              # auto = full mode on, read-only analysis mode off
+    include_builtin: true
+    lineage_investigator: true
+  teams:
+    enabled: false             # opt-in; higher cost/concurrency surface
 
 sources:
   warehouse:

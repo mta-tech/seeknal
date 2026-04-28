@@ -141,6 +141,7 @@ For editable installs (`pip install -e .`), set `SEEKNAL_TUI_BINARY_PATH` to you
 ```bash
 seeknal report-server start             # Host published reports
 seeknal gateway start                   # Expose ask as an API (WebSocket/SSE/REST)
+seeknal gateway worker --gateway-url http://gateway:8000 --api-token "$SEEKNAL_API_TOKEN"  # Token-routed Temporal worker
 ```
 
 Supports Google Gemini (default), OpenAI-compatible providers, Anthropic-compatible providers, and Ollama (local). Use `--provider ollama` for fully local, private analysis.

@@ -57,6 +57,64 @@ def get_agent_settings(config: dict[str, Any]) -> dict[str, Any]:
     return agent if isinstance(agent, dict) else {}
 
 
+def _get_mapping(config: dict[str, Any], key: str) -> dict[str, Any]:
+    """Return a nested mapping, or ``{}`` when the section is absent/invalid."""
+    value = config.get(key, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    """Coerce common YAML/env string booleans while preserving safe defaults."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return default
+
+
+def _coerce_int(value: Any, default: int | None) -> int | None:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _coerce_float(value: Any, default: float | None) -> float | None:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _coerce_auto_bool(value: Any, default: str | bool = "auto") -> str | bool:
+    """Return ``"auto"`` or a concrete boolean for tri-state settings."""
+    if value is None:
+        return default
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return default
+
+
 def get_agent_profile_instructions(config: dict[str, Any]) -> Optional[str]:
     """Build dynamic prompt instructions from the ``agent`` section."""
     agent = get_agent_settings(config)
@@ -249,6 +307,110 @@ def get_background_threshold(config: dict[str, Any]) -> int:
         return threshold if threshold > 0 else _DEFAULT_BACKGROUND_THRESHOLD
     except (TypeError, ValueError):
         return _DEFAULT_BACKGROUND_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# pydantic-deep agent harness configuration
+# ---------------------------------------------------------------------------
+
+_DEFAULT_HARNESS_SECTION = "agent_harness"
+
+
+def get_agent_harness_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Return optional low-level pydantic-deep harness settings.
+
+    The ``agent_harness`` section exposes framework/runtime controls without
+    mixing them into the business-facing ``agent`` profile. Missing or invalid
+    values intentionally fall back to the historical Seeknal Ask behavior.
+    """
+    return _get_mapping(config, _DEFAULT_HARNESS_SECTION)
+
+
+def get_auto_summarization_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized auto-summarization/context-management config."""
+    harness = get_agent_harness_settings(config)
+    section = _get_mapping(harness, "auto_summarization")
+    microcompact = _get_mapping(section, "microcompact")
+    sql_compactor = _get_mapping(section, "sql_result_compactor")
+
+    return {
+        "enabled": _coerce_bool(section.get("enabled"), True),
+        "context_manager": _coerce_auto_bool(section.get("context_manager"), "auto"),
+        "context_manager_max_tokens": _coerce_int(
+            section.get("context_manager_max_tokens"), None
+        ),
+        "summarization_model": section.get("summarization_model") or None,
+        "eviction_token_limit": _coerce_int(section.get("eviction_token_limit"), 20000),
+        "patch_tool_calls": _coerce_bool(section.get("patch_tool_calls"), True),
+        "microcompact": {
+            "enabled": _coerce_bool(microcompact.get("enabled"), True),
+            "keep_recent_turns_analysis": _coerce_int(
+                microcompact.get("keep_recent_turns_analysis"), 2
+            ),
+            "keep_recent_turns_full": _coerce_int(
+                microcompact.get("keep_recent_turns_full"), 3
+            ),
+        },
+        "sql_result_compactor": {
+            "enabled": _coerce_bool(sql_compactor.get("enabled"), True),
+            "min_chars_analysis": _coerce_int(
+                sql_compactor.get("min_chars_analysis"), 250
+            ),
+            "min_chars_full": _coerce_int(sql_compactor.get("min_chars_full"), 500),
+        },
+    }
+
+
+def get_cost_tracking_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized pydantic-deep cost tracking config."""
+    section = _get_mapping(get_agent_harness_settings(config), "cost_tracking")
+    return {
+        "enabled": _coerce_bool(section.get("enabled"), True),
+        "budget_usd": _coerce_float(section.get("budget_usd"), None),
+    }
+
+
+def get_hooks_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized pydantic-deep hook enablement config."""
+    section = _get_mapping(get_agent_harness_settings(config), "hooks")
+    return {
+        "enabled": _coerce_bool(section.get("enabled"), True),
+        "sql_security": _coerce_bool(section.get("sql_security"), True),
+        "sql_self_correction": _coerce_bool(section.get("sql_self_correction"), True),
+    }
+
+
+def get_plan_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized plan-mode config for pydantic-deep."""
+    section = _get_mapping(get_agent_harness_settings(config), "plan")
+    return {
+        "enabled": _coerce_auto_bool(section.get("enabled"), "auto"),
+        "plans_dir": str(section.get("plans_dir") or ".seeknal/plans"),
+    }
+
+
+def get_stuck_loop_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized stuck-loop detection config."""
+    section = _get_mapping(get_agent_harness_settings(config), "stuck_loop_detection")
+    return {"enabled": _coerce_bool(section.get("enabled"), True)}
+
+
+def get_subagents_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized parent-child subagent config."""
+    section = _get_mapping(get_agent_harness_settings(config), "subagents")
+    return {
+        "enabled": _coerce_auto_bool(section.get("enabled"), "auto"),
+        "include_builtin": _coerce_bool(section.get("include_builtin"), True),
+        "lineage_investigator": _coerce_bool(
+            section.get("lineage_investigator"), True
+        ),
+    }
+
+
+def get_teams_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized pydantic-deep TeamCapability config."""
+    section = _get_mapping(get_agent_harness_settings(config), "teams")
+    return {"enabled": _coerce_bool(section.get("enabled"), False)}
 
 
 # ---------------------------------------------------------------------------

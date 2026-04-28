@@ -138,7 +138,9 @@ def test_sql_pair_list_matches_natural_query_against_full_pair_text(tmp_path: Pa
     assert "bpom_rpo_jumlah_permohonan_bulanan.yml" in listed
 
 
-def test_execute_sql_pair_runs_stored_sql_once(tmp_path: Path):
+def test_execute_sql_pair_runs_stored_sql_once_as_non_authoritative_by_default(
+    tmp_path: Path,
+):
     repl = _set_ctx(tmp_path)
     pair = tmp_path / "seeknal/sql_pairs/answer.yml"
     pair.parent.mkdir(parents=True)
@@ -150,6 +152,29 @@ def test_execute_sql_pair_runs_stored_sql_once(tmp_path: Path):
     )
 
     out = execute_sql_pair("answer")
+
+    assert "# Executed SQL pair: seeknal/sql_pairs/answer.yml" in out
+    assert "SQL_PAIR_RESULT" in out
+    assert "AUTHORITATIVE_RESULT" not in out
+    assert "| answer |" in out
+    assert "42" in out
+    assert repl.calls == ["SELECT 42 AS answer"]
+    assert get_authoritative_sql_pair_result() is None
+    assert not should_synthesize_after_authoritative_sql_pair()
+
+
+def test_execute_sql_pair_can_mark_exact_match_authoritative(tmp_path: Path):
+    repl = _set_ctx(tmp_path)
+    pair = tmp_path / "seeknal/sql_pairs/answer.yml"
+    pair.parent.mkdir(parents=True)
+    pair.write_text(
+        "name: answer\n"
+        "prompt: What is the answer?\n"
+        "sql: |\n"
+        "  SELECT 42 AS answer\n"
+    )
+
+    out = execute_sql_pair("answer", authoritative=True)
 
     assert "# Executed SQL pair: seeknal/sql_pairs/answer.yml" in out
     assert "AUTHORITATIVE_RESULT" in out

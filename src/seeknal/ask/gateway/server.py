@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import json
 import re
 import time
@@ -25,6 +26,14 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from seeknal.ask.gateway.auth import (
+    TokenAuthError,
+    TokenPrincipal,
+    TokenRegistry,
+    WorkerRuntimeConfig,
+    extract_api_token,
+    load_token_registry,
+)
 from seeknal.ask.gateway.pairing import (
     FilePairingStore,
     PublicSessionStore,
@@ -218,17 +227,71 @@ def _gateway_tool_stop_reason(tool_name: str) -> str | None:
     return None
 
 
-def _safe_resolve_tenant(request: Request) -> tuple[str, JSONResponse | None]:
-    """Resolve tenant from a request, returning (tenant_id, error_response).
+@dataclass(frozen=True)
+class AuthContext:
+    """Resolved request authorization context."""
 
-    On success: ``(tenant_id, None)``.
-    On invalid format: ``(DEFAULT_TENANT, 400 JSONResponse)`` — callers
-    must check the error response before using the tenant_id.
+    tenant_id: str
+    principal: TokenPrincipal | None = None
+
+
+def _token_registry_from_state(app_state: Any) -> TokenRegistry | None:
+    registry = getattr(app_state, "token_registry", None)
+    if isinstance(registry, TokenRegistry) and registry.enabled:
+        return registry
+    return None
+
+
+def _safe_auth_context(request: Request) -> tuple[AuthContext, JSONResponse | None]:
+    """Resolve tenant/auth context for a request.
+
+    Compatibility mode (no token registry): preserve legacy tenant resolution
+    from X-Tenant-ID / ?tenant= / default.
+
+    Token mode: require a valid API token and derive tenant from that token,
+    ignoring user-supplied tenant headers/query values for isolation.
     """
+    registry = _token_registry_from_state(request.app.state)
+    if registry is not None:
+        try:
+            principal = registry.resolve(extract_api_token(request))
+        except TokenAuthError as exc:
+            return AuthContext(DEFAULT_TENANT), JSONResponse(
+                {"error": str(exc)}, status_code=401
+            )
+        return AuthContext(principal.tenant_id, principal), None
+
     try:
-        return resolve_tenant(request), None
+        return AuthContext(resolve_tenant(request)), None
     except InvalidTenantError as exc:
-        return DEFAULT_TENANT, JSONResponse({"error": str(exc)}, status_code=400)
+        return AuthContext(DEFAULT_TENANT), JSONResponse(
+            {"error": str(exc)}, status_code=400
+        )
+
+
+def _safe_resolve_tenant(request: Request) -> tuple[str, JSONResponse | None]:
+    """Resolve tenant from a request, returning (tenant_id, error_response)."""
+    auth, err = _safe_auth_context(request)
+    return auth.tenant_id, err
+
+
+def _safe_auth_context_ws(websocket: WebSocket) -> tuple[AuthContext, str | None]:
+    """Resolve auth context for WebSocket routes.
+
+    Returns (context, close_reason). ``close_reason`` is None on success.
+    """
+    registry = _token_registry_from_state(websocket.app.state)
+    if registry is not None:
+        try:
+            principal = registry.resolve(extract_api_token(websocket))
+        except TokenAuthError as exc:
+            return AuthContext(DEFAULT_TENANT), str(exc)
+        return AuthContext(principal.tenant_id, principal), None
+
+    try:
+        return AuthContext(resolve_tenant_ws(websocket)), None
+    except InvalidTenantError as exc:
+        return AuthContext(DEFAULT_TENANT), str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -714,11 +777,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.close(code=4000, reason="invalid session_id")
         return
 
-    try:
-        tenant_id = resolve_tenant_ws(websocket)
-    except InvalidTenantError as exc:
-        await websocket.close(code=4001, reason=str(exc))
+    auth, auth_error = _safe_auth_context_ws(websocket)
+    if auth_error:
+        await websocket.close(code=4001, reason=auth_error)
         return
+    tenant_id = auth.tenant_id
 
     await websocket.accept()
     project_path = Path(websocket.app.state.project_path)
@@ -935,9 +998,10 @@ async def temporal_start(request: Request) -> JSONResponse:
             status_code=503,
         )
 
-    tenant_id, err = _safe_resolve_tenant(request)
+    auth, err = _safe_auth_context(request)
     if err:
         return err
+    tenant_id = auth.tenant_id
 
     body = await request.json()
     question = body.get("question", "")
@@ -949,30 +1013,53 @@ async def temporal_start(request: Request) -> JSONResponse:
 
     from seeknal.ask.gateway.temporal import AgentWorkflowInput, AgentWorkflow
 
-    # Project path: request body > worker_project_path > app config
-    project_path = str(
-        body.get("project_path")
-        or getattr(request.app.state, "worker_project_path", None)
-        or request.app.state.project_path
-    )
+    token_mode = auth.principal is not None
+    if token_mode and any(
+        key in body for key in ("task_queue", "project_path", "push_url", "api_key")
+    ):
+        return JSONResponse(
+            {
+                "error": (
+                    "task_queue/project_path/push_url/api_key overrides are "
+                    "not allowed in token mode"
+                )
+            },
+            status_code=403,
+        )
 
-    # Push URL: request body > app config (allows external services to override SSE delivery)
-    push_url = (
-        body.get("push_url")
-        or getattr(request.app.state, "callback_base_url", None)
-    )
-    api_key = (
-        body.get("api_key")
-        or getattr(request.app.state, "callback_auth_token", None)
-    )
-
-    # Task queue: request body override > tenant-derived > app config fallback.
-    # Tenant routing is the normal path; the body.task_queue override is an
-    # escape hatch for internal clients that want to bypass it.
-    task_queue = (
-        body.get("task_queue")
-        or task_queue_for_tenant(tenant_id)
-    )
+    if auth.principal is not None:
+        # Token mode: tenant, queue, callback and optional project path are
+        # derived from the authenticated token record. User-supplied headers,
+        # query params, and body overrides cannot steer work into another tenant.
+        project_path = str(
+            auth.principal.project_path
+            or getattr(request.app.state, "worker_project_path", None)
+            or request.app.state.project_path
+        )
+        push_url = auth.principal.callback_url or getattr(
+            request.app.state, "callback_base_url", None
+        )
+        api_key = auth.principal.callback_bearer_token
+        task_queue = auth.principal.task_queue
+    else:
+        # Compatibility mode: preserve legacy trusted-local behavior.
+        project_path = str(
+            body.get("project_path")
+            or getattr(request.app.state, "worker_project_path", None)
+            or request.app.state.project_path
+        )
+        push_url = (
+            body.get("push_url")
+            or getattr(request.app.state, "callback_base_url", None)
+        )
+        api_key = (
+            body.get("api_key")
+            or getattr(request.app.state, "callback_auth_token", None)
+        )
+        task_queue = (
+            body.get("task_queue")
+            or task_queue_for_tenant(tenant_id)
+        )
     workflow_id = make_workflow_id(tenant_id, session_id)
 
     client = request.app.state.temporal_client
@@ -1181,28 +1268,36 @@ async def post_record(request: Request) -> JSONResponse:
 
 
 async def publish_event_callback(request: Request) -> JSONResponse:
-    """Receive streaming chunk from on-prem worker and publish to SSE.
+    """Receive streaming chunk from an on-prem worker and publish to SSE.
 
-    Called by the on-prem Temporal worker via HTTP POST for each streaming
-    event (token, tool_start, tool_end, answer, done).
-    Authenticated via shared secret (CALLBACK_AUTH_TOKEN env var).
-    The worker sets ``X-Tenant-ID`` so events route to the right
-    tenant-scoped subscribers.
+    In token mode the callback bearer token is resolved through the API token
+    registry, so tenant routing is derived from the token instead of
+    caller-provided X-Tenant-ID. In compatibility mode the legacy shared
+    CALLBACK_AUTH_TOKEN + X-Tenant-ID path is preserved.
     """
-    # Authenticate callback request
-    expected_token = getattr(request.app.state, "callback_auth_token", None)
-    if expected_token:
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer ") or auth_header[7:] != expected_token:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    registry = _token_registry_from_state(request.app.state)
+    if registry is not None:
+        try:
+            principal = registry.resolve_callback(extract_api_token(request))
+        except TokenAuthError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=401)
+        tenant_id = principal.tenant_id
+    else:
+        expected_token = getattr(request.app.state, "callback_auth_token", None)
+        if expected_token:
+            auth_header = request.headers.get("Authorization", "")
+            if (
+                not auth_header.startswith("Bearer ")
+                or auth_header[7:] != expected_token
+            ):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+        tenant_id, err = _safe_resolve_tenant(request)
+        if err:
+            return err
 
     session_id = request.path_params["session_id"]
     if not _validate_session_id(session_id):
         return JSONResponse({"error": "invalid session_id"}, status_code=400)
-
-    tenant_id, err = _safe_resolve_tenant(request)
-    if err:
-        return err
 
     body = await request.json()
     event_json = json.dumps(body)
@@ -1213,6 +1308,51 @@ async def publish_event_callback(request: Request) -> JSONResponse:
     return JSONResponse({"status": "published"})
 
 
+async def worker_config(request: Request) -> JSONResponse:
+    """Return token-derived runtime config for a standalone worker.
+
+    Secure deployments start workers with only gateway URL + API token. This
+    endpoint maps the token to tenant queue, callback credentials, and optional
+    Temporal connection settings. When no token registry is configured, it
+    returns legacy default settings for local compatibility.
+    """
+    registry = _token_registry_from_state(request.app.state)
+    if registry is not None:
+        try:
+            cfg = registry.worker_config_for(
+                extract_api_token(request),
+                default_callback_url=getattr(
+                    request.app.state, "callback_base_url", None
+                ),
+                default_temporal_address=getattr(
+                    request.app.state, "temporal_address", None
+                ),
+                default_temporal_namespace=getattr(
+                    request.app.state, "temporal_namespace", None
+                ),
+                default_project_path=getattr(
+                    request.app.state, "worker_project_path", None
+                ),
+            )
+        except TokenAuthError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=401)
+        return JSONResponse(cfg.public_dict())
+
+    tenant_id, err = _safe_resolve_tenant(request)
+    if err:
+        return err
+    cfg = WorkerRuntimeConfig(
+        tenant_id=tenant_id,
+        task_queue=task_queue_for_tenant(tenant_id),
+        callback_url=getattr(request.app.state, "callback_base_url", None),
+        callback_auth_token=getattr(request.app.state, "callback_auth_token", None),
+        temporal_address=getattr(request.app.state, "temporal_address", None),
+        temporal_namespace=getattr(request.app.state, "temporal_namespace", None),
+        project_path=getattr(request.app.state, "worker_project_path", None),
+    )
+    return JSONResponse(cfg.public_dict())
+
+
 def create_gateway_app(
     project_path: str | Path | None = None,
     lifespan: Callable | None = None,
@@ -1221,6 +1361,10 @@ def create_gateway_app(
     callback_base_url: str | None = None,
     callback_auth_token: str | None = None,
     sessions_dir: str | Path | None = None,
+    token_registry: TokenRegistry | None = None,
+    token_config: str | Path | None = None,
+    temporal_address: str | None = None,
+    temporal_namespace: str | None = None,
 ) -> Starlette:
     """Create the Starlette ASGI application.
 
@@ -1237,6 +1381,13 @@ def create_gateway_app(
         sessions_dir: Optional direct path for session storage. When set,
             session files go here instead of ``<project>/.seeknal/sessions/``.
             Used in backend mode where no project is available.
+        token_registry: Optional preloaded API-token registry. When enabled,
+            tenant/queue/callback routing is derived from bearer tokens.
+        token_config: Optional JSON/YAML token registry path. Ignored when
+            token_registry is provided.
+        temporal_address: Temporal address advertised to token-authenticated
+            workers through ``/internal/worker/config``.
+        temporal_namespace: Temporal namespace advertised to workers.
     """
     # Backend-only mode: no project_path means no in-process agent execution.
     # Only Temporal dispatch, SSE fan-out, and session listing work.
@@ -1256,6 +1407,7 @@ def create_gateway_app(
             publish_event_callback,
             methods=["POST"],
         ),
+        Route("/internal/worker/config", worker_config, methods=["GET"]),
     ]
 
     # In-process agent execution routes are only available when a project
@@ -1353,6 +1505,9 @@ def create_gateway_app(
         app.state.sessions_dir = None
     app.state.callback_base_url = callback_base_url
     app.state.callback_auth_token = callback_auth_token
+    app.state.token_registry = token_registry or load_token_registry(token_config)
+    app.state.temporal_address = temporal_address
+    app.state.temporal_namespace = temporal_namespace
     if temporal_client is not None:
         app.state.temporal_client = temporal_client
     return app

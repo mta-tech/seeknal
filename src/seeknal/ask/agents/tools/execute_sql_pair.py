@@ -15,16 +15,21 @@ def execute_sql_pair(
     name_or_path: str,
     limit: int = 100,
     refresh: bool = False,
+    authoritative: bool = False,
 ) -> str:
     """Load a SQL pair by name/path and execute its ``sql`` field.
 
     Use this when a relevant project-owned SQL pair exists. It avoids manual
     copy/paste drift: the SQL executed is exactly the SQL stored in the pair.
+    Set ``authoritative=True`` only when the pair's prompt, filters, and output
+    grain directly match the user's current question. Leave it false when the
+    pair is only a related example or partial match.
 
     Args:
         name_or_path: SQL-pair listed path, file name, or stem.
         limit: Maximum rows to return through ``execute_sql``.
         refresh: Re-run even when the same normalized SQL already succeeded.
+        authoritative: Stop-after-answer hint for exact/direct pair matches.
     """
     from seeknal.ask.agents.tools._context import (
         get_loaded_sql_pairs,
@@ -84,9 +89,10 @@ def execute_sql_pair(
     rel = target.relative_to(project_root).as_posix()
     pair_name = _pair_name(data, rel)
     mark_sql_pairs_checked(ctx)
-    get_loaded_sql_pairs(ctx)[pair_name] = sql
+    if authoritative:
+        get_loaded_sql_pairs(ctx)[pair_name] = sql
     result = execute_sql(sql=sql, limit=limit, refresh=refresh)
-    if _tool_succeeded(result):
+    if authoritative and _tool_succeeded(result):
         record_authoritative_sql_pair_result(
             name=pair_name,
             path=rel,
@@ -101,7 +107,14 @@ def execute_sql_pair(
             "post-query analysis.\n\n"
             + result
         )
-    return f"# Executed SQL pair: {rel}\n\n" + result
+    return (
+        f"# Executed SQL pair: {rel}\n\n"
+        "SQL_PAIR_RESULT: Treat this as trusted project-owned evidence. "
+        "If the user's question asks for a different grain, dimension, filter, "
+        "or deeper analysis than this pair returns, adapt the SQL or inspect "
+        "another pair instead of answering from this result alone.\n\n"
+        + result
+    )
 
 
 def _pair_name(data: dict[str, Any], fallback: str) -> str:

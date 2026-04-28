@@ -166,7 +166,7 @@ def test_create_agent_omits_ask_user_in_gateway_and_uses_analysis_for_connected_
         assert mock_deps.call_args[1]["ask_user"] is None
 
 
-def test_create_agent_omits_ask_user_in_interactive_analysis_mode(tmp_path: Path):
+def test_create_agent_includes_ask_user_in_interactive_analysis_mode(tmp_path: Path):
     from unittest.mock import MagicMock, patch
 
     (tmp_path / "seeknal_agent.yml").write_text(
@@ -209,8 +209,8 @@ def test_create_agent_omits_ask_user_in_interactive_analysis_mode(tmp_path: Path
 
         create_agent(project_path=tmp_path, environment="interactive")
 
-        mock_toolset.assert_called_once_with(mode="analysis", include_ask_user=False)
-        assert mock_deps.call_args[1]["ask_user"] is None
+        mock_toolset.assert_called_once_with(mode="analysis", include_ask_user=True)
+        assert mock_deps.call_args[1]["ask_user"] is not None
         assert mock_create.call_args[1]["include_memory"] is False
         assert mock_create.call_args[1]["include_todo"] is False
         assert mock_create.call_args[1]["include_subagents"] is False
@@ -224,3 +224,85 @@ def test_create_agent_omits_ask_user_in_interactive_analysis_mode(tmp_path: Path
         ]
         mock_micro.assert_called_once_with(keep_recent_turns=2)
         mock_sql.assert_called_once_with(min_chars=250)
+
+
+def test_create_agent_applies_agent_harness_config(tmp_path: Path):
+    from unittest.mock import MagicMock, patch
+
+    (tmp_path / "seeknal_agent.yml").write_text(
+        textwrap.dedent(
+            """\
+            agent_harness:
+              auto_summarization:
+                context_manager: false
+                context_manager_max_tokens: 128000
+                summarization_model: openai:gpt-4.1-mini
+                eviction_token_limit: 50000
+                patch_tool_calls: false
+                microcompact:
+                  keep_recent_turns_full: 5
+                sql_result_compactor:
+                  min_chars_full: 750
+              cost_tracking:
+                enabled: true
+                budget_usd: 2.5
+              hooks:
+                sql_self_correction: false
+              plan:
+                enabled: false
+                plans_dir: .seeknal/custom-plans
+              stuck_loop_detection:
+                enabled: false
+              subagents:
+                enabled: false
+              teams:
+                enabled: true
+            """
+        )
+    )
+
+    with (
+        patch("seeknal.cli.repl.REPL") as mock_repl_cls,
+        patch("seeknal.ask.security.configure_safe_connection"),
+        patch("seeknal.ask.modules.artifact_discovery.service.ArtifactDiscovery"),
+        patch(
+            "seeknal.ask.agents.providers.get_model_string", return_value="test:model"
+        ),
+        patch("seeknal.ask.agents.context_toolset.SeeknaContextToolset"),
+        patch("seeknal.ask.agents.tools.toolset.create_ask_toolset") as mock_toolset,
+        patch("seeknal.ask.processors.MicrocompactProcessor") as mock_micro,
+        patch("seeknal.ask.processors.SqlResultCompactor") as mock_sql,
+        patch("pydantic_deep.create_deep_agent") as mock_create,
+        patch("pydantic_deep.DeepAgentDeps") as mock_deps,
+    ):
+        mock_repl_cls.return_value = MagicMock(conn=MagicMock())
+        mock_toolset.return_value = MagicMock()
+        mock_create.return_value = MagicMock()
+        mock_deps.return_value = MagicMock()
+
+        from seeknal.ask.agents.agent import create_agent
+
+        create_agent(project_path=tmp_path, environment="interactive")
+
+        kwargs = mock_create.call_args[1]
+        assert kwargs["context_manager"] is False
+        assert kwargs["context_manager_max_tokens"] == 128000
+        assert kwargs["summarization_model"] == "openai:gpt-4.1-mini"
+        assert kwargs["eviction_token_limit"] == 50000
+        assert kwargs["patch_tool_calls"] is False
+        assert kwargs["include_plan"] is False
+        assert kwargs["plans_dir"] == ".seeknal/custom-plans"
+        assert kwargs["stuck_loop_detection"] is False
+        assert kwargs["include_subagents"] is False
+        assert kwargs["include_teams"] is False
+        assert kwargs["include_builtin_subagents"] is False
+        assert kwargs["cost_tracking"] is True
+        assert kwargs["cost_budget_usd"] == 2.5
+        assert len(kwargs["hooks"]) == 1
+        assert kwargs["hooks"][0].event.value == "pre_tool_use"
+        assert kwargs["history_processors"] == [
+            mock_micro.return_value,
+            mock_sql.return_value,
+        ]
+        mock_micro.assert_called_once_with(keep_recent_turns=5)
+        mock_sql.assert_called_once_with(min_chars=750)

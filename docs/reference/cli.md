@@ -2324,6 +2324,7 @@ seeknal gateway start [OPTIONS]
 | `--no-worker` | FLAG | False | Gateway-only mode (no local worker) |
 | `--max-activities` | INT | `15` | Max concurrent Temporal activities |
 | `--redis` | TEXT | None | Redis URL for multi-replica mode |
+| `--token-config` | PATH | `SEEKNAL_TOKEN_CONFIG` | JSON/YAML API token registry for tenant-scoped worker routing |
 
 ```bash
 # Basic local gateway
@@ -2346,7 +2347,7 @@ Runtime notes:
 
 ## seeknal gateway backend
 
-Start a cloud-only gateway without a local project. Use when the gateway runs on a separate machine from the data.
+Start a cloud-only gateway without a local project. Use when the gateway runs on a separate machine from the data. Configure `--token-config` to make bearer tokens authoritative for tenant queue routing, callbacks, sessions, and events.
 
 ```bash
 seeknal gateway backend [OPTIONS]
@@ -2364,7 +2365,11 @@ seeknal gateway worker [OPTIONS]
 |------|------|---------|-------------|
 | `--project` | PATH | Auto-detected | Project path |
 | `--callback-url` | TEXT | None | Gateway URL for event callbacks |
-| `--callback-auth-token` | TEXT | None | Shared secret for callback auth |
+| `--callback-auth-token` | TEXT | None | Shared secret for callback auth (legacy compatibility mode) |
+| `--gateway-url` | TEXT | `SEEKNAL_GATEWAY_URL` | Gateway URL for token-derived worker config bootstrap |
+| `--api-token` | TEXT | `SEEKNAL_API_TOKEN` | Worker API token used to fetch tenant queue/callback config |
+
+In token mode, the worker can start with `--gateway-url` and `--api-token`; it fetches `/internal/worker/config` and does not need a manually supplied Temporal queue.
 
 See [seeknal gateway CLI docs](../cli/gateway.md) for full details.
 

@@ -922,6 +922,43 @@ locale: {{}}
 sql_timeout_seconds: 60
 discovery_cache_ttl_seconds: 300
 
+# Optional low-level pydantic-deep harness controls. Defaults preserve the
+# standard Seeknal Ask behavior; tune these only when long conversations, cost
+# limits, hook behavior, planning, or delegation need project-specific policy.
+agent_harness:
+  auto_summarization:
+    enabled: true
+    context_manager: auto
+    context_manager_max_tokens:
+    eviction_token_limit: 20000
+    patch_tool_calls: true
+    microcompact:
+      enabled: true
+      keep_recent_turns_analysis: 2
+      keep_recent_turns_full: 3
+    sql_result_compactor:
+      enabled: true
+      min_chars_analysis: 250
+      min_chars_full: 500
+  cost_tracking:
+    enabled: true
+    budget_usd:
+  hooks:
+    enabled: true
+    sql_security: true
+    sql_self_correction: true
+  plan:
+    enabled: auto
+    plans_dir: .seeknal/plans
+  stuck_loop_detection:
+    enabled: true
+  subagents:
+    enabled: auto
+    include_builtin: true
+    lineage_investigator: true
+  teams:
+    enabled: false
+
 # Optional agent profile. Prefer durable business rules in SEEKNAL_ASK.md,
 # context/*.md, seeknal/sql_pairs/*.yml, and seeknal/tests/*.yml.
 agent: {{}}

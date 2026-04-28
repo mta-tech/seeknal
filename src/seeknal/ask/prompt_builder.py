@@ -143,20 +143,12 @@ contains the exact sequence of tool calls, approval discriminators, and
 output requirements for that workflow.
 
 Available skills:
-- `report-generation` — Evidence.dev report (uses generate_report)
-- `save-report-exposure` — codify a report as YAML exposure
-- `publish-memo-to-proof` — share memo on Proof Editor (approval-gated)
-- `publish-to-seeknal-report` — host built report on Seeknal Report Server (approval-gated)
-- `edit-proof-document` — rewrite an existing Proof doc (approval-gated)
-- `build-pipeline-node` — draft → validate → apply → run a new pipeline node
-- `bootstrap-semantic-model` — auto-generate semantic model from data
-- `query-metric` — query the semantic layer
-- `save-metric` — codify an ad-hoc metric
-- `execute-python-analysis` — Python sandbox for stats/ML/viz
-- `profile-data` — profile CSVs for schema + join keys
-- `database-analyst` — answer business questions from read-only connected databases
-- `business-question-answering` — translate business questions into metrics, SQL, and recommendations
-- `complex-analysis` — multi-step SQL → Python/statistics/ML analysis with evidence checks
+- Reports/publishing: `report-generation`, `save-report-exposure`,
+  `publish-memo-to-proof`, `publish-to-seeknal-report`, `edit-proof-document`
+- Pipelines/semantic layer: `build-pipeline-node`, `bootstrap-semantic-model`,
+  `query-metric`, `save-metric`
+- Analysis/data: `database-analyst`, `business-question-answering`,
+  `complex-analysis`, `execute-python-analysis`, `profile-data`
 
 Skipping the relevant skill at the start of a workflow means you will miss
 the approval gate or get the discriminator wrong."""
@@ -189,9 +181,8 @@ should make.
 constraints, which direction to take
 - Never ask what you could find out by querying the data yourself
 - Provide 2-4 concrete options with clear descriptions, not vague choices
-- Mark your recommended option with `"recommended": "true"`
-- One question at a time, most important first
-- After the user answers, proceed with the analysis using their direction
+- Mark your recommended option with `"recommended": "true"` (string), not boolean `true`
+- One question at a time, then proceed with the chosen direction
 
 **When NOT to ask:** Skip `ask_user` and proceed directly when:
 - The question has a clear, unambiguous answer from the data
@@ -233,12 +224,10 @@ For strategic / exploratory tasks (brainstorming, planning, scoping):
 For data questions:
 1. If the question is about a read-only connected database or an unknown
    business schema, first `load_skill('database-analyst')`.
-2. For connected sources, use generated and user-taught context first:
-   `list_source_context`/`read_source_context`, `list_context_files`/
-   `read_project_file`, and `list_sql_pairs`/`execute_sql_pair`/`read_sql_pair`
-   before ad-hoc table probing. When a SQL pair directly matches the question,
-   execute it as-is first and reuse that result instead of rewriting the query
-   unless it fails or the user asks for a different grain/filter.
+2. For connected sources, use source context and SQL pairs before ad-hoc table
+   probing. Exact full grain/filter/dimension match:
+   `execute_sql_pair(authoritative=true)`. Partial match: run the pair only as
+   an example, then adapt SQL or inspect another pair.
 3. If the user explicitly teaches you a rule or query ("remember", "save this",
    "write this down", "use this from now on", "save as SQL pair"), persist it:
    `save_preference` for short rules; `write_project_file` under `context/` for
@@ -252,6 +241,10 @@ For data questions:
    alias `query` may work, but `sql` is the canonical schema.
 7. Interpret with domain expertise — never just echo numbers
 8. Suggest actionable follow-ups
+
+Broad executive prompts like "apa yang perlu diperhatikan?" mean "find the
+important insights." Run evidence queries; summarize priorities, risks,
+anomalies, opportunities, and next checks — not setup or developer context.
 
 For quantitative business questions, do not answer from schema guesses when
 SQL tools are available. Run at least one `execute_sql` query first. If a
@@ -270,10 +263,8 @@ For complex analysis / modeling:
 3. Use the sandbox's pre-loaded `conn`; do not create a new DuckDB connection
 4. Keep conclusions tied to the SQL/Python evidence
 
-For semantic metrics:
-1. Query: `execute_sql` (or load `query-metric` skill if a semantic metric exists)
-2. Interpret with domain expertise — never just echo numbers
-3. Suggest actionable follow-ups
+For semantic metrics: query with `execute_sql` or `query-metric`, interpret
+with domain expertise, and suggest actionable follow-ups.
 
 For lineage / "how does X work" questions:
 1. `search_pipelines` → `read_pipeline` or `search_project_files` → `read_project_file`

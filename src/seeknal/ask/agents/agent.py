@@ -219,6 +219,13 @@ def create_agent(
         get_background_threshold,
         get_context_budget,
         get_ask_toolset_mode,
+        get_auto_summarization_config,
+        get_cost_tracking_config,
+        get_hooks_config,
+        get_plan_config,
+        get_stuck_loop_config,
+        get_subagents_config,
+        get_teams_config,
     )
 
     # Load project-level agent config (seeknal_agent.yml)
@@ -303,16 +310,25 @@ read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
 - For business questions over a connected source, prefer the context-first
   path: `list_source_context(query='<business term or table clue>')` and
   `list_sql_pairs(query='<business term>')`, execute the relevant SQL pair
-  with `execute_sql_pair` when the pair directly matches the question, and
-  read the relevant `SOURCE.md`,
+  with `execute_sql_pair(authoritative=true)` only when the pair directly
+  matches the full question including grain/filter/dimension, and read the
+  relevant `SOURCE.md`,
   `relationships.md`, `columns.md`, `profiling.md`, context note, or SQL pair,
   then use `list_tables`/`describe_table` only for gaps or verification. Do not
   brute-force unrelated tables when generated or user-taught context already
   narrows the surface.
-- Treat project-owned SQL pairs as authoritative examples: execute a matching
-  pair as-is first, do not rewrite it unless execution fails or the user asks
-  for a different filter/grain, and reuse successful query results instead of
-  rerunning the same or near-identical SQL.
+- Treat project-owned SQL pairs as trusted examples. They are authoritative
+  final answers only for exact/direct matches. If the user adds a different
+  grain, dimension, filter, ranking, or deeper analysis request, use the pair
+  as a template and run adapted SQL instead of answering from the partial pair.
+  Reuse successful query results instead of rerunning the same or near-identical
+  SQL.
+- Broad executive prompts such as "apa yang perlu diperhatikan?", "what should
+  I watch?", or "where should we focus?" are requests for insights, not setup.
+  Act like a principal data analyst: run a few small evidence queries across
+  relevant lenses and answer with priorities, anomalies, risks, opportunities,
+  and next checks. Do not make the final answer a catalog of tables, SQL pairs,
+  filters, or developer instructions.
 - DuckDB dialect: use `col ILIKE '%text%'`, not `ILIKE(col, '%text%')`.
   For text dimensions that may contain blanks, normalize with
   `NULLIF(TRIM(CAST(col AS VARCHAR)), '')` before `COALESCE`, grouping, or
@@ -338,6 +354,15 @@ read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
   output raw JSON tool-call text as the final answer.
 - For direct tool-call requests, copy the supplied SQL/table/code exactly
   unless the tool error proves it needs correction.
+"""
+        if environment != "interactive":
+            instructions += """
+
+## Headless read-only channel
+
+The `ask_user` tool is not available in gateway, telegram, or exposure mode.
+If a question is broad or ambiguous, give a concise best-effort answer and ask
+a plain-language follow-up in the final response; do not call `ask_user`.
 """
         connected_context = _build_connected_source_context(repl)
         if connected_context:
@@ -371,7 +396,7 @@ read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
     toolsets_list = [
         create_ask_toolset(
             mode=ask_toolset_mode,
-            include_ask_user=(environment == "interactive" and not analysis_toolset),
+            include_ask_user=(environment == "interactive"),
         ),
         context_toolset,
     ]
@@ -428,6 +453,66 @@ read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
     def _on_cost_update(cost_info):
         _cost_info["latest"] = cost_info
 
+    auto_summary_config = get_auto_summarization_config(agent_config)
+    cost_config = get_cost_tracking_config(agent_config)
+    hooks_config = get_hooks_config(agent_config)
+    plan_config = get_plan_config(agent_config)
+    stuck_loop_config = get_stuck_loop_config(agent_config)
+    subagents_config = get_subagents_config(agent_config)
+    teams_config = get_teams_config(agent_config)
+
+    def _resolve_auto_bool(value, *, default: bool) -> bool:
+        return default if value == "auto" else bool(value)
+
+    auto_summary_enabled = bool(auto_summary_config["enabled"])
+    context_manager_enabled = auto_summary_enabled and _resolve_auto_bool(
+        auto_summary_config["context_manager"],
+        default=not analysis_toolset,
+    )
+
+    history_processors = []
+    if auto_summary_enabled and auto_summary_config["microcompact"]["enabled"]:
+        history_processors.append(
+            MicrocompactProcessor(
+                keep_recent_turns=(
+                    auto_summary_config["microcompact"][
+                        "keep_recent_turns_analysis"
+                    ]
+                    if analysis_toolset
+                    else auto_summary_config["microcompact"]["keep_recent_turns_full"]
+                )
+            )
+        )
+    if auto_summary_enabled and auto_summary_config["sql_result_compactor"]["enabled"]:
+        history_processors.append(
+            SqlResultCompactor(
+                min_chars=(
+                    auto_summary_config["sql_result_compactor"][
+                        "min_chars_analysis"
+                    ]
+                    if analysis_toolset
+                    else auto_summary_config["sql_result_compactor"]["min_chars_full"]
+                )
+            )
+        )
+
+    plan_enabled = _resolve_auto_bool(
+        plan_config["enabled"],
+        default=(environment == "interactive" and not analysis_toolset),
+    )
+    subagents_enabled = _resolve_auto_bool(
+        subagents_config["enabled"],
+        default=not analysis_toolset,
+    )
+    teams_enabled = bool(teams_config["enabled"]) and subagents_enabled
+    subagent_configs = (
+        get_subagent_configs()
+        if subagents_enabled and subagents_config["lineage_investigator"]
+        else []
+    )
+    cost_tracking_enabled = bool(cost_config["enabled"])
+    cost_budget = budget if budget is not None else cost_config["budget_usd"]
+
     # Detect pydantic-deep API version for web/thinking capability params.
     # v0.3.1 uses `include_web` (default False).
     # v0.3.4+ uses `web_search`, `web_fetch`, `thinking` (default True).
@@ -435,23 +520,67 @@ read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
     import inspect
 
     _sig = inspect.signature(create_deep_agent)
+    _accepts_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in _sig.parameters.values()
+    )
+
+    def _supported_kwarg(name: str, value):
+        if _accepts_kwargs or name in _sig.parameters:
+            return {name: value}
+        return {}
+
     _web_kwargs: dict = {}
     if "web_search" in _sig.parameters:
         # v0.3.4+: disable built-in capabilities (breaks Google provider)
         _web_kwargs = {"web_search": False, "web_fetch": False, "thinking": False}
+
+    _deep_agent_kwargs: dict = {}
+    _deep_agent_kwargs.update(_web_kwargs)
+    _deep_agent_kwargs.update(
+        _supported_kwarg(
+            "context_manager_max_tokens",
+            auto_summary_config["context_manager_max_tokens"],
+        )
+    )
+    _deep_agent_kwargs.update(
+        _supported_kwarg(
+            "summarization_model",
+            auto_summary_config["summarization_model"],
+        )
+    )
+    _deep_agent_kwargs.update(
+        _supported_kwarg(
+            "eviction_token_limit",
+            auto_summary_config["eviction_token_limit"],
+        )
+    )
+    _deep_agent_kwargs.update(
+        _supported_kwarg("patch_tool_calls", auto_summary_config["patch_tool_calls"])
+    )
+    _deep_agent_kwargs.update(
+        _supported_kwarg("stuck_loop_detection", stuck_loop_config["enabled"])
+    )
+    _deep_agent_kwargs.update(_supported_kwarg("include_teams", teams_enabled))
+    _deep_agent_kwargs.update(
+        _supported_kwarg(
+            "include_builtin_subagents",
+            bool(subagents_config["include_builtin"]) and subagents_enabled,
+        )
+    )
 
     # Create pydantic-deep agent with full feature set
     agent = create_deep_agent(
         model=model_string,
         instructions=instructions,
         toolsets=toolsets_list,
-        hooks=get_ask_hooks(),
+        hooks=get_ask_hooks(hooks_config),
         # Connected-source analysis is safer and more user-legible when tool
         # calls are sequential. It lets harness state from an authoritative
         # SQL pair stop follow-up drift before sibling tool calls run, while
         # leaving the full/default Seeknal Ask mode unchanged.
         max_concurrency=1 if analysis_toolset else None,
-        **_web_kwargs,
+        **_deep_agent_kwargs,
         # Skills: bundled built-ins (report-generation, etc.) + per-project
         # user skills. Built-ins ship as SKILL.md files under
         # src/seeknal/ask/builtin_skills/ so `load_skill(...)` resolves
@@ -460,10 +589,10 @@ read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
         skill_directories=_resolve_skill_directories(project_path),
         # Planning: todo checklist + interactive ask_user via planner subagent
         include_todo=not analysis_toolset,
-        include_plan=(environment == "interactive" and not analysis_toolset),
-        plans_dir=".seeknal/plans",
+        include_plan=plan_enabled,
+        plans_dir=plan_config["plans_dir"],
         # Context management: 3-tier compaction + user context files
-        context_manager=not analysis_toolset,
+        context_manager=context_manager_enabled,
         # Keep zero-cost history compaction active in read-only analysis mode
         # too. Connected-source chats often accumulate many SQL result tables;
         # without compaction, a simple follow-up can resend the full previous
@@ -471,12 +600,7 @@ read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
         # memory, and subagents stay disabled for analysis mode, but these
         # deterministic processors are safe and preserve the final answer plus
         # compact SQL digests for multi-turn continuity.
-        history_processors=(
-            [
-                MicrocompactProcessor(keep_recent_turns=2 if analysis_toolset else 3),
-                SqlResultCompactor(min_chars=250 if analysis_toolset else 500),
-            ]
-        ),
+        history_processors=history_processors,
         context_files=context_files,
         # Memory: persistent schema knowledge across sessions
         include_memory=not analysis_toolset,
@@ -486,14 +610,14 @@ read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
         checkpoint_frequency="every_turn",
         max_checkpoints=20,
         # Cost tracking
-        cost_tracking=True,
-        cost_budget_usd=budget,
-        on_cost_update=_on_cost_update,
+        cost_tracking=cost_tracking_enabled,
+        cost_budget_usd=cost_budget,
+        on_cost_update=_on_cost_update if cost_tracking_enabled else None,
         # Output style
         output_style=style or "concise",
         # Subagents
-        include_subagents=not analysis_toolset,
-        subagents=[] if analysis_toolset else get_subagent_configs(),
+        include_subagents=subagents_enabled,
+        subagents=subagent_configs,
         # Disabled: seeknal has domain-specific alternatives
         include_filesystem=False,
         include_execute=False,
@@ -505,7 +629,7 @@ read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
     # input() on a non-TTY stdin (which blocks or raises EOFError).
     _ask_user_cb = (
         interactive_ask_user
-        if environment == "interactive" and not analysis_toolset
+        if environment == "interactive"
         else None
     )
     deps = DeepAgentDeps(

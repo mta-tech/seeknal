@@ -33,6 +33,13 @@ Tools stay thin. The skill owns the workflow:
 Do not invent schema. Do not suggest building pipelines unless the user asks for
 pipeline creation or durable transformation work.
 
+For broad executive prompts such as "apa yang perlu diperhatikan?", "what
+should I watch?", "what are the key issues?", or "where should we focus?", do
+not answer with source setup, SQL-pair inventory, table lists, or developer
+context. Treat the prompt as an insight request: run a small set of focused SQL
+queries and return priorities, anomalies, risks, opportunities, and next checks
+in business language.
+
 ## Workflow
 
 1. **Discover**
@@ -43,8 +50,13 @@ pipeline creation or durable transformation work.
    - Also call `list_sql_pairs` with the same business terms; project-owned
      SQL pairs are reusable examples, not harness hardcoding.
    - When a listed SQL pair directly matches the user's question, prefer
-     `execute_sql_pair` so the pair's SQL runs as-is. Use `read_sql_pair` first
-     only when you need to inspect the pair notes.
+     `execute_sql_pair(authoritative=true)` so the pair's SQL runs as-is and
+     can be used as the final answer. Use `read_sql_pair` first only when you
+     need to inspect the pair notes.
+   - If a pair only matches part of the question (for example the same metric
+     but a different grain/dimension such as "by province" or "top regions"),
+     call `execute_sql_pair(...)` without `authoritative=true`, then adapt the
+     SQL or inspect another pair. Do not answer from a partial-match pair alone.
    - For QA/failure investigation, call `list_ask_tests` or
      `read_ask_test_result` before proposing fixes.
    - Call `list_tables` when generated context is absent, too broad, or needs
@@ -59,7 +71,8 @@ pipeline creation or durable transformation work.
      `describe_table` confirms the column exists.
 
 3. **Query**
-   - Call `execute_sql_pair` for a directly matching SQL pair; otherwise call
+   - Call `execute_sql_pair(authoritative=true)` for an exact/direct SQL-pair
+     match; otherwise call `execute_sql_pair(...)` only as an example and then
      `execute_sql` with the canonical argument `sql`.
    - Correct form: `execute_sql(sql="SELECT ...")`.
    - `query` may be accepted as an alias, but prefer `sql` so tool calls are portable across providers.

@@ -958,11 +958,32 @@ async def stream_ask(
     reset_turn_governor(question)
 
     if quiet:
-        # Quiet mode: use sync ask() with spinner
-        from seeknal.ask.agents.agent import ask as sync_ask
+        # Quiet mode still runs inside this async function, so call the
+        # pydantic-ai async API directly instead of nesting run_sync inside an
+        # already-running event loop.
+        from pydantic_ai.usage import UsageLimits
+        from seeknal.ask.agents.tools._context import get_tool_context
+        from seeknal.ask.agents.agent import compact_history_for_analysis_mode
+
+        try:
+            request_limit = get_tool_context().request_limit
+        except RuntimeError:
+            request_limit = 100
+        compact_history_for_analysis_mode(message_history)
 
         with console.status("[spinner.active]Thinking..."):
-            return sync_ask(agent, deps, message_history, question)
+            result = await agent.run(
+                question,
+                deps=deps,
+                message_history=message_history,
+                usage_limits=UsageLimits(request_limit=request_limit),
+            )
+        message_history.clear()
+        message_history.extend(result.all_messages())
+        output = result.output or ""
+        if output:
+            console.print(output)
+        return output
 
     # Streaming mode with progressive rendering
     current_question = question.strip()

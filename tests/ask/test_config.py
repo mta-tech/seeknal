@@ -8,9 +8,16 @@ import pytest
 from seeknal.ask.config import (
     find_agent_config_path,
     get_agent_profile_instructions,
+    get_auto_summarization_config,
+    get_cost_tracking_config,
     get_discovery_cache_ttl_seconds,
+    get_hooks_config,
     get_locale_instructions,
+    get_plan_config,
+    get_stuck_loop_config,
     get_sql_timeout_seconds,
+    get_subagents_config,
+    get_teams_config,
     load_agent_config,
 )
 
@@ -156,3 +163,82 @@ def test_performance_defaults_and_overrides():
     assert get_discovery_cache_ttl_seconds(
         {"discovery_cache_ttl_seconds": "15"}
     ) == 15
+
+
+def test_agent_harness_defaults_preserve_current_ask_behavior():
+    auto = get_auto_summarization_config({})
+    assert auto["enabled"] is True
+    assert auto["context_manager"] == "auto"
+    assert auto["eviction_token_limit"] == 20000
+    assert auto["patch_tool_calls"] is True
+    assert auto["microcompact"]["keep_recent_turns_analysis"] == 2
+    assert auto["microcompact"]["keep_recent_turns_full"] == 3
+    assert auto["sql_result_compactor"]["min_chars_analysis"] == 250
+    assert auto["sql_result_compactor"]["min_chars_full"] == 500
+
+    assert get_cost_tracking_config({}) == {"enabled": True, "budget_usd": None}
+    assert get_hooks_config({}) == {
+        "enabled": True,
+        "sql_security": True,
+        "sql_self_correction": True,
+    }
+    assert get_plan_config({}) == {"enabled": "auto", "plans_dir": ".seeknal/plans"}
+    assert get_stuck_loop_config({}) == {"enabled": True}
+    assert get_subagents_config({}) == {
+        "enabled": "auto",
+        "include_builtin": True,
+        "lineage_investigator": True,
+    }
+    assert get_teams_config({}) == {"enabled": False}
+
+
+def test_agent_harness_overrides_are_normalized():
+    config = {
+        "agent_harness": {
+            "auto_summarization": {
+                "enabled": "true",
+                "context_manager": "false",
+                "context_manager_max_tokens": "128000",
+                "summarization_model": "openai:gpt-4.1-mini",
+                "eviction_token_limit": "50000",
+                "patch_tool_calls": "off",
+                "microcompact": {
+                    "enabled": "no",
+                    "keep_recent_turns_analysis": "4",
+                    "keep_recent_turns_full": "8",
+                },
+                "sql_result_compactor": {
+                    "enabled": "yes",
+                    "min_chars_analysis": "100",
+                    "min_chars_full": "900",
+                },
+            },
+            "cost_tracking": {"enabled": "on", "budget_usd": "1.25"},
+            "hooks": {"enabled": True, "sql_security": False},
+            "plan": {"enabled": False, "plans_dir": ".seeknal/custom-plans"},
+            "stuck_loop_detection": {"enabled": "off"},
+            "subagents": {"enabled": True, "include_builtin": False},
+            "teams": {"enabled": True},
+        }
+    }
+
+    auto = get_auto_summarization_config(config)
+    assert auto["context_manager"] is False
+    assert auto["context_manager_max_tokens"] == 128000
+    assert auto["summarization_model"] == "openai:gpt-4.1-mini"
+    assert auto["eviction_token_limit"] == 50000
+    assert auto["patch_tool_calls"] is False
+    assert auto["microcompact"]["enabled"] is False
+    assert auto["microcompact"]["keep_recent_turns_full"] == 8
+    assert auto["sql_result_compactor"]["min_chars_analysis"] == 100
+
+    assert get_cost_tracking_config(config) == {"enabled": True, "budget_usd": 1.25}
+    assert get_hooks_config(config)["sql_security"] is False
+    assert get_hooks_config(config)["sql_self_correction"] is True
+    assert get_plan_config(config) == {
+        "enabled": False,
+        "plans_dir": ".seeknal/custom-plans",
+    }
+    assert get_stuck_loop_config(config) == {"enabled": False}
+    assert get_subagents_config(config)["include_builtin"] is False
+    assert get_teams_config(config) == {"enabled": True}
