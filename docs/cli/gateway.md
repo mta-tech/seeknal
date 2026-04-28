@@ -89,6 +89,22 @@ seeknal gateway worker --project ./my-project --callback-url http://gateway:8000
 seeknal gateway backend --token-config ./gateway-tokens.yml --port 8000
 seeknal gateway worker --project ./my-project --gateway-url http://gateway:8000 --api-token "$SEEKNAL_API_TOKEN"
 
+# Docker worker image
+docker build -f Dockerfile.worker -t seeknal-worker:local .
+docker run --rm \
+  -v "$PWD/my-project:/app/project" \
+  --env-file "$PWD/my-project/.env" \
+  -e TEMPORAL_ADDRESS=host.docker.internal:7233 \
+  seeknal-worker:local --project /app/project
+
+# Docker worker with token-derived tenant routing
+docker run --rm \
+  -v "$PWD/my-project:/app/project" \
+  --env-file "$PWD/my-project/.env" \
+  -e SEEKNAL_GATEWAY_URL=http://host.docker.internal:8000 \
+  -e SEEKNAL_API_TOKEN="$SEEKNAL_API_TOKEN" \
+  seeknal-worker:local --project /app/project
+
 # Multi-replica with Redis
 seeknal gateway start --redis redis://localhost:6379
 
@@ -167,6 +183,24 @@ Client (browser/app/bot)
 | `SEEKNAL_API_TOKENS` | Inline JSON token registry for tests/small deployments |
 | `SEEKNAL_GATEWAY_URL` | Gateway URL used by `seeknal gateway worker` bootstrap |
 | `SEEKNAL_API_TOKEN` | Worker/client API token used for token-derived routing |
+
+## Docker worker image
+
+`Dockerfile.worker` builds a container that runs `seeknal gateway worker`.
+Mount a Seeknal project at `/app/project`, pass project secrets through an
+environment file or secret manager, and configure Temporal either directly with
+`TEMPORAL_ADDRESS`/`TEMPORAL_TASK_QUEUE` or indirectly with
+`SEEKNAL_GATEWAY_URL`/`SEEKNAL_API_TOKEN` in token-routed deployments.
+
+```bash
+docker build -f Dockerfile.worker -t seeknal-worker:local .
+docker compose -f deploy/docker-compose.worker.yml up --build
+```
+
+The compose file is intended for local or on-prem workers running near the data.
+Scale it with `docker compose -f deploy/docker-compose.worker.yml up --scale
+seeknal-worker=3` when the project database and DuckDB state are safe for that
+deployment pattern.
 
 ## See Also
 
