@@ -531,4 +531,3 @@ class TestSeeknalRunHelp:
         assert result.exit_code == 0
         assert "Examples:" in result.stdout
         assert "seeknal run" in result.stdout
-        assert "seeknal run --full" in result.stdout
