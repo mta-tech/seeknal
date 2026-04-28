@@ -1,4 +1,5 @@
 """Tests for the seeknal lineage CLI command."""
+import re
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -7,6 +8,15 @@ from seeknal.cli.main import app
 
 
 runner = CliRunner()
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _assert_help_option(output: str, name: str) -> None:
+    plain = _ANSI_ESCAPE_RE.sub("", output)
+    compact = re.sub(r"[\s-]+", "", plain)
+    assert name.replace("-", "") in compact
 
 
 def _create_sample_project(tmpdir: str) -> None:
@@ -42,9 +52,9 @@ class TestLineageCommand:
         result = runner.invoke(app, ["lineage", "--help"])
         assert result.exit_code == 0
         assert "lineage" in result.output.lower()
-        assert "--column" in result.output
-        assert "--output" in result.output
-        assert "--no-open" in result.output
+        _assert_help_option(result.output, "column")
+        _assert_help_option(result.output, "output")
+        _assert_help_option(result.output, "no-open")
 
     @patch("seeknal.dag.visualize.webbrowser")
     def test_lineage_generates_html(self, mock_browser):
