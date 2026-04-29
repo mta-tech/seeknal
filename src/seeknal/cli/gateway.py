@@ -63,6 +63,10 @@ def gateway_start(
         None, "--token-config", envvar="SEEKNAL_TOKEN_CONFIG",
         help="JSON/YAML API token registry for tenant-scoped worker routing"
     ),
+    worker_transport: str = typer.Option(
+        "temporal", "--worker-transport", envvar="SEEKNAL_WORKER_TRANSPORT",
+        help="Temporal activity execution transport: temporal/local or http for HTTP-only workers"
+    ),
 ):
     """Start the seeknal ask gateway server."""
     project_path = project or find_project_path()
@@ -152,6 +156,8 @@ def gateway_start(
                 if not no_worker:
                     import asyncio
 
+                    if worker_transport:
+                        os.environ["SEEKNAL_WORKER_TRANSPORT"] = worker_transport
                     worker = create_temporal_worker(
                         client,
                         task_queue=temporal_task_queue,
@@ -159,7 +165,7 @@ def gateway_start(
                     )
                     worker_task = asyncio.create_task(worker.run())
                     typer.echo(typer.style(
-                        f"Temporal worker enabled (queue={temporal_task_queue}, max_activities={max_activities})",
+                        f"Temporal worker enabled (queue={temporal_task_queue}, max_activities={max_activities}, transport={worker_transport})",
                         fg=typer.colors.GREEN,
                     ))
                 else:
@@ -208,6 +214,7 @@ def gateway_start(
         token_config=token_config,
         temporal_address=temporal_address,
         temporal_namespace=temporal_namespace,
+        worker_transport=worker_transport,
     )
     if worker_project_path:
         app.state.worker_project_path = worker_project_path
@@ -262,6 +269,14 @@ def gateway_backend(
         None, "--token-config", envvar="SEEKNAL_TOKEN_CONFIG",
         help="JSON/YAML API token registry for tenant-scoped worker routing"
     ),
+    max_activities: int = typer.Option(
+        15, "--max-activities", envvar="TEMPORAL_MAX_CONCURRENT_ACTIVITIES",
+        help="Maximum concurrent Temporal activities for gateway-hosted broker workers"
+    ),
+    worker_transport: str = typer.Option(
+        "temporal", "--worker-transport", envvar="SEEKNAL_WORKER_TRANSPORT",
+        help="Set to http to make the gateway-hosted Temporal activity broker work to HTTP-only workers"
+    ),
 ):
     """Start the seeknal ask gateway in backend-only mode.
 
@@ -303,7 +318,7 @@ def gateway_backend(
 
     @asynccontextmanager
     async def lifespan(app):
-        from seeknal.ask.gateway.temporal import connect_temporal_client
+        from seeknal.ask.gateway.temporal import connect_temporal_client, create_temporal_worker
 
         client = await connect_temporal_client(
             address=temporal_address,
@@ -317,6 +332,24 @@ def gateway_backend(
                 f"Temporal client connected (queue={temporal_task_queue})",
                 fg=typer.colors.GREEN,
             ))
+            worker = None
+            worker_task = None
+            if worker_transport.strip().lower() in {"http", "gateway", "poll"}:
+                import asyncio
+
+                os.environ["SEEKNAL_WORKER_TRANSPORT"] = "http"
+                worker = create_temporal_worker(
+                    client,
+                    task_queue=temporal_task_queue,
+                    max_concurrent_activities=max_activities,
+                )
+                worker_task = asyncio.create_task(worker.run())
+                app.state.http_broker_worker = worker
+                app.state.http_broker_worker_task = worker_task
+                typer.echo(typer.style(
+                    f"HTTP worker broker enabled (queue={temporal_task_queue}, max_activities={max_activities})",
+                    fg=typer.colors.GREEN,
+                ))
         else:
             typer.echo(typer.style(
                 f"Failed to connect to Temporal at {temporal_address}",
@@ -324,7 +357,14 @@ def gateway_backend(
             ))
             raise typer.Exit(1)
 
-        yield
+        try:
+            yield
+        finally:
+            worker_task = getattr(app.state, "http_broker_worker_task", None)
+            worker = getattr(app.state, "http_broker_worker", None)
+            if worker_task is not None and worker is not None:
+                await worker.shutdown()
+                await worker_task
 
     effective_callback_url = callback_url or f"http://{host}:{port}"
 
@@ -338,6 +378,7 @@ def gateway_backend(
         token_config=token_config,
         temporal_address=temporal_address,
         temporal_namespace=temporal_namespace,
+        worker_transport=worker_transport,
     )
     if worker_project_path:
         app.state.worker_project_path = worker_project_path
@@ -359,6 +400,95 @@ def gateway_backend(
     typer.echo(typer.style("  (no /ask, no /ws — backend mode)", fg=typer.colors.YELLOW))
 
     uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+async def _run_http_only_worker(
+    *,
+    project_path: Path,
+    gateway_url: str,
+    api_token: str,
+    poll_timeout: float = 30.0,
+) -> None:
+    """Run a worker that talks only HTTP(S) to the gateway/kc-service."""
+    import httpx
+
+    from seeknal.ask.gateway.server import _run_agent_streaming
+    from seeknal.ask.gateway.tenant import DEFAULT_TENANT
+
+    base_url = gateway_url.rstrip("/")
+    headers = {"Authorization": f"Bearer {api_token}"}
+
+    typer.echo("Seeknal HTTP worker started")
+    typer.echo(f"  Project: {project_path}")
+    typer.echo(f"  Gateway: {base_url}")
+    typer.echo("  Transport: http-only")
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        while True:
+            try:
+                response = await client.get(
+                    f"{base_url}/internal/worker/work-stream",
+                    headers=headers,
+                    params={"timeout": poll_timeout},
+                    timeout=poll_timeout + 10,
+                )
+            except httpx.RequestError as exc:
+                typer.echo(typer.style(
+                    f"Gateway poll failed: {exc}; retrying",
+                    fg=typer.colors.YELLOW,
+                ))
+                await asyncio.sleep(5)
+                continue
+            if response.status_code == 204:
+                continue
+            response.raise_for_status()
+            work = response.json()
+            work_id = work["work_id"]
+            session_id = work["session_id"]
+            tenant_id = work.get("tenant_id") or DEFAULT_TENANT
+            question = work["question"]
+            answer = ""
+            error = None
+            event_count = 0
+
+            async def post_event(event: dict) -> None:
+                await client.post(
+                    f"{base_url}/internal/worker/work/{work_id}/event",
+                    headers=headers,
+                    json=event,
+                    timeout=15.0,
+                )
+
+            try:
+                async for event in _run_agent_streaming(
+                    project_path,
+                    session_id,
+                    question,
+                    provider=work.get("provider"),
+                    model=work.get("model"),
+                    tenant_id=tenant_id,
+                ):
+                    event_count += 1
+                    if event.get("type") == "answer":
+                        answer = str(event.get("data") or "")
+                    elif event.get("type") == "error":
+                        error = str(event.get("data") or "")
+                    await post_event(event)
+            except Exception as exc:  # noqa: BLE001 - surface worker failures to gateway
+                error = str(exc)
+                await post_event({"type": "error", "data": error})
+                await post_event({"type": "done"})
+            finally:
+                await client.post(
+                    f"{base_url}/internal/worker/work/{work_id}/complete",
+                    headers=headers,
+                    json={
+                        "answer": answer,
+                        "event_count": event_count,
+                        "error": error,
+                    },
+                    timeout=15.0,
+                )
 
 
 @gateway_app.command("worker")
@@ -390,32 +520,40 @@ def gateway_worker(
         None, "--api-token", envvar="SEEKNAL_API_TOKEN",
         help="Worker API token used to fetch tenant queue/callback config from the gateway"
     ),
+    transport: str = typer.Option(
+        "auto", "--transport", envvar="SEEKNAL_WORKER_TRANSPORT",
+        help="Worker transport: auto, temporal, or http. http uses no Temporal SDK connection."
+    ),
 ):
-    """Start a standalone Temporal worker (no HTTP server).
+    """Start a standalone worker.
 
-    Connects to Temporal, polls the task queue, and executes agent
-    activities locally. Use this for on-prem worker deployments where
-    the gateway runs elsewhere.
-
-    Streaming events are POSTed to the gateway's callback URL.
+    In temporal mode, connects to Temporal and polls a task queue. In HTTP
+    mode, talks only to the gateway/kc-service using SEEKNAL_GATEWAY_URL and
+    SEEKNAL_API_TOKEN; the gateway owns Temporal routing.
     """
     import asyncio
 
     project_path = project or find_project_path()
+    from seeknal.cli.ask import _load_project_env
+    _load_project_env(project_path)
+    transport = (transport or "auto").strip().lower()
 
-    try:
-        from seeknal.ask.gateway.temporal import (
-            _require_temporal,
-            connect_temporal_client,
-            create_temporal_worker,
-        )
-        _require_temporal()
-    except ImportError:
-        typer.echo(typer.style(
-            "Temporal requires: pip install seeknal[temporal]",
-            fg=typer.colors.RED,
-        ))
-        raise typer.Exit(1)
+    if transport in {"http", "gateway", "poll"}:
+        if not gateway_url or not api_token:
+            typer.echo(typer.style(
+                "HTTP worker mode requires --gateway-url and --api-token",
+                fg=typer.colors.RED,
+            ))
+            raise typer.Exit(1)
+        try:
+            asyncio.run(_run_http_only_worker(
+                project_path=project_path,
+                gateway_url=gateway_url,
+                api_token=api_token,
+            ))
+        except KeyboardInterrupt:
+            typer.echo("\nHTTP worker stopped.")
+        return
 
     from seeknal.ask.gateway.tenant import task_queue_for_tenant
 
@@ -446,6 +584,14 @@ def gateway_worker(
             )
             response.raise_for_status()
             runtime_config = response.json()
+            config_transport = str(runtime_config.get("worker_transport") or "").strip().lower()
+            if transport == "auto" and config_transport in {"http", "gateway", "poll"}:
+                asyncio.run(_run_http_only_worker(
+                    project_path=project_path,
+                    gateway_url=gateway_url,
+                    api_token=api_token,
+                ))
+                return
         except Exception as exc:
             typer.echo(typer.style(
                 f"Failed to fetch worker config from gateway: {exc}",
@@ -461,6 +607,20 @@ def gateway_worker(
         if project is None and runtime_config.get("project_path"):
             project_path = Path(runtime_config["project_path"])
         tenant = runtime_config.get("tenant_id") or tenant
+
+    try:
+        from seeknal.ask.gateway.temporal import (
+            _require_temporal,
+            connect_temporal_client,
+            create_temporal_worker,
+        )
+        _require_temporal()
+    except ImportError:
+        typer.echo(typer.style(
+            "Temporal requires: pip install seeknal[temporal]",
+            fg=typer.colors.RED,
+        ))
+        raise typer.Exit(1)
 
     async def _run_worker():
         client = await connect_temporal_client(

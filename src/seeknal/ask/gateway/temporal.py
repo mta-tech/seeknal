@@ -103,6 +103,45 @@ if TEMPORAL_AVAILABLE:
 
         from seeknal.ask.gateway.server import _run_agent_streaming
 
+        # HTTP-only worker mode: the gateway/Temporal activity brokers work
+        # to an external worker over HTTP. The external worker does not connect
+        # to Temporal; it long-polls the gateway, runs the agent locally, and
+        # posts completion back. Keep the default as local execution for
+        # backward compatibility.
+        import os as _os
+        worker_transport = _os.environ.get("SEEKNAL_WORKER_TRANSPORT", "temporal").strip().lower()
+        if worker_transport in {"http", "gateway", "poll"}:
+            from seeknal.ask.gateway.http_worker import http_worker_broker
+
+            async def _http_heartbeat_loop():
+                while True:
+                    await asyncio.sleep(10)
+                    activity.heartbeat("waiting for HTTP worker")
+
+            heartbeat_task = asyncio.create_task(_http_heartbeat_loop())
+            try:
+                timeout = float(_os.environ.get("SEEKNAL_HTTP_WORK_TIMEOUT_SECONDS", "300"))
+                result = await http_worker_broker.enqueue_and_wait(
+                    session_id=input.session_id,
+                    question=input.question,
+                    project_path=input.project_path,
+                    tenant_id=input.tenant_id,
+                    provider=input.provider,
+                    model=input.model,
+                    timeout=timeout,
+                )
+                return AgentWorkflowOutput(
+                    answer=result.answer,
+                    event_count=result.event_count,
+                    error=result.error,
+                )
+            finally:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+
         # Set up HTTP client for callback if URL provided (on-prem worker mode)
         http_session = None
         callback_headers: dict[str, str] = {}
@@ -133,7 +172,6 @@ if TEMPORAL_AVAILABLE:
         # Worker override: SEEKNAL_PROJECT_PATH env var takes precedence over
         # input.project_path. This lets a standalone worker use its own local
         # project path instead of the gateway's (for split topologies).
-        import os as _os
         effective_project_path = _os.environ.get("SEEKNAL_PROJECT_PATH") or input.project_path
 
         try:

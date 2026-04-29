@@ -524,9 +524,21 @@ a plain-language follow-up in the final response; do not call `ask_user`.
         parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in _sig.parameters.values()
     )
+    # pydantic-deep 0.3.x exposes ``**agent_kwargs`` but still rejects some
+    # unknown experimental config keys in the underlying Agent constructor. Keep
+    # tests/mocks flexible, but avoid known runtime-incompatible kwargs for the
+    # real pydantic_deep implementation.
+    _real_pydantic_deep = getattr(create_deep_agent, "__module__", "").startswith(
+        "pydantic_deep"
+    )
+    _known_unsupported_kwargs = (
+        {"stuck_loop_detection"} if _real_pydantic_deep else set()
+    )
 
     def _supported_kwarg(name: str, value):
-        if _accepts_kwargs or name in _sig.parameters:
+        if name in _sig.parameters or (
+            _accepts_kwargs and name not in _known_unsupported_kwargs
+        ):
             return {name: value}
         return {}
 

@@ -161,6 +161,16 @@ Supports Google Gemini (default), OpenAI-compatible providers, Anthropic-compati
 
 ## Changelog
 
+### v2.9.1 (April 2026)
+
+**HTTP-only Ask worker mode** — Adds a gateway-routed worker topology where workers only need outbound HTTP(S) to Seeknal Gateway or a compatible kc-service gateway.
+
+- **HTTP worker transport**: `seeknal gateway worker --transport http` long-polls gateway work-stream endpoints, runs Ask locally near the data, and posts streaming events plus completion back over HTTP.
+- **Gateway broker mode**: `seeknal gateway start --temporal --worker-transport http` and `seeknal gateway backend --worker-transport http` keep Temporal routing inside the gateway while external workers avoid Temporal credentials/network access.
+- **Token-routed runtime config**: token records can advertise `worker_transport: http`; workers still bootstrap from `SEEKNAL_GATEWAY_URL` + `SEEKNAL_API_TOKEN`.
+- **Worker reliability fixes**: project `.env` is loaded in worker mode, gateway polling retries transient connection failures, and Temporal activities heartbeat while waiting for HTTP workers.
+- **pydantic-deep compatibility**: skips unsupported `stuck_loop_detection` passthrough on current runtime versions while preserving config compatibility in tests/mocks.
+
 ### v2.9.0 (April 2026)
 
 **Read-only Ask source harness + project SQL QA** — Adds a TUI-first workflow for users who already have analytical tables in a database and want Seeknal Ask to answer business questions without building a pipeline.
@@ -181,15 +191,6 @@ Supports Google Gemini (default), OpenAI-compatible providers, Anthropic-compati
 - **`preview_query` tool**: four pre-execution safety probes (row count, column count, JOIN fan-out, dry-run reachability) — blocks queries returning ≥100k rows; pure aggregations auto-skip
 - **Context files**: `list_context_files` and `write_project_file` tools scan/write `{project}/context/` with path-traversal guards
 - **Durable preferences**: `save_preference` appends to `preferences.yml`; preferences are injected into the system prompt on every session
-
-### v2.7.1 (April 2026)
-
-**Gateway pairing + `execute_uv_script` + pipeline runtime helpers** — Additive batch combining gateway Telegram pairing, a new agent tool for running uv-managed scripts, and lightweight per-node runtime helpers.
-
-- **Gateway pairing**: `FilePairingStore`, `TelegramLinkStore`, `PublicSessionStore` wired into lifespan; `/pair` Telegram command for admin-generated codes
-- **`execute_uv_script` tool**: run arbitrary uv-managed Python scripts from the agent with full dependency isolation
-- **Pipeline runtime**: `ctx.llm` (Ask-aligned text/JSON generation) and `ctx.state` (lightweight per-node persistent state) helpers available inside `@transform` functions
-- **Config discovery**: `find_agent_config_path()` locates `seeknal_agent.yml` under project root or `seeknal/` directory
 
 ## Install from Source
 

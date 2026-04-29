@@ -9,7 +9,7 @@ context so the Dockerfiles can copy `pyproject.toml`, `README.md`, and `src/`.
 | Dockerfile | Image purpose | Default command |
 | --- | --- | --- |
 | `docker/Dockerfile.gateway` | Seeknal Ask HTTP gateway for REST, SSE, WebSocket, Telegram, and Temporal client mode | `seeknal gateway start --project /app/project --port 8000 --host 0.0.0.0 --temporal --no-worker` |
-| `docker/Dockerfile.worker` | Standalone Temporal worker that runs Ask agent turns near the data | `seeknal gateway worker` |
+| `docker/Dockerfile.worker` | Standalone Ask worker. Supports Temporal SDK mode and HTTP-only gateway-routed mode | `seeknal gateway worker` |
 | `docker/Dockerfile.prefect` | Prefect deployment runner for Seeknal pipeline projects | `seeknal prefect serve --project-path /app` |
 | `docker/report-server/Dockerfile` | Report server for published Evidence-style reports | `seeknal report-server` |
 
@@ -63,8 +63,8 @@ docker run --rm \
   seeknal-worker:local --project /app/project
 ```
 
-For token-routed multi-tenant worker deployments, let the worker fetch its queue
-and callback configuration from the gateway:
+For token-routed multi-tenant Temporal worker deployments, let the worker fetch
+its queue and callback configuration from the gateway:
 
 ```bash
 docker run --rm \
@@ -74,6 +74,25 @@ docker run --rm \
   -e SEEKNAL_API_TOKEN="$SEEKNAL_API_TOKEN" \
   seeknal-worker:local --project /app/project
 ```
+
+For HTTP-only worker deployments, the worker has no Temporal address, queue, or
+credentials. It long-polls the gateway/kc-service for work and posts streaming
+events/completion back over HTTP:
+
+```bash
+docker run --rm \
+  -v /path/to/seeknal-project:/app/project \
+  --env-file /path/to/seeknal-project/.env \
+  -e SEEKNAL_WORKER_TRANSPORT=http \
+  -e SEEKNAL_GATEWAY_URL=https://gateway.example.com \
+  -e SEEKNAL_API_TOKEN="$SEEKNAL_API_TOKEN" \
+  seeknal-worker:local --project /app/project
+```
+
+The gateway side must run a Temporal worker activity in HTTP broker mode, for
+example `seeknal gateway start --temporal --worker-transport http` or `seeknal
+gateway backend --worker-transport http`. In this topology the gateway owns
+Temporal routing and the external worker only needs outbound HTTPS.
 
 ## Compose
 
