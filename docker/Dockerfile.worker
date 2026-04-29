@@ -67,6 +67,7 @@ WORKDIR /app/project
 # supplied after the image name, or by environment variables supported by the CLI:
 # TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, TEMPORAL_TASK_QUEUE,
 # TEMPORAL_MAX_CONCURRENT_ACTIVITIES, CALLBACK_BASE_URL, CALLBACK_AUTH_TOKEN,
-# SEEKNAL_GATEWAY_URL, and SEEKNAL_API_TOKEN.
+# SEEKNAL_GATEWAY_URL, SEEKNAL_API_TOKEN, and SEEKNAL_WORKER_TRANSPORT=http
+# for HTTP-only gateway-routed mode.
 ENTRYPOINT ["seeknal", "gateway", "worker"]
 CMD []

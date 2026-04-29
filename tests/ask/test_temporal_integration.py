@@ -297,3 +297,43 @@ class TestTemporalWorkerFactory:
         assert kwargs["task_queue"] == "test-queue"
         assert AgentWorkflow in kwargs["workflows"]
         assert run_agent_activity in kwargs["activities"]
+
+
+@pytest.mark.skipif(not TEMPORAL_AVAILABLE, reason="temporalio not installed")
+@pytest.mark.asyncio
+async def test_temporal_activity_can_broker_to_http_worker(monkeypatch, tmp_path):
+    """HTTP worker transport makes the Temporal activity enqueue instead of run locally."""
+    import asyncio
+
+    from seeknal.ask.gateway.http_worker import HttpWorkerResult, http_worker_broker
+    from seeknal.ask.gateway.temporal import run_agent_activity
+
+    await http_worker_broker.reset()
+    monkeypatch.setenv("SEEKNAL_WORKER_TRANSPORT", "http")
+    monkeypatch.setenv("SEEKNAL_HTTP_WORK_TIMEOUT_SECONDS", "5")
+
+    activity_task = asyncio.create_task(run_agent_activity(AgentWorkflowInput(
+        session_id="sess-activity-http",
+        question="hello",
+        project_path=str(tmp_path),
+        tenant_id="tenant-http",
+    )))
+    await asyncio.sleep(0)
+
+    item = await http_worker_broker.claim_next(tenant_id="tenant-http", timeout=1)
+    assert item is not None
+    assert item.session_id == "sess-activity-http"
+    assert item.question == "hello"
+
+    completed = await http_worker_broker.complete(
+        work_id=item.work_id,
+        tenant_id="tenant-http",
+        result=HttpWorkerResult(answer="done", event_count=2),
+    )
+    assert completed is True
+
+    output = await activity_task
+    assert output.answer == "done"
+    assert output.event_count == 2
+    assert output.error is None
+    await http_worker_broker.reset()

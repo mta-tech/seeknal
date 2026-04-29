@@ -32,13 +32,20 @@ def registry(tmp_path):
 def test_load_token_registry_from_mapping_env(monkeypatch):
     monkeypatch.setenv(
         "SEEKNAL_API_TOKENS",
-        json.dumps({"sk-1": {"tenant_id": "tenant1", "task_queue": "queue1"}}),
+        json.dumps({
+            "sk-1": {
+                "tenant_id": "tenant1",
+                "task_queue": "queue1",
+                "worker_transport": "http",
+            }
+        }),
     )
 
     principal = load_token_registry().resolve("sk-1")
 
     assert principal.tenant_id == "tenant1"
     assert principal.task_queue == "queue1"
+    assert principal.worker_transport == "http"
 
 
 def test_worker_config_derives_queue_and_callback_from_token(tmp_path, registry):
@@ -49,6 +56,7 @@ def test_worker_config_derives_queue_and_callback_from_token(tmp_path, registry)
         callback_base_url="https://fallback.example.com",
         temporal_address="localhost:7233",
         temporal_namespace="default",
+        worker_transport="http",
     )
 
     with TestClient(app) as client:
@@ -65,6 +73,7 @@ def test_worker_config_derives_queue_and_callback_from_token(tmp_path, registry)
     assert body["callback_url"] == "https://gateway.example.com"
     assert body["temporal_address"] == "temporal.example.com:7233"
     assert body["temporal_namespace"] == "seeknal-prod"
+    assert body["worker_transport"] == "http"
 
 
 def test_token_mode_requires_auth_for_tenant_scoped_routes(tmp_path, registry):
@@ -143,3 +152,86 @@ def test_temporal_start_derives_queue_from_token_and_rejects_overrides(tmp_path,
     assert workflow_input.tenant_id == "acme"
     assert workflow_input.callback_auth_token == "cb-acme-worker"
     assert workflow_input.project_path == str(tmp_path / "worker-project")
+
+
+@pytest.mark.asyncio
+async def test_http_worker_stream_is_token_scoped_and_completes(tmp_path, registry):
+    """HTTP-only workers receive tenant work via gateway without Temporal access."""
+    import asyncio
+    import httpx
+
+    from seeknal.ask.gateway.http_worker import http_worker_broker
+
+    await http_worker_broker.reset()
+    app = create_gateway_app(
+        project_path=None,
+        sessions_dir=tmp_path,
+        token_registry=registry,
+        worker_transport="http",
+    )
+    from seeknal.ask.gateway.sse import SSEBroadcaster
+    app.state.broadcaster = SSEBroadcaster()
+
+    async def enqueue():
+        return await http_worker_broker.enqueue_and_wait(
+            session_id="sess-http",
+            question="hello",
+            project_path=str(tmp_path / "worker-project"),
+            tenant_id="acme",
+            timeout=5,
+        )
+
+    wait_task = asyncio.create_task(enqueue())
+    await asyncio.sleep(0)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get(
+            "/internal/worker/work-stream",
+            params={"timeout": 1},
+            headers={"Authorization": "Bearer sk-acme-worker"},
+        )
+        assert response.status_code == 200
+        work = response.json()
+        assert work["tenant_id"] == "acme"
+        assert work["session_id"] == "sess-http"
+        assert work["question"] == "hello"
+
+        sse_queue = app.state.broadcaster.subscribe("sess-http", tenant_id="acme")
+        event_response = await client.post(
+            f"/internal/worker/work/{work['work_id']}/event",
+            headers={"Authorization": "Bearer sk-acme-worker"},
+            json={"type": "token", "data": "hi"},
+        )
+        assert event_response.status_code == 200
+        assert json.loads(sse_queue.get_nowait())["data"] == "hi"
+
+        complete_response = await client.post(
+            f"/internal/worker/work/{work['work_id']}/complete",
+            headers={"Authorization": "Bearer sk-acme-worker"},
+            json={"answer": "done", "event_count": 3},
+        )
+        assert complete_response.status_code == 200
+
+    result = await wait_task
+    assert result.answer == "done"
+    assert result.event_count == 3
+    assert result.error is None
+    await http_worker_broker.reset()
+
+
+@pytest.mark.asyncio
+async def test_http_worker_stream_rejects_missing_token_in_token_mode(tmp_path, registry):
+    import httpx
+
+    app = create_gateway_app(
+        project_path=None,
+        sessions_dir=tmp_path,
+        token_registry=registry,
+        worker_transport="http",
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/internal/worker/work-stream", params={"timeout": 0})
+
+    assert response.status_code == 401

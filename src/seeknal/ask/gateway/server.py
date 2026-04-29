@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -1308,6 +1308,82 @@ async def publish_event_callback(request: Request) -> JSONResponse:
     return JSONResponse({"status": "published"})
 
 
+
+
+async def http_worker_work_stream(request: Request) -> Response:
+    """Long-poll one work item for an HTTP-only worker.
+
+    Token mode derives the tenant from the worker API token. Compatibility mode
+    falls back to the existing tenant header/query resolver for local tests.
+    """
+    auth, err = _safe_auth_context(request)
+    if err:
+        return err
+
+    try:
+        timeout = float(request.query_params.get("timeout", "30"))
+    except ValueError:
+        timeout = 30.0
+    timeout = max(0.0, min(timeout, 60.0))
+
+    from seeknal.ask.gateway.http_worker import http_worker_broker
+
+    item = await http_worker_broker.claim_next(
+        tenant_id=auth.tenant_id,
+        timeout=timeout,
+    )
+    if item is None:
+        return Response(status_code=204)
+    return JSONResponse(item.public_dict())
+
+
+async def http_worker_work_event(request: Request) -> JSONResponse:
+    """Receive a streaming event from an HTTP-only worker and publish it to SSE."""
+    auth, err = _safe_auth_context(request)
+    if err:
+        return err
+
+    work_id = request.path_params["work_id"]
+    from seeknal.ask.gateway.http_worker import http_worker_broker
+
+    item = await http_worker_broker.owns(work_id=work_id, tenant_id=auth.tenant_id)
+    if item is None:
+        return JSONResponse({"error": "unknown work_id"}, status_code=404)
+
+    body = await request.json()
+    event_json = json.dumps(body)
+    await request.app.state.broadcaster.publish(
+        item.session_id,
+        event_json,
+        tenant_id=item.tenant_id,
+    )
+    return JSONResponse({"status": "published"})
+
+
+async def http_worker_work_complete(request: Request) -> JSONResponse:
+    """Receive final completion from an HTTP-only worker."""
+    auth, err = _safe_auth_context(request)
+    if err:
+        return err
+
+    work_id = request.path_params["work_id"]
+    body = await request.json()
+    from seeknal.ask.gateway.http_worker import HttpWorkerResult, http_worker_broker
+
+    ok = await http_worker_broker.complete(
+        work_id=work_id,
+        tenant_id=auth.tenant_id,
+        result=HttpWorkerResult(
+            answer=str(body.get("answer") or ""),
+            event_count=int(body.get("event_count") or 0),
+            error=body.get("error"),
+        ),
+    )
+    if not ok:
+        return JSONResponse({"error": "unknown work_id"}, status_code=404)
+    return JSONResponse({"status": "completed"})
+
+
 async def worker_config(request: Request) -> JSONResponse:
     """Return token-derived runtime config for a standalone worker.
 
@@ -1333,6 +1409,9 @@ async def worker_config(request: Request) -> JSONResponse:
                 default_project_path=getattr(
                     request.app.state, "worker_project_path", None
                 ),
+                default_worker_transport=getattr(
+                    request.app.state, "worker_transport", None
+                ),
             )
         except TokenAuthError as exc:
             return JSONResponse({"error": str(exc)}, status_code=401)
@@ -1349,6 +1428,7 @@ async def worker_config(request: Request) -> JSONResponse:
         temporal_address=getattr(request.app.state, "temporal_address", None),
         temporal_namespace=getattr(request.app.state, "temporal_namespace", None),
         project_path=getattr(request.app.state, "worker_project_path", None),
+        worker_transport=getattr(request.app.state, "worker_transport", None),
     )
     return JSONResponse(cfg.public_dict())
 
@@ -1365,6 +1445,7 @@ def create_gateway_app(
     token_config: str | Path | None = None,
     temporal_address: str | None = None,
     temporal_namespace: str | None = None,
+    worker_transport: str | None = None,
 ) -> Starlette:
     """Create the Starlette ASGI application.
 
@@ -1388,6 +1469,8 @@ def create_gateway_app(
         temporal_address: Temporal address advertised to token-authenticated
             workers through ``/internal/worker/config``.
         temporal_namespace: Temporal namespace advertised to workers.
+        worker_transport: Worker execution transport advertised to token-routed
+            workers (for example ``temporal`` or ``http``).
     """
     # Backend-only mode: no project_path means no in-process agent execution.
     # Only Temporal dispatch, SSE fan-out, and session listing work.
@@ -1408,6 +1491,9 @@ def create_gateway_app(
             methods=["POST"],
         ),
         Route("/internal/worker/config", worker_config, methods=["GET"]),
+        Route("/internal/worker/work-stream", http_worker_work_stream, methods=["GET"]),
+        Route("/internal/worker/work/{work_id}/event", http_worker_work_event, methods=["POST"]),
+        Route("/internal/worker/work/{work_id}/complete", http_worker_work_complete, methods=["POST"]),
     ]
 
     # In-process agent execution routes are only available when a project
@@ -1508,6 +1594,7 @@ def create_gateway_app(
     app.state.token_registry = token_registry or load_token_registry(token_config)
     app.state.temporal_address = temporal_address
     app.state.temporal_namespace = temporal_namespace
+    app.state.worker_transport = worker_transport
     if temporal_client is not None:
         app.state.temporal_client = temporal_client
     return app

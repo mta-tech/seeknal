@@ -39,6 +39,7 @@ class TokenPrincipal:
     project_path: str | None = None
     temporal_address: str | None = None
     temporal_namespace: str | None = None
+    worker_transport: str | None = None
     role: str | None = None
 
     @property
@@ -58,6 +59,7 @@ class WorkerRuntimeConfig:
     temporal_address: str | None = None
     temporal_namespace: str | None = None
     project_path: str | None = None
+    worker_transport: str | None = None
 
     def public_dict(self) -> dict[str, str | None]:
         return {
@@ -68,6 +70,7 @@ class WorkerRuntimeConfig:
             "temporal_address": self.temporal_address,
             "temporal_namespace": self.temporal_namespace,
             "project_path": self.project_path,
+            "worker_transport": self.worker_transport,
         }
 
 
@@ -116,6 +119,7 @@ class TokenRegistry:
         default_temporal_address: str | None = None,
         default_temporal_namespace: str | None = None,
         default_project_path: str | None = None,
+        default_worker_transport: str | None = None,
     ) -> WorkerRuntimeConfig:
         principal = self.resolve(token)
         return WorkerRuntimeConfig(
@@ -126,6 +130,7 @@ class TokenRegistry:
             temporal_address=principal.temporal_address or default_temporal_address,
             temporal_namespace=principal.temporal_namespace or default_temporal_namespace,
             project_path=principal.project_path or default_project_path,
+            worker_transport=principal.worker_transport or default_worker_transport,
         )
 
 
@@ -248,6 +253,9 @@ def _parse_token_records(raw: Any) -> list[TokenPrincipal]:
                 project_path=_optional_str(record.get("project_path")),
                 temporal_address=_optional_str(record.get("temporal_address")),
                 temporal_namespace=_optional_str(record.get("temporal_namespace")),
+                worker_transport=_optional_str(
+                    record.get("worker_transport") or record.get("transport")
+                ),
                 role=_optional_str(record.get("role")),
             )
         )
