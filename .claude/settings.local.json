@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git ls-tree:*)",
+      "Bash(git log:*)",
+      "Bash(source:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(echo:*)",
+      "Bash(then)",
+      "Bash(break)",
+      "Bash(fi)",
+      "Bash(done)",
+      "Bash(curl:*)",
+      "Bash(while:*)",
+      "Bash(do)",
+      "Bash(if echo \"$line\")",
+      "Bash(docker compose:*)"
+    ]
+  }
+}
