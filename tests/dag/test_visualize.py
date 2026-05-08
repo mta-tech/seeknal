@@ -586,6 +586,66 @@ class TestHTMLRenderer:
             assert "dagre@0.8.5" in content
             assert "cytoscape-dagre@2.5.0" in content
 
+    def test_render_embeds_valid_json_with_single_quotes_in_sql(self):
+        """SQL containing single quotes must round-trip through JSON.parse.
+
+        Regression: the old sanitizer replaced ``'`` with ``\\'`` after
+        json.dumps, producing invalid JSON like ``"ref(\\'source.x\\')"``.
+        """
+        import json as _json
+
+        m = Manifest(project="test")
+        m.add_node(Node(
+            id="transform.hr_employee",
+            name="hr_employee",
+            node_type=NodeType.TRANSFORM,
+            config={"sql": "SELECT * FROM ref('source.hris_v_hr_employee_hcms')"},
+        ))
+
+        builder = LineageDataBuilder(m)
+        data = builder.build()
+
+        renderer = HTMLRenderer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "lineage.html"
+            renderer.render(data, output)
+
+            content = output.read_text()
+            start = content.index("LINEAGE_DATA = ")
+            seg = content[start + len("LINEAGE_DATA = "):]
+            # Walk to the matching closing brace at depth 0.
+            depth = 0
+            in_str = False
+            esc = False
+            end_idx = None
+            for i, ch in enumerate(seg):
+                if esc:
+                    esc = False
+                    continue
+                if in_str:
+                    if ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end_idx = i + 1
+                        break
+            json_part = seg[:end_idx]
+
+            # The bug produced the invalid escape \' inside the JSON.
+            assert "\\'" not in json_part, "Invalid \\' escape leaked into JSON"
+
+            parsed = _json.loads(json_part)
+            sql = parsed["nodes"][0]["data"]["sql"]
+            assert "ref('source.hris_v_hr_employee_hcms')" in sql
+
     def test_render_no_innerhtml_with_user_data(self, simple_manifest):
         """Rendered HTML does not use innerHTML with user data."""
         builder = LineageDataBuilder(simple_manifest)
