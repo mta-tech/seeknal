@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,23 +11,17 @@ import pytest
 from seeknal.cli import gateway as gateway_module
 
 
-def test_asyncio_imported_at_module_level():
-    """`asyncio` must be importable from seeknal.cli.gateway's namespace.
-
-    Regression for #60: `_run_http_only_worker` references
-    `asyncio.sleep(5)` from its module globals. If asyncio is only
-    imported inside other functions, this raises NameError on the retry
-    path.
-    """
-    assert getattr(gateway_module, "asyncio", None) is asyncio
-
-
 @pytest.mark.asyncio
 async def test_http_only_worker_retry_path_does_not_raise_nameerror():
     """The httpx.RequestError retry path must complete without NameError.
 
-    Regression for #60. Drives _run_http_only_worker through one failed
-    poll → sleep → re-poll, then stops the loop with a sentinel exception.
+    Regression for #60: `_run_http_only_worker` is async-def at module
+    scope and calls `await asyncio.sleep(5)` in its retry branch. If
+    `asyncio` is not in scope (neither module-level nor function-local),
+    the retry path raises NameError on the first transient gateway
+    error. This drives one ConnectError → sleep → re-poll cycle and
+    asserts no NameError, regardless of whether the import is at module
+    or function scope.
     """
 
     class _StopLoop(Exception):
@@ -59,7 +52,7 @@ async def test_http_only_worker_retry_path_does_not_raise_nameerror():
         sleep_calls.append(seconds)
 
     with (
-        patch.object(gateway_module.asyncio, "sleep", _fake_sleep),
+        patch("asyncio.sleep", _fake_sleep),
         patch("httpx.AsyncClient", return_value=_FakeClient()),
     ):
         with pytest.raises(_StopLoop):

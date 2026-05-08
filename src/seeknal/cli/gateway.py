@@ -5,7 +5,6 @@ Starts the seeknal ask HTTP gateway (WebSocket + SSE + REST + Telegram + Tempora
 
 from __future__ import annotations
 
-import asyncio
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -411,6 +410,7 @@ async def _run_http_only_worker(
     poll_timeout: float = 30.0,
 ) -> None:
     """Run a worker that talks only HTTP(S) to the gateway/kc-service."""
+    import asyncio
     import httpx
 
     from seeknal.ask.gateway.server import _run_agent_streaming
