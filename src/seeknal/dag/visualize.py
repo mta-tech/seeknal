@@ -290,11 +290,16 @@ class HTMLRenderer:
         )
         template = env.get_template("lineage.html.j2")
 
-        # Sanitize JSON for embedding in JS single-quoted string literal
+        # JSON is embedded directly as a JS expression (var X = {{ json }};),
+        # not inside a string literal — JSON is already valid JS syntax. Only
+        # sanitize what would actually break out of the <script> block or
+        # confuse the JS parser:
+        #   - </  -> <\/   prevents </script> from closing the tag
+        #   - U+2028 / U+2029 are valid in JSON but historically illegal in
+        #     JS string literals; escape them to be safe across runtimes.
         json_str = json.dumps(dataclasses.asdict(lineage_data))
-        json_str = json_str.replace("\\", "\\\\")  # Escape backslashes first
-        json_str = json_str.replace("'", "\\'")    # Escape single quotes for JS
-        json_str = json_str.replace("</", "<\\/")  # Prevent </script> injection
+        json_str = json_str.replace("</", "<\\/")
+        json_str = json_str.replace(chr(0x2028), "\\u2028").replace(chr(0x2029), "\\u2029")
 
         html_content = template.render(lineage_data_json=json_str)
         output_path.parent.mkdir(parents=True, exist_ok=True)
