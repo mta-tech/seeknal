@@ -5,6 +5,7 @@ Starts the seeknal ask HTTP gateway (WebSocket + SSE + REST + Telegram + Tempora
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
