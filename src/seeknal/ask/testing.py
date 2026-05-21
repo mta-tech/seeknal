@@ -208,6 +208,10 @@ def run_ask_sql_tests(
     project_path = project_path.resolve()
     cases = discover_ask_sql_tests(project_path, select=select)
     mode = "sql-only" if sql_only else "agent"
+    # Issue #68.3: read the project's number_format locale once so
+    # _value_variants can emit dot-thousands-separator forms (e.g. '30.276')
+    # for Indonesian / German / etc. agents.
+    locale_tag = _read_project_number_locale(project_path)
     results = [
         _run_one_case(
             case,
@@ -215,6 +219,7 @@ def run_ask_sql_tests(
             provider=provider,
             model=model,
             sql_only=sql_only,
+            locale=locale_tag,
         )
         for case in cases
     ]
@@ -357,26 +362,35 @@ def check_answer(
     answer: str,
     oracle: SqlOracleResult,
     assertions: dict[str, Any] | None = None,
+    *,
+    locale: str | None = None,
 ) -> AnswerCheckResult:
     """Check an answer using generic project-owned assertions.
 
     Supported assertions:
     - `answer_contains`: string or list of strings required in answer.
     - `answer_not_contains`: string or list of forbidden strings.
-    - `expected_values`: bool, default true.  When true and no explicit
-      `answer_contains` is supplied, sample values from expected SQL output and
-      require them to appear in the answer text.
+    - `expected_values`: bool. Active **only** when `answer_contains` is not
+      set. When active, samples values from the oracle SQL result and requires
+      each to appear in the answer text. Set to ``false`` to disable. **Ignored
+      (treated as ``false``) whenever ``answer_contains`` is present** — these
+      two settings are mutually exclusive.
     - `max_expected_values`: int, default 20.
     - `case_sensitive`: bool, default false.
     - `compare: dataframe`: parse a markdown/JSON table from the answer and
       compare it with the expected SQL rows for the expected columns.
     - `numeric_tolerance` / `tolerance`: absolute tolerance for dataframe
       numeric comparisons. Default: 0.01.
+
+    Args:
+        locale: Optional locale tag (e.g. ``"id_ID"``, ``"de_DE"``). When set,
+            ``_value_variants`` emits locale-aware number variants so dot-as-
+            thousands-separator agents (Indonesian, German, etc.) match.
     """
     assertions = assertions or {}
     compare = str(assertions.get("compare", "")).strip().lower()
     if compare in {"dataframe", "table", "rows"}:
-        return _check_answer_dataframe(answer, oracle, assertions)
+        return _check_answer_dataframe(answer, oracle, assertions, locale=locale)
 
     case_sensitive = bool(assertions.get("case_sensitive", False))
     haystack = answer if case_sensitive else answer.lower()
@@ -395,10 +409,20 @@ def check_answer(
             missing.append(f"forbidden text present: {item}")
 
     expected_values_enabled = bool(assertions.get("expected_values", not required))
+    # Issue #68.1: a test with no assertions otherwise passes silently. Warn
+    # loudly when nothing is active so misconfigured YAML surfaces in CI logs.
+    if not required and not forbidden and not expected_values_enabled:
+        import warnings
+
+        warnings.warn(
+            "Ask SQL test has no active assertions and will always pass. "
+            "Add answer_contains, answer_not_contains, or expected_values: true.",
+            stacklevel=2,
+        )
     if expected_values_enabled and not required:
         max_values = int(assertions.get("max_expected_values", 20))
         for value in _sample_expected_values(oracle, max_values=max_values):
-            variants = _value_variants(value)
+            variants = _value_variants(value, locale=locale)
             if not variants:
                 continue
             if not any(
@@ -527,6 +551,7 @@ def _run_one_case(
     provider: str | None,
     model: str | None,
     sql_only: bool,
+    locale: str | None = None,
 ) -> AskSqlTestResult:
     rel = case.file_path.relative_to(project_path).as_posix()
     load_error = case.assertions.get("__load_error")
@@ -593,7 +618,7 @@ def _run_one_case(
             missing_assertions=[str(exc)],
         )
 
-    check = check_answer(answer, oracle, case.assertions)
+    check = check_answer(answer, oracle, case.assertions, locale=locale)
     actual_columns: list[str] = []
     actual_rows: list[list[Any]] = []
     if str(case.assertions.get("compare", "")).strip().lower() in {
@@ -625,6 +650,8 @@ def _check_answer_dataframe(
     answer: str,
     oracle: SqlOracleResult,
     assertions: dict[str, Any],
+    *,
+    locale: str | None = None,
 ) -> AnswerCheckResult:
     actual_columns, actual_rows, parse_error = extract_answer_table(
         answer, oracle.columns
@@ -653,7 +680,7 @@ def _check_answer_dataframe(
         extra = dict(assertions)
         extra.pop("compare", None)
         extra["expected_values"] = False
-        prose = check_answer(answer, oracle, extra)
+        prose = check_answer(answer, oracle, extra, locale=locale)
         if not prose.passed:
             return prose
     return AnswerCheckResult(True, "dataframe matched expected SQL")
@@ -828,13 +855,53 @@ def _sample_expected_values(oracle: SqlOracleResult, *, max_values: int) -> list
     return values
 
 
-def _value_variants(value: Any) -> list[str]:
+def _read_project_number_locale(project_path: Path) -> str | None:
+    """Return the project's ``locale.number_format`` tag, or ``None``.
+
+    Issue #68.3: when ``seeknal_agent.yml`` declares a non-English number
+    locale, the agent writes numbers using dot-as-thousands-separator
+    (e.g. ``30.276`` for thirty thousand in Indonesian). ``_value_variants``
+    consults this tag so ``expected_values: true`` keeps matching.
+    """
+    try:
+        from seeknal.ask.config import load_agent_config
+
+        cfg = load_agent_config(project_path)
+    except Exception:  # noqa: BLE001 - best-effort; missing/invalid YAML is fine
+        return None
+    locale_section = cfg.get("locale") if isinstance(cfg, dict) else None
+    if not isinstance(locale_section, dict):
+        return None
+    tag = locale_section.get("number_format") or locale_section.get("language")
+    return str(tag) if tag else None
+
+
+# Issue #68.3: locales that use '.' as thousands separator and ',' as decimal.
+# When the project's number_format matches one of these, the agent will
+# typically write `30.276` (thirty thousand) rather than `30,276`; the variants
+# table must include that form so expected_values doesn't always fail.
+_DOT_THOUSANDS_LOCALES = frozenset(
+    {"id", "de", "nl", "pt", "it", "es", "fr", "tr", "el", "ro", "pl", "cs"}
+)
+
+
+def _locale_uses_dot_thousands(locale: str | None) -> bool:
+    if not locale:
+        return False
+    return locale.split("_")[0].lower() in _DOT_THOUSANDS_LOCALES
+
+
+def _value_variants(value: Any, locale: str | None = None) -> list[str]:
     if value is None:
         return []
     if isinstance(value, bool):
         return [str(value).lower()]
     if isinstance(value, int):
-        return [str(value), f"{value:,}"]
+        variants = [str(value), f"{value:,}"]
+        if _locale_uses_dot_thousands(locale):
+            # Indonesian / German / etc. agents emit `30.276` for 30276.
+            variants.append(f"{value:,}".replace(",", "."))
+        return variants
     if isinstance(value, float):
         if not math.isfinite(value):
             return []
@@ -845,10 +912,16 @@ def _value_variants(value: Any) -> list[str]:
             f"{value:,.2f}",
             f"{value:.2f}",
         }
-        return sorted(
+        out = sorted(
             variant.rstrip("0").rstrip(".") if "." in variant else variant
             for variant in variants
         )
+        if _locale_uses_dot_thousands(locale):
+            # For floats, dot-thousands locales also swap the decimal: emit
+            # the comma-decimal form alongside the en-US dot-decimal forms.
+            comma_decimal = f"{value:,.2f}".replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+            out = sorted(set(out) | {comma_decimal})
+        return out
     text = str(value).strip()
     if not text:
         return []
