@@ -296,6 +296,12 @@ def execute_expected_sql(project_path: Path, sql: str) -> SqlOracleResult:
         return execute_via_psycopg2(dsn, stripped)
 
     # --- DuckDB REPL path (with rewrite) ---
+    # Issue #66: REPL holds a DuckDB connection plus ATTACH'd PG sources.
+    # Without an explicit close, each oracle SQL invocation leaks the
+    # underlying libpq connections until GC runs, exhausting the PG server's
+    # ``max_connections`` on suites with 20+ tests. Close deterministically
+    # in finally so connections are released as soon as the oracle returns.
+    repl = None
     try:
         from seeknal.ask.agents.tools.execute_sql import _rewrite_for_pg_pushdown
         from seeknal.cli.repl import REPL
@@ -309,6 +315,12 @@ def execute_expected_sql(project_path: Path, sql: str) -> SqlOracleResult:
         )
     except Exception as exc:  # noqa: BLE001 - test result should capture failure
         return SqlOracleResult(error=str(exc))
+    finally:
+        if repl is not None:
+            try:
+                repl.conn.close()
+            except Exception:  # noqa: BLE001 - best-effort close on teardown
+                pass
 
 
 def run_agent_answer(
