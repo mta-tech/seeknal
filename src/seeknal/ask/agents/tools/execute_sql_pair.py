@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -92,7 +93,7 @@ def execute_sql_pair(
     if authoritative:
         get_loaded_sql_pairs(ctx)[pair_name] = sql
     result = execute_sql(sql=sql, limit=limit, refresh=refresh)
-    if authoritative and _tool_succeeded(result):
+    if authoritative and _tool_succeeded(result) and not _result_looks_empty(result):
         record_authoritative_sql_pair_result(
             name=pair_name,
             path=rel,
@@ -105,6 +106,15 @@ def execute_sql_pair(
             "current business question. Do not run alternate SQL unless the "
             "user explicitly requested a different grain/filter or deeper "
             "post-query analysis.\n\n"
+            + result
+        )
+    if authoritative and _tool_succeeded(result) and _result_looks_empty(result):
+        return (
+            f"# Executed SQL pair: {rel}\n\n"
+            "SQL_PAIR_RESULT (not authoritative — empty/null-only result; the "
+            "pair's SQL likely has a bug, e.g. a wrongly quoted qualified table "
+            "name). Inspect the SQL and run a corrected query with execute_sql "
+            "instead of treating this pair as authoritative.\n\n"
             + result
         )
     return (
@@ -135,6 +145,37 @@ def _tool_succeeded(result: str) -> bool:
     except json.JSONDecodeError:
         return True
     return not (isinstance(payload, dict) and "category" in payload)
+
+
+_AGG_NULL_ROW = re.compile(
+    r"\|\s*(?:NULL|0|0\.0+|\[blank\])\s*(?:\|\s*(?:NULL|0|0\.0+|\[blank\])\s*)*\|"
+)
+
+
+def _result_looks_empty(result: str) -> bool:
+    """Detect a successful query whose payload is effectively empty.
+
+    A SQL pair that silently produces zero rows or an all-NULL/zero aggregate
+    is almost never a trustworthy authoritative answer for a business
+    question — most often it indicates a pair-level SQL bug (e.g. a wrongly
+    quoted fully-qualified table name that DuckDB resolves as a missing
+    relation but the surrounding UNION ALL hides). Demote those results so
+    the agent does not lock the turn to wrong numbers.
+    """
+    text = result or ""
+    if "Query executed successfully but returned no results." in text:
+        return True
+    if "(0 rows)" in text or "(0 row)" in text:
+        return True
+    # Single-row aggregate where every cell is NULL/0/[blank] is the
+    # silent-failure shape of a busted UNION-ALL leg.
+    if "(1 row)" in text:
+        lines = [ln for ln in text.splitlines() if ln.startswith("|") and "---" not in ln]
+        # Skip the header row; check the lone data row(s).
+        data_rows = lines[1:] if len(lines) >= 2 else []
+        if data_rows and all(_AGG_NULL_ROW.fullmatch(row.strip()) for row in data_rows):
+            return True
+    return False
 
 
 __all__ = ["execute_sql_pair"]

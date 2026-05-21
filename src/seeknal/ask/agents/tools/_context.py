@@ -78,6 +78,15 @@ class ToolContext:
     discovery_cache_ttl_seconds: int = 300
     discovery_cache: dict[str, tuple[float, Any]] = field(default_factory=dict)
     timing_events_this_turn: list[dict[str, Any]] = field(default_factory=list)
+    # SQL-pair guard behavior — "authoritative" keeps the legacy terminal
+    # stop after an authoritative SQL-pair result; "advisory" treats pairs as
+    # cheatsheets and never escalates Guard 3 to TERMINAL.
+    sql_pair_mode: str = "authoritative"
+    # Number of times the agent tried to run drifting SQL after an
+    # authoritative pair landed this turn. The first attempt is now a
+    # RETRYABLE nudge so the agent can override with allow_sql_pair_drift;
+    # only a second attempt without the override escalates to TERMINAL.
+    authoritative_drift_attempts_this_turn: int = 0
 
 
 def _make_registry():
@@ -192,11 +201,35 @@ def should_synthesize_after_authoritative_sql_pair(
     business questions. Advanced analysis requests (forecasting, modeling,
     correlations, charts, etc.) may legitimately need Python or follow-up
     queries after the pair result, so those remain agent-directed.
+
+    When the project opts into ``sql_pair_mode: advisory`` (see
+    ``seeknal_agent.yml``), SQL pairs are treated as cheatsheets and this
+    helper never escalates — Guard 3's terminal branch becomes dormant.
     """
     ctx = ctx or get_tool_context()
     if get_authoritative_sql_pair_result(ctx) is None:
         return False
+    if getattr(ctx, "sql_pair_mode", "authoritative") == "advisory":
+        return False
     return not _question_requests_post_sql_analysis(ctx.current_question)
+
+
+def authoritative_drift_attempts(ctx: ToolContext | None = None) -> int:
+    """Return how many drifting-SQL attempts the agent has made this turn."""
+    ctx = ctx or get_tool_context()
+    return int(getattr(ctx, "authoritative_drift_attempts_this_turn", 0) or 0)
+
+
+def bump_authoritative_drift_attempt(ctx: ToolContext | None = None) -> int:
+    """Record one drifting-SQL attempt after an authoritative pair landed.
+
+    Returns the post-increment count so callers can decide between RETRYABLE
+    and TERMINAL responses without keeping their own per-turn state.
+    """
+    ctx = ctx or get_tool_context()
+    current = authoritative_drift_attempts(ctx) + 1
+    ctx.authoritative_drift_attempts_this_turn = current
+    return current
 
 
 def reset_turn_governor(question: str | None = None) -> None:
@@ -214,10 +247,17 @@ def reset_turn_governor(question: str | None = None) -> None:
     ctx.terminal_tool_errors_this_turn.clear()
     ctx.loaded_sql_pairs_this_turn.clear()
     get_loaded_sql_pairs(ctx).clear()
-    ctx.sql_pairs_checked_this_turn = False
-    setattr(ctx.repl, "_seeknal_sql_pairs_checked_this_turn", False)
+    # NOTE: ``sql_pairs_checked`` is intentionally NOT reset here. Once the
+    # agent has seen the project's SQL pairs in this session (via
+    # list_sql_pairs/read_sql_pair/execute_sql_pair), Guard 1 should stay
+    # dormant for subsequent turns. Re-firing Guard 1 every new user turn
+    # forced the agent to re-list pairs even on simple follow-up questions
+    # ("dari 2024 dan seterusnya?") and burned tool budget on recovery.
+    # The agent can still choose to re-list pairs when the question shifts
+    # to a clearly new domain.
     ctx.authoritative_sql_pair_result_this_turn = None
     setattr(ctx.repl, "_seeknal_authoritative_sql_pair_result_this_turn", None)
+    ctx.authoritative_drift_attempts_this_turn = 0
     ctx.timing_events_this_turn.clear()
 
 
@@ -491,6 +531,23 @@ def _question_requests_post_sql_analysis(question: str | None) -> bool:
         "python",
         "statistical",
         "statistik",
+        # Filter-tweak intents — the user is asking for the same metric with
+        # a different scope. Treat as legitimate post-SQL work so Guard 3 does
+        # not lock the agent to a pair that lacks the requested exclusion.
+        # Keep these explicit (verbs / negations) and avoid common prepositions
+        # like " per " or " by " — those naturally show up in same-grain
+        # questions an authoritative pair already covers.
+        "exclud",
+        "without",
+        "tanpa",
+        "kecuali",
+        "selain",
+        "filter",
+        "breakdown",
+        # Common phrasing for asking the same number on a slightly different
+        # population — these should not trigger the lock-in either.
+        "saja",
+        "khusus",
     )
     return any(trigger in lowered for trigger in triggers)
 

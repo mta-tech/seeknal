@@ -517,3 +517,25 @@ def get_ask_toolset_mode(config: dict[str, Any]) -> str:
     if mode in _READ_ONLY_ANALYST_MODES:
         return "analysis"
     return "full"
+
+
+_VALID_SQL_PAIR_MODES = {"authoritative", "advisory"}
+
+
+def get_sql_pair_mode(config: dict[str, Any]) -> str:
+    """Return the SQL-pair guard mode declared in ``seeknal_agent.yml``.
+
+    Reads ``sql_pairs.mode`` and accepts ``authoritative`` (legacy default) or
+    ``advisory``. Anything else falls back to ``authoritative`` so a typo never
+    silently relaxes the guard.
+
+    Example::
+
+        sql_pairs:
+          mode: advisory
+    """
+    section = _get_mapping(config, "sql_pairs")
+    mode = section.get("mode")
+    if isinstance(mode, str) and mode.strip().lower() in _VALID_SQL_PAIR_MODES:
+        return mode.strip().lower()
+    return "authoritative"

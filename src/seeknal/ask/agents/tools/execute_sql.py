@@ -75,6 +75,7 @@ def execute_sql(
             synthesize an answer instead of allowing query drift.
     """
     from seeknal.ask.agents.tools._context import (
+        bump_authoritative_drift_attempt,
         get_authoritative_sql_pair_result,
         get_tool_context,
         get_successful_sql_cache,
@@ -150,18 +151,44 @@ def execute_sql(
         and get_authoritative_sql_pair_result(ctx) is not None
         and should_synthesize_after_authoritative_sql_pair(ctx)
     ):
-        result = format_tool_error(
-            TERMINAL_BOUNDED_EVIDENCE,
-            "A matching SQL pair already executed successfully for this turn.",
-            hint=(
-                "Stop tool use and answer from the AUTHORITATIVE_RESULT. "
-                "Only ask a new user turn for changed filters, grain, or "
-                "deeper post-query analysis."
-            ),
-        )
-        record_tool_result("execute_sql", result, args={"sql": sql})
-        return result
-    if drift_notice and not allow_sql_pair_drift:
+        if allow_sql_pair_drift:
+            # Agent has explicitly overridden — let the query through with the
+            # drift notice attached. The override is a meaningful escape hatch,
+            # not a no-op.
+            pass
+        else:
+            attempts = bump_authoritative_drift_attempt(ctx)
+            if attempts >= 2:
+                # Agent ignored the first RETRYABLE nudge — escalate to
+                # TERMINAL so the harness stops looping.
+                result = format_tool_error(
+                    TERMINAL_BOUNDED_EVIDENCE,
+                    "A matching SQL pair already executed successfully for this turn.",
+                    hint=(
+                        "Stop tool use and answer from the AUTHORITATIVE_RESULT. "
+                        "If the user asked for a different filter or grain, pass "
+                        "allow_sql_pair_drift=True on execute_sql to override."
+                    ),
+                )
+                record_tool_result("execute_sql", result, args={"sql": sql})
+                return result
+            result = format_tool_error(
+                RETRYABLE_SYNTAX,
+                "SQL differs from an authoritative SQL pair already loaded this turn.",
+                hint=(
+                    "If the user really wants this exact alternate query, retry "
+                    "with allow_sql_pair_drift=True. Otherwise answer from the "
+                    "AUTHORITATIVE_RESULT. This is the only nudge; a second "
+                    "attempt without the override will be terminal."
+                ),
+            )
+            record_tool_result("execute_sql", result, args={"sql": sql})
+            return result
+    if (
+        drift_notice
+        and not allow_sql_pair_drift
+        and getattr(ctx, "sql_pair_mode", "authoritative") != "advisory"
+    ):
         result = format_tool_error(
             RETRYABLE_SYNTAX,
             "SQL differs from the SQL pair loaded earlier this turn.",
@@ -336,18 +363,25 @@ def _sql_pair_drift_notice(ctx, sql: str) -> str | None:
 
 
 def _should_require_sql_pair_lookup(ctx, sql: str, checked: bool) -> bool:
-    """Require SQL-pair lookup before ad-hoc business SQL when pairs exist."""
+    """Require SQL-pair lookup before ad-hoc business SQL when pairs exist.
+
+    Only ``seeknal/sql_pairs/`` triggers the guard. ``context/sql_pairs/`` is
+    historically a derived-context storage location (see ``CLAUDE.md``); using
+    it as a guard trigger conflated curated cheatsheets with generated source
+    context.
+    """
     if checked or not (getattr(ctx, "current_question", None) or "").strip():
         return False
     if _looks_like_direct_sql_request(ctx.current_question):
         return False
     if _is_metadata_or_healthcheck_sql(sql):
         return False
-    roots = [ctx.project_path.resolve() / "seeknal" / "sql_pairs", ctx.project_path.resolve() / "context" / "sql_pairs"]
+    root = ctx.project_path.resolve() / "seeknal" / "sql_pairs"
+    if not root.exists():
+        return False
     return any(
-        root.exists()
-        and any(path.is_file() and path.suffix.lower() in {".yml", ".yaml"} for path in root.rglob("*"))
-        for root in roots
+        path.is_file() and path.suffix.lower() in {".yml", ".yaml"}
+        for path in root.rglob("*")
     )
 
 
