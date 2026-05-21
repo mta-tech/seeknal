@@ -1,12 +1,32 @@
 # On-prem worker deployment — runs near the data
 # Connects to cloud Temporal and POSTs streaming events to cloud gateway
 #
-# Scaling:
-#   Vertical: increase MAX_CONCURRENT_ACTIVITIES (e.g., 30, 50)
-#     Each activity = one agent turn (~200MB RAM for DuckDB + LLM session)
-#   Horizontal: docker compose up --scale seeknal-worker=3
-#     Each worker polls the same Temporal queue — auto load-balanced
-#     Careful with DuckDB file locking if multiple workers write to same DB
+# Scaling — pick ONE transport, then pick concurrency:
+#
+#   Temporal transport (default; cloud-managed Temporal):
+#     Vertical:   MAX_CONCURRENT_ACTIVITIES (default 15)
+#     Horizontal: docker compose up --scale seeknal-worker=3
+#                 All workers poll the same Temporal queue (auto load-balanced).
+#
+#   HTTP-only transport (--transport http; no Temporal SDK connection):
+#     Vertical:   SEEKNAL_WORKER_CONCURRENCY (default 1; bumped here to 10)
+#     Horizontal: docker compose up --scale seeknal-worker=3
+#                 All workers long-poll the same gateway /work-stream endpoint;
+#                 the gateway's HttpWorkerBroker hands each item to exactly one.
+#
+# Per-agent footprint:
+#   Tap-in mode (queries push down to PG/Iceberg/StarRocks): ~50-120MB / agent
+#   Full pipeline mode (local DuckDB/Spark compute):         ~150-250MB / agent
+#
+# Sizing rules (don't exceed any of these):
+#   1. Memory: N × per-agent + ~500MB base  <  container limit
+#   2. LLM rate limit: N × ~10 calls per 60s  <  provider RPM tier
+#        Anthropic Tier 1 (50 RPM)  → cap N at 3-5
+#        Anthropic Tier 2 (1000 RPM) → cap N at 15-20
+#   3. DB connections: N × attached_dbs  <  pg.max_connections / 2
+#
+# Sweet spot for tap-in: N=10 single worker, scale horizontally past N=20.
+# Careful with DuckDB file locking if multiple workers write to the same DB.
 
 services:
   seeknal-worker:
@@ -19,6 +39,9 @@ services:
       - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
       - TEMPORAL_TASK_QUEUE=${TEMPORAL_TASK_QUEUE:-seeknal-ask}
       - TEMPORAL_MAX_CONCURRENT_ACTIVITIES=${MAX_CONCURRENT_ACTIVITIES:-15}
+      # HTTP-only worker concurrency (ignored in Temporal mode):
+      - SEEKNAL_WORKER_CONCURRENCY=${SEEKNAL_WORKER_CONCURRENCY:-1}
+      - SEEKNAL_WORKER_SHUTDOWN_TIMEOUT=${SEEKNAL_WORKER_SHUTDOWN_TIMEOUT:-60}
       - CALLBACK_BASE_URL=${CLOUD_GATEWAY_URL:-}
       - CALLBACK_AUTH_TOKEN=${CALLBACK_AUTH_TOKEN:-}
       - SEEKNAL_GATEWAY_URL=${SEEKNAL_GATEWAY_URL:-}

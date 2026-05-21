@@ -402,19 +402,164 @@ def gateway_backend(
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
+async def _process_http_work_item(
+    work: dict,
+    *,
+    client,  # httpx.AsyncClient — typed loosely to avoid module-level httpx import
+    base_url: str,
+    headers: dict,
+    project_path: Path,
+    semaphore,  # asyncio.Semaphore
+) -> None:
+    """Process a single claimed work item end-to-end.
+
+    Guarantees on every exit path:
+      - POSTs ``complete`` to the gateway so the broker resolves the future
+      - Releases the semaphore slot
+      - Emits a lifecycle log line tagged with work_id + session_id
+
+    Cancellation (graceful shutdown) is handled by attempting to surface an
+    error+done event and a ``complete`` POST before re-raising so the calling
+    drainer sees the task as cancelled.
+    """
+    import asyncio
+
+    from seeknal.ask.gateway.server import _run_agent_streaming
+    from seeknal.ask.gateway.tenant import DEFAULT_TENANT
+
+    work_id = work["work_id"]
+    session_id = work["session_id"]
+    tenant_id = work.get("tenant_id") or DEFAULT_TENANT
+    question = work["question"]
+    short_id = work_id[:8]
+
+    typer.echo(f"[work={short_id} session={session_id}] start")
+
+    answer = ""
+    error: Optional[str] = None
+    event_count = 0
+
+    async def post_event(event: dict) -> None:
+        await client.post(
+            f"{base_url}/internal/worker/work/{work_id}/event",
+            headers=headers,
+            json=event,
+            timeout=15.0,
+        )
+
+    try:
+        try:
+            async for event in _run_agent_streaming(
+                project_path,
+                session_id,
+                question,
+                provider=work.get("provider"),
+                model=work.get("model"),
+                tenant_id=tenant_id,
+            ):
+                event_count += 1
+                if event.get("type") == "answer":
+                    answer = str(event.get("data") or "")
+                elif event.get("type") == "error":
+                    error = str(event.get("data") or "")
+                await post_event(event)
+        except asyncio.CancelledError:
+            error = error or "worker shutting down"
+            try:
+                await post_event({"type": "error", "data": error})
+                await post_event({"type": "done"})
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        except Exception as exc:  # noqa: BLE001 - surface worker failures to gateway
+            error = str(exc)
+            try:
+                await post_event({"type": "error", "data": error})
+                await post_event({"type": "done"})
+            except Exception:  # noqa: BLE001
+                pass
+    finally:
+        try:
+            await client.post(
+                f"{base_url}/internal/worker/work/{work_id}/complete",
+                headers=headers,
+                json={
+                    "answer": answer,
+                    "event_count": event_count,
+                    "error": error,
+                },
+                timeout=15.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            typer.echo(typer.style(
+                f"[work={short_id} session={session_id}] complete POST failed: {exc}",
+                fg=typer.colors.YELLOW,
+            ))
+        finally:
+            semaphore.release()
+            status = "error" if error else "ok"
+            typer.echo(
+                f"[work={short_id} session={session_id}] complete events={event_count} status={status}"
+            )
+
+
+async def _drain_or_cancel_tasks(tasks: set, timeout: float) -> None:
+    """Wait for in-flight tasks to finish, then cancel any stragglers.
+
+    Each task's own ``finally`` is responsible for the complete POST and
+    semaphore release — even under cancellation — so the broker does not
+    leak in-flight entries on shutdown.
+    """
+    import asyncio
+
+    if not tasks:
+        return
+    typer.echo(
+        f"  Draining {len(tasks)} in-flight task(s) (timeout {timeout:.0f}s)..."
+    )
+    pending = set(tasks)
+    done, still_pending = await asyncio.wait(pending, timeout=timeout)
+    if still_pending:
+        typer.echo(typer.style(
+            f"  Cancelling {len(still_pending)} task(s) past shutdown timeout",
+            fg=typer.colors.YELLOW,
+        ))
+        for task in still_pending:
+            task.cancel()
+        await asyncio.gather(*still_pending, return_exceptions=True)
+    typer.echo(
+        f"  Drained {len(done)} task(s), cancelled {len(still_pending)}."
+    )
+
+
 async def _run_http_only_worker(
     *,
     project_path: Path,
     gateway_url: str,
     api_token: str,
     poll_timeout: float = 30.0,
+    max_concurrency: int = 1,
+    shutdown_timeout: float = 60.0,
 ) -> None:
-    """Run a worker that talks only HTTP(S) to the gateway/kc-service."""
+    """Run a worker that talks only HTTP(S) to the gateway/kc-service.
+
+    ``max_concurrency`` caps the number of agent executions that run in
+    parallel within this worker process. The default of 1 preserves the
+    historical sequential behavior. Backpressure: the semaphore is acquired
+    *before* polling so the worker does not claim work it cannot start —
+    this preserves broker fairness across workers.
+
+    SIGINT and SIGTERM are handled explicitly via ``loop.add_signal_handler``
+    so the worker shuts down cleanly under K8s / systemd / docker stop —
+    the default ``asyncio.run`` SIGINT handling can fail to cancel the main
+    task reliably when child agent tasks are in flight.
+    """
     import asyncio
+    import signal
     import httpx
 
-    from seeknal.ask.gateway.server import _run_agent_streaming
-    from seeknal.ask.gateway.tenant import DEFAULT_TENANT
+    if max_concurrency < 1:
+        raise ValueError("max_concurrency must be >= 1")
 
     base_url = gateway_url.rstrip("/")
     headers = {"Authorization": f"Bearer {api_token}"}
@@ -423,73 +568,74 @@ async def _run_http_only_worker(
     typer.echo(f"  Project: {project_path}")
     typer.echo(f"  Gateway: {base_url}")
     typer.echo("  Transport: http-only")
+    typer.echo(f"  Max concurrency: {max_concurrency}")
+
+    semaphore = asyncio.Semaphore(max_concurrency)
+    live_tasks: set[asyncio.Task] = set()
+
+    # Install explicit signal handlers that cancel the main task. This is
+    # more reliable than asyncio.run's default SIGINT path under Python
+    # 3.11+ when child tasks are running. SIGTERM is also handled so K8s /
+    # docker stop trigger the same graceful drain.
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+
+    def _request_shutdown() -> None:
+        if main_task is not None and not main_task.done():
+            main_task.cancel()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown)
+        except NotImplementedError:
+            # add_signal_handler is not implemented on Windows; the default
+            # KeyboardInterrupt path will still cover SIGINT there.
+            pass
 
     async with httpx.AsyncClient(timeout=None) as client:
-        while True:
-            try:
-                response = await client.get(
-                    f"{base_url}/internal/worker/work-stream",
-                    headers=headers,
-                    params={"timeout": poll_timeout},
-                    timeout=poll_timeout + 10,
-                )
-            except httpx.RequestError as exc:
-                typer.echo(typer.style(
-                    f"Gateway poll failed: {exc}; retrying",
-                    fg=typer.colors.YELLOW,
-                ))
-                await asyncio.sleep(5)
-                continue
-            if response.status_code == 204:
-                continue
-            response.raise_for_status()
-            work = response.json()
-            work_id = work["work_id"]
-            session_id = work["session_id"]
-            tenant_id = work.get("tenant_id") or DEFAULT_TENANT
-            question = work["question"]
-            answer = ""
-            error = None
-            event_count = 0
-
-            async def post_event(event: dict) -> None:
-                await client.post(
-                    f"{base_url}/internal/worker/work/{work_id}/event",
-                    headers=headers,
-                    json=event,
-                    timeout=15.0,
-                )
-
-            try:
-                async for event in _run_agent_streaming(
-                    project_path,
-                    session_id,
-                    question,
-                    provider=work.get("provider"),
-                    model=work.get("model"),
-                    tenant_id=tenant_id,
-                ):
-                    event_count += 1
-                    if event.get("type") == "answer":
-                        answer = str(event.get("data") or "")
-                    elif event.get("type") == "error":
-                        error = str(event.get("data") or "")
-                    await post_event(event)
-            except Exception as exc:  # noqa: BLE001 - surface worker failures to gateway
-                error = str(exc)
-                await post_event({"type": "error", "data": error})
-                await post_event({"type": "done"})
-            finally:
-                await client.post(
-                    f"{base_url}/internal/worker/work/{work_id}/complete",
-                    headers=headers,
-                    json={
-                        "answer": answer,
-                        "event_count": event_count,
-                        "error": error,
-                    },
-                    timeout=15.0,
-                )
+        try:
+            while True:
+                # Backpressure: acquire a slot before claiming new work so
+                # the broker keeps unclaimed items available to other workers.
+                await semaphore.acquire()
+                claimed = False
+                try:
+                    try:
+                        response = await client.get(
+                            f"{base_url}/internal/worker/work-stream",
+                            headers=headers,
+                            params={"timeout": poll_timeout},
+                            timeout=poll_timeout + 10,
+                        )
+                    except httpx.RequestError as exc:
+                        typer.echo(typer.style(
+                            f"Gateway poll failed: {exc}; retrying",
+                            fg=typer.colors.YELLOW,
+                        ))
+                        await asyncio.sleep(5)
+                        continue
+                    if response.status_code == 204:
+                        continue
+                    response.raise_for_status()
+                    work = response.json()
+                    task = asyncio.create_task(_process_http_work_item(
+                        work,
+                        client=client,
+                        base_url=base_url,
+                        headers=headers,
+                        project_path=project_path,
+                        semaphore=semaphore,
+                    ))
+                    live_tasks.add(task)
+                    task.add_done_callback(live_tasks.discard)
+                    claimed = True
+                finally:
+                    if not claimed:
+                        semaphore.release()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            typer.echo("\nStopping HTTP worker...")
+        finally:
+            await _drain_or_cancel_tasks(live_tasks, shutdown_timeout)
 
 
 @gateway_app.command("worker")
@@ -525,6 +671,14 @@ def gateway_worker(
         "auto", "--transport", envvar="SEEKNAL_WORKER_TRANSPORT",
         help="Worker transport: auto, temporal, or http. http uses no Temporal SDK connection."
     ),
+    max_concurrency: int = typer.Option(
+        1, "--max-concurrency", envvar="SEEKNAL_WORKER_CONCURRENCY",
+        help="Maximum concurrent agents per HTTP worker process (HTTP transport only). For Temporal transport, use --max-activities instead."
+    ),
+    shutdown_timeout: float = typer.Option(
+        60.0, "--shutdown-timeout", envvar="SEEKNAL_WORKER_SHUTDOWN_TIMEOUT",
+        help="Seconds to wait for in-flight tasks to drain on shutdown before cancelling (HTTP transport only)."
+    ),
 ):
     """Start a standalone worker.
 
@@ -551,10 +705,18 @@ def gateway_worker(
                 project_path=project_path,
                 gateway_url=gateway_url,
                 api_token=api_token,
+                max_concurrency=max_concurrency,
+                shutdown_timeout=shutdown_timeout,
             ))
         except KeyboardInterrupt:
             typer.echo("\nHTTP worker stopped.")
         return
+
+    if transport == "temporal" and max_concurrency != 1:
+        typer.echo(typer.style(
+            "Note: --max-concurrency is HTTP-only; use --max-activities for Temporal transport.",
+            fg=typer.colors.YELLOW,
+        ))
 
     from seeknal.ask.gateway.tenant import task_queue_for_tenant
 
@@ -591,6 +753,8 @@ def gateway_worker(
                     project_path=project_path,
                     gateway_url=gateway_url,
                     api_token=api_token,
+                    max_concurrency=max_concurrency,
+                    shutdown_timeout=shutdown_timeout,
                 ))
                 return
         except Exception as exc:

@@ -2355,7 +2355,7 @@ seeknal gateway backend [OPTIONS]
 
 ## seeknal gateway worker
 
-Start a standalone Temporal worker that connects to an existing gateway. Use in split topologies.
+Start a standalone worker that processes Ask agent runs claimed from the gateway. Supports two transports: Temporal (durable, with `--max-activities` concurrency) and HTTP (lightweight, with `--max-concurrency` in-process concurrency).
 
 ```bash
 seeknal gateway worker [OPTIONS]
@@ -2364,14 +2364,19 @@ seeknal gateway worker [OPTIONS]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--project` | PATH | Auto-detected | Project path |
-| `--callback-url` | TEXT | None | Gateway URL for event callbacks |
+| `--transport` | TEXT | `auto` | `auto`, `temporal`, or `http`. Env: `SEEKNAL_WORKER_TRANSPORT`. |
+| `--max-activities` | INT | `15` | **Temporal only** — max concurrent activities. Env: `TEMPORAL_MAX_CONCURRENT_ACTIVITIES`. |
+| `--max-concurrency` | INT | `1` | **HTTP only** — max concurrent agent runs per worker process. Env: `SEEKNAL_WORKER_CONCURRENCY`. Default `1` preserves the legacy sequential behavior. |
+| `--shutdown-timeout` | FLOAT | `60.0` | **HTTP only** — seconds to drain in-flight tasks on `SIGINT` before cancelling. Env: `SEEKNAL_WORKER_SHUTDOWN_TIMEOUT`. |
+| `--callback-url` | TEXT | None | Gateway URL for event callbacks (Temporal mode) |
 | `--callback-auth-token` | TEXT | None | Shared secret for callback auth (legacy compatibility mode) |
+| `--tenant` | TEXT | None | Tenant ID — maps to task queue `seeknal-ask-{tenant}` |
 | `--gateway-url` | TEXT | `SEEKNAL_GATEWAY_URL` | Gateway URL for token-derived worker config bootstrap |
 | `--api-token` | TEXT | `SEEKNAL_API_TOKEN` | Worker API token used to fetch tenant queue/callback config |
 
 In token mode, the worker can start with `--gateway-url` and `--api-token`; it fetches `/internal/worker/config` and does not need a manually supplied Temporal queue.
 
-See [seeknal gateway CLI docs](../cli/gateway.md) for full details.
+See [seeknal gateway CLI docs](../cli/gateway.md) for full details, including sizing rules for `--max-concurrency` and graceful-shutdown semantics.
 
 ---
 

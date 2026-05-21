@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.4] - 2026-05-21
+
+HTTP-only Ask worker — in-process concurrency.
+
+### Added
+
+- **`--max-concurrency` on `seeknal gateway worker`** (closes #63) — HTTP-only worker mode now supports fanning out N work items per process via `asyncio.Semaphore` + `asyncio.create_task`. Default `1` preserves the historical sequential behavior; bump via the flag or `SEEKNAL_WORKER_CONCURRENCY` env. Reaches parity with the Temporal worker's `--max-activities` for deployments that cannot run Temporal. Backpressure: the semaphore is acquired before polling the gateway so the worker does not claim items it cannot start — preserves broker fairness across horizontally scaled workers.
+- **`--shutdown-timeout` on `seeknal gateway worker`** — bounded graceful shutdown for HTTP-only workers. On `SIGINT`, in-flight tasks drain up to `SEEKNAL_WORKER_SHUTDOWN_TIMEOUT` (default `60`s) and the broker receives `complete` POSTs for every claimed item (no leaks on rolling deploys). Stragglers are cancelled cleanly after the timeout.
+- **Per-task lifecycle logging** — every concurrent task tags its log lines with `work_id` + `session_id` so concurrent execution stays debuggable.
+- **Operator sizing guidance** — `deploy/docker-compose.worker.yml` documents the memory / LLM rate-limit / DB-connection math for sizing `SEEKNAL_WORKER_CONCURRENCY` per deployment tier.
+- **Multi-worker demo harness** (`tools/`) — `demo_gateway.py`, `demo_worker.py`, `demo_dispatcher.py`, `run_multi_worker_demo.sh`. Spawns a tmux session with 1 gateway + 3 workers + 1 dispatcher to validate horizontal scaling end-to-end without an LLM key.
+
+### Fixed
+
+- HTTP worker no longer blocks the entire container on a single slow agent run (30-90s LLM latency). Pre-fix, one in-flight item blocked all subsequent items per container; horizontal scaling was the only mitigation.
+- HTTP worker now installs explicit `SIGINT` / `SIGTERM` handlers via `loop.add_signal_handler` so K8s / systemd / `docker stop` trigger the bounded drain reliably. The default `asyncio.run` SIGINT handling can fail to cancel the main task when child tasks are in flight, leaving the worker polling after a shutdown signal — verified against the live multi-worker harness.
+
+### Notes
+
+- Backward-compatible by construction: with `--max-concurrency 1` (default) the worker is observationally identical to the pre-#63 sequential loop. Existing regression test for the retry path continues to pass unchanged.
+- No changes to `HttpWorkerBroker` (already concurrency-safe via `asyncio.Condition`) or to `_run_agent_streaming` (already concurrency-safe via per-task `ContextVar` isolation — proven in production by the Temporal worker at `max_activities=15`).
+
 ## [2.9.3] - 2026-05-21
 
 Ask agent reliability — SQL-pair guard fixes + multi-turn hygiene.
