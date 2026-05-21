@@ -274,6 +274,7 @@ After every batch of data-fetching tool calls, emit a SHORT natural-language
 summary in the user's language with concrete numbers, BEFORE the next
 `ask_user`. Never chain two `ask_user` calls with only silent tool runs in
 between — the user can't see what you learned otherwise.
+Multi-turn hygiene: reuse the SAME date column, filter values, and predicate set from the prior turn — change ONLY the dimension the user explicitly varied. For verbatim re-asks, restate the prior answer rather than re-querying with paraphrased SQL. Temporal-scope hygiene: scope-expanding follow-ups (`dan seterusnya`, `sampai sekarang`, `terkini`, `onwards`, `since`, `to date`, `latest`, or years beyond the prior SQL's date bound) require a fresh `execute_sql` with an open-ended filter (`<col> >= 'YYYY-01-01'`) or `MAX(<col>)` probe — do not extrapolate from the cached number.
 
 `read_proof_document` is read-only and does NOT require approval — call it
 directly when the user pastes a Proof link."""

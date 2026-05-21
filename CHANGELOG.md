@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.3] - 2026-05-21
+
+Ask agent reliability — SQL-pair guard fixes + multi-turn hygiene.
+
+### Fixed
+
+- **SQL-pair lock-in (Fix A)** — Guard 3 (`execute_sql` after authoritative pair) now demotes the first un-overridden drift attempt to RETRYABLE and only escalates to TERMINAL on a second attempt without `allow_sql_pair_drift=True`. The override flag is now a meaningful escape hatch instead of being silently ignored.
+- **Zero-row authoritative rejection (Fix B)** — `execute_sql_pair(authoritative=True)` no longer locks the turn to a result that is empty or all-NULL/zero aggregates. A SQL pair with a wrongly quoted qualified table name (silent UNION-ALL failure shape) now returns a non-authoritative `SQL_PAIR_RESULT` with explicit "the pair's SQL likely has a bug" guidance, freeing the agent to query directly.
+- **Read multi-doc YAML pairs without arming Guard 1 forever** — `read_sql_pair` now calls `mark_sql_pairs_checked` unconditionally on a successful read. Previously, list-format pair files (top-level YAML list of pairs) failed the dict-only check inside `_record_loaded_sql_pair` and skipped marking, so Guard 1 re-fired turn after turn.
+- **Session-scoped `sql_pairs_checked`** — `reset_turn_governor` no longer clears the checked flag between turns. Once the agent has consulted project pairs in a session, Guard 1 stays dormant for the rest of the session. Stops the per-turn "list pairs again" tax on simple follow-up questions.
+
+### Added
+
+- **`sql_pairs.mode: advisory` project config (Fix D)** — opt-in setting in `seeknal_agent.yml` that treats curated pairs as cheatsheets only: Guard 2 lets drifting SQL through without `allow_sql_pair_drift=True`, and Guard 3 never escalates to TERMINAL. Default remains `authoritative` (legacy behavior).
+
+### Changed
+
+- **Filter-tweak triggers in `_question_requests_post_sql_analysis` (Fix C)** — added Indonesian/English keywords (`exclud`, `tanpa`, `kecuali`, `selain`, `filter`, `breakdown`, `saja`, `khusus`) so follow-ups that narrow scope release Guard 3 instead of being treated as ordinary business questions.
+- **Drop `context/sql_pairs/` from Guard 1 roots (Fix E)** — only `seeknal/sql_pairs/` now triggers the mandatory-lookup nudge. `context/sql_pairs/` is reserved for generated source context per CLAUDE.md and was conflating two storage layers.
+- **Temporal-scope hygiene prompt rule** — workflow section teaches the agent to issue a fresh `execute_sql` with an open-ended filter or `MAX(<col>)` probe when follow-ups expand the time window (`dan seterusnya`, `sampai sekarang`, `terkini`, `onwards`, `since`, `to date`, `latest`, or years beyond the prior SQL's date bound). Fixes the "Q3 returned 50 instead of 94" extrapolation bug.
+- **Multi-turn hygiene prompt rule** — workflow section teaches the agent to reuse the SAME date column, filter values, and predicate set from the prior turn — change ONLY the dimension the user varied. For verbatim re-asks, restate the prior answer instead of re-querying. Eliminates filter drift across multi-turn conversations.
+
+### Tests
+
+- 84 ask-agent tests pass, including new regression tests covering: Guard 3 first-hit RETRYABLE, second-hit TERMINAL escalation; zero-row + null-only authoritative rejection; advisory-mode dormant guards; `context/sql_pairs/` not triggering Guard 1; filter-tweak Guard 3 release; multi-turn hygiene rule presence; hardcode-guard against domain-specific tokens leaking into the generic rule.
+- Base prompt still under the 160-line leanness budget.
+
 ## [2.8.0] - 2026-04-18
 
 Ask agent improvements batch — addresses open issues #23, #24, #25, #26, #27.

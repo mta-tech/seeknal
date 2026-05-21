@@ -30,6 +30,14 @@ def read_sql_pair(name_or_path: str) -> str:
         data = data[:_MAX_BYTES]
     text = data.decode("utf-8", errors="replace")
     header = f"# SQL pair: {target.relative_to(project_root).as_posix()}\n\n"
+    # Mark the lookup-guard satisfied for THIS turn unconditionally — the
+    # agent did consult a project pair, even if the YAML is not a dict
+    # (multi-document list format) and we cannot register its SQL for
+    # drift tracking. Otherwise Guard 1 keeps re-firing turn after turn
+    # for list-format pair files.
+    from seeknal.ask.agents.tools._context import mark_sql_pairs_checked
+
+    mark_sql_pairs_checked(ctx)
     _record_loaded_sql_pair(target, project_root, text)
     if truncated:
         return header + text + "\n\n... (truncated)"

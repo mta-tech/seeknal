@@ -154,6 +154,94 @@ class TestSectionBuilders:
         assert "Generate report now" in result
         assert "Publish to Seeknal Report Server" in result
 
+    def test_workflow_includes_temporal_scope_hygiene(self):
+        """A regression test for the Q3 'dan seterusnya' bug.
+
+        Without this rule the agent reused a prior turn's cached number
+        ('jumlah NIE tahun 2024 = 50') as the answer for 'jumlah NIE dari
+        tahun 2024 dan seterusnya?', missing 2025 and 2026 data. The
+        workflow prompt must teach the model to re-query when the follow-up
+        question expands the temporal scope.
+        """
+        result = _build_workflow()
+        assert "Temporal-scope hygiene" in result
+        # Indonesian scope-expansion triggers
+        assert "dan seterusnya" in result
+        assert "sampai sekarang" in result
+        # English scope-expansion triggers
+        assert "onwards" in result
+        assert "to date" in result
+        # The recovery procedure must be present too — recognizing the
+        # signal is useless without the corrective action.
+        assert "fresh `execute_sql`" in result or "fresh execute_sql" in result
+        assert "MAX(" in result
+
+    def test_workflow_includes_multi_turn_hygiene(self):
+        """Regression test for cross-turn answer drift.
+
+        Three weaknesses observed in the 10-scenario reliability test:
+
+        1. Verbatim re-ask burned an extra tool call because the agent
+           paraphrased its own SQL (cache miss).
+        2. Status filter set drifted across turns (e.g. ERLA `'0099'`
+           sometimes included, sometimes not).
+        3. Date column choice drifted (`tanggal` vs `tanggal_aju`).
+
+        All three are agent-reasoning issues solvable at the prompt level
+        without domain-specific keywords. The rule must reference generic
+        concepts (date column, filter values, predicate set) so it applies
+        to any project — not just BPOM.
+        """
+        result = _build_workflow()
+        assert "Multi-turn hygiene" in result
+        # Generic concepts (no domain-specific tokens like status codes,
+        # table names, or project identifiers).
+        assert "date column" in result
+        assert "filter values" in result
+        assert "predicate set" in result
+        # The two corrective actions: keep filters stable, restate verbatim
+        # re-asks instead of re-querying.
+        assert "verbatim" in result
+        assert "restate" in result.lower()
+
+    def test_workflow_multi_turn_hygiene_has_no_hardcoded_domain_terms(self):
+        """The rule must not reference any project-specific tokens.
+
+        Guard against future edits sneaking in BPOM / Seeknal-specific
+        keywords (status codes, table names, business categories) that
+        would silently narrow the rule's applicability.
+        """
+        result = _build_workflow()
+        # The multi-turn hygiene rule lives on a single source line; isolate
+        # it and check no hardcoded BPOM / domain tokens leaked in.
+        line = next(
+            (ln for ln in result.splitlines() if "Multi-turn hygiene" in ln),
+            "",
+        )
+        assert line, "Multi-turn hygiene rule must be present"
+        forbidden = [
+            # BPOM-specific
+            "NIE",
+            "ERBA",
+            "ERLA",
+            "0999",
+            "0906",
+            "9999",
+            "0099",
+            "kategori_dokumen",
+            "jenis_permohonan",
+            "tanggal_aju",
+            # Seeknal table names
+            "t_produk",
+            "warehouse.public",
+        ]
+        for token in forbidden:
+            assert token not in line, (
+                f"Hardcoded domain term {token!r} leaked into the "
+                f"multi-turn hygiene rule. Keep the rule generic so it "
+                f"applies to any project."
+            )
+
     def test_memory_returns_content(self):
         result = _build_memory()
         assert "persistent memory" in result

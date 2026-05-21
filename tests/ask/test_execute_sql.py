@@ -313,10 +313,20 @@ def test_loaded_sql_pair_drift_is_blocked_by_default(ctx):
     assert not any("COUNT(*) AS total" in call for call in ctx.repl.calls)
 
 
-def test_authoritative_sql_pair_blocks_drift_override_for_simple_question(ctx):
-    get_loaded_sql_pairs(ctx)["canonical"] = "SELECT id, v FROM small ORDER BY id"
+def test_authoritative_sql_pair_explicit_override_lets_drift_through(ctx):
+    """An authoritative pair must not silently lock out an explicit override.
+
+    Previous behavior (pre-Fix-A) treated ``allow_sql_pair_drift=True`` as a
+    no-op once a pair landed authoritatively for the turn, even for ordinary
+    business questions. This caused the agent to be stuck on a broken pair's
+    numbers. The override now means what it says: the agent is taking
+    responsibility for the drift, and the query runs with a strong notice.
+    """
     reset_turn_governor("How many records are there by month?")
-    get_loaded_sql_pairs(ctx)["canonical"] = "SELECT id, v FROM small ORDER BY id"
+    # Simulate read_sql_pair-style preload of canonical SQL plus an
+    # authoritative landing recorded by execute_sql_pair(authoritative=True).
+    from seeknal.ask.agents.tools._context import get_loaded_sql_pairs as _glp
+    _glp(ctx)["canonical"] = "SELECT id, v FROM small ORDER BY id"
     record_authoritative_sql_pair_result(
         name="canonical",
         path="seeknal/sql_pairs/canonical.yml",
@@ -329,9 +339,58 @@ def test_authoritative_sql_pair_blocks_drift_override_for_simple_question(ctx):
         allow_sql_pair_drift=True,
     )
 
-    assert "matching SQL pair already executed successfully" in out
-    assert "terminal_bounded_evidence" in out
+    assert "| total |" in out
+    assert "SQL pair drift" in out
+    assert any("COUNT(*) AS total" in call for call in ctx.repl.calls)
+
+
+def test_authoritative_sql_pair_first_drift_attempt_is_retryable(ctx):
+    """Fix A — Guard 3's first hit must be RETRYABLE, not TERMINAL.
+
+    The agent should learn about the authoritative pair and the override
+    flag once, retry intentionally, then have its query execute. Going
+    straight to TERMINAL on the first attempt was the lock-in behavior.
+    """
+    reset_turn_governor("Berapa total jumlah NIE?")
+    from seeknal.ask.agents.tools._context import get_loaded_sql_pairs as _glp
+    _glp(ctx)["canonical"] = "SELECT id, v FROM small ORDER BY id"
+    record_authoritative_sql_pair_result(
+        name="canonical",
+        path="seeknal/sql_pairs/canonical.yml",
+        result="| nie | count |\n| --- | --- |\n| 12345 | 3 |\n\n(1 row)",
+        ctx=ctx,
+    )
+
+    out = execute_sql("SELECT COUNT(*) AS total FROM small")
+
+    assert "retryable_syntax" in out
+    assert "allow_sql_pair_drift=True" in out
     assert not any("COUNT(*) AS total" in call for call in ctx.repl.calls)
+
+
+def test_authoritative_sql_pair_second_drift_attempt_is_terminal(ctx):
+    """Fix A — second un-overridden attempt escalates to TERMINAL.
+
+    Each attempt uses a different drifting SQL so the per-signature
+    repeated_failure_message guard (which would short-circuit duplicate
+    queries) does not pre-empt the drift escalation logic.
+    """
+    reset_turn_governor("Berapa total jumlah NIE?")
+    from seeknal.ask.agents.tools._context import get_loaded_sql_pairs as _glp
+    _glp(ctx)["canonical"] = "SELECT id, v FROM small ORDER BY id"
+    record_authoritative_sql_pair_result(
+        name="canonical",
+        path="seeknal/sql_pairs/canonical.yml",
+        result="| nie | count |\n| --- | --- |\n| 12345 | 3 |\n\n(1 row)",
+        ctx=ctx,
+    )
+
+    first = execute_sql("SELECT COUNT(*) AS total FROM small")
+    second = execute_sql("SELECT COUNT(*) AS jumlah FROM small WHERE id > 0")
+
+    assert "retryable_syntax" in first
+    assert "terminal_bounded_evidence" in second
+    assert not any("COUNT" in call for call in ctx.repl.calls)
 
 
 def test_authoritative_sql_pair_allows_drift_for_advanced_question(ctx):
@@ -401,3 +460,201 @@ def test_execute_sql_returns_terminal_timeout(tmp_path):
 
     assert "terminal_timeout" in out
     assert "SQL execution timed out after 1 seconds" in out
+
+
+# ---------------------------------------------------------------------------
+# Fix B — zero-row SQL pair must not become authoritative
+# ---------------------------------------------------------------------------
+
+
+def test_empty_pair_result_is_not_authoritative(tmp_path):
+    """A broken SQL pair that silently returns no rows must NOT lock the turn.
+
+    Reproduces the run-2 wrong-numbers symptom: a pair with a wrongly quoted
+    qualified table name like ``"warehouse.public.t_x"`` resolves as a missing
+    relation in DuckDB but the surrounding UNION ALL collapses the failure to
+    an empty result. Before Fix B, that empty result was recorded as
+    authoritative and locked the agent to wrong numbers.
+    """
+    from unittest.mock import MagicMock
+
+    from seeknal.ask.agents.tools._context import (
+        ToolContext,
+        get_authoritative_sql_pair_result,
+        reset_turn_governor,
+        set_tool_context,
+    )
+    from seeknal.ask.agents.tools.execute_sql_pair import execute_sql_pair
+
+    class _EmptyRepl:
+        def execute_oneshot(self, sql, limit=None):
+            return ["jumlah_nie"], []  # zero rows — silent UNION-ALL failure shape
+
+    ctx = ToolContext(
+        repl=_EmptyRepl(),
+        artifact_discovery=MagicMock(),
+        project_path=tmp_path,
+    )
+    set_tool_context(ctx)
+    reset_turn_governor("Berapa total jumlah NIE?")
+
+    pair = tmp_path / "seeknal" / "sql_pairs" / "broken.yml"
+    pair.parent.mkdir(parents=True)
+    pair.write_text(
+        'name: broken\n'
+        'prompt: Berapa total jumlah NIE\n'
+        'sql: |\n'
+        '  SELECT nomor FROM "warehouse.public.t_x" "main"\n'
+    )
+
+    out = execute_sql_pair("broken", authoritative=True)
+
+    assert "AUTHORITATIVE_RESULT" not in out
+    assert "not authoritative" in out
+    assert get_authoritative_sql_pair_result(ctx) is None
+
+
+def test_null_only_aggregate_is_not_authoritative(tmp_path):
+    """A pair whose only row is NULL/0 across all aggregate cells is suspect.
+
+    This is the second silent-failure shape: COUNT/SUM over an empty
+    intermediate select returns one row of all-NULL/0 instead of zero rows.
+    """
+    from unittest.mock import MagicMock
+
+    from seeknal.ask.agents.tools._context import (
+        ToolContext,
+        get_authoritative_sql_pair_result,
+        reset_turn_governor,
+        set_tool_context,
+    )
+    from seeknal.ask.agents.tools.execute_sql_pair import execute_sql_pair
+
+    class _NullRepl:
+        def execute_oneshot(self, sql, limit=None):
+            return ["jumlah_nie"], [(None,)]
+
+    ctx = ToolContext(
+        repl=_NullRepl(),
+        artifact_discovery=MagicMock(),
+        project_path=tmp_path,
+    )
+    set_tool_context(ctx)
+    reset_turn_governor("Berapa total jumlah NIE?")
+
+    pair = tmp_path / "seeknal" / "sql_pairs" / "broken.yml"
+    pair.parent.mkdir(parents=True)
+    pair.write_text(
+        'name: broken\n'
+        'prompt: Berapa total jumlah NIE\n'
+        'sql: |\n'
+        '  SELECT COUNT(*) AS jumlah_nie FROM warehouse.public.empty\n'
+    )
+
+    out = execute_sql_pair("broken", authoritative=True)
+
+    assert "AUTHORITATIVE_RESULT" not in out
+    assert "not authoritative" in out
+    assert get_authoritative_sql_pair_result(ctx) is None
+
+
+# ---------------------------------------------------------------------------
+# Fix C — filter-tweak questions release Guard 3
+# ---------------------------------------------------------------------------
+
+
+def test_filter_tweak_question_releases_guard3(ctx):
+    """Asking for the same metric with an added exclusion is post-SQL analysis.
+
+    Before Fix C, ``_question_requests_post_sql_analysis`` only matched
+    explicit analytical keywords (forecast, chart, model, ...). A user asking
+    "kecuali test accounts" or "tanpa tahun 1900" was dropped into Guard 3
+    lockout. The expanded keyword list now treats those as legitimate
+    follow-up scope so Guard 3 is dormant — Guard 2 (the polite RETRYABLE
+    drift nudge) still applies, which is the desired behavior.
+    """
+    from seeknal.ask.agents.tools._context import (
+        get_loaded_sql_pairs as _glp,
+        should_synthesize_after_authoritative_sql_pair,
+    )
+
+    reset_turn_governor("Berapa total NIE kecuali test account?")
+    _glp(ctx)["canonical"] = "SELECT id, v FROM small ORDER BY id"
+    record_authoritative_sql_pair_result(
+        name="canonical",
+        path="seeknal/sql_pairs/canonical.yml",
+        result="| nie | count |\n| --- | --- |\n| 12345 | 3 |\n\n(1 row)",
+        ctx=ctx,
+    )
+
+    # Guard 3 must NOT lock — the question is a filter tweak.
+    assert not should_synthesize_after_authoritative_sql_pair(ctx)
+    # Override works (Guard 3 dormant means the override is honored).
+    overridden = execute_sql(
+        "SELECT COUNT(*) AS total FROM small",
+        allow_sql_pair_drift=True,
+    )
+    assert "| total |" in overridden
+    assert "SQL pair drift" in overridden
+
+
+# ---------------------------------------------------------------------------
+# Fix D — advisory mode never escalates Guard 3
+# ---------------------------------------------------------------------------
+
+
+def test_advisory_mode_never_locks_authoritative(ctx):
+    """``sql_pairs.mode: advisory`` keeps pairs as cheatsheets only."""
+    from seeknal.ask.agents.tools._context import (
+        get_loaded_sql_pairs as _glp,
+        should_synthesize_after_authoritative_sql_pair,
+    )
+
+    reset_turn_governor("Berapa total jumlah NIE?")
+    ctx.sql_pair_mode = "advisory"
+    _glp(ctx)["canonical"] = "SELECT id, v FROM small ORDER BY id"
+    record_authoritative_sql_pair_result(
+        name="canonical",
+        path="seeknal/sql_pairs/canonical.yml",
+        result="| nie | count |\n| --- | --- |\n| 12345 | 3 |\n\n(1 row)",
+        ctx=ctx,
+    )
+
+    assert not should_synthesize_after_authoritative_sql_pair(ctx)
+
+    out = execute_sql("SELECT COUNT(*) AS total FROM small")
+
+    assert "| total |" in out
+    assert "SQL pair drift" in out
+
+
+def test_get_sql_pair_mode_reads_yaml_section(tmp_path):
+    """End-to-end: ``seeknal_agent.yml`` → ToolContext.sql_pair_mode."""
+    from seeknal.ask.config import get_sql_pair_mode
+
+    assert get_sql_pair_mode({}) == "authoritative"
+    assert get_sql_pair_mode({"sql_pairs": {"mode": "advisory"}}) == "advisory"
+    # Unknown mode falls back to authoritative (typo-safe).
+    assert get_sql_pair_mode({"sql_pairs": {"mode": "lenient"}}) == "authoritative"
+
+
+# ---------------------------------------------------------------------------
+# Fix E — context/sql_pairs no longer triggers Guard 1
+# ---------------------------------------------------------------------------
+
+
+def test_context_sql_pairs_dir_does_not_trigger_lookup_guard(ctx, tmp_path):
+    """Files under ``context/sql_pairs/`` must not force a lookup.
+
+    That directory is reserved for generated-source context per CLAUDE.md;
+    treating it as a curated-cheatsheet trigger conflated two storage layers.
+    """
+    pair = tmp_path / "context" / "sql_pairs" / "generated.yml"
+    pair.parent.mkdir(parents=True)
+    pair.write_text("name: generated\nprompt: any\nsql: SELECT 1\n")
+    reset_turn_governor("Berapa total jumlah NIE?")
+
+    out = execute_sql("SELECT COUNT(*) AS total FROM small")
+
+    assert "Project SQL pairs exist" not in out
+    assert "| total |" in out
