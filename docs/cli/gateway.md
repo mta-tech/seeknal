@@ -68,9 +68,58 @@ Supports `--token-config` so `/temporal/start`, `/events/{session_id}`, `/sessio
 
 ### `seeknal gateway worker`
 
-Start a standalone Temporal worker that connects to an existing gateway. Use in split topologies where the gateway and worker run on different machines.
+Start a standalone worker that processes Ask agent runs claimed from the gateway. This is the worker behind `seeknal ask` requests in any split topology — when users talk about "the ask worker", this is the command. It supports two transports:
+
+- **`temporal`** — connects to a Temporal server and polls a task queue. Provides durable execution, automatic retries, and per-activity isolation. Concurrency is governed by `--max-activities`.
+- **`http`** — long-polls the gateway's `/internal/worker/work-stream` endpoint via HTTPS. No Temporal SDK required. Concurrency is governed by `--max-concurrency`.
+
+Use `--transport auto` (default) to pick automatically: if a token is configured and the gateway reports HTTP routing, the worker uses HTTP; otherwise Temporal. Force one with `--transport temporal` or `--transport http`.
 
 For secure multi-tenant deployments, start the worker with `--gateway-url` and `--api-token`. The worker fetches `/internal/worker/config`, then uses the token-derived tenant queue, callback bearer token, and optional Temporal address/namespace. Existing local workers can still use `--tenant` or `TEMPORAL_TASK_QUEUE` when token mode is not configured.
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--project` | PATH | Auto-detected | Project path |
+| `--transport` | TEXT | `auto` | `auto`, `temporal`, or `http` |
+| `--max-activities` | INT | `15` | **Temporal only** — max concurrent activities per worker. Env: `TEMPORAL_MAX_CONCURRENT_ACTIVITIES`. |
+| `--max-concurrency` | INT | `1` | **HTTP only** — max concurrent agent runs per worker process. Env: `SEEKNAL_WORKER_CONCURRENCY`. Default `1` preserves the legacy sequential behavior. |
+| `--shutdown-timeout` | FLOAT | `60.0` | **HTTP only** — seconds to wait for in-flight tasks to drain on `SIGINT` before cancelling. Env: `SEEKNAL_WORKER_SHUTDOWN_TIMEOUT`. |
+| `--callback-url` | TEXT | None | Gateway URL for event callbacks (Temporal mode) |
+| `--callback-auth-token` | TEXT | None | Shared secret for callback auth (legacy compatibility mode) |
+| `--tenant` | TEXT | None | Tenant ID — maps to task queue `seeknal-ask-{tenant}` |
+| `--gateway-url` | TEXT | `SEEKNAL_GATEWAY_URL` | Gateway URL for token-derived runtime config |
+| `--api-token` | TEXT | `SEEKNAL_API_TOKEN` | Worker API token used for token-derived routing |
+
+#### Worker concurrency — sizing guide
+
+In **tap-in mode** (queries push down to PostgreSQL / Iceberg / StarRocks; the worker mostly orchestrates), one agent run is dominated by network I/O — LLM API latency plus DB query latency. This is the best case for in-process concurrency.
+
+| Anthropic tier | RPM ceiling | Recommended `--max-concurrency` per worker |
+|----------------|-------------|---------------------------------------------|
+| Tier 1 (50 RPM) | 50 | 3-5 |
+| Tier 2 (1000 RPM) | 1,000 | **10-15** ← typical production |
+| Tier 3 (2000 RPM) | 2,000 | 20-25 |
+
+**Rules of thumb (take the minimum):**
+
+1. **Memory**: `N × per-agent-MB + ~500MB base` < container limit. Tap-in mode ≈ 50-120 MB/agent. Full pipeline mode ≈ 150-250 MB/agent.
+2. **LLM rate limit**: `N × ~10 calls / 60s` < provider RPM tier.
+3. **DB connections**: `N × attached_databases` < `pg.max_connections / 2`.
+
+**Scale horizontally past N=20 in one worker.** Run multiple worker containers — each polls the same gateway endpoint, and the broker (`HttpWorkerBroker`) hands each item to exactly one. The new backpressure rule (semaphore acquired *before* polling) means saturated workers stop claiming work, so the broker re-distributes fairly across the pool.
+
+Sweet spot for typical production: **3 worker containers × `--max-concurrency 10`** = 30 total concurrent agents on ~6 GB total RAM, survives one worker dying, supports rolling deploys via the bounded-drain shutdown.
+
+#### Graceful shutdown (HTTP mode)
+
+On `SIGINT` / `SIGTERM`:
+
+1. The worker stops polling for new work.
+2. In-flight tasks drain up to `--shutdown-timeout` seconds.
+3. Stragglers are cancelled; cancelled tasks still POST `complete` so the broker doesn't leak `_inflight` entries.
+4. Worker exits cleanly.
+
+Set `SEEKNAL_WORKER_SHUTDOWN_TIMEOUT` to a value ≥ the longest expected agent run when running behind a rolling deployer (Kubernetes, ECS, etc.).
 
 ## Examples
 
@@ -119,6 +168,47 @@ seeknal gateway start --redis redis://localhost:6379
 
 # Temporal durable execution
 seeknal gateway start --temporal --max-activities 20
+
+# HTTP-only worker with in-process concurrency (default N=1 → sequential)
+seeknal gateway worker \
+  --transport http \
+  --gateway-url http://gateway:8000 \
+  --api-token "$SEEKNAL_API_TOKEN" \
+  --max-concurrency 10
+
+# Same via env vars (precedence: CLI flag > env var > default)
+SEEKNAL_WORKER_CONCURRENCY=10 \
+SEEKNAL_WORKER_SHUTDOWN_TIMEOUT=120 \
+seeknal gateway worker \
+  --transport http \
+  --gateway-url http://gateway:8000 \
+  --api-token "$SEEKNAL_API_TOKEN"
+
+# Multi-worker pool (run each command in its own terminal / systemd unit)
+# All three workers long-poll the same gateway; broker distributes items.
+for i in 1 2 3; do
+  SEEKNAL_WORKER_CONCURRENCY=10 \
+  seeknal gateway worker --transport http \
+    --gateway-url http://gateway:8000 \
+    --api-token "$SEEKNAL_API_TOKEN" &
+done
+
+# Docker: HTTP worker with concurrency
+docker run --rm \
+  -v "$PWD/my-project:/app/project" \
+  --env-file "$PWD/my-project/.env" \
+  -e SEEKNAL_GATEWAY_URL=http://host.docker.internal:8000 \
+  -e SEEKNAL_API_TOKEN="$SEEKNAL_API_TOKEN" \
+  -e SEEKNAL_WORKER_TRANSPORT=http \
+  -e SEEKNAL_WORKER_CONCURRENCY=10 \
+  -e SEEKNAL_WORKER_SHUTDOWN_TIMEOUT=120 \
+  seeknal-worker:local --project /app/project
+
+# Docker Compose: 3 worker replicas × N=10 (set via .env)
+# In .env:
+#   SEEKNAL_WORKER_CONCURRENCY=10
+#   SEEKNAL_WORKER_SHUTDOWN_TIMEOUT=120
+docker compose -f deploy/docker-compose.worker.yml up --scale seeknal-worker=3
 ```
 
 ## Multi-tenant token registry
@@ -192,6 +282,9 @@ Client (browser/app/bot)
 | `SEEKNAL_API_TOKENS` | Inline JSON token registry for tests/small deployments |
 | `SEEKNAL_GATEWAY_URL` | Gateway URL used by `seeknal gateway worker` bootstrap |
 | `SEEKNAL_API_TOKEN` | Worker/client API token used for token-derived routing |
+| `SEEKNAL_WORKER_TRANSPORT` | Worker transport: `auto` (default), `temporal`, or `http` |
+| `SEEKNAL_WORKER_CONCURRENCY` | HTTP worker — max concurrent agent runs per process (default `1`) |
+| `SEEKNAL_WORKER_SHUTDOWN_TIMEOUT` | HTTP worker — seconds to drain in-flight tasks on shutdown (default `60`) |
 
 ## Docker images
 
