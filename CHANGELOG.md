@@ -20,6 +20,7 @@ HTTP-only Ask worker — in-process concurrency.
 ### Fixed
 
 - HTTP worker no longer blocks the entire container on a single slow agent run (30-90s LLM latency). Pre-fix, one in-flight item blocked all subsequent items per container; horizontal scaling was the only mitigation.
+- HTTP worker now installs explicit `SIGINT` / `SIGTERM` handlers via `loop.add_signal_handler` so K8s / systemd / `docker stop` trigger the bounded drain reliably. The default `asyncio.run` SIGINT handling can fail to cancel the main task when child tasks are in flight, leaving the worker polling after a shutdown signal — verified against the live multi-worker harness.
 
 ### Notes
 

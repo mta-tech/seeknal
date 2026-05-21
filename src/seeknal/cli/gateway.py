@@ -548,8 +548,14 @@ async def _run_http_only_worker(
     historical sequential behavior. Backpressure: the semaphore is acquired
     *before* polling so the worker does not claim work it cannot start —
     this preserves broker fairness across workers.
+
+    SIGINT and SIGTERM are handled explicitly via ``loop.add_signal_handler``
+    so the worker shuts down cleanly under K8s / systemd / docker stop —
+    the default ``asyncio.run`` SIGINT handling can fail to cancel the main
+    task reliably when child agent tasks are in flight.
     """
     import asyncio
+    import signal
     import httpx
 
     if max_concurrency < 1:
@@ -566,6 +572,25 @@ async def _run_http_only_worker(
 
     semaphore = asyncio.Semaphore(max_concurrency)
     live_tasks: set[asyncio.Task] = set()
+
+    # Install explicit signal handlers that cancel the main task. This is
+    # more reliable than asyncio.run's default SIGINT path under Python
+    # 3.11+ when child tasks are running. SIGTERM is also handled so K8s /
+    # docker stop trigger the same graceful drain.
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+
+    def _request_shutdown() -> None:
+        if main_task is not None and not main_task.done():
+            main_task.cancel()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown)
+        except NotImplementedError:
+            # add_signal_handler is not implemented on Windows; the default
+            # KeyboardInterrupt path will still cover SIGINT there.
+            pass
 
     async with httpx.AsyncClient(timeout=None) as client:
         try:
