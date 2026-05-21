@@ -395,10 +395,13 @@ async def _run_agent_inner(
     from pydantic_ai.messages import (
         FunctionToolCallEvent,
         FunctionToolResultEvent,
+        ModelRequest,
+        ModelResponse,
         PartDeltaEvent,
         PartStartEvent,
         TextPart,
         TextPartDelta,
+        UserPromptPart,
     )
 
     from seeknal.ask.agents.agent import compact_history_for_analysis_mode, create_agent
@@ -415,12 +418,46 @@ async def _run_agent_inner(
         environment="gateway", include_web=include_web,
     )
     from seeknal.ask.agents.tools._context import (
+        build_verbatim_restate_response,
+        lookup_prior_turn_answer,
+        record_prior_turn_answer,
         reset_report_approval,
         reset_turn_governor,
     )
 
     reset_report_approval()
     reset_turn_governor(question)
+
+    # Verbatim re-ask short-circuit: same question as the prior turn returns
+    # the prior answer with a bilingual restate notice BEFORE any LLM/tool
+    # call. The gate must fire after reset_turn_governor but before the agent
+    # loop starts so we don't burn tool budget on an identical lookup.
+    _prior_answer = lookup_prior_turn_answer(question)
+    if _prior_answer is not None:
+        restate = build_verbatim_restate_response(_prior_answer)
+        # Persist the UNWRAPPED prior answer so a triple-ask doesn't recursively
+        # wrap the wrapper — the user-facing restate is decorated, but the
+        # stored prior stays canonical.
+        record_prior_turn_answer(question=question, answer=_prior_answer)
+        # Synthesize the request/response pair so session replay and the next
+        # turn's message_history both reflect that the user re-asked and got
+        # the restate. Without this, save_messages would skip recording the
+        # turn entirely (result is None), and the next load_messages would
+        # miss the exchange.
+        message_history.append(
+            ModelRequest(parts=[UserPromptPart(content=question)])
+        )
+        message_history.append(
+            ModelResponse(parts=[TextPart(content=restate)])
+        )
+        store.save_messages(session_id, message_history)
+        yield {"type": "answer", "data": restate}
+        store.update(
+            session_id,
+            last_question=question[:200],
+            status="active",
+        )
+        return
 
     # Auto-grant all approval gates (for Telegram and other headless channels)
     if auto_approve:
@@ -452,6 +489,7 @@ async def _run_agent_inner(
                     "elapsed_ms": int((time.monotonic() - tool_started) * 1000),
                 },
             }
+        record_prior_turn_answer(question=question, answer=direct_result.answer)
         yield {"type": "answer", "data": direct_result.answer}
         store.update(
             session_id,
@@ -607,6 +645,7 @@ async def _run_agent_inner(
                 answer = _NO_RESPONSE
 
         if answer:
+            record_prior_turn_answer(question=question, answer=answer)
             yield {"type": "answer", "data": answer}
 
     except UsageLimitExceeded as exc:
@@ -644,6 +683,7 @@ async def _run_agent_inner(
             answer = result.output or deterministic
         except UsageLimitExceeded:
             answer = deterministic
+        record_prior_turn_answer(question=question, answer=answer)
         yield {"type": "answer", "data": answer}
 
     finally:

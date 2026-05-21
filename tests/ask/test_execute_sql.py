@@ -658,3 +658,79 @@ def test_context_sql_pairs_dir_does_not_trigger_lookup_guard(ctx, tmp_path):
 
     assert "Project SQL pairs exist" not in out
     assert "| total |" in out
+
+
+# ---------------------------------------------------------------------------
+# Phase B (issue #64) — EXTRACT pushdown integration
+# ---------------------------------------------------------------------------
+
+
+def test_ac_b1_extract_pushdown_lint_notice_in_result(ctx):
+    """AC-B1: execute_sql result contains the EXTRACT-pushdown lint notice."""
+    ctx.repl.conn.execute(
+        "CREATE TABLE pg_t AS SELECT DATE '2023-06-15' AS tanggal"
+    )
+    out = execute_sql("SELECT * FROM pg_t WHERE EXTRACT(YEAR FROM tanggal) = 2023")
+    # Result must surface the EXTRACT rewrite to the user, matching the
+    # existing ILIKE/TRY_CAST notice style.
+    assert "ℹ SQL lint: rewrote EXTRACT(...) to a pushdown-safe date range" in out
+
+
+def test_ac_b2_extract_pushdown_cache_hit_skips_execute(ctx):
+    """AC-B2: second invocation of same SQL hits the cache; execute called once."""
+    from unittest.mock import patch
+
+    ctx.repl.conn.execute(
+        "CREATE TABLE pg_t2 AS SELECT DATE '2023-06-15' AS tanggal"
+    )
+    sql = "SELECT * FROM pg_t2 WHERE EXTRACT(YEAR FROM tanggal) = 2023"
+
+    # Run once to populate the cache.
+    first = execute_sql(sql)
+    assert "ℹ SQL lint" in first
+
+    # Now patch the executor and call again — it must NOT be invoked.
+    with patch(
+        "seeknal.ask.agents.tools.execute_sql._execute_oneshot_with_timeout"
+    ) as mocked:
+        second = execute_sql(sql)
+        mocked.assert_not_called()
+    # Cached result keeps the lint notice via the cached string.
+    assert "ℹ SQL lint" in second
+    assert "Reusing prior successful SQL result" in second
+
+
+def test_ac_b3_execute_sql_pair_delegation_emits_lint_notice(ctx, tmp_path):
+    """AC-B3: execute_sql_pair with EXTRACT YAML produces the same lint notice."""
+    from seeknal.ask.agents.tools.execute_sql_pair import execute_sql_pair
+
+    ctx.repl.conn.execute(
+        "CREATE TABLE pg_t3 AS SELECT DATE '2023-06-15' AS tanggal"
+    )
+    pair = tmp_path / "seeknal" / "sql_pairs" / "extract_year.yml"
+    pair.parent.mkdir(parents=True)
+    pair.write_text(
+        "name: extract_year\n"
+        "prompt: rows in 2023\n"
+        "sql: |\n"
+        "  SELECT * FROM pg_t3 WHERE EXTRACT(YEAR FROM tanggal) = 2023\n"
+    )
+
+    out = execute_sql_pair("extract_year")
+    assert "ℹ SQL lint: rewrote EXTRACT(...) to a pushdown-safe date range" in out
+
+
+def test_ac_b4_drift_notice_does_not_fire_for_extract_pair(ctx, tmp_path):
+    """AC-B4: drift notice is silent when pair SQL and agent SQL match post-rewrite."""
+    from seeknal.ask.agents.tools._context import get_loaded_sql_pairs
+
+    ctx.repl.conn.execute(
+        "CREATE TABLE pg_t4 AS SELECT DATE '2023-06-15' AS tanggal"
+    )
+    pair_sql = "SELECT * FROM pg_t4 WHERE EXTRACT(YEAR FROM tanggal) = 2023"
+    get_loaded_sql_pairs(ctx)["extract_year"] = pair_sql
+
+    # Same EXTRACT form — drift normalization rewrites both sides identically.
+    out = execute_sql(pair_sql, allow_sql_pair_drift=True)
+    assert "⚠ SQL pair drift" not in out
+    assert "| tanggal |" in out

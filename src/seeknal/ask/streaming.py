@@ -26,7 +26,10 @@ from seeknal.ask.agents.agent import (
 )
 from seeknal.ask.agents.tools._context import (
     build_evidence_synthesis_prompt,
+    build_verbatim_restate_response,
     has_sufficient_evidence,
+    lookup_prior_turn_answer,
+    record_prior_turn_answer,
     record_tool_result,
     reset_report_approval,
     reset_turn_governor,
@@ -961,6 +964,36 @@ async def stream_ask(
     reset_report_approval()
     reset_turn_governor(question)
 
+    # Verbatim re-ask short-circuit: if the user asks the exact same question
+    # twice in a row, return the prior answer with a bilingual restate notice
+    # BEFORE any LLM/tool call. Must fire after reset_turn_governor (which
+    # wipes in-turn evidence) but before the agent loop starts.
+    _prior_answer = lookup_prior_turn_answer(question)
+    if _prior_answer is not None:
+        from pydantic_ai.messages import (
+            ModelRequest,
+            ModelResponse,
+            TextPart,
+            UserPromptPart,
+        )
+
+        restate = build_verbatim_restate_response(_prior_answer)
+        _show_answer(console, restate)
+        # Persist the UNWRAPPED prior answer so a triple-ask doesn't recursively
+        # wrap the wrapper — the user-facing restate is decorated, but the
+        # stored prior stays canonical.
+        record_prior_turn_answer(question=question, answer=_prior_answer)
+        # Append the synthesized request/response pair so the caller's
+        # persisted history reflects that the user re-asked. Without this the
+        # next turn's message_history is missing the exchange.
+        message_history.append(
+            ModelRequest(parts=[UserPromptPart(content=question)])
+        )
+        message_history.append(
+            ModelResponse(parts=[TextPart(content=restate)])
+        )
+        return restate
+
     if quiet:
         # Quiet mode still runs inside this async function, so call the
         # pydantic-ai async API directly instead of nesting run_sync inside an
@@ -987,6 +1020,7 @@ async def stream_ask(
         output = result.output or ""
         if output:
             console.print(output)
+        record_prior_turn_answer(question=question, answer=output)
         return output
 
     # Streaming mode with progressive rendering
@@ -1028,6 +1062,7 @@ async def stream_ask(
                     reason,
                     console,
                 )
+                record_prior_turn_answer(question=question, answer=fallback)
                 return fallback
             raise
         # Update message history in place
@@ -1039,6 +1074,7 @@ async def stream_ask(
             answer = await _stream_quality_gate(
                 agent, deps, message_history, answer, console
             )
+            record_prior_turn_answer(question=question, answer=answer)
             return answer
 
         # Diminishing returns: track low-output retries

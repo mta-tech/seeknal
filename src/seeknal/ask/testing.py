@@ -208,6 +208,10 @@ def run_ask_sql_tests(
     project_path = project_path.resolve()
     cases = discover_ask_sql_tests(project_path, select=select)
     mode = "sql-only" if sql_only else "agent"
+    # Issue #68.3: read the project's number_format locale once so
+    # _value_variants can emit dot-thousands-separator forms (e.g. '30.276')
+    # for Indonesian / German / etc. agents.
+    locale_tag = _read_project_number_locale(project_path)
     results = [
         _run_one_case(
             case,
@@ -215,6 +219,7 @@ def run_ask_sql_tests(
             provider=provider,
             model=model,
             sql_only=sql_only,
+            locale=locale_tag,
         )
         for case in cases
     ]
@@ -234,18 +239,93 @@ def run_ask_sql_tests(
 
 
 def execute_expected_sql(project_path: Path, sql: str) -> SqlOracleResult:
-    """Execute expected SQL using the existing read-only REPL surface."""
+    """Execute expected SQL — prefer direct psycopg2 for PG-only references.
+
+    Routing:
+    - If the SQL references only one connected-PG namespace and no
+      unqualified tables, run it directly via psycopg2 (oracle PG path).
+    - Otherwise, fall back to the legacy DuckDB REPL path.
+
+    Once psycopg2 routing succeeds, execution failures are FATAL for this
+    oracle invocation — they propagate up or return as
+    ``SqlOracleResult(error=...)``. They do NOT silently fall back to
+    DuckDB, because doing so would give the user a wrong-engine answer
+    and defeat the purpose of the oracle path.
+    """
+    from seeknal.sources.config import SourceConfigError
+
+    ns: str | None = None
+    source = None
     try:
+        from seeknal.ask._pg_oracle import detect_pg_only_namespace
+        from seeknal.sources.config import load_source_registry
+
+        registry = load_source_registry(project_path)
+        ns = detect_pg_only_namespace(sql, registry)
+        if ns is not None:
+            # CRITICAL: registry.sources is keyed by .name (see
+            # src/seeknal/sources/config.py:334 -- sources[source.name] =
+            # source) not by .namespace (declared at line 294).
+            # Iterate values() and match on .namespace.
+            source = next(
+                (s for s in registry.sources.values() if s.namespace == ns),
+                None,
+            )
+    except (KeyError, SourceConfigError):
+        # Routing/detection error -> fall through to DuckDB path.
+        ns = None
+        source = None
+
+    if ns is not None and source is not None:
+        # Routing succeeded. From here on, psycopg2 errors are FATAL for
+        # this oracle invocation -- no DuckDB fallback (Principle #2).
+        from seeknal.ask._pg_oracle import (
+            execute_via_psycopg2,
+            resolve_pg_dsn,
+            strip_namespace,
+        )
+        from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+        # PRIVATE-API COUPLING: ProfileLoader._load_profile_data() is
+        # private (leading underscore). A regression test in
+        # tests/ask/test_oracle_psycopg2.py (AC-D6) asserts the attribute
+        # exists so a future rename fails loudly with a clear pointer.
+        profile_path = project_path / "profiles.yml"
+        loader = ProfileLoader(
+            profile_path=profile_path if profile_path.exists() else None
+        )
+        profile_data = loader._load_profile_data()
+
+        dsn = resolve_pg_dsn(source, profile_data)
+        stripped = strip_namespace(sql, ns)
+        return execute_via_psycopg2(dsn, stripped)
+
+    # --- DuckDB REPL path (with rewrite) ---
+    # Issue #66: REPL holds a DuckDB connection plus ATTACH'd PG sources.
+    # Without an explicit close, each oracle SQL invocation leaks the
+    # underlying libpq connections until GC runs, exhausting the PG server's
+    # ``max_connections`` on suites with 20+ tests. Close deterministically
+    # in finally so connections are released as soon as the oracle returns.
+    repl = None
+    try:
+        from seeknal.ask.agents.tools.execute_sql import _rewrite_for_pg_pushdown
         from seeknal.cli.repl import REPL
 
         repl = REPL(project_path=project_path, skip_history=True)
-        columns, rows = repl.execute_oneshot(sql)
+        sql_for_duckdb, _notices = _rewrite_for_pg_pushdown(sql)
+        columns, rows = repl.execute_oneshot(sql_for_duckdb)
         return SqlOracleResult(
             columns=[str(col) for col in columns],
             rows=[[_jsonable(cell) for cell in row] for row in rows],
         )
     except Exception as exc:  # noqa: BLE001 - test result should capture failure
         return SqlOracleResult(error=str(exc))
+    finally:
+        if repl is not None:
+            try:
+                repl.conn.close()
+            except Exception:  # noqa: BLE001 - best-effort close on teardown
+                pass
 
 
 def run_agent_answer(
@@ -282,26 +362,35 @@ def check_answer(
     answer: str,
     oracle: SqlOracleResult,
     assertions: dict[str, Any] | None = None,
+    *,
+    locale: str | None = None,
 ) -> AnswerCheckResult:
     """Check an answer using generic project-owned assertions.
 
     Supported assertions:
     - `answer_contains`: string or list of strings required in answer.
     - `answer_not_contains`: string or list of forbidden strings.
-    - `expected_values`: bool, default true.  When true and no explicit
-      `answer_contains` is supplied, sample values from expected SQL output and
-      require them to appear in the answer text.
+    - `expected_values`: bool. Active **only** when `answer_contains` is not
+      set. When active, samples values from the oracle SQL result and requires
+      each to appear in the answer text. Set to ``false`` to disable. **Ignored
+      (treated as ``false``) whenever ``answer_contains`` is present** — these
+      two settings are mutually exclusive.
     - `max_expected_values`: int, default 20.
     - `case_sensitive`: bool, default false.
     - `compare: dataframe`: parse a markdown/JSON table from the answer and
       compare it with the expected SQL rows for the expected columns.
     - `numeric_tolerance` / `tolerance`: absolute tolerance for dataframe
       numeric comparisons. Default: 0.01.
+
+    Args:
+        locale: Optional locale tag (e.g. ``"id_ID"``, ``"de_DE"``). When set,
+            ``_value_variants`` emits locale-aware number variants so dot-as-
+            thousands-separator agents (Indonesian, German, etc.) match.
     """
     assertions = assertions or {}
     compare = str(assertions.get("compare", "")).strip().lower()
     if compare in {"dataframe", "table", "rows"}:
-        return _check_answer_dataframe(answer, oracle, assertions)
+        return _check_answer_dataframe(answer, oracle, assertions, locale=locale)
 
     case_sensitive = bool(assertions.get("case_sensitive", False))
     haystack = answer if case_sensitive else answer.lower()
@@ -320,10 +409,20 @@ def check_answer(
             missing.append(f"forbidden text present: {item}")
 
     expected_values_enabled = bool(assertions.get("expected_values", not required))
+    # Issue #68.1: a test with no assertions otherwise passes silently. Warn
+    # loudly when nothing is active so misconfigured YAML surfaces in CI logs.
+    if not required and not forbidden and not expected_values_enabled:
+        import warnings
+
+        warnings.warn(
+            "Ask SQL test has no active assertions and will always pass. "
+            "Add answer_contains, answer_not_contains, or expected_values: true.",
+            stacklevel=2,
+        )
     if expected_values_enabled and not required:
         max_values = int(assertions.get("max_expected_values", 20))
         for value in _sample_expected_values(oracle, max_values=max_values):
-            variants = _value_variants(value)
+            variants = _value_variants(value, locale=locale)
             if not variants:
                 continue
             if not any(
@@ -452,6 +551,7 @@ def _run_one_case(
     provider: str | None,
     model: str | None,
     sql_only: bool,
+    locale: str | None = None,
 ) -> AskSqlTestResult:
     rel = case.file_path.relative_to(project_path).as_posix()
     load_error = case.assertions.get("__load_error")
@@ -518,7 +618,7 @@ def _run_one_case(
             missing_assertions=[str(exc)],
         )
 
-    check = check_answer(answer, oracle, case.assertions)
+    check = check_answer(answer, oracle, case.assertions, locale=locale)
     actual_columns: list[str] = []
     actual_rows: list[list[Any]] = []
     if str(case.assertions.get("compare", "")).strip().lower() in {
@@ -550,6 +650,8 @@ def _check_answer_dataframe(
     answer: str,
     oracle: SqlOracleResult,
     assertions: dict[str, Any],
+    *,
+    locale: str | None = None,
 ) -> AnswerCheckResult:
     actual_columns, actual_rows, parse_error = extract_answer_table(
         answer, oracle.columns
@@ -578,7 +680,7 @@ def _check_answer_dataframe(
         extra = dict(assertions)
         extra.pop("compare", None)
         extra["expected_values"] = False
-        prose = check_answer(answer, oracle, extra)
+        prose = check_answer(answer, oracle, extra, locale=locale)
         if not prose.passed:
             return prose
     return AnswerCheckResult(True, "dataframe matched expected SQL")
@@ -753,13 +855,53 @@ def _sample_expected_values(oracle: SqlOracleResult, *, max_values: int) -> list
     return values
 
 
-def _value_variants(value: Any) -> list[str]:
+def _read_project_number_locale(project_path: Path) -> str | None:
+    """Return the project's ``locale.number_format`` tag, or ``None``.
+
+    Issue #68.3: when ``seeknal_agent.yml`` declares a non-English number
+    locale, the agent writes numbers using dot-as-thousands-separator
+    (e.g. ``30.276`` for thirty thousand in Indonesian). ``_value_variants``
+    consults this tag so ``expected_values: true`` keeps matching.
+    """
+    try:
+        from seeknal.ask.config import load_agent_config
+
+        cfg = load_agent_config(project_path)
+    except Exception:  # noqa: BLE001 - best-effort; missing/invalid YAML is fine
+        return None
+    locale_section = cfg.get("locale") if isinstance(cfg, dict) else None
+    if not isinstance(locale_section, dict):
+        return None
+    tag = locale_section.get("number_format") or locale_section.get("language")
+    return str(tag) if tag else None
+
+
+# Issue #68.3: locales that use '.' as thousands separator and ',' as decimal.
+# When the project's number_format matches one of these, the agent will
+# typically write `30.276` (thirty thousand) rather than `30,276`; the variants
+# table must include that form so expected_values doesn't always fail.
+_DOT_THOUSANDS_LOCALES = frozenset(
+    {"id", "de", "nl", "pt", "it", "es", "fr", "tr", "el", "ro", "pl", "cs"}
+)
+
+
+def _locale_uses_dot_thousands(locale: str | None) -> bool:
+    if not locale:
+        return False
+    return locale.split("_")[0].lower() in _DOT_THOUSANDS_LOCALES
+
+
+def _value_variants(value: Any, locale: str | None = None) -> list[str]:
     if value is None:
         return []
     if isinstance(value, bool):
         return [str(value).lower()]
     if isinstance(value, int):
-        return [str(value), f"{value:,}"]
+        variants = [str(value), f"{value:,}"]
+        if _locale_uses_dot_thousands(locale):
+            # Indonesian / German / etc. agents emit `30.276` for 30276.
+            variants.append(f"{value:,}".replace(",", "."))
+        return variants
     if isinstance(value, float):
         if not math.isfinite(value):
             return []
@@ -770,10 +912,16 @@ def _value_variants(value: Any) -> list[str]:
             f"{value:,.2f}",
             f"{value:.2f}",
         }
-        return sorted(
+        out = sorted(
             variant.rstrip("0").rstrip(".") if "." in variant else variant
             for variant in variants
         )
+        if _locale_uses_dot_thousands(locale):
+            # For floats, dot-thousands locales also swap the decimal: emit
+            # the comma-decimal form alongside the en-US dot-decimal forms.
+            comma_decimal = f"{value:,.2f}".replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+            out = sorted(set(out) | {comma_decimal})
+        return out
     text = str(value).strip()
     if not text:
         return []

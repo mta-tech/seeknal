@@ -90,7 +90,8 @@ class TestPostgreSQLConfig:
         result = config.to_libpq_string()
         assert result == (
             "host=pg.example.com port=5432 dbname=mydb "
-            "user=admin password=secret sslmode=require connect_timeout=15"
+            "user=admin password=secret sslmode=require connect_timeout=15 "
+            "keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3"
         )
 
     def test_to_libpq_string_without_password(self):
@@ -105,7 +106,8 @@ class TestPostgreSQLConfig:
         result = config.to_libpq_string()
         assert result == (
             "host=localhost port=5432 dbname=postgres "
-            "user=postgres sslmode=prefer connect_timeout=10"
+            "user=postgres sslmode=prefer connect_timeout=10 "
+            "keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3"
         )
 
 

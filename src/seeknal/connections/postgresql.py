@@ -46,12 +46,20 @@ class PostgreSQLConfig:
     schema: str = "public"
     sslmode: str = "prefer"
     connect_timeout: int = 10
+    # TCP keepalive parameters — keep connections alive over SSH tunnels,
+    # VPNs, and NATs during long-running queries (e.g. DuckDB COPY TO STDOUT
+    # on large tables). connect_timeout only covers the initial handshake.
+    keepalives: int = 1
+    keepalives_idle: int = 30
+    keepalives_interval: int = 10
+    keepalives_count: int = 3
 
     def to_libpq_string(self) -> str:
         """Convert to libpq connection string for DuckDB ATTACH.
 
         Returns:
-            A string like "host=X port=Y dbname=Z user=W password=P sslmode=S connect_timeout=T"
+            A string like "host=X port=Y dbname=Z user=W password=P sslmode=S
+            connect_timeout=T keepalives=1 keepalives_idle=N ..."
         """
         parts = [
             f"host={self.host}",
@@ -63,6 +71,13 @@ class PostgreSQLConfig:
             parts.append(f"password={self.password}")
         parts.append(f"sslmode={self.sslmode}")
         parts.append(f"connect_timeout={self.connect_timeout}")
+        if self.keepalives:
+            parts.extend([
+                f"keepalives={self.keepalives}",
+                f"keepalives_idle={self.keepalives_idle}",
+                f"keepalives_interval={self.keepalives_interval}",
+                f"keepalives_count={self.keepalives_count}",
+            ])
         return " ".join(parts)
 
 
@@ -174,6 +189,10 @@ def parse_postgresql_config(config: Dict[str, Any]) -> PostgreSQLConfig:
         schema=_interpolate_env_vars(str(config.get("schema", "public"))),
         sslmode=_interpolate_env_vars(str(config.get("sslmode", "prefer"))),
         connect_timeout=connect_timeout,
+        keepalives=int(config.get("keepalives", 1)),
+        keepalives_idle=int(config.get("keepalives_idle", 30)),
+        keepalives_interval=int(config.get("keepalives_interval", 10)),
+        keepalives_count=int(config.get("keepalives_count", 3)),
     )
 
 
@@ -210,6 +229,10 @@ def parse_postgresql_url(url: str) -> PostgreSQLConfig:
         schema=query_params.get("schema", "public"),
         sslmode=query_params.get("sslmode", "prefer"),
         connect_timeout=int(query_params.get("connect_timeout", "10")),
+        keepalives=int(query_params.get("keepalives", "1")),
+        keepalives_idle=int(query_params.get("keepalives_idle", "30")),
+        keepalives_interval=int(query_params.get("keepalives_interval", "10")),
+        keepalives_count=int(query_params.get("keepalives_count", "3")),
     )
 
 

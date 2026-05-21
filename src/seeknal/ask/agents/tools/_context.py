@@ -232,6 +232,96 @@ def bump_authoritative_drift_attempt(ctx: ToolContext | None = None) -> int:
     return current
 
 
+def _normalize_question(text: str | None) -> str:
+    """Normalize a user question for verbatim re-ask comparison.
+
+    Lowercases, collapses whitespace to single spaces, strips leading/
+    trailing whitespace, and trims the common trailing punctuation
+    (``.``, ``?``, ``!``). Deliberately does NOT strip diacritics,
+    stopwords, or stem — exact meaning must be preserved so non-English
+    questions (Indonesian, Malay) are comparable verbatim.
+    """
+    if not text:
+        return ""
+    collapsed = " ".join(text.split())
+    lowered = collapsed.lower().strip()
+    return lowered.rstrip(".?!").rstrip()
+
+
+def record_prior_turn_answer(
+    *,
+    question: str,
+    answer: str,
+    ctx: ToolContext | None = None,
+) -> None:
+    """Store the (normalized question, final answer) pair on the durable REPL.
+
+    Only the last turn's pair is kept. Skipped when the answer is empty/
+    whitespace, or when it is a tool-error JSON payload — we never want to
+    lock the user into a degraded answer on the next identical re-ask.
+    """
+    ctx = ctx or get_tool_context()
+    if not answer or not answer.strip():
+        return
+    if _parse_tool_error(answer) is not None:
+        return
+    normalized = _normalize_question(question)
+    if not normalized:
+        return
+    setattr(ctx.repl, "_seeknal_prior_turn_question", normalized)
+    setattr(ctx.repl, "_seeknal_prior_turn_answer", answer)
+
+
+def lookup_prior_turn_answer(
+    current_question: str | None,
+    ctx: ToolContext | None = None,
+) -> str | None:
+    """Return the prior turn's final answer when this is a verbatim re-ask.
+
+    Returns the stored answer only when:
+      * ``current_question`` normalizes to a non-empty string, AND
+      * the stored normalized question matches it exactly, AND
+      * the stored answer is non-empty / non-whitespace.
+
+    Otherwise returns ``None`` and the caller must continue normally.
+    """
+    ctx = ctx or get_tool_context()
+    normalized_current = _normalize_question(current_question)
+    if not normalized_current:
+        return None
+    stored_question = getattr(ctx.repl, "_seeknal_prior_turn_question", None)
+    stored_answer = getattr(ctx.repl, "_seeknal_prior_turn_answer", None)
+    if not isinstance(stored_question, str) or not isinstance(stored_answer, str):
+        return None
+    if normalized_current != stored_question:
+        return None
+    if not stored_answer.strip():
+        return None
+    return stored_answer
+
+
+# Bilingual restate prefix wrapped around a prior-turn answer when the
+# verbatim re-ask gate fires. Indonesian + English — the BPOM/KAFI tests
+# exercise Indonesian/Malay phrasing and English tests also exist.
+_VERBATIM_RESTATE_PREFIX = (
+    "Pertanyaan ini sama dengan giliran sebelumnya — jawaban tetap sama:\n"
+    "/ This question is the same as the prior turn — the answer is the same:"
+)
+_VERBATIM_RESTATE_SUFFIX = (
+    "Jika Anda ingin data baru, ubah filter atau dimensi.\n"
+    "/ If you wanted fresh data, change the filter or dimension."
+)
+
+
+def build_verbatim_restate_response(prior_answer: str) -> str:
+    """Wrap a prior-turn answer with the bilingual restate notice."""
+    return (
+        f"{_VERBATIM_RESTATE_PREFIX}\n\n"
+        f"{prior_answer}\n\n"
+        f"{_VERBATIM_RESTATE_SUFFIX}"
+    )
+
+
 def reset_turn_governor(question: str | None = None) -> None:
     """Reset per-user-turn harness state.
 

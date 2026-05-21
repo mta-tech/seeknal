@@ -5,6 +5,95 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.5] - 2026-05-21
+
+Ask agent reliability — PostgreSQL EXTRACT pushdown, psycopg2 oracle path,
+verbatim-restate gate, and connection / assertion hardening.
+
+### Added
+
+- **`_rewrite_for_pg_pushdown` in `execute_sql.py`** (closes #64) — transforms
+  `EXTRACT(YEAR/MONTH+YEAR/QUARTER+YEAR/DAY+MONTH+YEAR FROM col) ∈ {=, !=, <>,
+  IN, BETWEEN}` to half-open date-range form so DuckDB's `postgres_scanner`
+  can push the filter to PostgreSQL instead of full-table-`COPY`-ing then
+  filtering locally. Step-0 masking guards string-literal / `--` / `/* */`
+  false positives; boundary years (1..9999), invalid date triples (Feb 29
+  non-leap), inverted `BETWEEN`, and dedup `IN (2023, 2023)` are all handled.
+  Wired into `_repair_common_sql_before_execution` so `execute_sql_pair` (via
+  delegation) and ad-hoc agent SQL both benefit; `_sql_pair_drift_notice`
+  normalizes both sides through the same rewrite to prevent spurious drift
+  warnings on `EXTRACT`-based pairs.
+- **`seeknal.ask._pg_oracle` module** (closes #64) — `detect_pg_only_namespace`,
+  `resolve_pg_dsn`, `strip_namespace`, `execute_via_psycopg2`. `execute_expected_sql`
+  in `testing.py` routes PG-only oracle SQL through `psycopg2` directly for
+  server-side ground truth, with deterministic namespace-scan routing
+  (multi-source SQL falls back to DuckDB with the rewrite applied; psycopg2
+  execution errors surface as `SqlOracleResult.error`, never silent fallback).
+  Uses `contextlib.closing(...)` + `autocommit=True` + `set_session(readonly=True)`
+  set before any cursor; distinct timing label `execute_sql_pg_direct`.
+- **TCP keepalives on `PostgreSQLConfig`** (closes #67) — four new fields
+  (`keepalives=1`, `keepalives_idle=30`, `keepalives_interval=10`,
+  `keepalives_count=3`) emitted by `to_libpq_string()`. Keeps connections
+  alive over SSH tunnels and VPNs with idle-timeout policies during
+  long-running queries. Tunable via DSN query params (`?keepalives_idle=60`)
+  or `profiles.yml`; set `keepalives=0` to disable.
+- **Verbatim re-ask short-circuit gate** — when Turn N's normalized question
+  equals Turn N-1's, bypass LLM/tool dispatch and return the prior answer
+  with a bilingual (Indonesian / English) restate prefix. Lives in
+  seeknal-core; benefits every Ask project (BPOM, KAFI, future tap-in /
+  managed) without per-project config. Deterministic (zero LLM call on
+  verbatim turns), safe (empty answers and tool-error JSON never become a
+  "prior answer"), session-coherent (gateway persists via `store.save_messages`;
+  streaming appends to in-place `message_history`), and no wrapper compounding
+  on triple-asks. Helpers in `agents/tools/_context.py`
+  (`_normalize_question`, `record_prior_turn_answer`, `lookup_prior_turn_answer`,
+  `build_verbatim_restate_response`); gate wired on both
+  `streaming.stream_ask` and `gateway.server._run_agent_inner`.
+
+### Fixed
+
+- **`execute_expected_sql` REPL leak** (closes #66) — DuckDB REPL block now
+  wrapped in `try/finally` with explicit `repl.conn.close()` so libpq
+  connections release deterministically. Pre-fix, suites of 20+ oracle tests
+  could exhaust PG `max_connections` mid-run with
+  `IO Error: server closed the connection unexpectedly`.
+- **Zero-assertion silent pass** (closes #68) — `check_answer` now emits
+  `warnings.warn` when a test has no `answer_contains`,
+  `answer_not_contains`, or `expected_values: true` active, so misconfigured
+  YAML surfaces in CI logs instead of always passing.
+- **`_value_variants` locale-unaware** (closes #68) — threads an optional
+  `locale` parameter through `run_ask_sql_tests → _run_one_case →
+  check_answer → _check_answer_dataframe → _value_variants`. Reads the
+  project's `locale.number_format` (fallback `locale.language`) once via
+  the new `_read_project_number_locale` helper. Dot-as-thousands locales
+  (`id`, `de`, `nl`, `pt`, `it`, `es`, `fr`, `tr`, `el`, `ro`, `pl`, `cs`)
+  get the extra `30.276` form for ints and `1.234,56` form for floats so
+  `expected_values: true` stops always-failing on Indonesian/German/etc.
+  projects.
+- **`check_answer` docstring** (closes #68) — clarifies that `expected_values`
+  is mutually exclusive with `answer_contains` and is treated as `false`
+  when `answer_contains` is present. No behavior change.
+
+### Notes
+
+- 88 new ACs total across `test_pg_pushdown_rewrite.py` (65),
+  `test_oracle_psycopg2.py` (23), and `test_verbatim_restate_gate.py` (18),
+  plus B-tier integration in `test_execute_sql.py`.
+- Engine divergence between DuckDB and PostgreSQL semantics (integer
+  division, string coercion, type rules) is real and explicitly accepted
+  for the psycopg2 oracle path — deterministic namespace-scan routing
+  keeps blast radius small.
+- CTE-aliased `EXTRACT` (`WITH x AS (SELECT EXTRACT(...) AS y) WHERE y = N`)
+  is out of scope for the regex-based pass; queued for a future AST-based
+  upgrade.
+- Lint notice for the EXTRACT rewrite is visible only on success branches,
+  matching existing `TRY_CAST` / `ILIKE` repair UX.
+- `psycopg2-binary>=2.9.0` was already a top-level dependency; no install
+  change.
+- `ProfileLoader._load_profile_data()` is private API; AC-D6 regression
+  test guards against silent breakage if it's ever renamed (the public
+  promotion is a follow-up).
+
 ## [2.9.4] - 2026-05-21
 
 HTTP-only Ask worker — in-process concurrency.
