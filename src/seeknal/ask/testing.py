@@ -234,12 +234,75 @@ def run_ask_sql_tests(
 
 
 def execute_expected_sql(project_path: Path, sql: str) -> SqlOracleResult:
-    """Execute expected SQL using the existing read-only REPL surface."""
+    """Execute expected SQL — prefer direct psycopg2 for PG-only references.
+
+    Routing:
+    - If the SQL references only one connected-PG namespace and no
+      unqualified tables, run it directly via psycopg2 (oracle PG path).
+    - Otherwise, fall back to the legacy DuckDB REPL path.
+
+    Once psycopg2 routing succeeds, execution failures are FATAL for this
+    oracle invocation — they propagate up or return as
+    ``SqlOracleResult(error=...)``. They do NOT silently fall back to
+    DuckDB, because doing so would give the user a wrong-engine answer
+    and defeat the purpose of the oracle path.
+    """
+    from seeknal.sources.config import SourceConfigError
+
+    ns: str | None = None
+    source = None
     try:
+        from seeknal.ask._pg_oracle import detect_pg_only_namespace
+        from seeknal.sources.config import load_source_registry
+
+        registry = load_source_registry(project_path)
+        ns = detect_pg_only_namespace(sql, registry)
+        if ns is not None:
+            # CRITICAL: registry.sources is keyed by .name (see
+            # src/seeknal/sources/config.py:334 -- sources[source.name] =
+            # source) not by .namespace (declared at line 294).
+            # Iterate values() and match on .namespace.
+            source = next(
+                (s for s in registry.sources.values() if s.namespace == ns),
+                None,
+            )
+    except (KeyError, SourceConfigError):
+        # Routing/detection error -> fall through to DuckDB path.
+        ns = None
+        source = None
+
+    if ns is not None and source is not None:
+        # Routing succeeded. From here on, psycopg2 errors are FATAL for
+        # this oracle invocation -- no DuckDB fallback (Principle #2).
+        from seeknal.ask._pg_oracle import (
+            execute_via_psycopg2,
+            resolve_pg_dsn,
+            strip_namespace,
+        )
+        from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+        # PRIVATE-API COUPLING: ProfileLoader._load_profile_data() is
+        # private (leading underscore). A regression test in
+        # tests/ask/test_oracle_psycopg2.py (AC-D6) asserts the attribute
+        # exists so a future rename fails loudly with a clear pointer.
+        profile_path = project_path / "profiles.yml"
+        loader = ProfileLoader(
+            profile_path=profile_path if profile_path.exists() else None
+        )
+        profile_data = loader._load_profile_data()
+
+        dsn = resolve_pg_dsn(source, profile_data)
+        stripped = strip_namespace(sql, ns)
+        return execute_via_psycopg2(dsn, stripped)
+
+    # --- DuckDB REPL path (with rewrite) ---
+    try:
+        from seeknal.ask.agents.tools.execute_sql import _rewrite_for_pg_pushdown
         from seeknal.cli.repl import REPL
 
         repl = REPL(project_path=project_path, skip_history=True)
-        columns, rows = repl.execute_oneshot(sql)
+        sql_for_duckdb, _notices = _rewrite_for_pg_pushdown(sql)
+        columns, rows = repl.execute_oneshot(sql_for_duckdb)
         return SqlOracleResult(
             columns=[str(col) for col in columns],
             rows=[[_jsonable(cell) for cell in row] for row in rows],

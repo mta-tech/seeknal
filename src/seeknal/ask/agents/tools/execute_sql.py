@@ -292,9 +292,355 @@ def execute_sql(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# PostgreSQL EXTRACT-pushdown rewrite (issue #64)
+# ---------------------------------------------------------------------------
+
+# Single shared column-token regex usable for bare ident `col`, table-qualified
+# `t.col`, schema-qualified `schema.t.col`, and quoted `"Col"` / `"t"."Col"`.
+_PUSHDOWN_COL_PATTERN = (
+    r'(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)'
+    r'(?:\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)){0,2}'
+)
+
+_PUSHDOWN_NOTICE = "rewrote EXTRACT(...) to a pushdown-safe date range"
+
+
+def _pushdown_mask_literals_and_comments(sql: str) -> tuple[str, list[tuple[str, str]]]:
+    """Replace string literals and SQL comments with opaque placeholders.
+
+    EXTRACT() text that appears inside a string literal or comment must never
+    be rewritten. Masking those regions out before running the EXTRACT regex
+    is the simplest robust approach. Placeholders are restored verbatim once
+    the rewrite passes finish.
+    """
+    replacements: list[tuple[str, str]] = []
+
+    def _store(text: str) -> str:
+        token = f"\x00PD{len(replacements)}\x00"
+        replacements.append((token, text))
+        return token
+
+    # Block comments first (non-greedy) — they can span newlines.
+    sql = re.sub(
+        r"/\*.*?\*/",
+        lambda m: _store(m.group(0)),
+        sql,
+        flags=re.DOTALL,
+    )
+    # Then line comments — anything from -- to end-of-line.
+    sql = re.sub(
+        r"--[^\n]*",
+        lambda m: _store(m.group(0)),
+        sql,
+    )
+    # Single-quoted string literals with '' escape.
+    sql = re.sub(
+        r"'(?:''|[^'])*'",
+        lambda m: _store(m.group(0)),
+        sql,
+    )
+    return sql, replacements
+
+
+def _pushdown_unmask(sql: str, replacements: list[tuple[str, str]]) -> str:
+    for token, text in replacements:
+        sql = sql.replace(token, text)
+    return sql
+
+
+def _pushdown_format_date(year: int, month: int = 1, day: int = 1) -> str:
+    """Format a date literal preserving year boundary 9999 -> 10000."""
+    return f"'{year}-{month:02d}-{day:02d}'"
+
+
+def _pushdown_year_valid(year: int) -> bool:
+    return 1 <= year <= 9999
+
+
+def _rewrite_for_pg_pushdown(sql: str) -> tuple[str, list[str]]:
+    """Rewrite EXTRACT(...) date-part filters to pushdown-safe date ranges.
+
+    DuckDB's postgres_scanner does not push EXTRACT(...) past the
+    COPY (SELECT ... TO STDOUT) boundary, so the filter runs locally
+    after the full table is transferred. This helper rewrites the
+    small, deterministic set of patterns documented in the spec to
+    half-open date-range form, which postgres_scanner WILL push
+    down. The same post-repair SQL is what the cache key and
+    drift-detection layers see (see _sql_cache_key, _normalize_sql).
+
+    Implementation notes:
+    - 2-part stripping (pg_ns.t -> t) relies on PG search_path
+      resolving the table; documented and tested.
+    - Invalid date triples (Feb 29 in non-leap year) leave the SQL
+      untouched via try/except ValueError — never crash the tool.
+    - Boundary year = 9999 produces '10000-01-01' upper bound; this
+      is correct ISO behavior and PostgreSQL accepts it.
+    - Year = 0 or negative -> leave untouched (out of spec).
+    """
+    import datetime
+
+    notices: list[str] = []
+    masked, replacements = _pushdown_mask_literals_and_comments(sql)
+    fired = False
+
+    flags = re.IGNORECASE | re.DOTALL
+
+    def extract_part(part: str) -> str:
+        return (
+            r"EXTRACT\s*\(\s*"
+            + part
+            + r"\s+FROM\s+("
+            + _PUSHDOWN_COL_PATTERN
+            + r")\s*\)"
+        )
+    # ------------------------------------------------------------------
+    # Step 1: coupled-3 (DAY + MONTH + YEAR over same column)
+    # ------------------------------------------------------------------
+    day_re = extract_part(r"DAY")
+    month_re = extract_part(r"MONTH")
+    year_re = extract_part(r"YEAR")
+
+    def _store_untouched(text: str) -> str:
+        """Reserve a placeholder for matched-but-not-rewritten text.
+
+        Prevents downstream step-2/step-3 patterns from rewriting a
+        sub-expression of a triple whose date was invalid (e.g. Feb 29 in
+        2023 — the MONTH+YEAR coupling must NOT take over once the triple
+        was recognized as the user's intent).
+        """
+        token = f"\x00PD{len(replacements)}\x00"
+        replacements.append((token, text))
+        return token
+
+    # Enumerate plausible orderings — DAY/MONTH/YEAR, and the reverse —
+    # because regex backtracking across AND-separated triples is awkward.
+    triple_orderings = [
+        (day_re, month_re, year_re, "d", "m", "y"),
+        (year_re, month_re, day_re, "y", "m", "d"),
+    ]
+    for first_re, second_re, third_re, k1, k2, k3 in triple_orderings:
+        pattern = re.compile(
+            first_re + r"\s*=\s*(\d+)\s+AND\s+"
+            + second_re + r"\s*=\s*(\d+)\s+AND\s+"
+            + third_re + r"\s*=\s*(-?\d+)",
+            flags=flags,
+        )
+
+        def _triple_repl(match: re.Match) -> str:
+            nonlocal fired
+            col1 = match.group(1)
+            val1 = int(match.group(2))
+            col2 = match.group(3)
+            val2 = int(match.group(4))
+            col3 = match.group(5)
+            val3 = int(match.group(6))
+            if not (col1 == col2 == col3):
+                return match.group(0)
+            parts = {k1: val1, k2: val2, k3: val3}
+            day = parts["d"]
+            month = parts["m"]
+            year = parts["y"]
+            if not _pushdown_year_valid(year):
+                return _store_untouched(match.group(0))
+            try:
+                start = datetime.date(year, month, day)
+                end = start + datetime.timedelta(days=1)
+            except ValueError:
+                return _store_untouched(match.group(0))
+            fired = True
+            return (
+                f"({col1} >= '{start.isoformat()}' "
+                f"AND {col1} < '{end.isoformat()}')"
+            )
+
+        masked = pattern.sub(_triple_repl, masked)
+
+    # ------------------------------------------------------------------
+    # Step 2: coupled-2 (MONTH + YEAR; QUARTER + YEAR, both orderings)
+    # ------------------------------------------------------------------
+    def _emit_month_year(col: str, month: int, year: int) -> str:
+        if month == 12:
+            end_year = year + 1
+            end_month = 1
+        else:
+            end_year = year
+            end_month = month + 1
+        start = _pushdown_format_date(year, month, 1)
+        end = _pushdown_format_date(end_year, end_month, 1)
+        return f"({col} >= {start} AND {col} < {end})"
+
+    def _emit_quarter_year(col: str, quarter: int, year: int) -> str:
+        start_month = 3 * (quarter - 1) + 1
+        end_month = start_month + 3
+        end_year = year
+        if end_month > 12:
+            end_month -= 12
+            end_year += 1
+        start = _pushdown_format_date(year, start_month, 1)
+        end = _pushdown_format_date(end_year, end_month, 1)
+        return f"({col} >= {start} AND {col} < {end})"
+
+    couple_orderings = [
+        # (first_part_regex, second_part_regex, emit_fn, first_is_year)
+        (month_re, year_re, _emit_month_year, False),
+        (year_re, month_re, _emit_month_year, True),
+        (extract_part(r"QUARTER"), year_re, _emit_quarter_year, False),
+        (year_re, extract_part(r"QUARTER"), _emit_quarter_year, True),
+    ]
+
+    for first_re, second_re, emit_fn, first_is_year in couple_orderings:
+        pattern = re.compile(
+            first_re + r"\s*=\s*(\d+)\s+AND\s+"
+            + second_re + r"\s*=\s*(-?\d+)",
+            flags=flags,
+        )
+
+        def _make_repl(emit_fn=emit_fn, first_is_year=first_is_year):
+            def _couple_repl(match: re.Match) -> str:
+                nonlocal fired
+                col1 = match.group(1)
+                val1 = int(match.group(2))
+                col2 = match.group(3)
+                val2 = int(match.group(4))
+                if col1 != col2:
+                    return match.group(0)
+                if first_is_year:
+                    year = val1
+                    other = val2
+                else:
+                    other = val1
+                    year = val2
+                if not _pushdown_year_valid(year):
+                    return match.group(0)
+                fired = True
+                return emit_fn(col1, other, year)
+
+            return _couple_repl
+
+        masked = pattern.sub(_make_repl(), masked)
+
+    # ------------------------------------------------------------------
+    # Step 3: standalone EXTRACT(YEAR FROM ...) patterns
+    # ------------------------------------------------------------------
+    # IN list
+    in_pattern = re.compile(
+        year_re + r"\s+IN\s*\(\s*((?:-?\d+\s*,\s*)*-?\d+)\s*\)",
+        flags=flags,
+    )
+
+    def _in_repl(match: re.Match) -> str:
+        nonlocal fired
+        col = match.group(1)
+        raw_years = match.group(2)
+        years_list: list[int] = []
+        seen: set[int] = set()
+        for tok in raw_years.split(","):
+            try:
+                y = int(tok.strip())
+            except ValueError:
+                return match.group(0)
+            if not _pushdown_year_valid(y):
+                return match.group(0)
+            if y in seen:
+                continue
+            seen.add(y)
+            years_list.append(y)
+        if not years_list:
+            return match.group(0)
+        fired = True
+        ranges = [
+            f"({col} >= {_pushdown_format_date(y)} "
+            f"AND {col} < {_pushdown_format_date(y + 1)})"
+            for y in years_list
+        ]
+        if len(ranges) == 1:
+            return ranges[0]
+        return "(" + " OR ".join(ranges) + ")"
+
+    masked = in_pattern.sub(_in_repl, masked)
+
+    # BETWEEN
+    between_pattern = re.compile(
+        year_re + r"\s+BETWEEN\s+(-?\d+)\s+AND\s+(-?\d+)",
+        flags=flags,
+    )
+
+    def _between_repl(match: re.Match) -> str:
+        nonlocal fired
+        col = match.group(1)
+        lo = int(match.group(2))
+        hi = int(match.group(3))
+        if lo > hi:
+            return match.group(0)
+        if not (_pushdown_year_valid(lo) and _pushdown_year_valid(hi)):
+            return match.group(0)
+        fired = True
+        return (
+            f"({col} >= {_pushdown_format_date(lo)} "
+            f"AND {col} < {_pushdown_format_date(hi + 1)})"
+        )
+
+    masked = between_pattern.sub(_between_repl, masked)
+
+    # != / <>
+    neq_pattern = re.compile(
+        year_re + r"\s*(?:!=|<>)\s*(-?\d+)",
+        flags=flags,
+    )
+
+    def _neq_repl(match: re.Match) -> str:
+        nonlocal fired
+        col = match.group(1)
+        year = int(match.group(2))
+        if not _pushdown_year_valid(year):
+            return match.group(0)
+        fired = True
+        return (
+            f"({col} < {_pushdown_format_date(year)} "
+            f"OR {col} >= {_pushdown_format_date(year + 1)})"
+        )
+
+    masked = neq_pattern.sub(_neq_repl, masked)
+
+    # =
+    eq_pattern = re.compile(
+        year_re + r"\s*=\s*(-?\d+)",
+        flags=flags,
+    )
+
+    def _eq_repl(match: re.Match) -> str:
+        nonlocal fired
+        col = match.group(1)
+        year = int(match.group(2))
+        if not _pushdown_year_valid(year):
+            return match.group(0)
+        fired = True
+        return (
+            f"({col} >= {_pushdown_format_date(year)} "
+            f"AND {col} < {_pushdown_format_date(year + 1)})"
+        )
+
+    masked = eq_pattern.sub(_eq_repl, masked)
+
+    # ------------------------------------------------------------------
+    # Step 4: restore masked literals / comments
+    # ------------------------------------------------------------------
+    final_sql = _pushdown_unmask(masked, replacements)
+    if fired:
+        notices.append(_PUSHDOWN_NOTICE)
+    return final_sql, notices
+
+
 def _repair_common_sql_before_execution(sql: str) -> tuple[str, list[str]]:
     """Apply safe DuckDB-dialect repairs before executing agent SQL."""
     notices: list[str] = []
+
+    # EXTRACT-pushdown rewrite runs FIRST so later repairs see the rewritten
+    # date ranges instead of EXTRACT(...) shapes that postgres_scanner cannot
+    # push down (issue #64).
+    sql, pushdown_notices = _rewrite_for_pg_pushdown(sql)
+    notices.extend(pushdown_notices)
 
     repaired = re.sub(
         r"\bILIKE\s*\(\s*([A-Za-z_][A-Za-z0-9_\\.\" ]*)\s*,\s*('(?:''|[^'])*')\s*\)",
@@ -342,15 +688,24 @@ def _sql_pair_drift_notice(ctx, sql: str) -> str | None:
     query, so this notice is intentionally advisory and never blocks execution.
     It gives the model a chance to stop after the authoritative pair result
     instead of silently drifting into a plausible but different query.
+
+    HIDDEN COUPLING (issue #64 R7 fix): Both sides are normalized THROUGH
+    ``_rewrite_for_pg_pushdown`` before comparison. Without this, a SQL pair
+    YAML containing ``EXTRACT(YEAR FROM ...) = N`` and an agent query using
+    the same form would normalize differently (the agent's SQL passes
+    through ``_repair_common_sql_before_execution`` first; the raw pair YAML
+    stored in ``get_loaded_sql_pairs`` does not). That mismatch produced a
+    spurious ``⚠ SQL pair drift`` warning on every EXTRACT pair invocation.
     """
     from seeknal.ask.agents.tools._context import get_loaded_sql_pairs
 
     loaded_pairs = get_loaded_sql_pairs(ctx)
     if not loaded_pairs:
         return None
-    normalized = _normalize_sql(sql)
+    normalized = _normalize_sql(_rewrite_for_pg_pushdown(sql)[0])
     for pair_sql in loaded_pairs.values():
-        if normalized == _normalize_sql(pair_sql):
+        pair_normalized = _normalize_sql(_rewrite_for_pg_pushdown(pair_sql)[0])
+        if normalized == pair_normalized:
             return None
     names = ", ".join(sorted(loaded_pairs)[:3])
     if len(loaded_pairs) > 3:
