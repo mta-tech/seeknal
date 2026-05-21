@@ -283,6 +283,22 @@ app.add_typer(intervals_app, name="intervals")
 
 
 # =============================================================================
+# Heartbeat daemon (HEARTBEAT.md polling + smart inbox + DAG/exposure)
+# =============================================================================
+from seeknal.cli.heartbeat import app as heartbeat_app  # noqa: E402
+
+app.add_typer(heartbeat_app, name="heartbeat")
+
+
+# =============================================================================
+# Admin (Ask access policy + admin approval queue)
+# =============================================================================
+from seeknal.cli.admin import app as admin_app  # noqa: E402
+
+app.add_typer(admin_app, name="admin")
+
+
+# =============================================================================
 # Atlas Integration (Optional)
 # =============================================================================
 # The Atlas command group is loaded dynamically if atlas-data-platform is installed.
@@ -1409,6 +1425,7 @@ def init(
             "context/sql_pairs",
             "context/tests",
             "target/intermediate",
+            "inbox",
         ]
 
         for dir_name in directories:
@@ -1486,6 +1503,35 @@ __pycache__/
 """
         (project_path / ".gitignore").write_text(gitignore_content)
         typer.echo(f"  Created: .gitignore")
+
+        # Scaffold HEARTBEAT.md (heartbeat daemon config). The format is one
+        # YAML block per the daemon's parser. The daemon is enabled by default
+        # so `seeknal heartbeat tick` works out of the box; set
+        # `enabled: false` to silence `seeknal heartbeat start`.
+        heartbeat_md_content = """\
+# HEARTBEAT.md — seeknal heartbeat daemon config
+#
+# Polling daemon that scans inbox folders, classifies new files, ingests
+# them into a target table, runs the DAG, and triggers exposures.
+#
+# Run one tick:        seeknal heartbeat tick
+# Run as a daemon:     seeknal heartbeat start
+# Recent runs:         seeknal heartbeat status
+
+```yaml
+interval: 60s            # 0s disables `start`; `tick` still works.
+inbox_folders:
+  - inbox
+ingested_target: null    # null → use profiles.yml source_defaults['ingested']['target']
+enabled: true
+quarantine_dir: target/heartbeat/quarantine
+classifier:
+  enabled: false         # Phase A.5 smart classifier — opt-in.
+  confidence_threshold: 0.8
+```
+"""
+        (project_path / "HEARTBEAT.md").write_text(heartbeat_md_content)
+        typer.echo(f"  Created: HEARTBEAT.md")
 
         # Generate default ask skills (SKILL.md files, Claude Code-style)
         _scaffold_ask_skills(project_path)
