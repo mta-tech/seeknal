@@ -456,6 +456,134 @@ class TelegramChannel:
             except Exception:
                 await update.message.reply_text(f"❌ Error: {exc}")
 
+    # ------------------------------------------------------------------
+    # Step 7 — Telegram → heartbeat-inbox bridge
+    # ------------------------------------------------------------------
+    # The Telegram channel stages every uploaded file under
+    # ``target/ask_ingest/_staging/`` and runs the interactive ``data-ingest``
+    # skill (existing behavior, untouched). Optionally, projects that also
+    # run ``seeknal heartbeat`` can mirror the staged file into the
+    # heartbeat's inbox folder so the deterministic tick picks it up on
+    # its next scan. The bridge is a *copy*, not a move, so the interactive
+    # path keeps working in parallel.
+    #
+    # The lint contract in ``tests/heartbeat/test_telegram_bridge.py::
+    # test_no_telegram_imports_in_heartbeat`` forbids the reverse direction
+    # — heartbeat must never import from this module. We honour the same
+    # boundary from this side by reading ``HEARTBEAT.md`` inline rather
+    # than importing ``seeknal.heartbeat.config``.
+
+    def _inbox_drop_settings(self) -> dict[str, Any]:
+        """Return the Telegram → heartbeat-inbox bridge settings.
+
+        Returns a dict with two keys:
+
+        - ``enabled`` (bool): when False, :meth:`_copy_to_inbox` is a no-op
+          and the existing staging-only behavior is preserved.
+        - ``folder`` (str | None): when set, overrides HEARTBEAT.md's first
+          ``inbox_folders`` entry. ``None`` defers to that lookup and finally
+          to the ``inbox`` default.
+
+        Default is disabled so existing deployments keep their current
+        behavior. Projects opt in by subclassing or future config wiring.
+        """
+        return {"enabled": False, "folder": None}
+
+    def _copy_to_inbox(self, staged_path: Path) -> Path | None:
+        """Copy a staged Telegram upload into the heartbeat's inbox folder.
+
+        Returns the destination path on success, or ``None`` when the
+        bridge is disabled OR the resolved inbox path would escape the
+        project root (containment guard).
+
+        Folder resolution order:
+
+        1. ``_inbox_drop_settings()["folder"]`` (explicit override)
+        2. HEARTBEAT.md's first ``inbox_folders`` entry
+        3. ``inbox`` (project-root default)
+
+        On filename collision, appends a UTC timestamp to the stem so the
+        original uploaded name is preserved as the prefix. The staged file
+        itself is left in place.
+        """
+        settings = self._inbox_drop_settings()
+        if not settings.get("enabled"):
+            return None
+
+        folder_name = settings.get("folder")
+        if folder_name is None:
+            folder_name = (
+                self._read_inbox_folder_from_heartbeat_md() or "inbox"
+            )
+
+        # Containment guard: resolved inbox must stay under project root.
+        try:
+            project_root = self._project_path.resolve()
+            inbox_dir = (project_root / folder_name).resolve()
+            inbox_dir.relative_to(project_root)
+        except (ValueError, OSError):
+            logger.warning(
+                "[telegram] inbox drop refused — resolved path escapes "
+                "project root: %s",
+                folder_name,
+            )
+            return None
+
+        try:
+            inbox_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "[telegram] inbox drop refused — mkdir failed: %s", exc
+            )
+            return None
+
+        dest = inbox_dir / staged_path.name
+        if dest.exists():
+            from datetime import datetime, timezone
+
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            dest = inbox_dir / f"{staged_path.stem}.{ts}{staged_path.suffix}"
+
+        import shutil
+
+        try:
+            shutil.copy2(staged_path, dest)
+        except OSError as exc:
+            logger.warning("[telegram] inbox drop copy failed: %s", exc)
+            return None
+        return dest
+
+    def _read_inbox_folder_from_heartbeat_md(self) -> str | None:
+        """Best-effort: return HEARTBEAT.md's first ``inbox_folders`` entry.
+
+        Done inline so this module stays independent of the heartbeat
+        package surface; the lint contract on the heartbeat side prevents
+        the reverse import.
+        """
+        md = self._project_path / "HEARTBEAT.md"
+        if not md.exists():
+            return None
+        try:
+            text = md.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None
+        match = re.search(r"```yaml\s*(.*?)```", text, re.DOTALL)
+        body = match.group(1) if match else text
+        try:
+            import yaml
+
+            data = yaml.safe_load(body)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        folders = data.get("inbox_folders")
+        if isinstance(folders, list) and folders:
+            first = folders[0]
+            if isinstance(first, str) and first.strip():
+                return first.strip()
+        return None
+
     async def _handle_document(self, update: Any, context: Any) -> None:
         """Handle document uploads — stage file and trigger data-ingest skill."""
         from telegram.constants import ChatAction
