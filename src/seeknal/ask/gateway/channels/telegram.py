@@ -32,7 +32,20 @@ _MAX_MESSAGE_LENGTH = 4096
 
 # Document upload constraints (match the gateway /upload endpoint)
 _UPLOAD_MAX_BYTES = 200 * 1024 * 1024  # 200 MB
-_UPLOAD_ALLOWED_SUFFIXES = {".xlsx", ".csv", ".tsv", ".json"}
+# Tabular files → the data-ingest skill (read_tabular → write_ingested_table).
+_TABULAR_SUFFIXES = {".xlsx", ".csv", ".tsv", ".json"}
+# Image / document files → the record-entry (vision/extraction) skill.
+_VISION_DOC_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif", ".pdf", ".txt",
+}
+# Archives → unpacked, then each entry routed by its own suffix.
+_ARCHIVE_SUFFIXES = {".zip"}
+# Union of every accepted document suffix; anything else is rejected.
+_UPLOAD_ALLOWED_SUFFIXES = (
+    _TABULAR_SUFFIXES | _VISION_DOC_SUFFIXES | _ARCHIVE_SUFFIXES
+)
+# Archive-extraction guards: cap entry count to bound a zip-bomb / fan-out.
+_ARCHIVE_MAX_ENTRIES = 50
 
 # Image upload constraints (routed into record-entry skill)
 _IMAGE_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
@@ -761,8 +774,70 @@ class TelegramChannel:
                 return first.strip()
         return None
 
+    def _extract_archive(
+        self, archive_path: Path, staging_dir: Path
+    ) -> tuple[Path | None, list[str], str | None]:
+        """Safely extract a ZIP into a staging subdirectory.
+
+        Returns ``(extract_dir, member_relpaths, error)``. On any guard
+        violation returns ``(None, [], error_message)``. Guards:
+
+        - entry-count cap (``_ARCHIVE_MAX_ENTRIES``) — bounds fan-out
+        - total-uncompressed-size cap (``_UPLOAD_MAX_BYTES``) — zip bomb
+        - zip-slip containment — every member must resolve inside the
+          extract dir; a ``../`` entry aborts the whole extraction
+        """
+        import shutil
+        import zipfile
+
+        extract_dir = staging_dir / f"{archive_path.stem}_unzip"
+        try:
+            with zipfile.ZipFile(archive_path) as zf:
+                infos = [i for i in zf.infolist() if not i.is_dir()]
+                if len(infos) > _ARCHIVE_MAX_ENTRIES:
+                    return None, [], (
+                        f"ZIP has {len(infos)} files; the limit is "
+                        f"{_ARCHIVE_MAX_ENTRIES}."
+                    )
+                total = sum(i.file_size for i in infos)
+                if total > _UPLOAD_MAX_BYTES:
+                    return None, [], (
+                        f"ZIP expands to {total / 1024 / 1024:.1f} MB; "
+                        f"the limit is 200 MB."
+                    )
+                extract_dir.mkdir(parents=True, exist_ok=True)
+                resolved_root = extract_dir.resolve()
+                members: list[str] = []
+                for info in infos:
+                    target = (extract_dir / info.filename).resolve()
+                    # zip-slip guard: the member must stay under extract_dir.
+                    try:
+                        target.relative_to(resolved_root)
+                    except ValueError:
+                        return None, [], (
+                            f"ZIP entry escapes the extract directory: "
+                            f"{info.filename}"
+                        )
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    members.append(info.filename)
+        except zipfile.BadZipFile:
+            return None, [], "That file is not a valid ZIP archive."
+        except OSError as exc:
+            return None, [], f"ZIP extraction failed: {exc}"
+        if not members:
+            return None, [], "The ZIP archive is empty."
+        return extract_dir, members, None
+
     async def _handle_document(self, update: Any, context: Any) -> None:
-        """Handle document uploads — stage file and trigger data-ingest skill."""
+        """Handle document uploads.
+
+        Routes by suffix: tabular files (.csv/.xlsx/.tsv/.json) into the
+        data-ingest skill; images / PDF / text into the record-entry
+        (vision) skill; ZIP archives are unpacked and each entry routed
+        by its own suffix.
+        """
         from telegram.constants import ChatAction
 
         doc = update.message.document
@@ -778,9 +853,15 @@ class TelegramChannel:
             chat_id, original_name, doc.file_size,
         )
 
-        if suffix not in _UPLOAD_ALLOWED_SUFFIXES:
+        if suffix in _TABULAR_SUFFIXES:
+            doc_category = "tabular"
+        elif suffix in _VISION_DOC_SUFFIXES:
+            doc_category = "vision"
+        elif suffix in _ARCHIVE_SUFFIXES:
+            doc_category = "archive"
+        else:
             await update.message.reply_text(
-                f"Sorry, I can't ingest '{suffix}' files. "
+                f"Sorry, I can't process '{suffix}' files. "
                 f"Supported: {', '.join(sorted(_UPLOAD_ALLOWED_SUFFIXES))}."
             )
             return
@@ -822,17 +903,51 @@ class TelegramChannel:
             return
 
         caption = (update.message.caption or "").strip()
-        user_prompt = (
-            f"The user uploaded a tabular file via Telegram. "
-            f"Absolute file path: {staged_path}. "
-            f"Please load the 'data-ingest' skill and walk through the ingestion "
-            f"workflow: use read_tabular to preview the file, propose a table "
-            f"name and business key via ask_user, write it via "
-            f"write_ingested_table, and save a reusable skill via "
-            f"save_ingestion_skill. "
-        )
+
+        if doc_category == "tabular":
+            user_prompt = (
+                f"The user uploaded a tabular file via Telegram. "
+                f"Absolute file path: {staged_path}. "
+                f"Please load the 'data-ingest' skill and walk through the "
+                f"ingestion workflow: use read_tabular to preview the file, "
+                f"propose a table name and business key via ask_user, write "
+                f"it via write_ingested_table, and save a reusable skill via "
+                f"save_ingestion_skill. "
+            )
+        elif doc_category == "vision":
+            user_prompt = (
+                f"The user uploaded a document file ({suffix}) via Telegram — "
+                f"an image, PDF, or text file. Absolute file path: "
+                f"{staged_path}. Load the 'record-entry' skill and extract "
+                f"its content: for an image use extract_from_image; for a PDF "
+                f"or text file read the content directly with the appropriate "
+                f"tool. Then propose_record_table, ask_user until every "
+                f"required field is confirmed, and write_ingested_table. "
+                f"Strict clarification — do not record until the draft is "
+                f"fully confirmed. "
+            )
+        else:  # archive
+            extract_dir, members, archive_err = self._extract_archive(
+                staged_path, staging_dir
+            )
+            if archive_err is not None or extract_dir is None:
+                try:
+                    await status_msg.edit_text(f"❌ {archive_err}")
+                except Exception:
+                    await update.message.reply_text(f"❌ {archive_err}")
+                return
+            file_list = "\n".join(f"  - {m}" for m in members)
+            user_prompt = (
+                f"The user uploaded a ZIP archive via Telegram; it was "
+                f"extracted to {extract_dir} and contains {len(members)} "
+                f"file(s):\n{file_list}\n\n"
+                f"Process each file by its type: tabular files "
+                f"(.csv/.xlsx/.tsv/.json) via the 'data-ingest' skill; "
+                f"images, PDFs, and text files via the 'record-entry' skill. "
+                f"Give a concise per-file summary of what was ingested. "
+            )
         if caption:
-            user_prompt += f"User note: {caption}"
+            user_prompt += f"\nUser note: {caption}"
 
         try:
             await status_msg.edit_text(f"🔍 Inspecting {original_name}...")

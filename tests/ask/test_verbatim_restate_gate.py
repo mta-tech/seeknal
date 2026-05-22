@@ -20,6 +20,7 @@ from seeknal.ask.agents.tools._context import (
     lookup_prior_turn_answer,
     record_prior_turn_answer,
     reset_turn_governor,
+    seed_prior_turn_from_history,
     set_tool_context,
 )
 
@@ -150,6 +151,90 @@ def test_reset_turn_governor_preserves_prior_turn_pair(tmp_path: Path):
     reset_turn_governor("Q2")
     assert getattr(ctx.repl, "_seeknal_prior_turn_question") == "q1"
     assert getattr(ctx.repl, "_seeknal_prior_turn_answer") == "A1"
+
+
+# ---------------------------------------------------------------------------
+# seed_prior_turn_from_history — gateway REPL-rebuild fix
+# ---------------------------------------------------------------------------
+# Regression for the gateway bug: create_agent rebuilds the REPL every turn,
+# so record_prior_turn_answer's in-memory pair never survives. The verbatim
+# gate was permanently dormant on gateway/Telegram sessions. seed_prior_turn_
+# from_history rehydrates the pair from the persisted message_history.
+
+
+def _history_pair(question: str, answer: str) -> list:
+    """Build a [ModelRequest, ModelResponse] message_history slice."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        UserPromptPart,
+    )
+
+    return [
+        ModelRequest(parts=[UserPromptPart(content=question)]),
+        ModelResponse(parts=[TextPart(content=answer)]),
+    ]
+
+
+def test_seed_populates_prior_turn_from_history(tmp_path: Path):
+    """A fresh REPL with no prior pair gets one seeded from message_history."""
+    ctx = _make_ctx(tmp_path)
+    history = _history_pair("Berapa NIE 2024?", "Total NIE 2024: 50")
+
+    # Fresh REPL — nothing recorded yet (simulates the per-turn rebuild).
+    assert lookup_prior_turn_answer("Berapa NIE 2024?") is None
+
+    seed_prior_turn_from_history(history)
+
+    # After seeding, the verbatim gate's lookup now resolves.
+    assert lookup_prior_turn_answer("Berapa NIE 2024?") == "Total NIE 2024: 50"
+
+
+def test_seed_empty_history_is_noop(tmp_path: Path):
+    """No history → nothing seeded, lookup stays None, no crash."""
+    _make_ctx(tmp_path)
+    seed_prior_turn_from_history([])
+    seed_prior_turn_from_history(None)
+    assert lookup_prior_turn_answer("anything") is None
+
+
+def test_seed_unwraps_restate_so_triple_ask_does_not_compound(tmp_path: Path):
+    """If the last answer in history is itself a wrapped restate, seeding must
+    store the canonical answer — never a restate-of-a-restate."""
+    ctx = _make_ctx(tmp_path)
+    canonical = "Total NIE 2024: 50"
+    wrapped = build_verbatim_restate_response(canonical)
+    history = _history_pair("Berapa NIE 2024?", wrapped)
+
+    seed_prior_turn_from_history(history)
+
+    stored = lookup_prior_turn_answer("Berapa NIE 2024?")
+    assert stored == canonical
+    # The wrapper prefix/suffix must not have survived into the stored pair.
+    assert "sama dengan giliran sebelumnya" not in (stored or "")
+
+
+def test_seed_takes_the_most_recent_turn(tmp_path: Path):
+    """With multiple turns in history, seeding uses the latest (question, answer)."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        UserPromptPart,
+    )
+
+    _make_ctx(tmp_path)
+    history = [
+        ModelRequest(parts=[UserPromptPart(content="old question")]),
+        ModelResponse(parts=[TextPart(content="old answer")]),
+        ModelRequest(parts=[UserPromptPart(content="new question")]),
+        ModelResponse(parts=[TextPart(content="new answer")]),
+    ]
+    seed_prior_turn_from_history(history)
+
+    assert lookup_prior_turn_answer("new question") == "new answer"
+    assert lookup_prior_turn_answer("old question") is None
 
 
 # ---------------------------------------------------------------------------

@@ -322,6 +322,87 @@ def build_verbatim_restate_response(prior_answer: str) -> str:
     )
 
 
+def _unwrap_restate(answer: str) -> str:
+    """Strip the bilingual restate wrapper, returning the canonical answer.
+
+    A no-op for answers that are not themselves a restate. Keeps triple-asks
+    from compounding the wrapper (restate of a restate of ...).
+    """
+    if not answer.startswith(_VERBATIM_RESTATE_PREFIX):
+        return answer
+    core = answer[len(_VERBATIM_RESTATE_PREFIX):]
+    if core.rstrip().endswith(_VERBATIM_RESTATE_SUFFIX):
+        core = core.rstrip()[: -len(_VERBATIM_RESTATE_SUFFIX)]
+    return core.strip()
+
+
+def seed_prior_turn_from_history(message_history: Any) -> None:
+    """Re-seed the durable prior-turn pair from a persisted message_history.
+
+    The gateway rebuilds the agent's REPL on every turn (``create_agent``),
+    so the in-memory prior-turn pair written by ``record_prior_turn_answer``
+    does not survive between turns — and the verbatim re-ask gate, which
+    reads that pair off ``ctx.repl``, never fires on gateway/Telegram
+    sessions. ``message_history`` IS persisted per session (via the
+    session store), so it is the authoritative cross-turn source.
+
+    Call this after ``create_agent`` (so the ToolContext + fresh REPL
+    exist) and before the verbatim gate. Walks ``message_history``
+    backwards for the most recent (user question, assistant answer) pair
+    and stores it via ``record_prior_turn_answer``.
+
+    Triple-ask safe: if the most recent answer is itself a wrapped
+    restate, the wrapper is stripped so the canonical answer is stored
+    (never a restate-of-a-restate). Best-effort and non-fatal — any
+    failure leaves the gate dormant rather than crashing the turn.
+    """
+    if not message_history:
+        return
+    try:
+        from pydantic_ai.messages import (
+            ModelRequest,
+            ModelResponse,
+            TextPart,
+            UserPromptPart,
+        )
+    except Exception:  # noqa: BLE001 - pydantic_ai optional at import time
+        return
+
+    prior_answer: str | None = None
+    prior_question: str | None = None
+    for msg in reversed(message_history):
+        if prior_answer is None and isinstance(msg, ModelResponse):
+            for part in msg.parts:
+                if (
+                    isinstance(part, TextPart)
+                    and isinstance(part.content, str)
+                    and part.content.strip()
+                ):
+                    prior_answer = part.content
+                    break
+        elif (
+            prior_answer is not None
+            and prior_question is None
+            and isinstance(msg, ModelRequest)
+        ):
+            for part in msg.parts:
+                if isinstance(part, UserPromptPart) and isinstance(
+                    part.content, str
+                ) and part.content.strip():
+                    prior_question = part.content
+                    break
+        if prior_answer is not None and prior_question is not None:
+            break
+
+    if prior_answer is None or prior_question is None:
+        return
+
+    canonical = _unwrap_restate(prior_answer)
+    if not canonical.strip():
+        return
+    record_prior_turn_answer(question=prior_question, answer=canonical)
+
+
 def reset_turn_governor(question: str | None = None) -> None:
     """Reset per-user-turn harness state.
 

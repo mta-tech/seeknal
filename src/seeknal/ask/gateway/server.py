@@ -423,10 +423,18 @@ async def _run_agent_inner(
         record_prior_turn_answer,
         reset_report_approval,
         reset_turn_governor,
+        seed_prior_turn_from_history,
     )
 
     reset_report_approval()
     reset_turn_governor(question)
+
+    # The gateway rebuilds the REPL on every turn (create_agent above), so
+    # the in-memory prior-turn pair from record_prior_turn_answer never
+    # survives between turns. Re-seed it from the persisted message_history
+    # so the verbatim re-ask gate below actually fires on gateway/Telegram
+    # sessions (without this it is permanently dormant here).
+    seed_prior_turn_from_history(message_history)
 
     # Verbatim re-ask short-circuit: same question as the prior turn returns
     # the prior answer with a bilingual restate notice BEFORE any LLM/tool
