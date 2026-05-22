@@ -390,12 +390,17 @@ class TelegramChannel:
     def _match_manifest_route(
         self, hint_text: str, manifest: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """Return the unique manifest route whose ``file_pattern`` matches.
+        """Return the manifest route whose ``file_pattern`` matches the hint.
 
         Photos from Telegram do not carry meaningful filenames, so we match
         the ``file_pattern`` token (``*order*`` -> ``order``) against the
-        lowercased caption text. When zero or multiple routes match we
-        return ``None`` and the legacy generic flow handles disambiguation.
+        lowercased caption text. Multiple routes may match — e.g. an
+        English token and its Indonesian alias both pointing at the same
+        ``target_table``. Such matches are collapsed: as long as every
+        match resolves to a single ``target_table`` the first one is
+        returned. Only a genuine ambiguity (matches spanning two or more
+        distinct target tables) returns ``None`` and defers to the legacy
+        generic flow.
         """
         if not hint_text:
             return None
@@ -412,7 +417,12 @@ class TelegramChannel:
                 continue
             if token in hint:
                 matched.append(route)
-        if len(matched) == 1:
+        if not matched:
+            return None
+        target_tables = {
+            str(route.get("target_table", "")).strip() for route in matched
+        }
+        if len(target_tables) == 1:
             return matched[0]
         return None
 
