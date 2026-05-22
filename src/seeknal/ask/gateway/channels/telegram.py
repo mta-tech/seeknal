@@ -10,6 +10,7 @@ Configure: TELEGRAM_BOT_TOKEN environment variable
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -348,6 +349,103 @@ class TelegramChannel:
             except Exception:
                 await update.message.reply_text(f"❌ Error: {e}")
 
+    # ------------------------------------------------------------------
+    # Manifest-aware photo intake
+    # ------------------------------------------------------------------
+    # When the project ships ``data/telegram_uploads/ingestion_manifest.json``
+    # with a route whose ``file_pattern`` matches the user's caption, the
+    # destination table is already decided. Drive the agent straight to
+    # ``extract_from_image`` -> ``write_ingested_table`` -> ``execute_sql``
+    # verify, skipping the ``propose_record_table`` round-trip. Without a
+    # manifest hit, fall back to the legacy generic prompt.
+
+    def _load_ingestion_manifest(self) -> dict[str, Any] | None:
+        """Read the project's ``data/telegram_uploads/ingestion_manifest.json``.
+
+        Returns the parsed dict, or ``None`` when missing, unreadable, or
+        lacking a non-empty ``routes`` list.
+        """
+        manifest_path = (
+            self._project_path
+            / "data"
+            / "telegram_uploads"
+            / "ingestion_manifest.json"
+        )
+        if not manifest_path.exists():
+            return None
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "[telegram] failed to read ingestion_manifest.json: %s", exc
+            )
+            return None
+        if not isinstance(data, dict):
+            return None
+        routes = data.get("routes")
+        if not isinstance(routes, list) or not routes:
+            return None
+        return data
+
+    def _match_manifest_route(
+        self, hint_text: str, manifest: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return the unique manifest route whose ``file_pattern`` matches.
+
+        Photos from Telegram do not carry meaningful filenames, so we match
+        the ``file_pattern`` token (``*order*`` -> ``order``) against the
+        lowercased caption text. When zero or multiple routes match we
+        return ``None`` and the legacy generic flow handles disambiguation.
+        """
+        if not hint_text:
+            return None
+        hint = hint_text.lower()
+        matched: list[dict[str, Any]] = []
+        for route in manifest.get("routes", []):
+            if not isinstance(route, dict):
+                continue
+            pattern = route.get("file_pattern", "")
+            if not isinstance(pattern, str):
+                continue
+            token = pattern.replace("*", "").strip().lower()
+            if not token:
+                continue
+            if token in hint:
+                matched.append(route)
+        if len(matched) == 1:
+            return matched[0]
+        return None
+
+    def _load_photo_intake_config(self) -> dict[str, Any]:
+        """Read ``telegram.photo_intake`` from ``seeknal_agent.yml``.
+
+        Defaults to ``require_confirmation=True`` (the safer setting) when
+        the file is missing, unreadable, or omits the key.
+        """
+        cfg_path = self._project_path / "seeknal_agent.yml"
+        if not cfg_path.exists():
+            cfg_path = self._project_path / "seeknal_agent.yaml"
+        if not cfg_path.exists():
+            return {"require_confirmation": True}
+        try:
+            import yaml
+
+            data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "[telegram] failed to read seeknal_agent.yml: %s", exc
+            )
+            return {"require_confirmation": True}
+        if not isinstance(data, dict):
+            return {"require_confirmation": True}
+        telegram_cfg = data.get("telegram") or {}
+        intake = telegram_cfg.get("photo_intake") or {}
+        return {
+            "require_confirmation": bool(
+                intake.get("require_confirmation", True)
+            )
+        }
+
     async def _handle_photo(self, update: Any, context: Any) -> None:
         """Handle photo uploads — stage and route into record-entry skill."""
         from telegram.constants import ChatAction
@@ -403,22 +501,91 @@ class TelegramChannel:
             return
 
         caption = (update.message.caption or "").strip()
-        user_prompt = (
-            "The user sent a photo via Telegram — most likely a fund-transfer "
-            "proof (BCA/Mandiri/BNI/BRI/GoPay/OVO/DANA/QRIS), a shop receipt, "
-            "or an order photo. Load the 'record-entry' skill and walk through "
-            f"the full workflow on this image:\n\n"
-            f"Absolute image path: {staged_path}\n"
+
+        manifest = self._load_ingestion_manifest()
+        matched_route = (
+            self._match_manifest_route(caption, manifest) if manifest else None
         )
-        if caption:
-            user_prompt += f"User caption / hint: {caption}\n"
-        user_prompt += (
-            "\nStart with `extract_from_image(image_path=<path>, hint=<caption "
-            "if any>)`, then `list_tables` + `propose_record_table`, then "
-            "`ask_user` until every required field is resolved, then "
-            "`write_ingested_table`. Strict clarification — do not record "
-            "until the draft is fully confirmed."
-        )
+
+        if matched_route:
+            target_table = str(matched_route.get("target_table", "")).strip()
+            required_cols = matched_route.get("required_columns") or []
+            if not isinstance(required_cols, list):
+                required_cols = []
+            require_confirmation = self._load_photo_intake_config()[
+                "require_confirmation"
+            ]
+            ingest_table = f"ingest_{target_table}"
+            cols_line = (
+                ", ".join(str(c) for c in required_cols)
+                if required_cols
+                else "(see manifest)"
+            )
+            logger.info(
+                "[telegram] manifest route matched: target=%s, confirm=%s",
+                target_table,
+                require_confirmation,
+            )
+
+            user_prompt = (
+                "The user sent a photo via Telegram and the project's "
+                "ingestion manifest routes this upload to a known canonical "
+                "table. The destination is already decided — do NOT call "
+                "`propose_record_table`.\n\n"
+                f"Absolute image path: {staged_path}\n"
+            )
+            if caption:
+                user_prompt += f"User caption / hint: {caption}\n"
+            user_prompt += (
+                f"\nCanonical destination: source.{target_table}\n"
+                f"Ingest staging table: {ingest_table}\n"
+                f"Required columns: {cols_line}\n\n"
+                "Workflow:\n"
+                "1. Call `extract_from_image(image_path=<path>, "
+                "hint=<caption if any>)`.\n"
+                "2. Coerce the extracted fields onto the required columns "
+                "listed above.\n"
+            )
+            if require_confirmation:
+                user_prompt += (
+                    "3. Show the draft row to the user in plain Indonesian "
+                    "and ask: Ya / Edit / Salah / Batal.\n"
+                    "4. After the user confirms, call "
+                    f"`write_ingested_table(table_name='{ingest_table}', "
+                    "mode='append', user_confirmed=True)`.\n"
+                )
+            else:
+                user_prompt += (
+                    "3. Auto-save is enabled — call "
+                    f"`write_ingested_table(table_name='{ingest_table}', "
+                    "mode='append', user_confirmed=True)` directly.\n"
+                )
+            user_prompt += (
+                "5. Verify by calling `execute_sql("
+                f"\"SELECT COUNT(*) FROM {ingest_table}\")` and quote the "
+                "row count in your reply. Never claim 'tersimpan' or "
+                "'saved' without this verification step.\n"
+                "Reply in plain Indonesian owner language."
+            )
+        else:
+            user_prompt = (
+                "The user sent a photo via Telegram — most likely a "
+                "fund-transfer proof "
+                "(BCA/Mandiri/BNI/BRI/GoPay/OVO/DANA/QRIS), a shop receipt, "
+                "or an order photo. Load the 'record-entry' skill and walk "
+                "through the full workflow on this image:\n\n"
+                f"Absolute image path: {staged_path}\n"
+            )
+            if caption:
+                user_prompt += f"User caption / hint: {caption}\n"
+            user_prompt += (
+                "\nStart with `extract_from_image(image_path=<path>, "
+                "hint=<caption if any>)`, then `list_tables` + "
+                "`propose_record_table`, then `ask_user` until every "
+                "required field is resolved, then `write_ingested_table`. "
+                "Strict clarification — do not record until the draft is "
+                "fully confirmed."
+            )
 
         try:
             await status_msg.edit_text("🧐 Reading the image...")
