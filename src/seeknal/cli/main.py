@@ -943,7 +943,11 @@ discovery_cache_ttl_seconds: 300
 # limits, hook behavior, planning, or delegation need project-specific policy.
 agent_harness:
   auto_summarization:
-    enabled: true
+    # Off by default: history compaction can break the pydantic-ai
+    # "history must end with a ModelRequest" invariant and crash chat turns.
+    # Safe to enable for long/low-cost sessions (a trailing-request guard
+    # protects it), but opt in deliberately.
+    enabled: false
     context_manager: auto
     context_manager_max_tokens:
     eviction_token_limit: 20000

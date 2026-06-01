@@ -1064,6 +1064,45 @@ async def stream_ask(
                 )
                 record_prior_turn_answer(question=question, answer=fallback)
                 return fallback
+
+            # Recoverable harness errors must NOT crash the chat turn. Two cases:
+            #  - UserError "Processed history must end with a `ModelRequest`"
+            #    (context compaction/summarization left a ModelResponse tail), and
+            #  - UnexpectedModelBehavior "exceeded max retries" (a tool gave up).
+            # Repair the history tail and answer from gathered evidence instead.
+            from pydantic_ai.exceptions import (
+                UnexpectedModelBehavior,
+                UserError,
+            )
+
+            _exc_msg = str(exc).lower()
+            if isinstance(exc, (UserError, UnexpectedModelBehavior)) and (
+                "processed history must end with" in _exc_msg
+                or "exceeded max retries" in _exc_msg
+                or "max retries count" in _exc_msg
+                or "exceeded maximum retries" in _exc_msg
+            ):
+                from seeknal.ask.processors import ensure_trailing_model_request
+
+                repaired = ensure_trailing_model_request(message_history)
+                message_history.clear()
+                message_history.extend(repaired)
+                try:
+                    fallback = await _stream_evidence_synthesis(
+                        agent,
+                        deps,
+                        message_history,
+                        "a recoverable harness error interrupted the run; "
+                        "answering from the evidence gathered so far",
+                        console,
+                    )
+                except Exception:
+                    from seeknal.ask.agents.agent import _NO_RESPONSE
+
+                    _show_answer(console, _NO_RESPONSE)
+                    fallback = _NO_RESPONSE
+                record_prior_turn_answer(question=question, answer=fallback)
+                return fallback
             raise
         # Update message history in place
         message_history.clear()

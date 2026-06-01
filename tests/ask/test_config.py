@@ -167,7 +167,10 @@ def test_performance_defaults_and_overrides():
 
 def test_agent_harness_defaults_preserve_current_ask_behavior():
     auto = get_auto_summarization_config({})
-    assert auto["enabled"] is True
+    # auto_summarization now defaults OFF: its history compaction could leave the
+    # message history ending in a ModelResponse and crash pydantic-ai's
+    # "history must end with a ModelRequest" invariant. Opt-in only.
+    assert auto["enabled"] is False
     assert auto["context_manager"] == "auto"
     assert auto["eviction_token_limit"] == 20000
     assert auto["patch_tool_calls"] is True
