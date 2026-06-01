@@ -22,6 +22,7 @@ The Seeknal CLI (`seeknal`) provides commands for managing data pipelines, featu
 | `ask` | AI-powered data analysis, chat, and reports |
 | `source` | Manage read-only sources for REPL and Ask |
 | `gateway` | HTTP gateway server (WebSocket, SSE, REST, Telegram) |
+| `heartbeat` | Polling daemon + smart inbox (scan → ingest → DAG → exposure → notify) |
 | `report-server` | Host published Evidence.dev reports |
 | `list` | List resources in the current project |
 | `show` | Show details of a specific resource |
@@ -83,6 +84,13 @@ The Seeknal CLI (`seeknal`) provides commands for managing data pipelines, featu
 - `gateway backend` - Cloud-only gateway (no local project)
 - `gateway worker` - Standalone Temporal worker
 - `report-server start` - Host published Evidence.dev reports
+
+### Smart Inbox / Daemon
+
+- `heartbeat start` - Run the polling daemon (loops until SIGTERM/SIGINT)
+- `heartbeat tick` - Run a single tick and exit (cron / k8s CronJob friendly)
+- `heartbeat status` - Show recent runs from `target/heartbeat/runs.jsonl`
+- `heartbeat review` - Interactive quarantine review (CLI parity with the Telegram flow)
 
 ### Visualization & Quality
 

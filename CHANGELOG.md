@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.6] - 2026-05-24
+
+Heartbeat smart-inbox loop — three seeknal-core bugs that blocked
+`seeknal heartbeat tick` from completing the full
+Scan → Ingest → DAG → Exposure loop for any project with transforms,
+plus a UX cleanup to the verbatim re-ask gate.
+
+### Fixed
+
+- **`Manifest` adjacency cache invalidation** (`seeknal.dag.manifest`) —
+  partial per-node `pop` left stale entries for transitively-affected
+  nodes, but the lazy rebuild in `get_upstream_nodes` /
+  `get_downstream_nodes` only fires when the cache dict is *entirely*
+  empty. Popped keys then fell through to `.get(node_id, set())` and
+  silently reported zero neighbors, so Kahn's algorithm in
+  `DAGRunner._get_topological_order` misreported acyclic DAGs as cyclic
+  (`"DAG contains cycles"`). Now clears both caches in one shot on every
+  mutation. Regression test in `tests/dag/test_manifest.py`.
+- **`heartbeat/runner.py::_run_dag` AttributeError** — referenced
+  `summary.fingerprints`, which is not on `ExecutionSummary`. Now reads
+  from `runner._current_fingerprints` (where `DAGRunner` actually stores
+  the per-node fingerprints it computed this run) and maps each to its
+  `.combined` hash, so `DagResult.fingerprints: dict[str, str]` populates
+  correctly.
+- **Cached transform-input view registration**
+  (`workflow/executors/transform_executor.py`) — `_load_views_from_inputs`
+  was creating views as quoted-literal `"source.x"`, while the existence
+  check in the same method and every transform SQL reference
+  `source.x` schema-qualified. DuckDB parses unquoted `source.x` as
+  `schema.table`, so incremental DAG re-runs hit
+  `Catalog Error: Table with name x does not exist`. Now emits
+  `CREATE SCHEMA IF NOT EXISTS "kind"` + `CREATE OR REPLACE VIEW
+  "kind"."name"`, matching the rest of the executor.
+
+### Changed
+
+- **Verbatim re-ask gate is a silent passthrough**
+  (`ask/agents/tools/_context.py`) —
+  `build_verbatim_restate_response(prior_answer)` now returns
+  `prior_answer` unchanged. The old bilingual banner ("Pertanyaan ini
+  sama dengan giliran sebelumnya / This question is the same as the
+  prior turn") is gone. `seed_prior_turn_from_history` is triple-ask
+  safe by construction — a restate is byte-identical to the canonical
+  answer, so re-seeding can never compound. Gate tests
+  (`tests/ask/test_verbatim_restate_gate.py`) updated for the no-banner
+  behaviour.
+- **Heartbeat success-notification log**
+  (`heartbeat/tick_notifier.py`) — emits
+  `[heartbeat] tick notification delivered to chat <id>` when the
+  Telegram POST returns `ok=true`. Used as an assertion target by the
+  heartbeat QA scenarios.
+
+### Docs
+
+- `docs/cli/heartbeat.md` is now part of the published CLI reference,
+  listed in `docs/cli/index.md` under a new **Smart Inbox / Daemon**
+  category alongside the existing Servers & APIs section.
+
 ## [2.9.5] - 2026-05-21
 
 Ask agent reliability — PostgreSQL EXTRACT pushdown, psycopg2 oracle path,
