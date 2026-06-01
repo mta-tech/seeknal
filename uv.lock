@@ -4213,7 +4213,7 @@ wheels = [
 
 [[package]]
 name = "seeknal"
-version = "2.9.2"
+version = "2.9.5"
 source = { editable = "." }
 dependencies = [
     { name = "croniter" },

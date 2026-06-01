@@ -300,40 +300,17 @@ def lookup_prior_turn_answer(
     return stored_answer
 
 
-# Bilingual restate prefix wrapped around a prior-turn answer when the
-# verbatim re-ask gate fires. Indonesian + English — the BPOM/KAFI tests
-# exercise Indonesian/Malay phrasing and English tests also exist.
-_VERBATIM_RESTATE_PREFIX = (
-    "Pertanyaan ini sama dengan giliran sebelumnya — jawaban tetap sama:\n"
-    "/ This question is the same as the prior turn — the answer is the same:"
-)
-_VERBATIM_RESTATE_SUFFIX = (
-    "Jika Anda ingin data baru, ubah filter atau dimensi.\n"
-    "/ If you wanted fresh data, change the filter or dimension."
-)
-
-
 def build_verbatim_restate_response(prior_answer: str) -> str:
-    """Wrap a prior-turn answer with the bilingual restate notice."""
-    return (
-        f"{_VERBATIM_RESTATE_PREFIX}\n\n"
-        f"{prior_answer}\n\n"
-        f"{_VERBATIM_RESTATE_SUFFIX}"
-    )
+    """Return the prior-turn answer for a verbatim re-ask, unchanged.
 
-
-def _unwrap_restate(answer: str) -> str:
-    """Strip the bilingual restate wrapper, returning the canonical answer.
-
-    A no-op for answers that are not themselves a restate. Keeps triple-asks
-    from compounding the wrapper (restate of a restate of ...).
+    A verbatim re-ask returns the previous answer exactly — no banner,
+    no meta-commentary, no "this is the same question" notice. The gate
+    behaves as a silent cache: identical question in, identical answer
+    out. The function is kept as the single named seam the gateway and
+    streaming entry points call, so the restate policy lives in one
+    place and is trivial to evolve.
     """
-    if not answer.startswith(_VERBATIM_RESTATE_PREFIX):
-        return answer
-    core = answer[len(_VERBATIM_RESTATE_PREFIX):]
-    if core.rstrip().endswith(_VERBATIM_RESTATE_SUFFIX):
-        core = core.rstrip()[: -len(_VERBATIM_RESTATE_SUFFIX)]
-    return core.strip()
+    return prior_answer
 
 
 def seed_prior_turn_from_history(message_history: Any) -> None:
@@ -351,10 +328,11 @@ def seed_prior_turn_from_history(message_history: Any) -> None:
     backwards for the most recent (user question, assistant answer) pair
     and stores it via ``record_prior_turn_answer``.
 
-    Triple-ask safe: if the most recent answer is itself a wrapped
-    restate, the wrapper is stripped so the canonical answer is stored
-    (never a restate-of-a-restate). Best-effort and non-fatal — any
-    failure leaves the gate dormant rather than crashing the turn.
+    Triple-ask safe by construction: a verbatim restate returns the
+    prior answer unchanged (see ``build_verbatim_restate_response``), so
+    the stored answer is always canonical — re-seeding from it can never
+    compound. Best-effort and non-fatal — any failure leaves the gate
+    dormant rather than crashing the turn.
     """
     if not message_history:
         return
@@ -397,10 +375,9 @@ def seed_prior_turn_from_history(message_history: Any) -> None:
     if prior_answer is None or prior_question is None:
         return
 
-    canonical = _unwrap_restate(prior_answer)
-    if not canonical.strip():
+    if not prior_answer.strip():
         return
-    record_prior_turn_answer(question=prior_question, answer=canonical)
+    record_prior_turn_answer(question=prior_question, answer=prior_answer)
 
 
 def reset_turn_governor(question: str | None = None) -> None:

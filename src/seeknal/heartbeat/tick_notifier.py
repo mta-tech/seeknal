@@ -179,6 +179,9 @@ def notify_tick(run: Any, project_name: str | None = None) -> bool:
             body = resp.read().decode("utf-8", errors="replace")
             data = json.loads(body) if body else {}
         if data.get("ok") is True:
+            logger.info(
+                "[heartbeat] tick notification delivered to chat %s", chat_id
+            )
             return True
         logger.warning(
             "[heartbeat] Telegram API returned ok=false: %s",

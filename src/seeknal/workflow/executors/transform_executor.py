@@ -225,8 +225,15 @@ class TransformExecutor(BaseExecutor):
                     cache_path = self.context.target_path / "cache" / kind / f"{name}.parquet"
                     if cache_path.exists():
                         try:
+                            # Register schema-qualified ("source"."name") so a
+                            # transform's `FROM source.name` resolves. A quoted
+                            # literal view "source.name" would NOT — DuckDB
+                            # parses the unquoted reference as schema.table.
+                            # This also matches the existence check above
+                            # (`SELECT 1 FROM {ref}`), which is schema-qualified.
+                            conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{kind}"')
                             conn.execute(
-                                f"CREATE OR REPLACE VIEW \"{ref}\" AS "
+                                f'CREATE OR REPLACE VIEW "{kind}"."{name}" AS '
                                 f"SELECT * FROM read_parquet('{cache_path}')"
                             )
                             logger.info(f"Loaded cached view: {ref} from {cache_path}")

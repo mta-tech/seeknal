@@ -307,11 +307,20 @@ class HeartbeatRunner:
                 exec_context=exec_context,
             )
             summary = runner.run()
+            # ExecutionSummary has no `fingerprints`; the DAGRunner stores the
+            # per-node fingerprints it computed this run on `_current_fingerprints`
+            # as fingerprint objects. DagResult wants dict[str, str], so map each
+            # to its `.combined` hash.
+            raw_fingerprints = getattr(runner, "_current_fingerprints", {}) or {}
+            fingerprints = {
+                nid: getattr(fp, "combined", str(fp))
+                for nid, fp in raw_fingerprints.items()
+            }
             return DagResult(
                 nodes_attempted=summary.total_nodes,
                 nodes_skipped=summary.skipped_nodes,
                 nodes_failed=summary.failed_nodes,
-                fingerprints=dict(summary.fingerprints),
+                fingerprints=fingerprints,
                 per_node=[
                     {
                         "node_id": nr.node_id,
