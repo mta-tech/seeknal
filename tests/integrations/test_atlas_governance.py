@@ -20,9 +20,11 @@ from seeknal.integrations.atlas_governance import (
     GovernanceGate,
     apply_column_masks,
     create_governance_gate_from_env,
+    govern_query,
     govern_read,
     mask_rows,
     mask_value,
+    referenced_tables,
 )
 
 BASE_URL = "http://atlas.test"
@@ -286,3 +288,75 @@ def test_govern_read_raises_when_denied() -> None:
             columns=["x"],
             rows=[("v",)],
         )
+
+
+# ---------------------------------------------------------------------------
+# referenced_tables + govern_query (ad-hoc SQL reads)
+# ---------------------------------------------------------------------------
+
+
+def test_referenced_tables_from_and_join() -> None:
+    sql = "SELECT a.id FROM prod.gold.customer a JOIN prod.gold.orders b ON a.id = b.cid"
+    assert referenced_tables(sql) == ["prod.gold.customer", "prod.gold.orders"]
+
+
+def test_referenced_tables_excludes_ctes() -> None:
+    sql = "WITH recent AS (SELECT * FROM prod.gold.orders) SELECT * FROM recent"
+    assert referenced_tables(sql) == ["prod.gold.orders"]
+
+
+def test_referenced_tables_tableless_is_empty() -> None:
+    assert referenced_tables("SELECT 1 AS one") == []
+
+
+def test_govern_query_passthrough_when_gate_none() -> None:
+    rows = [("C-001", "3201011234567")]
+    out = govern_query(
+        None,
+        sql="SELECT * FROM prod.gold.customer",
+        columns=["customer_id", "nik"],
+        rows=rows,
+    )
+    assert out == [("C-001", "3201011234567")]
+
+
+def test_govern_query_masks_referenced_table_columns() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"allowed": True, "masked_columns": ["nik"]})
+
+    out = govern_query(
+        _gate(handler),
+        sql="SELECT customer_id, nik FROM prod.gold.customer",
+        columns=["customer_id", "nik"],
+        rows=[("C-001", "3201011234567")],
+        keep=6,
+    )
+    assert out == [("C-001", f"320101{MASK_TOKEN}")]
+
+
+def test_govern_query_raises_when_a_table_denied() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/contracts/access-check":
+            return httpx.Response(200, json={"allowed": False, "reason": "no grant"})
+        return httpx.Response(200, json={})
+
+    with pytest.raises(AtlasPolicyDenied):
+        govern_query(
+            _gate(handler),
+            sql="SELECT * FROM prod.gold.finance",
+            columns=["x"],
+            rows=[("v",)],
+        )
+
+
+def test_govern_query_tableless_does_not_call_atlas() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("Atlas must not be called for a tableless query")
+
+    out = govern_query(
+        _gate(handler),
+        sql="SELECT 1 AS one",
+        columns=["one"],
+        rows=[(1,)],
+    )
+    assert out == [(1,)]

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -42,6 +43,8 @@ __all__ = [
     "apply_column_masks",
     "mask_rows",
     "govern_read",
+    "govern_query",
+    "referenced_tables",
     "mask_value",
     "MASK_TOKEN",
 ]
@@ -197,6 +200,63 @@ def govern_read(
         return [tuple(row) for row in rows]
     decision = gate.enforce_access(resource=resource, action=action, actor=actor)
     return mask_rows(columns, rows, decision.masked_columns, keep=keep)
+
+
+_FROM_JOIN_RE = re.compile(r"\b(?:FROM|JOIN)\s+([\"`\w.]+)", re.IGNORECASE)
+_WITH_CTE_RE = re.compile(r"\b(\w+)\s+AS\s*\(", re.IGNORECASE)
+
+
+def referenced_tables(sql: str) -> list[str]:
+    """Best-effort extraction of base table identifiers referenced by a query.
+
+    Returns ``FROM``/``JOIN`` targets (surrounding quotes stripped), excluding
+    names defined as CTEs in a ``WITH`` clause. This is a heuristic used to scope
+    governance checks — Atlas remains the authority, so over- or under-identifying
+    a table only changes which resources are checked, not whether Atlas enforces.
+    """
+
+    ctes = {name.lower() for name in _WITH_CTE_RE.findall(sql)}
+    tables: list[str] = []
+    seen: set[str] = set()
+    for raw in _FROM_JOIN_RE.findall(sql):
+        name = raw.strip('"`')
+        key = name.lower()
+        if not name or key in ctes or key in seen:
+            continue
+        seen.add(key)
+        tables.append(name)
+    return tables
+
+
+def govern_query(
+    gate: "GovernanceGate | None",
+    *,
+    sql: str,
+    columns: Sequence[str],
+    rows: Iterable[Sequence[Any]],
+    actor: str | None = None,
+    keep: int = 0,
+) -> list[tuple[Any, ...]]:
+    """Govern an ad-hoc SQL read: access-check referenced tables, then mask columns.
+
+    * ``gate is None`` → rows pass through unchanged.
+    * otherwise each base table referenced by ``sql`` is access-checked via
+      :meth:`GovernanceGate.enforce_access` (raising
+      :class:`~seeknal.integrations.atlas_client.AtlasPolicyDenied` on the first
+      deny), and the union of columns Atlas marks sensitive across those tables is
+      masked in the result.
+
+    A tableless query (no ``FROM``/``JOIN``) reads no governed resource and passes
+    through unchanged.
+    """
+
+    if gate is None:
+        return [tuple(row) for row in rows]
+    masked: set[str] = set()
+    for table in referenced_tables(sql):
+        decision = gate.enforce_access(resource=table, action="read", actor=actor)
+        masked.update(decision.masked_columns)
+    return mask_rows(columns, rows, tuple(masked), keep=keep)
 
 
 class GovernanceGate:
