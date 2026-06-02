@@ -191,4 +191,9 @@ def create_ask_toolset(
     return FunctionToolset(
         tools=tools,
         id=toolset_id,
+        # pydantic-ai's FunctionToolset defaults to max_retries=1. The SQL
+        # security / self-correction hooks raise ModelRetry on a bad query, so a
+        # single retry exhaustion would raise UnexpectedModelBehavior and kill the
+        # whole turn. Give the model room to self-correct before failing.
+        max_retries=3,
     )

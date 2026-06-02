@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.7] - 2026-06-01
+
+Ask agent harness robustness + table-name discoverability — fixes that make
+`seeknal ask chat` reliable for multi-turn consultant use and let the agent query
+the friendly node names it is shown.
+
+### Fixed
+
+- **Ask chat crash on context compaction (F1)** — the `auto_summarization` history
+  processors could leave the message history ending in a `ModelResponse`, tripping
+  pydantic-ai's "Processed history must end with a `ModelRequest`" invariant and
+  crashing ~27% of chat / ask-test turns. A final `ensure_trailing_model_request`
+  history processor now guarantees the invariant; `stream_ask` and the gateway
+  `_generate` degrade gracefully on `UserError` / `UnexpectedModelBehavior` instead
+  of crashing; the Ask `FunctionToolset` now allows `max_retries=3` so one SQL
+  self-correction retry no longer kills the turn. `auto_summarization` now defaults
+  OFF in `seeknal init` and the config default, and is crash-safe to re-enable.
+- **Fabricated answers in `ask test` mode (F3)** — `testing.run_agent_answer` did not
+  seed the per-turn governor, so `current_question` stayed `None` and the grounding /
+  anti-fabrication guards silently disabled. It now calls `reset_report_approval` +
+  `reset_turn_governor`, mirroring the live chat/gateway paths.
+- **Stale `__version__`** — `seeknal.__version__` was 2.9.5 while `pyproject.toml`
+  was 2.9.6; both now track the release version.
+
+### Added
+
+- **Clean table-name aliases (F2)** — nodes registered as `transform_X` / `source_X` /
+  `model_X` are now also queryable under their bare node name (`X`) via a final
+  catalog-aware registration pass in the REPL, so the name the Ask agent is shown in
+  the manifest / `list_tables` is the name it can query. Aliases never shadow a real
+  relation (legacy cache view, consolidated `entity_`, `ingest_`, or attached table);
+  base-name collisions resolve deterministically (`source_` before `transform_`).
+
 ## [2.9.6] - 2026-05-24
 
 Heartbeat smart-inbox loop — three seeknal-core bugs that blocked

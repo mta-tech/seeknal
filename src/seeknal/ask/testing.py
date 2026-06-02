@@ -338,7 +338,12 @@ def run_agent_answer(
     """Run the real Ask agent once in a headless environment."""
     from seeknal.ask.agents.agent import ask as agent_ask
     from seeknal.ask.agents.agent import create_agent
-    from seeknal.ask.agents.tools._context import get_tool_context, set_tool_context
+    from seeknal.ask.agents.tools._context import (
+        get_tool_context,
+        reset_report_approval,
+        reset_turn_governor,
+        set_tool_context,
+    )
 
     try:
         previous_context = get_tool_context()
@@ -352,6 +357,13 @@ def run_agent_answer(
             model=model,
             environment="gateway",
         )
+        # Seed the per-turn governor exactly as the live chat/gateway paths do
+        # (stream_ask in streaming.py, _generate in gateway/server.py). create_agent has already
+        # installed the ToolContext. Without this, ctx.current_question stays None
+        # and the grounding / anti-fabrication guards silently disable, letting the
+        # agent fabricate answers in test mode that it would never produce live.
+        reset_report_approval()
+        reset_turn_governor(prompt)
         return agent_ask(agent, deps, message_history, prompt)
     finally:
         if previous_context is not None:

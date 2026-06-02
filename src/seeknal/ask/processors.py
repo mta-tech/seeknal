@@ -55,6 +55,32 @@ def _get_turn_index(messages: list[ModelMessage], msg_idx: int) -> int:
     return max(current_turn, 0)
 
 
+def ensure_trailing_model_request(
+    messages: list[ModelMessage],
+) -> list[ModelMessage]:
+    """Guarantee the processed history ends with a ``ModelRequest``.
+
+    pydantic-ai's ``_prepare_request`` raises
+    ``UserError('Processed history must end with a `ModelRequest`.')`` when the
+    message list handed to the next model request ends in a ``ModelResponse``.
+    Upstream context management (the LLM summarizer / eviction, or any history
+    processor) can leave such a tail. Registered as the LAST history processor,
+    this trims any trailing non-``ModelRequest`` messages so the invariant holds
+    instead of crashing the whole turn. It is a no-op on well-formed history and
+    never returns an empty list.
+    """
+    if not messages or isinstance(messages[-1], ModelRequest):
+        return messages
+    trimmed = list(messages)
+    while trimmed and not isinstance(trimmed[-1], ModelRequest):
+        trimmed.pop()
+    # If history was reduced to all non-ModelRequest messages, trimming alone
+    # cannot satisfy the invariant; return the original (non-empty) list and let
+    # the streaming/gateway recovery handler degrade gracefully rather than send
+    # an empty history.
+    return trimmed or messages
+
+
 @dataclass
 class MicrocompactProcessor:
     """Tier 1: Replace old tool results with a short placeholder.

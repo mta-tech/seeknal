@@ -334,7 +334,12 @@ def get_auto_summarization_config(config: dict[str, Any]) -> dict[str, Any]:
     sql_compactor = _get_mapping(section, "sql_result_compactor")
 
     return {
-        "enabled": _coerce_bool(section.get("enabled"), True),
+        # Default OFF: the context-management history processors can leave the
+        # message history ending in a ModelResponse, which trips pydantic-ai's
+        # "Processed history must end with a `ModelRequest`" invariant. It is
+        # opt-in until/unless explicitly enabled (the trailing-ModelRequest guard
+        # in agents/agent.py makes it crash-safe when a project does enable it).
+        "enabled": _coerce_bool(section.get("enabled"), False),
         "context_manager": _coerce_auto_bool(section.get("context_manager"), "auto"),
         "context_manager_max_tokens": _coerce_int(
             section.get("context_manager_max_tokens"), None

@@ -694,6 +694,42 @@ async def _run_agent_inner(
         record_prior_turn_answer(question=question, answer=answer)
         yield {"type": "answer", "data": answer}
 
+    except Exception as exc:
+        # Recoverable harness errors must not 500 the gateway turn:
+        #  - UserError "Processed history must end with a `ModelRequest`"
+        #    (context compaction/summarization left a ModelResponse tail), and
+        #  - UnexpectedModelBehavior "exceeded max retries" (a tool gave up).
+        # Repair the history tail and answer from gathered evidence; re-raise
+        # anything else unchanged.
+        from pydantic_ai.exceptions import (
+            UnexpectedModelBehavior,
+            UserError,
+        )
+
+        _exc_msg = str(exc).lower()
+        if not (
+            isinstance(exc, (UserError, UnexpectedModelBehavior))
+            and (
+                "processed history must end with" in _exc_msg
+                or "exceeded max retries" in _exc_msg
+                or "max retries count" in _exc_msg
+                or "exceeded maximum retries" in _exc_msg
+            )
+        ):
+            raise
+        from seeknal.ask.agents.tools._context import synthesize_evidence_fallback
+
+        # Answer deterministically from evidence already gathered — no further
+        # model call, so the broken history is never re-fed. Nothing reads
+        # message_history after this branch (the finally block saves only when a
+        # run `result` exists), so repairing it here would be dead code.
+        answer = synthesize_evidence_fallback(
+            "a recoverable harness error interrupted the run; "
+            "answering from the evidence gathered so far"
+        )
+        record_prior_turn_answer(question=question, answer=answer)
+        yield {"type": "answer", "data": answer}
+
     finally:
         # Always save conversation — even when the consumer closes the generator
         # early (e.g. Telegram breaking on answer event). Without this, session
