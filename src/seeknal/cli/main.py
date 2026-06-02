@@ -235,6 +235,12 @@ from seeknal.cli.gov import gov_app  # ty: ignore[unresolved-import]
 
 app.add_typer(gov_app, name="gov")
 
+# Keycloak/OIDC authentication (login, status, logout). Stdlib + httpx only, so it
+# is registered unconditionally regardless of whether Atlas governance is configured.
+from seeknal.cli.auth import auth_app  # ty: ignore[unresolved-import]
+
+app.add_typer(auth_app, name="auth")
+
 # Virtual environment management
 env_app = typer.Typer(
     help="Virtual environments for safe pipeline development (plan/apply/promote)"
@@ -634,6 +640,13 @@ from seeknal.ui.output import echo_success as _ui_echo_success
 from seeknal.ui.output import echo_error as _ui_echo_error
 from seeknal.ui.output import echo_warning as _ui_echo_warning
 from seeknal.ui.output import echo_info as _ui_echo_info
+
+# Atlas runtime governance gate factory. Imported at module scope so tests can
+# monkeypatch ``seeknal.cli.main.create_governance_gate_from_env``. Stdlib + httpx
+# only; returns ``None`` (governance inactive) unless ATLAS_API_URL is set.
+from seeknal.integrations.atlas_governance import (  # ty: ignore[unresolved-import]
+    create_governance_gate_from_env,
+)
 
 
 def _echo_success(message: str):
@@ -1577,6 +1590,104 @@ classifier:
         raise typer.Exit(1)
 
 
+def _source_fqtn(node: Any) -> Optional[str]:
+    """Resolve a source node's fully-qualified table id for governance checks.
+
+    Source nodes carry their config in ``node.config`` (an alias for the parsed
+    YAML). The resolution prefers the most-qualified identifier available:
+
+    * If ``config.table`` is already three-part (``warehouse.namespace.table`` /
+      ``catalog.namespace.table``, e.g. the Iceberg ``atlas.qa_iceberg.signal_events``
+      form), it is used verbatim.
+    * Otherwise, if a warehouse/catalog name is resolvable from ``config`` (the
+      ``warehouse`` key, or ``params.warehouse``/``params.catalog``), it is prepended
+      to ``table`` to make the id as qualified as the engine can determine here.
+    * Otherwise the bare ``config.table`` (e.g. ``namespace.table`` or a single name)
+      is returned.
+
+    Warehouse-context assumption: when no warehouse/catalog is resolvable from the
+    node config (common for csv/postgresql sources, whose ``table`` is a path or
+    ``schema.table``), we fall back to the most-qualified string available. Atlas-side
+    normalization is expected to canonicalize the remaining qualifier (project/env
+    defaults) when matching the resource against policy.
+
+    Args:
+        node: A DAG source node exposing ``config`` (parsed YAML) and ``kind``.
+
+    Returns:
+        The resolved table id, or ``None`` when the node carries no table and so
+        identifies no governed resource (such nodes are skipped by the caller).
+    """
+
+    config = getattr(node, "config", None) or {}
+    table = config.get("table")
+    if not isinstance(table, str) or not table.strip():
+        return None
+    table = table.strip()
+
+    # Already fully qualified (warehouse.namespace.table) -> use as-is.
+    if table.count(".") >= 2:
+        return table
+
+    params = config.get("params") or {}
+    warehouse = (
+        config.get("warehouse")
+        or (params.get("warehouse") if isinstance(params, dict) else None)
+        or (params.get("catalog") if isinstance(params, dict) else None)
+    )
+    if isinstance(warehouse, str) and warehouse.strip():
+        return f"{warehouse.strip()}.{table}"
+
+    # No warehouse/catalog context resolvable from node config; emit the most
+    # qualified string we have. Atlas-side normalization covers the remainder.
+    return table
+
+
+def _enforce_pre_run(nodes_to_run: set, dag_builder: Any, gate: Any) -> None:
+    """Enforce Atlas read access for every source node about to run.
+
+    For each node in ``nodes_to_run`` whose type is ``SOURCE``, the fully-qualified
+    table id is resolved via :func:`_source_fqtn` and access-checked against the
+    Atlas gate. A denial aborts the whole run with exit code 1 and a hint pointing
+    the user at ``seeknal gov request-access``.
+
+    Args:
+        nodes_to_run: Set of node ids selected for execution.
+        dag_builder: The built DAG (``dag_builder.nodes`` maps id -> source node).
+        gate: An active governance gate, or ``None`` to skip enforcement entirely
+            (Atlas not configured -> no behavior change).
+
+    Raises:
+        typer.Exit: With code 1 when Atlas denies read access to a source.
+    """
+
+    if gate is None:
+        return
+
+    from seeknal.dag.manifest import NodeType
+    from seeknal.integrations.atlas_client import AtlasPolicyDenied
+    from seeknal.integrations.atlas_governance import user_sub_from_credentials
+
+    actor = user_sub_from_credentials()
+
+    for node_id in nodes_to_run:
+        node = dag_builder.nodes.get(node_id)
+        if node is None:
+            continue
+        node_type = getattr(node, "node_type", None) or getattr(node, "kind", None)
+        if node_type is not NodeType.SOURCE:
+            continue
+        fqtn = _source_fqtn(node)
+        if not fqtn:
+            continue
+        try:
+            gate.enforce_access(resource=fqtn, action="read", actor=actor)
+        except AtlasPolicyDenied as exc:
+            _echo_error(f"Access denied for source '{fqtn}': {exc}")
+            _echo_info(f'Run: seeknal gov request-access {fqtn} --reason "<why>"')
+            raise typer.Exit(1)
+
+
 @app.command()
 def run(
     dry_run: bool = typer.Option(
@@ -2130,6 +2241,13 @@ def _run_yaml_pipeline(
     if not nodes_to_run:
         _echo_success("No changes detected. Nothing to run.")
         return
+
+    # Atlas pre-run access enforcement. When Atlas is configured (ATLAS_API_URL set)
+    # the gate is non-None and every source node about to run is access-checked; a
+    # denial aborts the run. When Atlas is not configured the gate is None and this
+    # is a no-op (full backward compatibility, no behavior change). The factory is
+    # referenced via the module global so tests can monkeypatch it.
+    _enforce_pre_run(nodes_to_run, dag_builder, create_governance_gate_from_env())
 
     _echo_info(f"Nodes to run: {len(nodes_to_run)}")
 
