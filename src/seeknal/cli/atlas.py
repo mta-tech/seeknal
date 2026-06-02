@@ -607,6 +607,78 @@ def governance_audit_logs(
         raise typer.Exit(1)
 
 
+@governance_app.command("status")
+def governance_status():
+    """Show whether runtime Atlas governance enforcement is active.
+
+    Enforcement activates when ``ATLAS_API_URL`` is configured. When active, Seeknal
+    delegates data-access decisions and column masking to the Atlas backend on every
+    governed read — the rules live in Atlas, not in editable local files.
+
+    Example:
+        seeknal atlas governance status
+    """
+    from seeknal.integrations.atlas_governance import create_governance_gate_from_env
+
+    gate = create_governance_gate_from_env()
+    typer.echo("")
+    typer.echo(typer.style("Atlas Runtime Governance", bold=True))
+    typer.echo("=" * 40)
+    if gate is None:
+        _echo_warning("Inactive — ATLAS_API_URL is not set.")
+        typer.echo("Reads pass through ungoverned. Set ATLAS_API_URL to enable enforcement.")
+        typer.echo("")
+        return
+    _echo_success("Active — access decisions delegated to Atlas.")
+    typer.echo(f"  Endpoint:  {gate.config.base_url}")
+    typer.echo(f"  Token:     {'set' if gate.config.token else '(none)'}")
+    typer.echo(f"  Fail mode: {'fail-open' if gate.fail_open else 'fail-closed'}")
+    typer.echo("")
+
+
+@governance_app.command("check")
+def governance_check(
+    resource: str = typer.Argument(
+        ..., help="Resource identifier, e.g. prod.gold.customer"
+    ),
+    action: str = typer.Option(
+        "read", "--action", "-a", help="Action to check (read, write, ...)"
+    ),
+    actor: Optional[str] = typer.Option(
+        None, "--actor", help="Actor (defaults to ATLAS_ACTOR or the current user)"
+    ),
+):
+    """Check the Atlas access decision for a resource (exit 1 if denied).
+
+    Uses the configured Atlas backend (``ATLAS_API_URL``). The exit code is scriptable:
+    a non-zero exit means access is denied, so this can gate shell pipelines.
+
+    Example:
+        seeknal atlas governance check prod.gold.customer --action read
+    """
+    from seeknal.integrations.atlas_governance import create_governance_gate_from_env
+
+    gate = create_governance_gate_from_env()
+    if gate is None:
+        _echo_error("Atlas governance is not configured (set ATLAS_API_URL).")
+        raise typer.Exit(2)
+
+    decision = gate.check_access(resource=resource, action=action, actor=actor)
+    typer.echo("")
+    if decision.allowed:
+        _echo_success(f"ALLOW  {action} {resource}")
+        if decision.masked_columns:
+            typer.echo(f"  Masked columns: {', '.join(decision.masked_columns)}")
+        typer.echo(f"  Classification: {decision.classification}")
+        typer.echo("")
+    else:
+        _echo_error(f"DENY   {action} {resource}")
+        if decision.reason:
+            typer.echo(f"  Reason: {decision.reason}")
+        typer.echo("")
+        raise typer.Exit(1)
+
+
 # =============================================================================
 # Lineage Commands
 # =============================================================================

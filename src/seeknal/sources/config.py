@@ -801,6 +801,22 @@ def _preview_table(
 ) -> str:
     try:
         columns, rows = repl.execute_oneshot(f"SELECT * FROM {qualified}", limit=limit)
+        # Runtime governance: when Atlas is configured (ATLAS_API_URL), enforce read
+        # access on the table and mask sensitive columns before sample rows are
+        # persisted into the Ask context. Inactive when Atlas is not configured. A
+        # denial raises AtlasPolicyDenied, which degrades below to "Preview
+        # unavailable" so no governed rows leak into context.
+        from seeknal.integrations.atlas_governance import (
+            create_governance_gate_from_env,
+            govern_read,
+        )
+
+        rows = govern_read(
+            create_governance_gate_from_env(),
+            resource=qualified,
+            columns=columns,
+            rows=rows,
+        )
     except Exception as exc:  # noqa: BLE001 - sync should continue
         return f"# Preview for {qualified}\n\nPreview unavailable: {exc}\n"
 
