@@ -13,6 +13,10 @@ from typing import Callable
 import httpx
 import pytest
 
+import base64
+import json
+from pathlib import Path
+
 from seeknal.integrations.atlas_client import AtlasContractConfig, AtlasPolicyDenied
 from seeknal.integrations.atlas_governance import (
     MASK_TOKEN,
@@ -25,6 +29,8 @@ from seeknal.integrations.atlas_governance import (
     mask_rows,
     mask_value,
     referenced_tables,
+    user_sub_from_credentials,
+    user_token_from_credentials,
 )
 
 BASE_URL = "http://atlas.test"
@@ -360,3 +366,106 @@ def test_govern_query_tableless_does_not_call_atlas() -> None:
         rows=[(1,)],
     )
     assert out == [(1,)]
+
+
+# ---------------------------------------------------------------------------
+# Credentials-backed user token + JWT claim extraction
+# ---------------------------------------------------------------------------
+
+
+def _b64url(data: dict[str, object]) -> str:
+    """Base64url-encode a dict as a JWT segment (no padding)."""
+
+    raw = json.dumps(data).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _unsigned_jwt(payload: dict[str, object]) -> str:
+    """Build an unsigned JWT (header.payload.sig) carrying ``payload``."""
+
+    header = _b64url({"alg": "none", "typ": "JWT"})
+    return f"{header}.{_b64url(payload)}.sig"
+
+
+def _write_creds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, access_token: str) -> Path:
+    """Write a credentials file and point SEEKNAL_CREDENTIALS_PATH at it."""
+
+    creds = tmp_path / "credentials.json"
+    creds.write_text(
+        json.dumps(
+            {
+                "access_token": access_token,
+                "refresh_token": "r",
+                "expires_in": 3600,
+                "refresh_expires_in": 7200,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(creds))
+    return creds
+
+
+def test_gate_token_from_credentials_when_api_token_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ATLAS_API_URL", "https://atlas.example.com")
+    monkeypatch.delenv("ATLAS_API_TOKEN", raising=False)
+    _write_creds(tmp_path, monkeypatch, "user-access-token")
+
+    gate = create_governance_gate_from_env()
+    assert isinstance(gate, GovernanceGate)
+    assert gate.config.token == "user-access-token"
+
+
+def test_gate_api_token_takes_precedence_over_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ATLAS_API_URL", "https://atlas.example.com")
+    monkeypatch.setenv("ATLAS_API_TOKEN", "service-token")
+    _write_creds(tmp_path, monkeypatch, "user-access-token")
+
+    gate = create_governance_gate_from_env()
+    assert isinstance(gate, GovernanceGate)
+    assert gate.config.token == "service-token"
+
+
+def test_gate_token_none_when_credentials_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ATLAS_API_URL", "https://atlas.example.com")
+    monkeypatch.delenv("ATLAS_API_TOKEN", raising=False)
+    monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(tmp_path / "missing.json"))
+
+    gate = create_governance_gate_from_env()
+    assert isinstance(gate, GovernanceGate)
+    assert gate.config.token is None
+
+
+def test_user_token_from_credentials_reads_access_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_creds(tmp_path, monkeypatch, "abc.def.ghi")
+    assert user_token_from_credentials() == "abc.def.ghi"
+
+
+def test_user_token_from_credentials_none_when_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(tmp_path / "missing.json"))
+    assert user_token_from_credentials() is None
+
+
+def test_user_sub_from_credentials_decodes_jwt_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = _unsigned_jwt({"sub": "abc-123"})
+    _write_creds(tmp_path, monkeypatch, token)
+    assert user_sub_from_credentials() == "abc-123"
+
+
+def test_user_sub_from_credentials_none_when_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(tmp_path / "missing.json"))
+    assert user_sub_from_credentials() is None

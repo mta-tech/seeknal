@@ -110,20 +110,19 @@ class SuggestGroup(_typer_core.TyperGroup):
                 raise
             cmd_name = args[0] if args else None
             if cmd_name is not None:
-                matches = get_close_matches(
-                    cmd_name, self.list_commands(ctx), n=3, cutoff=0.4
-                )
+                matches = get_close_matches(cmd_name, self.list_commands(ctx), n=3, cutoff=0.4)
                 if matches:
                     suggestion = ", ".join(f"'{m}'" for m in matches)
                     msg = f"No such command '{cmd_name}'.\n\nDid you mean: {suggestion}?"
                     raise type(e)(msg) from e
             raise
 
+
 # Load .env file if present (for local development)
 # This makes environment variables available for all CLI commands
 try:
     from dotenv import load_dotenv  # ty: ignore[unresolved-import]
-    
+
     # Try to find .env in current directory or up to 3 parent directories
     cwd = Path.cwd()
     for path in [cwd] + list(cwd.parents)[:3]:
@@ -155,7 +154,9 @@ def main_callback(
         is_eager=True,
     ),
     no_animation: bool = typer.Option(False, "--no-animation", help="Disable all animations"),
-    theme: str = typer.Option("", "--theme", help="UI theme: dark, light, dark-ansi, light-ansi, auto"),
+    theme: str = typer.Option(
+        "", "--theme", help="UI theme: dark, light, dark-ansi, light-ansi, auto"
+    ),
 ):
     """Seeknal — All-in-one platform for data and AI/ML engineering."""
     if no_animation:
@@ -228,8 +229,16 @@ from seeknal.cli.docs import docs_app  # ty: ignore[unresolved-import]
 
 app.add_typer(docs_app, name="docs")
 
+# Atlas data-access governance (request-access, etc.). Uses only stdlib + httpx,
+# so it is registered unconditionally (not behind the atlas-optional guard).
+from seeknal.cli.gov import gov_app  # ty: ignore[unresolved-import]
+
+app.add_typer(gov_app, name="gov")
+
 # Virtual environment management
-env_app = typer.Typer(help="Virtual environments for safe pipeline development (plan/apply/promote)")
+env_app = typer.Typer(
+    help="Virtual environments for safe pipeline development (plan/apply/promote)"
+)
 app.add_typer(env_app, name="env")
 
 # Entity consolidation management
@@ -277,7 +286,7 @@ Examples:
   seeknal intervals pending feature_group.user_features --start 2024-01-01
   seeknal intervals restatement-add feature_group.user_features --start 2024-01-01 --end 2024-01-31
   seeknal intervals backfill feature_group.user_features --start 2024-01-01 --end 2024-01-31
-"""
+""",
 )
 app.add_typer(intervals_app, name="intervals")
 
@@ -304,10 +313,12 @@ app.add_typer(admin_app, name="admin")
 # The Atlas command group is loaded dynamically if atlas-data-platform is installed.
 # This allows Seeknal to work standalone while providing Atlas features when available.
 
+
 def _register_atlas_commands():
     """Register Atlas commands if atlas-data-platform is available."""
     try:
         from seeknal.cli.atlas import atlas_app
+
         app.add_typer(atlas_app, name="atlas")
     except ImportError:
         # Atlas not installed, add a placeholder command
@@ -336,19 +347,27 @@ _register_atlas_commands()
 # =============================================================================
 # The Ask command group is loaded dynamically so broken/minimal environments get a useful error.
 
+
 def _register_ask_commands():
     """Register Ask commands if pydantic-deep dependencies are available."""
     try:
         from seeknal.cli.ask import ask_app
+
         app.add_typer(ask_app, name="ask")
     except ImportError:
+
         @app.command("ask", hidden=True)
         def ask_not_installed():
             """AI-powered data analysis (not installed).
 
             Install with: pip install --upgrade seeknal
             """
-            typer.echo(typer.style("✗ Seeknal Ask dependencies are missing from this environment.", fg=typer.colors.RED))
+            typer.echo(
+                typer.style(
+                    "✗ Seeknal Ask dependencies are missing from this environment.",
+                    fg=typer.colors.RED,
+                )
+            )
             typer.echo("")
             typer.echo("Install with:")
             typer.echo(typer.style("  pip install --upgrade seeknal", fg=typer.colors.CYAN))
@@ -373,9 +392,7 @@ prefect_app = typer.Typer(
 
 @prefect_app.command("serve")
 def prefect_serve(
-    project_path: Path = typer.Option(
-        ".", "--project-path", "-p", help="Path to seeknal project"
-    ),
+    project_path: Path = typer.Option(".", "--project-path", "-p", help="Path to seeknal project"),
     name: Optional[str] = typer.Option(
         None, "--name", "-n", help="Deployment name (default: project directory name)"
     ),
@@ -385,34 +402,26 @@ def prefect_serve(
     interval: Optional[int] = typer.Option(
         None, "--interval", "-i", help="Interval in seconds between runs"
     ),
-    full: bool = typer.Option(
-        False, "--full/--no-full", help="Force full refresh (ignore cache)"
-    ),
+    full: bool = typer.Option(False, "--full/--no-full", help="Force full refresh (ignore cache)"),
     continue_on_error: bool = typer.Option(
-        False, "--continue-on-error/--no-continue-on-error",
-        help="Continue after node failures"
+        False, "--continue-on-error/--no-continue-on-error", help="Continue after node failures"
     ),
     max_workers: int = typer.Option(
-        0, "--max-workers", "-w",
-        help="Max parallel tasks per layer (0=auto)"
+        0, "--max-workers", "-w", help="Max parallel tasks per layer (0=auto)"
     ),
-    env: Optional[str] = typer.Option(
-        None, "--env", "-e", help="Environment name"
-    ),
-    profile: Optional[str] = typer.Option(
-        None, "--profile", help="Profile path"
-    ),
+    env: Optional[str] = typer.Option(None, "--env", "-e", help="Environment name"),
+    profile: Optional[str] = typer.Option(None, "--profile", help="Profile path"),
     start_date: Optional[str] = typer.Option(
-        None, "--start-date",
-        help="Start date for filtering (YYYY-MM-DD). Available as {{ start_date }} in transform SQL"
+        None,
+        "--start-date",
+        help="Start date for filtering (YYYY-MM-DD). Available as {{ start_date }} in transform SQL",
     ),
     end_date: Optional[str] = typer.Option(
-        None, "--end-date",
-        help="End date for filtering (YYYY-MM-DD). Available as {{ end_date }} in transform SQL"
+        None,
+        "--end-date",
+        help="End date for filtering (YYYY-MM-DD). Available as {{ end_date }} in transform SQL",
     ),
-    params: Optional[str] = typer.Option(
-        None, "--params", help="JSON string of parameters"
-    ),
+    params: Optional[str] = typer.Option(None, "--params", help="JSON string of parameters"),
 ):
     """Start a long-running process serving the pipeline as a Prefect flow."""
     import json as _json
@@ -440,51 +449,34 @@ def prefect_serve(
 
 @prefect_app.command("deploy")
 def prefect_deploy(
-    project_path: Path = typer.Option(
-        ".", "--project-path", "-p", help="Path to seeknal project"
-    ),
-    work_pool: str = typer.Option(
-        ..., "--work-pool", help="Prefect work pool name (required)"
-    ),
-    name: Optional[str] = typer.Option(
-        None, "--name", "-n", help="Deployment name"
-    ),
+    project_path: Path = typer.Option(".", "--project-path", "-p", help="Path to seeknal project"),
+    work_pool: str = typer.Option(..., "--work-pool", help="Prefect work pool name (required)"),
+    name: Optional[str] = typer.Option(None, "--name", "-n", help="Deployment name"),
     cron: Optional[str] = typer.Option(
         None, "--cron", "-c", help='Cron schedule (e.g., "0 2 * * *")'
     ),
-    interval: Optional[int] = typer.Option(
-        None, "--interval", "-i", help="Interval in seconds"
-    ),
+    interval: Optional[int] = typer.Option(None, "--interval", "-i", help="Interval in seconds"),
     exposure: Optional[str] = typer.Option(
         None, "--exposure", help="Deploy a report exposure by name"
     ),
-    full: bool = typer.Option(
-        False, "--full/--no-full", help="Force full refresh"
-    ),
+    full: bool = typer.Option(False, "--full/--no-full", help="Force full refresh"),
     continue_on_error: bool = typer.Option(
-        False, "--continue-on-error/--no-continue-on-error",
-        help="Continue after node failures"
+        False, "--continue-on-error/--no-continue-on-error", help="Continue after node failures"
     ),
-    max_workers: int = typer.Option(
-        0, "--max-workers", "-w", help="Max parallel tasks (0=auto)"
-    ),
-    env: Optional[str] = typer.Option(
-        None, "--env", "-e", help="Environment name"
-    ),
-    profile: Optional[str] = typer.Option(
-        None, "--profile", help="Profile path"
-    ),
+    max_workers: int = typer.Option(0, "--max-workers", "-w", help="Max parallel tasks (0=auto)"),
+    env: Optional[str] = typer.Option(None, "--env", "-e", help="Environment name"),
+    profile: Optional[str] = typer.Option(None, "--profile", help="Profile path"),
     start_date: Optional[str] = typer.Option(
-        None, "--start-date",
-        help="Start date for filtering (YYYY-MM-DD). Available as {{ start_date }} in transform SQL"
+        None,
+        "--start-date",
+        help="Start date for filtering (YYYY-MM-DD). Available as {{ start_date }} in transform SQL",
     ),
     end_date: Optional[str] = typer.Option(
-        None, "--end-date",
-        help="End date for filtering (YYYY-MM-DD). Available as {{ end_date }} in transform SQL"
+        None,
+        "--end-date",
+        help="End date for filtering (YYYY-MM-DD). Available as {{ end_date }} in transform SQL",
     ),
-    params: Optional[str] = typer.Option(
-        None, "--params", help="JSON string of parameters"
-    ),
+    params: Optional[str] = typer.Option(None, "--params", help="JSON string of parameters"),
 ):
     """Deploy the pipeline (or a report exposure) to Prefect Server/Cloud."""
     import json as _json
@@ -518,12 +510,8 @@ def prefect_deploy(
 
 @prefect_app.command("generate")
 def prefect_generate(
-    project_path: Path = typer.Option(
-        ".", "--project-path", "-p", help="Path to seeknal project"
-    ),
-    max_workers: int = typer.Option(
-        8, "--max-workers", "-w", help="Max parallel tasks"
-    ),
+    project_path: Path = typer.Option(".", "--project-path", "-p", help="Path to seeknal project"),
+    max_workers: int = typer.Option(8, "--max-workers", "-w", help="Max parallel tasks"),
     output: Path = typer.Option(
         None, "--output", "-o", help="Output path (default: prefect.yaml in project root)"
     ),
@@ -563,18 +551,20 @@ def _register_prefect_commands():
     """Register Prefect commands with optional dependency guard."""
     try:
         from seeknal.workflow.prefect_integration import PREFECT_AVAILABLE
+
         # Always register the commands — they handle the ImportError themselves
         app.add_typer(prefect_app, name="prefect")
     except Exception:
+
         @app.command("prefect", hidden=True)
         def prefect_not_installed():
             """Prefect orchestration (not installed).
 
             Install with: pip install seeknal[prefect]
             """
-            typer.echo(typer.style(
-                "✗ Prefect orchestration is not available.", fg=typer.colors.RED
-            ))
+            typer.echo(
+                typer.style("✗ Prefect orchestration is not available.", fg=typer.colors.RED)
+            )
             typer.echo("")
             typer.echo("Install with:")
             typer.echo(typer.style("  pip install seeknal[prefect]", fg=typer.colors.CYAN))
@@ -587,6 +577,7 @@ _register_prefect_commands()
 
 class OutputFormat(str, Enum):
     """Output format options."""
+
     TABLE = "table"
     JSON = "json"
     YAML = "yaml"
@@ -594,6 +585,7 @@ class OutputFormat(str, Enum):
 
 class ResourceType(str, Enum):
     """Resource types for listing."""
+
     PROJECTS = "projects"
     WORKSPACES = "workspaces"
     ENTITIES = "entities"
@@ -603,11 +595,13 @@ class ResourceType(str, Enum):
 
 class DeleteResourceType(str, Enum):
     """Resource types for deletion."""
+
     FEATURE_GROUP = "feature-group"
 
 
 class ValidationModeChoice(str, Enum):
     """Validation mode options for validate-features command."""
+
     WARN = "warn"
     FAIL = "fail"
 
@@ -621,6 +615,7 @@ def _get_version() -> str:
 
     try:
         from seeknal import __version__
+
         return __version__
     except ImportError:
         return "1.0.0"
@@ -696,7 +691,9 @@ def parse_date_safely(date_str: str, param_name: str = "date") -> datetime:
         # Validate future dates (max 1 year ahead from today)
         max_future_date = datetime.now() + timedelta(days=365)
         if dt > max_future_date:
-            _echo_error(f"Invalid {param_name}: Date {dt.strftime('%Y-%m-%d')} is more than 1 year in the future")
+            _echo_error(
+                f"Invalid {param_name}: Date {dt.strftime('%Y-%m-%d')} is more than 1 year in the future"
+            )
             raise typer.Exit(1)
 
         return dt
@@ -704,7 +701,9 @@ def parse_date_safely(date_str: str, param_name: str = "date") -> datetime:
     except ValueError as e:
         # Catch parsing errors from fromisoformat
         if "invalid" in str(e).lower() or "out of range" in str(e).lower():
-            _echo_error(f"Invalid {param_name}: {date_str}. Use YYYY-MM-DD or ISO timestamp (YYYY-MM-DDTHH:MM:SS)")
+            _echo_error(
+                f"Invalid {param_name}: {date_str}. Use YYYY-MM-DD or ISO timestamp (YYYY-MM-DDTHH:MM:SS)"
+            )
         else:
             _echo_error(f"Invalid {param_name}: {e}")
         raise typer.Exit(1)
@@ -734,6 +733,7 @@ def handle_cli_error(error_message: str = "Operation failed"):
         def init(name: str):
             # Command logic here
     """
+
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -744,7 +744,9 @@ def handle_cli_error(error_message: str = "Operation failed"):
             except Exception as e:
                 _echo_error(f"{error_message}: {e}")
                 raise typer.Exit(1)
+
         return wrapper
+
     return decorator
 
 
@@ -780,23 +782,27 @@ def _build_manifest_from_dag(dag_builder, project_name: str):
 
     manifest = Manifest(project=project_name)
     for node_id, node in dag_builder.nodes.items():
-        kind_str = node.kind.value if hasattr(node.kind, 'value') else str(node.kind)
+        kind_str = node.kind.value if hasattr(node.kind, "value") else str(node.kind)
         manifest_node_type = node_type_map.get(kind_str, ManifestNodeType.SOURCE)
         # Extract columns dict from YAML data
         raw_columns = {}
-        if hasattr(node, 'yaml_data'):
+        if hasattr(node, "yaml_data"):
             raw_columns = node.yaml_data.get("columns", {}) or {}
 
-        manifest.add_node(Node(
-            id=node_id,
-            name=node.name,
-            node_type=manifest_node_type,
-            description=node.yaml_data.get("description") if hasattr(node, 'yaml_data') else None,
-            tags=list(node.tags) if hasattr(node, 'tags') and node.tags else [],
-            columns=raw_columns,
-            config=node.yaml_data if hasattr(node, 'yaml_data') else {},
-            file_path=node.file_path if hasattr(node, 'file_path') else None,
-        ))
+        manifest.add_node(
+            Node(
+                id=node_id,
+                name=node.name,
+                node_type=manifest_node_type,
+                description=node.yaml_data.get("description")
+                if hasattr(node, "yaml_data")
+                else None,
+                tags=list(node.tags) if hasattr(node, "tags") and node.tags else [],
+                columns=raw_columns,
+                config=node.yaml_data if hasattr(node, "yaml_data") else {},
+                file_path=node.file_path if hasattr(node, "file_path") else None,
+            )
+        )
 
     for node_id in dag_builder.nodes:
         for downstream_id in dag_builder.get_downstream(node_id):
@@ -814,6 +820,7 @@ def info():
     typer.echo(f"Python version: {sys.version.split()[0]}")
     try:
         import pyspark
+
         pyspark_version = pyspark.__version__
     except ImportError:
         pyspark_version = "not installed (optional; install seeknal[spark])"
@@ -830,9 +837,7 @@ def _scaffold_ask_skills(project_path: Path) -> None:
     bundled ``SKILL.md`` into ``<project>/seeknal/skills/`` so users
     can edit/extend them per-project without touching the package.
     """
-    builtin_root = (
-        Path(__file__).resolve().parent.parent / "ask" / "builtin_skills"
-    )
+    builtin_root = Path(__file__).resolve().parent.parent / "ask" / "builtin_skills"
     if not builtin_root.is_dir():
         return  # No built-ins shipped (unexpected, but don't fail init)
 
@@ -1337,20 +1342,12 @@ rather than inventing one-off checks.
 @app.command()
 def init(
     name: str = typer.Option(
-        None, "--name", "-n",
-        help="Project name (defaults to current directory name)"
+        None, "--name", "-n", help="Project name (defaults to current directory name)"
     ),
-    description: str = typer.Option(
-        "", "--description", "-d",
-        help="Project description"
-    ),
-    path: Path = typer.Option(
-        Path("."), "--path", "-p",
-        help="Project path"
-    ),
+    description: str = typer.Option("", "--description", "-d", help="Project description"),
+    path: Path = typer.Option(Path("."), "--path", "-p", help="Project path"),
     force: bool = typer.Option(
-        False, "--force", "-f",
-        help="Overwrite existing project configuration"
+        False, "--force", "-f", help="Overwrite existing project configuration"
     ),
 ):
     """Initialize a new Seeknal project with dbt-style structure.
@@ -1544,6 +1541,7 @@ classifier:
 
         # Also create the legacy Project for database compatibility
         from seeknal.project import Project
+
         if description and isinstance(description, str):
             project = Project(name=name, description=description)
         else:
@@ -1582,102 +1580,93 @@ classifier:
 @app.command()
 def run(
     dry_run: bool = typer.Option(
-        False, "--dry-run",
-        help="Show what would be executed without running"
+        False, "--dry-run", help="Show what would be executed without running"
     ),
     # YAML pipeline execution flags
     full: bool = typer.Option(
-        False, "--full", "-f",
-        help="Run all nodes regardless of state (ignore incremental run cache)"
+        False,
+        "--full",
+        "-f",
+        help="Run all nodes regardless of state (ignore incremental run cache)",
     ),
     nodes: Optional[List[str]] = typer.Option(
-        None, "--nodes", "-n",
-        help="Run specific nodes only (e.g., --nodes transform.clean_data)"
+        None, "--nodes", "-n", help="Run specific nodes only (e.g., --nodes transform.clean_data)"
     ),
     types: Optional[List[str]] = typer.Option(
-        None, "--types", "-t",
-        help="Filter by node types (e.g., --types transform,feature_group)"
+        None, "--types", "-t", help="Filter by node types (e.g., --types transform,feature_group)"
     ),
     tags: Optional[List[str]] = typer.Option(
-        None, "--tags",
-        help="Run only nodes with these tags (plus upstream deps). OR logic."
+        None, "--tags", help="Run only nodes with these tags (plus upstream deps). OR logic."
     ),
     exclude_tags: Optional[List[str]] = typer.Option(
-        None, "--exclude-tags",
-        help="Skip nodes with these tags"
+        None, "--exclude-tags", help="Skip nodes with these tags"
     ),
     continue_on_error: bool = typer.Option(
-        False, "--continue-on-error",
-        help="Continue execution after failures"
+        False, "--continue-on-error", help="Continue execution after failures"
     ),
-    retry: int = typer.Option(
-        0, "--retry", "-r",
-        help="Number of retries for failed nodes"
-    ),
+    retry: int = typer.Option(0, "--retry", "-r", help="Number of retries for failed nodes"),
     show_plan: bool = typer.Option(
-        False, "--show-plan", "-p",
-        help="Show execution plan without running"
+        False, "--show-plan", "-p", help="Show execution plan without running"
     ),
     # Parallel execution flags
     parallel: bool = typer.Option(
-        False, "--parallel",
-        help="Execute independent nodes in parallel (layer-based concurrency)"
+        False, "--parallel", help="Execute independent nodes in parallel (layer-based concurrency)"
     ),
     max_workers: int = typer.Option(
-        4, "--max-workers",
-        help="Maximum parallel workers (default: 4, max recommended: CPU count)"
+        4, "--max-workers", help="Maximum parallel workers (default: 4, max recommended: CPU count)"
     ),
     # Materialization flags
     materialize: Optional[bool] = typer.Option(
-        None, "--materialize/--no-materialize",
-        help="Enable/disable Iceberg materialization (overrides node config)"
+        None,
+        "--materialize/--no-materialize",
+        help="Enable/disable Iceberg materialization (overrides node config)",
     ),
     # Environment flag
     env: Optional[str] = typer.Option(
-        None, "--env",
-        help="Run in isolated virtual environment (requires a plan: seeknal env plan <name>)"
+        None,
+        "--env",
+        help="Run in isolated virtual environment (requires a plan: seeknal env plan <name>)",
     ),
     # Parameterization flags
     param_date: Optional[str] = typer.Option(
-        None, "--date",
-        help="Override date parameter (YYYY-MM-DD format)"
+        None, "--date", help="Override date parameter (YYYY-MM-DD format)"
     ),
     param_run_id: Optional[str] = typer.Option(
-        None, "--run-id",
-        help="Custom run ID for parameterization"
+        None, "--run-id", help="Custom run ID for parameterization"
     ),
     # Interval tracking flags
     start: Optional[str] = typer.Option(
-        None, "--start",
-        help="Start timestamp for interval execution (ISO format or YYYY-MM-DD)"
+        None, "--start", help="Start timestamp for interval execution (ISO format or YYYY-MM-DD)"
     ),
     end: Optional[str] = typer.Option(
-        None, "--end",
-        help="End timestamp for interval execution (ISO format or YYYY-MM-DD)"
+        None, "--end", help="End timestamp for interval execution (ISO format or YYYY-MM-DD)"
     ),
     backfill: bool = typer.Option(
-        False, "--backfill",
-        help="Execute backfill for all missing intervals in the date range"
+        False, "--backfill", help="Execute backfill for all missing intervals in the date range"
     ),
     restate: bool = typer.Option(
-        False, "--restate",
-        help="Process restatement intervals marked for reprocessing"
+        False, "--restate", help="Process restatement intervals marked for reprocessing"
     ),
     start_date: Optional[str] = typer.Option(
-        None, "--start-date",
-        help="Start date for filtering (YYYY-MM-DD). Available as {{ start_date }} in transform SQL"
+        None,
+        "--start-date",
+        help="Start date for filtering (YYYY-MM-DD). Available as {{ start_date }} in transform SQL",
     ),
     end_date: Optional[str] = typer.Option(
-        None, "--end-date",
-        help="End date for filtering (YYYY-MM-DD). Available as {{ end_date }} in transform SQL"
+        None,
+        "--end-date",
+        help="End date for filtering (YYYY-MM-DD). Available as {{ end_date }} in transform SQL",
     ),
     profile: Optional[str] = typer.Option(
-        None, "--profile",
-        help="Path to profiles.yml for source_defaults and connections (default: ~/.seeknal/profiles.yml)"
+        None,
+        "--profile",
+        help="Path to profiles.yml for source_defaults and connections (default: ~/.seeknal/profiles.yml)",
     ),
     verbose: bool = typer.Option(
-        False, "--verbose", "-v",
-        help="Show full tracebacks and subprocess output inline on failure; write detailed log file for all nodes"
+        False,
+        "--verbose",
+        "-v",
+        help="Show full tracebacks and subprocess output inline on failure; write detailed log file for all nodes",
     ),
 ):
     """Execute YAML/Python pipeline.
@@ -1756,6 +1745,7 @@ def run(
     # Environment mode: delegate to shared helper
     if env is not None:
         from pathlib import Path
+
         project_path = Path.cwd().resolve()
         _run_in_environment(
             env_name=env,
@@ -1849,9 +1839,13 @@ def _run_yaml_pipeline(
     from pathlib import Path
     from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
     from seeknal.workflow.state import (
-        RunState, load_state, save_state,
-        calculate_node_hash, get_nodes_to_run,
-        update_node_state, NodeStatus,
+        RunState,
+        load_state,
+        save_state,
+        calculate_node_hash,
+        get_nodes_to_run,
+        update_node_state,
+        NodeStatus,
         include_upstream_sources,
     )
     from seeknal.workflow.executors import get_executor, ExecutionContext
@@ -1959,6 +1953,7 @@ def _run_yaml_pipeline(
 
             try:
                 from seeknal.workflow.iceberg_metadata import get_current_snapshot_id
+
                 current_snap, _ = get_current_snapshot_id(
                     table_ref=table_ref,
                     params=yaml_data.get("params", {}),
@@ -1994,7 +1989,8 @@ def _run_yaml_pipeline(
         # Union: tag-matched nodes (+ upstream) AND explicitly named nodes (+ downstream)
         tag_set = set(tags)
         tag_matched = {
-            node_id for node_id in dag_builder.nodes
+            node_id
+            for node_id in dag_builder.nodes
             if any(t in tag_set for t in dag_builder.nodes[node_id].tags)
         }
         if not tag_matched:
@@ -2016,7 +2012,8 @@ def _run_yaml_pipeline(
         # Run only tag-matched nodes + their upstream dependencies
         tag_set = set(tags)
         tag_matched = {
-            node_id for node_id in dag_builder.nodes
+            node_id
+            for node_id in dag_builder.nodes
             if any(t in tag_set for t in dag_builder.nodes[node_id].tags)
         }
         if not tag_matched:
@@ -2043,8 +2040,7 @@ def _run_yaml_pipeline(
         # Filter by type
         type_set = set(types)
         nodes_to_run = {
-            node_id for node_id in nodes_to_run
-            if dag_builder.nodes[node_id].kind.value in type_set
+            node_id for node_id in nodes_to_run if dag_builder.nodes[node_id].kind.value in type_set
         }
 
     # Apply type filter on top of tags (narrowing)
@@ -2053,11 +2049,13 @@ def _run_yaml_pipeline(
         # Only narrow the tag-matched nodes, keep upstream deps regardless of type
         tag_set = set(tags)
         tag_matched = {
-            node_id for node_id in dag_builder.nodes
+            node_id
+            for node_id in dag_builder.nodes
             if any(t in tag_set for t in dag_builder.nodes[node_id].tags)
         }
         nodes_to_run = {
-            node_id for node_id in nodes_to_run
+            node_id
+            for node_id in nodes_to_run
             if node_id not in tag_matched or dag_builder.nodes[node_id].kind.value in type_set
         }
 
@@ -2068,7 +2066,8 @@ def _run_yaml_pipeline(
         if tags:
             tag_set_for_warn = set(tags)
             tag_matched_for_warn = {
-                node_id for node_id in dag_builder.nodes
+                node_id
+                for node_id in dag_builder.nodes
                 if any(t in tag_set_for_warn for t in dag_builder.nodes[node_id].tags)
             }
             for node_id in list(nodes_to_run):
@@ -2082,7 +2081,8 @@ def _run_yaml_pipeline(
                             )
                             break
         nodes_to_run = {
-            node_id for node_id in nodes_to_run
+            node_id
+            for node_id in nodes_to_run
             if not any(tag in exclude_set for tag in dag_builder.nodes[node_id].tags)
         }
 
@@ -2149,9 +2149,7 @@ def _run_yaml_pipeline(
             layers[layer].append(node_id)
 
         if layers:
-            widest_layer_num, widest_layer_nodes = max(
-                layers.items(), key=lambda x: len(x[1])
-            )
+            widest_layer_num, widest_layer_nodes = max(layers.items(), key=lambda x: len(x[1]))
             if len(widest_layer_nodes) > 3:
                 _echo_info(
                     f"Tip: This pipeline has {len(widest_layer_nodes)} independent nodes "
@@ -2167,14 +2165,16 @@ def _run_yaml_pipeline(
         # Build a Manifest from dag_builder for the DAGRunner
         _manifest = _Manifest(project=project_path.name)
         for node_id, node in dag_builder.nodes.items():
-            _manifest.add_node(_Node(
-                id=node_id,
-                name=node.name,
-                node_type=_NodeType(node.kind.value),
-                tags=list(node.tags) if node.tags else [],
-                config=node.yaml_data,
-                file_path=node.file_path,
-            ))
+            _manifest.add_node(
+                _Node(
+                    id=node_id,
+                    name=node.name,
+                    node_type=_NodeType(node.kind.value),
+                    tags=list(node.tags) if node.tags else [],
+                    config=node.yaml_data,
+                    file_path=node.file_path,
+                )
+            )
         for node_id in dag_builder.nodes:
             for downstream_id in dag_builder.get_downstream(node_id):
                 _manifest.add_edge(node_id, downstream_id)
@@ -2197,9 +2197,10 @@ def _run_yaml_pipeline(
 
         # Write run log for parallel execution
         from seeknal.workflow.run_logger import RunLogger as _RunLogger
+
         _run_logger = _RunLogger(
             target_path=target_path,
-            run_id=_runner.run_state.run_id if hasattr(_runner, 'run_state') else "",
+            run_id=_runner.run_state.run_id if hasattr(_runner, "run_state") else "",
             project_name=project_path.name,
             verbose=verbose,
             flags=["--parallel", "--verbose"] if verbose else ["--parallel"],
@@ -2236,6 +2237,7 @@ def _run_yaml_pipeline(
 
     # Step 5: Execute nodes in topological order
     import time
+
     start_time = time.time()
 
     # Initialize run state
@@ -2245,6 +2247,7 @@ def _run_yaml_pipeline(
 
     # Initialize run logger
     from seeknal.workflow.run_logger import RunLogger
+
     run_flags = []
     if verbose:
         run_flags.append("--verbose")
@@ -2283,13 +2286,17 @@ def _run_yaml_pipeline(
         # Check if we should run this node
         if node_id not in nodes_to_run:
             if node_id in run_state.nodes and run_state.nodes[node_id].is_success():
-                typer.echo(f"{idx}/{len(execution_order)}: {node.name} [{typer.style('CACHED', fg=typer.colors.BLUE)}]")
+                typer.echo(
+                    f"{idx}/{len(execution_order)}: {node.name} [{typer.style('CACHED', fg=typer.colors.BLUE)}]"
+                )
                 cached += 1
                 run_logger.log_node(node_id, "CACHED")
             continue
 
         # Execute the node
-        typer.echo(f"{idx}/{len(execution_order)}: {node.name} [{typer.style('RUNNING', fg=typer.colors.YELLOW)}]")
+        typer.echo(
+            f"{idx}/{len(execution_order)}: {node.name} [{typer.style('RUNNING', fg=typer.colors.YELLOW)}]"
+        )
 
         if dry_run:
             # Dry run - just show what would happen
@@ -2303,11 +2310,7 @@ def _run_yaml_pipeline(
 
         # Inject Iceberg watermark for incremental reads
         # Skip watermark on --full refresh so executor does a full scan
-        if (
-            node.kind.value == "source"
-            and node.yaml_data.get("source") == "iceberg"
-            and not full
-        ):
+        if node.kind.value == "source" and node.yaml_data.get("source") == "iceberg" and not full:
             # Check current run_state first, then fall back to old_state
             stored = run_state.nodes.get(node_id)
             if not stored and old_state:
@@ -2366,7 +2369,8 @@ def _run_yaml_pipeline(
 
                 successful += 1
                 run_logger.log_node(
-                    node_id, "SUCCESS",
+                    node_id,
+                    "SUCCESS",
                     duration_seconds=duration,
                     row_count=result.row_count,
                 )
@@ -2391,7 +2395,8 @@ def _run_yaml_pipeline(
                 )
                 failed += 1
                 run_logger.log_node(
-                    node_id, "FAILED",
+                    node_id,
+                    "FAILED",
                     duration_seconds=duration,
                     error_message=result.error_message,
                     output_log=result.output_log,
@@ -2411,7 +2416,8 @@ def _run_yaml_pipeline(
                     total_attempts = retry + 1  # initial + retries
                     # Log the initial failure as attempt 1
                     run_logger.log_node(
-                        node_id, "FAILED",
+                        node_id,
+                        "FAILED",
                         duration_seconds=duration,
                         error_message=result.error_message,
                         output_log=result.output_log,
@@ -2442,7 +2448,8 @@ def _run_yaml_pipeline(
                                 failed -= 1
                                 successful += 1
                                 run_logger.log_node(
-                                    node_id, "SUCCESS",
+                                    node_id,
+                                    "SUCCESS",
                                     duration_seconds=duration,
                                     row_count=result.row_count,
                                     attempt=attempt + 1,
@@ -2451,7 +2458,8 @@ def _run_yaml_pipeline(
                                 break
                             else:
                                 run_logger.log_node(
-                                    node_id, "FAILED",
+                                    node_id,
+                                    "FAILED",
                                     duration_seconds=time.time() - node_start,
                                     error_message=result.error_message,
                                     output_log=result.output_log,
@@ -2461,7 +2469,8 @@ def _run_yaml_pipeline(
                         except Exception as e:
                             typer.echo(f"  Retry {attempt} failed: {e}")
                             run_logger.log_node(
-                                node_id, "FAILED",
+                                node_id,
+                                "FAILED",
                                 duration_seconds=time.time() - node_start,
                                 error_message=str(e),
                                 attempt=attempt + 1,
@@ -2482,7 +2491,8 @@ def _run_yaml_pipeline(
             )
             failed += 1
             run_logger.log_node(
-                node_id, "FAILED",
+                node_id,
+                "FAILED",
                 duration_seconds=duration,
                 error_message=str(e),
             )
@@ -2544,6 +2554,7 @@ def _run_yaml_pipeline(
                         )
         except Exception as exc:
             import logging
+
             logging.getLogger(__name__).warning("Entity consolidation failed: %s", exc)
 
     # Step 7: Print summary
@@ -2587,11 +2598,17 @@ def _run_yaml_pipeline(
         typer.echo("")
         typer.echo(f"  Data Quality:   {_rule_total} rule(s)")
         if _rule_passed > 0:
-            typer.echo(f"                  {typer.style(str(_rule_passed) + ' passed', fg=typer.colors.GREEN)}")
+            typer.echo(
+                f"                  {typer.style(str(_rule_passed) + ' passed', fg=typer.colors.GREEN)}"
+            )
         if _rule_warns > 0:
-            typer.echo(f"                  {typer.style(str(_rule_warns) + ' warning(s)', fg=typer.colors.YELLOW, bold=True)}")
+            typer.echo(
+                f"                  {typer.style(str(_rule_warns) + ' warning(s)', fg=typer.colors.YELLOW, bold=True)}"
+            )
         if _rule_errors > 0:
-            typer.echo(f"                  {typer.style(str(_rule_errors) + ' error(s)', fg=typer.colors.RED, bold=True)}")
+            typer.echo(
+                f"                  {typer.style(str(_rule_errors) + ' error(s)', fg=typer.colors.RED, bold=True)}"
+            )
 
     typer.echo("=" * 60)
 
@@ -2617,25 +2634,15 @@ def _run_yaml_pipeline(
 
 @app.command("list")
 def list_resources(
-    resource_type: ResourceType = typer.Argument(
-        ..., help="Type of resource to list"
-    ),
-    project: Optional[str] = typer.Option(
-        None, "--project", "-p",
-        help="Filter by project name"
-    ),
-    format: OutputFormat = typer.Option(
-        OutputFormat.TABLE, "--format", "-f",
-        help="Output format"
-    ),
+    resource_type: ResourceType = typer.Argument(..., help="Type of resource to list"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Filter by project name"),
+    format: OutputFormat = typer.Option(OutputFormat.TABLE, "--format", "-f", help="Output format"),
 ):
     """List resources (projects, entities, feature-groups, etc.)."""
     from seeknal.project import Project
     from seeknal.entity import Entity
     from seeknal.featurestore.featurestore import OfflineStore
-    from seeknal.models import (
-        WorkspaceTable, FeatureGroupTable
-    )
+    from seeknal.models import WorkspaceTable, FeatureGroupTable
     from seeknal.request import get_db_session
     from sqlmodel import select
     from tabulate import tabulate
@@ -2663,8 +2670,10 @@ def list_resources(
                     typer.echo("No feature groups found.")
                 else:
                     headers = ["Name", "Description", "Version"]
-                    data = [[fg.name, fg.description or "", getattr(fg, "version", 1) or 1]
-                            for fg in feature_groups]
+                    data = [
+                        [fg.name, fg.description or "", getattr(fg, "version", 1) or 1]
+                        for fg in feature_groups
+                    ]
                     typer.echo(tabulate(data, headers=headers, tablefmt="simple"))
             case ResourceType.OFFLINE_STORES:
                 OfflineStore.list()
@@ -2677,15 +2686,15 @@ def list_resources(
 def show(
     resource_type: str = typer.Argument(..., help="Type of resource"),
     name: str = typer.Argument(..., help="Resource name"),
-    format: OutputFormat = typer.Option(
-        OutputFormat.TABLE, "--format", "-f",
-        help="Output format"
-    ),
+    format: OutputFormat = typer.Option(OutputFormat.TABLE, "--format", "-f", help="Output format"),
 ):
     """Show detailed information about a resource."""
     from seeknal.request import (
-        ProjectRequest, EntityRequest, FlowRequest,
-        FeatureGroupRequest, WorkspaceRequest
+        ProjectRequest,
+        EntityRequest,
+        FlowRequest,
+        FeatureGroupRequest,
+        WorkspaceRequest,
     )
     import json
 
@@ -2710,14 +2719,14 @@ def show(
 
         if format == OutputFormat.JSON:
             # Convert to dict and print as JSON
-            data = {k: v for k, v in resource.__dict__.items() if not k.startswith('_')}
+            data = {k: v for k, v in resource.__dict__.items() if not k.startswith("_")}
             typer.echo(json.dumps(data, indent=2, default=str))
         else:
             # Print as table
             typer.echo(f"\n{resource_type.title()}: {name}")
             typer.echo("-" * 40)
             for key, value in resource.__dict__.items():
-                if not key.startswith('_') and value is not None:
+                if not key.startswith("_") and value is not None:
                     typer.echo(f"  {key}: {value}")
 
     except Exception as e:
@@ -2727,10 +2736,7 @@ def show(
 
 @app.command()
 def validate(
-    config_path: Optional[Path] = typer.Option(
-        None, "--config", "-c",
-        help="Path to config file"
-    ),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to config file"),
 ):
     """Validate configurations and connections."""
     from seeknal.context import CONFIG_BASE_URL
@@ -2766,6 +2772,7 @@ def _build_range_validator(config):
     params = config.params or {}
     column = config.columns[0] if len(config.columns) == 1 else config.columns[0]
     from seeknal.feature_validation.validators import RangeValidator
+
     return RangeValidator(
         column=column,
         min_val=params.get("min_val"),
@@ -2779,7 +2786,7 @@ def _build_freshness_validator(config):
         raise ValueError("FreshnessValidator requires a column")
     from datetime import timedelta
     from seeknal.feature_validation.validators import FreshnessValidator
-    
+
     params = config.params or {}
     max_age_seconds = params.get("max_age_seconds", 86400)  # Default 24 hours
     return FreshnessValidator(
@@ -2800,6 +2807,7 @@ _VALIDATOR_REGISTRY = {
 def _build_null_validator(config):
     """Build a NullValidator from config."""
     from seeknal.feature_validation.validators import NullValidator
+
     params = config.params or {}
     return NullValidator(
         columns=config.columns or [],
@@ -2810,6 +2818,7 @@ def _build_null_validator(config):
 def _build_uniqueness_validator(config):
     """Build a UniquenessValidator from config."""
     from seeknal.feature_validation.validators import UniquenessValidator
+
     params = config.params or {}
     return UniquenessValidator(
         columns=config.columns or [],
@@ -2929,17 +2938,14 @@ def _format_field(field, symbol: str = "") -> str:
 
 @app.command("validate-features")
 def validate_features(
-    feature_group: str = typer.Argument(
-        ..., help="Name of the feature group to validate"
-    ),
+    feature_group: str = typer.Argument(..., help="Name of the feature group to validate"),
     mode: ValidationModeChoice = typer.Option(
-        ValidationModeChoice.FAIL, "--mode", "-m",
-        help="Validation mode: 'warn' logs failures and continues, 'fail' stops on first failure"
+        ValidationModeChoice.FAIL,
+        "--mode",
+        "-m",
+        help="Validation mode: 'warn' logs failures and continues, 'fail' stops on first failure",
     ),
-    verbose: bool = typer.Option(
-        False, "--verbose", "-v",
-        help="Show detailed validation results"
-    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed validation results"),
 ):
     """Validate feature group data quality.
 
@@ -2989,7 +2995,9 @@ def validate_features(
             raise typer.Exit(1)
 
         # Convert CLI mode to ValidationMode enum
-        validation_mode = ValidationMode.WARN if mode == ValidationModeChoice.WARN else ValidationMode.FAIL
+        validation_mode = (
+            ValidationMode.WARN if mode == ValidationModeChoice.WARN else ValidationMode.FAIL
+        )
 
         # Show validator count
         typer.echo(f"  Validators to run: {len(validators)}")
@@ -3026,7 +3034,11 @@ def validate_features(
 
         # Summary statistics
         passed_style = typer.style(str(summary.passed_count), fg=typer.colors.GREEN, bold=True)
-        failed_style = typer.style(str(summary.failed_count), fg=typer.colors.RED if summary.failed_count > 0 else typer.colors.GREEN, bold=True)
+        failed_style = typer.style(
+            str(summary.failed_count),
+            fg=typer.colors.RED if summary.failed_count > 0 else typer.colors.GREEN,
+            bold=True,
+        )
 
         typer.echo(f"  Total validators: {summary.total_validators}")
         typer.echo(f"  Passed:           {passed_style}")
@@ -3066,19 +3078,15 @@ def validate_features(
         _echo_error(f"Validation failed: {e}")
         if verbose:
             import traceback
+
             typer.echo(typer.style(traceback.format_exc(), dim=True))
         raise typer.Exit(1)
 
 
 @app.command()
 def debug(
-    feature_group: str = typer.Argument(
-        ..., help="Feature group name to debug"
-    ),
-    limit: int = typer.Option(
-        10, "--limit", "-l",
-        help="Number of rows to show"
-    ),
+    feature_group: str = typer.Argument(..., help="Feature group name to debug"),
+    limit: int = typer.Option(10, "--limit", "-l", help="Number of rows to show"),
 ):
     """Show sample data from a feature group for debugging."""
     from seeknal.featurestore.feature_group import FeatureGroup, HistoricalFeatures, FeatureLookup
@@ -3113,20 +3121,13 @@ def debug(
 
 @app.command()
 def clean(
-    feature_group: str = typer.Argument(
-        ..., help="Feature group name to clean"
-    ),
+    feature_group: str = typer.Argument(..., help="Feature group name to clean"),
     before_date: Optional[str] = typer.Option(
-        None, "--before", "-b",
-        help="Delete data before this date (YYYY-MM-DD)"
+        None, "--before", "-b", help="Delete data before this date (YYYY-MM-DD)"
     ),
-    ttl_days: Optional[int] = typer.Option(
-        None, "--ttl",
-        help="Delete data older than TTL days"
-    ),
+    ttl_days: Optional[int] = typer.Option(None, "--ttl", help="Delete data older than TTL days"),
     dry_run: bool = typer.Option(
-        False, "--dry-run",
-        help="Show what would be deleted without deleting"
+        False, "--dry-run", help="Show what would be deleted without deleting"
     ),
 ):
     """Clean old feature data based on TTL or date."""
@@ -3140,6 +3141,7 @@ def clean(
         cutoff = parse_date_safely(before_date, "before date")
     else:
         from datetime import timedelta
+
         cutoff = datetime.now() - timedelta(days=ttl_days)
 
     typer.echo(f"Cleaning feature group: {feature_group}")
@@ -3163,13 +3165,8 @@ def delete(
     resource_type: DeleteResourceType = typer.Argument(
         ..., help="Type of resource to delete (feature-group)"
     ),
-    name: str = typer.Argument(
-        ..., help="Name of the resource to delete"
-    ),
-    force: bool = typer.Option(
-        False, "--force", "-f",
-        help="Skip confirmation prompt"
-    ),
+    name: str = typer.Argument(..., help="Name of the resource to delete"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt"),
 ):
     """Delete a resource (feature group) including storage and metadata."""
     from seeknal.featurestore.feature_group import FeatureGroup
@@ -3209,12 +3206,12 @@ def delete(
 
 @app.command("delete-table")
 def delete_table(
-    table_name: str = typer.Argument(
-        ..., help="Name of the online table to delete"
-    ),
+    table_name: str = typer.Argument(..., help="Name of the online table to delete"),
     force: bool = typer.Option(
-        False, "--force", "-f",
-        help="Force deletion without confirmation (bypass dependency warnings)"
+        False,
+        "--force",
+        "-f",
+        help="Force deletion without confirmation (bypass dependency warnings)",
     ),
 ):
     """Delete an online table and all associated data files.
@@ -3258,15 +3255,16 @@ def delete_table(
 
         # Step 3: Show warnings if dependencies exist
         if dependent_feature_groups:
-            _echo_warning(f"Table '{table_name}' has {len(dependent_feature_groups)} dependent feature group(s):")
+            _echo_warning(
+                f"Table '{table_name}' has {len(dependent_feature_groups)} dependent feature group(s):"
+            )
             for fg_name in dependent_feature_groups:
                 typer.echo(f"  - {fg_name}")
 
             if not force:
                 _echo_warning("Deleting this table may affect these feature groups.")
                 confirm = typer.confirm(
-                    "Are you sure you want to delete this table?",
-                    default=False
+                    "Are you sure you want to delete this table?", default=False
                 )
                 if not confirm:
                     _echo_info("Deletion cancelled")
@@ -3275,8 +3273,7 @@ def delete_table(
             # No dependencies, but still confirm unless --force
             if not force:
                 confirm = typer.confirm(
-                    f"Are you sure you want to delete table '{table_name}'?",
-                    default=False
+                    f"Are you sure you want to delete table '{table_name}'?", default=False
                 )
                 if not confirm:
                     _echo_info("Deletion cancelled")
@@ -3296,7 +3293,7 @@ def delete_table(
             lookup_key=entity_obj,
             online_store=OnlineStoreDuckDB(),
             project="default",  # TODO: Get from online_table.project_id if needed
-            id=online_table.id
+            id=online_table.id,
         )
 
         success = online_table_obj.delete()
@@ -3312,6 +3309,7 @@ def delete_table(
         _echo_error(f"Failed to delete table: {e}")
         raise typer.Exit(1)
 
+
 # Version subcommands
 @version_app.command("list")
 def version_list(
@@ -3319,12 +3317,10 @@ def version_list(
         ..., help="Name of the feature group to query versions for"
     ),
     format: OutputFormat = typer.Option(
-        OutputFormat.TABLE, "--format", "-f",
-        help="Output format: table (default), json, or yaml"
+        OutputFormat.TABLE, "--format", "-f", help="Output format: table (default), json, or yaml"
     ),
     limit: Optional[int] = typer.Option(
-        None, "--limit", "-l",
-        help="Maximum number of versions to display (most recent first)"
+        None, "--limit", "-l", help="Maximum number of versions to display (most recent first)"
     ),
 ):
     """
@@ -3381,16 +3377,12 @@ def version_list(
 
 @version_app.command("show")
 def version_show(
-    feature_group: str = typer.Argument(
-        ..., help="Name of the feature group to inspect"
-    ),
+    feature_group: str = typer.Argument(..., help="Name of the feature group to inspect"),
     version: Optional[int] = typer.Option(
-        None, "--version", "-v",
-        help="Specific version number to show (defaults to latest version)"
+        None, "--version", "-v", help="Specific version number to show (defaults to latest version)"
     ),
     format: OutputFormat = typer.Option(
-        OutputFormat.TABLE, "--format", "-f",
-        help="Output format: table (default), json, or yaml"
+        OutputFormat.TABLE, "--format", "-f", help="Output format: table (default), json, or yaml"
     ),
 ):
     """
@@ -3493,16 +3485,13 @@ def version_diff(
         ..., help="Name of the feature group to compare versions for"
     ),
     from_version: int = typer.Option(
-        ..., "--from", "-f",
-        help="Base version number to compare from (older version)"
+        ..., "--from", "-f", help="Base version number to compare from (older version)"
     ),
     to_version: int = typer.Option(
-        ..., "--to", "-t",
-        help="Target version number to compare to (newer version)"
+        ..., "--to", "-t", help="Target version number to compare to (newer version)"
     ),
     format: OutputFormat = typer.Option(
-        OutputFormat.TABLE, "--format",
-        help="Output format: table (default) or json"
+        OutputFormat.TABLE, "--format", help="Output format: table (default) or json"
     ),
 ):
     """
@@ -3564,19 +3553,28 @@ def version_diff(
 
                 # Display modified features
                 if modified:
-                    typer.echo("\n" + typer.style("Modified (~):", fg=typer.colors.YELLOW, bold=True))
+                    typer.echo(
+                        "\n" + typer.style("Modified (~):", fg=typer.colors.YELLOW, bold=True)
+                    )
                     for change in modified:
                         if isinstance(change, dict):
                             field_name = change.get("field", "unknown")
                             old_type = _format_field_type(change.get("old_type", "unknown"))
                             new_type = _format_field_type(change.get("new_type", "unknown"))
-                            typer.echo(typer.style(f"  ~ {field_name}: {old_type} → {new_type}", fg=typer.colors.YELLOW))
+                            typer.echo(
+                                typer.style(
+                                    f"  ~ {field_name}: {old_type} → {new_type}",
+                                    fg=typer.colors.YELLOW,
+                                )
+                            )
                         else:
                             typer.echo(typer.style(f"  ~ {change}", fg=typer.colors.YELLOW))
 
                 # Summary
                 typer.echo("\n" + "-" * 60)
-                typer.echo(f"Summary: {len(added)} added, {len(removed)} removed, {len(modified)} modified")
+                typer.echo(
+                    f"Summary: {len(added)} added, {len(removed)} removed, {len(modified)} modified"
+                )
 
     except ValueError as e:
         _echo_error(str(e))
@@ -3589,25 +3587,16 @@ def version_diff(
 @app.command()
 def parse(
     project: str = typer.Option(
-        None, "--project", "-p",
-        help="Project name (defaults to current directory name)"
+        None, "--project", "-p", help="Project name (defaults to current directory name)"
     ),
-    path: Path = typer.Option(
-        Path("."), "--path",
-        help="Project path to parse"
-    ),
+    path: Path = typer.Option(Path("."), "--path", help="Project path to parse"),
     target_path: Optional[Path] = typer.Option(
-        None, "--target", "-t",
-        help="Target directory for manifest (defaults to <path>/target)"
+        None, "--target", "-t", help="Target directory for manifest (defaults to <path>/target)"
     ),
     format: OutputFormat = typer.Option(
-        OutputFormat.TABLE, "--format", "-f",
-        help="Output format: table (default) or json"
+        OutputFormat.TABLE, "--format", "-f", help="Output format: table (default) or json"
     ),
-    no_diff: bool = typer.Option(
-        False, "--no-diff",
-        help="Skip comparison with previous manifest"
-    ),
+    no_diff: bool = typer.Option(False, "--no-diff", help="Skip comparison with previous manifest"),
 ):
     """
     Parse project and generate manifest.json.
@@ -3717,34 +3706,65 @@ def parse(
 
                     # Show added nodes
                     if diff.added_nodes:
-                        typer.echo(typer.style(f"  Added ({len(diff.added_nodes)}):", fg=typer.colors.GREEN))
+                        typer.echo(
+                            typer.style(
+                                f"  Added ({len(diff.added_nodes)}):", fg=typer.colors.GREEN
+                            )
+                        )
                         for node_id in sorted(diff.added_nodes.keys()):
                             typer.echo(typer.style(f"    + {node_id}", fg=typer.colors.GREEN))
 
                     # Show removed nodes
                     if diff.removed_nodes:
-                        typer.echo(typer.style(f"  Removed ({len(diff.removed_nodes)}):", fg=typer.colors.RED))
+                        typer.echo(
+                            typer.style(
+                                f"  Removed ({len(diff.removed_nodes)}):", fg=typer.colors.RED
+                            )
+                        )
                         for node_id in sorted(diff.removed_nodes.keys()):
                             typer.echo(typer.style(f"    - {node_id}", fg=typer.colors.RED))
 
                     # Show modified nodes
                     if diff.modified_nodes:
-                        typer.echo(typer.style(f"  Modified ({len(diff.modified_nodes)}):", fg=typer.colors.YELLOW))
+                        typer.echo(
+                            typer.style(
+                                f"  Modified ({len(diff.modified_nodes)}):", fg=typer.colors.YELLOW
+                            )
+                        )
                         for node_id in sorted(diff.modified_nodes.keys()):
                             change = diff.modified_nodes[node_id]
                             fields = ", ".join(change.changed_fields)
-                            typer.echo(typer.style(f"    ~ {node_id} ({fields})", fg=typer.colors.YELLOW))
+                            typer.echo(
+                                typer.style(f"    ~ {node_id} ({fields})", fg=typer.colors.YELLOW)
+                            )
 
                     # Show edge changes
                     if diff.added_edges:
-                        typer.echo(typer.style(f"  Added edges ({len(diff.added_edges)}):", fg=typer.colors.GREEN))
+                        typer.echo(
+                            typer.style(
+                                f"  Added edges ({len(diff.added_edges)}):", fg=typer.colors.GREEN
+                            )
+                        )
                         for edge in diff.added_edges:
-                            typer.echo(typer.style(f"    + {edge.from_node} -> {edge.to_node}", fg=typer.colors.GREEN))
+                            typer.echo(
+                                typer.style(
+                                    f"    + {edge.from_node} -> {edge.to_node}",
+                                    fg=typer.colors.GREEN,
+                                )
+                            )
 
                     if diff.removed_edges:
-                        typer.echo(typer.style(f"  Removed edges ({len(diff.removed_edges)}):", fg=typer.colors.RED))
+                        typer.echo(
+                            typer.style(
+                                f"  Removed edges ({len(diff.removed_edges)}):", fg=typer.colors.RED
+                            )
+                        )
                         for edge in diff.removed_edges:
-                            typer.echo(typer.style(f"    - {edge.from_node} -> {edge.to_node}", fg=typer.colors.RED))
+                            typer.echo(
+                                typer.style(
+                                    f"    - {edge.from_node} -> {edge.to_node}", fg=typer.colors.RED
+                                )
+                            )
 
                     typer.echo("")
                     typer.echo(f"Summary: {diff.summary()}")
@@ -3761,16 +3781,16 @@ def parse(
 def plan(
     env_name: Optional[str] = typer.Argument(
         None,
-        help="Environment name (optional). Without: show changes vs last run. With: create environment plan."
+        help="Environment name (optional). Without: show changes vs last run. With: create environment plan.",
     ),
     project_path: Path = typer.Option(".", help="Project directory"),
     tags: Optional[List[str]] = typer.Option(
-        None, "--tags",
-        help="Show only nodes with these tags (plus upstream deps). OR logic. Production mode only."
+        None,
+        "--tags",
+        help="Show only nodes with these tags (plus upstream deps). OR logic. Production mode only.",
     ),
     exclude_tags: Optional[List[str]] = typer.Option(
-        None, "--exclude-tags",
-        help="Hide nodes with these tags from the plan."
+        None, "--exclude-tags", help="Hide nodes with these tags from the plan."
     ),
 ):
     """Analyze changes and show execution plan.
@@ -3916,30 +3936,40 @@ def plan(
 
                 # Show edge changes
                 if diff.added_edges:
-                    typer.echo(typer.style(
-                        f"  Added edges ({len(diff.added_edges)}):", fg=typer.colors.GREEN
-                    ))
+                    typer.echo(
+                        typer.style(
+                            f"  Added edges ({len(diff.added_edges)}):", fg=typer.colors.GREEN
+                        )
+                    )
                     for edge in diff.added_edges:
-                        typer.echo(typer.style(
-                            f"    + {edge.from_node} -> {edge.to_node}", fg=typer.colors.GREEN
-                        ))
+                        typer.echo(
+                            typer.style(
+                                f"    + {edge.from_node} -> {edge.to_node}", fg=typer.colors.GREEN
+                            )
+                        )
 
                 if diff.removed_edges:
-                    typer.echo(typer.style(
-                        f"  Removed edges ({len(diff.removed_edges)}):", fg=typer.colors.RED
-                    ))
+                    typer.echo(
+                        typer.style(
+                            f"  Removed edges ({len(diff.removed_edges)}):", fg=typer.colors.RED
+                        )
+                    )
                     for edge in diff.removed_edges:
-                        typer.echo(typer.style(
-                            f"    - {edge.from_node} -> {edge.to_node}", fg=typer.colors.RED
-                        ))
+                        typer.echo(
+                            typer.style(
+                                f"    - {edge.from_node} -> {edge.to_node}", fg=typer.colors.RED
+                            )
+                        )
 
                 # Hint for detailed diff
                 if diff.modified_nodes:
                     typer.echo("")
-                    typer.echo(typer.style(
-                        "  Tip: Run 'seeknal diff <type>/<name>' for detailed YAML diff",
-                        fg=typer.colors.RESET,
-                    ))
+                    typer.echo(
+                        typer.style(
+                            "  Tip: Run 'seeknal diff <type>/<name>' for detailed YAML diff",
+                            fg=typer.colors.RESET,
+                        )
+                    )
             else:
                 _echo_info("No changes detected since last parse")
         else:
@@ -3982,14 +4012,12 @@ def plan(
         if tags and env_name is None:
             tag_set = set(tags)
             tag_matched = {
-                node_id for node_id in dag_builder.nodes
+                node_id
+                for node_id in dag_builder.nodes
                 if any(t in tag_set for t in dag_builder.nodes[node_id].tags)
             }
             if not tag_matched:
-                _echo_warning(
-                    f"No nodes found with tags: {', '.join(tags)}. "
-                    "Showing full plan."
-                )
+                _echo_warning(f"No nodes found with tags: {', '.join(tags)}. " "Showing full plan.")
             else:
                 # Auto-include all transitive upstream deps
                 with_upstream = set(tag_matched)
@@ -4001,12 +4029,14 @@ def plan(
             exclude_set = set(exclude_tags)
             if plan_filter_set is not None:
                 plan_filter_set = {
-                    node_id for node_id in plan_filter_set
+                    node_id
+                    for node_id in plan_filter_set
                     if not any(t in exclude_set for t in dag_builder.nodes[node_id].tags)
                 }
             else:
                 plan_filter_set = {
-                    node_id for node_id in dag_builder.nodes
+                    node_id
+                    for node_id in dag_builder.nodes
                     if not any(t in exclude_set for t in dag_builder.nodes[node_id].tags)
                 }
 
@@ -4113,20 +4143,27 @@ def diff_command(
         typer.echo("")
         if result.category:
             cat_labels = {
-                ChangeCategory.BREAKING: ("BREAKING (downstream rebuild required)", typer.colors.RED),
-                ChangeCategory.NON_BREAKING: ("NON_BREAKING (rebuild this node)", typer.colors.YELLOW),
+                ChangeCategory.BREAKING: (
+                    "BREAKING (downstream rebuild required)",
+                    typer.colors.RED,
+                ),
+                ChangeCategory.NON_BREAKING: (
+                    "NON_BREAKING (rebuild this node)",
+                    typer.colors.YELLOW,
+                ),
                 ChangeCategory.METADATA: ("METADATA (no rebuild needed)", typer.colors.BLUE),
             }
-            label, color = cat_labels.get(
-                result.category, ("UNKNOWN", typer.colors.RESET)
-            )
+            label, color = cat_labels.get(result.category, ("UNKNOWN", typer.colors.RESET))
             typer.echo(typer.style(f"  Category: {label}", fg=color, bold=True))
 
         if result.downstream_count > 0 and result.category == ChangeCategory.BREAKING:
-            typer.echo(typer.style(
-                f"  Impact: {result.downstream_count} downstream node(s) affected",
-                fg=typer.colors.YELLOW, bold=True,
-            ))
+            typer.echo(
+                typer.style(
+                    f"  Impact: {result.downstream_count} downstream node(s) affected",
+                    fg=typer.colors.YELLOW,
+                    bold=True,
+                )
+            )
             downstream = engine.get_downstream_nodes(result.node_id)
             for ds_id in downstream[:5]:
                 typer.echo(typer.style(f"    -> {ds_id}", fg=typer.colors.RED))
@@ -4159,7 +4196,9 @@ def diff_command(
             total_files = len(modified) + len(new) + len(deleted)
             total_ins = sum(r.insertions for r in modified)
             total_del = sum(r.deletions for r in modified)
-            typer.echo(f"  {total_files} file(s) changed, {total_ins} insertion(s), {total_del} deletion(s)")
+            typer.echo(
+                f"  {total_files} file(s) changed, {total_ins} insertion(s), {total_del} deletion(s)"
+            )
         else:
             # Summary mode
             typer.echo(typer.style("Changes since last apply:", bold=True))
@@ -4208,7 +4247,9 @@ def diff_command(
             py_files = list(py_dir.glob("*.py"))
             if py_files:
                 typer.echo("")
-                _echo_info(f"Note: {len(py_files)} Python pipeline file(s) found. Diff not yet supported for .py files.")
+                _echo_info(
+                    f"Note: {len(py_files)} Python pipeline file(s) found. Diff not yet supported for .py files."
+                )
 
 
 @app.command()
@@ -4230,28 +4271,30 @@ def promote(
 @app.command()
 def repl(
     profile: Optional[str] = typer.Option(
-        None, "--profile",
-        help="Path to profiles.yml for connections (default: ~/.seeknal/profiles.yml)"
+        None,
+        "--profile",
+        help="Path to profiles.yml for connections (default: ~/.seeknal/profiles.yml)",
     ),
     env: Optional[str] = typer.Option(
-        None, "--env",
-        help="Load data from a virtual environment (e.g., dev) instead of production"
+        None, "--env", help="Load data from a virtual environment (e.g., dev) instead of production"
     ),
     exec_sql: Optional[str] = typer.Option(
-        None, "--exec", "-e",
-        help="Execute SQL query and exit (non-interactive). Use '-' to read from stdin."
+        None,
+        "--exec",
+        "-e",
+        help="Execute SQL query and exit (non-interactive). Use '-' to read from stdin.",
     ),
     format: str = typer.Option(
-        "table", "--format", "-f",
-        help="Output format for --exec: table, json, csv"
+        "table", "--format", "-f", help="Output format for --exec: table, json, csv"
     ),
     output: Optional[str] = typer.Option(
-        None, "--output", "-o",
-        help="Export --exec results to file (format inferred from .csv, .json, .parquet)"
+        None,
+        "--output",
+        "-o",
+        help="Export --exec results to file (format inferred from .csv, .json, .parquet)",
     ),
     limit: Optional[int] = typer.Option(
-        None, "--limit",
-        help="Limit number of result rows for --exec"
+        None, "--limit", help="Limit number of result rows for --exec"
     ),
 ):
     """Start interactive SQL REPL or execute a one-shot query.
@@ -4302,8 +4345,7 @@ def repl(
         env_dir = project_path / "target" / "environments" / env
         if not env_dir.exists():
             _echo_error(
-                f"Environment '{env}' not found. "
-                f"Run 'seeknal env plan {env}' to create it."
+                f"Environment '{env}' not found. " f"Run 'seeknal env plan {env}' to create it."
             )
             raise typer.Exit(1)
 
@@ -4329,6 +4371,7 @@ def repl(
             raise typer.Exit(code=1)
         except Exception as e:
             from seeknal.db_utils import sanitize_error_message
+
             print(f"Error: {sanitize_error_message(str(e))}", file=sys.stderr)
             raise typer.Exit(code=1)
 
@@ -4414,12 +4457,19 @@ def _exec_export_to_file(columns: list, rows: list, output_path: str) -> None:
 
 @app.command()
 def draft(
-    node_type: str = typer.Argument(..., help="Node type (source, transform, feature-group, semantic-model, model, aggregation, rule, exposure)"),
+    node_type: str = typer.Argument(
+        ...,
+        help="Node type (source, transform, feature-group, semantic-model, model, aggregation, rule, exposure)",
+    ),
     name: str = typer.Argument(..., help="Node name"),
     description: Optional[str] = typer.Option(None, "--description", "-d", help="Node description"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing draft file"),
-    python: bool = typer.Option(False, "--python", "-py", help="Generate Python file instead of YAML"),
-    deps: str = typer.Option("", "--deps", help="Comma-separated Python dependencies for PEP 723 header"),
+    python: bool = typer.Option(
+        False, "--python", "-py", help="Generate Python file instead of YAML"
+    ),
+    deps: str = typer.Option(
+        "", "--deps", help="Comma-separated Python dependencies for PEP 723 header"
+    ),
 ):
     """Generate template from Jinja2 template.
 
@@ -4457,8 +4507,12 @@ def draft(
 def dry_run(
     file_path: str = typer.Argument(..., help="Path to YAML or Python pipeline file"),
     limit: int = typer.Option(10, "--limit", "-l", help="Row limit for preview (default: 10)"),
-    timeout: int = typer.Option(30, "--timeout", "-t", help="Query timeout in seconds (default: 30)"),
-    schema_only: bool = typer.Option(False, "--schema-only", "-s", help="Validate schema only, skip execution"),
+    timeout: int = typer.Option(
+        30, "--timeout", "-t", help="Query timeout in seconds (default: 30)"
+    ),
+    schema_only: bool = typer.Option(
+        False, "--schema-only", "-s", help="Validate schema only, skip execution"
+    ),
 ):
     """Validate YAML/Python and preview execution.
 
@@ -4493,7 +4547,9 @@ def inspect(
         help="Node ID to inspect (e.g., 'source.products', 'transform.sales_enriched')",
     ),
     limit: int = typer.Option(10, "--limit", "-l", help="Row limit for preview"),
-    schema_only: bool = typer.Option(False, "--schema", "-s", help="Show schema (columns + types) only"),
+    schema_only: bool = typer.Option(
+        False, "--schema", "-s", help="Show schema (columns + types) only"
+    ),
     list_all: bool = typer.Option(False, "--list", help="List all available intermediate outputs"),
     project_path: Path = typer.Option(".", help="Project directory"),
 ):
@@ -4537,9 +4593,7 @@ def inspect(
         # Suggest available nodes
         intermediate_dir = target_path / "intermediate"
         if intermediate_dir.exists():
-            available = [
-                f.stem.replace("_", ".", 1) for f in intermediate_dir.glob("*.parquet")
-            ]
+            available = [f.stem.replace("_", ".", 1) for f in intermediate_dir.glob("*.parquet")]
             if available:
                 _echo_info(f"\n  Available nodes:")
                 for node in sorted(available):
@@ -4613,7 +4667,9 @@ def _inspect_list(target_path: Path):
 @app.command()
 def apply(
     file_path: str = typer.Argument(..., help="Path to YAML or Python pipeline file"),
-    force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing file without prompt"),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Overwrite existing file without prompt"
+    ),
     no_parse: bool = typer.Option(False, "--no-parse", help="Skip manifest regeneration"),
 ):
     """Apply file to production.
@@ -4686,6 +4742,7 @@ def apply(
         if target_path.resolve() != path.resolve():
             _echo_info(f"Moving file to {target_path}...")
             import shutil
+
             target_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(path), str(target_path))
 
@@ -4695,6 +4752,7 @@ def apply(
 
         # Convert to list format for dry_run_command
         import sys
+
         sys.argv = ["seeknal", "dry-run", str(target_path)]
 
         # Run dry-run with schema-only mode
@@ -4818,7 +4876,7 @@ def audit(
         if node and view_name != node:
             continue
         try:
-            conn.execute(f'CREATE VIEW "{view_name}" AS SELECT * FROM read_parquet(\'{pf}\')')
+            conn.execute(f"CREATE VIEW \"{view_name}\" AS SELECT * FROM read_parquet('{pf}')")
         except Exception as e:
             _echo_warning(f"Could not load {view_name}: {e}")
 
@@ -4829,9 +4887,11 @@ def audit(
         raise typer.Exit(code=1)
 
     from seeknal.dag.manifest import Manifest
+
     manifest = Manifest.load(str(manifest_path))
 
     from seeknal.workflow.audits import parse_audits, AuditRunner
+
     runner = AuditRunner(conn)
     total_passed = 0
     total_failed = 0
@@ -4868,13 +4928,24 @@ def audit(
 @app.command()
 def query(
     metrics: str = typer.Option(..., help="Comma-separated metric names"),
-    dimensions: Optional[str] = typer.Option(None, help="Comma-separated dimensions (e.g. region,ordered_at__month)"),
+    dimensions: Optional[str] = typer.Option(
+        None, help="Comma-separated dimensions (e.g. region,ordered_at__month)"
+    ),
     filter: Optional[str] = typer.Option(None, "--filter", help="SQL filter expression"),
-    order_by: Optional[str] = typer.Option(None, "--order-by", help="Order by columns (prefix - for DESC)"),
+    order_by: Optional[str] = typer.Option(
+        None, "--order-by", help="Order by columns (prefix - for DESC)"
+    ),
     limit: int = typer.Option(100, help="Maximum rows to return"),
-    compile_only: bool = typer.Option(False, "--compile", help="Show generated SQL without executing"),
+    compile_only: bool = typer.Option(
+        False, "--compile", help="Show generated SQL without executing"
+    ),
     format: str = typer.Option("table", help="Output format: table, json, csv"),
-    output: Optional[str] = typer.Option(None, "--output", "-o", help="Export results to file (format inferred from extension: .csv, .json, .parquet)"),
+    output: Optional[str] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Export results to file (format inferred from extension: .csv, .json, .parquet)",
+    ),
     project_path: str = typer.Option(".", help="Path to project directory"),
 ):
     """
@@ -4944,16 +5015,20 @@ def query(
     for sm in semantic_models:
         for measure in sm.measures:
             if measure.name not in seen_names:
-                metric_list.append(MetricModel(
-                    name=measure.name,
-                    type=MetricType.SIMPLE,
-                    description=measure.description,
-                    measure=measure.name,
-                ))
+                metric_list.append(
+                    MetricModel(
+                        name=measure.name,
+                        type=MetricType.SIMPLE,
+                        description=measure.description,
+                        measure=measure.name,
+                    )
+                )
                 seen_names.add(measure.name)
 
     if not metric_list:
-        _echo_error("No metrics or measures found. Define measures in seeknal/semantic_models/ or metrics in seeknal/metrics/")
+        _echo_error(
+            "No metrics or measures found. Define measures in seeknal/semantic_models/ or metrics in seeknal/metrics/"
+        )
         raise typer.Exit(code=1)
 
     # Build compiler
@@ -4985,6 +5060,7 @@ def query(
 
     # Execute on DuckDB
     import duckdb
+
     conn = duckdb.connect(":memory:")
 
     # Register tables from cached parquet files (target/cache/{kind}/{name}.parquet)
@@ -5006,7 +5082,9 @@ def query(
             parts = stem.split("_", 1)
             table_name = parts[1] if len(parts) > 1 else stem
             try:
-                conn.execute(f"CREATE OR REPLACE VIEW \"{table_name}\" AS SELECT * FROM read_parquet('{pf}')")
+                conn.execute(
+                    f"CREATE OR REPLACE VIEW \"{table_name}\" AS SELECT * FROM read_parquet('{pf}')"
+                )
             except Exception:
                 pass
 
@@ -5021,6 +5099,7 @@ def query(
     # Export to file if --output is specified
     if output:
         import pandas as pd
+
         df = pd.DataFrame(rows, columns=columns)
         out_path = P(output)
         ext = out_path.suffix.lower()
@@ -5043,6 +5122,7 @@ def query(
     elif format == "csv":
         import csv
         import io
+
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(columns)
@@ -5051,6 +5131,7 @@ def query(
     else:
         try:
             from tabulate import tabulate as tabfmt
+
             typer.echo(tabfmt(rows, headers=columns, tablefmt="simple"))
         except ImportError:
             # Fallback to simple formatting
@@ -5064,9 +5145,15 @@ def query(
 @app.command("deploy-metrics")
 def deploy_metrics(
     connection: str = typer.Option(..., help="StarRocks connection name or URL"),
-    dimensions: Optional[str] = typer.Option(None, help="Comma-separated dimensions to include in MVs"),
-    refresh_interval: str = typer.Option("1 DAY", help="MV refresh interval (e.g. '1 HOUR', '1 DAY')"),
-    drop_existing: bool = typer.Option(False, "--drop-existing", help="Drop and recreate existing MVs"),
+    dimensions: Optional[str] = typer.Option(
+        None, help="Comma-separated dimensions to include in MVs"
+    ),
+    refresh_interval: str = typer.Option(
+        "1 DAY", help="MV refresh interval (e.g. '1 HOUR', '1 DAY')"
+    ),
+    drop_existing: bool = typer.Option(
+        False, "--drop-existing", help="Drop and recreate existing MVs"
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show DDL without executing"),
     project_path: str = typer.Option(".", help="Path to project directory"),
 ):
@@ -5136,12 +5223,14 @@ def deploy_metrics(
     for sm in semantic_models:
         for measure in sm.measures:
             if measure.name not in seen_names:
-                metric_list.append(MetricModel(
-                    name=measure.name,
-                    type=MetricTypeModel.SIMPLE,
-                    description=measure.description,
-                    measure=measure.name,
-                ))
+                metric_list.append(
+                    MetricModel(
+                        name=measure.name,
+                        type=MetricTypeModel.SIMPLE,
+                        description=measure.description,
+                        measure=measure.name,
+                    )
+                )
                 seen_names.add(measure.name)
 
     if not metric_list:
@@ -5151,12 +5240,14 @@ def deploy_metrics(
     # Resolve connection config
     if connection.startswith("starrocks://"):
         from seeknal.connections.starrocks import parse_starrocks_url
+
         sr_config = parse_starrocks_url(connection)
         conn_config = sr_config.to_pymysql_kwargs()
     else:
         # Try loading from profiles
         try:
             from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
             loader = ProfileLoader()
             conn_config = loader.load_starrocks_profile(connection)
         except Exception as e:
@@ -5178,7 +5269,9 @@ def deploy_metrics(
         for sm in semantic_models:
             if sm.default_time_dimension:
                 dim_list = [sm.default_time_dimension]
-                _echo_info(f"Auto-including dimension '{sm.default_time_dimension}' (required for StarRocks MV keys)")
+                _echo_info(
+                    f"Auto-including dimension '{sm.default_time_dimension}' (required for StarRocks MV keys)"
+                )
                 break
 
     deployer = MetricDeployer(compiler, conn_config)
@@ -5223,8 +5316,7 @@ def env_plan(
     env_name: str = typer.Argument(..., help="Environment name (e.g., dev, staging)"),
     project_path: Path = typer.Option(".", help="Project directory"),
     profile: Optional[str] = typer.Option(
-        None, "--profile",
-        help="Path to profiles.yml for source_defaults and connections"
+        None, "--profile", help="Path to profiles.yml for source_defaults and connections"
     ),
 ):
     """Preview changes in a virtual environment."""
@@ -5309,6 +5401,7 @@ def _resolve_env_profile(
 
     # Convention: ~/.seeknal/profiles-{env}.yml
     from seeknal.context import CONFIG_BASE_URL
+
     home_env_profile = Path(CONFIG_BASE_URL) / f"profiles-{env_name}.yml"
     if home_env_profile.exists():
         return home_env_profile
@@ -5392,6 +5485,7 @@ def _run_in_environment(
     copied_refs: set[str] = set()
     if refs_data:
         import shutil
+
         env_intermediate = env_dir / "intermediate"
         env_intermediate.mkdir(parents=True, exist_ok=True)
         for ref in refs_data.get("refs", []):
@@ -5417,7 +5511,11 @@ def _run_in_environment(
         while queue:
             nid = queue.pop()
             for up in manifest.get_upstream_nodes(nid):
-                if up not in nodes_to_execute and up not in copied_refs and up not in missing_upstream:
+                if (
+                    up not in nodes_to_execute
+                    and up not in copied_refs
+                    and up not in missing_upstream
+                ):
                     missing_upstream.add(up)
                     queue.append(up)
         nodes_to_execute = nodes_to_execute | missing_upstream
@@ -5454,6 +5552,7 @@ def _run_in_environment(
     else:
         # Sequential execution
         import time as _time
+
         successful = 0
         failed = 0
         order = runner._get_topological_order()
@@ -5488,17 +5587,14 @@ def _run_in_environment(
     env_state_path = env_dir / "run_state.json"
     if not env_state_path.exists():
         import json
+
         with open(env_state_path, "w") as f:
             json.dump({"applied": True, "env_name": env_name}, f)
 
     if failed > 0:
-        _echo_warning(
-            f"Environment '{env_name}' applied with {failed} failure(s)."
-        )
+        _echo_warning(f"Environment '{env_name}' applied with {failed} failure(s).")
     else:
-        _echo_success(
-            f"Environment '{env_name}' applied successfully."
-        )
+        _echo_success(f"Environment '{env_name}' applied successfully.")
 
 
 @env_app.command("apply")
@@ -5508,12 +5604,15 @@ def env_apply(
     force: bool = typer.Option(False, help="Apply even if plan is stale"),
     parallel: bool = typer.Option(False, "--parallel", help="Run nodes in parallel"),
     max_workers: int = typer.Option(4, "--max-workers", help="Max parallel workers"),
-    continue_on_error: bool = typer.Option(False, "--continue-on-error", help="Continue past failures"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would execute without running"),
+    continue_on_error: bool = typer.Option(
+        False, "--continue-on-error", help="Continue past failures"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would execute without running"
+    ),
     project_path: Path = typer.Option(".", help="Project directory"),
     profile: Optional[str] = typer.Option(
-        None, "--profile",
-        help="Path to profiles.yml for source_defaults and connections"
+        None, "--profile", help="Path to profiles.yml for source_defaults and connections"
     ),
 ):
     """Execute a plan in a virtual environment.
@@ -5558,7 +5657,8 @@ def _promote_environment(
 
     # Run dry_run first to get diff analysis (warnings, changed files)
     preview = manager.promote(
-        from_env, to_env,
+        from_env,
+        to_env,
         rematerialize=rematerialize,
         profile_path=profile_path,
         dry_run=True,
@@ -5617,7 +5717,8 @@ def _promote_environment(
     )
 
     result = manager.promote(
-        from_env, to_env,
+        from_env,
+        to_env,
         rematerialize=rematerialize,
         profile_path=profile_path,
     )
@@ -5669,19 +5770,23 @@ def env_promote(
     from_env: str = typer.Argument(..., help="Source environment"),
     to_env: str = typer.Argument("prod", help="Target (default: prod)"),
     project_path: Path = typer.Option(".", help="Project directory"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be promoted without executing"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be promoted without executing"
+    ),
     profile: Optional[str] = typer.Option(
-        None, "--profile",
-        help="Path to profiles.yml for re-materialization connections"
+        None, "--profile", help="Path to profiles.yml for re-materialization connections"
     ),
     rematerialize: bool = typer.Option(
-        False, "--rematerialize",
-        help="Re-execute materialization targets with production credentials after promotion"
+        False,
+        "--rematerialize",
+        help="Re-execute materialization targets with production credentials after promotion",
     ),
 ):
     """Promote environment to production."""
     _promote_environment(
-        from_env, to_env, project_path,
+        from_env,
+        to_env,
+        project_path,
         dry_run=dry_run,
         profile=profile,
         rematerialize=rematerialize,
@@ -5716,7 +5821,8 @@ def env_list(
 
         status = "applied" if applied else ("planned" if plan_exists else "created")
         status_color = (
-            typer.colors.GREEN if applied
+            typer.colors.GREEN
+            if applied
             else (typer.colors.BLUE if plan_exists else typer.colors.YELLOW)
         )
 
@@ -5757,13 +5863,9 @@ def env_delete(
 @app.command("download-sample-data")
 def download_sample_data(
     output_dir: Path = typer.Option(
-        Path("data/sample"), "--output-dir", "-o",
-        help="Output directory for sample data files"
+        Path("data/sample"), "--output-dir", "-o", help="Output directory for sample data files"
     ),
-    force: bool = typer.Option(
-        False, "--force", "-f",
-        help="Overwrite existing sample data files"
-    ),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing sample data files"),
 ):
     """Download sample e-commerce datasets for tutorials and testing.
 
@@ -5796,17 +5898,19 @@ def download_sample_data(
 
     # Get the package data directory
     from importlib.resources import files
+
     try:
         # Try Python 3.9+ style first
-        sample_data_dir = files('seeknal.docs.data.sample')
+        sample_data_dir = files("seeknal.docs.data.sample")
     except (TypeError, AttributeError):
         # Fallback for older Python versions
         import os
+
         package_dir = Path(__file__).parent.parent
-        sample_data_dir = package_dir / 'docs' / 'data' / 'sample'
+        sample_data_dir = package_dir / "docs" / "data" / "sample"
 
     # Check if source sample data exists
-    source_files = ['customers.csv', 'products.csv', 'orders.csv', 'sales.csv']
+    source_files = ["customers.csv", "products.csv", "orders.csv", "sales.csv"]
     missing_files = [f for f in source_files if not (sample_data_dir / f).exists()]
 
     if missing_files:
@@ -5865,16 +5969,14 @@ def download_sample_data(
 # Interval Management Commands
 # =============================================================================
 
+
 @intervals_app.command("list")
 def intervals_list(
     node_id: str = typer.Argument(
-        ...,
-        help="Node identifier (e.g., transform.clean_data, feature_group.user_features)"
+        ..., help="Node identifier (e.g., transform.clean_data, feature_group.user_features)"
     ),
     output_format: OutputFormat = typer.Option(
-        OutputFormat.TABLE,
-        "--output", "-o",
-        help="Output format"
+        OutputFormat.TABLE, "--output", "-o", help="Output format"
     ),
 ):
     """List completed intervals for a node.
@@ -5920,6 +6022,7 @@ def intervals_list(
 
     elif output_format == OutputFormat.JSON:
         import json
+
         data = {
             "node_id": node_id,
             "completed_intervals": node_state.completed_intervals,
@@ -5931,17 +6034,18 @@ def intervals_list(
 @intervals_app.command("pending")
 def intervals_pending(
     node_id: str = typer.Argument(
-        ...,
-        help="Node identifier (e.g., transform.clean_data, feature_group.user_features)"
+        ..., help="Node identifier (e.g., transform.clean_data, feature_group.user_features)"
     ),
     start: str = typer.Option(
         ...,
-        "--start", "-s",
+        "--start",
+        "-s",
         help="Start date (YYYY-MM-DD or ISO timestamp)",
     ),
     end: Optional[str] = typer.Option(
         None,
-        "--end", "-e",
+        "--end",
+        "-e",
         help="End date (YYYY-MM-DD or ISO timestamp). Defaults to next scheduled run.",
     ),
     schedule: str = typer.Option(
@@ -6004,18 +6108,17 @@ def intervals_pending(
 # Restatement subcommands - use add subcommand pattern
 @intervals_app.command("restatement-add")
 def restatement_add(
-    node_id: str = typer.Argument(
-        ...,
-        help="Node identifier"
-    ),
+    node_id: str = typer.Argument(..., help="Node identifier"),
     start: str = typer.Option(
         ...,
-        "--start", "-s",
+        "--start",
+        "-s",
         help="Start date (YYYY-MM-DD or ISO timestamp)",
     ),
     end: str = typer.Option(
         ...,
-        "--end", "-e",
+        "--end",
+        "-e",
         help="End date (YYYY-MM-DD or ISO timestamp)",
     ),
 ):
@@ -6058,10 +6161,7 @@ def restatement_add(
 
 @intervals_app.command("restatement-list")
 def restatement_list(
-    node_id: str = typer.Argument(
-        ...,
-        help="Node identifier"
-    ),
+    node_id: str = typer.Argument(..., help="Node identifier"),
 ):
     """List restatement intervals for a node.
 
@@ -6101,10 +6201,7 @@ def restatement_list(
 
 @intervals_app.command("restatement-clear")
 def restatement_clear(
-    node_id: str = typer.Argument(
-        ...,
-        help="Node identifier"
-    ),
+    node_id: str = typer.Argument(..., help="Node identifier"),
 ):
     """Clear all restatement intervals for a node.
 
@@ -6138,18 +6235,17 @@ def restatement_clear(
 
 @intervals_app.command("backfill")
 def intervals_backfill(
-    node_id: str = typer.Argument(
-        ...,
-        help="Node identifier to backfill"
-    ),
+    node_id: str = typer.Argument(..., help="Node identifier to backfill"),
     start: str = typer.Option(
         ...,
-        "--start", "-s",
+        "--start",
+        "-s",
         help="Start date (YYYY-MM-DD or ISO timestamp)",
     ),
     end: str = typer.Option(
         ...,
-        "--end", "-e",
+        "--end",
+        "-e",
         help="End date (YYYY-MM-DD or ISO timestamp)",
     ),
     schedule: str = typer.Option(
@@ -6221,7 +6317,9 @@ def intervals_backfill(
 
 @app.command()
 def migrate_state(
-    backend: str = typer.Option(..., "--backend", "-b", help="Target backend type (file, database)"),
+    backend: str = typer.Option(
+        ..., "--backend", "-b", help="Target backend type (file, database)"
+    ),
     project_path: Path = typer.Option(".", help="Project directory"),
     dry_run: bool = typer.Option(True, help="Preview changes without executing"),
 ):
@@ -6295,7 +6393,7 @@ def migrate_state(
                 status=run_info.status,
                 started_at=run_info.started_at,
                 finished_at=run_info.finished_at,
-                metadata=run_info.metadata or {}
+                metadata=run_info.metadata or {},
             )
 
         # Migrate all node states
@@ -6331,6 +6429,7 @@ def migrate_state(
         project_file = project_path / "seeknal_project.yml"
         if project_file.exists():
             import yaml
+
             with open(project_file) as f:
                 config = yaml.safe_load(f)
             config["state_backend"] = "database"
@@ -6356,32 +6455,22 @@ def lineage(
         None, help="Node to focus on (e.g., transform.clean_orders)"
     ),
     column: Optional[str] = typer.Option(
-        None, "--column", "-c",
-        help="Column to trace lineage for (requires node argument)"
+        None, "--column", "-c", help="Column to trace lineage for (requires node argument)"
     ),
-    project: str = typer.Option(
-        None, "--project", "-p", help="Project name"
-    ),
-    path: Path = typer.Option(
-        Path("."), "--path", help="Project path"
-    ),
+    project: str = typer.Option(None, "--project", "-p", help="Project name"),
+    path: Path = typer.Option(Path("."), "--path", help="Project path"),
     output: Path = typer.Option(
-        None, "--output", "-o",
-        help="Output HTML file path (default: target/lineage.html)"
+        None, "--output", "-o", help="Output HTML file path (default: target/lineage.html)"
     ),
-    no_open: bool = typer.Option(
-        False, "--no-open", help="Don't auto-open browser"
-    ),
+    no_open: bool = typer.Option(False, "--no-open", help="Don't auto-open browser"),
     ascii_output: bool = typer.Option(
         False, "--ascii", help="Print DAG as ASCII tree to stdout instead of HTML"
     ),
     tags: Optional[List[str]] = typer.Option(
-        None, "--tags",
-        help="Show only nodes with these tags (plus upstream deps). OR logic."
+        None, "--tags", help="Show only nodes with these tags (plus upstream deps). OR logic."
     ),
     exclude_tags: Optional[List[str]] = typer.Option(
-        None, "--exclude-tags",
-        help="Hide nodes with these tags from the lineage."
+        None, "--exclude-tags", help="Hide nodes with these tags from the lineage."
     ),
 ):
     """Generate interactive lineage visualization.
@@ -6428,7 +6517,8 @@ def lineage(
             if tags:
                 tag_set = set(tags)
                 tag_matched = {
-                    nid for nid, node in manifest.nodes.items()
+                    nid
+                    for nid, node in manifest.nodes.items()
                     if any(t in tag_set for t in node.tags)
                 }
                 if not tag_matched:
@@ -6438,6 +6528,7 @@ def lineage(
                 # Auto-include all transitive upstream deps via BFS
                 keep_ids = set(tag_matched)
                 from collections import deque
+
                 queue = deque(tag_matched)
                 while queue:
                     current = queue.popleft()
@@ -6450,12 +6541,14 @@ def lineage(
                 exclude_set = set(exclude_tags)
                 if keep_ids is not None:
                     keep_ids = {
-                        nid for nid in keep_ids
+                        nid
+                        for nid in keep_ids
                         if not any(t in exclude_set for t in manifest.nodes[nid].tags)
                     }
                 else:
                     keep_ids = {
-                        nid for nid, node in manifest.nodes.items()
+                        nid
+                        for nid, node in manifest.nodes.items()
                         if not any(t in exclude_set for t in node.tags)
                     }
 
@@ -6472,6 +6565,7 @@ def lineage(
 
         if ascii_output:
             from seeknal.dag.visualize import render_ascii_tree  # ty: ignore[unresolved-import]
+
             tree_text = render_ascii_tree(manifest, focus_node=node_id)
             typer.echo(tree_text)
             return
@@ -6492,26 +6586,15 @@ def lineage(
         raise typer.Exit(code=1)
 
 
-
-
 @app.command()
 def dq(
-    node_id: Optional[str] = typer.Argument(
-        None, help="Focus on a specific profile or rule node"
-    ),
-    project: str = typer.Option(
-        None, "--project", "-p", help="Project name"
-    ),
-    path: Path = typer.Option(
-        Path("."), "--path", help="Project path"
-    ),
+    node_id: Optional[str] = typer.Argument(None, help="Focus on a specific profile or rule node"),
+    project: str = typer.Option(None, "--project", "-p", help="Project name"),
+    path: Path = typer.Option(Path("."), "--path", help="Project path"),
     output: Path = typer.Option(
-        None, "--output", "-o",
-        help="Output HTML file path (default: target/dq_report.html)"
+        None, "--output", "-o", help="Output HTML file path (default: target/dq_report.html)"
     ),
-    no_open: bool = typer.Option(
-        False, "--no-open", help="Don't auto-open browser"
-    ),
+    no_open: bool = typer.Option(False, "--no-open", help="Don't auto-open browser"),
     ascii_output: bool = typer.Option(
         False, "--ascii", help="Print ASCII report to stdout instead of HTML"
     ),
@@ -6527,7 +6610,8 @@ def dq(
     """
     from seeknal.workflow.dag import DAGBuilder, CycleDetectedError, MissingDependencyError
     from seeknal.dag.dq import (
-        DQDataBuilder, DQVisualizationError,
+        DQDataBuilder,
+        DQVisualizationError,
         render_dq_ascii as _render_dq_ascii,
         generate_dq_html as _generate_dq_html,
     )
@@ -6555,6 +6639,7 @@ def dq(
         state = load_state(state_path)
         if state is None:
             from seeknal.workflow.state import RunState
+
             state = RunState()
             _echo_warning("No run state found. Run 'seeknal run' first for DQ data.")
 
@@ -6587,12 +6672,8 @@ def dq(
 
 @entity_app.command("list")
 def entity_list(
-    project: str = typer.Option(
-        None, "--project", "-p", help="Project name"
-    ),
-    path: Path = typer.Option(
-        Path("."), "--path", help="Project path"
-    ),
+    project: str = typer.Option(None, "--project", "-p", help="Project name"),
+    path: Path = typer.Option(Path("."), "--path", help="Project path"),
 ):
     """List all consolidated entities in the feature store.
 
@@ -6607,7 +6688,9 @@ def entity_list(
 
     feature_store_path = path / "target" / "feature_store"
     if not feature_store_path.exists():
-        _echo_info("No consolidated entities found. Run 'seeknal run' with feature group nodes first.")
+        _echo_info(
+            "No consolidated entities found. Run 'seeknal run' with feature group nodes first."
+        )
         return
 
     entities_found = False
@@ -6621,9 +6704,7 @@ def entity_list(
 
         entities_found = True
         fg_count = len(catalog.feature_groups)
-        total_features = sum(
-            len(fg.features) for fg in catalog.feature_groups.values()
-        )
+        total_features = sum(len(fg.features) for fg in catalog.feature_groups.values())
         parquet_exists = (entity_dir / "features.parquet").exists()
         status = "ready" if parquet_exists else "stale"
 
@@ -6635,18 +6716,16 @@ def entity_list(
         )
 
     if not entities_found:
-        _echo_info("No consolidated entities found. Run 'seeknal run' with feature group nodes first.")
+        _echo_info(
+            "No consolidated entities found. Run 'seeknal run' with feature group nodes first."
+        )
 
 
 @entity_app.command("show")
 def entity_show(
     name: str = typer.Argument(..., help="Entity name to inspect"),
-    project: str = typer.Option(
-        None, "--project", "-p", help="Project name"
-    ),
-    path: Path = typer.Option(
-        Path("."), "--path", help="Project path"
-    ),
+    project: str = typer.Option(None, "--project", "-p", help="Project name"),
+    path: Path = typer.Option(Path("."), "--path", help="Project path"),
 ):
     """Display detailed catalog for a consolidated entity.
 
@@ -6691,12 +6770,8 @@ def entity_show(
 
 @app.command()
 def consolidate(
-    project: str = typer.Option(
-        None, "--project", "-p", help="Project name"
-    ),
-    path: Path = typer.Option(
-        Path("."), "--path", help="Project path"
-    ),
+    project: str = typer.Option(None, "--project", "-p", help="Project name"),
+    path: Path = typer.Option(Path("."), "--path", help="Project path"),
     prune: bool = typer.Option(
         False, "--prune", help="Remove stale FG columns not in current manifest"
     ),

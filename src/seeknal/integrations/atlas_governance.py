@@ -22,10 +22,14 @@ single Atlas configuration drives both surfaces.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import getpass
+import json
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import httpx
@@ -47,6 +51,10 @@ __all__ = [
     "referenced_tables",
     "mask_value",
     "MASK_TOKEN",
+    "credentials_path",
+    "user_token_from_credentials",
+    "user_sub_from_credentials",
+    "user_email_from_credentials",
 ]
 
 #: Replacement rendered for a fully masked value.
@@ -63,6 +71,125 @@ def _fail_open_default() -> bool:
     """
 
     return os.getenv("ATLAS_FAIL_OPEN", "").strip().lower() in _TRUTHY
+
+
+#: Default location of the seeknal credentials file written by the login flow.
+_DEFAULT_CREDENTIALS_PATH = "~/.config/seeknal/credentials.json"
+
+
+def credentials_path() -> Path:
+    """Return the resolved path to the seeknal credentials file.
+
+    Honours the ``SEEKNAL_CREDENTIALS_PATH`` environment override, falling back to
+    ``~/.config/seeknal/credentials.json``. The file holds the JSON written by the
+    login flow (``access_token``, ``refresh_token``, ...); this function does not
+    require the file to exist.
+    """
+
+    override = os.getenv("SEEKNAL_CREDENTIALS_PATH", "").strip()
+    raw = override or _DEFAULT_CREDENTIALS_PATH
+    return Path(raw).expanduser()
+
+
+def _read_credentials() -> dict[str, Any] | None:
+    """Load the credentials JSON, returning ``None`` if absent or invalid.
+
+    Never raises: a missing file, unreadable file, or malformed JSON all yield
+    ``None`` so callers can treat "logged out" and "broken creds" uniformly.
+    """
+
+    path = credentials_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _user_token_from_credentials() -> str | None:
+    """Return the stored ``access_token`` from the credentials file, or ``None``.
+
+    Used by :func:`create_governance_gate_from_env` so per-user identity flows to
+    Atlas once the user has logged in. Returns ``None`` (never raises) when the
+    credentials file is missing, malformed, or carries no usable token.
+    """
+
+    creds = _read_credentials()
+    if not creds:
+        return None
+    token = creds.get("access_token")
+    if isinstance(token, str) and token.strip():
+        return token
+    return None
+
+
+#: Public alias for reuse by the CLI; mirrors the private gate-side reader.
+user_token_from_credentials = _user_token_from_credentials
+
+
+def _decode_jwt_payload(token: str) -> dict[str, Any] | None:
+    """Base64url-decode a JWT's payload segment into a dict.
+
+    No signature verification is performed — the Atlas backend validates the token;
+    this only needs to read claims locally. Returns ``None`` (never raises) when the
+    token is not a well-formed three-segment JWT or the payload is not a JSON object.
+    """
+
+    if not isinstance(token, str):
+        return None
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    segment = parts[1]
+    padding = "=" * (-len(segment) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(segment + padding)
+        payload = json.loads(raw)
+    except (ValueError, TypeError, binascii.Error):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def user_sub_from_credentials() -> str | None:
+    """Return the ``sub`` claim of the stored access token, or ``None``.
+
+    Reads the credentials file, base64url-decodes the JWT payload (no signature
+    check), and extracts the ``sub`` claim. Returns ``None`` (never raises) when the
+    file is absent/invalid, the token is not a JWT, or no ``sub`` claim is present.
+    """
+
+    token = _user_token_from_credentials()
+    if not token:
+        return None
+    payload = _decode_jwt_payload(token)
+    if not payload:
+        return None
+    sub = payload.get("sub")
+    return sub if isinstance(sub, str) and sub else None
+
+
+def user_email_from_credentials() -> str | None:
+    """Return the caller's email from the stored access token, or ``None``.
+
+    Prefers the ``email`` claim, falling back to ``preferred_username``. Returns
+    ``None`` (never raises) when no usable identity claim is available.
+    """
+
+    token = _user_token_from_credentials()
+    if not token:
+        return None
+    payload = _decode_jwt_payload(token)
+    if not payload:
+        return None
+    for claim in ("email", "preferred_username"):
+        value = payload.get(claim)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 @dataclass(frozen=True)
@@ -93,7 +220,9 @@ def create_governance_gate_from_env() -> "GovernanceGate | None":
         return None
 
     timeout = float(os.getenv("ATLAS_API_TIMEOUT_SECONDS", "10"))
-    token = os.getenv("ATLAS_API_TOKEN")
+    # An explicit service token wins; otherwise fall back to the logged-in user's
+    # token so per-user identity flows to Atlas. Both absent → token stays ``None``.
+    token = os.getenv("ATLAS_API_TOKEN") or _user_token_from_credentials()
     config = AtlasContractConfig(
         base_url=base_url.rstrip("/"),
         token=token,
