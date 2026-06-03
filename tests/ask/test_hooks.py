@@ -96,6 +96,39 @@ class TestSqlSecurityHook:
         result = asyncio.run(_sql_security_handler(hook_input))
         assert isinstance(result, HookResult)
 
+    # -- `query` alias: execute_sql accepts `sql` OR `query`; the hook must validate
+    #    whichever the tool will actually run (regression for the query-alias hard-block) --
+
+    def test_allows_valid_select_via_query_alias(self):
+        """A model that passes only `query=` (no `sql`) must still be allowed."""
+        hook_input = HookInput(
+            event=HookEvent.PRE_TOOL_USE.value,
+            tool_name="execute_sql",
+            tool_input={"query": "SELECT * FROM customers"},
+        )
+        result = asyncio.run(_sql_security_handler(hook_input))
+        assert result.allow is True
+
+    def test_allows_query_alias_when_sql_is_none(self):
+        """Regression: sql=None + query=... must not hard-block (was NoneType.strip())."""
+        hook_input = HookInput(
+            event=HookEvent.PRE_TOOL_USE.value,
+            tool_name="execute_sql",
+            tool_input={"sql": None, "query": "SELECT 1"},
+        )
+        result = asyncio.run(_sql_security_handler(hook_input))
+        assert result.allow is True
+
+    def test_blocks_dangerous_function_via_query_alias(self):
+        """The guard must still validate the aliased SQL, not wave it through."""
+        hook_input = HookInput(
+            event=HookEvent.PRE_TOOL_USE.value,
+            tool_name="execute_sql",
+            tool_input={"query": "SELECT read_parquet('/etc/passwd')"},
+        )
+        result = asyncio.run(_sql_security_handler(hook_input))
+        assert result.allow is False
+
 
 # ---------------------------------------------------------------------------
 # POST_TOOL_USE: SQL self-correction hook tests

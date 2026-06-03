@@ -34,7 +34,12 @@ async def _sql_security_handler(hook_input: HookInput) -> HookResult:
     try:
         from seeknal.ask.security import validate_sql_for_agent
 
-        sql = hook_input.tool_input.get("sql", "")
+        # execute_sql accepts either `sql` or the `query` alias; mirror that fallback
+        # here so the PRE_TOOL_USE hook validates the SQL the tool will actually run.
+        # (Without this, a model that passes only `query=` yields sql=None and
+        # validate_sql_for_agent(None) raises AttributeError, hard-blocking every query.)
+        tool_input = hook_input.tool_input or {}
+        sql = tool_input.get("sql") or tool_input.get("query") or ""
         validate_sql_for_agent(sql)
         return HookResult(allow=True)
     except ValueError as e:
