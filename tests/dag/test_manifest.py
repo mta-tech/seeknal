@@ -216,3 +216,37 @@ class TestManifest:
         has_cycle, cycle_path = manifest.detect_cycles()
         assert has_cycle is True
         assert len(cycle_path) > 0
+
+    def test_adjacency_cache_reflects_edges_added_after_first_query(self):
+        """Regression: adjacency must stay correct when edges are added
+        after the cache has been warmed.
+
+        ``build_manifest_from_dag`` adds every node first, then every edge.
+        Adding a node warms the adjacency cache (via cache invalidation),
+        so the cache gets populated while the graph still has no edges.
+        Partial per-node invalidation used to leave stale empty entries —
+        ``get_downstream_nodes`` only rebuilt when the cache was *entirely*
+        empty — so every node reported zero downstream. Kahn's algorithm in
+        ``DAGRunner`` then misreported a perfectly acyclic DAG as cyclic.
+        """
+        manifest = Manifest(project="test_project")
+        manifest.add_node(Node(id="source.a", name="a", node_type=NodeType.SOURCE))
+        manifest.add_node(
+            Node(id="transform.b", name="b", node_type=NodeType.TRANSFORM)
+        )
+        manifest.add_node(
+            Node(id="exposure.c", name="c", node_type=NodeType.EXPOSURE)
+        )
+
+        # Warm the caches while the graph still has no edges.
+        assert manifest.get_downstream_nodes("source.a") == set()
+
+        # Edges are added after the nodes (and after the cache was warmed).
+        manifest.add_edge("source.a", "transform.b")
+        manifest.add_edge("transform.b", "exposure.c")
+
+        # Adjacency must reflect the new edges, not the stale empty snapshot.
+        assert manifest.get_downstream_nodes("source.a") == {"transform.b"}
+        assert manifest.get_downstream_nodes("transform.b") == {"exposure.c"}
+        assert manifest.get_upstream_nodes("exposure.c") == {"transform.b"}
+        assert manifest.get_upstream_nodes("transform.b") == {"source.a"}

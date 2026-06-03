@@ -1,8 +1,9 @@
 """Tests for the verbatim re-ask short-circuit gate.
 
 When the user asks the IDENTICAL question twice in a row, the agent harness
-must short-circuit BEFORE any LLM/tool call and return the prior answer with
-a small bilingual restate notice. See ``.omc/specs/autopilot-verbatim-restate-gate.md``.
+must short-circuit BEFORE any LLM/tool call and return the prior answer
+verbatim — a silent cache, no banner or meta-commentary.
+See ``.omc/specs/autopilot-verbatim-restate-gate.md``.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from seeknal.ask.agents.tools._context import (
     lookup_prior_turn_answer,
     record_prior_turn_answer,
     reset_turn_governor,
+    seed_prior_turn_from_history,
     set_tool_context,
 )
 
@@ -124,18 +126,18 @@ def test_ac8_lookup_returns_none_when_prior_answer_empty(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# AC-13: bilingual prefix
+# AC-13: restate is a silent passthrough (no banner)
 # ---------------------------------------------------------------------------
 
 
-def test_ac13_restate_response_contains_bilingual_notice():
-    """AC-13: the restate response includes Indonesian + English notice text."""
-    wrapped = build_verbatim_restate_response("Total = 42")
-    assert "Pertanyaan ini sama dengan giliran sebelumnya" in wrapped
-    assert "This question is the same as the prior turn" in wrapped
-    assert "Total = 42" in wrapped
-    assert "Jika Anda ingin data baru" in wrapped
-    assert "If you wanted fresh data" in wrapped
+def test_ac13_restate_response_returns_prior_answer_unchanged():
+    """The restate response is the prior answer verbatim — no banner, no
+    meta-commentary. A verbatim re-ask behaves as a silent cache."""
+    restate = build_verbatim_restate_response("Total = 42")
+    assert restate == "Total = 42"
+    # The old bilingual notice must not reappear.
+    assert "giliran sebelumnya" not in restate
+    assert "the same as the prior turn" not in restate
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +152,91 @@ def test_reset_turn_governor_preserves_prior_turn_pair(tmp_path: Path):
     reset_turn_governor("Q2")
     assert getattr(ctx.repl, "_seeknal_prior_turn_question") == "q1"
     assert getattr(ctx.repl, "_seeknal_prior_turn_answer") == "A1"
+
+
+# ---------------------------------------------------------------------------
+# seed_prior_turn_from_history — gateway REPL-rebuild fix
+# ---------------------------------------------------------------------------
+# Regression for the gateway bug: create_agent rebuilds the REPL every turn,
+# so record_prior_turn_answer's in-memory pair never survives. The verbatim
+# gate was permanently dormant on gateway/Telegram sessions. seed_prior_turn_
+# from_history rehydrates the pair from the persisted message_history.
+
+
+def _history_pair(question: str, answer: str) -> list:
+    """Build a [ModelRequest, ModelResponse] message_history slice."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        UserPromptPart,
+    )
+
+    return [
+        ModelRequest(parts=[UserPromptPart(content=question)]),
+        ModelResponse(parts=[TextPart(content=answer)]),
+    ]
+
+
+def test_seed_populates_prior_turn_from_history(tmp_path: Path):
+    """A fresh REPL with no prior pair gets one seeded from message_history."""
+    ctx = _make_ctx(tmp_path)
+    history = _history_pair("Berapa NIE 2024?", "Total NIE 2024: 50")
+
+    # Fresh REPL — nothing recorded yet (simulates the per-turn rebuild).
+    assert lookup_prior_turn_answer("Berapa NIE 2024?") is None
+
+    seed_prior_turn_from_history(history)
+
+    # After seeding, the verbatim gate's lookup now resolves.
+    assert lookup_prior_turn_answer("Berapa NIE 2024?") == "Total NIE 2024: 50"
+
+
+def test_seed_empty_history_is_noop(tmp_path: Path):
+    """No history → nothing seeded, lookup stays None, no crash."""
+    _make_ctx(tmp_path)
+    seed_prior_turn_from_history([])
+    seed_prior_turn_from_history(None)
+    assert lookup_prior_turn_answer("anything") is None
+
+
+def test_seed_triple_ask_does_not_compound(tmp_path: Path):
+    """A restate returns the prior answer verbatim (no banner), so seeding
+    from a history whose last answer was itself a restate stores the exact
+    same canonical text — a triple-ask can never compound."""
+    _make_ctx(tmp_path)
+    canonical = "Total NIE 2024: 50"
+    # A restate of `canonical` is byte-identical to `canonical`.
+    restated = build_verbatim_restate_response(canonical)
+    assert restated == canonical
+    history = _history_pair("Berapa NIE 2024?", restated)
+
+    seed_prior_turn_from_history(history)
+
+    stored = lookup_prior_turn_answer("Berapa NIE 2024?")
+    assert stored == canonical
+
+
+def test_seed_takes_the_most_recent_turn(tmp_path: Path):
+    """With multiple turns in history, seeding uses the latest (question, answer)."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        UserPromptPart,
+    )
+
+    _make_ctx(tmp_path)
+    history = [
+        ModelRequest(parts=[UserPromptPart(content="old question")]),
+        ModelResponse(parts=[TextPart(content="old answer")]),
+        ModelRequest(parts=[UserPromptPart(content="new question")]),
+        ModelResponse(parts=[TextPart(content="new answer")]),
+    ]
+    seed_prior_turn_from_history(history)
+
+    assert lookup_prior_turn_answer("new question") == "new answer"
+    assert lookup_prior_turn_answer("old question") is None
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +315,8 @@ async def _stream_ask_with_stub_one_pass(
 def test_ac9_verbatim_reask_short_circuits_without_calling_execute_sql(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """AC-9: identical question on turn 2 yields restate prefix, no tool calls."""
+    """AC-9: identical question on turn 2 returns the prior answer verbatim,
+    no tool calls — a silent cache, no banner."""
     ctx = _make_ctx(tmp_path)
     execute_sql = MagicMock()
 
@@ -250,10 +338,11 @@ def test_ac9_verbatim_reask_short_circuits_without_calling_execute_sql(
     assert execute_sql.call_count == 1, (
         "execute_sql must only be called for the FIRST turn"
     )
-    # Turn 1 returns the fresh answer; turn 2 returns the restate.
+    # Turn 1 returns the fresh answer; turn 2 returns the SAME answer
+    # verbatim — silent cache, no banner / meta-commentary.
     assert "42 NIE" in answers[0]
-    assert "Pertanyaan ini sama" in answers[1]
-    assert "A1: 42 NIE" in answers[1]
+    assert answers[1] == answers[0]
+    assert "Pertanyaan ini sama" not in answers[1]
 
 
 def test_ac10_different_questions_both_execute_normally(
@@ -297,12 +386,8 @@ def test_ac11_triple_identical_question_short_circuits_twice(
 
     assert one_pass_calls == 1, "Only the first turn invokes the agent loop"
     assert execute_sql.call_count == 1
-    assert "Pertanyaan ini sama" not in answers[0]
-    assert "Pertanyaan ini sama" in answers[1]
-    assert "Pertanyaan ini sama" in answers[2]
-    # Each restated turn still embeds the original answer.
-    assert "A1" in answers[1]
-    assert "A1" in answers[2]
+    # Every gated turn returns the prior answer verbatim — no banner.
+    assert answers[0] == answers[1] == answers[2] == "A1"
 
 
 def test_ac12_tool_error_payload_does_not_lock_in_bad_answer(
@@ -417,12 +502,11 @@ def test_ac14_streaming_gate_appends_synthesized_history_pair(
         p for p in appended_request.parts if isinstance(p, UserPromptPart)
     ]
     assert user_parts and user_parts[0].content == "Q1?"
-    # The synthesized response carries the bilingual restate text.
+    # The synthesized response carries the prior answer verbatim.
     text_parts = [p for p in appended_response.parts if isinstance(p, TextPart)]
     assert text_parts
     text_content = text_parts[0].content
-    assert "Pertanyaan ini sama" in text_content
-    assert "A1" in text_content
+    assert text_content == "A1"
 
 
 # ---------------------------------------------------------------------------
@@ -483,11 +567,11 @@ def test_ac15_gateway_gate_persists_synthesized_history(
 
     events = asyncio.run(_drive())
 
-    # Sanity — the gate did emit the restate answer event.
+    # Sanity — the gate did emit the restate answer event (prior answer
+    # verbatim, no banner).
     answer_events = [e for e in events if e.get("type") == "answer"]
     assert answer_events
-    assert "Pertanyaan ini sama" in answer_events[0]["data"]
-    assert "A1: 42 NIE" in answer_events[0]["data"]
+    assert answer_events[0]["data"] == "A1: 42 NIE"
 
     # The synthesized pair must be on disk via store.load_messages.
     loaded = store.load_messages(session_id)
@@ -500,23 +584,23 @@ def test_ac15_gateway_gate_persists_synthesized_history(
     ]
     assert user_parts and user_parts[0].content == "Q1?"
     text_parts = [p for p in appended_response.parts if isinstance(p, TextPart)]
-    assert text_parts and "Pertanyaan ini sama" in text_parts[0].content
-    assert "A1: 42 NIE" in text_parts[0].content
+    assert text_parts and text_parts[0].content == "A1: 42 NIE"
 
 
 # ---------------------------------------------------------------------------
-# AC-16: triple-ask does NOT recursively wrap the wrapper
+# AC-16: triple-ask stays canonical — every gated turn returns the same answer
 # ---------------------------------------------------------------------------
 
 
-def test_ac16_triple_ask_stores_unwrapped_prior_answer(
+def test_ac16_triple_ask_stores_canonical_prior_answer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """AC-16: stored prior answer stays canonical across multiple gated turns.
+    """AC-16: the answer stays canonical across multiple gated turns.
 
-    Turn 1 records "A1". Turns 2 and 3 both short-circuit. The user-facing
-    restate IS the wrapped form, but ``_seeknal_prior_turn_answer`` after
-    turn 3 must still be exactly "A1" — never a wrapper-around-wrapper.
+    Turn 1 records "A1". Turns 2 and 3 both short-circuit. Because a
+    restate returns the prior answer verbatim (no banner), every turn's
+    answer is exactly "A1" and ``_seeknal_prior_turn_answer`` after turn
+    3 is still exactly "A1" — no compounding is even possible.
     """
     ctx = _make_ctx(tmp_path)
 
@@ -532,14 +616,9 @@ def test_ac16_triple_ask_stores_unwrapped_prior_answer(
 
     # Sanity: only the first turn invoked the agent loop.
     assert one_pass_calls == 1
-    # The restate returned to the user IS the wrapped form on turn 3.
-    assert "Pertanyaan ini sama" in answers[2]
-    assert "A1" in answers[2]
-    # But the stored prior answer is the canonical unwrapped value.
+    # Every turn returns the identical canonical answer — no banner.
+    assert answers[0] == answers[1] == answers[2] == "A1"
+    # The stored prior answer is still the canonical value.
     stored = getattr(ctx.repl, "_seeknal_prior_turn_answer", None)
-    assert stored == "A1", (
-        "Stored prior must remain the unwrapped original answer; otherwise a "
-        "triple-ask would recursively wrap the bilingual prefix/suffix."
-    )
-    # And it must NOT contain the bilingual markers — proving no compounding.
+    assert stored == "A1"
     assert "Pertanyaan ini sama" not in stored

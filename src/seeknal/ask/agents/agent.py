@@ -208,7 +208,11 @@ def create_agent(
     from seeknal.ask.agents.subagents import get_subagent_configs
     from seeknal.ask.agents.tools.ask_user import interactive_ask_user
     from seeknal.ask.agents.tools.toolset import create_ask_toolset
-    from seeknal.ask.processors import MicrocompactProcessor, SqlResultCompactor
+    from seeknal.ask.processors import (
+        MicrocompactProcessor,
+        SqlResultCompactor,
+        ensure_trailing_model_request,
+    )
     from seeknal.ask.security import configure_safe_connection
     from seeknal.cli.repl import REPL
     from seeknal.ask.config import (
@@ -499,6 +503,13 @@ a plain-language follow-up in the final response; do not call `ask_user`.
             )
         )
 
+    # Safety net — registered LAST so it runs after every other processor and the
+    # context-manager summarizer: guarantee the processed history ends with a
+    # ModelRequest so compaction/summarization can never trip pydantic-ai's
+    # "Processed history must end with a `ModelRequest`" invariant and crash the
+    # turn. No-op on well-formed history.
+    history_processors.append(ensure_trailing_model_request)
+
     plan_enabled = _resolve_auto_bool(
         plan_config["enabled"],
         default=(environment == "interactive" and not analysis_toolset),
@@ -674,10 +685,15 @@ def compact_history_for_analysis_mode(message_history: list) -> None:
     except RuntimeError:
         return
 
-    from seeknal.ask.processors import MicrocompactProcessor, SqlResultCompactor
+    from seeknal.ask.processors import (
+        MicrocompactProcessor,
+        SqlResultCompactor,
+        ensure_trailing_model_request,
+    )
 
     compacted = MicrocompactProcessor(keep_recent_turns=1)(message_history)
     compacted = SqlResultCompactor(min_chars=250)(compacted)
+    compacted = ensure_trailing_model_request(compacted)
     message_history.clear()
     message_history.extend(compacted)
 

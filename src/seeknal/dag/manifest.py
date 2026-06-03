@@ -163,23 +163,24 @@ class Manifest:
         return self.nodes.get(node_id)
 
     def _invalidate_node_cache(self, node_id: str) -> None:
-        """Invalidate cache for nodes affected by a change to node_id.
+        """Invalidate the adjacency caches after a graph mutation.
 
-        Clears caches for the node and all its upstream and downstream neighbors,
-        providing more efficient cache management than clearing all caches.
+        Both caches are rebuilt lazily and atomically — :meth:`_build_adjacency_lists`
+        recomputes every node in one pass. Partial per-node invalidation is
+        unsafe here: popping only the mutated node's key leaves stale entries
+        for transitively-affected nodes, and the lazy rebuild in
+        ``get_upstream_nodes`` / ``get_downstream_nodes`` only fires when the
+        cache dict is *completely* empty. A popped key would then fall through
+        to the ``.get(node_id, set())`` default and silently report no
+        neighbors. Clearing both caches entirely guarantees the next query
+        does a full, correct rebuild.
 
         Args:
-            node_id: The ID of the node that changed.
+            node_id: The ID of the node that changed (unused; kept for a
+                stable call signature).
         """
-        # Collect all affected nodes: the node itself and all its neighbors
-        affected_nodes = {node_id}
-        affected_nodes.update(self.get_upstream_nodes(node_id))
-        affected_nodes.update(self.get_downstream_nodes(node_id))
-
-        # Clear caches only for affected nodes
-        for node in affected_nodes:
-            self._upstream_cache.pop(node, None)
-            self._downstream_cache.pop(node, None)
+        self._upstream_cache = {}
+        self._downstream_cache = {}
 
     def _build_adjacency_lists(self) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
         """Build upstream and downstream adjacency lists."""

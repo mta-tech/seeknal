@@ -423,10 +423,18 @@ async def _run_agent_inner(
         record_prior_turn_answer,
         reset_report_approval,
         reset_turn_governor,
+        seed_prior_turn_from_history,
     )
 
     reset_report_approval()
     reset_turn_governor(question)
+
+    # The gateway rebuilds the REPL on every turn (create_agent above), so
+    # the in-memory prior-turn pair from record_prior_turn_answer never
+    # survives between turns. Re-seed it from the persisted message_history
+    # so the verbatim re-ask gate below actually fires on gateway/Telegram
+    # sessions (without this it is permanently dormant here).
+    seed_prior_turn_from_history(message_history)
 
     # Verbatim re-ask short-circuit: same question as the prior turn returns
     # the prior answer with a bilingual restate notice BEFORE any LLM/tool
@@ -683,6 +691,42 @@ async def _run_agent_inner(
             answer = result.output or deterministic
         except UsageLimitExceeded:
             answer = deterministic
+        record_prior_turn_answer(question=question, answer=answer)
+        yield {"type": "answer", "data": answer}
+
+    except Exception as exc:
+        # Recoverable harness errors must not 500 the gateway turn:
+        #  - UserError "Processed history must end with a `ModelRequest`"
+        #    (context compaction/summarization left a ModelResponse tail), and
+        #  - UnexpectedModelBehavior "exceeded max retries" (a tool gave up).
+        # Repair the history tail and answer from gathered evidence; re-raise
+        # anything else unchanged.
+        from pydantic_ai.exceptions import (
+            UnexpectedModelBehavior,
+            UserError,
+        )
+
+        _exc_msg = str(exc).lower()
+        if not (
+            isinstance(exc, (UserError, UnexpectedModelBehavior))
+            and (
+                "processed history must end with" in _exc_msg
+                or "exceeded max retries" in _exc_msg
+                or "max retries count" in _exc_msg
+                or "exceeded maximum retries" in _exc_msg
+            )
+        ):
+            raise
+        from seeknal.ask.agents.tools._context import synthesize_evidence_fallback
+
+        # Answer deterministically from evidence already gathered — no further
+        # model call, so the broken history is never re-fed. Nothing reads
+        # message_history after this branch (the finally block saves only when a
+        # run `result` exists), so repairing it here would be dead code.
+        answer = synthesize_evidence_fallback(
+            "a recoverable harness error interrupted the run; "
+            "answering from the evidence gathered so far"
+        )
         record_prior_turn_answer(question=question, answer=answer)
         yield {"type": "answer", "data": answer}
 

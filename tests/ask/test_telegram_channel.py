@@ -205,3 +205,107 @@ async def test_handle_message_uses_public_session_when_configured(tmp_path):
 
     channel._run_agent.assert_awaited()
     assert channel._run_agent.await_args.args[0] == "public-session"
+
+
+# ---------------------------------------------------------------------------
+# Document upload: suffix categories + ZIP extraction safety
+# ---------------------------------------------------------------------------
+
+
+def test_upload_suffixes_accept_png_pdf_txt_zip():
+    """png/pdf/txt/zip must be accepted document types (not rejected)."""
+    from seeknal.ask.gateway.channels.telegram import (
+        _ARCHIVE_SUFFIXES,
+        _TABULAR_SUFFIXES,
+        _UPLOAD_ALLOWED_SUFFIXES,
+        _VISION_DOC_SUFFIXES,
+    )
+
+    for ext in (".png", ".pdf", ".txt", ".zip"):
+        assert ext in _UPLOAD_ALLOWED_SUFFIXES, f"{ext} should be accepted"
+    # Categories are disjoint — a suffix routes to exactly one path.
+    assert not (_TABULAR_SUFFIXES & _VISION_DOC_SUFFIXES)
+    assert not (_TABULAR_SUFFIXES & _ARCHIVE_SUFFIXES)
+    assert not (_VISION_DOC_SUFFIXES & _ARCHIVE_SUFFIXES)
+    # The union is exactly the allow-list.
+    assert (
+        _TABULAR_SUFFIXES | _VISION_DOC_SUFFIXES | _ARCHIVE_SUFFIXES
+    ) == _UPLOAD_ALLOWED_SUFFIXES
+    # png/pdf/txt route to the vision path; zip is its own category.
+    assert {".png", ".pdf", ".txt"} <= _VISION_DOC_SUFFIXES
+    assert ".zip" in _ARCHIVE_SUFFIXES
+
+
+def test_extract_archive_valid_zip(tmp_path):
+    """A normal ZIP extracts to a subdir and lists its members."""
+    import zipfile
+
+    channel = TelegramChannel(Path(tmp_path), token="token")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    zip_path = staging / "batch.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("a.csv", "x,y\n1,2\n")
+        zf.writestr("nested/b.txt", "hello")
+
+    extract_dir, members, err = channel._extract_archive(zip_path, staging)
+
+    assert err is None
+    assert extract_dir is not None and extract_dir.is_dir()
+    assert sorted(members) == ["a.csv", "nested/b.txt"]
+    assert (extract_dir / "a.csv").read_text() == "x,y\n1,2\n"
+    assert (extract_dir / "nested" / "b.txt").read_text() == "hello"
+
+
+def test_extract_archive_rejects_zip_slip(tmp_path):
+    """A member with a ../ path that escapes the extract dir aborts extraction."""
+    import zipfile
+
+    channel = TelegramChannel(Path(tmp_path), token="token")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    zip_path = staging / "evil.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("../../escape.txt", "pwned")
+
+    extract_dir, members, err = channel._extract_archive(zip_path, staging)
+
+    assert extract_dir is None
+    assert members == []
+    assert err is not None and "escape" in err.lower()
+
+
+def test_extract_archive_rejects_too_many_entries(tmp_path):
+    """An archive over the entry-count cap is refused."""
+    import zipfile
+
+    from seeknal.ask.gateway.channels.telegram import _ARCHIVE_MAX_ENTRIES
+
+    channel = TelegramChannel(Path(tmp_path), token="token")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    zip_path = staging / "bomb.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for i in range(_ARCHIVE_MAX_ENTRIES + 1):
+            zf.writestr(f"f{i}.csv", "a\n1\n")
+
+    extract_dir, members, err = channel._extract_archive(zip_path, staging)
+
+    assert extract_dir is None
+    assert members == []
+    assert err is not None and str(_ARCHIVE_MAX_ENTRIES) in err
+
+
+def test_extract_archive_rejects_bad_zip(tmp_path):
+    """A non-ZIP file produces a clean error, not a crash."""
+    channel = TelegramChannel(Path(tmp_path), token="token")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    not_a_zip = staging / "fake.zip"
+    not_a_zip.write_text("this is plainly not a zip archive")
+
+    extract_dir, members, err = channel._extract_archive(not_a_zip, staging)
+
+    assert extract_dir is None
+    assert members == []
+    assert err is not None and "zip" in err.lower()

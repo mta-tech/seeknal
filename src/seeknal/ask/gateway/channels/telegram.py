@@ -10,6 +10,7 @@ Configure: TELEGRAM_BOT_TOKEN environment variable
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -31,7 +32,20 @@ _MAX_MESSAGE_LENGTH = 4096
 
 # Document upload constraints (match the gateway /upload endpoint)
 _UPLOAD_MAX_BYTES = 200 * 1024 * 1024  # 200 MB
-_UPLOAD_ALLOWED_SUFFIXES = {".xlsx", ".csv", ".tsv", ".json"}
+# Tabular files → the data-ingest skill (read_tabular → write_ingested_table).
+_TABULAR_SUFFIXES = {".xlsx", ".csv", ".tsv", ".json"}
+# Image / document files → the record-entry (vision/extraction) skill.
+_VISION_DOC_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif", ".pdf", ".txt",
+}
+# Archives → unpacked, then each entry routed by its own suffix.
+_ARCHIVE_SUFFIXES = {".zip"}
+# Union of every accepted document suffix; anything else is rejected.
+_UPLOAD_ALLOWED_SUFFIXES = (
+    _TABULAR_SUFFIXES | _VISION_DOC_SUFFIXES | _ARCHIVE_SUFFIXES
+)
+# Archive-extraction guards: cap entry count to bound a zip-bomb / fan-out.
+_ARCHIVE_MAX_ENTRIES = 50
 
 # Image upload constraints (routed into record-entry skill)
 _IMAGE_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
@@ -348,6 +362,113 @@ class TelegramChannel:
             except Exception:
                 await update.message.reply_text(f"❌ Error: {e}")
 
+    # ------------------------------------------------------------------
+    # Manifest-aware photo intake
+    # ------------------------------------------------------------------
+    # When the project ships ``data/telegram_uploads/ingestion_manifest.json``
+    # with a route whose ``file_pattern`` matches the user's caption, the
+    # destination table is already decided. Drive the agent straight to
+    # ``extract_from_image`` -> ``write_ingested_table`` -> ``execute_sql``
+    # verify, skipping the ``propose_record_table`` round-trip. Without a
+    # manifest hit, fall back to the legacy generic prompt.
+
+    def _load_ingestion_manifest(self) -> dict[str, Any] | None:
+        """Read the project's ``data/telegram_uploads/ingestion_manifest.json``.
+
+        Returns the parsed dict, or ``None`` when missing, unreadable, or
+        lacking a non-empty ``routes`` list.
+        """
+        manifest_path = (
+            self._project_path
+            / "data"
+            / "telegram_uploads"
+            / "ingestion_manifest.json"
+        )
+        if not manifest_path.exists():
+            return None
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "[telegram] failed to read ingestion_manifest.json: %s", exc
+            )
+            return None
+        if not isinstance(data, dict):
+            return None
+        routes = data.get("routes")
+        if not isinstance(routes, list) or not routes:
+            return None
+        return data
+
+    def _match_manifest_route(
+        self, hint_text: str, manifest: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return the manifest route whose ``file_pattern`` matches the hint.
+
+        Photos from Telegram do not carry meaningful filenames, so we match
+        the ``file_pattern`` token (``*order*`` -> ``order``) against the
+        lowercased caption text. Multiple routes may match — e.g. an
+        English token and its Indonesian alias both pointing at the same
+        ``target_table``. Such matches are collapsed: as long as every
+        match resolves to a single ``target_table`` the first one is
+        returned. Only a genuine ambiguity (matches spanning two or more
+        distinct target tables) returns ``None`` and defers to the legacy
+        generic flow.
+        """
+        if not hint_text:
+            return None
+        hint = hint_text.lower()
+        matched: list[dict[str, Any]] = []
+        for route in manifest.get("routes", []):
+            if not isinstance(route, dict):
+                continue
+            pattern = route.get("file_pattern", "")
+            if not isinstance(pattern, str):
+                continue
+            token = pattern.replace("*", "").strip().lower()
+            if not token:
+                continue
+            if token in hint:
+                matched.append(route)
+        if not matched:
+            return None
+        target_tables = {
+            str(route.get("target_table", "")).strip() for route in matched
+        }
+        if len(target_tables) == 1:
+            return matched[0]
+        return None
+
+    def _load_photo_intake_config(self) -> dict[str, Any]:
+        """Read ``telegram.photo_intake`` from ``seeknal_agent.yml``.
+
+        Defaults to ``require_confirmation=True`` (the safer setting) when
+        the file is missing, unreadable, or omits the key.
+        """
+        cfg_path = self._project_path / "seeknal_agent.yml"
+        if not cfg_path.exists():
+            cfg_path = self._project_path / "seeknal_agent.yaml"
+        if not cfg_path.exists():
+            return {"require_confirmation": True}
+        try:
+            import yaml
+
+            data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "[telegram] failed to read seeknal_agent.yml: %s", exc
+            )
+            return {"require_confirmation": True}
+        if not isinstance(data, dict):
+            return {"require_confirmation": True}
+        telegram_cfg = data.get("telegram") or {}
+        intake = telegram_cfg.get("photo_intake") or {}
+        return {
+            "require_confirmation": bool(
+                intake.get("require_confirmation", True)
+            )
+        }
+
     async def _handle_photo(self, update: Any, context: Any) -> None:
         """Handle photo uploads — stage and route into record-entry skill."""
         from telegram.constants import ChatAction
@@ -403,22 +524,91 @@ class TelegramChannel:
             return
 
         caption = (update.message.caption or "").strip()
-        user_prompt = (
-            "The user sent a photo via Telegram — most likely a fund-transfer "
-            "proof (BCA/Mandiri/BNI/BRI/GoPay/OVO/DANA/QRIS), a shop receipt, "
-            "or an order photo. Load the 'record-entry' skill and walk through "
-            f"the full workflow on this image:\n\n"
-            f"Absolute image path: {staged_path}\n"
+
+        manifest = self._load_ingestion_manifest()
+        matched_route = (
+            self._match_manifest_route(caption, manifest) if manifest else None
         )
-        if caption:
-            user_prompt += f"User caption / hint: {caption}\n"
-        user_prompt += (
-            "\nStart with `extract_from_image(image_path=<path>, hint=<caption "
-            "if any>)`, then `list_tables` + `propose_record_table`, then "
-            "`ask_user` until every required field is resolved, then "
-            "`write_ingested_table`. Strict clarification — do not record "
-            "until the draft is fully confirmed."
-        )
+
+        if matched_route:
+            target_table = str(matched_route.get("target_table", "")).strip()
+            required_cols = matched_route.get("required_columns") or []
+            if not isinstance(required_cols, list):
+                required_cols = []
+            require_confirmation = self._load_photo_intake_config()[
+                "require_confirmation"
+            ]
+            ingest_table = f"ingest_{target_table}"
+            cols_line = (
+                ", ".join(str(c) for c in required_cols)
+                if required_cols
+                else "(see manifest)"
+            )
+            logger.info(
+                "[telegram] manifest route matched: target=%s, confirm=%s",
+                target_table,
+                require_confirmation,
+            )
+
+            user_prompt = (
+                "The user sent a photo via Telegram and the project's "
+                "ingestion manifest routes this upload to a known canonical "
+                "table. The destination is already decided — do NOT call "
+                "`propose_record_table`.\n\n"
+                f"Absolute image path: {staged_path}\n"
+            )
+            if caption:
+                user_prompt += f"User caption / hint: {caption}\n"
+            user_prompt += (
+                f"\nCanonical destination: source.{target_table}\n"
+                f"Ingest staging table: {ingest_table}\n"
+                f"Required columns: {cols_line}\n\n"
+                "Workflow:\n"
+                "1. Call `extract_from_image(image_path=<path>, "
+                "hint=<caption if any>)`.\n"
+                "2. Coerce the extracted fields onto the required columns "
+                "listed above.\n"
+            )
+            if require_confirmation:
+                user_prompt += (
+                    "3. Show the draft row to the user in plain Indonesian "
+                    "and ask: Ya / Edit / Salah / Batal.\n"
+                    "4. After the user confirms, call "
+                    f"`write_ingested_table(table_name='{ingest_table}', "
+                    "mode='append', user_confirmed=True)`.\n"
+                )
+            else:
+                user_prompt += (
+                    "3. Auto-save is enabled — call "
+                    f"`write_ingested_table(table_name='{ingest_table}', "
+                    "mode='append', user_confirmed=True)` directly.\n"
+                )
+            user_prompt += (
+                "5. Verify by calling `execute_sql("
+                f"\"SELECT COUNT(*) FROM {ingest_table}\")` and quote the "
+                "row count in your reply. Never claim 'tersimpan' or "
+                "'saved' without this verification step.\n"
+                "Reply in plain Indonesian owner language."
+            )
+        else:
+            user_prompt = (
+                "The user sent a photo via Telegram — most likely a "
+                "fund-transfer proof "
+                "(BCA/Mandiri/BNI/BRI/GoPay/OVO/DANA/QRIS), a shop receipt, "
+                "or an order photo. Load the 'record-entry' skill and walk "
+                "through the full workflow on this image:\n\n"
+                f"Absolute image path: {staged_path}\n"
+            )
+            if caption:
+                user_prompt += f"User caption / hint: {caption}\n"
+            user_prompt += (
+                "\nStart with `extract_from_image(image_path=<path>, "
+                "hint=<caption if any>)`, then `list_tables` + "
+                "`propose_record_table`, then `ask_user` until every "
+                "required field is resolved, then `write_ingested_table`. "
+                "Strict clarification — do not record until the draft is "
+                "fully confirmed."
+            )
 
         try:
             await status_msg.edit_text("🧐 Reading the image...")
@@ -456,8 +646,198 @@ class TelegramChannel:
             except Exception:
                 await update.message.reply_text(f"❌ Error: {exc}")
 
+    # ------------------------------------------------------------------
+    # Step 7 — Telegram → heartbeat-inbox bridge
+    # ------------------------------------------------------------------
+    # The Telegram channel stages every uploaded file under
+    # ``target/ask_ingest/_staging/`` and runs the interactive ``data-ingest``
+    # skill (existing behavior, untouched). Optionally, projects that also
+    # run ``seeknal heartbeat`` can mirror the staged file into the
+    # heartbeat's inbox folder so the deterministic tick picks it up on
+    # its next scan. The bridge is a *copy*, not a move, so the interactive
+    # path keeps working in parallel.
+    #
+    # The lint contract in ``tests/heartbeat/test_telegram_bridge.py::
+    # test_no_telegram_imports_in_heartbeat`` forbids the reverse direction
+    # — heartbeat must never import from this module. We honour the same
+    # boundary from this side by reading ``HEARTBEAT.md`` inline rather
+    # than importing ``seeknal.heartbeat.config``.
+
+    def _inbox_drop_settings(self) -> dict[str, Any]:
+        """Return the Telegram → heartbeat-inbox bridge settings.
+
+        Returns a dict with two keys:
+
+        - ``enabled`` (bool): when False, :meth:`_copy_to_inbox` is a no-op
+          and the existing staging-only behavior is preserved.
+        - ``folder`` (str | None): when set, overrides HEARTBEAT.md's first
+          ``inbox_folders`` entry. ``None`` defers to that lookup and finally
+          to the ``inbox`` default.
+
+        Default is disabled so existing deployments keep their current
+        behavior. Projects opt in by subclassing or future config wiring.
+        """
+        return {"enabled": False, "folder": None}
+
+    def _copy_to_inbox(self, staged_path: Path) -> Path | None:
+        """Copy a staged Telegram upload into the heartbeat's inbox folder.
+
+        Returns the destination path on success, or ``None`` when the
+        bridge is disabled OR the resolved inbox path would escape the
+        project root (containment guard).
+
+        Folder resolution order:
+
+        1. ``_inbox_drop_settings()["folder"]`` (explicit override)
+        2. HEARTBEAT.md's first ``inbox_folders`` entry
+        3. ``inbox`` (project-root default)
+
+        On filename collision, appends a UTC timestamp to the stem so the
+        original uploaded name is preserved as the prefix. The staged file
+        itself is left in place.
+        """
+        settings = self._inbox_drop_settings()
+        if not settings.get("enabled"):
+            return None
+
+        folder_name = settings.get("folder")
+        if folder_name is None:
+            folder_name = (
+                self._read_inbox_folder_from_heartbeat_md() or "inbox"
+            )
+
+        # Containment guard: resolved inbox must stay under project root.
+        try:
+            project_root = self._project_path.resolve()
+            inbox_dir = (project_root / folder_name).resolve()
+            inbox_dir.relative_to(project_root)
+        except (ValueError, OSError):
+            logger.warning(
+                "[telegram] inbox drop refused — resolved path escapes "
+                "project root: %s",
+                folder_name,
+            )
+            return None
+
+        try:
+            inbox_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "[telegram] inbox drop refused — mkdir failed: %s", exc
+            )
+            return None
+
+        dest = inbox_dir / staged_path.name
+        if dest.exists():
+            from datetime import datetime, timezone
+
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            dest = inbox_dir / f"{staged_path.stem}.{ts}{staged_path.suffix}"
+
+        import shutil
+
+        try:
+            shutil.copy2(staged_path, dest)
+        except OSError as exc:
+            logger.warning("[telegram] inbox drop copy failed: %s", exc)
+            return None
+        return dest
+
+    def _read_inbox_folder_from_heartbeat_md(self) -> str | None:
+        """Best-effort: return HEARTBEAT.md's first ``inbox_folders`` entry.
+
+        Done inline so this module stays independent of the heartbeat
+        package surface; the lint contract on the heartbeat side prevents
+        the reverse import.
+        """
+        md = self._project_path / "HEARTBEAT.md"
+        if not md.exists():
+            return None
+        try:
+            text = md.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None
+        match = re.search(r"```yaml\s*(.*?)```", text, re.DOTALL)
+        body = match.group(1) if match else text
+        try:
+            import yaml
+
+            data = yaml.safe_load(body)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        folders = data.get("inbox_folders")
+        if isinstance(folders, list) and folders:
+            first = folders[0]
+            if isinstance(first, str) and first.strip():
+                return first.strip()
+        return None
+
+    def _extract_archive(
+        self, archive_path: Path, staging_dir: Path
+    ) -> tuple[Path | None, list[str], str | None]:
+        """Safely extract a ZIP into a staging subdirectory.
+
+        Returns ``(extract_dir, member_relpaths, error)``. On any guard
+        violation returns ``(None, [], error_message)``. Guards:
+
+        - entry-count cap (``_ARCHIVE_MAX_ENTRIES``) — bounds fan-out
+        - total-uncompressed-size cap (``_UPLOAD_MAX_BYTES``) — zip bomb
+        - zip-slip containment — every member must resolve inside the
+          extract dir; a ``../`` entry aborts the whole extraction
+        """
+        import shutil
+        import zipfile
+
+        extract_dir = staging_dir / f"{archive_path.stem}_unzip"
+        try:
+            with zipfile.ZipFile(archive_path) as zf:
+                infos = [i for i in zf.infolist() if not i.is_dir()]
+                if len(infos) > _ARCHIVE_MAX_ENTRIES:
+                    return None, [], (
+                        f"ZIP has {len(infos)} files; the limit is "
+                        f"{_ARCHIVE_MAX_ENTRIES}."
+                    )
+                total = sum(i.file_size for i in infos)
+                if total > _UPLOAD_MAX_BYTES:
+                    return None, [], (
+                        f"ZIP expands to {total / 1024 / 1024:.1f} MB; "
+                        f"the limit is 200 MB."
+                    )
+                extract_dir.mkdir(parents=True, exist_ok=True)
+                resolved_root = extract_dir.resolve()
+                members: list[str] = []
+                for info in infos:
+                    target = (extract_dir / info.filename).resolve()
+                    # zip-slip guard: the member must stay under extract_dir.
+                    try:
+                        target.relative_to(resolved_root)
+                    except ValueError:
+                        return None, [], (
+                            f"ZIP entry escapes the extract directory: "
+                            f"{info.filename}"
+                        )
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    members.append(info.filename)
+        except zipfile.BadZipFile:
+            return None, [], "That file is not a valid ZIP archive."
+        except OSError as exc:
+            return None, [], f"ZIP extraction failed: {exc}"
+        if not members:
+            return None, [], "The ZIP archive is empty."
+        return extract_dir, members, None
+
     async def _handle_document(self, update: Any, context: Any) -> None:
-        """Handle document uploads — stage file and trigger data-ingest skill."""
+        """Handle document uploads.
+
+        Routes by suffix: tabular files (.csv/.xlsx/.tsv/.json) into the
+        data-ingest skill; images / PDF / text into the record-entry
+        (vision) skill; ZIP archives are unpacked and each entry routed
+        by its own suffix.
+        """
         from telegram.constants import ChatAction
 
         doc = update.message.document
@@ -473,9 +853,15 @@ class TelegramChannel:
             chat_id, original_name, doc.file_size,
         )
 
-        if suffix not in _UPLOAD_ALLOWED_SUFFIXES:
+        if suffix in _TABULAR_SUFFIXES:
+            doc_category = "tabular"
+        elif suffix in _VISION_DOC_SUFFIXES:
+            doc_category = "vision"
+        elif suffix in _ARCHIVE_SUFFIXES:
+            doc_category = "archive"
+        else:
             await update.message.reply_text(
-                f"Sorry, I can't ingest '{suffix}' files. "
+                f"Sorry, I can't process '{suffix}' files. "
                 f"Supported: {', '.join(sorted(_UPLOAD_ALLOWED_SUFFIXES))}."
             )
             return
@@ -517,17 +903,51 @@ class TelegramChannel:
             return
 
         caption = (update.message.caption or "").strip()
-        user_prompt = (
-            f"The user uploaded a tabular file via Telegram. "
-            f"Absolute file path: {staged_path}. "
-            f"Please load the 'data-ingest' skill and walk through the ingestion "
-            f"workflow: use read_tabular to preview the file, propose a table "
-            f"name and business key via ask_user, write it via "
-            f"write_ingested_table, and save a reusable skill via "
-            f"save_ingestion_skill. "
-        )
+
+        if doc_category == "tabular":
+            user_prompt = (
+                f"The user uploaded a tabular file via Telegram. "
+                f"Absolute file path: {staged_path}. "
+                f"Please load the 'data-ingest' skill and walk through the "
+                f"ingestion workflow: use read_tabular to preview the file, "
+                f"propose a table name and business key via ask_user, write "
+                f"it via write_ingested_table, and save a reusable skill via "
+                f"save_ingestion_skill. "
+            )
+        elif doc_category == "vision":
+            user_prompt = (
+                f"The user uploaded a document file ({suffix}) via Telegram — "
+                f"an image, PDF, or text file. Absolute file path: "
+                f"{staged_path}. Load the 'record-entry' skill and extract "
+                f"its content: for an image use extract_from_image; for a PDF "
+                f"or text file read the content directly with the appropriate "
+                f"tool. Then propose_record_table, ask_user until every "
+                f"required field is confirmed, and write_ingested_table. "
+                f"Strict clarification — do not record until the draft is "
+                f"fully confirmed. "
+            )
+        else:  # archive
+            extract_dir, members, archive_err = self._extract_archive(
+                staged_path, staging_dir
+            )
+            if archive_err is not None or extract_dir is None:
+                try:
+                    await status_msg.edit_text(f"❌ {archive_err}")
+                except Exception:
+                    await update.message.reply_text(f"❌ {archive_err}")
+                return
+            file_list = "\n".join(f"  - {m}" for m in members)
+            user_prompt = (
+                f"The user uploaded a ZIP archive via Telegram; it was "
+                f"extracted to {extract_dir} and contains {len(members)} "
+                f"file(s):\n{file_list}\n\n"
+                f"Process each file by its type: tabular files "
+                f"(.csv/.xlsx/.tsv/.json) via the 'data-ingest' skill; "
+                f"images, PDFs, and text files via the 'record-entry' skill. "
+                f"Give a concise per-file summary of what was ingested. "
+            )
         if caption:
-            user_prompt += f"User note: {caption}"
+            user_prompt += f"\nUser note: {caption}"
 
         try:
             await status_msg.edit_text(f"🔍 Inspecting {original_name}...")

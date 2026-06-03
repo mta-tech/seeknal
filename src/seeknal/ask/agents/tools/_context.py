@@ -300,26 +300,84 @@ def lookup_prior_turn_answer(
     return stored_answer
 
 
-# Bilingual restate prefix wrapped around a prior-turn answer when the
-# verbatim re-ask gate fires. Indonesian + English — the BPOM/KAFI tests
-# exercise Indonesian/Malay phrasing and English tests also exist.
-_VERBATIM_RESTATE_PREFIX = (
-    "Pertanyaan ini sama dengan giliran sebelumnya — jawaban tetap sama:\n"
-    "/ This question is the same as the prior turn — the answer is the same:"
-)
-_VERBATIM_RESTATE_SUFFIX = (
-    "Jika Anda ingin data baru, ubah filter atau dimensi.\n"
-    "/ If you wanted fresh data, change the filter or dimension."
-)
-
-
 def build_verbatim_restate_response(prior_answer: str) -> str:
-    """Wrap a prior-turn answer with the bilingual restate notice."""
-    return (
-        f"{_VERBATIM_RESTATE_PREFIX}\n\n"
-        f"{prior_answer}\n\n"
-        f"{_VERBATIM_RESTATE_SUFFIX}"
-    )
+    """Return the prior-turn answer for a verbatim re-ask, unchanged.
+
+    A verbatim re-ask returns the previous answer exactly — no banner,
+    no meta-commentary, no "this is the same question" notice. The gate
+    behaves as a silent cache: identical question in, identical answer
+    out. The function is kept as the single named seam the gateway and
+    streaming entry points call, so the restate policy lives in one
+    place and is trivial to evolve.
+    """
+    return prior_answer
+
+
+def seed_prior_turn_from_history(message_history: Any) -> None:
+    """Re-seed the durable prior-turn pair from a persisted message_history.
+
+    The gateway rebuilds the agent's REPL on every turn (``create_agent``),
+    so the in-memory prior-turn pair written by ``record_prior_turn_answer``
+    does not survive between turns — and the verbatim re-ask gate, which
+    reads that pair off ``ctx.repl``, never fires on gateway/Telegram
+    sessions. ``message_history`` IS persisted per session (via the
+    session store), so it is the authoritative cross-turn source.
+
+    Call this after ``create_agent`` (so the ToolContext + fresh REPL
+    exist) and before the verbatim gate. Walks ``message_history``
+    backwards for the most recent (user question, assistant answer) pair
+    and stores it via ``record_prior_turn_answer``.
+
+    Triple-ask safe by construction: a verbatim restate returns the
+    prior answer unchanged (see ``build_verbatim_restate_response``), so
+    the stored answer is always canonical — re-seeding from it can never
+    compound. Best-effort and non-fatal — any failure leaves the gate
+    dormant rather than crashing the turn.
+    """
+    if not message_history:
+        return
+    try:
+        from pydantic_ai.messages import (
+            ModelRequest,
+            ModelResponse,
+            TextPart,
+            UserPromptPart,
+        )
+    except Exception:  # noqa: BLE001 - pydantic_ai optional at import time
+        return
+
+    prior_answer: str | None = None
+    prior_question: str | None = None
+    for msg in reversed(message_history):
+        if prior_answer is None and isinstance(msg, ModelResponse):
+            for part in msg.parts:
+                if (
+                    isinstance(part, TextPart)
+                    and isinstance(part.content, str)
+                    and part.content.strip()
+                ):
+                    prior_answer = part.content
+                    break
+        elif (
+            prior_answer is not None
+            and prior_question is None
+            and isinstance(msg, ModelRequest)
+        ):
+            for part in msg.parts:
+                if isinstance(part, UserPromptPart) and isinstance(
+                    part.content, str
+                ) and part.content.strip():
+                    prior_question = part.content
+                    break
+        if prior_answer is not None and prior_question is not None:
+            break
+
+    if prior_answer is None or prior_question is None:
+        return
+
+    if not prior_answer.strip():
+        return
+    record_prior_turn_answer(question=prior_question, answer=prior_answer)
 
 
 def reset_turn_governor(question: str | None = None) -> None:

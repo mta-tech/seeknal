@@ -218,12 +218,15 @@ def test_create_agent_includes_ask_user_in_interactive_analysis_mode(tmp_path: P
         assert "Teach mode" in instructions
         assert "save_preference" in instructions
         assert "context/sql_pairs/<slug>.yml" in instructions
+        # auto_summarization defaults OFF, so the compaction processors are not
+        # wired; only the trailing-ModelRequest guard (always registered last) is.
+        from seeknal.ask.processors import ensure_trailing_model_request
+
         assert mock_create.call_args[1]["history_processors"] == [
-            mock_micro.return_value,
-            mock_sql.return_value,
+            ensure_trailing_model_request,
         ]
-        mock_micro.assert_called_once_with(keep_recent_turns=2)
-        mock_sql.assert_called_once_with(min_chars=250)
+        mock_micro.assert_not_called()
+        mock_sql.assert_not_called()
 
 
 def test_create_agent_applies_agent_harness_config(tmp_path: Path):
@@ -234,6 +237,7 @@ def test_create_agent_applies_agent_harness_config(tmp_path: Path):
             """\
             agent_harness:
               auto_summarization:
+                enabled: true
                 context_manager: false
                 context_manager_max_tokens: 128000
                 summarization_model: openai:gpt-4.1-mini
@@ -300,9 +304,14 @@ def test_create_agent_applies_agent_harness_config(tmp_path: Path):
         assert kwargs["cost_budget_usd"] == 2.5
         assert len(kwargs["hooks"]) == 1
         assert kwargs["hooks"][0].event.value == "pre_tool_use"
+        # The trailing-ModelRequest guard is always appended LAST, after the
+        # configured compaction processors.
+        from seeknal.ask.processors import ensure_trailing_model_request
+
         assert kwargs["history_processors"] == [
             mock_micro.return_value,
             mock_sql.return_value,
+            ensure_trailing_model_request,
         ]
         mock_micro.assert_called_once_with(keep_recent_turns=5)
         mock_sql.assert_called_once_with(min_chars=750)

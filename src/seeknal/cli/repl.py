@@ -202,6 +202,13 @@ class REPL:
         except Exception as e:
             warnings.warn(f"REPL: Failed to register ask-ingested tables: {e}")
 
+        # Phase 4 (final): clean prefix-stripped aliases for queryable nodes. Runs
+        # last so it sees every real relation and never shadows one.
+        try:
+            self._register_clean_aliases()
+        except Exception as e:
+            warnings.warn(f"REPL: Failed to register clean-name aliases: {e}")
+
     def _register_parquets(self) -> None:
         """Phase 1: Register intermediate parquets as DuckDB views.
 
@@ -248,6 +255,11 @@ class REPL:
         becomes view ``transform_orders_cleaned``). The kind prefix is kept so that
         nodes of different types with the same name don't collide.
 
+        Clean prefix-stripped aliases (so the friendly node name the Ask agent is
+        shown is directly queryable) are NOT created here — they are added by
+        _register_clean_aliases() as a final, catalog-aware pass so an alias can
+        never shadow a real relation registered by another phase.
+
         Args:
             directory: Directory to scan for .parquet files.
             registered_names: Already-registered view names (skipped, updated in place).
@@ -290,6 +302,42 @@ class REPL:
                 self._registered_parquets += 1
             except Exception:
                 pass
+
+    def _register_clean_aliases(self) -> None:
+        """Final pass: expose clean, prefix-stripped aliases for project nodes.
+
+        Intermediate parquets register as ``{kind}_{name}`` views (e.g.
+        ``transform_channel_profitability``), but the Ask manifest / list_tables
+        surface the bare node name (``channel_profitability``). Register a bare
+        alias for each prefixed node — but ONLY when that bare name is not already
+        a real relation in the catalog, so an alias never shadows a source/cache
+        view, a consolidated ``entity_`` view, an ``ingest_`` view, or any other
+        registered relation. Runs after every other registration phase so the full
+        catalog is visible. Collisions between two prefixed nodes sharing a base
+        name resolve deterministically (sorted: ``source_`` < ``transform_``).
+        """
+        kind_prefixes = ("transform_", "source_", "model_")
+        try:
+            rows = self.conn.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'main'"
+            ).fetchall()
+        except Exception:
+            return
+        existing = {row[0] for row in rows}
+        for view_name in sorted(existing):
+            for prefix in kind_prefixes:
+                if view_name.startswith(prefix):
+                    alias = view_name[len(prefix):]
+                    if alias and alias not in existing:
+                        try:
+                            self.conn.execute(
+                                f'CREATE VIEW "{alias}" AS SELECT * FROM "{view_name}"'
+                            )
+                            existing.add(alias)
+                        except Exception:
+                            pass  # best-effort; the prefixed name still works
+                    break
 
     def _register_consolidated_entities(self) -> None:
         """Phase 1b: Register consolidated entity parquets as DuckDB views.
