@@ -300,17 +300,25 @@ app.add_typer(intervals_app, name="intervals")
 # =============================================================================
 # Heartbeat daemon (HEARTBEAT.md polling + smart inbox + DAG/exposure)
 # =============================================================================
-from seeknal.cli.heartbeat import app as heartbeat_app  # noqa: E402
+try:
+    from seeknal.cli.heartbeat import app as heartbeat_app  # noqa: E402
 
-app.add_typer(heartbeat_app, name="heartbeat")
+    app.add_typer(heartbeat_app, name="heartbeat")
+except ImportError:
+    # Optional command group — skip if the module is not present in this build.
+    pass
 
 
 # =============================================================================
 # Admin (Ask access policy + admin approval queue)
 # =============================================================================
-from seeknal.cli.admin import app as admin_app  # noqa: E402
+try:
+    from seeknal.cli.admin import app as admin_app  # noqa: E402
 
-app.add_typer(admin_app, name="admin")
+    app.add_typer(admin_app, name="admin")
+except ImportError:
+    # Optional command group — skip if the module is not present in this build.
+    pass
 
 
 # =============================================================================
