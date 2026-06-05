@@ -83,7 +83,14 @@ class TestMemoryAgentConfiguration:
 
             call_kwargs = mock_create.call_args[1]
             processors = call_kwargs["history_processors"]
-            assert len(processors) == 2
+            # auto_summarization defaults OFF (since 2.9.7), so the default agent
+            # ships exactly the always-on ensure_trailing_model_request safety-net
+            # processor. The summarization processors are added only when
+            # auto_summarization is enabled.
+            from seeknal.ask.processors import ensure_trailing_model_request
+
+            assert len(processors) == 1
+            assert processors[-1] is ensure_trailing_model_request
 
     def test_seeknal_directory_created(self, tmp_path):
         """Verify .seeknal/ directory is created."""
