@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0] - 2026-06-05
+
+Atlas data-access governance — first-class, config-activated access enforcement for
+`seeknal run` and the Ask SQL path, plus the requester/owner access-request CLI loop.
+Previously available only on the `feat/atlas-access-request-flow` branch; now mainline.
+
+### Added
+
+- **Config-activated runtime governance gate** — when `ATLAS_API_URL` is set, a pre-run
+  access check enforces `can_select` (via the Atlas backend / OpenFGA) for every source
+  node a run reads. Denial aborts the run with exit code 1 and a `seeknal gov
+  request-access` hint, **before any data is read**. With `ATLAS_API_URL` unset the gate
+  is a no-op — fully backward compatible.
+- **`seeknal gov request-access <table>`** — request access to a governed dataset through
+  the Atlas governance API (`--reason`, `--access read|write`, `--duration`).
+- **`seeknal auth login` / `status` / `logout`** — authenticate against the Atlas Keycloak
+  realm via PKCE loopback; credentials are cached at `~/.config/seeknal/credentials.json`
+  and supply the per-user identity (token + `sub`) used for access checks.
+- **Governed Ask SQL execution** — `execute_sql` / REPL reads run through the same
+  access-check and apply column masking when the backend reports masked columns.
+
+### Notes
+
+- Activation is opt-in via `ATLAS_API_URL` (+ `KEYCLOAK_ISSUER` for login). The gate fails
+  **closed** on denial; set `ATLAS_FAIL_OPEN=true` to allow on transport error.
+
 ## [2.9.7] - 2026-06-01
 
 Ask agent harness robustness + table-name discoverability — fixes that make
