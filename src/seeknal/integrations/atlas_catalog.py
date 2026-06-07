@@ -1,0 +1,330 @@
+"""Read-only Atlas data-catalog client, active only when Atlas is configured.
+
+This is the *catalog* surface of the Atlas integration: a GET-only client over the
+unified-catalog read API. Where :mod:`seeknal.integrations.atlas_client` handles
+apply-time dual writes and :mod:`seeknal.integrations.atlas_governance` enforces
+runtime access, this module lets a caller *browse* the catalog — list, fetch,
+search, and sample assets — plus a single write (:meth:`AtlasCatalogClient.annotate`)
+that upserts annotations onto an existing asset.
+
+Like the governance gate it is **config-activated**: with no ``ATLAS_API_URL`` the
+factory returns ``None`` and callers can skip catalog features entirely. It reuses
+the same :class:`~seeknal.integrations.atlas_client.AtlasContractConfig` and the
+per-user token resolution so a single Atlas configuration drives every surface.
+
+The backend asset shape is a JSON dict::
+
+    {id, asset_type, name, namespace, source_system, source_id, canonical_source,
+     metadata: {description, tags, canonical_asset_id}, created_at, updated_at}
+
+:class:`Dataset` is the typed projection of that dict the rest of Seeknal consumes.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import Any, Sequence
+
+import httpx
+
+from seeknal.integrations.atlas_client import AtlasContractConfig, AtlasContractError
+from seeknal.integrations.atlas_governance import user_token_from_credentials
+
+__all__ = ["Dataset", "AtlasCatalogClient", "create_catalog_client_from_env"]
+
+
+@dataclass(frozen=True)
+class Dataset:
+    """Typed projection of a unified-catalog asset.
+
+    Construct from a raw backend asset dict via :meth:`from_api`. ``description``,
+    ``tags``, and ``canonical_id`` are flattened out of the nested ``metadata`` block
+    the backend returns, while the full ``metadata`` dict is retained verbatim.
+    """
+
+    id: str
+    name: str
+    namespace: str = ""
+    asset_type: str = ""
+    source_system: str = ""
+    description: str = ""
+    tags: tuple[str, ...] = ()
+    canonical_id: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_api(cls, d: dict[str, Any]) -> "Dataset":
+        """Map a raw backend asset dict to a :class:`Dataset`.
+
+        Tolerant of missing fields: any absent key falls back to its dataclass
+        default. ``description``, ``tags``, and ``canonical_asset_id`` are read from
+        the nested ``metadata`` block; the whole ``metadata`` dict is preserved.
+        """
+
+        metadata = d.get("metadata") or {}
+        raw_tags = metadata.get("tags") or []
+        tags = tuple(str(tag) for tag in raw_tags if tag)
+        return cls(
+            id=str(d.get("id", "")),
+            name=str(d.get("name", "")),
+            namespace=str(d.get("namespace", "")),
+            asset_type=str(d.get("asset_type", "")),
+            source_system=str(d.get("source_system", "")),
+            description=str(metadata.get("description", "")),
+            tags=tags,
+            canonical_id=str(metadata.get("canonical_asset_id", "")),
+            metadata=dict(metadata),
+        )
+
+    @property
+    def fqn(self) -> str:
+        """Fully-qualified name for the dataset.
+
+        Prefers the canonical asset id when present; otherwise composes
+        ``"{namespace}.{name}"`` (dropping the leading dot when no namespace is set).
+        """
+
+        if self.canonical_id:
+            return self.canonical_id
+        if self.namespace:
+            return f"{self.namespace}.{self.name}"
+        return self.name
+
+
+class AtlasCatalogClient:
+    """GET-only HTTP client for the Atlas unified-catalog read API.
+
+    Construct via :func:`create_catalog_client_from_env`. Pass an explicit ``client``
+    (e.g. backed by :class:`httpx.MockTransport`) in tests. Mirrors the headers and
+    HTTP/error handling of :class:`~seeknal.integrations.atlas_governance.GovernanceGate`.
+    """
+
+    def __init__(
+        self,
+        config: AtlasContractConfig,
+        *,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self.config = config
+        self._client = client
+
+    # -- HTTP plumbing -------------------------------------------------------
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.config.token:
+            headers["Authorization"] = f"Bearer {self.config.token}"
+        return headers
+
+    def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        url = f"{self.config.base_url}{path}"
+        clean = {
+            key: value for key, value in (params or {}).items() if value is not None
+        }
+        try:
+            if self._client is not None:
+                response = self._client.get(url, params=clean, headers=self._headers())
+            else:
+                response = httpx.get(
+                    url,
+                    params=clean,
+                    headers=self._headers(),
+                    timeout=self.config.timeout_seconds,
+                )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            message = exc.response.text.strip() or str(exc)
+            raise AtlasContractError(
+                f"Atlas catalog request failed for {path}: {message}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise AtlasContractError(
+                f"Atlas catalog request failed for {path}: {exc}"
+            ) from exc
+
+    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self.config.base_url}{path}"
+        try:
+            if self._client is not None:
+                response = self._client.post(url, json=payload, headers=self._headers())
+            else:
+                response = httpx.post(
+                    url,
+                    json=payload,
+                    headers=self._headers(),
+                    timeout=self.config.timeout_seconds,
+                )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            message = exc.response.text.strip() or str(exc)
+            raise AtlasContractError(
+                f"Atlas catalog request failed for {path}: {message}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise AtlasContractError(
+                f"Atlas catalog request failed for {path}: {exc}"
+            ) from exc
+
+    # -- Public API ----------------------------------------------------------
+
+    def list_datasets(
+        self,
+        *,
+        query: str | None = None,
+        asset_type: str | None = None,
+        namespace: str | None = None,
+        source_system: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Dataset]:
+        """List catalog assets, optionally filtered. Returns a list of :class:`Dataset`.
+
+        GET ``/api/assets``. ``query`` maps to the ``q`` parameter and ``asset_type``
+        to ``type``. The backend returns a JSON array of asset dicts.
+        """
+
+        params = {
+            "q": query,
+            "type": asset_type,
+            "namespace": namespace,
+            "source_system": source_system,
+            "limit": limit,
+            "offset": offset,
+        }
+        resp = self._get("/api/assets", params)
+        return [Dataset.from_api(asset) for asset in (resp or [])]
+
+    def get_dataset(self, dataset_id: str) -> Dataset:
+        """Fetch a single catalog asset by id.
+
+        GET ``/api/assets/{dataset_id}`` and project the result into a :class:`Dataset`.
+        """
+
+        resp = self._get(f"/api/assets/{dataset_id}")
+        return Dataset.from_api(resp)
+
+    def search(
+        self,
+        query: str,
+        *,
+        asset_types: Sequence[str] | None = None,
+        tags: Sequence[str] | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Dataset]:
+        """Full-text search across the catalog. Returns a list of :class:`Dataset`.
+
+        GET ``/api/search`` with ``q=query``. The response may be a bare JSON array or
+        a dict wrapping the hits under ``results``/``items``/``assets``; both shapes are
+        handled, and each hit is mapped tolerantly via :meth:`Dataset.from_api`.
+        """
+
+        params = {
+            "q": query,
+            "asset_types": list(asset_types) if asset_types else None,
+            "tags": list(tags) if tags else None,
+            "limit": limit,
+            "offset": offset,
+        }
+        resp = self._get("/api/search", params)
+        if isinstance(resp, dict):
+            hits = resp.get("results") or resp.get("items") or resp.get("assets") or []
+        else:
+            hits = resp or []
+        return [Dataset.from_api(hit) for hit in hits if isinstance(hit, dict)]
+
+    def sample(
+        self, identifier: str, *, limit: int = 20, offset: int = 0
+    ) -> dict[str, Any]:
+        """Fetch a row sample for an asset, returning the backend JSON verbatim.
+
+        GET ``/api/sample`` with the required ``identifier`` plus ``limit``/``offset``.
+        The response is returned unmodified for the caller to render.
+        """
+
+        return self._get(
+            "/api/sample",
+            {"identifier": identifier, "limit": limit, "offset": offset},
+        )
+
+    def annotate(
+        self,
+        dataset_id: str,
+        *,
+        tags: Sequence[str] | None = None,
+        description: str | None = None,
+        owners: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Upsert the unified-catalog asset annotations.
+
+        Fetches the current asset, unions any new ``tags`` with the existing ones,
+        overrides ``description`` when supplied, records ``owners`` in metadata when
+        given, then POSTs the merged asset to ``/api/contracts/assets/register``.
+        Returns the backend response.
+        """
+
+        current = self.get_dataset(dataset_id)
+
+        merged_tags = list(current.tags)
+        if tags:
+            for tag in tags:
+                if tag and tag not in merged_tags:
+                    merged_tags.append(tag)
+
+        description_value = (
+            description if description is not None else current.description
+        )
+
+        metadata = dict(current.metadata)
+        metadata["description"] = description_value
+        metadata["tags"] = merged_tags
+        if owners:
+            metadata["owners"] = list(owners)
+
+        source_id = str(
+            current.metadata.get("source_id", "")
+            or f"{current.asset_type}:{current.name}"
+        )
+        asset = {
+            "asset_type": current.asset_type,
+            "name": current.name,
+            "namespace": current.namespace,
+            "source_system": current.source_system,
+            "source_id": source_id,
+            "description": description_value,
+            "tags": merged_tags,
+            "metadata": metadata,
+        }
+        payload = {
+            "project_name": os.getenv("SEEKNAL_PROJECT_NAME") or current.namespace,
+            "environment": os.getenv("ATLAS_ENVIRONMENT", "dev"),
+            "asset": asset,
+        }
+        return self._post("/api/contracts/assets/register", payload)
+
+
+def create_catalog_client_from_env() -> "AtlasCatalogClient | None":
+    """Build a catalog client only when Atlas is configured.
+
+    Returns ``None`` when ``ATLAS_API_URL`` is unset, signalling catalog features are
+    inactive. Otherwise mirrors
+    :func:`~seeknal.integrations.atlas_governance.create_governance_gate_from_env`:
+    an explicit ``ATLAS_API_TOKEN`` wins, else the logged-in user's token is used so
+    per-user identity flows to Atlas.
+    """
+
+    base_url = os.getenv("ATLAS_API_URL", "").strip()
+    if not base_url:
+        return None
+
+    timeout = float(os.getenv("ATLAS_API_TIMEOUT_SECONDS", "10"))
+    token = os.getenv("ATLAS_API_TOKEN") or user_token_from_credentials()
+    config = AtlasContractConfig(
+        base_url=base_url.rstrip("/"),
+        token=token,
+        timeout_seconds=timeout,
+    )
+    return AtlasCatalogClient(config)

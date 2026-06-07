@@ -241,6 +241,12 @@ from seeknal.cli.auth import auth_app  # ty: ignore[unresolved-import]
 
 app.add_typer(auth_app, name="auth")
 
+# Atlas data catalog (list/show/annotate/request-access/query). Same stdlib + httpx
+# + tabulate footprint as gov/auth, registered unconditionally alongside them.
+from seeknal.cli.dataset import dataset_app  # ty: ignore[unresolved-import]
+
+app.add_typer(dataset_app, name="dataset")
+
 # Virtual environment management
 env_app = typer.Typer(
     help="Virtual environments for safe pipeline development (plan/apply/promote)"

@@ -101,6 +101,7 @@ class REPL:
         self._registered_parquets: int = 0
         self._registered_pg: int = 0
         self._registered_iceberg: int = 0
+        self._registered_atlas: int = 0
         self._node_count: int = 0
         self._last_run: Optional[str] = None
         self._load_extensions()
@@ -195,6 +196,12 @@ class REPL:
             self._register_iceberg_catalogs()
         except Exception as e:
             warnings.warn(f"REPL: Failed to attach Iceberg catalogs: {e}")
+
+        # Phase 3b: Attach the Atlas governed catalog (config-gated, best-effort)
+        try:
+            self._register_atlas_catalog()
+        except Exception as e:
+            warnings.warn(f"REPL: Failed to attach Atlas catalog: {e}")
 
         # Phase 1c: Register ask-ingested parquets
         try:
@@ -508,6 +515,61 @@ class REPL:
         )
         self.attached.add("iceberg")
         self._registered_iceberg += 1
+
+    def _register_atlas_catalog(self) -> None:
+        """Phase 3b: Surface the Atlas governed catalog when Atlas is connected.
+
+        When ``ATLAS_API_URL`` is set, count the governed datasets Atlas exposes and —
+        if the Lakekeeper catalog env (``LAKEKEEPER_URL``) is configured — ATTACH the
+        warehouse so the datasets are queryable in the REPL as
+        ``atlas.<namespace>.<table>`` (mirrors the iceberg-source read path). The
+        governance gate still enforces access on every read. Best-effort: any failure
+        leaves the rest of the REPL catalog intact.
+        """
+        import os
+        import warnings
+
+        from seeknal.integrations.atlas_catalog import create_catalog_client_from_env
+
+        client = create_catalog_client_from_env()
+        if client is None:
+            return  # Atlas not configured → nothing to surface
+
+        uri = os.getenv("LAKEKEEPER_URL", "").strip()
+        warehouse = os.getenv("LAKEKEEPER_WAREHOUSE", "").strip()
+        if uri and "atlas" not in self.attached:
+            try:
+                from seeknal.workflow.materialization.operations import (
+                    DuckDBIcebergExtension,
+                )
+
+                DuckDBIcebergExtension.load_extension(self.conn)
+                DuckDBIcebergExtension.configure_s3(self.conn)
+                bearer_token = None
+                try:
+                    bearer_token = DuckDBIcebergExtension.get_oauth2_token()
+                except Exception:
+                    pass  # no OAuth2 configured → try without
+                catalog_uri = uri.rstrip("/")
+                if "/catalog" not in catalog_uri:
+                    catalog_uri = f"{catalog_uri}/catalog"
+                DuckDBIcebergExtension.attach_rest_catalog(
+                    con=self.conn,
+                    catalog_name="atlas",
+                    uri=catalog_uri,
+                    warehouse_path=warehouse,
+                    bearer_token=bearer_token,
+                )
+                self.attached.add("atlas")
+            except Exception as e:
+                warnings.warn(f"REPL: Atlas catalog attach skipped: {e}")
+
+        # Record how many governed datasets Atlas exposes (visibility), regardless of
+        # whether the warehouse could be attached.
+        try:
+            self._registered_atlas = len(client.list_datasets(limit=200))
+        except Exception as e:
+            warnings.warn(f"REPL: Atlas dataset listing failed: {e}")
 
     def execute_oneshot(
         self, sql: str, limit: Optional[int] = None
