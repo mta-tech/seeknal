@@ -28,16 +28,19 @@ import getpass
 import json
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import httpx
 
 from seeknal.integrations.atlas_client import (
+    AtlasAuthError,
     AtlasContractConfig,
     AtlasContractError,
     AtlasPolicyDenied,
+    SESSION_EXPIRED_HINT,
 )
 
 __all__ = [
@@ -55,6 +58,7 @@ __all__ = [
     "user_token_from_credentials",
     "user_sub_from_credentials",
     "user_email_from_credentials",
+    "refresh_access_token",
 ]
 
 #: Replacement rendered for a fully masked value.
@@ -129,6 +133,114 @@ def _user_token_from_credentials() -> str | None:
 
 #: Public alias for reuse by the CLI; mirrors the private gate-side reader.
 user_token_from_credentials = _user_token_from_credentials
+
+
+#: OIDC config for refreshing the stored access token. Mirrors ``cli/auth.py`` so a
+#: single ``KEYCLOAK_ISSUER`` / ``SEEKNAL_OIDC_CLIENT_ID`` drives login *and* refresh.
+_DEFAULT_OIDC_ISSUER = "http://localhost:8080/realms/atlas"
+_DEFAULT_OIDC_CLIENT_ID = "seeknal-cli"
+#: Seconds to wait on the token endpoint before giving up on a refresh.
+_REFRESH_TIMEOUT_SECONDS = 30.0
+
+
+def _oidc_issuer() -> str:
+    """Return the Keycloak realm issuer used for token refresh (no trailing slash)."""
+
+    return (os.getenv("KEYCLOAK_ISSUER", "").strip() or _DEFAULT_OIDC_ISSUER).rstrip("/")
+
+
+def _oidc_client_id() -> str:
+    """Return the public OIDC client id used for token refresh."""
+
+    return os.getenv("SEEKNAL_OIDC_CLIENT_ID", "").strip() or _DEFAULT_OIDC_CLIENT_ID
+
+
+def _persist_refreshed_tokens(existing: dict[str, Any], tokens: dict[str, Any]) -> None:
+    """Best-effort write of refreshed tokens to the credentials file (mode 0600).
+
+    Preserves the previous ``refresh_token``/``refresh_expires_in`` when the refresh
+    response omits them (Keycloak usually rotates the refresh token, but not always).
+    Never raises: a refresh whose token we already hold in memory must still succeed
+    even if the on-disk write fails.
+    """
+
+    payload = {
+        "access_token": tokens.get("access_token"),
+        "refresh_token": tokens.get("refresh_token") or existing.get("refresh_token"),
+        "expires_in": tokens.get("expires_in"),
+        "refresh_expires_in": (
+            tokens.get("refresh_expires_in") or existing.get("refresh_expires_in")
+        ),
+    }
+    try:
+        path = credentials_path()
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Write to a temp file that is owner-only (0600) from creation, then atomically
+        # rename into place. This avoids the brief world/group-readable window of
+        # ``write_text`` + ``chmod`` and prevents a torn file if the process dies mid-write.
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".credentials-", suffix=".tmp")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, indent=2))
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        pass
+
+
+def refresh_access_token(*, client: httpx.Client | None = None) -> str | None:
+    """Mint a fresh access token from the stored refresh token, or return ``None``.
+
+    Uses the OAuth2 ``refresh_token`` grant against the Keycloak realm (the public
+    ``seeknal-cli`` client). On success the rotated tokens are persisted to the
+    credentials file (mode 0600) and the new access token is returned. Returns
+    ``None`` (never raises) when there is no usable refresh token, the grant is
+    rejected (e.g. the refresh token itself has expired), or the identity provider is
+    unreachable — callers then surface a "log in again" hint instead of a traceback.
+
+    ``client`` lets tests inject an :class:`httpx.Client` (e.g. ``MockTransport``).
+    """
+
+    creds = _read_credentials()
+    if not creds:
+        return None
+    refresh_token = creds.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token.strip():
+        return None
+
+    data = {
+        "grant_type": "refresh_token",
+        "client_id": _oidc_client_id(),
+        "refresh_token": refresh_token,
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    endpoint = f"{_oidc_issuer()}/protocol/openid-connect/token"
+    try:
+        if client is not None:
+            response = client.post(
+                endpoint, data=data, headers=headers, timeout=_REFRESH_TIMEOUT_SECONDS
+            )
+        else:
+            response = httpx.post(
+                endpoint, data=data, headers=headers, timeout=_REFRESH_TIMEOUT_SECONDS
+            )
+        response.raise_for_status()
+        tokens = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if not isinstance(tokens, dict):
+        return None
+    new_token = tokens.get("access_token")
+    if not isinstance(new_token, str) or not new_token.strip():
+        return None
+    _persist_refreshed_tokens(creds, tokens)
+    return new_token
 
 
 def _decode_jwt_payload(token: str) -> dict[str, Any] | None:
@@ -401,10 +513,15 @@ class GovernanceGate:
         *,
         fail_open: bool | None = None,
         client: httpx.Client | None = None,
+        token_refresher: Callable[[], str | None] | None = None,
     ) -> None:
         self.config = config
         self._fail_open = _fail_open_default() if fail_open is None else fail_open
         self._client = client
+        # Mutable bearer copy so a 401 can be recovered by refreshing the access token
+        # (the frozen config stays the source of the *initial* token).
+        self._token = config.token
+        self._token_refresher = token_refresher or refresh_access_token
 
     @property
     def fail_open(self) -> bool:
@@ -416,31 +533,47 @@ class GovernanceGate:
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        if self.config.token:
-            headers["Authorization"] = f"Bearer {self.config.token}"
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
         return headers
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.config.base_url}{path}"
-        try:
-            if self._client is not None:
-                response = self._client.post(url, json=payload, headers=self._headers())
-            else:
-                response = httpx.post(
-                    url,
-                    json=payload,
-                    headers=self._headers(),
-                    timeout=self.config.timeout_seconds,
-                )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as exc:
-            message = exc.response.text.strip() or str(exc)
-            raise AtlasContractError(
-                f"Atlas governance request failed for {path}: {message}"
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise AtlasContractError(f"Atlas governance request failed for {path}: {exc}") from exc
+        refreshed = False
+        while True:
+            try:
+                if self._client is not None:
+                    response = self._client.post(url, json=payload, headers=self._headers())
+                else:
+                    response = httpx.post(
+                        url,
+                        json=payload,
+                        headers=self._headers(),
+                        timeout=self.config.timeout_seconds,
+                    )
+                response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as exc:
+                # Transparently refresh the access token once on a 401, then retry.
+                if exc.response.status_code == 401:
+                    if not refreshed:
+                        refreshed = True
+                        new_token = self._token_refresher()
+                        if new_token:
+                            self._token = new_token
+                            continue
+                    # Unrecoverable auth failure. Raise AtlasAuthError (a subclass of
+                    # AtlasContractError) to mirror AtlasCatalogClient._send: check_access
+                    # still catches it and fails closed, so the run/ask/repl callers that
+                    # only expect AtlasPolicyDenied are unaffected, but the decision now
+                    # carries a clear "session expired" reason instead of "unreachable".
+                    raise AtlasAuthError(SESSION_EXPIRED_HINT) from exc
+                message = exc.response.text.strip() or str(exc)
+                raise AtlasContractError(
+                    f"Atlas governance request failed for {path}: {message}"
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise AtlasContractError(f"Atlas governance request failed for {path}: {exc}") from exc
 
     # -- Public API ----------------------------------------------------------
 
@@ -471,6 +604,12 @@ class GovernanceGate:
 
         try:
             decision = self._post("/api/contracts/access-check", payload)
+        except AtlasAuthError as exc:
+            # An expired/missing session is an authentication problem, not an
+            # availability one: always fail closed (even when fail-open is enabled —
+            # an unauthenticated caller must never be waved through) and surface the
+            # re-authentication hint so the reason is actionable.
+            return AccessDecision(allowed=False, reason=str(exc))
         except AtlasContractError as exc:
             if self._fail_open:
                 return AccessDecision(

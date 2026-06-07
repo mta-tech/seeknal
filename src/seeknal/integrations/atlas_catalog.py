@@ -24,12 +24,20 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import httpx
 
-from seeknal.integrations.atlas_client import AtlasContractConfig, AtlasContractError
-from seeknal.integrations.atlas_governance import user_token_from_credentials
+from seeknal.integrations.atlas_client import (
+    AtlasAuthError,
+    AtlasContractConfig,
+    AtlasContractError,
+    SESSION_EXPIRED_HINT,
+)
+from seeknal.integrations.atlas_governance import (
+    refresh_access_token,
+    user_token_from_credentials,
+)
 
 __all__ = ["Dataset", "AtlasCatalogClient", "create_catalog_client_from_env"]
 
@@ -105,68 +113,101 @@ class AtlasCatalogClient:
         config: AtlasContractConfig,
         *,
         client: httpx.Client | None = None,
+        token_refresher: Callable[[], str | None] | None = None,
     ) -> None:
         self.config = config
         self._client = client
+        # ``config.token`` is the initial bearer; keep a mutable copy so a 401-driven
+        # refresh can swap in a new access token without rebuilding the frozen config.
+        self._token = config.token
+        self._token_refresher = token_refresher or refresh_access_token
 
     # -- HTTP plumbing -------------------------------------------------------
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        if self.config.token:
-            headers["Authorization"] = f"Bearer {self.config.token}"
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
         return headers
 
-    def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        """Issue a single HTTP request via the injected client or a one-shot call."""
+
+        if self._client is not None:
+            if method == "GET":
+                return self._client.get(url, params=params, headers=self._headers())
+            return self._client.post(url, json=json_body, headers=self._headers())
+        if method == "GET":
+            return httpx.get(
+                url,
+                params=params,
+                headers=self._headers(),
+                timeout=self.config.timeout_seconds,
+            )
+        return httpx.post(
+            url,
+            json=json_body,
+            headers=self._headers(),
+            timeout=self.config.timeout_seconds,
+        )
+
+    def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> Any:
+        """Send a request, transparently refreshing the token once on HTTP 401.
+
+        On a 401 the stored refresh token is used to mint a new access token and the
+        request is retried exactly once. When no refresh is possible (or the retry is
+        still 401), an :class:`AtlasAuthError` carrying a re-authentication hint is
+        raised — never a raw traceback. Other HTTP/transport failures map to
+        :class:`AtlasContractError` as before.
+        """
+
         url = f"{self.config.base_url}{path}"
+        refreshed = False
+        while True:
+            try:
+                response = self._request(method, url, params=params, json_body=json_body)
+                response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 401:
+                    if not refreshed:
+                        refreshed = True
+                        new_token = self._token_refresher()
+                        if new_token:
+                            self._token = new_token
+                            continue
+                    raise AtlasAuthError(SESSION_EXPIRED_HINT) from exc
+                message = exc.response.text.strip() or str(exc)
+                raise AtlasContractError(
+                    f"Atlas catalog request failed for {path}: {message}"
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise AtlasContractError(
+                    f"Atlas catalog request failed for {path}: {exc}"
+                ) from exc
+
+    def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         clean = {
             key: value for key, value in (params or {}).items() if value is not None
         }
-        try:
-            if self._client is not None:
-                response = self._client.get(url, params=clean, headers=self._headers())
-            else:
-                response = httpx.get(
-                    url,
-                    params=clean,
-                    headers=self._headers(),
-                    timeout=self.config.timeout_seconds,
-                )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as exc:
-            message = exc.response.text.strip() or str(exc)
-            raise AtlasContractError(
-                f"Atlas catalog request failed for {path}: {message}"
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise AtlasContractError(
-                f"Atlas catalog request failed for {path}: {exc}"
-            ) from exc
+        return self._send("GET", path, params=clean)
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        url = f"{self.config.base_url}{path}"
-        try:
-            if self._client is not None:
-                response = self._client.post(url, json=payload, headers=self._headers())
-            else:
-                response = httpx.post(
-                    url,
-                    json=payload,
-                    headers=self._headers(),
-                    timeout=self.config.timeout_seconds,
-                )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as exc:
-            message = exc.response.text.strip() or str(exc)
-            raise AtlasContractError(
-                f"Atlas catalog request failed for {path}: {message}"
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise AtlasContractError(
-                f"Atlas catalog request failed for {path}: {exc}"
-            ) from exc
+        return self._send("POST", path, json_body=payload)
 
     # -- Public API ----------------------------------------------------------
 

@@ -32,11 +32,17 @@ from seeknal.integrations.atlas_catalog import (
     Dataset,
     create_catalog_client_from_env,
 )
-from seeknal.integrations.atlas_client import AtlasContractError, AtlasPolicyDenied
+from seeknal.integrations.atlas_client import (
+    AtlasAuthError,
+    AtlasContractError,
+    AtlasPolicyDenied,
+    SESSION_EXPIRED_HINT,
+)
 from seeknal.integrations.atlas_governance import (
     AccessDecision,
     apply_column_masks,
     create_governance_gate_from_env,
+    refresh_access_token,
     user_email_from_credentials,
     user_token_from_credentials,
 )
@@ -77,10 +83,20 @@ def _resolve_dataset(client: AtlasCatalogClient, ref: str) -> Dataset:
     if _UUID_RE.match(ref):
         try:
             return client.get_dataset(ref)
+        except AtlasAuthError as exc:
+            echo_error(str(exc))
+            raise typer.Exit(1) from exc
         except AtlasContractError:
             pass  # fall through to a name search
 
-    matches = client.list_datasets(query=ref, limit=10)
+    try:
+        matches = client.list_datasets(query=ref, limit=10)
+    except AtlasAuthError as exc:
+        echo_error(str(exc))
+        raise typer.Exit(1) from exc
+    except AtlasContractError as exc:
+        echo_error(f"Catalog lookup failed: {exc}")
+        raise typer.Exit(1) from exc
     for dataset in matches:
         if ref in (dataset.name, dataset.fqn, dataset.id):
             return dataset
@@ -115,8 +131,17 @@ def _extract_sample(data: Any) -> tuple[list[str], list[list[Any]]]:
     """Normalise a ``/api/sample`` response into ``(columns, rows)``.
 
     Tolerant of the common shapes: ``{columns, rows}``, ``{schema, data}``, a list of
-    row dicts, or a list of row sequences.
+    row dicts, or a list of row sequences. The Atlas backend wraps each row as
+    ``{"values": {col: val}}``, so unwrap that envelope before projecting columns.
     """
+
+    def _row_dict(row: Any) -> dict[str, Any]:
+        if isinstance(row, dict):
+            inner = row.get("values")
+            if isinstance(inner, dict):
+                return inner
+            return row
+        return {}
 
     if isinstance(data, dict):
         raw_cols = data.get("columns") or data.get("schema") or []
@@ -124,15 +149,15 @@ def _extract_sample(data: Any) -> tuple[list[str], list[list[Any]]]:
         raw_rows = data.get("rows") or data.get("data") or []
         if raw_rows and isinstance(raw_rows[0], dict):
             if not columns:
-                columns = list(raw_rows[0].keys())
-            rows = [[r.get(c) for c in columns] for r in raw_rows]
+                columns = list(_row_dict(raw_rows[0]).keys())
+            rows = [[_row_dict(r).get(c) for c in columns] for r in raw_rows]
         else:
             rows = [list(r) for r in raw_rows]
         return [str(c) for c in columns], rows
     if isinstance(data, list):
         if data and isinstance(data[0], dict):
-            columns = list(data[0].keys())
-            return columns, [[r.get(c) for c in columns] for r in data]
+            columns = list(_row_dict(data[0]).keys())
+            return columns, [[_row_dict(r).get(c) for c in columns] for r in data]
         return [], [list(r) for r in data]
     return [], []
 
@@ -147,6 +172,9 @@ def _print_sample(
 
     try:
         data = client.sample(dataset.fqn, limit=limit)
+    except AtlasAuthError as exc:
+        echo_error(str(exc))
+        return
     except AtlasContractError as exc:
         echo_error(f"Sample failed: {exc}")
         return
@@ -300,20 +328,29 @@ def request_access(
         "priority": priority,
         "type": "dataset",
     }
-    headers = {"Content-Type": "application/json"}
-    token = user_token_from_credentials()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    try:
-        response = httpx.post(
+    def _post_access_request(bearer: str | None) -> httpx.Response:
+        headers = {"Content-Type": "application/json"}
+        if bearer:
+            headers["Authorization"] = f"Bearer {bearer}"
+        return httpx.post(
             f"{base}/governance/access-requests",
             json=body,
             headers=headers,
             timeout=_REQUEST_TIMEOUT_SECONDS,
         )
+
+    try:
+        response = _post_access_request(user_token_from_credentials())
+        # On an expired session, refresh the access token once and retry.
+        if response.status_code == 401:
+            new_token = refresh_access_token()
+            if new_token:
+                response = _post_access_request(new_token)
     except httpx.HTTPError as exc:
         echo_error(f"Access request failed: {exc}")
+        raise typer.Exit(1)
+    if response.status_code == 401:
+        echo_error(SESSION_EXPIRED_HINT)
         raise typer.Exit(1)
     if not (200 <= response.status_code < 300):
         detail = response.text.strip() or f"HTTP {response.status_code}"

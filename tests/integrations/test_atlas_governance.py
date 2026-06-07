@@ -8,7 +8,7 @@ it is fail-closed by default, and audit logging can never break a read.
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Any, Callable
 
 import httpx
 import pytest
@@ -17,7 +17,12 @@ import base64
 import json
 from pathlib import Path
 
-from seeknal.integrations.atlas_client import AtlasContractConfig, AtlasPolicyDenied
+from seeknal.integrations.atlas_client import (
+    AtlasAuthError,
+    AtlasContractConfig,
+    AtlasPolicyDenied,
+    SESSION_EXPIRED_HINT,
+)
 from seeknal.integrations.atlas_governance import (
     MASK_TOKEN,
     AccessDecision,
@@ -29,6 +34,7 @@ from seeknal.integrations.atlas_governance import (
     mask_rows,
     mask_value,
     referenced_tables,
+    refresh_access_token,
     user_sub_from_credentials,
     user_token_from_credentials,
 )
@@ -469,3 +475,181 @@ def test_user_sub_from_credentials_none_when_absent(
 ) -> None:
     monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(tmp_path / "missing.json"))
     assert user_sub_from_credentials() is None
+
+
+# ---------------------------------------------------------------------------
+# refresh_access_token
+# ---------------------------------------------------------------------------
+
+
+def _write_creds_with_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    access_token: str = "old-access",
+    refresh_token: str | None = "rt-1",
+) -> Path:
+    """Write a credentials file (optionally without a refresh token) and point env at it."""
+
+    payload: dict[str, Any] = {"access_token": access_token, "expires_in": 300}
+    if refresh_token is not None:
+        payload["refresh_token"] = refresh_token
+        payload["refresh_expires_in"] = 1800
+    creds = tmp_path / "credentials.json"
+    creds.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(creds))
+    return creds
+
+
+def test_refresh_access_token_success_persists_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KEYCLOAK_ISSUER", "http://kc.test/realms/atlas")
+    monkeypatch.delenv("SEEKNAL_OIDC_CLIENT_ID", raising=False)
+    creds = _write_creds_with_refresh(tmp_path, monkeypatch)
+
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = request.content.decode()
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "new-access",
+                "refresh_token": "rt-2",
+                "expires_in": 300,
+                "refresh_expires_in": 1800,
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    token = refresh_access_token(client=client)
+
+    assert token == "new-access"
+    assert seen["path"] == "/realms/atlas/protocol/openid-connect/token"
+    assert "grant_type=refresh_token" in seen["body"]
+    assert "refresh_token=rt-1" in seen["body"]
+    assert "client_id=seeknal-cli" in seen["body"]
+    # Rotated tokens are persisted (mode 0600) for the next call.
+    saved = json.loads(creds.read_text(encoding="utf-8"))
+    assert saved["access_token"] == "new-access"
+    assert saved["refresh_token"] == "rt-2"
+    # The refreshed credentials file must be owner-only (no world/group read window).
+    assert (creds.stat().st_mode & 0o777) == 0o600
+
+
+def test_refresh_access_token_none_without_refresh_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_creds_with_refresh(tmp_path, monkeypatch, refresh_token=None)
+    client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
+    assert refresh_access_token(client=client) is None
+
+
+def test_refresh_access_token_none_on_rejected_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KEYCLOAK_ISSUER", "http://kc.test/realms/atlas")
+    _write_creds_with_refresh(tmp_path, monkeypatch)
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(401, json={"error": "invalid_grant"}))
+    )
+    # An expired/invalid refresh token yields None (never raises).
+    assert refresh_access_token(client=client) is None
+
+
+def test_refresh_access_token_none_when_no_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(tmp_path / "missing.json"))
+    assert refresh_access_token() is None
+
+
+# ---------------------------------------------------------------------------
+# Gate token-refresh on 401
+# ---------------------------------------------------------------------------
+
+
+def test_gate_refreshes_token_on_401_and_retries() -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            assert request.headers["Authorization"] == "Bearer t0ken"
+            return httpx.Response(401, json={"detail": "Token has expired"})
+        assert request.headers["Authorization"] == "Bearer fresh"
+        return httpx.Response(200, json={"allowed": True, "reason": "ok"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    config = AtlasContractConfig(base_url=BASE_URL, token="t0ken", timeout_seconds=5.0)
+    gate = GovernanceGate(config, client=client, token_refresher=lambda: "fresh")
+
+    decision = gate.check_access(resource="retail_demo.sales", action="read")
+    assert decision.allowed is True
+    assert calls["n"] == 2
+
+
+def test_gate_fail_closed_when_refresh_unavailable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"detail": "expired"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    config = AtlasContractConfig(base_url=BASE_URL, token="t0ken", timeout_seconds=5.0)
+    gate = GovernanceGate(config, client=client, token_refresher=lambda: None)
+
+    # Unrecoverable 401 keeps the fail-closed contract (a denied decision, no raise),
+    # and the reason is the actionable re-auth hint, not "Atlas unreachable".
+    decision = gate.check_access(resource="retail_demo.sales", action="read")
+    assert decision.allowed is False
+    assert decision.reason == SESSION_EXPIRED_HINT
+
+
+def test_gate_post_raises_auth_error_on_unrecoverable_401() -> None:
+    """The low-level sender raises AtlasAuthError (not a generic error) on a dead 401,
+    mirroring AtlasCatalogClient._send so the exception type is consistent."""
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(401, json={"detail": "expired"}))
+    )
+    config = AtlasContractConfig(base_url=BASE_URL, token="t0ken", timeout_seconds=5.0)
+    gate = GovernanceGate(config, client=client, token_refresher=lambda: None)
+
+    with pytest.raises(AtlasAuthError) as excinfo:
+        gate._post("/api/contracts/access-check", {"operation": "access-check"})
+    assert "seeknal auth login" in str(excinfo.value)
+
+
+def test_gate_fail_open_still_denies_on_expired_session() -> None:
+    """Security: fail-open trades availability for enforcement on *transport* errors,
+    but an expired session is an auth failure and must never be waved through."""
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(401, json={"detail": "expired"}))
+    )
+    config = AtlasContractConfig(base_url=BASE_URL, token="t0ken", timeout_seconds=5.0)
+    gate = GovernanceGate(config, fail_open=True, client=client, token_refresher=lambda: None)
+
+    decision = gate.check_access(resource="retail_demo.sales", action="read")
+    assert decision.allowed is False  # NOT allowed, despite fail_open=True
+    assert decision.reason == SESSION_EXPIRED_HINT
+
+
+def test_enforce_access_on_expired_session_raises_policy_denied_not_auth_error() -> None:
+    """Run-safety contract: even though _post raises AtlasAuthError internally, the
+    public enforce_access() must still surface AtlasPolicyDenied (carrying the re-auth
+    hint as the reason). `seeknal run` catches only AtlasPolicyDenied, so raising
+    AtlasAuthError here would regress it into an uncaught traceback."""
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(401, json={"detail": "expired"}))
+    )
+    config = AtlasContractConfig(base_url=BASE_URL, token="t0ken", timeout_seconds=5.0)
+    gate = GovernanceGate(config, client=client, token_refresher=lambda: None)
+
+    with pytest.raises(AtlasPolicyDenied) as excinfo:
+        gate.enforce_access(resource="retail_demo.sales", action="read")
+    # Not an AtlasAuthError (sibling type that `seeknal run` would not catch).
+    assert not isinstance(excinfo.value, AtlasAuthError)
+    assert str(excinfo.value) == SESSION_EXPIRED_HINT

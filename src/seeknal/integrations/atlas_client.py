@@ -20,6 +20,24 @@ class AtlasPolicyDenied(AtlasContractError):
     """Raised when Atlas explicitly denies a Seeknal operation."""
 
 
+class AtlasAuthError(AtlasContractError):
+    """Raised when the caller's Atlas session is missing or expired (HTTP 401).
+
+    Carries a user-facing, re-authentication hint. It is only raised after an
+    automatic token refresh has been attempted and failed (or no refresh token was
+    available), so the right remedy is always to log in again. Subclasses
+    :class:`AtlasContractError` so existing ``except AtlasContractError`` handlers
+    keep working while callers may special-case the auth message.
+    """
+
+
+#: One-line, user-facing hint shown when the Atlas session is missing/expired and
+#: could not be refreshed automatically. Surfaced verbatim by the CLI (no traceback).
+SESSION_EXPIRED_HINT = (
+    "Your Atlas session has expired. Run `seeknal auth login` to sign in again."
+)
+
+
 @dataclass(frozen=True)
 class AtlasContractConfig:
     """Environment-backed Atlas client configuration."""

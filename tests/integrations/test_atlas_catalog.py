@@ -11,7 +11,7 @@ from seeknal.integrations.atlas_catalog import (
     Dataset,
     create_catalog_client_from_env,
 )
-from seeknal.integrations.atlas_client import AtlasContractConfig
+from seeknal.integrations.atlas_client import AtlasAuthError, AtlasContractConfig
 
 ASSET = {
     "id": "abc-123",
@@ -116,3 +116,68 @@ def test_factory_builds_client_with_env(monkeypatch):
     client = create_catalog_client_from_env()
     assert client is not None
     assert client.config.base_url == "http://atlas:8000" and client.config.token == "svc"
+
+
+def test_refreshes_token_on_401_and_retries():
+    """A 401 triggers a single refresh + retry with the new bearer, transparently."""
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            assert request.headers["Authorization"] == "Bearer tok"
+            return httpx.Response(401, json={"detail": "Token has expired"})
+        assert request.headers["Authorization"] == "Bearer refreshed"
+        return httpx.Response(200, json=[ASSET])
+
+    client = AtlasCatalogClient(
+        AtlasContractConfig(base_url="http://atlas", token="tok"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        token_refresher=lambda: "refreshed",
+    )
+    datasets = client.list_datasets(query="sales")
+    assert calls["n"] == 2
+    assert len(datasets) == 1 and datasets[0].name == "sales"
+
+
+def test_raises_auth_error_when_refresh_unavailable():
+    """When the session cannot be refreshed, raise AtlasAuthError with a login hint."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"detail": "Token has expired"})
+
+    client = AtlasCatalogClient(
+        AtlasContractConfig(base_url="http://atlas", token="tok"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        token_refresher=lambda: None,
+    )
+    try:
+        client.list_datasets(query="sales")
+    except AtlasAuthError as exc:
+        assert "seeknal auth login" in str(exc)
+    else:  # pragma: no cover - explicit failure if no error raised
+        raise AssertionError("expected AtlasAuthError")
+
+
+def test_post_path_also_refreshes_on_401():
+    """The shared sender covers POST (annotate) too, not just GET."""
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if request.url.path == "/api/assets/abc-123":
+            return httpx.Response(200, json=ASSET)  # get_dataset inside annotate()
+        # /api/contracts/assets/register (the POST)
+        if calls["n"] <= 2:
+            return httpx.Response(401, json={"detail": "expired"})
+        return httpx.Response(200, json={"ok": True})
+
+    client = AtlasCatalogClient(
+        AtlasContractConfig(base_url="http://atlas", token="tok"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        token_refresher=lambda: "refreshed",
+    )
+    result = client.annotate("abc-123", tags=["pii"])
+    assert result == {"ok": True}

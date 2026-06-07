@@ -7,9 +7,13 @@ from unittest.mock import MagicMock
 from typer.testing import CliRunner
 
 import seeknal.cli.dataset as dataset_mod
-from seeknal.cli.dataset import dataset_app
+from seeknal.cli.dataset import _extract_sample, dataset_app
 from seeknal.integrations.atlas_catalog import Dataset
-from seeknal.integrations.atlas_client import AtlasPolicyDenied
+from seeknal.integrations.atlas_client import (
+    AtlasAuthError,
+    AtlasPolicyDenied,
+    SESSION_EXPIRED_HINT,
+)
 from seeknal.integrations.atlas_governance import AccessDecision
 
 runner = CliRunner()
@@ -135,3 +139,89 @@ def test_request_access_prints_ar_id(monkeypatch):
     result = runner.invoke(dataset_app, ["request-access", "sales", "--reason", "need it"])
     assert result.exit_code == 0
     assert "AR-9" in result.output
+
+
+def test_extract_sample_unwraps_backend_values_envelope():
+    # The Atlas /api/sample backend returns columns as schema dicts and rows
+    # wrapped as {"values": {col: val}} -- the shape that previously rendered blank.
+    data = {
+        "columns": [{"name": "sale_id"}, {"name": "customer_name"}, {"name": "region"}],
+        "rows": [
+            {"values": {"sale_id": 1, "customer_name": "Alice", "region": "us-east"}},
+            {"values": {"sale_id": 2, "customer_name": "Bob", "region": "us-west"}},
+        ],
+    }
+    columns, rows = _extract_sample(data)
+    assert columns == ["sale_id", "customer_name", "region"]
+    assert rows == [[1, "Alice", "us-east"], [2, "Bob", "us-west"]]
+
+
+def test_query_renders_backend_values_envelope(monkeypatch):
+    client = _fake_client()
+    client.sample.return_value = {
+        "columns": [{"name": "sale_id"}, {"name": "region"}],
+        "rows": [{"values": {"sale_id": 1, "region": "us-east"}}],
+    }
+    _patch(monkeypatch, client=client)
+    result = runner.invoke(dataset_app, ["query", "retail_demo.sales"])
+    assert result.exit_code == 0
+    assert "us-east" in result.output
+    assert "1 row(s)." in result.output
+
+
+def test_show_presents_expired_session_without_traceback(monkeypatch):
+    client = _fake_client()
+    client.list_datasets.side_effect = AtlasAuthError(SESSION_EXPIRED_HINT)
+    _patch(monkeypatch, client=client)
+    result = runner.invoke(dataset_app, ["show", "sales"])
+    assert result.exit_code == 1
+    assert "seeknal auth login" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_query_presents_expired_session_without_traceback(monkeypatch):
+    client = _fake_client()
+    client.list_datasets.side_effect = AtlasAuthError(SESSION_EXPIRED_HINT)
+    _patch(monkeypatch, client=client)
+    result = runner.invoke(dataset_app, ["query", "retail_demo.sales"])
+    assert result.exit_code == 1
+    assert "seeknal auth login" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_request_access_refreshes_token_on_401(monkeypatch):
+    client = _fake_client()
+    _patch(monkeypatch, client=client)
+
+    calls = {"n": 0}
+    ok = MagicMock(status_code=200)
+    ok.json.return_value = {"id": "AR-12", "status": "pending"}
+    ok.content = b"{}"
+    expired = MagicMock(status_code=401)
+    expired.text = "Token has expired"
+
+    def fake_post(*a, **k):
+        calls["n"] += 1
+        return expired if calls["n"] == 1 else ok
+
+    monkeypatch.setattr(dataset_mod.httpx, "post", fake_post)
+    monkeypatch.setattr(dataset_mod, "refresh_access_token", lambda: "fresh-token")
+
+    result = runner.invoke(dataset_app, ["request-access", "sales", "--reason", "x"])
+    assert result.exit_code == 0
+    assert calls["n"] == 2  # 401 -> refresh -> retry succeeds
+    assert "AR-12" in result.output
+
+
+def test_request_access_friendly_when_refresh_fails(monkeypatch):
+    client = _fake_client()
+    _patch(monkeypatch, client=client)
+    expired = MagicMock(status_code=401)
+    expired.text = "Token has expired"
+    monkeypatch.setattr(dataset_mod.httpx, "post", lambda *a, **k: expired)
+    monkeypatch.setattr(dataset_mod, "refresh_access_token", lambda: None)
+
+    result = runner.invoke(dataset_app, ["request-access", "sales", "--reason", "x"])
+    assert result.exit_code == 1
+    assert "seeknal auth login" in result.output
+    assert "Traceback" not in result.output
