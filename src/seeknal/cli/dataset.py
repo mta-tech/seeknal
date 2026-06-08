@@ -55,6 +55,8 @@ dataset_app = typer.Typer(
 
 #: Seconds to wait for the Atlas governance API before giving up.
 _REQUEST_TIMEOUT_SECONDS = 30.0
+#: Max columns ``show`` prints inline before truncating with a "+N more" line.
+_SHOW_COLUMN_LIMIT = 50
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$")
 #: A dotted ``namespace.table`` identifier (a governed Lakekeeper table that may not
 #: be a registered catalog asset). No slashes/spaces — distinguishes it from an
@@ -124,6 +126,7 @@ def _dataset_dict(dataset: Dataset) -> dict[str, Any]:
         "description": dataset.description,
         "tags": list(dataset.tags),
         "fqn": dataset.fqn,
+        "columns": [{"name": name, "type": col_type} for name, col_type in dataset.columns],
     }
 
 
@@ -261,6 +264,13 @@ def show_dataset(
     if resolved.tags:
         typer.echo(f"  tags      : {', '.join(resolved.tags)}")
     typer.echo(f"  id        : {resolved.id}")
+    if resolved.columns:
+        typer.echo(f"  columns   : {len(resolved.columns)}")
+        for col_name, col_type in resolved.columns[:_SHOW_COLUMN_LIMIT]:
+            suffix = f" ({col_type})" if col_type else ""
+            typer.echo(f"    - {col_name}{suffix}")
+        if len(resolved.columns) > _SHOW_COLUMN_LIMIT:
+            typer.echo(f"    … (+{len(resolved.columns) - _SHOW_COLUMN_LIMIT} more)")
     if decision is not None:
         mark = "ALLOW" if decision.allowed else "DENY"
         masked = (

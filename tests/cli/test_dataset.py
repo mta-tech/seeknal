@@ -27,6 +27,7 @@ DS = Dataset(
     description="Retail sales",
     tags=("gold",),
     canonical_id="atlas.retail_demo.sales",
+    columns=(("sale_id", "long"), ("region", "string")),
 )
 
 
@@ -75,6 +76,21 @@ def test_show_prints_metadata_and_access(monkeypatch):
     result = runner.invoke(dataset_app, ["show", "sales"])
     assert result.exit_code == 0
     assert "retail_demo" in result.output and "ALLOW" in result.output
+
+
+def test_show_renders_columns(monkeypatch):
+    _patch(monkeypatch, client=_fake_client())
+    result = runner.invoke(dataset_app, ["show", "sales"])
+    assert result.exit_code == 0
+    assert "columns" in result.output
+    assert "sale_id" in result.output and "region" in result.output and "(long)" in result.output
+
+
+def test_show_json_includes_columns(monkeypatch):
+    _patch(monkeypatch, client=_fake_client())
+    result = runner.invoke(dataset_app, ["show", "sales", "--json"])
+    assert result.exit_code == 0
+    assert '"name": "sale_id"' in result.output and '"type": "long"' in result.output
 
 
 def test_show_with_sample(monkeypatch):

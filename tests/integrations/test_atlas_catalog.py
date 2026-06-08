@@ -268,6 +268,33 @@ def test_factory_reads_portal_url(monkeypatch):
     assert client is not None and client._portal_url == "http://portal:4200"
 
 
+def test_dataset_from_portal_carries_schema_columns():
+    row = {
+        **PORTAL_ICEBERG,
+        "schemaFields": [
+            {"name": "sale_id", "type": "long"},
+            {"name": "region", "type": "string"},
+        ],
+    }
+    d = Dataset.from_portal(row)
+    assert d.columns == (("sale_id", "long"), ("region", "string"))
+
+
+def test_columns_from_schema_fields_tolerates_shapes():
+    from seeknal.integrations.atlas_catalog import _columns_from_schema_fields
+
+    assert _columns_from_schema_fields(None) == ()
+    assert _columns_from_schema_fields("nope") == ()
+    # {name,type} | {fieldPath,nativeDataType} (DataHub) | {name,dataType}; no-name dropped.
+    assert _columns_from_schema_fields(
+        [
+            {"fieldPath": "a", "nativeDataType": "int"},
+            {"name": "b", "dataType": "varchar"},
+            {"type": "x"},
+        ]
+    ) == (("a", "int"), ("b", "varchar"))
+
+
 def test_post_path_also_refreshes_on_401():
     """The shared sender covers POST (annotate) too, not just GET."""
 

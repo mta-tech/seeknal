@@ -42,6 +42,33 @@ from seeknal.integrations.atlas_governance import (
 __all__ = ["Dataset", "AtlasCatalogClient", "create_catalog_client_from_env"]
 
 
+def _columns_from_schema_fields(raw: Any) -> tuple[tuple[str, str], ...]:
+    """Normalise a catalog ``schemaFields`` list into ``(name, type)`` pairs.
+
+    Tolerant of the shapes the catalog surfaces: ``{name, type}`` (portal/iceberg),
+    ``{fieldPath, nativeDataType}`` (DataHub), or ``{name, dataType}``. Entries
+    without a usable name are dropped; a non-list input yields ``()``.
+    """
+
+    if not isinstance(raw, list):
+        return ()
+    columns: list[tuple[str, str]] = []
+    for field_def in raw:
+        if not isinstance(field_def, dict):
+            continue
+        name = field_def.get("name") or field_def.get("fieldPath")
+        if not name:
+            continue
+        col_type = (
+            field_def.get("type")
+            or field_def.get("nativeDataType")
+            or field_def.get("dataType")
+            or ""
+        )
+        columns.append((str(name), str(col_type)))
+    return tuple(columns)
+
+
 @dataclass(frozen=True)
 class Dataset:
     """Typed projection of a unified-catalog asset.
@@ -60,6 +87,11 @@ class Dataset:
     tags: tuple[str, ...] = ()
     canonical_id: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: ``(name, type)`` column pairs when the catalog exposes a schema for the
+    #: dataset (Lakekeeper/iceberg tables and cubes via the portal). Empty when the
+    #: source carries no schema. Lets ``seeknal dataset show`` render the columns the
+    #: web detail view shows, without reading any data.
+    columns: tuple[tuple[str, str], ...] = ()
 
     @classmethod
     def from_api(cls, d: dict[str, Any]) -> "Dataset":
@@ -83,6 +115,9 @@ class Dataset:
             tags=tags,
             canonical_id=str(metadata.get("canonical_asset_id", "")),
             metadata=dict(metadata),
+            columns=_columns_from_schema_fields(
+                metadata.get("schemaFields") or metadata.get("columns")
+            ),
         )
 
     @classmethod
@@ -125,6 +160,7 @@ class Dataset:
                 "displayName": display,
                 "platform": d.get("platform"),
             },
+            columns=_columns_from_schema_fields(d.get("schemaFields")),
         )
 
     @property
