@@ -49,6 +49,13 @@ def test_derive_from_api_url_host():
     assert cfg.keycloak_issuer == "http://atlas.example:8080/realms/atlas"
 
 
+def test_derive_honors_explicit_host_port():
+    cfg = derive_config(host="atlas:9000")
+    assert cfg.api_url == "http://atlas:9000"  # explicit port kept, not dropped to :8000
+    assert cfg.portal_url == "http://atlas:4200"  # portal/keycloak still standard on bare host
+    assert cfg.keycloak_issuer == "http://atlas:8080/realms/atlas"
+
+
 def test_garbled_config_yields_empty(monkeypatch, tmp_path):
     path = _point_at(monkeypatch, tmp_path)
     path.write_text("not json", encoding="utf-8")

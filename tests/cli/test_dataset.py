@@ -98,7 +98,8 @@ def test_list_accessible_filters_to_allowed(monkeypatch):
     assert "accessible" in result.output
 
 
-def test_list_hints_to_set_portal_url_when_unset(monkeypatch):
+def test_list_hints_to_set_portal_url_when_unset(monkeypatch, tmp_path):
+    monkeypatch.setenv("SEEKNAL_ATLAS_CONFIG_PATH", str(tmp_path / "none.json"))
     monkeypatch.delenv("ATLAS_PORTAL_URL", raising=False)
     _patch(monkeypatch, client=_fake_client())
     result = runner.invoke(dataset_app, ["list"])
@@ -106,12 +107,25 @@ def test_list_hints_to_set_portal_url_when_unset(monkeypatch):
     assert "ATLAS_PORTAL_URL" in result.output
 
 
-def test_list_no_hint_when_portal_set(monkeypatch):
+def test_list_no_hint_when_portal_set(monkeypatch, tmp_path):
+    monkeypatch.setenv("SEEKNAL_ATLAS_CONFIG_PATH", str(tmp_path / "none.json"))
     monkeypatch.setenv("ATLAS_PORTAL_URL", "http://portal:4200")
     _patch(monkeypatch, client=_fake_client())
     result = runner.invoke(dataset_app, ["list"])
     assert result.exit_code == 0
-    assert "Set ATLAS_PORTAL_URL" not in result.output
+    assert "seeknal asset registry" not in result.output
+
+
+def test_list_no_hint_when_portal_in_config(monkeypatch, tmp_path):
+    from seeknal.integrations.atlas_config import derive_config, save_atlas_config
+
+    monkeypatch.setenv("SEEKNAL_ATLAS_CONFIG_PATH", str(tmp_path / "atlas.json"))
+    save_atlas_config(derive_config(host="cfg-host"))  # config provides portal_url
+    monkeypatch.delenv("ATLAS_PORTAL_URL", raising=False)
+    _patch(monkeypatch, client=_fake_client())
+    result = runner.invoke(dataset_app, ["list"])
+    assert result.exit_code == 0
+    assert "seeknal asset registry" not in result.output  # config suppresses the hint
 
 
 def test_show_prints_metadata_and_access(monkeypatch):
@@ -197,6 +211,29 @@ def test_query_accepts_direct_table_identifier(monkeypatch):
     assert result.exit_code == 0
     gate.enforce_access.assert_called_with(resource="retail_demo.sales", action="read")
     client.sample.assert_called_with("retail_demo.sales", limit=20)
+
+
+def test_request_access_uses_config_api_url_when_env_unset(monkeypatch, tmp_path):
+    from seeknal.integrations.atlas_config import derive_config, save_atlas_config
+
+    monkeypatch.setenv("SEEKNAL_ATLAS_CONFIG_PATH", str(tmp_path / "atlas.json"))
+    save_atlas_config(derive_config(host="cfg-host"))
+    monkeypatch.delenv("SEEKNAL_API_URL", raising=False)
+    monkeypatch.delenv("ATLAS_API_URL", raising=False)
+    _patch(monkeypatch, client=_fake_client())
+    seen: dict[str, str] = {}
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"id": "AR-1", "status": "pending"}
+    response.content = b"{}"
+
+    def fake_post(url, **kwargs):
+        seen["url"] = url
+        return response
+
+    monkeypatch.setattr(dataset_mod.httpx, "post", fake_post)
+    result = runner.invoke(dataset_app, ["request-access", "sales", "--reason", "x"])
+    assert result.exit_code == 0
+    assert seen["url"].startswith("http://cfg-host:8000/")  # base from config, not localhost
 
 
 def test_request_access_prints_ar_id(monkeypatch):

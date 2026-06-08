@@ -38,6 +38,7 @@ from seeknal.integrations.atlas_client import (
     AtlasPolicyDenied,
     SESSION_EXPIRED_HINT,
 )
+from seeknal.integrations.atlas_config import atlas_config
 from seeknal.integrations.atlas_governance import (
     AccessDecision,
     apply_column_masks,
@@ -251,10 +252,10 @@ def list_datasets(
         tabulate(rows, headers=["Name", "Namespace", "Source", "Type", "Tags"], tablefmt="simple")
     )
     echo_info(f"{len(datasets)} {'accessible ' if accessible else ''}dataset(s).")
-    if not os.getenv("ATLAS_PORTAL_URL", "").strip():
+    if not (os.getenv("ATLAS_PORTAL_URL", "").strip() or atlas_config().portal_url):
         echo_info(
-            "Showing the seeknal asset registry. Set ATLAS_PORTAL_URL to list the full "
-            "Atlas catalog (the datasets the web portal shows)."
+            "Showing the seeknal asset registry. Run `seeknal auth config set --host <host>` "
+            "(or set ATLAS_PORTAL_URL) to list the full Atlas catalog (what the web shows)."
         )
 
 
@@ -360,7 +361,10 @@ def request_access(
     resolved = _resolve_dataset(client, dataset)
 
     base = (
-        os.getenv("SEEKNAL_API_URL") or os.getenv("ATLAS_API_URL") or "http://localhost:8000"
+        os.getenv("SEEKNAL_API_URL")
+        or os.getenv("ATLAS_API_URL")
+        or atlas_config().api_url
+        or "http://localhost:8000"
     ).rstrip("/")
     body: dict[str, Any] = {
         "requester": user_email_from_credentials() or os.getenv("USER", ""),

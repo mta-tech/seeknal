@@ -110,6 +110,25 @@ def _host_of(value: str) -> str:
     return value.split("/")[0].split(":")[0]
 
 
+def _api_from_host(host: str) -> str:
+    """Build the API URL from a ``--host`` value, honoring an explicit scheme or port.
+
+    ``atlas-dev`` → ``http://atlas-dev:8000`` (standard port); ``atlas:9000`` →
+    ``http://atlas:9000`` (the given port is kept); ``https://atlas:8443`` is used
+    verbatim. portal/keycloak still derive from the bare host (override them
+    explicitly for non-standard ports).
+    """
+
+    if not host:
+        return ""
+    cleaned = host.rstrip("/")
+    if "://" in cleaned:
+        return cleaned
+    if ":" in cleaned:  # host:port — honor the port the user gave
+        return f"http://{cleaned}"
+    return f"http://{cleaned}:{_DEFAULT_API_PORT}"
+
+
 def derive_config(
     *,
     host: str = "",
@@ -127,9 +146,7 @@ def derive_config(
     """
 
     base_host = _host_of(host or api_url)
-    resolved_api = api_url.rstrip("/") or (
-        f"http://{base_host}:{_DEFAULT_API_PORT}" if base_host else ""
-    )
+    resolved_api = api_url.rstrip("/") or _api_from_host(host)
     resolved_portal = portal_url.rstrip("/") or (
         f"http://{base_host}:{_DEFAULT_PORTAL_PORT}" if base_host else ""
     )
