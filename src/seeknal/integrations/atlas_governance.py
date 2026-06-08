@@ -42,6 +42,7 @@ from seeknal.integrations.atlas_client import (
     AtlasPolicyDenied,
     SESSION_EXPIRED_HINT,
 )
+from seeknal.integrations.atlas_config import atlas_config
 
 __all__ = [
     "AccessDecision",
@@ -146,13 +147,21 @@ _REFRESH_TIMEOUT_SECONDS = 30.0
 def _oidc_issuer() -> str:
     """Return the Keycloak realm issuer used for token refresh (no trailing slash)."""
 
-    return (os.getenv("KEYCLOAK_ISSUER", "").strip() or _DEFAULT_OIDC_ISSUER).rstrip("/")
+    return (
+        os.getenv("KEYCLOAK_ISSUER", "").strip()
+        or atlas_config().keycloak_issuer
+        or _DEFAULT_OIDC_ISSUER
+    ).rstrip("/")
 
 
 def _oidc_client_id() -> str:
     """Return the public OIDC client id used for token refresh."""
 
-    return os.getenv("SEEKNAL_OIDC_CLIENT_ID", "").strip() or _DEFAULT_OIDC_CLIENT_ID
+    return (
+        os.getenv("SEEKNAL_OIDC_CLIENT_ID", "").strip()
+        or atlas_config().oidc_client_id
+        or _DEFAULT_OIDC_CLIENT_ID
+    )
 
 
 def _persist_refreshed_tokens(existing: dict[str, Any], tokens: dict[str, Any]) -> None:
@@ -327,7 +336,7 @@ def create_governance_gate_from_env() -> "GovernanceGate | None":
     inactive and callers should pass data through unchanged.
     """
 
-    base_url = os.getenv("ATLAS_API_URL", "").strip()
+    base_url = os.getenv("ATLAS_API_URL", "").strip() or atlas_config().api_url
     if not base_url:
         return None
 

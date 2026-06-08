@@ -35,6 +35,12 @@ from typing import Any, Optional
 import httpx
 import typer
 
+from seeknal.integrations.atlas_config import (
+    atlas_config,
+    config_path,
+    derive_config,
+    save_atlas_config,
+)
 from seeknal.integrations.atlas_governance import (
     credentials_path,
     user_email_from_credentials,
@@ -62,13 +68,21 @@ _CALLBACK_TIMEOUT_SECONDS = 300.0
 def _issuer() -> str:
     """Return the configured Keycloak issuer URL (trailing slash stripped)."""
 
-    return (os.getenv("KEYCLOAK_ISSUER", "").strip() or _DEFAULT_ISSUER).rstrip("/")
+    return (
+        os.getenv("KEYCLOAK_ISSUER", "").strip()
+        or atlas_config().keycloak_issuer
+        or _DEFAULT_ISSUER
+    ).rstrip("/")
 
 
 def _client_id() -> str:
     """Return the configured public OIDC client id."""
 
-    return os.getenv("SEEKNAL_OIDC_CLIENT_ID", "").strip() or _DEFAULT_CLIENT_ID
+    return (
+        os.getenv("SEEKNAL_OIDC_CLIENT_ID", "").strip()
+        or atlas_config().oidc_client_id
+        or _DEFAULT_CLIENT_ID
+    )
 
 
 def _redirect_port() -> int:
@@ -311,15 +325,35 @@ def login(
         "--no-browser",
         help="Print the authorization URL instead of opening a browser.",
     ),
+    host: Optional[str] = typer.Option(
+        None,
+        "--host",
+        help="Configure the Atlas host (derives api/portal/keycloak URLs) before logging in.",
+    ),
+    api_url: Optional[str] = typer.Option(
+        None,
+        "--api-url",
+        help="Configure the Atlas API URL (derives portal/keycloak) before logging in.",
+    ),
 ) -> None:
     """Log in via the Keycloak Authorization Code + PKCE loopback flow.
 
+    Pass ``--host``/``--api-url`` to configure the connection and sign in in one step
+    (it persists ~/.config/seeknal/atlas.json, so later commands need no env vars).
     Discovers the OIDC endpoints from the issuer well-known document, generates a
     PKCE verifier/challenge and CSRF state, opens (or prints) the authorization URL,
     captures the redirect on the loopback port, exchanges the code for tokens, and
     writes them to the credentials file. Prints the logged-in subject and email on
     success; exits with code 1 on any failure.
     """
+
+    if host or api_url:
+        cfg = derive_config(host=host or "", api_url=api_url or "")
+        path = save_atlas_config(cfg)
+        echo_info(
+            f"Configured Atlas ({path}): api={cfg.api_url} portal={cfg.portal_url} "
+            f"keycloak={cfg.keycloak_issuer}"
+        )
 
     issuer = _issuer()
     client_id = _client_id()
@@ -427,3 +461,78 @@ def logout() -> None:
         echo_error(f"Failed to remove credentials: {exc}")
         raise typer.Exit(1)
     echo_success(f"Logged out (removed {path}).")
+
+
+config_app = typer.Typer(
+    name="config",
+    help="Configure the Atlas connection (persists ~/.config/seeknal/atlas.json).",
+)
+auth_app.add_typer(config_app, name="config")
+
+
+@config_app.command("set")
+def config_set(
+    host: Optional[str] = typer.Option(
+        None,
+        "--host",
+        help="Atlas host; derives api :8000, portal :4200, keycloak :8080/realms/<realm>.",
+    ),
+    api_url: Optional[str] = typer.Option(
+        None, "--api-url", help="Atlas API URL (derives portal/keycloak from its host)."
+    ),
+    portal_url: Optional[str] = typer.Option(None, "--portal-url", help="Override the portal URL."),
+    keycloak_issuer: Optional[str] = typer.Option(
+        None, "--keycloak-issuer", help="Override the Keycloak issuer."
+    ),
+    realm: str = typer.Option("atlas", "--realm", help="Keycloak realm (for the derived issuer)."),
+    client_id: Optional[str] = typer.Option(
+        None, "--client-id", help="OIDC client id (default seeknal-cli)."
+    ),
+) -> None:
+    """Persist the Atlas connection so commands don't need env vars.
+
+    Give ``--host`` to derive all three URLs from one host, or set them explicitly.
+    Environment variables (ATLAS_API_URL, ATLAS_PORTAL_URL, KEYCLOAK_ISSUER) still
+    override this file.
+    """
+
+    if not host and not api_url:
+        echo_error("Provide --host (derives all URLs) or --api-url.")
+        raise typer.Exit(1)
+    cfg = derive_config(
+        host=host or "",
+        api_url=api_url or "",
+        portal_url=portal_url or "",
+        keycloak_issuer=keycloak_issuer or "",
+        realm=realm,
+        oidc_client_id=client_id or "",
+    )
+    path = save_atlas_config(cfg)
+    echo_success(f"Wrote Atlas config to {path}")
+    typer.echo(f"  api_url        : {cfg.api_url}")
+    typer.echo(f"  portal_url     : {cfg.portal_url}")
+    typer.echo(f"  keycloak_issuer: {cfg.keycloak_issuer}")
+    typer.echo(f"  oidc_client_id : {cfg.oidc_client_id}")
+    echo_info("Run `seeknal auth login` to sign in.")
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Show the effective Atlas connection settings and where each value comes from."""
+
+    cfg = atlas_config()
+    typer.echo(f"Atlas config ({config_path()}):")
+    for label, env_var, file_value in (
+        ("api_url", "ATLAS_API_URL", cfg.api_url),
+        ("portal_url", "ATLAS_PORTAL_URL", cfg.portal_url),
+        ("keycloak_issuer", "KEYCLOAK_ISSUER", cfg.keycloak_issuer),
+        ("oidc_client_id", "SEEKNAL_OIDC_CLIENT_ID", cfg.oidc_client_id),
+    ):
+        env_value = os.getenv(env_var, "").strip()
+        if env_value:
+            value, source = env_value, "env"
+        elif file_value:
+            value, source = file_value, "config"
+        else:
+            value, source = "(unset)", "default"
+        typer.echo(f"  {label:16}: {value}  [{source}]")

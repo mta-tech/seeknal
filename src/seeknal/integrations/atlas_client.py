@@ -11,6 +11,8 @@ from typing import Any
 
 import httpx
 
+from seeknal.integrations.atlas_config import atlas_config
+
 
 class AtlasContractError(RuntimeError):
     """Raised when Atlas contract sync fails."""
@@ -63,7 +65,7 @@ class AtlasApplyContext:
 def create_atlas_contract_client_from_env() -> "AtlasContractClient | None":
     """Create a client only when Atlas sync is explicitly configured."""
 
-    base_url = os.getenv("ATLAS_API_URL", "").strip()
+    base_url = os.getenv("ATLAS_API_URL", "").strip() or atlas_config().api_url
     if not base_url:
         return None
 

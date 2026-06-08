@@ -6,17 +6,32 @@ schema and lineage, preview governed rows, request access, and wire a governed
 dataset straight into a pipeline. Every read flows the logged-in user's identity
 to Atlas, so you see exactly what you are permitted to see.
 
-## Configure
+## Configure (one command)
+
+Point the CLI at your Atlas host once — it derives the seeknal-api, portal, and
+Keycloak URLs and persists them to `~/.config/seeknal/atlas.json`, so no per-shell
+env vars are needed:
 
 ```bash
-export ATLAS_API_URL=http://atlas-dev-server:8000        # seeknal-api (gate + sample)
-export ATLAS_PORTAL_URL=http://atlas-dev-server:4200     # portal catalog (list/lineage parity with the web)
-export KEYCLOAK_ISSUER=http://atlas-dev-server:8080/realms/atlas
-seeknal auth login                                       # or a non-interactive token mint
+seeknal auth config set --host atlas-dev-server   # api :8000 · portal :4200 · keycloak :8080/realms/atlas
+seeknal auth login                                # sign in (Keycloak PKCE)
+seeknal dataset list                              # ready — no env vars
 ```
 
-With `ATLAS_API_URL` unset the whole group is inactive (commands exit with a hint),
-and `seeknal run` is ungoverned — full backward compatibility.
+Or do both in one step, and inspect/override later:
+
+```bash
+seeknal auth login --host atlas-dev-server   # configure + sign in together
+seeknal auth config show                     # effective values + where each comes from (env/config/default)
+```
+
+Non-standard deployment? Override any piece: `--api-url`, `--portal-url`,
+`--keycloak-issuer`, `--realm`, `--client-id`. **Environment variables still win**
+over the config file (`ATLAS_API_URL`, `ATLAS_PORTAL_URL`, `KEYCLOAK_ISSUER`,
+`SEEKNAL_OIDC_CLIENT_ID`), so CI/automation can override without editing the file.
+
+With none of these set the whole group is inactive (commands exit with a hint) and
+`seeknal run` is ungoverned — full backward compatibility.
 
 ## Discover → inspect
 

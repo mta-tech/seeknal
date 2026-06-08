@@ -35,6 +35,7 @@ from seeknal.integrations.atlas_client import (
     AtlasContractError,
     SESSION_EXPIRED_HINT,
 )
+from seeknal.integrations.atlas_config import atlas_config
 from seeknal.integrations.atlas_governance import (
     refresh_access_token,
     user_token_from_credentials,
@@ -514,7 +515,8 @@ def create_catalog_client_from_env() -> "AtlasCatalogClient | None":
     per-user identity flows to Atlas.
     """
 
-    base_url = os.getenv("ATLAS_API_URL", "").strip()
+    cfg = atlas_config()
+    base_url = os.getenv("ATLAS_API_URL", "").strip() or cfg.api_url
     if not base_url:
         return None
 
@@ -527,5 +529,5 @@ def create_catalog_client_from_env() -> "AtlasCatalogClient | None":
     )
     # When the portal is configured, ``list_datasets`` lists from its ``/api/datasets``
     # aggregator so the CLI catalog matches the web (Lakekeeper tables + cube products).
-    portal_url = os.getenv("ATLAS_PORTAL_URL", "").strip() or None
+    portal_url = (os.getenv("ATLAS_PORTAL_URL", "").strip() or cfg.portal_url) or None
     return AtlasCatalogClient(config, portal_url=portal_url)
