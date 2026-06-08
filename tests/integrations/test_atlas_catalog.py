@@ -160,6 +160,114 @@ def test_raises_auth_error_when_refresh_unavailable():
         raise AssertionError("expected AtlasAuthError")
 
 
+PORTAL_ICEBERG = {
+    "urn": "urn:li:dataset:(urn:li:dataPlatform:iceberg,retail_demo.sales,PROD)",
+    "name": "retail_demo.sales",
+    "displayName": "sales",
+    "namespace": "retail_demo",
+    "platform": "iceberg",
+    "type": "table",
+    "tags": ["Restricted"],
+}
+PORTAL_CUBE = {
+    "urn": "urn:li:dataset:(urn:li:dataPlatform:cube,cube.public.Orders,PROD)",
+    "name": "cube.public.Orders",
+    "displayName": "Orders",
+    "namespace": "public",
+    "platform": "cube",
+    "type": "cube",
+    "tags": [],
+}
+
+
+def _portal_client(handler) -> AtlasCatalogClient:
+    transport = httpx.MockTransport(handler)
+    return AtlasCatalogClient(
+        AtlasContractConfig(base_url="http://atlas", token="tok"),
+        client=httpx.Client(transport=transport),
+        portal_url="http://portal",
+    )
+
+
+def test_dataset_from_portal_iceberg_recomposes_fqn_without_doubling():
+    d = Dataset.from_portal(PORTAL_ICEBERG)
+    assert d.name == "sales" and d.namespace == "retail_demo"
+    assert d.asset_type == "table" and d.source_system == "iceberg"
+    assert d.tags == ("Restricted",)
+    assert d.fqn == "retail_demo.sales"  # not retail_demo.retail_demo.sales
+
+
+def test_dataset_from_portal_cube_shape():
+    d = Dataset.from_portal(PORTAL_CUBE)
+    assert d.name == "Orders" and d.namespace == "public"
+    assert d.asset_type == "cube" and d.source_system == "cube"
+    assert d.fqn == "public.Orders"
+
+
+def test_dataset_from_portal_strips_namespace_when_no_display_name():
+    d = Dataset.from_portal(
+        {"name": "retail_demo.sales", "namespace": "retail_demo", "platform": "iceberg", "type": "table"}
+    )
+    assert d.name == "sales" and d.fqn == "retail_demo.sales"
+
+
+def test_list_from_portal_targets_portal_and_maps_rows():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["host"] = request.url.host
+        seen["path"] = request.url.path
+        seen["url"] = str(request.url)
+        assert request.headers["Authorization"] == "Bearer tok"
+        return httpx.Response(200, json={"datasets": [PORTAL_ICEBERG, PORTAL_CUBE], "total": 2})
+
+    datasets = _portal_client(handler).list_datasets(query="sa", namespace="retail_demo", limit=5)
+    assert seen["host"] == "portal" and seen["path"] == "/api/datasets"
+    assert "q=sa" in seen["url"] and "namespace=retail_demo" in seen["url"] and "limit=5" in seen["url"]
+    assert [d.fqn for d in datasets] == ["retail_demo.sales", "public.Orders"]
+
+
+def test_list_from_portal_forwards_platform_and_filters_type_client_side():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"datasets": [PORTAL_ICEBERG, PORTAL_CUBE]})
+
+    # source_system -> portal ?platform=; asset_type filtered client-side.
+    datasets = _portal_client(handler).list_datasets(source_system="cube", asset_type="cube")
+    assert "platform=cube" in seen["url"]
+    assert [d.fqn for d in datasets] == ["public.Orders"]
+
+
+def test_list_from_portal_tolerates_bare_array():
+    datasets = _portal_client(
+        lambda r: httpx.Response(200, json=[PORTAL_ICEBERG])
+    ).list_datasets()
+    assert [d.fqn for d in datasets] == ["retail_demo.sales"]
+
+
+def test_list_uses_assets_registry_when_portal_unset():
+    """Without ATLAS_PORTAL_URL the registry path (/api/assets) is used (backward compat)."""
+
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        return httpx.Response(200, json=[ASSET])
+
+    datasets = _client(handler).list_datasets()  # _client has no portal_url
+    assert seen["path"] == "/api/assets"
+    assert datasets[0].fqn == "atlas.retail_demo.sales"
+
+
+def test_factory_reads_portal_url(monkeypatch):
+    monkeypatch.setenv("ATLAS_API_URL", "http://atlas:8000")
+    monkeypatch.setenv("ATLAS_PORTAL_URL", "http://portal:4200/")
+    client = create_catalog_client_from_env()
+    assert client is not None and client._portal_url == "http://portal:4200"
+
+
 def test_post_path_also_refreshes_on_401():
     """The shared sender covers POST (annotate) too, not just GET."""
 

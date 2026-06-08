@@ -85,6 +85,48 @@ class Dataset:
             metadata=dict(metadata),
         )
 
+    @classmethod
+    def from_portal(cls, d: dict[str, Any]) -> "Dataset":
+        """Map a portal ``/api/datasets`` row (the web catalog shape) to a Dataset.
+
+        The portal aggregates Lakekeeper Iceberg tables and DataHub cube products and
+        returns rows shaped as ``{urn, name:"{ns}.{table}", displayName, namespace,
+        platform, type, tags}`` — where ``name`` is already the fully-qualified
+        ``namespace.table``. We keep the short ``displayName`` as :attr:`name` and the
+        ``namespace`` separate so :attr:`fqn` recomposes the governed identifier
+        (``namespace.name``) without doubling the namespace. ``platform`` (iceberg/cube)
+        becomes ``source_system`` and ``type`` (table/cube) becomes ``asset_type`` so the
+        CLI renders the same columns the registry path produces.
+        """
+
+        namespace = str(d.get("namespace", "") or "")
+        full_name = str(d.get("name", "") or "")
+        display = str(d.get("displayName", "") or "")
+        if display:
+            name = display
+        elif namespace and full_name.startswith(f"{namespace}."):
+            name = full_name[len(namespace) + 1 :]
+        else:
+            name = full_name
+        raw_tags = d.get("tags") or []
+        tags = tuple(str(tag) for tag in raw_tags if tag)
+        return cls(
+            id=str(d.get("urn") or full_name),
+            name=name,
+            namespace=namespace,
+            asset_type=str(d.get("type", "") or ""),
+            source_system=str(d.get("platform", "") or ""),
+            description=str(d.get("description", "") or ""),
+            tags=tags,
+            canonical_id="",
+            metadata={
+                "urn": d.get("urn"),
+                "fullName": full_name,
+                "displayName": display,
+                "platform": d.get("platform"),
+            },
+        )
+
     @property
     def fqn(self) -> str:
         """Fully-qualified name for the dataset.
@@ -114,6 +156,7 @@ class AtlasCatalogClient:
         *,
         client: httpx.Client | None = None,
         token_refresher: Callable[[], str | None] | None = None,
+        portal_url: str | None = None,
     ) -> None:
         self.config = config
         self._client = client
@@ -121,6 +164,11 @@ class AtlasCatalogClient:
         # refresh can swap in a new access token without rebuilding the frozen config.
         self._token = config.token
         self._token_refresher = token_refresher or refresh_access_token
+        # When set (env ``ATLAS_PORTAL_URL``), ``list_datasets`` reads the portal's
+        # ``/api/datasets`` aggregator — the *same* source the web UI lists — so the CLI
+        # catalog matches the web (Lakekeeper tables + cubes) instead of the seeknal
+        # asset registry. Unset → the registry path (``/api/assets``) is used.
+        self._portal_url = (portal_url or "").rstrip("/") or None
 
     # -- HTTP plumbing -------------------------------------------------------
 
@@ -165,6 +213,7 @@ class AtlasCatalogClient:
         *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        base: str | None = None,
     ) -> Any:
         """Send a request, transparently refreshing the token once on HTTP 401.
 
@@ -173,9 +222,13 @@ class AtlasCatalogClient:
         still 401), an :class:`AtlasAuthError` carrying a re-authentication hint is
         raised — never a raw traceback. Other HTTP/transport failures map to
         :class:`AtlasContractError` as before.
+
+        ``base`` overrides the request host (default :attr:`config.base_url`) so the
+        same per-user-token + 401-refresh plumbing can reach the portal aggregator at
+        ``ATLAS_PORTAL_URL`` as well as the seeknal-api backend.
         """
 
-        url = f"{self.config.base_url}{path}"
+        url = f"{base or self.config.base_url}{path}"
         refreshed = False
         while True:
             try:
@@ -223,9 +276,22 @@ class AtlasCatalogClient:
     ) -> list[Dataset]:
         """List catalog assets, optionally filtered. Returns a list of :class:`Dataset`.
 
-        GET ``/api/assets``. ``query`` maps to the ``q`` parameter and ``asset_type``
-        to ``type``. The backend returns a JSON array of asset dicts.
+        When ``ATLAS_PORTAL_URL`` is configured this reads the portal's
+        ``/api/datasets`` aggregator (the same Lakekeeper-tables + cube-products catalog
+        the web UI lists) so the CLI matches the web. Otherwise it reads the seeknal
+        asset registry: GET ``/api/assets`` (``query``→``q``, ``asset_type``→``type``),
+        which returns a JSON array of asset dicts.
         """
+
+        if self._portal_url is not None:
+            return self._list_from_portal(
+                query=query,
+                asset_type=asset_type,
+                namespace=namespace,
+                source_system=source_system,
+                limit=limit,
+                offset=offset,
+            )
 
         params = {
             "q": query,
@@ -237,6 +303,43 @@ class AtlasCatalogClient:
         }
         resp = self._get("/api/assets", params)
         return [Dataset.from_api(asset) for asset in (resp or [])]
+
+    def _list_from_portal(
+        self,
+        *,
+        query: str | None,
+        asset_type: str | None,
+        namespace: str | None,
+        source_system: str | None,
+        limit: int,
+        offset: int,
+    ) -> list[Dataset]:
+        """List datasets from the portal ``/api/datasets`` aggregator (web parity).
+
+        The portal accepts ``q``/``namespace``/``platform``/``limit``/``offset`` and
+        returns ``{"datasets": [...], "total", "facets"}`` (a bare array is also
+        tolerated). ``source_system`` is forwarded as the portal's ``platform`` filter;
+        ``asset_type`` (which the portal does not filter on) is applied client-side so
+        the CLI's ``--type`` flag keeps working across both catalog sources.
+        """
+
+        params = {
+            "q": query,
+            "namespace": namespace,
+            "platform": source_system,
+            "limit": limit,
+            "offset": offset,
+        }
+        clean = {key: value for key, value in params.items() if value is not None}
+        resp = self._send("GET", "/api/datasets", params=clean, base=self._portal_url)
+        if isinstance(resp, dict):
+            rows = resp.get("datasets") or resp.get("results") or resp.get("items") or []
+        else:
+            rows = resp or []
+        datasets = [Dataset.from_portal(row) for row in rows if isinstance(row, dict)]
+        if asset_type:
+            datasets = [d for d in datasets if d.asset_type == asset_type]
+        return datasets
 
     def get_dataset(self, dataset_id: str) -> Dataset:
         """Fetch a single catalog asset by id.
@@ -368,4 +471,7 @@ def create_catalog_client_from_env() -> "AtlasCatalogClient | None":
         token=token,
         timeout_seconds=timeout,
     )
-    return AtlasCatalogClient(config)
+    # When the portal is configured, ``list_datasets`` lists from its ``/api/datasets``
+    # aggregator so the CLI catalog matches the web (Lakekeeper tables + cube products).
+    portal_url = os.getenv("ATLAS_PORTAL_URL", "").strip() or None
+    return AtlasCatalogClient(config, portal_url=portal_url)
