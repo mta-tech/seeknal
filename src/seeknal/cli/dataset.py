@@ -222,6 +222,11 @@ def list_datasets(
     rows = [[d.name, d.namespace, d.asset_type, ", ".join(d.tags)] for d in datasets]
     typer.echo(tabulate(rows, headers=["Name", "Namespace", "Type", "Tags"], tablefmt="simple"))
     echo_info(f"{len(datasets)} dataset(s).")
+    if not os.getenv("ATLAS_PORTAL_URL", "").strip():
+        echo_info(
+            "Showing the seeknal asset registry. Set ATLAS_PORTAL_URL to list the full "
+            "Atlas catalog (the datasets the web portal shows)."
+        )
 
 
 @dataset_app.command("show")

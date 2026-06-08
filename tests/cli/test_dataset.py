@@ -75,6 +75,22 @@ def test_list_json(monkeypatch):
     assert '"name": "sales"' in result.output
 
 
+def test_list_hints_to_set_portal_url_when_unset(monkeypatch):
+    monkeypatch.delenv("ATLAS_PORTAL_URL", raising=False)
+    _patch(monkeypatch, client=_fake_client())
+    result = runner.invoke(dataset_app, ["list"])
+    assert result.exit_code == 0
+    assert "ATLAS_PORTAL_URL" in result.output
+
+
+def test_list_no_hint_when_portal_set(monkeypatch):
+    monkeypatch.setenv("ATLAS_PORTAL_URL", "http://portal:4200")
+    _patch(monkeypatch, client=_fake_client())
+    result = runner.invoke(dataset_app, ["list"])
+    assert result.exit_code == 0
+    assert "Set ATLAS_PORTAL_URL" not in result.output
+
+
 def test_show_prints_metadata_and_access(monkeypatch):
     _patch(monkeypatch, client=_fake_client())
     result = runner.invoke(dataset_app, ["show", "sales"])
