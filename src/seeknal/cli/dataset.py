@@ -491,4 +491,87 @@ def lineage_dataset(
         echo_info("No lineage recorded in DataHub for this dataset.")
 
 
+def _render_iceberg_source(name: str, namespace: str, table: str) -> str:
+    """Render a governed ``kind: source`` (iceberg) node for a Lakekeeper table.
+
+    ``table`` is addressed as ``atlas.<namespace>.<table>`` (the catalog name the
+    REPL/materialization attach the Lakekeeper warehouse under). ``catalog_uri`` and
+    ``warehouse`` are intentionally omitted — they resolve from the project's
+    ``profiles.yml`` (``materialization.catalog``) or ``source_defaults.iceberg`` —
+    so the snippet stays portable.
+    """
+
+    return (
+        "\n".join(
+            [
+                "kind: source",
+                f"name: {name}",
+                "source: iceberg",
+                f"table: atlas.{namespace}.{table}",
+                "# catalog_uri + warehouse resolve from profiles.yml "
+                "(materialization.catalog) or source_defaults.iceberg.",
+                "# `seeknal run` access-checks + masks this table via the Atlas gate.",
+            ]
+        )
+        + "\n"
+    )
+
+
+@dataset_app.command("use")
+def use_dataset(
+    dataset: str = typer.Argument(..., help="Dataset id or name."),
+    name: Optional[str] = typer.Option(
+        None, "--name", help="Source node name (default: the table name)."
+    ),
+    write: bool = typer.Option(
+        False, "--write", help="Write the source into seeknal/sources/<name>.yml."
+    ),
+) -> None:
+    """Scaffold a governed seeknal source for a dataset, ready to use in a pipeline.
+
+    Emits a ``kind: source`` (iceberg) node referencing the governed Lakekeeper
+    table. Drop it into your project (or use ``--write``) and ``seeknal run`` will
+    access-check + mask it via the Atlas gate — bridging discover → use.
+    """
+
+    client = _require_catalog()
+    resolved = _resolve_dataset(client, dataset)
+
+    if (resolved.source_system or resolved.asset_type).lower() == "cube":
+        echo_error(
+            f"'{resolved.fqn}' is a cube data product, not an iceberg table; "
+            "it cannot be scaffolded as an iceberg pipeline source."
+        )
+        raise typer.Exit(1)
+
+    segments = resolved.fqn.split(".")
+    if len(segments) < 2:
+        echo_error(
+            f"'{resolved.fqn}' is not a namespace.table identifier; only governed "
+            "Lakekeeper tables can be used as an iceberg source."
+        )
+        raise typer.Exit(1)
+    namespace, table = segments[-2], segments[-1]
+    node_name = name or table
+    snippet = _render_iceberg_source(node_name, namespace, table)
+
+    if write:
+        dest = os.path.join("seeknal", "sources", f"{node_name}.yml")
+        if os.path.exists(dest):
+            echo_error(f"{dest} already exists — choose --name or remove it first.")
+            raise typer.Exit(1)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as handle:
+            handle.write(snippet)
+        echo_success(f"Wrote {dest}")
+        echo_info(f"Reference it in a transform as ref('source.{node_name}'), then `seeknal run`.")
+        return
+
+    typer.echo(snippet)
+    echo_info(
+        f"Save as seeknal/sources/{node_name}.yml (or re-run with --write); "
+        "`seeknal run` will govern it."
+    )
+
+
 __all__ = ["dataset_app"]

@@ -187,6 +187,38 @@ def test_lineage_json(monkeypatch):
     assert '"name": "raw.sales"' in result.output and '"downstream"' in result.output
 
 
+def test_use_prints_iceberg_source(monkeypatch):
+    _patch(monkeypatch, client=_fake_client())
+    result = runner.invoke(dataset_app, ["use", "sales"])
+    assert result.exit_code == 0
+    assert "kind: source" in result.output
+    assert "source: iceberg" in result.output
+    assert "table: atlas.retail_demo.sales" in result.output
+
+
+def test_use_rejects_cube(monkeypatch):
+    client = _fake_client()
+    cube = Dataset(
+        id="urn:cube", name="Orders", namespace="public", asset_type="cube", source_system="cube"
+    )
+    client.list_datasets.return_value = [cube]
+    _patch(monkeypatch, client=client)
+    result = runner.invoke(dataset_app, ["use", "Orders"])
+    assert result.exit_code == 1
+    assert "cube" in result.output.lower()
+
+
+def test_use_write_creates_source_file(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _patch(monkeypatch, client=_fake_client())
+    result = runner.invoke(dataset_app, ["use", "sales", "--write"])
+    assert result.exit_code == 0
+    dest = tmp_path / "seeknal" / "sources" / "sales.yml"
+    assert dest.exists()
+    content = dest.read_text()
+    assert "source: iceberg" in content and "table: atlas.retail_demo.sales" in content
+
+
 def test_extract_sample_unwraps_backend_values_envelope():
     # The Atlas /api/sample backend returns columns as schema dicts and rows
     # wrapped as {"values": {col: val}} -- the shape that previously rendered blank.
