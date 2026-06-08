@@ -99,9 +99,15 @@ def _resolve_dataset(client: AtlasCatalogClient, ref: str) -> Dataset:
     except AtlasContractError as exc:
         echo_error(f"Catalog lookup failed: {exc}")
         raise typer.Exit(1) from exc
-    for dataset in matches:
-        if ref in (dataset.name, dataset.fqn, dataset.id):
-            return dataset
+    exact = [d for d in matches if ref in (d.name, d.fqn, d.id)]
+    if exact:
+        if len(exact) > 1:
+            others = ", ".join(d.fqn for d in exact[1:6])
+            echo_info(
+                f"'{ref}' matches {len(exact)} datasets; using {exact[0].fqn}. "
+                f"Others: {others}. Pass the full namespace.table to choose another."
+            )
+        return exact[0]
     if matches:
         return matches[0]
 

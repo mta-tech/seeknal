@@ -122,6 +122,18 @@ def test_show_with_sample(monkeypatch):
     client.sample.assert_called_once()
 
 
+def test_resolve_ambiguous_name_warns_and_picks_first(monkeypatch):
+    client = _fake_client()
+    d1 = Dataset(id="urn:1", name="customers", namespace="curated", asset_type="table")
+    d2 = Dataset(id="urn:2", name="customers", namespace="analytics", asset_type="table")
+    client.list_datasets.return_value = [d1, d2]
+    _patch(monkeypatch, client=client)
+    result = runner.invoke(dataset_app, ["show", "customers"])
+    assert result.exit_code == 0
+    assert "matches 2 datasets" in result.output
+    assert "curated.customers" in result.output and "analytics.customers" in result.output
+
+
 def test_annotate_calls_client(monkeypatch):
     client = _fake_client()
     _patch(monkeypatch, client=client)
