@@ -75,6 +75,29 @@ def test_list_json(monkeypatch):
     assert '"name": "sales"' in result.output
 
 
+def test_list_shows_source_column(monkeypatch):
+    _patch(monkeypatch, client=_fake_client())
+    result = runner.invoke(dataset_app, ["list"])
+    assert result.exit_code == 0
+    assert "Source" in result.output and "lakekeeper" in result.output
+
+
+def test_list_accessible_filters_to_allowed(monkeypatch):
+    client = _fake_client()
+    d1 = Dataset(id="1", name="ok", namespace="ns", asset_type="table", source_system="iceberg")
+    d2 = Dataset(id="2", name="nope", namespace="ns", asset_type="table", source_system="iceberg")
+    client.list_datasets.return_value = [d1, d2]
+    gate = MagicMock()
+    gate.check_access.side_effect = lambda *, resource, action: AccessDecision(
+        allowed=(resource == "ns.ok")
+    )
+    _patch(monkeypatch, client=client, gate=gate)
+    result = runner.invoke(dataset_app, ["list", "--accessible"])
+    assert result.exit_code == 0
+    assert "ok" in result.output and "nope" not in result.output
+    assert "accessible" in result.output
+
+
 def test_list_hints_to_set_portal_url_when_unset(monkeypatch):
     monkeypatch.delenv("ATLAS_PORTAL_URL", raising=False)
     _patch(monkeypatch, client=_fake_client())

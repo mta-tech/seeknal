@@ -206,6 +206,11 @@ def list_datasets(
     asset_type: Optional[str] = typer.Option(None, "--type", help="Filter by asset type."),
     namespace: Optional[str] = typer.Option(None, "--namespace", help="Filter by namespace."),
     limit: int = typer.Option(50, "--limit", help="Maximum number of datasets."),
+    accessible: bool = typer.Option(
+        False,
+        "--accessible",
+        help="Show only datasets you can read (runs an access check per row; slower).",
+    ),
     as_json: bool = typer.Option(False, "--json", help="Output JSON instead of a table."),
 ) -> None:
     """List datasets in the Atlas catalog."""
@@ -219,15 +224,33 @@ def list_datasets(
         echo_error(f"Failed to list datasets: {exc}")
         raise typer.Exit(1)
 
+    if accessible:
+        gate = create_governance_gate_from_env()
+        if gate is None:
+            echo_error("--accessible needs the governance gate (set ATLAS_API_URL).")
+            raise typer.Exit(2)
+        kept: list[Dataset] = []
+        for dataset in datasets:
+            try:
+                if gate.check_access(resource=dataset.fqn, action="read").allowed:
+                    kept.append(dataset)
+            except AtlasContractError:
+                pass  # fail closed: drop from the accessible list
+        datasets = kept
+
     if as_json:
         typer.echo(_json.dumps([_dataset_dict(d) for d in datasets], indent=2))
         return
     if not datasets:
-        echo_info("No datasets found.")
+        echo_info("No accessible datasets found." if accessible else "No datasets found.")
         return
-    rows = [[d.name, d.namespace, d.asset_type, ", ".join(d.tags)] for d in datasets]
-    typer.echo(tabulate(rows, headers=["Name", "Namespace", "Type", "Tags"], tablefmt="simple"))
-    echo_info(f"{len(datasets)} dataset(s).")
+    rows = [
+        [d.name, d.namespace, d.source_system, d.asset_type, ", ".join(d.tags)] for d in datasets
+    ]
+    typer.echo(
+        tabulate(rows, headers=["Name", "Namespace", "Source", "Type", "Tags"], tablefmt="simple")
+    )
+    echo_info(f"{len(datasets)} {'accessible ' if accessible else ''}dataset(s).")
     if not os.getenv("ATLAS_PORTAL_URL", "").strip():
         echo_info(
             "Showing the seeknal asset registry. Set ATLAS_PORTAL_URL to list the full "
