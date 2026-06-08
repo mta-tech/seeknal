@@ -268,6 +268,27 @@ def test_factory_reads_portal_url(monkeypatch):
     assert client is not None and client._portal_url == "http://portal:4200"
 
 
+def test_lineage_hits_portal_lineage_route():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["host"] = request.url.host
+        seen["path"] = request.url.path
+        return httpx.Response(
+            200,
+            json={
+                "upstreamLineage": [{"name": "raw.x", "type": "DATASET"}],
+                "downstreamLineage": [],
+            },
+        )
+
+    urn = "urn:li:dataset:(urn:li:dataPlatform:iceberg,retail_demo.sales,PROD)"
+    data = _portal_client(handler).lineage(urn)
+    assert seen["host"] == "portal"
+    assert seen["path"].startswith("/api/datasets/") and seen["path"].endswith("/lineage")
+    assert data["upstreamLineage"][0]["name"] == "raw.x"
+
+
 def test_dataset_from_portal_carries_schema_columns():
     row = {
         **PORTAL_ICEBERG,

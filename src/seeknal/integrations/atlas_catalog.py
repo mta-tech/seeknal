@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
+from urllib.parse import quote
 
 import httpx
 
@@ -429,6 +430,23 @@ class AtlasCatalogClient:
             "/api/sample",
             {"identifier": identifier, "limit": limit, "offset": offset},
         )
+
+    def lineage(self, urn: str) -> dict[str, Any]:
+        """Fetch a dataset's upstream/downstream lineage, returning the JSON verbatim.
+
+        When the portal is configured, reads its DataHub-backed lineage route
+        (``GET /api/datasets/{urn}/lineage`` → ``{dataset, upstreamLineage,
+        downstreamLineage}``, empty arrays when DataHub has no lineage). Otherwise
+        falls back to the backend relationships endpoint
+        (``GET /api/assets/{urn}/relationships``). The ``urn`` is URL-encoded.
+        """
+
+        encoded = quote(urn, safe="")
+        if self._portal_url is not None:
+            return self._send(
+                "GET", f"/api/datasets/{encoded}/lineage", base=self._portal_url
+            )
+        return self._get(f"/api/assets/{encoded}/relationships")
 
     def annotate(
         self,

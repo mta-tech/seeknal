@@ -407,4 +407,88 @@ def query_dataset(
     _print_sample(client, resolved, limit, decision)
 
 
+def _dataset_urn(dataset: Dataset) -> str:
+    """Best-effort DataHub dataset URN for a lineage lookup.
+
+    Prefers the urn the portal already carried in ``metadata``/``id``; otherwise
+    composes the iceberg URN from the fqn so a governed table resolved as a direct
+    ``namespace.table`` identifier still looks up lineage.
+    """
+
+    urn = str(dataset.metadata.get("urn") or "")
+    if urn.startswith("urn:"):
+        return urn
+    if dataset.id.startswith("urn:"):
+        return dataset.id
+    platform = str(dataset.metadata.get("platform") or dataset.source_system or "iceberg")
+    return f"urn:li:dataset:(urn:li:dataPlatform:{platform},{dataset.fqn},PROD)"
+
+
+def _name_from_urn(urn: str) -> str:
+    match = re.match(r"urn:li:dataset:\(urn:li:dataPlatform:\w+,([^,]+),", urn)
+    return match.group(1) if match else ""
+
+
+def _lineage_nodes(raw: Any) -> list[dict[str, str]]:
+    """Normalise a lineage relationship list into ``{name, type}`` dicts."""
+
+    nodes: list[dict[str, str]] = []
+    for node in raw or []:
+        if not isinstance(node, dict):
+            continue
+        urn = str(node.get("urn", ""))
+        name = node.get("name") or _name_from_urn(urn) or urn
+        nodes.append(
+            {"name": str(name), "type": str(node.get("type") or node.get("platform") or "")}
+        )
+    return nodes
+
+
+def _print_lineage(label: str, nodes: list[dict[str, str]]) -> None:
+    typer.echo(f"  {label}:")
+    if not nodes:
+        typer.echo("    (none)")
+        return
+    for node in nodes:
+        suffix = f" [{node['type']}]" if node["type"] else ""
+        typer.echo(f"    - {node['name']}{suffix}")
+
+
+@dataset_app.command("lineage")
+def lineage_dataset(
+    dataset: str = typer.Argument(..., help="Dataset id or name."),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON instead of text."),
+) -> None:
+    """Show a dataset's upstream/downstream lineage (DataHub-backed)."""
+
+    client = _require_catalog()
+    resolved = _resolve_dataset(client, dataset)
+    try:
+        data = client.lineage(_dataset_urn(resolved))
+    except AtlasAuthError as exc:
+        echo_error(str(exc))
+        raise typer.Exit(1)
+    except AtlasContractError as exc:
+        echo_error(f"Lineage lookup failed: {exc}")
+        raise typer.Exit(1)
+
+    upstream = _lineage_nodes(data.get("upstreamLineage") or data.get("upstream"))
+    downstream = _lineage_nodes(data.get("downstreamLineage") or data.get("downstream"))
+
+    if as_json:
+        typer.echo(
+            _json.dumps(
+                {"dataset": resolved.fqn, "upstream": upstream, "downstream": downstream},
+                indent=2,
+            )
+        )
+        return
+
+    echo_success(f"Lineage for {resolved.fqn}")
+    _print_lineage("upstream", upstream)
+    _print_lineage("downstream", downstream)
+    if not upstream and not downstream:
+        echo_info("No lineage recorded in DataHub for this dataset.")
+
+
 __all__ = ["dataset_app"]

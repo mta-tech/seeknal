@@ -37,6 +37,10 @@ def _fake_client() -> MagicMock:
     client.get_dataset.return_value = DS
     client.sample.return_value = {"columns": ["sale_id", "region"], "rows": [[1, "us-east"]]}
     client.annotate.return_value = {"ok": True}
+    client.lineage.return_value = {
+        "upstreamLineage": [{"name": "raw.sales", "type": "DATASET"}],
+        "downstreamLineage": [{"name": "gold.sales_daily", "type": "DATASET"}],
+    }
     return client
 
 
@@ -155,6 +159,32 @@ def test_request_access_prints_ar_id(monkeypatch):
     result = runner.invoke(dataset_app, ["request-access", "sales", "--reason", "need it"])
     assert result.exit_code == 0
     assert "AR-9" in result.output
+
+
+def test_lineage_renders_tree(monkeypatch):
+    client = _fake_client()
+    _patch(monkeypatch, client=client)
+    result = runner.invoke(dataset_app, ["lineage", "sales"])
+    assert result.exit_code == 0
+    assert "upstream" in result.output and "raw.sales" in result.output
+    assert "downstream" in result.output and "gold.sales_daily" in result.output
+
+
+def test_lineage_empty_is_friendly(monkeypatch):
+    client = _fake_client()
+    client.lineage.return_value = {"upstreamLineage": [], "downstreamLineage": []}
+    _patch(monkeypatch, client=client)
+    result = runner.invoke(dataset_app, ["lineage", "sales"])
+    assert result.exit_code == 0
+    assert "No lineage recorded" in result.output
+
+
+def test_lineage_json(monkeypatch):
+    client = _fake_client()
+    _patch(monkeypatch, client=client)
+    result = runner.invoke(dataset_app, ["lineage", "sales", "--json"])
+    assert result.exit_code == 0
+    assert '"name": "raw.sales"' in result.output and '"downstream"' in result.output
 
 
 def test_extract_sample_unwraps_backend_values_envelope():
