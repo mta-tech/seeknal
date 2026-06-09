@@ -785,33 +785,121 @@ async def list_sessions(request: Request) -> JSONResponse:
     return JSONResponse(sessions)
 
 
+_STAGED_EXT_BY_MIME = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+}
+_MAX_STAGED_IMAGE_BYTES = 15 * 1024 * 1024
+# Cap the whole /ask request body. A 15 MB image is ~20 MB base64 + JSON overhead.
+_MAX_REQUEST_BYTES = 25 * 1024 * 1024
+
+
+def _stage_attachments_and_augment(
+    attachments: Any, question: str, session_id: str, project_path: Path
+) -> tuple[str, list[str]]:
+    """Decode image attachments to the ask_ingest staging dir and prepend an
+    ``extract_from_image`` directive so the agent OCRs them. Returns
+    ``(question, staged_paths)`` — a safe no-op (``(question, [])``) when there
+    are no valid image attachments. The caller MUST unlink ``staged_paths`` after
+    the agent run (they hold sensitive financial images).
+
+    The caller has already validated ``session_id``; staged filenames are random
+    UUIDs with a whitelisted extension, so there is no path-traversal surface.
+    """
+    if not isinstance(attachments, list) or not attachments:
+        return question, []
+    import base64
+    import uuid as _uuid
+
+    staging_dir = (
+        project_path / "target" / "ask_ingest" / "_staging" / f"ask-{session_id}"
+    )
+    staged: list[str] = []
+    for att in attachments:
+        if not isinstance(att, dict) or att.get("kind") != "image":
+            continue
+        ext = _STAGED_EXT_BY_MIME.get(str(att.get("mime") or "").lower())
+        if not ext:
+            continue
+        try:
+            raw = base64.b64decode(att.get("data_base64") or "", validate=True)
+        except Exception:
+            continue
+        if not raw or len(raw) > _MAX_STAGED_IMAGE_BYTES:
+            continue
+        try:
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            path = staging_dir / f"{_uuid.uuid4().hex}{ext}"
+            path.write_bytes(raw)
+        except Exception:
+            continue
+        staged.append(str(path))
+
+    if not staged:
+        return question, []
+
+    listing = "\n".join(f"- {p}" for p in staged)
+    directive = (
+        "Pengguna mengirim gambar (kemungkinan struk, bukti transfer, atau "
+        "invoice). File tersimpan di:\n"
+        f"{listing}\n"
+        "Gunakan HANYA tool extract_from_image pada setiap path untuk membaca "
+        "isinya, lalu jawab pertanyaan pengguna berdasarkan hasil ekstraksi. "
+        "Ini hanya pembacaan: JANGAN menjalankan kode (execute_python) dan "
+        "JANGAN menulis ke tabel apa pun.\n\n"
+    )
+    base_q = (question or "").strip() or "Tolong baca gambar ini dan rangkum isinya."
+    return directive + base_q, staged
+
+
 async def ask_oneshot(request: Request) -> JSONResponse:
     """One-shot question → JSON response."""
     tenant_id, err = _safe_resolve_tenant(request)
     if err:
         return err
+    clen = request.headers.get("content-length")
+    if clen and clen.isdigit() and int(clen) > _MAX_REQUEST_BYTES:
+        return JSONResponse({"error": "payload too large"}, status_code=413)
     body = await request.json()
     question = body.get("question", "")
     session_id = body.get("session_id", "default")
-    if not question:
-        return JSONResponse({"error": "question is required"}, status_code=400)
     if not _validate_session_id(session_id):
         return JSONResponse({"error": "invalid session_id"}, status_code=400)
 
     project_path = Path(request.app.state.project_path)
+    # Telegram photos (forwarded by Tower) are staged to disk and the question is
+    # augmented with an extract_from_image directive so the agent OCRs them. The
+    # staged files are unlinked after the run (they hold sensitive financial images).
+    question, staged_paths = _stage_attachments_and_augment(
+        body.get("attachments"), question, session_id, project_path
+    )
+    if not question:
+        return JSONResponse({"error": "question is required"}, status_code=400)
+
     events = []
     answer = ""
-    async for event in _run_agent_streaming(
-        project_path,
-        session_id,
-        question,
-        tenant_id=tenant_id,
-        lock_backend=getattr(request.app.state, "session_lock", None),
-        broadcaster=getattr(request.app.state, "broadcaster", None),
-    ):
-        events.append(event)
-        if event["type"] == "answer":
-            answer = event["data"]
+    try:
+        async for event in _run_agent_streaming(
+            project_path,
+            session_id,
+            question,
+            tenant_id=tenant_id,
+            lock_backend=getattr(request.app.state, "session_lock", None),
+            broadcaster=getattr(request.app.state, "broadcaster", None),
+        ):
+            events.append(event)
+            if event["type"] == "answer":
+                answer = event["data"]
+    finally:
+        for _staged in staged_paths:
+            try:
+                Path(_staged).unlink(missing_ok=True)
+            except Exception:
+                pass
 
     return JSONResponse({"answer": answer, "events": events})
 
