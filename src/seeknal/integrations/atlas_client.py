@@ -7,7 +7,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -37,6 +37,12 @@ class AtlasAuthError(AtlasContractError):
 #: could not be refreshed automatically. Surfaced verbatim by the CLI (no traceback).
 SESSION_EXPIRED_HINT = (
     "Your Atlas session has expired. Run `seeknal auth login` to sign in again."
+)
+
+#: Hint for the never-logged-in case: Atlas rejected the request and we had no token
+#: to send at all (no ATLAS_API_TOKEN and no credentials file).
+NOT_LOGGED_IN_HINT = (
+    "Atlas requires authentication. Run `seeknal auth login` to sign in."
 )
 
 
@@ -69,8 +75,15 @@ def create_atlas_contract_client_from_env() -> "AtlasContractClient | None":
     if not base_url:
         return None
 
+    # Lazy import: atlas_governance imports from this module, so a top-level
+    # import here would be circular.
+    from seeknal.integrations.atlas_governance import user_token_from_credentials
+
     timeout = float(os.getenv("ATLAS_API_TIMEOUT_SECONDS", "10"))
-    token = os.getenv("ATLAS_API_TOKEN")
+    # An explicit service token wins; otherwise fall back to the logged-in user's
+    # token so apply-time contract calls authenticate after `seeknal auth login`,
+    # matching the governance gate and the catalog client.
+    token = os.getenv("ATLAS_API_TOKEN") or user_token_from_credentials()
     return AtlasContractClient(
         AtlasContractConfig(base_url=base_url.rstrip("/"), token=token, timeout_seconds=timeout)
     )
@@ -258,33 +271,73 @@ def _build_asset_ref(
 
 
 class AtlasContractClient:
-    """Minimal HTTP client for Atlas Phase 1 contract endpoints."""
+    """Minimal HTTP client for Atlas Phase 1 contract endpoints.
 
-    def __init__(self, config: AtlasContractConfig):
+    Pass an explicit ``client`` (e.g. backed by :class:`httpx.MockTransport`) and/or
+    ``token_refresher`` in tests; both default to the production behavior.
+    """
+
+    def __init__(
+        self,
+        config: AtlasContractConfig,
+        *,
+        client: httpx.Client | None = None,
+        token_refresher: "Callable[[], str | None] | None" = None,
+    ):
         self.config = config
+        self._client = client
+        # Mutable bearer copy so a 401 can be recovered by refreshing the access token
+        # (the frozen config stays the source of the *initial* token).
+        self._token = config.token
+        self._token_refresher = token_refresher
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        if self.config.token:
-            headers["Authorization"] = f"Bearer {self.config.token}"
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
         return headers
+
+    def _refresh_token(self) -> str | None:
+        if self._token_refresher is not None:
+            return self._token_refresher()
+        # Lazy import: atlas_governance imports from this module (circular otherwise).
+        from seeknal.integrations.atlas_governance import refresh_access_token
+
+        return refresh_access_token()
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.config.base_url}{path}"
-        try:
-            response = httpx.post(
-                url,
-                json=payload,
-                headers=self._headers(),
-                timeout=self.config.timeout_seconds,
-            )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as exc:
-            message = exc.response.text.strip() or str(exc)
-            raise AtlasContractError(f"Atlas contract request failed for {path}: {message}") from exc
-        except httpx.HTTPError as exc:
-            raise AtlasContractError(f"Atlas contract request failed for {path}: {exc}") from exc
+        refreshed = False
+        while True:
+            try:
+                if self._client is not None:
+                    response = self._client.post(url, json=payload, headers=self._headers())
+                else:
+                    response = httpx.post(
+                        url,
+                        json=payload,
+                        headers=self._headers(),
+                        timeout=self.config.timeout_seconds,
+                    )
+                response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as exc:
+                # Transparently refresh the access token once on a 401, then retry —
+                # mirrors GovernanceGate._post / AtlasCatalogClient._send so a single
+                # `seeknal auth login` covers the apply-time contract surface too.
+                if exc.response.status_code == 401:
+                    if not refreshed:
+                        refreshed = True
+                        new_token = self._refresh_token()
+                        if new_token:
+                            self._token = new_token
+                            continue
+                    hint = SESSION_EXPIRED_HINT if self._token else NOT_LOGGED_IN_HINT
+                    raise AtlasAuthError(hint) from exc
+                message = exc.response.text.strip() or str(exc)
+                raise AtlasContractError(f"Atlas contract request failed for {path}: {message}") from exc
+            except httpx.HTTPError as exc:
+                raise AtlasContractError(f"Atlas contract request failed for {path}: {exc}") from exc
 
     def preflight_apply(
         self,
