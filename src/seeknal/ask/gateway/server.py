@@ -785,7 +785,7 @@ async def list_sessions(request: Request) -> JSONResponse:
     return JSONResponse(sessions)
 
 
-_STAGED_EXT_BY_MIME = {
+_STAGED_IMAGE_EXT_BY_MIME = {
     "image/jpeg": ".jpg",
     "image/jpg": ".jpg",
     "image/png": ".png",
@@ -793,66 +793,107 @@ _STAGED_EXT_BY_MIME = {
     "image/heic": ".heic",
     "image/heif": ".heif",
 }
-_MAX_STAGED_IMAGE_BYTES = 15 * 1024 * 1024
-# Cap the whole /ask request body. A 15 MB image is ~20 MB base64 + JSON overhead.
+# Tabular data files (CSV/Excel/JSON) the agent reads with read_tabular.
+_TABULAR_EXT_BY_MIME = {
+    "text/csv": ".csv",
+    "application/csv": ".csv",
+    "text/tab-separated-values": ".tsv",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/json": ".json",
+}
+_TABULAR_EXTS = (".csv", ".tsv", ".xlsx", ".xls", ".json")
+_MAX_STAGED_BYTES = 15 * 1024 * 1024
+# Cap the whole /ask request body. A 15 MB file is ~20 MB base64 + JSON overhead.
 _MAX_REQUEST_BYTES = 25 * 1024 * 1024
+
+
+def _decode_and_write(att: Any, staging_dir: Path, ext: str) -> str | None:
+    import base64
+    import uuid as _uuid
+
+    try:
+        raw = base64.b64decode(att.get("data_base64") or "", validate=True)
+    except Exception:
+        return None
+    if not raw or len(raw) > _MAX_STAGED_BYTES:
+        return None
+    try:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        path = staging_dir / f"{_uuid.uuid4().hex}{ext}"
+        path.write_bytes(raw)
+    except Exception:
+        return None
+    return str(path)
 
 
 def _stage_attachments_and_augment(
     attachments: Any, question: str, session_id: str, project_path: Path
 ) -> tuple[str, list[str]]:
-    """Decode image attachments to the ask_ingest staging dir and prepend an
-    ``extract_from_image`` directive so the agent OCRs them. Returns
-    ``(question, staged_paths)`` — a safe no-op (``(question, [])``) when there
-    are no valid image attachments. The caller MUST unlink ``staged_paths`` after
-    the agent run (they hold sensitive financial images).
+    """Decode image + tabular-file attachments to the ask_ingest staging dir and
+    prepend a directive (``extract_from_image`` for photos, ``read_tabular`` for
+    CSV/Excel) so the agent reads them. Returns ``(question, staged_paths)`` — a
+    safe no-op when there are no valid attachments. The caller MUST unlink
+    ``staged_paths`` after the run (they hold sensitive data).
 
-    The caller has already validated ``session_id``; staged filenames are random
-    UUIDs with a whitelisted extension, so there is no path-traversal surface.
+    ``session_id`` is already validated; staged filenames are random UUIDs with a
+    whitelisted extension, so there is no path-traversal surface.
     """
     if not isinstance(attachments, list) or not attachments:
         return question, []
-    import base64
-    import uuid as _uuid
 
     staging_dir = (
         project_path / "target" / "ask_ingest" / "_staging" / f"ask-{session_id}"
     )
-    staged: list[str] = []
+    images: list[str] = []
+    files: list[str] = []
     for att in attachments:
-        if not isinstance(att, dict) or att.get("kind") != "image":
+        if not isinstance(att, dict):
             continue
-        ext = _STAGED_EXT_BY_MIME.get(str(att.get("mime") or "").lower())
-        if not ext:
-            continue
-        try:
-            raw = base64.b64decode(att.get("data_base64") or "", validate=True)
-        except Exception:
-            continue
-        if not raw or len(raw) > _MAX_STAGED_IMAGE_BYTES:
-            continue
-        try:
-            staging_dir.mkdir(parents=True, exist_ok=True)
-            path = staging_dir / f"{_uuid.uuid4().hex}{ext}"
-            path.write_bytes(raw)
-        except Exception:
-            continue
-        staged.append(str(path))
+        kind = att.get("kind")
+        if kind == "image":
+            ext = _STAGED_IMAGE_EXT_BY_MIME.get(str(att.get("mime") or "").lower())
+            if ext:
+                p = _decode_and_write(att, staging_dir, ext)
+                if p:
+                    images.append(p)
+        elif kind == "file":
+            filename = str(att.get("filename") or "").lower()
+            ext = next((e for e in _TABULAR_EXTS if filename.endswith(e)), None)
+            if not ext:
+                ext = _TABULAR_EXT_BY_MIME.get(str(att.get("mime") or "").lower())
+            if ext:
+                p = _decode_and_write(att, staging_dir, ext)
+                if p:
+                    files.append(p)
 
+    staged = images + files
     if not staged:
         return question, []
 
-    listing = "\n".join(f"- {p}" for p in staged)
+    parts: list[str] = []
+    if images:
+        listing = "\n".join(f"- {p}" for p in images)
+        parts.append(
+            "Pengguna mengirim gambar (kemungkinan struk, bukti transfer, atau "
+            f"invoice). File:\n{listing}\n"
+            "Gunakan tool extract_from_image pada setiap path untuk membacanya."
+        )
+    if files:
+        listing = "\n".join(f"- {p}" for p in files)
+        parts.append(
+            "Pengguna mengirim file data (CSV/Excel/JSON) untuk dilihat. File:\n"
+            f"{listing}\n"
+            "Gunakan tool read_tabular pada setiap path untuk membacanya, lalu "
+            "tampilkan ringkasan singkat (nama kolom + beberapa baris contoh) dalam "
+            "bahasa awam. JANGAN minta path file ke pengguna — filenya sudah ada."
+        )
     directive = (
-        "Pengguna mengirim gambar (kemungkinan struk, bukti transfer, atau "
-        "invoice). File tersimpan di:\n"
-        f"{listing}\n"
-        "Gunakan HANYA tool extract_from_image pada setiap path untuk membaca "
-        "isinya, lalu jawab pertanyaan pengguna berdasarkan hasil ekstraksi. "
-        "Ini hanya pembacaan: JANGAN menjalankan kode (execute_python) dan "
-        "JANGAN menulis ke tabel apa pun.\n\n"
+        "\n\n".join(parts)
+        + "\n\nIni hanya pembacaan: JANGAN menjalankan kode (execute_python) dan "
+        "JANGAN menulis ke tabel apa pun kecuali pengguna memintanya secara eksplisit.\n\n"
     )
-    base_q = (question or "").strip() or "Tolong baca gambar ini dan rangkum isinya."
+    base_q = (question or "").strip() or "Tolong baca file/gambar yang saya kirim dan rangkum isinya."
     return directive + base_q, staged
 
 
@@ -902,6 +943,68 @@ async def ask_oneshot(request: Request) -> JSONResponse:
                 pass
 
     return JSONResponse({"answer": answer, "events": events})
+
+
+async def ingest_propose(request: Request) -> JSONResponse:
+    """Stage + auto-judge an uploaded file → structured create/append proposal (no write)."""
+    _tenant_id, err = _safe_resolve_tenant(request)
+    if err:
+        return err
+    # Ingest WRITES tenant data — fail closed if the token registry isn't configured
+    # (do not inherit the read path's unauthenticated DEFAULT_TENANT fallback).
+    if _token_registry_from_state(request.app.state) is None:
+        return JSONResponse(
+            {"ok": False, "error": "ingest requires authentication"}, status_code=403
+        )
+    clen = request.headers.get("content-length")
+    if clen and clen.isdigit() and int(clen) > _MAX_REQUEST_BYTES:
+        return JSONResponse({"ok": False, "error": "payload too large"}, status_code=413)
+    body = await request.json()
+    project_path = Path(request.app.state.project_path)
+    from seeknal.ask.gateway.ingest_service import propose as _propose
+
+    # NOTE: source_path is intentionally NOT accepted over HTTP — it would be an
+    # arbitrary-local-file read sink. The web/Telegram path always sends data_base64.
+    try:
+        result = await asyncio.to_thread(
+            _propose,
+            project_path,
+            filename=str(body.get("filename") or "upload.csv"),
+            data_base64=body.get("data_base64"),
+            table_name=body.get("table_name"),
+            business_key=body.get("business_key"),
+        )
+    except Exception as exc:  # noqa: BLE001 — surface to the owner
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return JSONResponse(result)
+
+
+async def ingest_commit(request: Request) -> JSONResponse:
+    """Commit an owner-approved ingest proposal → create/append parquet + register view."""
+    _tenant_id, err = _safe_resolve_tenant(request)
+    if err:
+        return err
+    if _token_registry_from_state(request.app.state) is None:
+        return JSONResponse(
+            {"ok": False, "error": "ingest requires authentication"}, status_code=403
+        )
+    body = await request.json()
+    project_path = Path(request.app.state.project_path)
+    from seeknal.ask.gateway.ingest_service import commit as _commit
+
+    try:
+        result = await asyncio.to_thread(
+            _commit,
+            project_path,
+            token=str(body.get("token") or ""),
+            table_name=str(body.get("table_name") or ""),
+            business_key=str(body.get("business_key") or ""),
+            mode=str(body.get("mode") or "create"),
+            dedup_strategy=str(body.get("dedup_strategy") or "skip"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return JSONResponse(result)
 
 
 async def cancel_session_run(request: Request) -> JSONResponse:
@@ -1672,6 +1775,8 @@ def create_gateway_app(
     # is configured. In backend-only mode the client must use /temporal/start.
     if not backend_only:
         routes.insert(4, Route("/ask", ask_oneshot, methods=["POST"]))
+        routes.append(Route("/ingest/propose", ingest_propose, methods=["POST"]))
+        routes.append(Route("/ingest/commit", ingest_commit, methods=["POST"]))
         routes.append(Route("/upload", upload_file, methods=["POST"]))
         routes.append(Route("/record", post_record, methods=["POST"]))
         routes.append(WebSocketRoute("/ws/{session_id}", websocket_endpoint))
