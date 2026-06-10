@@ -135,6 +135,93 @@ def _extract_upstreams(
     return upstreams
 
 
+def _extract_owners(yaml_data: dict[str, Any]) -> list[str]:
+    """Normalize a node's `owner`/`owners` YAML into a de-duplicated list.
+
+    Sources declare a single `owner:` string; richer nodes may carry an
+    `owners:` list. Both are forwarded so Atlas/DataHub can set the ownership
+    aspect instead of leaving seeknal-applied datasets unassigned.
+    """
+
+    owners: list[str] = []
+
+    def _add(value: Any) -> None:
+        text = str(value).strip()
+        if text and text not in owners:
+            owners.append(text)
+
+    owner = yaml_data.get("owner")
+    if isinstance(owner, (list, tuple)):
+        for item in owner:
+            _add(item)
+    elif owner:
+        _add(owner)
+
+    extra = yaml_data.get("owners")
+    if isinstance(extra, (list, tuple)):
+        for item in extra:
+            _add(item)
+    elif extra:
+        _add(extra)
+
+    return owners
+
+
+def _extract_columns(yaml_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize a node's column metadata into ``[{name, description?, data_type?}]``.
+
+    Merges two YAML shapes seeknal uses: ``columns`` (a ``{name: description}``
+    mapping, or a list of dicts) and ``schema`` (a list of ``{name, data_type}``).
+    Forwarded so the backend can emit ``schemaMetadata`` / per-column
+    ``editableSchemaMetadata`` descriptions for Phase 4 column-level parity.
+    """
+
+    cols: dict[str, dict[str, Any]] = {}
+
+    def _slot(name: Any) -> dict[str, Any] | None:
+        text = str(name).strip()
+        if not text:
+            return None
+        return cols.setdefault(text, {"name": text})
+
+    for entry in yaml_data.get("schema", []) or []:
+        if isinstance(entry, dict) and entry.get("name"):
+            slot = _slot(entry["name"])
+            if slot is not None and entry.get("data_type"):
+                slot["data_type"] = str(entry["data_type"])
+
+    columns = yaml_data.get("columns")
+    if isinstance(columns, dict):
+        for name, value in columns.items():
+            slot = _slot(name)
+            if slot is None:
+                continue
+            if isinstance(value, dict):
+                desc = value.get("desc") or value.get("description")
+                if desc:
+                    slot["description"] = str(desc)
+                dtype = value.get("data_type") or value.get("dtype")
+                if dtype:
+                    slot["data_type"] = str(dtype)
+            elif value:
+                slot["description"] = str(value)
+    elif isinstance(columns, (list, tuple)):
+        for entry in columns:
+            if not isinstance(entry, dict) or not entry.get("name"):
+                continue
+            slot = _slot(entry["name"])
+            if slot is None:
+                continue
+            desc = entry.get("desc") or entry.get("description")
+            if desc:
+                slot["description"] = str(desc)
+            dtype = entry.get("data_type") or entry.get("dtype")
+            if dtype:
+                slot["data_type"] = str(dtype)
+
+    return list(cols.values())
+
+
 def _build_asset_ref(
     *,
     node_type: str,
@@ -147,6 +234,17 @@ def _build_asset_ref(
     asset_type = _asset_type_for_node(node_type)
     description = yaml_data.get("description")
     tags = list(yaml_data.get("tags", []) or [])
+    metadata: dict[str, Any] = {
+        "kind": node_type,
+        "path": str(target_path),
+        "inputs": len(yaml_data.get("inputs", []) or []),
+    }
+    owners = _extract_owners(yaml_data)
+    if owners:
+        metadata["owners"] = owners
+    columns = _extract_columns(yaml_data)
+    if columns:
+        metadata["columns"] = columns
     return {
         "asset_type": asset_type,
         "name": name,
@@ -155,11 +253,7 @@ def _build_asset_ref(
         "source_id": f"{asset_type}:{name}",
         "description": description,
         "tags": tags,
-        "metadata": {
-            "kind": node_type,
-            "path": str(target_path),
-            "inputs": len(yaml_data.get("inputs", []) or []),
-        },
+        "metadata": metadata,
     }
 
 
@@ -307,6 +401,32 @@ class AtlasContractClient:
                 details={"phase": "complete-apply"},
             )
             raise
+
+    def publish_lineage(
+        self,
+        *,
+        project_name: str,
+        environment: str,
+        asset: dict[str, Any],
+        upstreams: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Publish an ``asset → upstreams`` lineage edge set to Atlas/DataHub.
+
+        Standalone counterpart to the apply-time lineage publish, usable from
+        ``seeknal atlas lineage publish`` without the optional
+        ``atlas-data-platform`` package — it hits the same
+        ``/api/contracts/lineage/publish`` endpoint over plain HTTP.
+        """
+
+        return self._post(
+            "/api/contracts/lineage/publish",
+            {
+                "project_name": project_name,
+                "environment": environment,
+                "asset": asset,
+                "upstreams": upstreams,
+            },
+        )
 
     def report_local_failure(
         self,

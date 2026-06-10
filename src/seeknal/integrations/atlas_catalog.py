@@ -456,12 +456,15 @@ class AtlasCatalogClient:
         tags: Sequence[str] | None = None,
         description: str | None = None,
         owners: Sequence[str] | None = None,
+        terms: Sequence[str] | None = None,
+        domain: str | None = None,
     ) -> dict[str, Any]:
         """Upsert the unified-catalog asset annotations.
 
-        Fetches the current asset, unions any new ``tags`` with the existing ones,
-        overrides ``description`` when supplied, records ``owners`` in metadata when
-        given, then POSTs the merged asset to ``/api/contracts/assets/register``.
+        Fetches the current asset, unions any new ``tags``/``terms`` with the
+        existing ones, overrides ``description`` when supplied, records ``owners``
+        and ``domain`` in metadata when given, then POSTs the merged asset to
+        ``/api/contracts/assets/register``. Pass ``domain=""`` to clear it.
         Returns the backend response.
         """
 
@@ -482,6 +485,15 @@ class AtlasCatalogClient:
         metadata["tags"] = merged_tags
         if owners:
             metadata["owners"] = list(owners)
+        if terms:
+            merged_terms = list(metadata.get("glossaryTerms") or [])
+            for term in terms:
+                if term and term not in merged_terms:
+                    merged_terms.append(term)
+            metadata["glossaryTerms"] = merged_terms
+        if domain is not None:
+            # An empty string clears the domain assignment.
+            metadata["domain"] = domain or None
 
         source_id = str(
             current.metadata.get("source_id", "")

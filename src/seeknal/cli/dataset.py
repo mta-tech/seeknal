@@ -326,11 +326,15 @@ def annotate_dataset(
     tags: Optional[List[str]] = typer.Option(None, "--tag", help="Tag to add (repeatable)."),
     description: Optional[str] = typer.Option(None, "--description", help="Set the description."),
     owners: Optional[List[str]] = typer.Option(None, "--owner", help="Owner to add (repeatable)."),
+    terms: Optional[List[str]] = typer.Option(None, "--term", help="Glossary term to add (repeatable)."),
+    domain: Optional[str] = typer.Option(None, "--domain", help="Set the business domain ('' clears it)."),
 ) -> None:
-    """Annotate a dataset (tags / description / owners) in the Atlas catalog."""
+    """Annotate a dataset (tags / description / owners / terms / domain) in the Atlas catalog."""
 
-    if not tags and description is None and not owners:
-        echo_error("Provide at least one of --tag, --description, --owner.")
+    if not tags and description is None and not owners and not terms and domain is None:
+        echo_error(
+            "Provide at least one of --tag, --description, --owner, --term, --domain."
+        )
         raise typer.Exit(1)
     client = _require_catalog()
     resolved = _resolve_dataset(client, dataset)
@@ -340,6 +344,8 @@ def annotate_dataset(
             tags=tags or None,
             description=description,
             owners=owners or None,
+            terms=terms or None,
+            domain=domain,
         )
     except AtlasContractError as exc:
         echo_error(f"Annotation failed: {exc}")
