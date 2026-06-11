@@ -11,7 +11,21 @@ from typing import Any
 import pytest
 import typer
 
+from seeknal.integrations.atlas_client import NOT_LOGGED_IN_HINT
 from seeknal.workflow.apply import apply_command
+
+
+@pytest.fixture(autouse=True)
+def _isolated_atlas_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the contract client away from the developer's real login session.
+
+    create_atlas_contract_client_from_env now falls back to the credentials file
+    written by `seeknal auth login`; tests must not pick up a real token.
+    """
+
+    monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(tmp_path / "no-credentials.json"))
+    monkeypatch.setenv("SEEKNAL_ATLAS_CONFIG_PATH", str(tmp_path / "no-atlas.json"))
+    monkeypatch.delenv("ATLAS_API_TOKEN", raising=False)
 
 
 class _AtlasStubServer(ThreadingHTTPServer):
@@ -203,3 +217,34 @@ def test_apply_reports_local_failure_after_preflight(
     assert atlas.requests[-1]["body"]["status"] == "failed"
     assert atlas.requests[-1]["body"]["details"]["phase"] == "local-apply"
     assert atlas.requests[-1]["body"]["details"]["local_apply_completed"] is False
+
+
+def test_apply_unauthenticated_shows_login_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A 401 from policy-check (logged out) must tell the user to `seeknal auth login`."""
+
+    project_dir = _secure_project_dir(tmp_path)
+    draft = _write_draft(project_dir)
+    monkeypatch.chdir(project_dir)
+    monkeypatch.setattr("seeknal.workflow.apply.update_manifest", lambda _: True)
+
+    with _atlas_stub(
+        {
+            "/api/contracts/policy-check": [
+                (401, {"detail": "Missing authentication token"}),
+            ],
+        }
+    ) as atlas:
+        monkeypatch.setenv("ATLAS_API_URL", f"http://127.0.0.1:{atlas.server_port}")
+
+        with pytest.raises(typer.Exit) as exc_info:
+            apply_command(str(draft), force=False, no_parse=False)
+
+    assert exc_info.value.exit_code == 1
+    assert not (project_dir / "seeknal" / "transforms" / "orders_enriched.yml").exists()
+    assert [request["path"] for request in atlas.requests] == ["/api/contracts/policy-check"]
+    captured = capsys.readouterr()
+    assert NOT_LOGGED_IN_HINT in captured.err + captured.out

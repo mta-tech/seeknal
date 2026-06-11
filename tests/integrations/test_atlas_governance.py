@@ -1,0 +1,655 @@
+"""Tests for the runtime Atlas governance gate.
+
+These exercise the gate in isolation using an injected ``httpx.MockTransport`` so no
+real Atlas backend is required. The behaviours under test are the ones that make the
+gate trustworthy: it is inactive unless configured, it delegates decisions to Atlas,
+it is fail-closed by default, and audit logging can never break a read.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable
+
+import httpx
+import pytest
+
+import base64
+import json
+from pathlib import Path
+
+from seeknal.integrations.atlas_client import (
+    AtlasAuthError,
+    AtlasContractConfig,
+    AtlasPolicyDenied,
+    SESSION_EXPIRED_HINT,
+)
+from seeknal.integrations.atlas_governance import (
+    MASK_TOKEN,
+    AccessDecision,
+    GovernanceGate,
+    apply_column_masks,
+    create_governance_gate_from_env,
+    govern_query,
+    govern_read,
+    mask_rows,
+    mask_value,
+    referenced_tables,
+    refresh_access_token,
+    user_sub_from_credentials,
+    user_token_from_credentials,
+)
+
+BASE_URL = "http://atlas.test"
+
+
+def _gate(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    fail_open: bool = False,
+) -> GovernanceGate:
+    """Build a gate whose HTTP calls are served by ``handler`` via MockTransport."""
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    config = AtlasContractConfig(base_url=BASE_URL, token="t0ken", timeout_seconds=5.0)
+    return GovernanceGate(config, fail_open=fail_open, client=client)
+
+
+# ---------------------------------------------------------------------------
+# Activation
+# ---------------------------------------------------------------------------
+
+
+def test_gate_inactive_without_atlas_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ATLAS_API_URL", raising=False)
+    assert create_governance_gate_from_env() is None
+
+
+def test_gate_active_when_atlas_url_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ATLAS_API_URL", "https://atlas.example.com/")
+    monkeypatch.setenv("ATLAS_API_TOKEN", "abc")
+    gate = create_governance_gate_from_env()
+    assert isinstance(gate, GovernanceGate)
+    # trailing slash trimmed
+    assert gate.config.base_url == "https://atlas.example.com"
+    assert gate.config.token == "abc"
+
+
+# ---------------------------------------------------------------------------
+# check_access / enforce_access
+# ---------------------------------------------------------------------------
+
+
+def test_check_access_allowed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/contracts/access-check"
+        assert request.headers["Authorization"] == "Bearer t0ken"
+        return httpx.Response(200, json={"allowed": True, "classification": "internal"})
+
+    decision = _gate(handler).check_access(resource="prod.gold.sales", actor="alice")
+    assert decision == AccessDecision(
+        allowed=True, reason="", masked_columns=(), classification="internal"
+    )
+    assert decision.has_masking is False
+
+
+def test_check_access_denied_with_reason() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"allowed": False, "reason": "no grant"})
+
+    decision = _gate(handler).check_access(resource="prod.gold.finance", actor="bob")
+    assert decision.allowed is False
+    assert decision.reason == "no grant"
+
+
+def test_check_access_returns_masked_columns() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "allowed": True,
+                "masked_columns": ["nik", "npwp"],
+                "classification": "restricted",
+            },
+        )
+
+    decision = _gate(handler).check_access(resource="prod.gold.customer", actor="carol")
+    assert decision.allowed is True
+    assert decision.masked_columns == ("nik", "npwp")
+    assert decision.classification == "restricted"
+    assert decision.has_masking is True
+
+
+def test_enforce_access_returns_decision_when_allowed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"allowed": True, "masked_columns": ["nik"]})
+
+    decision = _gate(handler).enforce_access(resource="prod.gold.customer", actor="carol")
+    assert decision.allowed is True
+    assert decision.masked_columns == ("nik",)
+
+
+def test_enforce_access_raises_when_denied() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/contracts/access-check":
+            return httpx.Response(200, json={"allowed": False, "reason": "denied by policy"})
+        return httpx.Response(200, json={})  # audit endpoint
+
+    with pytest.raises(AtlasPolicyDenied, match="denied by policy"):
+        _gate(handler).enforce_access(resource="prod.gold.finance", actor="bob")
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed / fail-open on transport errors
+# ---------------------------------------------------------------------------
+
+
+def test_fail_closed_on_transport_error_by_default() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("atlas down", request=request)
+
+    decision = _gate(handler).check_access(resource="prod.gold.sales")
+    assert decision.allowed is False
+    assert "fail-closed" in decision.reason
+
+
+def test_enforce_access_raises_when_atlas_unreachable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("atlas down", request=request)
+
+    with pytest.raises(AtlasPolicyDenied):
+        _gate(handler).enforce_access(resource="prod.gold.sales")
+
+
+def test_fail_open_when_explicitly_enabled() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("atlas down", request=request)
+
+    decision = _gate(handler, fail_open=True).check_access(resource="prod.gold.sales")
+    assert decision.allowed is True
+    assert "fail-open" in decision.reason
+
+
+def test_server_5xx_is_fail_closed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="unavailable")
+
+    decision = _gate(handler).check_access(resource="prod.gold.sales")
+    assert decision.allowed is False
+
+
+# ---------------------------------------------------------------------------
+# Audit never raises
+# ---------------------------------------------------------------------------
+
+
+def test_audit_never_raises_on_server_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    # Must not raise.
+    assert _gate(handler).audit(action="read", resource="prod.gold.sales", status="success") is None
+
+
+def test_audit_never_raises_on_connect_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("atlas down", request=request)
+
+    assert _gate(handler).audit(action="read", resource="prod.gold.sales") is None
+
+
+# ---------------------------------------------------------------------------
+# Pure masking helpers
+# ---------------------------------------------------------------------------
+
+
+def test_mask_value_variants() -> None:
+    assert mask_value(None) is None
+    assert mask_value("3201011234567") == MASK_TOKEN
+    assert mask_value("3201011234567", keep=6) == f"320101{MASK_TOKEN}"
+    # value shorter than keep is returned unchanged
+    assert mask_value("ab", keep=6) == "ab"
+    assert mask_value(12345, keep=0) == MASK_TOKEN
+
+
+def test_apply_column_masks_redacts_only_listed_columns() -> None:
+    rows = [
+        {"customer_id": "C-001", "nik": "3201011234567", "arpu": 152000},
+        {"customer_id": "C-002", "nik": "3273010000000", "arpu": 98000},
+    ]
+    masked = apply_column_masks(rows, ["nik"], keep=6)
+    assert masked == [
+        {"customer_id": "C-001", "nik": f"320101{MASK_TOKEN}", "arpu": 152000},
+        {"customer_id": "C-002", "nik": f"327301{MASK_TOKEN}", "arpu": 98000},
+    ]
+    # original rows untouched
+    assert rows[0]["nik"] == "3201011234567"
+
+
+def test_apply_column_masks_no_columns_is_passthrough_copy() -> None:
+    rows = [{"a": 1, "b": 2}]
+    out = apply_column_masks(rows, [])
+    assert out == rows
+    assert out is not rows
+    assert out[0] is not rows[0]
+
+
+def test_apply_column_masks_ignores_absent_columns() -> None:
+    rows = [{"a": 1}]
+    out = apply_column_masks(rows, ["nik"], keep=4)
+    assert out == [{"a": 1}]
+
+
+# ---------------------------------------------------------------------------
+# Positional masking (execute_oneshot shape) + govern_read
+# ---------------------------------------------------------------------------
+
+
+def test_mask_rows_masks_named_columns() -> None:
+    columns = ["customer_id", "nik", "arpu"]
+    rows = [("C-001", "3201011234567", 152000), ("C-002", "3273010000000", 98000)]
+    out = mask_rows(columns, rows, ["nik"], keep=6)
+    assert out == [
+        ("C-001", f"320101{MASK_TOKEN}", 152000),
+        ("C-002", f"327301{MASK_TOKEN}", 98000),
+    ]
+    # input not mutated
+    assert rows[0] == ("C-001", "3201011234567", 152000)
+
+
+def test_mask_rows_ignores_absent_and_empty() -> None:
+    columns = ["a", "b"]
+    rows = [(1, 2)]
+    assert mask_rows(columns, rows, []) == [(1, 2)]
+    assert mask_rows(columns, rows, ["nik"]) == [(1, 2)]
+
+
+def test_mask_rows_preserves_none() -> None:
+    assert mask_rows(["nik"], [(None,)], ["nik"], keep=4) == [(None,)]
+
+
+def test_govern_read_passthrough_when_gate_none() -> None:
+    rows = [("3201011234567",)]
+    out = govern_read(None, resource="prod.t", columns=["nik"], rows=rows)
+    assert out == [("3201011234567",)]
+
+
+def test_govern_read_masks_when_allowed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"allowed": True, "masked_columns": ["nik"]})
+
+    out = govern_read(
+        _gate(handler),
+        resource="prod.gold.customer",
+        columns=["customer_id", "nik"],
+        rows=[("C-001", "3201011234567")],
+        keep=6,
+    )
+    assert out == [("C-001", f"320101{MASK_TOKEN}")]
+
+
+def test_govern_read_raises_when_denied() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/contracts/access-check":
+            return httpx.Response(200, json={"allowed": False, "reason": "no grant"})
+        return httpx.Response(200, json={})
+
+    with pytest.raises(AtlasPolicyDenied):
+        govern_read(
+            _gate(handler),
+            resource="prod.gold.finance",
+            columns=["x"],
+            rows=[("v",)],
+        )
+
+
+# ---------------------------------------------------------------------------
+# referenced_tables + govern_query (ad-hoc SQL reads)
+# ---------------------------------------------------------------------------
+
+
+def test_referenced_tables_from_and_join() -> None:
+    sql = "SELECT a.id FROM prod.gold.customer a JOIN prod.gold.orders b ON a.id = b.cid"
+    assert referenced_tables(sql) == ["prod.gold.customer", "prod.gold.orders"]
+
+
+def test_referenced_tables_excludes_ctes() -> None:
+    sql = "WITH recent AS (SELECT * FROM prod.gold.orders) SELECT * FROM recent"
+    assert referenced_tables(sql) == ["prod.gold.orders"]
+
+
+def test_referenced_tables_tableless_is_empty() -> None:
+    assert referenced_tables("SELECT 1 AS one") == []
+
+
+def test_govern_query_passthrough_when_gate_none() -> None:
+    rows = [("C-001", "3201011234567")]
+    out = govern_query(
+        None,
+        sql="SELECT * FROM prod.gold.customer",
+        columns=["customer_id", "nik"],
+        rows=rows,
+    )
+    assert out == [("C-001", "3201011234567")]
+
+
+def test_govern_query_masks_referenced_table_columns() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"allowed": True, "masked_columns": ["nik"]})
+
+    out = govern_query(
+        _gate(handler),
+        sql="SELECT customer_id, nik FROM prod.gold.customer",
+        columns=["customer_id", "nik"],
+        rows=[("C-001", "3201011234567")],
+        keep=6,
+    )
+    assert out == [("C-001", f"320101{MASK_TOKEN}")]
+
+
+def test_govern_query_raises_when_a_table_denied() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/contracts/access-check":
+            return httpx.Response(200, json={"allowed": False, "reason": "no grant"})
+        return httpx.Response(200, json={})
+
+    with pytest.raises(AtlasPolicyDenied):
+        govern_query(
+            _gate(handler),
+            sql="SELECT * FROM prod.gold.finance",
+            columns=["x"],
+            rows=[("v",)],
+        )
+
+
+def test_govern_query_tableless_does_not_call_atlas() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("Atlas must not be called for a tableless query")
+
+    out = govern_query(
+        _gate(handler),
+        sql="SELECT 1 AS one",
+        columns=["one"],
+        rows=[(1,)],
+    )
+    assert out == [(1,)]
+
+
+# ---------------------------------------------------------------------------
+# Credentials-backed user token + JWT claim extraction
+# ---------------------------------------------------------------------------
+
+
+def _b64url(data: dict[str, object]) -> str:
+    """Base64url-encode a dict as a JWT segment (no padding)."""
+
+    raw = json.dumps(data).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _unsigned_jwt(payload: dict[str, object]) -> str:
+    """Build an unsigned JWT (header.payload.sig) carrying ``payload``."""
+
+    header = _b64url({"alg": "none", "typ": "JWT"})
+    return f"{header}.{_b64url(payload)}.sig"
+
+
+def _write_creds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, access_token: str) -> Path:
+    """Write a credentials file and point SEEKNAL_CREDENTIALS_PATH at it."""
+
+    creds = tmp_path / "credentials.json"
+    creds.write_text(
+        json.dumps(
+            {
+                "access_token": access_token,
+                "refresh_token": "r",
+                "expires_in": 3600,
+                "refresh_expires_in": 7200,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(creds))
+    return creds
+
+
+def test_gate_token_from_credentials_when_api_token_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ATLAS_API_URL", "https://atlas.example.com")
+    monkeypatch.delenv("ATLAS_API_TOKEN", raising=False)
+    _write_creds(tmp_path, monkeypatch, "user-access-token")
+
+    gate = create_governance_gate_from_env()
+    assert isinstance(gate, GovernanceGate)
+    assert gate.config.token == "user-access-token"
+
+
+def test_gate_api_token_takes_precedence_over_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ATLAS_API_URL", "https://atlas.example.com")
+    monkeypatch.setenv("ATLAS_API_TOKEN", "service-token")
+    _write_creds(tmp_path, monkeypatch, "user-access-token")
+
+    gate = create_governance_gate_from_env()
+    assert isinstance(gate, GovernanceGate)
+    assert gate.config.token == "service-token"
+
+
+def test_gate_token_none_when_credentials_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ATLAS_API_URL", "https://atlas.example.com")
+    monkeypatch.delenv("ATLAS_API_TOKEN", raising=False)
+    monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(tmp_path / "missing.json"))
+
+    gate = create_governance_gate_from_env()
+    assert isinstance(gate, GovernanceGate)
+    assert gate.config.token is None
+
+
+def test_user_token_from_credentials_reads_access_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_creds(tmp_path, monkeypatch, "abc.def.ghi")
+    assert user_token_from_credentials() == "abc.def.ghi"
+
+
+def test_user_token_from_credentials_none_when_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(tmp_path / "missing.json"))
+    assert user_token_from_credentials() is None
+
+
+def test_user_sub_from_credentials_decodes_jwt_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = _unsigned_jwt({"sub": "abc-123"})
+    _write_creds(tmp_path, monkeypatch, token)
+    assert user_sub_from_credentials() == "abc-123"
+
+
+def test_user_sub_from_credentials_none_when_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(tmp_path / "missing.json"))
+    assert user_sub_from_credentials() is None
+
+
+# ---------------------------------------------------------------------------
+# refresh_access_token
+# ---------------------------------------------------------------------------
+
+
+def _write_creds_with_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    access_token: str = "old-access",
+    refresh_token: str | None = "rt-1",
+) -> Path:
+    """Write a credentials file (optionally without a refresh token) and point env at it."""
+
+    payload: dict[str, Any] = {"access_token": access_token, "expires_in": 300}
+    if refresh_token is not None:
+        payload["refresh_token"] = refresh_token
+        payload["refresh_expires_in"] = 1800
+    creds = tmp_path / "credentials.json"
+    creds.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(creds))
+    return creds
+
+
+def test_refresh_access_token_success_persists_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KEYCLOAK_ISSUER", "http://kc.test/realms/atlas")
+    monkeypatch.delenv("SEEKNAL_OIDC_CLIENT_ID", raising=False)
+    creds = _write_creds_with_refresh(tmp_path, monkeypatch)
+
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = request.content.decode()
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "new-access",
+                "refresh_token": "rt-2",
+                "expires_in": 300,
+                "refresh_expires_in": 1800,
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    token = refresh_access_token(client=client)
+
+    assert token == "new-access"
+    assert seen["path"] == "/realms/atlas/protocol/openid-connect/token"
+    assert "grant_type=refresh_token" in seen["body"]
+    assert "refresh_token=rt-1" in seen["body"]
+    assert "client_id=seeknal-cli" in seen["body"]
+    # Rotated tokens are persisted (mode 0600) for the next call.
+    saved = json.loads(creds.read_text(encoding="utf-8"))
+    assert saved["access_token"] == "new-access"
+    assert saved["refresh_token"] == "rt-2"
+    # The refreshed credentials file must be owner-only (no world/group read window).
+    assert (creds.stat().st_mode & 0o777) == 0o600
+
+
+def test_refresh_access_token_none_without_refresh_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_creds_with_refresh(tmp_path, monkeypatch, refresh_token=None)
+    client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
+    assert refresh_access_token(client=client) is None
+
+
+def test_refresh_access_token_none_on_rejected_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KEYCLOAK_ISSUER", "http://kc.test/realms/atlas")
+    _write_creds_with_refresh(tmp_path, monkeypatch)
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(401, json={"error": "invalid_grant"}))
+    )
+    # An expired/invalid refresh token yields None (never raises).
+    assert refresh_access_token(client=client) is None
+
+
+def test_refresh_access_token_none_when_no_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SEEKNAL_CREDENTIALS_PATH", str(tmp_path / "missing.json"))
+    assert refresh_access_token() is None
+
+
+# ---------------------------------------------------------------------------
+# Gate token-refresh on 401
+# ---------------------------------------------------------------------------
+
+
+def test_gate_refreshes_token_on_401_and_retries() -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            assert request.headers["Authorization"] == "Bearer t0ken"
+            return httpx.Response(401, json={"detail": "Token has expired"})
+        assert request.headers["Authorization"] == "Bearer fresh"
+        return httpx.Response(200, json={"allowed": True, "reason": "ok"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    config = AtlasContractConfig(base_url=BASE_URL, token="t0ken", timeout_seconds=5.0)
+    gate = GovernanceGate(config, client=client, token_refresher=lambda: "fresh")
+
+    decision = gate.check_access(resource="retail_demo.sales", action="read")
+    assert decision.allowed is True
+    assert calls["n"] == 2
+
+
+def test_gate_fail_closed_when_refresh_unavailable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"detail": "expired"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    config = AtlasContractConfig(base_url=BASE_URL, token="t0ken", timeout_seconds=5.0)
+    gate = GovernanceGate(config, client=client, token_refresher=lambda: None)
+
+    # Unrecoverable 401 keeps the fail-closed contract (a denied decision, no raise),
+    # and the reason is the actionable re-auth hint, not "Atlas unreachable".
+    decision = gate.check_access(resource="retail_demo.sales", action="read")
+    assert decision.allowed is False
+    assert decision.reason == SESSION_EXPIRED_HINT
+
+
+def test_gate_post_raises_auth_error_on_unrecoverable_401() -> None:
+    """The low-level sender raises AtlasAuthError (not a generic error) on a dead 401,
+    mirroring AtlasCatalogClient._send so the exception type is consistent."""
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(401, json={"detail": "expired"}))
+    )
+    config = AtlasContractConfig(base_url=BASE_URL, token="t0ken", timeout_seconds=5.0)
+    gate = GovernanceGate(config, client=client, token_refresher=lambda: None)
+
+    with pytest.raises(AtlasAuthError) as excinfo:
+        gate._post("/api/contracts/access-check", {"operation": "access-check"})
+    assert "seeknal auth login" in str(excinfo.value)
+
+
+def test_gate_fail_open_still_denies_on_expired_session() -> None:
+    """Security: fail-open trades availability for enforcement on *transport* errors,
+    but an expired session is an auth failure and must never be waved through."""
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(401, json={"detail": "expired"}))
+    )
+    config = AtlasContractConfig(base_url=BASE_URL, token="t0ken", timeout_seconds=5.0)
+    gate = GovernanceGate(config, fail_open=True, client=client, token_refresher=lambda: None)
+
+    decision = gate.check_access(resource="retail_demo.sales", action="read")
+    assert decision.allowed is False  # NOT allowed, despite fail_open=True
+    assert decision.reason == SESSION_EXPIRED_HINT
+
+
+def test_enforce_access_on_expired_session_raises_policy_denied_not_auth_error() -> None:
+    """Run-safety contract: even though _post raises AtlasAuthError internally, the
+    public enforce_access() must still surface AtlasPolicyDenied (carrying the re-auth
+    hint as the reason). `seeknal run` catches only AtlasPolicyDenied, so raising
+    AtlasAuthError here would regress it into an uncaught traceback."""
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(401, json={"detail": "expired"}))
+    )
+    config = AtlasContractConfig(base_url=BASE_URL, token="t0ken", timeout_seconds=5.0)
+    gate = GovernanceGate(config, client=client, token_refresher=lambda: None)
+
+    with pytest.raises(AtlasPolicyDenied) as excinfo:
+        gate.enforce_access(resource="retail_demo.sales", action="read")
+    # Not an AtlasAuthError (sibling type that `seeknal run` would not catch).
+    assert not isinstance(excinfo.value, AtlasAuthError)
+    assert str(excinfo.value) == SESSION_EXPIRED_HINT

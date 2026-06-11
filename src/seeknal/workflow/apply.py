@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from seeknal.ui.output import echo_success as _echo_success, echo_error as _echo_error, echo_warning as _echo_warning, echo_info as _echo_info
 from seeknal.integrations.atlas_client import (
+    AtlasAuthError,
     AtlasContractError,
     AtlasPolicyDenied,
     create_atlas_contract_client_from_env,
@@ -757,6 +758,10 @@ def apply_command(
                 project_path=project_path,
             )
         except AtlasPolicyDenied as exc:
+            _echo_error(str(exc))
+            raise typer.Exit(1)
+        except AtlasAuthError as exc:
+            # Auth problem, not an Atlas outage: surface the login hint verbatim.
             _echo_error(str(exc))
             raise typer.Exit(1)
         except AtlasContractError as exc:

@@ -262,6 +262,27 @@ def execute_sql(
     has_more_rows = len(rows) > effective_limit
     trimmed_rows = rows[:effective_limit]
 
+    # Runtime governance: when Atlas is configured (ATLAS_API_URL), access-check the
+    # tables this query references and mask sensitive columns before results reach the
+    # model. Inactive (passthrough) when Atlas is not configured. A denial is surfaced
+    # to the agent as a tool message rather than raising.
+    from seeknal.integrations.atlas_client import AtlasPolicyDenied
+    from seeknal.integrations.atlas_governance import (
+        create_governance_gate_from_env,
+        govern_query,
+    )
+
+    _gov_gate = create_governance_gate_from_env()
+    if _gov_gate is not None:
+        try:
+            trimmed_rows = govern_query(
+                _gov_gate, sql=sql, columns=columns, rows=trimmed_rows
+            )
+        except AtlasPolicyDenied as denial:
+            result = f"Access denied by Atlas governance policy: {denial}"
+            record_tool_result("execute_sql", result, args={"sql": sql})
+            return result
+
     # Resolve the real total only when we actually hit the cap — saves the
     # round-trip for normal-sized results.
     total_rows: int | None = None

@@ -64,6 +64,37 @@ If Atlas denies the policy check, the local file is not moved. If Atlas fails
 after the local write, the local artifact remains in place and `seeknal apply`
 exits with an error so the sync issue is visible.
 
+## Runtime data-access governance
+
+The same Atlas configuration also activates **runtime** governance for data reads.
+When `ATLAS_API_URL` is set, Seeknal delegates read decisions to the Atlas backend
+(OpenFGA-backed) instead of trusting local configuration:
+
+- Source **sample reads** (`seeknal source sync`, the `preview` context template) are
+  access-checked per table, and any columns Atlas classifies as sensitive are masked
+  before sample rows are written into the Ask context.
+- The gate is **fail-closed**: a denied decision *or* an unreachable Atlas yields no
+  rows (the preview degrades to "Preview unavailable"). Set `ATLAS_FAIL_OPEN=true`
+  only where availability must outweigh enforcement.
+- When `ATLAS_API_URL` is unset, governance is inactive and reads pass through
+  unchanged.
+
+Relevant environment variables:
+
+```bash
+export ATLAS_API_URL="http://atlas-dev-server:8000"   # activates governance
+export ATLAS_API_TOKEN="<optional bearer token>"
+export ATLAS_FAIL_OPEN="false"                        # default: fail-closed
+export ATLAS_ACTOR="alice@example.com"                # defaults to the OS user
+```
+
+Inspect or test decisions from the CLI:
+
+```bash
+seeknal atlas governance status                       # is enforcement active?
+seeknal atlas governance check prod.gold.customer --action read
+```
+
 ## Examples
 
 ### Apply a draft file

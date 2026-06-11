@@ -607,6 +607,78 @@ def governance_audit_logs(
         raise typer.Exit(1)
 
 
+@governance_app.command("status")
+def governance_status():
+    """Show whether runtime Atlas governance enforcement is active.
+
+    Enforcement activates when ``ATLAS_API_URL`` is configured. When active, Seeknal
+    delegates data-access decisions and column masking to the Atlas backend on every
+    governed read — the rules live in Atlas, not in editable local files.
+
+    Example:
+        seeknal atlas governance status
+    """
+    from seeknal.integrations.atlas_governance import create_governance_gate_from_env
+
+    gate = create_governance_gate_from_env()
+    typer.echo("")
+    typer.echo(typer.style("Atlas Runtime Governance", bold=True))
+    typer.echo("=" * 40)
+    if gate is None:
+        _echo_warning("Inactive — ATLAS_API_URL is not set.")
+        typer.echo("Reads pass through ungoverned. Set ATLAS_API_URL to enable enforcement.")
+        typer.echo("")
+        return
+    _echo_success("Active — access decisions delegated to Atlas.")
+    typer.echo(f"  Endpoint:  {gate.config.base_url}")
+    typer.echo(f"  Token:     {'set' if gate.config.token else '(none)'}")
+    typer.echo(f"  Fail mode: {'fail-open' if gate.fail_open else 'fail-closed'}")
+    typer.echo("")
+
+
+@governance_app.command("check")
+def governance_check(
+    resource: str = typer.Argument(
+        ..., help="Resource identifier, e.g. prod.gold.customer"
+    ),
+    action: str = typer.Option(
+        "read", "--action", "-a", help="Action to check (read, write, ...)"
+    ),
+    actor: Optional[str] = typer.Option(
+        None, "--actor", help="Actor (defaults to ATLAS_ACTOR or the current user)"
+    ),
+):
+    """Check the Atlas access decision for a resource (exit 1 if denied).
+
+    Uses the configured Atlas backend (``ATLAS_API_URL``). The exit code is scriptable:
+    a non-zero exit means access is denied, so this can gate shell pipelines.
+
+    Example:
+        seeknal atlas governance check prod.gold.customer --action read
+    """
+    from seeknal.integrations.atlas_governance import create_governance_gate_from_env
+
+    gate = create_governance_gate_from_env()
+    if gate is None:
+        _echo_error("Atlas governance is not configured (set ATLAS_API_URL).")
+        raise typer.Exit(2)
+
+    decision = gate.check_access(resource=resource, action=action, actor=actor)
+    typer.echo("")
+    if decision.allowed:
+        _echo_success(f"ALLOW  {action} {resource}")
+        if decision.masked_columns:
+            typer.echo(f"  Masked columns: {', '.join(decision.masked_columns)}")
+        typer.echo(f"  Classification: {decision.classification}")
+        typer.echo("")
+    else:
+        _echo_error(f"DENY   {action} {resource}")
+        if decision.reason:
+            typer.echo(f"  Reason: {decision.reason}")
+        typer.echo("")
+        raise typer.Exit(1)
+
+
 # =============================================================================
 # Lineage Commands
 # =============================================================================
@@ -636,28 +708,68 @@ def lineage_show(
         help="Output format (tree, json)"
     ),
 ):
-    """Show lineage for a feature group or entity.
+    """Show lineage for a dataset, feature group, or entity.
 
-    Displays upstream and downstream dependencies.
+    Reads DataHub-backed upstream/downstream lineage through the Atlas catalog
+    (the same source as ``seeknal dataset lineage``). Requires only
+    ``ATLAS_API_URL`` — the optional ``atlas-data-platform`` package is not
+    needed.
 
     Example:
         seeknal atlas lineage show user_features --direction upstream
     """
-    _require_atlas()
+    import json as _json
 
-    typer.echo(f"Fetching lineage for: {name}")
-    typer.echo(f"  Direction: {direction}")
-    typer.echo(f"  Depth: {depth}")
-    typer.echo("")
+    # Reuse the proven resolver/reader from the `dataset` command group so this
+    # command is a real DataHub-backed reader, not a placeholder.
+    from seeknal.cli.dataset import (
+        _require_catalog,
+        _resolve_dataset,
+        _dataset_urn,
+        _lineage_nodes,
+        _print_lineage,
+    )
+    from seeknal.integrations.atlas_client import (
+        AtlasAuthError,
+        AtlasContractError,
+    )
 
-    # Note: In a full implementation, this would call the DataHub lineage API
-    # For now, we provide a placeholder
-    _echo_info("Lineage visualization requires a running Atlas API and DataHub")
-    typer.echo("")
-    typer.echo("To enable lineage:")
-    typer.echo("  1. Start the Atlas API: seeknal atlas api start")
-    typer.echo("  2. Configure DATAHUB_GMS_URL environment variable")
-    typer.echo("  3. Publish lineage: seeknal atlas lineage publish")
+    client = _require_catalog()
+    resolved = _resolve_dataset(client, name)
+    try:
+        data = client.lineage(_dataset_urn(resolved))
+    except AtlasAuthError as exc:
+        _echo_error(str(exc))
+        raise typer.Exit(1)
+    except AtlasContractError as exc:
+        _echo_error(f"Lineage lookup failed: {exc}")
+        raise typer.Exit(1)
+
+    upstream = _lineage_nodes(data.get("upstreamLineage") or data.get("upstream"))
+    downstream = _lineage_nodes(
+        data.get("downstreamLineage") or data.get("downstream")
+    )
+
+    if format == "json":
+        typer.echo(
+            _json.dumps(
+                {
+                    "dataset": resolved.fqn,
+                    "upstream": upstream,
+                    "downstream": downstream,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    _echo_success(f"Lineage for {resolved.fqn}")
+    if direction in ("upstream", "both"):
+        _print_lineage("upstream", upstream)
+    if direction in ("downstream", "both"):
+        _print_lineage("downstream", downstream)
+    if not upstream and not downstream:
+        _echo_info("No lineage recorded in DataHub for this dataset.")
 
 
 @lineage_app.command("publish")
@@ -698,13 +810,25 @@ def lineage_publish(
         _echo_error("Both --inputs and --outputs are required")
         raise typer.Exit(1)
 
-    _require_atlas()
-
     import uuid
 
+    from seeknal.integrations.atlas_client import (
+        AtlasContractError,
+        create_atlas_contract_client_from_env,
+    )
+
+    # Route through the always-available contract client (same
+    # /api/contracts/lineage/publish path the apply flow uses) so manual
+    # lineage publishing works in a standard install without the optional
+    # atlas-data-platform package.
+    client = create_atlas_contract_client_from_env()
+    if client is None:
+        _echo_error("Atlas is not configured (set ATLAS_API_URL).")
+        raise typer.Exit(2)
+
     final_run_id = run_id or str(uuid.uuid4())
-    input_list = [i.strip() for i in inputs.split(",")]
-    output_list = [o.strip() for o in outputs.split(",")]
+    input_list = [i.strip() for i in inputs.split(",") if i.strip()]
+    output_list = [o.strip() for o in outputs.split(",") if o.strip()]
 
     typer.echo(f"Publishing lineage for: {pipeline}")
     typer.echo(f"  Run ID: {final_run_id}")
@@ -712,47 +836,35 @@ def lineage_publish(
     typer.echo(f"  Outputs: {output_list}")
     typer.echo("")
 
+    project = os.getenv("SEEKNAL_PROJECT_NAME") or "seeknal"
+    environment = os.getenv("ATLAS_ENVIRONMENT", os.getenv("SEEKNAL_ENV", "dev"))
+
+    def _ref(dataset_name: str) -> dict:
+        return {
+            "asset_type": "dataset",
+            "name": dataset_name,
+            "namespace": f"{project}/{environment}/dataset",
+            "source_system": "seeknal",
+            "source_id": f"dataset:{dataset_name}",
+            "metadata": {"pipeline": pipeline, "run_id": final_run_id},
+        }
+
+    upstreams = [_ref(name) for name in input_list]
     try:
-        from atlas.seeknal.governance_tools import (
-            create_lineage_publishing_tool,
-            create_governance_tools_config,
-        )
-
-        config = create_governance_tools_config()
-        tool = create_lineage_publishing_tool(config)
-
-        # Convert to URNs (simplified)
-        def to_urn(name: str) -> str:
-            return f"urn:li:dataset:(urn:li:dataPlatform:iceberg,{name},PROD)"
-
-        input_urns = [to_urn(i) for i in input_list]
-        output_urns = [to_urn(o) for o in output_list]
-
-        result = tool.publish_lineage(
-            pipeline_name=pipeline,
-            run_id=final_run_id,
-            inputs=input_urns,
-            outputs=output_urns,
-        )
-
-        if result.success:
-            _echo_success("Lineage published successfully")
-            typer.echo(f"  Upstream datasets: {result.upstream_count}")
-            typer.echo(f"  Downstream datasets: {result.downstream_count}")
-            typer.echo(f"  Latency: {result.latency_ms:.1f}ms")
-        else:
-            _echo_error(f"Failed to publish lineage: {result.error_message}")
-            raise typer.Exit(1)
-
-    except ImportError:
-        _echo_warning("DataHub client not fully configured")
-        typer.echo("")
-        typer.echo("Lineage publishing requires:")
-        typer.echo("  - DATAHUB_GMS_URL environment variable")
-        typer.echo("  - DATAHUB_TOKEN environment variable (optional)")
-    except Exception as e:
-        _echo_error(f"Error publishing lineage: {e}")
+        for output_name in output_list:
+            client.publish_lineage(
+                project_name=project,
+                environment=environment,
+                asset=_ref(output_name),
+                upstreams=upstreams,
+            )
+    except AtlasContractError as exc:
+        _echo_error(f"Failed to publish lineage: {exc}")
         raise typer.Exit(1)
+
+    _echo_success("Lineage published successfully")
+    typer.echo(f"  Upstream datasets: {len(input_list)}")
+    typer.echo(f"  Downstream datasets: {len(output_list)}")
 
 
 # =============================================================================
