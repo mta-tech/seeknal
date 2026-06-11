@@ -531,3 +531,35 @@ class TestSeeknalRunHelp:
         assert result.exit_code == 0
         assert "Examples:" in result.stdout
         assert "seeknal run" in result.stdout
+
+
+class TestSeeknalRunParams:
+    """Test the --params JSON flag for custom parameter overrides."""
+
+    def test_help_lists_params_flag(self):
+        result = runner.invoke(app, ["run", "--help"])
+        assert result.exit_code == 0
+        _assert_help_option(result.stdout, "params")
+
+    def test_valid_params_json_accepted(self, sample_yaml_files, monkeypatch):
+        """Valid JSON object is accepted (planning succeeds)."""
+        monkeypatch.chdir(sample_yaml_files)
+        result = runner.invoke(
+            app, ["run", "--show-plan", "--params", '{"region": "EU"}']
+        )
+        assert result.exit_code == 0
+        assert "Execution Plan" in result.stdout
+
+    def test_invalid_params_json_rejected(self, sample_yaml_files, monkeypatch):
+        """Malformed JSON exits non-zero with a clear message."""
+        monkeypatch.chdir(sample_yaml_files)
+        result = runner.invoke(app, ["run", "--params", "not-json"])
+        assert result.exit_code == 1
+        assert "not valid JSON" in result.stdout
+
+    def test_params_must_be_object(self, sample_yaml_files, monkeypatch):
+        """A JSON array/scalar is rejected; --params must be an object."""
+        monkeypatch.chdir(sample_yaml_files)
+        result = runner.invoke(app, ["run", "--params", '["EU"]'])
+        assert result.exit_code == 1
+        assert "must be a JSON object" in result.stdout

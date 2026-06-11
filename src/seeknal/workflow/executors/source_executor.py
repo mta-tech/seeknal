@@ -129,6 +129,18 @@ class SourceExecutor(BaseExecutor):
                 )
             if has_query:
                 self._validate_pushdown_query(params["query"])
+        elif source_type == "iceberg":
+            # Iceberg always needs 'table' (3-part catalog.namespace.table) to
+            # ATTACH the catalog, even when a pushdown 'query' is provided.
+            if not has_table:
+                raise ExecutorValidationError(
+                    self.node.id,
+                    "Iceberg source requires 'table' (3-part "
+                    "'catalog.namespace.table') to attach the catalog, "
+                    "even when 'query' is provided in params"
+                )
+            if has_query:
+                self._validate_pushdown_query(params["query"])
         elif not has_table:
             raise ExecutorValidationError(
                 self.node.id,
@@ -1260,7 +1272,21 @@ class SourceExecutor(BaseExecutor):
             # Create local schema and view from the Iceberg table
             con.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
 
-            if time_column and last_watermark and not params.get("query"):
+            pushdown_query = params.get("query")
+            if pushdown_query:
+                # Pushdown: run the user-provided SELECT against the attached
+                # Iceberg catalog. DuckDB's iceberg reader applies predicate /
+                # projection / partition pruning, so only the matching files and
+                # columns are scanned (and subsequently cached) — avoiding a full
+                # table read. Incremental mode is disabled for custom queries.
+                self._validate_pushdown_query(pushdown_query)
+                if time_column:
+                    logger.info(
+                        f"Iceberg source {node_id} has custom query, "
+                        "incremental mode disabled"
+                    )
+                view_sql = pushdown_query
+            elif time_column and last_watermark:
                 # Incremental: partition-pruned read — only new data since last watermark
                 from seeknal.validation import validate_column_name
                 validate_column_name(time_column)
@@ -1270,7 +1296,7 @@ class SourceExecutor(BaseExecutor):
                     f"OR \"{time_column}\" IS NULL"
                 )
             else:
-                # Full scan: first run, no time_column, or custom query
+                # Full scan: first run or no time_column
                 view_sql = f"SELECT * FROM {catalog_alias}.{namespace}.{table_name}"
 
             con.execute(f"CREATE OR REPLACE VIEW {schema}.{view_name} AS {view_sql}")
@@ -1282,8 +1308,11 @@ class SourceExecutor(BaseExecutor):
             row_count = count_result[0] if count_result else 0
 
             # Compute new watermark from loaded data
+            # Skip for pushdown queries: the result is a filtered/projected set,
+            # so MAX(time_column) would persist a misleading watermark (and the
+            # column may not even be in the projection).
             new_watermark = None
-            if time_column:
+            if time_column and not pushdown_query:
                 try:
                     wm_result = con.execute(
                         f"SELECT MAX(\"{time_column}\") FROM {schema}.{view_name}"
