@@ -66,6 +66,14 @@ class TestParameterResolver:
         result = resolver.resolve({"date": "{{today}}"})
         assert result["date"] == "2025-01-15"
 
+    def test_resolve_custom_param_in_query(self):
+        """A custom CLI param (e.g. from --params) substitutes inside a query string."""
+        resolver = ParameterResolver(cli_overrides={"region": "EU"})
+        result = resolver.resolve(
+            {"query": "SELECT * FROM t WHERE region = '{{ region }}'"}
+        )
+        assert result["query"] == "SELECT * FROM t WHERE region = 'EU'"
+
     def test_resolve_nested_dict(self):
         resolver = ParameterResolver()
         result = resolver.resolve({
@@ -424,3 +432,44 @@ class TestSystemEnvironmentCollisionWarning:
                 assert result == "test_value"
         finally:
             del os.environ["SEEKNAL_PARAM_MY_PARAM"]
+
+
+class TestSourceQueryParameterization:
+    """End-to-end: custom CLI params (`--params`) resolve in a source's pushdown query."""
+
+    def _build(self, tmp_path, cli_overrides):
+        from seeknal.workflow.dag import DAGBuilder  # ty: ignore[unresolved-import]
+
+        sources = tmp_path / "seeknal" / "sources"
+        sources.mkdir(parents=True)
+        (sources / "accts.yml").write_text(
+            "kind: source\n"
+            "name: accts\n"
+            "source: iceberg\n"
+            "table: dev.ns.accts\n"
+            "params:\n"
+            "  catalog_uri: http://lk:8181\n"
+            "  warehouse: dev\n"
+            "  query: \"SELECT * FROM dev.ns.accts WHERE region = '{{ region }}'"
+            " AND dt >= '{{ start_date }}'\"\n"
+        )
+        builder = DAGBuilder(project_path=tmp_path, cli_overrides=cli_overrides)
+        builder.build()
+        return builder.get_node("source.accts")
+
+    def test_custom_param_resolves_in_source_query(self, tmp_path):
+        """A custom param (region) plus a dedicated flag (start_date) both substitute."""
+        node = self._build(
+            tmp_path, {"region": "EU", "start_date": "2026-01-01"}
+        )
+        query = node.yaml_data["params"]["query"]
+        assert "region = 'EU'" in query
+        assert "dt >= '2026-01-01'" in query
+        assert "{{" not in query
+
+    def test_unresolved_custom_param_left_intact(self, tmp_path):
+        """Without an override the placeholder is left untouched (no silent blanking)."""
+        node = self._build(tmp_path, {"start_date": "2026-01-01"})
+        query = node.yaml_data["params"]["query"]
+        assert "{{ region }}" in query
+        assert "dt >= '2026-01-01'" in query

@@ -1759,6 +1759,13 @@ def run(
     param_run_id: Optional[str] = typer.Option(
         None, "--run-id", help="Custom run ID for parameterization"
     ),
+    params: Optional[str] = typer.Option(
+        None,
+        "--params",
+        help='JSON object of custom parameters, e.g. \'{"region": "EU"}\'. '
+        "Each key is available as {{ key }} in source/transform SQL "
+        "(dedicated flags like --date/--start-date take precedence).",
+    ),
     # Interval tracking flags
     start: Optional[str] = typer.Option(
         None, "--start", help="Start timestamp for interval execution (ISO format or YYYY-MM-DD)"
@@ -1866,6 +1873,9 @@ def run(
 
         # Combine with date override
         seeknal run --date 2025-01-15 --start-date 2025-01-01 --end-date 2025-01-31
+
+        # Custom parameters available as {{ key }} in source/transform SQL
+        seeknal run --params '{"region": "EU", "tier": "gold"}'
     """
     # Environment mode: delegate to shared helper
     if env is not None:
@@ -1885,8 +1895,21 @@ def run(
         )
         return
 
-    # Build CLI overrides for parameter resolution
+    # Build CLI overrides for parameter resolution.
+    # --params provides the base; dedicated flags below override matching keys.
     cli_overrides: dict[str, Any] = {}
+    if params:
+        import json as _json
+
+        try:
+            parsed = _json.loads(params)
+        except _json.JSONDecodeError as e:
+            _echo_error(f"--params is not valid JSON: {e}")
+            raise typer.Exit(1)
+        if not isinstance(parsed, dict):
+            _echo_error('--params must be a JSON object, e.g. \'{"region": "EU"}\'')
+            raise typer.Exit(1)
+        cli_overrides.update(parsed)
     if param_date:
         cli_overrides["date"] = param_date
         cli_overrides["run_date"] = param_date
