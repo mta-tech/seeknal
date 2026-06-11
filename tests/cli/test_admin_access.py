@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
+from typing import Iterator
 
 import pytest
 from typer.testing import CliRunner
@@ -15,6 +17,26 @@ from seeknal.cli.admin import app
 
 
 runner = CliRunner()
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture
+def tmp_path(tmp_path: Path) -> Iterator[Path]:
+    """Repo-internal replacement for the builtin ``tmp_path``.
+
+    The admin CLI loads/saves AccessPolicy/PendingQueue, which validate paths
+    with ``is_insecure_path`` — and that rejects anything under ``/tmp``, exactly
+    where the builtin ``tmp_path`` lives on Linux CI. A unique directory under
+    ``<repo>/.seeknal/test-tmp`` keeps per-test isolation while passing the
+    security check.
+    """
+
+    secure = _REPO_ROOT / ".seeknal" / "test-tmp" / tmp_path.name
+    shutil.rmtree(secure, ignore_errors=True)
+    secure.mkdir(parents=True, exist_ok=True)
+    yield secure
+    shutil.rmtree(secure, ignore_errors=True)
 
 
 def test_grant_and_list(tmp_path: Path, monkeypatch):
