@@ -21,6 +21,7 @@ from seeknal.dag.manifest import Node, NodeType
 from seeknal.workflow.executors.base import (
     ExecutionContext,
     ExecutorExecutionError,
+    ExecutorValidationError,
 )
 from seeknal.workflow.executors.source_executor import SourceExecutor
 
@@ -368,3 +369,124 @@ class TestIcebergWatermarkFallback:
 
         # new_watermark is None (MAX returned None), so fallback to last_watermark
         assert executor._iceberg_result_metadata["last_watermark"] == "2026-01-01 00:00:00"
+
+
+class TestIcebergPushdownQuery:
+    """params.query is used verbatim as the view body (predicate/projection pushdown)."""
+
+    def test_pushdown_query_used_as_view(self, execution_context):
+        """A custom query becomes the view body so DuckDB can prune the scan."""
+        query = "SELECT id, name FROM atlas.ns.tbl WHERE region = 'EU' LIMIT 100"
+        node = _make_iceberg_node(
+            table="atlas.ns.tbl",
+            params={"catalog_uri": "http://lakekeeper:8181", "query": query},
+        )
+        executor = SourceExecutor(node, execution_context)
+
+        mock_con = _make_mock_con(row_count=100)
+        mock_resp = _mock_urlopen()
+
+        with patch.dict("os.environ", ICEBERG_ENV, clear=True), \
+             patch("urllib.request.urlopen", return_value=mock_resp):
+            row_count = executor._load_iceberg(
+                mock_con, "atlas.ns.tbl",
+                {"catalog_uri": "http://lakekeeper:8181", "query": query},
+            )
+
+        assert row_count == 100
+
+        view_calls = [
+            c.args[0] for c in mock_con.execute.call_args_list
+            if c.args and "CREATE OR REPLACE VIEW" in str(c.args[0])
+        ]
+        assert len(view_calls) == 1
+        # The view body IS the pushdown query — predicate, projection, and LIMIT preserved
+        assert query in view_calls[0]
+        assert "WHERE region = 'EU'" in view_calls[0]
+        assert "LIMIT 100" in view_calls[0]
+        # And it is NOT the default full scan
+        assert "SELECT * FROM atlas.ns.tbl" not in view_calls[0]
+
+    def test_pushdown_query_skips_watermark(self, execution_context):
+        """A pushdown query disables incremental watermark computation."""
+        query = "SELECT id FROM atlas.ns.tbl WHERE id > 10"
+        node = _make_iceberg_node(
+            table="atlas.ns.tbl",
+            params={"catalog_uri": "http://lakekeeper:8181", "query": query},
+            freshness={"time_column": "event_time"},
+        )
+        executor = SourceExecutor(node, execution_context)
+
+        # MAX would return a high value IF it were called — assert it is not used.
+        mock_con = _make_mock_con(row_count=5, max_watermark="2099-01-01 00:00:00")
+        mock_resp = _mock_urlopen()
+
+        with patch.dict("os.environ", ICEBERG_ENV, clear=True), \
+             patch("urllib.request.urlopen", return_value=mock_resp):
+            executor._load_iceberg(
+                mock_con, "atlas.ns.tbl",
+                {"catalog_uri": "http://lakekeeper:8181", "query": query},
+                time_column="event_time",
+                last_watermark="2026-01-01 00:00:00",
+            )
+
+        # No watermark recomputed from the filtered set -> fall back to last watermark
+        assert executor._iceberg_result_metadata["last_watermark"] == "2026-01-01 00:00:00"
+
+        # The view body is the query, not an injected incremental WHERE/CAST clause
+        view_calls = [
+            c.args[0] for c in mock_con.execute.call_args_list
+            if c.args and "CREATE OR REPLACE VIEW" in str(c.args[0])
+        ]
+        assert len(view_calls) == 1
+        assert "CAST(" not in view_calls[0]
+
+
+class TestIcebergValidatePushdown:
+    """validate() safety-checks the pushdown query and keeps 'table' required."""
+
+    def test_validate_accepts_query_with_table(self, execution_context):
+        """A read-only query alongside a 3-part table validates cleanly."""
+        node = _make_iceberg_node(
+            table="atlas.ns.tbl",
+            params={
+                "catalog_uri": "http://lakekeeper:8181",
+                "query": "SELECT id FROM atlas.ns.tbl WHERE id > 5",
+            },
+        )
+        executor = SourceExecutor(node, execution_context)
+        executor.validate()  # should not raise
+
+    def test_validate_rejects_ddl_query(self, execution_context):
+        """A non-SELECT pushdown query is rejected."""
+        node = _make_iceberg_node(
+            table="atlas.ns.tbl",
+            params={
+                "catalog_uri": "http://lakekeeper:8181",
+                "query": "DROP TABLE atlas.ns.tbl",
+            },
+        )
+        executor = SourceExecutor(node, execution_context)
+        with pytest.raises(ExecutorValidationError):
+            executor.validate()
+
+    def test_validate_requires_table_even_with_query(self, execution_context):
+        """'table' is still required (for catalog ATTACH) when only a query is given."""
+        config = {
+            "source": "iceberg",
+            "params": {
+                "catalog_uri": "http://lakekeeper:8181",
+                "query": "SELECT 1 FROM atlas.ns.tbl",
+            },
+        }
+        node = Node(
+            id="source.q",
+            name="q",
+            node_type=NodeType.SOURCE,
+            config=config,
+            description="",
+            tags=[],
+        )
+        executor = SourceExecutor(node, execution_context)
+        with pytest.raises(ExecutorValidationError, match="requires 'table'"):
+            executor.validate()
