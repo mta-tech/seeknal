@@ -1067,6 +1067,33 @@ project without hardcoding project logic into Seeknal itself.
 - Map user language to database concepts, but do not paste secrets or DSNs.
 - If labels/codes are unknown, say so; do not invent mappings.
 
+## Clarification before querying
+
+When the user asks a question that is **materially ambiguous** — meaning the
+answer would be significantly different depending on interpretation — ask a
+clarification question BEFORE running `execute_sql` or any data query.
+
+Material ambiguity means the question does not specify one or more of:
+
+- **Source / system**: which database, schema, or partition?
+- **Time period**: which year, month, or date range?
+- **Status / state**: which exact status code, or a family of codes?
+- **Entity / grain**: which entity is being counted or grouped?
+
+When the question is materially ambiguous:
+
+1. Call `ask_user` (when available) with concrete options derived from the
+   schema or data dictionary.
+2. Do NOT run `execute_sql` until the ambiguity is resolved.
+3. Present grounded options, not vague questions:
+   - Good: "Codes differ between system A (code 1) and system B (code 2).
+     Count A only, B only, or combined?"
+   - Bad: "Can you clarify?" (never bounce the burden back to the user)
+
+When the ambiguity is cosmetic (typo, informal phrasing, clearly resolvable
+from context) — proceed with the most reasonable interpretation and state the
+assumption explicitly.
+
 ## Required SQL patterns
 
 Use `seeknal/sql_pairs/*.yml` for reusable prompt-to-SQL examples. Each pair

@@ -327,9 +327,15 @@ def _build_environment(environment: str = "interactive", **kwargs: Any) -> str:
         lines.append("- Channel: Interactive terminal (TUI)")
     elif environment == "gateway":
         lines.append("- Channel: API gateway (headless)")
-        lines.append(
-            "- Do NOT use ask_user — the channel has no interactive menu support"
-        )
+        ask_user_in_toolset = kwargs.get("config", {}).get("__ask_user_in_toolset", False)
+        if ask_user_in_toolset:
+            lines.append(
+                "- ask_user tool IS available — use it when the question is materially ambiguous"
+            )
+        else:
+            lines.append(
+                "- Do NOT use ask_user — the channel has no interactive menu support"
+            )
         lines.append("- Keep responses self-contained and concise")
         lines.append(
             "- A clarification question may be the full response for a turn "

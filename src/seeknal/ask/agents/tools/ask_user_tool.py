@@ -14,36 +14,55 @@ async def ask_user(
     question: str,
     options: list[dict[str, Any]],
 ) -> str:
-    """Ask the user a question with interactive selectable options.
+    """Confirm user intent BEFORE running data queries. Use this tool instead of writing text.
 
-    The user sees an arrow-key navigable menu and can select an option
-    or type a custom answer via "Other".
+    This is the REQUIRED mechanism when you need to clarify which interpretation to use
+    before querying the database. Calling this tool is a BLOCKING call — it pauses
+    execution, presents the options to the user, and RETURNS their choice to you.
+    You then bind that choice and continue. Think of it like execute_sql: you call it
+    when you need information you cannot determine yourself.
 
-    Use this tool to:
-    1. Scope a broad or strategic request before diving into analysis
-    2. Present choices when multiple valid directions exist
-    3. Gather preferences, priorities, or constraints from the user
-    4. Offer next-step options after presenting findings
+    WHEN TO USE: The user's question contains a concept (status, category, type, scale)
+    that could map to multiple database codes, and you have not yet confirmed which one
+    they intend. Call this tool BEFORE running any data SQL for that concept.
+
+    DO NOT: Write a text clarification instead of calling this tool. Writing text is only
+    permitted as a fallback when this tool is NOT available in your current toolset.
 
     Guidelines:
-    - Provide 2-4 concrete options with clear descriptions
+    - Provide 2-4 concrete options from the live data_dictionary lookup result
     - Mark your recommended option with recommended="true" (string), not boolean true
-    - Focus on things only the user can decide (not data lookups)
-    - Ask BEFORE heavy analysis, not after
+    - CALL THIS TOOL, then use its return value as the binding for subsequent SQL
 
     Args:
-        question: The question to ask. Should be clear and specific.
+        question: The clarification question. Should be clear and specific.
         options: 2-4 answer options. Each option is a dict with:
             - 'label': Short option text (1-5 words)
             - 'description': What this option means or implies
             - 'recommended': Set to 'true' to highlight as recommended (optional)
     """
-    from seeknal.ask.agents.tools._context import record_ask_user_response
+    from seeknal.ask.agents.tools._context import get_tool_context, record_ask_user_response
     from seeknal.ask.agents.tools.ask_user import interactive_ask_user
 
     if not options:
         return "No options provided."
 
-    answer = await interactive_ask_user(question, options)
+    # Use gateway/custom callback when available (e.g. WebSocket in gateway mode);
+    # fall back to the interactive terminal UI for TTY/interactive sessions.
+    try:
+        _cb = getattr(get_tool_context(), "ask_user_callback", None)
+    except RuntimeError:
+        _cb = None
+    _invoke = _cb if _cb is not None else interactive_ask_user
+    answer = await _invoke(question, options)
     record_ask_user_response(options, answer)
+
+    # Clear pending ambiguity — the user responded, gate can lift.
+    try:
+        _ctx = get_tool_context()
+        _ctx.ask_user_called_this_turn = True
+        _ctx.pending_dict_ambiguity = None
+    except RuntimeError:
+        pass  # No context in some test paths
+
     return answer

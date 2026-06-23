@@ -87,6 +87,15 @@ class ToolContext:
     # RETRYABLE nudge so the agent can override with allow_sql_pair_drift;
     # only a second attempt without the override escalates to TERMINAL.
     authoritative_drift_attempts_this_turn: int = 0
+    # Ask-user gate: tracks whether ask_user is wired for this session and
+    # whether it was invoked this turn. Used by execute_sql to block data
+    # queries when a dict lookup found multiple ambiguous codes.
+    ask_user_available: bool = False
+    ask_user_called_this_turn: bool = False
+    pending_dict_ambiguity: str | None = None
+    # The actual callable (gateway WS callback, interactive UI, or None).
+    # ask_user_tool.py reads this to route the call to the right handler.
+    ask_user_callback: Any = None
 
 
 def _make_registry():
@@ -407,6 +416,8 @@ def reset_turn_governor(question: str | None = None) -> None:
     setattr(ctx.repl, "_seeknal_authoritative_sql_pair_result_this_turn", None)
     ctx.authoritative_drift_attempts_this_turn = 0
     ctx.timing_events_this_turn.clear()
+    ctx.ask_user_called_this_turn = False
+    ctx.pending_dict_ambiguity = None
 
 
 def get_discovery_cache_value(key: str) -> Any | None:

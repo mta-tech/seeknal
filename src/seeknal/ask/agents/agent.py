@@ -7,7 +7,7 @@ For complex analyses, the agent decomposes tasks via the planning tool.
 
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
 from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
@@ -183,6 +183,7 @@ def create_agent(
     budget: Optional[float] = None,
     include_web: bool = False,
     environment: str = "interactive",
+    ask_user_callback: Optional[Callable[..., Any]] = None,
 ):
     """Create a Seeknal Ask agent.
 
@@ -196,6 +197,9 @@ def create_agent(
         include_web: Enable web search/fetch tools.
         environment: Execution environment — "interactive" (TTY), "gateway"
             (API/SSE), "telegram", or "exposure" (headless report re-run).
+        ask_user_callback: Optional async callable ``(question, options) -> str``.
+            When provided, the ``ask_user`` tool is included even in gateway
+            mode, enabling two-way clarification via WebSocket.
 
     Returns:
         A tuple of (agent, deps, message_history, cost_info).
@@ -238,6 +242,19 @@ def create_agent(
     # to avoid conflicting with user-facing seeknal_agent.yml fields.
     agent_config = dict(agent_config)
     agent_config["__project_path"] = str(project_path)
+    # ask_user can be enabled via three paths:
+    #   1. interactive environment (terminal session)
+    #   2. explicit callback injected by caller (e.g. WebSocket gateway, test mock)
+    #   3. project config: agent.ask_user.enabled: true → use interactive_ask_user fallback
+    _ask_user_enabled_in_config = bool(
+        agent_config.get("agent", {}).get("ask_user", {}).get("enabled", False)
+    )
+    _ask_user_in_toolset_early = (
+        (environment == "interactive")
+        or (ask_user_callback is not None)
+        or _ask_user_enabled_in_config
+    )
+    agent_config["__ask_user_in_toolset"] = _ask_user_in_toolset_early
 
     # Create singleton REPL with safe connection
     repl = REPL(project_path=project_path, skip_history=True)
@@ -362,26 +379,39 @@ read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
 - For direct tool-call requests, copy the supplied SQL/table/code exactly
   unless the tool error proves it needs correction.
 """
+        _ask_user_in_toolset = _ask_user_in_toolset_early
         if environment != "interactive":
-            instructions += """
+            if _ask_user_in_toolset:
+                instructions += """
+
+## Clarification via ask_user tool
+
+The `ask_user` tool is in your toolset. When the question is materially
+ambiguous (the user did not specify which status code, scope, or system to use
+AND different interpretations would produce materially different counts):
+
+1. CALL the `ask_user` tool with 2-4 concrete options.
+2. Do NOT write a text clarification instead. The tool IS the clarification.
+3. Do NOT call execute_sql for data before the tool returns.
+4. After the tool returns the user's choice: bind it and proceed with SQL.
+
+Ambiguity is material when: the user's concept maps to >1 database codes
+AND the different codes produce different result counts.
+
+If the ambiguity is only cosmetic (typo, informal phrasing, clearly resolvable
+from context, or the prior turn already locked the scope) — proceed with the
+most reasonable interpretation and state the assumption explicitly.
+"""
+            else:
+                instructions += """
 
 ## Headless read-only channel
 
-The `ask_user` tool is not available in gateway, telegram, or exposure mode.
-Do not call `ask_user`.
-"""
-        if environment in ("gateway", "telegram"):
-            instructions += """
-If the question is materially ambiguous — meaning the user did NOT specify
-which data scope, source, or time period to use, AND there is more than one
-plausible interpretation — STOP and emit a grounded clarification as your
-ENTIRE response. Do NOT call execute_sql while the question is materially
-ambiguous.
-
-Common missing specs that make a question materially ambiguous:
-  - Source / system: e.g. ERBA only, ERLA only, or combined?
-  - Time period: which year or date range?
-  - Status / state: which exact status code, or a family of codes?
+`ask_user` is NOT in your toolset. When the question is materially ambiguous
+— the user did not specify which scope, status, or system to use, AND there
+is more than one plausible interpretation — STOP and emit a grounded
+clarification as your ENTIRE response. Do NOT call execute_sql while the
+question is materially ambiguous.
 
 Good clarification (present concrete options):
   "Untuk formula bayi, kode berbeda antara ERBA (1301/1302) dan ERLA
@@ -423,10 +453,12 @@ most reasonable interpretation and state the assumption explicitly.
     # Build toolsets: ask tools + dynamic project context injection
     context_budget = get_context_budget(agent_config)
     context_toolset = SeeknaContextToolset(discovery, context_budget=context_budget)
+    _has_custom_ask_user_cb = ask_user_callback is not None
+    get_tool_context().ask_user_available = _ask_user_in_toolset_early
     toolsets_list = [
         create_ask_toolset(
             mode=ask_toolset_mode,
-            include_ask_user=(environment == "interactive"),
+            include_ask_user=_ask_user_in_toolset_early,
         ),
         context_toolset,
     ]
@@ -672,15 +704,17 @@ most reasonable interpretation and state the assumption explicitly.
         include_execute=False,
     )
 
-    # Use LocalBackend with interactive ask_user callback.
-    # Gateway/headless environments have no TTY — pass ask_user=None so the
-    # planner subagent auto-selects the recommended option instead of calling
-    # input() on a non-TTY stdin (which blocks or raises EOFError).
-    _ask_user_cb = (
-        interactive_ask_user
-        if environment == "interactive"
-        else None
-    )
+    # Wire ask_user callback: custom callback > interactive fallback from config > none.
+    if _has_custom_ask_user_cb:
+        _ask_user_cb = ask_user_callback
+    elif environment == "interactive" or _ask_user_enabled_in_config:
+        _ask_user_cb = interactive_ask_user
+    else:
+        _ask_user_cb = None
+    # Store callback in ToolContext so ask_user_tool.py can reach it directly
+    # (the tool calls interactive_ask_user by default; this lets gateway mode
+    # use the WebSocket callback instead without going through deps).
+    get_tool_context().ask_user_callback = _ask_user_cb
     deps = DeepAgentDeps(
         backend=LocalBackend(root_dir=str(project_path)),
         ask_user=_ask_user_cb,

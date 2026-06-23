@@ -121,6 +121,26 @@ def execute_sql(
             ),
         )
 
+    # Ambiguity gate: if a dict lookup found multiple codes and ask_user is
+    # available, block data queries until the user clarifies which code to use.
+    if (
+        ctx.ask_user_available
+        and not _is_dict_lookup(sql)
+        and ctx.pending_dict_ambiguity
+        and not ctx.ask_user_called_this_turn
+    ):
+        result = format_tool_error(
+            RETRYABLE_SYNTAX,
+            f"Ambiguous coded concept pending clarification: {ctx.pending_dict_ambiguity}.",
+            hint=(
+                "Call ask_user to present the ambiguous options to the user before querying "
+                "data tables. Build 2-4 options from the dict lookup results. Once the user "
+                "responds with their choice, bind that specific code and proceed with execute_sql."
+            ),
+        )
+        record_tool_result("execute_sql", result, args={"sql": sql})
+        return result
+
     prior_failure = repeated_failure_message("execute_sql", {"sql": sql})
     if prior_failure:
         result = format_tool_error(
@@ -303,6 +323,13 @@ def execute_sql(
         result += "\n\n" + "\n".join(f"ℹ SQL lint: {notice}" for notice in lint_notices)
     if drift_notice:
         result += "\n\n" + drift_notice
+    # After a dict lookup: detect if multiple codes were returned for the same
+    # kategori and ask_user hasn't clarified yet — set pending ambiguity flag.
+    if ctx.ask_user_available and not ctx.ask_user_called_this_turn:
+        ambiguity = _detect_dict_ambiguity(sql, columns, trimmed_rows)
+        if ambiguity:
+            ctx.pending_dict_ambiguity = ambiguity
+
     success_cache[cache_key] = result
     record_tool_result("execute_sql", result, args={"sql": sql})
     return result
@@ -311,6 +338,41 @@ def execute_sql(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _is_dict_lookup(sql: str) -> bool:
+    """Return True if the SQL queries the data_dictionary table."""
+    return bool(re.search(r'\bdata_dictionary\b', sql, re.IGNORECASE))
+
+
+def _detect_dict_ambiguity(sql: str, columns: list, rows: list) -> str | None:
+    """Return an ambiguity description if the dict lookup returned multiple codes.
+
+    Only triggers for inbound lookups (word→code) that have a 'kode' column.
+    When >1 distinct kode values appear under the same kategori, the agent
+    must call ask_user before running any data query.
+    """
+    if not _is_dict_lookup(sql) or not columns or len(rows) < 2:
+        return None
+
+    col_lower = [str(c).lower() for c in columns]
+    if 'kode' not in col_lower:
+        return None
+
+    kode_idx = col_lower.index('kode')
+    kategori_idx = col_lower.index('kategori') if 'kategori' in col_lower else None
+
+    per_kategori: dict[str, set[str]] = {}
+    for row in rows:
+        kat = str(row[kategori_idx]) if kategori_idx is not None else '_'
+        kode = str(row[kode_idx])
+        per_kategori.setdefault(kat, set()).add(kode)
+
+    for kat, kodes in per_kategori.items():
+        if len(kodes) > 1:
+            return f"{kat} has {len(kodes)} matching codes ({', '.join(sorted(kodes))})"
+
+    return None
 
 
 # ---------------------------------------------------------------------------

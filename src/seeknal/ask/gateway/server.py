@@ -72,6 +72,25 @@ _LOCK_IDLE_TTL = 1800  # 30 minutes
 _session_cancellations: set[str] = set()
 
 
+def _resolve_ask_user_timeout() -> float | None:
+    """Read SEEKNAL_ASK_USER_TIMEOUT from env. None=production, N=experimentation."""
+    import os
+    import warnings
+
+    raw = os.environ.get("SEEKNAL_ASK_USER_TIMEOUT")
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+        if value <= 0:
+            warnings.warn(f"SEEKNAL_ASK_USER_TIMEOUT={raw!r} must be positive; ignoring.")
+            return None
+        return value
+    except (TypeError, ValueError):
+        warnings.warn(f"SEEKNAL_ASK_USER_TIMEOUT={raw!r} invalid; ignoring.")
+        return None
+
+
 def _get_session_lock(
     session_id: str, tenant_id: str = DEFAULT_TENANT
 ) -> asyncio.Lock:
@@ -310,6 +329,7 @@ async def _run_agent_streaming(
     include_web: bool = False,
     lock_backend: Any = None,
     broadcaster: Any = None,
+    websocket: Any = None,
 ):
     """Run agent and yield JSON event dicts as they occur.
 
@@ -332,6 +352,7 @@ async def _run_agent_streaming(
                 project_path, session_id, question, provider, model,
                 tenant_id=tenant_id, auto_approve=auto_approve,
                 include_web=include_web,
+                websocket=websocket,
             ):
                 if _is_cancelled(session_id, tenant_id=tenant_id):
                     cancel_event = {
@@ -388,6 +409,7 @@ async def _run_agent_inner(
     tenant_id: str = DEFAULT_TENANT,
     auto_approve: bool = False,
     include_web: bool = False,
+    websocket: Any = None,
 ):
     """Inner agent execution without locking or SSE publishing."""
     from pydantic_ai import Agent
@@ -413,9 +435,28 @@ async def _run_agent_inner(
 
     message_history = store.load_messages(session_id)
 
+    _ask_user_cb = None
+    if websocket is not None:
+        from seeknal.ask.agents.tools.ask_user_gateway import make_gateway_ask_user
+        from seeknal.ask.gateway._ask_rendezvous import get_global_rendezvous
+
+        _rendezvous = get_global_rendezvous()
+        _ask_user_timeout = _resolve_ask_user_timeout()
+
+        async def _broadcast_ask_user_event(event: dict) -> None:
+            await websocket.send_text(json.dumps(event))
+
+        _ask_user_cb = await make_gateway_ask_user(
+            rendezvous=_rendezvous,
+            session_id=session_id,
+            broadcast_event=_broadcast_ask_user_event,
+            timeout=_ask_user_timeout,
+        )
+
     agent, deps, _, _ = create_agent(
         project_path, provider=provider, model=model,
         environment="gateway", include_web=include_web,
+        ask_user_callback=_ask_user_cb,
     )
     from seeknal.ask.agents.tools._context import (
         build_verbatim_restate_response,
@@ -1041,6 +1082,7 @@ async def _send_websocket_run_events(
         tenant_id=tenant_id,
         lock_backend=getattr(websocket.app.state, "session_lock", None),
         broadcaster=getattr(websocket.app.state, "broadcaster", None),
+        websocket=websocket,
     ):
         await websocket.send_text(json.dumps(event))
 
@@ -1094,16 +1136,23 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         followup = json.loads(receive_task.result())
                     except json.JSONDecodeError:
                         followup = {}
-                    if followup.get("type") == "cancel":
+                    msg_type = followup.get("type")
+                    if msg_type == "cancel":
                         _request_cancel(session_id, tenant_id=tenant_id)
+                    elif msg_type == "ask_user_response":
+                        from seeknal.ask.gateway._ask_rendezvous import (
+                            get_global_rendezvous,
+                        )
+                        pid = followup.get("prompt_id", "")
+                        answer = followup.get("answer", "")
+                        ok = await get_global_rendezvous().resolve(session_id, pid, answer)
+                        if not ok:
+                            await websocket.send_text(
+                                json.dumps({"type": "error", "data": f"ask_user_response prompt_id={pid!r} not found"})
+                            )
                     else:
                         await websocket.send_text(
-                            json.dumps(
-                                {
-                                    "type": "error",
-                                    "data": "wait for current run or send type=cancel",
-                                }
-                            )
+                            json.dumps({"type": "error", "data": "wait for current run or send type=cancel"})
                         )
                 else:
                     receive_task.cancel()
@@ -1118,6 +1167,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         if run_task is not None and not run_task.done():
             run_task.cancel()
     finally:
+        from seeknal.ask.gateway._ask_rendezvous import get_global_rendezvous
+        await get_global_rendezvous().cleanup(session_id)
         await session_manager.disconnect(session_id, websocket)
 
 
