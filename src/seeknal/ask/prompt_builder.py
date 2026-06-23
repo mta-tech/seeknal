@@ -331,10 +331,18 @@ def _build_environment(environment: str = "interactive", **kwargs: Any) -> str:
             "- Do NOT use ask_user — the channel has no interactive menu support"
         )
         lines.append("- Keep responses self-contained and concise")
+        lines.append(
+            "- A clarification question may be the full response for a turn "
+            "when the question is materially ambiguous"
+        )
     elif environment == "telegram":
         lines.append("- Channel: Telegram bot")
         lines.append("- Do NOT use ask_user — present options as numbered text instead")
         lines.append("- Keep responses brief (Telegram truncates long messages)")
+        lines.append(
+            "- A short clarification question may be the full response "
+            "when the question is materially ambiguous"
+        )
     elif environment == "exposure":
         lines.append("- Mode: Report re-run (headless)")
         lines.append("- Skip data discovery — execute the analysis directly")

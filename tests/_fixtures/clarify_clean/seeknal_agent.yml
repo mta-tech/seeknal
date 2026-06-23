@@ -1,0 +1,32 @@
+mode:
+  default: auto
+locale: {}
+agent: {}
+sources:
+  warehouse:
+    source_kind: connected
+    source_type: database
+    connector: postgresql
+    namespace: warehouse
+    access: read_only
+    role: business_source_of_truth
+    priority: 100
+    context_sync:
+      enabled: false
+      refresh_policy: manual
+    dsn_env: WAREHOUSE_URL
+
+agent_harness:
+  auto_summarization:
+    enabled: false
+  cost_tracking:
+    enabled: false
+  hooks:
+    enabled: true
+    sql_security: true
+    sql_self_correction: true
+  stuck_loop_detection:
+    enabled: true
+  subagents:
+    enabled: auto
+    include_builtin: true

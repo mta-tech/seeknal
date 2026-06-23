@@ -368,8 +368,31 @@ read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
 ## Headless read-only channel
 
 The `ask_user` tool is not available in gateway, telegram, or exposure mode.
-If a question is broad or ambiguous, give a concise best-effort answer and ask
-a plain-language follow-up in the final response; do not call `ask_user`.
+Do not call `ask_user`.
+"""
+        if environment in ("gateway", "telegram"):
+            instructions += """
+If the question is materially ambiguous — meaning the user did NOT specify
+which data scope, source, or time period to use, AND there is more than one
+plausible interpretation — STOP and emit a grounded clarification as your
+ENTIRE response. Do NOT call execute_sql while the question is materially
+ambiguous.
+
+Common missing specs that make a question materially ambiguous:
+  - Source / system: e.g. ERBA only, ERLA only, or combined?
+  - Time period: which year or date range?
+  - Status / state: which exact status code, or a family of codes?
+
+Good clarification (present concrete options):
+  "Untuk formula bayi, kode berbeda antara ERBA (1301/1302) dan ERLA
+   (622/604/624). Hitung ERBA saja, ERLA saja, atau gabungan?"
+
+Bad clarification (never bounce the burden back):
+  "Bisa Anda jelaskan?" / "Apa maksud Anda?"
+
+If the ambiguity is only cosmetic (typo, informal phrasing, clearly resolvable
+from context, or the prior turn already locked the scope) — proceed with the
+most reasonable interpretation and state the assumption explicitly.
 """
         connected_context = _build_connected_source_context(repl)
         if connected_context:
