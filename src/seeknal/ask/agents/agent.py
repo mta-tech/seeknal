@@ -249,6 +249,9 @@ def create_agent(
     _ask_user_enabled_in_config = bool(
         agent_config.get("agent", {}).get("ask_user", {}).get("enabled", False)
     )
+    _ask_user_auto_select = bool(
+        agent_config.get("agent", {}).get("ask_user", {}).get("auto_select", True)
+    )
     _ask_user_in_toolset_early = (
         (environment == "interactive")
         or (ask_user_callback is not None)
@@ -455,6 +458,7 @@ most reasonable interpretation and state the assumption explicitly.
     context_toolset = SeeknaContextToolset(discovery, context_budget=context_budget)
     _has_custom_ask_user_cb = ask_user_callback is not None
     get_tool_context().ask_user_available = _ask_user_in_toolset_early
+    get_tool_context().ask_user_auto_select = _ask_user_auto_select
     toolsets_list = [
         create_ask_toolset(
             mode=ask_toolset_mode,

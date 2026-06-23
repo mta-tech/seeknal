@@ -100,12 +100,24 @@ def _fallback_numbered(question: str, options: list[dict[str, Any]]) -> str:
     console.print()
 
     if not sys.stdin.isatty():
-        selected = _recommended_or_first(options)
-        console.print(
-            "[text.dim]Non-interactive stdin detected; "
-            f"auto-selecting: {selected}[/]"
-        )
-        return selected
+        try:
+            from seeknal.ask.agents.tools._context import get_tool_context
+            _auto_select = getattr(get_tool_context(), "ask_user_auto_select", True)
+        except RuntimeError:
+            _auto_select = True
+
+        if _auto_select:
+            selected = _recommended_or_first(options)
+            console.print(
+                "[text.dim]Non-interactive stdin detected; "
+                f"auto-selecting: {selected}[/]"
+            )
+            return selected
+        else:
+            raise RuntimeError(
+                "ask_user: stdin is not interactive and auto_select=false. "
+                "Provide a real terminal (TTY) or a WebSocket callback."
+            )
 
     try:
         choice = input(f"Select [1-{len(labels)}]: ").strip()

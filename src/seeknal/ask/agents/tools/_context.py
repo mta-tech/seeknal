@@ -96,6 +96,9 @@ class ToolContext:
     # The actual callable (gateway WS callback, interactive UI, or None).
     # ask_user_tool.py reads this to route the call to the right handler.
     ask_user_callback: Any = None
+    # Controls non-TTY behavior: True = auto-select recommended (experimentation/testing);
+    # False = raise error when stdin is not interactive (forces real WS callback or TTY).
+    ask_user_auto_select: bool = True
 
 
 def _make_registry():
