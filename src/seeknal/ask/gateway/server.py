@@ -352,7 +352,7 @@ async def _run_agent_streaming(
                 project_path, session_id, question, provider, model,
                 tenant_id=tenant_id, auto_approve=auto_approve,
                 include_web=include_web,
-                websocket=websocket,
+                broadcaster=broadcaster,
             ):
                 if _is_cancelled(session_id, tenant_id=tenant_id):
                     cancel_event = {
@@ -409,7 +409,7 @@ async def _run_agent_inner(
     tenant_id: str = DEFAULT_TENANT,
     auto_approve: bool = False,
     include_web: bool = False,
-    websocket: Any = None,
+    broadcaster: Any = None,
 ):
     """Inner agent execution without locking or SSE publishing."""
     from pydantic_ai import Agent
@@ -436,21 +436,20 @@ async def _run_agent_inner(
     message_history = store.load_messages(session_id)
 
     _ask_user_cb = None
-    if websocket is not None:
+    if broadcaster is not None:
         from seeknal.ask.agents.tools.ask_user_gateway import make_gateway_ask_user
         from seeknal.ask.gateway._ask_rendezvous import get_global_rendezvous
 
-        _rendezvous = get_global_rendezvous()
-        _ask_user_timeout = _resolve_ask_user_timeout()
-
-        async def _broadcast_ask_user_event(event: dict) -> None:
-            await websocket.send_text(json.dumps(event))
+        async def _sse_broadcast_ask_user_event(event: dict) -> None:
+            await _publish_event_async(
+                session_id, event, tenant_id=tenant_id, broadcaster=broadcaster
+            )
 
         _ask_user_cb = await make_gateway_ask_user(
-            rendezvous=_rendezvous,
+            rendezvous=get_global_rendezvous(),
             session_id=session_id,
-            broadcast_event=_broadcast_ask_user_event,
-            timeout=_ask_user_timeout,
+            broadcast_event=_sse_broadcast_ask_user_event,
+            timeout=_resolve_ask_user_timeout(),
         )
 
     agent, deps, _, _ = create_agent(
@@ -977,6 +976,8 @@ async def ask_oneshot(request: Request) -> JSONResponse:
             if event["type"] == "answer":
                 answer = event["data"]
     finally:
+        from seeknal.ask.gateway._ask_rendezvous import get_global_rendezvous
+        await get_global_rendezvous().cleanup(session_id)
         for _staged in staged_paths:
             try:
                 Path(_staged).unlink(missing_ok=True)
@@ -1139,17 +1140,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     msg_type = followup.get("type")
                     if msg_type == "cancel":
                         _request_cancel(session_id, tenant_id=tenant_id)
-                    elif msg_type == "ask_user_response":
-                        from seeknal.ask.gateway._ask_rendezvous import (
-                            get_global_rendezvous,
-                        )
-                        pid = followup.get("prompt_id", "")
-                        answer = followup.get("answer", "")
-                        ok = await get_global_rendezvous().resolve(session_id, pid, answer)
-                        if not ok:
-                            await websocket.send_text(
-                                json.dumps({"type": "error", "data": f"ask_user_response prompt_id={pid!r} not found"})
-                            )
                     else:
                         await websocket.send_text(
                             json.dumps({"type": "error", "data": "wait for current run or send type=cancel"})
@@ -1167,8 +1157,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         if run_task is not None and not run_task.done():
             run_task.cancel()
     finally:
-        from seeknal.ask.gateway._ask_rendezvous import get_global_rendezvous
-        await get_global_rendezvous().cleanup(session_id)
         await session_manager.disconnect(session_id, websocket)
 
 
@@ -1710,6 +1698,68 @@ async def http_worker_work_complete(request: Request) -> JSONResponse:
     return JSONResponse({"status": "completed"})
 
 
+async def session_ask_user_response(request: Request) -> JSONResponse:
+    """Receive a client's answer to a pending ask_user prompt.
+
+    Used by both sub-paths: in-process /ask (via SSE) and HTTP worker (via long-poll).
+    Body: {"prompt_id": "...", "answer": "..."}
+    """
+    tenant_id, err = _safe_resolve_tenant(request)
+    if err:
+        return err
+    session_id = request.path_params["session_id"]
+    if not _validate_session_id(session_id):
+        return JSONResponse({"error": "invalid session_id"}, status_code=400)
+    body = await request.json()
+    prompt_id = str(body.get("prompt_id") or "")
+    answer = str(body.get("answer") or "")
+    if not prompt_id:
+        return JSONResponse({"error": "prompt_id required"}, status_code=400)
+    from seeknal.ask.gateway._ask_rendezvous import get_global_rendezvous
+    ok = await get_global_rendezvous().resolve(session_id, prompt_id, answer)
+    if not ok:
+        return JSONResponse(
+            {"error": f"prompt_id {prompt_id!r} not found or already resolved"},
+            status_code=404,
+        )
+    return JSONResponse({"status": "resolved"})
+
+
+async def http_worker_ask_user_wait(request: Request) -> JSONResponse:
+    """Long-poll endpoint: HTTP worker waits for the client's ask_user answer.
+
+    Worker calls this after pushing the ask_user event. Gateway holds the
+    connection until the client POSTs /sessions/{id}/ask_user_response or timeout fires.
+    Query params: prompt_id (required), timeout in seconds (optional).
+    """
+    auth, err = _safe_auth_context(request)
+    if err:
+        return err
+    work_id = request.path_params["work_id"]
+    prompt_id = str(request.query_params.get("prompt_id") or "")
+    if not prompt_id:
+        return JSONResponse({"error": "prompt_id required"}, status_code=400)
+    try:
+        _t = request.query_params.get("timeout")
+        timeout: float | None = float(_t) if _t else None
+        if timeout is not None and timeout <= 0:
+            timeout = None
+    except ValueError:
+        timeout = None
+
+    from seeknal.ask.gateway.http_worker import http_worker_broker
+    from seeknal.ask.gateway._ask_rendezvous import get_global_rendezvous
+
+    item = await http_worker_broker.owns(work_id=work_id, tenant_id=auth.tenant_id)
+    if item is None:
+        return JSONResponse({"error": "unknown work_id"}, status_code=404)
+
+    rendezvous = get_global_rendezvous()
+    await rendezvous.register(item.session_id, prompt_id)
+    answer = await rendezvous.wait(item.session_id, prompt_id, timeout=timeout)
+    return JSONResponse({"answer": answer})
+
+
 async def worker_config(request: Request) -> JSONResponse:
     """Return token-derived runtime config for a standalone worker.
 
@@ -1807,6 +1857,7 @@ def create_gateway_app(
         Route("/health", health),
         Route("/sessions", list_sessions),
         Route("/sessions/{session_id}/cancel", cancel_session_run, methods=["POST"]),
+        Route("/sessions/{session_id}/ask_user_response", session_ask_user_response, methods=["POST"]),
         Route("/sessions/{session_id}/history", session_history),
         Route("/temporal/start", temporal_start, methods=["POST"]),
         Route("/events/{session_id}", sse_endpoint),
@@ -1820,6 +1871,7 @@ def create_gateway_app(
         Route("/internal/worker/work-stream", http_worker_work_stream, methods=["GET"]),
         Route("/internal/worker/work/{work_id}/event", http_worker_work_event, methods=["POST"]),
         Route("/internal/worker/work/{work_id}/complete", http_worker_work_complete, methods=["POST"]),
+        Route("/internal/worker/work/{work_id}/ask_user_wait", http_worker_ask_user_wait, methods=["GET"]),
     ]
 
     # In-process agent execution routes are only available when a project

@@ -1,19 +1,21 @@
-"""Gateway WebSocket-aware ask_user callback.
+"""Gateway ask_user callback factory — transport agnostic.
 
-Bridges the agent's ask_user tool to a WebSocket client via the
-AskUserRendezvous registry.
+Bridges the agent's ask_user tool to the client via AskUserRendezvous.
+The broadcast_event callable is the only transport-specific piece: pass
+an SSE publisher for in-process /ask, or an HTTP POST for HTTP workers.
 
-Wiring:
+Usage::
+
     rendezvous = get_global_rendezvous()
 
     async def broadcast_event(event: dict) -> None:
-        await websocket.send_text(json.dumps(event))
+        await _publish_event_async(session_id, event, broadcaster=broadcaster)
 
     callback = await make_gateway_ask_user(
         rendezvous=rendezvous,
         session_id="s1",
         broadcast_event=broadcast_event,
-        timeout=None,  # production: wait forever
+        timeout=None,  # production: wait forever; N = auto-select after N seconds
     )
 
     agent, deps, *_ = create_agent(
