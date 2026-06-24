@@ -544,3 +544,26 @@ def get_sql_pair_mode(config: dict[str, Any]) -> str:
     if isinstance(mode, str) and mode.strip().lower() in _VALID_SQL_PAIR_MODES:
         return mode.strip().lower()
     return "authoritative"
+
+
+def get_request_clarification_enabled(config: dict[str, Any]) -> bool:
+    """Return whether the headless ``request_clarification`` tool is enabled.
+
+    Reads ``agent.request_clarification.enabled`` from ``seeknal_agent.yml``.
+    Defaults to ``True`` so the SEEK5 Model B clarification form works out of
+    the box in gateway/telegram/worker environments. Set ``enabled: false`` to
+    mute it per project — the agent then answers directly without asking
+    (the pre-SEEK5 worker behavior).
+
+    Only takes effect in non-interactive environments; the interactive CLI
+    keeps the ``ask_user`` menu regardless.
+
+    Example::
+
+        agent:
+          request_clarification:
+            enabled: false
+    """
+    agent_section = _get_mapping(config, "agent")
+    rc_section = _get_mapping(agent_section, "request_clarification")
+    return _coerce_bool(rc_section.get("enabled"), default=True)

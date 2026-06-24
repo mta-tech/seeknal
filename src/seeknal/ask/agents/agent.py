@@ -223,6 +223,7 @@ def create_agent(
         get_background_threshold,
         get_context_budget,
         get_ask_toolset_mode,
+        get_request_clarification_enabled,
         get_auto_summarization_config,
         get_cost_tracking_config,
         get_hooks_config,
@@ -406,7 +407,10 @@ in the final response.
         create_ask_toolset(
             mode=ask_toolset_mode,
             include_ask_user=(environment == "interactive"),
-            include_request_clarification=environment in ("gateway", "telegram"),
+            include_request_clarification=(
+                environment in ("gateway", "telegram")
+                and get_request_clarification_enabled(agent_config)
+            ),
         ),
         context_toolset,
     ]
