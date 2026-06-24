@@ -87,6 +87,10 @@ class ToolContext:
     # RETRYABLE nudge so the agent can override with allow_sql_pair_drift;
     # only a second attempt without the override escalates to TERMINAL.
     authoritative_drift_attempts_this_turn: int = 0
+    # Model B clarification: set by request_clarification in headless/worker
+    # mode. The gateway streaming layer emits these prompts as an ``ask_user``
+    # event and ends the turn. ``None`` means no clarification is pending.
+    pending_clarification: list[dict[str, Any]] | None = None
 
 
 def _make_registry():
@@ -407,6 +411,7 @@ def reset_turn_governor(question: str | None = None) -> None:
     setattr(ctx.repl, "_seeknal_authoritative_sql_pair_result_this_turn", None)
     ctx.authoritative_drift_attempts_this_turn = 0
     ctx.timing_events_this_turn.clear()
+    ctx.pending_clarification = None
 
 
 def get_discovery_cache_value(key: str) -> Any | None:

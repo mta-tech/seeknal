@@ -49,6 +49,7 @@ from seeknal.ask.agents.tools.read_proof_document import read_proof_document
 from seeknal.ask.agents.tools.read_project_file import read_project_file
 from seeknal.ask.agents.tools.read_source_context import read_source_context
 from seeknal.ask.agents.tools.read_sql_pair import read_sql_pair
+from seeknal.ask.agents.tools.request_clarification import request_clarification
 from seeknal.ask.agents.tools.run_pipeline import run_pipeline
 from seeknal.ask.agents.tools.run_ask_test import run_ask_test
 from seeknal.ask.agents.tools.save_ingestion_skill import save_ingestion_skill
@@ -149,6 +150,7 @@ def create_ask_toolset(
     *,
     mode: str = "full",
     include_ask_user: bool = True,
+    include_request_clarification: bool = False,
 ) -> FunctionToolset:
     """Create the seeknal-ask toolset.
 
@@ -159,6 +161,9 @@ def create_ask_toolset(
         include_ask_user: Include the direct interactive ``ask_user`` tool.
             Headless channels pass ``False`` so tool schemas cannot trigger
             blocking user input.
+        include_request_clarification: Include the headless ``request_clarification``
+            tool (Model B). Registered for gateway/telegram; the interactive CLI
+            keeps ``ask_user`` instead, so the two are never combined.
     """
     if mode == "analysis":
         # Keep the connected-source/read-only surface deliberately thin:
@@ -187,6 +192,9 @@ def create_ask_toolset(
 
     if include_ask_user:
         tools.append(ask_user)
+
+    if include_request_clarification:
+        tools.append(request_clarification)
 
     return FunctionToolset(
         tools=tools,

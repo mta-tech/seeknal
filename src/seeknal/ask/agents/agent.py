@@ -367,9 +367,11 @@ read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
 
 ## Headless read-only channel
 
-The `ask_user` tool is not available in gateway, telegram, or exposure mode.
-If a question is broad or ambiguous, give a concise best-effort answer and ask
-a plain-language follow-up in the final response; do not call `ask_user`.
+The interactive `ask_user` menu is not available in gateway, telegram, or
+exposure mode; do not call `ask_user`. When a `request_clarification` tool is
+present in your toolset, use it to present a structured clarification form for
+genuinely ambiguous requests; otherwise ask a concise plain-language follow-up
+in the final response.
 """
         connected_context = _build_connected_source_context(repl)
         if connected_context:
@@ -404,6 +406,7 @@ a plain-language follow-up in the final response; do not call `ask_user`.
         create_ask_toolset(
             mode=ask_toolset_mode,
             include_ask_user=(environment == "interactive"),
+            include_request_clarification=environment in ("gateway", "telegram"),
         ),
         context_toolset,
     ]

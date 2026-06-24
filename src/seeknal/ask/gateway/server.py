@@ -525,6 +525,30 @@ async def _run_agent_inner(
             ),
         ) as run:
             async for node in run:
+                # Model B clarification short-circuit: request_clarification
+                # set a pending form — emit it and end the turn before the
+                # model acts on the tool result. Persist the partial run so
+                # the next turn can bind the user's answer from history.
+                if ctx.pending_clarification:
+                    _prompts = ctx.pending_clarification
+                    ctx.pending_clarification = None
+                    try:
+                        store.save_messages(session_id, run.all_messages())
+                        store.update(
+                            session_id,
+                            last_question=question[:200],
+                            status="active",
+                        )
+                    except Exception:
+                        import logging
+
+                        logging.getLogger(__name__).exception(
+                            "[gateway] failed to save clarification turn %s",
+                            session_id,
+                        )
+                    yield {"type": "ask_user", "data": {"prompts": _prompts}}
+                    return
+
                 if isinstance(node, UserPromptNode):
                     continue
 
@@ -564,6 +588,11 @@ async def _run_agent_inner(
                         async for event in handle_stream:
                             if isinstance(event, FunctionToolCallEvent):
                                 tool_name = event.part.tool_name
+                                # request_clarification is delivered as the
+                                # ask_user event by the turn short-circuit;
+                                # suppress its tool_start/tool_end noise.
+                                if tool_name == "request_clarification":
+                                    continue
                                 tool_args = event.part.args_as_dict()
                                 call_id = (
                                     str(getattr(event.part, "tool_call_id", ""))
@@ -580,6 +609,8 @@ async def _run_agent_inner(
                                 }
                             elif isinstance(event, FunctionToolResultEvent):
                                 tool_name = event.result.tool_name
+                                if tool_name == "request_clarification":
+                                    continue
                                 content = _extract_gateway_tool_result_text(event.result)
                                 result_call_id = (
                                     str(getattr(event.result, "tool_call_id", ""))
