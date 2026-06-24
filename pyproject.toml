@@ -47,7 +47,7 @@ dependencies = [
     "pygments>=2.20.0",
     # Core AI features shipped by default
     "pydantic-deep>=0.3.17,<0.4.0",
-    "pydantic-ai-slim[google,openai]>=1.71.0",
+    "pydantic-ai-slim[google,openai]>=1.71.0,<2.0.0",
     "ruamel.yaml>=0.18.0",
     "ddgs>=9.0",
     "starlette>=0.40.0",
@@ -88,7 +88,7 @@ spark = [
 # Kept as an extra for backwards-compatible `seeknal[ask]` installs.
 ask = [
     "pydantic-deep>=0.3.17,<0.4.0",
-    "pydantic-ai-slim[google,openai]>=1.71.0",
+    "pydantic-ai-slim[google,openai]>=1.71.0,<2.0.0",
     "ruamel.yaml>=0.18.0",
     "ddgs>=9.0",
     "starlette>=0.40.0",
