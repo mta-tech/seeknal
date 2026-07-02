@@ -224,6 +224,8 @@ def create_agent(
         get_context_budget,
         get_ask_toolset_mode,
         get_request_clarification_enabled,
+        get_forecast_enabled,
+        get_upload_to_s3_enabled,
         get_auto_summarization_config,
         get_cost_tracking_config,
         get_hooks_config,
@@ -410,6 +412,14 @@ in the final response.
             include_request_clarification=(
                 environment in ("gateway", "telegram")
                 and get_request_clarification_enabled(agent_config)
+            ),
+            include_forecast=(
+                environment in ("gateway", "telegram")
+                and get_forecast_enabled(agent_config)
+            ),
+            include_upload_to_s3=(
+                environment in ("gateway", "telegram")
+                and get_upload_to_s3_enabled(agent_config)
             ),
         ),
         context_toolset,
