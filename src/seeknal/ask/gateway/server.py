@@ -549,6 +549,16 @@ async def _run_agent_inner(
                     yield {"type": "ask_user", "data": {"prompts": _prompts}}
                     return
 
+                # CSV upload emission (FC2d). Unlike pending_clarification
+                # (which ends the turn with `return`), this MUST NOT return —
+                # the agent still has to present its answer after the upload.
+                # Emit + clear + fall through so the turn continues.
+                if ctx.pending_upload:
+                    _upload = ctx.pending_upload
+                    ctx.pending_upload = None
+                    yield {"type": "upload_complete", "data": _upload}
+                    # deliberately NO return — continue the turn
+
                 if isinstance(node, UserPromptNode):
                     continue
 

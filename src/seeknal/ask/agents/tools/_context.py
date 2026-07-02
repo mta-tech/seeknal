@@ -91,6 +91,11 @@ class ToolContext:
     # mode. The gateway streaming layer emits these prompts as an ``ask_user``
     # event and ends the turn. ``None`` means no clarification is pending.
     pending_clarification: list[dict[str, Any]] | None = None
+    # FC2d: pending CSV download. Set by upload_to_s3 (and run_forecast's
+    # optional CSV step). The gateway streaming layer emits an
+    # ``upload_complete`` event and CONTINUES the turn — unlike
+    # pending_clarification which ends it. ``None`` means no upload is pending.
+    pending_upload: dict[str, Any] | None = None
 
 
 def _make_registry():
@@ -412,6 +417,7 @@ def reset_turn_governor(question: str | None = None) -> None:
     ctx.authoritative_drift_attempts_this_turn = 0
     ctx.timing_events_this_turn.clear()
     ctx.pending_clarification = None
+    ctx.pending_upload = None
 
 
 def get_discovery_cache_value(key: str) -> Any | None:
