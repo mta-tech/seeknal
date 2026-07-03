@@ -74,10 +74,22 @@ def run_forecast(sql: str, periods: int = 3) -> str:
         make_tool_signature,
         record_tool_result,
     )
-    from seeknal.ask.agents.tools.execute_sql import _execute_oneshot_with_timeout
+    from seeknal.ask.agents.tools.execute_sql import (
+        _execute_oneshot_with_timeout,
+        _repair_common_sql_before_execution,
+    )
 
     ctx = get_tool_context()
     periods = max(1, min(int(periods), _MAX_HORIZON))
+
+    # ── STEP 0: PREPARE SQL — same pipeline as execute_sql (r3) ────────────
+    # Strip trailing semicolons (LLMs include them, DuckDB rejects).
+    sql = str(sql).strip().rstrip(";").strip()
+    # Repair + rewrite: _rewrite_for_pg_pushdown converts EXTRACT(YEAR…) to
+    # date-range filters so DuckDB's postgres_scanner pushes the WHERE to
+    # PostgreSQL. Without this, DuckDB pulls the entire table and processes
+    # locally — different cast/NULL semantics → wrong results.
+    sql, _notices = _repair_common_sql_before_execution(sql)
 
     # ── STEP 1: EXECUTE the caller's SQL (no domain columns hardcoded) ─────
     columns, rows = _execute_oneshot_with_timeout(ctx, sql, limit=_FORECAST_PULL_LIMIT)
@@ -103,7 +115,17 @@ def run_forecast(sql: str, periods: int = 3) -> str:
             f"Data minimal {_MIN_ROWS} baris untuk dikirim ke engine; dapat {len(rows)}."
         )
 
+    # Coerce data + filter out rows with NULL/empty X or unparseable Y.
+    # DuckDB may return NULL for rows where a cast (e.g. tanggal_bayar::timestamp)
+    # failed — those rows must be excluded, not silently converted to 0.
     data = [[_coerce_x(r[0]), _coerce_y(r[1])] for r in rows]
+    data = [[x, y] for x, y in data if x is not None and y is not None]
+    if len(data) < _MIN_ROWS:
+        return _format_error(
+            f"Data minimal {_MIN_ROWS} baris valid untuk dikirim ke engine; "
+            f"dapat {len(data)} setelah filter NULL."
+        )
+
     freq = _infer_freq([row[0] for row in data])
     if freq is None:
         record_tool_result(
@@ -188,23 +210,34 @@ def _infer_freq(x_values: list[str]) -> str | None:
     return None
 
 
-def _coerce_x(v: Any) -> str:
-    """Normalise the X column to a YYYY-MM-DD string the engine can parse."""
+def _coerce_x(v: Any) -> str | None:
+    """Normalise the X column to a YYYY-MM-DD string the engine can parse.
+
+    Returns None for NULL/empty values so the caller can filter them out
+    before sending to the engine (NULL dates from failed casts must be
+    excluded, not silently converted to empty strings).
+    """
+    from datetime import date as _date
+
     if v is None:
-        return ""
+        return None
     if isinstance(v, datetime):
         return v.strftime("%Y-%m-%d")
-    text = str(v)
-    # DuckDB may return a date/datetime object or string; trim to date part.
-    return text[:10]
+    if isinstance(v, _date):  # DuckDB DATE type (not datetime.datetime)
+        return v.isoformat()
+    text = str(v)[:10]
+    return text if text.strip() else None
 
 
-def _coerce_y(v: Any) -> float:
-    """Normalise the Y column to a non-negative number."""
+def _coerce_y(v: Any) -> float | None:
+    """Normalise the Y column to a non-negative number.
+
+    Returns None for unparseable values so the caller can filter them out.
+    """
     try:
         n = float(v)
     except (TypeError, ValueError):
-        return 0.0
+        return None
     return max(0.0, n)
 
 
