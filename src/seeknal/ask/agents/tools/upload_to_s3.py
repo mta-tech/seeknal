@@ -54,9 +54,16 @@ def upload_to_s3(filename: str, sql: str) -> str:
         failure (the agent should surface it, not retry silently).
     """
     from seeknal.ask.agents.tools._context import get_tool_context, record_tool_result
-    from seeknal.ask.agents.tools.execute_sql import _execute_oneshot_with_timeout
+    from seeknal.ask.agents.tools.execute_sql import (
+        _execute_oneshot_with_timeout,
+        _repair_common_sql_before_execution,
+    )
 
     ctx = get_tool_context()
+
+    # STEP 0: PREPARE SQL — same pipeline as execute_sql (r2)
+    sql = str(sql).strip().rstrip(";").strip()
+    sql, _notices = _repair_common_sql_before_execution(sql)
 
     # STEP 1: EXECUTE the caller's SQL (tool does SQL internally — agent
     # provides Raw SQL only).
