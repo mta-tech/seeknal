@@ -9,6 +9,7 @@ wires it into pydantic-deep's hook lifecycle.
 
 import json
 import logging
+import os
 import re
 
 from pydantic_deep.capabilities.hooks import Hook, HookEvent, HookInput, HookResult
@@ -151,6 +152,63 @@ def _enrich_syntax_hint(message: str, existing_hint: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# POST_TOOL_USE: CSV upload reminder (FC2d)
+# ---------------------------------------------------------------------------
+
+# Reminder threshold (module-level — HookInput carries no config object).
+_CSV_REMINDER_MIN_ROWS = int(os.environ.get("SEEKNAL_CSV_REMINDER_MIN_ROWS", "20"))
+
+# Count markdown-table data rows: lines like "| 123 | ..." (skip separators).
+_TABLE_ROW_RE = re.compile(r"^\|\s*[^:\-][^|]*\|", re.MULTILINE)
+
+
+def _count_result_rows(tool_result: str) -> int:
+    """Best-effort row count from an execute_sql markdown table result.
+
+    execute_sql returns a markdown table; data rows match the pattern while
+    separator rows (``|---|``) and the "N rows" footer do not. The header row
+    DOES match the pattern, so when a separator is present (the standard
+    execute_sql shape) we subtract it. Returns 0 on any parse trouble — the
+    hook then no-ops (safe default).
+    """
+    if not tool_result:
+        return 0
+    try:
+        matches = _TABLE_ROW_RE.findall(tool_result)
+        has_separator = bool(re.search(r"^\|[\s:\-]+\|", tool_result, re.MULTILINE))
+        count = len(matches)
+        if has_separator and count > 0:
+            count -= 1  # exclude the header row
+        return max(0, count)
+    except TypeError:
+        return 0
+
+
+async def _csv_upload_reminder_handler(hook_input: HookInput) -> HookResult:
+    """Nudge the agent to offer upload_to_s3 when execute_sql returns many rows.
+
+    Reminder ONLY — never enforces. Appends a short hint to the tool result via
+    ``modified_result``; the agent decides whether to act on it. Triggers on
+    ``execute_sql`` exclusively. Independent of ``_sql_self_correction_handler``
+    (different condition; both run).
+    """
+    try:
+        if hook_input.tool_name != "execute_sql" or not hook_input.tool_result:
+            return HookResult()
+        rows = _count_result_rows(hook_input.tool_result)
+        if rows < _CSV_REMINDER_MIN_ROWS:
+            return HookResult()
+        nudge = (
+            f"\n\n_({rows} rows returned — consider offering "
+            f"`upload_to_s3(filename=..., sql=...)` if the user wants a CSV export.)_"
+        )
+        return HookResult(modified_result=hook_input.tool_result + nudge)
+    except Exception:  # noqa: BLE001 - a hook must never propagate failures
+        logger.exception("[csv_reminder_hook] unexpected error; passing through")
+        return HookResult()
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -161,6 +219,7 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
     Includes:
     - PRE_TOOL_USE: SQL security validation
     - POST_TOOL_USE: SQL self-correction hints
+    - POST_TOOL_USE: CSV upload reminder (FC2d, execute_sql only)
     """
     cfg = config or {}
     if cfg.get("enabled", True) is False:
@@ -180,6 +239,14 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
             Hook(
                 event=HookEvent.POST_TOOL_USE,
                 handler=_sql_self_correction_handler,
+                matcher="execute_sql",
+            )
+        )
+    if cfg.get("csv_upload_reminder", True):
+        hooks.append(
+            Hook(
+                event=HookEvent.POST_TOOL_USE,
+                handler=_csv_upload_reminder_handler,
                 matcher="execute_sql",
             )
         )

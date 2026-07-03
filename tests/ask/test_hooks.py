@@ -292,9 +292,10 @@ class TestSqlSelfCorrectionHook:
 
 
 class TestGetAskHooks:
-    def test_returns_two_hooks(self):
+    def test_returns_three_hooks(self):
+        # PRE sql_security + POST sql_self_correction + POST csv_upload_reminder
         hooks = get_ask_hooks()
-        assert len(hooks) == 2
+        assert len(hooks) == 3
 
     def test_first_hook_is_pre_tool_use(self):
         hooks = get_ask_hooks()
