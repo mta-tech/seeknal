@@ -44,6 +44,11 @@ _VIEWER_TOOLS = {
     "extract_from_image",
     "extract_finance_document",
     "ask_user",
+    # FC2: forecast + CSV export tools. Both execute read-only SQL (or accept
+    # pre-computed data) and produce user-facing output (markdown / CSV in
+    # SeaweedFS). No DB writes — same privilege class as execute_sql.
+    "run_forecast",
+    "upload_to_s3",
 }
 
 # Analysts can additionally save personal preferences, draft pipelines, and
