@@ -382,6 +382,12 @@ def get_hooks_config(config: dict[str, Any]) -> dict[str, Any]:
         "enabled": _coerce_bool(section.get("enabled"), True),
         "sql_security": _coerce_bool(section.get("sql_security"), True),
         "sql_self_correction": _coerce_bool(section.get("sql_self_correction"), True),
+        # FC2d: csv_upload_reminder nudge hook — fires after execute_sql /
+        # run_forecast to suggest offering upload_to_s3. Defaults to True
+        # (opt-out per project). Before this fix the key was silently ignored
+        # and the hook registered unconditionally — ``csv_upload_reminder:
+        # false`` in seeknal_agent.yml had no effect.
+        "csv_upload_reminder": _coerce_bool(section.get("csv_upload_reminder"), True),
     }
 
 

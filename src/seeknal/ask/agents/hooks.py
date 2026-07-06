@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import time
 
 from pydantic_deep.capabilities.hooks import Hook, HookEvent, HookInput, HookResult
 
@@ -152,11 +153,25 @@ def _enrich_syntax_hint(message: str, existing_hint: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# POST_TOOL_USE: CSV upload reminder (FC2d)
+# POST_TOOL_USE: CSV auto-upload (FC2d r4)
 # ---------------------------------------------------------------------------
+#
+# Design (r4): the hook AUTOMATICALLY calls upload_to_s3 when execute_sql
+# returns a substantial result. The agent does NOT decide — from the user's
+# perspective, every substantial data answer comes with a Download button
+# without asking. This is the "tools csv otomatis upload" behavior.
+#
+# For run_forecast the hook cannot auto-upload (forecast.points are computed
+# in the engine, not re-extractable from the markdown tool_result), so it
+# falls back to a strong nudge that tells the agent to call upload_to_s3 in
+# data mode with the projection rows.
 
-# Reminder threshold (module-level — HookInput carries no config object).
-_CSV_REMINDER_MIN_ROWS = int(os.environ.get("SEEKNAL_CSV_REMINDER_MIN_ROWS", "20"))
+# Auto-upload threshold. Below this row count the result is considered trivial
+# (fits in chat, no Download button needed). Above this threshold the hook
+# auto-uploads via upload_to_s3. Default lowered from 20 → 5 in r4 — the
+# previous default was too restrictive for the "always offer CSV" UX goal.
+# Override via the SEEKNAL_CSV_REMINDER_MIN_ROWS env var.
+_CSV_REMINDER_MIN_ROWS = int(os.environ.get("SEEKNAL_CSV_REMINDER_MIN_ROWS", "5"))
 
 # Count markdown-table data rows: lines like "| 123 | ..." (skip separators).
 _TABLE_ROW_RE = re.compile(r"^\|\s*[^:\-][^|]*\|", re.MULTILINE)
@@ -184,28 +199,141 @@ def _count_result_rows(tool_result: str) -> int:
         return 0
 
 
-async def _csv_upload_reminder_handler(hook_input: HookInput) -> HookResult:
-    """Nudge the agent to offer upload_to_s3 when execute_sql returns many rows.
+def _derive_filename_from_sql(sql: str) -> str:
+    """Best-effort CSV filename derived from the SQL query.
 
-    Reminder ONLY — never enforces. Appends a short hint to the tool result via
-    ``modified_result``; the agent decides whether to act on it. Triggers on
-    ``execute_sql`` exclusively. Independent of ``_sql_self_correction_handler``
-    (different condition; both run).
+    Falls back to a timestamped generic name when introspection fails. The
+    name only affects the user-facing Download label, not storage — the
+    object key is namespaced under ``csv-exports/{uuid}/{filename}`` so
+    collisions are impossible regardless.
+    """
+    table = "result"
+    try:
+        # Capture the full FROM target (e.g. "warehouse.public.t_produk_3_erba"),
+        # then split on dots to get the bare table name. Word boundaries +
+        # greedy [\w.]+ ensure we don't stop at the first segment.
+        m = re.search(r"\bFROM\s+([\w\.]+)", sql, re.IGNORECASE)
+        if m:
+            table_full = m.group(1).strip("`\"'")
+            table = table_full.split(".")[-1].lower()
+            # Strip common table-name prefixes for tidier filenames. The hook
+            # is generic; these patterns just produce cleaner names when present.
+            table = re.sub(r"^(t_|tbl_|table_|ft_)", "", table) or "result"
+    except Exception:
+        table = "result"
+    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    return f"{table}-{ts}.csv"
+
+
+async def _csv_upload_reminder_handler(hook_input: HookInput) -> HookResult:
+    """Auto-upload substantial query results to S3; nudge for forecast points.
+
+    Two branches (matcher=``execute_sql|run_forecast``):
+
+    **execute_sql (Mode 1, AUTO-UPLOAD):** when the result has ≥
+    ``_CSV_REMINDER_MIN_ROWS`` rows, the hook DIRECTLY calls
+    ``upload_to_s3(filename, sql=<the agent's SQL>)``. No agent decision —
+    the upload is automatic. ``ctx.pending_upload`` is set inside
+    ``upload_to_s3``; the gateway then emits ``upload_complete`` and a
+    Download button appears alongside the answer. The hook appends a short
+    note to ``tool_result`` so the agent knows the CSV was uploaded (and
+    can mention the download URL in its answer).
+
+    **run_forecast (Mode 2, NUDGE):** the projection points live only in the
+    tool_result markdown — they are computed by the engine, not SQL-queryable.
+    The hook cannot re-execute them. It therefore nudges the agent to call
+    ``upload_to_s3(filename, data=points, columns=[...])`` (Mode 2). Nudge
+    only fires on forecast success (``## Ringkasan``); ``## Kesalahan`` and
+    ``## Ditolak`` produce no exportable data and are skipped.
+
+    Failures (storage unreachable, PUT rejected) are swallowed — the hook
+    must never crash the agent turn. The agent is told via the modified
+    result so it can mention the failure or retry.
     """
     try:
-        if hook_input.tool_name != "execute_sql" or not hook_input.tool_result:
+        tool_name = hook_input.tool_name
+        result = hook_input.tool_result or ""
+        if not result:
             return HookResult()
-        rows = _count_result_rows(hook_input.tool_result)
-        if rows < _CSV_REMINDER_MIN_ROWS:
-            return HookResult()
-        nudge = (
-            f"\n\n_({rows} rows returned — consider offering "
-            f"`upload_to_s3(filename=..., sql=...)` if the user wants a CSV export.)_"
-        )
-        return HookResult(modified_result=hook_input.tool_result + nudge)
-    except Exception:  # noqa: BLE001 - a hook must never propagate failures
-        logger.exception("[csv_reminder_hook] unexpected error; passing through")
+
+        if tool_name == "execute_sql":
+            return await _auto_upload_sql_result(hook_input, result)
+
+        if tool_name == "run_forecast":
+            return _nudge_forecast_data_export(result)
+
         return HookResult()
+    except Exception:  # noqa: BLE001 - hooks must never propagate failures
+        logger.exception("[csv_upload_hook] unexpected error; passing through")
+        return HookResult()
+
+
+async def _auto_upload_sql_result(
+    hook_input: HookInput, result: str
+) -> HookResult:
+    """Auto-upload Mode 1: re-execute the SQL via upload_to_s3.
+
+    Called by ``_csv_upload_reminder_handler`` when execute_sql returns a
+    substantial result. Imports upload_to_s3 lazily to avoid an import cycle
+    (hooks.py is imported early in agent construction).
+    """
+    rows = _count_result_rows(result)
+    if rows < _CSV_REMINDER_MIN_ROWS:
+        return HookResult()
+
+    # The SQL the agent used for this execute_sql call. Re-execute it inside
+    # upload_to_s3 (Mode 1) to build the CSV — most queries hit PostgreSQL's
+    # page cache on the second run, so the latency cost is acceptable.
+    tool_input = hook_input.tool_input or {}
+    sql = tool_input.get("sql") or tool_input.get("query") or ""
+    if not sql:
+        # No SQL captured (defensive) — fall back to a soft nudge so the agent
+        # can offer the upload manually.
+        nudge = (
+            f"\n\n_({rows} rows returned — auto-upload skipped (no SQL captured). "
+            f"Offer `upload_to_s3(filename=..., sql=...)` if the user wants a CSV.)_"
+        )
+        return HookResult(modified_result=result + nudge)
+
+    filename = _derive_filename_from_sql(sql)
+    try:
+        # Lazy import to keep hooks.py import-time light and avoid any cycle.
+        from seeknal.ask.agents.tools.upload_to_s3 import upload_to_s3
+
+        upload_outcome = upload_to_s3(filename, sql=sql)
+    except Exception as exc:
+        # Storage unreachable / PUT rejected / etc — surface to agent, but
+        # never crash the turn. The user still gets the query answer.
+        nudge = (
+            f"\n\n_({rows} rows returned — auto-upload failed: "
+            f"{type(exc).__name__}. The user can still request CSV manually.)_"
+        )
+        return HookResult(modified_result=result + nudge)
+
+    # Upload succeeded — tell the agent so it can mention the Download button.
+    nudge = (
+        f"\n\n_(Auto-uploaded {rows} rows to S3. {upload_outcome} "
+        f"— a Download button is rendered alongside your answer.)_"
+    )
+    return HookResult(modified_result=result + nudge)
+
+
+def _nudge_forecast_data_export(result: str) -> HookResult:
+    """Mode 2 nudge for run_forecast (cannot auto-upload — points are computed).
+
+    Forecast success is marked by ``## Ringkasan``. ``## Kesalahan`` and
+    ``## Ditolak`` produce no exportable data — skip the nudge so the agent
+    focuses on the error/reason instead of offering CSV.
+    """
+    if "## Ringkasan" not in result:
+        return HookResult()
+    nudge = (
+        "\n\n_(Forecast complete — automatically offer "
+        "`upload_to_s3(filename=..., data=points, columns="
+        "[\"period\",\"point\",\"lower_80\",\"upper_80\",\"lower_95\",\"upper_95\"])` "
+        "so the user gets a Download button for the projection points.)_"
+    )
+    return HookResult(modified_result=result + nudge)
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +345,12 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
     """Return all hooks for the seeknal ask agent.
 
     Includes:
-    - PRE_TOOL_USE: SQL security validation
-    - POST_TOOL_USE: SQL self-correction hints
-    - POST_TOOL_USE: CSV upload reminder (FC2d, execute_sql only)
+    - PRE_TOOL_USE: SQL security validation (execute_sql only)
+    - POST_TOOL_USE: SQL self-correction hints (execute_sql only)
+    - POST_TOOL_USE: CSV upload reminder (FC2d) — fires after both
+      ``execute_sql`` and ``run_forecast``; matcher is the regex
+      ``"execute_sql|run_forecast"`` so pydantic_deep routes both tools to the
+      single handler, which dispatches internally on ``tool_name``.
     """
     cfg = config or {}
     if cfg.get("enabled", True) is False:
@@ -247,7 +378,10 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
             Hook(
                 event=HookEvent.POST_TOOL_USE,
                 handler=_csv_upload_reminder_handler,
-                matcher="execute_sql",
+                # Regex matched against tool_name by pydantic_deep._match_hooks.
+                # Extending to new data-producing tools = extend this regex,
+                # then add a branch in _csv_upload_reminder_handler.
+                matcher="execute_sql|run_forecast",
             )
         )
     return hooks

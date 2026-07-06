@@ -14,6 +14,7 @@ arrive as a single ``sql`` argument the agent assembles.
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime
 from typing import Any
 
@@ -25,6 +26,31 @@ _IBA_FORECAST_API_KEY = os.environ.get("IBA_FORECAST_API_KEY", "")
 _MIN_ROWS = 10          # tool sendability floor (engine eligibility ≥24 is separate)
 _MAX_HORIZON = 12       # hard cap; engine also enforces periods ≤ 12
 _FORECAST_PULL_LIMIT = 500  # well under execute_sql's row/byte budget
+
+# ── SQL shape policy (structural, not error-text-based) ────────────────
+# The forecast tool accepts a flat single-table aggregate only. Detection is
+# regex-based on SQL keywords and independent of any runtime error message,
+# so it remains stable across DuckDB versions and error-wording changes.
+# Each entry maps a forbidden pattern to an actionable, OpenAI-style English
+# reason that explains WHY the pattern violates the contract and WHAT to do.
+_FORBIDDEN_SQL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"\bJOIN\b", re.IGNORECASE),
+        "JOIN clauses are not supported. Query a single table and aggregate "
+        "to one row per period — no year-over-year self-joins, no date-spine "
+        "joins, no joins to other tables.",
+    ),
+    (
+        re.compile(r"\bGENERATE_SERIES\b", re.IGNORECASE),
+        "GENERATE_SERIES is not supported. The forecast engine counts missing "
+        "periods (gap_months) internally from the X-column spacing — do not "
+        "pre-fill missing months in SQL.",
+    ),
+    (
+        re.compile(r"\bWITH\s+RECURSIVE\b", re.IGNORECASE),
+        "Recursive CTEs are not supported. Use a single flat SELECT.",
+    ),
+)
 
 
 def run_forecast(sql: str, periods: int = 3) -> str:
@@ -91,8 +117,39 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     # locally — different cast/NULL semantics → wrong results.
     sql, _notices = _repair_common_sql_before_execution(sql)
 
+    # ── STEP 0.5: STRUCTURAL POLICY CHECK (r4) ────────────────────────────
+    # Fail fast on forbidden SQL patterns BEFORE calling DuckDB. This is
+    # structural detection (regex on SQL keywords) — independent of DuckDB's
+    # error wording, so it stays stable across upstream version bumps. The
+    # observed production crash ("Conversion Error: TIMESTAMP -> TIMESTAMP[]"
+    # on LEFT JOIN with date_trunc) is prevented here without coupling to the
+    # exact error text. See _FORBIDDEN_SQL_PATTERNS for the policy table.
+    forbidden = _detect_forbidden_patterns(sql)
+    if forbidden:
+        record_tool_result(
+            "run_forecast",
+            "error",
+            args={"sql_sig": make_tool_signature("run_forecast", {"sql": sql})},
+        )
+        return _format_policy_violation(sql, forbidden)
+
     # ── STEP 1: EXECUTE the caller's SQL (no domain columns hardcoded) ─────
-    columns, rows = _execute_oneshot_with_timeout(ctx, sql, limit=_FORECAST_PULL_LIMIT)
+    # Wrap in try/except (r4) — DuckDB errors that slip past the structural
+    # pre-check (syntax errors, missing tables, type casts not tied to JOIN)
+    # must NOT crash the Temporal activity. Return a structured ``## Kesalahan``
+    # block so the agent can self-correct in the next loop iteration (FC2a
+    # §3.4: local validation failures must return a markdown block, not raise).
+    try:
+        columns, rows = _execute_oneshot_with_timeout(
+            ctx, sql, limit=_FORECAST_PULL_LIMIT
+        )
+    except Exception as exc:
+        record_tool_result(
+            "run_forecast",
+            "error",
+            args={"sql_sig": make_tool_signature("run_forecast", {"sql": sql})},
+        )
+        return _format_sql_exec_error(exc, sql)
 
     # ── STEP 2: VALIDATE + INFER ───────────────────────────────────────────
     if len(columns) != 2:
@@ -243,6 +300,128 @@ def _coerce_y(v: Any) -> float | None:
 
 def _format_error(message: str) -> str:
     return f"## Kesalahan\n\n{message}"
+
+
+def _detect_forbidden_patterns(sql: str) -> list[str]:
+    """Return actionable reasons for each forbidden SQL pattern found.
+
+    Detection is structural (regex on SQL keywords) and independent of any
+    runtime error message, so it stays stable across DuckDB versions and
+    error-wording changes. Returns a list of OpenAI-style English reasons
+    (already bullet-prefixed) explaining why each matched pattern violates
+    the forecast tool's flat 2-column contract.
+    """
+    return [
+        f"- {reason}"
+        for pattern, reason in _FORBIDDEN_SQL_PATTERNS
+        if pattern.search(sql)
+    ]
+
+
+def _sql_preview(sql: str, limit: int = 200) -> str:
+    """Truncate and flatten a SQL string for inclusion in error context.
+
+    Whitespace is collapsed so multi-line SQL renders on one preview line,
+    keeping the agent context budget bounded while still giving enough signal
+    for debugging.
+    """
+    preview = sql[:limit].replace("\n", " ")
+    if len(sql) > limit:
+        preview += " ... (truncated)"
+    return preview
+
+
+def _format_policy_violation(sql: str, violations: list[str]) -> str:
+    """Format a structural policy violation (failed BEFORE execution).
+
+    Used when ``_detect_forbidden_patterns`` finds JOIN / generate_series /
+    recursive CTE patterns in the SQL. Distinct from ``_format_sql_exec_error``
+    (which handles runtime exceptions) because the diagnosis here is certain:
+    we know which pattern is forbidden, so the message is authoritative rather
+    than hedged.
+    """
+    return (
+        "## Kesalahan\n\n"
+        "**Forecast SQL rejected by policy check (STEP 0.5).**\n\n"
+        "The SQL contains patterns that the forecast tool does not support:\n"
+        f"{chr(10).join(violations)}\n\n"
+        "Required SQL shape for run_forecast:\n"
+        "```\n"
+        "SELECT <time_grain_expr>      AS x,   -- e.g. date_trunc('month', col::timestamp)\n"
+        "       <value_aggregate_expr> AS y    -- e.g. COUNT(DISTINCT id)\n"
+        "FROM   <table>\n"
+        "WHERE  <filters>\n"
+        "GROUP  BY 1\n"
+        "ORDER  BY 1\n"
+        "```\n"
+        "- Exactly 2 columns (X timestamp, Y non-negative number).\n"
+        "- No JOINs, no generate_series, no recursive CTE.\n"
+        "- One row per period; the engine handles gap-filling and eligibility.\n\n"
+        f"SQL preview (after preprocessing): `{_sql_preview(sql)}`"
+    )
+
+
+def _format_sql_exec_error(exc: Exception, sql: str) -> str:
+    """Format a SQL execution failure as a traceable, structured Kesalahan block.
+
+    The message is English and separates three concerns for debuggability:
+
+    1. **What happened** — the exception class and its first non-empty lines
+       (verbatim, truncated to keep the agent context budget bounded). This is
+       the debug trail and is reported as-is, never parsed for branching.
+    2. **Why the SQL likely violates the tool contract** — detected
+       structurally from the SQL itself, independent of the runtime error
+       wording. Useful when DuckDB's error is opaque (e.g. "Conversion Error"
+       with no hint about JOIN being the cause).
+    3. **What to do** — the required flat 2-column shape.
+
+    This separation keeps the formatter robust: even if DuckDB rephrases its
+    errors or the SQL fails for an unanticipated reason, the structural hints
+    still surface the most likely policy violation, and the verbatim exception
+    still gives the debug trail. Detection logic never branches on error text.
+    """
+    exc_type = type(exc).__name__
+    # First 3 non-empty lines — enough to capture DuckDB's ``LINE N: ...`` caret
+    # without echoing a multi-KB traceback into the agent context.
+    raw_lines = [ln.strip() for ln in str(exc).splitlines() if ln.strip()]
+    detail = "\n".join(raw_lines[:3]) if raw_lines else str(exc)
+
+    # Re-run structural detection for the hint section. The same patterns are
+    # checked at STEP 0.5, but a SQL can still reach this handler if it failed
+    # the pre-check (it shouldn't) or if a non-patterned error occurred.
+    violations = _detect_forbidden_patterns(sql)
+    if violations:
+        cause = (
+            "The SQL also contains patterns that the forecast tool does not "
+            "support:\n" + "\n".join(violations)
+        )
+    else:
+        cause = (
+            "No unsupported pattern was detected in the SQL. The failure is "
+            "likely a syntax error, a missing table or column, or a type cast "
+            "issue. Re-check the SQL against the table schema."
+        )
+
+    return (
+        "## Kesalahan\n\n"
+        "**Forecast SQL execution failed (STEP 1: EXECUTE).**\n\n"
+        f"Error type: `{exc_type}`\n"
+        f"Detail:\n```\n{detail}\n```\n\n"
+        f"{cause}\n\n"
+        "Required SQL shape for run_forecast:\n"
+        "```\n"
+        "SELECT <time_grain_expr>      AS x,   -- e.g. date_trunc('month', col::timestamp)\n"
+        "       <value_aggregate_expr> AS y    -- e.g. COUNT(DISTINCT id)\n"
+        "FROM   <table>\n"
+        "WHERE  <filters>\n"
+        "GROUP  BY 1\n"
+        "ORDER  BY 1\n"
+        "```\n"
+        "- Exactly 2 columns (X timestamp, Y non-negative number).\n"
+        "- No JOINs, no generate_series, no recursive CTE.\n"
+        "- One row per period; the engine handles gap-filling and eligibility.\n\n"
+        f"SQL preview (after preprocessing): `{_sql_preview(sql)}`"
+    )
 
 
 def _format_refused(reason: str) -> str:
