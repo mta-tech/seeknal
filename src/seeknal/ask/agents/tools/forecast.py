@@ -20,7 +20,15 @@ from typing import Any
 
 import httpx
 
-_IBA_FORECAST_URL = os.environ.get("IBA_FORECAST_URL", "http://iba-forecast:6705")
+_IBA_FORECAST_URL = os.environ.get("IBA_FORECAST_URL", "")
+# r6: if IBA_FORECAST_URL is not set, use SEEKNAL_GATEWAY_URL + /internal/forecast
+# This routes through iba-service proxy instead of direct service access.
+if not _IBA_FORECAST_URL:
+    _gw = os.environ.get("SEEKNAL_GATEWAY_URL", "")
+    if _gw:
+        _IBA_FORECAST_URL = _gw.rstrip("/").removesuffix("/v6") + "/v6/internal/forecast"
+    else:
+        _IBA_FORECAST_URL = "http://iba-forecast:6705/forecast"
 _IBA_FORECAST_API_KEY = os.environ.get("IBA_FORECAST_API_KEY", "")
 
 _MIN_ROWS = 10          # tool sendability floor (engine eligibility ≥24 is separate)
@@ -197,7 +205,7 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     # ── STEP 3: POST → engine (generic payload) ────────────────────────────
     try:
         resp = httpx.post(
-            f"{_IBA_FORECAST_URL}/forecast",
+            _IBA_FORECAST_URL,
             json={"data": data, "periods": periods, "freq": freq},
             headers={"X-API-Key": _IBA_FORECAST_API_KEY},
             timeout=120.0,

@@ -38,7 +38,15 @@ from typing import Any
 
 import httpx
 
-_IBA_STORAGE_URL = os.environ.get("IBA_STORAGE_URL", "http://iba-storage:8000")
+_IBA_STORAGE_URL = os.environ.get("IBA_STORAGE_URL", "")
+# r6: if IBA_STORAGE_URL is not set, use SEEKNAL_GATEWAY_URL for proxy.
+# Gateway route: /v6/internal/storage/presign → iba-storage presign endpoint.
+if not _IBA_STORAGE_URL:
+    _gw_s = os.environ.get("SEEKNAL_GATEWAY_URL", "")
+    if _gw_s:
+        _IBA_STORAGE_URL = _gw_s.rstrip("/").removesuffix("/v6") + "/v6/internal/storage/presign"
+    else:
+        _IBA_STORAGE_URL = "http://iba-storage:8000"
 _IBA_STORAGE_API_KEY = os.environ.get("IBA_STORAGE_API_KEY", "")
 
 
@@ -111,9 +119,16 @@ def upload_to_s3(
     # NOTE: iba-storage mounts the internal router under ``/api`` (main.py:
     # ``app.include_router(internal_router, prefix="/api")``), so the full path
     # is ``/api/v1/internal/get-upload-url`` — not ``/v1/...``.
+    # r6: if gateway URL is used, the path is already included.
+    # If direct URL, append the presign path.
+    if "/internal/storage/presign" in _IBA_STORAGE_URL:
+        _presign_url = _IBA_STORAGE_URL
+    else:
+        _presign_url = f"{_IBA_STORAGE_URL}/api/v1/internal/get-upload-url"
+
     try:
         resp = httpx.post(
-            f"{_IBA_STORAGE_URL}/api/v1/internal/get-upload-url",
+            _presign_url,
             json={"filename": filename, "content_type": "text/csv"},
             headers={"X-API-Key": _IBA_STORAGE_API_KEY},
             timeout=30.0,
