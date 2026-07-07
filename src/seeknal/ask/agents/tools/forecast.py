@@ -434,22 +434,22 @@ def _format_refused(reason: str) -> str:
 
 
 def _format_forecast_markdown(result: dict[str, Any], history: list[list[Any]]) -> str:
+    """r5: Simplified single continuous timeline table.
+
+    One table with historical (no bounds) + forecast (with bounds) rows.
+    No YoY side-by-side, no 8-section layout, no hardcoded Indonesian headers.
+    Language follows the conversation context — the agent can rephrase.
+    """
     forecast = result.get("forecast") or {}
     assessment = result.get("assessment") or {}
     provenance = result.get("provenance") or {}
 
     points = forecast.get("points") or []
     metrics = assessment.get("metrics") or {}
-    elig = assessment.get("eligibility") or {}
 
-    # History → date→value lookup for year-over-year side-by-side.
-    actual_by_x = {str(x)[:10]: y for x, y in history}
-
-    def _prior_year(period: str) -> str | None:
-        try:
-            return str(int(period[:4]) - 1) + period[4:]
-        except (ValueError, IndexError):
-            return None
+    quality_label = assessment.get("quality_label", "-")
+    mape = metrics.get("mape")
+    reason = result.get("reason")
 
     def _fmt(v: Any) -> str:
         try:
@@ -457,114 +457,66 @@ def _format_forecast_markdown(result: dict[str, Any], history: list[list[Any]]) 
         except (TypeError, ValueError):
             return "-"
 
-    quality_label = assessment.get("quality_label", "-")
-    mape = metrics.get("mape")
-    mae = metrics.get("mae")
-    mase = metrics.get("mase")
+    # Build continuous timeline: last N historical + all forecast points.
+    rows: list[str] = []
 
-    # Historis & Proyeksi — YoY side-by-side, 80% bounds as separate columns.
-    # The "Actual (thn lalu)" column shows the SAME CALENDAR PERIOD one year
-    # before the forecast period (e.g. forecast 2026-07 → actual 2025-07).
-    # Format: "Mon-YYYY: value" to avoid ambiguity about which year the
-    # actual belongs to.
-    yoy_lines = []
+    # Historical rows (last 6 from the pulled data, no bounds).
+    hist_display = history[-6:] if len(history) > 6 else history
+    for x, y in hist_display:
+        period = str(x)[:7]
+        rows.append(f"| {period} | {_fmt(y)} | - | - |")
+
+    # Forecast rows (with 80% bounds).
     for p in points:
-        period = p.get("period", "")
-        prior = _prior_year(period)
-        actual = actual_by_x.get(prior) if prior else None
-        # Show prior year explicitly: "Jul-2025: 6,804" not just "6,804"
-        if actual is not None and prior:
-            try:
-                from datetime import datetime as _dt
-                _dtobj = _dt.fromisoformat(prior)
-                _mon = _dtobj.strftime("%b")  # e.g. "Jul"
-                _yr = _dtobj.year
-                actual_str = f"{_mon}-{_yr}: {_fmt(actual)}"
-            except (ValueError, TypeError):
-                actual_str = _fmt(actual)
-        else:
-            actual_str = "-"
-        yoy_lines.append(
-            f"| {period[:7]} | {actual_str} | {_fmt(p.get('point'))} | "
-            f"{_fmt(p.get('upper_80'))} | {_fmt(p.get('lower_80'))} |"
+        period = str(p.get("period", ""))[:7]
+        rows.append(
+            f"| {period} | {_fmt(p.get('point'))} | "
+            f"{_fmt(p.get('lower_80'))} | {_fmt(p.get('upper_80'))} |"
         )
 
-    # Proyeksi Detail — full 80% + 95% bounds per period.
-    detail_lines = []
-    for p in points:
-        detail_lines.append(
-            f"| {p.get('period', '')[:7]} | {_fmt(p.get('point'))} | "
-            f"{_fmt(p.get('lower_80'))} | {_fmt(p.get('upper_80'))} | "
-            f"{_fmt(p.get('lower_95'))} | {_fmt(p.get('upper_95'))} |"
-        )
+    table = "\n".join(rows) if rows else "| - | - | - | - |"
 
-    yoy_table = (
-        "\n".join(yoy_lines) if yoy_lines else "| - | - | - | - | - |"
+    # Quality line.
+    mape_str = f"{mape:.1f}%" if mape is not None else "N/A"
+    quality_line = f"**Quality: {quality_label}** (MAPE {mape_str})"
+
+    # Warning if TOLAK.
+    warning = ""
+    if reason:
+        warning = f"\n\n> ⚠ {reason}"
+
+    return (
+        f"## Proyeksi\n\n"
+        f"| Period | Value | Lower 80% | Upper 80% |\n"
+        f"|--------|-------|-----------|----------|\n"
+        f"{table}\n\n"
+        f"{quality_line}"
+        f"{warning}"
     )
-    detail_table = (
-        "\n".join(detail_lines) if detail_lines else "| - | - | - | - | - | - |"
-    )
-
-    return f"""## Ringkasan
-Forecast for the next {forecast.get('periods', '-')} periods using {provenance.get('model', '-')}.
-
-## Kualitas Proyeksi
-**{quality_label}** — MAPE {mape:.1f}% (avg error from 12-period backtest).
-- {_quality_explain(quality_label)}
-- MAE {(_fmt(mae) if mae is not None else '-')} (absolute error, in raw units) · MASE {(f'{mase:.3f}' if mase is not None else '-')} (<1 beats naive baseline)
-
-## Kondisi Data
-- Historical periods: {elig.get('n_months', '-')} (engine requires >= 24 to forecast)
-- Average per period: {_fmt(elig.get('avg_monthly'))}
-- Gap periods: {elig.get('gap_months', '-')} (missing periods in the series)
-- Eligibility: {'passed' if elig.get('passed') else 'refused — ' + str(elig.get('reason', ''))}
-
-## Historis & Proyeksi
-Actual tahun sebelumnya vs forecast, side by side (80% bounds).
-| Period  | Actual (thn lalu)  | Point  | Upper 80% | Lower 80% |
-|---------|---------------------|--------|-----------|-----------|
-{yoy_table}
-
-## Proyeksi Detail
-| Period | Point | Lower 80% | Upper 80% | Lower 95% | Upper 95% |
-|---|---|---|---|---|---|
-{detail_table}
-
-## Rentang Realistis
-Bounds widen with horizon (σ·√h). The Upper/Lower 80% columns in the
-Historis & Proyeksi table use the 80% confidence band; Proyeksi Detail
-adds the wider 95% band. Larger sigma (residual noise) = wider bounds.
-
-## Tingkat Keyakinan
-{quality_label} — {_confidence_explain(quality_label)}
-
-## Metodologi
-- Model: {provenance.get('model', '-')} → {provenance.get('sub_type', '-')} ({_subtype_explain(provenance.get('sub_type', ''))})
-- Training window: {provenance.get('training_window', '-')} (the historical range that set the forecast level)
-- Residual sigma: {(f'{provenance.get("sigma", 0):.1f}' if provenance.get('sigma') is not None else '-')} (drives the σ·√h bounds above)
-- Methodology: deterministic AutoETS via statsforecast; the LLM does no forecast arithmetic.
-"""
 
 
 def _quality_explain(label: str) -> str:
+    """Kept for backward compat — r5 output no longer uses this in the main table."""
     return {
         "BAIK": "trustworthy for planning",
         "CUKUP": "usable with caveats",
         "LEMAH": "rough estimate, hedge it",
-        "TOLAK": "not reliable enough",
+        "TOLAK": "low accuracy — use with caveat",
     }.get(label, "-")
 
 
 def _confidence_explain(label: str) -> str:
+    """Kept for backward compat."""
     return {
-        "BAIK": "MAPE ≤ 15% — high-confidence forecast.",
-        "CUKUP": "MAPE 15–25% — directionally reliable, expect ±20% noise.",
-        "LEMAH": "MAPE 25–35% — wide intervals, treat as a rough range.",
-        "TOLAK": "MAPE > 35% — not reliable for planning.",
+        "BAIK": "MAPE <= 15%",
+        "CUKUP": "MAPE 15-25%",
+        "LEMAH": "MAPE 25-35%",
+        "TOLAK": "MAPE > 35%",
     }.get(label, "-")
 
 
 def _subtype_explain(sub_type: str) -> str:
+    """Kept for backward compat."""
     if "ETS(A,N,N)" in str(sub_type):
-        return "Simple Exponential Smoothing — level-only, correct for stationary non-seasonal data"
-    return "AutoETS-selected flavor"
+        return "Simple Exponential Smoothing"
+    return "AutoETS-selected"

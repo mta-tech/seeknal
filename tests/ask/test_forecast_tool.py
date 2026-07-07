@@ -119,19 +119,14 @@ SQL_2COL = (
 def test_forecast_ok_formats_7_blocks(ctx):
     with patch("seeknal.ask.agents.tools.forecast.httpx.post", return_value=_mock_post(_ok_response())):
         out = run_forecast(SQL_2COL, periods=3)
+    # r5: simplified output — single continuous table under "## Proyeksi"
     for header in [
-        "## Ringkasan",
-        "## Kualitas Proyeksi",
-        "## Kondisi Data",
-        "## Historis & Proyeksi",
-        "## Proyeksi Detail",
-        "## Rentang Realistis",
-        "## Tingkat Keyakinan",
-        "## Metodologi",
+        "## Proyeksi",
+        "| Period | Value | Lower 80% | Upper 80% |",
     ]:
         assert header in out, f"missing {header}"
     assert "BAIK" in out
-    assert "ETS(A,N,N)" in out
+    assert "Quality:" in out
 
 
 def test_forecast_validates_two_columns(ctx):
@@ -190,3 +185,113 @@ def test_forecast_periods_clamped(ctx):
     with patch("seeknal.ask.agents.tools.forecast.httpx.post", side_effect=fake_post):
         run_forecast(SQL_2COL, periods=99)
     assert captured["periods"] == 12  # clamped to _MAX_HORIZON
+
+
+# ── r4: structural policy check (STEP 0.5) + SQL exec error handling (STEP 1) ──
+
+
+def test_forecast_policy_check_rejects_join(ctx):
+    """SQL containing a JOIN is rejected at STEP 0.5 BEFORE DuckDB is called.
+
+    This is the regression test for the production crash:
+    ``Conversion Error: Unimplemented type for cast (TIMESTAMP -> TIMESTAMP[])``
+    on ``LEFT JOIN actuals a ON m.x = a.x``. The structural pre-check prevents
+    DuckDB from ever seeing the query, so the systematic type-mismatch cannot
+    recur regardless of how DuckDB phrases its error message.
+    """
+    # Mirror of the production failure: a date-spine LEFT JOIN with date_trunc.
+    sql = (
+        "SELECT m.x, a.y FROM monthly m "
+        "LEFT JOIN monthly a ON m.x = a.x"
+    )
+    with patch("seeknal.ask.agents.tools.forecast.httpx.post") as post:
+        out = run_forecast(sql, periods=3)
+    assert "## Kesalahan" in out
+    assert "STEP 0.5" in out  # policy check, not STEP 1 exec error
+    assert "JOIN" in out  # hint mentions JOIN
+    # Engine is never contacted (no POST), and no DuckDB execution needed.
+    post.assert_not_called()
+
+
+def test_forecast_policy_check_rejects_generate_series(ctx):
+    """SQL containing generate_series is rejected at STEP 0.5.
+
+    Mirrors RECIPE-F5/F6 legacy pattern. The engine counts gaps internally;
+    SQL gap-filling is unnecessary AND triggers DuckDB type errors when mixed
+    with date_trunc.
+    """
+    sql = (
+        "SELECT date_trunc('month', d) AS x, 1 AS y "
+        "FROM generate_series(DATE '2024-01-01', DATE '2024-12-01', "
+        "INTERVAL '1 month') AS t(d)"
+    )
+    with patch("seeknal.ask.agents.tools.forecast.httpx.post") as post:
+        out = run_forecast(sql, periods=3)
+    assert "## Kesalahan" in out
+    assert "STEP 0.5" in out
+    assert "GENERATE_SERIES" in out.upper() or "generate_series" in out
+    post.assert_not_called()
+
+
+def test_forecast_sql_execution_error_returns_kesalahan(ctx):
+    """SQL that passes the policy check but fails at DuckDB execution (STEP 1)
+    returns a Kesalahan block — does NOT raise / crash the activity.
+
+    Before r4: a runtime DuckDB exception propagated as raw
+    ``{"error": "..."}`` JSON, breaking the Temporal activity. After r4: the
+    exception is caught and formatted as a structured English Kesalahan block
+    that the agent can self-correct from in the next loop iteration.
+
+    Uses a SELECT against a nonexistent table — no JOIN / generate_series, so
+    it passes STEP 0.5, but DuckDB raises ``Catalog Error`` at execution.
+    """
+    sql = (
+        "SELECT date_trunc('month', d::timestamp) AS x, y "
+        "FROM nonexistent_table_xyz ORDER BY 1"
+    )
+    with patch("seeknal.ask.agents.tools.forecast.httpx.post") as post:
+        out = run_forecast(sql, periods=3)
+    assert "## Kesalahan" in out
+    assert "STEP 1" in out  # exec error, not policy check
+    assert "Error type:" in out  # structured debug info
+    # Engine is never contacted because execution failed first.
+    post.assert_not_called()
+
+
+def test_forecast_accepts_dynamic_schemas(ctx):
+    """The tool is content-agnostic: SQLs with different table/value/filter
+    content (but identical 2-column shape) all succeed end-to-end.
+
+    Proves the agentic dynamic-SQL model works: the agent picks tables,
+    columns, filters per question (per forecast_guide.md §1/§7), and the
+    tool handles any flat 2-column input. This is the design invariant
+    called out in FC2a r2: tool owns SHAPE, agent owns CONTENT.
+    """
+    # Schema A: COUNT(*) aggregate.
+    sql_a = (
+        "SELECT date_trunc('month', d::timestamp) AS x, COUNT(*) AS y "
+        "FROM monthly GROUP BY 1 ORDER BY 1"
+    )
+    # Schema B: SUM(y) aggregate — same shape, different value expression.
+    sql_b = (
+        "SELECT date_trunc('month', d::timestamp) AS x, SUM(y) AS y "
+        "FROM monthly GROUP BY 1 ORDER BY 1"
+    )
+    # Schema C: MAX(y) per quarter — same shape, different grain + aggregate.
+    sql_c = (
+        "SELECT date_trunc('quarter', d::timestamp) AS x, MAX(y) AS y "
+        "FROM monthly GROUP BY 1 ORDER BY 1"
+    )
+
+    with patch(
+        "seeknal.ask.agents.tools.forecast.httpx.post",
+        return_value=_mock_post(_ok_response(periods=3)),
+    ) as post:
+        out_a = run_forecast(sql_a, periods=3)
+        out_b = run_forecast(sql_b, periods=3)
+        out_c = run_forecast(sql_c, periods=3)
+
+    for label, out in (("A", out_a), ("B", out_b), ("C", out_c)):
+        assert "## Proyeksi" in out, f"schema {label} did not produce r5 table output"
+    # Engine called once per successful run — proves all three shapes reached it.
+    assert post.call_count == 3

@@ -166,12 +166,11 @@ def _enrich_syntax_hint(message: str, existing_hint: str) -> str:
 # falls back to a strong nudge that tells the agent to call upload_to_s3 in
 # data mode with the projection rows.
 
-# Auto-upload threshold. Below this row count the result is considered trivial
-# (fits in chat, no Download button needed). Above this threshold the hook
-# auto-uploads via upload_to_s3. Default lowered from 20 → 5 in r4 — the
-# previous default was too restrictive for the "always offer CSV" UX goal.
+# Auto-upload threshold. r4: default 5. r5: lowered to 1 — any non-empty
+# tabular result (≥1 row) gets auto-uploaded. The user wants every tabular
+# answer to have a Download button, even for small results.
 # Override via the SEEKNAL_CSV_REMINDER_MIN_ROWS env var.
-_CSV_REMINDER_MIN_ROWS = int(os.environ.get("SEEKNAL_CSV_REMINDER_MIN_ROWS", "5"))
+_CSV_REMINDER_MIN_ROWS = int(os.environ.get("SEEKNAL_CSV_REMINDER_MIN_ROWS", "1"))
 
 # Count markdown-table data rows: lines like "| 123 | ..." (skip separators).
 _TABLE_ROW_RE = re.compile(r"^\|\s*[^:\-][^|]*\|", re.MULTILINE)

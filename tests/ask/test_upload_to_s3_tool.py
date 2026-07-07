@@ -109,3 +109,114 @@ def test_upload_no_domain_strings():
         assert not re.search(rf"\b{re.escape(bad)}\b", src, re.IGNORECASE), (
             f"domain term {bad!r} found in upload_to_s3.py"
         )
+
+
+# ── r4: dual-mode (sql= | data=+columns=) ──────────────────────────────────
+
+
+def test_upload_data_mode_builds_csv_and_sets_pending_upload(ctx):
+    """T2: Mode 2 — agent provides computed rows + columns directly.
+
+    Mirrors the forecast-points use case: forecast.points are computed by the
+    engine, not SQL-queryable, so the agent must be able to pass them straight
+    to upload_to_s3 instead of going through a SQL round-trip.
+    """
+    presign = _mock_response(_presign_response())
+    put = MagicMock()
+    put.raise_for_status.return_value = None
+
+    forecast_points = [
+        ["2026-07-01", 5890, 5100, 6680, 4800, 6980],
+        ["2026-08-01", 5890, 4952, 6828, 4598, 7182],
+        ["2026-09-01", 5890, 4824, 6956, 4430, 7350],
+    ]
+    cols = ["period", "point", "lower_80", "upper_80", "lower_95", "upper_95"]
+
+    captured_put_bytes = []
+
+    def _capture_put(url, content=None, **kw):
+        captured_put_bytes.append(content)
+        m = MagicMock()
+        m.raise_for_status.return_value = None
+        return m
+
+    with patch("seeknal.ask.agents.tools.upload_to_s3.httpx.post", return_value=presign), patch(
+        "seeknal.ask.agents.tools.upload_to_s3.httpx.put", side_effect=_capture_put
+    ):
+        out = upload_to_s3("forecast-2026-07.csv", data=forecast_points, columns=cols)
+
+    assert "Upload complete" in out
+    assert ctx.pending_upload is not None
+    assert ctx.pending_upload["file_name"] == "forecast-2026-07.csv"
+    assert ctx.pending_upload["file_size"] > 0
+
+    # Verify the CSV actually contains the provided rows + header (not a SQL
+    # execution, not empty). This is the byte stream PUT to SeaweedFS.
+    csv_text = captured_put_bytes[0].decode("utf-8")
+    assert "period,point,lower_80,upper_80,lower_95,upper_95" in csv_text
+    assert "2026-07-01,5890,5100,6680,4800,6980" in csv_text
+    assert "2026-09-01" in csv_text
+
+
+def test_upload_data_mode_no_sql_call(ctx):
+    """T2b: Mode 2 must NOT touch the SQL layer — no DuckDB execution.
+
+    The whole point of data mode is that the agent already has the rows
+    (computed in-process). Calling _execute_oneshot_with_timeout would fail
+    or be wasteful. Verify by spying on ctx.repl.execute_oneshot.
+    """
+    presign = _mock_response(_presign_response())
+    put = MagicMock()
+    put.raise_for_status.return_value = None
+
+    ctx.repl.execute_oneshot = MagicMock(return_value=([], []))
+
+    with patch("seeknal.ask.agents.tools.upload_to_s3.httpx.post", return_value=presign), patch(
+        "seeknal.ask.agents.tools.upload_to_s3.httpx.put", return_value=put
+    ):
+        upload_to_s3("f.csv", data=[[1, 2], [3, 4]], columns=["a", "b"])
+
+    ctx.repl.execute_oneshot.assert_not_called()
+
+
+def test_upload_missing_both_modes_returns_kesalahan(ctx):
+    """T3: calling upload_to_s3(filename) without sql= or data= → clear Kesalahan."""
+    out = upload_to_s3("file.csv")
+    assert "## Kesalahan" in out
+    assert "missing data source" in out.lower() or "missing" in out.lower()
+    assert ctx.pending_upload is None
+
+
+def test_upload_conflicting_modes_returns_kesalahan(ctx):
+    """T3b: providing BOTH sql= and data= → clear Kesalahan (mutually exclusive)."""
+    out = upload_to_s3("file.csv", sql="SELECT 1", data=[[1]], columns=["a"])
+    assert "## Kesalahan" in out
+    assert "conflict" in out.lower() or "mutually" in out.lower()
+    assert ctx.pending_upload is None
+
+
+def test_upload_data_mode_missing_columns_returns_kesalahan(ctx):
+    """T3c: data= without columns= → Kesalahan with the fix."""
+    out = upload_to_s3("file.csv", data=[[1, 2]])
+    assert "## Kesalahan" in out
+    assert "columns" in out.lower()
+    assert ctx.pending_upload is None
+
+
+def test_upload_data_mode_jagged_row_returns_kesalahan(ctx):
+    """T3d: rows with mismatched lengths → Kesalahan (reject malformed CSV early)."""
+    out = upload_to_s3(
+        "file.csv",
+        data=[[1, 2], [3, 4], [5]],  # third row has 1 cell, not 2
+        columns=["a", "b"],
+    )
+    assert "## Kesalahan" in out
+    assert "row 2" in out  # 0-indexed
+    assert ctx.pending_upload is None
+
+
+def test_upload_data_mode_empty_rows_returns_nothing(ctx):
+    """T3e: data=[] → no rows to export, no PUT, no pending_upload."""
+    out = upload_to_s3("file.csv", data=[], columns=["a"])
+    assert "No rows" in out
+    assert ctx.pending_upload is None
