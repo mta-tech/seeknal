@@ -310,10 +310,10 @@ async def _auto_upload_sql_result(
         return HookResult(modified_result=result + nudge)
 
     # Upload succeeded — tell the agent so it can mention the Download button.
-    nudge = (
-        f"\n\n_(Auto-uploaded {rows} rows to S3. {upload_outcome} "
-        f"— a Download button is rendered alongside your answer.)_"
-    )
+    # upload_outcome deliberately carries no raw URL (see upload_to_s3.py) —
+    # do not reconstruct one here either, or the agent will paste it into the
+    # answer as a markdown link, duplicating/breaking the dedicated UI widget.
+    nudge = f"\n\n_(Auto-uploaded {rows} rows to S3. {upload_outcome})_"
     return HookResult(modified_result=result + nudge)
 
 

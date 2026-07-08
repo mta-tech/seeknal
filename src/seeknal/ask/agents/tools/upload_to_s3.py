@@ -82,7 +82,13 @@ def upload_to_s3(
             ``data=``; ignored in Mode 1.
 
     Returns:
-        ``"Upload complete. Download (valid 8h): https://..."`` on success.
+        A confirmation string on success -- deliberately WITHOUT the raw
+        download URL (the frontend renders its own Download button from the
+        ``upload_complete`` event; a URL in the tool result invites the agent
+        to paste it into the answer as a markdown link, duplicating and often
+        breaking the dedicated UI widget). Do NOT include a raw link/URL in
+        your answer text -- refer to the download in prose only (e.g. "the
+        full data is available via the Download button below") if relevant.
         ``"No rows to export."`` if the SQL returned zero rows or ``data=[]``.
         On argument-mismatch: a ``## Kesalahan`` block describing the fix.
         On storage-unreachable / PUT-failure: an error string describing the
@@ -188,7 +194,12 @@ def upload_to_s3(
         "upload_to_s3", urls.get("download_url", ""),
         args={"filename": filename, "mode": "sql" if used_sql_mode else "data"},
     )
-    return f"Upload complete. Download (valid 8h): {urls.get('download_url', '')}"
+    return (
+        "Upload complete. A Download button for this file is now shown to "
+        "the user automatically (valid 8h). Do NOT include a raw link/URL "
+        "in your answer -- refer to it in prose only if relevant (e.g. "
+        "\"the full data is available via the Download button below\")."
+    )
 
 
 def _resolve_mode(
