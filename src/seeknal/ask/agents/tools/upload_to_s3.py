@@ -33,6 +33,8 @@ from __future__ import annotations
 import csv
 import io
 import os
+import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -129,6 +131,16 @@ def upload_to_s3(
         )
         return "No rows to export."
 
+    # Mode 1 (SQL, the agent's deliberate one-shot export per the project's
+    # analyst skill) gets a filename derived from the user's question instead
+    # of whatever the agent passed — deterministic and consistent regardless
+    # of how carefully the agent named it. Mode 2
+    # (forecast's self-upload, D7) is untouched: it already names files well
+    # (`forecast-{table}-{timestamp}.csv`) and changing it risks that
+    # already-verified-live behavior for no benefit.
+    if used_sql_mode:
+        filename = _derive_filename_from_question(getattr(ctx, "current_question", None), sql)
+
     # ── STEP 2: BUILD CSV (header from cols; no metadata rows mixed in) ────
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -222,6 +234,54 @@ def upload_to_s3(
         "in your answer -- refer to it in prose only if relevant (e.g. "
         "\"the full data is available via the Download button below\")."
     )
+
+
+def _derive_filename_from_sql(sql: str) -> str:
+    """Best-effort CSV filename derived from the SQL query's table name.
+
+    Fallback used by ``_derive_filename_from_question`` when the user's
+    question is unavailable. The name only affects the user-facing Download
+    label, not storage — the object key is namespaced under
+    ``csv-exports/{uuid}/{filename}`` so collisions are impossible regardless.
+    """
+    table = "result"
+    try:
+        # Capture the full FROM target (e.g. "warehouse.public.some_table"),
+        # then split on dots to get the bare table name. Word boundaries +
+        # greedy [\w.]+ ensure we don't stop at the first segment.
+        m = re.search(r"\bFROM\s+([\w\.]+)", sql, re.IGNORECASE)
+        if m:
+            table_full = m.group(1).strip("`\"'")
+            table = table_full.split(".")[-1].lower()
+            table = re.sub(r"^(t_|tbl_|table_|ft_)", "", table) or "result"
+    except Exception:
+        table = "result"
+    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    return f"{table}-{ts}.csv"
+
+
+def _derive_filename_from_question(question: str | None, sql: str, max_len: int = 60) -> str:
+    """CSV filename derived from the user's question, not just the SQL.
+
+    Slugifies ``question`` (lowercase, non-alphanumerics collapsed to ``-``),
+    truncates at a word boundary to ``max_len`` characters (never mid-word),
+    and appends a timestamp — e.g. "What was the monthly trend last year?" ->
+    ``what-was-the-monthly-trend-last-year-20260709-060344.csv``. Falls back
+    to ``_derive_filename_from_sql`` when the question is empty/unavailable so
+    Mode 1 always gets a reasonable name regardless of caller context.
+    """
+    if question and question.strip():
+        slug = re.sub(r"[^a-z0-9]+", "-", question.strip().lower()).strip("-")
+        slug = re.sub(r"-{2,}", "-", slug)
+        if slug:
+            if len(slug) > max_len:
+                truncated = slug[:max_len]
+                if "-" in truncated:
+                    truncated = truncated.rsplit("-", 1)[0]
+                slug = truncated or slug[:max_len]
+            ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            return f"{slug}-{ts}.csv"
+    return _derive_filename_from_sql(sql)
 
 
 def _resolve_mode(

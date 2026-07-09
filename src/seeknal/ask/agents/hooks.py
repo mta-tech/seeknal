@@ -9,9 +9,7 @@ wires it into pydantic-deep's hook lifecycle.
 
 import json
 import logging
-import os
 import re
-import time
 
 from pydantic_deep.capabilities.hooks import Hook, HookEvent, HookInput, HookResult
 
@@ -153,165 +151,45 @@ def _enrich_syntax_hint(message: str, existing_hint: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# POST_TOOL_USE: CSV auto-upload (FC2d r4)
+# CSV export — no hook here by design
 # ---------------------------------------------------------------------------
 #
-# Design (r4): the hook AUTOMATICALLY calls upload_to_s3 when execute_sql
-# returns a substantial result. The agent does NOT decide — from the user's
-# perspective, every substantial data answer comes with a Download button
-# without asking. This is the "tools csv otomatis upload" behavior.
+# There used to be a POST_TOOL_USE hook that auto-uploaded the result of
+# every `execute_sql` call with at least one row. It has been removed
+# entirely, not just disabled. The problem: it fired after EVERY query, not
+# just the one behind the final answer. A single question typically runs
+# several queries before landing on the right one (checking a date range,
+# profiling a min/max, trying a filter that turns out wrong) — each of those
+# got its own upload. Confirmed live: a "monthly trend" question produced
+# two separate Download buttons, one for the real trend and one for a
+# throwaway `SELECT MAX(...)` profiling query the agent ran along the way.
+# The hook had no way to know which query the answer was actually about —
+# it just fired on all of them.
 #
-# run_forecast does NOT go through this hook (audit fix D7, 2026-07-09):
-# forecast.py now self-uploads its own projection points immediately after a
-# successful forecast (see forecast.py `_upload_forecast_points`). The prior
-# design nudged the agent to call upload_to_s3 itself via a POST_TOOL_USE
-# hint here -- live testing showed the nudge never actually fired (its
-# success-marker string, "## Ringkasan", stopped matching this tool's output
-# after the r5 rewrite to "## Proyeksi"), and even when reachable was not
-# reliably followed by the agent across repeated live runs. Self-upload
-# inside the tool makes the Download button unconditional on both string
-# matching and agent behavior.
-
-# Auto-upload threshold. r4: default 5. r5: lowered to 1 — any non-empty
-# tabular result (≥1 row) gets auto-uploaded. The user wants every tabular
-# answer to have a Download button, even for small results.
-# Override via the SEEKNAL_CSV_REMINDER_MIN_ROWS env var.
-_CSV_REMINDER_MIN_ROWS = int(os.environ.get("SEEKNAL_CSV_REMINDER_MIN_ROWS", "1"))
-
-# Count markdown-table data rows: lines like "| 123 | ..." (skip separators).
-_TABLE_ROW_RE = re.compile(r"^\|\s*[^:\-][^|]*\|", re.MULTILINE)
-
-
-def _count_result_rows(tool_result: str) -> int:
-    """Best-effort row count from an execute_sql markdown table result.
-
-    execute_sql returns a markdown table; data rows match the pattern while
-    separator rows (``|---|``) and the "N rows" footer do not. The header row
-    DOES match the pattern, so when a separator is present (the standard
-    execute_sql shape) we subtract it. Returns 0 on any parse trouble — the
-    hook then no-ops (safe default).
-    """
-    if not tool_result:
-        return 0
-    try:
-        matches = _TABLE_ROW_RE.findall(tool_result)
-        has_separator = bool(re.search(r"^\|[\s:\-]+\|", tool_result, re.MULTILINE))
-        count = len(matches)
-        if has_separator and count > 0:
-            count -= 1  # exclude the header row
-        return max(0, count)
-    except TypeError:
-        return 0
-
-
-def _derive_filename_from_sql(sql: str) -> str:
-    """Best-effort CSV filename derived from the SQL query.
-
-    Falls back to a timestamped generic name when introspection fails. The
-    name only affects the user-facing Download label, not storage — the
-    object key is namespaced under ``csv-exports/{uuid}/{filename}`` so
-    collisions are impossible regardless.
-    """
-    table = "result"
-    try:
-        # Capture the full FROM target (e.g. "warehouse.public.t_produk_3_erba"),
-        # then split on dots to get the bare table name. Word boundaries +
-        # greedy [\w.]+ ensure we don't stop at the first segment.
-        m = re.search(r"\bFROM\s+([\w\.]+)", sql, re.IGNORECASE)
-        if m:
-            table_full = m.group(1).strip("`\"'")
-            table = table_full.split(".")[-1].lower()
-            # Strip common table-name prefixes for tidier filenames. The hook
-            # is generic; these patterns just produce cleaner names when present.
-            table = re.sub(r"^(t_|tbl_|table_|ft_)", "", table) or "result"
-    except Exception:
-        table = "result"
-    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-    return f"{table}-{ts}.csv"
-
-
-async def _csv_upload_reminder_handler(hook_input: HookInput) -> HookResult:
-    """Auto-upload substantial execute_sql results to S3.
-
-    When the result has ≥ ``_CSV_REMINDER_MIN_ROWS`` rows, the hook DIRECTLY
-    calls ``upload_to_s3(filename, sql=<the agent's SQL>)``. No agent
-    decision — the upload is automatic. ``ctx.pending_upload`` is set inside
-    ``upload_to_s3``; the gateway then emits ``upload_complete`` and a
-    Download button appears alongside the answer. The hook appends a short
-    note to ``tool_result`` so the agent knows the CSV was uploaded (and
-    can mention the download URL in its answer).
-
-    run_forecast is handled entirely inside forecast.py now (see D7 note
-    above `_csv_upload_reminder_handler`'s matcher, and forecast.py's
-    `_upload_forecast_points`) — this handler no longer touches it.
-
-    Failures (storage unreachable, PUT rejected) are swallowed — the hook
-    must never crash the agent turn. The agent is told via the modified
-    result so it can mention the failure or retry.
-    """
-    try:
-        tool_name = hook_input.tool_name
-        result = hook_input.tool_result or ""
-        if not result:
-            return HookResult()
-
-        if tool_name == "execute_sql":
-            return await _auto_upload_sql_result(hook_input, result)
-
-        return HookResult()
-    except Exception:  # noqa: BLE001 - hooks must never propagate failures
-        logger.exception("[csv_upload_hook] unexpected error; passing through")
-        return HookResult()
-
-
-async def _auto_upload_sql_result(
-    hook_input: HookInput, result: str
-) -> HookResult:
-    """Auto-upload Mode 1: re-execute the SQL via upload_to_s3.
-
-    Called by ``_csv_upload_reminder_handler`` when execute_sql returns a
-    substantial result. Imports upload_to_s3 lazily to avoid an import cycle
-    (hooks.py is imported early in agent construction).
-    """
-    rows = _count_result_rows(result)
-    if rows < _CSV_REMINDER_MIN_ROWS:
-        return HookResult()
-
-    # The SQL the agent used for this execute_sql call. Re-execute it inside
-    # upload_to_s3 (Mode 1) to build the CSV — most queries hit PostgreSQL's
-    # page cache on the second run, so the latency cost is acceptable.
-    tool_input = hook_input.tool_input or {}
-    sql = tool_input.get("sql") or tool_input.get("query") or ""
-    if not sql:
-        # No SQL captured (defensive) — fall back to a soft nudge so the agent
-        # can offer the upload manually.
-        nudge = (
-            f"\n\n_({rows} rows returned — auto-upload skipped (no SQL captured). "
-            f"Offer `upload_to_s3(filename=..., sql=...)` if the user wants a CSV.)_"
-        )
-        return HookResult(modified_result=result + nudge)
-
-    filename = _derive_filename_from_sql(sql)
-    try:
-        # Lazy import to keep hooks.py import-time light and avoid any cycle.
-        from seeknal.ask.agents.tools.upload_to_s3 import upload_to_s3
-
-        upload_outcome = upload_to_s3(filename, sql=sql)
-    except Exception as exc:
-        # Storage unreachable / PUT rejected / etc — surface to agent, but
-        # never crash the turn. The user still gets the query answer.
-        nudge = (
-            f"\n\n_({rows} rows returned — auto-upload failed: "
-            f"{type(exc).__name__}. The user can still request CSV manually.)_"
-        )
-        return HookResult(modified_result=result + nudge)
-
-    # Upload succeeded — tell the agent so it can mention the Download button.
-    # upload_outcome deliberately carries no raw URL (see upload_to_s3.py) —
-    # do not reconstruct one here either, or the agent will paste it into the
-    # answer as a markdown link, duplicating/breaking the dedicated UI widget.
-    nudge = f"\n\n_(Auto-uploaded {rows} rows to S3. {upload_outcome})_"
-    return HookResult(modified_result=result + nudge)
+# CSV export is still fully automatic — it just moved from "a hook watching
+# tool calls" to "a step in the agent's own answering workflow"
+# (`bpom-analyst/SKILL.md`): once the agent has verified its answer and is
+# about to write it, it calls `upload_to_s3(filename, sql=...)` itself,
+# exactly once, with the SQL it knows its own answer is about. That's a
+# judgment only the agent can make correctly — a hook watching tool calls
+# from outside can't tell "exploratory query" from "the query behind the
+# answer" without understanding the conversation. Contrast with
+# `run_forecast` (`forecast.py`), which always produces exactly one
+# canonical dataset (the projection points) and can safely upload it
+# deterministically in code, no agent decision needed — there's no
+# equivalent single "the data" for a general data question. `upload_to_s3`
+# itself is unchanged — same repair/row-cap/governance parity as
+# `execute_sql`, same structured error shape on failure so the
+# self-correction hook below still enriches its errors.
+#
+# Known tradeoff: this makes CSV export dependent on the agent following its
+# own workflow instruction rather than a hook that fires unconditionally.
+# An end-of-turn safety net (catch the case where the agent forgot) was
+# considered, but the mechanism it would need — a hook that runs once after
+# the whole turn finishes — isn't actually wired into the agent's execution
+# loop in this codebase (verified directly in the installed hook framework:
+# the method exists but nothing ever calls it), so it was not implemented
+# rather than shipping something that silently does nothing.
 
 
 # ---------------------------------------------------------------------------
@@ -335,11 +213,12 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
       `format_tool_error`/`classify_duckdb_error` JSON shape execute_sql
       does on failure, so this hook's existing generic hint-enrichment
       applies to both without new logic).
-    - POST_TOOL_USE: CSV auto-upload (FC2d) — execute_sql only. run_forecast
-      self-uploads its own projection points (see forecast.py, D7 fix); it no
-      longer needs a POST_TOOL_USE hook here. upload_to_s3 is deliberately
-      NOT matched here either — auto-uploading the result of an upload call
-      would be circular.
+
+    No CSV-upload hook lives here anymore: `execute_sql` no longer
+    auto-uploads per call (see the module comment above this function for
+    why); `run_forecast` self-uploads its own projection points from inside
+    `forecast.py`; regular data answers are exported by the agent calling
+    `upload_to_s3` explicitly, once, per `bpom-analyst/SKILL.md`.
     """
     cfg = config or {}
     if cfg.get("enabled", True) is False:
@@ -360,14 +239,6 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
                 event=HookEvent.POST_TOOL_USE,
                 handler=_sql_self_correction_handler,
                 matcher="execute_sql|upload_to_s3",
-            )
-        )
-    if cfg.get("csv_upload_reminder", True):
-        hooks.append(
-            Hook(
-                event=HookEvent.POST_TOOL_USE,
-                handler=_csv_upload_reminder_handler,
-                matcher="execute_sql",
             )
         )
     return hooks

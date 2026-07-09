@@ -292,173 +292,31 @@ class TestSqlSelfCorrectionHook:
 
 
 class TestGetAskHooks:
-    def test_returns_three_hooks(self):
-        # PRE sql_security + POST sql_self_correction + POST csv_upload_reminder
+    def test_returns_two_hooks(self):
+        # PRE sql_security + POST sql_self_correction. The csv_upload_reminder
+        # hook was retired — CSV export is now a deliberate one-time agent
+        # decision made as part of the answering workflow, not a
+        # POST_TOOL_USE hook that fired on every execute_sql call.
         hooks = get_ask_hooks()
-        assert len(hooks) == 3
+        assert len(hooks) == 2
 
     def test_first_hook_is_pre_tool_use(self):
         hooks = get_ask_hooks()
         assert hooks[0].event == HookEvent.PRE_TOOL_USE
-        assert hooks[0].matcher == "execute_sql"
+        # Covers both execute_sql and upload_to_s3 (audit fix, 2026-07-09).
+        assert hooks[0].matcher == "execute_sql|upload_to_s3"
 
     def test_second_hook_is_post_tool_use(self):
         hooks = get_ask_hooks()
         assert hooks[1].event == HookEvent.POST_TOOL_USE
-        assert hooks[1].matcher == "execute_sql"
+        assert hooks[1].matcher == "execute_sql|upload_to_s3"
 
     def test_backward_compat_alias(self):
         """get_security_hooks is an alias for get_ask_hooks."""
         assert get_security_hooks is get_ask_hooks
 
-
-# ---------------------------------------------------------------------------
-# r4: csv_upload_reminder hook — run_forecast dispatch + config gate
-# ---------------------------------------------------------------------------
-
-
-class TestCsvUploadReminderHookDispatch:
-    """Verify the reminder handler dispatches correctly per tool_name.
-
-    T5/T6 from the FC2d r4 plan: the matcher regex ``execute_sql|run_forecast``
-    routes BOTH tools to ``_csv_upload_reminder_handler``; the handler then
-    branches on ``tool_name`` to apply the right success/skip rule.
-    """
-
-    @pytest.mark.asyncio
-    async def test_nudge_after_run_forecast_success(self):
-        """T5: forecast returns 7-blok ``## Ringkasan`` → nudge appended."""
-        from seeknal.ask.agents.hooks import _csv_upload_reminder_handler
-
-        hi = HookInput(
-            event=HookEvent.POST_TOOL_USE,
-            tool_name="run_forecast",
-            tool_input={},
-            tool_result="## Ringkasan\nForecast for next 3 periods using autoets.\n\n## Kualitas Proyeksi\n**BAIK**",
-            tool_error=None,
-        )
-        out = await _csv_upload_reminder_handler(hi)
-        assert out.modified_result is not None
-        assert "upload_to_s3" in out.modified_result
-        assert "data=" in out.modified_result  # data-mode hint, not SQL hint
-
-    @pytest.mark.asyncio
-    async def test_no_nudge_after_run_forecast_kesalahan(self):
-        """T6a: forecast returns ``## Kesalahan`` (validation/exec error) → skip."""
-        from seeknal.ask.agents.hooks import _csv_upload_reminder_handler
-
-        hi = HookInput(
-            event=HookEvent.POST_TOOL_USE,
-            tool_name="run_forecast",
-            tool_input={},
-            tool_result="## Kesalahan\n\n**Forecast SQL rejected by policy check.**",
-            tool_error=None,
-        )
-        out = await _csv_upload_reminder_handler(hi)
-        assert out.modified_result is None
-
-    @pytest.mark.asyncio
-    async def test_no_nudge_after_run_forecast_ditolak(self):
-        """T6b: forecast returns ``## Ditolak`` (engine refuse) → skip."""
-        from seeknal.ask.agents.hooks import _csv_upload_reminder_handler
-
-        hi = HookInput(
-            event=HookEvent.POST_TOOL_USE,
-            tool_name="run_forecast",
-            tool_input={},
-            tool_result="## Ditolak\n\nData tidak cukup (tersedia 18 bulan, minimum 24)",
-            tool_error=None,
-        )
-        out = await _csv_upload_reminder_handler(hi)
-        assert out.modified_result is None
-
-    @pytest.mark.asyncio
-    async def test_no_nudge_after_run_forecast_empty_result(self):
-        """Defensive: empty result string → skip (no KeyError)."""
-        from seeknal.ask.agents.hooks import _csv_upload_reminder_handler
-
-        hi = HookInput(
-            event=HookEvent.POST_TOOL_USE,
-            tool_name="run_forecast",
-            tool_input={},
-            tool_result="",
-            tool_error=None,
-        )
-        out = await _csv_upload_reminder_handler(hi)
-        assert out.modified_result is None
-
-    @pytest.mark.asyncio
-    async def test_execute_sql_still_uses_row_count(self):
-        """r5: threshold=1, so even 1 row triggers auto-upload.
-        Only EMPTY result (0 rows) skips.
-        """
-        from seeknal.ask.agents.hooks import _csv_upload_reminder_handler
-
-        # Empty table (0 rows) → below threshold 1 → no nudge
-        empty_table = "| id |\n|---|\n\n"
-        hi = HookInput(
-            event=HookEvent.POST_TOOL_USE,
-            tool_name="execute_sql",
-            tool_input={"sql": "SELECT * FROM empty"},
-            tool_result=empty_table,
-            tool_error=None,
-        )
-        out = await _csv_upload_reminder_handler(hi)
-        assert out.modified_result is None
-
-        # 25-row table → triggers upload + nudge
-        rows = "\n".join(f"| {i} |" for i in range(25))
-        big_table = f"| id |\n|---|\n{rows}\n"
-        hi2 = HookInput(
-            event=HookEvent.POST_TOOL_USE,
-            tool_name="execute_sql",
-            tool_input={"sql": "SELECT * FROM big"},
-            tool_result=big_table,
-            tool_error=None,
-        )
-        with patch("seeknal.ask.agents.tools.upload_to_s3.upload_to_s3", return_value="Upload complete. Download: http://x"):
-            out2 = await _csv_upload_reminder_handler(hi2)
-        assert out2.modified_result is not None
-        assert "Auto-uploaded" in out2.modified_result
-
-
-class TestCsvUploadReminderConfigGate:
-    """T4: get_hooks_config must read csv_upload_reminder; get_ask_hooks honors it."""
-
-    def test_get_hooks_config_reads_csv_upload_reminder_true(self):
-        from seeknal.ask.config import get_hooks_config
-
-        cfg = get_hooks_config({"agent_harness": {"hooks": {"csv_upload_reminder": True}}})
-        assert cfg["csv_upload_reminder"] is True
-
-    def test_get_hooks_config_reads_csv_upload_reminder_false(self):
-        from seeknal.ask.config import get_hooks_config
-
-        cfg = get_hooks_config({"agent_harness": {"hooks": {"csv_upload_reminder": False}}})
-        assert cfg["csv_upload_reminder"] is False
-
-    def test_get_hooks_config_defaults_csv_upload_reminder_true(self):
-        from seeknal.ask.config import get_hooks_config
-
-        # When the yaml omits the key, the default should be True (opt-out).
-        cfg = get_hooks_config({"agent_harness": {"hooks": {}}})
-        assert cfg["csv_upload_reminder"] is True
-
-    def test_get_ask_hooks_skips_csv_reminder_when_disabled(self):
-        """T4b: csv_upload_reminder: false → hook NOT registered (only 2 hooks)."""
-        hooks = get_ask_hooks({"csv_upload_reminder": False})
-        # sql_security + sql_self_correction (no csv_reminder)
+    def test_csv_upload_reminder_key_no_longer_registers_anything(self):
+        """The retired config key is accepted (no KeyError) but has no effect."""
+        hooks = get_ask_hooks({"csv_upload_reminder": True})
         assert len(hooks) == 2
         assert all("csv_upload_reminder" not in (h.handler.__name__ or "") for h in hooks)
-
-    def test_get_ask_hooks_registers_csv_reminder_with_extended_matcher(self):
-        """T4c: csv_upload_reminder: true → hook registered with the r4 matcher."""
-        hooks = get_ask_hooks({"csv_upload_reminder": True})
-        csv_hooks = [
-            h for h in hooks
-            if h.event == HookEvent.POST_TOOL_USE
-            and "csv_upload_reminder" in (h.handler.__name__ or "")
-        ]
-        assert len(csv_hooks) == 1
-        # Matcher is a regex that must match both execute_sql and run_forecast.
-        assert csv_hooks[0].matcher == "execute_sql|run_forecast"

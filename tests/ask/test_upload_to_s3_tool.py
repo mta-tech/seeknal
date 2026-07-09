@@ -74,10 +74,30 @@ def test_upload_sets_pending_upload_with_server_expiry(ctx):
         out = upload_to_s3("file.csv", SQL)
     assert "Upload complete" in out
     assert ctx.pending_upload is not None
+    # Mode 1 filenames are now derived from the user's question (falls back
+    # to the SQL's table name when no question is set, as here) rather than
+    # passed through verbatim — see test_filename_derived_from_question
+    # below for the question-set case.
+    assert ctx.pending_upload["file_name"].startswith("data-")
+    assert ctx.pending_upload["file_name"].endswith(".csv")
     # expires_at must be sourced from the server's download_url_expires_at (ISO).
-    assert ctx.pending_upload["file_name"] == "file.csv"
     assert ctx.pending_upload["object_name"] == "csv-exports/abc/file.csv"
     assert ctx.pending_upload["expires_at"].startswith("2030")  # 1900000000 ~ 2030-03
+
+
+def test_filename_derived_from_question(ctx):
+    """Mode 1 prefers a slug of ctx.current_question over the passed filename."""
+    ctx.current_question = "What was the monthly trend last year?"
+    presign = _mock_response(_presign_response())
+    put = MagicMock()
+    put.raise_for_status.return_value = None
+    with patch("seeknal.ask.agents.tools.upload_to_s3.httpx.post", return_value=presign), patch(
+        "seeknal.ask.agents.tools.upload_to_s3.httpx.put", return_value=put
+    ):
+        upload_to_s3("ignored-name.csv", SQL)
+    file_name = ctx.pending_upload["file_name"]
+    assert file_name.startswith("what-was-the-monthly-trend-last-year-")
+    assert file_name.endswith(".csv")
 
 
 def test_upload_storage_unreachable_returns_error(ctx):

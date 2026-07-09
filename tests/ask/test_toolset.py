@@ -306,7 +306,9 @@ def test_create_agent_applies_agent_harness_config(tmp_path: Path):
         assert kwargs["include_builtin_subagents"] is False
         assert kwargs["cost_tracking"] is True
         assert kwargs["cost_budget_usd"] == 2.5
-        assert len(kwargs["hooks"]) == 2
+        # sql_self_correction disabled above; the csv_upload_reminder hook
+        # was retired entirely — only sql_security remains.
+        assert len(kwargs["hooks"]) == 1
         assert kwargs["hooks"][0].event.value == "pre_tool_use"
         # The trailing-ModelRequest guard is always appended LAST, after the
         # configured compaction processors.

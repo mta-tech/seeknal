@@ -184,7 +184,6 @@ def test_agent_harness_defaults_preserve_current_ask_behavior():
         "enabled": True,
         "sql_security": True,
         "sql_self_correction": True,
-        "csv_upload_reminder": True,
     }
     assert get_plan_config({}) == {"enabled": "auto", "plans_dir": ".seeknal/plans"}
     assert get_stuck_loop_config({}) == {"enabled": True}
