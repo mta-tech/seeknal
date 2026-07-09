@@ -100,6 +100,12 @@ def upload_to_s3(
         full data is available via the Download button below") if relevant.
         ``"No rows to export."`` if the SQL returned zero rows or ``data=[]``.
         On argument-mismatch: a ``## Kesalahan`` block describing the fix.
+        On Mode 1 SQL execution failure: the same structured JSON error
+        ``execute_sql`` returns (``format_tool_error``/``classify_duckdb_error``)
+        -- one auto-retry is attempted first using DuckDB's own table-name
+        suggestion. Returning the same shape lets the existing POST_TOOL_USE
+        self-correction hook enrich it with retry hints, same as it already
+        does for ``execute_sql`` failures.
         On storage-unreachable / PUT-failure: an error string describing the
         failure (the agent should surface it, not retry silently).
     """
@@ -268,16 +274,59 @@ def _resolve_mode(
         #        skipping that here would let a masked column leave
         #        ungoverned through the exported file.
         from seeknal.ask.agents.tools._context import get_tool_context
+        from seeknal.ask.agents.tools.errors import classify_duckdb_error, format_tool_error
         from seeknal.ask.agents.tools.execute_sql import (
             _execute_oneshot_with_timeout,
             _repair_common_sql_before_execution,
+            _repair_sql_from_duckdb_suggestion,
         )
 
         ctx = get_tool_context()
+        # D1 follow-up (audit fix, 2026-07-09): execute_sql.py strips a
+        # trailing semicolon BEFORE repair/execution; this branch didn't, so
+        # agent SQL ending in ";" (LLMs add this routinely) survived into
+        # _execute_oneshot_with_timeout, which wraps the query as
+        # "SELECT * FROM (<sql>) AS _q LIMIT N" to apply the row cap -- the
+        # leftover ";" then lands mid-statement ("...;) AS _q LIMIT 5000"),
+        # a guaranteed DuckDB ParserException on every semicolon-terminated
+        # query. Strip it here too, matching execute_sql.py exactly.
+        sql = str(sql).strip().rstrip(";").strip()
         repaired_sql, _notices = _repair_common_sql_before_execution(sql)
-        cols, rows = _execute_oneshot_with_timeout(
-            ctx, repaired_sql, limit=_CSV_EXPORT_ROW_LIMIT
-        )
+
+        # Error handling reuses execute_sql.py's exact retry/classification
+        # contract instead of inventing a parallel one (audit fix, 2026-07-09):
+        # this call was previously unguarded, so any execution failure (not
+        # just the semicolon case above) propagated as an unhandled exception
+        # through the tool-calling machinery -- observed live to abort the
+        # whole agent turn with no answer at all (SSE trace showed a bare
+        # "error" event, no tool_result/answer; conversation history recorded
+        # question/answer as null; worker log showed the turn completing with
+        # only 3 events and status=error versus 22-68 for a normal turn).
+        # Returning the SAME format_tool_error() JSON shape execute_sql.py
+        # returns means the existing POST_TOOL_USE self-correction hook
+        # (hooks.py, matcher now covers this tool too) enriches it with the
+        # same retry hints the agent already knows how to act on -- table
+        # suggestions, DuckDB syntax tips -- rather than a second,
+        # upload_to_s3-specific self-correction path.
+        try:
+            cols, rows = _execute_oneshot_with_timeout(
+                ctx, repaired_sql, limit=_CSV_EXPORT_ROW_LIMIT
+            )
+        except Exception as exc:
+            # One auto-retry using DuckDB's own "Did you mean" suggestion,
+            # same as execute_sql.py -- most missing-table typos self-resolve
+            # here without costing the agent a turn.
+            suggested_sql = _repair_sql_from_duckdb_suggestion(repaired_sql, str(exc))
+            if suggested_sql and suggested_sql != repaired_sql:
+                try:
+                    cols, rows = _execute_oneshot_with_timeout(
+                        ctx, suggested_sql, limit=_CSV_EXPORT_ROW_LIMIT
+                    )
+                    repaired_sql = suggested_sql
+                except Exception as retry_exc:
+                    return format_tool_error(classify_duckdb_error(str(retry_exc)), str(retry_exc))
+            else:
+                return format_tool_error(classify_duckdb_error(str(exc)), str(exc))
         rows = [list(r) for r in rows]
 
         from seeknal.integrations.atlas_client import AtlasPolicyDenied

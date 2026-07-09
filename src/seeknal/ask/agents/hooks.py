@@ -323,11 +323,23 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
     """Return all hooks for the seeknal ask agent.
 
     Includes:
-    - PRE_TOOL_USE: SQL security validation (execute_sql only)
-    - POST_TOOL_USE: SQL self-correction hints (execute_sql only)
+    - PRE_TOOL_USE: SQL security validation — execute_sql AND upload_to_s3
+      (audit fix, 2026-07-09: upload_to_s3's Mode 1 executes agent-supplied
+      SQL through the same DuckDB seam as execute_sql, but was never covered
+      by this hook -- its `sql=` argument bypassed read-only/dangerous-
+      function validation entirely. `_sql_security_handler` already reads
+      `tool_input.get("sql")`, matching upload_to_s3's parameter name as-is;
+      only the matcher needed extending).
+    - POST_TOOL_USE: SQL self-correction hints — execute_sql AND upload_to_s3
+      (audit fix, 2026-07-09: `upload_to_s3` Mode 1 now returns the same
+      `format_tool_error`/`classify_duckdb_error` JSON shape execute_sql
+      does on failure, so this hook's existing generic hint-enrichment
+      applies to both without new logic).
     - POST_TOOL_USE: CSV auto-upload (FC2d) — execute_sql only. run_forecast
       self-uploads its own projection points (see forecast.py, D7 fix); it no
-      longer needs a POST_TOOL_USE hook here.
+      longer needs a POST_TOOL_USE hook here. upload_to_s3 is deliberately
+      NOT matched here either — auto-uploading the result of an upload call
+      would be circular.
     """
     cfg = config or {}
     if cfg.get("enabled", True) is False:
@@ -339,7 +351,7 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
             Hook(
                 event=HookEvent.PRE_TOOL_USE,
                 handler=_sql_security_handler,
-                matcher="execute_sql",
+                matcher="execute_sql|upload_to_s3",
             )
         )
     if cfg.get("sql_self_correction", True):
@@ -347,7 +359,7 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
             Hook(
                 event=HookEvent.POST_TOOL_USE,
                 handler=_sql_self_correction_handler,
-                matcher="execute_sql",
+                matcher="execute_sql|upload_to_s3",
             )
         )
     if cfg.get("csv_upload_reminder", True):
