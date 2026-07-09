@@ -49,6 +49,15 @@ if not _IBA_STORAGE_URL:
         _IBA_STORAGE_URL = "http://iba-storage:8000"
 _IBA_STORAGE_API_KEY = os.environ.get("IBA_STORAGE_API_KEY", "")
 
+# CSV exports are files, not chat-context tables — decoupled from both
+# execute_sql's 500-row chat-display cap and ctx.request_limit (the
+# pydantic-ai UsageLimits.request_limit model-request budget, NOT a row
+# count; using it as a row limit silently truncated "full data" exports to
+# ~100 rows). 5000 keeps exports well under typical SeaweedFS/browser CSV
+# handling while covering the export use case (raw dumps larger than the
+# chat table, smaller than a full warehouse scan).
+_CSV_EXPORT_ROW_LIMIT = int(os.environ.get("SEEKNAL_CSV_EXPORT_ROW_LIMIT", "5000"))
+
 
 def upload_to_s3(
     filename: str,
@@ -182,6 +191,13 @@ def upload_to_s3(
     except (KeyError, TypeError, ValueError):
         expires_at = ""
 
+    # download_url (2026-07-08): when reached via SEEKNAL_GATEWAY_URL, this is
+    # no longer a raw SeaweedFS presigned URL -- iba-service's
+    # /v6/internal/storage/presign proxy now overwrites it with a signed link
+    # to its own /v1/downloads endpoint (see iba-service's internal_storage.py
+    # + core/signing.py) so SeaweedFS's own address never reaches a browser.
+    # This tool just passes whatever URL the presign response contains
+    # through unmodified either way -- no change needed here for that fix.
     ctx.pending_upload = {
         "download_url": urls.get("download_url", ""),
         "file_name": filename,
@@ -236,12 +252,48 @@ def _resolve_mode(
 
     if has_sql:
         # Mode 1: execute SQL via the existing DuckDB ATTACH seam.
+        #
+        # Repair + row-limit + governance mirror execute_sql.py exactly so the
+        # CSV always matches what the agent saw on screen (audit fix D1-D3,
+        # 2026-07-09):
+        #   D1 — without _repair_common_sql_before_execution, EXTRACT(YEAR
+        #        FROM ...) filters are NOT pushed down to PostgreSQL and are
+        #        evaluated locally in DuckDB with different cast/NULL
+        #        semantics, silently producing different row counts than the
+        #        execute_sql call the agent already ran for the same SQL.
+        #   D2 — ctx.request_limit is pydantic-ai's UsageLimits.request_limit
+        #        (a model-request budget, default 100), not a row count. Using
+        #        it here silently truncated "full data" exports.
+        #   D3 — execute_sql masks sensitive columns via Atlas governance;
+        #        skipping that here would let a masked column leave
+        #        ungoverned through the exported file.
         from seeknal.ask.agents.tools._context import get_tool_context
-        from seeknal.ask.agents.tools.execute_sql import _execute_oneshot_with_timeout
+        from seeknal.ask.agents.tools.execute_sql import (
+            _execute_oneshot_with_timeout,
+            _repair_common_sql_before_execution,
+        )
 
         ctx = get_tool_context()
-        cols, rows = _execute_oneshot_with_timeout(ctx, sql, limit=ctx.request_limit)
-        return list(cols), [list(r) for r in rows], True
+        repaired_sql, _notices = _repair_common_sql_before_execution(sql)
+        cols, rows = _execute_oneshot_with_timeout(
+            ctx, repaired_sql, limit=_CSV_EXPORT_ROW_LIMIT
+        )
+        rows = [list(r) for r in rows]
+
+        from seeknal.integrations.atlas_client import AtlasPolicyDenied
+        from seeknal.integrations.atlas_governance import (
+            create_governance_gate_from_env,
+            govern_query,
+        )
+
+        gov_gate = create_governance_gate_from_env()
+        if gov_gate is not None:
+            try:
+                rows = govern_query(gov_gate, sql=repaired_sql, columns=list(cols), rows=rows)
+            except AtlasPolicyDenied as denial:
+                return f"Access denied by Atlas governance policy: {denial}"
+
+        return list(cols), rows, True
 
     if has_data:
         # Mode 2: use provided rows + column names directly.

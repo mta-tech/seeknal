@@ -161,10 +161,16 @@ def _enrich_syntax_hint(message: str, existing_hint: str) -> str:
 # perspective, every substantial data answer comes with a Download button
 # without asking. This is the "tools csv otomatis upload" behavior.
 #
-# For run_forecast the hook cannot auto-upload (forecast.points are computed
-# in the engine, not re-extractable from the markdown tool_result), so it
-# falls back to a strong nudge that tells the agent to call upload_to_s3 in
-# data mode with the projection rows.
+# run_forecast does NOT go through this hook (audit fix D7, 2026-07-09):
+# forecast.py now self-uploads its own projection points immediately after a
+# successful forecast (see forecast.py `_upload_forecast_points`). The prior
+# design nudged the agent to call upload_to_s3 itself via a POST_TOOL_USE
+# hint here -- live testing showed the nudge never actually fired (its
+# success-marker string, "## Ringkasan", stopped matching this tool's output
+# after the r5 rewrite to "## Proyeksi"), and even when reachable was not
+# reliably followed by the agent across repeated live runs. Self-upload
+# inside the tool makes the Download button unconditional on both string
+# matching and agent behavior.
 
 # Auto-upload threshold. r4: default 5. r5: lowered to 1 — any non-empty
 # tabular result (≥1 row) gets auto-uploaded. The user wants every tabular
@@ -225,25 +231,19 @@ def _derive_filename_from_sql(sql: str) -> str:
 
 
 async def _csv_upload_reminder_handler(hook_input: HookInput) -> HookResult:
-    """Auto-upload substantial query results to S3; nudge for forecast points.
+    """Auto-upload substantial execute_sql results to S3.
 
-    Two branches (matcher=``execute_sql|run_forecast``):
-
-    **execute_sql (Mode 1, AUTO-UPLOAD):** when the result has ≥
-    ``_CSV_REMINDER_MIN_ROWS`` rows, the hook DIRECTLY calls
-    ``upload_to_s3(filename, sql=<the agent's SQL>)``. No agent decision —
-    the upload is automatic. ``ctx.pending_upload`` is set inside
+    When the result has ≥ ``_CSV_REMINDER_MIN_ROWS`` rows, the hook DIRECTLY
+    calls ``upload_to_s3(filename, sql=<the agent's SQL>)``. No agent
+    decision — the upload is automatic. ``ctx.pending_upload`` is set inside
     ``upload_to_s3``; the gateway then emits ``upload_complete`` and a
     Download button appears alongside the answer. The hook appends a short
     note to ``tool_result`` so the agent knows the CSV was uploaded (and
     can mention the download URL in its answer).
 
-    **run_forecast (Mode 2, NUDGE):** the projection points live only in the
-    tool_result markdown — they are computed by the engine, not SQL-queryable.
-    The hook cannot re-execute them. It therefore nudges the agent to call
-    ``upload_to_s3(filename, data=points, columns=[...])`` (Mode 2). Nudge
-    only fires on forecast success (``## Ringkasan``); ``## Kesalahan`` and
-    ``## Ditolak`` produce no exportable data and are skipped.
+    run_forecast is handled entirely inside forecast.py now (see D7 note
+    above `_csv_upload_reminder_handler`'s matcher, and forecast.py's
+    `_upload_forecast_points`) — this handler no longer touches it.
 
     Failures (storage unreachable, PUT rejected) are swallowed — the hook
     must never crash the agent turn. The agent is told via the modified
@@ -257,9 +257,6 @@ async def _csv_upload_reminder_handler(hook_input: HookInput) -> HookResult:
 
         if tool_name == "execute_sql":
             return await _auto_upload_sql_result(hook_input, result)
-
-        if tool_name == "run_forecast":
-            return _nudge_forecast_data_export(result)
 
         return HookResult()
     except Exception:  # noqa: BLE001 - hooks must never propagate failures
@@ -317,24 +314,6 @@ async def _auto_upload_sql_result(
     return HookResult(modified_result=result + nudge)
 
 
-def _nudge_forecast_data_export(result: str) -> HookResult:
-    """Mode 2 nudge for run_forecast (cannot auto-upload — points are computed).
-
-    Forecast success is marked by ``## Ringkasan``. ``## Kesalahan`` and
-    ``## Ditolak`` produce no exportable data — skip the nudge so the agent
-    focuses on the error/reason instead of offering CSV.
-    """
-    if "## Ringkasan" not in result:
-        return HookResult()
-    nudge = (
-        "\n\n_(Forecast complete — automatically offer "
-        "`upload_to_s3(filename=..., data=points, columns="
-        "[\"period\",\"point\",\"lower_80\",\"upper_80\",\"lower_95\",\"upper_95\"])` "
-        "so the user gets a Download button for the projection points.)_"
-    )
-    return HookResult(modified_result=result + nudge)
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -346,10 +325,9 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
     Includes:
     - PRE_TOOL_USE: SQL security validation (execute_sql only)
     - POST_TOOL_USE: SQL self-correction hints (execute_sql only)
-    - POST_TOOL_USE: CSV upload reminder (FC2d) — fires after both
-      ``execute_sql`` and ``run_forecast``; matcher is the regex
-      ``"execute_sql|run_forecast"`` so pydantic_deep routes both tools to the
-      single handler, which dispatches internally on ``tool_name``.
+    - POST_TOOL_USE: CSV auto-upload (FC2d) — execute_sql only. run_forecast
+      self-uploads its own projection points (see forecast.py, D7 fix); it no
+      longer needs a POST_TOOL_USE hook here.
     """
     cfg = config or {}
     if cfg.get("enabled", True) is False:
@@ -377,10 +355,7 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
             Hook(
                 event=HookEvent.POST_TOOL_USE,
                 handler=_csv_upload_reminder_handler,
-                # Regex matched against tool_name by pydantic_deep._match_hooks.
-                # Extending to new data-producing tools = extend this regex,
-                # then add a branch in _csv_upload_reminder_handler.
-                matcher="execute_sql|run_forecast",
+                matcher="execute_sql",
             )
         )
     return hooks

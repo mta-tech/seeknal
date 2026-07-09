@@ -13,22 +13,29 @@ arrive as a single ``sql`` argument the agent assembles.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
-_IBA_FORECAST_URL = os.environ.get("IBA_FORECAST_URL", "")
-# r6: if IBA_FORECAST_URL is not set, use SEEKNAL_GATEWAY_URL + /internal/forecast
-# This routes through iba-service proxy instead of direct service access.
-if not _IBA_FORECAST_URL:
-    _gw = os.environ.get("SEEKNAL_GATEWAY_URL", "")
-    if _gw:
-        _IBA_FORECAST_URL = _gw.rstrip("/").removesuffix("/v6") + "/v6/internal/forecast"
-    else:
-        _IBA_FORECAST_URL = "http://iba-forecast:6705/forecast"
+logger = logging.getLogger(__name__)
+
+# r6: forecast URL construction.
+# Priority: IBA_FORECAST_URL (direct) > SEEKNAL_GATEWAY_URL (proxy) > fallback.
+# The URL stored here is the FULL POST URL (including path).
+_FORECAST_DIRECT_URL = os.environ.get("IBA_FORECAST_URL", "")
+_GATEWAY_URL = os.environ.get("SEEKNAL_GATEWAY_URL", "")
+if _FORECAST_DIRECT_URL:
+    _IBA_FORECAST_URL = _FORECAST_DIRECT_URL.rstrip("/")
+    if not _IBA_FORECAST_URL.endswith("/forecast"):
+        _IBA_FORECAST_URL = f"{_IBA_FORECAST_URL}/forecast"
+elif _GATEWAY_URL:
+    _IBA_FORECAST_URL = _GATEWAY_URL.rstrip("/").removesuffix("/v6") + "/v6/internal/forecast"
+else:
+    _IBA_FORECAST_URL = "http://iba-forecast:6705/forecast"
 _IBA_FORECAST_API_KEY = os.environ.get("IBA_FORECAST_API_KEY", "")
 
 _MIN_ROWS = 10          # tool sendability floor (engine eligibility ≥24 is separate)
@@ -238,7 +245,26 @@ def run_forecast(sql: str, periods: int = 3) -> str:
         return _format_refused(result.get("reason", "Ditolak engine."))
 
     # ── STEP 4: FORMAT 7-blok markdown ─────────────────────────────────────
-    return _format_forecast_markdown(result, data)
+    markdown = _format_forecast_markdown(result, data)
+
+    # ── STEP 5: self-upload projection points (audit fix D7, 2026-07-09) ───
+    # Forecast points are computed here and are not SQL-queryable, so they
+    # cannot use execute_sql's auto-upload hook. The prior design relied on a
+    # POST_TOOL_USE nudge telling the agent to call upload_to_s3 itself
+    # (hooks.py `_nudge_forecast_data_export`) -- live testing showed this
+    # never fired, because its success marker checked the rendered markdown
+    # for "## Ringkasan", a header this formatter stopped emitting after the
+    # r5 rewrite to "## Proyeksi". Even setting that bug aside, a text nudge
+    # was not reliably followed by the agent across repeated live runs.
+    # Calling upload_to_s3 here instead reads the projection points straight
+    # from `result` (the engine's JSON response, see STEP 3) rather than the
+    # markdown -- so the Download button no longer depends on any markdown
+    # header, wording, or language, and no longer depends on agent behavior.
+    # This also matches FC2d's original ownership split: export of
+    # forecast.points is owned by the producing tool, not a hook.
+    _upload_forecast_points(sql, result)
+
+    return markdown
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -304,6 +330,53 @@ def _coerce_y(v: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return max(0.0, n)
+
+
+def _upload_forecast_points(sql: str, result: dict[str, Any]) -> None:
+    """Best-effort export of the forecast projection points to CSV (D7 fix).
+
+    Mirrors ``upload_to_s3`` Mode 2 (data=/columns=). Failures are swallowed
+    -- an export hiccup must never break the forecast answer that already
+    computed successfully. Lazy import avoids a hooks.py-style import cycle
+    (upload_to_s3 pulls in execute_sql internals at call time).
+    """
+    points = (result.get("forecast") or {}).get("points") or []
+    if not points:
+        return
+    columns = ["period", "point", "lower_80", "upper_80", "lower_95", "upper_95"]
+    rows = [
+        [p.get("period"), p.get("point"), p.get("lower_80"), p.get("upper_80"),
+         p.get("lower_95"), p.get("upper_95")]
+        for p in points
+    ]
+    filename = _derive_forecast_filename(sql)
+    try:
+        from seeknal.ask.agents.tools.upload_to_s3 import upload_to_s3
+
+        upload_to_s3(filename, data=rows, columns=columns)
+    except Exception:
+        logger.exception("[run_forecast] projection-points auto-upload failed; answer unaffected")
+
+
+def _derive_forecast_filename(sql: str) -> str:
+    """Best-effort CSV filename derived from the forecast SQL's source table.
+
+    Falls back to a generic timestamped name when introspection fails --
+    matches the pattern in hooks.py's ``_derive_filename_from_sql``. The
+    object key is namespaced under ``csv-exports/{uuid}/{filename}`` by
+    upload_to_s3, so collisions are impossible regardless of this name.
+    """
+    table = "forecast"
+    try:
+        m = re.search(r"\bFROM\s+([\w\.]+)", sql, re.IGNORECASE)
+        if m:
+            table_full = m.group(1).strip("`\"'")
+            table = table_full.split(".")[-1].lower()
+            table = re.sub(r"^(t_|tbl_|table_|ft_)", "", table) or "forecast"
+    except Exception:
+        table = "forecast"
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"forecast-{table}-{ts}.csv"
 
 
 def _format_error(message: str) -> str:
@@ -445,8 +518,15 @@ def _format_forecast_markdown(result: dict[str, Any], history: list[list[Any]]) 
     """r5: Simplified single continuous timeline table.
 
     One table with historical (no bounds) + forecast (with bounds) rows.
-    No YoY side-by-side, no 8-section layout, no hardcoded Indonesian headers.
-    Language follows the conversation context — the agent can rephrase.
+    No YoY side-by-side, no 8-section layout.
+
+    This is a technical intermediate block, not the final user-facing answer:
+    the block header (``## Proyeksi``) and quality labels (BAIK/CUKUP/LEMAH/
+    TOLAK, matching ``evaluate.py::assess_quality``) are fixed Indonesian
+    technical markers, not translated per conversation language. The agent
+    reads this raw tool_result and writes its own final prose answer around
+    it — that final answer is what actually follows the conversation's
+    language; this markdown is not re-localized.
     """
     forecast = result.get("forecast") or {}
     assessment = result.get("assessment") or {}
