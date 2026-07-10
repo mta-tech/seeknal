@@ -225,6 +225,7 @@ def create_agent(
         get_ask_toolset_mode,
         get_request_clarification_enabled,
         get_forecast_enabled,
+        get_anomaly_enabled,
         get_upload_to_s3_enabled,
         get_auto_summarization_config,
         get_cost_tracking_config,
@@ -266,7 +267,7 @@ def create_agent(
 
     # Set request limit and background threshold on the per-session ToolContext
     # (NOT on module-level globals — avoids race conditions across concurrent sessions)
-    from seeknal.ask.agents.tools._context import get_tool_context
+    from seeknal.ask.agents.tools._context import _resolve_engine_url, get_tool_context
 
     tool_ctx = get_tool_context()
     tool_ctx.request_limit = get_request_limit(agent_config)
@@ -278,6 +279,15 @@ def create_agent(
     tool_ctx.sql_pair_mode = get_sql_pair_mode(agent_config)
     if analysis_toolset:
         tool_ctx.tool_call_limit = 24
+
+    # IBA forecast-engine connection: resolved once here (session init),
+    # never inside run_forecast/detect_anomaly themselves. See
+    # ToolContext.iba_forecast_url docstring in _context.py.
+    import os as _os
+
+    tool_ctx.iba_forecast_url = _resolve_engine_url("forecast")
+    tool_ctx.iba_anomaly_url = _resolve_engine_url("anomaly")
+    tool_ctx.iba_forecast_api_key = _os.environ.get("IBA_FORECAST_API_KEY", "")
 
     # Build final system prompt via section registry (4-layer architecture)
     from seeknal.ask.prompt_builder import create_default_builder
@@ -416,6 +426,10 @@ in the final response.
             include_forecast=(
                 environment in ("gateway", "telegram")
                 and get_forecast_enabled(agent_config)
+            ),
+            include_anomaly=(
+                environment in ("gateway", "telegram")
+                and get_anomaly_enabled(agent_config)
             ),
             include_upload_to_s3=(
                 environment in ("gateway", "telegram")

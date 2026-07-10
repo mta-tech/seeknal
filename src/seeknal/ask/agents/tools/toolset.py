@@ -8,6 +8,7 @@ tools instead of relying on prompt-only steering.
 
 from pydantic_ai.toolsets import FunctionToolset
 
+from seeknal.ask.agents.tools.anomaly import detect_anomaly
 from seeknal.ask.agents.tools.apply_draft import apply_draft
 from seeknal.ask.agents.tools.ask_user_tool import ask_user
 from seeknal.ask.agents.tools.bootstrap_semantic_model import bootstrap_semantic_model
@@ -147,14 +148,21 @@ _FULL_ONLY_TOOLS = [
     propose_record_table,
 ]
 
-# Forecast trigger (FC2a). Gated by ``include_forecast`` — registered only in
-# non-interactive environments when ``agent.forecast.enabled`` is true.
+# Deterministic forecast trigger tool. Gated by ``include_forecast`` --
+# registered only in non-interactive environments when
+# ``agent.forecast.enabled`` is true.
 _FORECAST_TOOLS = [
     run_forecast,
 ]
 
-# CSV export tool (FC2d). Gated by ``include_upload_to_s3`` — registered only
-# in non-interactive environments when ``agent.upload_to_s3.enabled`` is true.
+# Anomaly-awareness tool. Sibling of run_forecast: same gating pattern, same
+# engine. Gated by ``include_anomaly``.
+_ANOMALY_TOOLS = [
+    detect_anomaly,
+]
+
+# CSV export tool. Gated by ``include_upload_to_s3`` -- registered only in
+# non-interactive environments when ``agent.upload_to_s3.enabled`` is true.
 _EXPORT_TOOLS = [
     upload_to_s3,
 ]
@@ -166,6 +174,7 @@ def create_ask_toolset(
     include_ask_user: bool = True,
     include_request_clarification: bool = False,
     include_forecast: bool = False,
+    include_anomaly: bool = False,
     include_upload_to_s3: bool = False,
 ) -> FunctionToolset:
     """Create the seeknal-ask toolset.
@@ -180,11 +189,14 @@ def create_ask_toolset(
         include_request_clarification: Include the headless ``request_clarification``
             tool (Model B). Registered for gateway/telegram; the interactive CLI
             keeps ``ask_user`` instead, so the two are never combined.
-        include_forecast: Include the deterministic ``run_forecast`` trigger tool
-            (FC2a). Registered only in non-interactive environments when
+        include_forecast: Include the deterministic ``run_forecast`` trigger
+            tool. Registered only in non-interactive environments when
             ``agent.forecast.enabled`` is true in ``seeknal_agent.yml``.
-        include_upload_to_s3: Include the generic CSV export tool ``upload_to_s3``
-            (FC2d). Registered only in non-interactive environments when
+        include_anomaly: Include the ``detect_anomaly`` tool. Registered
+            only in non-interactive environments when ``agent.anomaly.enabled``
+            is true in ``seeknal_agent.yml``.
+        include_upload_to_s3: Include the generic CSV export tool ``upload_to_s3``.
+            Registered only in non-interactive environments when
             ``agent.upload_to_s3.enabled`` is true in ``seeknal_agent.yml``.
     """
     if mode == "analysis":
@@ -220,6 +232,9 @@ def create_ask_toolset(
 
     if include_forecast:
         tools.extend(_FORECAST_TOOLS)
+
+    if include_anomaly:
+        tools.extend(_ANOMALY_TOOLS)
 
     if include_upload_to_s3:
         tools.extend(_EXPORT_TOOLS)
