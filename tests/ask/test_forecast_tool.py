@@ -49,6 +49,12 @@ def ctx(tmp_path: Path) -> ToolContext:
         artifact_discovery=MagicMock(),
         project_path=tmp_path,
         sql_timeout_seconds=0,
+        # Engine connectivity: injected here exactly like a real session
+        # (agent.py resolves these once at init and sets them on ToolContext);
+        # run_forecast never reads os.environ itself. See
+        # test_forecast_engine_not_configured for the unset-config path.
+        iba_forecast_url="http://test-engine/forecast",
+        iba_forecast_api_key="test-key",
     )
     set_tool_context(ctx)
     return ctx
@@ -127,6 +133,19 @@ def test_forecast_ok_formats_7_blocks(ctx):
         assert header in out, f"missing {header}"
     assert "BAIK" in out
     assert "Quality:" in out
+
+
+def test_forecast_engine_not_configured(ctx):
+    """No IBA_FORECAST_URL / SEEKNAL_GATEWAY_URL resolved at session init ->
+    clear config error, never a guess at a docker-internal hostname, and no
+    SQL/network attempt.
+    """
+    ctx.iba_forecast_url = None
+    with patch("seeknal.ask.agents.tools.forecast.httpx.post") as post:
+        out = run_forecast(SQL_2COL, periods=3)
+    assert "## Kesalahan" in out
+    assert "belum dikonfigurasi" in out
+    post.assert_not_called()
 
 
 def test_forecast_validates_two_columns(ctx):
