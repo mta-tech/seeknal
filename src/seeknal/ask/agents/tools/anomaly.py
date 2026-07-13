@@ -55,8 +55,14 @@ def detect_anomaly(sql: str) -> str:
     from seeknal.ask.agents.tools._context import (
         ENGINE_NOT_CONFIGURED,
         get_tool_context,
-        make_tool_signature,
         record_tool_result,
+        repeated_failure_message,
+    )
+    from seeknal.ask.agents.tools.errors import (
+        RETRYABLE_SYNTAX,
+        TERMINAL_DEPENDENCY_UNAVAILABLE,
+        classify_duckdb_error,
+        format_tool_error,
     )
     from seeknal.ask.agents.tools.execute_sql import (
         _execute_oneshot_with_timeout,
@@ -74,14 +80,32 @@ def detect_anomaly(sql: str) -> str:
     if ctx.iba_engine_url is None:
         return ENGINE_NOT_CONFIGURED
 
+    # ── REPEATED FAILURE CHECK — same pattern as execute_sql ─────────────
+    prior_failure = repeated_failure_message("detect_anomaly", {"sql": sql})
+    if prior_failure:
+        result = format_tool_error(
+            RETRYABLE_SYNTAX,
+            prior_failure,
+            hint=(
+                "Do not retry the same anomaly SQL. Check the error, adjust "
+                "the query, or answer with historical analysis instead."
+            ),
+        )
+        record_tool_result("detect_anomaly", result, args={"sql": sql})
+        return result
+
     sql = str(sql).strip().rstrip(";").strip()
     sql, _notices = _repair_common_sql_before_execution(sql)
 
     forbidden = _detect_forbidden_patterns(sql)
     if forbidden:
         record_tool_result(
-            "detect_anomaly", "error",
-            args={"sql_sig": make_tool_signature("detect_anomaly", {"sql": sql})},
+            "detect_anomaly",
+            format_tool_error(
+                RETRYABLE_SYNTAX,
+                "Anomaly SQL rejected by policy check (JOIN/generate_series/recursive CTE).",
+            ),
+            args={"sql": sql},
         )
         return _format_policy_violation(sql, forbidden)
 
@@ -91,15 +115,20 @@ def detect_anomaly(sql: str) -> str:
         )
     except Exception as exc:
         record_tool_result(
-            "detect_anomaly", "error",
-            args={"sql_sig": make_tool_signature("detect_anomaly", {"sql": sql})},
+            "detect_anomaly",
+            format_tool_error(classify_duckdb_error(str(exc)), str(exc)),
+            args={"sql": sql},
         )
         return _format_sql_exec_error(exc, sql)
 
     if len(columns) != 2:
         record_tool_result(
-            "detect_anomaly", "error",
-            args={"sql_sig": make_tool_signature("detect_anomaly", {"sql": sql})},
+            "detect_anomaly",
+            format_tool_error(
+                RETRYABLE_SYNTAX,
+                f"SQL harus mengembalikan tepat 2 kolom (X waktu, Y nilai); dapat {len(columns)}.",
+            ),
+            args={"sql": sql},
         )
         return (
             f"## Kesalahan\n\nSQL harus mengembalikan tepat 2 kolom "
@@ -107,14 +136,26 @@ def detect_anomaly(sql: str) -> str:
         )
     if len(rows) < _MIN_ROWS:
         record_tool_result(
-            "detect_anomaly", "error",
-            args={"sql_sig": make_tool_signature("detect_anomaly", {"sql": sql})},
+            "detect_anomaly",
+            format_tool_error(
+                RETRYABLE_SYNTAX,
+                f"Data minimal {_MIN_ROWS} baris untuk deteksi anomali; dapat {len(rows)}.",
+            ),
+            args={"sql": sql},
         )
         return f"## Kesalahan\n\nData minimal {_MIN_ROWS} baris untuk deteksi anomali; dapat {len(rows)}."
 
     data = [[_coerce_x(r[0]), _coerce_y(r[1])] for r in rows]
     data = [[x, y] for x, y in data if x is not None and y is not None]
     if len(data) < _MIN_ROWS:
+        record_tool_result(
+            "detect_anomaly",
+            format_tool_error(
+                RETRYABLE_SYNTAX,
+                f"Data minimal {_MIN_ROWS} baris valid untuk deteksi anomali; dapat {len(data)} setelah filter NULL.",
+            ),
+            args={"sql": sql},
+        )
         return (
             f"## Kesalahan\n\nData minimal {_MIN_ROWS} baris valid untuk deteksi "
             f"anomali; dapat {len(data)} setelah filter NULL."
@@ -131,20 +172,28 @@ def detect_anomaly(sql: str) -> str:
         result: dict[str, Any] = resp.json()
     except httpx.HTTPStatusError as exc:
         record_tool_result(
-            "detect_anomaly", "error",
-            args={"sql_sig": make_tool_signature("detect_anomaly", {"sql": sql})},
+            "detect_anomaly",
+            format_tool_error(
+                TERMINAL_DEPENDENCY_UNAVAILABLE,
+                f"Engine error: HTTP {exc.response.status_code}.",
+            ),
+            args={"sql": sql},
         )
         return f"## Kesalahan\n\nEngine error: HTTP {exc.response.status_code}."
     except (httpx.RequestError, httpx.HTTPError):
         record_tool_result(
-            "detect_anomaly", "error",
-            args={"sql_sig": make_tool_signature("detect_anomaly", {"sql": sql})},
+            "detect_anomaly",
+            format_tool_error(
+                TERMINAL_DEPENDENCY_UNAVAILABLE,
+                "Engine tidak tersedia (timeout atau koneksi gagal).",
+            ),
+            args={"sql": sql},
         )
         return "## Kesalahan\n\nEngine tidak tersedia (timeout atau koneksi gagal)."
 
     record_tool_result(
         "detect_anomaly", "ok",
-        args={"sql_sig": make_tool_signature("detect_anomaly", {"sql": sql})},
+        args={"sql": sql},
     )
     return _format_anomaly_markdown(result.get("anomalies") or [])
 

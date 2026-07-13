@@ -106,8 +106,14 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     from seeknal.ask.agents.tools._context import (
         ENGINE_NOT_CONFIGURED,
         get_tool_context,
-        make_tool_signature,
         record_tool_result,
+        repeated_failure_message,
+    )
+    from seeknal.ask.agents.tools.errors import (
+        RETRYABLE_SYNTAX,
+        TERMINAL_DEPENDENCY_UNAVAILABLE,
+        classify_duckdb_error,
+        format_tool_error,
     )
     from seeknal.ask.agents.tools.execute_sql import (
         _execute_oneshot_with_timeout,
@@ -119,6 +125,22 @@ def run_forecast(sql: str, periods: int = 3) -> str:
         return ENGINE_NOT_CONFIGURED
 
     periods = max(1, min(int(periods), _MAX_HORIZON))
+
+    # ── REPEATED FAILURE CHECK — same pattern as execute_sql ─────────────
+    # If the agent retries the exact same SQL that already failed, short-circuit
+    # with the prior failure message instead of re-executing.
+    prior_failure = repeated_failure_message("run_forecast", {"sql": sql})
+    if prior_failure:
+        result = format_tool_error(
+            RETRYABLE_SYNTAX,
+            prior_failure,
+            hint=(
+                "Do not retry the same forecast SQL. Check the error, adjust "
+                "the query, or answer with historical analysis instead."
+            ),
+        )
+        record_tool_result("run_forecast", result, args={"sql": sql})
+        return result
 
     # ── STEP 0: PREPARE SQL — same pipeline as execute_sql (r3) ────────────
     # Strip trailing semicolons (LLMs include them, DuckDB rejects).
@@ -140,8 +162,11 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     if forbidden:
         record_tool_result(
             "run_forecast",
-            "error",
-            args={"sql_sig": make_tool_signature("run_forecast", {"sql": sql})},
+            format_tool_error(
+                RETRYABLE_SYNTAX,
+                "Forecast SQL rejected by policy check (JOIN/generate_series/recursive CTE).",
+            ),
+            args={"sql": sql},
         )
         return _format_policy_violation(sql, forbidden)
 
@@ -158,8 +183,8 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     except Exception as exc:
         record_tool_result(
             "run_forecast",
-            "error",
-            args={"sql_sig": make_tool_signature("run_forecast", {"sql": sql})},
+            format_tool_error(classify_duckdb_error(str(exc)), str(exc)),
+            args={"sql": sql},
         )
         return _format_sql_exec_error(exc, sql)
 
@@ -167,8 +192,11 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     if len(columns) != 2:
         record_tool_result(
             "run_forecast",
-            "error",
-            args={"sql_sig": make_tool_signature("run_forecast", {"sql": sql})},
+            format_tool_error(
+                RETRYABLE_SYNTAX,
+                f"SQL harus mengembalikan tepat 2 kolom (X waktu, Y nilai); dapat {len(columns)}.",
+            ),
+            args={"sql": sql},
         )
         return _format_error(
             f"SQL harus mengembalikan tepat 2 kolom (X waktu, Y nilai); "
@@ -177,8 +205,11 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     if len(rows) < _MIN_ROWS:
         record_tool_result(
             "run_forecast",
-            "error",
-            args={"sql_sig": make_tool_signature("run_forecast", {"sql": sql})},
+            format_tool_error(
+                RETRYABLE_SYNTAX,
+                f"Data minimal {_MIN_ROWS} baris untuk dikirim ke engine; dapat {len(rows)}.",
+            ),
+            args={"sql": sql},
         )
         return _format_error(
             f"Data minimal {_MIN_ROWS} baris untuk dikirim ke engine; dapat {len(rows)}."
@@ -190,6 +221,14 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     data = [[_coerce_x(r[0]), _coerce_y(r[1])] for r in rows]
     data = [[x, y] for x, y in data if x is not None and y is not None]
     if len(data) < _MIN_ROWS:
+        record_tool_result(
+            "run_forecast",
+            format_tool_error(
+                RETRYABLE_SYNTAX,
+                f"Data minimal {_MIN_ROWS} baris valid untuk dikirim ke engine; dapat {len(data)} setelah filter NULL.",
+            ),
+            args={"sql": sql},
+        )
         return _format_error(
             f"Data minimal {_MIN_ROWS} baris valid untuk dikirim ke engine; "
             f"dapat {len(data)} setelah filter NULL."
@@ -199,8 +238,11 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     if freq is None:
         record_tool_result(
             "run_forecast",
-            "error",
-            args={"sql_sig": make_tool_signature("run_forecast", {"sql": sql})},
+            format_tool_error(
+                RETRYABLE_SYNTAX,
+                "Spacing X tidak konsisten; tidak bisa menentukan freq (MS/QS/YS).",
+            ),
+            args={"sql": sql},
         )
         return _format_error(
             "Spacing X tidak konsisten; tidak bisa menentukan freq (MS/QS/YS)."
@@ -219,15 +261,21 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     except httpx.HTTPStatusError as exc:
         record_tool_result(
             "run_forecast",
-            "error",
-            args={"sql_sig": make_tool_signature("run_forecast", {"sql": sql})},
+            format_tool_error(
+                TERMINAL_DEPENDENCY_UNAVAILABLE,
+                f"Engine error: HTTP {exc.response.status_code}.",
+            ),
+            args={"sql": sql},
         )
         return _format_error(f"Engine error: HTTP {exc.response.status_code}.")
     except (httpx.RequestError, httpx.HTTPError):
         record_tool_result(
             "run_forecast",
-            "error",
-            args={"sql_sig": make_tool_signature("run_forecast", {"sql": sql})},
+            format_tool_error(
+                TERMINAL_DEPENDENCY_UNAVAILABLE,
+                "Engine tidak tersedia (timeout atau koneksi gagal).",
+            ),
+            args={"sql": sql},
         )
         return _format_error("Engine tidak tersedia (timeout atau koneksi gagal).")
 
@@ -235,7 +283,7 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     record_tool_result(
         "run_forecast",
         "ok" if status == "ok" else "refused",
-        args={"sql_sig": make_tool_signature("run_forecast", {"sql": sql, "periods": periods})},
+        args={"sql": sql},
     )
 
     if status != "ok":

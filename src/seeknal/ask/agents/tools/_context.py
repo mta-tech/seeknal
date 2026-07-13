@@ -108,6 +108,15 @@ class ToolContext:
     # Each tool appends its endpoint: /forecast, /anomaly, etc.
     iba_engine_url: str | None = None
     iba_engine_api_key: str = ""
+    # IBA storage presign URL, resolved ONCE at agent init (see
+    # agent.py::create_agent). upload_to_s3 reads this off ctx;
+    # the tool never touches os.environ itself.
+    #
+    # Unlike iba_engine_url (which is a BASE URL with tools appending
+    # /forecast, /anomaly), this is the FULL presign URL because the
+    # proxy path (via iba-service) already includes the endpoint path.
+    iba_storage_presign_url: str | None = None
+    iba_storage_api_key: str = ""
 
 
 def _resolve_engine_base_url() -> str | None:
@@ -138,6 +147,33 @@ ENGINE_NOT_CONFIGURED = (
     "## Kesalahan\n\nEngine belum dikonfigurasi -- set environment "
     "variable IBA_ENGINE_URL (URL langsung ke iba-engine container)."
 )
+
+
+def _resolve_storage_presign_url() -> str | None:
+    """Resolve the IBA storage presign URL from IBA_STORAGE_URL.
+
+    Returns the FULL presign URL (not a base URL) because the proxy path
+    (via iba-service) already includes the endpoint path.
+
+    Resolution order:
+    1. IBA_STORAGE_URL → append /api/v1/internal/get-upload-url (direct to iba-storage)
+    2. SEEKNAL_GATEWAY_URL → append /v6/internal/storage/presign (proxy via iba-service)
+    3. Fallback → http://iba-storage:8000/api/v1/internal/get-upload-url
+
+    Called once at session init (agent.py) and stored on ToolContext;
+    upload_to_s3 never reads os.environ directly.
+    """
+    raw = os.environ.get("IBA_STORAGE_URL", "").strip()
+    if raw:
+        return raw.rstrip("/") + "/api/v1/internal/get-upload-url"
+
+    # Fallback: proxy through iba-service
+    gw = os.environ.get("SEEKNAL_GATEWAY_URL", "").strip()
+    if gw:
+        return gw.rstrip("/").removesuffix("/v6") + "/v6/internal/storage/presign"
+
+    # Last resort: Docker-internal iba-storage
+    return "http://iba-storage:8000/api/v1/internal/get-upload-url"
 
 
 def _make_registry():

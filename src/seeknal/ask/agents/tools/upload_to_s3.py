@@ -40,16 +40,9 @@ from typing import Any
 
 import httpx
 
-_IBA_STORAGE_URL = os.environ.get("IBA_STORAGE_URL", "")
-# r6: if IBA_STORAGE_URL is not set, use SEEKNAL_GATEWAY_URL for proxy.
-# Gateway route: /v6/internal/storage/presign → iba-storage presign endpoint.
-if not _IBA_STORAGE_URL:
-    _gw_s = os.environ.get("SEEKNAL_GATEWAY_URL", "")
-    if _gw_s:
-        _IBA_STORAGE_URL = _gw_s.rstrip("/").removesuffix("/v6") + "/v6/internal/storage/presign"
-    else:
-        _IBA_STORAGE_URL = "http://iba-storage:8000"
-_IBA_STORAGE_API_KEY = os.environ.get("IBA_STORAGE_API_KEY", "")
+# No storage URL/API key here: connectivity is resolved once at session init
+# (agent.py) and injected via ToolContext.iba_storage_presign_url/iba_storage_api_key
+# -- this module never reads os.environ for storage config. See _context.py's ToolContext.
 
 # CSV exports are files, not chat-context tables — decoupled from both
 # execute_sql's 500-row chat-display cap and ctx.request_limit (the
@@ -112,6 +105,10 @@ def upload_to_s3(
         failure (the agent should surface it, not retry silently).
     """
     from seeknal.ask.agents.tools._context import get_tool_context, record_tool_result
+    from seeknal.ask.agents.tools.errors import (
+        TERMINAL_DEPENDENCY_UNAVAILABLE,
+        format_tool_error,
+    )
     from seeknal.ask.agents.tools.execute_sql import _execute_oneshot_with_timeout
 
     ctx = get_tool_context()
@@ -149,34 +146,46 @@ def upload_to_s3(
     csv_bytes = buf.getvalue().encode("utf-8")
 
     # ── STEP 3: presigned URLs + server-computed expiry (W13-B update) ─────
-    # NOTE: iba-storage mounts the internal router under ``/api`` (main.py:
-    # ``app.include_router(internal_router, prefix="/api")``), so the full path
-    # is ``/api/v1/internal/get-upload-url`` — not ``/v1/...``.
-    # r6: if gateway URL is used, the path is already included.
-    # If direct URL, append the presign path.
-    if "/internal/storage/presign" in _IBA_STORAGE_URL:
-        _presign_url = _IBA_STORAGE_URL
-    else:
-        _presign_url = f"{_IBA_STORAGE_URL}/api/v1/internal/get-upload-url"
+    # Presign URL resolved once at session init and stored on ToolContext.
+    # See _context.py::_resolve_storage_presign_url for the fallback chain.
+    presign_url = ctx.iba_storage_presign_url
+    if not presign_url:
+        record_tool_result(
+            "upload_to_s3",
+            format_tool_error(
+                TERMINAL_DEPENDENCY_UNAVAILABLE,
+                "Storage belum dikonfigurasi -- set IBA_STORAGE_URL atau SEEKNAL_GATEWAY_URL.",
+            ),
+            args={"filename": filename, "mode": "sql" if used_sql_mode else "data"},
+        )
+        return "Storage belum dikonfigurasi -- set IBA_STORAGE_URL atau SEEKNAL_GATEWAY_URL."
 
     try:
         resp = httpx.post(
-            _presign_url,
+            presign_url,
             json={"filename": filename, "content_type": "text/csv"},
-            headers={"X-API-Key": _IBA_STORAGE_API_KEY},
+            headers={"X-API-Key": ctx.iba_storage_api_key},
             timeout=30.0,
         )
         resp.raise_for_status()
         urls = resp.json()
     except httpx.RequestError:
         record_tool_result(
-            "upload_to_s3", "error",
+            "upload_to_s3",
+            format_tool_error(
+                TERMINAL_DEPENDENCY_UNAVAILABLE,
+                "Storage unavailable (timeout or connection failed).",
+            ),
             args={"filename": filename, "mode": "sql" if used_sql_mode else "data"},
         )
         return "Storage unavailable (timeout or connection failed)."
     except httpx.HTTPStatusError as exc:
         record_tool_result(
-            "upload_to_s3", "error",
+            "upload_to_s3",
+            format_tool_error(
+                TERMINAL_DEPENDENCY_UNAVAILABLE,
+                f"Failed to obtain presigned URL: HTTP {exc.response.status_code}.",
+            ),
             args={"filename": filename, "mode": "sql" if used_sql_mode else "data"},
         )
         return f"Failed to obtain presigned URL: HTTP {exc.response.status_code}."
@@ -193,7 +202,11 @@ def upload_to_s3(
         put.raise_for_status()
     except httpx.HTTPError:
         record_tool_result(
-            "upload_to_s3", "error",
+            "upload_to_s3",
+            format_tool_error(
+                TERMINAL_DEPENDENCY_UNAVAILABLE,
+                "CSV upload failed (SeaweedFS rejected the write).",
+            ),
             args={"filename": filename, "mode": "sql" if used_sql_mode else "data"},
         )
         return "CSV upload failed (SeaweedFS rejected the write)."

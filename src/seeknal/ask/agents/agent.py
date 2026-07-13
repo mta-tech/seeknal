@@ -267,7 +267,7 @@ def create_agent(
 
     # Set request limit and background threshold on the per-session ToolContext
     # (NOT on module-level globals — avoids race conditions across concurrent sessions)
-    from seeknal.ask.agents.tools._context import _resolve_engine_base_url, get_tool_context
+    from seeknal.ask.agents.tools._context import _resolve_engine_base_url, _resolve_storage_presign_url, get_tool_context
 
     tool_ctx = get_tool_context()
     tool_ctx.request_limit = get_request_limit(agent_config)
@@ -287,6 +287,12 @@ def create_agent(
 
     tool_ctx.iba_engine_url = _resolve_engine_base_url()
     tool_ctx.iba_engine_api_key = _os.environ.get("IBA_ENGINE_API_KEY", "")
+
+    # IBA storage connection: resolved once here (session init),
+    # never inside upload_to_s3 itself. See ToolContext.iba_storage_presign_url
+    # docstring in _context.py.
+    tool_ctx.iba_storage_presign_url = _resolve_storage_presign_url()
+    tool_ctx.iba_storage_api_key = _os.environ.get("IBA_STORAGE_API_KEY", "")
 
     # Build final system prompt via section registry (4-layer architecture)
     from seeknal.ask.prompt_builder import create_default_builder
