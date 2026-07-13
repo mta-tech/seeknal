@@ -267,7 +267,7 @@ def create_agent(
 
     # Set request limit and background threshold on the per-session ToolContext
     # (NOT on module-level globals — avoids race conditions across concurrent sessions)
-    from seeknal.ask.agents.tools._context import _resolve_engine_url, get_tool_context
+    from seeknal.ask.agents.tools._context import _resolve_engine_base_url, get_tool_context
 
     tool_ctx = get_tool_context()
     tool_ctx.request_limit = get_request_limit(agent_config)
@@ -280,14 +280,13 @@ def create_agent(
     if analysis_toolset:
         tool_ctx.tool_call_limit = 24
 
-    # IBA forecast-engine connection: resolved once here (session init),
+    # IBA engine connection: resolved once here (session init),
     # never inside run_forecast/detect_anomaly themselves. See
-    # ToolContext.iba_forecast_url docstring in _context.py.
+    # ToolContext.iba_engine_url docstring in _context.py.
     import os as _os
 
-    tool_ctx.iba_forecast_url = _resolve_engine_url("forecast")
-    tool_ctx.iba_anomaly_url = _resolve_engine_url("anomaly")
-    tool_ctx.iba_forecast_api_key = _os.environ.get("IBA_FORECAST_API_KEY", "")
+    tool_ctx.iba_engine_url = _resolve_engine_base_url()
+    tool_ctx.iba_engine_api_key = _os.environ.get("IBA_ENGINE_API_KEY", "")
 
     # Build final system prompt via section registry (4-layer architecture)
     from seeknal.ask.prompt_builder import create_default_builder

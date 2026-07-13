@@ -97,44 +97,46 @@ class ToolContext:
     # ``upload_complete`` event and CONTINUES the turn — unlike
     # pending_clarification which ends it. ``None`` means no upload is pending.
     pending_upload: dict[str, Any] | None = None
-    # IBA forecast-engine connection, resolved ONCE at agent init (see
-    # agent.py::create_agent) via _resolve_engine_url() below and injected
-    # here -- same pattern as ``repl``/``project_path``. run_forecast and
-    # detect_anomaly read these off ctx; neither tool touches os.environ
-    # itself, so the tool files stay pure functions triggered by
-    # docstring/skill/context, with connectivity supplied externally.
-    iba_forecast_url: str | None = None
-    iba_anomaly_url: str | None = None
-    iba_forecast_api_key: str = ""
+    # IBA engine connection, resolved ONCE at agent init (see
+    # agent.py::create_agent) and injected here -- same pattern as
+    # ``repl``/``project_path``. run_forecast and detect_anomaly read
+    # these off ctx; neither tool touches os.environ itself, so the tool
+    # files stay pure functions triggered by docstring/skill/context,
+    # with connectivity supplied externally.
+    #
+    # iba_engine_url is the BASE URL (e.g. http://iba-engine:8000).
+    # Each tool appends its endpoint: /forecast, /anomaly, etc.
+    iba_engine_url: str | None = None
+    iba_engine_api_key: str = ""
 
 
-def _resolve_engine_url(endpoint: str) -> str | None:
-    """Resolve the IBA forecast-engine URL for one endpoint ("forecast" or "anomaly").
+def _resolve_engine_base_url() -> str | None:
+    """Resolve the IBA engine base URL from IBA_ENGINE_URL.
 
-    Priority: IBA_FORECAST_URL (direct engine URL) > SEEKNAL_GATEWAY_URL
-    (proxied through the gateway). Returns None when neither is configured --
-    the engine connection is deployment-specific infrastructure, not
-    something a tool should guess a docker-internal hostname for. Called
-    once at session init (agent.py) and stored on ToolContext; tool modules
-    never read os.environ directly.
+    Only IBA_ENGINE_URL is supported -- direct container-to-container on
+    Docker network. The old SEEKNAL_GATEWAY_URL proxy path is removed.
+    Returns None when not configured -- the engine connection is
+    deployment-specific infrastructure, not something a tool should guess
+    a docker-internal hostname for. Called once at session init (agent.py)
+    and stored on ToolContext; tool modules never read os.environ directly.
+
+    The returned URL is the BASE (e.g. "http://iba-engine:8000") without
+    any endpoint suffix. Each tool appends its own: /forecast, /anomaly.
     """
-    direct = os.environ.get("IBA_FORECAST_URL", "").strip()
-    if direct:
-        base = direct.rstrip("/")
-        for suffix in ("/forecast", "/anomaly"):
-            if base.endswith(suffix):
-                base = base[: -len(suffix)]
-        return f"{base}/{endpoint}"
-    gateway = os.environ.get("SEEKNAL_GATEWAY_URL", "").strip()
-    if gateway:
-        return gateway.rstrip("/").removesuffix("/v6") + f"/v6/internal/{endpoint}"
-    return None
+    raw = os.environ.get("IBA_ENGINE_URL", "").strip()
+    if not raw:
+        return None
+    base = raw.rstrip("/")
+    # Strip known endpoint suffixes if user accidentally included one
+    for suffix in ("/forecast", "/anomaly"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+    return base
 
 
 ENGINE_NOT_CONFIGURED = (
-    "## Kesalahan\n\nForecast engine belum dikonfigurasi -- set environment "
-    "variable IBA_FORECAST_URL (URL langsung ke engine) atau "
-    "SEEKNAL_GATEWAY_URL (proxy gateway)."
+    "## Kesalahan\n\nEngine belum dikonfigurasi -- set environment "
+    "variable IBA_ENGINE_URL (URL langsung ke iba-engine container)."
 )
 
 

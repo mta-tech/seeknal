@@ -53,8 +53,8 @@ def ctx(tmp_path: Path) -> ToolContext:
         # (agent.py resolves these once at init and sets them on ToolContext);
         # run_forecast never reads os.environ itself. See
         # test_forecast_engine_not_configured for the unset-config path.
-        iba_forecast_url="http://test-engine/forecast",
-        iba_forecast_api_key="test-key",
+        iba_engine_url="http://test-engine",
+        iba_engine_api_key="test-key",
     )
     set_tool_context(ctx)
     return ctx
@@ -136,11 +136,11 @@ def test_forecast_ok_formats_7_blocks(ctx):
 
 
 def test_forecast_engine_not_configured(ctx):
-    """No IBA_FORECAST_URL / SEEKNAL_GATEWAY_URL resolved at session init ->
+    """No IBA_ENGINE_URL resolved at session init ->
     clear config error, never a guess at a docker-internal hostname, and no
     SQL/network attempt.
     """
-    ctx.iba_forecast_url = None
+    ctx.iba_engine_url = None
     with patch("seeknal.ask.agents.tools.forecast.httpx.post") as post:
         out = run_forecast(SQL_2COL, periods=3)
     assert "## Kesalahan" in out

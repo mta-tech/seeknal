@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 
 # No engine URL/API key here: connectivity is resolved once at session init
-# (agent.py) and injected via ToolContext.iba_anomaly_url/iba_forecast_api_key
+# (agent.py) and injected via ToolContext.iba_engine_url/iba_engine_api_key
 # -- this module never reads os.environ. See _context.py's ToolContext.
 
 _MIN_ROWS = 3  # matches the engine's own floor for anomaly detection
@@ -71,7 +71,7 @@ def detect_anomaly(sql: str) -> str:
     )
 
     ctx = get_tool_context()
-    if ctx.iba_anomaly_url is None:
+    if ctx.iba_engine_url is None:
         return ENGINE_NOT_CONFIGURED
 
     sql = str(sql).strip().rstrip(";").strip()
@@ -122,9 +122,9 @@ def detect_anomaly(sql: str) -> str:
 
     try:
         resp = httpx.post(
-            ctx.iba_anomaly_url,
+            f"{ctx.iba_engine_url}/anomaly",
             json={"data": data},
-            headers={"X-API-Key": ctx.iba_forecast_api_key},
+            headers={"X-API-Key": ctx.iba_engine_api_key},
             timeout=60.0,
         )
         resp.raise_for_status()

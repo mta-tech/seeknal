@@ -24,7 +24,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # No engine URL/API key here: connectivity is resolved once at session init
-# (agent.py) and injected via ToolContext.iba_forecast_url/iba_forecast_api_key
+# (agent.py) and injected via ToolContext.iba_engine_url/iba_engine_api_key
 # -- this module never reads os.environ. See _context.py's ToolContext.
 
 _MIN_ROWS = 10          # tool sendability floor, matches the engine's own eligibility floor
@@ -115,7 +115,7 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     )
 
     ctx = get_tool_context()
-    if ctx.iba_forecast_url is None:
+    if ctx.iba_engine_url is None:
         return ENGINE_NOT_CONFIGURED
 
     periods = max(1, min(int(periods), _MAX_HORIZON))
@@ -209,9 +209,9 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     # ── STEP 3: POST → engine (generic payload) ────────────────────────────
     try:
         resp = httpx.post(
-            ctx.iba_forecast_url,
+            f"{ctx.iba_engine_url}/forecast",
             json={"data": data, "periods": periods, "freq": freq},
-            headers={"X-API-Key": ctx.iba_forecast_api_key},
+            headers={"X-API-Key": ctx.iba_engine_api_key},
             timeout=120.0,
         )
         resp.raise_for_status()

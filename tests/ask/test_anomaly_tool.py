@@ -53,8 +53,8 @@ def ctx(tmp_path: Path) -> ToolContext:
         # (agent.py resolves these once at init and sets them on ToolContext);
         # detect_anomaly never reads os.environ itself. See
         # test_anomaly_engine_not_configured for the unset-config path.
-        iba_anomaly_url="http://test-engine/anomaly",
-        iba_forecast_api_key="test-key",
+        iba_engine_url="http://test-engine",
+        iba_engine_api_key="test-key",
     )
     set_tool_context(ctx)
     return ctx
@@ -98,11 +98,11 @@ def test_anomaly_none_found(ctx):
 
 
 def test_anomaly_engine_not_configured(ctx):
-    """No IBA_FORECAST_URL / SEEKNAL_GATEWAY_URL resolved at session init ->
+    """No IBA_ENGINE_URL resolved at session init ->
     clear config error, never a guess at a docker-internal hostname, and no
     SQL/network attempt.
     """
-    ctx.iba_anomaly_url = None
+    ctx.iba_engine_url = None
     with patch("seeknal.ask.agents.tools.anomaly.httpx.post") as post:
         out = detect_anomaly(SQL_2COL)
     assert "## Kesalahan" in out
