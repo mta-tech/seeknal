@@ -125,14 +125,18 @@ SQL_2COL = (
 def test_forecast_ok_formats_7_blocks(ctx):
     with patch("seeknal.ask.agents.tools.forecast.httpx.post", return_value=_mock_post(_ok_response())):
         out = run_forecast(SQL_2COL, periods=3)
-    # r5: simplified output — single continuous table under "## Proyeksi"
+    # Post-r5 output: multi-section Indonesian-localized formatter. Verify
+    # the key sections are emitted (Ringkasan summary, projection detail
+    # table with bounds, methodology footer).
     for header in [
-        "## Proyeksi",
-        "| Period | Value | Lower 80% | Upper 80% |",
+        "## Ringkasan",
+        "## Kualitas Proyeksi",
+        "## Proyeksi Detail",
+        "| Periode | Prediksi | Bawah 80% | Atas 80% |",
+        "## Metodologi",
     ]:
         assert header in out, f"missing {header}"
     assert "BAIK" in out
-    assert "Quality:" in out
 
 
 def test_forecast_engine_not_configured(ctx):
@@ -203,7 +207,7 @@ def test_forecast_periods_clamped(ctx):
 
     with patch("seeknal.ask.agents.tools.forecast.httpx.post", side_effect=fake_post):
         run_forecast(SQL_2COL, periods=99)
-    assert captured["periods"] == 12  # clamped to _MAX_HORIZON
+    assert captured["periods"] == 36  # clamped to _MAX_HORIZON (grain-aware: "3 tahun" on monthly = 36)
 
 
 # ── r4: structural policy check (STEP 0.5) + SQL exec error handling (STEP 1) ──

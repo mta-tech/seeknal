@@ -39,6 +39,12 @@ def ctx(tmp_path: Path) -> ToolContext:
         project_path=tmp_path,
         sql_timeout_seconds=0,
         request_limit=100,
+        # Storage connectivity injected here exactly like a real session
+        # (agent.py resolves these once at init and sets them on ToolContext);
+        # upload_to_s3 never reads os.environ itself. See
+        # test_upload_storage_unreachable_returns_error for the unset path.
+        iba_storage_presign_url="http://storage/presign",
+        iba_storage_api_key="test-key",
     )
     set_tool_context(ctx)
     return ctx
