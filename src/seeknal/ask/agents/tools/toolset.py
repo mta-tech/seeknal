@@ -8,6 +8,7 @@ tools instead of relying on prompt-only steering.
 
 from pydantic_ai.toolsets import FunctionToolset
 
+from seeknal.ask.agents.tools.anomaly import detect_anomaly
 from seeknal.ask.agents.tools.apply_draft import apply_draft
 from seeknal.ask.agents.tools.ask_user_tool import ask_user
 from seeknal.ask.agents.tools.bootstrap_semantic_model import bootstrap_semantic_model
@@ -22,6 +23,7 @@ from seeknal.ask.agents.tools.execute_sql_pair import execute_sql_pair
 from seeknal.ask.agents.tools.execute_uv_script import execute_uv_script
 from seeknal.ask.agents.tools.execute_sql import execute_sql
 from seeknal.ask.agents.tools.extract_from_image import extract_from_image
+from seeknal.ask.agents.tools.forecast import run_forecast
 from seeknal.ask.agents.tools.generate_report import generate_report
 from seeknal.ask.agents.tools.get_entities import get_entities
 from seeknal.ask.agents.tools.get_entity_schema import get_entity_schema
@@ -60,6 +62,7 @@ from seeknal.ask.agents.tools.search_pipelines import search_pipelines
 from seeknal.ask.agents.tools.search_project_files import search_project_files
 from seeknal.ask.agents.tools.show_lineage import show_lineage
 from seeknal.ask.agents.tools.submit_plan import submit_plan
+from seeknal.ask.agents.tools.upload_to_s3 import upload_to_s3
 from seeknal.ask.agents.tools.write_ingested_table import write_ingested_table
 from seeknal.ask.agents.tools.write_project_file import write_project_file
 
@@ -145,12 +148,34 @@ _FULL_ONLY_TOOLS = [
     propose_record_table,
 ]
 
+# Deterministic forecast trigger tool. Gated by ``include_forecast`` --
+# registered only in non-interactive environments when
+# ``agent.forecast.enabled`` is true.
+_FORECAST_TOOLS = [
+    run_forecast,
+]
+
+# Anomaly-awareness tool. Sibling of run_forecast: same gating pattern, same
+# engine. Gated by ``include_anomaly``.
+_ANOMALY_TOOLS = [
+    detect_anomaly,
+]
+
+# CSV export tool. Gated by ``include_upload_to_s3`` -- registered only in
+# non-interactive environments when ``agent.upload_to_s3.enabled`` is true.
+_EXPORT_TOOLS = [
+    upload_to_s3,
+]
+
 
 def create_ask_toolset(
     *,
     mode: str = "full",
     include_ask_user: bool = True,
     include_request_clarification: bool = False,
+    include_forecast: bool = False,
+    include_anomaly: bool = False,
+    include_upload_to_s3: bool = False,
 ) -> FunctionToolset:
     """Create the seeknal-ask toolset.
 
@@ -164,6 +189,15 @@ def create_ask_toolset(
         include_request_clarification: Include the headless ``request_clarification``
             tool (Model B). Registered for gateway/telegram; the interactive CLI
             keeps ``ask_user`` instead, so the two are never combined.
+        include_forecast: Include the deterministic ``run_forecast`` trigger
+            tool. Registered only in non-interactive environments when
+            ``agent.forecast.enabled`` is true in ``seeknal_agent.yml``.
+        include_anomaly: Include the ``detect_anomaly`` tool. Registered
+            only in non-interactive environments when ``agent.anomaly.enabled``
+            is true in ``seeknal_agent.yml``.
+        include_upload_to_s3: Include the generic CSV export tool ``upload_to_s3``.
+            Registered only in non-interactive environments when
+            ``agent.upload_to_s3.enabled`` is true in ``seeknal_agent.yml``.
     """
     if mode == "analysis":
         # Keep the connected-source/read-only surface deliberately thin:
@@ -195,6 +229,15 @@ def create_ask_toolset(
 
     if include_request_clarification:
         tools.append(request_clarification)
+
+    if include_forecast:
+        tools.extend(_FORECAST_TOOLS)
+
+    if include_anomaly:
+        tools.extend(_ANOMALY_TOOLS)
+
+    if include_upload_to_s3:
+        tools.extend(_EXPORT_TOOLS)
 
     return FunctionToolset(
         tools=tools,

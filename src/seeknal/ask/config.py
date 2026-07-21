@@ -567,3 +567,63 @@ def get_request_clarification_enabled(config: dict[str, Any]) -> bool:
     agent_section = _get_mapping(config, "agent")
     rc_section = _get_mapping(agent_section, "request_clarification")
     return _coerce_bool(rc_section.get("enabled"), default=True)
+
+
+def get_forecast_enabled(config: dict[str, Any]) -> bool:
+    """Return whether the deterministic ``run_forecast`` tool is enabled.
+
+    Reads ``agent.forecast.enabled`` from ``seeknal_agent.yml``. Defaults to
+    ``False`` — forecasting is opt-in per project (it needs the IBA forecast
+    engine running and a domain CAPTURE context to build the 2-column SQL).
+    Only takes effect in non-interactive environments; the interactive CLI
+    never registers the tool.
+
+    Example::
+
+        agent:
+          forecast:
+            enabled: true
+            max_horizon: 12
+    """
+    agent_section = _get_mapping(config, "agent")
+    forecast_section = _get_mapping(agent_section, "forecast")
+    return _coerce_bool(forecast_section.get("enabled"), default=False)
+
+
+def get_anomaly_enabled(config: dict[str, Any]) -> bool:
+    """Return whether the ``detect_anomaly`` tool is enabled.
+
+    Reads ``agent.anomaly.enabled`` from ``seeknal_agent.yml``. Defaults to
+    ``False`` -- anomaly detection is opt-in per project, same gating
+    pattern as ``forecast`` (it needs the IBA forecast engine running).
+    Only takes effect in non-interactive environments; the interactive CLI
+    never registers the tool.
+
+    Example::
+
+        agent:
+          anomaly:
+            enabled: true
+    """
+    agent_section = _get_mapping(config, "agent")
+    anomaly_section = _get_mapping(agent_section, "anomaly")
+    return _coerce_bool(anomaly_section.get("enabled"), default=False)
+
+
+def get_upload_to_s3_enabled(config: dict[str, Any]) -> bool:
+    """Return whether the generic CSV export tool ``upload_to_s3`` is enabled.
+
+    Reads ``agent.upload_to_s3.enabled`` from ``seeknal_agent.yml``. Defaults
+    to ``False`` — CSV export is opt-in per project (needs iba-storage running
+    with SeaweedFS and the presigned-URL flow configured). Only takes effect
+    in non-interactive environments.
+
+    Example::
+
+        agent:
+          upload_to_s3:
+            enabled: true
+    """
+    agent_section = _get_mapping(config, "agent")
+    export_section = _get_mapping(agent_section, "upload_to_s3")
+    return _coerce_bool(export_section.get("enabled"), default=False)
