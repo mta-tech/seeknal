@@ -162,7 +162,11 @@ def test_create_agent_omits_ask_user_in_gateway_and_uses_analysis_for_connected_
 
         create_agent(project_path=tmp_path, environment="gateway")
 
-        mock_toolset.assert_called_once_with(mode="analysis", include_ask_user=False)
+        mock_toolset.assert_called_once_with(
+            mode="analysis",
+            include_ask_user=False,
+            include_request_clarification=True,
+        )
         assert mock_deps.call_args[1]["ask_user"] is None
 
 
@@ -209,7 +213,11 @@ def test_create_agent_includes_ask_user_in_interactive_analysis_mode(tmp_path: P
 
         create_agent(project_path=tmp_path, environment="interactive")
 
-        mock_toolset.assert_called_once_with(mode="analysis", include_ask_user=True)
+        mock_toolset.assert_called_once_with(
+            mode="analysis",
+            include_ask_user=True,
+            include_request_clarification=False,
+        )
         assert mock_deps.call_args[1]["ask_user"] is not None
         assert mock_create.call_args[1]["include_memory"] is False
         assert mock_create.call_args[1]["include_todo"] is False
