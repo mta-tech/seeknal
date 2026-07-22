@@ -230,7 +230,7 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
             Hook(
                 event=HookEvent.PRE_TOOL_USE,
                 handler=_sql_security_handler,
-                matcher="execute_sql|upload_to_s3",
+                matcher="execute_sql|upload_to_s3|run_forecast|detect_anomaly",
             )
         )
     if cfg.get("sql_self_correction", True):
@@ -238,7 +238,7 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
             Hook(
                 event=HookEvent.POST_TOOL_USE,
                 handler=_sql_self_correction_handler,
-                matcher="execute_sql|upload_to_s3",
+                matcher="execute_sql|upload_to_s3|run_forecast|detect_anomaly",
             )
         )
     return hooks

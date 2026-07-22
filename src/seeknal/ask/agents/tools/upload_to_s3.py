@@ -109,7 +109,6 @@ def upload_to_s3(
         TERMINAL_DEPENDENCY_UNAVAILABLE,
         format_tool_error,
     )
-    from seeknal.ask.agents.tools.execute_sql import _execute_oneshot_with_timeout
 
     ctx = get_tool_context()
 
