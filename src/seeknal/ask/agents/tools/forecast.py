@@ -30,6 +30,13 @@ logger = logging.getLogger(__name__)
 _MIN_ROWS = 10          # tool sendability floor, matches the engine's own eligibility floor
 _MAX_HORIZON = 36       # grain-aware cap (e.g. "3 tahun" on monthly data = 36 steps); engine mirrors this
 _FORECAST_PULL_LIMIT = 500  # well under execute_sql's row/byte budget
+# Fixed ETS trailing window (months) sent to the engine as `window_size`, which
+# makes the engine skip its adaptive 24-vs-36 backtest pick. A single pinned
+# window removes the "adaptive window can flip on tiny data drift" source of
+# cross-run inconsistency — consistency is prioritised over marginal MAPE gains.
+# 36 = three full seasonal cycles (most stable seasonal estimate). The engine
+# uses min(window_size, n), so shorter series safely use all their data.
+_FIXED_WINDOW = 36
 
 # ── SQL shape policy (structural, not error-text-based) ────────────────
 # The forecast tool accepts a flat single-table aggregate only. Detection is
@@ -252,7 +259,8 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     try:
         resp = httpx.post(
             f"{ctx.iba_engine_url}/forecast",
-            json={"data": data, "periods": periods, "freq": freq},
+            json={"data": data, "periods": periods, "freq": freq,
+                  "window_size": _FIXED_WINDOW},
             headers={"X-API-Key": ctx.iba_engine_api_key},
             timeout=120.0,
         )
@@ -292,14 +300,15 @@ def run_forecast(sql: str, periods: int = 3) -> str:
     # ── STEP 4: FORMAT structured markdown ────────────────────────────────
     markdown = _format_forecast_markdown(result, data, lang="id")
 
-    # ── STEP 5: self-upload projection points ───────────────────────────────
-    # Forecast points are computed here, not SQL-queryable, so they can't
-    # ride execute_sql's export path. This tool exports them itself,
-    # deterministically, reading straight from `result` (the engine's JSON
-    # response, see STEP 3) rather than depending on the agent remembering
-    # to call upload_to_s3 -- every successful forecast gets a Download
-    # button, with no dependence on agent behavior.
-    _upload_forecast_points(sql, result)
+    # ── STEP 5: self-upload ONE combined history+projection CSV ──────────────
+    # Forecast points are computed here, not SQL-queryable, so they can't ride
+    # execute_sql's export path. This tool exports them itself, deterministically,
+    # combining the exact history sent to the engine (`data`) with the engine's
+    # projection (`result`) into a SINGLE CSV -- so the one Download button the
+    # user gets matches the answer in full (history + projection), and the agent
+    # never needs a separate upload_to_s3 for history (removes the double-upload
+    # path). No dependence on agent behavior.
+    _upload_combined_forecast_csv(sql, data, result, periods, freq)
 
     return markdown
 
@@ -372,30 +381,53 @@ def _coerce_y(v: Any) -> float | None:
     return max(0.0, n)
 
 
-def _upload_forecast_points(sql: str, result: dict[str, Any]) -> None:
-    """Best-effort export of the forecast projection points to CSV.
+def _upload_combined_forecast_csv(
+    sql: str,
+    history: list[list[Any]],
+    result: dict[str, Any],
+    periods: int,
+    freq: str,
+) -> None:
+    """Best-effort export of ONE combined history+projection CSV.
 
-    Mirrors ``upload_to_s3`` Mode 2 (data=/columns=). Failures are swallowed
-    -- an export hiccup must never break the forecast answer that already
-    computed successfully. Lazy import avoids an import cycle (upload_to_s3
-    pulls in execute_sql internals at call time).
+    Long ("kind" column) format so the user's single Download button carries the
+    full answer: every historical period the engine was fit on (kind=historis)
+    plus every projected period (kind=proyeksi-*). Deterministic — built straight
+    from the exact ``history`` sent to the engine (``[[x, y], ...]``) and the
+    engine's own ``result`` — so it always matches the answer and is byte-identical
+    across runs. The agent no longer uploads history separately (removes the
+    double-upload path).
+
+    Mirrors ``upload_to_s3`` Mode 2 (data=/columns=). Failures are swallowed --
+    an export hiccup must never break the forecast answer that already computed
+    successfully. Lazy import avoids an import cycle (upload_to_s3 pulls in
+    execute_sql internals at call time).
     """
     points = (result.get("forecast") or {}).get("points") or []
-    if not points:
+    if not points and not history:
         return
-    columns = ["period", "point", "lower_80", "upper_80", "lower_95", "upper_95", "p10", "p90"]
-    rows = [
-        [p.get("period"), p.get("point"), p.get("lower_80"), p.get("upper_80"),
-         p.get("lower_95"), p.get("upper_95"), p.get("p10"), p.get("p90")]
-        for p in points
-    ]
+    columns = ["period", "kind", "value",
+               "point", "lower_80", "upper_80", "lower_95", "upper_95"]
+    unit = {"MS": "bulan", "QS": "kuartal", "YS": "tahun"}.get(freq, "periode")
+    proj_kind = f"proyeksi-{periods}{unit}"
+    rows: list[list[Any]] = []
+    # History rows: value filled, projection columns blank.
+    for x, y in history:
+        rows.append([x, "historis", int(round(y)), "", "", "", "", ""])
+    # Projection rows: value blank, projection columns filled from the engine.
+    for p in points:
+        rows.append([
+            p.get("period"), proj_kind, "",
+            p.get("point"), p.get("lower_80"), p.get("upper_80"),
+            p.get("lower_95"), p.get("upper_95"),
+        ])
     filename = _derive_forecast_filename(sql)
     try:
         from seeknal.ask.agents.tools.upload_to_s3 import upload_to_s3
 
         upload_to_s3(filename, data=rows, columns=columns)
     except Exception:
-        logger.exception("[run_forecast] projection-points auto-upload failed; answer unaffected")
+        logger.exception("[run_forecast] combined-CSV auto-upload failed; answer unaffected")
 
 
 def _derive_forecast_filename(sql: str) -> str:
@@ -416,7 +448,7 @@ def _derive_forecast_filename(sql: str) -> str:
     except Exception:
         table = "forecast"
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    return f"forecast-{table}-{ts}.csv"
+    return f"forecast-combined-{table}-{ts}.csv"
 
 
 def _format_error(message: str) -> str:
