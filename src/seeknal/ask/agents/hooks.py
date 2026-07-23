@@ -151,6 +151,48 @@ def _enrich_syntax_hint(message: str, existing_hint: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# CSV export — no hook here by design
+# ---------------------------------------------------------------------------
+#
+# There used to be a POST_TOOL_USE hook that auto-uploaded the result of
+# every `execute_sql` call with at least one row. It has been removed
+# entirely, not just disabled. The problem: it fired after EVERY query, not
+# just the one behind the final answer. A single question typically runs
+# several queries before landing on the right one (checking a date range,
+# profiling a min/max, trying a filter that turns out wrong) — each of those
+# got its own upload. Confirmed live: a "monthly trend" question produced
+# two separate Download buttons, one for the real trend and one for a
+# throwaway `SELECT MAX(...)` profiling query the agent ran along the way.
+# The hook had no way to know which query the answer was actually about —
+# it just fired on all of them.
+#
+# CSV export is still fully automatic — it just moved from "a hook watching
+# tool calls" to "a step in the agent's own answering workflow"
+# (`bpom-analyst/SKILL.md`): once the agent has verified its answer and is
+# about to write it, it calls `upload_to_s3(filename, sql=...)` itself,
+# exactly once, with the SQL it knows its own answer is about. That's a
+# judgment only the agent can make correctly — a hook watching tool calls
+# from outside can't tell "exploratory query" from "the query behind the
+# answer" without understanding the conversation. Contrast with
+# `run_forecast` (`forecast.py`), which always produces exactly one
+# canonical dataset (the projection points) and can safely upload it
+# deterministically in code, no agent decision needed — there's no
+# equivalent single "the data" for a general data question. `upload_to_s3`
+# itself is unchanged — same repair/row-cap/governance parity as
+# `execute_sql`, same structured error shape on failure so the
+# self-correction hook below still enriches its errors.
+#
+# Known tradeoff: this makes CSV export dependent on the agent following its
+# own workflow instruction rather than a hook that fires unconditionally.
+# An end-of-turn safety net (catch the case where the agent forgot) was
+# considered, but the mechanism it would need — a hook that runs once after
+# the whole turn finishes — isn't actually wired into the agent's execution
+# loop in this codebase (verified directly in the installed hook framework:
+# the method exists but nothing ever calls it), so it was not implemented
+# rather than shipping something that silently does nothing.
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -159,8 +201,24 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
     """Return all hooks for the seeknal ask agent.
 
     Includes:
-    - PRE_TOOL_USE: SQL security validation
-    - POST_TOOL_USE: SQL self-correction hints
+    - PRE_TOOL_USE: SQL security validation — execute_sql AND upload_to_s3
+      (audit fix, 2026-07-09: upload_to_s3's Mode 1 executes agent-supplied
+      SQL through the same DuckDB seam as execute_sql, but was never covered
+      by this hook -- its `sql=` argument bypassed read-only/dangerous-
+      function validation entirely. `_sql_security_handler` already reads
+      `tool_input.get("sql")`, matching upload_to_s3's parameter name as-is;
+      only the matcher needed extending).
+    - POST_TOOL_USE: SQL self-correction hints — execute_sql AND upload_to_s3
+      (audit fix, 2026-07-09: `upload_to_s3` Mode 1 now returns the same
+      `format_tool_error`/`classify_duckdb_error` JSON shape execute_sql
+      does on failure, so this hook's existing generic hint-enrichment
+      applies to both without new logic).
+
+    No CSV-upload hook lives here anymore: `execute_sql` no longer
+    auto-uploads per call (see the module comment above this function for
+    why); `run_forecast` self-uploads its own projection points from inside
+    `forecast.py`; regular data answers are exported by the agent calling
+    `upload_to_s3` explicitly, once, per `bpom-analyst/SKILL.md`.
     """
     cfg = config or {}
     if cfg.get("enabled", True) is False:
@@ -172,7 +230,7 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
             Hook(
                 event=HookEvent.PRE_TOOL_USE,
                 handler=_sql_security_handler,
-                matcher="execute_sql",
+                matcher="execute_sql|upload_to_s3|run_forecast|detect_anomaly",
             )
         )
     if cfg.get("sql_self_correction", True):
@@ -180,7 +238,7 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
             Hook(
                 event=HookEvent.POST_TOOL_USE,
                 handler=_sql_self_correction_handler,
-                matcher="execute_sql",
+                matcher="execute_sql|upload_to_s3|run_forecast|detect_anomaly",
             )
         )
     return hooks

@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextvars
 import hashlib
 import json
+import os
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -87,6 +88,92 @@ class ToolContext:
     # RETRYABLE nudge so the agent can override with allow_sql_pair_drift;
     # only a second attempt without the override escalates to TERMINAL.
     authoritative_drift_attempts_this_turn: int = 0
+    # Model B clarification: set by request_clarification in headless/worker
+    # mode. The gateway streaming layer emits these prompts as an ``ask_user``
+    # event and ends the turn. ``None`` means no clarification is pending.
+    pending_clarification: list[dict[str, Any]] | None = None
+    # FC2d: pending CSV download. Set by upload_to_s3 (and run_forecast's
+    # optional CSV step). The gateway streaming layer emits an
+    # ``upload_complete`` event and CONTINUES the turn — unlike
+    # pending_clarification which ends it. ``None`` means no upload is pending.
+    pending_upload: dict[str, Any] | None = None
+    # IBA engine connection, resolved ONCE at agent init (see
+    # agent.py::create_agent) and injected here -- same pattern as
+    # ``repl``/``project_path``. run_forecast and detect_anomaly read
+    # these off ctx; neither tool touches os.environ itself, so the tool
+    # files stay pure functions triggered by docstring/skill/context,
+    # with connectivity supplied externally.
+    #
+    # iba_engine_url is the BASE URL (e.g. http://iba-engine:8000).
+    # Each tool appends its endpoint: /forecast, /anomaly, etc.
+    iba_engine_url: str | None = None
+    iba_engine_api_key: str = ""
+    # IBA storage presign URL, resolved ONCE at agent init (see
+    # agent.py::create_agent). upload_to_s3 reads this off ctx;
+    # the tool never touches os.environ itself.
+    #
+    # Unlike iba_engine_url (which is a BASE URL with tools appending
+    # /forecast, /anomaly), this is the FULL presign URL because the
+    # proxy path (via iba-service) already includes the endpoint path.
+    iba_storage_presign_url: str | None = None
+    iba_storage_api_key: str = ""
+
+
+def _resolve_engine_base_url() -> str | None:
+    """Resolve the IBA engine base URL from IBA_ENGINE_URL.
+
+    Only IBA_ENGINE_URL is supported -- direct container-to-container on
+    Docker network. The old SEEKNAL_GATEWAY_URL proxy path is removed.
+    Returns None when not configured -- the engine connection is
+    deployment-specific infrastructure, not something a tool should guess
+    a docker-internal hostname for. Called once at session init (agent.py)
+    and stored on ToolContext; tool modules never read os.environ directly.
+
+    The returned URL is the BASE (e.g. "http://iba-engine:8000") without
+    any endpoint suffix. Each tool appends its own: /forecast, /anomaly.
+    """
+    raw = os.environ.get("IBA_ENGINE_URL", "").strip()
+    if not raw:
+        return None
+    base = raw.rstrip("/")
+    # Strip known endpoint suffixes if user accidentally included one
+    for suffix in ("/forecast", "/anomaly"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+    return base
+
+
+ENGINE_NOT_CONFIGURED = (
+    "## Kesalahan\n\nEngine belum dikonfigurasi -- set environment "
+    "variable IBA_ENGINE_URL (URL langsung ke iba-engine container)."
+)
+
+
+def _resolve_storage_presign_url() -> str | None:
+    """Resolve the IBA storage presign URL from IBA_STORAGE_URL.
+
+    Returns the FULL presign URL (not a base URL) because the proxy path
+    (via iba-service) already includes the endpoint path.
+
+    Resolution order:
+    1. IBA_STORAGE_URL → append /api/v1/internal/get-upload-url (direct to iba-storage)
+    2. SEEKNAL_GATEWAY_URL → append /v6/internal/storage/presign (proxy via iba-service)
+    3. Fallback → http://iba-storage:8000/api/v1/internal/get-upload-url
+
+    Called once at session init (agent.py) and stored on ToolContext;
+    upload_to_s3 never reads os.environ directly.
+    """
+    raw = os.environ.get("IBA_STORAGE_URL", "").strip()
+    if raw:
+        return raw.rstrip("/") + "/api/v1/internal/get-upload-url"
+
+    # Fallback: proxy through iba-service
+    gw = os.environ.get("SEEKNAL_GATEWAY_URL", "").strip()
+    if gw:
+        return gw.rstrip("/").removesuffix("/v6") + "/v6/internal/storage/presign"
+
+    # Last resort: Docker-internal iba-storage
+    return "http://iba-storage:8000/api/v1/internal/get-upload-url"
 
 
 def _make_registry():
@@ -407,6 +494,8 @@ def reset_turn_governor(question: str | None = None) -> None:
     setattr(ctx.repl, "_seeknal_authoritative_sql_pair_result_this_turn", None)
     ctx.authoritative_drift_attempts_this_turn = 0
     ctx.timing_events_this_turn.clear()
+    ctx.pending_clarification = None
+    ctx.pending_upload = None
 
 
 def get_discovery_cache_value(key: str) -> Any | None:

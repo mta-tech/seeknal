@@ -162,7 +162,9 @@ def test_create_agent_omits_ask_user_in_gateway_and_uses_analysis_for_connected_
 
         create_agent(project_path=tmp_path, environment="gateway")
 
-        mock_toolset.assert_called_once_with(mode="analysis", include_ask_user=False)
+        assert mock_toolset.call_count == 1
+        assert mock_toolset.call_args.kwargs["mode"] == "analysis"
+        assert mock_toolset.call_args.kwargs["include_ask_user"] is False
         assert mock_deps.call_args[1]["ask_user"] is None
 
 
@@ -209,7 +211,9 @@ def test_create_agent_includes_ask_user_in_interactive_analysis_mode(tmp_path: P
 
         create_agent(project_path=tmp_path, environment="interactive")
 
-        mock_toolset.assert_called_once_with(mode="analysis", include_ask_user=True)
+        assert mock_toolset.call_count == 1
+        assert mock_toolset.call_args.kwargs["mode"] == "analysis"
+        assert mock_toolset.call_args.kwargs["include_ask_user"] is True
         assert mock_deps.call_args[1]["ask_user"] is not None
         assert mock_create.call_args[1]["include_memory"] is False
         assert mock_create.call_args[1]["include_todo"] is False
@@ -302,6 +306,8 @@ def test_create_agent_applies_agent_harness_config(tmp_path: Path):
         assert kwargs["include_builtin_subagents"] is False
         assert kwargs["cost_tracking"] is True
         assert kwargs["cost_budget_usd"] == 2.5
+        # sql_self_correction disabled above; the csv_upload_reminder hook
+        # was retired entirely — only sql_security remains.
         assert len(kwargs["hooks"]) == 1
         assert kwargs["hooks"][0].event.value == "pre_tool_use"
         # The trailing-ModelRequest guard is always appended LAST, after the

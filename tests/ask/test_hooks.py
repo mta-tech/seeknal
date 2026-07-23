@@ -293,19 +293,31 @@ class TestSqlSelfCorrectionHook:
 
 class TestGetAskHooks:
     def test_returns_two_hooks(self):
+        # PRE sql_security + POST sql_self_correction. The csv_upload_reminder
+        # hook was retired — CSV export is now a deliberate one-time agent
+        # decision made as part of the answering workflow, not a
+        # POST_TOOL_USE hook that fired on every execute_sql call.
         hooks = get_ask_hooks()
         assert len(hooks) == 2
 
     def test_first_hook_is_pre_tool_use(self):
         hooks = get_ask_hooks()
         assert hooks[0].event == HookEvent.PRE_TOOL_USE
-        assert hooks[0].matcher == "execute_sql"
+        # Covers execute_sql, upload_to_s3, run_forecast, detect_anomaly
+        # (audit fix 2026-07-09; extended for forecast/anomaly 2026-07-22).
+        assert hooks[0].matcher == "execute_sql|upload_to_s3|run_forecast|detect_anomaly"
 
     def test_second_hook_is_post_tool_use(self):
         hooks = get_ask_hooks()
         assert hooks[1].event == HookEvent.POST_TOOL_USE
-        assert hooks[1].matcher == "execute_sql"
+        assert hooks[1].matcher == "execute_sql|upload_to_s3|run_forecast|detect_anomaly"
 
     def test_backward_compat_alias(self):
         """get_security_hooks is an alias for get_ask_hooks."""
         assert get_security_hooks is get_ask_hooks
+
+    def test_csv_upload_reminder_key_no_longer_registers_anything(self):
+        """The retired config key is accepted (no KeyError) but has no effect."""
+        hooks = get_ask_hooks({"csv_upload_reminder": True})
+        assert len(hooks) == 2
+        assert all("csv_upload_reminder" not in (h.handler.__name__ or "") for h in hooks)

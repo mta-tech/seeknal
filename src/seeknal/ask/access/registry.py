@@ -44,6 +44,9 @@ _VIEWER_TOOLS = {
     "extract_from_image",
     "extract_finance_document",
     "ask_user",
+    "run_forecast",
+    "detect_anomaly",
+    "upload_to_s3",
 }
 
 # Analysts can additionally save personal preferences, draft pipelines, and
