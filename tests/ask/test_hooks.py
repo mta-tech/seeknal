@@ -305,12 +305,12 @@ class TestGetAskHooks:
         assert hooks[0].event == HookEvent.PRE_TOOL_USE
         # Covers execute_sql, upload_to_s3, run_forecast, detect_anomaly
         # (audit fix 2026-07-09; extended for forecast/anomaly 2026-07-22).
-        assert hooks[0].matcher == "execute_sql|upload_to_s3|run_forecast|detect_anomaly"
+        assert hooks[0].matcher == "execute_sql|upload_to_s3|run_forecast|detect_anomaly|visualize_chart"
 
     def test_second_hook_is_post_tool_use(self):
         hooks = get_ask_hooks()
         assert hooks[1].event == HookEvent.POST_TOOL_USE
-        assert hooks[1].matcher == "execute_sql|upload_to_s3|run_forecast|detect_anomaly"
+        assert hooks[1].matcher == "execute_sql|upload_to_s3|run_forecast|detect_anomaly|visualize_chart"
 
     def test_backward_compat_alias(self):
         """get_security_hooks is an alias for get_ask_hooks."""
