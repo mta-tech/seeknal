@@ -78,6 +78,7 @@ def execute_sql(
         bump_authoritative_drift_attempt,
         get_authoritative_sql_pair_result,
         get_tool_context,
+        get_structured_sql_cache,
         get_successful_sql_cache,
         record_tool_result,
         repeated_failure_message,
@@ -304,6 +305,14 @@ def execute_sql(
     if drift_notice:
         result += "\n\n" + drift_notice
     success_cache[cache_key] = result
+    # M9: chart tools need machine-readable rows, not the rendered table above.
+    # Cache the governed (masked) rows under the SAME key so a later
+    # visualize_chart(sql) call charts exactly the dataset this answer used,
+    # without re-executing the query.
+    get_structured_sql_cache(ctx)[cache_key] = {
+        "columns": list(columns),
+        "rows": [list(row) for row in trimmed_rows],
+    }
     record_tool_result("execute_sql", result, args={"sql": sql})
     return result
 

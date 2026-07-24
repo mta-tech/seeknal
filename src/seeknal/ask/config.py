@@ -627,3 +627,44 @@ def get_upload_to_s3_enabled(config: dict[str, Any]) -> bool:
     agent_section = _get_mapping(config, "agent")
     export_section = _get_mapping(agent_section, "upload_to_s3")
     return _coerce_bool(export_section.get("enabled"), default=False)
+
+
+def get_visualize_chart_enabled(config: dict[str, Any]) -> bool:
+    """Return whether the chat chart tool ``visualize_chart`` is enabled.
+
+    Reads ``agent.visualize_chart.enabled`` from ``seeknal_agent.yml``. Defaults
+    to ``False`` -- charting is opt-in per project, and must stay off until the
+    consuming service understands the ``visualization`` event, otherwise the
+    chart is silently dropped in transit. Only takes effect in non-interactive
+    environments.
+
+    Example::
+
+        agent:
+          visualize_chart:
+            enabled: true
+    """
+    agent_section = _get_mapping(config, "agent")
+    chart_section = _get_mapping(agent_section, "visualize_chart")
+    return _coerce_bool(chart_section.get("enabled"), default=False)
+
+
+def get_visualize_chart_auto_emit(config: dict[str, Any]) -> bool:
+    """Return whether charts may be emitted without an explicit user request.
+
+    Reads ``agent.visualize_chart.auto_emit`` from ``seeknal_agent.yml``.
+    Defaults to ``False``: with charting enabled the agent still charts only
+    when asked, unless a project opts into the bounded automatic mode. The flag
+    is consumed by skill/context policy, not by the tool -- deciding a chart is
+    useful is a reading of the question, which belongs in the skill.
+
+    Example::
+
+        agent:
+          visualize_chart:
+            enabled: true
+            auto_emit: true
+    """
+    agent_section = _get_mapping(config, "agent")
+    chart_section = _get_mapping(agent_section, "visualize_chart")
+    return _coerce_bool(chart_section.get("auto_emit"), default=False)

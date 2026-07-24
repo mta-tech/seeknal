@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import os
 import re
 import time
@@ -39,6 +40,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 # No storage URL/API key here: connectivity is resolved once at session init
 # (agent.py) and injected via ToolContext.iba_storage_presign_url/iba_storage_api_key
@@ -104,7 +107,11 @@ def upload_to_s3(
         On storage-unreachable / PUT-failure: an error string describing the
         failure (the agent should surface it, not retry silently).
     """
-    from seeknal.ask.agents.tools._context import get_tool_context, record_tool_result
+    from seeknal.ask.agents.tools._context import (
+        get_tool_context,
+        record_tool_result,
+        register_exported_dataset,
+    )
     from seeknal.ask.agents.tools.errors import (
         TERMINAL_DEPENDENCY_UNAVAILABLE,
         format_tool_error,
@@ -235,6 +242,18 @@ def upload_to_s3(
         "expires_at": expires_at,
         "object_name": urls.get("object_name", ""),
     }
+
+    # M9: publish the exported rows so visualize_chart can draw this exact
+    # dataset. Matters most for Mode 2, whose rows a tool computed in-process
+    # and no query can reproduce -- charting those from SQL would silently drop
+    # the computed part. Best-effort: a registry failure must never fail an
+    # upload that already succeeded.
+    try:
+        register_exported_dataset(filename, list(cols), rows, ctx=ctx)
+    except Exception:
+        logger.exception(
+            "[upload_to_s3] dataset registration failed; upload unaffected"
+        )
 
     record_tool_result(
         "upload_to_s3", urls.get("download_url", ""),

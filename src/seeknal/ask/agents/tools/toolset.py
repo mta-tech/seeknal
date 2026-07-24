@@ -63,6 +63,7 @@ from seeknal.ask.agents.tools.search_project_files import search_project_files
 from seeknal.ask.agents.tools.show_lineage import show_lineage
 from seeknal.ask.agents.tools.submit_plan import submit_plan
 from seeknal.ask.agents.tools.upload_to_s3 import upload_to_s3
+from seeknal.ask.agents.tools.visualize_chart import visualize_chart
 from seeknal.ask.agents.tools.write_ingested_table import write_ingested_table
 from seeknal.ask.agents.tools.write_project_file import write_project_file
 
@@ -167,6 +168,13 @@ _EXPORT_TOOLS = [
     upload_to_s3,
 ]
 
+# Chat chart tool. The single owner of chart building -- no other tool attaches
+# a chart of its own. Gated by ``include_visualize_chart``, registered only in
+# non-interactive environments when ``agent.visualize_chart.enabled`` is true.
+_VISUALIZATION_TOOLS = [
+    visualize_chart,
+]
+
 
 def create_ask_toolset(
     *,
@@ -176,6 +184,7 @@ def create_ask_toolset(
     include_forecast: bool = False,
     include_anomaly: bool = False,
     include_upload_to_s3: bool = False,
+    include_visualize_chart: bool = False,
 ) -> FunctionToolset:
     """Create the seeknal-ask toolset.
 
@@ -198,6 +207,9 @@ def create_ask_toolset(
         include_upload_to_s3: Include the generic CSV export tool ``upload_to_s3``.
             Registered only in non-interactive environments when
             ``agent.upload_to_s3.enabled`` is true in ``seeknal_agent.yml``.
+        include_visualize_chart: Include the chat chart tool ``visualize_chart``.
+            Registered only in non-interactive environments when
+            ``agent.visualize_chart.enabled`` is true in ``seeknal_agent.yml``.
     """
     if mode == "analysis":
         # Keep the connected-source/read-only surface deliberately thin:
@@ -238,6 +250,9 @@ def create_ask_toolset(
 
     if include_upload_to_s3:
         tools.extend(_EXPORT_TOOLS)
+
+    if include_visualize_chart:
+        tools.extend(_VISUALIZATION_TOOLS)
 
     return FunctionToolset(
         tools=tools,

@@ -47,6 +47,7 @@ _VIEWER_TOOLS = {
     "run_forecast",
     "detect_anomaly",
     "upload_to_s3",
+    "visualize_chart",
 }
 
 # Analysts can additionally save personal preferences, draft pipelines, and
