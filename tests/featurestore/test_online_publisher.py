@@ -19,6 +19,7 @@ from seeknal.featurestore.online_publisher import (
     StagingValidationError,
     UpstreamIncompleteError,
     advisory_key,
+    is_serialization_failure,
 )
 
 NOW = datetime(2026, 7, 27, tzinfo=timezone.utc)
@@ -216,6 +217,100 @@ class TestPublishResult:
     def test_serialises_for_logging(self):
         payload = PublishResult("r", "t", activated=True, staged_rows=5).to_dict()
         assert payload["succeeded"] is True and payload["staged_rows"] == 5
+
+
+class TestSerializationRetry:
+    """The advisory lock serializes one target, but forced REPEATABLE READ means
+    a conflicting write elsewhere can still abort with SQLSTATE 40001."""
+
+    def test_recognises_sqlstate_40001(self):
+        assert is_serialization_failure(Exception("ERROR 40001: oops"))
+
+    def test_recognises_the_message_form(self):
+        assert is_serialization_failure(
+            Exception("could not serialize access due to concurrent update")
+        )
+
+    def test_does_not_treat_unrelated_errors_as_retryable(self):
+        assert not is_serialization_failure(Exception("relation does not exist"))
+
+    def test_retries_then_succeeds(self, monkeypatch):
+        pub = publisher()
+        calls = []
+
+        def flaky(con, view, *, attempt=0, **kw):
+            calls.append(attempt)
+            if attempt < 2:
+                raise RuntimeError("could not serialize access due to concurrent update")
+            return PublishResult("r", "t", activated=True)
+
+        monkeypatch.setattr(pub, "publish", flaky)
+        result = pub.publish_with_retry(
+            FakeCon(), "v", max_retries=3, backoff_seconds=0
+        )
+        assert result.succeeded
+        assert calls == [0, 1, 2]
+
+    def test_each_attempt_uses_a_distinct_staging_name(self):
+        """Reusing a staging name after the prior attempt dropped it is the R16
+        stale-catalog hazard, which silently yields a zero-row CTAS."""
+        pub = publisher()
+        names = {
+            pub.d.staging_fqn("run-1" if a == 0 else f"run-1a{a}") for a in range(3)
+        }
+        assert len(names) == 3
+
+    def test_validation_errors_are_not_retried(self, monkeypatch):
+        pub = publisher()
+        calls = []
+
+        def always_invalid(con, view, *, attempt=0, **kw):
+            calls.append(attempt)
+            raise StagingValidationError("duplicate keys")
+
+        monkeypatch.setattr(pub, "publish", always_invalid)
+        with pytest.raises(StagingValidationError):
+            pub.publish_with_retry(FakeCon(), "v", max_retries=3, backoff_seconds=0)
+        assert calls == [0], "a deterministic failure must not be retried"
+
+    def test_upstream_gate_failures_are_not_retried(self, monkeypatch):
+        pub = publisher()
+        calls = []
+
+        def blocked(con, view, *, attempt=0, **kw):
+            calls.append(attempt)
+            raise UpstreamIncompleteError("incomplete")
+
+        monkeypatch.setattr(pub, "publish", blocked)
+        with pytest.raises(UpstreamIncompleteError):
+            pub.publish_with_retry(FakeCon(), "v", max_retries=3, backoff_seconds=0)
+        assert calls == [0]
+
+    def test_non_retryable_errors_propagate_immediately(self, monkeypatch):
+        pub = publisher()
+        calls = []
+
+        def boom(con, view, *, attempt=0, **kw):
+            calls.append(attempt)
+            raise RuntimeError("relation does not exist")
+
+        monkeypatch.setattr(pub, "publish", boom)
+        with pytest.raises(RuntimeError, match="relation does not exist"):
+            pub.publish_with_retry(FakeCon(), "v", max_retries=3, backoff_seconds=0)
+        assert calls == [0]
+
+    def test_gives_up_after_max_retries(self, monkeypatch):
+        pub = publisher()
+        calls = []
+
+        def always_conflict(con, view, *, attempt=0, **kw):
+            calls.append(attempt)
+            raise RuntimeError("could not serialize access due to concurrent update")
+
+        monkeypatch.setattr(pub, "publish", always_conflict)
+        with pytest.raises(OnlinePublishError, match="after 3 attempts"):
+            pub.publish_with_retry(FakeCon(), "v", max_retries=2, backoff_seconds=0)
+        assert calls == [0, 1, 2]
 
 
 class TestSqlSafety:

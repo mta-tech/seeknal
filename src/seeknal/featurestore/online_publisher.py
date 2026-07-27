@@ -37,7 +37,7 @@ import logging
 import time
 import zlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from seeknal.featurestore.online_contract import (
@@ -115,6 +115,23 @@ class PublishResult:
 def _q(literal: str) -> str:
     """Escape a string for embedding in a single-quoted SQL literal."""
     return literal.replace("'", "''")
+
+
+#: PostgreSQL SQLSTATE for a serialization failure. The DuckDB bridge forces
+#: REPEATABLE READ (the server default is READ COMMITTED), so a conflicting
+#: concurrent write aborts rather than blocking. The advisory lock prevents
+#: contention on one target, but this remains possible as defence-in-depth.
+SERIALIZATION_FAILURE = "40001"
+
+
+def is_serialization_failure(exc: BaseException) -> bool:
+    """True if *exc* looks like a PostgreSQL serialization failure.
+
+    Matched on message text because the error surfaces through DuckDB's bridge
+    rather than as a typed psycopg exception.
+    """
+    text = str(exc).lower()
+    return SERIALIZATION_FAILURE in text or "could not serialize access" in text
 
 
 def advisory_key(table_fqn: str) -> int:
@@ -255,9 +272,18 @@ class OnlinePublisher:
 
     # -- staging + validation ---------------------------------------------
 
-    def stage(self, con: Any, view_name: str, publish_run_id: str) -> tuple[str, int]:
-        """Bulk-load *view_name* into a uniquely-named remote staging table."""
-        staging = self.d.staging_fqn(publish_run_id)
+    def stage(
+        self, con: Any, view_name: str, publish_run_id: str, attempt: int = 0
+    ) -> tuple[str, int]:
+        """Bulk-load *view_name* into a uniquely-named remote staging table.
+
+        *attempt* is folded into the name so a retry never reuses a staging
+        name from a previous attempt. Reuse would be the R16 hazard: the earlier
+        attempt's cleanup drops the table, and recreating the same name on the
+        same attachment can silently produce a zero-row CTAS.
+        """
+        discriminator = publish_run_id if attempt == 0 else f"{publish_run_id}a{attempt}"
+        staging = self.d.staging_fqn(discriminator)
         con.execute(f"CREATE TABLE {self.alias}.{staging} AS SELECT * FROM {view_name}")
         staged = self._scalar(con, f"SELECT count(*) FROM {staging}") or 0
         return staging, int(staged)
@@ -308,8 +334,13 @@ class OnlinePublisher:
         upstream_node_ids: list[str] | None = None,
         idempotency_key: str | None = None,
         cleanup_staging: bool = True,
+        attempt: int = 0,
     ) -> PublishResult:
-        """Stage, validate, then atomically activate and record the publication."""
+        """Stage, validate, then atomically activate and record the publication.
+
+        A single attempt. Use :meth:`publish_with_retry` to absorb serialization
+        failures.
+        """
         started = time.perf_counter()
         result = PublishResult(
             publish_run_id=publish_run_id, table=self.d.physical_fqn
@@ -328,7 +359,7 @@ class OnlinePublisher:
                 self._scalar(con, f"SELECT count(*) FROM {self.d.physical_fqn}") or 0
             )
 
-            staging, staged = self.stage(con, view_name, publish_run_id)
+            staging, staged = self.stage(con, view_name, publish_run_id, attempt)
             result.staged_rows = staged
             result.distinct_keys = self.validate_staging(con, staging, staged)
 
@@ -427,6 +458,55 @@ class OnlinePublisher:
 
         return result
 
+    def publish_with_retry(
+        self,
+        con: Any,
+        view_name: str,
+        *,
+        max_retries: int = 3,
+        backoff_seconds: float = 0.5,
+        **kwargs: Any,
+    ) -> PublishResult:
+        """Publish, retrying only on serialization failure.
+
+        The advisory lock serializes publications to one target, but the bridge
+        forces REPEATABLE READ, so a conflicting concurrent write elsewhere can
+        still abort the transaction with SQLSTATE 40001. That is transient and
+        safe to retry -- the failed attempt committed nothing.
+
+        Only serialization failures are retried. Validation errors, an
+        incomplete upstream, and remote-verification failures are deterministic:
+        retrying them would just fail again more slowly, and retrying a
+        verification failure could mask real data loss.
+
+        Each attempt stages under a fresh name (see :meth:`stage`).
+        """
+        last: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                return self.publish(con, view_name, attempt=attempt, **kwargs)
+            except (StagingValidationError, UpstreamIncompleteError):
+                raise  # deterministic - retrying cannot help
+            except Exception as exc:
+                if not is_serialization_failure(exc):
+                    raise
+                last = exc
+                if attempt < max_retries:
+                    delay = backoff_seconds * (2**attempt)
+                    logger.warning(
+                        "publication hit a serialization failure (attempt %d/%d), "
+                        "retrying in %.1fs: %s",
+                        attempt + 1,
+                        max_retries + 1,
+                        delay,
+                        exc,
+                    )
+                    time.sleep(delay)
+        raise OnlinePublishError(
+            f"publication failed after {max_retries + 1} attempts due to repeated "
+            f"serialization failures; last error: {last}"
+        )
+
     # -- retirement --------------------------------------------------------
 
     def retire(self, con: Any, key_values: dict[str, Any]) -> int:
@@ -460,10 +540,12 @@ class OnlinePublisher:
 __all__ = [
     "EXECUTIONS_TABLE",
     "PUBLICATIONS_TABLE",
+    "SERIALIZATION_FAILURE",
     "OnlinePublishError",
     "OnlinePublisher",
     "PublishResult",
     "StagingValidationError",
     "UpstreamIncompleteError",
     "advisory_key",
+    "is_serialization_failure",
 ]
