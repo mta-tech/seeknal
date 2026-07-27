@@ -58,6 +58,28 @@ from ...workflow.materialization.yaml_integration import materialize_node_if_ena
 logger = logging.getLogger(__name__)
 
 
+def _as_datetime(value: Any, default: datetime) -> datetime:
+    """Coerce a param value to a datetime, falling back to *default*.
+
+    Interval bounds arrive from YAML params and may already be a datetime, an
+    ISO string, or absent. An unparseable value falls back rather than raising,
+    because a malformed interval should not abort a run whose features are
+    already computed. The fallback is deliberately a zero-width window anchored
+    to now, which records that no interval was declared instead of inventing a
+    plausible-looking one.
+    """
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            logger.warning(
+                "could not parse interval bound %r; falling back to now", value
+            )
+    return default
+
+
 @register_executor(NodeType.FEATURE_GROUP)
 class FeatureGroupExecutor(BaseExecutor):
     """
@@ -698,4 +720,112 @@ class FeatureGroupExecutor(BaseExecutor):
                     "error": str(e),
                 }
 
+        # Online serving publication.
+        #
+        # Deliberately NOT best-effort, unlike the Iceberg block above. ADR-006
+        # makes best-effort dispatch the policy for independent targets, and it
+        # is preserved for them -- but the same ADR states that consistency
+        # across targets must be managed at the pipeline level where required.
+        # This is that place: publishing a derived feature whose upstream window
+        # is incomplete produces a confidently wrong served value, not a missing
+        # one, so a failure here must fail the run rather than be logged.
+        if result.status == ExecutionStatus.SUCCESS and not result.is_dry_run:
+            self._publish_online(result)
+
         return result
+
+    def _publish_online(self, result: ExecutorResult) -> None:
+        """Publish this node's output to the PostgreSQL online store.
+
+        No-op unless a materialization target declared ``serve_online: true``;
+        publication is opt-in, so silence never publishes.
+
+        Sets ``result.status = FAILED`` on failure. That is the intended
+        difference from Iceberg materialization: an unserved feature is an
+        absence, whereas a wrongly-served one is a correctness defect.
+        """
+        from seeknal.featurestore.online_contract import OnlineTableDescriptor
+        from seeknal.featurestore.online_publisher import OnlinePublisher
+        from seeknal.featurestore.online_serving import parse_online_targets
+
+        config = self.node.config or {}
+        try:
+            targets = parse_online_targets(config.get("materializations"))
+        except Exception as exc:
+            result.status = ExecutionStatus.FAILED
+            result.error_message = f"invalid online serving config: {exc}"
+            logger.error("Node '%s': %s", self.node.id, result.error_message)
+            return
+
+        if not targets:
+            return
+
+        from seeknal.connections.postgresql import parse_postgresql_config
+        from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+        con = self.context.get_duckdb_connection()
+        view_name = result.metadata.get("view_name") or self.node.name
+        published: list[dict[str, Any]] = []
+
+        # The data interval this run covers. ExecutionContext carries no
+        # interval of its own, so it comes from resolved params when the
+        # workflow supplies one. Falling back to "now" for both bounds makes
+        # the window zero-width, which is honest -- it records that the run
+        # declared no interval rather than inventing a plausible one.
+        now = datetime.utcnow()
+        interval_start = _as_datetime(self.context.params.get("interval_start"), now)
+        interval_end = _as_datetime(self.context.params.get("interval_end"), now)
+
+        for target in targets:
+            try:
+                conn_dict = ProfileLoader().load_connection_profile(target.connection)
+                pg_config = parse_postgresql_config(conn_dict)
+
+                descriptor = OnlineTableDescriptor.from_relation(
+                    con,
+                    view_name,
+                    project=config.get("project", "default"),
+                    feature_group=self.node.name,
+                    entity_keys=target.unique_keys,
+                    schema=target.schema,
+                )
+                publisher = OnlinePublisher(descriptor, pg_config.to_libpq_string())
+                publisher.attach(con)
+                try:
+                    publish_result = publisher.publish_with_retry(
+                        con,
+                        view_name,
+                        publish_run_id=f"{self.node.id}-{int(time.time() * 1000)}",
+                        source_interval_start=interval_start,
+                        source_interval_end=interval_end,
+                        definition_sha=str(config.get("definition_sha", "")),
+                    )
+                finally:
+                    publisher.detach(con)
+
+                published.append(publish_result.to_dict())
+                logger.info(
+                    "Node '%s' published %d rows to online store %s",
+                    self.node.id,
+                    publish_result.staged_rows,
+                    target.table,
+                )
+            except Exception as exc:
+                result.status = ExecutionStatus.FAILED
+                result.error_message = (
+                    f"online publication to {target.table} failed: {exc}"
+                )
+                result.metadata["online_publication"] = {
+                    "enabled": True,
+                    "success": False,
+                    "table": target.table,
+                    "error": str(exc),
+                }
+                logger.error("Node '%s': %s", self.node.id, result.error_message)
+                return
+
+        result.metadata["online_publication"] = {
+            "enabled": True,
+            "success": True,
+            "publications": published,
+        }

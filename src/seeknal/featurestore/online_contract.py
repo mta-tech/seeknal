@@ -468,6 +468,57 @@ class OnlineTableDescriptor:
         }
 
     @classmethod
+    def from_relation(
+        cls,
+        con: Any,
+        relation: str,
+        *,
+        project: str,
+        feature_group: str,
+        entity_keys: Iterable[str],
+        version: int = 1,
+        schema: str = "feature_online",
+    ) -> "OnlineTableDescriptor":
+        """Build a descriptor by introspecting a DuckDB relation's real types.
+
+        Types come from the relation itself rather than from ``Entity.join_keys``,
+        which carries names only and cannot produce typed DDL. Metadata columns
+        already present in the relation are skipped, since they are contributed
+        by :data:`METADATA_COLUMNS` rather than being features.
+
+        Raises:
+            OnlineContractError: If a declared entity key is missing from the
+                relation, or a column has no declared PostgreSQL mapping.
+        """
+        rows = con.execute(f"DESCRIBE {relation}").fetchall()
+        types: dict[str, str] = {r[0]: r[1] for r in rows}
+
+        keys = list(entity_keys)
+        missing = [k for k in keys if k not in types]
+        if missing:
+            raise OnlineContractError(
+                f"entity key(s) {missing} are not present in {relation}; "
+                f"available columns: {sorted(types)}"
+            )
+
+        key_specs = tuple(
+            ColumnSpec(name=k, logical_type=types[k], nullable=False) for k in keys
+        )
+        feature_specs = tuple(
+            ColumnSpec(name=name, logical_type=logical, nullable=True)
+            for name, logical in types.items()
+            if name not in keys and name not in RESERVED_COLUMN_NAMES
+        )
+        return cls(
+            project=project,
+            feature_group=feature_group,
+            version=version,
+            entity_keys=key_specs,
+            features=feature_specs,
+            schema=schema,
+        )
+
+    @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "OnlineTableDescriptor":
         def cols(items: Iterable[Mapping[str, Any]]) -> tuple[ColumnSpec, ...]:
             return tuple(
