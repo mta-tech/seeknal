@@ -96,6 +96,34 @@ class TestParsing:
         assert len(targets) == 1
 
 
+class TestServingTtl:
+    """serving_ttl_days was documented on FeatureGroup for a long time with a
+    stated default of 1 day, but no implementation existed anywhere."""
+
+    def test_defaults_to_no_expiry(self):
+        """Adopting the documented default of 1 would silently retire nearly
+        every row in an existing online store on first run after upgrade."""
+        (t,) = parse_online_targets([pg_target()])
+        assert t.serving_ttl_days is None
+
+    def test_explicit_value_is_parsed(self):
+        (t,) = parse_online_targets([pg_target(serving_ttl_days=7)])
+        assert t.serving_ttl_days == 7
+
+    def test_numeric_string_is_accepted(self):
+        (t,) = parse_online_targets([pg_target(serving_ttl_days="30")])
+        assert t.serving_ttl_days == 30
+
+    def test_non_numeric_rejected(self):
+        with pytest.raises(OnlineServingConfigError, match="integer number of days"):
+            parse_online_targets([pg_target(serving_ttl_days="a week")])
+
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_non_positive_rejected_with_guidance(self, bad):
+        with pytest.raises(OnlineServingConfigError, match="omit it for no expiry"):
+            parse_online_targets([pg_target(serving_ttl_days=bad)])
+
+
 class TestTargetValidation:
     def test_invented_upsert_mode_rejected_with_pointer(self):
         """An earlier design used 'upsert', which is not in the real enum."""

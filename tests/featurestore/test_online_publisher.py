@@ -181,6 +181,35 @@ class TestLedgerSchema:
         assert "ON CONFLICT" in con.joined and "DO UPDATE" in con.joined
 
 
+class TestExpiry:
+    def test_rejects_non_positive_ttl(self):
+        with pytest.raises(OnlinePublishError, match="must be positive"):
+            publisher().expire_stale(FakeCon(), 0)
+
+    def test_measures_age_from_interval_end_not_computed_at(self):
+        """A row recomputed minutes ago over a month-old window is stale;
+        measuring from computed_at would call it fresh."""
+        con = FakeCon(scalars=[0, 5])
+        publisher().expire_stale(con, 7)
+        assert "source_interval_end <" in con.joined
+        assert "computed_at <" not in con.joined
+
+    def test_retires_rather_than_deletes(self):
+        con = FakeCon(scalars=[0, 5])
+        publisher().expire_stale(con, 7)
+        assert "SET retired_at" in con.joined
+        assert "DELETE" not in con.joined.upper()
+
+    def test_skips_already_retired_rows(self):
+        con = FakeCon(scalars=[0, 5])
+        publisher().expire_stale(con, 7)
+        assert "retired_at IS NULL" in con.joined
+
+    def test_returns_number_newly_retired(self):
+        con = FakeCon(scalars=[2, 9])  # 2 before, 9 after
+        assert publisher().expire_stale(con, 7) == 7
+
+
 class TestRetirement:
     def test_missing_key_column_rejected(self):
         d = descriptor(

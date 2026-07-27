@@ -93,6 +93,18 @@ class OnlineServingTarget:
     unique_keys: tuple[str, ...]
     mode: str = "upsert_by_key"
     generation_mode: GenerationMode = GenerationMode.STAGED
+    #: Age limit for served features, measured from ``source_interval_end``.
+    #: ``None`` means no expiry.
+    #:
+    #: Expiry **retires** rows rather than deleting them: they leave the live
+    #: projection but remain queryable for audit, which keeps an intentional
+    #: withdrawal distinguishable from a transient absence.
+    #:
+    #: Deliberately defaults to ``None`` rather than the ``1`` that
+    #: ``FeatureGroup``'s docstring long claimed. That value was never
+    #: implemented, so adopting it now would silently retire nearly everything
+    #: in an existing online store on the first run after upgrade.
+    serving_ttl_days: int | None = None
 
     def __post_init__(self) -> None:
         if not self.connection:
@@ -159,6 +171,19 @@ def parse_online_targets(
                 f"{[m.value for m in GenerationMode]}"
             ) from None
 
+        ttl = entry.get("serving_ttl_days")
+        if ttl is not None:
+            try:
+                ttl = int(ttl)
+            except (TypeError, ValueError):
+                raise OnlineServingConfigError(
+                    f"serving_ttl_days must be an integer number of days, got {ttl!r}"
+                ) from None
+            if ttl <= 0:
+                raise OnlineServingConfigError(
+                    f"serving_ttl_days must be positive, got {ttl}; omit it for no expiry"
+                )
+
         targets.append(
             OnlineServingTarget(
                 connection=entry.get("connection", ""),
@@ -166,6 +191,7 @@ def parse_online_targets(
                 unique_keys=tuple(entry.get("unique_keys", ()) or ()),
                 mode=entry.get("mode", "upsert_by_key"),
                 generation_mode=generation_mode,
+                serving_ttl_days=ttl,
             )
         )
     return targets

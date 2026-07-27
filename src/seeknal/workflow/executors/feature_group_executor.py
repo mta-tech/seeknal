@@ -800,6 +800,12 @@ class FeatureGroupExecutor(BaseExecutor):
                         source_interval_end=interval_end,
                         definition_sha=str(config.get("definition_sha", "")),
                     )
+                    if target.serving_ttl_days:
+                        expired = publisher.expire_stale(con, target.serving_ttl_days)
+                        publish_result.warnings.append(
+                            f"retired {expired} row(s) older than "
+                            f"{target.serving_ttl_days} day(s)"
+                        )
                 finally:
                     publisher.detach(con)
 

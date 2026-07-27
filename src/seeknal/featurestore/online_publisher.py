@@ -509,6 +509,57 @@ class OnlinePublisher:
 
     # -- retirement --------------------------------------------------------
 
+    def expire_stale(self, con: Any, ttl_days: int) -> int:
+        """Retire rows whose data is older than *ttl_days*.
+
+        Age is measured from ``source_interval_end`` -- the end of the window the
+        values describe -- not ``computed_at``. A row recomputed minutes ago over
+        a month-old window is stale by any definition a consumer cares about, and
+        measuring from ``computed_at`` would call it fresh.
+
+        Rows are **retired, not deleted**: they leave the live projection but stay
+        queryable for audit. Deleting them would make an intentional expiry
+        indistinguishable from a transient absence during refresh, which is the
+        distinction Principle 2 depends on.
+
+        Returns:
+            The number of rows retired by this call.
+        """
+        if ttl_days <= 0:
+            raise OnlinePublishError(
+                f"ttl_days must be positive, got {ttl_days}"
+            )
+
+        before = int(
+            self._scalar(
+                con,
+                f"SELECT count(*) FROM {self.d.physical_fqn} WHERE retired_at IS NOT NULL",
+            )
+            or 0
+        )
+        self._remote(
+            con,
+            f"UPDATE {self.d.physical_fqn} SET retired_at = now() "
+            f"WHERE retired_at IS NULL "
+            f"AND source_interval_end < now() - INTERVAL '{int(ttl_days)} days'",
+        )
+        after = int(
+            self._scalar(
+                con,
+                f"SELECT count(*) FROM {self.d.physical_fqn} WHERE retired_at IS NOT NULL",
+            )
+            or 0
+        )
+        retired = after - before
+        if retired:
+            logger.info(
+                "retired %d row(s) from %s older than %d day(s)",
+                retired,
+                self.d.physical_fqn,
+                ttl_days,
+            )
+        return retired
+
     def retire(self, con: Any, key_values: dict[str, Any]) -> int:
         """Mark an entity retired. Rows are never physically deleted.
 

@@ -51,10 +51,20 @@ class Materialization(BaseModel):
         date_pattern (str, optional): Date pattern that use in event_time_col. Default to "yyyy-MM-dd".
         offline (bool, optional): Set the feature group should be stored in offline-store. Default to True.
         online (bool, optional): Set the feature group should be stored in online-store. Default to False.
-        serving_ttl_days (int, optional): Look back window for features defined at the online-store.
-            This parameters determines how long features will live in the online store. The unit is in days.
-            Shorter TTLs improve performance and reduce computation. Default to 1.
-            For example, if we set TTLs as 1 then only one day data available in online-store
+        serving_ttl_days (int, optional): Age limit for features in the PostgreSQL
+            online store, in days, measured from the end of the data window
+            (``source_interval_end``) rather than from computation time. Rows past
+            the limit are **retired**, not deleted: they leave the live projection
+            but stay queryable for audit.
+
+            Configured per target on the ``materializations`` entry, alongside
+            ``serve_online``. Defaults to no expiry.
+
+            Note: this attribute previously documented a default of 1 day, but no
+            implementation ever existed anywhere in the codebase. Adopting that
+            default on implementation would have silently retired nearly every row
+            in an existing online store on the first run after upgrade, so expiry
+            is opt-in.
         force_update_online (bool, optional): force to update the data in online-store. This will not consider
             to check whether the data going materialized newer than the data that already stored in online-store.
             Default to False.
