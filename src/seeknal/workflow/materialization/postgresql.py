@@ -257,7 +257,19 @@ class PostgresMaterializationHelper:
             self._detach(con)
 
     def materialize_upsert(self, con: Any, view_name: str) -> WriteResult:
-        """Upsert by key: temp table + DELETE USING matching keys + INSERT from temp.
+        """Upsert by key, as a single transactional ``INSERT ... ON CONFLICT``.
+
+        Replaces an earlier ``DELETE ... USING`` + ``INSERT`` implementation that
+        ran without an explicit transaction. That sequence left a window in
+        which a matched row had been deleted but not yet reinserted, so a
+        concurrent reader saw the entity **missing** rather than stale. For a
+        latest-only online store that is a wrong answer, not a slow one.
+
+        ``ON CONFLICT DO UPDATE`` removes the window entirely: rows are updated
+        in place and are never absent. It requires a unique constraint on the
+        conflict target, so auto-created tables now get a primary key --
+        ``CREATE TABLE AS SELECT`` creates none, which previously left the
+        table without a key or indexes.
 
         Args:
             con: DuckDB connection.
@@ -269,11 +281,22 @@ class PostgresMaterializationHelper:
         start = time.time()
         qualified = self._qualified_table()
         unique_keys = self.mat_config.unique_keys
-        temp_table = "_seeknal_upsert"
+        if not unique_keys:
+            raise PostgresMaterializationError(
+                f"upsert_by_key requires unique_keys for {self.mat_config.table}"
+            )
 
         self._attach(con)
         try:
-            # Auto-create if table does not exist
+            columns = [
+                d[0] for d in con.execute(f"SELECT * FROM {view_name} LIMIT 0").description
+            ]
+            missing = [k for k in unique_keys if k not in columns]
+            if missing:
+                raise PostgresMaterializationError(
+                    f"unique_keys {missing} are not present in {view_name}"
+                )
+
             if not self._table_exists(con):
                 if not self.mat_config.create_table:
                     raise PostgresMaterializationError(
@@ -283,23 +306,55 @@ class PostgresMaterializationHelper:
                 con.execute(
                     f"CREATE TABLE {qualified} AS SELECT * FROM {view_name} WHERE 1=0"
                 )
+                # ON CONFLICT needs a unique constraint on the conflict target,
+                # and a point lookup needs the index. CTAS provides neither.
+                schema, table_name = self._split_table()
+                key_list = ", ".join(f'"{k}"' for k in unique_keys)
+                self._remote_execute(
+                    con,
+                    f'ALTER TABLE "{schema}"."{table_name}" '
+                    f'ADD CONSTRAINT "{table_name}_pk" PRIMARY KEY ({key_list})',
+                )
+                # The constraint was added out-of-band, so the attached catalog
+                # still has the pre-ALTER definition and ON CONFLICT would fail
+                # with "not referenced by a UNIQUE/PRIMARY KEY CONSTRAINT".
+                # Refresh it before relying on the constraint.
+                con.execute("CALL pg_clear_cache()")
 
-            con.execute(f"CREATE TEMP TABLE {temp_table} AS SELECT * FROM {view_name}")
-
-            key_conditions = " AND ".join(
-                f"t.{k} = s.{k}" for k in unique_keys
+            col_list = ", ".join(f'"{c}"' for c in columns)
+            key_list = ", ".join(f'"{k}"' for k in unique_keys)
+            updates = ", ".join(
+                f'"{c}" = EXCLUDED."{c}"' for c in columns if c not in unique_keys
             )
-            con.execute(
-                f"DELETE FROM {qualified} t "
-                f"USING {temp_table} s "
-                f"WHERE {key_conditions}"
-            )
-            con.execute(f"INSERT INTO {qualified} SELECT * FROM {temp_table}")
+            if not updates:
+                raise PostgresMaterializationError(
+                    f"{view_name} has no non-key columns to update"
+                )
 
+            con.execute("BEGIN TRANSACTION")
+            try:
+                con.execute(
+                    f"INSERT INTO {qualified} ({col_list}) "
+                    f"SELECT {col_list} FROM {view_name} "
+                    f"ON CONFLICT ({key_list}) DO UPDATE SET {updates}"
+                )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+
+            # Verify from the remote side. _row_count reads the LOCAL view, so
+            # on its own it is not evidence that anything was written.
             row_count = self._row_count(con, view_name)
-
-            # Clean up temp table
-            con.execute(f"DROP TABLE IF EXISTS {temp_table}")
+            remote_total = con.execute(
+                f"SELECT count(*) FROM {qualified}"
+            ).fetchone()[0]
+            if remote_total < row_count:
+                raise PostgresMaterializationError(
+                    f"remote verification failed for {self.mat_config.table}: "
+                    f"staged {row_count} rows but the target holds only "
+                    f"{remote_total}"
+                )
 
             duration = time.time() - start
             logger.info(
@@ -316,13 +371,14 @@ class PostgresMaterializationHelper:
         except PostgresMaterializationError:
             raise
         except Exception as exc:
-            # Clean up temp table on failure
-            try:
-                con.execute(f"DROP TABLE IF EXISTS {temp_table}")
-            except Exception:
-                pass
             raise PostgresMaterializationError(
                 f"Upsert materialization failed for {self.mat_config.table}: {exc}"
             ) from exc
         finally:
             self._detach(con)
+
+    def _remote_execute(self, con: Any, sql: str) -> None:
+        """Run *sql* natively on the PostgreSQL server."""
+        con.execute(
+            f"CALL postgres_execute('{self.PG_ALIAS}', '{sql.replace(chr(39), chr(39) * 2)}')"
+        )

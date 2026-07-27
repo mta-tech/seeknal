@@ -70,10 +70,20 @@ def pg_config():
 
 @pytest.fixture
 def mock_con():
-    """A MagicMock DuckDB connection whose execute().fetchone() returns (42,)."""
+    """A MagicMock DuckDB connection whose execute().fetchone() returns (42,).
+
+    ``description`` is populated because the upsert path introspects the source
+    relation's columns to build an explicit ON CONFLICT ... DO UPDATE clause.
+    """
     con = MagicMock()
     con.execute.return_value = MagicMock()
     con.execute.return_value.fetchone.return_value = (42,)
+    con.execute.return_value.description = [
+        ("user_id",),
+        ("role_id",),
+        ("name",),
+        ("updated_at",),
+    ]
     return con
 
 
@@ -258,21 +268,43 @@ class TestPostgresMaterializationHelper:
 
     # -- Upsert mode -------------------------------------------------------
 
-    def test_materialize_upsert_basic(self, pg_config, mock_con, mat_config_upsert):
+    def test_materialize_upsert_uses_on_conflict_not_delete_insert(
+        self, pg_config, mock_con, mat_config_upsert
+    ):
+        """The DELETE ... USING + INSERT sequence left a window in which a
+        matched row was deleted but not yet reinserted, so a concurrent reader
+        saw the entity missing rather than stale. ON CONFLICT DO UPDATE removes
+        that window: rows are updated in place and are never absent."""
         helper = PostgresMaterializationHelper(pg_config, mat_config_upsert)
         result = helper.materialize_upsert(mock_con, "upsert_view")
 
         sqls = _sql_calls(mock_con)
-        assert any("CREATE TEMP TABLE _seeknal_upsert" in s for s in sqls)
-        assert any(
-            "DELETE FROM pg_db.public.users" in s and "USING _seeknal_upsert" in s
-            for s in sqls
+        assert any("ON CONFLICT" in s and "DO UPDATE SET" in s for s in sqls)
+        assert not any("DELETE FROM" in s for s in sqls), (
+            "the delete/insert window must not reappear"
         )
-        assert any(
-            "INSERT INTO pg_db.public.users SELECT * FROM _seeknal_upsert" in s for s in sqls
-        )
-        assert any("DROP TABLE IF EXISTS _seeknal_upsert" in s for s in sqls)
         assert result.success is True
+
+    def test_materialize_upsert_is_transactional(
+        self, pg_config, mock_con, mat_config_upsert
+    ):
+        helper = PostgresMaterializationHelper(pg_config, mat_config_upsert)
+        helper.materialize_upsert(mock_con, "upsert_view")
+        sqls = _sql_calls(mock_con)
+        assert any("BEGIN TRANSACTION" in s for s in sqls)
+        assert any(s.strip() == "COMMIT" for s in sqls)
+
+    def test_materialize_upsert_updates_every_non_key_column(
+        self, pg_config, mock_con, mat_config_upsert
+    ):
+        """Omitting a column would produce a logically mixed old/new row even
+        though PostgreSQL row visibility remains atomic."""
+        helper = PostgresMaterializationHelper(pg_config, mat_config_upsert)
+        helper.materialize_upsert(mock_con, "upsert_view")
+        (upsert,) = [s for s in _sql_calls(mock_con) if "ON CONFLICT" in s]
+        for col in ("role_id", "name", "updated_at"):
+            assert f'"{col}" = EXCLUDED."{col}"' in upsert
+        assert '"user_id" = EXCLUDED."user_id"' not in upsert  # it is the key
 
     def test_materialize_upsert_multiple_keys(
         self, pg_config, mock_con, mat_config_upsert_multi_key
@@ -280,22 +312,47 @@ class TestPostgresMaterializationHelper:
         helper = PostgresMaterializationHelper(pg_config, mat_config_upsert_multi_key)
         helper.materialize_upsert(mock_con, "v")
 
-        sqls = _sql_calls(mock_con)
-        delete_sqls = [s for s in sqls if "DELETE FROM" in s]
-        assert len(delete_sqls) == 1
-        assert "t.user_id = s.user_id" in delete_sqls[0]
-        assert "t.role_id = s.role_id" in delete_sqls[0]
-        assert " AND " in delete_sqls[0]
+        (upsert,) = [s for s in _sql_calls(mock_con) if "ON CONFLICT" in s]
+        assert 'ON CONFLICT ("user_id", "role_id")' in upsert
 
-    def test_materialize_upsert_cleanup_on_failure(self, pg_config, mat_config_upsert):
-        """Temp table should be dropped even when the upsert fails."""
+    def test_materialize_upsert_requires_unique_keys(self, pg_config, mock_con):
+        cfg = PostgresMaterializationConfig(
+            connection="test_pg",
+            table="public.users",
+            mode=PostgresMaterializationMode.UPSERT_BY_KEY,
+            unique_keys=[],
+        )
+        helper = PostgresMaterializationHelper(pg_config, cfg)
+        with pytest.raises(PostgresMaterializationError, match="requires unique_keys"):
+            helper.materialize_upsert(mock_con, "v")
+
+    def test_materialize_upsert_rejects_keys_absent_from_source(
+        self, pg_config, mock_con
+    ):
+        cfg = PostgresMaterializationConfig(
+            connection="test_pg",
+            table="public.users",
+            mode=PostgresMaterializationMode.UPSERT_BY_KEY,
+            unique_keys=["nonexistent"],
+        )
+        helper = PostgresMaterializationHelper(pg_config, cfg)
+        with pytest.raises(PostgresMaterializationError, match="not present in"):
+            helper.materialize_upsert(mock_con, "v")
+
+    def test_materialize_upsert_rolls_back_on_failure(self, pg_config, mat_config_upsert):
+        """A failed upsert must roll back rather than leave a partial write.
+
+        Replaces an earlier test that asserted a temp table was dropped. The
+        implementation no longer stages through a temp table, so the property
+        worth guarding is transactional: nothing is left half-applied.
+        """
         con = MagicMock()
 
         def side_effect(sql):
             result = MagicMock()
             result.fetchone.return_value = (1,)
-            # Blow up on the DELETE USING step
-            if "DELETE FROM" in sql and "USING" in sql:
+            result.description = [("user_id",), ("name",)]
+            if "ON CONFLICT" in sql:
                 raise RuntimeError("pg error")
             return result
 
@@ -305,10 +362,31 @@ class TestPostgresMaterializationHelper:
         with pytest.raises(PostgresMaterializationError):
             helper.materialize_upsert(con, "v")
 
-        # The cleanup DROP should still have been attempted
         sqls = _sql_calls(con)
-        cleanup_drops = [s for s in sqls if "DROP TABLE IF EXISTS _seeknal_upsert" in s]
-        assert len(cleanup_drops) >= 1
+        assert any(s.strip() == "ROLLBACK" for s in sqls)
+        assert not any(s.strip() == "COMMIT" for s in sqls)
+
+    def test_materialize_upsert_verifies_remotely(self, pg_config, mat_config_upsert):
+        """_row_count reads the LOCAL view, so on its own it is not evidence
+        that anything was written remotely."""
+        con = MagicMock()
+
+        def side_effect(sql):
+            result = MagicMock()
+            result.description = [("user_id",), ("name",)]
+            # local view has 10 rows; the remote target reports only 3
+            result.fetchone.return_value = (3,) if "count(*)" in sql else (10,)
+            if f"SELECT COUNT(*) FROM v" == sql:
+                result.fetchone.return_value = (10,)
+            return result
+
+        con.execute.side_effect = side_effect
+
+        helper = PostgresMaterializationHelper(pg_config, mat_config_upsert)
+        with pytest.raises(
+            PostgresMaterializationError, match="remote verification failed"
+        ):
+            helper.materialize_upsert(con, "v")
 
     # -- Dispatch -----------------------------------------------------------
 
