@@ -797,7 +797,18 @@ async def _run_agent_inner(
             # gathered (the structured cache or the exported CSV) and makes no
             # external call. One call is allowed, matching the one-chart-per-
             # question rule the pending_visualization slot already enforces.
-            chart_toolset = _chart_only_toolset(agent)
+            #
+            # But only when the main pass has NOT already produced a chart. A
+            # chart already in the slot means this stage must not invite a
+            # second one: on models that narrate tool calls as text, that
+            # invitation comes back as a raw {"action": ...} block leaked into
+            # the answer. The existing chart is still emitted by
+            # _drain_pending_side_channels below, so Case B loses nothing.
+            chart_toolset = (
+                _chart_only_toolset(agent)
+                if ctx.pending_visualization is None
+                else None
+            )
             # The prompt and the toolset must agree. Offering the tool while
             # the prompt still says "do not call any tools" makes the model
             # obey the prompt and describe a chart in prose instead.

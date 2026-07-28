@@ -404,3 +404,242 @@ def test_synthesis_prompt_still_bans_tools_by_default(ctx: ToolContext) -> None:
     # Callers that cannot offer the tool (the interactive one-shot path) keep
     # the original no-tools contract.
     assert "Do not call any tools" in build_evidence_synthesis_prompt("budget reached")
+
+
+def _synthesis_gate(agent, ctx: ToolContext):
+    """Mirror the gateway's chart-offer gate (server.py UsageLimitExceeded path).
+
+    The real decision lives in ``_run_agent_inner``; replicate the exact
+    expression here so this test guards the branch that leaked a second,
+    text-narrated chart into the answer when the main pass had already charted.
+    """
+    return _chart_only_toolset(agent) if ctx.pending_visualization is None else None
+
+
+def _chart_agent() -> Agent:
+    def execute_sql(sql: str) -> str:
+        """Run SQL."""
+        return ""
+
+    def visualize_chart(widget_type: str) -> str:  # local stand-in
+        """Chart it."""
+        return ""
+
+    return Agent("test", toolsets=[FunctionToolset(tools=[execute_sql, visualize_chart])])
+
+
+def test_synthesis_offers_chart_when_none_was_produced_yet(ctx: ToolContext) -> None:
+    ctx.current_question = "tren per bulan"
+    ctx.evidence_snippets_this_turn.append("| bulan | jumlah |\n| 2024-01 | 10 |")
+    assert ctx.pending_visualization is None  # Case A: nothing charted yet
+
+    chart_toolset = _synthesis_gate(_chart_agent(), ctx)
+
+    # Case A keeps the rescue: the tool is offered and the prompt agrees.
+    assert chart_toolset is not None
+    prompt = build_evidence_synthesis_prompt(
+        "budget reached", allow_chart=chart_toolset is not None
+    )
+    assert "Do not call any tools" not in prompt
+    assert "visualize_chart" in prompt
+
+
+def test_synthesis_does_not_reoffer_chart_when_one_already_exists(
+    ctx: ToolContext,
+) -> None:
+    ctx.current_question = "tren per bulan"
+    ctx.evidence_snippets_this_turn.append("| bulan | jumlah |\n| 2024-01 | 10 |")
+    # Case B: the main pass already produced a chart this turn.
+    ctx.pending_visualization = [
+        {"chart_json": {"widgetType": "line_chart", "widgetData": []}, "chart_type": "line_chart"}
+    ]
+
+    chart_toolset = _synthesis_gate(_chart_agent(), ctx)
+
+    # No second chart is invited, so the prompt bans tools and no ReAct
+    # {"action": ...} block can be narrated into the answer. The existing
+    # chart is still emitted by _drain_pending_side_channels in the gateway.
+    assert chart_toolset is None
+    prompt = build_evidence_synthesis_prompt(
+        "terminal tool error after sufficient evidence",
+        allow_chart=chart_toolset is not None,
+    )
+    assert "Do not call any tools" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Full-fidelity integration: drive the REAL _run_agent_inner synthesis branch.
+#
+# Unlike the gate-replica tests above, this patches create_agent (the same
+# hook test_gateway_parity.py uses) and runs the actual gateway generator, so
+# the assertions cover the exact lines changed in server.py, not a copy.
+
+
+class _FakeRun:
+    """Minimal async-iterable stand-in for pydantic-ai's agent.iter() handle."""
+
+    def __init__(self, ctx, chart_payload) -> None:
+        self._ctx = ctx
+        self._chart_payload = chart_payload
+        self.result = MagicMock()
+        self.result.output = ""
+        self.result.all_messages = list
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def __aiter__(self):
+        return self._gen()
+
+    async def _gen(self):
+        # Main pass: the chart tool ran (slot filled), then a later tool failed
+        # terminally -- exactly the captured-session sequence. Raise the stop the
+        # gateway maps to the evidence-synthesis branch.
+        from pydantic_ai.exceptions import UsageLimitExceeded
+
+        self._ctx.pending_visualization = self._chart_payload
+        raise UsageLimitExceeded("terminal tool error after sufficient evidence")
+        yield  # pragma: no cover - makes this an async generator
+
+
+def _named_visualize_chart(widget_type: str) -> str:
+    """Tool literally named ``visualize_chart`` so _chart_only_toolset finds it."""
+    return ""
+
+
+# FunctionToolset keys tools by function name; use the canonical name.
+_named_visualize_chart.__name__ = "visualize_chart"
+
+
+class _FakeAgent:
+    """Fake agent that mimics a model narrating a ReAct block WHEN offered the
+    chart tool -- the exact failure the captured session showed. If the gateway
+    (correctly) does not offer the tool, no scaffold can appear."""
+
+    def __init__(self, ctx, chart_payload) -> None:
+        self._ctx = ctx
+        self._chart_payload = chart_payload
+        self.toolsets = [FunctionToolset(tools=[_named_visualize_chart])]
+        self.override_called_with = None
+        self.run_calls = 0
+        self._chart_offered = False
+
+    def iter(self, *args, **kwargs):
+        return _FakeRun(self._ctx, self._chart_payload)
+
+    def override(self, *, toolsets=None, **kwargs):
+        # The gateway enters this override only when it re-offers the chart.
+        self.override_called_with = toolsets
+        self._chart_offered = True
+
+        class _Noop:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                return False
+
+        return _Noop()
+
+    async def run(self, prompt, **kwargs):
+        self.run_calls += 1
+        result = MagicMock()
+        if self._chart_offered:
+            # A preview model narrates the tool call as text instead of a real
+            # function call -- this is the leak the fix prevents.
+            result.output = (
+                "Berikut tren pendaftaran NIE.\n\n"
+                '```json\n{"action": "visualize_chart", '
+                '"action_input": "{\'widget_type\': \'grouped_line_chart\'}"}\n```'
+            )
+        else:
+            result.output = "Registrations grew each year; Campuran leads."
+        result.all_messages = list
+        return result
+
+
+@pytest.mark.asyncio
+async def test_run_agent_inner_does_not_reoffer_chart_after_one_was_built(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case B through the real gateway: a chart already built + a terminal tool
+    error routes into synthesis, and synthesis must NOT re-offer the chart tool
+    (which is what leaked a {"action": ...} block into the answer)."""
+    from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
+    from seeknal.ask.gateway import server as gw
+
+    chart_payload = [
+        {
+            "chart_json": {
+                "widgetId": "sess-x-1",
+                "widgetType": "grouped_line_chart",
+                "widgetTitle": "Tren Penerbitan NIE per Jenis Produk",
+                "widgetData": [{"periode": "2025-01-01", "jumlah": 1024, "jenis": "Campuran"}],
+                "widgetSize": 1,
+            },
+            "chart_type": "grouped_line_chart",
+        }
+    ]
+
+    captured: dict = {}
+
+    def fake_create_agent(*args, **kwargs):
+        ctx = ToolContext(
+            repl=MagicMock(),
+            artifact_discovery=MagicMock(),
+            project_path=tmp_path,
+            disable_quality_gate=True,
+        )
+        # Evidence + terminal error so _gateway_tool_stop_reason would fire and
+        # build_evidence_synthesis_prompt has snippets to work with.
+        ctx.current_question = "tren penerbitan NIE per jenis produk ERBA"
+        ctx.successful_sql_results_this_turn = 1
+        ctx.evidence_snippets_this_turn.append(
+            "[execute_sql]\n| periode | jumlah |\n| 2025-01 | 1024 |\n(1 row)"
+        )
+        ctx.terminal_tool_errors_this_turn.append(
+            "upload_to_s3: terminal_dependency_unavailable — SeaweedFS rejected the write"
+        )
+        set_tool_context(ctx)
+        captured["ctx"] = ctx
+        agent = _FakeAgent(ctx, chart_payload)
+        captured["agent"] = agent
+        return agent, MagicMock(), [], {}
+
+    monkeypatch.setattr(
+        "seeknal.ask.agents.agent.create_agent", fake_create_agent
+    )
+
+    events = [
+        ev
+        async for ev in gw._run_agent_inner(
+            tmp_path, "sess-caseB", "tren penerbitan NIE per jenis produk ERBA"
+        )
+    ]
+
+    agent = captured["agent"]
+    types = [ev["type"] for ev in events]
+
+    # 1. The chart built in the main pass is still delivered (drain path).
+    assert "visualization" in types
+    viz = next(ev for ev in events if ev["type"] == "visualization")
+    assert viz["data"][0]["chart_json"]["widgetTitle"].startswith("Tren Penerbitan")
+
+    # 2. An answer is produced.
+    answer_ev = next(ev for ev in events if ev["type"] == "answer")
+    answer = answer_ev["data"]
+
+    # 3. THE FIX: synthesis was NOT offered the chart tool (slot was full), so
+    #    the model could not be invited to narrate a second chart.
+    assert agent.override_called_with is None, (
+        "synthesis re-offered the chart tool despite an existing chart"
+    )
+
+    # 4. No ReAct tool-call scaffold leaked into the visible answer.
+    assert '"action"' not in answer
+    assert "action_input" not in answer
+    assert "visualize_chart" not in answer
