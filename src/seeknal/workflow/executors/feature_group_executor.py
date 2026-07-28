@@ -792,6 +792,28 @@ class FeatureGroupExecutor(BaseExecutor):
                 publisher = OnlinePublisher(descriptor, pg_config.to_libpq_string())
                 publisher.attach(con)
                 try:
+                    # Publication used to always target __v1, because
+                    # from_relation defaults to 1 and nothing here overrode it.
+                    # A feature added to an existing group would then fail
+                    # against the old table rather than cutting over to __v2.
+                    version = publisher.resolve_version(con)
+                    if version != descriptor.version:
+                        descriptor = OnlineTableDescriptor(
+                            project=descriptor.project,
+                            feature_group=descriptor.feature_group,
+                            version=version,
+                            entity_keys=descriptor.entity_keys,
+                            features=descriptor.features,
+                            schema=descriptor.schema,
+                        )
+                        publisher = OnlinePublisher(
+                            descriptor, pg_config.to_libpq_string()
+                        )
+                        logger.info(
+                            "Node '%s' publishing to schema version v%d",
+                            self.node.id,
+                            version,
+                        )
                     publish_result = publisher.publish_with_retry(
                         con,
                         view_name,

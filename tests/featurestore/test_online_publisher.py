@@ -41,9 +41,11 @@ def descriptor(**over):
 class FakeCon:
     """Records SQL and replays scripted scalar answers."""
 
-    def __init__(self, scalars=None):
+    def __init__(self, scalars=None, tables=None):
         self.sql: list[str] = []
         self.scalars = list(scalars or [])
+        # Rows returned by fetchall(), used by resolve_version's table listing.
+        self.tables = [(t,) for t in (tables or [])]
 
     def execute(self, sql):
         self.sql.append(sql)
@@ -51,6 +53,9 @@ class FakeCon:
 
     def fetchone(self):
         return (self.scalars.pop(0),) if self.scalars else (0,)
+
+    def fetchall(self):
+        return list(self.tables)
 
     @property
     def joined(self) -> str:
@@ -179,6 +184,76 @@ class TestLedgerSchema:
         con = FakeCon()
         publisher().record_execution(con, "n1", NOW, NOW)
         assert "ON CONFLICT" in con.joined and "DO UPDATE" in con.joined
+
+
+class TestVersionResolution:
+    """Publication used to always target __v1: from_relation defaults to 1 and
+    nothing overrode it, so compatible_with was never exercised at runtime and
+    a feature added to an existing group would fail against the old table
+    instead of cutting over to __v2."""
+
+    def test_first_publication_is_v1(self):
+        assert publisher().resolve_version(FakeCon(tables=[])) == 1
+
+    def test_matching_schema_reuses_the_existing_version(self):
+        d = descriptor()
+        con = FakeCon(scalars=[d.schema_sha], tables=[f"{d.base_name}__v1"])
+        assert publisher(d).resolve_version(con) == 1
+
+    def test_incompatible_schema_bumps_to_the_next_version(self):
+        d = descriptor()
+        con = FakeCon(scalars=["a-different-sha"], tables=[f"{d.base_name}__v1"])
+        assert publisher(d).resolve_version(con) == 2
+
+    def test_bumps_past_the_highest_existing_version(self):
+        d = descriptor()
+        con = FakeCon(
+            scalars=["other", "other", "other"],
+            tables=[f"{d.base_name}__v{i}" for i in (1, 2, 3)],
+        )
+        assert publisher(d).resolve_version(con) == 4
+
+    def test_reuses_the_newest_matching_version(self):
+        d = descriptor()
+        # v2 is inspected first (newest-first) and matches.
+        con = FakeCon(scalars=[d.schema_sha], tables=[f"{d.base_name}__v1", f"{d.base_name}__v2"])
+        assert publisher(d).resolve_version(con) == 2
+
+    def test_empty_table_is_treated_as_compatible(self):
+        """A table with no rows constrains nothing, so publishing into it is
+        preferable to stranding it and creating another version."""
+        d = descriptor()
+        con = FakeCon(scalars=[None], tables=[f"{d.base_name}__v1"])
+        assert publisher(d).resolve_version(con) == 1
+
+    def test_unrelated_tables_are_ignored(self):
+        d = descriptor()
+        con = FakeCon(scalars=[d.schema_sha], tables=["some_other_table", f"{d.base_name}__v1"])
+        assert publisher(d).resolve_version(con) == 1
+
+
+class TestLedgerMigration:
+    """CREATE TABLE IF NOT EXISTS keeps an older definition silently, so a
+    ledger created before idempotency_key was UNIQUE keeps accepting
+    duplicates."""
+
+    def test_adds_the_unique_constraint_when_absent(self):
+        con = FakeCon(scalars=[0])  # no unique constraint found
+        applied = publisher().migrate_schema(con)
+        assert "idempotency_key UNIQUE" in applied
+        assert "ADD CONSTRAINT" in con.joined and "UNIQUE" in con.joined
+
+    def test_is_a_noop_when_already_present(self):
+        con = FakeCon(scalars=[1])
+        assert publisher().migrate_schema(con) == []
+        assert "ADD CONSTRAINT" not in con.joined
+
+    def test_refreshes_the_attached_catalog_after_the_alter(self):
+        """The ALTER runs out-of-band, so the attached catalog keeps the
+        pre-ALTER definition unless the cache is cleared."""
+        con = FakeCon(scalars=[0])
+        publisher().migrate_schema(con)
+        assert "pg_clear_cache" in con.joined
 
 
 class TestExpiry:

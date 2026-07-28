@@ -170,8 +170,21 @@ class OnlinePublisher:
         return row[0] if row else None
 
     def attach(self, con: Any) -> None:
+        """Attach the target database, idempotently.
+
+        Attaching an alias that is already attached raises. That is unhelpful
+        when several publishers share one connection -- which happens normally,
+        e.g. when version resolution replaces a descriptor and rebuilds the
+        publisher around the same connection. Re-attaching is a no-op, not an
+        error, so it is treated as one.
+        """
         con.execute("INSTALL postgres; LOAD postgres;")
-        con.execute(f"ATTACH '{self.dsn}' AS {self.alias} (TYPE POSTGRES)")
+        try:
+            con.execute(f"ATTACH '{self.dsn}' AS {self.alias} (TYPE POSTGRES)")
+        except Exception as exc:
+            if "already exists" not in str(exc):
+                raise
+            logger.debug("%s already attached; reusing it", self.alias)
 
     def detach(self, con: Any) -> None:
         try:
@@ -185,14 +198,17 @@ class OnlinePublisher:
         """Create the schema, target table, stable views, and ledgers."""
         self._remote(con, f"CREATE SCHEMA IF NOT EXISTS {self.d.schema}")
         self._remote(con, self.d.create_table_ddl())
-        self._remote(con, self.d.create_view_ddl())
-        self._remote(con, self.d.live_view_ddl())
+        self._swap_views(con)
         self._remote(
             con,
             f"CREATE TABLE IF NOT EXISTS {self.d.schema}.{PUBLICATIONS_TABLE} ("
             "  publish_run_id TEXT PRIMARY KEY,"
             "  target_table TEXT NOT NULL,"
-            "  idempotency_key TEXT NOT NULL,"
+            # UNIQUE, not merely NOT NULL. Without it the column is decorative:
+            # two runs computing the same idempotency key both insert, and the
+            # ledger records a duplicate publication as if it were distinct
+            # work. The constraint is what makes a replay detectable.
+            "  idempotency_key TEXT NOT NULL UNIQUE,"
             "  definition_sha TEXT NOT NULL,"
             "  schema_sha TEXT NOT NULL,"
             "  source_interval_start TIMESTAMPTZ NOT NULL,"
@@ -215,6 +231,38 @@ class OnlinePublisher:
             "  PRIMARY KEY (node_id, interval_start, interval_end)"
             ")",
         )
+        # CREATE TABLE IF NOT EXISTS keeps an older definition silently, so a
+        # ledger predating the UNIQUE constraint would go on accepting
+        # duplicate idempotency keys. Reconcile explicitly.
+        self.migrate_schema(con)
+
+    def _swap_views(self, con: Any) -> None:
+        """Point the stable views at this descriptor's version.
+
+        ``CREATE OR REPLACE VIEW`` alone is not sufficient. PostgreSQL requires
+        the replacement to keep existing columns' names, order and types and may
+        only append -- so cutting over from ``__v1`` to a ``__v2`` that inserts a
+        column mid-list fails with:
+
+            cannot change name of view column "computed_at" to "b"
+
+        The schema contract documents exactly this and prescribes DROP + CREATE
+        for incompatible evolution; this is where that is carried out.
+
+        The DROP and CREATE run in one transaction. PostgreSQL DDL is
+        transactional, so concurrent readers see the old view or the new one and
+        never a window with no view at all.
+        """
+        base = self.d.view_fqn
+        stmts = [
+            f"DROP VIEW IF EXISTS {base}__live",
+            f"DROP VIEW IF EXISTS {base}",
+            self.d.create_view_ddl(),
+            self.d.live_view_ddl(),
+        ]
+        # postgres_execute sends one string to the server; wrapping the
+        # statements in BEGIN/COMMIT keeps the cutover atomic for readers.
+        self._remote(con, "BEGIN; " + "; ".join(stmts) + "; COMMIT")
 
     def record_execution(
         self,
@@ -236,6 +284,91 @@ class OnlinePublisher:
             "status = EXCLUDED.status, definition_sha = EXCLUDED.definition_sha, "
             "recorded_at = now()"
         )
+
+    def migrate_schema(self, con: Any) -> list[str]:
+        """Apply constraints missing from ledgers created by earlier versions.
+
+        ``CREATE TABLE IF NOT EXISTS`` silently keeps an older definition, so a
+        ledger created before ``idempotency_key`` was UNIQUE keeps accepting
+        duplicates. Applied idempotently and reported, rather than assumed.
+        """
+        applied: list[str] = []
+        exists = self._scalar(
+            con,
+            "SELECT count(*) FROM pg_constraint c "
+            "JOIN pg_class t ON t.oid = c.conrelid "
+            "JOIN pg_namespace n ON n.oid = t.relnamespace "
+            f"WHERE n.nspname = '{_q(self.d.schema)}' "
+            f"AND t.relname = '{_q(PUBLICATIONS_TABLE)}' AND c.contype = 'u'",
+        )
+        if not exists:
+            try:
+                self._remote(
+                    con,
+                    f"ALTER TABLE {self.d.schema}.{PUBLICATIONS_TABLE} "
+                    f"ADD CONSTRAINT {PUBLICATIONS_TABLE}_idem_uq UNIQUE (idempotency_key)",
+                )
+                con.execute("CALL pg_clear_cache()")
+                applied.append("idempotency_key UNIQUE")
+            except Exception as exc:
+                # Pre-existing duplicates block the constraint. Surface that
+                # rather than continuing as though the ledger were sound.
+                logger.warning(
+                    "could not add idempotency_key UNIQUE (existing duplicates?): %s",
+                    exc,
+                )
+        return applied
+
+    # -- version resolution ------------------------------------------------
+
+    def resolve_version(self, con: Any) -> int:
+        """Return the version this descriptor should publish to.
+
+        Publication previously always targeted ``__v1``: the executor never
+        supplied a version and ``from_relation`` defaults to 1, so
+        ``compatible_with`` was never exercised at runtime and a feature added
+        to an existing group would fail against the old table instead of
+        creating ``__v2``.
+
+        Resolution walks existing versions newest-first and returns the first
+        whose stored ``schema_sha`` matches this descriptor. If versions exist
+        but none match, the shape changed incompatibly and the next version
+        number is returned.
+        """
+        rows = con.execute(
+            f"SELECT * FROM postgres_query('{self.alias}', "
+            f"'SELECT table_name FROM information_schema.tables "
+            f"WHERE table_schema = ''{_q(self.d.schema)}'' "
+            f"AND table_name LIKE ''{_q(self.d.base_name)}\\_\\_v%'' "
+            f"ORDER BY table_name')"
+        ).fetchall()
+
+        versions: list[int] = []
+        prefix = f"{self.d.base_name}__v"
+        for (name,) in rows:
+            if name.startswith(prefix):
+                suffix = name[len(prefix) :]
+                if suffix.isdigit():
+                    versions.append(int(suffix))
+        if not versions:
+            return 1
+
+        for v in sorted(versions, reverse=True):
+            sha = self._scalar(
+                con,
+                f"SELECT schema_sha FROM {self.d.schema}.{self.d.base_name}__v{v} LIMIT 1",
+            )
+            if sha is None or sha == self.d.schema_sha:
+                # No rows yet means the shape is unconstrained by data.
+                return v
+
+        nxt = max(versions) + 1
+        logger.info(
+            "schema of %s changed incompatibly; publishing to __v%d",
+            self.d.base_name,
+            nxt,
+        )
+        return nxt
 
     # -- gating ------------------------------------------------------------
 
