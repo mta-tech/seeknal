@@ -267,6 +267,21 @@ class OnlinePublisher:
             "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
             ")",
         )
+        # Pre-publication snapshot of the rows each publication touches, so a
+        # bad-but-successful publication can be undone. LIKE keeps it in step
+        # with the physical table's shape automatically; _rb_run_id records
+        # which publication the snapshot protects, so a rollback cannot restore
+        # rows belonging to a different generation.
+        self._remote(
+            con,
+            f"CREATE TABLE IF NOT EXISTS {self.d.rollback_fqn} "
+            f"(LIKE {self.d.physical_fqn})",
+        )
+        self._remote(
+            con,
+            f"ALTER TABLE {self.d.rollback_fqn} "
+            "ADD COLUMN IF NOT EXISTS _rb_run_id TEXT",
+        )
         # The CREATEs above ran through postgres_execute, out-of-band from the
         # attached catalog, so refresh its metadata before anything writes
         # through it.
@@ -589,6 +604,28 @@ class OnlinePublisher:
                         "publications to one target must not run concurrently"
                     )
 
+                # Snapshot the rows this publication is about to overwrite,
+                # BEFORE the upsert and inside the same transaction. Taken
+                # after the lock so it cannot race another publication, and
+                # inside the transaction so a rolled-back publication leaves no
+                # stale rollback point behind.
+                #
+                # Only rows that already exist are captured. Rows the
+                # publication newly inserts are absent here by construction,
+                # which is exactly how rollback tells "restore the old value"
+                # from "delete a row that should not exist".
+                cols = ", ".join(f'"{c.name}"' for c in self.d.all_columns)
+                key_tuple = ", ".join(f'"{c.name}"' for c in self.d.entity_keys)
+                con.execute(f"DELETE FROM {self.alias}.{self.d.rollback_fqn}")
+                con.execute(
+                    f"INSERT INTO {self.alias}.{self.d.rollback_fqn} "
+                    f"({cols}, _rb_run_id) "
+                    f"SELECT {cols}, '{_q(publish_run_id)}' "
+                    f"FROM {self.alias}.{self.d.physical_fqn} "
+                    f"WHERE ({key_tuple}) IN "
+                    f"(SELECT {key_tuple} FROM {self.alias}.{staging})"
+                )
+
                 con.execute(
                     f"INSERT INTO {self.alias}.{self.d.physical_fqn} "
                     f"({', '.join(chr(34) + c.name + chr(34) for c in self.d.all_columns)}) "
@@ -727,6 +764,132 @@ class OnlinePublisher:
                     result.warnings.append(f"staging cleanup failed for {staging}")
 
         return result
+
+    def latest_publication(self, con: Any) -> str | None:
+        """publish_run_id of the most recent successful publication, or None."""
+        return self._scalar(
+            con,
+            f"SELECT publish_run_id FROM {self.d.schema}.{PUBLICATIONS_TABLE} "
+            f"WHERE target_table = '{_q(self.d.physical_fqn)}' "
+            "AND status = 'succeeded' ORDER BY activated_at DESC LIMIT 1",
+        )
+
+    def rollback(self, con: Any, publish_run_id: str) -> dict[str, int]:
+        """Undo *publish_run_id*, restoring the values it replaced.
+
+        Publication is in place, so a successful-but-wrong run overwrites the
+        previous values and the ledger records metadata rather than rows. This
+        restores the snapshot taken during that publication.
+
+        Only the most recent successful publication can be rolled back. Deeper
+        history is not retained, and rolling back an older run would silently
+        discard every publication since -- the snapshot describes one step, not
+        a timeline. Refusing is the honest answer; the alternative is restoring
+        a state that never existed.
+
+        Rows the publication newly inserted are deleted; rows it overwrote are
+        restored. Both happen in one transaction under the same advisory lock
+        publication uses, so a rollback cannot interleave with a publication.
+
+        Returns:
+            Counts of ``restored`` and ``deleted`` rows.
+
+        Raises:
+            OnlinePublishError: *publish_run_id* is not the latest successful
+                publication, or the lock could not be taken.
+        """
+        latest = self.latest_publication(con)
+        if latest is None:
+            raise OnlinePublishError(
+                f"no successful publication is recorded for {self.d.physical_fqn}; "
+                "there is nothing to roll back"
+            )
+        if latest != publish_run_id:
+            raise OnlinePublishError(
+                f"cannot roll back {publish_run_id!r}: the latest successful "
+                f"publication is {latest!r}. Only one generation of pre-publication "
+                "state is retained, so rolling back an older run would discard "
+                "every publication since it. Roll back the latest run instead, or "
+                "republish the intended values."
+            )
+
+        cols = ", ".join(f'"{c.name}"' for c in self.d.all_columns)
+        key_tuple = ", ".join(f'"{c.name}"' for c in self.d.entity_keys)
+        rb = f"{self.alias}.{self.d.rollback_fqn}"
+        phys = f"{self.alias}.{self.d.physical_fqn}"
+        snapshot_keys = (
+            f"SELECT {key_tuple} FROM {rb} WHERE _rb_run_id = '{_q(publish_run_id)}'"
+        )
+
+        restored = deleted = 0
+        con.execute("BEGIN TRANSACTION")
+        try:
+            acquired = con.execute(
+                f"SELECT * FROM postgres_query('{self.alias}', "
+                f"'SELECT pg_try_advisory_xact_lock({advisory_key(self.d.physical_fqn)}) AS locked')"
+            ).fetchone()
+            if not acquired or not acquired[0]:
+                raise OnlinePublishError(
+                    f"another operation holds the lock for {self.d.physical_fqn}; "
+                    "a rollback must not interleave with a publication"
+                )
+
+            deleted = int(
+                self._scalar(
+                    con,
+                    f"SELECT count(*) FROM {self.d.physical_fqn} "
+                    f"WHERE publish_run_id = '{_q(publish_run_id)}' "
+                    f"AND ({key_tuple}) NOT IN (SELECT {key_tuple} FROM "
+                    f"{self.d.rollback_fqn} WHERE _rb_run_id = '{_q(publish_run_id)}')",
+                )
+                or 0
+            )
+            restored = int(
+                self._scalar(
+                    con,
+                    f"SELECT count(*) FROM {self.d.rollback_fqn} "
+                    f"WHERE _rb_run_id = '{_q(publish_run_id)}'",
+                )
+                or 0
+            )
+
+            # Rows this run created: delete them. They had no prior value, so
+            # there is nothing to restore.
+            con.execute(
+                f"DELETE FROM {phys} WHERE publish_run_id = '{_q(publish_run_id)}' "
+                f"AND ({key_tuple}) NOT IN ({snapshot_keys})"
+            )
+            # Rows it overwrote: replace with the snapshot. Delete-then-insert
+            # rather than a multi-column UPDATE ... FROM so every column is
+            # restored without enumerating assignments, and so a column added
+            # later cannot be silently left at its new value.
+            con.execute(f"DELETE FROM {phys} WHERE ({key_tuple}) IN ({snapshot_keys})")
+            con.execute(
+                f"INSERT INTO {phys} ({cols}) SELECT {cols} FROM {rb} "
+                f"WHERE _rb_run_id = '{_q(publish_run_id)}'"
+            )
+            con.execute(
+                f"UPDATE {self.alias}.{self.d.schema}.{PUBLICATIONS_TABLE} "
+                "SET status = 'rolled_back' "
+                f"WHERE publish_run_id = '{_q(publish_run_id)}'"
+            )
+            # The snapshot describes a publication that no longer stands. Left
+            # in place it would advertise a rollback point that, if applied
+            # twice, would delete rows the first rollback correctly restored.
+            con.execute(f"DELETE FROM {rb}")
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+
+        logger.info(
+            "rolled back %s on %s: %d restored, %d deleted",
+            publish_run_id,
+            self.d.physical_fqn,
+            restored,
+            deleted,
+        )
+        return {"restored": restored, "deleted": deleted}
 
     def publish_with_retry(
         self,

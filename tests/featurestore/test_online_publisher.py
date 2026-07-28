@@ -450,3 +450,63 @@ class TestSqlSafety:
         """Callers should be able to catch OnlinePublishError broadly."""
         assert issubclass(StagingValidationError, OnlinePublishError)
         assert issubclass(UpstreamIncompleteError, OnlinePublishError)
+
+
+class TestRollback:
+    """Publication is in place, so a successful-but-wrong run overwrites the
+    previous values and the ledger records metadata rather than rows. These pin
+    the guard rails around undoing one."""
+
+    def test_refuses_when_nothing_was_ever_published(self):
+        con = FakeCon(scalars=[None])
+        with pytest.raises(OnlinePublishError, match="nothing to roll back"):
+            publisher().rollback(con, "r-1")
+
+    def test_refuses_to_roll_back_an_older_run(self):
+        """Only one generation of pre-publication state is kept, so rolling
+        back an older run would silently discard every publication since."""
+        con = FakeCon(scalars=["r-newer"])
+        with pytest.raises(OnlinePublishError, match="latest successful"):
+            publisher().rollback(con, "r-older")
+
+    def test_refuses_when_the_lock_is_held(self):
+        """A rollback must not interleave with a publication."""
+        con = FakeCon(scalars=["r-1", False])
+        with pytest.raises(OnlinePublishError, match="holds the lock"):
+            publisher().rollback(con, "r-1")
+        assert "ROLLBACK" in con.joined
+
+    def test_restores_and_deletes_under_one_transaction(self):
+        con = FakeCon(scalars=["r-1", True, 3, 5])
+        counts = publisher().rollback(con, "r-1")
+        assert counts == {"restored": 5, "deleted": 3}
+        assert "BEGIN TRANSACTION" in con.joined
+        assert "COMMIT" in con.joined
+        assert "pg_try_advisory_xact_lock" in con.joined
+
+    def test_rows_the_run_created_are_deleted_not_restored(self):
+        """Rows absent from the snapshot had no prior value, so there is
+        nothing to restore -- they must go."""
+        con = FakeCon(scalars=["r-1", True, 3, 5])
+        publisher().rollback(con, "r-1")
+        assert "NOT IN" in con.joined
+
+    def test_ledger_is_marked_rolled_back(self):
+        con = FakeCon(scalars=["r-1", True, 0, 2])
+        publisher().rollback(con, "r-1")
+        assert "'rolled_back'" in con.joined
+
+    def test_the_snapshot_is_cleared_so_it_cannot_be_applied_twice(self):
+        """Left in place, a second rollback would delete the rows the first one
+        correctly restored."""
+        d = descriptor()
+        con = FakeCon(scalars=["r-1", True, 0, 2])
+        publisher(d).rollback(con, "r-1")
+        assert f"DELETE FROM pg_online.{d.rollback_fqn}" in con.joined
+
+    def test_snapshot_table_is_bound_to_the_versioned_table(self):
+        """A rollback restores rows into a specific physical table; restoring a
+        v1 snapshot into v2 would write the wrong shape."""
+        d = descriptor()
+        assert d.physical_name in d.rollback_name
+        assert d.rollback_name != d.base_name

@@ -326,6 +326,28 @@ class OnlineTableDescriptor:
     def staging_fqn(self, publish_run_id: str) -> str:
         return f"{self.schema}.{self.staging_name(publish_run_id)}"
 
+    @property
+    def rollback_name(self) -> str:
+        """Table holding the pre-publication state of the rows one publication
+        touched, so a bad publication can be undone.
+
+        Bound to the *versioned* physical table, not the base name: a rollback
+        restores rows into a specific physical table, and restoring a v1
+        snapshot into v2 would write the wrong shape. A version cutover
+        therefore starts with no rollback point, which is correct -- the
+        previous version's table is still intact and is itself the way back.
+
+        Only the most recent publication is retained. Keeping a deeper history
+        would mean unbounded growth proportional to churn, and a rollback older
+        than one generation is not meaningfully safer: the intervening
+        publications would have to be replayed to know what the state should be.
+        """
+        return safe_identifier("rb", self.physical_name)
+
+    @property
+    def rollback_fqn(self) -> str:
+        return f"{self.schema}.{self.rollback_name}"
+
     # -- columns -----------------------------------------------------------
 
     @property
