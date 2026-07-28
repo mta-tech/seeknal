@@ -162,7 +162,14 @@ def parse_online_targets(
                 f"{entry.get('type')!r} for table {entry.get('table')!r}"
             )
 
-        raw_mode = entry.get("generation_mode", GenerationMode.STAGED.value)
+        # Defaults to in_place, not staged. STAGED is declared in the enum and
+        # described in the docs, but no code path implements it: the executor
+        # never reads generation_mode and always calls the in-place publisher.
+        # Defaulting to STAGED would therefore have silently given every target
+        # in-place behaviour while its config claimed otherwise -- the same
+        # class of phantom setting as the long-documented, never-implemented
+        # serving_ttl_days.
+        raw_mode = entry.get("generation_mode", GenerationMode.IN_PLACE.value)
         try:
             generation_mode = GenerationMode(raw_mode)
         except ValueError:
@@ -170,6 +177,14 @@ def parse_online_targets(
                 f"unknown generation_mode {raw_mode!r}; expected one of "
                 f"{[m.value for m in GenerationMode]}"
             ) from None
+        if generation_mode is GenerationMode.STAGED:
+            raise OnlineServingConfigError(
+                "generation_mode 'staged' is not implemented yet: the executor "
+                "always publishes in place, so declaring 'staged' would describe "
+                "behaviour the system does not have. Use 'in_place' explicitly, "
+                "and note that in-place upsert cannot remove entities that "
+                "disappear from the source."
+            )
 
         ttl = entry.get("serving_ttl_days")
         if ttl is not None:

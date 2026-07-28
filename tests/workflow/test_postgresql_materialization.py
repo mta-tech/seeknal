@@ -366,17 +366,26 @@ class TestPostgresMaterializationHelper:
         assert any(s.strip() == "ROLLBACK" for s in sqls)
         assert not any(s.strip() == "COMMIT" for s in sqls)
 
-    def test_materialize_upsert_verifies_remotely(self, pg_config, mat_config_upsert):
-        """_row_count reads the LOCAL view, so on its own it is not evidence
-        that anything was written remotely."""
+    def test_materialize_upsert_verifies_keys_landed_remotely(
+        self, pg_config, mat_config_upsert
+    ):
+        """Verification must check that incoming KEYS are present, not that the
+        target's total row count is large enough.
+
+        Comparing total rows against the incoming count is close to vacuous: a
+        target already holding a million rows satisfies total >= incoming even
+        if the upsert wrote nothing.
+        """
         con = MagicMock()
 
         def side_effect(sql):
             result = MagicMock()
             result.description = [("user_id",), ("name",)]
-            # local view has 10 rows; the remote target reports only 3
-            result.fetchone.return_value = (3,) if "count(*)" in sql else (10,)
-            if f"SELECT COUNT(*) FROM v" == sql:
+            if "WHERE EXISTS" in sql:
+                result.fetchone.return_value = (7,)  # only 7 keys landed
+            elif "SELECT DISTINCT" in sql:
+                result.fetchone.return_value = (10,)  # 10 distinct incoming
+            else:
                 result.fetchone.return_value = (10,)
             return result
 
@@ -386,6 +395,45 @@ class TestPostgresMaterializationHelper:
         with pytest.raises(
             PostgresMaterializationError, match="remote verification failed"
         ):
+            helper.materialize_upsert(con, "v")
+
+    def test_materialize_upsert_passes_when_all_keys_landed(
+        self, pg_config, mat_config_upsert
+    ):
+        con = MagicMock()
+
+        def side_effect(sql):
+            result = MagicMock()
+            result.description = [("user_id",), ("name",)]
+            result.fetchone.return_value = (10,)  # incoming == matched
+            return result
+
+        con.execute.side_effect = side_effect
+
+        helper = PostgresMaterializationHelper(pg_config, mat_config_upsert)
+        assert helper.materialize_upsert(con, "v").success is True
+
+    def test_verification_is_not_satisfied_by_a_large_pre_existing_table(
+        self, pg_config, mat_config_upsert
+    ):
+        """Regression guard for the weak check this replaced."""
+        con = MagicMock()
+
+        def side_effect(sql):
+            result = MagicMock()
+            result.description = [("user_id",), ("name",)]
+            if "WHERE EXISTS" in sql:
+                result.fetchone.return_value = (0,)  # nothing actually landed
+            elif "SELECT DISTINCT" in sql:
+                result.fetchone.return_value = (5,)
+            else:
+                result.fetchone.return_value = (1_000_000,)  # huge target
+            return result
+
+        con.execute.side_effect = side_effect
+
+        helper = PostgresMaterializationHelper(pg_config, mat_config_upsert)
+        with pytest.raises(PostgresMaterializationError, match="remote verification"):
             helper.materialize_upsert(con, "v")
 
     # -- Dispatch -----------------------------------------------------------

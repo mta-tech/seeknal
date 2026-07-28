@@ -345,15 +345,26 @@ class PostgresMaterializationHelper:
 
             # Verify from the remote side. _row_count reads the LOCAL view, so
             # on its own it is not evidence that anything was written.
+            #
+            # Comparing the target's TOTAL row count against the incoming count
+            # is close to vacuous: on a target that already holds a million
+            # rows, writing zero still satisfies total >= incoming. Instead,
+            # confirm that every incoming key is now present in the target,
+            # which is the property an upsert actually promises.
             row_count = self._row_count(con, view_name)
-            remote_total = con.execute(
-                f"SELECT count(*) FROM {qualified}"
+            join_pred = " AND ".join(f't."{k}" = s."{k}"' for k in unique_keys)
+            matched = con.execute(
+                f"SELECT count(*) FROM (SELECT DISTINCT {key_list} FROM {view_name}) s "
+                f"WHERE EXISTS (SELECT 1 FROM {qualified} t WHERE {join_pred})"
             ).fetchone()[0]
-            if remote_total < row_count:
+            expected_keys = con.execute(
+                f"SELECT count(*) FROM (SELECT DISTINCT {key_list} FROM {view_name})"
+            ).fetchone()[0]
+            if matched != expected_keys:
                 raise PostgresMaterializationError(
                     f"remote verification failed for {self.mat_config.table}: "
-                    f"staged {row_count} rows but the target holds only "
-                    f"{remote_total}"
+                    f"{expected_keys} distinct incoming key(s) but only {matched} "
+                    f"are present in the target after the upsert"
                 )
 
             duration = time.time() - start

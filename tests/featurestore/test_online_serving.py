@@ -75,7 +75,10 @@ class TestParsing:
         (t,) = parse_online_targets([pg_target()])
         assert t.table == "feature_online.fg_retail__customer_30d"
         assert t.unique_keys == ("customer_id",)
-        assert t.generation_mode is GenerationMode.STAGED
+        # Defaults to IN_PLACE, not STAGED. STAGED is declared in the enum but
+        # no code path implements it, so defaulting to it would have described
+        # behaviour the system does not have.
+        assert t.generation_mode is GenerationMode.IN_PLACE
 
     def test_only_postgresql_can_serve_online(self):
         with pytest.raises(OnlineServingConfigError, match="only supported for type"):
@@ -88,6 +91,17 @@ class TestParsing:
     def test_unknown_generation_mode_rejected(self):
         with pytest.raises(OnlineServingConfigError, match="unknown generation_mode"):
             parse_online_targets([pg_target(generation_mode="teleport")])
+
+    def test_staged_is_rejected_until_implemented(self):
+        """Accepting 'staged' while always publishing in place would let config
+        claim behaviour the system does not have -- the same phantom-setting
+        failure as the long-documented, never-implemented serving_ttl_days."""
+        with pytest.raises(OnlineServingConfigError, match="not implemented"):
+            parse_online_targets([pg_target(generation_mode="staged")])
+
+    def test_in_place_is_accepted_explicitly(self):
+        (t,) = parse_online_targets([pg_target(generation_mode="in_place")])
+        assert t.generation_mode is GenerationMode.IN_PLACE
 
     def test_mixed_list_parses_only_opted_in_entries(self):
         targets = parse_online_targets(
