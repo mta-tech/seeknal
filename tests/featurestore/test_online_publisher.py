@@ -237,22 +237,36 @@ class TestLedgerMigration:
     ledger created before idempotency_key was UNIQUE keeps accepting
     duplicates."""
 
+    # Two probes now run, in order: the idempotency_key UNIQUE constraint, then
+    # the feature_group column. Scalars are supplied per probe.
+
     def test_adds_the_unique_constraint_when_absent(self):
-        con = FakeCon(scalars=[0])  # no unique constraint found
+        con = FakeCon(scalars=[0, 1])  # no unique constraint, column present
         applied = publisher().migrate_schema(con)
         assert "idempotency_key UNIQUE" in applied
         assert "ADD CONSTRAINT" in con.joined and "UNIQUE" in con.joined
 
     def test_is_a_noop_when_already_present(self):
-        con = FakeCon(scalars=[1])
+        con = FakeCon(scalars=[1, 1])
         assert publisher().migrate_schema(con) == []
         assert "ADD CONSTRAINT" not in con.joined
+        assert "ADD COLUMN" not in con.joined
 
     def test_refreshes_the_attached_catalog_after_the_alter(self):
         """The ALTER runs out-of-band, so the attached catalog keeps the
         pre-ALTER definition unless the cache is cleared."""
-        con = FakeCon(scalars=[0])
+        con = FakeCon(scalars=[0, 1])
         publisher().migrate_schema(con)
+        assert "pg_clear_cache" in con.joined
+
+    def test_adds_the_feature_group_column_when_absent(self):
+        """A ledger predating the policy table has no feature_group column, and
+        CREATE TABLE IF NOT EXISTS will not add it -- leaving publication status
+        with no join key to the read policy."""
+        con = FakeCon(scalars=[1, 0])  # constraint present, column missing
+        applied = publisher().migrate_schema(con)
+        assert "feature_group column" in applied
+        assert "ADD COLUMN" in con.joined and "feature_group" in con.joined
         assert "pg_clear_cache" in con.joined
 
 

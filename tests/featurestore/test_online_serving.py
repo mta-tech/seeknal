@@ -23,6 +23,7 @@ def pg_target(**over):
         "mode": "upsert_by_key",
         "unique_keys": ["customer_id"],
         "serve_online": True,
+        "read_roles": ["data-scientist"],
     }
     entry.update(over)
     return entry
@@ -158,9 +159,53 @@ class TestTargetValidation:
 
     def test_schema_and_table_name_split(self):
         t = OnlineServingTarget(
-            connection="c", table="feature_online.fg_x", unique_keys=("id",)
+            connection="c",
+            table="feature_online.fg_x",
+            unique_keys=("id",),
+            read_roles=("admin",),
         )
         assert (t.schema, t.table_name) == ("feature_online", "fg_x")
+
+
+class TestReadRoles:
+    """read_roles is required. The catalog denies reads on any group with no
+    policy, so a target that opted into serving must say who may read it --
+    there is no default that is both safe and useful."""
+
+    def test_missing_read_roles_is_rejected(self):
+        entry = pg_target()
+        entry.pop("read_roles")
+        with pytest.raises(OnlineServingConfigError, match="read_roles"):
+            parse_online_targets([entry])
+
+    def test_empty_read_roles_is_rejected(self):
+        with pytest.raises(OnlineServingConfigError, match="read_roles"):
+            parse_online_targets([pg_target(read_roles=[])])
+
+    def test_roles_are_parsed_and_stripped(self):
+        (t,) = parse_online_targets([pg_target(read_roles=[" admin ", "data-analyst"])])
+        assert t.read_roles == ("admin", "data-analyst")
+
+    def test_a_bare_string_is_rejected_not_iterated(self):
+        """"admin" iterated character-by-character becomes five one-letter roles
+        that match nothing, silently making the group unreadable."""
+        with pytest.raises(OnlineServingConfigError, match="must be a list"):
+            parse_online_targets([pg_target(read_roles="admin")])
+
+    def test_duplicate_roles_are_rejected(self):
+        with pytest.raises(OnlineServingConfigError, match="duplicate"):
+            parse_online_targets([pg_target(read_roles=["admin", "admin"])])
+
+    def test_blank_role_is_rejected(self):
+        with pytest.raises(OnlineServingConfigError, match="blank"):
+            parse_online_targets([pg_target(read_roles=["admin", "  "])])
+
+    def test_offline_targets_need_no_roles(self):
+        """A target that never opted into serving is unaffected."""
+        entry = pg_target()
+        entry.pop("read_roles")
+        entry.pop("serve_online")
+        assert parse_online_targets([entry]) == []
 
 
 # ---------------------------------------------------------------------------

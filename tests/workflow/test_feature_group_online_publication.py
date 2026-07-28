@@ -59,6 +59,7 @@ PG_TARGET = {
     "mode": "upsert_by_key",
     "unique_keys": ["customer_id"],
     "serve_online": True,
+    "read_roles": ["data-scientist"],
 }
 
 

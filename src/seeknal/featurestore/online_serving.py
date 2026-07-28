@@ -28,7 +28,17 @@ Example
         mode: upsert_by_key          # existing PostgresMaterializationMode value
         unique_keys: [customer_id]
         serve_online: true           # opt in
-        generation_mode: staged      # staged | in_place
+        generation_mode: in_place    # staged is declared but not implemented
+        read_roles: [data-scientist] # who may read it -- required
+
+**Access policy (2.7).** ``read_roles`` declares which roles may read the served
+values. It is required whenever ``serve_online`` is set, and it travels with the
+data: the publisher writes it into the store in the same transaction that
+activates the values, so a feature group can never be readable before its policy
+is. The catalog reads that policy and is fail-closed -- a group with no policy
+row is denied to everyone. Requiring it here is what makes the fail-closed
+reader safe to deploy: an unlabelled group is unreadable, so silence cannot
+leak data.
 """
 
 from __future__ import annotations
@@ -105,6 +115,15 @@ class OnlineServingTarget:
     #: implemented, so adopting it now would silently retire nearly everything
     #: in an existing online store on the first run after upgrade.
     serving_ttl_days: int | None = None
+    #: Roles permitted to read this feature group's served values.
+    #:
+    #: Required, and deliberately not defaulted. A default would have to be
+    #: either permissive (every reader role -- which silently publishes
+    #: PII-derived features to everyone, the exact failure this exists to
+    #: prevent) or empty (which publishes data nobody can read). Neither is a
+    #: sane thing to infer, so the declaration is mandatory: a target that asked
+    #: to serve online can reasonably be asked who may read it.
+    read_roles: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.connection:
@@ -120,6 +139,25 @@ class OnlineServingTarget:
             raise OnlineServingConfigError(
                 f"online target {self.table!r} must declare 'unique_keys'; they "
                 "become the primary key and the ON CONFLICT target"
+            )
+        if not self.read_roles:
+            raise OnlineServingConfigError(
+                f"online target {self.table!r} must declare 'read_roles': the "
+                "roles permitted to read its served values. The catalog is "
+                "fail-closed, so a group published without a policy is readable "
+                "by nobody. Declare the roles explicitly rather than relying on "
+                "a default that would either over-share or serve nothing."
+            )
+        for role in self.read_roles:
+            if not isinstance(role, str) or not role.strip():
+                raise OnlineServingConfigError(
+                    f"read_roles for {self.table!r} contains a blank entry; each "
+                    "role must be a non-empty string"
+                )
+        if len(set(self.read_roles)) != len(self.read_roles):
+            raise OnlineServingConfigError(
+                f"read_roles for {self.table!r} contains duplicates: "
+                f"{list(self.read_roles)}"
             )
         # Reject the invented value an earlier design used, with a pointer to
         # the real one, rather than silently accepting it.
@@ -199,6 +237,16 @@ def parse_online_targets(
                     f"serving_ttl_days must be positive, got {ttl}; omit it for no expiry"
                 )
 
+        raw_roles = entry.get("read_roles", ()) or ()
+        if isinstance(raw_roles, str):
+            # A bare string would otherwise be iterated character by character,
+            # turning "admin" into five one-letter roles that match nothing.
+            raise OnlineServingConfigError(
+                f"read_roles for {entry.get('table')!r} must be a list of roles, "
+                f"not the string {raw_roles!r}"
+            )
+        read_roles = tuple(str(r).strip() for r in raw_roles)
+
         targets.append(
             OnlineServingTarget(
                 connection=entry.get("connection", ""),
@@ -207,6 +255,7 @@ def parse_online_targets(
                 mode=entry.get("mode", "upsert_by_key"),
                 generation_mode=generation_mode,
                 serving_ttl_days=ttl,
+                read_roles=read_roles,
             )
         )
     return targets

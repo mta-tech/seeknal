@@ -37,8 +37,8 @@ import logging
 import time
 import zlib
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Sequence
 
 from seeknal.featurestore.online_contract import (
     OnlineContractError,
@@ -58,6 +58,18 @@ PUBLICATIONS_TABLE = "_online_publications"
 #: Completeness record for every DAG node execution, publishing or not. This is
 #: what the publication gate reads.
 EXECUTIONS_TABLE = "_execution_intervals"
+
+#: Read policy per feature group: which roles may read the served values.
+#:
+#: Keyed by ``base_name`` -- the stable, version-independent name readers bind
+#: to -- not by the versioned physical table. A schema version cutover must not
+#: drop or reset the access policy, and keying by version would do exactly that:
+#: publishing ``__v2`` would leave the policy attached to ``__v1`` and the new
+#: version unreadable (or, worse under a fail-open reader, unprotected).
+#:
+#: The policy is written in the same transaction that activates the values, so
+#: data can never become readable before the policy that governs it.
+POLICY_TABLE = "_feature_group_policy"
 
 
 class OnlinePublishError(Exception):
@@ -91,6 +103,9 @@ class PublishResult:
     duration_seconds: float = 0.0
     error: str | None = None
     warnings: list[str] = field(default_factory=list)
+    #: Roles the store confirms may read this group, read back after commit
+    #: rather than echoed from the request.
+    read_roles: tuple[str, ...] = ()
 
     @property
     def succeeded(self) -> bool:
@@ -109,6 +124,7 @@ class PublishResult:
             "duration_seconds": self.duration_seconds,
             "error": self.error,
             "warnings": list(self.warnings),
+            "read_roles": list(self.read_roles),
         }
 
 
@@ -216,6 +232,13 @@ class OnlinePublisher:
             "  staged_rows BIGINT NOT NULL,"
             "  activated_rows BIGINT NOT NULL,"
             "  status TEXT NOT NULL,"
+            # The stable base name. target_table records the *versioned*
+            # physical table, which cannot be mapped back to a base name by
+            # stripping "__vN": safe_identifier() truncates long names and
+            # appends a CRC32 suffix, so the versioned and base forms of a long
+            # feature group diverge unrecoverably. Recording it is the only
+            # reliable join key between publication status and read policy.
+            "  feature_group TEXT,"
             "  activated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
             ")",
         )
@@ -231,6 +254,23 @@ class OnlinePublisher:
             "  PRIMARY KEY (node_id, interval_start, interval_end)"
             ")",
         )
+        self._remote(
+            con,
+            f"CREATE TABLE IF NOT EXISTS {self.d.schema}.{POLICY_TABLE} ("
+            "  feature_group TEXT PRIMARY KEY,"
+            # CHECK, not merely NOT NULL. An empty array is a policy that grants
+            # nothing, which under a fail-closed reader is indistinguishable
+            # from "no policy" -- so the database refuses to store one rather
+            # than leaving an unreadable group looking deliberately configured.
+            "  read_roles TEXT[] NOT NULL CHECK (cardinality(read_roles) > 0),"
+            "  publish_run_id TEXT NOT NULL,"
+            "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ")",
+        )
+        # The CREATEs above ran through postgres_execute, out-of-band from the
+        # attached catalog, so refresh its metadata before anything writes
+        # through it.
+        con.execute("CALL pg_clear_cache()")
         # CREATE TABLE IF NOT EXISTS keeps an older definition silently, so a
         # ledger predating the UNIQUE constraint would go on accepting
         # duplicate idempotency keys. Reconcile explicitly.
@@ -317,6 +357,25 @@ class OnlinePublisher:
                     "could not add idempotency_key UNIQUE (existing duplicates?): %s",
                     exc,
                 )
+
+        # feature_group joins publication status to read policy. Ledgers written
+        # before the policy table exists lack the column entirely, and
+        # CREATE TABLE IF NOT EXISTS will not add it.
+        has_column = self._scalar(
+            con,
+            "SELECT count(*) FROM information_schema.columns "
+            f"WHERE table_schema = '{_q(self.d.schema)}' "
+            f"AND table_name = '{_q(PUBLICATIONS_TABLE)}' "
+            "AND column_name = 'feature_group'",
+        )
+        if not has_column:
+            self._remote(
+                con,
+                f"ALTER TABLE {self.d.schema}.{PUBLICATIONS_TABLE} "
+                "ADD COLUMN IF NOT EXISTS feature_group TEXT",
+            )
+            con.execute("CALL pg_clear_cache()")
+            applied.append("feature_group column")
         return applied
 
     # -- version resolution ------------------------------------------------
@@ -464,6 +523,7 @@ class OnlinePublisher:
         source_interval_start: datetime,
         source_interval_end: datetime,
         definition_sha: str,
+        read_roles: Sequence[str],
         upstream_node_ids: list[str] | None = None,
         idempotency_key: str | None = None,
         cleanup_staging: bool = True,
@@ -473,12 +533,29 @@ class OnlinePublisher:
 
         A single attempt. Use :meth:`publish_with_retry` to absorb serialization
         failures.
+
+        Args:
+            read_roles: Roles permitted to read the served values. Required and
+                without a default: the catalog is fail-closed, so publishing
+                without a policy yields data nobody can read, and defaulting to
+                something permissive would silently expose whatever gets
+                published. The policy is written inside the activation
+                transaction, so values are never readable before the policy
+                governing them exists.
         """
         started = time.perf_counter()
         result = PublishResult(
             publish_run_id=publish_run_id, table=self.d.physical_fqn
         )
         staging: str | None = None
+
+        roles = tuple(str(r).strip() for r in (read_roles or ()) if str(r).strip())
+        if not roles:
+            raise OnlinePublishError(
+                f"publish({self.d.base_name!r}) requires a non-empty read_roles: "
+                "the catalog denies reads on any feature group with no policy, so "
+                "activating values without one would publish data nobody can read."
+            )
 
         try:
             self.ensure_schema(con)
@@ -524,16 +601,43 @@ class OnlinePublisher:
                     )
                 )
 
+                # The read policy activates in the SAME transaction as the
+                # values. Writing it before would expose a window in which the
+                # policy names a group with no data; writing it after would
+                # expose the far worse window in which values are live and the
+                # fail-closed catalog has no policy to check them against.
+                roles_sql = "ARRAY[" + ", ".join(f"'{_q(r)}'" for r in roles) + "]"
+                # updated_at is supplied explicitly rather than left to its
+                # DEFAULT. Writing through the attached catalog, DuckDB sends
+                # this row as a full-row COPY -- every column, with NULL for the
+                # ones the statement omitted -- so the column DEFAULT never
+                # applies and NOT NULL rejects the row:
+                #   null value in column "updated_at" violates not-null
+                # The ledger insert nearby gets away with omitting activated_at,
+                # so this is not a general rule about omitted columns; do not
+                # "simplify" this back to relying on the DEFAULT.
+                now_literal = datetime.now(timezone.utc).isoformat()
+                con.execute(
+                    f"INSERT INTO {self.alias}.{self.d.schema}.{POLICY_TABLE} "
+                    "(feature_group, read_roles, publish_run_id, updated_at) VALUES ("
+                    f"'{_q(self.d.base_name)}', {roles_sql}, '{_q(publish_run_id)}', "
+                    f"TIMESTAMPTZ '{now_literal}') "
+                    "ON CONFLICT (feature_group) DO UPDATE SET "
+                    "read_roles = EXCLUDED.read_roles, "
+                    "publish_run_id = EXCLUDED.publish_run_id, "
+                    "updated_at = EXCLUDED.updated_at"
+                )
+
                 con.execute(
                     f"INSERT INTO {self.alias}.{self.d.schema}.{PUBLICATIONS_TABLE} "
                     "(publish_run_id, target_table, idempotency_key, definition_sha, "
                     " schema_sha, source_interval_start, source_interval_end, "
-                    " staged_rows, activated_rows, status) VALUES ("
+                    " staged_rows, activated_rows, status, feature_group) VALUES ("
                     f"'{_q(publish_run_id)}', '{_q(self.d.physical_fqn)}', '{_q(ik)}', "
                     f"'{_q(definition_sha)}', '{_q(self.d.schema_sha)}', "
                     f"'{source_interval_start.isoformat()}', "
                     f"'{source_interval_end.isoformat()}', "
-                    f"{staged}, {staged}, 'succeeded')"
+                    f"{staged}, {staged}, 'succeeded', '{_q(self.d.base_name)}')"
                 )
                 con.execute("COMMIT")
             except Exception:
@@ -587,6 +691,28 @@ class OnlinePublisher:
                     "is already committed; this is a ledger inconsistency, not a "
                     "failed publication."
                 )
+
+            # A policy that silently failed to land would leave the values
+            # unreadable rather than over-exposed -- fail-closed, so not a leak
+            # -- but the group would be dark with no indication why. Confirm it
+            # rather than assume the insert took effect.
+            policy_roles = self._scalar(
+                con,
+                f"SELECT array_to_string(read_roles, ',') FROM "
+                f"{self.d.schema}.{POLICY_TABLE} "
+                f"WHERE feature_group = '{_q(self.d.base_name)}'",
+            )
+            stored = tuple(r for r in str(policy_roles or "").split(",") if r)
+            if set(stored) != set(roles):
+                raise OnlinePublishError(
+                    f"read policy verification failed AFTER COMMIT for "
+                    f"{self.d.base_name!r}: expected roles {sorted(roles)}, store "
+                    f"has {sorted(stored)}. The values are already committed and "
+                    "will be served to whoever the stored policy allows -- "
+                    f"reconcile {self.d.schema}.{POLICY_TABLE} before relying on "
+                    "this group's access control."
+                )
+            result.read_roles = tuple(sorted(roles))
 
         except Exception as exc:
             result.error = f"{type(exc).__name__}: {exc}"
