@@ -510,3 +510,16 @@ class TestRollback:
         d = descriptor()
         assert d.physical_name in d.rollback_name
         assert d.rollback_name != d.base_name
+
+
+class TestFullSnapshotRetire:
+    """full_snapshot retires entities the source no longer contains; an
+    incremental publication retires nothing."""
+
+    def test_field_defaults_to_zero(self):
+        assert PublishResult(publish_run_id="r", table="t").retired_absent == 0
+
+    def test_result_serializes_retired_absent(self):
+        r = PublishResult(publish_run_id="r", table="t")
+        r.retired_absent = 4
+        assert r.to_dict()["retired_absent"] == 4

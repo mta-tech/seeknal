@@ -106,6 +106,9 @@ class PublishResult:
     #: Roles the store confirms may read this group, read back after commit
     #: rather than echoed from the request.
     read_roles: tuple[str, ...] = ()
+    #: Entities retired because a full-snapshot publication no longer contained
+    #: them. Zero for incremental publications, which retire nothing.
+    retired_absent: int = 0
 
     @property
     def succeeded(self) -> bool:
@@ -125,6 +128,7 @@ class PublishResult:
             "error": self.error,
             "warnings": list(self.warnings),
             "read_roles": list(self.read_roles),
+            "retired_absent": self.retired_absent,
         }
 
 
@@ -542,6 +546,7 @@ class OnlinePublisher:
         upstream_node_ids: list[str] | None = None,
         idempotency_key: str | None = None,
         cleanup_staging: bool = True,
+        full_snapshot: bool = False,
         attempt: int = 0,
     ) -> PublishResult:
         """Stage, validate, then atomically activate and record the publication.
@@ -557,6 +562,17 @@ class OnlinePublisher:
                 published. The policy is written inside the activation
                 transaction, so values are never readable before the policy
                 governing them exists.
+            full_snapshot: Whether this publication is the *complete* entity set,
+                not an incremental update. In-place upsert cannot remove an
+                entity that disappeared from the source: the old row is never
+                touched, so a departed customer keeps being served stale
+                features forever. When True, entities present in the live table
+                but absent from this publication are **retired** (not deleted)
+                in the same transaction, so the served set matches the source.
+                Defaults to False because the common case is an incremental
+                refresh, where retiring everything not in this batch would
+                wrongly withdraw entities that simply were not recomputed. Only
+                a caller that knows it computed the whole population may set it.
         """
         started = time.perf_counter()
         result = PublishResult(
@@ -617,14 +633,25 @@ class OnlinePublisher:
                 cols = ", ".join(f'"{c.name}"' for c in self.d.all_columns)
                 key_tuple = ", ".join(f'"{c.name}"' for c in self.d.entity_keys)
                 con.execute(f"DELETE FROM {self.alias}.{self.d.rollback_fqn}")
+                # A full snapshot may also retire live rows absent from staging,
+                # so rollback must be able to restore those too -- not only the
+                # rows the upsert overwrites. Snapshot every existing row in
+                # that case; otherwise just the rows about to be overwritten.
+                snapshot_filter = (
+                    ""
+                    if full_snapshot
+                    else f"WHERE ({key_tuple}) IN "
+                    f"(SELECT {key_tuple} FROM {self.alias}.{staging})"
+                )
                 con.execute(
                     f"INSERT INTO {self.alias}.{self.d.rollback_fqn} "
                     f"({cols}, _rb_run_id) "
                     f"SELECT {cols}, '{_q(publish_run_id)}' "
                     f"FROM {self.alias}.{self.d.physical_fqn} "
-                    f"WHERE ({key_tuple}) IN "
-                    f"(SELECT {key_tuple} FROM {self.alias}.{staging})"
+                    f"{snapshot_filter}"
                 )
+
+                now_literal = datetime.now(timezone.utc).isoformat()
 
                 con.execute(
                     f"INSERT INTO {self.alias}.{self.d.physical_fqn} "
@@ -637,6 +664,37 @@ class OnlinePublisher:
                         f'"{n}" = EXCLUDED."{n}"' for n in self.d.served_column_names
                     )
                 )
+
+                if full_snapshot:
+                    # Retire live rows the source no longer contains. In-place
+                    # upsert never touches a departed entity's row, so without
+                    # this it would be served stale forever. Retired, not
+                    # deleted: an intentional withdrawal stays distinguishable
+                    # from a transient gap and the row remains auditable and
+                    # restorable. publish_run_id is left as the row's original
+                    # -- it belongs to the publication that created it, and the
+                    # rollback delete keys off this run's id, so leaving it
+                    # keeps a retired row from being deleted on rollback rather
+                    # than restored.
+                    # Counted via postgres_query, which runs on the server, so
+                    # the names are remote-native (no attached-catalog alias).
+                    # It reads committed state on a separate connection, but the
+                    # count is stable across the upsert: the upsert only touches
+                    # rows IN staging, and this counts live rows NOT in staging,
+                    # which the advisory lock keeps from changing underneath.
+                    retired = self._scalar(
+                        con,
+                        f"SELECT count(*) FROM {self.d.physical_fqn} "
+                        f"WHERE retired_at IS NULL AND ({key_tuple}) NOT IN "
+                        f"(SELECT {key_tuple} FROM {staging})",
+                    )
+                    con.execute(
+                        f"UPDATE {self.alias}.{self.d.physical_fqn} "
+                        f"SET retired_at = TIMESTAMPTZ '{now_literal}' "
+                        f"WHERE retired_at IS NULL AND ({key_tuple}) NOT IN "
+                        f"(SELECT {key_tuple} FROM {self.alias}.{staging})"
+                    )
+                    result.retired_absent = int(retired or 0)
 
                 # The read policy activates in the SAME transaction as the
                 # values. Writing it before would expose a window in which the
@@ -653,7 +711,7 @@ class OnlinePublisher:
                 # The ledger insert nearby gets away with omitting activated_at,
                 # so this is not a general rule about omitted columns; do not
                 # "simplify" this back to relying on the DEFAULT.
-                now_literal = datetime.now(timezone.utc).isoformat()
+                # now_literal is computed once above, before the upsert.
                 con.execute(
                     f"INSERT INTO {self.alias}.{self.d.schema}.{POLICY_TABLE} "
                     "(feature_group, read_roles, publish_run_id, updated_at) VALUES ("

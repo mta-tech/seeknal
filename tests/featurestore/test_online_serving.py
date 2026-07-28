@@ -286,3 +286,16 @@ class TestUpstreamResolution:
     def test_result_is_deterministic(self):
         dag = FakeDag(upstream={"fg.a": {"c", "a", "b"}})
         assert resolve_upstream_nodes(dag, "fg.a") == ["a", "b", "c"]
+
+
+class TestFullSnapshot:
+    """In-place upsert cannot remove a departed entity, so full_snapshot opts
+    into retiring entities absent from a complete-population publication."""
+
+    def test_defaults_to_false(self):
+        (t,) = parse_online_targets([pg_target()])
+        assert t.full_snapshot is False
+
+    def test_parsed_when_declared(self):
+        (t,) = parse_online_targets([pg_target(full_snapshot=True)])
+        assert t.full_snapshot is True

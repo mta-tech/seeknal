@@ -124,6 +124,14 @@ class OnlineServingTarget:
     #: sane thing to infer, so the declaration is mandatory: a target that asked
     #: to serve online can reasonably be asked who may read it.
     read_roles: tuple[str, ...] = ()
+    #: Whether each publication is the complete entity population rather than an
+    #: incremental refresh. In-place upsert cannot remove an entity that leaves
+    #: the source, so a departed entity is served stale forever. When true, such
+    #: entities are retired on publication. Defaults to false: the common case
+    #: is incremental, where retiring everything not in the batch would withdraw
+    #: entities that were simply not recomputed. Only set it when the pipeline
+    #: recomputes the whole population each run.
+    full_snapshot: bool = False
 
     def __post_init__(self) -> None:
         if not self.connection:
@@ -256,6 +264,7 @@ def parse_online_targets(
                 generation_mode=generation_mode,
                 serving_ttl_days=ttl,
                 read_roles=read_roles,
+                full_snapshot=bool(entry.get("full_snapshot", False)),
             )
         )
     return targets

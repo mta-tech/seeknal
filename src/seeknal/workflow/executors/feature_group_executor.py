@@ -853,6 +853,7 @@ class FeatureGroupExecutor(BaseExecutor):
                         source_interval_end=interval_end,
                         definition_sha=str(config.get("definition_sha", "")),
                         read_roles=target.read_roles,
+                        full_snapshot=target.full_snapshot,
                     )
                     if target.serving_ttl_days:
                         # Expiry runs after the publication has committed, so a
