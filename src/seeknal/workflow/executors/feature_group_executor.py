@@ -768,13 +768,44 @@ class FeatureGroupExecutor(BaseExecutor):
         published: list[dict[str, Any]] = []
 
         # The data interval this run covers. ExecutionContext carries no
-        # interval of its own, so it comes from resolved params when the
-        # workflow supplies one. Falling back to "now" for both bounds makes
-        # the window zero-width, which is honest -- it records that the run
-        # declared no interval rather than inventing a plausible one.
+        # interval of its own, so it comes from resolved params.
+        #
+        # A missing interval used to fall back to now/now. That is a zero-width
+        # window, and it silently makes both downstream guarantees vacuous:
+        # freshness is measured from source_interval_end, and the completeness
+        # check asserts served rows cover their claimed window. A row claiming
+        # an instant always "covers" it, so a publication with no real interval
+        # would pass every check while telling a consumer nothing.
+        #
+        # Publication is opt-in, so a target that asked to serve online can
+        # reasonably be required to say what window it covers.
         now = datetime.utcnow()
-        interval_start = _as_datetime(self.context.params.get("interval_start"), now)
-        interval_end = _as_datetime(self.context.params.get("interval_end"), now)
+        raw_start = self.context.params.get("interval_start")
+        raw_end = self.context.params.get("interval_end")
+        if raw_start is None or raw_end is None:
+            result.status = ExecutionStatus.FAILED
+            result.error_message = (
+                "online publication requires interval_start and interval_end "
+                "params: without them the served rows claim a zero-width window, "
+                "which makes freshness and completeness checks meaningless"
+            )
+            result.metadata["online_publication"] = {
+                "enabled": True,
+                "success": False,
+                "error": result.error_message,
+            }
+            logger.error("Node '%s': %s", self.node.id, result.error_message)
+            return
+        interval_start = _as_datetime(raw_start, now)
+        interval_end = _as_datetime(raw_end, now)
+        if interval_end <= interval_start:
+            result.status = ExecutionStatus.FAILED
+            result.error_message = (
+                f"interval_end ({interval_end.isoformat()}) must be after "
+                f"interval_start ({interval_start.isoformat()})"
+            )
+            logger.error("Node '%s': %s", self.node.id, result.error_message)
+            return
 
         for target in targets:
             try:
@@ -823,11 +854,30 @@ class FeatureGroupExecutor(BaseExecutor):
                         definition_sha=str(config.get("definition_sha", "")),
                     )
                     if target.serving_ttl_days:
-                        expired = publisher.expire_stale(con, target.serving_ttl_days)
-                        publish_result.warnings.append(
-                            f"retired {expired} row(s) older than "
-                            f"{target.serving_ttl_days} day(s)"
-                        )
+                        # Expiry runs after the publication has committed, so a
+                        # failure here must NOT be reported as a failed run: the
+                        # new values are already activated and serving. Marking
+                        # the run failed would send an operator looking for a
+                        # publication problem that does not exist, and could
+                        # trigger a pointless republish.
+                        #
+                        # Stale rows lingering is a maintenance issue, not a
+                        # correctness one -- they are retired on the next run.
+                        try:
+                            expired = publisher.expire_stale(
+                                con, target.serving_ttl_days
+                            )
+                            publish_result.warnings.append(
+                                f"retired {expired} row(s) older than "
+                                f"{target.serving_ttl_days} day(s)"
+                            )
+                        except Exception as ttl_exc:
+                            msg = (
+                                f"publication succeeded but TTL expiry failed: "
+                                f"{ttl_exc}"
+                            )
+                            publish_result.warnings.append(msg)
+                            logger.warning("Node '%s': %s", self.node.id, msg)
                 finally:
                     publisher.detach(con)
 

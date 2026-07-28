@@ -31,12 +31,19 @@ def make_result(status=ExecutionStatus.SUCCESS):
     )
 
 
-def make_executor(config, con=None):
+VALID_INTERVAL = {
+    "interval_start": "2026-06-27T00:00:00+00:00",
+    "interval_end": "2026-07-27T00:00:00+00:00",
+}
+
+
+def make_executor(config, con=None, params=None):
     """A stand-in exposing only what _publish_online touches."""
     return SimpleNamespace(
         node=SimpleNamespace(id="feature_group.customer_30d", name="customer_30d", config=config),
         context=SimpleNamespace(
-            params={}, get_duckdb_connection=lambda: con or object()
+            params=dict(VALID_INTERVAL if params is None else params),
+            get_duckdb_connection=lambda: con or object(),
         ),
     )
 
@@ -127,6 +134,66 @@ class TestFailureFailsTheRun:
         result = make_result()
         publish(make_executor({"materializations": [PG_TARGET]}), result)
         assert result.status is not ExecutionStatus.SUCCESS
+
+
+class TestIntervalIsRequired:
+    """A missing interval used to default to now/now. That zero-width window
+    silently makes both downstream guarantees vacuous: freshness is measured
+    from source_interval_end, and completeness asserts rows cover their claimed
+    window -- and a row claiming an instant always covers it. The publication
+    would pass every check while telling a consumer nothing."""
+
+    def test_missing_both_bounds_fails_the_run(self):
+        result = make_result()
+        publish(make_executor({"materializations": [PG_TARGET]}, params={}), result)
+        assert result.status is ExecutionStatus.FAILED
+        assert "interval_start" in (result.error_message or "")
+
+    def test_missing_one_bound_fails_the_run(self):
+        result = make_result()
+        publish(
+            make_executor(
+                {"materializations": [PG_TARGET]},
+                params={"interval_start": "2026-07-01T00:00:00+00:00"},
+            ),
+            result,
+        )
+        assert result.status is ExecutionStatus.FAILED
+
+    def test_inverted_interval_fails_the_run(self):
+        result = make_result()
+        publish(
+            make_executor(
+                {"materializations": [PG_TARGET]},
+                params={
+                    "interval_start": "2026-07-27T00:00:00+00:00",
+                    "interval_end": "2026-06-27T00:00:00+00:00",
+                },
+            ),
+            result,
+        )
+        assert result.status is ExecutionStatus.FAILED
+        assert "must be after" in (result.error_message or "")
+
+    def test_zero_width_interval_fails_the_run(self):
+        same = "2026-07-27T00:00:00+00:00"
+        result = make_result()
+        publish(
+            make_executor(
+                {"materializations": [PG_TARGET]},
+                params={"interval_start": same, "interval_end": same},
+            ),
+            result,
+        )
+        assert result.status is ExecutionStatus.FAILED
+
+    def test_no_interval_needed_when_nothing_opted_in(self):
+        """Targets that never asked to serve online are unaffected."""
+        entry = dict(PG_TARGET)
+        entry.pop("serve_online")
+        result = make_result()
+        publish(make_executor({"materializations": [entry]}, params={}), result)
+        assert result.status is ExecutionStatus.SUCCESS
 
 
 class TestIntervalCoercion:

@@ -558,9 +558,18 @@ class OnlinePublisher:
                 or 0
             )
             if confirmed != staged:
+                # The transaction has already COMMITTED at this point. Saying
+                # only "verification failed" invites an operator to assume
+                # nothing landed and republish, when in fact the activation and
+                # ledger are durable. State the committed-but-unverified
+                # condition explicitly so the next action is an investigation,
+                # not a blind retry.
                 raise OnlinePublishError(
-                    f"remote verification failed: staged {staged} rows but only "
-                    f"{confirmed} carry publish_run_id {publish_run_id!r}"
+                    f"remote verification failed AFTER COMMIT: staged {staged} rows "
+                    f"but only {confirmed} carry publish_run_id {publish_run_id!r}. "
+                    f"The activation and ledger row for {publish_run_id!r} are "
+                    "already committed and may be serving -- inspect "
+                    f"{self.d.physical_fqn} before republishing."
                 )
 
             ledgered = int(
@@ -573,8 +582,10 @@ class OnlinePublisher:
             )
             if ledgered != 1:
                 raise OnlinePublishError(
-                    f"ledger verification failed: expected 1 row for "
-                    f"{publish_run_id!r}, found {ledgered}"
+                    f"ledger verification failed AFTER COMMIT: expected 1 row for "
+                    f"{publish_run_id!r}, found {ledgered}. The feature activation "
+                    "is already committed; this is a ledger inconsistency, not a "
+                    "failed publication."
                 )
 
         except Exception as exc:
