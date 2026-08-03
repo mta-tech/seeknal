@@ -10,7 +10,10 @@ Two modes:
   - **Mode 1 (SQL):** ``upload_to_s3(filename, sql="SELECT ...")`` — tool
     executes the SQL via ``ctx.repl.execute_oneshot`` and uses the column names
     from the cursor as the CSV header. Use this when the data lives in a
-    database (execute_sql results, ad-hoc queries).
+    database (execute_sql results, ad-hoc queries). Mode 1 exports ALL
+    returned rows — it deliberately passes ``limit=None`` so the exported file
+    carries every row the query produces (an export is an intentional full-data
+    dump, unlike execute_sql's 500-row chat-display cap).
   - **Mode 2 (data):** ``upload_to_s3(filename, data=[[...], ...],
     columns=["col1", "col2"])`` — tool builds the CSV directly from the
     provided rows and column names. Use this when the data is computed
@@ -33,7 +36,6 @@ from __future__ import annotations
 import csv
 import io
 import logging
-import os
 import re
 import time
 from datetime import datetime, timezone
@@ -46,16 +48,6 @@ logger = logging.getLogger(__name__)
 # No storage URL/API key here: connectivity is resolved once at session init
 # (agent.py) and injected via ToolContext.iba_storage_presign_url/iba_storage_api_key
 # -- this module never reads os.environ for storage config. See _context.py's ToolContext.
-
-# CSV exports are files, not chat-context tables — decoupled from both
-# execute_sql's 500-row chat-display cap and ctx.request_limit (the
-# pydantic-ai UsageLimits.request_limit model-request budget, NOT a row
-# count; using it as a row limit silently truncated "full data" exports to
-# ~100 rows). 5000 keeps exports well under typical SeaweedFS/browser CSV
-# handling while covering the export use case (raw dumps larger than the
-# chat table, smaller than a full warehouse scan).
-_CSV_EXPORT_ROW_LIMIT = int(os.environ.get("SEEKNAL_CSV_EXPORT_ROW_LIMIT", "5000"))
-
 
 def upload_to_s3(
     filename: str,
@@ -350,17 +342,20 @@ def _resolve_mode(
     if has_sql:
         # Mode 1: execute SQL via the existing DuckDB ATTACH seam.
         #
-        # Repair + row-limit + governance mirror execute_sql.py exactly so the
-        # CSV always matches what the agent saw on screen (audit fix D1-D3,
-        # 2026-07-09):
+        # Repair + governance mirror execute_sql.py exactly so the CSV always
+        # matches what the agent saw on screen (audit fix D1-D3, 2026-07-09).
+        # The ROW LIMIT is deliberately NOT mirrored: exports are intentional
+        # full-data dumps, so limit=None is passed to
+        # _execute_oneshot_with_timeout (repl.py only wraps "LIMIT N" when a
+        # non-None limit is given) — every returned row reaches the file.
         #   D1 — without _repair_common_sql_before_execution, EXTRACT(YEAR
         #        FROM ...) filters are NOT pushed down to PostgreSQL and are
         #        evaluated locally in DuckDB with different cast/NULL
         #        semantics, silently producing different row counts than the
         #        execute_sql call the agent already ran for the same SQL.
         #   D2 — ctx.request_limit is pydantic-ai's UsageLimits.request_limit
-        #        (a model-request budget, default 100), not a row count. Using
-        #        it here silently truncated "full data" exports.
+        #        (a model-request budget, default 100), NOT a row count; it is
+        #        never used as a row limit here. Exports carry no row cap.
         #   D3 — execute_sql masks sensitive columns via Atlas governance;
         #        skipping that here would let a masked column leave
         #        ungoverned through the exported file.
@@ -376,11 +371,11 @@ def _resolve_mode(
         # D1 follow-up (audit fix, 2026-07-09): execute_sql.py strips a
         # trailing semicolon BEFORE repair/execution; this branch didn't, so
         # agent SQL ending in ";" (LLMs add this routinely) survived into
-        # _execute_oneshot_with_timeout, which wraps the query as
-        # "SELECT * FROM (<sql>) AS _q LIMIT N" to apply the row cap -- the
-        # leftover ";" then lands mid-statement ("...;) AS _q LIMIT 5000"),
-        # a guaranteed DuckDB ParserException on every semicolon-terminated
-        # query. Strip it here too, matching execute_sql.py exactly.
+        # _execute_oneshot_with_timeout and the leftover ";" could land
+        # mid-statement if the query ever got wrapped ("SELECT * FROM
+        # (<sql>;) AS _q ..."), a guaranteed DuckDB ParserException on every
+        # semicolon-terminated query. Strip it here too, matching
+        # execute_sql.py exactly.
         sql = str(sql).strip().rstrip(";").strip()
         repaired_sql, _notices = _repair_common_sql_before_execution(sql)
 
@@ -400,9 +395,7 @@ def _resolve_mode(
         # suggestions, DuckDB syntax tips -- rather than a second,
         # upload_to_s3-specific self-correction path.
         try:
-            cols, rows = _execute_oneshot_with_timeout(
-                ctx, repaired_sql, limit=_CSV_EXPORT_ROW_LIMIT
-            )
+            cols, rows = _execute_oneshot_with_timeout(ctx, repaired_sql, limit=None)
         except Exception as exc:
             # One auto-retry using DuckDB's own "Did you mean" suggestion,
             # same as execute_sql.py -- most missing-table typos self-resolve
@@ -411,7 +404,7 @@ def _resolve_mode(
             if suggested_sql and suggested_sql != repaired_sql:
                 try:
                     cols, rows = _execute_oneshot_with_timeout(
-                        ctx, suggested_sql, limit=_CSV_EXPORT_ROW_LIMIT
+                        ctx, suggested_sql, limit=None
                     )
                     repaired_sql = suggested_sql
                 except Exception as retry_exc:
