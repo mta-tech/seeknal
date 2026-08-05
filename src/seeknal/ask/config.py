@@ -524,6 +524,28 @@ def get_ask_toolset_mode(config: dict[str, Any]) -> str:
     return "full"
 
 
+def get_pg_passthrough_enabled(config: dict[str, Any]) -> bool:
+    """Return whether PG-only SQL may be executed directly on PostgreSQL.
+
+    DuckDB's ``postgres_scanner`` never pushes aggregation past the
+    ``COPY (SELECT ... TO STDOUT)`` boundary, so ``COUNT(DISTINCT ...)`` over an
+    attached table transfers the raw column and computes locally. Routing
+    PG-only SQL straight to PostgreSQL lets the source do the aggregation and
+    returns only the result rows.
+
+    Default is ``False``: no project changes execution engine without an
+    explicit decision. Any failure on the routed path falls back to DuckDB, so
+    enabling this can slow a query down but can never change its answer.
+
+    Example::
+
+        sql_routing:
+          pg_passthrough: true
+    """
+    section = _get_mapping(config, "sql_routing")
+    return _coerce_bool(section.get("pg_passthrough"), False)
+
+
 _VALID_SQL_PAIR_MODES = {"authoritative", "advisory"}
 
 

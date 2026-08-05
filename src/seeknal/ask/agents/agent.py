@@ -273,6 +273,9 @@ def create_agent(
     tool_ctx = get_tool_context()
     tool_ctx.request_limit = get_request_limit(agent_config)
     tool_ctx.sql_timeout_seconds = get_sql_timeout_seconds(agent_config)
+    from seeknal.ask.config import get_pg_passthrough_enabled
+
+    tool_ctx.pg_passthrough = get_pg_passthrough_enabled(agent_config)
     tool_ctx.discovery_cache_ttl_seconds = get_discovery_cache_ttl_seconds(agent_config)
     tool_ctx.background_threshold = get_background_threshold(agent_config)
     from seeknal.ask.config import get_sql_pair_mode

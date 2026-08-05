@@ -76,6 +76,10 @@ class ToolContext:
     sql_pairs_checked_this_turn: bool = False
     authoritative_sql_pair_result_this_turn: dict[str, str] | None = None
     sql_timeout_seconds: int = 60
+    # SQLR: route PG-only SQL straight to PostgreSQL instead of running it
+    # through DuckDB's postgres_scanner. Off unless the project opts in; any
+    # failure on that path falls back to DuckDB (see execute_sql._try_pg_route).
+    pg_passthrough: bool = False
     discovery_cache_ttl_seconds: int = 300
     discovery_cache: dict[str, tuple[float, Any]] = field(default_factory=dict)
     timing_events_this_turn: list[dict[str, Any]] = field(default_factory=list)
