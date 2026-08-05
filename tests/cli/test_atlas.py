@@ -44,6 +44,7 @@ class TestAtlasCliIntegration:
         result = runner.invoke(app, ["atlas", "--help"])
         assert result.exit_code == 0
         assert "api" in result.output.lower()
+        assert "feature-service" in result.output.lower()
         assert "governance" in result.output.lower()
         assert "lineage" in result.output.lower()
 
@@ -155,6 +156,229 @@ class TestAtlasLineageCommands:
         assert "inputs" in result.output.lower() or "outputs" in result.output.lower()
 
 
+class TestAtlasFeatureServiceCommands:
+    """Test ``seeknal atlas feature-service`` commands."""
+
+    def test_publish_sends_complete_multi_group_draft_without_schema_version(
+        self, tmp_path
+    ):
+        path = tmp_path / "customer-risk.yml"
+        path.write_text(
+            """\
+schemaVersion: 1
+serviceId: customer-risk
+version: "1"
+variant: default
+owner: ml-platform
+entityKeys:
+  - semanticName: customer_id
+    physicalName: customer_id
+    dataType: string
+    ordinal: 0
+selections:
+  - view:
+      viewId: customer_profile
+      revision: "4"
+      schemaRevision: "4"
+      sourceLocator: seeknal:feature-group:customer_profile:4
+      fields:
+        - name: age
+          dataType: int64
+      entityKeys:
+        - semanticName: customer_id
+          physicalName: customer_id
+          dataType: string
+          ordinal: 0
+    features: [age]
+    ordinal: 0
+  - view:
+      viewId: customer_activity
+      revision: "7"
+      schemaRevision: "7"
+      sourceLocator: seeknal:feature-group:customer_activity:7
+      fields:
+        - name: spend_30d
+          dataType: float64
+      entityKeys:
+        - semanticName: customer_id
+          physicalName: customer_id
+          dataType: string
+          ordinal: 0
+    features: [spend_30d]
+    ordinal: 1
+""",
+            encoding="utf-8",
+        )
+        client = MagicMock()
+        client.publish_feature_service.return_value = {
+            "service": {
+                "serviceId": "customer-risk",
+                "version": "1",
+                "variant": "default",
+            },
+            "replayed": False,
+            "servingAuthorization": {
+                "provisionedByPublication": False,
+                "reason": "policy_binding_required",
+            },
+        }
+
+        with patch(
+            "seeknal.integrations.atlas_client.create_atlas_contract_client_from_env",
+            return_value=client,
+        ):
+            result = runner.invoke(
+                app, ["atlas", "feature-service", "publish", str(path)]
+            )
+
+        assert result.exit_code == 0
+        draft = client.publish_feature_service.call_args.args[0]
+        assert "schemaVersion" not in draft
+        assert [item["view"]["viewId"] for item in draft["selections"]] == [
+            "customer_profile",
+            "customer_activity",
+        ]
+        assert "Created Feature Service" in result.output
+        assert "separate policy binding" in result.output
+
+    def test_publish_reports_replayed(self, tmp_path):
+        path = tmp_path / "service.yml"
+        path.write_text(
+            "schemaVersion: 1\nserviceId: customer-risk\nversion: '1'\n"
+            "variant: default\n",
+            encoding="utf-8",
+        )
+        client = MagicMock()
+        client.publish_feature_service.return_value = {
+            "service": {
+                "serviceId": "customer-risk",
+                "version": "1",
+                "variant": "default",
+            },
+            "replayed": True,
+        }
+
+        with patch(
+            "seeknal.integrations.atlas_client.create_atlas_contract_client_from_env",
+            return_value=client,
+        ):
+            result = runner.invoke(
+                app, ["atlas", "feature-service", "publish", str(path)]
+            )
+
+        assert result.exit_code == 0
+        assert "Replayed Feature Service" in result.output
+
+    @pytest.mark.parametrize("schema_version", ["2", "true", "null"])
+    def test_publish_rejects_unsupported_schema_version(
+        self, tmp_path, schema_version
+    ):
+        path = tmp_path / "service.yml"
+        path.write_text(
+            f"schemaVersion: {schema_version}\nserviceId: customer-risk\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            app, ["atlas", "feature-service", "publish", str(path)]
+        )
+
+        assert result.exit_code == 1
+        assert "expected schemaVersion: 1" in result.output
+
+    def test_publish_fails_clearly_without_atlas_config(self, tmp_path):
+        path = tmp_path / "service.yml"
+        path.write_text(
+            "schemaVersion: 1\nserviceId: customer-risk\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "seeknal.integrations.atlas_client.create_atlas_contract_client_from_env",
+            return_value=None,
+        ):
+            result = runner.invoke(
+                app, ["atlas", "feature-service", "publish", str(path)]
+            )
+
+        assert result.exit_code == 2
+        assert "Atlas is not configured" in result.output
+        assert "ATLAS_API_URL" in result.output
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "createdBy",
+            "createdAt",
+            "publishedAt",
+            "schemaHash",
+            "lifecycle",
+            "deployment",
+        ],
+    )
+    def test_publish_rejects_server_owned_fields_before_http(self, tmp_path, field):
+        path = tmp_path / "service.yml"
+        path.write_text(
+            f"schemaVersion: 1\nserviceId: customer-risk\n{field}: rejected\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "seeknal.integrations.atlas_client.create_atlas_contract_client_from_env"
+        ) as factory:
+            result = runner.invoke(
+                app, ["atlas", "feature-service", "publish", str(path)]
+            )
+
+        assert result.exit_code == 1
+        assert "server-owned field" in result.output
+        assert field in result.output
+        factory.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            (
+                "auth",
+                "Run `seeknal auth login`",
+            ),
+            (
+                "server",
+                "Failed to publish Feature Service",
+            ),
+        ],
+    )
+    def test_publish_handles_atlas_errors(self, tmp_path, error, expected):
+        from seeknal.integrations.atlas_client import (
+            SESSION_EXPIRED_HINT,
+            AtlasAuthError,
+            AtlasContractError,
+        )
+
+        path = tmp_path / "service.yml"
+        path.write_text(
+            "schemaVersion: 1\nserviceId: customer-risk\n",
+            encoding="utf-8",
+        )
+        client = MagicMock()
+        client.publish_feature_service.side_effect = (
+            AtlasAuthError(SESSION_EXPIRED_HINT)
+            if error == "auth"
+            else AtlasContractError("backend unavailable")
+        )
+
+        with patch(
+            "seeknal.integrations.atlas_client.create_atlas_contract_client_from_env",
+            return_value=client,
+        ):
+            result = runner.invoke(
+                app, ["atlas", "feature-service", "publish", str(path)]
+            )
+
+        assert result.exit_code == 1
+        assert expected in result.output
+
+
 class TestAtlasModuleAvailability:
     """Test Atlas module availability checks."""
 
@@ -197,5 +421,6 @@ class TestAtlasAppExport:
         result = runner.invoke(atlas_app, ["--help"])
         assert result.exit_code == 0
         assert "api" in result.output
+        assert "feature-service" in result.output
         assert "governance" in result.output
         assert "lineage" in result.output

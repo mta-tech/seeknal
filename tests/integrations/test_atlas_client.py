@@ -183,6 +183,54 @@ def test_post_non_401_errors_keep_generic_contract_error() -> None:
     assert "boom" in str(excinfo.value)
 
 
+def test_publish_feature_service_posts_draft_to_contract_endpoint() -> None:
+    seen: list[tuple[str, dict[str, object]]] = []
+    draft = {
+        "serviceId": "customer-risk",
+        "version": "1",
+        "variant": "default",
+        "selections": [
+            {"view": {"viewId": "customer_profile"}, "features": ["age"], "ordinal": 0},
+            {"view": {"viewId": "customer_activity"}, "features": ["spend"], "ordinal": 1},
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "service": draft,
+                    "replayed": False,
+                    "servingAuthorization": {
+                        "provisionedByPublication": False,
+                        "reason": "policy_binding_required",
+                    },
+                },
+                "meta": {"requestId": "req-123"},
+            },
+        )
+
+    client = _client(handler, token="user-token")
+
+    result = client.publish_feature_service(draft)
+
+    assert result["replayed"] is False
+    assert result["service"] == draft
+    assert seen == [("/api/contracts/feature-services/publish", draft)]
+
+
+def test_publish_feature_service_rejects_invalid_response_envelope() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"service": {}, "replayed": False})
+
+    client = _client(handler, token="user-token")
+
+    with pytest.raises(AtlasContractError, match="missing data envelope"):
+        client.publish_feature_service({"serviceId": "customer-risk"})
+
+
 def test_preflight_apply_authenticates_with_refreshed_token(tmp_path: Path) -> None:
     """End-to-end: a stale session is refreshed mid-preflight and apply proceeds."""
 

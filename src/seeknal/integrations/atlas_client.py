@@ -481,6 +481,30 @@ class AtlasContractClient:
             },
         )
 
+    def publish_feature_service(
+        self,
+        draft: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Publish one complete canonical Feature Service draft snapshot."""
+
+        response = self._post(
+            "/api/contracts/feature-services/publish",
+            draft,
+        )
+        data = response.get("data")
+        if not isinstance(data, dict):
+            raise AtlasContractError(
+                "Atlas returned an invalid Feature Service publication response: "
+                "missing data envelope."
+            )
+        if not isinstance(data.get("service"), dict) or not isinstance(
+            data.get("replayed"), bool
+        ):
+            raise AtlasContractError(
+                "Atlas returned an invalid Feature Service publication response."
+            )
+        return data
+
     def report_local_failure(
         self,
         context: AtlasApplyContext,

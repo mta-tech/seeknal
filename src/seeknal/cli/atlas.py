@@ -14,6 +14,8 @@ Usage:
 
     seeknal atlas lineage show <fg>   Show lineage for a feature group
     seeknal atlas lineage publish     Publish lineage to DataHub
+    seeknal atlas feature-service publish <yaml>
+                                      Publish a Feature Service contract
 
 Examples:
     # Start the Atlas API server
@@ -45,6 +47,8 @@ from the Seeknal CLI.
 
 Commands:
   api         Manage the Atlas Seeknal API server
+  feature-service
+              Publish immutable Feature Service contracts
   governance  Data governance operations (policies, access, audit)
   lineage     Lineage tracking and publishing
 
@@ -71,6 +75,12 @@ lineage_app = typer.Typer(
     help="Lineage tracking and publishing",
 )
 atlas_app.add_typer(lineage_app, name="lineage")
+
+feature_service_app = typer.Typer(
+    name="feature-service",
+    help="Publish immutable Feature Service contracts",
+)
+atlas_app.add_typer(feature_service_app, name="feature-service")
 
 
 def _check_atlas_installed() -> bool:
@@ -865,6 +875,104 @@ def lineage_publish(
     _echo_success("Lineage published successfully")
     typer.echo(f"  Upstream datasets: {len(input_list)}")
     typer.echo(f"  Downstream datasets: {len(output_list)}")
+
+
+# =============================================================================
+# Feature Service Commands
+# =============================================================================
+
+
+@feature_service_app.command("publish")
+def feature_service_publish(
+    yaml_path: Path = typer.Argument(
+        ...,
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Versioned YAML containing a complete canonical Feature Service draft",
+    ),
+):
+    """Publish a complete canonical Feature Service draft to Atlas.
+
+    The YAML must declare ``schemaVersion: 1`` alongside the full draft
+    snapshot. Seeknal does not synthesize a service from local Feature Groups.
+
+    Example:
+        seeknal atlas feature-service publish feature-service.yml
+    """
+    import yaml
+
+    from seeknal.integrations.atlas_client import (
+        AtlasAuthError,
+        AtlasContractError,
+        create_atlas_contract_client_from_env,
+    )
+
+    try:
+        document = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        _echo_error(f"Could not read Feature Service YAML: {exc}")
+        raise typer.Exit(1)
+
+    if not isinstance(document, dict):
+        _echo_error("Feature Service YAML must contain a mapping.")
+        raise typer.Exit(1)
+
+    schema_version = document.get("schemaVersion")
+    if type(schema_version) is not int or schema_version != 1:
+        _echo_error("Unsupported Feature Service schemaVersion; expected schemaVersion: 1.")
+        raise typer.Exit(1)
+
+    draft = {key: value for key, value in document.items() if key != "schemaVersion"}
+    if not draft:
+        _echo_error("Feature Service YAML must include the complete draft snapshot.")
+        raise typer.Exit(1)
+
+    server_owned_fields = {
+        "createdBy",
+        "createdAt",
+        "publishedAt",
+        "schemaHash",
+        "lifecycle",
+        "deployment",
+    }
+    invalid_fields = sorted(server_owned_fields.intersection(draft))
+    if invalid_fields:
+        _echo_error(
+            "Feature Service YAML contains server-owned field(s): "
+            f"{', '.join(invalid_fields)}. Remove them before publishing."
+        )
+        raise typer.Exit(1)
+
+    client = create_atlas_contract_client_from_env()
+    if client is None:
+        _echo_error(
+            "Atlas is not configured; set ATLAS_API_URL or run "
+            "`seeknal auth config set --host <atlas-host>`."
+        )
+        raise typer.Exit(2)
+
+    try:
+        response = client.publish_feature_service(draft)
+    except AtlasAuthError as exc:
+        _echo_error(str(exc))
+        raise typer.Exit(1)
+    except AtlasContractError as exc:
+        _echo_error(f"Failed to publish Feature Service: {exc}")
+        raise typer.Exit(1)
+
+    service = response.get("service") or {}
+    identity = " / ".join(
+        str(service.get(field) or draft.get(field) or "?")
+        for field in ("serviceId", "version", "variant")
+    )
+    outcome = "Replayed" if response.get("replayed") is True else "Created"
+    _echo_success(f"{outcome} Feature Service: {identity}")
+    _echo_info(
+        "Feature Service metadata is published. Serving operate authorization "
+        "requires a separate policy binding."
+    )
 
 
 # =============================================================================
