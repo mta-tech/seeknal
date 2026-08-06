@@ -77,6 +77,15 @@ def test_source_fqtn_postgresql_schema_table_fallback() -> None:
     assert main_module._source_fqtn(node) == "public.events"
 
 
+def test_source_fqtn_skips_local_file_sources() -> None:
+    node = _FakeNode(
+        NodeType.SOURCE,
+        {"source": "csv", "table": "data/customers.csv"},
+    )
+
+    assert main_module._source_fqtn(node) is None
+
+
 def test_source_fqtn_none_when_no_table() -> None:
     node = _FakeNode(NodeType.SOURCE, {"source": "csv"})
     assert main_module._source_fqtn(node) is None

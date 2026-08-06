@@ -65,6 +65,11 @@ from seeknal.pipeline.context import PipelineContext
 from seeknal.pipeline.llm import PipelineLLM
 from seeknal.pipeline.state import PipelineState
 from seeknal.pipeline.feature_frame import FeatureFrame
+from seeknal.pipeline.feature_service import (
+    FeatureServiceSpec,
+    FeatureView,
+    feature_service,
+)
 from seeknal.pipeline.materialization import (
     Materialization,
     OfflineConfig,
@@ -77,6 +82,7 @@ __all__ = [
     "source",
     "transform",
     "feature_group",
+    "feature_service",
     "second_order_aggregation",
     # Context
     "PipelineContext",
@@ -84,6 +90,8 @@ __all__ = [
     "PipelineState",
     # Feature Frame
     "FeatureFrame",
+    "FeatureServiceSpec",
+    "FeatureView",
     # Materialization
     "Materialization",
     "OfflineConfig",

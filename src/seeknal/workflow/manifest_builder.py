@@ -27,6 +27,7 @@ def build_manifest_from_dag(dag_builder: Any, project_name: str):
         "source": ManifestNodeType.SOURCE,
         "transform": ManifestNodeType.TRANSFORM,
         "feature_group": ManifestNodeType.FEATURE_GROUP,
+        "feature_service": ManifestNodeType.FEATURE_SERVICE,
         "model": ManifestNodeType.MODEL,
         "rule": ManifestNodeType.RULE,
         "aggregation": ManifestNodeType.AGGREGATION,
@@ -41,7 +42,10 @@ def build_manifest_from_dag(dag_builder: Any, project_name: str):
     manifest = Manifest(project=project_name)
     for node_id, node in dag_builder.nodes.items():
         kind_str = node.kind.value if hasattr(node.kind, "value") else str(node.kind)
-        manifest_node_type = node_type_map.get(kind_str, ManifestNodeType.SOURCE)
+        try:
+            manifest_node_type = node_type_map[kind_str]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported manifest node kind: {kind_str}") from exc
         raw_columns: dict[str, Any] = {}
         if hasattr(node, "yaml_data"):
             raw_columns = node.yaml_data.get("columns", {}) or {}

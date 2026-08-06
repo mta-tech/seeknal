@@ -554,6 +554,129 @@ class TestSeeknalPrefectFlow:
 class TestLayerExecution:
     """Test the _execute_pipeline logic with mock runner."""
 
+    def test_available_pipeline_prepares_atlas_context_and_contract_state(
+        self,
+        tmp_path,
+    ):
+        from seeknal.dag.manifest import Manifest, Node, NodeType
+        from seeknal.workflow.executors.base import (
+            ExecutionContext,
+            ExecutorResult,
+            ExecutionStatus,
+        )
+        from seeknal.workflow.prefect_integration import (
+            PrefectNodeResult,
+            _execute_pipeline,
+        )
+        from seeknal.workflow.runner import DAGRunner
+
+        manifest = Manifest(project="test")
+        manifest.add_node(
+            Node(
+                id="feature_group.customer_profile",
+                name="customer_profile",
+                node_type=NodeType.FEATURE_GROUP,
+                config={
+                    "features": {"score": "double"},
+                    "materializations": [{"type": "atlas_online"}],
+                },
+            )
+        )
+        manifest.add_node(
+            Node(
+                id="feature_service.customer_analytics",
+                name="customer_analytics",
+                node_type=NodeType.FEATURE_SERVICE,
+                config={
+                    "views": [
+                        {
+                            "ref": "feature_group.customer_profile",
+                            "features": ["score"],
+                        }
+                    ]
+                },
+            )
+        )
+        manifest.add_edge(
+            "feature_group.customer_profile",
+            "feature_service.customer_analytics",
+        )
+        context = ExecutionContext(
+            project_name="test",
+            workspace_path=tmp_path,
+            target_path=tmp_path / "target",
+        )
+        runner = DAGRunner(
+            manifest,
+            target_path=tmp_path / "target",
+            exec_context=context,
+        )
+        executor = MagicMock()
+        executor.run.return_value = ExecutorResult(
+            node_id="feature_group.customer_profile",
+            status=ExecutionStatus.SUCCESS,
+            row_count=1,
+            metadata={"materialization": {"success": True}},
+        )
+
+        class _TaskAdapter:
+            @staticmethod
+            def with_options(**_kwargs):
+                def execute_node(prepared_runner, node_id):
+                    result = prepared_runner._execute_node(node_id)
+                    return PrefectNodeResult(
+                        node_id=result.node_id,
+                        status=result.status.value,
+                        duration=result.duration,
+                        row_count=result.row_count,
+                        error_message=result.error_message,
+                        metadata=result.metadata,
+                    )
+
+                return execute_node
+
+        builder = MagicMock()
+        builder._build_runner.return_value = (runner, tmp_path / "target")
+        builder.project_path = tmp_path
+
+        with (
+            patch(
+                "seeknal.workflow.executors.get_executor",
+                return_value=executor,
+            ),
+            patch(
+                "seeknal.workflow.prefect_integration.run_node_task",
+                _TaskAdapter(),
+            ),
+            patch("seeknal.workflow.prefect_integration._run_consolidation"),
+            patch("seeknal.workflow.prefect_integration._create_results_artifact"),
+        ):
+            results = _execute_pipeline(
+                builder,
+                max_workers=1,
+                continue_on_error=False,
+                full_refresh=True,
+            )
+
+        assert [
+            result.node_id for result in results if result.status == "success"
+        ] == [
+            "feature_group.customer_profile"
+        ]
+        assert runner.run_state.run_id
+        assert len(runner.run_state.run_id) == 32
+        fingerprints = context.config["_seeknal_node_fingerprints"]
+        assert fingerprints["feature_group.customer_profile"]["combined"]
+        assert context.config["_seeknal_run_id"] == runner.run_state.run_id
+        assert runner.run_state.nodes[
+            "feature_group.customer_profile"
+        ].fingerprint is not None
+        feature_service = runner.run_state.nodes[
+            "feature_service.customer_analytics"
+        ]
+        assert feature_service.fingerprint is not None
+        assert feature_service.metadata["contract_only"] is True
+
     @patch("seeknal.workflow.state.save_state")
     @patch("seeknal.workflow.state.update_node_state")
     @patch("seeknal.workflow.prefect_integration._create_results_artifact")

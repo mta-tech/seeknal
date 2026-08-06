@@ -182,6 +182,7 @@ class DAGBuilder:
         "source": NodeType.SOURCE,
         "transform": NodeType.TRANSFORM,
         "feature_group": NodeType.FEATURE_GROUP,
+        "feature_service": NodeType.FEATURE_SERVICE,
         "model": NodeType.MODEL,
         "aggregation": NodeType.AGGREGATION,
         "second_order_aggregation": NodeType.SECOND_ORDER_AGGREGATION,
@@ -626,6 +627,34 @@ class DAGBuilder:
                 if source_type:
                     self._merge_source_defaults(data, source_type)
 
+            if kind_str == "feature_service":
+                from seeknal.pipeline.feature_service import FeatureServiceSpec
+
+                spec = FeatureServiceSpec.model_validate(
+                    {
+                        key: data.get(key)
+                        for key in (
+                            "name",
+                            "version",
+                            "variant",
+                            "owner",
+                            "description",
+                            "consumer",
+                            "tags",
+                            "views",
+                        )
+                        if key in data
+                    }
+                )
+                normalized = spec.node_metadata()
+                data.update(
+                    {
+                        key: value
+                        for key, value in normalized.items()
+                        if key not in {"id", "kind"}
+                    }
+                )
+
             # Normalize materializations (plural/singular)
             data = self._normalize_materializations(data, file_path)
 
@@ -714,7 +743,7 @@ class DAGBuilder:
                     source_type = yaml_data.get("source")
                     if source_type:
                         self._merge_source_defaults(yaml_data, source_type)
-                elif kind_str in ("transform", "feature_group"):
+                elif kind_str in ("transform", "feature_group", "feature_service"):
                     # Include inputs from metadata
                     if "inputs" in node_meta:
                         yaml_data["inputs"] = node_meta["inputs"]
@@ -753,6 +782,17 @@ class DAGBuilder:
                     else:
                         yaml_data["entity"] = entity_raw
                     yaml_data["features"] = node_meta.get("features", {})
+
+                if kind_str == "feature_service":
+                    for field_name in (
+                        "version",
+                        "variant",
+                        "owner",
+                        "description",
+                        "consumer",
+                        "views",
+                    ):
+                        yaml_data[field_name] = node_meta.get(field_name)
 
                 # Handle materialization for all node types (source, transform, feature_group)
                 decorator_mat = node_meta.get("materialization")

@@ -44,7 +44,9 @@ pip install seeknal[atlas]
 | `atlas governance violations` | List policy violations |
 | `atlas lineage show <name>` | Show lineage for a resource |
 | `atlas lineage publish <pipeline>` | Publish lineage to DataHub |
-| `atlas feature-service publish <yaml>` | Publish an immutable Feature Service contract |
+| `atlas feature-service plan <selector>` | Validate applied serving evidence without publishing |
+| `atlas feature-service compile <selector>` | Emit the canonical Atlas contract from applied state |
+| `atlas feature-service publish <selector>` | Publish an immutable Feature Service contract |
 
 ## Examples
 
@@ -85,53 +87,81 @@ The bare host derives the standard endpoints, including the Seeknal API at
 `http://atlas-dev-server:8000`. For a non-standard deployment, pass the API
 explicitly with `--api-url`.
 
-Create `customer-analytics.yml`:
+Create the serving Feature Group:
 
 ```yaml
-schemaVersion: 1
-serviceId: customer-analytics
+kind: feature_group
+name: customer_profile
+owner: ml-platform
+entity:
+  name: customer
+  join_keys: [customer_id]
+features:
+  customer_id:
+    dtype: string
+  age:
+    dtype: integer
+  lifetime_value:
+    dtype: float
+  observed_at:
+    dtype: timestamp
+inputs:
+  - ref: transform.customer_profile
+materializations:
+  - type: atlas_online
+    connection: atlas_feature_store
+    table: customer_profile
+    mode: replace
+    event_time_column: observed_at
+    ttl_seconds: 86400
+```
+
+Then declare the contract-only Feature Service:
+
+```yaml
+kind: feature_service
+name: customer-analytics
 version: "1"
 variant: default
 owner: ml-platform
 description: Customer features for analytics models
 tags: [customer, ml]
-entityKeys:
-  - semanticName: customer_id
-    physicalName: customer_id
-    dataType: string
-    ordinal: 0
-selections:
-  - view:
-      viewId: customer_profile
-      revision: v1
-      schemaRevision: v1
-      sourceLocator: seeknal:feature-group:customer_profile:v1
-      fields:
-        - name: age
-          dataType: int64
-        - name: lifetime_value
-          dataType: float64
-      entityKeys:
-        - semanticName: customer_id
-          physicalName: customer_id
-          dataType: string
-          ordinal: 0
+views:
+  - ref: feature_group.customer_profile
     features: [age, lifetime_value]
-    ordinal: 0
 ```
 
-Publish it:
+Run the Feature Group, inspect the exact applied contract, then publish it:
 
 ```bash
-seeknal atlas feature-service publish customer-analytics.yml
+seeknal parse
+seeknal run --profile profiles.yml --full
+seeknal atlas feature-service plan feature_service.customer-analytics
+seeknal atlas feature-service compile feature_service.customer-analytics
+seeknal atlas feature-service publish feature_service.customer-analytics
 ```
 
-The command is idempotent: an identical replay returns the existing immutable
-version, while schema or metadata drift for the same identity is rejected.
-`seeknal apply` continues to register Feature Groups as catalog assets; it does
-not infer a production Feature Service from each group. Publishing metadata also
-does not grant serving access—an operator must separately provision the
-Feature Service policy binding and OpenFGA tuples.
+Compilation reads `target/manifest.json` and `target/run_state.json`. It fails
+unless every selected Feature Group has a successful `atlas_online`
+materialization whose revision and schema hash match the applied fingerprint.
+This prevents publishing a YAML intention that is not actually serving.
+
+The publish command is idempotent: an identical replay returns the existing
+immutable version, while contract drift for the same identity is rejected.
+Raw contract snapshots, including legacy `schemaVersion: 1` YAML, cannot be
+published. Define the Feature Service in the Seeknal project using YAML or the
+Python builder, run the project to materialize and record applied state, then
+publish its `feature_service.<name>` selector. This keeps every published
+contract anchored to applied Feature Group and Feature Service state.
+
+Seeknal owns Feature Group execution, the atomic staging-to-live table swap, and
+publication evidence. Atlas/Data Catalog owns immutable contract registration,
+read-only serving, governance, and UI. Publishing metadata does not grant
+serving access—an operator must separately provision the Feature Service policy
+binding and OpenFGA tuples.
+
+See the runnable YAML and Python projects under
+`examples/feature-serving-e2e/`.
 
 ## See Also
 

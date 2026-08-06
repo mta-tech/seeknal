@@ -778,64 +778,11 @@ def handle_cli_error(error_message: str = "Operation failed"):
 
 
 def _build_manifest_from_dag(dag_builder, project_name: str):
-    """Build a Manifest from a DAGBuilder result.
+    """Build a Manifest from a DAGBuilder result."""
 
-    Shared by plan, parse, and env_plan commands to avoid duplicating
-    the node_type_map and conversion logic.
+    from seeknal.workflow.manifest_builder import build_manifest_from_dag
 
-    Args:
-        dag_builder: A built DAGBuilder instance with nodes and edges.
-        project_name: Project name for the manifest metadata.
-
-    Returns:
-        A Manifest instance populated from the DAGBuilder.
-    """
-    from seeknal.dag.manifest import Manifest, Node, NodeType as ManifestNodeType
-
-    node_type_map = {
-        "source": ManifestNodeType.SOURCE,
-        "transform": ManifestNodeType.TRANSFORM,
-        "feature_group": ManifestNodeType.FEATURE_GROUP,
-        "model": ManifestNodeType.MODEL,
-        "rule": ManifestNodeType.RULE,
-        "aggregation": ManifestNodeType.AGGREGATION,
-        "second_order_aggregation": ManifestNodeType.SECOND_ORDER_AGGREGATION,
-        "exposure": ManifestNodeType.EXPOSURE,
-        "python": ManifestNodeType.PYTHON,
-        "semantic_model": ManifestNodeType.SEMANTIC_MODEL,
-        "metric": ManifestNodeType.METRIC,
-        "profile": ManifestNodeType.PROFILE,
-    }
-
-    manifest = Manifest(project=project_name)
-    for node_id, node in dag_builder.nodes.items():
-        kind_str = node.kind.value if hasattr(node.kind, "value") else str(node.kind)
-        manifest_node_type = node_type_map.get(kind_str, ManifestNodeType.SOURCE)
-        # Extract columns dict from YAML data
-        raw_columns = {}
-        if hasattr(node, "yaml_data"):
-            raw_columns = node.yaml_data.get("columns", {}) or {}
-
-        manifest.add_node(
-            Node(
-                id=node_id,
-                name=node.name,
-                node_type=manifest_node_type,
-                description=node.yaml_data.get("description")
-                if hasattr(node, "yaml_data")
-                else None,
-                tags=list(node.tags) if hasattr(node, "tags") and node.tags else [],
-                columns=raw_columns,
-                config=node.yaml_data if hasattr(node, "yaml_data") else {},
-                file_path=node.file_path if hasattr(node, "file_path") else None,
-            )
-        )
-
-    for node_id in dag_builder.nodes:
-        for downstream_id in dag_builder.get_downstream(node_id):
-            manifest.add_edge(node_id, downstream_id)
-
-    return manifest
+    return build_manifest_from_dag(dag_builder, project_name)
 
 
 @app.command()
@@ -1395,6 +1342,7 @@ def init(
         ├── sources/         # YAML source definitions
         ├── transforms/      # YAML transforms
         ├── feature_groups/  # Feature groups (YAML + Python)
+        ├── feature_services/ # Feature Services (YAML + Python)
         ├── models/          # YAML models
         ├── pipelines/       # Legacy Python pipeline scripts (*.py)
         ├── sql_pairs/       # Ask context examples
@@ -1442,6 +1390,7 @@ def init(
             "seeknal/sources",
             "seeknal/transforms",
             "seeknal/feature_groups",
+            "seeknal/feature_services",
             "seeknal/models",
             "seeknal/pipelines",
             "seeknal/templates",
@@ -1634,6 +1583,9 @@ def _source_fqtn(node: Any) -> Optional[str]:
     """
 
     config = getattr(node, "config", None) or {}
+    source_type = str(config.get("source") or "").strip().lower()
+    if source_type in {"csv", "json", "parquet", "file", "local"}:
+        return None
     table = config.get("table")
     if not isinstance(table, str) or not table.strip():
         return None
@@ -1991,6 +1943,7 @@ def _run_yaml_pipeline(
         load_state,
         save_state,
         calculate_node_hash,
+        compute_dag_fingerprints,
         get_nodes_to_run,
         update_node_state,
         NodeStatus,
@@ -2076,6 +2029,19 @@ def _run_yaml_pipeline(
     for node_id in dag_builder.nodes:
         dag_adjacency[node_id] = dag_builder.get_downstream(node_id)
         dag_upstream[node_id] = dag_builder.get_upstream(node_id)
+
+    current_fingerprints = compute_dag_fingerprints(
+        {
+            node_id: {
+                "kind": node.node_type.value,
+                "config": node.config,
+                "file_path": node.file_path or "unknown.yml",
+                "columns": node.columns,
+            }
+            for node_id, node in manifest.nodes.items()
+        },
+        dag_upstream,
+    )
 
     # Determine nodes to run
     nodes_to_run = get_nodes_to_run(current_hashes, old_state, dag_adjacency)
@@ -2239,6 +2205,20 @@ def _run_yaml_pipeline(
     if not full and not tags:
         nodes_to_run = include_upstream_sources(nodes_to_run, dag_upstream)
 
+    from seeknal.dag.manifest import CONTRACT_ONLY_NODE_TYPES
+
+    contract_only = {
+        node_id
+        for node_id in nodes_to_run
+        if dag_builder.nodes[node_id].kind in CONTRACT_ONLY_NODE_TYPES
+    }
+    for node_id in sorted(contract_only):
+        _echo_info(
+            f"{node_id} is contract-only; use "
+            "`seeknal atlas feature-service publish`."
+        )
+    nodes_to_run -= contract_only
+
     if show_plan:
         # Show execution plan and exit
         _echo_info("")
@@ -2276,6 +2256,22 @@ def _run_yaml_pipeline(
         return
 
     if not nodes_to_run:
+        if not dry_run and contract_only:
+            applied_state = old_state or RunState(
+                config={"full": full, "nodes": nodes, "types": types},
+            )
+            for node_id in contract_only:
+                fingerprint = current_fingerprints[node_id]
+                update_node_state(
+                    applied_state,
+                    node_id,
+                    NodeStatus.SUCCESS.value,
+                    hash=current_hashes.get(node_id, fingerprint.content_hash),
+                    metadata={"contract_only": True},
+                )
+                applied_state.nodes[node_id].fingerprint = fingerprint
+            save_state(applied_state, state_path)
+            _echo_success("State saved")
         _echo_success("No changes detected. Nothing to run.")
         return
 
@@ -2346,6 +2342,17 @@ def _run_yaml_pipeline(
             profile_path=profile_path,
         )
         _runner = _DAGRunner(_manifest, target_path=target_path, exec_context=_parallel_ctx)
+        if not dry_run:
+            for node_id in contract_only:
+                fingerprint = current_fingerprints[node_id]
+                update_node_state(
+                    _runner.run_state,
+                    node_id,
+                    NodeStatus.SUCCESS.value,
+                    hash=current_hashes.get(node_id, fingerprint.content_hash),
+                    metadata={"contract_only": True},
+                )
+                _runner.run_state.nodes[node_id].fingerprint = fingerprint
         parallel_runner = ParallelDAGRunner(_runner, max_workers, continue_on_error)
         parallel_summary = parallel_runner.run(nodes_to_run, dry_run=dry_run)
         print_parallel_summary(parallel_summary)
@@ -2399,6 +2406,14 @@ def _run_yaml_pipeline(
     run_state = RunState(
         config={"full": full, "nodes": nodes, "types": types},
     )
+    exec_context.config["_seeknal_node_fingerprints"] = {
+        node_id: {
+            **fingerprint.to_dict(),
+            "combined": fingerprint.combined,
+        }
+        for node_id, fingerprint in current_fingerprints.items()
+    }
+    exec_context.config["_seeknal_run_id"] = run_state.run_id
 
     # Initialize run logger
     from seeknal.workflow.run_logger import RunLogger
@@ -2425,6 +2440,16 @@ def _run_yaml_pipeline(
         for node_id, node_state in old_state.nodes.items():
             if node_state.is_success() and node_id not in nodes_to_run:
                 run_state.nodes[node_id] = node_state
+    for node_id in contract_only:
+        fingerprint = current_fingerprints[node_id]
+        update_node_state(
+            run_state,
+            node_id,
+            NodeStatus.SUCCESS.value,
+            hash=current_hashes.get(node_id, fingerprint.content_hash),
+            metadata={"contract_only": True},
+        )
+        run_state.nodes[node_id].fingerprint = fingerprint
 
     typer.echo("")
     typer.echo(typer.style("Execution", bold=True))
@@ -2509,6 +2534,7 @@ def _run_yaml_pipeline(
                     metadata=result.metadata,
                     hash=current_hash,
                 )
+                run_state.nodes[node_id].fingerprint = current_fingerprints.get(node_id)
 
                 # Persist Iceberg metadata to top-level NodeState fields
                 # so snapshot-based change detection works on next run
@@ -2546,7 +2572,10 @@ def _run_yaml_pipeline(
                     node_id,
                     NodeStatus.FAILED.value,
                     duration_ms=int(duration * 1000),
-                    metadata={"error": result.error_message},
+                    metadata={
+                        **(result.metadata or {}),
+                        "error": result.error_message,
+                    },
                 )
                 failed += 1
                 run_logger.log_node(
@@ -2598,7 +2627,11 @@ def _run_yaml_pipeline(
                                     NodeStatus.SUCCESS.value,
                                     duration_ms=int(duration * 1000),
                                     row_count=result.row_count,
+                                    metadata=result.metadata,
                                     hash=current_hash,
+                                )
+                                run_state.nodes[node_id].fingerprint = (
+                                    current_fingerprints.get(node_id)
                                 )
                                 failed -= 1
                                 successful += 1
@@ -4869,6 +4902,7 @@ def apply(
             "source": "sources",
             "transform": "transforms",
             "feature_group": "feature_groups",
+            "feature_service": "feature_services",
             "second_order_aggregation": "second_order_aggregations",
         }
         target_dir_name = kind_dir_map.get(node_kind, "pipelines")

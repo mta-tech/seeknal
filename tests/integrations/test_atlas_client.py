@@ -231,6 +231,58 @@ def test_publish_feature_service_rejects_invalid_response_envelope() -> None:
         client.publish_feature_service({"serviceId": "customer-risk"})
 
 
+def test_request_feature_service_activation_posts_idempotent_approval_request() -> None:
+    seen: list[tuple[str, dict[str, object], str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            (
+                request.url.path,
+                json.loads(request.content),
+                request.headers.get("Idempotency-Key"),
+            )
+        )
+        return httpx.Response(
+            201,
+            json={
+                "data": {
+                    "request": {
+                        "requestId": "48d2e044-8376-4f1f-8f22-9f01ac491901",
+                        "state": "pending_owner_review",
+                    },
+                    "replayed": False,
+                }
+            },
+        )
+
+    client = _client(handler, token="user-token")
+    result = client.request_feature_service_activation(
+        service_id="customer-risk",
+        version="1",
+        variant="default",
+        environment="production",
+        consumer_identity="recommendation-api",
+        capabilities=("consume_online", "operate"),
+        idempotency_key="activation-123",
+    )
+
+    assert result["request"]["state"] == "pending_owner_review"
+    assert seen == [
+        (
+            "/api/v1/feature-services/customer-risk/versions/1/variants/default/activation-requests",
+            {
+                "environment": "production",
+                "consumerKind": "application",
+                "consumerIdentity": "recommendation-api",
+                "capabilities": ["consume_online", "operate"],
+                "justification": "Requested by the Seeknal publish command.",
+                "expiresAt": None,
+            },
+            "activation-123",
+        )
+    ]
+
+
 def test_preflight_apply_authenticates_with_refreshed_token(tmp_path: Path) -> None:
     """End-to-end: a stale session is refreshed mid-preflight and apply proceeds."""
 

@@ -27,8 +27,12 @@ SCHEMAS = {
         "optional": ["description", "owner", "tags", "inputs", "params", "transform", "output"],
     },
     "feature_group": {
-        "required": ["kind", "name", "entity", "materialization"],
-        "optional": ["description", "owner", "tags", "inputs", "transform", "features", "tests"],
+        "required": ["kind", "name", "entity"],
+        "optional": ["description", "owner", "tags", "inputs", "transform", "features", "tests", "materialization", "materializations"],
+    },
+    "feature_service": {
+        "required": ["kind", "name", "version", "owner", "views"],
+        "optional": ["description", "consumer", "tags", "variant"],
     },
     "model": {
         "required": ["kind", "name", "output_columns", "inputs"],

@@ -71,6 +71,8 @@ class ParallelDAGRunner:
             ParallelExecutionSummary with results
         """
         start_time = time.time()
+        if nodes_to_run and not dry_run:
+            self.runner.prepare_execution()
         layers = self.runner._get_topological_layers()
 
         summary = ParallelExecutionSummary(
@@ -218,6 +220,11 @@ class ParallelDAGRunner:
                     status=status,
                     duration_ms=int(result.duration * 1000),
                     row_count=result.row_count,
+                    metadata={
+                        "materialization": result.metadata["materialization"]
+                    }
+                    if result.metadata.get("materialization")
+                    else None,
                 )
                 # Store fingerprint if computed
                 if (

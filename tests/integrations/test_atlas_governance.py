@@ -92,6 +92,21 @@ def test_check_access_allowed() -> None:
     assert decision.has_masking is False
 
 
+def test_check_access_sends_backend_contract_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SEEKNAL_PROJECT_NAME", "customer-features")
+    monkeypatch.setenv("ATLAS_ENVIRONMENT", "qa")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["project_name"] == "customer-features"
+        assert payload["environment"] == "qa"
+        return httpx.Response(200, json={"allowed": True})
+
+    assert _gate(handler).check_access(resource="warehouse.curated.customers").allowed
+
+
 def test_check_access_denied_with_reason() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"allowed": False, "reason": "no grant"})

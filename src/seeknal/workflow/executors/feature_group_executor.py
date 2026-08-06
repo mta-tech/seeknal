@@ -27,20 +27,19 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import pandas as pd
 
 from .base import (
     BaseExecutor,
     ExecutorResult,
-    ExecutionContext,
     ExecutionStatus,
     ExecutorValidationError,
     ExecutorExecutionError,
     register_executor,
 )
-from ...dag.manifest import Node, NodeType
+from ...dag.manifest import NodeType
 
 # Import FeatureGroup implementations
 from ...entity import Entity
@@ -49,13 +48,35 @@ from ...featurestore.duckdbengine.feature_group import (
     Materialization as DuckDBMaterialization,
     OfflineStoreDuckDB,
 )
-# Import context for project/workspace
-from ...context import context as seeknal_context
 
 # Iceberg materialization support
 from ...workflow.materialization.yaml_integration import materialize_node_if_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def _duckdb_compatible_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize pandas extension dtypes unsupported by older DuckDB builds."""
+    compatible = frame.copy()
+    for column in compatible.columns:
+        if isinstance(compatible[column].dtype, pd.StringDtype):
+            compatible[column] = compatible[column].astype(object)
+    return compatible
+
+
+def _event_time_column(config: Dict[str, Any]) -> Optional[str]:
+    """Resolve event time from legacy or multi-target materialization config."""
+    legacy = config.get("materialization")
+    if isinstance(legacy, dict) and legacy.get("event_time_col"):
+        return legacy["event_time_col"]
+    for target in config.get("materializations") or []:
+        if (
+            isinstance(target, dict)
+            and target.get("type") == "atlas_online"
+            and target.get("event_time_column")
+        ):
+            return target["event_time_column"]
+    return None
 
 
 @register_executor(NodeType.FEATURE_GROUP)
@@ -355,17 +376,6 @@ class FeatureGroupExecutor(BaseExecutor):
         Returns:
             ExecutorResult with execution outcome
         """
-        try:
-            from ...featurestore.feature_group import (
-                FeatureGroup,
-                Materialization as SparkMaterialization,
-            )
-        except ImportError as exc:
-            raise ExecutorExecutionError(
-                "Spark feature groups require optional Spark dependencies; "
-                "install with `pip install seeknal[spark]`."
-            ) from exc
-
         # Parse entity config
         entity_config = config["entity"]
         entity = Entity(
@@ -378,8 +388,9 @@ class FeatureGroupExecutor(BaseExecutor):
 
         # Parse materialization config
         mat_config = config["materialization"]
+        event_time_col = _event_time_column(config)
         materialization = DuckDBMaterialization(
-            event_time_col=mat_config.get("event_time_col"),
+            event_time_col=event_time_col,
             offline=mat_config.get("offline", True),
             online=mat_config.get("online", False),
             offline_store=OfflineStoreDuckDB(),
@@ -435,7 +446,7 @@ class FeatureGroupExecutor(BaseExecutor):
                 # Create a view directly from the DataFrame
                 # We use a unique temp table name to avoid conflicts
                 temp_table = f"_temp_fg_{self.node.name}_{id(self)}"
-                con.register(temp_table, source_df)
+                con.register(temp_table, _duckdb_compatible_frame(source_df))
                 con.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM {temp_table}")
                 
                 logger.info(f"Created view '{view_name}' for materialization ({len(source_df)} rows)")
@@ -455,7 +466,7 @@ class FeatureGroupExecutor(BaseExecutor):
             meta_path.write_text(_json.dumps({
                 "entity_name": entity.name,
                 "join_keys": entity.join_keys,
-                "event_time_col": mat_config.get("event_time_col", "event_time"),
+                "event_time_col": event_time_col or "event_time",
             }))
             logger.info(
                 "Wrote intermediate parquet: %s (%d rows)",
@@ -503,6 +514,17 @@ class FeatureGroupExecutor(BaseExecutor):
         Returns:
             ExecutorResult with execution outcome
         """
+        try:
+            from ...featurestore.feature_group import (
+                FeatureGroup,
+                Materialization as SparkMaterialization,
+            )
+        except ImportError as exc:
+            raise ExecutorExecutionError(
+                "Spark feature groups require optional Spark dependencies; "
+                "install with `pip install seeknal[spark]`."
+            ) from exc
+
         # Parse entity config
         entity_config = config["entity"]
         entity = Entity(
@@ -595,18 +617,29 @@ class FeatureGroupExecutor(BaseExecutor):
         Returns:
             Transformed DataFrame
         """
-        import duckdb
+        import re
 
         con = self.context.get_duckdb_connection()
-        con.register("source", df)
 
-        # Execute transform
-        result_df = con.execute(transform_sql).df()
+        # Qualified source references already resolve to the upstream views
+        # created in the shared execution connection. Registering a DataFrame
+        # named ``source`` here is both unnecessary and invalid when ``source``
+        # is the existing schema.
+        if re.search(r"\bsource\s*\.", transform_sql, flags=re.IGNORECASE):
+            return con.execute(transform_sql).df()
 
-        # Clean up
-        con.unregister("source")
+        # Unqualified transforms use ``source`` as a DataFrame relation. Keep
+        # that relation isolated from the shared connection's source schema,
+        # and normalize pandas 3 StringDtype columns for DuckDB versions that
+        # do not recognize the new ``str`` dtype name.
+        import duckdb
 
-        return result_df
+        transform_con = duckdb.connect()
+        try:
+            transform_con.register("source", _duckdb_compatible_frame(df))
+            return transform_con.execute(transform_sql).df()
+        finally:
+            transform_con.close()
 
     def _apply_transform_spark(
         self,
@@ -654,48 +687,151 @@ class FeatureGroupExecutor(BaseExecutor):
 
         # Log summary
         if self.context.verbose:
-            from ...context import logger
-            logger.info(
+            from ...context import logger as context_logger
+            context_logger.info(
                 f"Feature group '{self.node.name}' executed: "
                 f"{result.row_count} rows, "
                 f"{result.metadata.get('feature_count', 0)} features, "
                 f"engine={result.metadata.get('engine', 'unknown')}"
             )
 
-        # Handle Iceberg materialization if enabled
+        # Multi-target materialization is the authoritative path for Feature
+        # Groups. ``atlas_online`` is handled only here in Seeknal; Atlas is a
+        # read-only serving consumer.
         if result.status == ExecutionStatus.SUCCESS and not result.is_dry_run:
-            try:
-                # Get the context's DuckDB connection (has the view)
-                con = self.context.get_duckdb_connection()
-                mat_result = materialize_node_if_enabled(
-                    self.node,
-                    source_con=con,
-                    enabled_override=self.context.materialize_enabled
-                )
-                if mat_result:
-                    # Materialization was enabled and succeeded
+            mat_targets = self.node.config.get("materializations", [])
+            if mat_targets and self.context.materialize_enabled is not False:
+                try:
+                    from seeknal.workflow.materialization.dispatcher import (
+                        MaterializationDispatcher,
+                    )
+                    from seeknal.workflow.materialization.profile_loader import (
+                        ProfileLoader,
+                    )
+
+                    fingerprints = self.context.config.get(
+                        "_seeknal_node_fingerprints", {}
+                    )
+                    fingerprint = fingerprints.get(self.node.id)
+                    if not fingerprint:
+                        raise ValueError(
+                            "applied node fingerprint is unavailable for materialization"
+                        )
+                    run_id = self.context.config.get("_seeknal_run_id")
+                    if any(
+                        target.get("type") == "atlas_online"
+                        for target in mat_targets
+                    ) and (not isinstance(run_id, str) or not run_id.strip()):
+                        raise ValueError(
+                            "injected _seeknal_run_id is required for atlas_online "
+                            "materialization"
+                        )
+                    entity = self.node.config.get("entity")
+                    entity_keys = (
+                        entity.get("join_keys", [])
+                        if isinstance(entity, dict)
+                        else []
+                    )
+                    targets = []
+                    for configured in mat_targets:
+                        target = dict(configured)
+                        if target.get("type") == "atlas_online":
+                            target.update(
+                                {
+                                    "entity_keys": target.get(
+                                        "entity_keys", entity_keys
+                                    ),
+                                    "revision": fingerprint["combined"],
+                                    "definition_sha": fingerprint["content_hash"],
+                                    "schema_sha": fingerprint["schema_hash"],
+                                    "publish_run_id": run_id.strip(),
+                                }
+                            )
+                        targets.append(target)
+
+                    profile_path = getattr(self.context, "profile_path", None)
+                    loader = (
+                        ProfileLoader(profile_path=profile_path)
+                        if profile_path
+                        else None
+                    )
+                    dispatch_result = MaterializationDispatcher(
+                        profile_loader=loader
+                    ).dispatch(
+                        con=self.context.get_duckdb_connection(),
+                        view_name=f"{self.node.node_type.value}.{self.node.name}",
+                        targets=targets,
+                        node_id=self.node.id,
+                        env_name=getattr(self.context, "env_name", None),
+                    )
                     result.metadata["materialization"] = {
                         "enabled": True,
-                        "success": mat_result.get("success", False),
-                        "table": mat_result.get("table"),
-                        "row_count": mat_result.get("row_count"),
-                        "mode": mat_result.get("mode"),
-                        "iceberg_table": mat_result.get("iceberg_table"),
+                        "success": dispatch_result.all_succeeded,
+                        "total": dispatch_result.total,
+                        "succeeded": dispatch_result.succeeded,
+                        "failed": dispatch_result.failed,
+                        "results": dispatch_result.serializable_results,
                     }
-                    logger.info(
-                        f"Materialized node '{self.node.id}' to Iceberg table "
-                        f"'{mat_result.get('table')}' ({mat_result.get('row_count')} rows)"
+                    required_failures = [
+                        item
+                        for item in dispatch_result.serializable_results
+                        if item.get("type") == "atlas_online"
+                        and not item.get("success", False)
+                    ]
+                    if required_failures:
+                        errors = [
+                            item.get("error") or "unknown materialization error"
+                            for item in required_failures
+                        ]
+                        result.status = ExecutionStatus.FAILED
+                        result.error_message = "; ".join(errors)
+                except Exception as e:
+                    result.metadata["materialization"] = {
+                        "enabled": True,
+                        "success": False,
+                        "error": str(e),
+                    }
+                    if any(
+                        target.get("type") == "atlas_online"
+                        for target in mat_targets
+                    ):
+                        logger.error(
+                            "Required Atlas online materialization failed for "
+                            "node '%s': %s",
+                            self.node.id,
+                            e,
+                        )
+                        result.status = ExecutionStatus.FAILED
+                        result.error_message = str(e)
+                    else:
+                        logger.warning(
+                            f"Failed to materialize node '{self.node.id}': {e}"
+                        )
+            elif not mat_targets:
+                try:
+                    con = self.context.get_duckdb_connection()
+                    mat_result = materialize_node_if_enabled(
+                        self.node,
+                        source_con=con,
+                        enabled_override=self.context.materialize_enabled,
                     )
-            except Exception as e:
-                # Log materialization error but don't fail the executor
-                # Materialization is optional/augmentation, not core functionality
-                logger.warning(
-                    f"Failed to materialize node '{self.node.id}' to Iceberg: {e}"
-                )
-                result.metadata["materialization"] = {
-                    "enabled": True,
-                    "success": False,
-                    "error": str(e),
-                }
+                    if mat_result:
+                        result.metadata["materialization"] = {
+                            "enabled": True,
+                            "success": mat_result.get("success", False),
+                            "table": mat_result.get("table"),
+                            "row_count": mat_result.get("row_count"),
+                            "mode": mat_result.get("mode"),
+                            "iceberg_table": mat_result.get("iceberg_table"),
+                        }
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to materialize node '{self.node.id}' to Iceberg: {e}"
+                    )
+                    result.metadata["materialization"] = {
+                        "enabled": True,
+                        "success": False,
+                        "error": str(e),
+                    }
 
         return result

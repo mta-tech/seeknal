@@ -604,6 +604,16 @@ class GovernanceGate:
         resolved_actor = actor or os.getenv("ATLAS_ACTOR") or getpass.getuser()
         payload: dict[str, Any] = {
             "operation": "access-check",
+            "project_name": (
+                os.getenv("SEEKNAL_PROJECT_NAME", "").strip() or "seeknal"
+            ),
+            "environment": (
+                os.getenv(
+                    "ATLAS_ENVIRONMENT",
+                    os.getenv("SEEKNAL_ENV", "dev"),
+                ).strip()
+                or "dev"
+            ),
             "resource": resource,
             "action": action,
             "actor": resolved_actor,

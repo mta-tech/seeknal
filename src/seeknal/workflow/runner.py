@@ -11,6 +11,7 @@ This module provides the core workflow runner that:
 
 import logging
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -20,7 +21,12 @@ from typing import Any, Dict, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 from seeknal.ui.output import echo_success as _echo_success, echo_error as _echo_error, echo_info as _echo_info, echo_warning as _echo_warning
-from seeknal.dag.manifest import Manifest, Node, NodeType  # ty: ignore[unresolved-import]
+from seeknal.dag.manifest import (  # ty: ignore[unresolved-import]
+    CONTRACT_ONLY_NODE_TYPES,
+    Manifest,
+    Node,
+    NodeType,
+)
 from seeknal.dag.diff import ManifestDiff  # ty: ignore[unresolved-import]
 from seeknal.workflow.state import (  # ty: ignore[unresolved-import]
     RunState, NodeStatus, NodeFingerprint,
@@ -241,24 +247,13 @@ class DAGRunner:
         to_run: Set[str] = set()
         skip_reasons: Dict[str, str] = {}
 
+        self._current_fingerprints = self._compute_current_fingerprints()
+
         if full:
             # Run all nodes (--full overrides --tags)
             to_run.update(self.manifest.nodes.keys())
             for nid in to_run:
                 skip_reasons[nid] = "full refresh"
-            # Compute fingerprints even on full refresh so incremental runs can compare
-            upstream_map: Dict[str, Set[str]] = {}
-            for nid in self.manifest.nodes:
-                upstream_map[nid] = self.manifest.get_upstream_nodes(nid)
-            manifest_nodes = {}
-            for nid, node in self.manifest.nodes.items():
-                manifest_nodes[nid] = {
-                    "kind": node.node_type.value,
-                    "config": node.config,
-                    "file_path": node.file_path or "unknown.yml",
-                    "columns": node.columns,
-                }
-            self._current_fingerprints = compute_dag_fingerprints(manifest_nodes, upstream_map)
         elif tags and nodes:
             # Union: tag-matched (+ upstream) AND explicit nodes (+ downstream)
             tag_set = set(tags)
@@ -346,26 +341,67 @@ class DAGRunner:
                 )
             }
 
+        contract_only = {
+            node_id
+            for node_id in to_run
+            if self.manifest.nodes[node_id].node_type in CONTRACT_ONLY_NODE_TYPES
+        }
+        self._contract_only_nodes = contract_only
+        for node_id in sorted(contract_only):
+            if nodes and any(
+                selected in {node_id, self.manifest.nodes[node_id].name}
+                for selected in nodes
+            ):
+                _echo_info(
+                    f"{node_id} is contract-only; use "
+                    "`seeknal atlas feature-service publish`."
+                )
+            skip_reasons[node_id] = "contract-only resource"
+        to_run -= contract_only
+
         return to_run, skip_reasons
 
-    def _fingerprint_based_detection(self) -> tuple[Set[str], Dict[str, str]]:
-        """Use fingerprint comparison to detect changed nodes."""
-        # Build upstream map from manifest
-        upstream_map: Dict[str, Set[str]] = {}
-        for nid in self.manifest.nodes:
-            upstream_map[nid] = self.manifest.get_upstream_nodes(nid)
+    def _record_contract_only_state(self) -> None:
+        """Persist applied fingerprints for resources that are never executed."""
+        for node_id in getattr(self, "_contract_only_nodes", set()):
+            fingerprint = self._current_fingerprints[node_id]
+            update_node_state(
+                self.run_state,
+                node_id,
+                status=NodeStatus.SUCCESS.value,
+                hash=fingerprint.content_hash,
+                metadata={"contract_only": True},
+            )
+            self.run_state.nodes[node_id].fingerprint = fingerprint
 
-        # Build node data for fingerprint computation
-        manifest_nodes = {}
-        for nid, node in self.manifest.nodes.items():
-            manifest_nodes[nid] = {
+    def _compute_current_fingerprints(self) -> Dict[str, NodeFingerprint]:
+        """Compute fingerprints for every node in the current manifest."""
+        upstream_map = {
+            nid: self.manifest.get_upstream_nodes(nid)
+            for nid in self.manifest.nodes
+        }
+        manifest_nodes = {
+            nid: {
                 "kind": node.node_type.value,
                 "config": node.config,
                 "file_path": node.file_path or "unknown.yml",
                 "columns": node.columns,
             }
+            for nid, node in self.manifest.nodes.items()
+        }
+        return compute_dag_fingerprints(manifest_nodes, upstream_map)
 
-        current_fps = compute_dag_fingerprints(manifest_nodes, upstream_map)
+    def prepare_execution(self) -> None:
+        """Prepare shared metadata for one DAG execution run."""
+        self._current_fingerprints = self._compute_current_fingerprints()
+        self.run_state.run_id = uuid.uuid4().hex
+
+    def _fingerprint_based_detection(self) -> tuple[Set[str], Dict[str, str]]:
+        """Use fingerprint comparison to detect changed nodes."""
+        current_fps = getattr(self, "_current_fingerprints", None)
+        if current_fps is None:
+            current_fps = self._compute_current_fingerprints()
+            self._current_fingerprints = current_fps
 
         # Compare with stored fingerprints
         changed: Set[str] = set()
@@ -490,9 +526,6 @@ class DAGRunner:
                 skip_reasons[nid] = "postgresql data changed"
             # else: same watermark → stays cached (no action)
 
-        # Store current fingerprints for later saving
-        self._current_fingerprints = current_fps
-
         if not changed:
             return set(), skip_reasons
 
@@ -608,6 +641,17 @@ class DAGRunner:
             )
 
         try:
+            if self.exec_context is not None:
+                fingerprints = getattr(self, "_current_fingerprints", {})
+                self.exec_context.config["_seeknal_node_fingerprints"] = {
+                    nid: {
+                        **fingerprint.to_dict(),
+                        "combined": fingerprint.combined,
+                    }
+                    for nid, fingerprint in fingerprints.items()
+                }
+                self.exec_context.config["_seeknal_run_id"] = self.run_state.run_id
+
             # Inject Iceberg watermark for incremental reads
             # Skip watermark on --full refresh so executor does a full scan
             if self.exec_context is not None:
@@ -643,6 +687,15 @@ class DAGRunner:
             result = self._execute_by_type(node)
 
             duration = time.time() - start_time
+            if result.get("status") == "failed":
+                return NodeResult(
+                    node_id=node_id,
+                    status=ExecutionStatus.FAILED,
+                    duration=duration,
+                    row_count=result.get("row_count", 0),
+                    error_message=result.get("error_message"),
+                    metadata=result,
+                )
             return NodeResult(
                 node_id=node_id,
                 status=ExecutionStatus.SUCCESS,
@@ -764,9 +817,15 @@ class DAGRunner:
             tags=tags,
             exclude_tags=exclude_tags,
         )
+        if not dry_run:
+            if to_run:
+                self.prepare_execution()
+            self._record_contract_only_state()
 
         if not to_run and not full:
             _echo_info("No changes detected. Nothing to run.")
+            if not dry_run and getattr(self, "_contract_only_nodes", set()):
+                save_state(self.run_state, self.state_path)
             return ExecutionSummary(
                 total_nodes=len(self.manifest.nodes),
                 changed_nodes=0,
@@ -825,6 +884,11 @@ class DAGRunner:
                         status=NodeStatus.SUCCESS.value,
                         duration_ms=int(result.duration * 1000),
                         row_count=result.row_count,
+                        metadata={
+                            "materialization": result.metadata["materialization"]
+                        }
+                        if result.metadata.get("materialization")
+                        else None,
                     )
                     # Store fingerprint if computed
                     if hasattr(self, '_current_fingerprints') and node_id in self._current_fingerprints:
@@ -862,6 +926,19 @@ class DAGRunner:
             elif result.status == ExecutionStatus.FAILED:
                 _echo_error(f"{node.name} failed: {result.error_message}")
                 summary.failed_nodes += 1
+
+                if not dry_run:
+                    update_node_state(
+                        self.run_state,
+                        node_id,
+                        status=NodeStatus.FAILED.value,
+                        duration_ms=int(result.duration * 1000),
+                        row_count=result.row_count,
+                        metadata={
+                            **result.metadata,
+                            "error": result.error_message,
+                        },
+                    )
 
                 if not continue_on_error:
                     _echo_error("Stopping execution due to failure")

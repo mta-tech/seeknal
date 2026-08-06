@@ -1,0 +1,11 @@
+connections:
+  atlas_feature_store:
+    type: postgresql
+    host: ${ATLAS_PG_HOST:localhost}
+    port: ${ATLAS_PG_PORT:5432}
+    database: ${ATLAS_PG_DATABASE:seeknal}
+    user: seeknal_feature_materializer
+    password: ${ATLAS_FEATURE_MATERIALIZER_PASSWORD}
+    schema: feature_online
+    sslmode: ${ATLAS_PG_SSLMODE:prefer}
+    connect_timeout: 10

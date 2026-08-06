@@ -353,6 +353,43 @@ class TestEntityConsolidatorDiscover:
 
 
 class TestEntityConsolidatorConsolidate:
+    def test_single_fg_uses_configured_event_time_column(self, tmp_path):
+        frame = pd.DataFrame(
+            {
+                "customer_id": ["C1"],
+                "observed_at": pd.to_datetime(["2026-08-05T00:00:00Z"]),
+                "age": [41],
+            }
+        )
+        parquet_path = _write_fg_parquet(tmp_path, "customer_profile", frame)
+        fg_list = [
+            FGMetadata(
+                name="customer_profile",
+                entity_name="customer",
+                join_keys=["customer_id"],
+                event_time_col="observed_at",
+                parquet_path=parquet_path,
+                features=["age"],
+            )
+        ]
+
+        result = EntityConsolidator(tmp_path).consolidate_entity(
+            "customer",
+            fg_list,
+        )
+
+        assert result.success
+        con = duckdb.connect()
+        try:
+            consolidated = con.execute(
+                f"SELECT customer_id, event_time, customer_profile.age "
+                f"FROM '{result.output_path}'"
+            ).fetchone()
+        finally:
+            con.close()
+        assert consolidated[0] == "C1"
+        assert consolidated[2] == 41
+
     def test_single_entity_two_fgs(self, tmp_path):
         """Two FGs for one entity produce a consolidated parquet with struct cols."""
         df_cust = pd.DataFrame({

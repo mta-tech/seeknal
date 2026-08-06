@@ -388,6 +388,23 @@ def calculate_node_hash(yaml_data: Dict[str, Any], yaml_path: Path) -> str:
             if "materialization" in yaml_data:
                 functional_content["materialization"] = yaml_data["materialization"]
 
+        elif kind == "feature_service":
+            # Feature Services are publication contracts rather than executable
+            # nodes. Their complete contract must still invalidate applied state
+            # when metadata, views, or selected features change.
+            for field_name in (
+                "name",
+                "version",
+                "variant",
+                "owner",
+                "description",
+                "consumer",
+                "tags",
+                "views",
+            ):
+                if field_name in yaml_data:
+                    functional_content[field_name] = yaml_data[field_name]
+
         elif kind == "model":
             if "aggregation" in yaml_data:
                 functional_content["aggregation"] = yaml_data["aggregation"]
@@ -888,10 +905,11 @@ def compute_node_fingerprint(
     # Content hash: reuse existing calculate_node_hash
     content_hash = calculate_node_hash(yaml_data, yaml_path)
 
-    # Schema hash: from output columns if defined
-    columns = yaml_data.get("columns", {})
+    # Schema hash: Feature Groups declare their output schema under
+    # ``features`` while other node kinds commonly use ``columns``.
+    columns = yaml_data.get("features") or yaml_data.get("columns", {})
     if columns:
-        schema_str = json.dumps(dict(sorted(columns.items())), sort_keys=True)
+        schema_str = json.dumps(columns, sort_keys=True, separators=(",", ":"))
     else:
         schema_str = ""
     schema_hash = hashlib.sha256(schema_str.encode("utf-8")).hexdigest()
@@ -908,7 +926,7 @@ def compute_node_fingerprint(
 
     # Config hash: non-functional config like materialization, tags, owner
     config_fields = {}
-    for key in ("materialization", "freshness", "schedule"):
+    for key in ("materialization", "materializations", "freshness", "schedule"):
         if key in yaml_data:
             config_fields[key] = yaml_data[key]
     config_str = json.dumps(config_fields, sort_keys=True) if config_fields else ""

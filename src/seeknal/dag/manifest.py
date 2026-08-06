@@ -20,6 +20,7 @@ class NodeType(Enum):
     SOURCE = "source"
     TRANSFORM = "transform"
     FEATURE_GROUP = "feature_group"
+    FEATURE_SERVICE = "feature_service"
     MODEL = "model"
     PROFILE = "profile"
     RULE = "rule"
@@ -29,6 +30,9 @@ class NodeType(Enum):
     PYTHON = "python"  # For nodes that need special Python execution
     SEMANTIC_MODEL = "semantic_model"
     METRIC = "metric"
+
+
+CONTRACT_ONLY_NODE_TYPES = frozenset({NodeType.FEATURE_SERVICE})
 
 
 @dataclass(slots=True)

@@ -110,7 +110,11 @@ def run_node_task(
             duration=result.duration,
             row_count=result.row_count,
             error_message=result.error_message,
-            metadata=result.metadata,
+            metadata={
+                "materialization": result.metadata["materialization"]
+            }
+            if result.metadata.get("materialization")
+            else None,
         )
     except Exception as e:
         return PrefectNodeResult(
@@ -486,6 +490,9 @@ def _execute_pipeline(
 
     # 3. Determine which nodes to run
     nodes_to_run = _get_nodes_to_run(runner, full_refresh)
+    if nodes_to_run:
+        runner.prepare_execution()
+    runner._record_contract_only_state()
     layers = runner._get_topological_layers()
 
     run_logger.info(
@@ -638,7 +645,19 @@ def _get_nodes_to_run(runner, full_refresh: bool) -> Set[str]:
     If full_refresh, run everything. Otherwise, skip cached/succeeded nodes
     and include their downstream (change detection).
     """
-    all_nodes = set(runner.manifest.nodes.keys())
+    from seeknal.workflow.runner import DAGRunner
+
+    if isinstance(runner, DAGRunner):
+        nodes_to_run, _ = runner._get_nodes_to_run(full=full_refresh)
+        return nodes_to_run
+
+    from seeknal.dag.manifest import CONTRACT_ONLY_NODE_TYPES
+
+    all_nodes = {
+        node_id
+        for node_id, node in runner.manifest.nodes.items()
+        if node.node_type not in CONTRACT_ONLY_NODE_TYPES
+    }
 
     if full_refresh:
         return all_nodes
@@ -671,7 +690,11 @@ def _batch_update_state(
             status=status,
             duration_ms=int(result.duration * 1000),
             row_count=result.row_count,
+            metadata=result.metadata,
         )
+        fingerprints = getattr(runner, "_current_fingerprints", {})
+        if nid in fingerprints:
+            runner.run_state.nodes[nid].fingerprint = fingerprints[nid]
 
     # Write state after entire layer
     save_state(runner.run_state, runner.state_path)
@@ -871,6 +894,7 @@ def seeknal_backfill_flow(
                 },
             )
             runner, _ = builder._build_runner()
+            runner.prepare_execution()
             result = runner._execute_node(node_id)
 
             results.append({

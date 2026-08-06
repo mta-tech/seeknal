@@ -2,7 +2,7 @@
 Python pipeline discovery and parsing.
 
 This module provides functionality to discover Python pipeline files,
-extract decorated nodes (@source, @transform, @feature_group), and
+extract decorated nodes (@source, @transform, @feature_group, @feature_service), and
 analyze dependencies via AST parsing.
 """
 
@@ -143,7 +143,13 @@ class PythonPipelineDiscoverer:
                 """Visit function definition and track current function."""
                 # Skip decorator functions themselves
                 for decorator in node.decorator_list:
-                    if isinstance(decorator, ast.Name) and decorator.id in ("source", "transform", "feature_group", "second_order_aggregation"):
+                    if isinstance(decorator, ast.Name) and decorator.id in (
+                        "source",
+                        "transform",
+                        "feature_group",
+                        "feature_service",
+                        "second_order_aggregation",
+                    ):
                         return
 
                 self.current_func = node.name

@@ -307,6 +307,7 @@ def feature_group(
     features: Optional[dict] = None,
     inputs: Optional[list[str]] = None,
     materialization: Optional[Any] = None,
+    materializations: Optional[list[dict[str, Any]]] = None,
     tags: Optional[list[str]] = None,
     **params,
 ):
@@ -324,6 +325,7 @@ def feature_group(
         inputs: List of upstream node IDs this feature group depends on
         materialization: Optional Materialization config for offline/online stores
             (Can be Materialization, MaterializationConfig, or dict)
+        materializations: Explicit list of multi-target materialization configs
         tags: Optional tags for organization
         **params: Additional feature group-specific parameters
 
@@ -354,6 +356,16 @@ def feature_group(
         def user_features_v2(ctx):
             return ctx.duckdb.sql("SELECT * FROM df").df()
     """
+    if materializations is not None:
+        if not isinstance(materializations, list) or not all(
+            isinstance(item, dict) for item in materializations
+        ):
+            raise TypeError("materializations must be a list of dictionaries")
+        if materialization is not None:
+            raise ValueError(
+                "Use either materialization or materializations, not both"
+            )
+
     def decorator(func: Callable) -> Callable:
         node_name = name or getattr(func, "__name__", "unknown")
         node_id = f"feature_group.{node_name}"
@@ -387,6 +399,7 @@ def feature_group(
             "features": features or {},
             "inputs": [{"ref": d} for d in deps],
             "materialization": mat_dict,
+            "materializations": [dict(item) for item in materializations or []],
             "tags": tags or [],
             "params": params,
             "func": func,

@@ -122,7 +122,17 @@ class EntityConsolidator:
                 continue
 
             mat_config = config.get("materialization", {})
-            event_time_col = mat_config.get("event_time_col", "event_time")
+            event_time_col = mat_config.get("event_time_col")
+            if not event_time_col:
+                for target in config.get("materializations") or []:
+                    if (
+                        isinstance(target, dict)
+                        and target.get("type") == "atlas_online"
+                        and target.get("event_time_column")
+                    ):
+                        event_time_col = target["event_time_column"]
+                        break
+            event_time_col = event_time_col or "event_time"
 
             # Locate the intermediate parquet
             parquet_path = self.intermediate_path / f"feature_group_{node.name}.parquet"
@@ -227,7 +237,7 @@ class EntityConsolidator:
 
             # Join key columns from base
             join_key_cols = ", ".join(f"{base_alias}.{k}" for k in join_keys)
-            event_time_col_ref = f"{base_alias}.event_time"
+            event_time_col_ref = f"{base_alias}.{base_fg.event_time_col}"
 
             # Build struct_pack for each FG
             struct_cols = []
@@ -251,7 +261,10 @@ class EntityConsolidator:
                 conditions = " AND ".join(
                     f"{base_alias}.{k} = {alias}.{k}" for k in join_keys
                 )
-                conditions += f" AND {base_alias}.event_time = {alias}.event_time"
+                conditions += (
+                    f" AND {base_alias}.{base_fg.event_time_col} = "
+                    f"{alias}.{fg.event_time_col}"
+                )
                 join_clauses.append(
                     f"LEFT JOIN fg_{fg.name} AS {alias} ON {conditions}"
                 )

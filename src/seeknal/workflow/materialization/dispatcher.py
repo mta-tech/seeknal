@@ -22,7 +22,7 @@ Usage::
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Dict, List, Optional
 
 from seeknal.workflow.materialization.operations import WriteResult  # ty: ignore[unresolved-import]
@@ -51,6 +51,22 @@ class DispatchResult:
     def all_succeeded(self) -> bool:
         """Return True when every target succeeded (and at least one was attempted)."""
         return self.failed == 0 and self.total > 0
+
+    @property
+    def serializable_results(self) -> List[Dict[str, Any]]:
+        """Return JSON-safe per-target evidence for ``run_state.json``."""
+
+        serialized: List[Dict[str, Any]] = []
+        for item in self.results:
+            normalized = dict(item)
+            write_result = normalized.get("write_result")
+            if write_result is not None:
+                if hasattr(write_result, "to_dict"):
+                    normalized["write_result"] = write_result.to_dict()
+                elif is_dataclass(write_result):
+                    normalized["write_result"] = asdict(write_result)
+            serialized.append(normalized)
+        return serialized
 
 
 class MaterializationDispatcher:
@@ -108,7 +124,11 @@ class MaterializationDispatcher:
             try:
                 logger.info("Materializing %s", target_label)
 
-                if target_type == "postgresql":
+                if target_type == "atlas_online":
+                    write_result = self._materialize_atlas_online(
+                        con, view_name, target
+                    )
+                elif target_type == "postgresql":
                     write_result = self._materialize_postgresql(con, view_name, target)
                 elif target_type == "iceberg":
                     write_result = self._materialize_iceberg(con, view_name, target)
@@ -248,6 +268,31 @@ class MaterializationDispatcher:
         # Create helper and materialize
         helper = PostgresMaterializationHelper(pg_config, mat_config)
         return helper.materialize(con, view_name)
+
+    def _materialize_atlas_online(
+        self, con: Any, view_name: str, target_config: Dict[str, Any]
+    ) -> Any:
+        """Route to the dedicated atomic Atlas serving materializer."""
+
+        from seeknal.connections.postgresql import parse_postgresql_config
+        from seeknal.workflow.materialization.atlas_online import AtlasOnlineMaterializer
+        from seeknal.workflow.materialization.atlas_online_config import (
+            AtlasOnlineMaterializationConfig,
+        )
+
+        mat_config = AtlasOnlineMaterializationConfig.model_validate(target_config)
+        if self._profile_loader is not None:
+            conn_dict = self._profile_loader.load_connection_profile(
+                mat_config.connection
+            )
+        else:
+            from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+            conn_dict = ProfileLoader().load_connection_profile(mat_config.connection)
+        pg_config = parse_postgresql_config(conn_dict)
+        return AtlasOnlineMaterializer(pg_config, mat_config).materialize(
+            con, view_name
+        )
 
     def _materialize_iceberg(
         self, con: Any, view_name: str, target_config: Dict[str, Any]

@@ -345,7 +345,7 @@ class PythonExecutor(BaseExecutor):
                 "total": dispatch_result.total,
                 "succeeded": dispatch_result.succeeded,
                 "failed": dispatch_result.failed,
-                "results": dispatch_result.results,
+                "results": dispatch_result.serializable_results,
             }
 
             if dispatch_result.all_succeeded:

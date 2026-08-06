@@ -305,18 +305,25 @@ class AtlasContractClient:
 
         return refresh_access_token()
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         url = f"{self.config.base_url}{path}"
         refreshed = False
         while True:
+            headers = {**self._headers(), **(extra_headers or {})}
             try:
                 if self._client is not None:
-                    response = self._client.post(url, json=payload, headers=self._headers())
+                    response = self._client.post(url, json=payload, headers=headers)
                 else:
                     response = httpx.post(
                         url,
                         json=payload,
-                        headers=self._headers(),
+                        headers=headers,
                         timeout=self.config.timeout_seconds,
                     )
                 response.raise_for_status()
@@ -502,6 +509,46 @@ class AtlasContractClient:
         ):
             raise AtlasContractError(
                 "Atlas returned an invalid Feature Service publication response."
+            )
+        return data
+
+    def request_feature_service_activation(
+        self,
+        *,
+        service_id: str,
+        version: str,
+        variant: str,
+        environment: str,
+        consumer_identity: str,
+        consumer_kind: str = "application",
+        capabilities: tuple[str, ...] = ("consume_online",),
+        justification: str = "Requested by the Seeknal publish command.",
+        expires_at: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Request approval; never grant serving access from the CLI."""
+
+        response = self._post(
+            (
+                f"/api/v1/feature-services/{service_id}/versions/{version}"
+                f"/variants/{variant}/activation-requests"
+            ),
+            {
+                "environment": environment,
+                "consumerKind": consumer_kind,
+                "consumerIdentity": consumer_identity,
+                "capabilities": list(capabilities),
+                "justification": justification,
+                "expiresAt": expires_at,
+            },
+            extra_headers={
+                "Idempotency-Key": idempotency_key or str(uuid.uuid4())
+            },
+        )
+        data = response.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("request"), dict):
+            raise AtlasContractError(
+                "Atlas returned an invalid Feature Service activation response."
             )
         return data
 

@@ -14,8 +14,8 @@ Usage:
 
     seeknal atlas lineage show <fg>   Show lineage for a feature group
     seeknal atlas lineage publish     Publish lineage to DataHub
-    seeknal atlas feature-service publish <yaml>
-                                      Publish a Feature Service contract
+    seeknal atlas feature-service publish <selector>
+                                      Publish an applied Feature Service
 
 Examples:
     # Start the Atlas API server
@@ -882,68 +882,189 @@ def lineage_publish(
 # =============================================================================
 
 
-@feature_service_app.command("publish")
-def feature_service_publish(
-    yaml_path: Path = typer.Argument(
-        ...,
-        exists=True,
-        dir_okay=False,
-        readable=True,
+def _compiled_feature_service(
+    selector: str,
+    *,
+    project_path: Path,
+    environment: str | None,
+) -> dict:
+    from seeknal.integrations.atlas_feature_service import (
+        FeatureServiceCompilationError,
+        FeatureServiceCompiler,
+    )
+
+    try:
+        return FeatureServiceCompiler(
+            project_path,
+            environment=environment,
+        ).compile(selector).payload
+    except FeatureServiceCompilationError as exc:
+        _echo_error(f"Feature Service compilation failed: {exc}")
+        raise typer.Exit(1)
+
+
+@feature_service_app.command("plan")
+def feature_service_plan(
+    selector: str = typer.Argument(
+        ..., help="Feature Service selector, for example feature_service.customer_risk"
+    ),
+    project_path: Path = typer.Option(
+        Path("."),
+        "--project-dir",
+        "-p",
+        file_okay=False,
         resolve_path=True,
-        help="Versioned YAML containing a complete canonical Feature Service draft",
+        help="Seeknal project containing target/ applied state",
+    ),
+    environment: Optional[str] = typer.Option(
+        None,
+        "--environment",
+        "-e",
+        help="Applied environment under target/environments/<name>",
     ),
 ):
-    """Publish a complete canonical Feature Service draft to Atlas.
+    """Validate that an applied Feature Service is ready to publish."""
 
-    The YAML must declare ``schemaVersion: 1`` alongside the full draft
-    snapshot. Seeknal does not synthesize a service from local Feature Groups.
+    draft = _compiled_feature_service(
+        selector,
+        project_path=project_path,
+        environment=environment,
+    )
+    _echo_success(
+        "Feature Service is publishable from applied state: "
+        f"{draft['serviceId']} / {draft['version']} / {draft['variant']}"
+    )
+    typer.echo(f"  Environment: {environment or 'default'}")
+    typer.echo(f"  Feature views: {len(draft['selections'])}")
+    for selection in draft["selections"]:
+        view = selection["view"]
+        typer.echo(
+            f"  - {view['viewId']} @ {view['revision'][:12]} "
+            f"({len(selection['features'])} selected features)"
+        )
+        typer.echo(f"    Source: {view['sourceLocator']}")
+
+
+@feature_service_app.command("compile")
+def feature_service_compile(
+    selector: str = typer.Argument(
+        ..., help="Feature Service selector, for example feature_service.customer_risk"
+    ),
+    project_path: Path = typer.Option(
+        Path("."),
+        "--project-dir",
+        "-p",
+        file_okay=False,
+        resolve_path=True,
+        help="Seeknal project containing target/ applied state",
+    ),
+    environment: Optional[str] = typer.Option(
+        None,
+        "--environment",
+        "-e",
+        help="Applied environment under target/environments/<name>",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        dir_okay=False,
+        resolve_path=True,
+        help="Write canonical JSON to this path instead of stdout",
+    ),
+):
+    """Compile an applied Feature Service into the Atlas wire contract."""
+
+    import json
+
+    draft = _compiled_feature_service(
+        selector,
+        project_path=project_path,
+        environment=environment,
+    )
+    encoded = json.dumps(draft, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    if output is None:
+        typer.echo(encoded, nl=False)
+        return
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(encoded, encoding="utf-8")
+    _echo_success(f"Compiled Feature Service: {output}")
+
+
+@feature_service_app.command("publish")
+def feature_service_publish(
+    source: str = typer.Argument(
+        ...,
+        help="Applied Feature Service selector, for example feature_service.customer_risk",
+    ),
+    project_path: Path = typer.Option(
+        Path("."),
+        "--project-dir",
+        "-p",
+        file_okay=False,
+        resolve_path=True,
+        help="Seeknal project containing target/ applied state",
+    ),
+    environment: Optional[str] = typer.Option(
+        None,
+        "--environment",
+        "-e",
+        help="Applied environment under target/environments/<name>",
+    ),
+    request_activation: bool = typer.Option(
+        False,
+        "--request-activation",
+        help="Create an approval request after publication; never grants access directly.",
+    ),
+    consumer: Optional[str] = typer.Option(
+        None,
+        "--consumer",
+        help="OpenFGA consumer identity for the activation request.",
+    ),
+    consumer_kind: str = typer.Option(
+        "application",
+        "--consumer-kind",
+        help="Consumer type: model, application, notebook, or service_account.",
+    ),
+    capability: Optional[list[str]] = typer.Option(
+        None,
+        "--capability",
+        help="Requested capability; repeat for consume_online, consume_offline, or operate.",
+    ),
+    justification: str = typer.Option(
+        "Requested by the Seeknal publish command.",
+        "--justification",
+        help="Auditable business justification for serving access.",
+    ),
+):
+    """Compile applied state and publish an immutable Feature Service to Atlas.
+
+    Publication requires a ``feature_service.<name>`` selector so the contract
+    is anchored to the project's applied Feature Group and Feature Service state.
 
     Example:
-        seeknal atlas feature-service publish feature-service.yml
+        seeknal atlas feature-service publish feature_service.customer_risk
     """
-    import yaml
-
     from seeknal.integrations.atlas_client import (
         AtlasAuthError,
         AtlasContractError,
         create_atlas_contract_client_from_env,
     )
 
-    try:
-        document = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
-        _echo_error(f"Could not read Feature Service YAML: {exc}")
-        raise typer.Exit(1)
-
-    if not isinstance(document, dict):
-        _echo_error("Feature Service YAML must contain a mapping.")
-        raise typer.Exit(1)
-
-    schema_version = document.get("schemaVersion")
-    if type(schema_version) is not int or schema_version != 1:
-        _echo_error("Unsupported Feature Service schemaVersion; expected schemaVersion: 1.")
-        raise typer.Exit(1)
-
-    draft = {key: value for key, value in document.items() if key != "schemaVersion"}
-    if not draft:
-        _echo_error("Feature Service YAML must include the complete draft snapshot.")
-        raise typer.Exit(1)
-
-    server_owned_fields = {
-        "createdBy",
-        "createdAt",
-        "publishedAt",
-        "schemaHash",
-        "lifecycle",
-        "deployment",
-    }
-    invalid_fields = sorted(server_owned_fields.intersection(draft))
-    if invalid_fields:
+    if not source.startswith("feature_service."):
         _echo_error(
-            "Feature Service YAML contains server-owned field(s): "
-            f"{', '.join(invalid_fields)}. Remove them before publishing."
+            "Raw Feature Service contract files (including schemaVersion: 1 YAML) "
+            "can no longer be published. Declare the Feature Service in the Seeknal "
+            "project using YAML or the Python builder, run the project to materialize "
+            "and record applied state, then publish its feature_service.<name> selector."
         )
         raise typer.Exit(1)
+
+    draft = _compiled_feature_service(
+        source,
+        project_path=project_path,
+        environment=environment,
+    )
 
     client = create_atlas_contract_client_from_env()
     if client is None:
@@ -952,6 +1073,23 @@ def feature_service_publish(
             "`seeknal auth config set --host <atlas-host>`."
         )
         raise typer.Exit(2)
+
+    requested_capabilities = tuple(capability or ["consume_online"])
+    if request_activation:
+        if not consumer or not consumer.strip():
+            _echo_error("--consumer is required with --request-activation.")
+            raise typer.Exit(1)
+        allowed_capabilities = {"consume_online", "consume_offline", "operate"}
+        if (
+            consumer_kind not in {"model", "application", "notebook", "service_account"}
+            or not set(requested_capabilities) <= allowed_capabilities
+        ):
+            _echo_error(
+                "Activation consumer kind or capability is invalid. "
+                "Use model/application/notebook/service_account and "
+                "consume_online/consume_offline/operate."
+            )
+            raise typer.Exit(1)
 
     try:
         response = client.publish_feature_service(draft)
@@ -969,10 +1107,37 @@ def feature_service_publish(
     )
     outcome = "Replayed" if response.get("replayed") is True else "Created"
     _echo_success(f"{outcome} Feature Service: {identity}")
+    activation_path = response.get("activationPath")
+    if isinstance(activation_path, str) and activation_path:
+        _echo_info(f"Activation: {activation_path}")
     _echo_info(
-        "Feature Service metadata is published. Serving operate authorization "
-        "requires a separate policy binding."
+        "Feature Service metadata is published. Seeknal materializes features; "
+        "serving authorization requires an approved activation request."
     )
+    if request_activation:
+        try:
+            activation = client.request_feature_service_activation(
+                service_id=str(service.get("serviceId") or draft["serviceId"]),
+                version=str(service.get("version") or draft["version"]),
+                variant=str(service.get("variant") or draft.get("variant") or "default"),
+                environment=environment or "development",
+                consumer_identity=consumer.strip(),
+                consumer_kind=consumer_kind,
+                capabilities=requested_capabilities,
+                justification=justification,
+            )
+        except AtlasAuthError as exc:
+            _echo_error(str(exc))
+            raise typer.Exit(1)
+        except AtlasContractError as exc:
+            _echo_error(f"Feature Service was published, but activation request failed: {exc}")
+            raise typer.Exit(1)
+        activation_request = activation["request"]
+        _echo_success(
+            "Activation requested: "
+            f"{activation_request.get('requestId', '?')} "
+            f"({activation_request.get('state', 'pending_owner_review')})"
+        )
 
 
 # =============================================================================
