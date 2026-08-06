@@ -76,6 +76,10 @@ class ToolContext:
     sql_pairs_checked_this_turn: bool = False
     authoritative_sql_pair_result_this_turn: dict[str, str] | None = None
     sql_timeout_seconds: int = 60
+    # How many lines read_project_file returns per call. 200 suits source files;
+    # projects whose rule documents run longer can raise it so the tail is not
+    # silently cut (see ask.config.get_read_max_lines).
+    read_max_lines: int = 200
     # SQLR: route PG-only SQL straight to PostgreSQL instead of running it
     # through DuckDB's postgres_scanner. Off unless the project opts in; any
     # failure on that path falls back to DuckDB (see execute_sql._try_pg_route).

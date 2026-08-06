@@ -315,6 +315,9 @@ def get_background_threshold(config: dict[str, Any]) -> int:
 
 _DEFAULT_HARNESS_SECTION = "agent_harness"
 
+# read_project_file window. 200 fits source files; rule documents are read whole.
+_DEFAULT_READ_MAX_LINES = 200
+
 
 def get_agent_harness_settings(config: dict[str, Any]) -> dict[str, Any]:
     """Return optional low-level pydantic-deep harness settings.
@@ -522,6 +525,32 @@ def get_ask_toolset_mode(config: dict[str, Any]) -> str:
     if mode in _READ_ONLY_ANALYST_MODES:
         return "analysis"
     return "full"
+
+
+def get_read_max_lines(config: dict[str, Any]) -> int:
+    """Return how many lines ``read_project_file`` returns per call.
+
+    The default suits source files, where a 200-line window is usually the part
+    worth reading. Project rule documents are different: they are meant to be
+    read whole, and a document longer than the window is silently cut at it. The
+    tool does say how to continue, but a model that does not ask again simply
+    never sees the rest — so a project whose context files run long can raise
+    this instead of depending on that follow-up.
+
+    Example::
+
+        agent_harness:
+          read_max_lines: 500
+    """
+    section = _get_mapping(config, _DEFAULT_HARNESS_SECTION)
+    value = section.get("read_max_lines")
+    if value is None:
+        return _DEFAULT_READ_MAX_LINES
+    try:
+        lines = int(value)
+        return lines if lines > 0 else _DEFAULT_READ_MAX_LINES
+    except (TypeError, ValueError):
+        return _DEFAULT_READ_MAX_LINES
 
 
 def get_pg_passthrough_enabled(config: dict[str, Any]) -> bool:
