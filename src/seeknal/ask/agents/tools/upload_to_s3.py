@@ -198,16 +198,31 @@ def upload_to_s3(
             timeout=60.0,
         )
         put.raise_for_status()
-    except httpx.HTTPError:
+    # FC2i: split the two failure modes STEP 3 above already distinguishes.
+    # httpx.HTTPError is the base class of BOTH HTTPStatusError (the endpoint
+    # answered with a status) and RequestError (it was never reached), so
+    # catching it lost the one detail that identifies the fault — and named
+    # SeaweedFS, which is three hops away and often never contacted at all.
+    except httpx.RequestError as exc:
         record_tool_result(
             "upload_to_s3",
             format_tool_error(
                 TERMINAL_DEPENDENCY_UNAVAILABLE,
-                "CSV upload failed (SeaweedFS rejected the write).",
+                f"CSV upload failed: storage endpoint unreachable ({type(exc).__name__}).",
             ),
             args={"filename": filename, "mode": "sql" if used_sql_mode else "data"},
         )
-        return "CSV upload failed (SeaweedFS rejected the write)."
+        return f"CSV upload failed: storage endpoint unreachable ({type(exc).__name__})."
+    except httpx.HTTPStatusError as exc:
+        record_tool_result(
+            "upload_to_s3",
+            format_tool_error(
+                TERMINAL_DEPENDENCY_UNAVAILABLE,
+                f"CSV upload failed: storage rejected the write (HTTP {exc.response.status_code}).",
+            ),
+            args={"filename": filename, "mode": "sql" if used_sql_mode else "data"},
+        )
+        return f"CSV upload failed: storage rejected the write (HTTP {exc.response.status_code})."
 
     # ── STEP 5: register pending_upload — gateway loop emits upload_complete
     # expires_at is sourced VERBATIM from the server response

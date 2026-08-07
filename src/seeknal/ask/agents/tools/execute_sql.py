@@ -822,12 +822,137 @@ def _count_total(ctx, sql: str) -> int | None:
     return None
 
 
+# PostgreSQL truncates identifiers at NAMEDATALEN-1 bytes. A name it cannot
+# hold would come back truncated — a different header, which is exactly what
+# carrying the local names over is meant to prevent — so such a statement is
+# left on the local engine instead.
+_PG_MAX_IDENTIFIER_BYTES = 63
+
+
+def _local_column_names(ctx, sql: str) -> list[str] | None:
+    """Ask the local engine what it would call this statement's result columns.
+
+    Returns None when the question cannot be answered; the caller then leaves
+    the statement on the local engine rather than guessing at a name.
+    """
+    from seeknal.ask.sql_routing import probe_sql
+
+    probe = probe_sql(sql)
+    if probe is None:
+        return None
+    try:
+        with ctx.db_lock:
+            cursor = ctx.repl.conn.execute(probe)
+            return [str(column[0]) for column in cursor.description or []]
+    except Exception:  # noqa: BLE001 — probing is best-effort
+        return None
+
+
+def _try_pg_route(ctx, sql: str, limit: int | None):
+    """Run PG-only SQL directly on PostgreSQL; return ``(columns, rows)`` or None.
+
+    DuckDB's postgres_scanner pushes down predicates but never aggregation, so
+    ``COUNT(DISTINCT ...)`` over an attached table transfers the raw column and
+    computes locally. Sending PG-only SQL to PostgreSQL lets the source do the
+    aggregation and return only the result rows.
+
+    Returning None means "not routed" and the caller continues on the DuckDB
+    path. That is the case for every failure too — unsupported SQL, a dialect
+    error, an unreachable database. Routing may make a query slower by falling
+    back, but it can never change the answer or surface a new error.
+
+    This is the one place the agent path deliberately differs from the oracle
+    path in ``ask/testing.py``, which must NOT fall back (a wrong-engine answer
+    would defeat a ground-truth oracle). Here availability wins.
+    """
+    import time
+
+    from seeknal.ask.agents.tools._context import record_timing_event
+
+    if not getattr(ctx, "pg_passthrough", False):
+        return None
+
+    started = time.monotonic()
+    try:
+        from seeknal.ask._pg_oracle import execute_via_psycopg2, resolve_pg_dsn
+        from seeknal.ask.sql_routing import analyze
+        from seeknal.sources.config import load_source_registry
+        from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+        registry = load_source_registry(ctx.project_path)
+        remote = {
+            s.namespace
+            for s in registry.sources.values()
+            if s.source_kind == "connected"
+            and s.source_type == "database"
+            and s.connector in ("postgresql", "postgres")
+            and s.is_read_only
+        }
+        plan = analyze(sql, remote, target_dialect="postgres")
+        if not plan.is_routable and plan.reason.startswith("unaliased projection"):
+            # The statement leaves a projection for the engine to name, and the
+            # engines disagree. Ask the local engine what it would call them —
+            # LIMIT 0 plans the statement without reading rows — then carry
+            # those names over so the routed result is labelled identically.
+            plan = analyze(
+                sql,
+                remote,
+                target_dialect="postgres",
+                local_column_names=_local_column_names(ctx, sql),
+                max_identifier_bytes=_PG_MAX_IDENTIFIER_BYTES,
+            )
+        if not plan.is_routable:
+            return None
+        # registry.sources is keyed by .name, not .namespace — match on the
+        # attribute (same lookup as ask/testing.py:266).
+        source = next(
+            (s for s in registry.sources.values() if s.namespace == plan.namespace),
+            None,
+        )
+        if source is None:
+            return None
+
+        profile_path = ctx.project_path / "profiles.yml"
+        loader = ProfileLoader(
+            profile_path=profile_path if profile_path.exists() else None
+        )
+        dsn = resolve_pg_dsn(source, loader._load_profile_data())
+
+        pg_sql = plan.sql
+        if limit is not None:
+            pg_sql = f"SELECT * FROM ({pg_sql}) _seeknal_routed LIMIT {int(limit)}"
+
+        result = execute_via_psycopg2(dsn, pg_sql)
+        if result.error:
+            record_timing_event(
+                "execute_sql_pg_fallback",
+                int((time.monotonic() - started) * 1000),
+                reason=str(result.error)[:200],
+            )
+            return None
+        return [str(col) for col in result.columns], list(result.rows)
+    except Exception as exc:  # noqa: BLE001 — any failure means "use DuckDB"
+        try:
+            record_timing_event(
+                "execute_sql_pg_fallback",
+                int((time.monotonic() - started) * 1000),
+                reason=f"{type(exc).__name__}: {exc}"[:200],
+            )
+        except Exception:  # noqa: BLE001 — observability never blocks
+            pass
+        return None
+
+
 def _execute_oneshot_with_timeout(ctx, sql: str, limit: int | None = None):
     """Execute REPL SQL with the session db lock and optional hard timeout."""
     import concurrent.futures
     import time
 
     from seeknal.ask.agents.tools._context import record_timing_event
+
+    routed = _try_pg_route(ctx, sql, limit)
+    if routed is not None:
+        return routed
 
     timeout = int(getattr(ctx, "sql_timeout_seconds", 0) or 0)
     started = time.monotonic()
