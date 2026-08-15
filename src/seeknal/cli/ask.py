@@ -306,7 +306,7 @@ def work_command(
     retry_rejected: bool = typer.Option(
         False,
         "--retry-rejected",
-        help="Retry only the stored outcome POST after instance recovery",
+        help="Retry the stored claim/outcome after instance recovery",
     ),
 ):
     """Execute delivered Intel work non-interactively and report outcomes."""

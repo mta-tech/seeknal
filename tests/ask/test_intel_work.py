@@ -91,6 +91,10 @@ def _write_policy(
     )
 
 
+def _successful_submitter(_binding, _item, _request_id, assertion):
+    return {"state_after": assertion["disposition"]}
+
+
 @pytest.fixture
 def work_project(tmp_path: Path):
     _write_context_pack(tmp_path)
@@ -415,7 +419,7 @@ def test_redelivery_after_restart_does_not_execute_or_post_twice(work_project):
             "reason": "Actual margin-floor finding from all three documents.",
         }
     )
-    poster = MagicMock(return_value={"state": "done"})
+    poster = MagicMock(side_effect=_successful_submitter)
 
     first = execute_work_queue(
         project,
@@ -437,9 +441,127 @@ def test_redelivery_after_restart_does_not_execute_or_post_twice(work_project):
     assert first[0].status == "acknowledged"
     assert second[0].status == "already_acknowledged"
     runner.assert_called_once()
-    poster.assert_called_once()
+    assert poster.call_count == 2
+    assert [call.args[3]["disposition"] for call in poster.call_args_list] == [
+        "in_progress",
+        "done",
+    ]
+    assert poster.call_args_list[0].args[2] != poster.call_args_list[1].args[2]
     state = json.loads(state_path.read_text())
     assert state["items"][WORK_ID]["phase"] == "acknowledged"
+
+
+def test_fresh_delivered_item_is_claimed_before_terminal_outcome(work_project):
+    project, policy_path, state_path = work_project
+    server = {"state": "delivered", "claimed_at": None}
+    posted: list[tuple[str, str]] = []
+    runner_states: list[str] = []
+
+    def submitter(_binding, _item, request_id, assertion):
+        disposition = assertion["disposition"]
+        posted.append((request_id, disposition))
+        if (
+            disposition in {"done", "failed", "blocked"}
+            and server["state"] == "delivered"
+        ):
+            raise IntelWorkOutcomeRejected(
+                409,
+                "terminal outcome requires a prior claim",
+                code="WORK_CLAIM_REQUIRED",
+            )
+        if disposition == "in_progress":
+            assert server["state"] == "delivered"
+            server["state"] = "in_progress"
+            server["claimed_at"] = "2026-08-15T16:10:00+00:00"
+            return {"state_after": "in_progress", "receipt_id": "claim-receipt"}
+        assert server["state"] == "in_progress"
+        server["state"] = disposition
+        return {"state_after": disposition, "receipt_id": "terminal-receipt"}
+
+    def runner(*_args, **_kwargs):
+        runner_states.append(server["state"])
+        return {"disposition": "done", "reason": "Verified result."}
+
+    result = execute_work_queue(
+        project,
+        item_id=WORK_ID,
+        policy_path=policy_path,
+        state_path=state_path,
+        run_assignment=runner,
+        submit_outcome=submitter,
+    )
+
+    assert [disposition for _, disposition in posted] == ["in_progress", "done"]
+    assert posted[0][0] != posted[1][0]
+    assert runner_states == ["in_progress"]
+    assert server == {
+        "state": "done",
+        "claimed_at": "2026-08-15T16:10:00+00:00",
+    }
+    assert result[0].claim_response == {
+        "state_after": "in_progress",
+        "receipt_id": "claim-receipt",
+    }
+
+
+def test_legacy_unclaimed_409_is_claimed_then_replayed_without_rerun(work_project):
+    project, policy_path, state_path = work_project
+    binding, items = load_work_queue(project, policy_path=policy_path)
+    item = items[0]
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "items": {
+                    WORK_ID: {
+                        "phase": "rejected",
+                        "client_request_id": "legacy-terminal-request",
+                        "instance_id": binding.instance_id,
+                        "agent_id": binding.agent_id,
+                        "instruction": item.instruction,
+                        "protocol_version": item.protocol_version,
+                        "payload_hash": item.payload_hash,
+                        "assertion": {
+                            "disposition": "done",
+                            "reason": "Previously verified result.",
+                        },
+                        "server_response": {"http_status": 409},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = MagicMock()
+    server_state = "delivered"
+    dispositions: list[str] = []
+
+    def submitter(_binding, _item, _request_id, assertion):
+        nonlocal server_state
+        disposition = assertion["disposition"]
+        dispositions.append(disposition)
+        if disposition == "in_progress":
+            assert server_state == "delivered"
+            server_state = "in_progress"
+            return {"state_after": "in_progress"}
+        assert server_state == "in_progress"
+        server_state = disposition
+        return {"state_after": disposition}
+
+    result = execute_work_queue(
+        project,
+        item_id=WORK_ID,
+        policy_path=policy_path,
+        state_path=state_path,
+        run_assignment=runner,
+        submit_outcome=submitter,
+    )
+
+    assert dispositions == ["in_progress", "done"]
+    assert server_state == "done"
+    runner.assert_not_called()
+    assert result[0].status == "acknowledged"
 
 
 def test_redelivery_fails_closed_on_changed_payload(work_project):
@@ -447,7 +569,7 @@ def test_redelivery_fails_closed_on_changed_payload(work_project):
     runner = MagicMock(
         return_value={"disposition": "done", "reason": "Verified result."}
     )
-    poster = MagicMock(return_value={"state": "done"})
+    poster = MagicMock(side_effect=_successful_submitter)
     execute_work_queue(
         project,
         item_id=WORK_ID,
@@ -469,7 +591,7 @@ def test_redelivery_fails_closed_on_changed_payload(work_project):
         )
 
     runner.assert_called_once()
-    poster.assert_called_once()
+    assert poster.call_count == 2
 
 
 def test_redelivery_fails_closed_on_changed_binding(work_project):
@@ -477,7 +599,7 @@ def test_redelivery_fails_closed_on_changed_binding(work_project):
     runner = MagicMock(
         return_value={"disposition": "done", "reason": "Verified result."}
     )
-    poster = MagicMock(return_value={"state": "done"})
+    poster = MagicMock(side_effect=_successful_submitter)
     execute_work_queue(
         project,
         item_id=WORK_ID,
@@ -504,7 +626,7 @@ def test_redelivery_fails_closed_on_changed_binding(work_project):
         )
 
     runner.assert_called_once()
-    poster.assert_called_once()
+    assert poster.call_count == 2
 
 
 def test_prepared_outcome_retries_post_without_rerunning(work_project):
@@ -513,7 +635,11 @@ def test_prepared_outcome_retries_post_without_rerunning(work_project):
         return_value={"disposition": "done", "reason": "Verified result."}
     )
     poster = MagicMock(
-        side_effect=[IntelWorkError("temporary post failure"), {"state": "done"}]
+        side_effect=[
+            {"state_after": "in_progress"},
+            IntelWorkError("temporary post failure"),
+            {"state_after": "done"},
+        ]
     )
 
     with pytest.raises(IntelWorkError, match="temporary post failure"):
@@ -535,9 +661,74 @@ def test_prepared_outcome_retries_post_without_rerunning(work_project):
     )
 
     runner.assert_called_once()
-    assert poster.call_count == 2
-    assert poster.call_args_list[0].args[2] == poster.call_args_list[1].args[2]
+    assert poster.call_count == 3
+    assert poster.call_args_list[1].args[2] == poster.call_args_list[2].args[2]
+    assert poster.call_args_list[0].args[2] != poster.call_args_list[1].args[2]
     assert result[0].status == "acknowledged"
+
+
+def test_claim_retry_uses_same_request_id_before_execution(work_project):
+    project, policy_path, state_path = work_project
+    runner = MagicMock(
+        return_value={"disposition": "done", "reason": "Verified result."}
+    )
+    poster = MagicMock(
+        side_effect=[
+            IntelWorkError("claim request timed out"),
+            {"state_after": "in_progress"},
+            {"state_after": "done"},
+        ]
+    )
+
+    with pytest.raises(IntelWorkError, match="claim request timed out"):
+        execute_work_queue(
+            project,
+            item_id=WORK_ID,
+            policy_path=policy_path,
+            state_path=state_path,
+            run_assignment=runner,
+            submit_outcome=poster,
+        )
+    result = execute_work_queue(
+        project,
+        item_id=WORK_ID,
+        policy_path=policy_path,
+        state_path=state_path,
+        run_assignment=runner,
+        submit_outcome=poster,
+    )
+
+    assert poster.call_args_list[0].args[2] == poster.call_args_list[1].args[2]
+    assert poster.call_args_list[1].args[3]["disposition"] == "in_progress"
+    runner.assert_called_once()
+    assert result[0].status == "acknowledged"
+
+
+def test_claim_rejection_never_runs_assignment(work_project):
+    project, policy_path, state_path = work_project
+    runner = MagicMock()
+    poster = MagicMock(
+        side_effect=IntelWorkOutcomeRejected(
+            403,
+            "instance is offline",
+            code="INSTANCE_OFFLINE",
+        )
+    )
+
+    with pytest.raises(IntelWorkOutcomeRejected, match="INSTANCE_OFFLINE"):
+        execute_work_queue(
+            project,
+            item_id=WORK_ID,
+            policy_path=policy_path,
+            state_path=state_path,
+            run_assignment=runner,
+            submit_outcome=poster,
+        )
+
+    runner.assert_not_called()
+    poster.assert_called_once()
+    state = json.loads(state_path.read_text())
+    assert state["items"][WORK_ID]["phase"] == "claim_rejected"
 
 
 def test_executor_never_prompts(work_project):
@@ -553,7 +744,7 @@ def test_executor_never_prompts(work_project):
                 "disposition": "done",
                 "reason": "Verified without prompting.",
             },
-            submit_outcome=lambda *_args, **_kwargs: {"state": "done"},
+            submit_outcome=_successful_submitter,
         )
 
     assert result[0].status == "acknowledged"
@@ -565,7 +756,10 @@ def test_403_is_durable_and_not_retried(work_project):
         return_value={"disposition": "done", "reason": "Verified result."}
     )
     poster = MagicMock(
-        side_effect=IntelWorkOutcomeRejected(403, "instance unavailable")
+        side_effect=[
+            {"state_after": "in_progress"},
+            IntelWorkOutcomeRejected(403, "instance unavailable"),
+        ]
     )
 
     with pytest.raises(IntelWorkOutcomeRejected):
@@ -588,7 +782,7 @@ def test_403_is_durable_and_not_retried(work_project):
         )
 
     runner.assert_called_once()
-    poster.assert_called_once()
+    assert poster.call_count == 2
 
 
 def test_rejected_outcome_can_be_explicitly_retried_without_rerunning(work_project):
@@ -598,8 +792,9 @@ def test_rejected_outcome_can_be_explicitly_retried_without_rerunning(work_proje
     )
     poster = MagicMock(
         side_effect=[
+            {"state_after": "in_progress"},
             IntelWorkOutcomeRejected(403, "instance unavailable"),
-            {"state": "done"},
+            {"state_after": "done"},
         ]
     )
     with pytest.raises(IntelWorkOutcomeRejected):
@@ -624,7 +819,7 @@ def test_rejected_outcome_can_be_explicitly_retried_without_rerunning(work_proje
 
     assert result[0].status == "acknowledged"
     runner.assert_called_once()
-    assert poster.call_count == 2
+    assert poster.call_count == 3
 
 
 def test_post_outcome_uses_exact_endpoint_body_and_secure_helper(work_project):
@@ -673,6 +868,48 @@ def test_post_outcome_uses_exact_endpoint_body_and_secure_helper(work_project):
     ]
 
 
+def test_post_outcome_surfaces_safe_server_error_code(work_project):
+    project, policy_path, _ = work_project
+    binding, items = load_work_queue(project, policy_path=policy_path)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={
+                "detail": {
+                    "code": "WORK_CLAIM_REQUIRED",
+                    "message": "terminal outcome requires a prior claim",
+                }
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    credential = subprocess.CompletedProcess(
+        ["intel"],
+        0,
+        stdout=json.dumps({"Authorization": "Bearer test-only-credential"}),
+        stderr="",
+    )
+    with (
+        patch(
+            "seeknal.ask.agents.tools.intel_knowledge.subprocess.run",
+            return_value=credential,
+        ),
+        patch("seeknal.ask.intel_work.httpx.Client", return_value=client),
+        pytest.raises(IntelWorkOutcomeRejected) as rejected,
+    ):
+        post_outcome(
+            binding,
+            items[0],
+            "terminal-request-id",
+            {"disposition": "done", "reason": "Verified result."},
+        )
+
+    assert rejected.value.code == "WORK_CLAIM_REQUIRED"
+    assert "[WORK_CLAIM_REQUIRED]" in str(rejected.value)
+    assert "terminal outcome requires a prior claim" in str(rejected.value)
+
+
 def test_intel_work_toolset_has_knowledge_tools_and_no_prompt_tools():
     from seeknal.ask.agents.tools.toolset import create_ask_toolset
 
@@ -716,3 +953,26 @@ def test_work_cli_defaults_to_google_and_never_reads_stdin(tmp_path: Path):
     assert execute.call_args.kwargs["provider"] == "google"
     assert execute.call_args.kwargs["item_id"] == WORK_ID
     assert execute.call_args.kwargs["retry_rejected"] is False
+
+
+def test_work_cli_surfaces_server_rejection_code(tmp_path: Path):
+    from typer.testing import CliRunner
+
+    from seeknal.cli.ask import ask_app
+
+    with patch(
+        "seeknal.ask.intel_work.execute_work_queue",
+        side_effect=IntelWorkOutcomeRejected(
+            409,
+            "terminal outcome requires a prior claim",
+            code="WORK_CLAIM_REQUIRED",
+        ),
+    ):
+        result = CliRunner().invoke(
+            ask_app,
+            ["work", "--project", str(tmp_path), "--item", WORK_ID],
+        )
+
+    assert result.exit_code == 1
+    assert "[WORK_CLAIM_REQUIRED]" in result.output
+    assert "terminal outcome requires a prior claim" in result.output

@@ -127,11 +127,13 @@ class IntelWorkError(RuntimeError):
 class IntelWorkOutcomeRejected(IntelWorkError):
     """Non-retryable server rejection, including revoked/offline instances."""
 
-    def __init__(self, status_code: int, detail: str):
+    def __init__(self, status_code: int, detail: str, *, code: str | None = None):
         self.status_code = status_code
         self.detail = detail
+        self.code = code
+        code_text = f" [{code}]" if code else ""
         super().__init__(
-            f"Intel work outcome rejected with HTTP {status_code}: {detail}"
+            f"Intel work outcome rejected with HTTP {status_code}{code_text}: {detail}"
         )
 
 
@@ -150,6 +152,7 @@ class WorkExecutionResult:
     status: str
     client_request_id: str
     assertion: dict[str, Any] | None = None
+    claim_response: dict[str, Any] | None = None
     server_response: dict[str, Any] | None = None
 
 
@@ -320,6 +323,29 @@ def _client_request_id(instance_id: str, work_item_id: str) -> str:
     )
 
 
+def _claim_client_request_id(instance_id: str, work_item_id: str) -> str:
+    return str(
+        uuid.uuid5(
+            _CLIENT_REQUEST_NAMESPACE,
+            f"{instance_id}:{work_item_id}:claim",
+        )
+    )
+
+
+def _claim_assertion() -> dict[str, Any]:
+    return {
+        "disposition": "in_progress",
+        "reason": "Seeknal claimed this delivered assignment before execution.",
+        "continuation": {
+            "kind": "seeknal_execution",
+            "detail": (
+                "Seeknal is retrieving granted Intel knowledge and will report "
+                "the verified outcome."
+            ),
+        },
+    }
+
+
 def _empty_state() -> dict[str, Any]:
     return {"version": _STATE_VERSION, "items": {}}
 
@@ -346,7 +372,14 @@ def _validated_state_record(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise IntelWorkError("Intel work state record is invalid.")
     record = cast(dict[str, Any], raw)
-    if record.get("phase") not in {"claimed", "prepared", "acknowledged", "rejected"}:
+    if record.get("phase") not in {
+        "claim_prepared",
+        "claim_rejected",
+        "claimed",
+        "prepared",
+        "acknowledged",
+        "rejected",
+    }:
         raise IntelWorkError("Intel work state record has an invalid phase.")
     for field in (
         "client_request_id",
@@ -423,6 +456,29 @@ def _safe_json_response(response: httpx.Response) -> dict[str, Any]:
     )
 
 
+def _rejection_details(response: httpx.Response) -> tuple[str | None, str]:
+    payload = _safe_json_response(response)
+    detail = payload.get("detail")
+    if isinstance(detail, dict):
+        raw_code = detail.get("code")
+        raw_message = detail.get("message")
+        code = (
+            raw_code.strip()[:128]
+            if isinstance(raw_code, str) and _nonblank(raw_code)
+            else None
+        )
+        message = (
+            raw_message.strip()[:500]
+            if isinstance(raw_message, str) and _nonblank(raw_message)
+            else None
+        )
+        if message:
+            return code, message
+    if isinstance(detail, str) and _nonblank(detail):
+        return None, detail.strip()[:500]
+    return None, "instance authorization or outcome contract was rejected"
+
+
 def post_outcome(
     binding: _IntelBinding,
     item: WorkItem,
@@ -463,8 +519,8 @@ def post_outcome(
             f"Intel work outcome service failed with HTTP {response.status_code}."
         )
     if response.status_code >= 300:
-        detail = "instance authorization or outcome contract was rejected"
-        raise IntelWorkOutcomeRejected(response.status_code, detail)
+        code, detail = _rejection_details(response)
+        raise IntelWorkOutcomeRejected(response.status_code, detail, code=code)
     return _safe_json_response(response)
 
 
@@ -705,6 +761,48 @@ def _interrupted_assertion() -> dict[str, Any]:
     }
 
 
+def _rejection_snapshot(exc: IntelWorkOutcomeRejected) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "http_status": exc.status_code,
+        "detail": exc.detail,
+    }
+    if exc.code:
+        snapshot["code"] = exc.code
+    return snapshot
+
+
+def _require_state_after(response: Mapping[str, Any], expected: str) -> None:
+    if response.get("state_after") != expected:
+        raise IntelWorkError(
+            f"Intel work receipt did not confirm expected {expected} state."
+        )
+
+
+def _stored_rejection(
+    record: Mapping[str, Any], response_key: str
+) -> IntelWorkOutcomeRejected:
+    response = record.get(response_key)
+    if not isinstance(response, Mapping):
+        return IntelWorkOutcomeRejected(
+            403,
+            "previous outcome rejection requires explicit post-only retry",
+        )
+    status_code = response.get("http_status")
+    if not isinstance(status_code, int):
+        status_code = 403
+    code = response.get("code")
+    detail = response.get("detail")
+    return IntelWorkOutcomeRejected(
+        status_code,
+        detail.strip()[:500]
+        if isinstance(detail, str) and _nonblank(detail)
+        else "previous outcome rejection requires explicit post-only retry",
+        code=(
+            code.strip()[:128] if isinstance(code, str) and _nonblank(code) else None
+        ),
+    )
+
+
 def execute_work_queue(
     project_path: Path,
     *,
@@ -720,8 +818,8 @@ def execute_work_queue(
     """Execute delivered work once and durably suppress redelivery duplicates."""
     project_path = Path(project_path).resolve()
     state_path = state_path or (project_path / ".seeknal" / "intel_work_state.json")
-    runner = run_assignment or run_assignment_with_ask
-    submitter = submit_outcome or post_outcome
+    runner = run_assignment if run_assignment is not None else run_assignment_with_ask
+    submitter = submit_outcome if submit_outcome is not None else post_outcome
 
     with _state_lock(state_path):
         state = _load_state(state_path)
@@ -742,7 +840,7 @@ def execute_work_queue(
                 for stored_id, stored in records.items()
                 if stored_id not in delivered
                 and isinstance(stored, dict)
-                and stored.get("phase") in {"claimed", "prepared"}
+                and stored.get("phase") in {"claim_prepared", "claimed", "prepared"}
             )
 
         results: list[WorkExecutionResult] = []
@@ -774,27 +872,11 @@ def execute_work_queue(
                         status="already_acknowledged",
                         client_request_id=record["client_request_id"],
                         assertion=record.get("assertion"),
+                        claim_response=record.get("claim_server_response"),
                         server_response=record.get("server_response"),
                     )
                 )
                 continue
-            if record is not None and record.get("phase") == "rejected":
-                if not retry_rejected:
-                    response = record.get("server_response")
-                    status_code = (
-                        response.get("http_status")
-                        if isinstance(response, dict)
-                        else 403
-                    )
-                    if not isinstance(status_code, int):
-                        status_code = 403
-                    raise IntelWorkOutcomeRejected(
-                        status_code,
-                        "previous outcome rejection requires explicit post-only retry",
-                    )
-                record["phase"] = "prepared"
-                record["retry_requested_at"] = _utcnow()
-                _save_state(state_path, state)
 
             item = delivered.get(selected_id)
             if item is None:
@@ -812,21 +894,104 @@ def execute_work_queue(
 
             if record is None:
                 record = {
-                    "phase": "claimed",
+                    "phase": "claim_prepared",
                     "client_request_id": _client_request_id(
                         binding.instance_id,
                         selected_id,
                     ),
+                    "claim_client_request_id": _claim_client_request_id(
+                        binding.instance_id,
+                        selected_id,
+                    ),
+                    "claim_assertion": _claim_assertion(),
                     "instance_id": binding.instance_id,
                     "agent_id": binding.agent_id,
                     "instruction": item.instruction,
                     "protocol_version": item.protocol_version,
                     "payload_hash": item.payload_hash,
-                    "claimed_at": _utcnow(),
+                    "created_at": _utcnow(),
                 }
                 records[selected_id] = record
                 _save_state(state_path, state)
 
+            record.setdefault(
+                "claim_client_request_id",
+                _claim_client_request_id(binding.instance_id, selected_id),
+            )
+            record.setdefault("claim_assertion", _claim_assertion())
+            phase_at_start = record["phase"]
+            has_prepared_assertion = isinstance(record.get("assertion"), Mapping)
+            legacy_interrupted = phase_at_start == "claimed" and not isinstance(
+                record.get("claim_server_response"), Mapping
+            )
+
+            if phase_at_start == "claim_rejected":
+                if not retry_rejected:
+                    raise _stored_rejection(record, "claim_server_response")
+                record["phase"] = "claim_prepared"
+                record["retry_requested_at"] = _utcnow()
+                _save_state(state_path, state)
+            elif phase_at_start == "rejected":
+                rejected = _stored_rejection(record, "server_response")
+                missing_claim = not isinstance(
+                    record.get("claim_server_response"), Mapping
+                )
+                recover_unclaimed = (
+                    missing_claim
+                    and selected_id in delivered
+                    and (
+                        rejected.code == "WORK_CLAIM_REQUIRED"
+                        or rejected.status_code == 409
+                    )
+                )
+                if recover_unclaimed:
+                    record["phase"] = "claim_prepared"
+                elif retry_rejected:
+                    record["phase"] = "claim_prepared" if missing_claim else "prepared"
+                else:
+                    raise rejected
+                record["retry_requested_at"] = _utcnow()
+                _save_state(state_path, state)
+            elif phase_at_start in {"claimed", "prepared"} and not isinstance(
+                record.get("claim_server_response"), Mapping
+            ):
+                record["phase"] = "claim_prepared"
+                _save_state(state_path, state)
+
+            if record["phase"] == "claim_prepared":
+                claim_assertion = validate_assertion(record["claim_assertion"])
+                try:
+                    claim_response = submitter(
+                        binding,
+                        item,
+                        record["claim_client_request_id"],
+                        claim_assertion,
+                    )
+                except IntelWorkOutcomeRejected as exc:
+                    record["phase"] = "claim_rejected"
+                    record["claim_rejected_at"] = _utcnow()
+                    record["claim_server_response"] = _rejection_snapshot(exc)
+                    _save_state(state_path, state)
+                    raise
+                _require_state_after(claim_response, "in_progress")
+                record["phase"] = "claimed"
+                record["claimed_at"] = _utcnow()
+                record["claim_server_response"] = claim_response
+                _save_state(state_path, state)
+
+            if has_prepared_assertion:
+                record["phase"] = "prepared"
+                _save_state(state_path, state)
+            elif (
+                legacy_interrupted
+                or record.get("phase") == "claimed"
+                and phase_at_start == "claimed"
+            ):
+                record["assertion"] = _interrupted_assertion()
+                record["phase"] = "prepared"
+                record["prepared_at"] = _utcnow()
+                _save_state(state_path, state)
+            elif record.get("phase") == "claimed":
                 try:
                     assertion = dict(
                         runner(
@@ -840,11 +1005,6 @@ def execute_work_queue(
                     assertion = _interrupted_assertion()
                 assertion = validate_assertion(assertion)
                 record["assertion"] = assertion
-                record["phase"] = "prepared"
-                record["prepared_at"] = _utcnow()
-                _save_state(state_path, state)
-            elif record.get("phase") == "claimed":
-                record["assertion"] = _interrupted_assertion()
                 record["phase"] = "prepared"
                 record["prepared_at"] = _utcnow()
                 _save_state(state_path, state)
@@ -865,9 +1025,10 @@ def execute_work_queue(
             except IntelWorkOutcomeRejected as exc:
                 record["phase"] = "rejected"
                 record["rejected_at"] = _utcnow()
-                record["server_response"] = {"http_status": exc.status_code}
+                record["server_response"] = _rejection_snapshot(exc)
                 _save_state(state_path, state)
                 raise
+            _require_state_after(server_response, assertion["disposition"])
 
             record["phase"] = "acknowledged"
             record["acknowledged_at"] = _utcnow()
@@ -879,6 +1040,7 @@ def execute_work_queue(
                     status="acknowledged",
                     client_request_id=record["client_request_id"],
                     assertion=assertion,
+                    claim_response=record.get("claim_server_response"),
                     server_response=server_response,
                 )
             )
