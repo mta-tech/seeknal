@@ -28,6 +28,11 @@ from seeknal.ask.agents.tools.generate_report import generate_report
 from seeknal.ask.agents.tools.get_entities import get_entities
 from seeknal.ask.agents.tools.get_entity_schema import get_entity_schema
 from seeknal.ask.agents.tools.inspect_output import inspect_output
+from seeknal.ask.agents.tools.intel_knowledge import (
+    intel_knowledge_list,
+    intel_knowledge_read,
+    intel_knowledge_search,
+)
 from seeknal.ask.agents.tools.list_ask_test_results import list_ask_test_results
 from seeknal.ask.agents.tools.list_ask_tests import list_ask_tests
 from seeknal.ask.agents.tools.list_context_files import list_context_files
@@ -117,6 +122,14 @@ _READ_ONLY_CONTEXT_TOOLS = [
     read_ask_test_result,
 ]
 
+_INTEL_KNOWLEDGE_TOOLS = [
+    # Credential-backed laptop capability. create_agent enables this only for
+    # the interactive CLI; gateway/telegram must not inherit a local grant.
+    intel_knowledge_list,
+    intel_knowledge_search,
+    intel_knowledge_read,
+]
+
 _FULL_ONLY_TOOLS = [
     execute_uv_script,
     generate_report,
@@ -176,6 +189,7 @@ def create_ask_toolset(
     include_forecast: bool = False,
     include_anomaly: bool = False,
     include_upload_to_s3: bool = False,
+    include_intel_knowledge: bool = False,
 ) -> FunctionToolset:
     """Create the seeknal-ask toolset.
 
@@ -198,6 +212,9 @@ def create_ask_toolset(
         include_upload_to_s3: Include the generic CSV export tool ``upload_to_s3``.
             Registered only in non-interactive environments when
             ``agent.upload_to_s3.enabled`` is true in ``seeknal_agent.yml``.
+        include_intel_knowledge: Include credential-backed Intel knowledge
+            tools. ``create_agent`` enables these only for the interactive CLI
+            so remote channels cannot consume a laptop-local grant.
     """
     if mode == "analysis":
         # Keep the connected-source/read-only surface deliberately thin:
@@ -238,6 +255,9 @@ def create_ask_toolset(
 
     if include_upload_to_s3:
         tools.extend(_EXPORT_TOOLS)
+
+    if include_intel_knowledge:
+        tools.extend(_INTEL_KNOWLEDGE_TOOLS)
 
     return FunctionToolset(
         tools=tools,

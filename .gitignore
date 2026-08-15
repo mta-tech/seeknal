@@ -93,3 +93,13 @@ trees/
 /specs/
 .gstack/
 .omx/
+
+# OMC / agent tooling & local state (untracked, machine-local — never commit)
+.omc/
+_bmad/
+/SEEKNAL_ASK.md
+.clawhip/
+.seeknal/
+/state/
+.claude/worktrees/
+.claude/skills/bmad-*/

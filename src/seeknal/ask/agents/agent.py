@@ -319,6 +319,12 @@ read tools, SQL-pair read tools, project-memory tools, and `execute_python`.
   table docs, use `list_source_context`/`read_source_context`,
   `list_context_files`/`read_project_file`, and `list_sql_pairs`/
   `execute_sql_pair`/`read_sql_pair` instead of guessing or hardcoding.
+- When `SEEKNAL_ASK.md` says Intel knowledge is available, use
+  `intel_knowledge_list`, `intel_knowledge_search`, and
+  `intel_knowledge_read` to fetch granted corpus content on demand. These
+  tools are already bound to the exact agent and instance in the managed
+  context pack (or explicit `intel` config); never infer either ID from a
+  scope name and never ask the user to select a scope.
 - Teach mode: when the user explicitly says "remember", "write this down",
   "save this", "use this from now on", or "save as a SQL pair", persist that
   instruction as project-local memory. Use `save_preference` for one-sentence
@@ -440,6 +446,7 @@ in the final response.
                 environment in ("gateway", "telegram")
                 and get_upload_to_s3_enabled(agent_config)
             ),
+            include_intel_knowledge=(environment == "interactive"),
         ),
         context_toolset,
     ]

@@ -47,6 +47,9 @@ _VIEWER_TOOLS = {
     "run_forecast",
     "detect_anomaly",
     "upload_to_s3",
+    "intel_knowledge_list",
+    "intel_knowledge_search",
+    "intel_knowledge_read",
 }
 
 # Analysts can additionally save personal preferences, draft pipelines, and

@@ -118,8 +118,26 @@ class PromptBuilder:
 # ---------------------------------------------------------------------------
 
 
-def _build_identity(**kwargs: Any) -> str:
-    return """\
+def _build_identity(environment: str = "interactive", **kwargs: Any) -> str:
+    intel_tool_names = ""
+    intel_guidance = ""
+    if environment == "interactive":
+        intel_tool_names = (
+            "intel_knowledge_list, intel_knowledge_search, intel_knowledge_read,\n"
+        )
+        intel_guidance = """\
+Intel knowledge in `SEEKNAL_ASK.md` is remote granted corpus, not a project
+file. When its managed block says Intel knowledge is available, use
+`intel_knowledge_list` or `intel_knowledge_search` to find resources and
+`intel_knowledge_read` to fetch their content before answering. If the user
+names an Intel resource, do not look for it with `read_project_file` or
+`search_project_files`. The Intel tools are already bound to the exact agent
+and instance from the managed context pack or explicit project config; never
+infer either ID from a scope name and never ask the user to choose a scope.
+
+"""
+
+    return f"""\
 You are Seeknal Ask, a senior data analyst and strategist.
 
 You analyze data managed by seeknal — a data engineering platform that produces
@@ -132,9 +150,11 @@ plan_pipeline, show_lineage, open_in_browser, read_proof_document,
 list_source_context, read_source_context, list_context_files, read_project_file,
 list_sql_pairs, execute_sql_pair, read_sql_pair, list_ask_tests, read_ask_test, run_ask_test,
 list_ask_test_results, read_ask_test_result, save_preference,
+{intel_tool_names}\
 write_project_file, ask_user, submit_plan, execute_uv_script) plus a set of FAT skills loaded on demand via
 `load_skill`.
 
+{intel_guidance}\
 When you start a multi-step workflow — generating a report, building a
 pipeline node, querying or saving a metric, publishing to Proof or to a
 Seeknal Report Server, profiling data, running Python analysis — the FIRST
@@ -339,7 +359,6 @@ def _build_environment(environment: str = "interactive", **kwargs: Any) -> str:
         lines.append("- Mode: Report re-run (headless)")
         lines.append("- Skip data discovery — execute the analysis directly")
         lines.append("- Do NOT use ask_user — this is an automated run")
-
     return "\n".join(lines)
 
 

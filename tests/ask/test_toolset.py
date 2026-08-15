@@ -42,7 +42,13 @@ class _SourceContextRepl:
 
 
 def test_analysis_toolset_keeps_database_read_only_but_allows_project_memory():
-    names = _tool_names(create_ask_toolset(mode="analysis", include_ask_user=False))
+    names = _tool_names(
+        create_ask_toolset(
+            mode="analysis",
+            include_ask_user=False,
+            include_intel_knowledge=True,
+        )
+    )
 
     assert {"execute_sql", "list_tables", "describe_table", "execute_python"} <= names
     assert {
@@ -51,6 +57,11 @@ def test_analysis_toolset_keeps_database_read_only_but_allows_project_memory():
         "list_sql_pairs",
         "execute_sql_pair",
         "read_sql_pair",
+    } <= names
+    assert {
+        "intel_knowledge_list",
+        "intel_knowledge_search",
+        "intel_knowledge_read",
     } <= names
     assert {"list_ask_tests", "read_ask_test", "run_ask_test"} <= names
     assert {"list_ask_test_results", "read_ask_test_result"} <= names
@@ -83,13 +94,30 @@ def test_connected_source_context_includes_attached_tables_and_columns():
 
 
 def test_full_toolset_keeps_legacy_tools_and_can_omit_ask_user():
-    names = _tool_names(create_ask_toolset(mode="full", include_ask_user=False))
+    names = _tool_names(
+        create_ask_toolset(
+            mode="full",
+            include_ask_user=False,
+            include_intel_knowledge=True,
+        )
+    )
 
     assert "execute_sql" in names
     assert "run_pipeline" in names
     assert "write_project_file" in names
     assert "generate_report" in names
+    assert "intel_knowledge_list" in names
+    assert "intel_knowledge_search" in names
+    assert "intel_knowledge_read" in names
     assert "ask_user" not in names
+
+
+def test_toolset_secure_default_omits_laptop_intel_credential_tools():
+    names = _tool_names(create_ask_toolset(mode="full", include_ask_user=False))
+
+    assert "intel_knowledge_list" not in names
+    assert "intel_knowledge_search" not in names
+    assert "intel_knowledge_read" not in names
 
 
 def test_connected_auto_config_routes_to_analysis_toolset(tmp_path: Path):
@@ -148,8 +176,8 @@ def test_create_agent_omits_ask_user_in_gateway_and_uses_analysis_for_connected_
         ),
         patch("seeknal.ask.agents.context_toolset.SeeknaContextToolset"),
         patch("seeknal.ask.agents.tools.toolset.create_ask_toolset") as mock_toolset,
-        patch("seeknal.ask.processors.MicrocompactProcessor") as mock_micro,
-        patch("seeknal.ask.processors.SqlResultCompactor") as mock_sql,
+        patch("seeknal.ask.processors.MicrocompactProcessor"),
+        patch("seeknal.ask.processors.SqlResultCompactor"),
         patch("pydantic_deep.create_deep_agent") as mock_create,
         patch("pydantic_deep.DeepAgentDeps") as mock_deps,
     ):
@@ -165,6 +193,7 @@ def test_create_agent_omits_ask_user_in_gateway_and_uses_analysis_for_connected_
         assert mock_toolset.call_count == 1
         assert mock_toolset.call_args.kwargs["mode"] == "analysis"
         assert mock_toolset.call_args.kwargs["include_ask_user"] is False
+        assert mock_toolset.call_args.kwargs["include_intel_knowledge"] is False
         assert mock_deps.call_args[1]["ask_user"] is None
 
 
@@ -214,6 +243,7 @@ def test_create_agent_includes_ask_user_in_interactive_analysis_mode(tmp_path: P
         assert mock_toolset.call_count == 1
         assert mock_toolset.call_args.kwargs["mode"] == "analysis"
         assert mock_toolset.call_args.kwargs["include_ask_user"] is True
+        assert mock_toolset.call_args.kwargs["include_intel_knowledge"] is True
         assert mock_deps.call_args[1]["ask_user"] is not None
         assert mock_create.call_args[1]["include_memory"] is False
         assert mock_create.call_args[1]["include_todo"] is False

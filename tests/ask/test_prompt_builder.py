@@ -131,6 +131,24 @@ class TestSectionBuilders:
         assert "Seeknal Ask" in result
         assert "senior data analyst" in result
 
+    def test_identity_routes_managed_intel_resources_to_intel_tools(self):
+        result = _build_identity(environment="interactive")
+        normalized = " ".join(result.split())
+
+        assert "Intel knowledge" in result
+        assert "intel_knowledge_search" in result
+        assert "intel_knowledge_read" in result
+        assert "do not look for it with `read_project_file`" in result
+        assert "never infer either ID from a scope name" in normalized
+
+    @pytest.mark.parametrize("environment", ["gateway", "telegram", "exposure"])
+    def test_remote_identity_omits_laptop_intel_tools(self, environment: str):
+        result = _build_identity(environment=environment)
+
+        assert "intel_knowledge_list" not in result
+        assert "intel_knowledge_search" not in result
+        assert "intel_knowledge_read" not in result
+
     def test_asking_questions_returns_for_interactive(self):
         result = _build_asking_questions(environment="interactive")
         assert result is not None
