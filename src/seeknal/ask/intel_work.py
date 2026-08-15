@@ -8,6 +8,8 @@ secure instance credential used by Intel knowledge tools.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from contextlib import contextmanager
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
@@ -43,7 +45,8 @@ _LEGACY_ASSIGNMENT_PROTOCOL = "intel.external_agent_work_item.v1"
 _DELIVERY = "at_least_once"
 _STATE_VERSION = 1
 _HTTP_TIMEOUT_SECONDS = 30
-_MAX_REASON_CHARS = 12_000
+_MAX_REASON_CHARS = 4_096
+MAX_ARTIFACT_DECODED_BYTES = 256 * 1024
 _CLIENT_REQUEST_NAMESPACE = uuid.UUID("61bd37f6-2627-4a5a-9c90-e935704ea723")
 _VALID_DISPOSITIONS = {
     "in_progress",
@@ -54,6 +57,11 @@ _VALID_DISPOSITIONS = {
 }
 
 _NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+_ReasonString = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=_MAX_REASON_CHARS),
+]
+_ExactText = Annotated[str, StringConstraints(min_length=1)]
 
 
 class _StrictModel(BaseModel):
@@ -72,29 +80,37 @@ class _Blocker(_StrictModel):
 
 class _DoneAssertion(_StrictModel):
     disposition: Literal["done"]
-    reason: _NonBlankString
+    reason: _ReasonString
+
+
+class _Deliverable(_StrictModel):
+    filename: _NonBlankString
+    content_type: _NonBlankString
+    title: _NonBlankString
+    summary: _NonBlankString
+    content: _ExactText
 
 
 class _FailedAssertion(_StrictModel):
     disposition: Literal["failed"]
-    reason: _NonBlankString
+    reason: _ReasonString
 
 
 class _InProgressAssertion(_StrictModel):
     disposition: Literal["in_progress"]
-    reason: _NonBlankString
+    reason: _ReasonString
     continuation: _Continuation
 
 
 class _UnknownAssertion(_StrictModel):
     disposition: Literal["outcome_unknown"]
-    reason: _NonBlankString
+    reason: _ReasonString
     continuation: _Continuation
 
 
 class _BlockedAssertion(_StrictModel):
     disposition: Literal["blocked"]
-    reason: _NonBlankString
+    reason: _ReasonString
     blocker: _Blocker
 
 
@@ -118,6 +134,7 @@ class IntelWorkAgentOutput(_StrictModel):
 
     assertion: _AgentAssertion
     sources: list[_SourceAttestation]
+    deliverable: _Deliverable | None = None
 
 
 class IntelWorkError(RuntimeError):
@@ -174,12 +191,47 @@ def _validate_pair(value: Any, *, name: str, fields: tuple[str, str]) -> None:
             raise IntelWorkError(f"{name}.{field} must be a non-blank string.")
 
 
+def _validate_artifact(value: Any) -> dict[str, str]:
+    fields = {
+        "filename",
+        "content_type",
+        "title",
+        "summary",
+        "content_base64",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise IntelWorkError(
+            "artifact must contain exactly filename, content_type, title, summary, "
+            "and content_base64."
+        )
+    artifact = cast(dict[str, Any], value)
+    for field in fields:
+        if not _nonblank(artifact.get(field)):
+            raise IntelWorkError(f"artifact.{field} must be a non-blank string.")
+    encoded = cast(str, artifact["content_base64"])
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise IntelWorkError(
+            "artifact.content_base64 must be canonical padded Base64."
+        ) from exc
+    if base64.b64encode(decoded).decode("ascii") != encoded:
+        raise IntelWorkError(
+            "artifact.content_base64 must be canonical padded Base64."
+        )
+    if len(decoded) > MAX_ARTIFACT_DECODED_BYTES:
+        raise IntelWorkError(
+            "ARTIFACT_TOO_LARGE: decoded artifact exceeds 256 KiB."
+        )
+    return cast(dict[str, str], artifact)
+
+
 def validate_assertion(assertion: Mapping[str, Any]) -> dict[str, Any]:
     """Validate the exact server-enforced disposition shape before POST."""
     if not isinstance(assertion, Mapping):
         raise IntelWorkError("Outcome assertion must be an object.")
     result = dict(assertion)
-    allowed = {"disposition", "reason", "continuation", "blocker"}
+    allowed = {"disposition", "reason", "continuation", "blocker", "artifact"}
     if set(result) - allowed:
         raise IntelWorkError("Outcome assertion contains unsupported fields.")
 
@@ -188,9 +240,12 @@ def validate_assertion(assertion: Mapping[str, Any]) -> dict[str, Any]:
         raise IntelWorkError("Outcome assertion has an invalid disposition.")
     if not _nonblank(result.get("reason")):
         raise IntelWorkError("Outcome assertion reason must be a non-blank string.")
+    if len(cast(str, result["reason"])) > _MAX_REASON_CHARS:
+        raise IntelWorkError("Outcome assertion reason exceeds 4096 characters.")
 
     continuation_present = "continuation" in result
     blocker_present = "blocker" in result
+    artifact_present = "artifact" in result
     continuation = result.get("continuation")
     blocker = result.get("blocker")
     if disposition in {"in_progress", "outcome_unknown"}:
@@ -207,6 +262,11 @@ def validate_assertion(assertion: Mapping[str, Any]) -> dict[str, Any]:
             raise IntelWorkError("blocked forbids continuation.")
     elif continuation_present or blocker_present:
         raise IntelWorkError(f"{disposition} forbids continuation and blocker.")
+
+    if artifact_present:
+        if disposition != "done":
+            raise IntelWorkError(f"{disposition} forbids artifact.")
+        result["artifact"] = _validate_artifact(result["artifact"])
 
     return result
 
@@ -611,6 +671,74 @@ def _unknown_assertion(reason: str, detail: str) -> dict[str, Any]:
     }
 
 
+def _failed_assertion(reason: str) -> dict[str, Any]:
+    return {"disposition": "failed", "reason": reason}
+
+
+def _build_artifact(deliverable: Any) -> dict[str, str]:
+    if not isinstance(deliverable, Mapping):
+        raise IntelWorkError("ARTIFACT_INVALID: deliverable must be an object.")
+    expected = {"filename", "content_type", "title", "summary", "content"}
+    if set(deliverable) != expected:
+        raise IntelWorkError(
+            "ARTIFACT_INVALID: deliverable must contain exactly filename, "
+            "content_type, title, summary, and content."
+        )
+    for field in ("filename", "content_type", "title", "summary"):
+        if not _nonblank(deliverable.get(field)):
+            raise IntelWorkError(
+                f"ARTIFACT_INVALID: deliverable.{field} must be non-blank."
+            )
+    content = deliverable.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise IntelWorkError(
+            "ARTIFACT_INVALID: deliverable.content must be non-blank text."
+        )
+
+    filename = cast(str, deliverable["filename"]).strip()
+    content_type = cast(str, deliverable["content_type"]).strip().lower()
+    if Path(filename).name != filename or "\x00" in filename:
+        raise IntelWorkError(
+            "ARTIFACT_INVALID: deliverable.filename must be a plain filename."
+        )
+    expected_types = {
+        ".csv": "text/csv",
+        ".html": "text/html",
+        ".json": "application/json",
+        ".markdown": "text/markdown",
+        ".md": "text/markdown",
+        ".txt": "text/plain",
+    }
+    expected_type = expected_types.get(Path(filename).suffix.lower())
+    if expected_type is None or content_type != expected_type:
+        raise IntelWorkError(
+            "ARTIFACT_CONTENT_TYPE_MISMATCH: filename and content_type do not "
+            "describe the generated text."
+        )
+    if content_type == "application/json":
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise IntelWorkError(
+                "ARTIFACT_CONTENT_TYPE_MISMATCH: application/json content is invalid."
+            ) from exc
+
+    content_bytes = content.encode("utf-8")
+    if len(content_bytes) > MAX_ARTIFACT_DECODED_BYTES:
+        raise IntelWorkError(
+            "ARTIFACT_TOO_LARGE: deliverable exceeds the 256 KiB decoded limit "
+            f"({len(content_bytes)} bytes)."
+        )
+    artifact = {
+        "filename": filename,
+        "content_type": content_type,
+        "title": cast(str, deliverable["title"]).strip(),
+        "summary": cast(str, deliverable["summary"]).strip(),
+        "content_base64": base64.b64encode(content_bytes).decode("ascii"),
+    }
+    return _validate_artifact(artifact)
+
+
 def _parse_assignment_output(
     output: Any,
     message_history: list[Any],
@@ -625,7 +753,12 @@ def _parse_assignment_output(
             "Seeknal did not return a valid typed outcome assertion.",
             "Review the non-interactive Ask output and retry the assignment.",
         )
-    if not isinstance(payload, dict) or set(payload) != {"assertion", "sources"}:
+    expected_envelope = {"assertion", "sources", "deliverable"}
+    if (
+        not isinstance(payload, dict)
+        or not {"assertion", "sources"}.issubset(payload)
+        or set(payload) - expected_envelope
+    ):
         return _unknown_assertion(
             "Seeknal returned an invalid typed outcome envelope.",
             "Review the non-interactive Ask output and retry the assignment.",
@@ -636,6 +769,21 @@ def _parse_assignment_output(
             "Seeknal returned an invalid outcome assertion.",
             "Review the non-interactive Ask output and retry the assignment.",
         )
+    deliverable = payload.get("deliverable")
+    raw_reason = raw_assertion.get("reason")
+    if (
+        raw_assertion.get("disposition") == "done"
+        and isinstance(raw_reason, str)
+        and len(raw_reason) > _MAX_REASON_CHARS
+    ):
+        if isinstance(deliverable, Mapping) and _nonblank(deliverable.get("summary")):
+            raw_assertion = dict(raw_assertion)
+            raw_assertion["reason"] = cast(str, deliverable["summary"]).strip()
+        else:
+            return _unknown_assertion(
+                "Seeknal's done reason exceeded the safe outcome size limit.",
+                "Return a short summary in reason and the full analysis as an artifact.",
+            )
     try:
         assertion = validate_assertion(raw_assertion)
     except IntelWorkError:
@@ -645,12 +793,6 @@ def _parse_assignment_output(
         )
     if assertion["disposition"] != "done":
         return assertion
-    if len(assertion["reason"]) > _MAX_REASON_CHARS:
-        return _unknown_assertion(
-            "Seeknal's done reason exceeded the safe outcome size limit.",
-            "Condense the evidence-backed finding and retry the assignment.",
-        )
-
     sources = payload.get("sources")
     successful_reads = _successful_read_ids(message_history)
     known_filenames = _resource_filename_map(message_history)
@@ -696,6 +838,12 @@ def _parse_assignment_output(
             "Seeknal did not cite every Intel resource it used for the done claim.",
             "Review all fetched Intel resources and retry the assignment.",
         )
+    if deliverable is not None:
+        try:
+            assertion["artifact"] = _build_artifact(deliverable)
+        except IntelWorkError as exc:
+            return _failed_assertion(str(exc))
+        assertion = validate_assertion(assertion)
     return assertion
 
 
@@ -712,10 +860,13 @@ def run_assignment_with_ask(
     from seeknal.ask.agents.agent import create_agent
     from seeknal.ask.agents.tools._context import get_tool_context
 
+    effective_model = (
+        "gemini-2.5-flash" if provider == "google" and model is None else model
+    )
     agent, deps, message_history, _ = create_agent(
         project_path,
         provider=provider,
-        model=model,
+        model=effective_model,
         environment="intel_work",
         output_type=IntelWorkAgentOutput,
     )
@@ -725,12 +876,20 @@ def run_assignment_with_ask(
         "evidence, and cite each source by filename in the outcome reason. "
         "Do not ask a question, request confirmation, or claim completion "
         "without fetched evidence. Return the structured result with exactly "
-        "assertion and sources. assertion must follow the Intel "
+        "assertion, sources, and deliverable. assertion must follow the Intel "
         "outcome contract. sources must be a list of objects with exactly "
         "resource_id (the exact value passed to intel_knowledge_read) and "
         "filename. For done, include every successfully read resource and the "
-        "actual finding in assertion.reason. For any uncertain result, use "
-        "outcome_unknown with a continuation.\n\nAssignment:\n"
+        "actual finding in assertion.reason. Keep assertion.reason to a short, "
+        "meaningful human summary of at most 4096 characters. When the requested "
+        "analysis is a memo, report, or otherwise longer than that summary, put "
+        "the complete deliverable in deliverable.content without truncation, use "
+        "a plain filename with an honest content_type (for a Markdown memo use a "
+        ".md filename and text/markdown), and populate its title and summary. "
+        "Set deliverable to null when there is no completed artifact, and never "
+        "return one with any disposition other than done. The decoded deliverable "
+        "must not exceed 256 KiB. For any uncertain result, use outcome_unknown "
+        "with a continuation.\n\nAssignment:\n"
         f"{item.instruction}"
     )
     result = agent.run_sync(
@@ -758,6 +917,16 @@ def _interrupted_assertion() -> dict[str, Any]:
                 "new execution."
             ),
         },
+    }
+
+
+def _execution_failed_assertion(exc: Exception) -> dict[str, Any]:
+    return {
+        "disposition": "failed",
+        "reason": (
+            "SEEKNAL_ANALYSIS_EXECUTION_FAILED: Ask did not produce a "
+            f"deliverable ({type(exc).__name__})."
+        ),
     }
 
 
@@ -1001,8 +1170,8 @@ def execute_work_queue(
                             model=model,
                         )
                     )
-                except Exception:
-                    assertion = _interrupted_assertion()
+                except Exception as exc:
+                    assertion = _execution_failed_assertion(exc)
                 assertion = validate_assertion(assertion)
                 record["assertion"] = assertion
                 record["phase"] = "prepared"
@@ -1048,12 +1217,44 @@ def execute_work_queue(
 
 
 def results_as_json(results: list[WorkExecutionResult]) -> str:
-    """Return secret-free CLI JSON for executor results."""
-    return json.dumps([asdict(result) for result in results], indent=2)
+    """Return secret-free, payload-bounded CLI JSON for executor results."""
+
+    def summarize_assertion(assertion: dict[str, Any] | None) -> dict[str, Any] | None:
+        if assertion is None:
+            return None
+        summarized = dict(assertion)
+        artifact = summarized.get("artifact")
+        if isinstance(artifact, Mapping):
+            encoded = artifact.get("content_base64")
+            if isinstance(encoded, str):
+                try:
+                    content = base64.b64decode(encoded, validate=True)
+                except (binascii.Error, ValueError):
+                    content = b""
+                summarized["artifact"] = {
+                    key: value
+                    for key, value in artifact.items()
+                    if key != "content_base64"
+                }
+                summarized["artifact"].update(
+                    {
+                        "decoded_bytes": len(content),
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                    }
+                )
+        return summarized
+
+    payload: list[dict[str, Any]] = []
+    for result in results:
+        item = asdict(result)
+        item["assertion"] = summarize_assertion(result.assertion)
+        payload.append(item)
+    return json.dumps(payload, indent=2)
 
 
 __all__ = [
     "ASSIGNMENT_PROTOCOL",
+    "MAX_ARTIFACT_DECODED_BYTES",
     "QUEUE_PROTOCOL",
     "OUTCOME_PROTOCOL",
     "IntelWorkError",

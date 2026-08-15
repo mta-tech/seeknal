@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from pathlib import Path
 import subprocess
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -23,11 +26,13 @@ from seeknal.ask.intel_work import (
     IntelWorkError,
     IntelWorkAgentOutput,
     IntelWorkOutcomeRejected,
+    MAX_ARTIFACT_DECODED_BYTES,
     WorkExecutionResult,
     execute_work_queue,
     _parse_assignment_output,
     load_work_queue,
     post_outcome,
+    results_as_json,
     run_assignment_with_ask,
     validate_assertion,
 )
@@ -197,6 +202,87 @@ def test_valid_outcome_shapes(assertion):
     assert validate_assertion(assertion) == assertion
 
 
+def _artifact(content: bytes = b"# Exact memo\n") -> dict[str, str]:
+    return {
+        "filename": "mta-20-analysis.md",
+        "content_type": "text/markdown",
+        "title": "MTA-20 analysis",
+        "summary": "A complete evidence-backed analysis.",
+        "content_base64": base64.b64encode(content).decode("ascii"),
+    }
+
+
+def test_done_accepts_exact_canonical_artifact():
+    assertion = {
+        "disposition": "done",
+        "reason": "The complete memo is attached.",
+        "artifact": _artifact(),
+    }
+
+    assert validate_assertion(assertion) == assertion
+
+
+@pytest.mark.parametrize(
+    "disposition_shape",
+    [
+        {
+            "disposition": "in_progress",
+            "reason": "Working.",
+            "continuation": {"kind": "work", "detail": "Continue."},
+        },
+        {
+            "disposition": "outcome_unknown",
+            "reason": "Unknown.",
+            "continuation": {"kind": "review", "detail": "Review."},
+        },
+        {
+            "disposition": "blocked",
+            "reason": "Blocked.",
+            "blocker": {"owner": "operator", "action": "Restore access."},
+        },
+        {"disposition": "failed", "reason": "Failed."},
+    ],
+)
+def test_artifact_is_forbidden_unless_done_mutation_biter(disposition_shape):
+    disposition_shape["artifact"] = _artifact()
+
+    with pytest.raises(IntelWorkError, match="forbids artifact"):
+        validate_assertion(disposition_shape)
+
+
+def test_artifact_decoded_size_limit_mutation_biter():
+    assertion = {
+        "disposition": "done",
+        "reason": "The complete memo is attached.",
+        "artifact": _artifact(b"x" * (MAX_ARTIFACT_DECODED_BYTES + 1)),
+    }
+
+    with pytest.raises(IntelWorkError, match="ARTIFACT_TOO_LARGE"):
+        validate_assertion(assertion)
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "not base64!",
+        base64.b64encode(b"padding").decode("ascii").rstrip("="),
+        "ZE==",
+    ],
+)
+def test_artifact_requires_canonical_padded_base64(encoded):
+    artifact = _artifact()
+    artifact["content_base64"] = encoded
+
+    with pytest.raises(IntelWorkError, match="canonical padded Base64"):
+        validate_assertion(
+            {
+                "disposition": "done",
+                "reason": "The complete memo is attached.",
+                "artifact": artifact,
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "assertion",
     [
@@ -262,7 +348,7 @@ def _read_history(
     resource_id: str,
     content: str = "fetched evidence",
     filename: str = "nusalintas-margin-floor-addendum.md",
-) -> list:
+) -> list[Any]:
     list_call_id = "intel-list-1"
     call_id = "intel-read-1"
     return [
@@ -333,6 +419,76 @@ def test_done_requires_typed_assertion_and_read_source_attestation():
     )
 
     assert assertion["disposition"] == "done"
+
+
+def test_done_memo_is_encoded_byte_exactly_and_reason_stays_short():
+    resource_id = "resource-margin-floor"
+    memo = "# MTA-20\n\nCafé evidence.\n"
+    assertion = _parse_assignment_output(
+        {
+            "assertion": {
+                "disposition": "done",
+                "reason": "Finding from nusalintas-margin-floor-addendum.md; memo attached.",
+            },
+            "sources": [
+                {
+                    "resource_id": resource_id,
+                    "filename": "nusalintas-margin-floor-addendum.md",
+                }
+            ],
+            "deliverable": {
+                "filename": "mta-20-analysis.md",
+                "content_type": "text/markdown",
+                "title": "MTA-20 analysis",
+                "summary": "Evidence-backed MTA-20 analysis.",
+                "content": memo,
+            },
+        },
+        _read_history(resource_id),
+    )
+
+    assert assertion["disposition"] == "done"
+    assert len(assertion["reason"]) < 4096
+    decoded = base64.b64decode(assertion["artifact"]["content_base64"], validate=True)
+    assert decoded == memo.encode("utf-8")
+    assert hashlib.sha256(decoded).hexdigest() == hashlib.sha256(
+        memo.encode("utf-8")
+    ).hexdigest()
+
+
+def test_oversized_deliverable_fails_closed_without_truncation():
+    resource_id = "resource-margin-floor"
+    content = "x" * (MAX_ARTIFACT_DECODED_BYTES + 1)
+    assertion = _parse_assignment_output(
+        {
+            "assertion": {
+                "disposition": "done",
+                "reason": "Finding from nusalintas-margin-floor-addendum.md.",
+            },
+            "sources": [
+                {
+                    "resource_id": resource_id,
+                    "filename": "nusalintas-margin-floor-addendum.md",
+                }
+            ],
+            "deliverable": {
+                "filename": "mta-20-analysis.md",
+                "content_type": "text/markdown",
+                "title": "MTA-20 analysis",
+                "summary": "Evidence-backed MTA-20 analysis.",
+                "content": content,
+            },
+        },
+        _read_history(resource_id),
+    )
+
+    assert assertion == {
+        "disposition": "failed",
+        "reason": (
+            "ARTIFACT_TOO_LARGE: deliverable exceeds the 256 KiB decoded limit "
+            f"({MAX_ARTIFACT_DECODED_BYTES + 1} bytes)."
+        ),
+    }
 
 
 @pytest.mark.parametrize(
@@ -408,7 +564,40 @@ def test_assignment_runner_requests_typed_output_and_requires_real_read(work_pro
     assert assertion["disposition"] == "done"
     assert create_agent.call_args.kwargs["environment"] == "intel_work"
     assert create_agent.call_args.kwargs["output_type"] is IntelWorkAgentOutput
+    assert create_agent.call_args.kwargs["model"] == "gemini-2.5-flash"
     assert "reconcile" in agent.run_sync.call_args.args[0].lower()
+
+
+def test_assignment_runner_preserves_explicit_model_override(work_project):
+    project, policy_path, _ = work_project
+    _, items = load_work_queue(project, policy_path=policy_path)
+    output = IntelWorkAgentOutput.model_validate(
+        {
+            "assertion": {"disposition": "failed", "reason": "Known failure."},
+            "sources": [],
+            "deliverable": None,
+        }
+    )
+    agent = MagicMock()
+    agent.run_sync.return_value = MagicMock(
+        output=output,
+        all_messages=MagicMock(return_value=[]),
+    )
+    with (
+        patch(
+            "seeknal.ask.agents.agent.create_agent",
+            return_value=(agent, MagicMock(), [], {}),
+        ) as create_agent,
+        patch(
+            "seeknal.ask.agents.tools._context.get_tool_context",
+            return_value=MagicMock(request_limit=12),
+        ),
+    ):
+        run_assignment_with_ask(
+            items[0], project, provider="google", model="gemini-2.5-pro"
+        )
+
+    assert create_agent.call_args.kwargs["model"] == "gemini-2.5-pro"
 
 
 def test_redelivery_after_restart_does_not_execute_or_post_twice(work_project):
@@ -479,7 +668,7 @@ def test_fresh_delivered_item_is_claimed_before_terminal_outcome(work_project):
         return {"state_after": disposition, "receipt_id": "terminal-receipt"}
 
     def runner(*_args, **_kwargs):
-        runner_states.append(server["state"])
+        runner_states.append(str(server["state"]))
         return {"disposition": "done", "reason": "Verified result."}
 
     result = execute_work_queue(
@@ -667,6 +856,83 @@ def test_prepared_outcome_retries_post_without_rerunning(work_project):
     assert result[0].status == "acknowledged"
 
 
+def test_prepared_artifact_retry_is_byte_identical_and_not_republished(work_project):
+    project, policy_path, state_path = work_project
+    terminal = {
+        "disposition": "done",
+        "reason": "The complete memo is attached.",
+        "artifact": _artifact(b"# Durable memo\n\nExact bytes.\n"),
+    }
+    runner = MagicMock(return_value=terminal)
+    poster = MagicMock(
+        side_effect=[
+            {"state_after": "in_progress"},
+            IntelWorkError("terminal response lost"),
+            {"state_after": "done"},
+        ]
+    )
+
+    with pytest.raises(IntelWorkError, match="terminal response lost"):
+        execute_work_queue(
+            project,
+            item_id=WORK_ID,
+            policy_path=policy_path,
+            state_path=state_path,
+            run_assignment=runner,
+            submit_outcome=poster,
+        )
+    completed = execute_work_queue(
+        project,
+        item_id=WORK_ID,
+        policy_path=policy_path,
+        state_path=state_path,
+        run_assignment=runner,
+        submit_outcome=poster,
+    )
+    replay = execute_work_queue(
+        project,
+        item_id=WORK_ID,
+        policy_path=policy_path,
+        state_path=state_path,
+        run_assignment=runner,
+        submit_outcome=poster,
+    )
+
+    runner.assert_called_once()
+    assert poster.call_count == 3
+    first_terminal = poster.call_args_list[1]
+    retried_terminal = poster.call_args_list[2]
+    assert first_terminal.args[2] == retried_terminal.args[2]
+    assert first_terminal.args[3] == retried_terminal.args[3] == terminal
+    assert completed[0].status == "acknowledged"
+    assert replay[0].status == "already_acknowledged"
+
+
+def test_results_json_reports_artifact_digest_without_base64():
+    content = b"# Exact memo\n"
+    rendered = results_as_json(
+        [
+            WorkExecutionResult(
+                work_item_id=WORK_ID,
+                status="acknowledged",
+                client_request_id="stable",
+                assertion={
+                    "disposition": "done",
+                    "reason": "Memo attached.",
+                    "artifact": _artifact(content),
+                },
+            )
+        ]
+    )
+    payload = json.loads(rendered)
+
+    assert "content_base64" not in rendered
+    assert payload[0]["assertion"]["artifact"]["decoded_bytes"] == len(content)
+    assert payload[0]["assertion"]["artifact"]["sha256"] == hashlib.sha256(
+        content
+    ).hexdigest()
+
+
 def test_claim_retry_uses_same_request_id_before_execution(work_project):
     project, policy_path, state_path = work_project
     runner = MagicMock(
@@ -748,6 +1014,37 @@ def test_executor_never_prompts(work_project):
         )
 
     assert result[0].status == "acknowledged"
+
+
+def test_known_runner_exception_posts_failed_not_outcome_unknown(work_project):
+    project, policy_path, state_path = work_project
+    posted: list[dict[str, Any]] = []
+
+    def submitter(_binding, _item, _request_id, assertion):
+        posted.append(assertion)
+        return {"state_after": assertion["disposition"]}
+
+    result = execute_work_queue(
+        project,
+        item_id=WORK_ID,
+        policy_path=policy_path,
+        state_path=state_path,
+        run_assignment=MagicMock(side_effect=RuntimeError("secret detail")),
+        submit_outcome=submitter,
+    )
+
+    assert [assertion["disposition"] for assertion in posted] == [
+        "in_progress",
+        "failed",
+    ]
+    assert result[0].assertion == {
+        "disposition": "failed",
+        "reason": (
+            "SEEKNAL_ANALYSIS_EXECUTION_FAILED: Ask did not produce a "
+            "deliverable (RuntimeError)."
+        ),
+    }
+    assert "secret detail" not in results_as_json(result)
 
 
 def test_403_is_durable_and_not_retried(work_project):
