@@ -1,0 +1,718 @@
+"""Tests for non-interactive Intel work delivery and outcome reporting."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import subprocess
+from unittest.mock import MagicMock, patch
+
+import httpx
+import pytest
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    ToolCallPart,
+    ToolReturnPart,
+)
+
+from seeknal.ask.intel_work import (
+    ASSIGNMENT_PROTOCOL,
+    OUTCOME_PROTOCOL,
+    QUEUE_PROTOCOL,
+    IntelWorkError,
+    IntelWorkAgentOutput,
+    IntelWorkOutcomeRejected,
+    WorkExecutionResult,
+    execute_work_queue,
+    _parse_assignment_output,
+    load_work_queue,
+    post_outcome,
+    run_assignment_with_ask,
+    validate_assertion,
+)
+
+
+AGENT_ID = "1f9e7ac9-d30a-4d4f-9a75-b2ebfd148f9b"
+INSTANCE_ID = "4da9fe9b-7b04-422c-9dbe-c4fbdd1a24c4"
+WORK_ID = "b9567c36-272b-4e40-8147-083a91c07d38"
+INSTRUCTION = "Reconcile the margin-floor controls and cite each document."
+
+
+def _write_context_pack(project_path: Path) -> None:
+    project_path.joinpath("SEEKNAL_ASK.md").write_text(
+        f"""\
+<!-- intel:managed:start -->
+- List: `intel knowledge list --agent {AGENT_ID} --instance {INSTANCE_ID}`
+- Search: `intel knowledge search \"<query>\" --agent {AGENT_ID} --instance {INSTANCE_ID}`
+- Read: `intel knowledge read <resource-id> --agent {AGENT_ID} --instance {INSTANCE_ID}`
+<!-- intel:managed:end -->
+""",
+        encoding="utf-8",
+    )
+
+
+def _item(*, protocol: str = ASSIGNMENT_PROTOCOL, instruction: str = INSTRUCTION):
+    return {
+        "protocol_version": protocol,
+        "id": WORK_ID,
+        "instruction": {"kind": "text", "text": instruction},
+        "outcome_owner": "fitra",
+        "outcome_channel": {
+            "protocol_version": OUTCOME_PROTOCOL,
+            "method": "POST",
+            "path": f"/v1/external-agents/me/work/{WORK_ID}/outcome",
+        },
+    }
+
+
+def _write_policy(
+    policy_path: Path,
+    *,
+    items=None,
+    queue_protocol: str = QUEUE_PROTOCOL,
+    delivery: str = "at_least_once",
+) -> None:
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    policy_path.write_text(
+        json.dumps(
+            {
+                "etag": "test",
+                "bundle": {
+                    "work_queue": {
+                        "protocol_version": queue_protocol,
+                        "delivery": delivery,
+                        "items": [_item()] if items is None else items,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def work_project(tmp_path: Path):
+    _write_context_pack(tmp_path)
+    policy_path = tmp_path / "policy.json"
+    state_path = tmp_path / ".seeknal" / "intel_work_state.json"
+    _write_policy(policy_path)
+    return tmp_path, policy_path, state_path
+
+
+def test_protocol_constants_are_exact():
+    assert ASSIGNMENT_PROTOCOL == "intel.external_agent_work_assignment.v1"
+    assert QUEUE_PROTOCOL == "intel.external_agent_work_queue.v1"
+    assert OUTCOME_PROTOCOL == "intel.external_agent_work_outcome.v1"
+
+
+def test_load_queue_uses_bound_instance_and_exact_contract(work_project):
+    project, policy_path, _ = work_project
+
+    binding, items = load_work_queue(project, policy_path=policy_path)
+
+    assert binding.agent_id == AGENT_ID
+    assert binding.instance_id == INSTANCE_ID
+    assert len(items) == 1
+    assert items[0].work_item_id == WORK_ID
+    assert items[0].instruction == INSTRUCTION
+
+
+def test_load_queue_accepts_live_legacy_item_envelope(work_project):
+    project, policy_path, _ = work_project
+    _write_policy(
+        policy_path,
+        items=[_item(protocol="intel.external_agent_work_item.v1")],
+    )
+
+    _, items = load_work_queue(project, policy_path=policy_path)
+
+    assert items[0].work_item_id == WORK_ID
+
+
+@pytest.mark.parametrize(
+    ("queue_protocol", "delivery"),
+    [("wrong.queue.v1", "at_least_once"), (QUEUE_PROTOCOL, "at_most_once")],
+)
+def test_wrong_queue_contract_fails_closed(
+    work_project, queue_protocol: str, delivery: str
+):
+    project, policy_path, _ = work_project
+    _write_policy(
+        policy_path,
+        queue_protocol=queue_protocol,
+        delivery=delivery,
+    )
+
+    with pytest.raises(IntelWorkError):
+        load_work_queue(project, policy_path=policy_path)
+
+
+def test_wrong_assignment_protocol_fails_closed(work_project):
+    project, policy_path, _ = work_project
+    _write_policy(policy_path, items=[_item(protocol="wrong.assignment.v1")])
+
+    with pytest.raises(IntelWorkError, match="assignment protocol"):
+        load_work_queue(project, policy_path=policy_path)
+
+
+def test_conflicting_duplicate_item_fails_closed(work_project):
+    project, policy_path, _ = work_project
+    _write_policy(
+        policy_path,
+        items=[_item(), _item(instruction="Different instruction")],
+    )
+
+    with pytest.raises(IntelWorkError, match="conflicting duplicate"):
+        load_work_queue(project, policy_path=policy_path)
+
+
+@pytest.mark.parametrize(
+    "assertion",
+    [
+        {"disposition": "done", "reason": "Completed with evidence."},
+        {"disposition": "failed", "reason": "Known execution failure."},
+        {
+            "disposition": "in_progress",
+            "reason": "Work continues.",
+            "continuation": {"kind": "retry", "detail": "Resume after sync."},
+        },
+        {
+            "disposition": "outcome_unknown",
+            "reason": "Completion could not be verified.",
+            "continuation": {"kind": "review", "detail": "Inspect the run."},
+        },
+        {
+            "disposition": "blocked",
+            "reason": "Requires operator action.",
+            "blocker": {"owner": "fitra", "action": "Restore access."},
+        },
+    ],
+)
+def test_valid_outcome_shapes(assertion):
+    assert validate_assertion(assertion) == assertion
+
+
+@pytest.mark.parametrize(
+    "assertion",
+    [
+        {
+            "disposition": "done",
+            "reason": "ok",
+            "continuation": {"kind": "x", "detail": "y"},
+        },
+        {
+            "disposition": "failed",
+            "reason": "ok",
+            "blocker": {"owner": "x", "action": "y"},
+        },
+        {"disposition": "outcome_unknown", "reason": "unknown"},
+        {"disposition": "in_progress", "reason": "progress"},
+        {"disposition": "blocked", "reason": "blocked"},
+        {
+            "disposition": "blocked",
+            "reason": "blocked",
+            "blocker": {"owner": "x", "action": "y"},
+            "continuation": {"kind": "x", "detail": "y"},
+        },
+        {"disposition": "done", "reason": "   "},
+    ],
+)
+def test_invalid_outcome_shapes_fail_before_post(assertion):
+    with pytest.raises(IntelWorkError):
+        validate_assertion(assertion)
+
+
+@pytest.mark.parametrize(
+    "assertion",
+    [
+        {"disposition": "done", "reason": "ok", "continuation": None},
+        {"disposition": "done", "reason": "ok", "blocker": None},
+        {
+            "disposition": "blocked",
+            "reason": "blocked",
+            "blocker": {"owner": "x", "action": "y"},
+            "continuation": None,
+        },
+        {
+            "disposition": "outcome_unknown",
+            "reason": "unknown",
+            "continuation": {"kind": "x", "detail": "y"},
+            "blocker": None,
+        },
+    ],
+)
+def test_forbidden_null_fields_are_rejected(assertion):
+    with pytest.raises(IntelWorkError, match="forbids"):
+        validate_assertion(assertion)
+
+
+def test_outcome_unknown_requires_continuation_mutation_biter():
+    with pytest.raises(IntelWorkError, match="continuation"):
+        validate_assertion(
+            {"disposition": "outcome_unknown", "reason": "Cannot verify."}
+        )
+
+
+def _read_history(
+    resource_id: str,
+    content: str = "fetched evidence",
+    filename: str = "nusalintas-margin-floor-addendum.md",
+) -> list:
+    list_call_id = "intel-list-1"
+    call_id = "intel-read-1"
+    return [
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="intel_knowledge_list",
+                    args={},
+                    tool_call_id=list_call_id,
+                )
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="intel_knowledge_list",
+                    content=json.dumps(
+                        {
+                            "resources": [
+                                {
+                                    "id": resource_id,
+                                    "filename": filename,
+                                }
+                            ]
+                        }
+                    ),
+                    tool_call_id=list_call_id,
+                )
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="intel_knowledge_read",
+                    args={"resource_id": resource_id},
+                    tool_call_id=call_id,
+                )
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="intel_knowledge_read",
+                    content=content,
+                    tool_call_id=call_id,
+                )
+            ]
+        ),
+    ]
+
+
+def test_done_requires_typed_assertion_and_read_source_attestation():
+    resource_id = "resource-margin-floor"
+    assertion = _parse_assignment_output(
+        {
+            "assertion": {
+                "disposition": "done",
+                "reason": "Finding from nusalintas-margin-floor-addendum.md.",
+            },
+            "sources": [
+                {
+                    "resource_id": resource_id,
+                    "filename": "nusalintas-margin-floor-addendum.md",
+                }
+            ],
+        },
+        _read_history(resource_id),
+    )
+
+    assert assertion["disposition"] == "done"
+
+
+@pytest.mark.parametrize(
+    ("answer", "history"),
+    [
+        ("I could not reconcile the requested controls.", _read_history("resource-1")),
+        (
+            {
+                "assertion": {"disposition": "done", "reason": "Unsupported."},
+                "sources": [],
+            },
+            _read_history("resource-1"),
+        ),
+        (
+            {
+                "assertion": {
+                    "disposition": "done",
+                    "reason": "Claim cites nusalintas-margin-floor-addendum.md.",
+                },
+                "sources": [
+                    {
+                        "resource_id": "resource-not-read",
+                        "filename": "nusalintas-margin-floor-addendum.md",
+                    }
+                ],
+            },
+            _read_history("resource-actually-read"),
+        ),
+    ],
+)
+def test_unverified_agent_answer_never_becomes_done(answer, history):
+    assertion = _parse_assignment_output(answer, history)
+
+    assert assertion["disposition"] == "outcome_unknown"
+    assert "continuation" in assertion
+
+
+def test_assignment_runner_requests_typed_output_and_requires_real_read(work_project):
+    project, policy_path, _ = work_project
+    _, items = load_work_queue(project, policy_path=policy_path)
+    resource_id = "resource-margin-floor"
+    output = IntelWorkAgentOutput.model_validate(
+        {
+            "assertion": {
+                "disposition": "done",
+                "reason": "Finding from nusalintas-margin-floor-addendum.md.",
+            },
+            "sources": [
+                {
+                    "resource_id": resource_id,
+                    "filename": "nusalintas-margin-floor-addendum.md",
+                }
+            ],
+        }
+    )
+    run_result = MagicMock(output=output)
+    run_result.all_messages.return_value = _read_history(resource_id)
+    agent = MagicMock()
+    agent.run_sync.return_value = run_result
+    deps = MagicMock()
+    with (
+        patch(
+            "seeknal.ask.agents.agent.create_agent",
+            return_value=(agent, deps, [], {}),
+        ) as create_agent,
+        patch(
+            "seeknal.ask.agents.tools._context.get_tool_context",
+            return_value=MagicMock(request_limit=12),
+        ),
+    ):
+        assertion = run_assignment_with_ask(items[0], project)
+
+    assert assertion["disposition"] == "done"
+    assert create_agent.call_args.kwargs["environment"] == "intel_work"
+    assert create_agent.call_args.kwargs["output_type"] is IntelWorkAgentOutput
+    assert "reconcile" in agent.run_sync.call_args.args[0].lower()
+
+
+def test_redelivery_after_restart_does_not_execute_or_post_twice(work_project):
+    project, policy_path, state_path = work_project
+    runner = MagicMock(
+        return_value={
+            "disposition": "done",
+            "reason": "Actual margin-floor finding from all three documents.",
+        }
+    )
+    poster = MagicMock(return_value={"state": "done"})
+
+    first = execute_work_queue(
+        project,
+        item_id=WORK_ID,
+        policy_path=policy_path,
+        state_path=state_path,
+        run_assignment=runner,
+        submit_outcome=poster,
+    )
+    second = execute_work_queue(
+        project,
+        item_id=WORK_ID,
+        policy_path=policy_path,
+        state_path=state_path,
+        run_assignment=runner,
+        submit_outcome=poster,
+    )
+
+    assert first[0].status == "acknowledged"
+    assert second[0].status == "already_acknowledged"
+    runner.assert_called_once()
+    poster.assert_called_once()
+    state = json.loads(state_path.read_text())
+    assert state["items"][WORK_ID]["phase"] == "acknowledged"
+
+
+def test_redelivery_fails_closed_on_changed_payload(work_project):
+    project, policy_path, state_path = work_project
+    runner = MagicMock(
+        return_value={"disposition": "done", "reason": "Verified result."}
+    )
+    poster = MagicMock(return_value={"state": "done"})
+    execute_work_queue(
+        project,
+        item_id=WORK_ID,
+        policy_path=policy_path,
+        state_path=state_path,
+        run_assignment=runner,
+        submit_outcome=poster,
+    )
+    _write_policy(policy_path, items=[_item(instruction="Changed assignment")])
+
+    with pytest.raises(IntelWorkError, match="payload conflicts"):
+        execute_work_queue(
+            project,
+            item_id=WORK_ID,
+            policy_path=policy_path,
+            state_path=state_path,
+            run_assignment=runner,
+            submit_outcome=poster,
+        )
+
+    runner.assert_called_once()
+    poster.assert_called_once()
+
+
+def test_redelivery_fails_closed_on_changed_binding(work_project):
+    project, policy_path, state_path = work_project
+    runner = MagicMock(
+        return_value={"disposition": "done", "reason": "Verified result."}
+    )
+    poster = MagicMock(return_value={"state": "done"})
+    execute_work_queue(
+        project,
+        item_id=WORK_ID,
+        policy_path=policy_path,
+        state_path=state_path,
+        run_assignment=runner,
+        submit_outcome=poster,
+    )
+    project.joinpath("SEEKNAL_ASK.md").write_text(
+        "<!-- intel:managed:start -->\n"
+        f"`intel knowledge list --agent {AGENT_ID} --instance instance-new`\n"
+        "<!-- intel:managed:end -->\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(IntelWorkError, match="binding does not match"):
+        execute_work_queue(
+            project,
+            item_id=WORK_ID,
+            policy_path=policy_path,
+            state_path=state_path,
+            run_assignment=runner,
+            submit_outcome=poster,
+        )
+
+    runner.assert_called_once()
+    poster.assert_called_once()
+
+
+def test_prepared_outcome_retries_post_without_rerunning(work_project):
+    project, policy_path, state_path = work_project
+    runner = MagicMock(
+        return_value={"disposition": "done", "reason": "Verified result."}
+    )
+    poster = MagicMock(
+        side_effect=[IntelWorkError("temporary post failure"), {"state": "done"}]
+    )
+
+    with pytest.raises(IntelWorkError, match="temporary post failure"):
+        execute_work_queue(
+            project,
+            item_id=WORK_ID,
+            policy_path=policy_path,
+            state_path=state_path,
+            run_assignment=runner,
+            submit_outcome=poster,
+        )
+    result = execute_work_queue(
+        project,
+        item_id=WORK_ID,
+        policy_path=policy_path,
+        state_path=state_path,
+        run_assignment=runner,
+        submit_outcome=poster,
+    )
+
+    runner.assert_called_once()
+    assert poster.call_count == 2
+    assert poster.call_args_list[0].args[2] == poster.call_args_list[1].args[2]
+    assert result[0].status == "acknowledged"
+
+
+def test_executor_never_prompts(work_project):
+    project, policy_path, state_path = work_project
+
+    with patch("builtins.input", side_effect=AssertionError("prompted")):
+        result = execute_work_queue(
+            project,
+            item_id=WORK_ID,
+            policy_path=policy_path,
+            state_path=state_path,
+            run_assignment=lambda *_args, **_kwargs: {
+                "disposition": "done",
+                "reason": "Verified without prompting.",
+            },
+            submit_outcome=lambda *_args, **_kwargs: {"state": "done"},
+        )
+
+    assert result[0].status == "acknowledged"
+
+
+def test_403_is_durable_and_not_retried(work_project):
+    project, policy_path, state_path = work_project
+    runner = MagicMock(
+        return_value={"disposition": "done", "reason": "Verified result."}
+    )
+    poster = MagicMock(
+        side_effect=IntelWorkOutcomeRejected(403, "instance unavailable")
+    )
+
+    with pytest.raises(IntelWorkOutcomeRejected):
+        execute_work_queue(
+            project,
+            item_id=WORK_ID,
+            policy_path=policy_path,
+            state_path=state_path,
+            run_assignment=runner,
+            submit_outcome=poster,
+        )
+    with pytest.raises(IntelWorkOutcomeRejected):
+        execute_work_queue(
+            project,
+            item_id=WORK_ID,
+            policy_path=policy_path,
+            state_path=state_path,
+            run_assignment=runner,
+            submit_outcome=poster,
+        )
+
+    runner.assert_called_once()
+    poster.assert_called_once()
+
+
+def test_rejected_outcome_can_be_explicitly_retried_without_rerunning(work_project):
+    project, policy_path, state_path = work_project
+    runner = MagicMock(
+        return_value={"disposition": "done", "reason": "Verified result."}
+    )
+    poster = MagicMock(
+        side_effect=[
+            IntelWorkOutcomeRejected(403, "instance unavailable"),
+            {"state": "done"},
+        ]
+    )
+    with pytest.raises(IntelWorkOutcomeRejected):
+        execute_work_queue(
+            project,
+            item_id=WORK_ID,
+            policy_path=policy_path,
+            state_path=state_path,
+            run_assignment=runner,
+            submit_outcome=poster,
+        )
+
+    result = execute_work_queue(
+        project,
+        item_id=WORK_ID,
+        policy_path=policy_path,
+        state_path=state_path,
+        retry_rejected=True,
+        run_assignment=runner,
+        submit_outcome=poster,
+    )
+
+    assert result[0].status == "acknowledged"
+    runner.assert_called_once()
+    assert poster.call_count == 2
+
+
+def test_post_outcome_uses_exact_endpoint_body_and_secure_helper(work_project):
+    project, _, _ = work_project
+    binding, items = load_work_queue(project, policy_path=work_project[1])
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"work_item_id": WORK_ID, "state": "done"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    credential = subprocess.CompletedProcess(
+        ["intel"],
+        0,
+        stdout=json.dumps({"Authorization": "Bearer test-only-credential"}),
+        stderr="",
+    )
+    assertion = {"disposition": "done", "reason": "Actual finding."}
+    with (
+        patch(
+            "seeknal.ask.agents.tools.intel_knowledge.subprocess.run",
+            return_value=credential,
+        ) as helper,
+        patch("seeknal.ask.intel_work.httpx.Client", return_value=client),
+    ):
+        response = post_outcome(binding, items[0], "stable-request-id", assertion)
+
+    assert response["state"] == "done"
+    assert captured[0].method == "POST"
+    assert captured[0].url.path == (
+        f"/api/v1/external-agents/me/work/{WORK_ID}/outcome"
+    )
+    assert json.loads(captured[0].content) == {
+        "protocol_version": OUTCOME_PROTOCOL,
+        "client_request_id": "stable-request-id",
+        "work_item_id": WORK_ID,
+        "assertion": assertion,
+    }
+    assert helper.call_args.args[0] == [
+        "intel",
+        "connect",
+        "credential-helper",
+        "--instance",
+        INSTANCE_ID,
+    ]
+
+
+def test_intel_work_toolset_has_knowledge_tools_and_no_prompt_tools():
+    from seeknal.ask.agents.tools.toolset import create_ask_toolset
+
+    names = set(
+        create_ask_toolset(mode="intel_work", include_intel_knowledge=True).tools.keys()
+    )
+
+    assert names == {
+        "intel_knowledge_list",
+        "intel_knowledge_search",
+        "intel_knowledge_read",
+    }
+
+
+def test_work_cli_defaults_to_google_and_never_reads_stdin(tmp_path: Path):
+    from typer.testing import CliRunner
+
+    from seeknal.cli.ask import ask_app
+
+    completed = WorkExecutionResult(
+        work_item_id=WORK_ID,
+        status="acknowledged",
+        client_request_id="stable-request-id",
+        assertion={"disposition": "done", "reason": "Verified result."},
+        server_response={"state": "done"},
+    )
+    with (
+        patch("builtins.input", side_effect=AssertionError("prompted")),
+        patch(
+            "seeknal.ask.intel_work.execute_work_queue",
+            return_value=[completed],
+        ) as execute,
+    ):
+        result = CliRunner().invoke(
+            ask_app,
+            ["work", "--project", str(tmp_path), "--item", WORK_ID],
+        )
+
+    assert result.exit_code == 0
+    assert '"status": "acknowledged"' in result.stdout
+    assert execute.call_args.kwargs["provider"] == "google"
+    assert execute.call_args.kwargs["item_id"] == WORK_ID
+    assert execute.call_args.kwargs["retry_rejected"] is False

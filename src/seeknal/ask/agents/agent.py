@@ -183,6 +183,7 @@ def create_agent(
     budget: Optional[float] = None,
     include_web: bool = False,
     environment: str = "interactive",
+    output_type: object | None = None,
 ):
     """Create a Seeknal Ask agent.
 
@@ -195,7 +196,9 @@ def create_agent(
         budget: Max USD budget for the session (None = unlimited).
         include_web: Enable web search/fetch tools.
         environment: Execution environment — "interactive" (TTY), "gateway"
-            (API/SSE), "telegram", or "exposure" (headless report re-run).
+            (API/SSE), "telegram", "exposure" (headless report re-run), or
+            "intel_work" (prompt-free assigned work).
+        output_type: Optional structured output schema for headless execution.
 
     Returns:
         A tuple of (agent, deps, message_history, cost_info).
@@ -252,7 +255,10 @@ def create_agent(
 
     # Set tool context (per-session via ContextVar — safe for concurrent sessions)
     session_id = uuid.uuid4().hex[:8]
-    ask_toolset_mode = get_ask_toolset_mode(agent_config)
+    intel_work_mode = environment == "intel_work"
+    ask_toolset_mode = (
+        "intel_work" if intel_work_mode else get_ask_toolset_mode(agent_config)
+    )
     analysis_toolset = ask_toolset_mode == "analysis"
 
     set_tool_context(
@@ -261,7 +267,7 @@ def create_agent(
             artifact_discovery=discovery,
             project_path=project_path,
             session_id=session_id,
-            disable_quality_gate=analysis_toolset,
+            disable_quality_gate=(analysis_toolset or intel_work_mode),
         )
     )
 
@@ -295,10 +301,22 @@ def create_agent(
     tool_ctx.iba_storage_api_key = _os.environ.get("IBA_STORAGE_API_KEY", "")
 
     # Build final system prompt via section registry (4-layer architecture)
-    from seeknal.ask.prompt_builder import create_default_builder
+    from seeknal.ask.prompt_builder import (
+        _build_environment,
+        _build_identity,
+        create_default_builder,
+    )
 
-    builder = create_default_builder()
-    instructions = builder.build(environment=environment, config=agent_config)
+    if intel_work_mode:
+        instructions = "\n\n".join(
+            [
+                _build_identity(environment=environment),
+                _build_environment(environment=environment),
+            ]
+        )
+    else:
+        builder = create_default_builder()
+        instructions = builder.build(environment=environment, config=agent_config)
     if analysis_toolset:
         instructions += """
 
@@ -404,11 +422,23 @@ in the final response.
         if generated_context_index:
             instructions += f"\n\n{generated_context_index}"
 
+    if intel_work_mode:
+        instructions += """
+
+## Intel assigned-work execution
+
+This is a non-interactive executor. Use only the available Intel knowledge
+tools to complete the supplied assignment. Never ask a question, request
+confirmation, choose a fallback branch, create a source, write a file, or
+claim completion without reading relevant granted resources. Return a concise,
+evidence-backed finding that cites every Intel document used.
+"""
+
     # Inject persistent user preferences from preferences.yml (if present)
     # so they carry across sessions. See save_preference tool for writes.
     from seeknal.ask.agents.tools.save_preference import load_preferences
 
-    _prefs = load_preferences(project_path)
+    _prefs = [] if intel_work_mode else load_preferences(project_path)
     if _prefs:
         _pref_block = (
             "\n\n## User preferences (persistent)\n\n"
@@ -446,10 +476,13 @@ in the final response.
                 environment in ("gateway", "telegram")
                 and get_upload_to_s3_enabled(agent_config)
             ),
-            include_intel_knowledge=(environment == "interactive"),
+            include_intel_knowledge=(
+                environment in {"interactive", "intel_work"}
+            ),
         ),
-        context_toolset,
     ]
+    if not intel_work_mode:
+        toolsets_list.append(context_toolset)
 
     # Add web tools if requested. Prefers Firecrawl (search + scrape) when
     # FIRECRAWL_API_KEY is set, otherwise falls back to DuckDuckGo search-only.
@@ -494,7 +527,7 @@ in the final response.
     # Context files: auto-discover SEEKNAL_ASK.md for user-provided instructions
     context_files = []
     ask_md = project_path / "SEEKNAL_ASK.md"
-    if ask_md.exists():
+    if ask_md.exists() and not intel_work_mode:
         context_files.append(str(ask_md))
 
     # Cost tracking callback
@@ -519,6 +552,8 @@ in the final response.
         auto_summary_config["context_manager"],
         default=not analysis_toolset,
     )
+    if intel_work_mode:
+        context_manager_enabled = False
 
     history_processors = []
     if auto_summary_enabled and auto_summary_config["microcompact"]["enabled"]:
@@ -557,10 +592,14 @@ in the final response.
         plan_config["enabled"],
         default=(environment == "interactive" and not analysis_toolset),
     )
+    if intel_work_mode:
+        plan_enabled = False
     subagents_enabled = _resolve_auto_bool(
         subagents_config["enabled"],
         default=not analysis_toolset,
     )
+    if intel_work_mode:
+        subagents_enabled = False
     teams_enabled = bool(teams_config["enabled"]) and subagents_enabled
     subagent_configs = (
         get_subagent_configs()
@@ -637,6 +676,8 @@ in the final response.
             bool(subagents_config["include_builtin"]) and subagents_enabled,
         )
     )
+    if output_type is not None:
+        _deep_agent_kwargs.update(_supported_kwarg("output_type", output_type))
 
     # Create pydantic-deep agent with full feature set
     agent = create_deep_agent(
@@ -648,16 +689,16 @@ in the final response.
         # calls are sequential. It lets harness state from an authoritative
         # SQL pair stop follow-up drift before sibling tool calls run, while
         # leaving the full/default Seeknal Ask mode unchanged.
-        max_concurrency=1 if analysis_toolset else None,
+        max_concurrency=1 if analysis_toolset or intel_work_mode else None,
         **_deep_agent_kwargs,
         # Skills: bundled built-ins (report-generation, etc.) + per-project
         # user skills. Built-ins ship as SKILL.md files under
         # src/seeknal/ask/builtin_skills/ so `load_skill(...)` resolves
         # even in projects that have no local seeknal/skills/ dir.
-        include_skills=True,
+        include_skills=not intel_work_mode,
         skill_directories=_resolve_skill_directories(project_path),
         # Planning: todo checklist + interactive ask_user via planner subagent
-        include_todo=not analysis_toolset,
+        include_todo=not analysis_toolset and not intel_work_mode,
         include_plan=plan_enabled,
         plans_dir=plan_config["plans_dir"],
         # Context management: 3-tier compaction + user context files
@@ -672,10 +713,10 @@ in the final response.
         history_processors=history_processors,
         context_files=context_files,
         # Memory: persistent schema knowledge across sessions
-        include_memory=not analysis_toolset,
+        include_memory=not analysis_toolset and not intel_work_mode,
         memory_dir=".seeknal/ask_memory",
         # Checkpoints: save/rewind in long chat sessions
-        include_checkpoints=not analysis_toolset,
+        include_checkpoints=not analysis_toolset and not intel_work_mode,
         checkpoint_frequency="every_turn",
         max_checkpoints=20,
         # Cost tracking

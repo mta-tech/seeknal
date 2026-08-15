@@ -351,3 +351,47 @@ def test_create_agent_applies_agent_harness_config(tmp_path: Path):
         ]
         mock_micro.assert_called_once_with(keep_recent_turns=5)
         mock_sql.assert_called_once_with(min_chars=750)
+
+
+def test_create_agent_intel_work_is_prompt_free_and_intel_only(tmp_path: Path):
+    from unittest.mock import MagicMock, patch
+
+    with (
+        patch("seeknal.cli.repl.REPL") as mock_repl_cls,
+        patch("seeknal.ask.security.configure_safe_connection"),
+        patch("seeknal.ask.modules.artifact_discovery.service.ArtifactDiscovery"),
+        patch(
+            "seeknal.ask.agents.providers.get_model_string", return_value="test:model"
+        ),
+        patch("seeknal.ask.agents.context_toolset.SeeknaContextToolset"),
+        patch("seeknal.ask.agents.tools.toolset.create_ask_toolset") as mock_toolset,
+        patch("seeknal.ask.processors.MicrocompactProcessor"),
+        patch("seeknal.ask.processors.SqlResultCompactor"),
+        patch("pydantic_deep.create_deep_agent") as mock_create,
+        patch("pydantic_deep.DeepAgentDeps") as mock_deps,
+    ):
+        mock_repl_cls.return_value = MagicMock(conn=MagicMock())
+        mock_toolset.return_value = MagicMock()
+        mock_create.return_value = MagicMock()
+        mock_deps.return_value = MagicMock()
+
+        from seeknal.ask.agents.agent import create_agent
+
+        create_agent(project_path=tmp_path, environment="intel_work")
+
+    toolset_kwargs = mock_toolset.call_args.kwargs
+    assert toolset_kwargs["mode"] == "intel_work"
+    assert toolset_kwargs["include_ask_user"] is False
+    assert toolset_kwargs["include_request_clarification"] is False
+    assert toolset_kwargs["include_intel_knowledge"] is True
+    assert mock_deps.call_args.kwargs["ask_user"] is None
+    agent_kwargs = mock_create.call_args.kwargs
+    assert agent_kwargs["include_skills"] is False
+    assert agent_kwargs["include_todo"] is False
+    assert agent_kwargs["include_plan"] is False
+    assert agent_kwargs["include_memory"] is False
+    assert agent_kwargs["include_checkpoints"] is False
+    assert agent_kwargs["include_subagents"] is False
+    assert agent_kwargs["context_files"] == []
+    assert agent_kwargs["context_manager"] is False
+    assert "Never ask a question" in agent_kwargs["instructions"]

@@ -289,6 +289,51 @@ def chat_command(
         console.print(f"[text.dim]Resume with: seeknal ask chat --session {session_name}[/]")
 
 
+@ask_app.command("work")
+def work_command(
+    project: Optional[Path] = typer.Option(
+        None, "--project", help="Project path (auto-detected if not set)"
+    ),
+    item: Optional[str] = typer.Option(
+        None, "--item", help="Execute one delivered Intel work item by exact ID"
+    ),
+    provider: str = typer.Option(
+        "google", "--provider", "-p", help="LLM provider (defaults to google)"
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m", help="Model name override"
+    ),
+    retry_rejected: bool = typer.Option(
+        False,
+        "--retry-rejected",
+        help="Retry only the stored outcome POST after instance recovery",
+    ),
+):
+    """Execute delivered Intel work non-interactively and report outcomes."""
+    project_path = project or find_project_path()
+    _load_project_env(project_path)
+
+    from seeknal.ask.intel_work import (
+        IntelWorkError,
+        execute_work_queue,
+        results_as_json,
+    )
+
+    try:
+        results = execute_work_queue(
+            project_path,
+            item_id=item,
+            provider=provider,
+            model=model,
+            retry_rejected=retry_rejected,
+        )
+    except IntelWorkError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
+
+    typer.echo(results_as_json(results))
+
+
 @ask_app.command("test")
 def test_command(
     provider: Optional[str] = typer.Option(

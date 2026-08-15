@@ -195,8 +195,9 @@ def create_ask_toolset(
 
     Args:
         mode: ``"full"`` keeps the legacy all-tools surface. ``"analysis"``
-            exposes only read/discovery/analysis tools for connected-source or
-            other read-only analyst sessions.
+            exposes read/discovery/analysis tools for connected-source work.
+            ``"intel_work"`` exposes only explicitly enabled Intel knowledge
+            tools for prompt-free assigned-work execution.
         include_ask_user: Include the direct interactive ``ask_user`` tool.
             Headless channels pass ``False`` so tool schemas cannot trigger
             blocking user input.
@@ -227,6 +228,12 @@ def create_ask_toolset(
             *_ANALYSIS_TOOLS,
         ]
         toolset_id = "seeknal-ask-analysis"
+    elif mode == "intel_work":
+        # The caller adds only _INTEL_KNOWLEDGE_TOOLS below. Keep this base
+        # empty so assigned work has no prompt, database, project-write,
+        # publish, or generic execution surface.
+        tools = []
+        toolset_id = "seeknal-intel-work"
     elif mode == "full":
         tools = [
             *_DATABASE_ANALYSIS_TOOLS,
@@ -241,19 +248,19 @@ def create_ask_toolset(
     else:
         raise ValueError(f"Unsupported ask toolset mode: {mode!r}")
 
-    if include_ask_user:
+    if include_ask_user and mode != "intel_work":
         tools.append(ask_user)
 
-    if include_request_clarification:
+    if include_request_clarification and mode != "intel_work":
         tools.append(request_clarification)
 
-    if include_forecast:
+    if include_forecast and mode != "intel_work":
         tools.extend(_FORECAST_TOOLS)
 
-    if include_anomaly:
+    if include_anomaly and mode != "intel_work":
         tools.extend(_ANOMALY_TOOLS)
 
-    if include_upload_to_s3:
+    if include_upload_to_s3 and mode != "intel_work":
         tools.extend(_EXPORT_TOOLS)
 
     if include_intel_knowledge:

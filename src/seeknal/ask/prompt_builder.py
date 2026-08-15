@@ -61,7 +61,7 @@ class PromptBuilder:
 
         Args:
             environment: Execution environment
-                (interactive/gateway/telegram/exposure).
+                (interactive/gateway/telegram/exposure/intel_work).
             config: Agent config dict from seeknal_agent.yml.
 
         Returns:
@@ -119,6 +119,16 @@ class PromptBuilder:
 
 
 def _build_identity(environment: str = "interactive", **kwargs: Any) -> str:
+    if environment == "intel_work":
+        return """\
+You are Seeknal Ask running a non-interactive Intel assigned-work execution.
+
+Your only tools are `intel_knowledge_list`, `intel_knowledge_search`, and
+`intel_knowledge_read`. Fetch the granted evidence needed by the assignment,
+reconcile it carefully, cite every Intel document used, and return the actual
+finding. Never ask a question, request confirmation, invent an ID, or claim
+completion without successfully reading the relevant resources."""
+
     intel_tool_names = ""
     intel_guidance = ""
     if environment == "interactive":
@@ -177,7 +187,7 @@ the approval gate or get the discriminator wrong."""
 def _build_asking_questions(
     environment: str = "interactive", **kwargs: Any
 ) -> str | None:
-    if environment in ("gateway", "telegram", "exposure"):
+    if environment in ("gateway", "telegram", "exposure", "intel_work"):
         return None
     return """\
 ## Asking Questions
@@ -359,6 +369,10 @@ def _build_environment(environment: str = "interactive", **kwargs: Any) -> str:
         lines.append("- Mode: Report re-run (headless)")
         lines.append("- Skip data discovery — execute the analysis directly")
         lines.append("- Do NOT use ask_user — this is an automated run")
+    elif environment == "intel_work":
+        lines.append("- Mode: Intel assigned-work executor (non-interactive)")
+        lines.append("- Do NOT use ask_user or request clarification")
+        lines.append("- Execute only from fetched Intel knowledge evidence")
     return "\n".join(lines)
 
 
