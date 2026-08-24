@@ -190,6 +190,7 @@ def create_ask_toolset(
     include_anomaly: bool = False,
     include_upload_to_s3: bool = False,
     include_intel_knowledge: bool = False,
+    action_delivery: bool = False,
 ) -> FunctionToolset:
     """Create the seeknal-ask toolset.
 
@@ -216,6 +217,8 @@ def create_ask_toolset(
         include_intel_knowledge: Include credential-backed Intel knowledge
             tools. ``create_agent`` enables these only for the interactive CLI
             so remote channels cannot consume a laptop-local grant.
+        action_delivery: Replace the regular blocking ``ask_user`` function
+            tool with the typed output action owned by the IBA worker path.
     """
     if mode == "analysis":
         # Keep the connected-source/read-only surface deliberately thin:
@@ -248,7 +251,7 @@ def create_ask_toolset(
     else:
         raise ValueError(f"Unsupported ask toolset mode: {mode!r}")
 
-    if include_ask_user and mode != "intel_work":
+    if include_ask_user and not action_delivery and mode != "intel_work":
         tools.append(ask_user)
 
     if include_request_clarification and mode != "intel_work":

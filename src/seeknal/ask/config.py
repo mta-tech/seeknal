@@ -326,6 +326,17 @@ def get_agent_harness_settings(config: dict[str, Any]) -> dict[str, Any]:
     return _get_mapping(config, _DEFAULT_HARNESS_SECTION)
 
 
+def get_action_delivery_enabled(config: dict[str, Any]) -> bool:
+    """Return whether IBA's typed action-delivery path is enabled.
+
+    This remains opt-in because ordinary Seeknal CLI, gateway, and Telegram
+    callers consume text output, while the IBA premises worker consumes typed
+    action payloads.
+    """
+    section = _get_mapping(get_agent_harness_settings(config), "action_delivery")
+    return _coerce_bool(section.get("enabled"), default=False)
+
+
 def get_auto_summarization_config(config: dict[str, Any]) -> dict[str, Any]:
     """Return normalized auto-summarization/context-management config."""
     harness = get_agent_harness_settings(config)

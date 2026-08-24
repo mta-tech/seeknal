@@ -237,6 +237,7 @@ def create_agent(
         get_stuck_loop_config,
         get_subagents_config,
         get_teams_config,
+        get_action_delivery_enabled,
     )
 
     # Load project-level agent config (seeknal_agent.yml)
@@ -260,6 +261,14 @@ def create_agent(
         "intel_work" if intel_work_mode else get_ask_toolset_mode(agent_config)
     )
     analysis_toolset = ask_toolset_mode == "analysis"
+    action_delivery_enabled = (
+        not intel_work_mode and get_action_delivery_enabled(agent_config)
+    )
+    if action_delivery_enabled and output_type is not None:
+        raise ValueError(
+            "agent_harness.action_delivery.enabled cannot be combined with "
+            "create_agent(output_type=...); the IBA worker owns typed action output."
+        )
 
     set_tool_context(
         ToolContext(
@@ -456,10 +465,16 @@ evidence-backed finding that cites every Intel document used.
     # Build toolsets: ask tools + dynamic project context injection
     context_budget = get_context_budget(agent_config)
     context_toolset = SeeknaContextToolset(discovery, context_budget=context_budget)
+    _ask_toolset_kwargs = {}
+    if action_delivery_enabled:
+        _ask_toolset_kwargs["action_delivery"] = True
+
     toolsets_list = [
         create_ask_toolset(
             mode=ask_toolset_mode,
-            include_ask_user=(environment == "interactive"),
+            include_ask_user=(
+                environment == "interactive" and not action_delivery_enabled
+            ),
             include_request_clarification=(
                 environment in ("gateway", "telegram")
                 and get_request_clarification_enabled(agent_config)
@@ -479,6 +494,7 @@ evidence-backed finding that cites every Intel document used.
             include_intel_knowledge=(
                 environment in {"interactive", "intel_work"}
             ),
+            **_ask_toolset_kwargs,
         ),
     ]
     if not intel_work_mode:
@@ -676,7 +692,25 @@ evidence-backed finding that cites every Intel document used.
             bool(subagents_config["include_builtin"]) and subagents_enabled,
         )
     )
-    if output_type is not None:
+    if action_delivery_enabled:
+        from seeknal.ask.agents.actions import action_output_types
+        from seeknal.ask.agents.skills import (
+            action_capabilities,
+            prepare_action_output_tools,
+        )
+
+        _deep_agent_kwargs.update(
+            _supported_kwarg("output_type", action_output_types())
+        )
+        _deep_agent_kwargs.update(
+            _supported_kwarg(
+                "prepare_output_tools",
+                prepare_action_output_tools(
+                    action_capabilities(_resolve_skill_directories(project_path))
+                ),
+            )
+        )
+    elif output_type is not None:
         _deep_agent_kwargs.update(_supported_kwarg("output_type", output_type))
 
     # Create pydantic-deep agent with full feature set

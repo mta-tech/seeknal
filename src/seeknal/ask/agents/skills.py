@@ -32,6 +32,10 @@ class SkillCapabilities:
     actions: frozenset[str] = frozenset()
 
 
+_CORE_SKILL_NAME = "core"
+_CORE_ACTIONS = frozenset({"visualize", "ask_user"})
+
+
 def _capability_names(
     skill: Skill,
     field: str,
@@ -84,6 +88,38 @@ def get_ask_skill_capabilities(
     return capabilities
 
 
+def action_capabilities(
+    skill_directories: Iterable[str | Path],
+) -> dict[str, SkillCapabilities]:
+    """Return skill capabilities with DF's always-loaded core actions.
+
+    ``core`` is a built-in baseline rather than a discoverable pydantic-deep
+    skill. Keeping it here avoids changing the default skills registry while
+    making the opt-in action path faithfully mirror DF's always-on core.
+    """
+    capabilities = get_ask_skill_capabilities(skill_directories)
+    capabilities[_CORE_SKILL_NAME] = SkillCapabilities(actions=_CORE_ACTIONS)
+    return capabilities
+
+
+def derive_loaded_skills(messages: Iterable[object]) -> set[str]:
+    """Reconstruct loaded skills from recorded ``load_skill`` tool calls."""
+    from pydantic_ai.messages import ToolCallPart
+
+    loaded = {_CORE_SKILL_NAME}
+    for message in messages:
+        for part in getattr(message, "parts", ()):
+            if not isinstance(part, ToolCallPart) or part.tool_name != "load_skill":
+                continue
+            args = part.args
+            if not isinstance(args, dict):
+                continue
+            skill_name = args.get("skill_name", args.get("name"))
+            if isinstance(skill_name, str) and skill_name:
+                loaded.add(skill_name)
+    return loaded
+
+
 def legal_actions_for_loaded_skills(
     loaded_skills: Set[str],
     capabilities: Mapping[str, SkillCapabilities],
@@ -101,6 +137,20 @@ def legal_actions_for_loaded_skills(
         if capability:
             legal_actions.update(capability.actions)
     return frozenset(legal_actions)
+
+
+def prepare_action_output_tools(
+    capabilities: Mapping[str, SkillCapabilities],
+):
+    """Build pydantic-ai's per-step output-tool gate for declared actions."""
+
+    async def prepare_output_tools(ctx, definitions):
+        legal_actions = legal_actions_for_loaded_skills(
+            derive_loaded_skills(ctx.messages), capabilities
+        )
+        return [definition for definition in definitions if definition.name in legal_actions]
+
+    return prepare_output_tools
 
 REPORT_SKILL_CONTENT = """\
 When asked to create a report, dashboard, or visualization, produce a
