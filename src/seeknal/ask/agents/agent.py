@@ -246,6 +246,12 @@ def create_agent(
     # to avoid conflicting with user-facing seeknal_agent.yml fields.
     agent_config = dict(agent_config)
     agent_config["__project_path"] = str(project_path)
+    action_delivery_requested = get_action_delivery_enabled(agent_config)
+    if action_delivery_requested and environment == "intel_work":
+        raise ValueError(
+            "agent_harness.action_delivery.enabled is only supported for the "
+            "IBA premises-worker path, not intel_work."
+        )
 
     # Create singleton REPL with safe connection
     repl = REPL(project_path=project_path, skip_history=True)
@@ -261,9 +267,7 @@ def create_agent(
         "intel_work" if intel_work_mode else get_ask_toolset_mode(agent_config)
     )
     analysis_toolset = ask_toolset_mode == "analysis"
-    action_delivery_enabled = (
-        not intel_work_mode and get_action_delivery_enabled(agent_config)
-    )
+    action_delivery_enabled = action_delivery_requested
     if action_delivery_enabled and output_type is not None:
         raise ValueError(
             "agent_harness.action_delivery.enabled cannot be combined with "

@@ -314,6 +314,7 @@ def get_background_threshold(config: dict[str, Any]) -> int:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_HARNESS_SECTION = "agent_harness"
+_ACTION_DELIVERY_CONSUMER = "iba-premises-worker"
 
 
 def get_agent_harness_settings(config: dict[str, Any]) -> dict[str, Any]:
@@ -331,10 +332,21 @@ def get_action_delivery_enabled(config: dict[str, Any]) -> bool:
 
     This remains opt-in because ordinary Seeknal CLI, gateway, and Telegram
     callers consume text output, while the IBA premises worker consumes typed
-    action payloads.
+    action payloads. Seeknal has no reliable way to probe that external worker,
+    so enabled action delivery requires an explicit consumer declaration.
     """
     section = _get_mapping(get_agent_harness_settings(config), "action_delivery")
-    return _coerce_bool(section.get("enabled"), default=False)
+    enabled = _coerce_bool(section.get("enabled"), default=False)
+    if not enabled:
+        return False
+
+    if section.get("consumer") != _ACTION_DELIVERY_CONSUMER:
+        raise ValueError(
+            "agent_harness.action_delivery.enabled requires "
+            "consumer: iba-premises-worker; Seeknal cannot detect the "
+            "external premises-worker consumer."
+        )
+    return True
 
 
 def get_auto_summarization_config(config: dict[str, Any]) -> dict[str, Any]:

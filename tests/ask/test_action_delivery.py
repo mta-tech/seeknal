@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -18,6 +19,7 @@ from seeknal.ask.agents.skills import (
     prepare_action_output_tools,
 )
 from seeknal.ask.agents.tools.toolset import create_ask_toolset
+from seeknal.ask.config import get_action_delivery_enabled
 
 
 def _create_agent_kwargs(project_path: Path, config: str = "") -> dict:
@@ -52,11 +54,48 @@ def test_action_delivery_defaults_off_without_new_agent_kwargs(tmp_path: Path) -
 def test_action_delivery_flag_adds_typed_outputs_and_preparer(tmp_path: Path) -> None:
     kwargs = _create_agent_kwargs(
         tmp_path,
-        "agent_harness:\n  action_delivery:\n    enabled: true\n",
+        "agent_harness:\n  action_delivery:\n    enabled: true\n    consumer: iba-premises-worker\n",
     )
 
     assert {output.name for output in kwargs["output_type"]} == {"ask_user", "visualize"}
     assert callable(kwargs["prepare_output_tools"])
+
+
+def test_action_delivery_fails_closed_without_its_premises_worker_consumer(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "seeknal_agent.yml").write_text(
+        "agent_harness:\n  action_delivery:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    from seeknal.ask.agents.agent import create_agent
+
+    with (
+        patch("seeknal.cli.repl.REPL") as mock_repl_cls,
+        pytest.raises(ValueError, match="consumer: iba-premises-worker"),
+    ):
+        create_agent(project_path=tmp_path, environment="interactive")
+
+    mock_repl_cls.assert_not_called()
+
+
+def test_action_delivery_configuration_requires_the_named_consumer() -> None:
+    with pytest.raises(ValueError, match="consumer: iba-premises-worker"):
+        get_action_delivery_enabled(
+            {"agent_harness": {"action_delivery": {"enabled": True}}}
+        )
+
+    assert get_action_delivery_enabled({}) is False
+    assert get_action_delivery_enabled(
+        {
+            "agent_harness": {
+                "action_delivery": {
+                    "enabled": True,
+                    "consumer": "iba-premises-worker",
+                }
+            }
+        }
+    ) is True
 
 
 def test_action_delivery_replaces_blocking_ask_user_function_tool() -> None:
