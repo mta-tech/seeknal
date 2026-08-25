@@ -38,6 +38,14 @@ class _REPLStub:
         return cols, rows
 
 
+@pytest.fixture(autouse=True)
+def disable_atlas_governance(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These are formatter and result-cap tests, not Atlas governance tests.
+    # Do not inherit a developer's live Atlas endpoint into this in-memory SQL
+    # fixture; dedicated governance tests exercise that boundary explicitly.
+    monkeypatch.delenv("ATLAS_API_URL", raising=False)
+
+
 @pytest.fixture
 def ctx(tmp_path: Path) -> ToolContext:
     repl = _REPLStub()
