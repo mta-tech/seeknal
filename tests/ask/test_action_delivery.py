@@ -9,16 +9,31 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from seeknal.ask.agents.actions import AskUserAction, VisualizeAction, action_output_types
+from seeknal.ask.agents.actions import (
+    AskUserAction,
+    VisualizeAction,
+    WriteReport,
+    action_output_types,
+)
 from seeknal.ask.agents.skills import (
     SkillCapabilities,
     action_capabilities,
+    derive_loaded_skills,
+    prepare_regular_action_tools,
     prepare_action_output_tools,
 )
 from seeknal.ask.agents.tools.toolset import create_ask_toolset
+from seeknal.ask.agents.tools.write_report import write_report as deliver_report
 from seeknal.ask.config import get_action_delivery_enabled
 
 
@@ -59,6 +74,11 @@ def test_action_delivery_flag_adds_typed_outputs_and_preparer(tmp_path: Path) ->
 
     assert {output.name for output in kwargs["output_type"]} == {"ask_user", "visualize"}
     assert callable(kwargs["prepare_output_tools"])
+    assert callable(kwargs["prepare_tools"])
+    assert any("action_skills" in path for path in kwargs["skill_directories"])
+
+    capabilities = action_capabilities(kwargs["skill_directories"])
+    assert capabilities["report"].actions == frozenset({"write_report"})
 
 
 def test_action_delivery_fails_closed_without_its_premises_worker_consumer(
@@ -164,8 +184,11 @@ def test_output_preparer_derives_loaded_skill_from_real_load_skill_argument() ->
             SimpleNamespace(
                 messages=[
                     ModelResponse(
-                        parts=[ToolCallPart("load_skill", {"skill_name": "report"})]
-                    )
+                        parts=[ToolCallPart("load_skill", {"skill_name": "report"}, tool_call_id="report-call")]
+                    ),
+                    ModelRequest(
+                        parts=[ToolReturnPart("load_skill", "<skill>\n<name>report</name>\n</skill>", tool_call_id="report-call")]
+                    ),
                 ]
             ),
             definitions,
@@ -178,6 +201,108 @@ def test_output_preparer_derives_loaded_skill_from_real_load_skill_argument() ->
         "ask_user",
         "write_report",
     ]
+
+
+def test_load_skill_unlocks_actions_only_after_a_confirmed_skill_return() -> None:
+    call = ToolCallPart(
+        "load_skill", {"skill_name": "report"}, tool_call_id="report-call"
+    )
+    failed = ModelRequest(
+        parts=[
+            ToolReturnPart(
+                "load_skill",
+                "Error: Skill 'report' not found.",
+                tool_call_id="report-call",
+            )
+        ]
+    )
+    succeeded = ModelRequest(
+        parts=[
+            ToolReturnPart(
+                "load_skill",
+                "<skill>\n<name>report</name>\n</skill>",
+                tool_call_id="report-call",
+            )
+        ]
+    )
+    request = ModelResponse(parts=[call])
+
+    assert derive_loaded_skills([request, failed]) == {"core"}
+    assert derive_loaded_skills([request, succeeded]) == {"core", "report"}
+
+
+def test_regular_write_report_tool_is_gated_by_confirmed_skill_load() -> None:
+    capabilities = action_capabilities([])
+    capabilities["report"] = SkillCapabilities(actions=frozenset({"write_report"}))
+    definitions = [
+        SimpleNamespace(name="execute_sql"),
+        SimpleNamespace(name="write_report"),
+    ]
+    prepare = prepare_regular_action_tools(capabilities, {"write_report"})
+    call = ModelResponse(
+        parts=[ToolCallPart("load_skill", {"skill_name": "report"}, tool_call_id="report-call")]
+    )
+    failed = ModelRequest(
+        parts=[ToolReturnPart("load_skill", "Error: unavailable", tool_call_id="report-call")]
+    )
+    succeeded = ModelRequest(
+        parts=[ToolReturnPart("load_skill", "<skill>\n<name>report</name>\n</skill>", tool_call_id="report-call")]
+    )
+
+    before = asyncio.run(prepare(SimpleNamespace(messages=[]), definitions))
+    after_failed = asyncio.run(prepare(SimpleNamespace(messages=[call, failed]), definitions))
+    after_success = asyncio.run(prepare(SimpleNamespace(messages=[call, succeeded]), definitions))
+
+    assert [definition.name for definition in before] == ["execute_sql"]
+    assert [definition.name for definition in after_failed] == ["execute_sql"]
+    assert [definition.name for definition in after_success] == ["execute_sql", "write_report"]
+
+
+def test_write_report_returns_the_full_markdown_for_the_bridge() -> None:
+    report = "# Q3\n\nRevenue rose."
+
+    assert WriteReport(report=report).report == report
+    assert deliver_report(report) == report
+
+
+def test_write_report_is_regular_and_unlocked_after_confirmed_load() -> None:
+    observed: list[list[str]] = []
+
+    def model(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        observed.append(sorted(tool.name for tool in info.function_tools))
+        step = len(observed)
+        if step == 1:
+            return ModelResponse(
+                parts=[ToolCallPart("load_skill", {"skill_name": "report"})]
+            )
+        if step == 2:
+            return ModelResponse(
+                parts=[ToolCallPart("write_report", {"report": "# Q3"})]
+            )
+        if step == 3:
+            return ModelResponse(parts=[TextPart("Report delivered.")])
+        raise AssertionError("write_report should not terminate the run")
+
+    capabilities = action_capabilities([])
+    capabilities["report"] = SkillCapabilities(actions=frozenset({"write_report"}))
+    agent = Agent(
+        FunctionModel(model),
+        prepare_tools=prepare_regular_action_tools(capabilities, {"write_report"}),
+    )
+
+    @agent.tool_plain
+    async def load_skill(skill_name: str) -> str:
+        return f"<skill>\n<name>{skill_name}</name>\n</skill>"
+
+    @agent.tool_plain
+    async def write_report(report: str) -> str:
+        return deliver_report(report)
+
+    result = agent.run_sync("Write the report")
+
+    assert "write_report" not in observed[0]
+    assert "write_report" in observed[1]
+    assert result.output == "Report delivered."
 
 
 def test_visualize_schema_transcribes_df_required_and_optional_fields() -> None:

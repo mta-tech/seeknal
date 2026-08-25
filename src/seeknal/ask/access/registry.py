@@ -65,6 +65,7 @@ _ANALYST_TOOLS = {
     "plan_pipeline",
     "submit_plan",
     "generate_report",
+    "write_report",
     "publish_to_proof",
     "edit_proof_document",
     "bootstrap_semantic_model",

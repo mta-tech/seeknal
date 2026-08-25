@@ -70,6 +70,7 @@ from seeknal.ask.agents.tools.submit_plan import submit_plan
 from seeknal.ask.agents.tools.upload_to_s3 import upload_to_s3
 from seeknal.ask.agents.tools.write_ingested_table import write_ingested_table
 from seeknal.ask.agents.tools.write_project_file import write_project_file
+from seeknal.ask.agents.tools.write_report import write_report
 
 
 _DATABASE_ANALYSIS_TOOLS = [
@@ -180,6 +181,8 @@ _EXPORT_TOOLS = [
     upload_to_s3,
 ]
 
+_ACTION_DELIVERY_TOOLS = [write_report]
+
 
 def create_ask_toolset(
     *,
@@ -268,6 +271,9 @@ def create_ask_toolset(
 
     if include_intel_knowledge:
         tools.extend(_INTEL_KNOWLEDGE_TOOLS)
+
+    if action_delivery and mode == "full":
+        tools.extend(_ACTION_DELIVERY_TOOLS)
 
     return FunctionToolset(
         tools=tools,

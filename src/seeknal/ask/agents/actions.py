@@ -42,6 +42,12 @@ class AskUserAction(BaseModel):
     thought: str = ""
 
 
+class WriteReport(BaseModel):
+    """Full Markdown payload for DF's non-terminal ``write_report`` tool."""
+
+    report: str
+
+
 def action_output_types() -> list[ToolOutput[Any]]:
     """Return the core action output tools offered to an enabled agent."""
     return [

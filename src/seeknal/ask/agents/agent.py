@@ -43,9 +43,14 @@ _DIMINISHING_RETURNS_MSG = (
 # Shipped alongside the package — each subdirectory here is a SKILL.md
 # bundle that pydantic-deep's SkillsToolset will auto-discover.
 _BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "builtin_skills"
+_ACTION_SKILLS_DIR = Path(__file__).parent.parent / "action_skills"
 
 
-def _resolve_skill_directories(project_path: Path) -> list[str]:
+def _resolve_skill_directories(
+    project_path: Path,
+    *,
+    include_action_skills: bool = False,
+) -> list[str]:
     """Return the ordered skill search path for the ask agent.
 
     Built-ins come first so they're always discoverable; project-local
@@ -55,6 +60,8 @@ def _resolve_skill_directories(project_path: Path) -> list[str]:
     if _BUILTIN_SKILLS_DIR.exists():
         dirs.append(str(_BUILTIN_SKILLS_DIR))
     dirs.append(str(project_path / "seeknal" / "skills"))
+    if include_action_skills and _ACTION_SKILLS_DIR.exists():
+        dirs.append(str(_ACTION_SKILLS_DIR))
     return dirs
 
 
@@ -273,6 +280,10 @@ def create_agent(
             "agent_harness.action_delivery.enabled cannot be combined with "
             "create_agent(output_type=...); the IBA worker owns typed action output."
         )
+    skill_directories = _resolve_skill_directories(
+        project_path,
+        include_action_skills=action_delivery_enabled,
+    )
 
     set_tool_context(
         ToolContext(
@@ -701,16 +712,24 @@ evidence-backed finding that cites every Intel document used.
         from seeknal.ask.agents.skills import (
             action_capabilities,
             prepare_action_output_tools,
+            prepare_regular_action_tools,
         )
 
+        skill_capabilities = action_capabilities(skill_directories)
         _deep_agent_kwargs.update(
             _supported_kwarg("output_type", action_output_types())
         )
         _deep_agent_kwargs.update(
             _supported_kwarg(
                 "prepare_output_tools",
-                prepare_action_output_tools(
-                    action_capabilities(_resolve_skill_directories(project_path))
+                prepare_action_output_tools(skill_capabilities),
+            )
+        )
+        _deep_agent_kwargs.update(
+            _supported_kwarg(
+                "prepare_tools",
+                prepare_regular_action_tools(
+                    skill_capabilities, {"write_report"}
                 ),
             )
         )
@@ -734,7 +753,7 @@ evidence-backed finding that cites every Intel document used.
         # src/seeknal/ask/builtin_skills/ so `load_skill(...)` resolves
         # even in projects that have no local seeknal/skills/ dir.
         include_skills=not intel_work_mode,
-        skill_directories=_resolve_skill_directories(project_path),
+        skill_directories=skill_directories,
         # Planning: todo checklist + interactive ask_user via planner subagent
         include_todo=not analysis_toolset and not intel_work_mode,
         include_plan=plan_enabled,

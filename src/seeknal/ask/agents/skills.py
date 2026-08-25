@@ -7,7 +7,7 @@ into every system prompt — they're loaded only when the agent decides to use t
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Set
+from collections.abc import Collection, Iterable, Mapping, Set
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -102,20 +102,28 @@ def action_capabilities(
 
 
 def derive_loaded_skills(messages: Iterable[object]) -> set[str]:
-    """Reconstruct loaded skills from recorded ``load_skill`` tool calls."""
-    from pydantic_ai.messages import ToolCallPart
+    """Reconstruct skills whose ``load_skill`` calls returned successfully."""
+    from pydantic_ai.messages import ToolCallPart, ToolReturnPart
 
     loaded = {_CORE_SKILL_NAME}
+    requested: dict[str, str] = {}
     for message in messages:
         for part in getattr(message, "parts", ()):
-            if not isinstance(part, ToolCallPart) or part.tool_name != "load_skill":
-                continue
-            args = part.args
-            if not isinstance(args, dict):
-                continue
-            skill_name = args.get("skill_name", args.get("name"))
-            if isinstance(skill_name, str) and skill_name:
-                loaded.add(skill_name)
+            if isinstance(part, ToolCallPart) and part.tool_name == "load_skill":
+                args = part.args
+                skill_name = args.get("skill_name", args.get("name")) if isinstance(args, dict) else None
+                if isinstance(skill_name, str) and skill_name:
+                    requested[part.tool_call_id] = skill_name
+            elif isinstance(part, ToolReturnPart) and part.tool_name == "load_skill":
+                skill_name = requested.get(part.tool_call_id)
+                content = part.content
+                if (
+                    skill_name
+                    and part.outcome == "success"
+                    and isinstance(content, str)
+                    and f"<name>{skill_name}</name>" in content
+                ):
+                    loaded.add(skill_name)
     return loaded
 
 
@@ -150,3 +158,23 @@ def prepare_action_output_tools(
         return [definition for definition in definitions if definition.name in legal_actions]
 
     return prepare_output_tools
+
+
+def prepare_regular_action_tools(
+    capabilities: Mapping[str, SkillCapabilities],
+    action_names: Collection[str],
+):
+    """Build a per-step gate for non-terminal, skill-declared actions."""
+    gated_names = frozenset(action_names)
+
+    async def prepare_tools(ctx, definitions):
+        legal_actions = legal_actions_for_loaded_skills(
+            derive_loaded_skills(ctx.messages), capabilities
+        )
+        return [
+            definition
+            for definition in definitions
+            if definition.name not in gated_names or definition.name in legal_actions
+        ]
+
+    return prepare_tools
