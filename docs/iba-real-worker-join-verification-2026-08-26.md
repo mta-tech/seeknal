@@ -198,3 +198,88 @@ the failure trajectory's `/complete` callback: the previously reproducible
 `404` was not observed. Both client-observed arms pass under the stated local
 deterministic runtime seam. This remains a local join verification, not a live
 external-model or production deployment test.
+
+## Tenant-namespace re-verification — IBA `679169ab` (observed 2026-08-26)
+
+This is a fresh local join run at exact remote-durable IBA `origin/main`
+`679169ab9c496241d4df1255500905493bd552de`. It extends, rather than replaces,
+the `bf43f3e` failure and `43b7a8b` repair evidence above.
+
+The deliberate authority axes were:
+
+| Axis | Value |
+| --- | --- |
+| Verified caller identity | `browser:join-user` |
+| Configured trusted resolver result | `tenant-a` |
+| WorkerToken tenant | `tenant-a` |
+| Forged caller payload field, success arm | `tenant_id: tenant-b` |
+
+The IBA app was a fresh detached checkout configured with a generated local
+trajectory secret, one `join-model`, the default broker-backed EventSource,
+the resolver above, and the tenant-`a` WorkerToken. The real shipped
+`seeknal gateway worker` CLI and its unchanged HTTP client/callback code were
+used through the same transparent observer as prior runs. A local deterministic
+runtime seam emitted the stable success or failure trajectory only; no product
+source or IBA router was changed.
+
+### OBSERVED — successful arm at 2026-08-26T16:55:19+07:00
+
+The user request carried the forged `tenant_id: tenant-b` alongside
+`X-Identity-Id: browser:join-user`. The observer saw:
+
+1. `GET /internal/worker/config` -> `200`.
+2. `GET /internal/worker/work-stream` -> `200`, a **bare** work object with
+   top-level `attempt`, `question`, `session_id`, `tenant_id`, and `work_id`.
+   Its `tenant_id` was **`tenant-a`**, not the supplied `tenant-b`.
+3. `POST .../event` for `token`, `answer`, and `done` -> `200` each.
+4. `POST .../complete` with `event_count=3`, no error -> `200`.
+5. Continued worker polls returned `204` until intentional shutdown.
+
+The user stream contained assistant `text_delta`, assistant `text_delta`, and
+`completion`. The real worker logged `complete events=3 status=ok`; the user
+request and worker process each exited `0`.
+
+### OBSERVED — deterministic failure arm at 2026-08-26T16:55:40+07:00
+
+1. `GET /internal/worker/config` -> `200`.
+2. `GET /internal/worker/work-stream` -> `200`, the same bare object shape,
+   with `tenant_id: tenant-a`.
+3. `POST .../event` for `error` -> `200`.
+4. `POST .../event` for `done` -> `200`.
+5. `POST .../complete` with `event_count=2`, error present -> `200`.
+6. Continued worker polls returned `204` until intentional shutdown.
+
+The user stream contained exactly one terminal event:
+`{"type":"error","code":"agent_error","message":"The agent run failed."}`.
+The real worker logged `complete events=2 status=error`; the user request and
+worker process each exited `0`.
+
+### OBSERVED — unconfigured resolver negative path at 2026-08-26T16:56:09+07:00
+
+A separate fresh IBA app was configured identically except that it used the
+default unconfigured tenant resolver. The same user request, including forged
+`tenant_id: tenant-b`, received an ordinary pre-stream HTTP `503` with the
+`CONFIG_UNAVAILABLE` envelope. An authenticated raw
+`GET /internal/worker/work-stream?timeout=0` using the same tenant-`a` worker
+token then received `204` with zero response bytes. No work was admitted in
+this negative app instance.
+
+### REASONED — boundary interpretation
+
+The live observations prove that the claimed work's tenant was `tenant-a` and
+that a forged `tenant-b` body field did not move this run's queue. Reading the
+pinned source explains the boundary: the user request parser has no tenant
+field, the EventSource resolves its tenant from the verified identity through
+the injected resolver, and worker authorization derives tenant only from the
+Bearer token. That source interpretation is not substituted for the observed
+claim/callback evidence above.
+
+### Current tenant-namespace verdict
+
+**PASS.** At `679169ab`, both deterministic real-worker trajectories delivered
+through the tenant-`a` queue and acknowledged every callback, including
+failure `/complete`, with `200`. The forged caller `tenant-b` value had no
+observed effect. The unconfigured resolver failed closed before streaming and
+admitted no work in the independently configured negative instance. This is
+still a local deterministic-runtime join verification, not an external-model
+or production deployment test.
