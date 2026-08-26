@@ -1,6 +1,6 @@
 # IBA real worker join verification — 2026-08-26
 
-## Scope and verdicts
+## Original scope and verdicts — IBA `bf43f3e`
 
 This is a local, client-observed join test of the shipped Seeknal HTTP worker
 against IBA v2's actual premises-worker routes. It is not a deployment or a
@@ -138,3 +138,63 @@ end-to-end completion acknowledgement despite successful user error delivery.
 The route owner should decide whether terminal-event cleanup must retain the
 work until `/complete`, or whether the worker/route contract deliberately
 permits this `404` and needs an explicit acknowledgement rule.
+
+## Re-verification — IBA `43b7a8b` (observed 2026-08-26)
+
+The original defect was fixed by IBA commit
+`43b7a8b7282080a54b613d6329df63970a87f465`, verified as the exact
+`origin/main` revision before this re-run. This section does not revise the
+historical `bf43f3e` evidence above: it records the client-observed result
+after the fix.
+
+Configuration and boundary were intentionally the same as the original join
+test: a fresh detached IBA checkout, generated local trajectory secret,
+single allowed `join-model`, tenant-matched `WorkerRegistry` token, default
+broker-backed EventSource, the shipped `seeknal gateway worker` CLI, real IBA
+worker routes, and a transparent observer that forwarded the worker's requests
+to the actual app. The deterministic local `server._run_agent_streaming` seam
+was retained solely to produce stable success and failure trajectories; no
+Seeknal product code or IBA-owned files were edited.
+
+| Arm | Current verdict | Client-observed result |
+| --- | --- | --- |
+| Success | **PASS** | Bare work claim; `token`, `answer`, `done`, and `/complete` callbacks all `200`; user received two assistant `text_delta` records and one `completion`; request and worker processes exited `0`. |
+| Deterministic failure | **PASS** | Bare work claim; `error`, `done`, and `/complete` callbacks all `200`; user received one terminal `error` (`agent_error`); request and worker processes exited `0`. |
+
+### Success callback sequence — observed 2026-08-26T14:53:40+07:00
+
+1. `GET /internal/worker/config` -> `200`.
+2. `GET /internal/worker/work-stream` -> `200`, bare object with top-level
+   `attempt`, `question`, `session_id`, `tenant_id`, and `work_id`; no `work`
+   wrapper.
+3. `POST .../event` for `token` -> `200`.
+4. `POST .../event` for `answer` -> `200`.
+5. `POST .../event` for `done` -> `200`.
+6. `POST .../complete` with `event_count=3`, no error -> `200`.
+7. Continued worker polls returned `204` before intentional shutdown.
+
+The real worker logged `complete events=3 status=ok` and exited `0`. The user
+stream contained `text_delta` on `assistant` for the deterministic markers
+`joined ` and `joined answer`, followed by `completion` with `elapsed_ms: 1`.
+
+### Failure callback sequence — observed 2026-08-26T14:54:00+07:00
+
+1. `GET /internal/worker/config` -> `200`.
+2. `GET /internal/worker/work-stream` -> `200`, the same bare-object shape.
+3. `POST .../event` for `error` -> `200`.
+4. `POST .../event` for `done` -> `200`.
+5. `POST .../complete` with `event_count=2`, error present -> **`200`**.
+6. Continued worker polls returned `204` before intentional shutdown.
+
+The real worker logged `complete events=2 status=error` and exited `0`. The
+user stream contained exactly one terminal event:
+`{"type":"error","code":"agent_error","message":"The agent run failed."}`.
+
+### Current conclusion
+
+The prior `bf43f3e` failure was real and remains documented above. At
+`43b7a8b`, the same real-worker route ordering now retains the work through
+the failure trajectory's `/complete` callback: the previously reproducible
+`404` was not observed. Both client-observed arms pass under the stated local
+deterministic runtime seam. This remains a local join verification, not a live
+external-model or production deployment test.
