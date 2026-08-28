@@ -361,3 +361,15 @@ def test_chart_title_whitespace_stripped_and_assigned(ctx: ToolContext) -> None:
     chart = _chart(ctx)
     assert chart["widgetTitle"] == "Monthly Sales Trend"
 
+
+def test_chart_series_column_preserves_values_and_order(ctx: ToolContext) -> None:
+    data = [["2026-01", 100, "East"], ["2026-01", 150, "West"], ["2026-02", 120, "East"]]
+    out = visualize_chart("grouped_bar_chart", "Regional Sales", data=data, columns=["month", "revenue", "region"])
+
+    assert "Chart ready" in out
+    rows = _chart(ctx)["widgetData"]
+    assert len(rows) == 3
+    assert rows[0]["region"] == "East"
+    assert rows[1]["region"] == "West"
+
+
