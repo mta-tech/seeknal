@@ -352,3 +352,12 @@ def test_applied_limits_are_reported_to_the_agent(ctx: ToolContext) -> None:
 
     assert "Applied limits" in out
     assert OTHERS_LABEL in out
+
+
+def test_chart_title_whitespace_stripped_and_assigned(ctx: ToolContext) -> None:
+    out = visualize_chart("line_chart", "  Monthly Sales Trend  ", sql=SQL)
+
+    assert "Chart ready" in out
+    chart = _chart(ctx)
+    assert chart["widgetTitle"] == "Monthly Sales Trend"
+
