@@ -414,11 +414,15 @@ def _upload_combined_forecast_csv(
     # History rows: value filled, projection columns blank.
     for x, y in history:
         rows.append([x, "historis", int(round(y)), "", "", "", "", ""])
-    # Projection rows: value blank, projection columns filled from the engine.
+    # Projection rows: `value` carries the point estimate too, so `value` is one
+    # continuous Y across historis+proyeksi and the pair [period, value, kind] is
+    # chartable as [x, y, series]. `point` + bounds stay as the explicit projection
+    # fields. Charting `point` alone would render every historis period as a flat 0.
     for p in points:
+        point_value = p.get("point")
         rows.append([
-            p.get("period"), proj_kind, "",
-            p.get("point"), p.get("lower_80"), p.get("upper_80"),
+            p.get("period"), proj_kind, point_value,
+            point_value, p.get("lower_80"), p.get("upper_80"),
             p.get("lower_95"), p.get("upper_95"),
         ])
     filename = _derive_forecast_filename(sql)

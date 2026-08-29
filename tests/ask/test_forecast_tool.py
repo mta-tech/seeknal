@@ -318,3 +318,86 @@ def test_forecast_accepts_dynamic_schemas(ctx):
         assert "## Proyeksi" in out, f"schema {label} did not produce r5 table output"
     # Engine called once per successful run — proves all three shapes reached it.
     assert post.call_count == 3
+
+
+# ── s234: combined CSV schema — `value` carries numbers for every row ──
+
+
+def test_combined_csv_projection_rows_value_equals_point():
+    """Projection rows: `value` is the point estimate, not an empty string.
+
+    This was the root cause of s234 — the tool wrote Y to two mutually exclusive
+    columns.  After the fix, ``value`` is continuous across both ``historis``
+    and ``proyeksi-*`` rows, so ``[period, value, kind]`` is chartable as
+    ``[x, y, series]``.
+    """
+    from seeknal.ask.agents.tools.forecast import _upload_combined_forecast_csv
+
+    history = [["2024-01-01", 10], ["2024-02-01", 15], ["2024-03-01", 12]]
+    result = {
+        "forecast": {
+            "points": [
+                {"period": "2024-04-01", "point": 18, "lower_80": 14, "upper_80": 22, "lower_95": 12, "upper_95": 24},
+                {"period": "2024-05-01", "point": 20, "lower_80": 16, "upper_80": 24, "lower_95": 14, "upper_95": 26},
+            ]
+        }
+    }
+
+    with patch("seeknal.ask.agents.tools.upload_to_s3.upload_to_s3") as mock_upload:
+        _upload_combined_forecast_csv("SELECT 1", history, result, periods=2, freq="MS")
+
+    assert mock_upload.called
+    kwargs = mock_upload.call_args.kwargs
+    called_data = kwargs["data"]
+    called_columns = kwargs["columns"]
+
+    # Eight columns, names unchanged.
+    assert called_columns == ["period", "kind", "value", "point", "lower_80", "upper_80", "lower_95", "upper_95"]
+
+    # History rows: value filled, point empty (unchanged behaviour).
+    assert called_data[0][2] == 10   # value
+    assert called_data[0][3] == ""   # point
+    assert called_data[1][2] == 15
+    assert called_data[1][3] == ""
+
+    # Projection rows: value == point (this is the fix).
+    assert called_data[3][2] == 18   # value (was "")
+    assert called_data[3][3] == 18   # point
+    assert called_data[3][2] != ""   # no longer empty
+    assert called_data[4][2] == 20
+    assert called_data[4][3] == 20
+
+
+def test_combined_csv_column_count_stays_8():
+    """Column count is 8 — the fix only fills value, it doesn't alter layout."""
+    from seeknal.ask.agents.tools.forecast import _upload_combined_forecast_csv
+
+    history = [["2024-01-01", 5]]
+    result = {
+        "forecast": {
+            "points": [{"period": "2024-02-01", "point": 7, "lower_80": 5, "upper_80": 9, "lower_95": 3, "upper_95": 11}]
+        }
+    }
+
+    with patch("seeknal.ask.agents.tools.upload_to_s3.upload_to_s3") as mock_upload:
+        _upload_combined_forecast_csv("SELECT 1", history, result, periods=1, freq="MS")
+
+    kwargs = mock_upload.call_args.kwargs
+    assert len(kwargs["columns"]) == 8
+
+
+def test_combined_csv_history_rows_unchanged():
+    """History rows still have value filled and projection columns blank."""
+    from seeknal.ask.agents.tools.forecast import _upload_combined_forecast_csv
+
+    history = [["2024-01-01", 5], ["2024-02-01", 10]]
+    result: dict[str, Any] = {"forecast": {"points": []}}
+
+    with patch("seeknal.ask.agents.tools.upload_to_s3.upload_to_s3") as mock_upload:
+        _upload_combined_forecast_csv("SELECT 1", history, result, periods=0, freq="MS")
+
+    kwargs = mock_upload.call_args.kwargs
+    data = kwargs["data"]
+    assert len(data) == 2
+    assert data[0] == ["2024-01-01", "historis", 5, "", "", "", "", ""]
+    assert data[1] == ["2024-02-01", "historis", 10, "", "", "", "", ""]

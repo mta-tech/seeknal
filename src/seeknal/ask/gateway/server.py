@@ -299,6 +299,47 @@ def _safe_auth_context_ws(websocket: WebSocket) -> tuple[AuthContext, str | None
 # ---------------------------------------------------------------------------
 
 
+
+_CHART_TOOL_NAME = "visualize_chart"
+
+
+def _chart_only_toolset(agent):
+    """Return a toolset holding just ``visualize_chart``, or ``None``.
+
+    Used by the evidence-synthesis stage, which otherwise runs with no tools at
+    all. The tool is lifted from the agent's own toolsets rather than imported,
+    so the project flag that decides whether charting exists at all keeps
+    deciding it here -- a project without the tool gets ``None`` and the
+    original no-tools behaviour, unchanged.
+    """
+    from pydantic_ai.toolsets import FunctionToolset
+
+    for toolset in getattr(agent, "toolsets", []) or []:
+        tools = getattr(toolset, "tools", None)
+        if isinstance(tools, dict) and _CHART_TOOL_NAME in tools:
+            return FunctionToolset(tools=[tools[_CHART_TOOL_NAME].function])
+    return None
+
+
+def _drain_pending_side_channels(ctx):
+    """Yield any pending upload/chart events, clearing each slot.
+
+    Called immediately before every ``answer`` yield. The per-node checks in the
+    run loop only fire when another node follows the tool that set them, and the
+    loop can exit through several paths, so a chart or an export produced by the
+    LAST tool call would otherwise be silently dropped. Draining next to the
+    answer covers every path that actually produces one.
+    """
+    if ctx.pending_upload:
+        _upload = ctx.pending_upload
+        ctx.pending_upload = None
+        yield {"type": "upload_complete", "data": _upload}
+    if ctx.pending_visualization:
+        _visualization = ctx.pending_visualization
+        ctx.pending_visualization = None
+        yield {"type": "visualization", "data": _visualization}
+
+
 async def _run_agent_streaming(
     project_path: Path,
     session_id: str,
@@ -559,6 +600,15 @@ async def _run_agent_inner(
                     yield {"type": "upload_complete", "data": _upload}
                     # deliberately NO return — continue the turn
 
+                # Chart emission (M9). Same lifecycle as pending_upload above:
+                # emit + clear + fall through, because the agent still has to
+                # present the answer the chart belongs to.
+                if ctx.pending_visualization:
+                    _visualization = ctx.pending_visualization
+                    ctx.pending_visualization = None
+                    yield {"type": "visualization", "data": _visualization}
+                    # deliberately NO return — continue the turn
+
                 if isinstance(node, UserPromptNode):
                     continue
 
@@ -660,6 +710,21 @@ async def _run_agent_inner(
                 elif isinstance(node, End):
                     break
 
+            # Drain the side channels one last time. The checks above run at
+            # the START of a node, so anything a tool set during the FINAL
+            # node — the common case, since exports and charts are the last
+            # thing an agent does before answering — would otherwise never be
+            # emitted: the loop ends before the next iteration can see it.
+            if ctx.pending_upload:
+                _upload = ctx.pending_upload
+                ctx.pending_upload = None
+                yield {"type": "upload_complete", "data": _upload}
+
+            if ctx.pending_visualization:
+                _visualization = ctx.pending_visualization
+                ctx.pending_visualization = None
+                yield {"type": "visualization", "data": _visualization}
+
             result = run.result
 
         # Final answer
@@ -695,6 +760,8 @@ async def _run_agent_inner(
 
         if answer:
             record_prior_turn_answer(question=question, answer=answer)
+            for _evt in _drain_pending_side_channels(ctx):
+                yield _evt
             yield {"type": "answer", "data": answer}
 
     except UsageLimitExceeded as exc:
@@ -716,23 +783,63 @@ async def _run_agent_inner(
             reason = (
                 "tool-call budget reached before the model produced a final answer"
             )
-        prompt = build_evidence_synthesis_prompt(reason)
         deterministic = synthesize_evidence_fallback(reason)
         try:
             ctx = get_tool_context()
-            result = await agent.run(
-                prompt,
-                deps=deps,
-                message_history=message_history,
-                usage_limits=UsageLimits(
-                    request_limit=ctx.request_limit,
-                    tool_calls_limit=0,
-                ),
+            # The synthesis stage bans tools so the turn cannot keep exploring
+            # after its budget ran out -- but that also banned charting, and
+            # the agent typically charts last. A question that spent its budget
+            # gathering evidence then reported "no chart available" was the
+            # visible symptom.
+            #
+            # visualize_chart is exempt because it cannot extend the
+            # exploration this stage exists to stop: it reads rows already
+            # gathered (the structured cache or the exported CSV) and makes no
+            # external call. One call is allowed, matching the one-chart-per-
+            # question rule the pending_visualization slot already enforces.
+            #
+            # But only when the main pass has NOT already produced a chart. A
+            # chart already in the slot means this stage must not invite a
+            # second one: on models that narrate tool calls as text, that
+            # invitation comes back as a raw {"action": ...} block leaked into
+            # the answer. The existing chart is still emitted by
+            # _drain_pending_side_channels below, so Case B loses nothing.
+            chart_toolset = (
+                _chart_only_toolset(agent)
+                if ctx.pending_visualization is None
+                else None
             )
+            # The prompt and the toolset must agree. Offering the tool while
+            # the prompt still says "do not call any tools" makes the model
+            # obey the prompt and describe a chart in prose instead.
+            prompt = build_evidence_synthesis_prompt(
+                reason, allow_chart=chart_toolset is not None
+            )
+            limits = UsageLimits(
+                request_limit=ctx.request_limit,
+                tool_calls_limit=0 if chart_toolset is None else 1,
+            )
+            if chart_toolset is None:
+                result = await agent.run(
+                    prompt,
+                    deps=deps,
+                    message_history=message_history,
+                    usage_limits=limits,
+                )
+            else:
+                with agent.override(toolsets=[chart_toolset]):
+                    result = await agent.run(
+                        prompt,
+                        deps=deps,
+                        message_history=message_history,
+                        usage_limits=limits,
+                    )
             answer = result.output or deterministic
         except UsageLimitExceeded:
             answer = deterministic
         record_prior_turn_answer(question=question, answer=answer)
+        for _evt in _drain_pending_side_channels(get_tool_context()):
+            yield _evt
         yield {"type": "answer", "data": answer}
 
     except Exception as exc:
@@ -769,6 +876,8 @@ async def _run_agent_inner(
             "answering from the evidence gathered so far"
         )
         record_prior_turn_answer(question=question, answer=answer)
+        for _evt in _drain_pending_side_channels(get_tool_context()):
+            yield _evt
         yield {"type": "answer", "data": answer}
 
     finally:
