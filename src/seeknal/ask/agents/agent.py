@@ -183,6 +183,7 @@ def create_agent(
     budget: Optional[float] = None,
     include_web: bool = False,
     environment: str = "interactive",
+    model_settings: Optional[dict] = None,
 ):
     """Create a Seeknal Ask agent.
 
@@ -196,6 +197,10 @@ def create_agent(
         include_web: Enable web search/fetch tools.
         environment: Execution environment — "interactive" (TTY), "gateway"
             (API/SSE), "telegram", or "exposure" (headless report re-run).
+        model_settings: Optional dict of LLM sampling overrides (e.g.
+            ``{"temperature": 0.0}``). When ``None``, falls back to
+            ``agent_harness.model_settings`` in ``seeknal_agent.yml``; when
+            that is also absent, the provider default sampling is used.
 
     Returns:
         A tuple of (agent, deps, message_history, cost_info).
@@ -218,6 +223,7 @@ def create_agent(
     from seeknal.ask.config import (
         load_agent_config,
         get_request_limit,
+        get_tool_call_limit,
         get_sql_timeout_seconds,
         get_discovery_cache_ttl_seconds,
         get_background_threshold,
@@ -235,6 +241,7 @@ def create_agent(
         get_stuck_loop_config,
         get_subagents_config,
         get_teams_config,
+        get_model_settings_config,
     )
 
     # Load project-level agent config (seeknal_agent.yml)
@@ -283,7 +290,7 @@ def create_agent(
 
     tool_ctx.sql_pair_mode = get_sql_pair_mode(agent_config)
     if analysis_toolset:
-        tool_ctx.tool_call_limit = 24
+        tool_ctx.tool_call_limit = get_tool_call_limit(agent_config)
 
     # IBA engine connection: resolved once here (session init),
     # never inside run_forecast/detect_anomaly themselves. See
@@ -638,6 +645,14 @@ in the final response.
             "include_builtin_subagents",
             bool(subagents_config["include_builtin"]) and subagents_enabled,
         )
+    )
+    # LLM sampling overrides (temperature, max_tokens, ...). Priority:
+    # explicit caller arg > seeknal_agent.yml agent_harness.model_settings >
+    # None (pydantic_deep default: Anthropic cache keys only, provider default
+    # sampling) -- identical to pre-MS1 behaviour when both are unset.
+    _resolved_model_settings = model_settings or get_model_settings_config(agent_config)
+    _deep_agent_kwargs.update(
+        _supported_kwarg("model_settings", _resolved_model_settings)
     )
 
     # Create pydantic-deep agent with full feature set
