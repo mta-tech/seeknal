@@ -446,6 +446,7 @@ Performance and safety-related fields:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `request_limit` | integer | `100` | Maximum LLM requests in one Ask turn |
+| `tool_call_limit` | integer | `24` | Maximum tool calls in one Ask turn (read-only analysis mode only; full mode is unbounded) |
 | `background_threshold` | integer | `60` | Seconds before eligible long-running tools are backgrounded |
 | `context_budget` | integer | `8000` | Character budget for injected project context |
 | `sql_timeout_seconds` | integer | `60` | Hard timeout for `execute_sql`; use `0` to disable |
