@@ -208,6 +208,7 @@ def get_locale_instructions(config: dict[str, Any]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_REQUEST_LIMIT = 100
+_DEFAULT_TOOL_CALL_LIMIT = 24
 _DEFAULT_SQL_TIMEOUT_SECONDS = 60
 _DEFAULT_DISCOVERY_CACHE_TTL_SECONDS = 300
 
@@ -226,6 +227,25 @@ def get_request_limit(config: dict[str, Any]) -> int:
         return limit if limit > 0 else _DEFAULT_REQUEST_LIMIT
     except (TypeError, ValueError):
         return _DEFAULT_REQUEST_LIMIT
+
+
+def get_tool_call_limit(config: dict[str, Any]) -> int:
+    """Return the ``tool_call_limit`` from config, or the default (24).
+
+    Caps how many tool calls a single agent turn can make in read-only
+    analysis mode before pydantic-ai raises ``UsageLimitExceeded``. Separate
+    from ``request_limit`` (which counts LLM requests); the smaller ceiling is
+    reached first. Applied only when the analysis toolset is active -- full
+    mode leaves tool calls unbounded (see ``create_agent``).
+    """
+    value = config.get("tool_call_limit")
+    if value is None:
+        return _DEFAULT_TOOL_CALL_LIMIT
+    try:
+        limit = int(value)
+        return limit if limit > 0 else _DEFAULT_TOOL_CALL_LIMIT
+    except (TypeError, ValueError):
+        return _DEFAULT_TOOL_CALL_LIMIT
 
 
 def get_sql_timeout_seconds(config: dict[str, Any]) -> int:
@@ -719,3 +739,50 @@ def get_visualize_chart_auto_emit(config: dict[str, Any]) -> bool:
     agent_section = _get_mapping(config, "agent")
     chart_section = _get_mapping(agent_section, "visualize_chart")
     return _coerce_bool(chart_section.get("auto_emit"), default=False)
+
+
+# Whitelist of model_settings keys allowed through to the LLM API request.
+# See pydantic_ai/settings.py for the full list of fields pydantic-ai honours;
+# MS1 intentionally exposes only the four most common determinism controls.
+# Provider-specific keys (anthropic_thinking, openai_reasoning_effort, ...) are
+# deferred to a later spec -- adding them requires per-provider validation.
+_ALLOWED_MODEL_SETTINGS = ("temperature", "max_tokens", "top_p", "seed")
+
+
+def get_model_settings_config(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Return optional model_settings (temperature, max_tokens, ...) or None.
+
+    Reads ``agent_harness.model_settings`` from ``seeknal_agent.yml``. Returns
+    ``None`` when the section is absent, preserving the historical behaviour
+    of letting the provider apply its own default sampling parameters.
+
+    Each value is coerced to its proper type so that YAML strings such as
+    ``temperature: "0.0"`` still work. Unknown keys are dropped to prevent
+    YAML injection of arbitrary fields into the LLM API request.
+
+    Example::
+
+        agent_harness:
+          model_settings:
+            temperature: 0.0
+            max_tokens: 4096
+    """
+    harness = get_agent_harness_settings(config)
+    section = _get_mapping(harness, "model_settings")
+    if not section:
+        return None
+
+    result: dict[str, Any] = {}
+    temp = _coerce_float(section.get("temperature"), None)
+    if temp is not None:
+        result["temperature"] = temp
+    top_p = _coerce_float(section.get("top_p"), None)
+    if top_p is not None:
+        result["top_p"] = top_p
+    max_tokens = _coerce_int(section.get("max_tokens"), None)
+    if max_tokens is not None:
+        result["max_tokens"] = max_tokens
+    seed = _coerce_int(section.get("seed"), None)
+    if seed is not None:
+        result["seed"] = seed
+    return result or None

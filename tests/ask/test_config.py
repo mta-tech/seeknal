@@ -18,6 +18,7 @@ from seeknal.ask.config import (
     get_sql_timeout_seconds,
     get_subagents_config,
     get_teams_config,
+    get_tool_call_limit,
     load_agent_config,
 )
 
@@ -163,6 +164,18 @@ def test_performance_defaults_and_overrides():
     assert get_discovery_cache_ttl_seconds(
         {"discovery_cache_ttl_seconds": "15"}
     ) == 15
+
+
+def test_tool_call_limit_default_and_overrides():
+    # Default preserves current behavior (24) when the key is absent.
+    assert get_tool_call_limit({}) == 24
+    # A positive integer or numeric string overrides the default.
+    assert get_tool_call_limit({"tool_call_limit": 40}) == 40
+    assert get_tool_call_limit({"tool_call_limit": "50"}) == 50
+    # Non-positive or unparseable values fall back to the default.
+    assert get_tool_call_limit({"tool_call_limit": 0}) == 24
+    assert get_tool_call_limit({"tool_call_limit": -5}) == 24
+    assert get_tool_call_limit({"tool_call_limit": "abc"}) == 24
 
 
 def test_agent_harness_defaults_preserve_current_ask_behavior():
