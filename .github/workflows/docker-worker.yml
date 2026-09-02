@@ -2,7 +2,7 @@ name: Docker Worker
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, 'feat/**']
     paths:
       - 'docker/Dockerfile.worker'
       - 'src/**'
