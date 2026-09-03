@@ -5,6 +5,7 @@ Starts the seeknal ask HTTP gateway (WebSocket + SSE + REST + Telegram + Tempora
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -489,6 +490,115 @@ def _resolve_worker_model_choice(
     return None, None
 
 
+MAX_WORKER_RESUME_TURNS = 200
+"""Same value as IBA's ``MAX_TRAJECTORY_TURNS`` (``iba_backend/trajectory.py``).
+
+IBA already refuses to issue or verify a trajectory longer than this, so a
+correctly-behaving broker never sends more. Kept equal rather than smaller so
+this never refuses a claim IBA itself considers valid; kept no larger so a
+broker that ignores its own bound (compromised, buggy, or not IBA at all)
+cannot hand the worker more history than IBA's own security review assumed
+was possible."""
+
+MAX_WORKER_RESUME_TURNS_BYTES = 1_000_000
+"""Same value as IBA's ``MAX_TRAJECTORY_BYTES`` (``iba_backend/trajectory.py``).
+See ``MAX_WORKER_RESUME_TURNS`` for why it is equal rather than smaller."""
+
+_RESUME_TURN_ROLES = frozenset({"user", "assistant", "system"})
+
+
+def _resolve_worker_resume_turns(
+    raw_resume_turns: object,
+) -> "tuple[Optional[list], bool]":
+    """Validate a broker-supplied ``resume_turns`` claim field, or refuse it.
+
+    P2-1 (security review 2026-09-01, Part 2 §2.7): this worker used to read
+    ``work_id``, ``session_id``, ``tenant_id``, ``question``, ``provider`` and
+    ``model`` off the work item and never ``resume_turns`` -- so IBA's
+    HMAC-sealed trajectory (``iba_backend/trajectory.py``,
+    ``build_pause_trajectory``/``verify_trajectory``) travelled all the way to
+    the claim payload and was dropped on the floor. This function is what
+    makes the worker actually read it.
+
+    ``resume_turns`` crosses the broker->worker trust boundary exactly like
+    ``question`` and the broker-chosen provider/model do (see
+    ``_resolve_worker_model_choice`` above, the sibling this mirrors): IBA's
+    seal proves the turns are ones *IBA* previously issued to *this* identity
+    and conversation -- it does not prove they are safe model input, any more
+    than a verified ``question`` is. So this worker re-validates shape and
+    bounds itself rather than trusting IBA's admission checks, exactly as it
+    already refuses a broker-chosen provider/model rather than trusting IBA's
+    allowlist.
+
+    Bounds mirror IBA's own, so nothing a correctly-behaving broker sends is
+    ever refused here -- see ``MAX_WORKER_RESUME_TURNS`` /
+    ``MAX_WORKER_RESUME_TURNS_BYTES``. A broker that ignores its own bounds is
+    what gets refused.
+
+    Returns ``(turns, refused)``:
+
+    - ``(None, False)`` -- ``resume_turns`` was absent, or present as an
+      empty list. IBA's own contract already treats "absent" and "empty" as
+      the same claim shape (ADR-0013: "Absence and an empty list say the same
+      thing") and never emits an empty list on a real claim, so this is the
+      ordinary case and produces no log line. The caller keeps today's
+      behavior: history comes from the session store, unchanged.
+    - ``(None, True)`` -- ``resume_turns`` was present but malformed. Refused
+      with exactly one log line naming the reason, never the content. The
+      caller must run this turn with NO history at all -- not a fall back to
+      the session store -- because a broker that sent a malformed trust
+      boundary field is not one whose ``session_id`` claim should be trusted
+      to address the right history either.
+    - ``(turns, False)`` -- ``resume_turns`` was present, well-formed, and
+      within bounds. One log line records the count and byte size, never
+      content. The caller replaces the session-store history with these
+      turns for this run; see ``_run_agent_inner`` for why resume REPLACES
+      rather than appends.
+    """
+    if raw_resume_turns is None:
+        return None, False
+
+    def _refuse(reason: str) -> "tuple[None, bool]":
+        typer.echo(typer.style(
+            f"[worker] refusing broker-supplied resume_turns: {reason} -- "
+            "running this turn without history",
+            fg=typer.colors.YELLOW,
+        ))
+        return None, True
+
+    if not isinstance(raw_resume_turns, list):
+        return _refuse(f"expected a list, got {type(raw_resume_turns).__name__}")
+    if not raw_resume_turns:
+        return None, False
+    if len(raw_resume_turns) > MAX_WORKER_RESUME_TURNS:
+        return _refuse(
+            f"{len(raw_resume_turns)} turns exceeds the limit of "
+            f"{MAX_WORKER_RESUME_TURNS}"
+        )
+    try:
+        size = len(json.dumps(raw_resume_turns).encode("utf-8"))
+    except (TypeError, ValueError):
+        return _refuse("turns are not JSON-serializable")
+    if size > MAX_WORKER_RESUME_TURNS_BYTES:
+        return _refuse(
+            f"{size} bytes exceeds the limit of {MAX_WORKER_RESUME_TURNS_BYTES}"
+        )
+    for turn in raw_resume_turns:
+        if not isinstance(turn, dict):
+            return _refuse(f"turn is not an object ({type(turn).__name__})")
+        role = turn.get("role")
+        if not isinstance(role, str) or role not in _RESUME_TURN_ROLES:
+            return _refuse(f"turn has an invalid role ({role!r})")
+        if not isinstance(turn.get("content"), str):
+            return _refuse("turn has non-string content")
+
+    typer.echo(
+        f"[worker] seeding history from resume_turns: "
+        f"turns={len(raw_resume_turns)} bytes={size}"
+    )
+    return raw_resume_turns, False
+
+
 async def _process_http_work_item(
     work: dict,
     *,
@@ -522,6 +632,9 @@ async def _process_http_work_item(
     worker_provider, worker_model = _resolve_worker_model_choice(
         work.get("provider"), work.get("model")
     )
+    resume_turns, resume_turns_refused = _resolve_worker_resume_turns(
+        work.get("resume_turns")
+    )
 
     typer.echo(f"[work={short_id} session={session_id}] start")
 
@@ -546,6 +659,8 @@ async def _process_http_work_item(
                 provider=worker_provider,
                 model=worker_model,
                 tenant_id=tenant_id,
+                resume_turns=resume_turns,
+                resume_turns_refused=resume_turns_refused,
             ):
                 event_count += 1
                 if event.get("type") == "answer":

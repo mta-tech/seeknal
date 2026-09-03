@@ -310,6 +310,8 @@ async def _run_agent_streaming(
     include_web: bool = False,
     lock_backend: Any = None,
     broadcaster: Any = None,
+    resume_turns: list | None = None,
+    resume_turns_refused: bool = False,
 ):
     """Run agent and yield JSON event dicts as they occur.
 
@@ -319,6 +321,13 @@ async def _run_agent_streaming(
 
     A per-(tenant, session) ``asyncio.Lock`` serializes concurrent runs
     to prevent message history corruption.
+
+    ``resume_turns``/``resume_turns_refused`` come from
+    ``cli.gateway._resolve_worker_resume_turns`` (P2-1) — see
+    ``_run_agent_inner`` for what they do to ``message_history``. Callers
+    other than the HTTP worker path leave both at their defaults, which is a
+    no-op: history still comes from the session store, exactly as before
+    this parameter existed.
     """
     turn_started = time.monotonic()
     _clear_cancel(session_id, tenant_id=tenant_id)
@@ -332,6 +341,8 @@ async def _run_agent_streaming(
                 project_path, session_id, question, provider, model,
                 tenant_id=tenant_id, auto_approve=auto_approve,
                 include_web=include_web,
+                resume_turns=resume_turns,
+                resume_turns_refused=resume_turns_refused,
             ):
                 if _is_cancelled(session_id, tenant_id=tenant_id):
                     cancel_event = {
@@ -388,8 +399,42 @@ async def _run_agent_inner(
     tenant_id: str = DEFAULT_TENANT,
     auto_approve: bool = False,
     include_web: bool = False,
+    resume_turns: list | None = None,
+    resume_turns_refused: bool = False,
 ):
-    """Inner agent execution without locking or SSE publishing."""
+    """Inner agent execution without locking or SSE publishing.
+
+    ``resume_turns`` / ``resume_turns_refused`` implement P2-1 (security
+    review 2026-09-01, Part 2 §2.7): IBA's HMAC-verified trajectory now
+    actually seeds this run's history, rather than being forwarded on the
+    claim and dropped.
+
+    The resume-vs-stored-history rule, decided here because this is the one
+    place both sources meet:
+
+    - ``resume_turns`` present and valid (``resume_turns_refused`` is
+      False and ``resume_turns`` is truthy) -- these turns REPLACE
+      ``message_history`` loaded from the session store, they are not
+      appended to it. IBA's verified trajectory and this worker's
+      session-store file are two representations of the SAME prior
+      conversation, not independent halves of it; appending would hand the
+      model the exchange twice. The verified trajectory also wins because it
+      is the stronger source of truth for "what did this conversation
+      actually contain" -- ``session_id`` alone is a caller-chosen string
+      (see the C-1 finding on ``sessions.py`` in the same review) with no
+      cryptographic tie to the conversation it names, while ``resume_turns``
+      is checked by IBA against a seal before this worker ever sees it.
+    - ``resume_turns_refused`` is True (present but malformed) -- this run
+      gets NO history at all, not a fall back to the session store. A broker
+      that sent a malformed trust-boundary field is not one whose
+      ``session_id`` should be trusted to address the right history either;
+      falling back would silently substitute a different, unverified source
+      for the one that just failed validation.
+    - Neither (``resume_turns`` is ``None`` and not refused) -- unchanged:
+      ``message_history`` comes from the session store, exactly as before
+      this parameter existed. This is the common case and every existing
+      caller of ``_run_agent_streaming``/``_run_agent_inner`` hits it.
+    """
     from pydantic_ai import Agent
     from pydantic_ai._agent_graph import End, UserPromptNode
     from pydantic_ai.messages import (
@@ -412,6 +457,10 @@ async def _run_agent_inner(
         store.create(name=session_id)
 
     message_history = store.load_messages(session_id)
+    if resume_turns_refused:
+        message_history = []
+    elif resume_turns:
+        message_history = _resume_turns_to_message_history(resume_turns)
 
     agent, deps, _, _ = create_agent(
         project_path, provider=provider, model=model,
@@ -1253,6 +1302,41 @@ async def session_history(request: Request) -> JSONResponse:
 
     events = _messages_to_events(messages)
     return JSONResponse(events)
+
+
+def _resume_turns_to_message_history(resume_turns: list) -> list:
+    """Convert a validated IBA ``resume_turns`` claim into pydantic-ai history.
+
+    ``resume_turns`` is already validated by
+    ``cli.gateway._resolve_worker_resume_turns`` by the time it reaches here:
+    every entry is a dict with a string ``role`` in
+    ``{"user", "assistant", "system"}`` and a string ``content``. This
+    function only has to decide what each role becomes as a message.
+
+    Only ``user`` and ``assistant`` turns become messages, mirroring the
+    ``ModelRequest``/``ModelResponse`` shapes ``_messages_to_events`` above
+    already reads. ``system`` turns are DROPPED, never appended after the
+    worker's own prompt: ``create_agent`` passes this worker's prompt as
+    ``instructions=`` (``agents/agent.py``), which pydantic-ai keeps entirely
+    OUTSIDE ``message_history`` and regenerates fresh on every model request.
+    There is therefore no position inside ``message_history`` where a
+    broker-supplied ``system`` turn could out-rank the real instructions —
+    but folding one in as a message would still risk a model reading it as an
+    instruction layered *after* the real ones, for no benefit. Dropping it is
+    simpler than appending it somewhere, and provably cannot lead the prompt.
+    """
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+
+    history: list = []
+    for turn in resume_turns:
+        role = turn.get("role")
+        content = turn.get("content")
+        if role == "user":
+            history.append(ModelRequest(parts=[UserPromptPart(content=content)]))
+        elif role == "assistant":
+            history.append(ModelResponse(parts=[TextPart(content=content)]))
+        # role == "system" is intentionally skipped; see the docstring above.
+    return history
 
 
 def _messages_to_events(messages: list) -> list[dict]:
