@@ -2210,7 +2210,8 @@ def _run_yaml_pipeline(
     contract_only = {
         node_id
         for node_id in nodes_to_run
-        if dag_builder.nodes[node_id].kind in CONTRACT_ONLY_NODE_TYPES
+        if node_id in dag_builder.nodes
+        and dag_builder.nodes[node_id].kind in CONTRACT_ONLY_NODE_TYPES
     }
     for node_id in sorted(contract_only):
         _echo_info(
