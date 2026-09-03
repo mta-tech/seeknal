@@ -29,7 +29,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-__all__ = ["UnsafePathSegment", "contained_child"]
+__all__ = ["UnsafePathSegment", "contained_child", "contained_path"]
 
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
@@ -71,7 +71,27 @@ def contained_child(base: Path, segment: str, *, label: str) -> Path:
     # demand one. Existing components, including symlinks, are still followed,
     # which is exactly the case the allowlist above cannot see.
     root = base.resolve()
-    candidate = (root / segment).resolve()
-    if candidate != root and root not in candidate.parents:
+    return contained_path(root, root / segment, label=label)
+
+
+def contained_path(base: Path, candidate: Path, *, label: str) -> Path:
+    """Resolve ``candidate`` and PROVE it is inside ``base``.
+
+    This is the containment half of :func:`contained_child`, split out for a
+    caller that already holds a full path rather than a bare segment to join
+    (for example, a path supplied wholesale by a remote caller). It carries
+    none of the character-allowlist checks — those only make sense for a
+    single path component — so a caller with an untrusted *whole path* still
+    needs its own upfront shape checks (absolute, exists, etc.) before this
+    is a complete guarantee; this function only proves the result did not
+    escape ``base``, resolving both sides and comparing PATH OBJECTS so that
+    a symlink inside ``base`` pointing outside it is still caught.
+
+    Raises:
+        UnsafePathSegment: if the resolved candidate is outside ``base``.
+    """
+    root = base.resolve()
+    resolved = candidate.resolve()
+    if resolved != root and root not in resolved.parents:
         raise UnsafePathSegment(f"{label} resolves outside its base directory")
-    return candidate
+    return resolved

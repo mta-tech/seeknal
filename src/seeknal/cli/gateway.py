@@ -13,6 +13,7 @@ from typing import Optional
 import typer
 
 from seeknal.ask.project import find_project_path
+from seeknal.ask.safe_paths import UnsafePathSegment, contained_path
 
 gateway_app = typer.Typer(
     name="gateway",
@@ -540,6 +541,7 @@ async def _run_http_only_worker(
     poll_timeout: float = 30.0,
     max_concurrency: int = 1,
     shutdown_timeout: float = 60.0,
+    min_poll_interval: float = 1.0,
 ) -> None:
     """Run a worker that talks only HTTP(S) to the gateway/kc-service.
 
@@ -553,6 +555,17 @@ async def _run_http_only_worker(
     so the worker shuts down cleanly under K8s / systemd / docker stop —
     the default ``asyncio.run`` SIGINT handling can fail to cancel the main
     task reliably when child agent tasks are in flight.
+
+    ``min_poll_interval`` is a floor on how often this worker re-polls after
+    an instant ``204``. The wire contract (ADR-0014) is a long-poll — the
+    gateway should hold the request open for up to ``timeout`` seconds before
+    answering ``204`` — but this worker cannot assume every gateway it talks
+    to honours that. A gateway that answers ``204`` immediately would
+    otherwise drive this loop as fast as it can dial, as happened for three
+    days against a gateway that ignored ``timeout`` entirely. Measuring
+    elapsed wall time around the poll (rather than sleeping unconditionally)
+    means a gateway that *does* long-poll for close to ``min_poll_interval``
+    adds no extra delay.
     """
     import asyncio
     import signal
@@ -600,6 +613,7 @@ async def _run_http_only_worker(
                 await semaphore.acquire()
                 claimed = False
                 try:
+                    poll_started = loop.time()
                     try:
                         response = await client.get(
                             f"{base_url}/internal/worker/work-stream",
@@ -615,6 +629,16 @@ async def _run_http_only_worker(
                         await asyncio.sleep(5)
                         continue
                     if response.status_code == 204:
+                        # Back-off floor: a gateway that answers 204 instantly
+                        # (rather than long-polling for ~poll_timeout seconds)
+                        # must not drive this loop into a busy spin. Elapsed
+                        # wall time is measured, not assumed, so a gateway
+                        # that already held the request near min_poll_interval
+                        # adds no extra sleep.
+                        elapsed = loop.time() - poll_started
+                        remaining = min_poll_interval - elapsed
+                        if remaining > 0:
+                            await asyncio.sleep(remaining)
                         continue
                     response.raise_for_status()
                     work = response.json()
@@ -636,6 +660,51 @@ async def _run_http_only_worker(
             typer.echo("\nStopping HTTP worker...")
         finally:
             await _drain_or_cancel_tasks(live_tasks, shutdown_timeout)
+
+
+class BrokerProjectPathRefused(RuntimeError):
+    """A broker-supplied ``project_path`` failed the operator's containment rule."""
+
+
+def _resolve_broker_project_path(
+    raw_project_path: object, *, project_root: Optional[Path]
+) -> Path:
+    """Validate a broker-supplied ``project_path`` against the operator's root.
+
+    Reached only when ``--project`` was omitted, so it is the gateway's own
+    ``/internal/worker/config`` response naming the directory this worker is
+    about to operate on (P2-4 in the IBA v2 security review, 2026-09-01,
+    Part 2 §2.4). That is the same trust boundary C-1 closed for session and
+    tenant ids in ``safe_paths.py`` — the broker does not get to choose a
+    worker filesystem root the operator never authorised.
+
+    Raises:
+        BrokerProjectPathRefused: with an operator-facing message, if there
+            is no configured root, the path is not absolute, it does not
+            exist as a directory, or it resolves outside ``project_root``
+            (symlinks followed, compared as resolved path objects — see
+            ``safe_paths.contained_path`` — never by string prefix).
+    """
+    if project_root is None:
+        raise BrokerProjectPathRefused(
+            "the gateway supplied a project_path but SEEKNAL_PROJECT_ROOT is "
+            "not set. Set --project-root / SEEKNAL_PROJECT_ROOT to the "
+            "directory under which broker-chosen projects may live, or pass "
+            "--project explicitly so the broker's value is ignored."
+        )
+    candidate = Path(str(raw_project_path))
+    if not candidate.is_absolute():
+        raise BrokerProjectPathRefused(
+            f"broker-supplied project_path {str(candidate)!r} is not an absolute path"
+        )
+    if not candidate.is_dir():
+        raise BrokerProjectPathRefused(
+            f"broker-supplied project_path {str(candidate)!r} does not exist as a directory"
+        )
+    try:
+        return contained_path(project_root, candidate, label="broker-supplied project_path")
+    except UnsafePathSegment as exc:
+        raise BrokerProjectPathRefused(str(exc)) from exc
 
 
 @gateway_app.command("worker")
@@ -667,6 +736,12 @@ def gateway_worker(
         None, "--api-token", envvar="SEEKNAL_API_TOKEN",
         help="Worker API token used to fetch tenant queue/callback config from the gateway"
     ),
+    project_root: Optional[Path] = typer.Option(
+        None, "--project-root", envvar="SEEKNAL_PROJECT_ROOT",
+        help="Operator-configured root directory a broker-supplied project_path must be "
+             "contained within (Temporal transport, --project omitted only). Required for "
+             "the worker to accept a project_path from the gateway's /internal/worker/config."
+    ),
     transport: str = typer.Option(
         "auto", "--transport", envvar="SEEKNAL_WORKER_TRANSPORT",
         help="Worker transport: auto, temporal, or http. http uses no Temporal SDK connection."
@@ -678,6 +753,11 @@ def gateway_worker(
     shutdown_timeout: float = typer.Option(
         60.0, "--shutdown-timeout", envvar="SEEKNAL_WORKER_SHUTDOWN_TIMEOUT",
         help="Seconds to wait for in-flight tasks to drain on shutdown before cancelling (HTTP transport only)."
+    ),
+    min_poll_interval: float = typer.Option(
+        1.0, "--min-poll-interval", envvar="SEEKNAL_WORKER_MIN_POLL_INTERVAL",
+        help="Minimum seconds between poll requests when the gateway answers 204 instantly "
+             "instead of long-polling (HTTP transport only)."
     ),
 ):
     """Start a standalone worker.
@@ -707,6 +787,7 @@ def gateway_worker(
                 api_token=api_token,
                 max_concurrency=max_concurrency,
                 shutdown_timeout=shutdown_timeout,
+                min_poll_interval=min_poll_interval,
             ))
         except KeyboardInterrupt:
             typer.echo("\nHTTP worker stopped.")
@@ -755,6 +836,7 @@ def gateway_worker(
                     api_token=api_token,
                     max_concurrency=max_concurrency,
                     shutdown_timeout=shutdown_timeout,
+                    min_poll_interval=min_poll_interval,
                 ))
                 return
         except Exception as exc:
@@ -770,7 +852,13 @@ def gateway_worker(
         callback_url = runtime_config.get("callback_url") or callback_url
         callback_auth_token = runtime_config.get("callback_auth_token") or callback_auth_token
         if project is None and runtime_config.get("project_path"):
-            project_path = Path(runtime_config["project_path"])
+            try:
+                project_path = _resolve_broker_project_path(
+                    runtime_config["project_path"], project_root=project_root
+                )
+            except BrokerProjectPathRefused as exc:
+                typer.echo(typer.style(f"Refusing broker-supplied project_path: {exc}", fg=typer.colors.RED))
+                raise typer.Exit(1)
         tenant = runtime_config.get("tenant_id") or tenant
 
     try:
