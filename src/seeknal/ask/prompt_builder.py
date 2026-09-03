@@ -284,7 +284,7 @@ For complex analysis / modeling:
 1. Use SQL to extract the smallest useful dataset
 2. Then `load_skill('complex-analysis')` or `load_skill('execute-python-analysis')`
    before `execute_python`
-3. Use the sandbox's pre-loaded `conn`; do not create a new DuckDB connection
+3. Use the subprocess's pre-loaded `conn`; do not create a new DuckDB connection
 4. Keep conclusions tied to the SQL/Python evidence
 
 For semantic metrics: query with `execute_sql` or `query-metric`, interpret

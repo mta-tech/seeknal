@@ -403,6 +403,92 @@ def gateway_backend(
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
+def _parse_worker_allowed_models(raw: str) -> set[tuple[str, str]]:
+    """Parse ``SEEKNAL_WORKER_ALLOWED_MODELS`` into ``(provider, model)`` pairs.
+
+    Format: comma-separated ``provider:model`` entries, e.g.
+    ``"openai:gpt-4o,anthropic:claude-sonnet-4-6"``. Blank or malformed
+    entries are skipped rather than raising — an operator typo in an env var
+    must not crash the worker process.
+    """
+    allowed: set[tuple[str, str]] = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        provider, _, model = entry.partition(":")
+        provider = provider.strip()
+        model = model.strip()
+        if provider and model:
+            allowed.add((provider, model))
+    return allowed
+
+
+def _resolve_worker_model_choice(
+    work_provider: object, work_model: object
+) -> tuple[Optional[str], Optional[str]]:
+    """Refuse a broker-chosen provider/model that is not the operator's own.
+
+    P2-3 (security review 2026-09-01, Part 2 §2.4): ``_process_http_work_item``
+    used to pass ``work.get("provider")``/``work.get("model")`` straight into
+    ``create_agent`` → ``get_model_string``. A compromised or malicious broker
+    could use that to route the customer's prompt to a different configured
+    provider than the operator chose. IBA's gateway does not send these
+    fields today and has decided it never will — the premises node owns
+    model selection — so a value the broker sends that is not already the
+    operator's own configuration is refused rather than trusted.
+
+    A value is honoured only if it equals the operator's configured
+    provider/model (``SEEKNAL_ASK_LLM_PROVIDER`` / ``SEEKNAL_ASK_MODEL``, the
+    same resolution ``get_model_string`` would apply with no override) or
+    appears in ``SEEKNAL_WORKER_ALLOWED_MODELS`` (comma-separated
+    ``provider:model`` entries; unset means only the configured pair is
+    accepted). Missing entirely (today's IBA gateway) is treated the same as
+    "matches configuration" — the pair is simply not present to disagree with.
+
+    A refusal is deliberately **not fatal to the work item** — the IBA
+    gateway never sends these fields, so a stricter failure would break
+    nothing today, but would turn a future accidental/misconfigured key into
+    a hard outage for every run. Instead the run proceeds with the
+    operator's configuration, which is exactly what happens when the broker
+    sends nothing at all.
+
+    Returns the ``(provider, model)`` pair to actually use — either the
+    broker's values (honoured) or ``(None, None)`` (refused or absent), which
+    makes ``get_model_string`` resolve the operator's configured
+    provider/model from the environment.
+    """
+    provider = str(work_provider) if work_provider else None
+    model = str(work_model) if work_model else None
+    if provider is None and model is None:
+        return None, None
+
+    from seeknal.ask.agents.providers import resolve_provider_config
+
+    configured = resolve_provider_config(provider=None, model=None)
+    configured_provider = configured["provider"]
+    configured_model = configured["model"]
+
+    effective_provider = provider or configured_provider
+    effective_model = model or configured_model
+    if (effective_provider, effective_model) == (configured_provider, configured_model):
+        return provider, model
+
+    allowed = _parse_worker_allowed_models(
+        os.environ.get("SEEKNAL_WORKER_ALLOWED_MODELS", "")
+    )
+    if (effective_provider, effective_model) in allowed:
+        return provider, model
+
+    typer.echo(typer.style(
+        f"[worker] refusing broker-supplied provider={provider!r} model={model!r}: "
+        f"not the configured {configured_provider}:{configured_model} and not in "
+        "SEEKNAL_WORKER_ALLOWED_MODELS -- proceeding with operator configuration",
+        fg=typer.colors.YELLOW,
+    ))
+    return None, None
+
+
 async def _process_http_work_item(
     work: dict,
     *,
@@ -433,6 +519,9 @@ async def _process_http_work_item(
     tenant_id = work.get("tenant_id") or DEFAULT_TENANT
     question = work["question"]
     short_id = work_id[:8]
+    worker_provider, worker_model = _resolve_worker_model_choice(
+        work.get("provider"), work.get("model")
+    )
 
     typer.echo(f"[work={short_id} session={session_id}] start")
 
@@ -454,8 +543,8 @@ async def _process_http_work_item(
                 project_path,
                 session_id,
                 question,
-                provider=work.get("provider"),
-                model=work.get("model"),
+                provider=worker_provider,
+                model=worker_model,
                 tenant_id=tenant_id,
             ):
                 event_count += 1

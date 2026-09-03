@@ -131,15 +131,28 @@ _INTEL_KNOWLEDGE_TOOLS = [
     intel_knowledge_read,
 ]
 
-_FULL_ONLY_TOOLS = [
-    execute_uv_script,
-    generate_report,
+# Tools whose effect leaves the node: they publish to a hosted third-party
+# service (Proof Editor at memokami.exe.xyz / proofeditor.ai, or a configured
+# Seeknal Report Server) or open a local GUI browser, which is meaningless on
+# a headless premises worker and not something a customer's data should ever
+# drive. Stripped from the toolset in the gateway environment regardless of
+# project mode -- see ``strip_gateway_egress_tools`` on ``create_ask_toolset``.
+# ``execute_uv_script`` is deliberately NOT here: it only runs ``uv run`` as a
+# local subprocess against project-local parquet files and makes no network
+# call, so it stays on the node like ``execute_python``.
+_GATEWAY_EGRESS_TOOLS = [
     open_in_browser,
-    save_report_exposure,
     publish_to_proof,
     publish_to_seeknal_report,
     read_proof_document,
     edit_proof_document,
+]
+
+_FULL_ONLY_TOOLS = [
+    execute_uv_script,
+    generate_report,
+    *_GATEWAY_EGRESS_TOOLS,
+    save_report_exposure,
     draft_node,
     dry_run_draft,
     apply_draft,
@@ -194,6 +207,7 @@ def create_ask_toolset(
     include_upload_to_s3: bool = False,
     include_intel_knowledge: bool = False,
     action_delivery: bool = False,
+    strip_gateway_egress_tools: bool = False,
 ) -> FunctionToolset:
     """Create the seeknal-ask toolset.
 
@@ -222,6 +236,14 @@ def create_ask_toolset(
             so remote channels cannot consume a laptop-local grant.
         action_delivery: Replace the regular blocking ``ask_user`` function
             tool with the typed output action owned by the IBA worker path.
+        strip_gateway_egress_tools: Remove ``_GATEWAY_EGRESS_TOOLS`` (hosted
+            Proof Editor publish/read/edit, the Seeknal Report Server
+            publish, and opening a local browser) from the toolset no matter
+            what ``mode`` resolves to. ``create_agent`` sets this for
+            ``environment == "gateway"`` — a project without an explicit
+            source registry resolves to ``"full"`` mode, and on a premises
+            worker that surface must not include tools whose effect is to
+            send project data to a third-party host or pop a GUI browser.
     """
     if mode == "analysis":
         # Keep the connected-source/read-only surface deliberately thin:
@@ -274,6 +296,9 @@ def create_ask_toolset(
 
     if action_delivery and mode == "full":
         tools.extend(_ACTION_DELIVERY_TOOLS)
+
+    if strip_gateway_egress_tools:
+        tools = [tool for tool in tools if tool not in _GATEWAY_EGRESS_TOOLS]
 
     return FunctionToolset(
         tools=tools,

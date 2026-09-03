@@ -596,3 +596,180 @@ def test_gateway_worker_ignores_broker_project_path_when_project_flag_given(tmp_
     assert result.exit_code == 0, result.output
     assert "Refusing broker-supplied project_path" not in result.output
     assert f"Project: {project_dir}" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Broker-supplied provider/model steering (P2-3)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_worker_allowed_models_parses_and_skips_malformed_entries():
+    parsed = gateway_module._parse_worker_allowed_models(
+        "openai:gpt-4o, anthropic:claude-sonnet-4-6,bad,ignored:,:blank,  ,"
+        "google:gemini-2.5-pro"
+    )
+
+    assert parsed == {
+        ("openai", "gpt-4o"),
+        ("anthropic", "claude-sonnet-4-6"),
+        ("google", "gemini-2.5-pro"),
+    }
+
+
+def test_parse_worker_allowed_models_empty_string_is_empty_set():
+    assert gateway_module._parse_worker_allowed_models("") == set()
+
+
+def test_resolve_worker_model_choice_passes_through_when_broker_sends_nothing():
+    assert gateway_module._resolve_worker_model_choice(None, None) == (None, None)
+
+
+def test_resolve_worker_model_choice_honours_pair_equal_to_configuration(monkeypatch):
+    monkeypatch.delenv("SEEKNAL_WORKER_ALLOWED_MODELS", raising=False)
+    from seeknal.ask.agents.providers import resolve_provider_config
+
+    configured = resolve_provider_config(provider=None, model=None)
+
+    provider, model = gateway_module._resolve_worker_model_choice(
+        configured["provider"], configured["model"]
+    )
+
+    assert (provider, model) == (configured["provider"], configured["model"])
+
+
+def test_resolve_worker_model_choice_refuses_mismatched_pair_with_no_allowlist(monkeypatch):
+    monkeypatch.delenv("SEEKNAL_WORKER_ALLOWED_MODELS", raising=False)
+    from seeknal.ask.agents.providers import resolve_provider_config
+
+    configured = resolve_provider_config(provider=None, model=None)
+    assert (configured["provider"], configured["model"]) != ("openai", "x")
+
+    provider, model = gateway_module._resolve_worker_model_choice("openai", "x")
+
+    assert (provider, model) == (None, None)
+
+
+def test_resolve_worker_model_choice_honours_explicit_allowlist(monkeypatch):
+    monkeypatch.setenv("SEEKNAL_WORKER_ALLOWED_MODELS", "openai:gpt-4o")
+
+    provider, model = gateway_module._resolve_worker_model_choice("openai", "gpt-4o")
+
+    assert (provider, model) == ("openai", "gpt-4o")
+
+
+def test_resolve_worker_model_choice_refuses_pair_not_covered_by_allowlist(monkeypatch):
+    monkeypatch.setenv("SEEKNAL_WORKER_ALLOWED_MODELS", "openai:gpt-4o")
+
+    provider, model = gateway_module._resolve_worker_model_choice(
+        "openai", "a-different-model"
+    )
+
+    assert (provider, model) == (None, None)
+
+
+def test_resolve_worker_model_choice_logs_names_once_and_never_the_prompt(
+    monkeypatch, capsys
+):
+    monkeypatch.delenv("SEEKNAL_WORKER_ALLOWED_MODELS", raising=False)
+
+    gateway_module._resolve_worker_model_choice("openai", "x")
+
+    out = capsys.readouterr().out
+    assert out.count("refusing broker-supplied") == 1
+    assert "openai" in out
+    assert "'x'" in out
+
+
+class _PostOnlyClient:
+    """Fake httpx.AsyncClient exposing only the `.post()` `_process_http_work_item` uses."""
+
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict]] = []
+
+    async def post(self, url: str, *, json: dict, **_kwargs):
+        self.posts.append((url, json))
+        return _make_fake_response(status_code=200, payload={})
+
+
+async def _run_work_item_and_capture_streaming_kwargs(work: dict) -> dict:
+    """Drive the real `_process_http_work_item` end to end.
+
+    Only `_run_agent_streaming` is mocked (to record what it actually
+    received), matching the review's request to pin the call boundary
+    rather than mock the decision function (`_resolve_worker_model_choice`)
+    itself.
+    """
+    received: dict = {}
+
+    async def fake_streaming(_project, _session, _question, **kwargs):
+        received.update(kwargs)
+        yield {"type": "answer", "data": "ok"}
+
+    client = _PostOnlyClient()
+    with patch("seeknal.ask.gateway.server._run_agent_streaming", fake_streaming):
+        await gateway_module._process_http_work_item(
+            work,
+            client=client,
+            base_url="http://example.invalid",
+            headers={},
+            project_path=Path("/tmp/does-not-matter"),
+            semaphore=asyncio.Semaphore(1),
+        )
+    return received
+
+
+@pytest.mark.asyncio
+async def test_process_http_work_item_ignores_mismatched_broker_provider_and_model(
+    monkeypatch,
+):
+    """The scenario the review specified: an openai/x work item against a
+    Gemini-configured node must reach `create_agent`/`get_model_string` with
+    the operator's configured provider/model, not the broker's.
+    """
+    monkeypatch.delenv("SEEKNAL_WORKER_ALLOWED_MODELS", raising=False)
+    from seeknal.ask.agents.providers import resolve_provider_config
+
+    configured = resolve_provider_config(provider=None, model=None)
+    assert (configured["provider"], configured["model"]) != ("openai", "x")
+
+    received = await _run_work_item_and_capture_streaming_kwargs({
+        "work_id": "w-deadbeef",
+        "session_id": "s1",
+        "question": "q1",
+        "provider": "openai",
+        "model": "x",
+    })
+
+    assert received["provider"] is None
+    assert received["model"] is None
+
+
+@pytest.mark.asyncio
+async def test_process_http_work_item_honours_allowlisted_broker_provider_and_model(
+    monkeypatch,
+):
+    monkeypatch.setenv("SEEKNAL_WORKER_ALLOWED_MODELS", "openai:gpt-4o")
+
+    received = await _run_work_item_and_capture_streaming_kwargs({
+        "work_id": "w-deadbeef",
+        "session_id": "s1",
+        "question": "q1",
+        "provider": "openai",
+        "model": "gpt-4o",
+    })
+
+    assert received["provider"] == "openai"
+    assert received["model"] == "gpt-4o"
+
+
+@pytest.mark.asyncio
+async def test_process_http_work_item_passes_none_when_broker_sends_nothing():
+    """Today's IBA gateway sends no provider/model at all -- unchanged behavior."""
+    received = await _run_work_item_and_capture_streaming_kwargs({
+        "work_id": "w-deadbeef",
+        "session_id": "s1",
+        "question": "q1",
+    })
+
+    assert received["provider"] is None
+    assert received["model"] is None

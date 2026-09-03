@@ -509,6 +509,7 @@ evidence-backed finding that cites every Intel document used.
             include_intel_knowledge=(
                 environment in {"interactive", "intel_work"}
             ),
+            strip_gateway_egress_tools=(environment == "gateway"),
             **_ask_toolset_kwargs,
         ),
     ]

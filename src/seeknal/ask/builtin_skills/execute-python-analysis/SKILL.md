@@ -1,7 +1,7 @@
 ---
 name: execute-python-analysis
-description: "Run Python code in an isolated subprocess for statistical/ML/visualization work beyond what SQL can express"
-tags: [analysis, python, sandbox, pandas, matplotlib]
+description: "Run Python code in a separate subprocess for statistical/ML/visualization work beyond what SQL can express"
+tags: [analysis, python, subprocess, pandas, matplotlib]
 version: "1.0.0"
 ---
 
@@ -14,7 +14,7 @@ prefer `execute_sql` instead.
 
 ## Tool you will call
 
-- `execute_python` — runs code in an isolated subprocess sandbox
+- `execute_python` — runs code in a separate subprocess with the worker's privileges
 
 ## When to use
 
@@ -34,14 +34,15 @@ DO NOT use `execute_python` for:
 - Metric queries with time grains → use `query_metric`
 - File I/O (reading data) → use `conn.sql('SELECT * FROM ...')` inside the code
 
-## Phase 1 — Understand the sandbox
+## Phase 1 — Understand the subprocess
 
-Each `execute_python` call runs in a FRESH isolated subprocess. This has
-implications you MUST account for:
+Each `execute_python` call runs in a FRESH subprocess with the worker's own
+privileges (a correctness boundary, not a security one — see the tool
+docstring). This has implications you MUST account for:
 
 ### The `conn` object is ALREADY connected to your project
 
-**CRITICAL — do NOT create your own DuckDB connection.** The sandbox
+**CRITICAL — do NOT create your own DuckDB connection.** The subprocess
 pre-loads a `conn` object (a `SafeConnection` wrapper around the real
 project DuckDB) with EVERY project table/view already registered. It is
 ready to use on the first line.
@@ -49,7 +50,7 @@ ready to use on the first line.
 ❌ **WRONG** — creates a new empty DB, loses all project data:
 ```python
 import duckdb
-conn = duckdb.connect(':memory:')        # shadows the sandbox conn
+conn = duckdb.connect(':memory:')        # shadows the pre-loaded conn
 df = conn.execute("SELECT * FROM transform_daily_revenue").df()
 # → CatalogException: Table with name transform_daily_revenue does not exist!
 ```
@@ -66,14 +67,14 @@ The pre-loaded `conn` has:
   `feature_group_customer_features`, etc.)
 - All project intermediate parquets from `target/intermediate/` mounted
 
-Do NOT `import duckdb` — the sandbox does not expect you to instantiate one.
+Do NOT `import duckdb` — the subprocess does not expect you to instantiate one.
 If you're unsure what tables exist, run `SHOW TABLES`:
 ```python
 tables = conn.sql("SHOW TABLES").df()
 print(tables)
 ```
 
-### Other sandbox properties
+### Other subprocess properties
 
 1. **No persistence between calls.** Variables from a previous call do NOT
    exist in the next call. Re-query data at the start of every call:
@@ -156,7 +157,7 @@ plt.hist(df['age'], bins=20)
 plt.title('Age Distribution')
 ```
 
-Do NOT call `plt.show()` — the sandbox captures all open figures to temp
+Do NOT call `plt.show()` — the subprocess captures all open figures to temp
 PNG files and lists their paths in the return value. The agent can reference
 these paths when building reports.
 

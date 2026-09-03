@@ -1,4 +1,4 @@
-"""Subprocess sandbox for executing Python code in isolation.
+"""Runs Python code in a separate subprocess.
 
 Generates a runner script that:
 1. Opens a fresh DuckDB connection
@@ -6,8 +6,11 @@ Generates a runner script that:
 3. Executes agent-generated code with AST last-expression capture
 4. Returns results as JSON on stdout
 
-Uses sys.executable for subprocess isolation — packages come from the
-current venv, so no dependency download is needed at runtime.
+Uses sys.executable, so packages come from the current venv and no
+dependency download is needed at runtime. The separate process gives each
+call a fresh, isolated Python/DuckDB state — a correctness property, not a
+security one: this is a plain subprocess with the worker's own privileges,
+with no seccomp/chroot/namespace confinement or import allowlist.
 """
 
 import json
@@ -274,11 +277,13 @@ def execute_in_sandbox(
     project_path: Path,
     timeout: int = 30,
 ) -> str:
-    """Execute Python code in an isolated subprocess.
+    """Execute Python code in a separate subprocess.
 
-    Uses sys.executable to run a generated script in a separate process,
-    providing process isolation with killable timeout. Packages come from
-    the current venv — no dependency download needed.
+    Uses sys.executable to run a generated script in a separate process with
+    a killable timeout. Packages come from the current venv — no dependency
+    download needed. This gives the run a fresh process and DuckDB
+    connection (a correctness property); it is not a security boundary —
+    the subprocess has the caller's own privileges.
 
     Args:
         code: Python code to execute.
@@ -317,7 +322,7 @@ def execute_in_sandbox(
     )
     runner_path.write_text(script_content, encoding="utf-8")
 
-    # Execute in isolated subprocess
+    # Run in a separate subprocess
     try:
         result = subprocess.run(
             [sys.executable, str(runner_path)],

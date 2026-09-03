@@ -14,6 +14,17 @@ def _tool_names(toolset) -> set[str]:
     return set(toolset.tools.keys())
 
 
+# P2-2: hosted-SaaS-publish / GUI-browser tools that must never be in the
+# gateway (premises worker) toolset, whatever project mode resolves to.
+_GATEWAY_EGRESS_TOOL_NAMES = {
+    "open_in_browser",
+    "publish_to_proof",
+    "publish_to_seeknal_report",
+    "read_proof_document",
+    "edit_proof_document",
+}
+
+
 class _SourceContextRepl:
     attached = {"wh"}
 
@@ -395,3 +406,93 @@ def test_create_agent_intel_work_is_prompt_free_and_intel_only(tmp_path: Path):
     assert agent_kwargs["context_files"] == []
     assert agent_kwargs["context_manager"] is False
     assert "Never ask a question" in agent_kwargs["instructions"]
+
+
+def test_strip_gateway_egress_tools_removes_publish_and_browser_tools_from_full_mode():
+    names = _tool_names(
+        create_ask_toolset(mode="full", strip_gateway_egress_tools=True)
+    )
+
+    assert not (names & _GATEWAY_EGRESS_TOOL_NAMES)
+    # execute_uv_script is a local-only `uv run` subprocess against
+    # project-local parquet -- no network call -- so it is NOT egress and
+    # must stay, same as execute_python.
+    assert "execute_uv_script" in names
+    assert "execute_python" in names
+    # Unrelated full-mode tools are untouched by the strip.
+    assert "run_pipeline" in names
+    assert "generate_report" in names
+
+
+def test_full_mode_without_strip_flag_keeps_egress_tools():
+    names = _tool_names(create_ask_toolset(mode="full"))
+
+    assert _GATEWAY_EGRESS_TOOL_NAMES <= names
+
+
+def test_strip_gateway_egress_tools_is_a_noop_outside_full_mode():
+    # analysis/intel_work never included these tools in the first place --
+    # the flag must not raise or change their (already narrow) surface.
+    analysis_names = _tool_names(
+        create_ask_toolset(mode="analysis", strip_gateway_egress_tools=True)
+    )
+    assert not (analysis_names & _GATEWAY_EGRESS_TOOL_NAMES)
+
+    intel_names = _tool_names(
+        create_ask_toolset(mode="intel_work", strip_gateway_egress_tools=True)
+    )
+    assert not (intel_names & _GATEWAY_EGRESS_TOOL_NAMES)
+
+
+def _ask_toolset_from_created_agent(tmp_path: Path, environment: str):
+    """Build a real (unmocked) ask FunctionToolset via create_agent().
+
+    Only the heavy/unrelated seams (REPL, artifact discovery, the model
+    string, the context toolset, and the pydantic-deep agent constructor)
+    are mocked -- create_ask_toolset runs for real so the resulting tool
+    surface reflects the actual environment-based wiring in agent.py.
+    """
+    from unittest.mock import MagicMock, patch
+
+    with (
+        patch("seeknal.cli.repl.REPL") as mock_repl_cls,
+        patch("seeknal.ask.security.configure_safe_connection"),
+        patch("seeknal.ask.modules.artifact_discovery.service.ArtifactDiscovery"),
+        patch(
+            "seeknal.ask.agents.providers.get_model_string", return_value="test:model"
+        ),
+        patch("seeknal.ask.agents.context_toolset.SeeknaContextToolset"),
+        patch("pydantic_deep.create_deep_agent") as mock_create,
+        patch("pydantic_deep.DeepAgentDeps"),
+    ):
+        mock_repl_cls.return_value = MagicMock(conn=MagicMock())
+        mock_create.return_value = MagicMock()
+
+        from seeknal.ask.agents.agent import create_agent
+
+        create_agent(project_path=tmp_path, environment=environment)
+        return mock_create.call_args.kwargs["toolsets"][0]
+
+
+def test_create_agent_gateway_toolset_excludes_egress_tools_for_project_with_no_source_registry(
+    tmp_path: Path,
+):
+    # No seeknal_agent.yml -- this is the "full" default get_ask_toolset_mode
+    # returns for any project without an explicit source registry (P2-2).
+    assert get_ask_toolset_mode(load_agent_config(tmp_path)) == "full"
+
+    names = _tool_names(_ask_toolset_from_created_agent(tmp_path, "gateway"))
+
+    assert not (names & _GATEWAY_EGRESS_TOOL_NAMES)
+    assert "execute_uv_script" in names
+    assert "run_pipeline" in names
+
+
+def test_create_agent_interactive_toolset_keeps_egress_tools_for_same_project(
+    tmp_path: Path,
+):
+    # Same project (no source registry, "full" mode) but the interactive
+    # environment -- the strip must be scoped to gateway, not global.
+    names = _tool_names(_ask_toolset_from_created_agent(tmp_path, "interactive"))
+
+    assert _GATEWAY_EGRESS_TOOL_NAMES <= names
