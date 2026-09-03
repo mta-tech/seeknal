@@ -70,10 +70,11 @@ def test_resolve_worker_resume_turns_valid_turns_pass_through():
         pytest.param([{"content": "q"}], id="turn-missing-role"),
         pytest.param([{"role": "root", "content": "q"}], id="turn-invalid-role"),
         pytest.param([{"role": "user"}], id="turn-missing-content"),
-        # The exact shape IBA's own build_pause_trajectory emits for an
-        # "interact" pause turn (trajectory.py: assistant content is a dict,
-        # not a string). Worker-side validation refuses it rather than
-        # guessing how to stringify an IBA-internal form structure.
+        # An interact-*shaped* dict that is NOT a well-formed interact-pause
+        # form (an empty ``form`` has no ``questions`` list) -- distinct from
+        # the real IBA shape exercised in
+        # test_resolve_worker_resume_turns_accepts_ibas_real_interact_pause_shape
+        # below, which IS accepted.
         pytest.param(
             [{"role": "assistant", "content": {"type": "interact", "form": {}}}],
             id="turn-non-string-content",
@@ -134,6 +135,199 @@ def test_resolve_worker_resume_turns_seeded_log_reports_count_and_bytes_only():
     assert "turns=1" in out
     assert "bytes=" in out
     assert "SECRET-QUESTION-TEXT" not in out
+
+
+# ---------------------------------------------------------------------------
+# The real IBA interact-pause shape (follow-up, 2026-09-04): observed on the
+# real product, every resumed pause was refused as "non-string content"
+# because build_pause_trajectory's assistant turn is a structured object,
+# not a string -- "preserving every form field without lossy
+# stringification" (iba_backend/trajectory.py:246-267, the CHOICE docstring
+# on build_pause_trajectory). The exact shape below is copied from that
+# function's contract and from iba_backend/agent_bridge.py:218-271
+# (_ask_user_form/_ask_user_question/_ask_user_option), which is what
+# actually populates ``form`` for a worker ask_user pause.
+# ---------------------------------------------------------------------------
+
+IBA_INTERACT_PAUSE_TURNS = [
+    {"role": "user", "content": "Which region should I use for this analysis?"},
+    {
+        "role": "assistant",
+        "content": {
+            "type": "interact",
+            "form": {
+                "questions": [
+                    {
+                        "text": "Which region would you like to use for this analysis?",
+                        "options": [
+                            {"label": "East", "description": "US East region"},
+                            {"label": "North", "description": "US North region"},
+                            {"label": "South", "description": "US South region"},
+                            {"label": "West", "description": "US West region"},
+                        ],
+                    }
+                ],
+                "thought": "The user did not specify a region.",
+            },
+        },
+    },
+]
+
+
+def test_resolve_worker_resume_turns_accepts_ibas_real_interact_pause_shape():
+    assert gateway_module._resolve_worker_resume_turns(IBA_INTERACT_PAUSE_TURNS) == (
+        IBA_INTERACT_PAUSE_TURNS,
+        False,
+    )
+
+
+def test_resolve_worker_resume_turns_refuses_dict_content_without_interact_type():
+    """Accepting the interact shape is one additional accepted shape, not a
+    loosened check: a dict that doesn't declare itself an interact pause is
+    still refused, even with an otherwise well-formed ``form``."""
+    turns = [{
+        "role": "assistant",
+        "content": {
+            "type": "something_else",
+            "form": {"questions": [], "thought": ""},
+        },
+    }]
+
+    assert gateway_module._resolve_worker_resume_turns(turns) == (None, True)
+
+
+def test_resolve_worker_resume_turns_refuses_interact_shape_on_non_assistant_role():
+    """The acceptance is assistant-turn-specific -- IBA never produces this
+    shape on a user or system turn, so a broker that does is refused."""
+    turns = [{
+        "role": "user",
+        "content": {
+            "type": "interact",
+            "form": {"questions": [], "thought": ""},
+        },
+    }]
+
+    assert gateway_module._resolve_worker_resume_turns(turns) == (None, True)
+
+
+def test_resolve_worker_resume_turns_refuses_oversized_interact_questions():
+    turns = [{
+        "role": "assistant",
+        "content": {
+            "type": "interact",
+            "form": {
+                "questions": [{"text": "q", "options": []}] * 11,
+                "thought": "",
+            },
+        },
+    }]
+
+    assert gateway_module._resolve_worker_resume_turns(turns) == (None, True)
+
+
+def test_resolve_worker_resume_turns_accepts_exactly_the_question_cap():
+    turns = [{
+        "role": "assistant",
+        "content": {
+            "type": "interact",
+            "form": {
+                "questions": [{"text": "q", "options": []}] * 10,
+                "thought": "",
+            },
+        },
+    }]
+
+    turns_out, refused = gateway_module._resolve_worker_resume_turns(turns)
+    assert refused is False
+    assert turns_out == turns
+
+
+def test_resolve_worker_resume_turns_refuses_oversized_interact_options():
+    turns = [{
+        "role": "assistant",
+        "content": {
+            "type": "interact",
+            "form": {
+                "questions": [{"text": "q", "options": [{"label": "x"}] * 21}],
+                "thought": "",
+            },
+        },
+    }]
+
+    assert gateway_module._resolve_worker_resume_turns(turns) == (None, True)
+
+
+def test_resolve_worker_resume_turns_accepts_exactly_the_option_cap():
+    turns = [{
+        "role": "assistant",
+        "content": {
+            "type": "interact",
+            "form": {
+                "questions": [{"text": "q", "options": [{"label": "x"}] * 20}],
+                "thought": "",
+            },
+        },
+    }]
+
+    turns_out, refused = gateway_module._resolve_worker_resume_turns(turns)
+    assert refused is False
+    assert turns_out == turns
+
+
+def test_resume_turns_to_message_history_renders_interact_pause_as_text():
+    history = _resume_turns_to_message_history(IBA_INTERACT_PAUSE_TURNS)
+
+    assert len(history) == 2
+    contents = _flatten_contents(history)
+    assert contents[0] == "Which region should I use for this analysis?"
+    rendered = contents[1]
+    assert "The user did not specify a region." in rendered
+    assert "Which region would you like to use for this analysis?" in rendered
+    assert "Options: East, North, South, West" in rendered
+
+
+def test_resume_turns_to_message_history_omits_description_and_recommended():
+    """Only labels are rendered -- the fuller option payload IBA also
+    carries (description, recommended) is not surfaced as prose."""
+    history = _resume_turns_to_message_history(IBA_INTERACT_PAUSE_TURNS)
+
+    rendered = _flatten_contents(history)[1]
+    assert "US East region" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_run_agent_inner_interact_pause_turn_seeded_ahead_of_the_answer(
+    tmp_path, monkeypatch
+):
+    """The rule from the original brief still holds for this shape: the
+    rendered interact-pause text is part of message_history, seeded ahead of
+    the new `question` -- which here is the user's ANSWER to the
+    clarification the pause turn asked."""
+    agent = _CapturingAgent()
+    _install_capturing_agent(monkeypatch, tmp_path, agent)
+
+    await _collect_events(
+        tmp_path,
+        "resume-interact-pause",
+        "East, please.",
+        resume_turns=IBA_INTERACT_PAUSE_TURNS,
+        resume_turns_refused=False,
+    )
+
+    assert len(agent.iter_calls) == 1
+    call = agent.iter_calls[0]
+    seeded_contents = _flatten_contents(call["message_history"])
+    assert seeded_contents == [
+        "Which region should I use for this analysis?",
+        (
+            "The user did not specify a region.\n"
+            "Which region would you like to use for this analysis? "
+            "Options: East, North, South, West"
+        ),
+    ]
+    # The answer is the NEW prompt, appended after this seeded history by
+    # pydantic-ai -- not part of message_history itself.
+    assert call["question"] == "East, please."
 
 
 # ---------------------------------------------------------------------------

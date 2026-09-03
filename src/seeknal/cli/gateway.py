@@ -506,6 +506,60 @@ See ``MAX_WORKER_RESUME_TURNS`` for why it is equal rather than smaller."""
 
 _RESUME_TURN_ROLES = frozenset({"user", "assistant", "system"})
 
+MAX_RESUME_INTERACT_QUESTIONS = 10
+"""Same value as IBA's own ``ASK_USER_MAX_PROMPTS`` (``iba_backend/agent_bridge.py``).
+IBA refuses to sign a pause form with more prompts than this BEFORE the
+signer ever runs (``agent_bridge.py``, the ``ask_user`` branch of
+``translate()``), so a correctly-behaving broker's interact turn never
+exceeds it."""
+
+MAX_RESUME_INTERACT_OPTIONS = 20
+"""IBA places no explicit per-question option cap of its own -- only the
+overall ``ASK_USER_MAX_FORM_BYTES`` (32,768) on the whole form. This is a
+worker-side defense-in-depth bound so a compromised or non-IBA broker cannot
+make rendering one interact turn arbitrarily expensive."""
+
+
+def _is_interact_pause_content(content: object) -> bool:
+    """True when ``content`` is IBA's own interact-pause shape.
+
+    ``{"type": "interact", "form": {"questions": [{"text": ..., "options":
+    [{"label": ...}, ...]}, ...], "thought": ...}}`` -- produced by
+    ``iba_backend/trajectory.py::build_pause_trajectory`` (the assistant turn
+    of a pause) via ``iba_backend/agent_bridge.py::_ask_user_form`` /
+    ``_ask_user_question`` / ``_ask_user_option``.
+
+    A bare dict that merely resembles this shape (wrong ``type``, missing
+    ``form``, non-string ``text``/``label``) is NOT accepted -- this check
+    is exactly as tight as the plain string-content check it stands beside,
+    it just recognizes one more legitimate shape rather than loosening what
+    counts as legitimate. ``questions``/``options`` beyond the caps below are
+    refused rather than truncated, matching how every other bound in
+    ``_resolve_worker_resume_turns`` refuses the whole claim instead of
+    silently trimming it.
+    """
+    if not isinstance(content, dict) or content.get("type") != "interact":
+        return False
+    form = content.get("form")
+    if not isinstance(form, dict):
+        return False
+    questions = form.get("questions")
+    if not isinstance(questions, list) or len(questions) > MAX_RESUME_INTERACT_QUESTIONS:
+        return False
+    thought = form.get("thought", "")
+    if not isinstance(thought, str):
+        return False
+    for question in questions:
+        if not isinstance(question, dict) or not isinstance(question.get("text"), str):
+            return False
+        options = question.get("options")
+        if not isinstance(options, list) or len(options) > MAX_RESUME_INTERACT_OPTIONS:
+            return False
+        for option in options:
+            if not isinstance(option, dict) or not isinstance(option.get("label"), str):
+                return False
+    return True
+
 
 def _resolve_worker_resume_turns(
     raw_resume_turns: object,
@@ -534,6 +588,18 @@ def _resolve_worker_resume_turns(
     ever refused here -- see ``MAX_WORKER_RESUME_TURNS`` /
     ``MAX_WORKER_RESUME_TURNS_BYTES``. A broker that ignores its own bounds is
     what gets refused.
+
+    A turn's ``content`` must be a string, UNLESS the turn is an
+    ``assistant`` turn and ``content`` is IBA's own interact-pause shape (see
+    ``_is_interact_pause_content``) -- ``build_pause_trajectory`` deliberately
+    represents a clarification pause as a structured object rather than a
+    string, "preserving every form field without lossy stringification".
+    Observed on the real product 2026-09-03: every real resumed pause was
+    being refused here as "non-string content", because that structured
+    shape is not a string and this validator did not yet know about it. Any
+    OTHER non-string content -- including that same shape on a ``user`` or
+    ``system`` turn, where IBA never produces it -- is still refused; this is
+    one additional accepted shape, not a loosened check.
 
     Returns ``(turns, refused)``:
 
@@ -589,7 +655,10 @@ def _resolve_worker_resume_turns(
         role = turn.get("role")
         if not isinstance(role, str) or role not in _RESUME_TURN_ROLES:
             return _refuse(f"turn has an invalid role ({role!r})")
-        if not isinstance(turn.get("content"), str):
+        content = turn.get("content")
+        if not isinstance(content, str) and not (
+            role == "assistant" and _is_interact_pause_content(content)
+        ):
             return _refuse("turn has non-string content")
 
     typer.echo(

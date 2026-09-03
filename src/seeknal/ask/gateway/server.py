@@ -1304,14 +1304,57 @@ async def session_history(request: Request) -> JSONResponse:
     return JSONResponse(events)
 
 
+def _render_interact_pause_text(content: dict) -> str:
+    """Render IBA's structured interact-pause ``content`` as plain text.
+
+    ``content`` is ``{"type": "interact", "form": {"questions": [...],
+    "thought": ...}}`` (``iba_backend/trajectory.py::build_pause_trajectory``,
+    via ``iba_backend/agent_bridge.py::_ask_user_form``) -- already validated
+    by ``cli.gateway._is_interact_pause_content`` by the time it reaches here.
+
+    Rendered as the assistant's OWN WORDS (a single text part), not as a
+    tool call, because that is what actually happened: the model paused mid
+    run to ask the user a clarifying question, and this history slot IS that
+    question -- the resume turn that follows is the user's answer to it.
+    IBA's trajectory never carries a matching tool call or ``ToolReturnPart``
+    (``build_pause_trajectory`` only ever produces plain role/content turns),
+    so representing this as a tool call would fabricate a tool exchange that
+    never happened; the model must see the question it asked, in its own
+    voice, for the user's next turn to make sense as a reply to it.
+
+    Each question renders as its text plus its option labels (never the
+    ``description``/``recommended`` fields IBA also carries -- labels are
+    what the user actually chose between), matching how a person reading the
+    transcript would summarize a multiple-choice question: ``"<text>
+    Options: <label>, <label>, ..."``. ``thought`` is prepended when present,
+    since it explains WHY the question was asked, ahead of the question
+    itself.
+    """
+    form = content["form"]
+    lines: list[str] = []
+    thought = form.get("thought")
+    if thought:
+        lines.append(thought)
+    for question in form.get("questions", []):
+        text = question.get("text", "")
+        labels = [
+            option.get("label", "") for option in question.get("options", [])
+        ]
+        lines.append(f"{text} Options: {', '.join(labels)}" if labels else text)
+    return "\n".join(lines)
+
+
 def _resume_turns_to_message_history(resume_turns: list) -> list:
     """Convert a validated IBA ``resume_turns`` claim into pydantic-ai history.
 
     ``resume_turns`` is already validated by
     ``cli.gateway._resolve_worker_resume_turns`` by the time it reaches here:
     every entry is a dict with a string ``role`` in
-    ``{"user", "assistant", "system"}`` and a string ``content``. This
-    function only has to decide what each role becomes as a message.
+    ``{"user", "assistant", "system"}``, and a ``content`` that is either a
+    string or -- for an ``assistant`` turn only -- IBA's structured
+    interact-pause shape (see ``_render_interact_pause_text``). This
+    function only has to decide what each role/content pair becomes as a
+    message.
 
     Only ``user`` and ``assistant`` turns become messages, mirroring the
     ``ModelRequest``/``ModelResponse`` shapes ``_messages_to_events`` above
@@ -1334,7 +1377,11 @@ def _resume_turns_to_message_history(resume_turns: list) -> list:
         if role == "user":
             history.append(ModelRequest(parts=[UserPromptPart(content=content)]))
         elif role == "assistant":
-            history.append(ModelResponse(parts=[TextPart(content=content)]))
+            text = (
+                content if isinstance(content, str)
+                else _render_interact_pause_text(content)
+            )
+            history.append(ModelResponse(parts=[TextPart(content=text)]))
         # role == "system" is intentionally skipped; see the docstring above.
     return history
 
