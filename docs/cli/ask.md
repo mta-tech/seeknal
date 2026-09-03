@@ -329,7 +329,7 @@ analysis:
 | `get_entity_schema` | Show entity schema |
 | `execute_sql` | Run read-only DuckDB SQL queries |
 | `preview_query` | Estimate row/column size before running a query |
-| `execute_python` | Run Python in sandboxed subprocess (pandas, numpy, scipy, matplotlib) |
+| `execute_python` | Run Python in a separate subprocess with the worker's privileges (pandas, numpy, scipy, matplotlib) |
 | `list_context_files` | List user-authored project memory files under `context/` |
 | `read_project_file` | Read project/context files safely, excluding secrets |
 | `write_project_file` | Save user-taught project memory under `context/` |

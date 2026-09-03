@@ -279,3 +279,62 @@ async def test_execute_python_blocks_unrequested_visualization(tmp_path, monkeyp
 
     assert "terminal_dependency_unavailable" in out
     assert "Visualization was not explicitly requested" in out
+
+
+# ---------------------------------------------------------------------------
+# P2-5: "sandbox" overstates what execute_python actually is (a plain
+# subprocess with the worker's own privileges, not a security boundary).
+# These pin the wording so it cannot creep back in.
+# ---------------------------------------------------------------------------
+
+
+def test_execute_python_docstring_does_not_claim_sandbox_or_isolation():
+    doc = (execute_python.__doc__ or "").lower()
+
+    assert "sandbox" not in doc
+    assert "isolated" not in doc
+
+
+def test_execute_python_tool_description_does_not_claim_sandbox_or_isolation():
+    """Pin the exact string pydantic-ai surfaces to the model as the tool's
+    description -- not just the raw docstring, but what the FunctionToolset
+    actually registers.
+    """
+    from pydantic_ai.toolsets import FunctionToolset
+
+    toolset = FunctionToolset(tools=[execute_python])
+    description = (toolset.tools["execute_python"].description or "").lower()
+
+    assert "sandbox" not in description
+    assert "isolated" not in description
+
+
+def test_infer_error_hint_does_not_claim_sandbox():
+    """Runtime hint strings returned to the model in tool results must not
+    use the word either -- they describe the same execution environment as
+    the tool description.
+    """
+    module_hint = _infer_error_hint(
+        "ModuleNotFoundError: No module named 'statsmodels'", "import statsmodels"
+    )
+    generic_missing_hint = _infer_error_hint("ModuleNotFoundError", "import statsmodels")
+    plot_hint = _infer_error_hint(
+        "'NoneType' object has no attribute 'plot'", "plt.plot([1, 2])"
+    )
+    catalog_hint_own_connection = _infer_error_hint(
+        "CatalogException: Table with name t does not exist!",
+        "import duckdb\nconn = duckdb.connect(':memory:')",
+    )
+    catalog_hint_missing_table = _infer_error_hint(
+        "CatalogException: Table with name t does not exist!", "conn.sql('SELECT 1')"
+    )
+
+    for hint in (
+        module_hint,
+        generic_missing_hint,
+        plot_hint,
+        catalog_hint_own_connection,
+        catalog_hint_missing_table,
+    ):
+        assert hint is not None
+        assert "sandbox" not in hint.lower()

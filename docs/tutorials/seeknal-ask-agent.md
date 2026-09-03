@@ -159,7 +159,7 @@ The agent uses a **thin tools + fat skills** architecture. 16 thin tools handle 
 | Tool | What It Does |
 |------|-------------|
 | `execute_sql` | Runs read-only DuckDB SQL queries (with auto-retry on errors) |
-| `execute_python` | Runs Python code in a sandboxed subprocess with `pandas`, `numpy`, `scipy`, and `matplotlib` pre-loaded |
+| `execute_python` | Runs Python code in a separate subprocess (the worker's own privileges) with `pandas`, `numpy`, `scipy`, and `matplotlib` pre-loaded |
 | `execute_uv_script` | Runs prototype Python scripts through `uv run` with custom PEP 723 dependencies |
 | `query_metric` | Queries business metrics from the semantic layer |
 
@@ -190,7 +190,7 @@ Skills are multi-step workflows that the agent discovers and loads when needed. 
 | `report-generation` | End-to-end Evidence.dev report: data exploration, draft approval, build, and codification |
 | `build-pipeline-node` | Scaffold, validate, apply, and run a new pipeline node from natural language |
 | `profile-data` | Comprehensive data profiling with quality assessment and join-key detection |
-| `execute-python-analysis` | Guided statistical/ML/visualization work in the Python sandbox |
+| `execute-python-analysis` | Guided statistical/ML/visualization work in the Python subprocess |
 | `query-metric` | Semantic layer metric queries with automatic joins and time grain resolution |
 | `save-metric` | Codify ad-hoc metric queries as permanent YAML definitions |
 | `save-report-exposure` | Codify completed analyses as repeatable YAML exposure specs |

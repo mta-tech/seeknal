@@ -1,8 +1,11 @@
 """Execute Python tool — run Python code for data analysis.
 
-Executes agent-generated Python in an isolated subprocess.
-The subprocess gets its own DuckDB connection with project data registered
-as views from parquet files — no access to the parent process.
+Executes agent-generated Python in a separate subprocess with the worker's
+full privileges. The subprocess gets its own DuckDB connection with project
+data registered as views from parquet files, and does not share in-process
+state (variables, open connections) with the parent — that is a correctness
+property for repeatable, fresh-state runs, not a security boundary. There is
+no seccomp/chroot/namespace confinement or import allowlist here.
 
 Falls back to in-process threading if subprocess execution fails.
 """
@@ -172,42 +175,42 @@ def _do_execute(code: str, conn: Any, timeout: int = 30) -> str:
 
 
 def _infer_error_hint(result: str, code: str) -> str | None:
-    """Return a targeted hint based on common sandbox errors."""
+    """Return a targeted hint based on common execution errors."""
     if "ModuleNotFoundError" in result:
         missing = _missing_module_from_error(result)
         if missing:
             return (
-                f"`{missing}` is not installed in this Seeknal Python sandbox. "
-                "Do not retry the same import. Continue with the pre-loaded "
-                "libraries that are actually available, use SQL/pandas/numpy "
-                "where possible, or provide a text/table answer when plotting "
-                "is unavailable."
+                f"`{missing}` is not installed in this Seeknal Python "
+                "subprocess. Do not retry the same import. Continue with the "
+                "pre-loaded libraries that are actually available, use "
+                "SQL/pandas/numpy where possible, or provide a text/table "
+                "answer when plotting is unavailable."
             )
         return (
             "The requested package is not installed in this Seeknal Python "
-            "sandbox. Do NOT retry the same import; use SQL/pandas/numpy/"
+            "subprocess. Do NOT retry the same import; use SQL/pandas/numpy/"
             "scipy/sklearn if available, or provide a text/table answer."
         )
     if "'NoneType' object has no attribute" in result and re.search(r"\bplt\b|\bmatplotlib\b", code):
         return (
             "`plt`/`matplotlib` is not available in this Seeknal Python "
-            "sandbox. Do not retry chart generation in this session; provide "
-            "a text/table answer or use SQL/Python to compute non-visual "
-            "statistics."
+            "subprocess. Do not retry chart generation in this session; "
+            "provide a text/table answer or use SQL/Python to compute "
+            "non-visual statistics."
         )
     if "CatalogException" in result and "does not exist" in result:
         if "duckdb.connect" in code:
             return (
                 "You called `duckdb.connect()` yourself — that creates a "
                 "NEW empty in-memory database without your project's tables. "
-                "The sandbox ALREADY provides a `conn` object with every "
+                "The subprocess ALREADY provides a `conn` object with every "
                 "project table registered as a view. Remove `import duckdb` "
                 "and `conn = duckdb.connect(...)` entirely — the pre-loaded "
                 "`conn` is ready to use: "
                 "`df = conn.sql('SELECT * FROM transform_daily_revenue').df()`."
             )
         return (
-            "The table name doesn't exist in the sandbox's `conn`. Run "
+            "The table name doesn't exist in the subprocess's `conn`. Run "
             "`list_tables` (via a separate tool call or `conn.sql(\"SHOW "
             "TABLES\").df()` inside execute_python) to see what's available. "
             "Views are registered by their full kind-prefixed name "
@@ -254,9 +257,14 @@ def _imported_top_level_modules(code: str) -> set[str]:
 
 
 async def execute_python(code: str) -> str:
-    """Run Python in an isolated subprocess sandbox. Prefer execute_sql for simple queries.
+    """Run Python in a separate subprocess with the worker's privileges. Prefer execute_sql for simple queries.
 
-    See the `execute-python-analysis` skill for the sandbox semantics (no
+    Each call gets a fresh process and its own DuckDB connection — a
+    correctness boundary for repeatable runs with no state carried over from
+    the previous call, not a security boundary. There is no containment: the
+    subprocess can read/write anything the worker process can.
+
+    See the `execute-python-analysis` skill for the execution semantics (no
     cross-call persistence, limited package set), the available libs (conn,
     pd, np, plt, sklearn, scipy), the SQL-comment gotcha (`#` is not a DuckDB
     comment), plot capture, and error recovery.
