@@ -50,23 +50,6 @@ from seeknal.connections.postgresql import (
 from seeknal.sources.config import SourceConfig, SourceRegistry
 
 
-# Regexes for namespace detection (used in detect_pg_only_namespace).
-# Quoted variants like "ns"."schema"."table" are also recognized.
-_IDENT = r'(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)'
-_RE_3PART = re.compile(rf'\b({_IDENT})\.({_IDENT})\.({_IDENT})\b')
-_RE_2PART = re.compile(rf'\b({_IDENT})\.({_IDENT})\b')
-_RE_UNQUALIFIED = re.compile(
-    rf'\b(?:FROM|JOIN)\s+({_IDENT})\b(?!\s*\.)',
-    flags=re.IGNORECASE,
-)
-
-
-def _strip_ident_quotes(token: str) -> str:
-    if token.startswith('"') and token.endswith('"'):
-        return token[1:-1]
-    return token
-
-
 def detect_pg_only_namespace(
     sql: str,
     registry: SourceRegistry,
@@ -80,7 +63,14 @@ def detect_pg_only_namespace(
     A connected-PG source is one where ``source_kind == "connected"``,
     ``source_type == "database"``, ``connector in {"postgresql", "postgres"}``,
     and the source is read-only.
+
+    The structural decision is delegated to :mod:`seeknal.ask.sql_routing`,
+    which parses the statement instead of matching text — a name can be a
+    remote table, a local view, or a CTE the statement defines, and only a
+    parser can tell those apart.
     """
+    from seeknal.ask.sql_routing import analyze
+
     pg_ns_set: set[str] = set()
     for source in registry.sources.values():
         if (
@@ -91,39 +81,7 @@ def detect_pg_only_namespace(
         ):
             pg_ns_set.add(source.namespace)
 
-    if not pg_ns_set:
-        return None
-
-    # Collect leading-identifier set from qualified refs.
-    # 3-part scan FIRST; replace those spans with whitespace so a follow-up
-    # 2-part scan does not double-count the inner ``schema.table`` portion.
-    leading: set[str] = set()
-    masked = list(sql)
-    for m in _RE_3PART.finditer(sql):
-        leading.add(_strip_ident_quotes(m.group(1)))
-        for idx in range(m.start(), m.end()):
-            masked[idx] = " "
-    masked_sql = "".join(masked)
-    for m in _RE_2PART.finditer(masked_sql):
-        leading.add(_strip_ident_quotes(m.group(1)))
-
-    if not leading:
-        return None
-
-    # Any unqualified table ref forces a DuckDB fallback. This prevents
-    # false-positive routing on SQL that mixes a qualified PG table and a
-    # bare parquet view. Scan the masked SQL so the leading identifier of
-    # a 3-part ref is not counted as an unqualified ``FROM`` ident.
-    if _RE_UNQUALIFIED.search(masked_sql):
-        return None
-
-    # Every leading identifier must be the same single connected-PG namespace.
-    if not leading.issubset(pg_ns_set):
-        return None
-    if len(leading) != 1:
-        return None
-    (ns,) = leading
-    return ns
+    return analyze(sql, pg_ns_set, target_dialect="postgres").namespace
 
 
 def resolve_pg_dsn(

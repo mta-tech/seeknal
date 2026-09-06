@@ -68,6 +68,7 @@ from seeknal.ask.agents.tools.search_project_files import search_project_files
 from seeknal.ask.agents.tools.show_lineage import show_lineage
 from seeknal.ask.agents.tools.submit_plan import submit_plan
 from seeknal.ask.agents.tools.upload_to_s3 import upload_to_s3
+from seeknal.ask.agents.tools.visualize_chart import visualize_chart
 from seeknal.ask.agents.tools.write_ingested_table import write_ingested_table
 from seeknal.ask.agents.tools.write_project_file import write_project_file
 from seeknal.ask.agents.tools.write_report import write_report
@@ -196,6 +197,13 @@ _EXPORT_TOOLS = [
 
 _ACTION_DELIVERY_TOOLS = [write_report]
 
+# Chat chart tool. The single owner of chart building -- no other tool attaches
+# a chart of its own. Gated by ``include_visualize_chart``, registered only in
+# non-interactive environments when ``agent.visualize_chart.enabled`` is true.
+_VISUALIZATION_TOOLS = [
+    visualize_chart,
+]
+
 
 def create_ask_toolset(
     *,
@@ -208,6 +216,7 @@ def create_ask_toolset(
     include_intel_knowledge: bool = False,
     action_delivery: bool = False,
     strip_gateway_egress_tools: bool = False,
+    include_visualize_chart: bool = False,
 ) -> FunctionToolset:
     """Create the seeknal-ask toolset.
 
@@ -244,6 +253,14 @@ def create_ask_toolset(
             source registry resolves to ``"full"`` mode, and on a premises
             worker that surface must not include tools whose effect is to
             send project data to a third-party host or pop a GUI browser.
+            ``visualize_chart`` is not in ``_GATEWAY_EGRESS_TOOLS`` and is
+            unaffected by this strip: it is purely local (reads already-
+            fetched rows from the structured SQL cache or an exported CSV,
+            makes no network call) and its output is drained by the gateway
+            itself as a ``visualization`` event, not sent to a third party.
+        include_visualize_chart: Include the chat chart tool ``visualize_chart``.
+            Registered only in non-interactive environments when
+            ``agent.visualize_chart.enabled`` is true in ``seeknal_agent.yml``.
     """
     if mode == "analysis":
         # Keep the connected-source/read-only surface deliberately thin:
@@ -296,6 +313,9 @@ def create_ask_toolset(
 
     if action_delivery and mode == "full":
         tools.extend(_ACTION_DELIVERY_TOOLS)
+
+    if include_visualize_chart:
+        tools.extend(_VISUALIZATION_TOOLS)
 
     if strip_gateway_egress_tools:
         tools = [tool for tool in tools if tool not in _GATEWAY_EGRESS_TOOLS]

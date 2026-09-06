@@ -237,6 +237,7 @@ def create_agent(
         get_forecast_enabled,
         get_anomaly_enabled,
         get_upload_to_s3_enabled,
+        get_visualize_chart_enabled,
         get_auto_summarization_config,
         get_cost_tracking_config,
         get_hooks_config,
@@ -302,6 +303,10 @@ def create_agent(
     tool_ctx = get_tool_context()
     tool_ctx.request_limit = get_request_limit(agent_config)
     tool_ctx.sql_timeout_seconds = get_sql_timeout_seconds(agent_config)
+    from seeknal.ask.config import get_pg_passthrough_enabled, get_read_max_lines
+
+    tool_ctx.pg_passthrough = get_pg_passthrough_enabled(agent_config)
+    tool_ctx.read_max_lines = get_read_max_lines(agent_config)
     tool_ctx.discovery_cache_ttl_seconds = get_discovery_cache_ttl_seconds(agent_config)
     tool_ctx.background_threshold = get_background_threshold(agent_config)
     from seeknal.ask.config import get_sql_pair_mode
@@ -510,6 +515,10 @@ evidence-backed finding that cites every Intel document used.
                 environment in {"interactive", "intel_work"}
             ),
             strip_gateway_egress_tools=(environment == "gateway"),
+            include_visualize_chart=(
+                environment in ("gateway", "telegram")
+                and get_visualize_chart_enabled(agent_config)
+            ),
             **_ask_toolset_kwargs,
         ),
     ]
