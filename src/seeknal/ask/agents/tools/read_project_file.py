@@ -65,7 +65,7 @@ def _do_read(path: str, project_path, start_line: int = 1, max_lines: int = 200)
 def read_project_file(
     path: str,
     start_line: int = 1,
-    max_lines: int = 200,
+    max_lines: int | None = None,
 ) -> str:
     """Read any file in the project by its relative path.
 
@@ -78,9 +78,12 @@ def read_project_file(
     Args:
         path: File path relative to the project root.
         start_line: Line number to start reading from (default 1).
-        max_lines: Maximum number of lines to return (default 200).
+        max_lines: Maximum number of lines to return. Omit to use the
+            project's configured window.
     """
     from seeknal.ask.agents.tools._context import get_tool_context
 
     ctx = get_tool_context()
+    if max_lines is None:
+        max_lines = getattr(ctx, "read_max_lines", 200)
     return _do_read(path, ctx.project_path, start_line, max_lines)

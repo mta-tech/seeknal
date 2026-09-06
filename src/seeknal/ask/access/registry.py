@@ -50,6 +50,7 @@ _VIEWER_TOOLS = {
     "intel_knowledge_list",
     "intel_knowledge_search",
     "intel_knowledge_read",
+    "visualize_chart",
 }
 
 # Analysts can additionally save personal preferences, draft pipelines, and

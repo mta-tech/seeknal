@@ -246,3 +246,41 @@ def test_upload_data_mode_empty_rows_returns_nothing(ctx):
     out = upload_to_s3("file.csv", data=[], columns=["a"])
     assert "No rows" in out
     assert ctx.pending_upload is None
+
+
+def test_upload_sql_mode_exports_all_rows_no_5000_cap(ctx):
+    """CSV export row-limit fix (2026-08-03): Mode 1 exports EVERY row.
+
+    Regression guard for the removal of _CSV_EXPORT_ROW_LIMIT. A query
+    producing >5000 rows must land in the exported CSV in full — the tool now
+    passes limit=None to _execute_oneshot_with_timeout (repl.py only wraps
+    LIMIT when a non-None limit is given).
+    """
+    repl = ctx.repl
+    repl.conn.execute(
+        "CREATE TABLE big AS SELECT i AS id, 'row-' || i AS v "
+        "FROM generate_series(0, 11999) AS t(i)"
+    )
+    presign = _mock_response(_presign_response())
+    captured_put_bytes = []
+
+    def _capture_put(url, content=None, **kw):
+        captured_put_bytes.append(content)
+        m = MagicMock()
+        m.raise_for_status.return_value = None
+        return m
+
+    with patch("seeknal.ask.agents.tools.upload_to_s3.httpx.post", return_value=presign), patch(
+        "seeknal.ask.agents.tools.upload_to_s3.httpx.put", side_effect=_capture_put
+    ):
+        out = upload_to_s3("big.csv", "SELECT id, v FROM big")
+
+    assert "Upload complete" in out
+    csv_text = captured_put_bytes[0].decode("utf-8")
+    lines = [ln for ln in csv_text.splitlines() if ln]
+    # Header + all 12000 rows — NOT truncated at 5000.
+    assert len(lines) == 12001, f"expected 12001 lines, got {len(lines)}"
+    assert lines[0] == "id,v"
+    assert lines[1] == "0,row-0"
+    assert lines[-1] == "11999,row-11999"
+    assert ctx.pending_upload["file_size"] == len(csv_text.encode("utf-8"))

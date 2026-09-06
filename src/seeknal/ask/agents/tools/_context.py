@@ -76,6 +76,14 @@ class ToolContext:
     sql_pairs_checked_this_turn: bool = False
     authoritative_sql_pair_result_this_turn: dict[str, str] | None = None
     sql_timeout_seconds: int = 60
+    # How many lines read_project_file returns per call. 200 suits source files;
+    # projects whose rule documents run longer can raise it so the tail is not
+    # silently cut (see ask.config.get_read_max_lines).
+    read_max_lines: int = 200
+    # SQLR: route PG-only SQL straight to PostgreSQL instead of running it
+    # through DuckDB's postgres_scanner. Off unless the project opts in; any
+    # failure on that path falls back to DuckDB (see execute_sql._try_pg_route).
+    pg_passthrough: bool = False
     discovery_cache_ttl_seconds: int = 300
     discovery_cache: dict[str, tuple[float, Any]] = field(default_factory=dict)
     timing_events_this_turn: list[dict[str, Any]] = field(default_factory=list)
@@ -97,6 +105,27 @@ class ToolContext:
     # ``upload_complete`` event and CONTINUES the turn — unlike
     # pending_clarification which ends it. ``None`` means no upload is pending.
     pending_upload: dict[str, Any] | None = None
+    # M9: pending chat chart. Set by visualize_chart (and run_forecast's
+    # self-chart step). The gateway streaming layer emits a ``visualization``
+    # event and CONTINUES the turn -- same lifecycle as pending_upload.
+    # Single-slot on purpose: one question yields at most one chart, so a
+    # second chart attempt in the same turn is refused rather than silently
+    # overwriting the first. ``None`` means no chart is pending.
+    pending_visualization: list[dict[str, Any]] | None = None
+    # M9: the dataset this turn exported as CSV, as
+    # ``{"name": str, "columns": [...], "rows": [[...], ...]}``.
+    #
+    # Single-slot, last-wins -- mirroring ``pending_upload``, which is also
+    # single-slot, so the registered rows always match the one Download button
+    # the user actually gets. One question yields one CSV.
+    #
+    # Exists so a chart can be drawn from data that is NOT re-queryable. A
+    # forecast's projection is computed in-process, never in SQL, so charting
+    # it from its source query would show history only -- a picture that
+    # contradicts the text beside it. Re-typing those numbers into the tool is
+    # worse still: transcription drift. Reusing the exact rows that went into
+    # the CSV keeps table, download and chart on one source of truth.
+    exported_dataset: dict[str, Any] | None = None
     # IBA engine connection, resolved ONCE at agent init (see
     # agent.py::create_agent) and injected here -- same pattern as
     # ``repl``/``project_path``. run_forecast and detect_anomaly read
@@ -216,6 +245,56 @@ def get_successful_sql_cache(ctx: ToolContext | None = None) -> dict[str, str]:
         setattr(ctx.repl, "_seeknal_successful_sql_cache", cache)
     ctx.successful_sql_cache = cache
     return cache
+
+
+def get_structured_sql_cache(
+    ctx: ToolContext | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return the session structured SQL-result cache on the durable REPL object.
+
+    Parallel to :func:`get_successful_sql_cache`, which caches the *rendered
+    markdown table*. Chart building needs machine-readable rows, so this cache
+    holds ``{"columns": [...], "rows": [[...], ...]}`` written by ``execute_sql``
+    under the SAME ``_sql_cache_key(sql)`` key.
+
+    Sharing that key is the correctness contract behind M9 charts: the same SQL
+    resolves to the same entry, so the chart and the textual answer are built
+    from one dataset instead of two independent reads. Rows are stored
+    post-governance (Atlas masking already applied), so a chart can never
+    surface a value the answer itself was not allowed to show.
+    """
+    ctx = ctx or get_tool_context()
+    cache = getattr(ctx.repl, "_seeknal_structured_sql_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(ctx.repl, "_seeknal_structured_sql_cache", cache)
+    return cache
+
+
+def register_exported_dataset(
+    name: str,
+    columns: list[str],
+    rows: list[list[Any]],
+    ctx: ToolContext | None = None,
+) -> None:
+    """Record the rows a tool just exported as CSV, so a chart can reuse them.
+
+    Called by whichever tool produced the downloadable file. Last write wins,
+    matching ``pending_upload``: if a turn exports twice, both the Download
+    button and the chart follow the second export.
+
+    Args:
+        name: The exported file name, for reference in tool results.
+        columns: Column names in export order.
+        rows: Row values aligned to ``columns``.
+        ctx: Tool context; resolved from the contextvar when omitted.
+    """
+    ctx = ctx or get_tool_context()
+    ctx.exported_dataset = {
+        "name": name,
+        "columns": list(columns),
+        "rows": [list(row) for row in rows],
+    }
 
 
 def get_loaded_sql_pairs(ctx: ToolContext | None = None) -> dict[str, str]:
@@ -496,6 +575,8 @@ def reset_turn_governor(question: str | None = None) -> None:
     ctx.timing_events_this_turn.clear()
     ctx.pending_clarification = None
     ctx.pending_upload = None
+    ctx.pending_visualization = None
+    ctx.exported_dataset = None
 
 
 def get_discovery_cache_value(key: str) -> Any | None:
@@ -652,13 +733,22 @@ def synthesize_evidence_fallback(reason: str) -> str:
     return "\n".join(lines).strip()
 
 
-def build_evidence_synthesis_prompt(reason: str) -> str:
-    """Build a no-tool final-answer prompt from the turn governor evidence.
+def build_evidence_synthesis_prompt(reason: str, allow_chart: bool = False) -> str:
+    """Build a final-answer prompt from the turn governor evidence.
 
     This is a safety valve for bounded read-only analysis sessions. If the
     model keeps exploring until the harness budget is reached, we give it the
-    already-collected evidence and explicitly prohibit more tools so the user
+    already-collected evidence and prohibit further exploration so the user
     gets a natural-language answer instead of raw harness diagnostics.
+
+    Args:
+        reason: Why the turn stopped, quoted back to the model.
+        allow_chart: Whether ``visualize_chart`` is available at this stage.
+            The caller decides that by restricting the toolset; the prompt has
+            to agree with it, because a blanket "do not call any tools" is
+            obeyed even when a tool *is* offered -- the model then describes a
+            chart in prose instead of drawing one, which is exactly the
+            "visualisation unavailable" answer this stage used to produce.
     """
     ctx = get_tool_context()
     question = (ctx.current_question or "").strip()
@@ -670,7 +760,15 @@ def build_evidence_synthesis_prompt(reason: str) -> str:
 
     parts = [
         "You are writing the final answer for a read-only data-analysis turn.",
-        "Do not call any tools. Do not ask for more context.",
+        (
+            "Do not gather more data: no SQL, no lookups, no context reads, and "
+            "do not ask for more context. You MAY call visualize_chart once, "
+            "and only that -- it draws rows already gathered and adds no "
+            "exploration. If the evidence below carries a trend, a comparison "
+            "or a breakdown, chart it rather than describing a chart in words."
+            if allow_chart
+            else "Do not call any tools. Do not ask for more context."
+        ),
         "Use only the evidence below; if it is incomplete, say what is missing as a caveat.",
         "Do not infer labels for coded dimensions unless the evidence includes the mapping.",
         "If a label mapping is missing, keep the raw code and state that the label was not found.",

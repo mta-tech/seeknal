@@ -214,6 +214,10 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
       does on failure, so this hook's existing generic hint-enrichment
       applies to both without new logic).
 
+    `visualize_chart` is covered by both for the same reason `upload_to_s3` is:
+    its Mode 1 runs agent-supplied SQL through the same DuckDB seam, and it
+    names the argument `sql`, so the existing handlers apply unchanged.
+
     No CSV-upload hook lives here anymore: `execute_sql` no longer
     auto-uploads per call (see the module comment above this function for
     why); `run_forecast` self-uploads its own projection points from inside
@@ -230,7 +234,7 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
             Hook(
                 event=HookEvent.PRE_TOOL_USE,
                 handler=_sql_security_handler,
-                matcher="execute_sql|upload_to_s3|run_forecast|detect_anomaly",
+                matcher="execute_sql|upload_to_s3|run_forecast|detect_anomaly|visualize_chart",
             )
         )
     if cfg.get("sql_self_correction", True):
@@ -238,7 +242,7 @@ def get_ask_hooks(config: dict | None = None) -> list[Hook]:
             Hook(
                 event=HookEvent.POST_TOOL_USE,
                 handler=_sql_self_correction_handler,
-                matcher="execute_sql|upload_to_s3|run_forecast|detect_anomaly",
+                matcher="execute_sql|upload_to_s3|run_forecast|detect_anomaly|visualize_chart",
             )
         )
     return hooks
