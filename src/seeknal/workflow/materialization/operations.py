@@ -44,7 +44,6 @@ Key Components:
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import re
 import threading
@@ -56,18 +55,25 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 
 
+from seeknal.workflow.materialization.config import (
+    ADVANCED_MODES,
+    DEFAULT_MAX_BATCH_BYTES,
+    CatalogConfig,
+    MaterializationConfig,
+    MaterializationMode,
+    validate_iceberg_write_options,
+    validate_table_name,
+    validate_partition_columns,
+    SAFE_TYPE_CONVERSIONS,
+)
+
+
 def _qi(name: str) -> str:
     """Quote a DuckDB identifier if it contains special characters (e.g. hyphens)."""
     if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
         return name
     return f'"{name}"'
 
-from seeknal.workflow.materialization.config import (
-    MaterializationConfig,
-    validate_table_name,
-    validate_partition_columns,
-    SAFE_TYPE_CONVERSIONS,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +95,10 @@ class SnapshotError(MaterializationOperationError):
 
 class WriteError(MaterializationOperationError):
     """Raised when write operation fails."""
-    pass
+
+    def __init__(self, message: str, *, failure_category: Optional[str] = None):
+        super().__init__(message)
+        self.failure_category = failure_category
 
 
 @dataclass
@@ -109,6 +118,13 @@ class WriteResult:
     row_count: int = 0
     duration_seconds: float = 0.0
     error_message: Optional[str] = None
+    mode: Optional[str] = None
+    input_row_count: Optional[int] = None
+    inserted_row_count: Optional[int] = None
+    updated_row_count: Optional[int] = None
+    affected_partition_count: Optional[int] = None
+    outcome: Optional[str] = None
+    snapshot_verified: Optional[bool] = None
 
 
 @dataclass
@@ -636,8 +652,8 @@ class SnapshotManager:
                     f"Found {len(orphaned)} orphaned snapshots for {table_name}: {orphaned}"
                 )
                 logger.info(
-                    f"Iceberg retention policy will clean up snapshots "
-                    f"according to snapshot.expire.snapshots.older-than-ms"
+                    "Iceberg retention policy will clean up snapshots "
+                    "according to snapshot.expire.snapshots.older-than-ms"
                 )
 
             return len(orphaned)
@@ -726,6 +742,12 @@ def write_to_iceberg(
     mode: str = "append",
     batch_size: int = 100000,
     auditor: Optional[MaterializationAuditor] = None,
+    *,
+    unique_keys: Optional[List[str]] = None,
+    partition_by: Optional[List[str]] = None,
+    create_table: bool = True,
+    max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
+    catalog_config: Optional[CatalogConfig] = None,
 ) -> WriteResult:
     """
     Write data to Iceberg table with atomic commit.
@@ -751,8 +773,66 @@ def write_to_iceberg(
     """
     start_time = time.time()
 
+    validate_iceberg_write_options(
+        mode,
+        unique_keys=unique_keys,
+        partition_by=partition_by,
+        create_table=create_table,
+        max_batch_bytes=max_batch_bytes,
+    )
+    mode = mode.value if isinstance(mode, MaterializationMode) else mode
+
     # Validate table name
     table_name = validate_table_name(table_name)
+
+    if mode in ADVANCED_MODES:
+        if catalog_config is None:
+            raise WriteError(
+                f"catalog_config is required for Iceberg {mode} writes",
+                failure_category="preflight_failed",
+            )
+        from seeknal.workflow.materialization.iceberg_mutations import (
+            IcebergMutationError,
+            write_advanced_iceberg_mutation,
+        )
+
+        try:
+            mutation = write_advanced_iceberg_mutation(
+                con,
+                catalog_name,
+                table_name,
+                view_name,
+                mode,
+                unique_keys=unique_keys,
+                partition_by=partition_by,
+                create_table=create_table,
+                max_batch_bytes=max_batch_bytes,
+                catalog_config=catalog_config,
+            )
+        except IcebergMutationError as exc:
+            raise WriteError(
+                f"Failed to write to {table_name}: {exc}",
+                failure_category=getattr(exc, "failure_category", "preflight_failed"),
+            ) from exc
+        except Exception as exc:
+            raise WriteError(
+                f"Failed to write to {table_name}: {exc}", failure_category="preflight_failed"
+            ) from exc
+
+        duration = time.time() - start_time
+        return WriteResult(
+            success=True,
+            snapshot_id=mutation.snapshot_id,
+            row_count=mutation.row_count,
+            duration_seconds=duration,
+            mode=mode,
+            input_row_count=mutation.row_count,
+            inserted_row_count=mutation.inserted_row_count,
+            updated_row_count=mutation.updated_row_count,
+            affected_partition_count=mutation.affected_partition_count,
+            outcome=mutation.outcome,
+            snapshot_verified=mutation.snapshot_verified,
+        )
 
     # Create materialization state
     materialization_id = uuid.uuid4().hex[:8]

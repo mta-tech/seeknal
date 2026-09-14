@@ -22,8 +22,12 @@ class MaterializationConfig:
     Args:
         enabled: Enable/disable materialization (None uses lower-priority config)
         table: Iceberg table name (catalog.namespace.table format)
-        mode: Write mode - "append" or "overwrite"
+        mode: Write mode - "append", "overwrite", "upsert", or
+            "insert_overwrite"
         create_table: Auto-create table if it doesn't exist
+        unique_keys: Key columns required by upsert
+        partition_by: Identity partition columns required by insert_overwrite
+        max_batch_bytes: Maximum logical Arrow batch size for advanced modes
 
     Example:
         from seeknal.pipeline.materialization_config import MaterializationConfig
@@ -54,11 +58,12 @@ class MaterializationConfig:
 
     enabled: Optional[bool] = None
     table: Optional[str] = None
-    mode: Optional[str] = None  # "append" or "overwrite"
+    mode: Optional[str] = None
     create_table: Optional[bool] = None
+    unique_keys: Optional[list[str]] = None
+    partition_by: Optional[list[str]] = None
+    max_batch_bytes: Optional[int] = None
 
-    # Future v2 fields (commented out to show extensibility)
-    # partition_by: Optional[str] = None
     # schema_evolution: Optional[str] = None  # "safe", "auto", "strict"
 
     def to_dict(self) -> dict:
@@ -73,6 +78,9 @@ class MaterializationConfig:
                 ("table", self.table),
                 ("mode", self.mode),
                 ("create_table", self.create_table),
+                ("unique_keys", self.unique_keys),
+                ("partition_by", self.partition_by),
+                ("max_batch_bytes", self.max_batch_bytes),
             ] if v is not None
         }
 

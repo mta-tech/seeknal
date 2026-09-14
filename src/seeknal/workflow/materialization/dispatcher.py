@@ -22,12 +22,29 @@ Usage::
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
 from seeknal.workflow.materialization.operations import WriteResult  # ty: ignore[unresolved-import]
 
 logger = logging.getLogger(__name__)
+
+
+def iceberg_commit_requires_reconciliation(metadata: Dict[str, Any]) -> bool:
+    """A conflicting or uncertain publication must not enter generic retries."""
+    pending: List[Any] = [metadata]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            if item.get("failure_category") in {"conflict", "commit_unknown"}:
+                return True
+            pending.extend(
+                item[key] for key in ("materialization", "results", "write_result")
+                if key in item
+            )
+        elif isinstance(item, list):
+            pending.extend(item)
+    return False
 
 
 @dataclass
@@ -46,11 +63,21 @@ class DispatchResult:
     succeeded: int = 0
     failed: int = 0
     results: List[Dict[str, Any]] = field(default_factory=list)
+    required_failed: bool = False
 
     @property
     def all_succeeded(self) -> bool:
         """Return True when every target succeeded (and at least one was attempted)."""
         return self.failed == 0 and self.total > 0
+
+    @property
+    def serializable_results(self) -> List[Dict[str, Any]]:
+        """Keep typed write results internally and JSON values at runner boundaries."""
+        return [
+            {**item, "write_result": asdict(item["write_result"])}
+            if "write_result" in item else dict(item)
+            for item in self.results
+        ]
 
 
 class MaterializationDispatcher:
@@ -96,6 +123,10 @@ class MaterializationDispatcher:
         result = DispatchResult(total=len(targets))
 
         for i, target in enumerate(targets):
+            target = dict(target)
+            if target.get("enabled") is False:
+                result.total -= 1
+                continue
             # Apply env-based namespace prefix if running in an environment
             if env_name:
                 target = self._prefix_target(target, env_name)
@@ -115,6 +146,8 @@ class MaterializationDispatcher:
                 else:
                     raise ValueError(f"Unknown materialization type: {target_type}")
 
+                if not write_result.success:
+                    raise ValueError(write_result.error_message or "Materialization failed")
                 result.succeeded += 1
                 result.results.append({
                     "target": target_label,
@@ -128,11 +161,18 @@ class MaterializationDispatcher:
 
             except Exception as exc:
                 result.failed += 1
+                result.required_failed |= (
+                    target_type == "iceberg"
+                    and target.get("mode") not in (None, "append", "overwrite")
+                )
                 result.results.append({
                     "target": target_label,
                     "type": target_type,
                     "success": False,
                     "error": str(exc),
+                    "failure_category": getattr(exc, "failure_category", None) or (
+                        "preflight_failed" if target_type == "iceberg" else None
+                    ),
                 })
                 logger.error("Failed to materialize %s: %s", target_label, exc)
 
@@ -260,16 +300,27 @@ class MaterializationDispatcher:
             write_to_iceberg,
         )
         from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
+        from seeknal.workflow.materialization.config import (
+            ADVANCED_MODES,
+            validate_iceberg_write_options,
+        )
 
         # Load Iceberg profile config
         loader = self._profile_loader if self._profile_loader is not None else ProfileLoader()
         profile_config = loader.load_profile()
 
-        # Setup DuckDB extensions (httpfs + iceberg)
-        DuckDBIcebergExtension.load_extension(con)
-
-        # Configure S3/MinIO credentials from env
-        DuckDBIcebergExtension.configure_s3(con)
+        mode = target_config.get("mode", profile_config.default_mode.value)
+        target_config["mode"] = mode
+        advanced = mode in ADVANCED_MODES
+        options = {}
+        if advanced:
+            options = {
+                "unique_keys": target_config.get("unique_keys", profile_config.unique_keys),
+                "partition_by": target_config.get("partition_by", profile_config.partition_by),
+                "create_table": target_config.get("create_table", profile_config.create_table),
+                "max_batch_bytes": target_config.get("max_batch_bytes", profile_config.max_batch_bytes),
+            }
+        validate_iceberg_write_options(mode, **options)
 
         # Get OAuth2 token from Keycloak
         catalog = profile_config.catalog.interpolate_env_vars()
@@ -305,6 +356,22 @@ class MaterializationDispatcher:
         if not warehouse_path:
             warehouse_path = os.environ.get("LAKEKEEPER_WAREHOUSE", "")
 
+        if advanced:
+            return write_to_iceberg(
+                con=con,
+                catalog_name="iceberg_catalog",
+                table_name=target_config.get("table", ""),
+                view_name=view_name,
+                mode=mode,
+                catalog_config=replace(
+                    catalog, uri=uri, warehouse=warehouse_path, bearer_token=token
+                ),
+                **options,
+            )
+
+        DuckDBIcebergExtension.load_extension(con)
+        DuckDBIcebergExtension.configure_s3(con)
+
         # Attach REST catalog using DuckDB ATTACH syntax
         catalog_name = "iceberg_catalog"
         DuckDBIcebergExtension.attach_rest_catalog(
@@ -316,7 +383,6 @@ class MaterializationDispatcher:
         )
 
         table_name = target_config.get("table", "")
-        mode = target_config.get("mode", "append")
 
         return write_to_iceberg(
             con=con,

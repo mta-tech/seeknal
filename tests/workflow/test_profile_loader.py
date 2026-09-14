@@ -17,7 +17,65 @@ from seeknal.workflow.materialization.profile_loader import (  # ty: ignore[unre
 )
 from seeknal.workflow.materialization.config import (  # ty: ignore[unresolved-import]
     ConfigurationError,
+    DEFAULT_MAX_BATCH_BYTES,
 )
+
+
+class TestIcebergMaterializationProfile:
+    def test_loads_advanced_write_defaults(self, tmp_path):
+        profile_file = tmp_path / "profiles.yml"
+        profile_file.write_text("""\
+materialization:
+  enabled: false
+  default_mode: upsert
+  unique_keys: [customer_id]
+  partition_by: [event_date]
+  create_table: false
+  max_batch_bytes: 4096
+""")
+
+        config = ProfileLoader(profile_path=profile_file).load_profile()
+
+        assert config.default_mode.value == "upsert"
+        assert config.unique_keys == ["customer_id"]
+        assert config.partition_by == ["event_date"]
+        assert config.create_table is False
+        assert config.max_batch_bytes == 4096
+
+    def test_profile_allows_inherited_mode_fields(self, tmp_path):
+        profile_file = tmp_path / "profiles.yml"
+        profile_file.write_text("""\
+materialization:
+  enabled: false
+  default_mode: insert_overwrite
+""")
+
+        config = ProfileLoader(profile_path=profile_file).load_profile()
+
+        assert config.partition_by == []
+        assert config.max_batch_bytes == DEFAULT_MAX_BATCH_BYTES
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("unique_keys", "customer_id", "unique_keys must be a list"),
+            ("partition_by", "event_date", "partition_by must be a list"),
+            ("create_table", "'yes'", "create_table must be a boolean"),
+            ("max_batch_bytes", "large", "positive integer"),
+        ],
+    )
+    def test_rejects_malformed_write_defaults(
+        self, tmp_path, field, value, message
+    ):
+        profile_file = tmp_path / "profiles.yml"
+        profile_file.write_text(
+            "materialization:\n"
+            "  enabled: false\n"
+            f"  {field}: {value}\n"
+        )
+
+        with pytest.raises(ConfigurationError, match=message):
+            ProfileLoader(profile_path=profile_file).load_profile()
 
 
 # =============================================================================

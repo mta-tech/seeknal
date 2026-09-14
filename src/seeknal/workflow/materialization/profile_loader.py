@@ -40,6 +40,7 @@ from seeknal.workflow.materialization.config import (  # ty: ignore[unresolved-i
     SchemaEvolutionConfig,
     DuckDBConfig,
     MaterializationMode,
+    DEFAULT_MAX_BATCH_BYTES,
     SchemaEvolutionMode,
     CatalogType,
     ConfigurationError,
@@ -556,12 +557,17 @@ class ProfileLoader:
             default_mode=mode,
             duckdb=duckdb_config,
             schema_evolution=schema_evolution_config,
+            unique_keys=mat_config.get("unique_keys", []),
             partition_by=mat_config.get("partition_by", []),
+            create_table=mat_config.get("create_table", True),
+            max_batch_bytes=mat_config.get(
+                "max_batch_bytes", DEFAULT_MAX_BATCH_BYTES
+            ),
             table=mat_config.get("table"),
         )
 
         # Validate config
-        config.validate()
+        config.validate(require_fields=False)
 
         return config
 

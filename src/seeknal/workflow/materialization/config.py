@@ -41,6 +41,73 @@ class MaterializationMode(str, Enum):
     """Materialization write mode."""
     APPEND = "append"
     OVERWRITE = "overwrite"
+    UPSERT = "upsert"
+    INSERT_OVERWRITE = "insert_overwrite"
+
+
+DEFAULT_MAX_BATCH_BYTES = 268435456
+ADVANCED_MODES = {"upsert", "insert_overwrite"}
+
+
+def validate_iceberg_write_options(
+    mode: Any,
+    unique_keys: Optional[List[str]] = None,
+    partition_by: Optional[List[str]] = None,
+    create_table: bool = True,
+    max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
+    *,
+    require_fields: bool = True,
+) -> None:
+    """Validate Iceberg write configuration shared by all entry points."""
+    mode_value = mode.value if isinstance(mode, MaterializationMode) else mode
+    supported_modes = {item.value for item in MaterializationMode}
+    if not isinstance(mode_value, str) or mode_value not in supported_modes:
+        raise ConfigurationError(
+            f"Invalid materialization mode: {mode_value}. "
+            f"Must be one of: {sorted(supported_modes)}"
+        )
+
+    def validate_identifiers(field_name: str, values: Optional[List[str]]) -> None:
+        if values is None:
+            return
+        if not isinstance(values, list):
+            raise ConfigurationError(f"{field_name} must be a list of column names")
+
+        seen: set[str] = set()
+        for value in values:
+            if not isinstance(value, str) or not re.fullmatch(
+                r"[a-zA-Z_][a-zA-Z0-9_]*", value
+            ):
+                raise ConfigurationError(
+                    f"Invalid {field_name} column name: {value}. "
+                    "Must be a valid SQL identifier."
+                )
+            if value in seen:
+                raise ConfigurationError(
+                    f"Duplicate column '{value}' in {field_name}"
+                )
+            seen.add(value)
+
+    validate_identifiers("unique_keys", unique_keys)
+    validate_identifiers("partition_by", partition_by)
+
+    if not isinstance(create_table, bool):
+        raise ConfigurationError("create_table must be a boolean")
+    if isinstance(max_batch_bytes, bool) or not isinstance(max_batch_bytes, int):
+        raise ConfigurationError("max_batch_bytes must be a positive integer")
+    if max_batch_bytes <= 0:
+        raise ConfigurationError("max_batch_bytes must be a positive integer")
+
+    if require_fields and mode_value == MaterializationMode.UPSERT.value and not unique_keys:
+        raise ConfigurationError("Mode 'upsert' requires a non-empty unique_keys list")
+    if (
+        require_fields
+        and mode_value == MaterializationMode.INSERT_OVERWRITE.value
+        and not partition_by
+    ):
+        raise ConfigurationError(
+            "Mode 'insert_overwrite' requires a non-empty partition_by list"
+        )
 
 
 class SchemaEvolutionMode(str, Enum):
@@ -317,7 +384,10 @@ class MaterializationConfig:
     default_mode: MaterializationMode = MaterializationMode.APPEND
     duckdb: DuckDBConfig = field(default_factory=DuckDBConfig)
     schema_evolution: SchemaEvolutionConfig = field(default_factory=SchemaEvolutionConfig)
+    unique_keys: List[str] = field(default_factory=list)
     partition_by: List[str] = field(default_factory=list)
+    create_table: bool = True
+    max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES
     table: Optional[str] = None
 
     def merge_with_node_config(
@@ -342,7 +412,27 @@ class MaterializationConfig:
         node_enabled = node_config.get("enabled")
         node_mode = node_config.get("mode")
         node_table = node_config.get("table")
-        node_partition_by = node_config.get("partition_by", [])
+        node_unique_keys = node_config.get("unique_keys")
+        node_partition_by = node_config.get("partition_by")
+        node_create_table = node_config.get("create_table")
+        node_max_batch_bytes = node_config.get("max_batch_bytes")
+
+        validate_iceberg_write_options(
+            node_mode if node_mode is not None else self.default_mode,
+            unique_keys=node_unique_keys,
+            partition_by=node_partition_by,
+            create_table=(
+                node_create_table
+                if node_create_table is not None
+                else self.create_table
+            ),
+            max_batch_bytes=(
+                node_max_batch_bytes
+                if node_max_batch_bytes is not None
+                else self.max_batch_bytes
+            ),
+            require_fields=False,
+        )
 
         # Catalog config (usually not overridden at node level)
         node_catalog = node_config.get("catalog", {})
@@ -370,20 +460,52 @@ class MaterializationConfig:
         return MaterializationConfig(
             enabled=node_enabled if node_enabled is not None else self.enabled,
             catalog=merged_catalog,
-            default_mode=MaterializationMode(node_mode) if node_mode else self.default_mode,
+            default_mode=(
+                MaterializationMode(node_mode)
+                if node_mode is not None
+                else self.default_mode
+            ),
             duckdb=self.duckdb,  # DuckDB config typically not overridden
             schema_evolution=merged_schema_evolution,
-            partition_by=node_partition_by if node_partition_by else self.partition_by,
+            unique_keys=(
+                node_unique_keys
+                if node_unique_keys is not None
+                else self.unique_keys
+            ),
+            partition_by=(
+                node_partition_by
+                if node_partition_by is not None
+                else self.partition_by
+            ),
+            create_table=(
+                node_create_table
+                if node_create_table is not None
+                else self.create_table
+            ),
+            max_batch_bytes=(
+                node_max_batch_bytes
+                if node_max_batch_bytes is not None
+                else self.max_batch_bytes
+            ),
             table=node_table if node_table else self.table,
         )
 
-    def validate(self) -> None:
+    def validate(self, *, require_fields: bool = True) -> None:
         """
         Validate the complete materialization configuration.
 
         Raises:
             ConfigurationError: If configuration is invalid
         """
+        validate_iceberg_write_options(
+            self.default_mode,
+            unique_keys=self.unique_keys,
+            partition_by=self.partition_by,
+            create_table=self.create_table,
+            max_batch_bytes=self.max_batch_bytes,
+            require_fields=require_fields,
+        )
+
         if not self.enabled:
             return
 
@@ -395,15 +517,6 @@ class MaterializationConfig:
             raise ConfigurationError(
                 "Column drops are not allowed for data safety reasons"
             )
-
-        # Validate partition columns format
-        for partition_col in self.partition_by:
-            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', partition_col):
-                raise ConfigurationError(
-                    f"Invalid partition column name: {partition_col}. "
-                    f"Must be a valid SQL identifier."
-                )
-
 
 def validate_table_name(table_name: str) -> str:
     """

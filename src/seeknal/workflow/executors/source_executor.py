@@ -1443,7 +1443,8 @@ class SourceExecutor(BaseExecutor):
                         "total": dispatch_result.total,
                         "succeeded": dispatch_result.succeeded,
                         "failed": dispatch_result.failed,
-                        "results": dispatch_result.results,
+                        "required_failed": dispatch_result.required_failed,
+                        "results": dispatch_result.serializable_results,
                     }
                     if dispatch_result.all_succeeded:
                         logger.info(
@@ -1463,6 +1464,8 @@ class SourceExecutor(BaseExecutor):
                         "enabled": True,
                         "success": False,
                         "error": str(e),
+                        "required_failed": bool(getattr(e, "required_materialization", False)),
+                        "failure_category": getattr(e, "failure_category", None),
                     }
             elif not mat_targets:
                 # Fallback: legacy Iceberg-only path (singular materialization config)
@@ -1471,7 +1474,8 @@ class SourceExecutor(BaseExecutor):
                     mat_result = materialize_node_if_enabled(
                         self.node,
                         source_con=con,
-                        enabled_override=self.context.materialize_enabled
+                        enabled_override=self.context.materialize_enabled,
+                        profile_path=getattr(self.context, "profile_path", None),
                     )
                     if mat_result:
                         result.metadata["materialization"] = {
@@ -1481,6 +1485,11 @@ class SourceExecutor(BaseExecutor):
                             "row_count": mat_result.get("row_count"),
                             "mode": mat_result.get("mode"),
                             "iceberg_table": mat_result.get("iceberg_table"),
+                            **(
+                                {"write_result": mat_result}
+                                if mat_result.get("mode") in {"upsert", "insert_overwrite"}
+                                else {}
+                            ),
                         }
                         logger.info(
                             f"Materialized node '{self.node.id}' to Iceberg table "
@@ -1494,6 +1503,8 @@ class SourceExecutor(BaseExecutor):
                         "enabled": True,
                         "success": False,
                         "error": str(e),
+                        "required_failed": bool(getattr(e, "required_materialization", False)),
+                        "failure_category": getattr(e, "failure_category", None),
                     }
 
         return result

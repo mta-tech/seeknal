@@ -654,8 +654,8 @@ class FeatureGroupExecutor(BaseExecutor):
 
         # Log summary
         if self.context.verbose:
-            from ...context import logger
-            logger.info(
+            from ...context import logger as context_logger
+            context_logger.info(
                 f"Feature group '{self.node.name}' executed: "
                 f"{result.row_count} rows, "
                 f"{result.metadata.get('feature_count', 0)} features, "
@@ -664,13 +664,54 @@ class FeatureGroupExecutor(BaseExecutor):
 
         # Handle Iceberg materialization if enabled
         if result.status == ExecutionStatus.SUCCESS and not result.is_dry_run:
+            targets = self.node.config.get("materializations", [])
+            # Feature-store offline/online settings are not catalog targets.
+            if targets and any(target.get("table") for target in targets):
+                if self.context.materialize_enabled is False:
+                    return result
+                from seeknal.workflow.materialization.dispatcher import MaterializationDispatcher
+                from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+                try:
+                    profile_path = getattr(self.context, "profile_path", None)
+                    loader = ProfileLoader(profile_path=profile_path) if profile_path else None
+                    dispatched = MaterializationDispatcher(loader).dispatch(
+                        con=self.context.get_duckdb_connection(),
+                        view_name=f"feature_group.{self.node.name}",
+                        targets=targets,
+                        node_id=self.node.id,
+                        env_name=getattr(self.context, "env_name", None),
+                    )
+                    result.metadata["materialization"] = {
+                        "enabled": True,
+                        "success": dispatched.all_succeeded,
+                        "total": dispatched.total,
+                        "succeeded": dispatched.succeeded,
+                        "failed": dispatched.failed,
+                        "required_failed": dispatched.required_failed,
+                        "results": dispatched.serializable_results,
+                    }
+                except Exception as exc:
+                    result.metadata["materialization"] = {
+                        "enabled": True,
+                        "success": False,
+                        "error": str(exc),
+                        "required_failed": bool(
+                            getattr(exc, "required_materialization", False)
+                        ),
+                        "failure_category": getattr(
+                            exc, "failure_category", None
+                        ),
+                    }
+                return result
             try:
                 # Get the context's DuckDB connection (has the view)
                 con = self.context.get_duckdb_connection()
                 mat_result = materialize_node_if_enabled(
                     self.node,
                     source_con=con,
-                    enabled_override=self.context.materialize_enabled
+                    enabled_override=self.context.materialize_enabled,
+                    profile_path=getattr(self.context, "profile_path", None),
                 )
                 if mat_result:
                     # Materialization was enabled and succeeded
@@ -681,6 +722,11 @@ class FeatureGroupExecutor(BaseExecutor):
                         "row_count": mat_result.get("row_count"),
                         "mode": mat_result.get("mode"),
                         "iceberg_table": mat_result.get("iceberg_table"),
+                        **(
+                            {"write_result": mat_result}
+                            if mat_result.get("mode") in {"upsert", "insert_overwrite"}
+                            else {}
+                        ),
                     }
                     logger.info(
                         f"Materialized node '{self.node.id}' to Iceberg table "
@@ -696,6 +742,8 @@ class FeatureGroupExecutor(BaseExecutor):
                     "enabled": True,
                     "success": False,
                     "error": str(e),
+                    "required_failed": bool(getattr(e, "required_materialization", False)),
+                    "failure_category": getattr(e, "failure_category", None),
                 }
 
         return result

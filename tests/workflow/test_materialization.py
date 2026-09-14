@@ -28,6 +28,9 @@ from seeknal.workflow.materialization.config import (
     CatalogType,
     ConfigurationError,
     CredentialError,
+    DEFAULT_MAX_BATCH_BYTES,
+    ADVANCED_MODES,
+    validate_iceberg_write_options,
     validate_table_name,
     validate_partition_columns,
 )
@@ -190,6 +193,75 @@ class TestMaterializationConfig:
         schema_columns = ["event_date", "region", "value"]
         with pytest.raises(ConfigurationError):
             validate_partition_columns(["event_date", "invalid;column"], schema_columns)
+
+    def test_merge_preserves_explicit_empty_and_false_overrides(self):
+        profile = MaterializationConfig(
+            unique_keys=["id"],
+            partition_by=["event_date"],
+            create_table=True,
+            max_batch_bytes=1024,
+        )
+
+        merged = profile.merge_with_node_config({
+            "unique_keys": [],
+            "partition_by": [],
+            "create_table": False,
+            "max_batch_bytes": 512,
+        })
+
+        assert merged.unique_keys == []
+        assert merged.partition_by == []
+        assert merged.create_table is False
+        assert merged.max_batch_bytes == 512
+
+
+class TestValidateIcebergWriteOptions:
+    def test_modes_and_shared_constants(self):
+        assert MaterializationMode.UPSERT.value == "upsert"
+        assert MaterializationMode.INSERT_OVERWRITE.value == "insert_overwrite"
+        assert ADVANCED_MODES == {"upsert", "insert_overwrite"}
+        assert DEFAULT_MAX_BATCH_BYTES == 268435456
+
+    @pytest.mark.parametrize(
+        ("mode", "kwargs"),
+        [
+            ("append", {}),
+            ("overwrite", {}),
+            ("upsert", {"unique_keys": ["customer_id"]}),
+            ("insert_overwrite", {"partition_by": ["event_date"]}),
+        ],
+    )
+    def test_accepts_all_modes(self, mode, kwargs):
+        validate_iceberg_write_options(mode, **kwargs)
+
+    @pytest.mark.parametrize(
+        ("mode", "message"),
+        [
+            ("upsert", "unique_keys"),
+            ("insert_overwrite", "partition_by"),
+        ],
+    )
+    def test_advanced_modes_require_resolved_fields(self, mode, message):
+        with pytest.raises(ConfigurationError, match=message):
+            validate_iceberg_write_options(mode)
+
+        validate_iceberg_write_options(mode, require_fields=False)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"mode": "invalid"}, "Invalid materialization mode"),
+            ({"mode": "append", "unique_keys": "id"}, "unique_keys must be a list"),
+            ({"mode": "append", "partition_by": ["bad-key"]}, "Invalid partition_by"),
+            ({"mode": "append", "unique_keys": ["id", "id"]}, "Duplicate column"),
+            ({"mode": "append", "create_table": 1}, "create_table must be a boolean"),
+            ({"mode": "append", "max_batch_bytes": True}, "positive integer"),
+            ({"mode": "append", "max_batch_bytes": 0}, "positive integer"),
+        ],
+    )
+    def test_rejects_malformed_options(self, kwargs, message):
+        with pytest.raises(ConfigurationError, match=message):
+            validate_iceberg_write_options(**kwargs)
 
 
 # =============================================================================
