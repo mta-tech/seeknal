@@ -1,0 +1,147 @@
+{
+  "actual_status": "PASSED",
+  "duration_seconds": 9.064145,
+  "finished_at_utc": "2026-09-16T09:05:48.283585Z",
+  "independent_readback": {
+    "duckdb": {
+      "dimension_digest": "ce1b2aa3d3ac7640ca59d0ff91d2219398017047201033fd73d4bac1f27f60f9",
+      "dimension_rows": 40,
+      "extension_install_fallback": {
+        "aws": true,
+        "httpfs": true,
+        "iceberg": false
+      },
+      "mart_digest": "0501420a18a3cf4f158f9be9905481c3ef6fc75aed85713eb901fd525c6f5a5b",
+      "mart_rows": 1416
+    }
+  },
+  "namespace": "synthetic_20260916t090539z_6df7cfe1",
+  "object_checks": {
+    "dimension": {
+      "data_files_checked": 3,
+      "metadata_files_checked": 1
+    },
+    "mart": {
+      "data_files_checked": 90,
+      "metadata_files_checked": 1
+    }
+  },
+  "operations": {
+    "dimension_create": {
+      "input_rows": 32,
+      "snapshot_id": "4763366849288265537"
+    },
+    "dimension_rerun": {
+      "outcome": "noop",
+      "snapshot_id": "7657130116514664701",
+      "snapshot_unchanged": true
+    },
+    "dimension_upsert": {
+      "inserted_rows": 8,
+      "rows_after": 40,
+      "rows_digest": "ce1b2aa3d3ac7640ca59d0ff91d2219398017047201033fd73d4bac1f27f60f9",
+      "snapshot_id": "7657130116514664701",
+      "updated_rows": 8
+    },
+    "invalid_batches": {
+      "duplicate_key": {
+        "failure_category": "preflight_failed",
+        "rejected": true
+      },
+      "null_key": {
+        "failure_category": "preflight_failed",
+        "rejected": true
+      }
+    },
+    "mart_create": {
+      "input_rows": 1440,
+      "snapshot_id": "5078657728470118741"
+    },
+    "mart_empty": {
+      "outcome": "noop",
+      "snapshot_id": "6554455244769446560",
+      "snapshot_unchanged": true
+    },
+    "mart_partition_replacement": {
+      "affected_partitions": 2,
+      "input_rows": 8,
+      "rows_after": 1416,
+      "rows_digest": "0501420a18a3cf4f158f9be9905481c3ef6fc75aed85713eb901fd525c6f5a5b",
+      "snapshot_id": "6554455244769446560",
+      "unaffected_rows_digest": "858c89c14ac30b828047c83b95605b8599324cbc931d12561ac0da56f626547b"
+    }
+  },
+  "preserved_for_inspection": true,
+  "source": {
+    "after": {
+      "checksums": {
+        "dim_balai": "37d0f83ca2210ce92daf76a594789b7c",
+        "dim_balai_delta": "ad3de1342a948c9a5371d289924d4020",
+        "mart_replacement": "a235f12b72c2fe8aba39faed047046b6"
+      },
+      "counts": {
+        "dim_balai": 32,
+        "dim_balai_delta": 16,
+        "dim_komoditi": 12,
+        "dim_lokasi": 64,
+        "dim_waktu": 90,
+        "fact_pemeriksaan": 12000,
+        "fact_pengujian": 25000,
+        "mart_replacement": 8
+      },
+      "database": "bpom_synthetic",
+      "transaction_read_only": true,
+      "user": "bpom_reader"
+    },
+    "before": {
+      "checksums": {
+        "dim_balai": "37d0f83ca2210ce92daf76a594789b7c",
+        "dim_balai_delta": "ad3de1342a948c9a5371d289924d4020",
+        "mart_replacement": "a235f12b72c2fe8aba39faed047046b6"
+      },
+      "counts": {
+        "dim_balai": 32,
+        "dim_balai_delta": 16,
+        "dim_komoditi": 12,
+        "dim_lokasi": 64,
+        "dim_waktu": 90,
+        "fact_pemeriksaan": 12000,
+        "fact_pengujian": 25000,
+        "mart_replacement": 8
+      },
+      "database": "bpom_synthetic",
+      "transaction_read_only": true,
+      "user": "bpom_reader"
+    },
+    "mart_full_count": 1440
+  },
+  "source_identity": {
+    "implementation_commit": "77328f7d64118b5c29956430f1e50594550e9904",
+    "source_commit": "6f5730148cb9fbb5bc9b7dc9d36d85d9b61678ab",
+    "synthetic_data": true,
+    "wheel_sha256": "2aa2da82a540fd469437300cc02175af15c2501f2b3e9562ec429d39f05737f7"
+  },
+  "started_at_utc": "2026-09-16T09:05:39.219440Z",
+  "synthetic": true,
+  "timings_seconds": {
+    "configuration": 0.057691,
+    "dimension_create": 0.174946,
+    "dimension_identical_rerun": 0.036808,
+    "dimension_upsert": 0.133014,
+    "duckdb_independent_readback": 7.780617,
+    "mart_create": 0.199113,
+    "mart_empty_noop": 0.010104,
+    "mart_partition_replacement": 0.088261,
+    "s3_object_checks": 0.218588,
+    "source_after": 0.007356,
+    "source_before": 0.022213
+  },
+  "versions": {
+    "duckdb": "1.4.3",
+    "pyarrow": "23.0.0",
+    "pyiceberg": "0.10.0",
+    "python": "3.11",
+    "python_full": "3.11.16",
+    "seeknal": "2.11.1"
+  }
+}
