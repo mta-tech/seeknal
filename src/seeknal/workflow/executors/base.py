@@ -520,6 +520,13 @@ class BaseExecutor(ABC):
                 import warnings
                 warnings.warn(f"Post-execution cleanup failed: {str(e)}")
 
+        materialization = result.metadata.get("materialization")
+        if (
+            isinstance(materialization, dict) and materialization.get("required_failed")
+        ) or result.metadata.get("required_materialization_failed"):
+            result.status = ExecutionStatus.FAILED
+            result.error_message = "Required Iceberg materialization failed; inspect materialization results"
+
         return result
 
 

@@ -10,6 +10,11 @@ from functools import wraps
 from typing import Callable, Optional, Any, Union
 
 from seeknal.pipeline.materialization_config import MaterializationConfig  # ty: ignore[unresolved-import]
+from seeknal.workflow.materialization.config import (
+    ConfigurationError,
+    DEFAULT_MAX_BATCH_BYTES,
+    validate_iceberg_write_options,
+)
 
 # Global registry for discovered nodes
 _PIPELINE_REGISTRY: dict[str, dict] = {}
@@ -62,12 +67,19 @@ def _validate_materialization_config(
                 "(e.g., 'warehouse.prod.sales_forecast')"
             )
 
-    # Validate mode
-    if mode and mode not in ("append", "overwrite"):
-        raise ValueError(
-            f"Invalid materialization.mode '{mode}'. "
-            "Must be 'append' or 'overwrite'"
+    try:
+        validate_iceberg_write_options(
+            mode if mode is not None else "append",
+            unique_keys=config.get("unique_keys"),
+            partition_by=config.get("partition_by"),
+            create_table=config.get("create_table", True),
+            max_batch_bytes=config.get(
+                "max_batch_bytes", DEFAULT_MAX_BATCH_BYTES
+            ),
+            require_fields=False,
         )
+    except ConfigurationError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _set_node_meta(wrapper: Callable, node_id: str, meta: dict) -> None:
@@ -80,10 +92,13 @@ def materialize(
     type: str = "iceberg",
     connection: Optional[str] = None,
     table: str = "",
-    mode: str = "full",
+    mode: Optional[str] = None,
     time_column: Optional[str] = None,
     lookback: Optional[str] = None,
     unique_keys: Optional[list[str]] = None,
+    partition_by: Optional[list[str]] = None,
+    create_table: Optional[bool] = None,
+    max_batch_bytes: Optional[int] = None,
     **kwargs,
 ):
     """Stackable decorator to attach materialization targets to a pipeline node.
@@ -96,11 +111,14 @@ def materialize(
         type: Materialization target type ("iceberg", "postgresql")
         connection: Named connection profile (required for postgresql)
         table: Target table name
-        mode: Write mode ("full", "incremental_by_time", "upsert_by_key",
-              "append", "overwrite")
+        mode: Write mode. Defaults to "append" for Iceberg and "full" for
+            PostgreSQL.
         time_column: Column for incremental mode partitioning
         lookback: Lookback window for incremental mode (e.g., "7d")
         unique_keys: Key columns for upsert mode
+        partition_by: Identity partition columns for Iceberg insert_overwrite
+        create_table: Auto-create the target table when missing
+        max_batch_bytes: Maximum logical Arrow batch size for advanced modes
         **kwargs: Additional target-specific parameters
 
     Example:
@@ -113,7 +131,32 @@ def materialize(
             return ctx.ref('source.orders')
     """
     def decorator(func: Callable) -> Callable:
-        mat_config: dict[str, Any] = {"type": type, "table": table, "mode": mode}
+        resolved_mode = mode
+        if resolved_mode is None:
+            resolved_mode = "append" if type == "iceberg" else "full"
+
+        if type == "iceberg":
+            try:
+                validate_iceberg_write_options(
+                    resolved_mode,
+                    unique_keys=unique_keys,
+                    partition_by=partition_by,
+                    create_table=create_table if create_table is not None else True,
+                    max_batch_bytes=(
+                        max_batch_bytes
+                        if max_batch_bytes is not None
+                        else DEFAULT_MAX_BATCH_BYTES
+                    ),
+                    require_fields=False,
+                )
+            except ConfigurationError as exc:
+                raise ValueError(str(exc)) from exc
+
+        mat_config: dict[str, Any] = {
+            "type": type,
+            "table": table,
+            "mode": resolved_mode,
+        }
         if connection is not None:
             mat_config["connection"] = connection
         if time_column is not None:
@@ -122,6 +165,12 @@ def materialize(
             mat_config["lookback"] = lookback
         if unique_keys is not None:
             mat_config["unique_keys"] = unique_keys
+        if partition_by is not None:
+            mat_config["partition_by"] = partition_by
+        if create_table is not None:
+            mat_config["create_table"] = create_table
+        if max_batch_bytes is not None:
+            mat_config["max_batch_bytes"] = max_batch_bytes
         mat_config.update(kwargs)
 
         # Stackable: append to existing list or create new

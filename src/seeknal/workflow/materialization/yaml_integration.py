@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -48,6 +48,9 @@ from seeknal.workflow.materialization.config import (
     CatalogType,
     ConfigurationError,
     validate_table_name,
+    ADVANCED_MODES,
+    DEFAULT_MAX_BATCH_BYTES,
+    validate_iceberg_write_options,
 )
 
 if TYPE_CHECKING:
@@ -94,11 +97,15 @@ class YAMLMaterializationConfig:
     create_table: bool = True
     catalog_uri: Optional[str] = None
     warehouse: Optional[str] = None
+    unique_keys: Optional[List[str]] = None
+    partition_by: Optional[List[str]] = None
+    max_batch_bytes: Optional[int] = None
 
 
 class IcebergMaterializationError(Exception):
     """Base exception for Iceberg materialization errors."""
-    pass
+    required_materialization = False
+    failure_category: Optional[str] = None
 
 
 class IcebergMaterializationHelper:
@@ -281,7 +288,12 @@ class IcebergMaterializationHelper:
                 pass
 
     @classmethod
-    def extract_materialization_config(cls, node_config: Dict[str, Any]) -> YAMLMaterializationConfig:
+    def extract_materialization_config(
+        cls,
+        node_config: Dict[str, Any],
+        *,
+        default_mode: MaterializationMode = MaterializationMode.APPEND,
+    ) -> YAMLMaterializationConfig:
         """
         Extract materialization configuration from YAML node config.
 
@@ -301,10 +313,22 @@ class IcebergMaterializationHelper:
                 "Materialization config must be a dictionary"
             )
 
+        # Unsupported modes must also fail the node rather than silently retain
+        # the legacy best-effort behavior. Tuple membership handles malformed
+        # (unhashable) mode values without failing before error classification.
+        advanced_requested = mat_config.get("mode", default_mode) not in ("append", "overwrite")
+
+        def config_error(message: str) -> IcebergMaterializationError:
+            error = IcebergMaterializationError(message)
+            if advanced_requested:
+                error.required_materialization = True
+                error.failure_category = "preflight_failed"
+            return error
+
         # Check if materialization is enabled
         enabled = mat_config.get("enabled", False)
         if not isinstance(enabled, bool):
-            raise IcebergMaterializationError(
+            raise config_error(
                 "Materialization 'enabled' must be a boolean"
             )
 
@@ -314,7 +338,7 @@ class IcebergMaterializationHelper:
         # Extract table name (required when enabled)
         table = mat_config.get("table")
         if not table:
-            raise IcebergMaterializationError(
+            raise config_error(
                 "Materialization 'table' is required when enabled=true"
             )
 
@@ -322,29 +346,41 @@ class IcebergMaterializationHelper:
         try:
             validate_table_name(table)
         except Exception as e:
-            raise IcebergMaterializationError(
+            raise config_error(
                 f"Invalid table name '{table}': {e}"
             ) from e
 
         # Extract mode
-        mode_str = mat_config.get("mode", "append")
+        mode_str = mat_config.get("mode", default_mode)
         try:
             mode = MaterializationMode(mode_str)
         except ValueError:
-            raise IcebergMaterializationError(
-                f"Invalid materialization mode '{mode_str}'. Must be 'append' or 'overwrite'"
+            raise config_error(
+                f"Invalid materialization mode '{mode_str}'. "
+                f"Must be one of: {[item.value for item in MaterializationMode]}"
             )
 
         # Extract create_table flag
         create_table = mat_config.get("create_table", True)
         if not isinstance(create_table, bool):
-            raise IcebergMaterializationError(
+            raise config_error(
                 "Materialization 'create_table' must be a boolean"
             )
 
         # Extract optional per-node catalog overrides
         catalog_uri = mat_config.get("catalog_uri")
         warehouse = mat_config.get("warehouse")
+        try:
+            validate_iceberg_write_options(
+                mode,
+                unique_keys=mat_config.get("unique_keys"),
+                partition_by=mat_config.get("partition_by"),
+                create_table=create_table,
+                max_batch_bytes=mat_config.get("max_batch_bytes", DEFAULT_MAX_BATCH_BYTES),
+                require_fields=False,
+            )
+        except ConfigurationError as exc:
+            raise config_error(str(exc)) from exc
 
         return YAMLMaterializationConfig(
             enabled=True,
@@ -353,6 +389,9 @@ class IcebergMaterializationHelper:
             create_table=create_table,
             catalog_uri=catalog_uri,
             warehouse=warehouse,
+            unique_keys=mat_config.get("unique_keys"),
+            partition_by=mat_config.get("partition_by"),
+            max_batch_bytes=mat_config.get("max_batch_bytes"),
         )
 
     @classmethod
@@ -360,9 +399,16 @@ class IcebergMaterializationHelper:
         cls,
         view_name: str,
         table_name: str,
-        mode: MaterializationMode = MaterializationMode.APPEND,
+        mode: Optional[MaterializationMode] = None,
         catalog_uri: Optional[str] = None,
         source_con: Optional[Any] = None,
+        *,
+        warehouse: Optional[str] = None,
+        unique_keys: Optional[List[str]] = None,
+        partition_by: Optional[List[str]] = None,
+        create_table: Optional[bool] = None,
+        max_batch_bytes: Optional[int] = None,
+        profile_path: Optional[Path] = None,
     ) -> Dict[str, Any]:
         """
         Materialize a DuckDB view to an Iceberg table.
@@ -391,6 +437,42 @@ class IcebergMaterializationHelper:
         Raises:
             IcebergMaterializationError: If materialization fails
         """
+        from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+        loader = ProfileLoader(profile_path=profile_path)
+        if mode is None:
+            mode = loader.load_profile().default_mode
+        mode = MaterializationMode(mode)
+        if mode.value in ADVANCED_MODES:
+            from seeknal.workflow.materialization.dispatcher import MaterializationDispatcher
+
+            target = {
+                "table": table_name,
+                "mode": mode.value,
+                **{key: value for key, value in {
+                    "catalog_uri": catalog_uri,
+                    "warehouse": warehouse,
+                    "unique_keys": unique_keys,
+                    "partition_by": partition_by,
+                    "create_table": create_table,
+                    "max_batch_bytes": max_batch_bytes,
+                }.items() if value is not None},
+            }
+            con = source_con if source_con is not None else duckdb.connect(":memory:")
+            try:
+                result = MaterializationDispatcher(loader)._materialize_iceberg(
+                    con, view_name, target
+                )
+                return {**asdict(result), "table": table_name, "iceberg_table": table_name}
+            except Exception as exc:
+                error = IcebergMaterializationError(str(exc))
+                error.required_materialization = True
+                error.failure_category = getattr(exc, "failure_category", "preflight_failed")
+                raise error from exc
+            finally:
+                if source_con is None:
+                    con.close()
+
         logger.info(
             f"Materializing view '{view_name}' to Iceberg table '{table_name}' "
             f"(mode={mode.value})"
@@ -556,6 +638,8 @@ class IcebergMaterializationHelper:
         catalog_uri: Optional[str] = None,
         source_con: Optional[Any] = None,
         enabled_override: Optional[bool] = None,
+        *,
+        profile_path: Optional[Path] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Materialize a workflow node result to Iceberg.
@@ -584,7 +668,11 @@ class IcebergMaterializationHelper:
         elif enabled_override is True:
             # Force enable materialization - but only if node has valid config
             mat_section = node.config.get("materialization", {})
-            if not mat_section.get("table"):
+            if (
+                not mat_section.get("table")
+                and not mat_section.get("enabled", False)
+                and mat_section.get("mode") not in ADVANCED_MODES
+            ):
                 # Node doesn't have a table configured, skip materialization
                 logger.debug(
                     f"Skipping materialization for node '{node.id}': "
@@ -598,7 +686,16 @@ class IcebergMaterializationHelper:
 
         # Extract materialization config from node
         try:
-            mat_config = cls.extract_materialization_config(node.config)
+            default_mode = MaterializationMode.APPEND
+            mat_section = node.config.get("materialization", {})
+            if isinstance(mat_section, dict) and mat_section.get("enabled") and "mode" not in mat_section:
+                from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+                loader = ProfileLoader(profile_path=profile_path) if profile_path else ProfileLoader()
+                default_mode = loader.load_profile().default_mode
+            mat_config = cls.extract_materialization_config(
+                node.config, default_mode=default_mode
+            )
         except Exception as e:
             logger.error(f"Failed to extract materialization config from node '{node.id}': {e}")
             raise
@@ -620,8 +717,14 @@ class IcebergMaterializationHelper:
             view_name=view_name,
             table_name=mat_config.table,
             mode=mat_config.mode,
-            catalog_uri=catalog_uri,
+            catalog_uri=mat_config.catalog_uri or catalog_uri,
             source_con=source_con,
+            warehouse=mat_config.warehouse,
+            unique_keys=mat_config.unique_keys,
+            partition_by=mat_config.partition_by,
+            create_table=node.config["materialization"].get("create_table"),
+            max_batch_bytes=mat_config.max_batch_bytes,
+            profile_path=profile_path,
         )
 
 
@@ -631,6 +734,8 @@ def materialize_node_if_enabled(
     catalog_uri: Optional[str] = None,
     source_con: Optional[Any] = None,
     enabled_override: Optional[bool] = None,
+    *,
+    profile_path: Optional[Path] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Convenience function to materialize a node if materialization is enabled.
@@ -655,4 +760,10 @@ def materialize_node_if_enabled(
         >>> if mat_result:
         ...     print(f"Materialized {mat_result['row_count']} rows to {mat_result['table']}")
     """
-    return IcebergMaterializationHelper.materialize_node(node, catalog_uri, source_con, enabled_override)
+    return IcebergMaterializationHelper.materialize_node(
+        node,
+        catalog_uri,
+        source_con,
+        enabled_override,
+        profile_path=profile_path,
+    )

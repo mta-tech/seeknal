@@ -1,0 +1,20 @@
+kind: transform
+name: mart_sales_daily
+description: Recompute complete daily sales partitions
+inputs:
+  - ref: source.sales
+transform: |
+  SELECT
+    CAST(order_timestamp AS DATE) AS sales_date,
+    product_id,
+    SUM(quantity) AS units_sold,
+    CAST(SUM(net_amount) AS DOUBLE) AS net_sales
+  FROM input_0
+  GROUP BY 1, 2
+materialization:
+  enabled: true
+  table: atlas.analytics.mart_sales_daily
+  mode: insert_overwrite
+  partition_by: [sales_date]
+  create_table: true
+  max_batch_bytes: 268435456

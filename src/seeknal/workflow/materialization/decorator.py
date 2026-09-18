@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import logging
+from dataclasses import asdict, replace
 from typing import Any, Callable, Dict, Optional
 
 from seeknal.workflow.executors.base import (
@@ -30,6 +31,7 @@ from seeknal.workflow.executors.base import (
 from seeknal.workflow.materialization.config import (
     MaterializationConfig,
     ConfigurationError,
+    ADVANCED_MODES,
 )
 from seeknal.workflow.materialization.profile_loader import ProfileLoader
 from seeknal.workflow.materialization.operations import (
@@ -111,14 +113,12 @@ class MaterializationMixin:
         """
         # Lazy initialization of profile loader
         if self._profile_loader is None:
-            self._profile_loader = ProfileLoader()
+            self._profile_loader = ProfileLoader(
+                profile_path=getattr(self._mat_context, "profile_path", None)
+            )
 
         # Load profile
         profile_config = self._profile_loader.load_profile()
-
-        # Check if globally enabled
-        if not profile_config.enabled:
-            return None
 
         # Get node (handle both direct and BaseExecutor cases)
         node = self._mat_node
@@ -326,6 +326,39 @@ class MaterializationMixin:
             # Setup auditor
             self._auditor = MaterializationAuditor()
 
+            if config.default_mode.value in ADVANCED_MODES:
+                catalog = config.catalog.interpolate_env_vars()
+                if not catalog.bearer_token:
+                    catalog = replace(
+                        catalog, bearer_token=DuckDBIcebergExtension.get_oauth2_token()
+                    )
+                table_ref = config.table or f"warehouse.{node.id}"
+                view_ref = node.id if "." in node.id else "loaded_data"
+                write_result = write_to_iceberg(
+                    con=con,
+                    catalog_name="iceberg_catalog",
+                    table_name=table_ref,
+                    view_name=view_ref,
+                    mode=config.default_mode.value,
+                    unique_keys=config.unique_keys,
+                    partition_by=config.partition_by,
+                    create_table=config.create_table,
+                    max_batch_bytes=config.max_batch_bytes,
+                    catalog_config=catalog,
+                    auditor=self._auditor,
+                )
+                if not write_result.success:
+                    raise ValueError(write_result.error_message or "Iceberg materialization failed")
+                return ExecutorResult(
+                    node_id=node.id,
+                    status=ExecutionStatus.SUCCESS,
+                    metadata={
+                        "materialization": "success",
+                        "table": table_ref,
+                        **asdict(write_result),
+                    },
+                )
+
             # Load Iceberg extension
             DuckDBIcebergExtension.load_extension(con)
 
@@ -375,7 +408,7 @@ class MaterializationMixin:
 
             logger.info(
                 f"Materialization successful: {node.id} -> {table_ref} "
-                f"(snapshot {write_result.snapshot_id[:8]})"
+                f"(snapshot {(write_result.snapshot_id or 'unverified')[:8]})"
             )
 
             return ExecutorResult(
@@ -395,6 +428,8 @@ class MaterializationMixin:
                 metadata={
                     "materialization": "failed",
                     "error": str(e),
+                    "required_materialization_failed": config.default_mode.value in ADVANCED_MODES,
+                    "failure_category": getattr(e, "failure_category", None),
                 },
             )
 

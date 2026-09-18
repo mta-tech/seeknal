@@ -2546,7 +2546,7 @@ def _run_yaml_pipeline(
                     node_id,
                     NodeStatus.FAILED.value,
                     duration_ms=int(duration * 1000),
-                    metadata={"error": result.error_message},
+                    metadata={**(result.metadata or {}), "error": result.error_message},
                 )
                 failed += 1
                 run_logger.log_node(
@@ -2567,6 +2567,10 @@ def _run_yaml_pipeline(
                     break
 
                 # Retry logic
+                from seeknal.workflow.materialization.dispatcher import iceberg_commit_requires_reconciliation
+
+                if retry > 0 and iceberg_commit_requires_reconciliation(result.metadata):
+                    _echo_warning("Iceberg commit requires reconciliation; automatic retries suppressed")
                 if retry > 0:
                     total_attempts = retry + 1  # initial + retries
                     # Log the initial failure as attempt 1
@@ -2580,6 +2584,8 @@ def _run_yaml_pipeline(
                         total_attempts=total_attempts,
                     )
                     for attempt in range(1, retry + 1):
+                        if iceberg_commit_requires_reconciliation(result.metadata):
+                            break
                         typer.echo(f"  Retry {attempt}/{retry}...")
 
                         try:
@@ -2612,6 +2618,13 @@ def _run_yaml_pipeline(
                                 )
                                 break
                             else:
+                                update_node_state(
+                                    run_state,
+                                    node_id,
+                                    NodeStatus.FAILED.value,
+                                    duration_ms=int((time.time() - node_start) * 1000),
+                                    metadata={**(result.metadata or {}), "error": result.error_message},
+                                )
                                 run_logger.log_node(
                                     node_id,
                                     "FAILED",

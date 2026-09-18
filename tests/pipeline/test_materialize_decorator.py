@@ -74,11 +74,20 @@ class TestMaterializeDecorator:
         mat = my_func._seeknal_materializations[0]
         assert mat["type"] == "iceberg"
         assert mat["table"] == ""
-        assert mat["mode"] == "full"
+        assert mat["mode"] == "append"
         assert "connection" not in mat
         assert "time_column" not in mat
         assert "lookback" not in mat
         assert "unique_keys" not in mat
+
+    def test_postgresql_omitted_mode_remains_full(self):
+        """PostgreSQL retains its existing full-refresh default."""
+
+        @materialize(type="postgresql", table="public.t1")
+        def my_func(ctx):
+            pass
+
+        assert my_func._seeknal_materializations[0]["mode"] == "full"
 
     def test_materialize_all_params(self):
         """@materialize passes through all optional parameters."""

@@ -1,0 +1,19 @@
+kind: transform
+name: dim_customer
+description: Apply complete customer row images as SCD Type 1 updates
+inputs:
+  - ref: source.customer_updates
+transform: |
+  SELECT
+    customer_id,
+    customer_name,
+    customer_segment,
+    updated_at
+  FROM input_0
+materialization:
+  enabled: true
+  table: atlas.analytics.dim_customer
+  mode: upsert
+  unique_keys: [customer_id]
+  create_table: true
+  max_batch_bytes: 268435456

@@ -1,0 +1,25 @@
+kind: transform
+name: customer_current
+description: Publish the same complete customer rows to two Iceberg targets
+inputs:
+  - ref: source.customer_updates
+transform: |
+  SELECT
+    customer_id,
+    customer_name,
+    customer_segment,
+    updated_at
+  FROM input_0
+materializations:
+  - type: iceberg
+    enabled: true
+    table: atlas.analytics.dim_customer
+    mode: upsert
+    unique_keys: [customer_id]
+    create_table: true
+  - type: iceberg
+    enabled: true
+    table: atlas.audit.customer_current
+    mode: upsert
+    unique_keys: [customer_id]
+    create_table: true

@@ -17,8 +17,11 @@ class TestMaterializationConfig:
         config = MaterializationConfig(
             enabled=True,
             table="warehouse.prod.sales_forecast",
-            mode="overwrite",
-            create_table=True,
+            mode="upsert",
+            create_table=False,
+            unique_keys=["customer_id"],
+            partition_by=["event_date"],
+            max_batch_bytes=4096,
         )
 
         result = config.to_dict()
@@ -26,8 +29,11 @@ class TestMaterializationConfig:
         assert result == {
             "enabled": True,
             "table": "warehouse.prod.sales_forecast",
-            "mode": "overwrite",
-            "create_table": True,
+            "mode": "upsert",
+            "create_table": False,
+            "unique_keys": ["customer_id"],
+            "partition_by": ["event_date"],
+            "max_batch_bytes": 4096,
         }
 
     def test_to_dict_with_partial_fields(self):
@@ -46,6 +52,9 @@ class TestMaterializationConfig:
         }
         assert "mode" not in result
         assert "create_table" not in result
+        assert "unique_keys" not in result
+        assert "partition_by" not in result
+        assert "max_batch_bytes" not in result
 
     def test_to_dict_with_all_none(self):
         """Test to_dict() returns empty dict when all fields are None."""
@@ -69,6 +78,9 @@ class TestMaterializationConfig:
         assert config.table == "warehouse.prod.table"
         assert config.mode == "append"
         assert config.create_table is None
+        assert config.unique_keys is None
+        assert config.partition_by is None
+        assert config.max_batch_bytes is None
 
     def test_from_dict_ignores_unknown_fields(self):
         """Test from_dict() ignores unknown fields."""
@@ -92,6 +104,9 @@ class TestMaterializationConfig:
         assert config.table is None
         assert config.mode is None
         assert config.create_table is None
+        assert config.unique_keys is None
+        assert config.partition_by is None
+        assert config.max_batch_bytes is None
 
     def test_round_trip_conversion(self):
         """Test round-trip: to_dict() -> from_dict() preserves data."""
@@ -100,6 +115,9 @@ class TestMaterializationConfig:
             table="warehouse.dev.table",
             mode="append",
             create_table=False,
+            unique_keys=[],
+            partition_by=[],
+            max_batch_bytes=1024,
         )
 
         # Convert to dict
@@ -112,6 +130,9 @@ class TestMaterializationConfig:
         assert restored.table == original.table
         assert restored.mode == original.mode
         assert restored.create_table == original.create_table
+        assert restored.unique_keys == original.unique_keys
+        assert restored.partition_by == original.partition_by
+        assert restored.max_batch_bytes == original.max_batch_bytes
 
 
 class TestMaterializationConfigValidation:
@@ -182,8 +203,61 @@ class TestMaterializationConfigValidation:
             mode="invalid_mode"
         )
 
-        with pytest.raises(ValueError, match="Must be 'append' or 'overwrite'"):
+        with pytest.raises(ValueError, match="Must be one of"):
             _validate_materialization_config(config)
+
+    def test_validate_advanced_modes_allow_inherited_required_fields(self):
+        from seeknal.pipeline.decorators import _validate_materialization_config
+
+        _validate_materialization_config(MaterializationConfig(mode="upsert"))
+        _validate_materialization_config(
+            MaterializationConfig(mode="insert_overwrite")
+        )
+
+    @pytest.mark.parametrize(
+        ("config", "message"),
+        [
+            (MaterializationConfig(unique_keys="id"), "unique_keys must be a list"),
+            (MaterializationConfig(partition_by=["bad-key"]), "Invalid partition_by"),
+            (MaterializationConfig(create_table=1), "create_table must be a boolean"),
+            (MaterializationConfig(max_batch_bytes=True), "positive integer"),
+        ],
+    )
+    def test_validate_rejects_malformed_advanced_fields(self, config, message):
+        from seeknal.pipeline.decorators import _validate_materialization_config
+
+        with pytest.raises(ValueError, match=message):
+            _validate_materialization_config(config)
+
+    def test_materialize_backend_specific_defaults_and_forwarding(self):
+        from seeknal.pipeline.decorators import materialize
+
+        @materialize(
+            type="iceberg",
+            table="atlas.ns.mart",
+            mode="insert_overwrite",
+            partition_by=["event_date"],
+            create_table=False,
+            max_batch_bytes=2048,
+        )
+        def iceberg_target(ctx):
+            return ctx
+
+        @materialize(type="iceberg", table="atlas.ns.default_table")
+        def default_iceberg(ctx):
+            return ctx
+
+        @materialize(type="postgresql", table="public.table")
+        def default_postgres(ctx):
+            return ctx
+
+        iceberg_config = iceberg_target._seeknal_materializations[0]
+        assert iceberg_config["mode"] == "insert_overwrite"
+        assert iceberg_config["partition_by"] == ["event_date"]
+        assert iceberg_config["create_table"] is False
+        assert iceberg_config["max_batch_bytes"] == 2048
+        assert default_iceberg._seeknal_materializations[0]["mode"] == "append"
+        assert default_postgres._seeknal_materializations[0]["mode"] == "full"
 
     def test_validate_invalid_type(self):
         """Test validation raises TypeError for invalid type."""

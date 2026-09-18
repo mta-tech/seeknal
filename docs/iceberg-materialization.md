@@ -1,6 +1,6 @@
 # Apache Iceberg Materialization
 
-This guide covers using Apache Iceberg table format for materializing Seeknal pipeline outputs with ACID transactions, time travel, and incremental updates.
+This guide covers using Apache Iceberg table format for materializing Seeknal pipeline outputs, including append, full-table replacement, key-based upsert, and dynamic partition replacement.
 
 ## Overview
 
@@ -37,15 +37,15 @@ Apache Iceberg is an open table format for huge analytic datasets. Iceberg adds 
 │                   Materialization Decorator                     │
 │  - Checks if enabled in profiles.yml                           │
 │  - Validates schema compatibility                               │
-│  - Handles mode (append/overwrite)                             │
+│  - Handles append, overwrite, upsert, and partition replace    │
 └─────────────────────────────────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                  DuckDB + Iceberg Extension                    │
-│  - Loads Iceberg extension                                      │
-│  - Creates/updates Iceberg table                                │
-│  - Writes to S3/GCS/Azure                                       │
+│                 DuckDB + PyIceberg Writers                     │
+│  - DuckDB keeps the existing append/overwrite paths            │
+│  - PyIceberg handles upsert and insert_overwrite transactions  │
+│  - Writes to S3/GCS/Azure                                      │
 └─────────────────────────────────────────────────────────────────┘
                             │
                             ▼
@@ -164,7 +164,7 @@ materialization:
     uri: ${LAKEKEEPER_URI}              # e.g., http://lakekeeper.example.com:8181
     warehouse: s3://my-bucket/warehouse  # S3/GCS/Azure path
     verify_tls: true                     # Enable TLS verification (default)
-  default_mode: append                   # or "overwrite"
+  default_mode: append                   # append, overwrite, upsert, insert_overwrite
 
   schema_evolution:
     mode: safe                           # safe, auto, or strict
@@ -283,6 +283,11 @@ schema_evolution:
 
 ## Write Modes
 
+Seeknal supports four Iceberg write modes. `append` remains the default. The
+existing `append` and `overwrite` execution paths retain their previous
+behavior; the transaction guarantees described below apply specifically to
+`upsert` and `insert_overwrite`.
+
 ### OVERWRITE Mode
 
 Replace entire table contents:
@@ -314,6 +319,103 @@ materialization:
 - Event streaming
 
 **Note:** Requires schema compatibility with existing data.
+
+### UPSERT Mode
+
+Update rows with matching keys and insert new keys:
+
+```yaml
+materialization:
+  enabled: true
+  table: atlas.production.dim_customer
+  mode: upsert
+  unique_keys: [customer_id]
+  create_table: true
+```
+
+The input must contain a complete row image for every key it supplies. Matching
+rows are replaced with the incoming values, new keys are inserted, and target
+keys absent from the batch remain unchanged. Source keys must be present,
+non-null, finite when numeric, and unique within the batch. NaN and infinity
+are rejected. Composite keys are supported by listing
+all key columns. Ambiguous duplicate target keys among the rows touched by the
+batch are rejected.
+
+Use this mode for SCD Type 1 dimensions or keyed fact corrections. Seeknal does
+not infer keys from entity metadata. Generate surrogate keys and manage
+dimension-to-fact relationships upstream. SCD Type 2, delete-by-absence, CDC
+deletes, and partial-column patches are outside this mode's contract.
+
+### INSERT_OVERWRITE Mode
+
+Replace only the identity partitions present in the incoming batch:
+
+```yaml
+materialization:
+  enabled: true
+  table: atlas.production.mart_sales_daily
+  mode: insert_overwrite
+  partition_by: [sales_date]
+  create_table: true
+```
+
+For every distinct partition tuple in the batch, Seeknal removes the previous
+rows in that partition and writes the incoming rows. Partitions absent from the
+batch remain unchanged. The batch must therefore contain the **complete result
+for every partition it touches**. Sending only changed rows will remove older
+rows from those partitions.
+
+The first release supports existing or newly created tables with matching
+identity partition columns. Unpartitioned tables, partition transforms such as
+`month`, `bucket`, or `truncate`, null or non-finite partition values, partition-spec
+evolution, and raw overwrite predicates are rejected before the write.
+
+Both new modes require compatible source and target schemas and map columns by
+name. They do not perform in-place schema evolution. Resolve type, precision,
+nullability, or column-set differences before writing.
+
+### Advanced-Mode Safety
+
+Both new modes use PyIceberg capabilities available in 0.10.0 and publish one
+table operation through an Iceberg transaction. This is atomic per target
+table, not across multiple materialization targets. Installations with an older
+PyIceberg that lacks the required APIs fail with a capability error rather than
+falling back to append.
+
+The writer checks its required PyIceberg APIs before catalog mutation, including
+the compatibility helpers used for schema validation and snapshot requirements.
+The current integration evidence covers PyIceberg 0.10.0; rerun the integration
+suite when upgrading it.
+
+Seeknal does not blindly retry commit conflicts or writes whose commit state is
+unknown. Reconcile the target snapshot and data before rerunning such a batch.
+An identical successful upsert can be rerun without creating duplicate logical
+rows, but this is not an exactly-once scheduling guarantee.
+
+Failures expose a `failure_category` through `WriteError` and per-target dispatch
+results: `preflight_failed`, `conflict`, or `commit_unknown`. An advanced-mode
+failure makes the pipeline node fail and `seeknal run` exit unsuccessfully.
+Existing append/overwrite and PostgreSQL best-effort behavior is unchanged.
+
+A failed or interrupted write may leave staged files that are not referenced by
+any committed snapshot. The writer deliberately does not delete them: a lost
+commit response can make a successful publication appear failed. Before production
+enablement, configure the catalog's supported orphan-file maintenance procedure:
+inventory against all retained snapshots, use a retention window longer than the
+longest writer/reconciliation interval, review the deletion candidates, then
+remove only files proven unreferenced after that window. Snapshot expiration
+alone is not evidence that orphan files have been removed.
+
+`max_batch_bytes` limits the frozen Arrow input used by these modes. It defaults
+to `268435456` bytes (256 MiB) and rejects a batch when `pyarrow.Table.nbytes`
+exceeds the limit. This is a logical input-size guard, not a peak RSS limit or a
+guarantee that the process cannot run out of memory.
+
+Empty input follows these rules:
+
+- Missing target plus `create_table: false`: fail.
+- Missing target plus `create_table: true`: no-op without creating a namespace or table.
+- Existing target: validate schema and partition spec, then no-op.
 
 ## CLI Commands
 
@@ -441,7 +543,7 @@ schema:
 materialization:
   enabled: true
   table: atlas.production.orders         # 3-part name: catalog.namespace.table
-  mode: append                           # append or overwrite
+  mode: append                           # append, overwrite, upsert, insert_overwrite
 ```
 
 ### Materialization Fields
@@ -450,8 +552,11 @@ materialization:
 |-------|------|----------|---------|-------------|
 | `enabled` | boolean | Yes | `false` | Enable materialization for this node |
 | `table` | string | When enabled | - | Fully qualified table name (`catalog.namespace.table`) |
-| `mode` | string | No | `append` | Write mode: `append` or `overwrite` |
+| `mode` | string | No | `append` | `append`, `overwrite`, `upsert`, or `insert_overwrite` |
 | `create_table` | boolean | No | `true` | Auto-create table if it doesn't exist |
+| `unique_keys` | list[string] | For `upsert` | - | Stable source/target key columns |
+| `partition_by` | list[string] | For `insert_overwrite` | - | Identity partition columns; must match the target spec |
+| `max_batch_bytes` | integer | No | `268435456` | Maximum logical Arrow input bytes for the two new modes |
 
 ### Configuration Hierarchy
 
@@ -651,6 +756,10 @@ materialization:
 - Slowly changing dimensions
 - Reference data
 - Full rebuild scenarios
+
+For an SCD Type 1 dimension with stable keys, prefer `upsert` to avoid replacing
+the whole table. Continue using `overwrite` when the pipeline intentionally
+rebuilds the complete dimension.
 
 ### 5. Set Snapshot Retention Policy
 
@@ -949,14 +1058,27 @@ VACUUM atlas.production.orders;
 ### MaterializationConfig
 
 ```python
+from dataclasses import dataclass
+from typing import Optional
+
+from seeknal.pipeline.materialization_config import MaterializationConfig
+
 @dataclass
 class MaterializationConfig:
-    enabled: bool                          # Enable materialization
-    catalog: CatalogConfig                 # Catalog configuration
-    default_mode: MaterializationMode      # append or overwrite
-    schema_evolution: SchemaEvolutionConfig
-    partition_by: List[str]                # Partition columns
+    enabled: Optional[bool] = None
+    table: Optional[str] = None
+    mode: Optional[str] = None
+    create_table: Optional[bool] = None
+    unique_keys: Optional[list[str]] = None
+    partition_by: Optional[list[str]] = None
+    max_batch_bytes: Optional[int] = None
 ```
+
+The same fields work in the singular `materialization:` YAML form, each target
+inside plural `materializations:`, typed `MaterializationConfig`, and the
+stackable `@materialize` decorator. See
+[`examples/iceberg-write-modes/`](../examples/iceberg-write-modes/) for complete
+examples.
 
 ### CatalogConfig
 
@@ -994,6 +1116,12 @@ class SchemaEvolutionConfig:
 | Orders table accumulates with append mode | By Design | Use `overwrite` mode for full refresh, or clear between runs |
 | DuckDB `SUM()` produces HUGEINT, invalid for Iceberg | DuckDB Limitation | Cast aggregates explicitly: `CAST(SUM(col) AS BIGINT)` |
 
+The repository's local REST-catalog/FileIO integration tests validate the write
+contract in isolation. They do not prove connectivity, credentials, TLS,
+Lakekeeper behavior, or S3-compatible storage behavior in a deployed
+environment. Run a representative smoke test against the actual deployment
+before enabling either new mode for production data.
+
 ## Further Reading
 
 - [Apache Iceberg Specification](https://iceberg.apache.org/spec/)
@@ -1021,7 +1149,7 @@ End-to-end verified with Lakekeeper + MinIO:
 Initial release:
 - Profile-driven configuration (dbt-like profiles.yml)
 - Per-node YAML overrides
-- Atomic write operations with rollback
+- Snapshot management and write status tracking
 - Schema evolution (safe/auto/strict modes)
 - Snapshot management for time travel
 - Security features (TLS, audit logging, SQL injection prevention)

@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.0] - 2026-09-17
+
+### Added
+- Iceberg `upsert` materialization with explicit unique keys for SCD Type 1 dimensions and keyed fact updates.
+- Iceberg `insert_overwrite` materialization for complete incoming identity partitions, preserving partitions outside the batch.
+- Shared YAML/Python/feature-store configuration, strict input validation, snapshot evidence, and a configurable Arrow batch-size limit for both modes.
+- Interactive visual documentation and real PostgreSQL/Lakekeeper/S3 validation evidence using synthetic BPOM-style data.
+
+### Fixed
+- Preserve the selected profile and required-failure status across materialization paths, including profile-inherited modes.
+- Suppress automatic CLI and runner retries after conflicting or uncertain Iceberg commits, retaining machine-readable failure categories.
+- Reject null, duplicate, and non-finite upsert keys before catalog mutation.
+
 ## [2.11.1] - 2026-08-28
 
 ### Changed

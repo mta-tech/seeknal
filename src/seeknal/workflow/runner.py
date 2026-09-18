@@ -643,6 +643,14 @@ class DAGRunner:
             result = self._execute_by_type(node)
 
             duration = time.time() - start_time
+            if result.get("status") == ExecutionStatus.FAILED.value:
+                return NodeResult(
+                    node_id=node_id,
+                    status=ExecutionStatus.FAILED,
+                    duration=duration,
+                    error_message=result.get("error_message") or "Executor failed",
+                    metadata=result,
+                )
             return NodeResult(
                 node_id=node_id,
                 status=ExecutionStatus.SUCCESS,
@@ -862,6 +870,12 @@ class DAGRunner:
             elif result.status == ExecutionStatus.FAILED:
                 _echo_error(f"{node.name} failed: {result.error_message}")
                 summary.failed_nodes += 1
+                if not dry_run:
+                    update_node_state(
+                        self.run_state, node_id, status=NodeStatus.FAILED.value,
+                        duration_ms=int(result.duration * 1000),
+                        metadata={**result.metadata, "error": result.error_message},
+                    )
 
                 if not continue_on_error:
                     _echo_error("Stopping execution due to failure")
@@ -869,10 +883,22 @@ class DAGRunner:
                     break
 
                 # Retry logic
+                from seeknal.workflow.materialization.dispatcher import iceberg_commit_requires_reconciliation
+
                 if retry > 0:
                     for attempt in range(1, retry + 1):
+                        if iceberg_commit_requires_reconciliation(result.metadata):
+                            _echo_warning("Iceberg commit requires reconciliation; automatic retries suppressed")
+                            break
                         _echo_warning(f"Retry {attempt}/{retry} for {node.name}")
                         result = self._execute_node(node_id, dry_run=dry_run)
+                        if not dry_run:
+                            update_node_state(
+                                self.run_state, node_id, status=result.status.value,
+                                duration_ms=int(result.duration * 1000),
+                                row_count=result.row_count,
+                                metadata={**result.metadata, "error": result.error_message},
+                            )
                         if result.status == ExecutionStatus.SUCCESS:
                             _echo_success(f"{node.name} succeeded on retry {attempt}")
                             summary.failed_nodes -= 1

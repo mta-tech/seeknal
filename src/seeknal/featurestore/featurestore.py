@@ -147,6 +147,10 @@ class IcebergStoreOutput:
     namespace: str = "default"
     warehouse: Optional[str] = None
     mode: str = "append"
+    unique_keys: Optional[List[str]] = None
+    partition_by: Optional[List[str]] = None
+    create_table: Optional[bool] = None
+    max_batch_bytes: Optional[int] = None
 
     def to_dict(self):
         """Convert the configuration to a dictionary representation.
@@ -160,6 +164,12 @@ class IcebergStoreOutput:
             "namespace": self.namespace,
             "table": self.table,
             "mode": self.mode,
+            **{key: value for key, value in {
+                "unique_keys": self.unique_keys,
+                "partition_by": self.partition_by,
+                "create_table": self.create_table,
+                "max_batch_bytes": self.max_batch_bytes,
+            }.items() if value is not None},
         }
 
 
@@ -479,7 +489,10 @@ class OfflineStore:
         from seeknal.workflow.materialization.config import (
             MaterializationConfig,
             ConfigurationError,
+            ADVANCED_MODES,
+            validate_iceberg_write_options,
         )
+        from dataclasses import replace
 
         if kwds is None:
             kwds = {}
@@ -491,35 +504,47 @@ class OfflineStore:
 
         # Handle dict case (from database deserialization)
         if isinstance(iceberg_config, dict):
-            # Create a temporary IcebergStoreOutput from dict
-            from dataclasses import dataclass
+            iceberg_config = IcebergStoreOutput(**iceberg_config)
+        if not isinstance(iceberg_config, IcebergStoreOutput):
+            raise ValueError("ICEBERG output requires IcebergStoreOutput or its dictionary representation")
 
-            @dataclass
-            class _TempIcebergConfig:
-                catalog: str = "lakekeeper"
-                warehouse: Optional[str] = None
-                namespace: str = "default"
-                table: str = ""
-                mode: str = "append"
-
-            iceberg_config = _TempIcebergConfig(**iceberg_config)
+        write_mode = iceberg_config.mode or "append"
+        advanced = write_mode in ADVANCED_MODES
 
         # Load profile for catalog configuration
         profile_loader = ProfileLoader()
         try:
             profile_config = profile_loader.load_profile()
         except (ConfigurationError, Exception) as e:
+            if advanced:
+                raise
             logger.warning(f"Could not load materialization profile: {e}. Using defaults.")
             profile_config = MaterializationConfig()
 
+        options = {}
+        if advanced:
+            options = {
+                key: getattr(iceberg_config, key)
+                if getattr(iceberg_config, key) is not None
+                else getattr(profile_config, key)
+                for key in ("unique_keys", "partition_by", "create_table", "max_batch_bytes")
+            }
+        validate_iceberg_write_options(write_mode, **options)
+        catalog = (
+            profile_config.catalog.interpolate_env_vars()
+            if advanced else profile_config.catalog
+        )
+
         # Merge profile config with IcebergStoreOutput
         # Profile provides defaults, IcebergStoreOutput can override
-        catalog_uri = profile_config.catalog.uri if profile_config.catalog.uri else ""
+        catalog_uri = catalog.uri or ""
         warehouse_path = (
             iceberg_config.warehouse or
-            profile_config.catalog.warehouse
+            catalog.warehouse
         )
-        bearer_token = profile_config.catalog.bearer_token
+        bearer_token = catalog.bearer_token
+        if advanced and not bearer_token:
+            bearer_token = DuckDBIcebergExtension.get_oauth2_token()
 
         # Validate required configuration
         if not catalog_uri:
@@ -547,18 +572,21 @@ class OfflineStore:
         con = duckdb.connect(":memory:")
 
         try:
-            # Load Iceberg extension
-            DuckDBIcebergExtension.load_extension(con)
-
-            # Setup REST catalog
             catalog_name = "seeknal_catalog"
-            DuckDBIcebergExtension.create_rest_catalog(
-                con=con,
-                catalog_name=catalog_name,
-                uri=catalog_uri,
-                warehouse_path=warehouse_path,
-                bearer_token=bearer_token,
-            )
+            if not advanced:
+                DuckDBIcebergExtension.load_extension(con)
+                DuckDBIcebergExtension.create_rest_catalog(
+                    con=con,
+                    catalog_name=catalog_name,
+                    uri=catalog_uri,
+                    warehouse_path=warehouse_path,
+                    bearer_token=bearer_token,
+                )
+            else:
+                options["catalog_config"] = replace(
+                    catalog, uri=catalog_uri, warehouse=warehouse_path,
+                    bearer_token=bearer_token,
+                )
 
             # Create table reference
             namespace = iceberg_config.namespace or "default"
@@ -573,14 +601,17 @@ class OfflineStore:
                 raise ValueError("No data provided for writing to Iceberg")
 
             # Write to Iceberg with atomic commit
-            write_mode = iceberg_config.mode or "append"
             write_result = write_to_iceberg(
                 con=con,
                 catalog_name=catalog_name,
                 table_name=f"{namespace}.{table_name}",
                 view_name=view_name,
                 mode=write_mode,
+                **options,
             )
+
+            if not write_result.success:
+                raise ValueError(write_result.error_message or "Iceberg materialization failed")
 
             # Return result dictionary
             return {
@@ -591,6 +622,7 @@ class OfflineStore:
                 "table": table_name,
                 "namespace": namespace,
                 "catalog": iceberg_config.catalog,
+                **({"write_result": asdict(write_result)} if advanced else {}),
             }
 
         except Exception as e:
