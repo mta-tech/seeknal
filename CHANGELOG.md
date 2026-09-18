@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.0] - 2026-09-18
+
+### Added
+- Configurable per-turn tool-call limits for read-only Seeknal Ask analysis, including synchronous and streaming execution.
+- Optional LLM sampling settings (`temperature`, `max_tokens`, `top_p`, and `seed`) under `agent_harness.model_settings`, with explicit Python caller overrides.
+
+### Fixed
+- Preserve explicit empty model settings instead of restoring YAML sampling overrides.
+- Ignore malformed or out-of-range YAML sampling values before calling the model provider.
+
 ## [2.12.0] - 2026-09-17
 
 ### Added
