@@ -452,6 +452,32 @@ Performance and safety-related fields:
 | `sql_timeout_seconds` | integer | `60` | Hard timeout for `execute_sql`; use `0` to disable |
 | `discovery_cache_ttl_seconds` | integer | `300` | Per-session TTL for table/schema discovery cache; use `0` to disable |
 
+Set `tool_call_limit` to a positive integer; missing, non-positive, or unparseable
+values use `24`. This limit applies to read-only analysis in both synchronous and
+streaming Ask calls. Full mode does not apply this tool-call ceiling;
+`request_limit` remains a separate limit on LLM requests.
+
+Optional sampling overrides are configured as follows:
+
+```yaml
+tool_call_limit: 40
+agent_harness:
+  model_settings:
+    temperature: 0.0
+    max_tokens: 4096
+    top_p: 0.9
+    seed: 42
+```
+
+Only these four YAML model settings are forwarded. Numeric strings are accepted;
+malformed values are ignored. `temperature` must be finite and non-negative,
+`top_p` must be between `0` and `1`, and `max_tokens` must be a positive integer.
+Provider-specific support and narrower ranges still apply; a seed does not
+guarantee deterministic answers across models or providers. Omit this section to
+use provider defaults. When calling `create_agent` in Python, an explicit
+`model_settings` dictionary takes precedence over YAML; `{}` suppresses YAML
+sampling overrides, while `None` inherits them.
+
 Advanced agent-runtime fields live under `agent_harness`. They map to
 pydantic-deep features and are optional; omit the section unless a project
 needs to tune context, cost, hooks, planning, or delegation behavior.

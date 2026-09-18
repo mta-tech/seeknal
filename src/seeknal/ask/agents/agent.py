@@ -650,7 +650,11 @@ in the final response.
     # explicit caller arg > seeknal_agent.yml agent_harness.model_settings >
     # None (pydantic_deep default: Anthropic cache keys only, provider default
     # sampling) -- identical to pre-MS1 behaviour when both are unset.
-    _resolved_model_settings = model_settings or get_model_settings_config(agent_config)
+    _resolved_model_settings = (
+        model_settings
+        if model_settings is not None
+        else get_model_settings_config(agent_config)
+    )
     _deep_agent_kwargs.update(
         _supported_kwarg("model_settings", _resolved_model_settings)
     )
@@ -784,7 +788,7 @@ def ask(
     Returns:
         The agent's text response.
     """
-    from pydantic_ai.usage import UsageLimits
+    from pydantic_ai.usage import RunUsage, UsageLimits
     from seeknal.ask.agents.tools._context import get_tool_context
 
     # Prefer per-session limits from the tool context; fall back to the
@@ -793,16 +797,23 @@ def ask(
     try:
         ctx = get_tool_context()
         _request_limit = ctx.request_limit
+        _tool_call_limit = ctx.tool_call_limit
     except RuntimeError:
         _request_limit = 100
+        _tool_call_limit = None
     compact_history_for_analysis_mode(message_history)
-    _usage_limits = UsageLimits(request_limit=_request_limit)
+    _usage_limits = UsageLimits(
+        request_limit=_request_limit,
+        tool_calls_limit=_tool_call_limit,
+    )
+    _usage = RunUsage()
 
     result = agent.run_sync(
         question,
         deps=deps,
         message_history=message_history,
         usage_limits=_usage_limits,
+        usage=_usage,
     )
     # Update message history for multi-turn
     message_history.clear()
@@ -810,7 +821,13 @@ def ask(
 
     response = result.output or ""
     if response:
-        return _quality_gate(agent, deps, message_history, response)
+        return _quality_gate(
+            agent,
+            deps,
+            message_history,
+            response,
+            usage=_usage,
+        )
 
     # Ralph Loop: nudge the agent to produce a text summary
     low_output_streak = 0
@@ -822,13 +839,20 @@ def ask(
             deps=deps,
             message_history=message_history,
             usage_limits=_usage_limits,
+            usage=_usage,
         )
         message_history.clear()
         message_history.extend(result.all_messages())
 
         response = result.output or ""
         if response:
-            return _quality_gate(agent, deps, message_history, response)
+            return _quality_gate(
+                agent,
+                deps,
+                message_history,
+                response,
+                usage=_usage,
+            )
 
         # Diminishing returns: track low-output retries
         output_chars = len(response)
@@ -848,6 +872,8 @@ def _quality_gate(
     deps,
     message_history: list,
     answer: str,
+    *,
+    usage=None,
 ) -> str:
     """Check answer quality and retry once if the answer lacks specific data.
 
@@ -860,6 +886,7 @@ def _quality_gate(
         deps: DeepAgentDeps instance.
         message_history: Conversation history (mutated in place).
         answer: The agent's answer to validate.
+        usage: Optional cumulative usage shared by the current user turn.
 
     Returns:
         The original answer if it passes, or the retry answer (regardless
@@ -887,13 +914,19 @@ def _quality_gate(
     try:
         ctx = get_tool_context()
         _request_limit = ctx.request_limit
+        _tool_call_limit = ctx.tool_call_limit
     except RuntimeError:
         _request_limit = 100
+        _tool_call_limit = None
     result = agent.run_sync(
         reason,
         deps=deps,
         message_history=message_history,
-        usage_limits=UsageLimits(request_limit=_request_limit),
+        usage_limits=UsageLimits(
+            request_limit=_request_limit,
+            tool_calls_limit=_tool_call_limit,
+        ),
+        usage=usage,
     )
     message_history.clear()
     message_history.extend(result.all_messages())

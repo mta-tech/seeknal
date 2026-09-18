@@ -7,6 +7,7 @@ to defaults — the config file is entirely optional.
 
 from __future__ import annotations
 
+import math
 import warnings
 from pathlib import Path
 from typing import Any, Optional
@@ -774,15 +775,32 @@ def get_model_settings_config(config: dict[str, Any]) -> dict[str, Any] | None:
 
     result: dict[str, Any] = {}
     temp = _coerce_float(section.get("temperature"), None)
-    if temp is not None:
+    if temp is not None and math.isfinite(temp):
         result["temperature"] = temp
     top_p = _coerce_float(section.get("top_p"), None)
-    if top_p is not None:
+    if top_p is not None and math.isfinite(top_p) and top_p <= 1:
         result["top_p"] = top_p
-    max_tokens = _coerce_int(section.get("max_tokens"), None)
-    if max_tokens is not None:
+
+    max_tokens_value = section.get("max_tokens")
+    max_tokens = _coerce_model_setting_int(max_tokens_value)
+    if max_tokens is not None and max_tokens > 0:
         result["max_tokens"] = max_tokens
-    seed = _coerce_int(section.get("seed"), None)
+
+    seed = _coerce_model_setting_int(section.get("seed"))
     if seed is not None:
         result["seed"] = seed
     return result or None
+
+
+def _coerce_model_setting_int(value: Any) -> int | None:
+    """Coerce an integer model setting without truncating floats or booleans."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None

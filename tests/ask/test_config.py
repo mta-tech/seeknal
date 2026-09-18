@@ -13,6 +13,7 @@ from seeknal.ask.config import (
     get_discovery_cache_ttl_seconds,
     get_hooks_config,
     get_locale_instructions,
+    get_model_settings_config,
     get_plan_config,
     get_stuck_loop_config,
     get_sql_timeout_seconds,
@@ -176,6 +177,49 @@ def test_tool_call_limit_default_and_overrides():
     assert get_tool_call_limit({"tool_call_limit": 0}) == 24
     assert get_tool_call_limit({"tool_call_limit": -5}) == 24
     assert get_tool_call_limit({"tool_call_limit": "abc"}) == 24
+
+
+def test_model_settings_are_normalized_and_unknown_keys_are_dropped():
+    config = {
+        "agent_harness": {
+            "model_settings": {
+                "temperature": "0.25",
+                "top_p": "0.9",
+                "max_tokens": "4096",
+                "seed": "-7",
+                "provider_specific": "ignored",
+            }
+        }
+    }
+
+    assert get_model_settings_config(config) == {
+        "temperature": 0.25,
+        "top_p": 0.9,
+        "max_tokens": 4096,
+        "seed": -7,
+    }
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"temperature": float("nan")},
+        {"temperature": float("inf")},
+        {"temperature": -0.1},
+        {"top_p": float("nan")},
+        {"top_p": -0.1},
+        {"top_p": 1.1},
+        {"max_tokens": 0},
+        {"max_tokens": -1},
+        {"max_tokens": 1.5},
+        {"max_tokens": True},
+        {"seed": 1.5},
+        {"seed": False},
+    ],
+)
+def test_invalid_model_settings_fall_back_to_provider_defaults(settings):
+    config = {"agent_harness": {"model_settings": settings}}
+    assert get_model_settings_config(config) is None
 
 
 def test_agent_harness_defaults_preserve_current_ask_behavior():
