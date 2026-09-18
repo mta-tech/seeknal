@@ -15,6 +15,8 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
+from seeknal.ask.safe_paths import contained_child
+
 # ---------------------------------------------------------------------------
 # Human-readable session name generation
 # ---------------------------------------------------------------------------
@@ -91,12 +93,20 @@ class SessionStore:
         if tenant_id == "default":
             self._base = base
         else:
-            self._base = base / tenant_id
+            # C-1: `tenant_id` reaches here from the BROKER, across a trust
+            # boundary, and this join runs before any session name is seen — so
+            # an escaping tenant escapes at construction, and the mkdir below
+            # would create the directory it escaped into.
+            self._base = contained_child(base, tenant_id, label="tenant id")
         self._tenant_id = tenant_id
         self._base.mkdir(parents=True, exist_ok=True)
 
     def _session_dir(self, name: str) -> Path:
-        return self._base / name
+        # C-1: `name` is the gateway's `session_id`, which originates outside
+        # this node entirely. Contained rather than trusted: this store cannot
+        # rely on every broker that will ever talk to it being careful, and the
+        # component whose property is violated is this one.
+        return contained_child(self._base, name, label="session name")
 
     def _metadata_path(self, name: str) -> Path:
         return self._session_dir(name) / "metadata.json"
