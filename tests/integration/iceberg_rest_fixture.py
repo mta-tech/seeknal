@@ -18,8 +18,12 @@ from typing import Any, Iterator
 import pyarrow as pa
 import requests
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 from pyiceberg.catalog.rest import ConfigResponse, CreateTableRequest, TableResponse
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.exceptions import CommitFailedException, NoSuchTableError
@@ -75,10 +79,7 @@ def _namespace_tuple(namespace: str) -> tuple[str, ...]:
     return tuple(namespace.split("\x1f"))
 
 
-def _make_app(state: RestFixtureState, warehouse: str) -> FastAPI:
-    app = FastAPI()
-
-    @app.middleware("http")
+def _make_app(state: RestFixtureState, warehouse: str) -> Starlette:
     async def require_bearer(request: Request, call_next: Any) -> Any:
         authorization = request.headers.get("authorization")
         state.received_authorization.append(authorization)
@@ -87,14 +88,13 @@ def _make_app(state: RestFixtureState, warehouse: str) -> FastAPI:
             return _error(401, "missing or invalid test token", "Unauthorized")
         return await call_next(request)
 
-    @app.get("/v1/config")
-    async def config() -> Any:
-        return _model_json(
-            ConfigResponse(defaults={"warehouse": warehouse}, overrides={})
+    async def config(request: Request) -> Response:
+        return JSONResponse(
+            _model_json(ConfigResponse(defaults={"warehouse": warehouse}, overrides={}))
         )
 
-    @app.head("/v1/namespaces/{namespace}")
-    async def namespace_exists(namespace: str) -> Response:
+    async def namespace_exists(request: Request) -> Response:
+        namespace = request.path_params["namespace"]
         status = (
             204
             if _namespace_tuple(namespace) in state.backend.list_namespaces()
@@ -102,7 +102,6 @@ def _make_app(state: RestFixtureState, warehouse: str) -> FastAPI:
         )
         return Response(status_code=status)
 
-    @app.post("/v1/namespaces")
     async def create_namespace(request: Request) -> Any:
         payload = await request.json()
         try:
@@ -111,16 +110,17 @@ def _make_app(state: RestFixtureState, warehouse: str) -> FastAPI:
             )
         except Exception as exc:
             return _error(409, str(exc), type(exc).__name__)
-        return None
+        return JSONResponse(None)
 
-    @app.head("/v1/namespaces/{namespace}/tables/{table_name}")
-    async def table_exists(namespace: str, table_name: str) -> Response:
+    async def table_exists(request: Request) -> Response:
+        namespace = request.path_params["namespace"]
+        table_name = request.path_params["table_name"]
         identifier = (*_namespace_tuple(namespace), table_name)
         status = 204 if state.backend.table_exists(identifier) else 404
         return Response(status_code=status)
 
-    @app.post("/v1/namespaces/{namespace}/tables")
-    async def create_table(namespace: str, request: Request) -> Any:
+    async def create_table(request: Request) -> Response:
+        namespace = request.path_params["namespace"]
         state.create_table_attempts += 1
         request_payload = await request.json()
         request_payload.setdefault("location", None)
@@ -144,19 +144,23 @@ def _make_app(state: RestFixtureState, warehouse: str) -> FastAPI:
                 table = state.backend.create_table(identifier, **create_kwargs)
         except Exception as exc:
             return _error(409, str(exc), type(exc).__name__)
-        return _table_response(table)
+        return JSONResponse(_table_response(table))
 
-    @app.get("/v1/namespaces/{namespace}/tables/{table_name}")
-    async def load_table(namespace: str, table_name: str) -> Any:
+    async def load_table(request: Request) -> Response:
+        namespace = request.path_params["namespace"]
+        table_name = request.path_params["table_name"]
         try:
-            return _table_response(
-                state.backend.load_table((*_namespace_tuple(namespace), table_name))
+            return JSONResponse(
+                _table_response(
+                    state.backend.load_table((*_namespace_tuple(namespace), table_name))
+                )
             )
         except Exception as exc:
             return _error(404, str(exc), type(exc).__name__)
 
-    @app.post("/v1/namespaces/{namespace}/tables/{table_name}")
-    async def commit_table(namespace: str, table_name: str, request: Request) -> Any:
+    async def commit_table(request: Request) -> Response:
+        namespace = request.path_params["namespace"]
+        table_name = request.path_params["table_name"]
         state.commit_attempts += 1
         payload = CommitTableRequest.model_validate(await request.json())
         identifier = (*_namespace_tuple(namespace), table_name)
@@ -182,9 +186,32 @@ def _make_app(state: RestFixtureState, warehouse: str) -> FastAPI:
             state.staged_tables.pop(identifier, None)
         except CommitFailedException as exc:
             return _error(409, str(exc), type(exc).__name__)
-        return _model_json(response)
+        return JSONResponse(_model_json(response))
 
-    return app
+    return Starlette(
+        routes=[
+            Route("/v1/config", config, methods=["GET"]),
+            Route("/v1/namespaces/{namespace}", namespace_exists, methods=["HEAD"]),
+            Route("/v1/namespaces", create_namespace, methods=["POST"]),
+            Route(
+                "/v1/namespaces/{namespace}/tables/{table_name}",
+                table_exists,
+                methods=["HEAD"],
+            ),
+            Route("/v1/namespaces/{namespace}/tables", create_table, methods=["POST"]),
+            Route(
+                "/v1/namespaces/{namespace}/tables/{table_name}",
+                load_table,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/namespaces/{namespace}/tables/{table_name}",
+                commit_table,
+                methods=["POST"],
+            ),
+        ],
+        middleware=[Middleware(BaseHTTPMiddleware, dispatch=require_bearer)],
+    )
 
 
 def _listening_socket() -> tuple[socket.socket, int]:
