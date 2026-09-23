@@ -197,7 +197,7 @@ class TestIcebergWriteOperation:
 
     @patch('seeknal.workflow.materialization.profile_loader.ProfileLoader.load_profile')
     @patch('seeknal.workflow.materialization.operations.DuckDBIcebergExtension.load_extension')
-    @patch('seeknal.workflow.materialization.operations.DuckDBIcebergExtension.create_rest_catalog')
+    @patch('seeknal.workflow.materialization.operations.DuckDBIcebergExtension.attach_rest_catalog')
     @patch('seeknal.workflow.materialization.operations.write_to_iceberg')
     def test_write_to_iceberg_append_mode(
         self,
@@ -385,7 +385,7 @@ class TestIcebergRealInfrastructure:
             DuckDBIcebergExtension.load_extension(con)
 
             # Create catalog
-            DuckDBIcebergExtension.create_rest_catalog(
+            DuckDBIcebergExtension.attach_rest_catalog(
                 con=con,
                 catalog_name="test_catalog",
                 uri=catalog_uri,

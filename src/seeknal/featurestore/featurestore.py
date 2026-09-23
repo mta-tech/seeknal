@@ -423,15 +423,17 @@ class OfflineStore:
                 try:
                     # Load Iceberg extension
                     DuckDBIcebergExtension.load_extension(con)
+                    DuckDBIcebergExtension.configure_s3(con)
 
                     # Setup REST catalog
                     catalog_name = "seeknal_catalog"
-                    DuckDBIcebergExtension.create_rest_catalog(
+                    DuckDBIcebergExtension.attach_rest_catalog(
                         con=con,
                         catalog_name=catalog_name,
                         uri=catalog_uri,
                         warehouse_path=warehouse_path,
-                        bearer_token=bearer_token,
+                        bearer_token=bearer_token
+                        or DuckDBIcebergExtension.get_oauth2_token(),
                     )
 
                     # Create table reference and drop
@@ -575,12 +577,14 @@ class OfflineStore:
             catalog_name = "seeknal_catalog"
             if not advanced:
                 DuckDBIcebergExtension.load_extension(con)
-                DuckDBIcebergExtension.create_rest_catalog(
+                DuckDBIcebergExtension.configure_s3(con)
+                DuckDBIcebergExtension.attach_rest_catalog(
                     con=con,
                     catalog_name=catalog_name,
                     uri=catalog_uri,
                     warehouse_path=warehouse_path,
-                    bearer_token=bearer_token,
+                    bearer_token=bearer_token
+                    or DuckDBIcebergExtension.get_oauth2_token(),
                 )
             else:
                 options["catalog_config"] = replace(
