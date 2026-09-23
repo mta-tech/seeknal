@@ -18,10 +18,18 @@ async def run_pipeline(
 
     Args:
         nodes: Comma-separated node IDs (e.g. 'transform.clean'). Empty = all.
-        full: True to ignore cache and re-run everything.
+        full: True to ignore cache and re-run EVERY node. Cannot be combined
+            with ``nodes`` (`seeknal run` refuses that combination).
         confirmed: Must be True to actually run. False returns a preview.
     """
     from seeknal.ask.agents.tools._context import get_tool_context
+
+    if nodes and full:
+        return (
+            "run_pipeline: full=True runs every node and cannot be combined with "
+            "nodes. Call run_pipeline(nodes=...) to run the selected nodes (and "
+            "their downstream), or run_pipeline(full=True) to re-run everything."
+        )
 
     ctx = get_tool_context()
 
@@ -110,7 +118,13 @@ async def run_pipeline(
                     "not recognized", "does not exist", "invalid",
                 ]):
                     error_lines.append(line.strip())
-            error_summary = "\n".join(error_lines[:20]) if error_lines else "(no details captured)"
+            if error_lines:
+                error_summary = "\n".join(error_lines[:20])
+            else:
+                # No recognizable error keyword: show the end of the output
+                # so the agent still sees why the run stopped.
+                tail = [line for line in (output + "\n" + errors).splitlines() if line.strip()]
+                error_summary = "\n".join(tail[-10:]) or "(no details captured)"
 
             # If a Python model failed, include its source for the agent to debug
             model_source = ""

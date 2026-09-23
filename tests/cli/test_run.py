@@ -577,7 +577,11 @@ class TestRunSelectionGuards:
 
     @pytest.mark.parametrize(
         "selection, flag",
-        [(["--tags", "gold"], "--tags"), (["--nodes", "clean_users"], "--nodes")],
+        [
+            (["--tags", "gold"], "--tags"),
+            (["--nodes", "clean_users"], "--nodes"),
+            (["--types", "source"], "--types"),
+        ],
     )
     def test_full_with_selection_is_refused(self, tagged_project, monkeypatch, selection, flag):
         monkeypatch.chdir(tagged_project)
@@ -603,7 +607,32 @@ class TestRunSelectionGuards:
         assert "--tags also runs 2 upstream node(s)" in result.output
         assert "source.raw_users" in result.output
         assert "transform.clean_users" in result.output
-        assert "Skip them with --exclude-tags" in result.output
+        assert "tag it and add --exclude-tags" in " ".join(result.output.split())
+
+    def test_tags_notice_omits_upstream_removed_by_exclude_tags(self, tagged_project, monkeypatch):
+        source = tagged_project / "seeknal" / "sources" / "raw_users.yml"
+        source.write_text(source.read_text() + "tags: [bronze]\n")
+        monkeypatch.chdir(tagged_project)
+
+        result = runner.invoke(
+            app, ["run", "--show-plan", "--tags", "gold", "--exclude-tags", "bronze"]
+        )
+
+        out = " ".join(result.output.split())
+        assert "--tags also runs 1 upstream node(s)" in out
+        assert "transform.clean_users" in out
+        assert "depend on: source.raw_users" not in out
+
+    def test_tags_notice_omits_nodes_named_with_nodes(self, tagged_project, monkeypatch):
+        monkeypatch.chdir(tagged_project)
+
+        result = runner.invoke(
+            app, ["run", "--show-plan", "--tags", "gold", "--nodes", "clean_users"]
+        )
+
+        out = " ".join(result.output.split())
+        assert "--tags also runs 1 upstream node(s)" in out
+        assert "source.raw_users" in out
 
     def test_tags_without_upstream_prints_no_notice(self, sample_yaml_files, monkeypatch):
         source = sample_yaml_files / "seeknal" / "sources" / "raw_users.yml"
