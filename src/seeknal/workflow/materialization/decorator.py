@@ -41,6 +41,7 @@ from seeknal.workflow.materialization.operations import (
     create_iceberg_table,
     DuckDBIcebergExtension,
     MaterializationAuditor,
+    iceberg_catalog_alias,
     _get_table_schema,
 )
 
@@ -165,8 +166,8 @@ class MaterializationMixin:
         if not token:
             token = DuckDBIcebergExtension.get_oauth2_token()
 
-        # Attach catalog
-        catalog_name = "iceberg_catalog"
+        # Attach catalog under a per-warehouse alias (see iceberg_catalog_alias)
+        catalog_name = iceberg_catalog_alias(catalog.uri, catalog.warehouse)
 
         DuckDBIcebergExtension.attach_rest_catalog(
             con=con,
@@ -336,6 +337,7 @@ class MaterializationMixin:
                 view_ref = node.id if "." in node.id else "loaded_data"
                 write_result = write_to_iceberg(
                     con=con,
+                    # PyIceberg path: keep the historical catalog name (see dispatcher).
                     catalog_name="iceberg_catalog",
                     table_name=table_ref,
                     view_name=view_ref,

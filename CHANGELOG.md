@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.1] - 2026-09-23
+
+### Fixed
+- Iceberg `append`/`overwrite` materialization now honours each node's `warehouse:`. A run attached every write under one fixed DuckDB alias (`iceberg_catalog`), so the first warehouse attached bound the whole run: later nodes' rows landed in that warehouse and overwrote same-named tables (FIX-11 b). Each (catalog endpoint, warehouse) now gets its own alias, and an existing alias is verified before reuse (re-attached if it points at another warehouse; refused if it is not an Iceberg attachment).
+- Iceberg `overwrite` is now atomic: `DELETE` + `INSERT` run in one transaction, so a failed insert (e.g. a schema mismatch) keeps the previous rows instead of leaving the table empty. A failed commit is logged as an unknown outcome.
+- Materialization logs now name the target warehouse (`Iceberg target: warehouse=… table=… alias=…`).
+- Quote-escape warehouse, endpoint and token values in Iceberg `ATTACH` statements, and escape embedded double quotes in quoted identifiers.
+
 ## [2.12.0] - 2026-09-17
 
 ### Added

@@ -44,6 +44,7 @@ Key Components:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
@@ -72,10 +73,59 @@ def _qi(name: str) -> str:
     """Quote a DuckDB identifier if it contains special characters (e.g. hyphens)."""
     if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
         return name
-    return f'"{name}"'
+    return '"' + name.replace('"', '""') + '"'
 
 
 logger = logging.getLogger(__name__)
+
+
+def _rest_catalog_url(uri: str) -> str:
+    """Normalize a Lakekeeper/REST endpoint to its ``.../catalog`` URL."""
+    base_url = (uri or "").rstrip("/")
+    return base_url if "/catalog" in base_url else f"{base_url}/catalog"
+
+
+def iceberg_catalog_alias(uri: str, warehouse: str) -> str:
+    """Return the DuckDB alias for writes to one (catalog endpoint, warehouse).
+
+    Each target gets its own alias so several warehouses can be attached on
+    one connection during a run. A single shared alias bound the whole run to
+    whichever warehouse was attached first (FIX-11 b). The readable part is the
+    warehouse name; the hash keeps same-named warehouses on different
+    endpoints apart.
+    """
+    warehouse = warehouse or ""
+    slug = re.sub(r"[^a-z0-9]+", "_", warehouse.lower()).strip("_")[:40] or "default"
+    digest = hashlib.sha1(
+        f"{_rest_catalog_url(uri)}|{warehouse}".encode("utf-8")
+    ).hexdigest()[:8]
+    return f"iceberg_{slug}_{digest}"
+
+
+def _sql_str(value: str) -> str:
+    """Escape a value for use inside a single-quoted SQL string literal."""
+    return str(value).replace("'", "''")
+
+
+def _attached_database(
+    con: Any, catalog_name: str
+) -> Optional[tuple[Optional[str], str]]:
+    """Return (path, type) DuckDB reports for an attached alias, if known.
+
+    ``path`` is None for in-memory databases; the result is None when the
+    metadata cannot be read.
+    """
+    try:
+        row = con.execute(
+            "SELECT path, type FROM duckdb_databases() WHERE database_name = ?",
+            [catalog_name],
+        ).fetchone()
+    except Exception:
+        return None
+    if not row or not isinstance(row[1], str):
+        return None
+    path = row[0] if isinstance(row[0], str) else None
+    return path, row[1]
 
 
 class MaterializationOperationError(Exception):
@@ -404,45 +454,66 @@ class DuckDBIcebergExtension:
             MaterializationOperationError: If catalog attachment fails
         """
         try:
-            # Build catalog endpoint URL (add /catalog if not present)
-            base_url = uri.rstrip("/")
-            if "/catalog" not in base_url:
-                catalog_url = f"{base_url}/catalog"
-            else:
-                catalog_url = base_url
+            catalog_url = _rest_catalog_url(uri)
 
             # Build ATTACH SQL with inline token auth
             # Quote catalog_name for identifiers with hyphens (e.g. prod-dwa-hot-bronze)
             quoted_name = _qi(catalog_name)
             if bearer_token:
                 sql = (
-                    f"ATTACH '{warehouse_path}' AS {quoted_name} ("
+                    f"ATTACH '{_sql_str(warehouse_path)}' AS {quoted_name} ("
                     f"TYPE ICEBERG, "
-                    f"ENDPOINT '{catalog_url}', "
+                    f"ENDPOINT '{_sql_str(catalog_url)}', "
                     f"AUTHORIZATION_TYPE 'oauth2', "
-                    f"TOKEN '{bearer_token}'"
+                    f"TOKEN '{_sql_str(bearer_token)}'"
                     f")"
                 )
             else:
                 sql = (
-                    f"ATTACH '{warehouse_path}' AS {quoted_name} ("
+                    f"ATTACH '{_sql_str(warehouse_path)}' AS {quoted_name} ("
                     f"TYPE ICEBERG, "
-                    f"ENDPOINT '{catalog_url}', "
+                    f"ENDPOINT '{_sql_str(catalog_url)}', "
                     f"AUTHORIZATION_TYPE 'none'"
                     f")"
                 )
 
-            con.execute(sql)
-            logger.info(f"Attached REST catalog: {catalog_name} at {catalog_url}")
+            try:
+                con.execute(sql)
+            except Exception as e:
+                if "already exists" not in str(e).lower():
+                    raise
+                attached = _attached_database(con, catalog_name)
+                if attached is None:
+                    logger.debug(f"Catalog '{catalog_name}' already attached, reusing")
+                    return
+                attached_path, attached_type = attached
+                if attached_type.lower() != "iceberg":
+                    raise MaterializationOperationError(
+                        f"Alias '{catalog_name}' is already used by a non-Iceberg "
+                        f"database ({attached_type}: {attached_path}); refusing to replace it"
+                    )
+                if attached_path in (None, warehouse_path):
+                    logger.debug(f"Catalog '{catalog_name}' already attached, reusing")
+                    return
+                # The alias points at another warehouse: reusing it would write
+                # this node's rows into the wrong warehouse.
+                logger.warning(
+                    f"Catalog alias '{catalog_name}' is attached to warehouse "
+                    f"'{attached_path}', re-attaching to '{warehouse_path}'"
+                )
+                con.execute(f"DETACH {quoted_name}")
+                con.execute(sql)
+            logger.info(
+                f"Attached REST catalog: {catalog_name} "
+                f"(warehouse={warehouse_path}) at {catalog_url}"
+            )
 
+        except MaterializationOperationError:
+            raise
         except Exception as e:
-            # Catalog may already be attached
-            if "already exists" in str(e).lower():
-                logger.debug(f"Catalog '{catalog_name}' already attached, reusing")
-            else:
-                raise MaterializationOperationError(
-                    f"Failed to attach REST catalog '{catalog_name}': {e}"
-                ) from e
+            raise MaterializationOperationError(
+                f"Failed to attach REST catalog '{catalog_name}': {e}"
+            ) from e
 
 
 class SnapshotManager:
@@ -883,8 +954,9 @@ def write_to_iceberg(
         else:
             # Table already existed — use INSERT INTO or overwrite
             if mode == "overwrite":
-                con.execute(f"DELETE FROM {full_table_name}")
-            con.execute(f"INSERT INTO {full_table_name} SELECT * FROM {view_name}")
+                _overwrite_atomically(con, full_table_name, view_name)
+            else:
+                con.execute(f"INSERT INTO {full_table_name} SELECT * FROM {view_name}")
 
         # Get snapshot ID (best-effort — CTAS may not expose snapshots immediately)
         try:
@@ -949,6 +1021,43 @@ def write_to_iceberg(
         raise WriteError(
             f"Failed to write to {full_table_name}: {e}"
         ) from e
+
+
+def _overwrite_atomically(con: Any, full_table_name: str, view_name: str) -> None:
+    """Replace a table's rows with a view's rows in one transaction.
+
+    Without the transaction a failing INSERT (e.g. a schema mismatch) ran after
+    the DELETE had already committed, leaving the table empty. Verified on
+    DuckDB 1.4 + Lakekeeper: ROLLBACK keeps the previous rows.
+    """
+    con.execute("BEGIN TRANSACTION")
+    try:
+        con.execute(f"DELETE FROM {full_table_name}")
+        con.execute(f"INSERT INTO {full_table_name} SELECT * FROM {view_name}")
+    except Exception:
+        _rollback_quietly(con, full_table_name)
+        raise
+    try:
+        con.execute("COMMIT")
+    except Exception as commit_error:
+        # A catalog commit that errors (e.g. timeout) may still have been
+        # applied server-side, so the table state is not known here.
+        logger.error(
+            f"Commit failed for {full_table_name}; outcome unknown, verify the "
+            f"table's current snapshot: {commit_error}"
+        )
+        _rollback_quietly(con, full_table_name)
+        raise
+
+
+def _rollback_quietly(con: Any, full_table_name: str) -> None:
+    """Roll back after a failed overwrite; a transaction already ended is fine."""
+    try:
+        con.execute("ROLLBACK")
+    except Exception as rollback_error:
+        if "no transaction is active" in str(rollback_error).lower():
+            return
+        logger.error(f"Rollback failed for {full_table_name}: {rollback_error}")
 
 
 def _ensure_table_exists(
