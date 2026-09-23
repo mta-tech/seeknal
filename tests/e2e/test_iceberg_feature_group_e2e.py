@@ -198,10 +198,17 @@ class TestIcebergWriteOperation:
     @patch('seeknal.workflow.materialization.profile_loader.ProfileLoader.load_profile')
     @patch('seeknal.workflow.materialization.operations.DuckDBIcebergExtension.load_extension')
     @patch('seeknal.workflow.materialization.operations.DuckDBIcebergExtension.attach_rest_catalog')
+    @patch('seeknal.workflow.materialization.operations.DuckDBIcebergExtension.configure_s3')
+    @patch(
+        'seeknal.workflow.materialization.operations.DuckDBIcebergExtension.get_oauth2_token',
+        return_value=None,
+    )
     @patch('seeknal.workflow.materialization.operations.write_to_iceberg')
     def test_write_to_iceberg_append_mode(
         self,
         mock_write_to_iceberg,
+        mock_get_token,
+        mock_configure_s3,
         mock_create_catalog,
         mock_load_extension,
         mock_load_profile,

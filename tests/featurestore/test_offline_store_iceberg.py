@@ -487,6 +487,7 @@ class TestOfflineStoreIcebergAttachesWithRealApi:
         assert kwargs["uri"] == "http://catalog.example.com"
         assert kwargs["bearer_token"] == "tok"
         assert write.call_args.kwargs["catalog_name"] == "seeknal_catalog"
+        assert write.call_args.kwargs["table_name"] == "test.test_features"
         assert result["num_rows"] == 3
 
     def test_delete_attaches_and_drops_table(self, store, profile):
