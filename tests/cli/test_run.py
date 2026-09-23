@@ -563,3 +563,64 @@ class TestSeeknalRunParams:
         result = runner.invoke(app, ["run", "--params", '["EU"]'])
         assert result.exit_code == 1
         assert "must be a JSON object" in result.stdout
+
+
+class TestRunSelectionGuards:
+    """--full must not silently widen a node selection, and --tags must say
+    which upstream nodes it adds (team reproduction report, FIX-11 b)."""
+
+    @pytest.fixture
+    def tagged_project(self, sample_yaml_files):
+        feature_group = sample_yaml_files / "seeknal" / "feature_groups" / "user_features.yml"
+        feature_group.write_text(feature_group.read_text() + "tags: [gold]\n")
+        return sample_yaml_files
+
+    @pytest.mark.parametrize(
+        "selection, flag",
+        [(["--tags", "gold"], "--tags"), (["--nodes", "clean_users"], "--nodes")],
+    )
+    def test_full_with_selection_is_refused(self, tagged_project, monkeypatch, selection, flag):
+        monkeypatch.chdir(tagged_project)
+
+        result = runner.invoke(app, ["run", "--show-plan", "--full", *selection])
+
+        assert result.exit_code == 1
+        assert f"--full cannot be combined with {flag}" in result.output
+
+    def test_full_alone_still_runs_everything(self, tagged_project, monkeypatch):
+        monkeypatch.chdir(tagged_project)
+
+        result = runner.invoke(app, ["run", "--show-plan", "--full"])
+
+        assert result.exit_code == 0
+
+    def test_tags_lists_upstream_nodes_it_adds(self, tagged_project, monkeypatch):
+        monkeypatch.chdir(tagged_project)
+
+        result = runner.invoke(app, ["run", "--show-plan", "--tags", "gold"])
+
+        assert result.exit_code == 0
+        assert "--tags also runs 2 upstream node(s)" in result.output
+        assert "source.raw_users" in result.output
+        assert "transform.clean_users" in result.output
+        assert "Skip them with --exclude-tags" in result.output
+
+    def test_tags_without_upstream_prints_no_notice(self, sample_yaml_files, monkeypatch):
+        source = sample_yaml_files / "seeknal" / "sources" / "raw_users.yml"
+        source.write_text(source.read_text() + "tags: [bronze]\n")
+        monkeypatch.chdir(sample_yaml_files)
+
+        result = runner.invoke(app, ["run", "--show-plan", "--tags", "bronze"])
+
+        assert result.exit_code == 0
+        assert "--tags also runs" not in result.output
+
+
+def test_upstream_notice_truncates_long_lists(capsys):
+    from seeknal.cli.main import _echo_upstream_included
+
+    _echo_upstream_included({f"transform.n{i:02d}" for i in range(12)}, limit=3)
+
+    out = " ".join(capsys.readouterr().out.split())  # console may wrap long lines
+    assert "12 upstream node(s)" in out
+    assert "transform.n00, transform.n01, transform.n02, ... (+9 more)" in out

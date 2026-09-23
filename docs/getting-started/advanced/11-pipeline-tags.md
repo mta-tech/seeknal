@@ -154,6 +154,7 @@ seeknal run --tags revenue_pipeline
 
 **Expected output:**
 ```
+ℹ --tags also runs 1 upstream node(s) the tagged nodes depend on: transform.events_cleaned. Skip them with --exclude-tags.
 ℹ Execution Plan:
 ------------------------------------------------------------
   1. RUN  events_cleaned
@@ -220,16 +221,16 @@ seeknal run --tags revenue_pipeline --nodes source.sales_snapshot
 
 Both the revenue pipeline nodes AND `source.sales_snapshot` (plus their respective upstream deps) are included.
 
-### Full Override
+### `--full` Cannot Be Combined with a Selection
 
-`--full` always overrides `--tags`:
+`--full` runs **every** node, so combining it with `--tags` or `--nodes` is refused instead of silently running (and materializing) the whole project:
 
 ```bash
 seeknal run --full --tags revenue_pipeline
 ```
 
 ```
-ℹ --full flag set, ignoring --tags filter. Running all nodes.
+✗ --full cannot be combined with --tags: --full runs ALL nodes. Drop --full to run only the selected nodes, or drop --tags to run everything.
 ```
 
 ---
@@ -307,7 +308,7 @@ In the HTML visualization, click any node to see its tags displayed as badge chi
 | `--tags A,B` | OR logic — matches nodes with **any** specified tag |
 | `--tags X --exclude-tags Y` | Include first, then exclude |
 | `--tags X --nodes Y` | Union of both sets (each with own upstream deps) |
-| `--full --tags X` | `--full` wins, `--tags` ignored with info message |
+| `--full --tags X` / `--full --nodes X` | Refused with an error: `--full` runs all nodes |
 | `--tags X --types Y` | Tags first, then types filter within tag-matched set |
 
 ---
@@ -323,7 +324,7 @@ In the HTML visualization, click any node to see its tags displayed as badge chi
     **2. Missing upstream nodes in output**
 
     - Symptom: Untagged upstream nodes appear in the filtered run
-    - This is expected! Upstream dependencies are auto-included to ensure the subgraph can execute. Only **downstream** untagged nodes are excluded.
+    - This is expected! Upstream dependencies are auto-included to ensure the subgraph can execute, and the run lists them when it starts (`--tags also runs N upstream node(s) ...`). They run and materialize like the tagged nodes; exclude them with `--exclude-tags` if their outputs are already current. Only **downstream** untagged nodes are excluded.
 
     **3. Tags not showing in plan/lineage**
 
