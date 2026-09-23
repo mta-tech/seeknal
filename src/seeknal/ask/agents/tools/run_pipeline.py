@@ -24,6 +24,7 @@ async def run_pipeline(
     """
     from seeknal.ask.agents.tools._context import get_tool_context
 
+    nodes = nodes.strip()
     if nodes and full:
         return (
             "run_pipeline: full=True runs every node and cannot be combined with "

@@ -226,7 +226,7 @@ Both the revenue pipeline nodes AND `source.sales_snapshot` (plus their respecti
 
 ### `--full` Cannot Be Combined with a Selection
 
-`--full` runs **every** node, so combining it with `--tags` or `--nodes` is refused instead of silently running (and materializing) the whole project:
+`--full` runs **every** node, so combining it with `--tags`, `--nodes` or `--types` is refused instead of silently running (and materializing) the whole project:
 
 ```bash
 seeknal run --full --tags revenue_pipeline
