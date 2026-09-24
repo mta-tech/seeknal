@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
+from seeknal.ask.agents.tools._context import ToolContext
 from seeknal.ask.agents.tools.run_pipeline import run_pipeline
 
 
@@ -45,7 +45,18 @@ class _FakeProc:
 
 
 def test_failure_without_error_keywords_shows_output_tail(tmp_path: Path, monkeypatch):
-    set_tool_context(ToolContext(repl=MagicMock(), artifact_discovery=MagicMock(), project_path=tmp_path))
+    from seeknal.ask.agents.tools import _context
+
+    token = _context._tool_context_var.set(
+        ToolContext(repl=MagicMock(), artifact_discovery=MagicMock(), project_path=tmp_path)
+    )
+    try:
+        _run_failing_pipeline_and_check(monkeypatch)
+    finally:
+        _context._tool_context_var.reset(token)
+
+
+def _run_failing_pipeline_and_check(monkeypatch):
 
     async def fake_exec(*_args, **_kwargs):
         return _FakeProc(["Seeknal Pipeline Run", "✗ --full cannot be combined with --tags"], 1)
