@@ -7,8 +7,8 @@ These tests verify complete version management workflows including:
 - Verifying version history persists correctly
 """
 
-import importlib.util
 import json
+import sys
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,12 +19,15 @@ from typer.testing import CliRunner
 
 from seeknal.cli.main import app
 
-# These tests patch ``seeknal.featurestore.feature_group`` (the Spark feature
-# group), which needs the optional ``spark`` extra.
-requires_spark = pytest.mark.skipif(
-    importlib.util.find_spec("pyspark") is None,
-    reason="optional `spark` extra not installed",
-)
+
+
+@pytest.fixture(autouse=True)
+def _stub_spark_feature_group(monkeypatch):
+    """Stub the Spark feature-group module (optional spark extra) so these
+    tests, which patch ``FeatureGroup``, also run without Spark."""
+    if "seeknal.featurestore.feature_group" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "seeknal.featurestore.feature_group", mock.MagicMock())
+    yield
 
 
 runner = CliRunner()
@@ -42,7 +45,6 @@ def clean_test_env(tmp_path):
 class TestVersionQueryingWorkflow:
     """E2E tests for version querying workflows."""
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_workflow(self, mock_fg_class, clean_test_env):
         """Test the full version listing workflow."""
@@ -66,7 +68,6 @@ class TestVersionQueryingWorkflow:
         assert "Created At" in result.stdout
         assert "Features" in result.stdout
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_show_workflow(self, mock_fg_class, clean_test_env):
         """Test the version show workflow with specific version."""
@@ -102,7 +103,6 @@ class TestVersionQueryingWorkflow:
         assert "Schema:" in result.stdout
         assert "Fields:" in result.stdout
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_workflow(self, mock_fg_class, clean_test_env):
         """Test the schema comparison workflow between versions."""
@@ -134,7 +134,6 @@ class TestVersionRollbackWorkflow:
     """E2E tests for version rollback scenarios."""
 
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_shows_multiple_versions_after_rollback(
         self, mock_fg_class, clean_test_env
@@ -160,7 +159,6 @@ class TestVersionRollbackWorkflow:
 class TestSchemaComparisonWorkflow:
     """E2E tests for schema comparison workflows."""
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_schema_comparison_detects_added_features(self, mock_fg_class, clean_test_env):
         """Test that schema comparison correctly detects added features."""
@@ -187,7 +185,6 @@ class TestSchemaComparisonWorkflow:
         assert "new_feature_2" in result.stdout
         assert "2 added" in result.stdout
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_schema_comparison_detects_removed_features(self, mock_fg_class, clean_test_env):
         """Test that schema comparison correctly detects removed features."""
@@ -210,7 +207,6 @@ class TestSchemaComparisonWorkflow:
         assert "deprecated_feature" in result.stdout
         assert "1 removed" in result.stdout
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_schema_comparison_detects_modified_features(self, mock_fg_class, clean_test_env):
         """Test that schema comparison correctly detects type changes."""
@@ -237,7 +233,6 @@ class TestSchemaComparisonWorkflow:
         assert "double" in result.stdout
         assert "1 modified" in result.stdout
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_schema_comparison_no_changes(self, mock_fg_class, clean_test_env):
         """Test schema comparison when versions have identical schemas."""
@@ -262,7 +257,6 @@ class TestSchemaComparisonWorkflow:
 class TestVersionErrorHandling:
     """E2E tests for error handling in version workflows."""
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_empty_feature_group(self, mock_fg_class, clean_test_env):
         """Test version list with feature group that has no versions."""
@@ -277,7 +271,6 @@ class TestVersionErrorHandling:
         assert result.exit_code == 0
         assert "No versions found" in result.stdout
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_show_nonexistent_version(self, mock_fg_class, clean_test_env):
         """Test version show with non-existent version number."""
@@ -294,7 +287,6 @@ class TestVersionErrorHandling:
         assert result.exit_code == 1
         assert "not found" in result.stdout
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_same_version_error(self, mock_fg_class, clean_test_env):
         """Test that comparing same version with itself fails with clear error."""
@@ -313,7 +305,6 @@ class TestVersionErrorHandling:
         assert result.exit_code == 1
         assert "must be different" in result.stdout
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_diff_nonexistent_version(self, mock_fg_class, clean_test_env):
         """Test diff with non-existent version."""
@@ -345,7 +336,6 @@ class TestVersionCLIIntegration:
         assert "Manage feature group versions" in result.stdout
 
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_json_output(self, mock_fg_class, clean_test_env):
         """Test version list with JSON output format."""
@@ -368,7 +358,6 @@ class TestVersionCLIIntegration:
         assert len(output) == 2
         assert output[0]["version"] == 2
 
-    @requires_spark
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_full_version_workflow(self, mock_fg_class, clean_test_env):
         """Test complete version management workflow: list -> show -> diff."""

@@ -14,19 +14,19 @@ import shutil
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
+import importlib.util
 
 import pytest
+from typer.testing import CliRunner
 
-import importlib.util
+from seeknal.cli.main import app
+
 
 # `clean` and `debug` operate on Spark feature groups (optional `spark` extra).
 requires_spark = pytest.mark.skipif(
     importlib.util.find_spec("pyspark") is None,
     reason="optional `spark` extra not installed",
 )
-from typer.testing import CliRunner
-
-from seeknal.cli.main import app
 
 
 runner = CliRunner()
