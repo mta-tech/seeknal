@@ -57,6 +57,10 @@ from pyspark.sql.types import StructType, StructField, StringType, IntegerType, 
 # =============================================================================
 
 
+@pytest.mark.skipif(
+    os.getenv("LAKEKEEPER_URI") is None,
+    reason="Requires LAKEKEEPER_URI environment variable (live atlas-dev-server)"
+)
 class TestInfrastructureValidation:
     """Tests to verify atlas-dev-server infrastructure is running."""
 
