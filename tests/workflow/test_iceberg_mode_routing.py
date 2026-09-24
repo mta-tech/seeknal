@@ -428,8 +428,7 @@ def test_featurestore_typed_and_dict_configs_forward_identical_advanced_options(
             "seeknal.workflow.materialization.operations.DuckDBIcebergExtension.load_extension"
         ) as load_extension,
         patch(
-            "seeknal.workflow.materialization.operations.DuckDBIcebergExtension.create_rest_catalog",
-            create=True,
+            "seeknal.workflow.materialization.operations.DuckDBIcebergExtension.attach_rest_catalog"
         ) as create_catalog,
     ):
         result = store._write_to_iceberg(MagicMock())

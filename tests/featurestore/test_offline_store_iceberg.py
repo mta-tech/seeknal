@@ -432,3 +432,79 @@ class TestOfflineStoreEnumIceberg:
         expected_values = ["FILE", "HIVE_TABLE", "ICEBERG"]
         for value in expected_values:
             assert hasattr(OfflineStoreEnum, value)
+
+
+class TestOfflineStoreIcebergAttachesWithRealApi:
+    """Regression: the feature store called DuckDBIcebergExtension.create_rest_catalog,
+    which does not exist, so basic-mode Iceberg writes and deletes raised
+    AttributeError. These tests patch individual methods on the real class
+    (patch.object fails for a missing attribute) instead of mocking the class.
+    """
+
+    @pytest.fixture
+    def store(self):
+        return OfflineStore(
+            kind=OfflineStoreEnum.ICEBERG,
+            value=IcebergStoreOutput(
+                table="test_features", catalog="lakekeeper",
+                namespace="test", warehouse="silver",
+            ),
+            name="attach_store",
+        )
+
+    @pytest.fixture
+    def profile(self):
+        from seeknal.workflow.materialization.config import CatalogConfig, MaterializationConfig
+
+        return MaterializationConfig(
+            catalog=CatalogConfig(uri="http://catalog.example.com", warehouse="bronze")
+        )
+
+    def test_write_attaches_node_warehouse_with_s3_and_token(self, store, profile):
+        from seeknal.workflow.materialization.operations import (
+            DuckDBIcebergExtension as Ext,
+            WriteResult,
+        )
+
+        with (
+            patch("seeknal.workflow.materialization.profile_loader.ProfileLoader") as loader,
+            patch("duckdb.connect") as connect,
+            patch("seeknal.workflow.materialization.operations.write_to_iceberg",
+                  return_value=WriteResult(success=True, row_count=3)) as write,
+            patch.object(Ext, "load_extension"),
+            patch.object(Ext, "configure_s3") as configure_s3,
+            patch.object(Ext, "get_oauth2_token", return_value="tok") as token,
+            patch.object(Ext, "attach_rest_catalog") as attach,
+        ):
+            loader.return_value.load_profile.return_value = profile
+            result = store._write_to_iceberg(Mock())
+
+        configure_s3.assert_called_once_with(connect.return_value)
+        token.assert_called_once()
+        kwargs = attach.call_args.kwargs
+        assert kwargs["catalog_name"] == "seeknal_catalog"
+        assert kwargs["warehouse_path"] == "silver"  # store-level warehouse wins over profile
+        assert kwargs["uri"] == "http://catalog.example.com"
+        assert kwargs["bearer_token"] == "tok"
+        assert write.call_args.kwargs["catalog_name"] == "seeknal_catalog"
+        assert write.call_args.kwargs["table_name"] == "test.test_features"
+        assert result["num_rows"] == 3
+
+    def test_delete_attaches_and_drops_table(self, store, profile):
+        from seeknal.workflow.materialization.operations import DuckDBIcebergExtension as Ext
+
+        with (
+            patch("seeknal.workflow.materialization.profile_loader.ProfileLoader") as loader,
+            patch("duckdb.connect") as connect,
+            patch.object(Ext, "load_extension"),
+            patch.object(Ext, "configure_s3"),
+            patch.object(Ext, "get_oauth2_token", return_value=None),
+            patch.object(Ext, "attach_rest_catalog") as attach,
+        ):
+            loader.return_value.load_profile.return_value = profile
+            assert store.delete(project="p", entity="e") is True
+
+        assert attach.call_args.kwargs["warehouse_path"] == "silver"
+        connect.return_value.execute.assert_any_call(
+            "DROP TABLE IF EXISTS seeknal_catalog.test.test_features"
+        )

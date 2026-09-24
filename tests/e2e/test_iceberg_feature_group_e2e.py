@@ -27,16 +27,11 @@ from typer.testing import CliRunner
 
 from seeknal.cli.main import app
 from seeknal.featurestore import (
-    FeatureGroup,
-    Materialization,
-    OfflineMaterialization,
     OfflineStore,
     OfflineStoreEnum,
     IcebergStoreOutput,
 )
 from seeknal.entity import Entity
-from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
 
 
 runner = CliRunner()
@@ -51,21 +46,13 @@ def clean_test_env(tmp_path):
     os.chdir(original_dir)
 
 
-@pytest.fixture(scope="function")
-def spark_session():
-    """Create a Spark session for testing."""
-    spark = SparkSession.builder \
-        .master("local[1]") \
-        .appName("IcebergFeatureGroupTest") \
-        .config("spark.sql.warehouse.dir", str(Path.cwd() / "warehouse")) \
-        .getOrCreate()
-    yield spark
-    spark.stop()
 
 
 @pytest.fixture(scope="function")
 def sample_customer_data(spark_session):
     """Create sample customer feature data."""
+    from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
+
     schema = StructType([
         StructField("customer_id", StringType(), False),
         StructField("event_date", StringType(), False),
@@ -156,8 +143,10 @@ class TestIcebergFeatureGroupBasic:
 class TestIcebergFeatureGroupCreation:
     """Tests for creating Feature Groups with Iceberg storage."""
 
-    def test_create_feature_group_with_iceberg_storage(self):
+    def test_create_feature_group_with_iceberg_storage(self, spark_session):
         """Test creating a FeatureGroup with Iceberg storage configuration."""
+        from seeknal.featurestore import FeatureGroup, Materialization, OfflineMaterialization
+
         customer_entity = Entity(
             name="customer",
             join_keys=["customer_id"]
@@ -197,11 +186,18 @@ class TestIcebergWriteOperation:
 
     @patch('seeknal.workflow.materialization.profile_loader.ProfileLoader.load_profile')
     @patch('seeknal.workflow.materialization.operations.DuckDBIcebergExtension.load_extension')
-    @patch('seeknal.workflow.materialization.operations.DuckDBIcebergExtension.create_rest_catalog')
+    @patch('seeknal.workflow.materialization.operations.DuckDBIcebergExtension.attach_rest_catalog')
+    @patch('seeknal.workflow.materialization.operations.DuckDBIcebergExtension.configure_s3')
+    @patch(
+        'seeknal.workflow.materialization.operations.DuckDBIcebergExtension.get_oauth2_token',
+        return_value=None,
+    )
     @patch('seeknal.workflow.materialization.operations.write_to_iceberg')
     def test_write_to_iceberg_append_mode(
         self,
         mock_write_to_iceberg,
+        mock_get_token,
+        mock_configure_s3,
         mock_create_catalog,
         mock_load_extension,
         mock_load_profile,
@@ -385,7 +381,7 @@ class TestIcebergRealInfrastructure:
             DuckDBIcebergExtension.load_extension(con)
 
             # Create catalog
-            DuckDBIcebergExtension.create_rest_catalog(
+            DuckDBIcebergExtension.attach_rest_catalog(
                 con=con,
                 catalog_name="test_catalog",
                 uri=catalog_uri,
