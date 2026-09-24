@@ -46,23 +46,6 @@ def clean_test_env(tmp_path):
     os.chdir(original_dir)
 
 
-@pytest.fixture(scope="function")
-def spark_session(tmp_path):
-    """Local Spark session; skips when the optional `spark` extra is absent."""
-    pytest.importorskip("pyspark", reason="optional `spark` extra not installed")
-    from pyspark.sql import SparkSession
-
-    try:
-        spark = (
-            SparkSession.builder.master("local[1]")
-            .appName("seeknal-iceberg-e2e")
-            .config("spark.sql.warehouse.dir", str(tmp_path / "warehouse"))
-            .getOrCreate()
-        )
-    except Exception as exc:  # noqa: BLE001 - e.g. no Java runtime
-        pytest.skip(f"Spark session unavailable: {exc}")
-    yield spark
-    spark.stop()
 
 
 @pytest.fixture(scope="function")

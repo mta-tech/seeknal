@@ -11,7 +11,16 @@ from seeknal.cli.auth import auth_app
 runner = CliRunner()
 
 
+_ATLAS_ENV_VARS = (
+    "ATLAS_API_URL", "ATLAS_PORTAL_URL", "ATLAS_API_TOKEN", "ATLAS_ENVIRONMENT",
+    "KEYCLOAK_ISSUER", "KEYCLOAK_URL", "KEYCLOAK_CLIENT_ID",
+)
+
+
 def _isolate_config(monkeypatch, tmp_path):
+    """Use a temp config file and ignore the developer's own Atlas env vars."""
+    for name in _ATLAS_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
     path = tmp_path / "atlas.json"
     monkeypatch.setenv("SEEKNAL_ATLAS_CONFIG_PATH", str(path))
     return path

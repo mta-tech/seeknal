@@ -1942,6 +1942,22 @@ def run(
     )
 
 
+def _require_spark_extra(command: str) -> None:
+    """Exit with a clear message when a Spark-only command runs without Spark.
+
+    These commands operate on Spark feature groups (``seeknal.featurestore
+    .feature_group``), which need the optional ``spark`` extra.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("pyspark") is None:
+        _echo_error(
+            f"`{command}` works on Spark feature groups and needs the optional "
+            "Spark extra. Install it with: pip install 'seeknal[spark]'"
+        )
+        raise typer.Exit(1)
+
+
 def _run_yaml_pipeline(
     cli_overrides: dict[str, Any] | None = None,
     run_id: str | None = None,
@@ -3130,6 +3146,7 @@ def validate_features(
         seeknal validate-features user_features --mode warn
         seeknal validate-features user_features --mode fail --verbose
     """
+    _require_spark_extra("seeknal validate-features")
     from seeknal.featurestore.feature_group import FeatureGroup
     from seeknal.feature_validation.models import ValidationMode
     from seeknal.feature_validation.validators import ValidationException
@@ -3257,6 +3274,7 @@ def debug(
     limit: int = typer.Option(10, "--limit", "-l", help="Number of rows to show"),
 ):
     """Show sample data from a feature group for debugging."""
+    _require_spark_extra("seeknal debug")
     from seeknal.featurestore.feature_group import FeatureGroup, HistoricalFeatures, FeatureLookup
 
     try:
@@ -3299,6 +3317,7 @@ def clean(
     ),
 ):
     """Clean old feature data based on TTL or date."""
+    _require_spark_extra("seeknal clean")
     from seeknal.featurestore.feature_group import FeatureGroup
 
     if before_date is None and ttl_days is None:
@@ -3337,6 +3356,7 @@ def delete(
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt"),
 ):
     """Delete a resource (feature group) including storage and metadata."""
+    _require_spark_extra("seeknal delete feature-group")
     from seeknal.featurestore.feature_group import FeatureGroup
 
     match resource_type:
@@ -3503,6 +3523,7 @@ def version_list(
         seeknal version list user_features --limit 5
         seeknal version list user_features --format json
     """
+    _require_spark_extra("seeknal version list")
     from seeknal.featurestore.feature_group import FeatureGroup
     from tabulate import tabulate
     import json
@@ -3568,6 +3589,7 @@ def version_show(
         seeknal version show user_features --version 2  # Show version 2
         seeknal version show user_features --format json
     """
+    _require_spark_extra("seeknal version show")
     from seeknal.featurestore.feature_group import FeatureGroup
     import json
 
@@ -3677,6 +3699,7 @@ def version_diff(
         seeknal version diff user_features --from 1 --to 2
         seeknal version diff user_features --from 1 --to 3 --format json
     """
+    _require_spark_extra("seeknal version diff")
     from seeknal.featurestore.feature_group import FeatureGroup
     import json
 
