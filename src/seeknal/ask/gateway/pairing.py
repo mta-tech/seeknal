@@ -8,6 +8,8 @@ import re
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from seeknal.ask.safe_paths import contained_child
 from typing import Any
 
 from seeknal.ask.gateway.tenant import DEFAULT_TENANT
@@ -76,7 +78,10 @@ class FilePairingStore:
         self._lock = asyncio.Lock()
 
     def _tenant_dir(self, tenant_id: str) -> Path:
-        tenant_dir = self._base / tenant_id
+        # Same defect as C-1, same field, one module over: `tenant_id` crosses a
+        # trust boundary and this joins it onto a base and then MKDIRS it. Found
+        # by sweeping the class rather than by another report.
+        tenant_dir = contained_child(self._base, tenant_id, label="tenant id")
         tenant_dir.mkdir(parents=True, exist_ok=True)
         return tenant_dir
 
@@ -265,7 +270,10 @@ class TelegramLinkStore:
         self._base.mkdir(parents=True, exist_ok=True)
 
     def _tenant_dir(self, tenant_id: str) -> Path:
-        tenant_dir = self._base / tenant_id
+        # Same defect as C-1, same field, one module over: `tenant_id` crosses a
+        # trust boundary and this joins it onto a base and then MKDIRS it. Found
+        # by sweeping the class rather than by another report.
+        tenant_dir = contained_child(self._base, tenant_id, label="tenant id")
         tenant_dir.mkdir(parents=True, exist_ok=True)
         return tenant_dir
 
@@ -340,7 +348,10 @@ class PublicSessionStore:
         self._base.mkdir(parents=True, exist_ok=True)
 
     def _tenant_dir(self, tenant_id: str) -> Path:
-        tenant_dir = self._base / tenant_id
+        # Same defect as C-1, same field, one module over: `tenant_id` crosses a
+        # trust boundary and this joins it onto a base and then MKDIRS it. Found
+        # by sweeping the class rather than by another report.
+        tenant_dir = contained_child(self._base, tenant_id, label="tenant id")
         tenant_dir.mkdir(parents=True, exist_ok=True)
         return tenant_dir
 
