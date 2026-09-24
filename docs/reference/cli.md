@@ -281,9 +281,10 @@ seeknal run [OPTIONS]
 | `--date` | TEXT | None | Set date context (overrides run_date, date, today params) |
 | `--run-id` | TEXT | None | Custom run identifier |
 | `--dry-run` | FLAG | False | Show what would be executed without running |
-| `--full`, `-f` | FLAG | False | Run all nodes regardless of state (ignore incremental run cache) |
+| `--full`, `-f` | FLAG | False | Run all nodes regardless of state (ignore incremental run cache). Cannot be combined with `--tags`, `--nodes` or `--types` |
 | `--nodes`, `-n` | TEXT (multiple) | None | Run specific nodes only (e.g., --nodes transform.clean_data) |
 | `--types`, `-t` | TEXT (multiple) | None | Filter by node types (e.g., --types transform,feature_group,second_order_aggregation) |
+| `--tags` | TEXT (multiple) | None | Run nodes with any of these tags plus all their upstream dependencies (the added upstream nodes are listed when the run starts) |
 | `--exclude-tags` | TEXT (multiple) | None | Skip nodes with these tags |
 | `--continue-on-error` | FLAG | False | Continue execution after failures |
 | `--retry`, `-r` | INTEGER | 0 | Number of retries for failed nodes |

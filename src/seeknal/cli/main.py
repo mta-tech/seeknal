@@ -1877,6 +1877,21 @@ def run(
         # Custom parameters available as {{ key }} in source/transform SQL
         seeknal run --params '{"region": "EU", "tier": "gold"}'
     """
+    # --full selects every node, so combining it with a node selection would
+    # silently run (and materialize) far more than the user asked for.
+    if full and (tags or nodes or types):
+        selection = " / ".join(
+            flag
+            for flag, value in (("--tags", tags), ("--nodes", nodes), ("--types", types))
+            if value
+        )
+        _echo_error(
+            f"--full cannot be combined with {selection}: --full runs ALL nodes. "
+            f"Drop --full to run only the selected nodes, or drop {selection} "
+            f"to run everything."
+        )
+        raise typer.Exit(1)
+
     # Environment mode: delegate to shared helper
     if env is not None:
         from pathlib import Path
@@ -1956,6 +1971,24 @@ def _require_spark_extra(command: str) -> None:
             "Spark extra. Install it with: pip install 'seeknal[spark]'"
         )
         raise typer.Exit(1)
+
+
+def _echo_upstream_included(upstream: set[str], limit: int = 10) -> None:
+    """Tell the user which upstream nodes --tags pulled into the run.
+
+    They run (and materialize) like the tagged nodes, so an unexpected
+    upstream write is easy to miss otherwise.
+    """
+    if not upstream:
+        return
+    names = sorted(upstream)
+    shown = ", ".join(names[:limit])
+    more = f", ... (+{len(names) - limit} more)" if len(names) > limit else ""
+    _echo_info(
+        f"--tags also runs {len(names)} upstream node(s) the tagged nodes depend on: "
+        f"{shown}{more}. They run and materialize like the tagged nodes; to skip "
+        f"one, tag it and add --exclude-tags, or select nodes with --nodes."
+    )
 
 
 def _run_yaml_pipeline(
@@ -2144,10 +2177,8 @@ def _run_yaml_pipeline(
             nodes_to_run |= iceberg_to_run
 
     # Apply filters
+    tag_upstream_added: set[str] = set()
     if full:
-        # Override: run all nodes (--full overrides --tags)
-        if tags:
-            _echo_info("Note: --full overrides --tags (running all nodes)")
         nodes_to_run = set(dag_builder.nodes.keys())
     elif tags and nodes:
         # Union: tag-matched nodes (+ upstream) AND explicitly named nodes (+ downstream)
@@ -2163,6 +2194,7 @@ def _run_yaml_pipeline(
         with_upstream = set(tag_matched)
         for node_id in tag_matched:
             with_upstream |= dag_builder.get_all_upstream(node_id)
+        tag_upstream_added = with_upstream - tag_matched
         # Add downstream for explicitly named nodes
         specified = set()
         for node_name in nodes:
@@ -2172,6 +2204,7 @@ def _run_yaml_pipeline(
                     specified.update(dag_builder.get_all_downstream(node_id))
                     break
         nodes_to_run = with_upstream | specified
+        tag_upstream_added -= specified
     elif tags:
         # Run only tag-matched nodes + their upstream dependencies
         tag_set = set(tags)
@@ -2187,6 +2220,7 @@ def _run_yaml_pipeline(
         with_upstream = set(tag_matched)
         for node_id in tag_matched:
             with_upstream |= dag_builder.get_all_upstream(node_id)
+        tag_upstream_added = with_upstream - tag_matched
         nodes_to_run = with_upstream
     elif nodes:
         # Run specific nodes and their downstream
@@ -2249,6 +2283,9 @@ def _run_yaml_pipeline(
             for node_id in nodes_to_run
             if not any(tag in exclude_set for tag in dag_builder.nodes[node_id].tags)
         }
+
+    # Report upstream nodes --tags pulled in, as they will actually run
+    _echo_upstream_included(tag_upstream_added & nodes_to_run)
 
     # Include upstream source dependencies for transforms
     # This ensures DuckDB views/tables are available for transform SQL

@@ -170,6 +170,10 @@ Supports Google Gemini (default), OpenAI-compatible providers, Anthropic-compati
 - **Atomic overwrite**: `mode: overwrite` replaces rows in one transaction; if the new data fails to insert (e.g. a schema mismatch), the previous rows are kept instead of the table being left empty.
 - **Clearer logs**: every Iceberg write logs its target warehouse (`Iceberg target: warehouse=… table=…`).
 - `upsert` and `insert_overwrite` were not affected.
+- **Works without Spark out of the box**: a default install (no `seeknal[spark]` extra) runs pipelines with sources, transforms, feature groups and rules; Spark-only commands explain how to install the extra.
+- **Feature-store Iceberg fix**: `OfflineStore` Iceberg writes/deletes no longer fail with `AttributeError`.
+- **Safer run selection**: `--full` can no longer be combined with `--tags`/`--nodes`/`--types` (it silently ran everything), and `--tags` lists the upstream nodes it adds.
+- Dependencies: `duckdb>=1.4.4` (pandas 3 support), `sqlmodel<0.0.45`.
 
 ### v2.9.1 (April 2026)
 
