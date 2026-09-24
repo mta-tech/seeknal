@@ -1948,9 +1948,9 @@ def _require_spark_extra(command: str) -> None:
     These commands operate on Spark feature groups (``seeknal.featurestore
     .feature_group``), which need the optional ``spark`` extra.
     """
-    import importlib.util
-
-    if importlib.util.find_spec("pyspark") is None:
+    try:
+        import seeknal.featurestore.feature_group  # noqa: F401
+    except ImportError:
         _echo_error(
             f"`{command}` works on Spark feature groups and needs the optional "
             "Spark extra. Install it with: pip install 'seeknal[spark]'"
