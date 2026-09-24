@@ -164,7 +164,11 @@ seeknal run --tags revenue_pipeline
 Showing 4 of 9 nodes (filtered by tags: revenue_pipeline), 4 to run
 ```
 
-Notice that `events_cleaned` is included even though it has no tags — it's an **upstream dependency** of `sales_enriched`. Seeknal automatically includes all transitive upstream nodes to ensure the filtered subgraph can execute correctly.
+Notice that `events_cleaned` is included even though it has no tags — it's an **upstream dependency** of `sales_enriched`. Seeknal automatically includes all transitive upstream nodes to ensure the filtered subgraph can execute correctly, and says so when the run starts:
+
+```
+ℹ --tags also runs N upstream node(s) the tagged nodes depend on: <node ids>. They run and materialize like the tagged nodes; to skip one, tag it and add --exclude-tags, or select nodes with --nodes.
+```
 
 Untagged nodes like `source.sales_snapshot` or rules are excluded from the filtered view.
 
@@ -220,16 +224,16 @@ seeknal run --tags revenue_pipeline --nodes source.sales_snapshot
 
 Both the revenue pipeline nodes AND `source.sales_snapshot` (plus their respective upstream deps) are included.
 
-### Full Override
+### `--full` Cannot Be Combined with a Selection
 
-`--full` always overrides `--tags`:
+`--full` runs **every** node, so combining it with `--tags`, `--nodes` or `--types` is refused instead of silently running (and materializing) the whole project:
 
 ```bash
 seeknal run --full --tags revenue_pipeline
 ```
 
 ```
-ℹ --full flag set, ignoring --tags filter. Running all nodes.
+✗ --full cannot be combined with --tags: --full runs ALL nodes. Drop --full to run only the selected nodes, or drop --tags to run everything.
 ```
 
 ---
@@ -307,7 +311,7 @@ In the HTML visualization, click any node to see its tags displayed as badge chi
 | `--tags A,B` | OR logic — matches nodes with **any** specified tag |
 | `--tags X --exclude-tags Y` | Include first, then exclude |
 | `--tags X --nodes Y` | Union of both sets (each with own upstream deps) |
-| `--full --tags X` | `--full` wins, `--tags` ignored with info message |
+| `--full` with `--tags` / `--nodes` / `--types` | Refused with an error: `--full` runs all nodes |
 | `--tags X --types Y` | Tags first, then types filter within tag-matched set |
 
 ---
@@ -323,7 +327,7 @@ In the HTML visualization, click any node to see its tags displayed as badge chi
     **2. Missing upstream nodes in output**
 
     - Symptom: Untagged upstream nodes appear in the filtered run
-    - This is expected! Upstream dependencies are auto-included to ensure the subgraph can execute. Only **downstream** untagged nodes are excluded.
+    - This is expected! Upstream dependencies are auto-included to ensure the subgraph can execute, and the run lists them when it starts (`--tags also runs N upstream node(s) ...`). They run and materialize like the tagged nodes; to skip one whose output is already current, tag it and add `--exclude-tags`, or select nodes with `--nodes`. Only **downstream** untagged nodes are excluded.
 
     **3. Tags not showing in plan/lineage**
 

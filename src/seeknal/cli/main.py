@@ -1877,6 +1877,21 @@ def run(
         # Custom parameters available as {{ key }} in source/transform SQL
         seeknal run --params '{"region": "EU", "tier": "gold"}'
     """
+    # --full selects every node, so combining it with a node selection would
+    # silently run (and materialize) far more than the user asked for.
+    if full and (tags or nodes or types):
+        selection = " / ".join(
+            flag
+            for flag, value in (("--tags", tags), ("--nodes", nodes), ("--types", types))
+            if value
+        )
+        _echo_error(
+            f"--full cannot be combined with {selection}: --full runs ALL nodes. "
+            f"Drop --full to run only the selected nodes, or drop {selection} "
+            f"to run everything."
+        )
+        raise typer.Exit(1)
+
     # Environment mode: delegate to shared helper
     if env is not None:
         from pathlib import Path
@@ -1939,6 +1954,40 @@ def run(
         materialize=materialize,
         profile=profile,
         verbose=verbose,
+    )
+
+
+def _require_spark_extra(command: str) -> None:
+    """Exit with a clear message when a Spark-only command runs without Spark.
+
+    These commands operate on Spark feature groups (``seeknal.featurestore
+    .feature_group``), which need the optional ``spark`` extra.
+    """
+    try:
+        import seeknal.featurestore.feature_group  # noqa: F401
+    except ImportError:
+        _echo_error(
+            f"`{command}` works on Spark feature groups and needs the optional "
+            "Spark extra. Install it with: pip install 'seeknal[spark]'"
+        )
+        raise typer.Exit(1)
+
+
+def _echo_upstream_included(upstream: set[str], limit: int = 10) -> None:
+    """Tell the user which upstream nodes --tags pulled into the run.
+
+    They run (and materialize) like the tagged nodes, so an unexpected
+    upstream write is easy to miss otherwise.
+    """
+    if not upstream:
+        return
+    names = sorted(upstream)
+    shown = ", ".join(names[:limit])
+    more = f", ... (+{len(names) - limit} more)" if len(names) > limit else ""
+    _echo_info(
+        f"--tags also runs {len(names)} upstream node(s) the tagged nodes depend on: "
+        f"{shown}{more}. They run and materialize like the tagged nodes; to skip "
+        f"one, tag it and add --exclude-tags, or select nodes with --nodes."
     )
 
 
@@ -2128,10 +2177,8 @@ def _run_yaml_pipeline(
             nodes_to_run |= iceberg_to_run
 
     # Apply filters
+    tag_upstream_added: set[str] = set()
     if full:
-        # Override: run all nodes (--full overrides --tags)
-        if tags:
-            _echo_info("Note: --full overrides --tags (running all nodes)")
         nodes_to_run = set(dag_builder.nodes.keys())
     elif tags and nodes:
         # Union: tag-matched nodes (+ upstream) AND explicitly named nodes (+ downstream)
@@ -2147,6 +2194,7 @@ def _run_yaml_pipeline(
         with_upstream = set(tag_matched)
         for node_id in tag_matched:
             with_upstream |= dag_builder.get_all_upstream(node_id)
+        tag_upstream_added = with_upstream - tag_matched
         # Add downstream for explicitly named nodes
         specified = set()
         for node_name in nodes:
@@ -2156,6 +2204,7 @@ def _run_yaml_pipeline(
                     specified.update(dag_builder.get_all_downstream(node_id))
                     break
         nodes_to_run = with_upstream | specified
+        tag_upstream_added -= specified
     elif tags:
         # Run only tag-matched nodes + their upstream dependencies
         tag_set = set(tags)
@@ -2171,6 +2220,7 @@ def _run_yaml_pipeline(
         with_upstream = set(tag_matched)
         for node_id in tag_matched:
             with_upstream |= dag_builder.get_all_upstream(node_id)
+        tag_upstream_added = with_upstream - tag_matched
         nodes_to_run = with_upstream
     elif nodes:
         # Run specific nodes and their downstream
@@ -2233,6 +2283,9 @@ def _run_yaml_pipeline(
             for node_id in nodes_to_run
             if not any(tag in exclude_set for tag in dag_builder.nodes[node_id].tags)
         }
+
+    # Report upstream nodes --tags pulled in, as they will actually run
+    _echo_upstream_included(tag_upstream_added & nodes_to_run)
 
     # Include upstream source dependencies for transforms
     # This ensures DuckDB views/tables are available for transform SQL
@@ -3130,6 +3183,7 @@ def validate_features(
         seeknal validate-features user_features --mode warn
         seeknal validate-features user_features --mode fail --verbose
     """
+    _require_spark_extra("seeknal validate-features")
     from seeknal.featurestore.feature_group import FeatureGroup
     from seeknal.feature_validation.models import ValidationMode
     from seeknal.feature_validation.validators import ValidationException
@@ -3257,6 +3311,7 @@ def debug(
     limit: int = typer.Option(10, "--limit", "-l", help="Number of rows to show"),
 ):
     """Show sample data from a feature group for debugging."""
+    _require_spark_extra("seeknal debug")
     from seeknal.featurestore.feature_group import FeatureGroup, HistoricalFeatures, FeatureLookup
 
     try:
@@ -3299,6 +3354,7 @@ def clean(
     ),
 ):
     """Clean old feature data based on TTL or date."""
+    _require_spark_extra("seeknal clean")
     from seeknal.featurestore.feature_group import FeatureGroup
 
     if before_date is None and ttl_days is None:
@@ -3337,6 +3393,7 @@ def delete(
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt"),
 ):
     """Delete a resource (feature group) including storage and metadata."""
+    _require_spark_extra("seeknal delete feature-group")
     from seeknal.featurestore.feature_group import FeatureGroup
 
     match resource_type:
@@ -3503,6 +3560,7 @@ def version_list(
         seeknal version list user_features --limit 5
         seeknal version list user_features --format json
     """
+    _require_spark_extra("seeknal version list")
     from seeknal.featurestore.feature_group import FeatureGroup
     from tabulate import tabulate
     import json
@@ -3568,6 +3626,7 @@ def version_show(
         seeknal version show user_features --version 2  # Show version 2
         seeknal version show user_features --format json
     """
+    _require_spark_extra("seeknal version show")
     from seeknal.featurestore.feature_group import FeatureGroup
     import json
 
@@ -3677,6 +3736,7 @@ def version_diff(
         seeknal version diff user_features --from 1 --to 2
         seeknal version diff user_features --from 1 --to 3 --format json
     """
+    _require_spark_extra("seeknal version diff")
     from seeknal.featurestore.feature_group import FeatureGroup
     import json
 

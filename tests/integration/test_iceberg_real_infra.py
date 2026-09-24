@@ -57,6 +57,10 @@ from pyspark.sql.types import StructType, StructField, StringType, IntegerType, 
 # =============================================================================
 
 
+@pytest.mark.skipif(
+    os.getenv("LAKEKEEPER_URI") is None,
+    reason="Requires LAKEKEEPER_URI environment variable (live atlas-dev-server)"
+)
 class TestInfrastructureValidation:
     """Tests to verify atlas-dev-server infrastructure is running."""
 
@@ -142,7 +146,7 @@ class TestDuckDBIcebergExtension:
         catalog_uri = os.getenv("LAKEKEEPER_URI", "http://172.19.0.9:8181")
         warehouse_path = os.getenv("LAKEKEEPER_WAREHOUSE", "s3://iceberg/warehouse")
 
-        DuckDBIcebergExtension.create_rest_catalog(
+        DuckDBIcebergExtension.attach_rest_catalog(
             con=self.con,
             catalog_name="test_catalog",
             uri=catalog_uri,
@@ -158,7 +162,7 @@ class TestDuckDBIcebergExtension:
         catalog_uri = os.getenv("LAKEKEEPER_URI", "http://172.19.0.9:8181")
         warehouse_path = os.getenv("LAKEKEEPER_WAREHOUSE", "s3://iceberg/warehouse")
 
-        DuckDBIcebergExtension.create_rest_catalog(
+        DuckDBIcebergExtension.attach_rest_catalog(
             con=self.con,
             catalog_name="test_catalog",
             uri=catalog_uri,
@@ -503,7 +507,7 @@ def cleanup_test_tables(catalog_name="test_catalog", namespace="test"):
         catalog_uri = os.getenv("LAKEKEEPER_URI", "http://172.19.0.9:8181")
         warehouse_path = os.getenv("LAKEKEEPER_WAREHOUSE", "s3://iceberg/warehouse")
 
-        DuckDBIcebergExtension.create_rest_catalog(
+        DuckDBIcebergExtension.attach_rest_catalog(
             con=con,
             catalog_name=catalog_name,
             uri=catalog_uri,

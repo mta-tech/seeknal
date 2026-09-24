@@ -297,6 +297,7 @@ class MaterializationDispatcher:
 
         from seeknal.workflow.materialization.operations import (  # ty: ignore[unresolved-import]
             DuckDBIcebergExtension,
+            iceberg_catalog_alias,
             write_to_iceberg,
         )
         from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
@@ -356,7 +357,15 @@ class MaterializationDispatcher:
         if not warehouse_path:
             warehouse_path = os.environ.get("LAKEKEEPER_WAREHOUSE", "")
 
+        table_label = target_config.get("table", "")
         if advanced:
+            logger.info(
+                f"Iceberg target: warehouse={warehouse_path} table={table_label} "
+                f"(pyiceberg {mode})"
+            )
+            # PyIceberg path: isolation comes from the explicit uri/warehouse;
+            # keep the historical catalog name so ~/.pyiceberg.yaml and
+            # PYICEBERG_CATALOG__ICEBERG_CATALOG__* settings still apply.
             return write_to_iceberg(
                 con=con,
                 catalog_name="iceberg_catalog",
@@ -369,11 +378,18 @@ class MaterializationDispatcher:
                 **options,
             )
 
+        # One alias per (endpoint, warehouse): a shared alias bound every
+        # later node in the run to the first node's warehouse (FIX-11 b).
+        catalog_name = iceberg_catalog_alias(uri, warehouse_path)
+        logger.info(
+            f"Iceberg target: warehouse={warehouse_path} table={table_label} "
+            f"alias={catalog_name}"
+        )
+
         DuckDBIcebergExtension.load_extension(con)
         DuckDBIcebergExtension.configure_s3(con)
 
         # Attach REST catalog using DuckDB ATTACH syntax
-        catalog_name = "iceberg_catalog"
         DuckDBIcebergExtension.attach_rest_catalog(
             con=con,
             catalog_name=catalog_name,

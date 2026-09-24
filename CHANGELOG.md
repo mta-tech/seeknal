@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.1] - 2026-09-23
+
+### Fixed
+- Iceberg `append`/`overwrite` materialization now honours each node's `warehouse:`. A run attached every write under one fixed DuckDB alias (`iceberg_catalog`), so the first warehouse attached bound the whole run: later nodes' rows landed in that warehouse and overwrote same-named tables (FIX-11 b). Each (catalog endpoint, warehouse) now gets its own alias, and an existing alias is verified before reuse (re-attached if it points at another warehouse; refused if it is not an Iceberg attachment).
+- Iceberg `overwrite` is now atomic: `DELETE` + `INSERT` run in one transaction, so a failed insert (e.g. a schema mismatch) keeps the previous rows instead of leaving the table empty. A failed commit is logged as an unknown outcome.
+- Materialization logs now name the target warehouse (`Iceberg target: warehouse=… table=… alias=…`).
+- Quote-escape warehouse, endpoint and token values in Iceberg `ATTACH` statements, and escape embedded double quotes in quoted identifiers.
+- Feature-store Iceberg writes and deletes (`OfflineStore`, basic modes) called a non-existent `DuckDBIcebergExtension.create_rest_catalog` and always raised `AttributeError`; they now attach the catalog with the existing API.
+- Out-of-the-box install without the optional `spark` extra: DuckDB feature groups no longer import Spark, so `seeknal run` pipelines with feature groups work on a default install. `engine: spark` feature groups work again (they raised `NameError`) and report a clear `seeknal[spark]` hint when Spark is missing; Spark-only CLI commands (`version list/show/diff`, `delete feature-group`, `clean`, `debug`, `validate-features`) print the same hint instead of a `ModuleNotFoundError`.
+- Dependencies: `duckdb>=1.4.4` (1.4.3 could not read pandas 3 text columns) and `sqlmodel<0.0.45` (0.0.45 rejects the naive timestamps stored by Seeknal's metadata models).
+
+### Changed
+- `seeknal run` refuses `--full` combined with `--tags`, `--nodes` or `--types` (it silently ran every node) and lists the upstream nodes that `--tags` adds to a run. The Ask `run_pipeline` tool no longer combines `full=True` with `nodes`.
+
 ## [2.12.0] - 2026-09-17
 
 ### Added
