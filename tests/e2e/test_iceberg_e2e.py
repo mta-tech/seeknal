@@ -27,9 +27,6 @@ from typer.testing import CliRunner
 
 from seeknal.cli.main import app
 from seeknal.featurestore import (
-    FeatureGroup,
-    Materialization,
-    OfflineMaterialization,
     OfflineStore,
     OfflineStoreEnum,
     IcebergStoreOutput,
@@ -47,6 +44,32 @@ def clean_test_env(tmp_path):
     os.chdir(tmp_path)
     yield tmp_path
     os.chdir(original_dir)
+
+
+@pytest.fixture(scope="function")
+def spark_session(tmp_path):
+    """Local Spark session; skips when the optional `spark` extra is absent."""
+    pytest.importorskip("pyspark", reason="optional `spark` extra not installed")
+    from pyspark.sql import SparkSession
+
+    try:
+        spark = (
+            SparkSession.builder.master("local[1]")
+            .appName("seeknal-iceberg-e2e")
+            .config("spark.sql.warehouse.dir", str(tmp_path / "warehouse"))
+            .getOrCreate()
+        )
+    except Exception as exc:  # noqa: BLE001 - e.g. no Java runtime
+        pytest.skip(f"Spark session unavailable: {exc}")
+    yield spark
+    spark.stop()
+
+
+def _spark_feature_group_api():
+    """Spark FeatureGroup API (needs the optional `spark` extra)."""
+    from seeknal.featurestore import FeatureGroup, Materialization, OfflineMaterialization
+
+    return FeatureGroup, Materialization, OfflineMaterialization
 
 
 @pytest.fixture(scope="function")
@@ -68,9 +91,10 @@ class TestIcebergFeatureGroupCreation:
 
     @mock.patch("seeknal.workflow.materialization.profile_loader.ProfileLoader")
     def test_create_feature_group_with_iceberg_storage(
-        self, mock_profile_loader, clean_test_env
+        self, mock_profile_loader, clean_test_env, spark_session
     ):
         """Test creating a feature group with Iceberg offline storage."""
+        FeatureGroup, Materialization, OfflineMaterialization = _spark_feature_group_api()
         # Mock profile loader to return valid config
         mock_loader_instance = mock.MagicMock()
         mock_config = mock.MagicMock()
@@ -362,8 +386,9 @@ class TestIcebergCLIIntegration:
 class TestIcebergBackwardCompatibility:
     """E2E tests for backward compatibility with existing storage types."""
 
-    def test_hive_table_still_works(self, clean_test_env):
+    def test_hive_table_still_works(self, clean_test_env, spark_session):
         """Test that HIVE_TABLE storage still works alongside ICEBERG."""
+        FeatureGroup, Materialization, OfflineMaterialization = _spark_feature_group_api()
         # Create entity
         customer_entity = Entity(name="customer", join_keys=["customer_id"])
 
@@ -387,8 +412,9 @@ class TestIcebergBackwardCompatibility:
         # Verify HIVE_TABLE still works
         assert fg.materialization.offline_materialization.store.kind == "hive_table"
 
-    def test_file_storage_still_works(self, clean_test_env):
+    def test_file_storage_still_works(self, clean_test_env, spark_session):
         """Test that FILE storage still works alongside ICEBERG."""
+        FeatureGroup, Materialization, OfflineMaterialization = _spark_feature_group_api()
         # Create entity
         customer_entity = Entity(name="customer", join_keys=["customer_id"])
 

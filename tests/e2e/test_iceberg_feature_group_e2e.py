@@ -27,16 +27,11 @@ from typer.testing import CliRunner
 
 from seeknal.cli.main import app
 from seeknal.featurestore import (
-    FeatureGroup,
-    Materialization,
-    OfflineMaterialization,
     OfflineStore,
     OfflineStoreEnum,
     IcebergStoreOutput,
 )
 from seeknal.entity import Entity
-from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
 
 
 runner = CliRunner()
@@ -52,13 +47,20 @@ def clean_test_env(tmp_path):
 
 
 @pytest.fixture(scope="function")
-def spark_session():
-    """Create a Spark session for testing."""
-    spark = SparkSession.builder \
-        .master("local[1]") \
-        .appName("IcebergFeatureGroupTest") \
-        .config("spark.sql.warehouse.dir", str(Path.cwd() / "warehouse")) \
-        .getOrCreate()
+def spark_session(tmp_path):
+    """Local Spark session; skips when the optional `spark` extra is absent."""
+    pytest.importorskip("pyspark", reason="optional `spark` extra not installed")
+    from pyspark.sql import SparkSession
+
+    try:
+        spark = (
+            SparkSession.builder.master("local[1]")
+            .appName("seeknal-iceberg-e2e")
+            .config("spark.sql.warehouse.dir", str(tmp_path / "warehouse"))
+            .getOrCreate()
+        )
+    except Exception as exc:  # noqa: BLE001 - e.g. no Java runtime
+        pytest.skip(f"Spark session unavailable: {exc}")
     yield spark
     spark.stop()
 
@@ -66,6 +68,8 @@ def spark_session():
 @pytest.fixture(scope="function")
 def sample_customer_data(spark_session):
     """Create sample customer feature data."""
+    from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
+
     schema = StructType([
         StructField("customer_id", StringType(), False),
         StructField("event_date", StringType(), False),
@@ -156,8 +160,10 @@ class TestIcebergFeatureGroupBasic:
 class TestIcebergFeatureGroupCreation:
     """Tests for creating Feature Groups with Iceberg storage."""
 
-    def test_create_feature_group_with_iceberg_storage(self):
+    def test_create_feature_group_with_iceberg_storage(self, spark_session):
         """Test creating a FeatureGroup with Iceberg storage configuration."""
+        from seeknal.featurestore import FeatureGroup, Materialization, OfflineMaterialization
+
         customer_entity = Entity(
             name="customer",
             join_keys=["customer_id"]
