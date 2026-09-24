@@ -16,6 +16,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+
+import importlib.util
+
+# `clean` and `debug` operate on Spark feature groups (optional `spark` extra).
+requires_spark = pytest.mark.skipif(
+    importlib.util.find_spec("pyspark") is None,
+    reason="optional `spark` extra not installed",
+)
 from typer.testing import CliRunner
 
 from seeknal.cli.main import app
@@ -129,6 +137,7 @@ class TestListingWorkflow:
 class TestDryRunWorkflow:
     """E2E tests for dry-run workflows."""
 
+    @requires_spark
     def test_clean_dry_run(self, clean_test_env):
         """Test cleaning feature data in dry-run mode."""
         runner.invoke(app, ["init", "--name", "clean_dry_run_test"])
@@ -220,6 +229,7 @@ class TestHelpWorkflow:
 class TestCleanWorkflow:
     """E2E tests for data cleanup workflows."""
 
+    @requires_spark
     def test_clean_with_ttl(self, clean_test_env):
         """Test clean command with TTL parameter."""
         runner.invoke(app, ["init", "--name", "clean_ttl_test"])
@@ -230,6 +240,7 @@ class TestCleanWorkflow:
         assert result.exit_code == 0
         assert "Cleaning feature group: test_fg" in result.stdout
 
+    @requires_spark
     def test_clean_with_before_date(self, clean_test_env):
         """Test clean command with before date parameter."""
         runner.invoke(app, ["init", "--name", "clean_date_test"])
@@ -244,6 +255,7 @@ class TestCleanWorkflow:
 class TestDebugWorkflow:
     """E2E tests for debug workflows."""
 
+    @requires_spark
     def test_debug_displays_feature_group_name(self, clean_test_env):
         """Test that debug command displays feature group name."""
         runner.invoke(app, ["init", "--name", "debug_test"])
