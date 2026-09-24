@@ -355,17 +355,6 @@ class FeatureGroupExecutor(BaseExecutor):
         Returns:
             ExecutorResult with execution outcome
         """
-        try:
-            from ...featurestore.feature_group import (
-                FeatureGroup,
-                Materialization as SparkMaterialization,
-            )
-        except ImportError as exc:
-            raise ExecutorExecutionError(
-                "Spark feature groups require optional Spark dependencies; "
-                "install with `pip install seeknal[spark]`."
-            ) from exc
-
         # Parse entity config
         entity_config = config["entity"]
         entity = Entity(
