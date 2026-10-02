@@ -439,8 +439,11 @@ async def _process_http_work_item(
     error: Optional[str] = None
     event_count = 0
 
-    async def post_event(event: dict) -> None:
-        await client.post(
+    class _WorkVanished(Exception):
+        """Gateway no longer knows this work (404/410) — stop streaming."""
+
+    async def post_event(event: dict) -> object:
+        return await client.post(
             f"{base_url}/internal/worker/work/{work_id}/event",
             headers=headers,
             json=event,
@@ -462,7 +465,16 @@ async def _process_http_work_item(
                     answer = str(event.get("data") or "")
                 elif event.get("type") == "error":
                     error = str(event.get("data") or "")
-                await post_event(event)
+                resp = await post_event(event)
+                # Fire-and-forget delivery used to keep streaming hundreds of
+                # events into a work the gateway had already expired
+                # (observed: 411× event 404 on 29–30 Sep). Abort on the first
+                # sign the work record is gone instead of burning LLM tokens.
+                if resp.status_code in (404, 410):
+                    raise _WorkVanished(
+                        f"gateway no longer knows work {work_id} "
+                        f"(HTTP {resp.status_code}) after {event_count} events"
+                    )
         except asyncio.CancelledError:
             error = error or "worker shutting down"
             try:
@@ -616,8 +628,28 @@ async def _run_http_only_worker(
                         continue
                     if response.status_code == 204:
                         continue
-                    response.raise_for_status()
-                    work = response.json()
+                    # A gateway error response (5xx during deploys, 429 rate
+                    # limit, 401 bad token, …) must never kill the worker
+                    # process: raise_for_status() here caused 52–60 restart
+                    # crash-loops on 28 Sep while the gateway returned 500s.
+                    # Log, back off, and keep polling instead.
+                    if response.status_code != 200:
+                        typer.echo(typer.style(
+                            f"Gateway poll returned HTTP {response.status_code}; "
+                            "retrying in 15s",
+                            fg=typer.colors.YELLOW,
+                        ))
+                        await asyncio.sleep(15)
+                        continue
+                    try:
+                        work = response.json()
+                    except ValueError as exc:
+                        typer.echo(typer.style(
+                            f"Gateway poll returned non-JSON body: {exc}; retrying",
+                            fg=typer.colors.YELLOW,
+                        ))
+                        await asyncio.sleep(5)
+                        continue
                     task = asyncio.create_task(_process_http_work_item(
                         work,
                         client=client,
