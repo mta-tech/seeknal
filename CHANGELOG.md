@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.2] - 2026-10-12
+
+### Fixed
+- SQL transforms publish schema-preserving intermediate parquet files for zero-row results, replacing stale output and allowing downstream transforms to process empty batches.
+- Capture the last SELECT result once and bind the transform view to its published parquet, preventing recursive `input_0` references and preserving results when later SQL drops a temporary input table.
+- Publish intermediate files through an atomic replacement and fail the node on publication errors instead of continuing with stale data.
+
 ## [2.12.1] - 2026-09-23
 
 ### Fixed
