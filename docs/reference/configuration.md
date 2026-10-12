@@ -450,6 +450,7 @@ Performance and safety-related fields:
 | `context_budget` | integer | `8000` | Character budget for injected project context |
 | `sql_timeout_seconds` | integer | `60` | Hard timeout for `execute_sql`; use `0` to disable |
 | `discovery_cache_ttl_seconds` | integer | `300` | Per-session TTL for table/schema discovery cache; use `0` to disable |
+| `guard.waf.enabled` | boolean | `false` | Neutralize known edge-WAF false-positive signature shapes in outbound Ask requests (see [WAF false-positive guard](#waf-false-positive-guard-opt-in)) |
 
 Advanced agent-runtime fields live under `agent_harness`. They map to
 pydantic-deep features and are optional; omit the section unless a project
@@ -507,6 +508,32 @@ sources:
     access: read_only
     role: business_source_of_truth
 ```
+
+### WAF false-positive guard (opt-in)
+
+`guard.waf.enabled` enables a runtime guard for deployments whose LLM endpoint
+sits behind an edge firewall/WAF (for example LiteLLM behind an Aliyun WAF).
+Such firewalls can reject legitimate traffic with a `405` HTML block page when
+any request-body string resembles an attack signature — including tool
+descriptions, SQL examples in context files, or the model's own generated SQL
+(for example `ORDER BY 1`). When enabled, only the matched signature shapes
+are rewritten with an invisible `U+200B` (model intent unchanged); the
+question, session history, tool results, generated text, tool-call arguments,
+and the assembled instructions are covered, and firewall blocks are
+classified in the worker log with their trace id. Default: off — omitted
+means no behavior change.
+
+```yaml
+guard:
+  waf:
+    enabled: true
+```
+
+Note: tool descriptions and `SEEKNAL_ASK.md` are compiled outside message
+history, so they cannot be neutralized at runtime — keep their examples free
+of SQL-injection enumeration shapes (`ORDER BY <number>`,
+`UNION … SELECT '<literal>'`, quote tautologies). The definitive fix is to
+disable body inspection for the API path (`/v1/*`) on the firewall.
 
 ## Variable Interpolation
 

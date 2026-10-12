@@ -1011,6 +1011,16 @@ agent_harness:
   teams:
     enabled: false
 
+# Optional edge-WAF guard. Enable when the LLM endpoint sits behind an edge
+# firewall/WAF (e.g. LiteLLM behind an Aliyun WAF) that can reject legitimate
+# requests with a 405 HTML block page when any body text resembles an attack
+# signature (SQL examples, ORDER BY <number>, quote tautologies). When enabled,
+# matched signature shapes in outbound requests are rewritten with an invisible
+# U+200B so the request passes without changing intent.
+# guard:
+#   waf:
+#     enabled: true
+
 # Optional agent profile. Prefer durable business rules in SEEKNAL_ASK.md,
 # context/*.md, seeknal/sql_pairs/*.yml, and seeknal/tests/*.yml.
 agent: {{}}
