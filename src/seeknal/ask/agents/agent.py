@@ -5,6 +5,7 @@ LLM generates SQL -> execute_sql tool -> hook validates -> error? -> LLM retries
 For complex analyses, the agent decomposes tasks via the planning tool.
 """
 
+import logging
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -228,6 +229,7 @@ def create_agent(
         get_anomaly_enabled,
         get_upload_to_s3_enabled,
         get_visualize_chart_enabled,
+        get_waf_guard_enabled,
         get_auto_summarization_config,
         get_cost_tracking_config,
         get_hooks_config,
@@ -548,6 +550,16 @@ in the final response.
             )
         )
 
+    # WAF false-positive guard (opt-in via seeknal_agent.yml
+    # `guard.waf.enabled`): pydantic-ai invokes history processors before every
+    # model request, so this neutralizes edge-WAF signature shapes in the whole
+    # run — tool results from every tool, generated text, and tool-call
+    # arguments included. Invisible U+200B only; nothing when disabled.
+    if get_waf_guard_enabled(agent_config):
+        from seeknal.ask.waf_guard import build_history_processor
+
+        history_processors.append(build_history_processor())
+
     # Safety net — registered LAST so it runs after every other processor and the
     # context-manager summarizer: guarantee the processed history ends with a
     # ModelRequest so compaction/summarization can never trip pydantic-ai's
@@ -639,6 +651,40 @@ in the final response.
             bool(subagents_config["include_builtin"]) and subagents_enabled,
         )
     )
+
+    # WAF false-positive guard (opt-in): the system prompt/instructions are
+    # compiled into each request OUTSIDE the message history, so the history
+    # processor cannot reach them. Neutralize the assembled string here and
+    # warn for known injection sources that the framework adds separately
+    # (SEEKNAL_ASK.md is injected as a system context file by pydantic-deep) —
+    # those can only be fixed at the text level. See
+    # finding/TEMUAN-WAF-2026-10-12.md §17.
+    if get_waf_guard_enabled(agent_config):
+        from seeknal.ask.waf_guard import (
+            configure_from_project,
+            neutralize_str,
+            scan_text,
+        )
+
+        configure_from_project(project_path)
+        _waf_sources = {"instructions": instructions}
+        if ask_md.exists():
+            try:
+                _waf_sources["SEEKNAL_ASK.md"] = ask_md.read_text()
+            except OSError:
+                pass
+        for _waf_source_name, _waf_source_text in _waf_sources.items():
+            _waf_hits = scan_text(_waf_source_text)
+            if _waf_hits:
+                logging.getLogger(__name__).warning(
+                    "[agent] waf_guard: %s contains WAF-risky shape(s) %s — "
+                    "neutralized at runtime where possible; if blocks persist, "
+                    "review that text source (instruction content cannot be "
+                    "neutralized by the history processor).",
+                    _waf_source_name,
+                    _waf_hits,
+                )
+        instructions = neutralize_str(instructions)
 
     # Create pydantic-deep agent with full feature set
     agent = create_deep_agent(

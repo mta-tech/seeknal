@@ -6,6 +6,7 @@ Starts the seeknal ask HTTP gateway (WebSocket + SSE + REST + Telegram + Tempora
 from __future__ import annotations
 
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -402,6 +403,55 @@ def gateway_backend(
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
+# Edge-WAF block pages carry their request id in a few common shapes; match
+# both so operators can look the block up in the firewall console.
+_EDGE_WAF_TRACE_RE = re.compile(r'"traceid"\s*:\s*"([^"]+)"')
+_EDGE_WAF_REQUEST_ID_RE = re.compile(r"Request ID is:\s*([0-9a-zA-Z-]+)")
+
+
+def _describe_llm_failure(exc: Exception) -> tuple[str, Optional[str]]:
+    """Classify a worker run failure for the completion payload.
+
+    A firewall in front of the LLM endpoint answers blocked requests with an
+    HTML page instead of JSON. Surfacing that raw HTML to users is noise, so
+    when the failure is recognisable as such (4xx + HTML body) this returns a
+    short actionable message plus a telemetry note (status, body size, trace
+    id) for the worker log. Every other failure keeps the original
+    ``str(exc)`` untouched and returns ``None`` as the note.
+
+    Returns ``(user_facing_error, telemetry_note_or_None)``.
+    """
+    status_code = getattr(exc, "status_code", None)
+    try:
+        status_int = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        status_int = None
+
+    body = getattr(exc, "body", None)
+    detail = str(exc)
+    if not isinstance(body, str):
+        body = detail
+    stripped = body.lstrip().lower()
+    is_html_page = stripped.startswith("<!doctype") or stripped.startswith("<html")
+
+    if status_int is not None and 400 <= status_int < 500 and is_html_page:
+        trace_match = _EDGE_WAF_TRACE_RE.search(body) or _EDGE_WAF_REQUEST_ID_RE.search(body)
+        trace_id = trace_match.group(1) if trace_match else None
+        message = (
+            "Permintaan diblokir firewall keamanan penyedia LLM (WAF); "
+            "jawaban tidak dihasilkan. Coba rumuskan ulang pertanyaan."
+        )
+        if trace_id:
+            message += f" Trace ID: {trace_id}."
+        note = (
+            f"edge_waf_block status={status_int} "
+            f"body_bytes={len(body.encode('utf-8', 'replace'))}"
+            + (f" trace_id={trace_id}" if trace_id else "")
+        )
+        return message, note
+    return detail, None
+
+
 async def _process_http_work_item(
     work: dict,
     *,
@@ -472,7 +522,12 @@ async def _process_http_work_item(
                 pass
             raise
         except Exception as exc:  # noqa: BLE001 - surface worker failures to gateway
-            error = str(exc)
+            error, _waf_note = _describe_llm_failure(exc)
+            if _waf_note:
+                typer.echo(typer.style(
+                    f"[work={short_id} session={session_id}] {_waf_note}",
+                    fg=typer.colors.YELLOW,
+                ))
             try:
                 await post_event({"type": "error", "data": error})
                 await post_event({"type": "done"})

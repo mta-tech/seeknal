@@ -700,6 +700,28 @@ def get_visualize_chart_enabled(config: dict[str, Any]) -> bool:
     return _coerce_bool(chart_section.get("enabled"), default=False)
 
 
+def get_waf_guard_enabled(config: dict[str, Any]) -> bool:
+    """Return whether the WAF false-positive guard is enabled.
+
+    Reads ``guard.waf.enabled`` from ``seeknal_agent.yml``. Defaults to
+    ``False``. Edge firewalls in front of OpenAI-compatible LLM endpoints
+    reject the whole request body when any string matches an attack signature
+    (SQLi/XSS/traversal/template), even in legitimate conversation or data.
+    When enabled, matched substrings in outbound LLM text are neutralized with
+    an invisible U+200B so the request passes; nothing else changes. Enable it
+    explicitly per project once a deployment sits behind such a firewall.
+
+    Example::
+
+        guard:
+          waf:
+            enabled: true
+    """
+    guard_section = _get_mapping(config, "guard")
+    waf_section = _get_mapping(guard_section, "waf")
+    return _coerce_bool(waf_section.get("enabled"), default=False)
+
+
 def get_visualize_chart_auto_emit(config: dict[str, Any]) -> bool:
     """Return whether charts may be emitted without an explicit user request.
 

@@ -93,8 +93,8 @@ def run_forecast(sql: str, periods: int = 3) -> str:
                        COUNT(DISTINCT some_id)                AS y
                 FROM schema.table
                 WHERE some_date::timestamp >= '2022-09-01'
-                GROUP BY 1
-                ORDER BY 1
+                GROUP BY x
+                ORDER BY x
 
         periods: Steps ahead to forecast (default 3), on the grain the SQL
             produces. Clamped to a max of 36.

@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `seeknal.ask.waf_guard` — opt-in guard that neutralizes WAF false-positive signature shapes (SQLi / XSS / path traversal / template injection) in every outbound model request: question, session history, tool results from all tools, generated text, and tool-call arguments. Implemented as a pydantic-ai history processor attached in `create_agent`, so no existing conversation/SQL-execution code path changes. Edge firewalls in front of OpenAI-compatible endpoints (e.g. the Aliyun WAF in front of LiteLLM) reject the whole request when any string matches an attack signature — even in legitimate conversation or warehouse data. Opt-in per project via `seeknal_agent.yml` (`guard.waf.enabled: true`); default off — no behavior change until a project opts in (14/14 live A/B gallery verified).
+
+### Fixed
+- Worker no longer surfaces raw HTML firewall block pages as the chat error: edge-WAF blocks (4xx + HTML body) are classified, the firewall trace id is logged, and users get a short actionable message instead.
+- `run_forecast` docstring example no longer uses `ORDER BY 1` / `GROUP BY 1`. The ORDER-BY-number shape is flagged by edge WAFs as SQLi enumeration, and tool descriptions ride in every model request where the history-processor guard cannot reach them — one such example was enough to block every turn for a project with `agent.forecast.enabled: true`. The example now orders/groups by the `x` alias (semantically identical).
+- `seeknal.ask.waf_guard` also covers `ORDER BY <number>` and quoted `UNION [ALL] SELECT '<literal>'` shapes in message content (history, tool results, context) so the same false positives outside tool descriptions are neutralized at runtime.
+- `seeknal.ask.waf_guard` matching is now representation-agnostic: word-boundary anchors are removed so patterns also match JSON-escaped text — streamed tool-call arguments arrive as raw JSON where newlines are literal `\n` (`n` is a word character), which silently defeated `\bORDER BY` and let the model's own `...\nORDER BY 1` SQL reach the firewall un-neutralized. The runtime walk also recurses into nested dict/list content and tolerates structured tool returns.
+
 ## [2.12.1] - 2026-09-23
 
 ### Fixed
