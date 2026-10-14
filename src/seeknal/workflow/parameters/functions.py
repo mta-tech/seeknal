@@ -14,11 +14,12 @@ import os
 from typing import Optional
 
 
-def today(offset_days: int = 0) -> str:
+def today(offset_days: int = 0, base_date: Optional[date] = None) -> str:
     """Return today's date in ISO format.
 
     Args:
         offset_days: Days offset from today (negative for past)
+        base_date: Date to treat as "today" (e.g. from ``seeknal run --date``)
 
     Returns:
         ISO formatted date string (YYYY-MM-DD)
@@ -28,26 +29,30 @@ def today(offset_days: int = 0) -> str:
         >>> today(-1)  # Returns yesterday
         >>> today(7)  # Returns a week from now
     """
-    d = date.today() + timedelta(days=offset_days)
+    d = (base_date or date.today()) + timedelta(days=offset_days)
     return d.isoformat()
 
 
-def yesterday() -> str:
+def yesterday(base_date: Optional[date] = None) -> str:
     """Return yesterday's date in ISO format.
 
     Convenience function for today(-1).
 
+    Args:
+        base_date: Date to treat as "today" (e.g. from ``seeknal run --date``)
+
     Returns:
         ISO formatted date string (YYYY-MM-DD)
     """
-    return today(-1)
+    return today(-1, base_date=base_date)
 
 
-def month_start(months_offset: int = 0) -> str:
+def month_start(months_offset: int = 0, base_date: Optional[date] = None) -> str:
     """Return first day of current/offset month.
 
     Args:
         months_offset: Months offset (negative for past months)
+        base_date: Date to treat as "today" (e.g. from ``seeknal run --date``)
 
     Returns:
         ISO formatted date string (YYYY-MM-DD)
@@ -56,7 +61,7 @@ def month_start(months_offset: int = 0) -> str:
         >>> month_start()  # First day of current month
         >>> month_start(-1)  # First day of last month
     """
-    today_date = date.today()
+    today_date = base_date or date.today()
 
     # Calculate target month/year
     year = today_date.year
@@ -73,11 +78,12 @@ def month_start(months_offset: int = 0) -> str:
     return date(year, month, 1).isoformat()
 
 
-def year_start(years_offset: int = 0) -> str:
+def year_start(years_offset: int = 0, base_date: Optional[date] = None) -> str:
     """Return first day of current/offset year.
 
     Args:
         years_offset: Years offset (negative for past years)
+        base_date: Date to treat as "today" (e.g. from ``seeknal run --date``)
 
     Returns:
         ISO formatted date string (YYYY-MM-DD)
@@ -86,7 +92,7 @@ def year_start(years_offset: int = 0) -> str:
         >>> year_start()  # First day of current year
         >>> year_start(-1)  # First day of last year
     """
-    today_date = date.today()
+    today_date = base_date or date.today()
     return date(today_date.year + years_offset, 1, 1).isoformat()
 
 
@@ -127,6 +133,10 @@ FUNCTION_REGISTRY = {
     "year_start": (year_start, True),
     "env": (env_var, True),
 }
+
+
+# Functions whose notion of "today" follows ``seeknal run --date``
+DATE_FUNCTIONS = frozenset({"today", "yesterday", "month_start", "year_start"})
 
 
 def get_function(name: str):

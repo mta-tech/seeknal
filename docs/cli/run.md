@@ -42,8 +42,10 @@ into per-entity views in `target/feature_store/`.
 | `--max-workers` | Maximum parallel workers (default: 4) |
 | `--materialize/--no-materialize` | Enable/disable materialization (overrides node config) |
 | `--env` | Run in isolated virtual environment |
-| `--date` | Override date parameter (YYYY-MM-DD) |
+| `--date` | Run as if today were this date (YYYY-MM-DD); see [Parameters](#parameters) |
 | `--run-id` | Custom run ID for parameterization |
+| `--params` | JSON object of custom parameters, e.g. `'{"region": "EU"}'` |
+| `--start-date` / `--end-date` | Values for `{{ start_date }}` / `{{ end_date }}` (YYYY-MM-DD) |
 | `--start` | Start timestamp for interval execution (ISO format or YYYY-MM-DD) |
 | `--end` | End timestamp for interval execution |
 | `--backfill` | Execute backfill for all missing intervals in the date range |
@@ -123,6 +125,55 @@ seeknal run --start 2024-01-01 --end 2024-01-31
 # Backfill missing intervals
 seeknal run --backfill --start 2024-01-01 --end 2024-01-31
 ```
+
+## Parameters
+
+`{{ }}` placeholders are filled in when the DAG is built:
+
+- **YAML nodes:** `params:` values, `transform:` SQL, and a source's `table:`
+  (pushdown queries live in `params.query`, so they are covered too).
+- **Python nodes:** decorator keyword arguments, e.g.
+  `@transform(run_day="{{ today }}")`, read with `ctx.get_param("run_day")`.
+  A source's `table=` is also templated.
+
+| Placeholder | Value |
+|---|---|
+| `{{ today }}`, `{{ today(-1) }}`, `{{ yesterday }}` | Today / offset in days |
+| `{{ month_start }}`, `{{ month_start(-1) }}`, `{{ year_start }}` | First day of the (offset) month / year |
+| `{{ date }}` | The `--date` value (only set when `--date` is given) |
+| `{{ run_date }}` | The `--date` value, or the run's start timestamp |
+| `{{ start_date }}`, `{{ end_date }}` | `--start-date` / `--end-date` |
+| `{{ <key> }}` | A key from `--params` or the node's `params:` (Python nodes: declared keys only) |
+| `{{ env:VAR\|default }}` | Environment variable |
+| `{{ run_id }}` | `--run-id`, or a generated UUID |
+
+`--date` sets "today" for the whole run: every date function counts from it, so
+`seeknal run --date 2026-10-12` makes `{{ today(-1) }}` resolve to `2026-10-11`.
+
+A CLI value replaces a declared parameter with the same name. Declare defaults in
+`params:` (YAML) or as decorator arguments (Python), and override them per run:
+
+```yaml
+kind: transform
+name: daily_orders
+inputs:
+  - ref: source.orders
+params:
+  run_day: "{{ today }}"
+  region: EU
+transform: |
+  SELECT * FROM ref('source.orders')
+  WHERE CAST(order_date AS DATE) = CAST('{{ run_day }}' AS DATE)
+    AND region = '{{ region }}'
+```
+
+```bash
+seeknal run                                              # run_day = today, region = EU
+seeknal run --date 2026-10-12 --params '{"region": "US"}'
+```
+
+A node re-runs automatically when its resolved values change, so `--full` is not
+needed for a new `--date`.
 
 ## Entity Consolidation
 
