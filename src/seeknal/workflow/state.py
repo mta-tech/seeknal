@@ -431,6 +431,10 @@ def calculate_node_hash(yaml_data: Dict[str, Any], yaml_path: Path) -> str:
                     functional_content["_file_mtime"] = stat.st_mtime
                     functional_content["_file_size"] = stat.st_size
 
+        # Resolved params (e.g. a date from --date) change what these nodes compute
+        if kind in ("feature_group", "second_order_aggregation") and "params" in yaml_data:
+            functional_content["params"] = yaml_data["params"]
+
         # Convert to normalized JSON string with sorted keys
         # This ensures consistent hashing regardless of dict ordering
         content_str = json.dumps(functional_content, sort_keys=True)

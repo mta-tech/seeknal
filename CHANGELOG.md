@@ -8,7 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [2.12.2] - 2026-10-15
 
 ### Fixed
+- `seeknal run --date` now sets "today" for every date function: `{{ today(-1) }}`, `{{ yesterday }}`, `{{ month_start }}` and `{{ year_start }}` counted from the real date and ignored `--date`, which broke backfills. `--date` is now validated (YYYY-MM-DD, years 2000-2100).
+- YAML transform SQL is resolved even when the node has no `params:` block and no CLI flags are given; `{{ today }}` used to reach DuckDB unresolved.
+- A source's `table:` (YAML) / `table=` (Python `@source`) is now templated, so `data/orders_{{ today }}.csv` works.
+- Python `@transform` / `@feature_group` keyword params (e.g. `run_day="{{ today }}"`) now reach `ctx.params` / `ctx.get_param()`, with CLI values (`--date`, `--params`) replacing declared keys. They were dropped before, so Python nodes could not see run parameters. Python `@source` params are now resolved too. Only `{{ }}` strings change; other values keep their Python types.
+- Feature groups and second-order aggregations re-run when their resolved `params` change (e.g. a new `--date`), like transforms and sources already did.
+- A non-string `--params` value (e.g. `{"limit": 5}`) for a declared param no longer crashes DAG parsing, and an unknown function such as `{{ foo(1) }}` is left as written instead of losing its braces. A `today` passed via `--params` is validated like `--date`.
 - The Lakekeeper catalog URI env var is now read consistently. The Iceberg source, REPL, dry-run preview and snapshot metadata read only `LAKEKEEPER_URL`, while Iceberg materialization and the credential manager read only `LAKEKEEPER_URI`, so setting one name left the other path without a catalog. Every path now accepts both: `LAKEKEEPER_URI` is canonical and `LAKEKEEPER_URL` is an alias (used when `LAKEKEEPER_URI` is unset or empty).
+
+### Changed
+- Because transform SQL is now always resolved, `{{ env:VAR }}` without a default fails the build when `VAR` is unset (it previously reached DuckDB as literal text when the node had no `params:` and no CLI flags were given). Use `{{ env:VAR|default }}`.
+- One-time re-run after upgrading for Python nodes that declare decorator params, and for feature groups / second-order aggregations with `params`, since those params are now part of the node fingerprint.
 
 ## [2.12.1] - 2026-09-23
 
