@@ -34,6 +34,7 @@ from typing import Any, Dict, Optional
 import yaml  # ty: ignore[unresolved-import]
 
 from seeknal.context import CONFIG_BASE_URL  # ty: ignore[unresolved-import]
+from seeknal.utils.lakekeeper import lakekeeper_uri_from_env  # ty: ignore[unresolved-import]
 from seeknal.workflow.materialization.config import (  # ty: ignore[unresolved-import]
     MaterializationConfig,
     CatalogConfig,
@@ -222,10 +223,10 @@ class CredentialManager:
         credentials = {}
 
         # Get URI from environment variable
-        uri = os.environ.get("LAKEKEEPER_URI")
+        uri = lakekeeper_uri_from_env()
         if not uri:
             raise CredentialError(
-                "LAKEKEEPER_URI environment variable is not set. "
+                "LAKEKEEPER_URI (or LAKEKEEPER_URL) environment variable is not set. "
                 "Set it with: export LAKEKEEPER_URI=https://lakekeeper.example.com"
             )
         credentials["uri"] = uri

@@ -546,12 +546,14 @@ def _load_iceberg_source(table: str, params: dict):
     import duckdb
     import os
 
-    catalog_uri = params.get("catalog_uri", os.environ.get("LAKEKEEPER_URL", ""))
+    from seeknal.utils.lakekeeper import lakekeeper_uri_from_env
+
+    catalog_uri = params.get("catalog_uri", lakekeeper_uri_from_env())
     warehouse = params.get("warehouse", os.environ.get("LAKEKEEPER_WAREHOUSE", ""))
 
     if not catalog_uri:
         _echo_warning("Iceberg: no catalog_uri configured — skipping preview")
-        _echo_info("Set LAKEKEEPER_URL env var or add catalog_uri to params")
+        _echo_info("Set LAKEKEEPER_URI env var or add catalog_uri to params")
         return None
 
     con = duckdb.connect()

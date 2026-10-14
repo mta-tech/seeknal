@@ -174,6 +174,27 @@ class TestIcebergFullScanFirstRun:
         assert executor._iceberg_result_metadata["last_watermark"] is None
 
 
+class TestIcebergCatalogUriFromEnv:
+    """catalog_uri falls back to LAKEKEEPER_URI, then the LAKEKEEPER_URL alias."""
+
+    @pytest.mark.parametrize("env_var", ["LAKEKEEPER_URI", "LAKEKEEPER_URL"])
+    def test_env_var_used_as_attach_endpoint(self, execution_context, env_var):
+        node = _make_iceberg_node(table="atlas.ns.tbl", params={})
+        executor = SourceExecutor(node, execution_context)
+        mock_con = _make_mock_con()
+
+        env = {**ICEBERG_ENV, env_var: "http://from-env:8181"}
+        with patch.dict("os.environ", env, clear=True), \
+             patch("urllib.request.urlopen", return_value=_mock_urlopen()):
+            executor._load_iceberg(mock_con, "atlas.ns.tbl", {})
+
+        attach_calls = [
+            str(c) for c in mock_con.execute.call_args_list if "ATTACH" in str(c)
+        ]
+        assert len(attach_calls) == 1
+        assert "ENDPOINT 'http://from-env:8181/catalog'" in attach_calls[0]
+
+
 class TestIcebergIncrementalWithWatermark:
     """time_column + last_watermark -> WHERE clause injected."""
 

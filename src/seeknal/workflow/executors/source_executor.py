@@ -1117,7 +1117,7 @@ class SourceExecutor(BaseExecutor):
         (e.g., atlas.my_namespace.my_table).
 
         Connection details can be provided via params or environment variables:
-        - catalog_uri: Lakekeeper URL (env: LAKEKEEPER_URL)
+        - catalog_uri: Lakekeeper URL (env: LAKEKEEPER_URI, alias LAKEKEEPER_URL)
         - warehouse: Warehouse name (env: LAKEKEEPER_WAREHOUSE, default: seeknal-warehouse)
 
         S3 and OAuth2 credentials are always read from environment variables:
@@ -1139,6 +1139,8 @@ class SourceExecutor(BaseExecutor):
         import json
         import urllib.request
 
+        from seeknal.utils.lakekeeper import lakekeeper_uri_from_env
+
         # Validate 3-part table name
         parts = table.split(".")
         if len(parts) != 3:
@@ -1153,15 +1155,12 @@ class SourceExecutor(BaseExecutor):
         namespace = _qi(namespace_raw)
 
         # Get connection config from params or env vars
-        catalog_uri = params.get(
-            "catalog_uri",
-            os.getenv("LAKEKEEPER_URL", "")
-        )
+        catalog_uri = params.get("catalog_uri", lakekeeper_uri_from_env())
         if not catalog_uri:
             raise ExecutorExecutionError(
                 self.node.id,
                 "Iceberg source requires 'catalog_uri' in params or "
-                "LAKEKEEPER_URL environment variable"
+                "LAKEKEEPER_URI (or LAKEKEEPER_URL) environment variable"
             )
 
         warehouse = params.get(
