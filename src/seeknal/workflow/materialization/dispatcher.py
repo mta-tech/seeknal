@@ -295,6 +295,7 @@ class MaterializationDispatcher:
         """Route to Iceberg materialization via operations module."""
         import os
 
+        from seeknal.utils.lakekeeper import lakekeeper_uri_from_env
         from seeknal.workflow.materialization.operations import (  # ty: ignore[unresolved-import]
             DuckDBIcebergExtension,
             iceberg_catalog_alias,
@@ -333,7 +334,7 @@ class MaterializationDispatcher:
         # 1. target_config overrides (per-materialization YAML) — highest priority
         # 2. materialization.catalog section (from profile_config / profiles.yml)
         # 3. source_defaults.iceberg section
-        # 4. environment variables (LAKEKEEPER_URI, LAKEKEEPER_WAREHOUSE)
+        # 4. environment variables (LAKEKEEPER_URI or LAKEKEEPER_URL, LAKEKEEPER_WAREHOUSE)
         uri = target_config.get("catalog_uri", "")
         warehouse_path = target_config.get("warehouse", "")
 
@@ -353,7 +354,7 @@ class MaterializationDispatcher:
 
         # Fall back to environment variables
         if not uri:
-            uri = os.environ.get("LAKEKEEPER_URI", "")
+            uri = lakekeeper_uri_from_env()
         if not warehouse_path:
             warehouse_path = os.environ.get("LAKEKEEPER_WAREHOUSE", "")
 

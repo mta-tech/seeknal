@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 import duckdb
 import requests
 
+from seeknal.utils.lakekeeper import lakekeeper_uri_from_env
 from seeknal.workflow.materialization.config import (
     MaterializationConfig,
     CatalogConfig,
@@ -126,10 +127,7 @@ class IcebergMaterializationHelper:
 
     # Default catalog configuration (can be overridden by .env or profiles.yml)
     # Use direct Lakekeeper access (port 8181) instead of API Gateway (port 80)
-    DEFAULT_CATALOG_URI = os.getenv(
-        "LAKEKEEPER_URI",
-        "http://172.19.0.9:8181"
-    )
+    DEFAULT_CATALOG_URI = lakekeeper_uri_from_env("http://172.19.0.9:8181")
     DEFAULT_WAREHOUSE = os.getenv(
         "LAKEKEEPER_WAREHOUSE",
         "s3://warehouse"

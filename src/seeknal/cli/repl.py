@@ -520,8 +520,8 @@ class REPL:
         """Phase 3b: Surface the Atlas governed catalog when Atlas is connected.
 
         When ``ATLAS_API_URL`` is set, count the governed datasets Atlas exposes and —
-        if the Lakekeeper catalog env (``LAKEKEEPER_URL``) is configured — ATTACH the
-        warehouse so the datasets are queryable in the REPL as
+        if the Lakekeeper catalog env (``LAKEKEEPER_URI``, alias ``LAKEKEEPER_URL``) is
+        configured — ATTACH the warehouse so the datasets are queryable in the REPL as
         ``atlas.<namespace>.<table>`` (mirrors the iceberg-source read path). The
         governance gate still enforces access on every read. Best-effort: any failure
         leaves the rest of the REPL catalog intact.
@@ -530,12 +530,13 @@ class REPL:
         import warnings
 
         from seeknal.integrations.atlas_catalog import create_catalog_client_from_env
+        from seeknal.utils.lakekeeper import lakekeeper_uri_from_env
 
         client = create_catalog_client_from_env()
         if client is None:
             return  # Atlas not configured → nothing to surface
 
-        uri = os.getenv("LAKEKEEPER_URL", "").strip()
+        uri = lakekeeper_uri_from_env()
         warehouse = os.getenv("LAKEKEEPER_WAREHOUSE", "").strip()
         if uri and "atlas" not in self.attached:
             try:
