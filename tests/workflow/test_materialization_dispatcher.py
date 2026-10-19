@@ -459,6 +459,9 @@ class TestIcebergCatalogFallback:
         catalog.interpolate_env_vars.return_value = catalog
         config = MagicMock()
         config.catalog = catalog
+        config.when_matched_update_if = None
+        config.compare_columns = []
+        config.when_not_matched = "insert"
         return config
 
     def test_iceberg_falls_back_to_source_defaults(self, mock_con):

@@ -6,6 +6,7 @@ import os
 import re
 import math
 from collections import Counter
+from copy import copy
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
@@ -37,6 +38,9 @@ class IcebergMutationResult:
     affected_partition_count: Optional[int]
     outcome: str
     snapshot_verified: bool
+    input_row_count: Optional[int] = None
+    skipped_by_condition: int = 0
+    skipped_not_matched: int = 0
 
 
 def _quoted_relation(name: str) -> str:
@@ -263,17 +267,23 @@ def _validate_partition_spec(
         )
 
 
-def _validate_target_key_uniqueness(table: Any, batch: Any, unique_keys: Sequence[str]) -> None:
+def _validate_target_key_uniqueness(
+    table: Any,
+    batch: Any,
+    unique_keys: Sequence[str],
+    compare_columns: Sequence[str] = (),
+) -> Any:
+    selected_fields = tuple(dict.fromkeys((*unique_keys, *compare_columns)))
     if batch.num_rows == 0:
-        return
+        return batch.select(selected_fields).slice(0, 0)
     try:
         from pyiceberg.table import upsert_util
 
         match_filter = upsert_util.create_match_filter(batch, list(unique_keys))
         target_keys = table.scan(
             row_filter=match_filter,
-            selected_fields=tuple(unique_keys),
-        ).to_arrow()
+            selected_fields=selected_fields,
+        ).to_arrow().select(selected_fields)
     except Exception as exc:
         raise IcebergMutationError(f"Failed to validate target unique keys: {exc}") from exc
     counts = Counter(_row_tuples(target_keys, unique_keys))
@@ -281,6 +291,85 @@ def _validate_target_key_uniqueness(table: Any, batch: Any, unique_keys: Sequenc
         raise IcebergMutationError(
             "Target table contains duplicate rows matching source unique_keys; upsert is ambiguous"
         )
+    return target_keys
+
+
+def _validate_upsert_condition(batch: Any, target: Any, condition: str) -> None:
+    """Bind against public schemas only, including when the input has no rows."""
+    import duckdb
+
+    try:
+        with duckdb.connect() as con:
+            con.register("source", batch.slice(0, 0))
+            con.register("target", target.slice(0, 0))
+            con.execute(f"SELECT 1 FROM source CROSS JOIN target WHERE ({condition}) LIMIT 0")
+    except Exception as exc:
+        raise IcebergMutationError(f"Invalid when_matched_update_if condition: {exc}") from exc
+
+
+def _filter_matched_rows(
+    batch: Any,
+    current: Any,
+    keys: Sequence[str],
+    condition: Optional[str],
+    when_not_matched: str,
+) -> tuple[Any, int, int]:
+    """Evaluate one decision per input row, preserving source order and schema."""
+    import duckdb
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    names = {name.lower() for name in (*batch.column_names, *current.column_names)}
+
+    def helper_name(stem: str) -> str:
+        name = stem
+        while name.lower() in names:
+            name += "_"
+        names.add(name.lower())
+        return name
+
+    index = helper_name("__seeknal_row_index")
+
+    def quoted(name: str) -> str:
+        return '"' + name.replace('"', '""') + '"'
+
+    join = " AND ".join(
+        f"source.{quoted(key)} = target.{quoted(key)}"
+        for key in keys
+    )
+    source_projection = ", ".join(
+        f"numbered.{quoted(column)} AS {quoted(column)}" for column in batch.column_names
+    )
+    # Equality with a validated non-null source key makes this a reliable match
+    # marker. Keep all helper fields outside source/target so whole-row SQL
+    # expressions observe exactly the same records as during schema binding.
+    matched = f"target.{quoted(keys[0])} IS NOT NULL"
+    try:
+        with duckdb.connect() as con:
+            con.register("source", batch)
+            con.register(
+                "indexed_source",
+                batch.append_column(index, pa.array(range(batch.num_rows), pa.int64())),
+            )
+            con.register("target", current)
+            decisions = con.execute(
+                f'SELECT numbered.{quoted(index)}, {matched} AS matched, '
+                f'CASE WHEN {matched} THEN (({condition or "TRUE"}) IS TRUE) ELSE FALSE END AS allowed '
+                f'FROM indexed_source AS numbered '
+                f'CROSS JOIN LATERAL (SELECT {source_projection}) AS source '
+                f'LEFT JOIN target ON {join} ORDER BY numbered.{quoted(index)}'
+            ).fetch_arrow_table()
+        is_matched = decisions.column(1)
+        allowed = pc.fill_null(decisions.column(2), False)
+        skipped_by_condition = pc.sum(pc.and_(is_matched, pc.invert(allowed))).as_py() or 0
+        new_keys = pc.invert(is_matched)
+        skipped_not_matched = (pc.sum(new_keys).as_py() or 0) if when_not_matched == "skip" else 0
+        keep = pc.and_(is_matched, allowed)
+        if when_not_matched == "insert":
+            keep = pc.or_(keep, new_keys)
+        return batch.take(pc.filter(decisions.column(0), keep)), skipped_by_condition, skipped_not_matched
+    except Exception as exc:
+        raise IcebergMutationError(f"Failed to evaluate when_matched_update_if condition: {exc}") from exc
 
 
 def _current_snapshot_id(table: Any) -> Optional[int]:
@@ -354,6 +443,9 @@ def write_advanced_iceberg_mutation(
     create_table: bool,
     max_batch_bytes: int,
     catalog_config: CatalogConfig,
+    when_matched_update_if: Optional[str] = None,
+    compare_columns: Optional[Sequence[str]] = None,
+    when_not_matched: str = "insert",
 ) -> IcebergMutationResult:
     """Validate and atomically publish one advanced Iceberg mutation."""
     _validate_pyiceberg_capabilities()
@@ -361,6 +453,9 @@ def write_advanced_iceberg_mutation(
         raise IcebergMutationError(f"Unsupported advanced Iceberg write mode: {mode}")
 
     batch = _freeze_arrow_batch(con, view_name)
+    input_row_count = batch.num_rows
+    skipped_by_condition = 0
+    skipped_not_matched = 0
     _validate_unique_column_names(batch)
     if batch.nbytes > max_batch_bytes:
         raise IcebergMutationError(
@@ -369,8 +464,10 @@ def write_advanced_iceberg_mutation(
 
     keys = list(unique_keys or [])
     partitions = list(partition_by or [])
+    comparisons = list(compare_columns or [])
     if mode == "upsert":
         _validate_source_keys(batch, keys)
+        _validate_columns(batch, comparisons, "compare_columns")
         if partitions:
             _validate_columns(batch, partitions, "partition_by")
             _validate_non_null(batch, partitions, "partition_by")
@@ -396,8 +493,16 @@ def write_advanced_iceberg_mutation(
     if table is None:
         if not create_table:
             raise IcebergMutationError(f"Iceberg table {'.'.join(identifier)} does not exist and create_table=false")
-        if batch.num_rows == 0:
-            return IcebergMutationResult(None, 0, 0, 0, 0, "noop", False)
+        if when_matched_update_if is not None:
+            _validate_upsert_condition(
+                batch, batch.select(list(dict.fromkeys((*keys, *comparisons)))), when_matched_update_if
+            )
+        if batch.num_rows == 0 or (mode == "upsert" and when_not_matched == "skip"):
+            return IcebergMutationResult(
+                None, 0, 0, 0, 0, "noop", False,
+                input_row_count=input_row_count,
+                skipped_not_matched=input_row_count if when_not_matched == "skip" else 0,
+            )
         try:
             schema, partition_spec = _partition_spec_for_create(batch, partitions)
         except Exception as exc:
@@ -423,18 +528,31 @@ def write_advanced_iceberg_mutation(
             affected_partition_count=(len(set(_row_tuples(batch, partitions))) if mode == "insert_overwrite" else None),
             outcome="committed",
             snapshot_verified=verified,
+            input_row_count=input_row_count,
         )
 
     batch = _validate_schema(table, batch)
     if mode == "upsert":
         _validate_columns(batch, keys, "unique_keys")
-        _validate_target_key_uniqueness(table, batch, keys)
+        if when_matched_update_if is not None:
+            import pyarrow as pa
+
+            target_schema = table.schema().as_arrow()
+            target_empty = pa.Table.from_batches([], schema=target_schema).select(
+                list(dict.fromkeys((*keys, *comparisons)))
+            )
+            _validate_upsert_condition(batch, target_empty, when_matched_update_if)
+        current = _validate_target_key_uniqueness(table, batch, keys, comparisons)
         if partitions:
             _validate_partition_spec(
                 table,
                 partitions,
                 mode,
                 require_partitioned=False,
+            )
+        if batch.num_rows and (when_matched_update_if is not None or when_not_matched == "skip"):
+            batch, skipped_by_condition, skipped_not_matched = _filter_matched_rows(
+                batch, current, keys, when_matched_update_if, when_not_matched
             )
     else:
         _validate_partition_spec(
@@ -454,6 +572,9 @@ def write_advanced_iceberg_mutation(
             0,
             "noop",
             True,
+            input_row_count=input_row_count,
+            skipped_by_condition=skipped_by_condition,
+            skipped_not_matched=skipped_not_matched,
         )
 
     from pyiceberg.table.update import AssertRefSnapshotId
@@ -490,6 +611,9 @@ def write_advanced_iceberg_mutation(
         affected_partition_count=affected_partitions,
         outcome=outcome,
         snapshot_verified=verified,
+        input_row_count=input_row_count,
+        skipped_by_condition=skipped_by_condition,
+        skipped_not_matched=skipped_not_matched,
     )
 
 
@@ -497,6 +621,15 @@ def _commit_transaction(transaction: Any, operation: str) -> Any:
     from pyiceberg.exceptions import CommitFailedException
 
     try:
+        # PyIceberg 0.12 retries snapshot producers internally and drops the
+        # original AssertRefSnapshotId when rebasing them. Our preflight reads
+        # must stay tied to that snapshot. Override the client's retry policy
+        # on a private table copy; do not persist a table property or change the
+        # catalog's cached table object. A conflict requires a fresh invocation.
+        transaction._table = copy(transaction._table)
+        transaction._table.metadata = transaction._table.metadata.model_copy(
+            update={"properties": {**transaction._table.metadata.properties, "commit.retry.num-retries": "0"}}
+        )
         return transaction.commit_transaction()
     except CommitFailedException as exc:
         raise IcebergCommitError(

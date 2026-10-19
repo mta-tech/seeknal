@@ -42,6 +42,7 @@ seeknal docs --list
 
 ```bash
 seeknal docs repl
+seeknal docs iceberg-upsert
 ```
 
 ### Full-text search
@@ -54,6 +55,7 @@ seeknal docs "materialization"
 
 ```bash
 seeknal docs --json "environment"
+seeknal docs --json iceberg-upsert
 ```
 
 ### Limit results

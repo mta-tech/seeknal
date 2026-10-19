@@ -156,7 +156,10 @@ class MaterializationDispatcher:
                     "write_result": write_result,
                 })
                 logger.info(
-                    "Materialized %s: %d rows", target_label, write_result.row_count
+                    "Materialized %s: %d rows; skipped_by_condition=%d skipped_not_matched=%d",
+                    target_label, write_result.row_count,
+                    getattr(write_result, "skipped_by_condition", 0),
+                    getattr(write_result, "skipped_not_matched", 0)
                 )
 
             except Exception as exc:
@@ -322,7 +325,13 @@ class MaterializationDispatcher:
                 "create_table": target_config.get("create_table", profile_config.create_table),
                 "max_batch_bytes": target_config.get("max_batch_bytes", profile_config.max_batch_bytes),
             }
-        validate_iceberg_write_options(mode, **options)
+        conditional_options = {
+            key: target_config.get(key, getattr(profile_config, key))
+            for key in ("when_matched_update_if", "compare_columns", "when_not_matched")
+        }
+        validate_iceberg_write_options(mode, **options, **conditional_options)
+        if advanced:
+            options.update(conditional_options)
 
         # Get OAuth2 token from Keycloak
         catalog = profile_config.catalog.interpolate_env_vars()

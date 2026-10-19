@@ -238,6 +238,7 @@ nav:
       - DuckDB Flow Guide: duckdb-flow-guide.md
       - Spark Transformers: spark-transformers-reference.md
       - Iceberg Materialization: iceberg-materialization.md
+      - Conditional Iceberg Upsert: cli/iceberg-upsert.md
       - DAG Runner: workflows/runner.md
       - Comprehensive Guide: getting-started-comprehensive.md
 

@@ -346,6 +346,9 @@ class MaterializationMixin:
                     partition_by=config.partition_by,
                     create_table=config.create_table,
                     max_batch_bytes=config.max_batch_bytes,
+                    when_matched_update_if=config.when_matched_update_if,
+                    compare_columns=config.compare_columns,
+                    when_not_matched=config.when_not_matched,
                     catalog_config=catalog,
                     auditor=self._auditor,
                 )

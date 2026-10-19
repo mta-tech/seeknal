@@ -72,6 +72,6 @@ def contained_child(base: Path, segment: str, *, label: str) -> Path:
     # which is exactly the case the allowlist above cannot see.
     root = base.resolve()
     candidate = (root / segment).resolve()
-    if candidate != root and root not in candidate.parents:
-        raise UnsafePathSegment(f"{label} resolves outside its base directory")
+    if candidate == root or root not in candidate.parents:
+        raise UnsafePathSegment(f"{label} must resolve below its base directory")
     return candidate

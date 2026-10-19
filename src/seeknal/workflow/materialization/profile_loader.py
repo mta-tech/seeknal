@@ -565,6 +565,9 @@ class ProfileLoader:
                 "max_batch_bytes", DEFAULT_MAX_BATCH_BYTES
             ),
             table=mat_config.get("table"),
+            when_matched_update_if=mat_config.get("when_matched_update_if"),
+            compare_columns=mat_config.get("compare_columns", []),
+            when_not_matched=mat_config.get("when_not_matched", "insert"),
         )
 
         # Validate config

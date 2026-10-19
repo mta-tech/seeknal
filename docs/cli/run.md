@@ -195,6 +195,7 @@ Use `seeknal entity list` and `seeknal entity show` to inspect consolidated enti
 
 ## See Also
 
+- [Conditional Iceberg upsert](iceberg-upsert.md) - Protect matched rows from older versions or backfills
 - [seeknal plan](plan.md) - Preview changes and execution plan
 - [seeknal validate](validate.md) - Validate configuration
 - [seeknal entity](entity.md) - Inspect consolidated entities

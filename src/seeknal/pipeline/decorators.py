@@ -20,6 +20,19 @@ from seeknal.workflow.materialization.config import (
 _PIPELINE_REGISTRY: dict[str, dict] = {}
 
 
+def _conditional_validation_options(config: dict[str, Any]) -> dict[str, Any]:
+    options = {
+        key: config[key]
+        for key in ("when_matched_update_if", "compare_columns", "when_not_matched")
+        if key in config
+    }
+    if options.get("compare_columns") and "when_matched_update_if" not in options:
+        # An omitted predicate can come from the profile. Validate identifiers
+        # now; merged runtime validation still requires the actual predicate.
+        options["when_matched_update_if"] = "TRUE"
+    return options
+
+
 def _validate_materialization_config(
     materialization: Optional[Union[dict, MaterializationConfig]]
 ) -> None:
@@ -67,9 +80,10 @@ def _validate_materialization_config(
                 "(e.g., 'warehouse.prod.sales_forecast')"
             )
 
+    conditional_options = _conditional_validation_options(config)
     try:
         validate_iceberg_write_options(
-            mode if mode is not None else "append",
+            mode if mode is not None else ("upsert" if conditional_options else "append"),
             unique_keys=config.get("unique_keys"),
             partition_by=config.get("partition_by"),
             create_table=config.get("create_table", True),
@@ -77,6 +91,7 @@ def _validate_materialization_config(
                 "max_batch_bytes", DEFAULT_MAX_BATCH_BYTES
             ),
             require_fields=False,
+            **conditional_options,
         )
     except ConfigurationError as exc:
         raise ValueError(str(exc)) from exc
@@ -148,6 +163,7 @@ def materialize(
                         else DEFAULT_MAX_BATCH_BYTES
                     ),
                     require_fields=False,
+                    **_conditional_validation_options(kwargs),
                 )
             except ConfigurationError as exc:
                 raise ValueError(str(exc)) from exc

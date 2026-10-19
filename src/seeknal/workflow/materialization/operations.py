@@ -175,6 +175,8 @@ class WriteResult:
     affected_partition_count: Optional[int] = None
     outcome: Optional[str] = None
     snapshot_verified: Optional[bool] = None
+    skipped_by_condition: int = 0
+    skipped_not_matched: int = 0
 
 
 @dataclass
@@ -819,6 +821,9 @@ def write_to_iceberg(
     create_table: bool = True,
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
     catalog_config: Optional[CatalogConfig] = None,
+    when_matched_update_if: Optional[str] = None,
+    compare_columns: Optional[List[str]] = None,
+    when_not_matched: str = "insert",
 ) -> WriteResult:
     """
     Write data to Iceberg table with atomic commit.
@@ -850,6 +855,9 @@ def write_to_iceberg(
         partition_by=partition_by,
         create_table=create_table,
         max_batch_bytes=max_batch_bytes,
+        when_matched_update_if=when_matched_update_if,
+        compare_columns=compare_columns,
+        when_not_matched=when_not_matched,
     )
     mode = mode.value if isinstance(mode, MaterializationMode) else mode
 
@@ -879,6 +887,9 @@ def write_to_iceberg(
                 create_table=create_table,
                 max_batch_bytes=max_batch_bytes,
                 catalog_config=catalog_config,
+                when_matched_update_if=when_matched_update_if,
+                compare_columns=compare_columns,
+                when_not_matched=when_not_matched,
             )
         except IcebergMutationError as exc:
             raise WriteError(
@@ -897,12 +908,14 @@ def write_to_iceberg(
             row_count=mutation.row_count,
             duration_seconds=duration,
             mode=mode,
-            input_row_count=mutation.row_count,
+            input_row_count=mutation.input_row_count if mutation.input_row_count is not None else mutation.row_count,
             inserted_row_count=mutation.inserted_row_count,
             updated_row_count=mutation.updated_row_count,
             affected_partition_count=mutation.affected_partition_count,
             outcome=mutation.outcome,
             snapshot_verified=mutation.snapshot_verified,
+            skipped_by_condition=mutation.skipped_by_condition,
+            skipped_not_matched=mutation.skipped_not_matched,
         )
 
     # Create materialization state

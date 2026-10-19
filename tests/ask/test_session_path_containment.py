@@ -187,3 +187,16 @@ def test_an_ordinary_tenant_still_gets_a_pairing_directory(tmp_path, store_name)
 
     store = getattr(pairing, store_name)(base_dir=tmp_path / store_name)
     assert store._tenant_dir("tenant-a").is_dir()
+
+
+def test_a_session_alias_cannot_resolve_to_the_store_root(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.create(name="keep-this-session")
+    sessions = tmp_path / "sessions"
+    (sessions / "alias").symlink_to(sessions, target_is_directory=True)
+
+    with pytest.raises(UnsafePathSegment):
+        store.delete("alias")
+
+    assert store.get("keep-this-session") is not None
+    assert (sessions / "alias").is_symlink()

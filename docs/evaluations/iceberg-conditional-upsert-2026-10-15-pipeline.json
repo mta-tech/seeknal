@@ -1,0 +1,28 @@
+{
+  "case": "seeknal_run_cli_parquet_source_transform_rest",
+  "boundary": "actual Typer CLI, DAGBuilder, manifest, source/transform execution and run_state; local REST fixture",
+  "dataset": "deterministic synthetic; no production data",
+  "rounds": [
+    {
+      "source_rows": 60,
+      "transform_rows": 60,
+      "input": 60,
+      "accepted": 60,
+      "skipped_by_condition": 0,
+      "skipped_not_matched": 0
+    },
+    {
+      "source_rows": 78,
+      "transform_rows": 72,
+      "input": 72,
+      "accepted": 32,
+      "inserted": 12,
+      "updated": 20,
+      "skipped_by_condition": 40,
+      "skipped_not_matched": 0
+    }
+  ],
+  "final_rows": 72,
+  "digest": "b5461599ed56984816edd06c484468d863369c6b7c95626240aed0f03fda1e74",
+  "elapsed_seconds": 1.119
+}
