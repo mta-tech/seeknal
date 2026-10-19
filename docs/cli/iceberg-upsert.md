@@ -8,6 +8,10 @@ related:
 
 # Conditional Iceberg upsert
 
+These conditional options are part of the unreleased 2.13.0 integration
+candidate in [draft PR #111](https://github.com/mta-tech/seeknal/pull/111).
+See [upgrade guidance](upgrade.md) before moving an existing 2.12.1 project.
+
 Use `mode: upsert` with explicit `unique_keys` to replace matched rows and
 insert new keys. Add `when_matched_update_if` to accept a matched incoming row
 only when its SQL predicate is true. An omitted predicate preserves the usual
@@ -49,8 +53,9 @@ Run the pipeline using the selected profile:
 seeknal run --full --profile profiles.yml
 ```
 
-`--full` runs all selected nodes; the target still uses the configured upsert
-mode. It does not turn the write into a table overwrite. The SQL above chooses
+`--full` runs the DAG regardless of cache, subject to `--exclude-tags`; the
+target still uses the configured upsert mode. It does not turn the write into
+a table overwrite. The SQL above chooses
 one row per incoming key. If equal timestamps can carry different values, add
 a deterministic tie-breaker to that SQL and to the update predicate as needed.
 
@@ -140,9 +145,43 @@ compare_columns: []
 ```
 
 Set `when_not_matched: insert` explicitly to reset an inherited `skip` policy.
-In Python's `IcebergStoreOutput`, `None` means inheritance, rather than the
-explicit predicate clearing supported by node YAML. There is no
+In Python's typed pipeline `MaterializationConfig` and `IcebergStoreOutput`,
+`None` means inheritance, rather than the explicit predicate clearing
+supported by node YAML target dictionaries. There is no
 `version_column` shorthand; express timestamp and tie-breaker rules explicitly.
+
+## Python pipeline configuration
+
+The public typed configuration preserves the same conditional options through
+decorator registration and DAG discovery. This example assumes the upstream
+source already has one complete row per non-null `customer_id`:
+
+```python
+from seeknal.pipeline import transform
+from seeknal.pipeline.materialization_config import MaterializationConfig
+
+@transform(
+    name="silver_customers",
+    inputs=["source.customers"],
+    materialization=MaterializationConfig(
+        enabled=True,
+        table="lake.analytics.silver_customers",
+        mode="upsert",
+        unique_keys=["customer_id"],
+        when_matched_update_if="source.updated_at > target.updated_at",
+        compare_columns=["updated_at"],
+        when_not_matched="skip",
+    ),
+)
+def silver_customers(ctx):
+    return ctx.ref("source.customers")
+```
+
+Here an incoming NULL or a target NULL does not pass the strict comparison.
+Use the explicit NULL-handling predicate from the YAML example if a target
+NULL should accept an incoming value. Stackable `@materialize` target
+dictionaries accept these options too; specify `mode="upsert"` there because
+the stackable decorator's omitted mode defaults to append.
 
 ## Noops, counts, and conflicts
 
@@ -171,6 +210,11 @@ Comparison columns share the existing target uniqueness scan. Reading them
 adds I/O, memory, and join work; PyIceberg still performs its own upsert scan.
 Key filtering does not guarantee file or partition pruning. `max_batch_bytes`
 limits the original Arrow input, not total join/writer working memory.
+
+Advanced writes require PyIceberg 0.10+ at runtime. The large macOS ARM
+composite-key scan crash is still unresolved although the same workload
+passes Linux CI. See the [candidate verification notes](../releases/2.13.0.md#known-limits)
+for the tested versions and platform boundary.
 
 ## See also
 

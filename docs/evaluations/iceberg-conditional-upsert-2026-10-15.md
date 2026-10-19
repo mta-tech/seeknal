@@ -5,6 +5,13 @@ starting from Seeknal `v2.12.1` (`094ba65c2329d01aa6ba230e84d167fec5038aa6`).
 The dataset is deterministic synthetic data, as requested; no customer or
 production data was used.
 
+This is historical implementation evidence, not an announcement of a
+published 2.13.0 release. The work was subsequently recovered into
+[draft PR #111](https://github.com/mta-tech/seeknal/pull/111). See the
+[candidate verification notes](../releases/2.13.0.md#compatibility-and-verification)
+for integrated Linux results, the unresolved macOS ARM native crash, and
+pre-existing type-check errors.
+
 ## Implemented behavior
 
 - Optional `when_matched_update_if`, `compare_columns`, and

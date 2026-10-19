@@ -2,6 +2,10 @@
 
 This guide covers using Apache Iceberg table format for materializing Seeknal pipeline outputs, including append, full-table replacement, key-based upsert, and dynamic partition replacement.
 
+Conditional predicates and skip reporting described here belong to the
+unreleased [2.13.0 integration candidate](releases/2.13.0.md). Start with the
+[upgrade guide](cli/upgrade.md) when evaluating it from 2.12.1.
+
 ## Overview
 
 Apache Iceberg is an open table format for huge analytic datasets. Iceberg adds tables to compute engines like Spark, Trino, Flink, and DuckDB using a high-performance table format that works just like a SQL table.
@@ -283,10 +287,11 @@ schema_evolution:
 
 ## Write Modes
 
-Seeknal supports four Iceberg write modes. `append` remains the default. The
-existing `append` and `overwrite` execution paths retain their previous
-behavior; the transaction guarantees described below apply specifically to
-`upsert` and `insert_overwrite`.
+Seeknal supports four Iceberg write modes. `append` remains the default.
+`append` and `overwrite` use the native DuckDB Iceberg path; `upsert` and
+`insert_overwrite` use PyIceberg. Existing-table overwrite wraps DELETE and
+INSERT in a transaction. The advanced modes have their own snapshot-conflict
+and no-retry behavior described below.
 
 ### OVERWRITE Mode
 
@@ -302,7 +307,9 @@ materialization:
 - Correcting bad data
 - Rebuilding from scratch
 
-**Warning:** Deletes all existing data before writing new data.
+**Warning:** Replaces the whole table. For an existing table, a failed INSERT
+rolls back the DELETE; a failed COMMIT can have an unknown outcome and must be
+checked against the target. An empty overwrite is not an append/upsert noop.
 
 ### APPEND Mode (Default)
 
