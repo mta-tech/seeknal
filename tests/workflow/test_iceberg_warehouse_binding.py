@@ -197,6 +197,9 @@ def test_dispatcher_binds_each_target_to_its_own_warehouse_on_one_connection():
     loader = MagicMock()
     profile = MagicMock()
     profile.default_mode.value = "append"
+    profile.when_matched_update_if = None
+    profile.compare_columns = []
+    profile.when_not_matched = "insert"
     profile.catalog.interpolate_env_vars.return_value = MagicMock(
         uri="", warehouse="", bearer_token="t"
     )
@@ -349,6 +352,9 @@ def test_advanced_modes_keep_the_pyiceberg_catalog_name():
     loader = MagicMock()
     profile = MagicMock()
     profile.default_mode.value = "append"
+    profile.when_matched_update_if = None
+    profile.compare_columns = []
+    profile.when_not_matched = "insert"
     profile.catalog = CatalogConfig(uri="", warehouse="", bearer_token="t")
     loader.load_profile.return_value = profile
     dispatcher = MaterializationDispatcher(profile_loader=loader)
