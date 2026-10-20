@@ -27,14 +27,14 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 
-from seeknal.ui.output import echo_error as _echo_error, echo_info as _echo_info, echo_warning as _echo_warning
-from seeknal.dag.manifest import Manifest, Node, NodeType
+from seeknal.ui.output import echo_info as _echo_info
+from seeknal.dag.manifest import Node, NodeType
 
 from .base import (
     BaseExecutor,
-    ExecutionContext,
     ExecutionStatus,
     ExecutorExecutionError,
     ExecutorResult,
@@ -321,62 +321,51 @@ class TransformExecutor(BaseExecutor):
             resolved_sql = self._resolve_input_refs(resolved_sql, con)
 
             # Execute multi-statement SQL
-            row_count, statements_executed = self._execute_sql(
+            row_count, statements_executed, select_result = self._execute_sql(
                 resolved_sql,
                 con,
             )
             
-            # Create view for materialization (if there's a SELECT result)
-            # View name format: transform.{node_name}
-            view_name = f"transform.{self.node.name}"
-            try:
-                # Check if there's a SELECT statement that produced results
-                # Convert row_count to int for comparison (handles string returns from DuckDB)
-                if isinstance(row_count, str):
-                    try:
-                        row_count = int(row_count)
-                    except ValueError:
-                        row_count = -1  # Invalid count
-                if row_count >= 0:  # Has results
-                    # Create a view from the last SELECT by wrapping it
-                    # The last SELECT statement should have created a result set
-                    # We create a view by re-executing the last SELECT with CREATE VIEW
-                    last_select = self._get_last_select_statement(resolved_sql)
-                    if last_select:
-                        # Create schema if it doesn't exist
-                        con.execute("CREATE SCHEMA IF NOT EXISTS transform")
-                        
-                        # Create view from the SELECT
-                        create_view_sql = f"CREATE OR REPLACE VIEW {view_name} AS {last_select}"
-                        con.execute(create_view_sql)
-                        
-                        if self.context.verbose:
-                            _echo_info(f"Created view '{view_name}' for materialization")
-            except Exception as e:
-                # View creation is not critical for transform execution
-                # Log warning but don't fail
-                import warnings
-                warnings.warn(f"Failed to create view '{view_name}': {e}")
-
-            # Calculate duration
-            duration = time.time() - start_time
-
-            # Get output path (if materialized)
-            output_path = self._get_output_path_if_materialized(resolved_sql)
-            
-            # Write to intermediate storage (for Python ctx.ref() compatibility)
-            intermediate_path = self.context.target_path / "intermediate" / f"{self.node.id.replace('.', '_')}.parquet"
-            if row_count > 0:
+            # Persist the captured SELECT result, including empty batches. The
+            # published view reads the parquet rather than mutable input_N aliases.
+            if select_result is not None:
+                intermediate_path = (
+                    self.context.target_path / "intermediate"
+                    / f"{self.node.id.replace('.', '_')}.parquet"
+                )
+                output_name = select_result
+                temporary_path = intermediate_path.with_name(
+                    f".{intermediate_path.name}.{uuid4().hex}.tmp"
+                )
                 try:
                     intermediate_path.parent.mkdir(parents=True, exist_ok=True)
-                    # Write the transform view result to parquet
-                    con.execute(f"COPY (SELECT * FROM transform.{self.node.name}) TO '{intermediate_path}' (FORMAT PARQUET)")
+                    escaped_temporary_path = str(temporary_path).replace("'", "''")
+                    con.execute(
+                        f"COPY (SELECT * FROM {output_name}) "
+                        f"TO '{escaped_temporary_path}' (FORMAT PARQUET)"
+                    )
+                    # Same-directory replacement publishes only complete files.
+                    temporary_path.replace(intermediate_path)
+                    escaped_path = str(intermediate_path).replace("'", "''")
+                    con.execute("CREATE SCHEMA IF NOT EXISTS transform")
+                    con.execute(
+                        f"CREATE OR REPLACE VIEW transform.{self.node.name} AS "
+                        f"SELECT * FROM read_parquet('{escaped_path}')"
+                    )
                     if self.context.verbose:
                         _echo_info(f"Wrote transform output to {intermediate_path}")
                 except Exception as e:
-                    # Intermediate storage is not critical
-                    import warnings
-                    warnings.warn(f"Failed to write to intermediate storage: {str(e)}")
+                    raise ExecutorExecutionError(
+                        self.node.id,
+                        f"Failed to publish intermediate output {intermediate_path}: {e}",
+                        e,
+                    ) from e
+                finally:
+                    con.execute(f"DROP TABLE IF EXISTS {output_name}")
+                    temporary_path.unlink(missing_ok=True)
+
+            duration = time.time() - start_time
+            output_path = self._get_output_path_if_materialized(resolved_sql)
 
             # Return success result
             return ExecutorResult(
@@ -682,7 +671,7 @@ class TransformExecutor(BaseExecutor):
                             con.execute(f"CREATE OR REPLACE VIEW __THIS__ AS SELECT * FROM read_parquet('{intermediate_path}')")
                             con.execute(f"CREATE OR REPLACE VIEW input_0 AS SELECT * FROM read_parquet('{intermediate_path}')")
                             if self.context.verbose:
-                                _echo_info(f"Loaded Python node output as input_0")
+                                _echo_info("Loaded Python node output as input_0")
                         except Exception as e:
                             raise ExecutorExecutionError(
                                 self.node.id,
@@ -781,19 +770,19 @@ class TransformExecutor(BaseExecutor):
         self,
         sql: str,
         con: Any,
-    ) -> Tuple[int, int]:
+    ) -> Tuple[int, int, Optional[str]]:
         """
         Execute multi-statement SQL in DuckDB.
 
         Splits SQL by semicolons and executes each statement.
-        Returns row count from the last SELECT statement.
+        Captures the last SELECT result before later statements can change it.
 
         Args:
             sql: SQL string (may contain multiple statements)
             con: DuckDB connection
 
         Returns:
-            Tuple of (row_count, statements_executed)
+            Tuple of (row_count, statements_executed, last_select_result)
 
         Raises:
             ExecutorExecutionError: If SQL execution fails
@@ -809,6 +798,7 @@ class TransformExecutor(BaseExecutor):
 
         row_count = 0
         last_select_result = None
+        result_table = f"_seeknal_output_{uuid4().hex}"
 
         for i, statement in enumerate(statements, 1):
             try:
@@ -820,29 +810,25 @@ class TransformExecutor(BaseExecutor):
                 if self.context.verbose:
                     _echo_info(f"  Executing statement {i}/{len(statements)}")
 
-                result = con.execute(statement)
-
-                # Check if this is a SELECT statement
-                is_select = self._is_select_statement(statement)
-
+                is_select = self._is_select_statement(statement, con)
                 if is_select:
-                    # Fetch row count from SELECT
-                    # For performance, we can use COUNT(*) or fetch all
-                    try:
-                        # Always fetch as DataFrame to get accurate row count
-                        # This is simpler and more reliable than trying to detect aggregate queries
-                        df = result.df()
-                        row_count = len(df)
-                        last_select_result = df
-                    except Exception as e:
-                        # If row count extraction fails, estimate
-                        _echo_warning(f"Could not extract row count: {e}")
-                        row_count = -1  # Unknown count
-
-                elif self.context.verbose:
-                    _echo_info(f"    Statement {i} executed successfully")
+                    # Capture once in DuckDB's native types before later SQL
+                    # can drop or modify the inputs. An Arrow round trip would
+                    # change types such as UUID and TIME WITH TIME ZONE.
+                    con.execute(
+                        f"CREATE OR REPLACE TEMP TABLE {result_table} AS {statement}"
+                    )
+                    last_select_result = result_table
+                    row_count = con.execute(
+                        f"SELECT COUNT(*) FROM {result_table}"
+                    ).fetchone()[0]
+                else:
+                    con.execute(statement)
+                    if self.context.verbose:
+                        _echo_info(f"    Statement {i} executed successfully")
 
             except Exception as e:
+                con.execute(f"DROP TABLE IF EXISTS {result_table}")
                 # Provide helpful error message
                 statement_preview = statement[:100] + (
                     "..." if len(statement) > 100 else ""
@@ -853,7 +839,7 @@ class TransformExecutor(BaseExecutor):
                     e,
                 ) from e
 
-        return row_count, len(statements)
+        return row_count, len(statements), last_select_result
 
     def _split_sql_statements(self, sql: str) -> List[str]:
         """
@@ -932,40 +918,24 @@ class TransformExecutor(BaseExecutor):
 
         return statements
 
-    def _is_select_statement(self, statement: str) -> bool:
+    def _is_select_statement(self, statement: str, con: Any = None) -> bool:
+        """Check the parsed main statement, including CTEs, for SELECT output.
+
+        WITH can introduce SELECT or DML. Only SELECT is captured as a
+        transform result; INSERT/UPDATE/DELETE execute for their side effects.
         """
-        Check if a statement is a SELECT (returns rows).
+        import duckdb
 
-        Returns True for:
-        - SELECT ...
-        - WITH ... SELECT ... (CTE)
-
-        Returns False for:
-        - CREATE TABLE/VIEW/INDEX/SCHEMA
-        - INSERT/UPDATE/DELETE
-        - DROP/TRUNCATE/ALTER
-
-        Args:
-            statement: SQL statement to check
-
-        Returns:
-            True if statement returns rows
-        """
-        # Remove leading whitespace
-        statement = statement.strip()
-
-        # Check for CTE (WITH clause)
-        if statement.upper().startswith("WITH"):
-            # Find the main SELECT after the CTE
-            # This is simplified - proper parsing would need a SQL parser
-            return "SELECT" in statement.upper()
-
-        # Check for SELECT
-        if statement.upper().startswith("SELECT"):
-            return True
-
-        # Not a SELECT
-        return False
+        try:
+            parsed = (
+                con.extract_statements(statement)
+                if con is not None
+                else duckdb.extract_statements(statement)
+            )
+            return len(parsed) == 1 and parsed[0].type.name == "SELECT"
+        except duckdb.Error:
+            # Execution reports invalid SQL with the statement's full context.
+            return False
 
     def _get_last_select_statement(self, sql: str) -> Optional[str]:
         """

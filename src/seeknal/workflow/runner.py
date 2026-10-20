@@ -242,7 +242,8 @@ class DAGRunner:
         skip_reasons: Dict[str, str] = {}
 
         if full:
-            # Run all nodes (--full overrides --tags)
+            # Run all nodes. DAGRunner API: full overrides tags; the `seeknal run`
+            # CLI refuses the combination instead.
             to_run.update(self.manifest.nodes.keys())
             for nid in to_run:
                 skip_reasons[nid] = "full refresh"

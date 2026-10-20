@@ -156,7 +156,10 @@ class MaterializationDispatcher:
                     "write_result": write_result,
                 })
                 logger.info(
-                    "Materialized %s: %d rows", target_label, write_result.row_count
+                    "Materialized %s: %d rows; skipped_by_condition=%d skipped_not_matched=%d",
+                    target_label, write_result.row_count,
+                    getattr(write_result, "skipped_by_condition", 0),
+                    getattr(write_result, "skipped_not_matched", 0)
                 )
 
             except Exception as exc:
@@ -295,8 +298,10 @@ class MaterializationDispatcher:
         """Route to Iceberg materialization via operations module."""
         import os
 
+        from seeknal.utils.lakekeeper import lakekeeper_uri_from_env
         from seeknal.workflow.materialization.operations import (  # ty: ignore[unresolved-import]
             DuckDBIcebergExtension,
+            iceberg_catalog_alias,
             write_to_iceberg,
         )
         from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
@@ -320,7 +325,13 @@ class MaterializationDispatcher:
                 "create_table": target_config.get("create_table", profile_config.create_table),
                 "max_batch_bytes": target_config.get("max_batch_bytes", profile_config.max_batch_bytes),
             }
-        validate_iceberg_write_options(mode, **options)
+        conditional_options = {
+            key: target_config.get(key, getattr(profile_config, key))
+            for key in ("when_matched_update_if", "compare_columns", "when_not_matched")
+        }
+        validate_iceberg_write_options(mode, **options, **conditional_options)
+        if advanced:
+            options.update(conditional_options)
 
         # Get OAuth2 token from Keycloak
         catalog = profile_config.catalog.interpolate_env_vars()
@@ -332,7 +343,7 @@ class MaterializationDispatcher:
         # 1. target_config overrides (per-materialization YAML) — highest priority
         # 2. materialization.catalog section (from profile_config / profiles.yml)
         # 3. source_defaults.iceberg section
-        # 4. environment variables (LAKEKEEPER_URI, LAKEKEEPER_WAREHOUSE)
+        # 4. environment variables (LAKEKEEPER_URI or LAKEKEEPER_URL, LAKEKEEPER_WAREHOUSE)
         uri = target_config.get("catalog_uri", "")
         warehouse_path = target_config.get("warehouse", "")
 
@@ -352,11 +363,19 @@ class MaterializationDispatcher:
 
         # Fall back to environment variables
         if not uri:
-            uri = os.environ.get("LAKEKEEPER_URI", "")
+            uri = lakekeeper_uri_from_env()
         if not warehouse_path:
             warehouse_path = os.environ.get("LAKEKEEPER_WAREHOUSE", "")
 
+        table_label = target_config.get("table", "")
         if advanced:
+            logger.info(
+                f"Iceberg target: warehouse={warehouse_path} table={table_label} "
+                f"(pyiceberg {mode})"
+            )
+            # PyIceberg path: isolation comes from the explicit uri/warehouse;
+            # keep the historical catalog name so ~/.pyiceberg.yaml and
+            # PYICEBERG_CATALOG__ICEBERG_CATALOG__* settings still apply.
             return write_to_iceberg(
                 con=con,
                 catalog_name="iceberg_catalog",
@@ -369,11 +388,18 @@ class MaterializationDispatcher:
                 **options,
             )
 
+        # One alias per (endpoint, warehouse): a shared alias bound every
+        # later node in the run to the first node's warehouse (FIX-11 b).
+        catalog_name = iceberg_catalog_alias(uri, warehouse_path)
+        logger.info(
+            f"Iceberg target: warehouse={warehouse_path} table={table_label} "
+            f"alias={catalog_name}"
+        )
+
         DuckDBIcebergExtension.load_extension(con)
         DuckDBIcebergExtension.configure_s3(con)
 
         # Attach REST catalog using DuckDB ATTACH syntax
-        catalog_name = "iceberg_catalog"
         DuckDBIcebergExtension.attach_rest_catalog(
             con=con,
             catalog_name=catalog_name,

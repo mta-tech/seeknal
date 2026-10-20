@@ -912,6 +912,7 @@ def atlas_info():
                 "DATAHUB_GMS_URL",
                 "OPENFGA_URL",
                 "KEYCLOAK_URL",
+                "LAKEKEEPER_URI",
                 "LAKEKEEPER_URL",
                 "CUBE_URL",
             ]

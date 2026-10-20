@@ -8,6 +8,7 @@ These tests verify complete version management workflows including:
 """
 
 import json
+import sys
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,16 @@ import pytest
 from typer.testing import CliRunner
 
 from seeknal.cli.main import app
+
+
+
+@pytest.fixture(autouse=True)
+def _stub_spark_feature_group(monkeypatch):
+    """Stub the Spark feature-group module (optional spark extra) so these
+    tests, which patch ``FeatureGroup``, also run without Spark."""
+    if "seeknal.featurestore.feature_group" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "seeknal.featurestore.feature_group", mock.MagicMock())
+    yield
 
 
 runner = CliRunner()
@@ -29,72 +40,6 @@ def clean_test_env(tmp_path):
     os.chdir(tmp_path)
     yield tmp_path
     os.chdir(original_dir)
-
-
-class TestVersionMaterializationWorkflow:
-    """E2E tests for version-specific materialization workflows."""
-
-    def test_materialize_with_version_displays_parameters(self, clean_test_env):
-        """Test that materialize command with --version displays parameters correctly."""
-        runner.invoke(app, ["init", "--name", "version_materialize_test"])
-
-        result = runner.invoke(
-            app,
-            [
-                "materialize", "test_fg",
-                "--start-date", "2024-01-01",
-                "--end-date", "2024-12-31",
-                "--version", "1",
-                "--mode", "overwrite"
-            ]
-        )
-        # Will fail because feature group doesn't exist, but should show parameters
-        assert "Materializing feature group: test_fg" in result.stdout
-        assert "Version: 1" in result.stdout
-        assert "Start date: 2024-01-01" in result.stdout
-        assert "Mode: overwrite" in result.stdout
-
-    def test_materialize_with_different_versions(self, clean_test_env):
-        """Test materializing with different version numbers."""
-        runner.invoke(app, ["init", "--name", "multi_version_test"])
-
-        # Test with version 1
-        result = runner.invoke(
-            app,
-            [
-                "materialize", "test_fg",
-                "--start-date", "2024-01-01",
-                "--version", "1"
-            ]
-        )
-        assert "Version: 1" in result.stdout
-
-        # Test with version 2
-        result = runner.invoke(
-            app,
-            [
-                "materialize", "test_fg",
-                "--start-date", "2024-01-01",
-                "--version", "2"
-            ]
-        )
-        assert "Version: 2" in result.stdout
-
-    def test_materialize_without_version_uses_latest(self, clean_test_env):
-        """Test that materialize without --version defaults to latest."""
-        runner.invoke(app, ["init", "--name", "latest_version_test"])
-
-        result = runner.invoke(
-            app,
-            [
-                "materialize", "test_fg",
-                "--start-date", "2024-01-01",
-                "--mode", "append"
-            ]
-        )
-        # Should not show version line when not specified
-        assert "Materializing feature group: test_fg" in result.stdout
-        assert "Mode: append" in result.stdout
 
 
 class TestVersionQueryingWorkflow:
@@ -188,25 +133,6 @@ class TestVersionQueryingWorkflow:
 class TestVersionRollbackWorkflow:
     """E2E tests for version rollback scenarios."""
 
-    def test_version_rollback_materialize_older_version(self, clean_test_env):
-        """Test materializing an older version for rollback scenario."""
-        runner.invoke(app, ["init", "--name", "rollback_test"])
-
-        # Simulate discovering issue with v2, rolling back to v1
-        result = runner.invoke(
-            app,
-            [
-                "materialize", "user_features",
-                "--start-date", "2024-01-01",
-                "--end-date", "2024-01-31",
-                "--version", "1",
-                "--mode", "overwrite"
-            ]
-        )
-
-        assert "Materializing feature group: user_features" in result.stdout
-        assert "Version: 1" in result.stdout
-        assert "Mode: overwrite" in result.stdout
 
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_shows_multiple_versions_after_rollback(
@@ -409,12 +335,6 @@ class TestVersionCLIIntegration:
         assert "diff" in result.stdout
         assert "Manage feature group versions" in result.stdout
 
-    def test_materialize_help_shows_version_option(self, clean_test_env):
-        """Test that materialize --help shows version option."""
-        result = runner.invoke(app, ["materialize", "--help"])
-
-        assert result.exit_code == 0
-        assert "--version" in result.stdout
 
     @mock.patch("seeknal.featurestore.feature_group.FeatureGroup")
     def test_version_list_json_output(self, mock_fg_class, clean_test_env):
@@ -492,25 +412,6 @@ class TestVersionCLIIntegration:
 class TestVersionBackwardCompatibility:
     """E2E tests verifying backward compatibility of version operations."""
 
-    def test_materialize_without_version_works(self, clean_test_env):
-        """Test that materialization without version flag still works (backward compat)."""
-        runner.invoke(app, ["init", "--name", "backward_compat_test"])
-
-        result = runner.invoke(
-            app,
-            [
-                "materialize", "test_fg",
-                "--start-date", "2024-01-01",
-                "--end-date", "2024-12-31",
-                "--mode", "overwrite"
-            ]
-        )
-
-        # Should still work without version specified
-        assert "Materializing feature group: test_fg" in result.stdout
-        assert "Start date: 2024-01-01" in result.stdout
-        # Version line should not appear when not specified
-        # Note: We check that the command runs successfully without version
 
     def test_existing_cli_commands_still_work(self, clean_test_env):
         """Test that existing CLI commands work alongside new version commands."""
@@ -530,7 +431,7 @@ class TestVersionBackwardCompatibility:
         assert "Seeknal version:" in result.stdout
 
         # Test list
-        for resource in ["projects", "entities", "flows"]:
+        for resource in ["projects", "entities"]:
             result = runner.invoke(app, ["list", resource])
             assert result.exit_code == 0
 

@@ -1,0 +1,254 @@
+{
+  "version": "2.13.0",
+  "base_sha": "094ba65c2329d01aa6ba230e84d167fec5038aa6",
+  "components": [
+    {
+      "pr": 95,
+      "head_sha": "334b1336a20e3b8c5d894f6add343a74068cf1cc"
+    },
+    {
+      "pr": 107,
+      "head_sha": "ac12acc391dfff02904b8b8c7a5eb9198292c2e3"
+    },
+    {
+      "pr": 110,
+      "head_sha": "6fe0325bcceec1c1f9c103f5f8df76a6a30d7d1e",
+      "commits": [
+        "ca98904d331db940049aa8ba6fe30ad7e3d3be78",
+        "30a0ebba48bf9abbf2f554437d46375d9bafae64",
+        "6fe0325bcceec1c1f9c103f5f8df76a6a30d7d1e"
+      ]
+    }
+  ],
+  "excluded_prs": [
+    92,
+    106,
+    109
+  ],
+  "upsert_recovery": {
+    "original_thread": "01a13d83-c996-728f-9c5c-262610cf40a5",
+    "original_branch": "feat/iceberg-conditional-upsert",
+    "original_directory": "/workspace/seeknal",
+    "original_base_sha": "094ba65c2329d01aa6ba230e84d167fec5038aa6",
+    "implementation_turn": "01a13f78-55ba-75ac-b75c-93483ff8e5c3",
+    "docs_turn": "01a151f8-9c31-7363-89af-84f0dd508e7c",
+    "config_subtask": "01a13f79-d103-702b-9378-16252d93e092",
+    "e2e_subtask": "01a13f7a-6cdc-7198-a0e9-71b0c43280bd",
+    "method": "Replayed completed fileChange patches and reviewed file-edit heredoc bodies from readable original Codex task/subtask history onto exact base. No feature reimplementation and no resume admitted to original cloud task.",
+    "tracked_numstats_match_original": true,
+    "validator_line_count_matches_original": 343,
+    "recovered_patch_sha256": "261e86be7536ddd383e7cc86db61ae602e8a424a4a3fffc10b5642c9b22fc56d",
+    "recovered_files": [
+      {
+        "path": "docs/cli/docs.md",
+        "git_blob_sha": "732ae22711fc1b75129ca8a426625349b9b9d4c2",
+        "sha256": "740f847e01c1de06209d30064af0fb5715a6825b1b9bec9d635287d0908798dd",
+        "bytes": 1971,
+        "base_blob_sha": "1a751a30e6c40d20c44917cd998f1da36c8c9ea7"
+      },
+      {
+        "path": "docs/cli/iceberg-upsert.md",
+        "git_blob_sha": "d4bf4f0a3a06a1c6b057af0d864f91c5feb41d5e",
+        "sha256": "d2ebe5fe4a5b2c51b0c3784059984ac518763d4a9515974b14124d421373b942",
+        "bytes": 7189,
+        "base_blob_sha": "0000000000000000000000000000000000000000"
+      },
+      {
+        "path": "docs/cli/index.md",
+        "git_blob_sha": "1d23a82e11ac21879c5bc82dd777277d25b50453",
+        "sha256": "a319510b3fb7fbca04b2080b19a7c1448de33f074624292d26de8f983612470f",
+        "bytes": 4113,
+        "base_blob_sha": "fd1203b208b2be7ab50cae6306d4d3eb3c715df9"
+      },
+      {
+        "path": "docs/cli/run.md",
+        "git_blob_sha": "d4919430d635d76996f735b959b880db2307d422",
+        "sha256": "e9a28422c41651c9a4647cdcde1e98cbdcb9e3ea11dc9cd9a319d0149c78e011",
+        "bytes": 3948,
+        "base_blob_sha": "40ed4f22f5d7ef1e3b7066dab392eea7e2cf6a0b"
+      },
+      {
+        "path": "docs/evaluations/iceberg-conditional-upsert-2026-10-15-pipeline.json",
+        "git_blob_sha": "bf21896d7d83cd75aa8c83d97f03f333c4c7a566",
+        "sha256": "0dde3d9ac99a8c8ab4dfd9d15e00e43f2b5c27e0f560207603a32d0302a6a64e",
+        "bytes": 772,
+        "base_blob_sha": "0000000000000000000000000000000000000000"
+      },
+      {
+        "path": "docs/evaluations/iceberg-conditional-upsert-2026-10-15-yaml.json",
+        "git_blob_sha": "2bee12ec4a3adba777354b51ab4a7e5b9be670c8",
+        "sha256": "fb41b2ef365d58f7d7d9ed418912b9c14f0df2acc2236a0387e42332db2b482e",
+        "bytes": 350,
+        "base_blob_sha": "0000000000000000000000000000000000000000"
+      },
+      {
+        "path": "docs/evaluations/iceberg-conditional-upsert-2026-10-15.json",
+        "git_blob_sha": "d1691bf88d06ed2cf091a955cd02ed41ac10dd2b",
+        "sha256": "f3f3d8002c051077df4c594643018ad79879f580a1c45fe39bef47d1395bad3b",
+        "bytes": 1548,
+        "base_blob_sha": "0000000000000000000000000000000000000000"
+      },
+      {
+        "path": "docs/evaluations/iceberg-conditional-upsert-2026-10-15.md",
+        "git_blob_sha": "92294cbfe05fef0d5def3f5abc20d6f106d736c2",
+        "sha256": "9f22bac4ad814e28d75740b0775f26592326f8953f3cdd801a3650881f83693f",
+        "bytes": 7077,
+        "base_blob_sha": "0000000000000000000000000000000000000000"
+      },
+      {
+        "path": "docs/iceberg-materialization.md",
+        "git_blob_sha": "15f9d58506d922a4db75f8d23281a54bc0b43a9c",
+        "sha256": "c915207afcde110a5ab43bd0fc6bd4b4afa033735b5c88a7cc109f5cb2e4a1b3",
+        "bytes": 39973,
+        "base_blob_sha": "fb406584abcdb413020f98b223d4517fd3a5bd71"
+      },
+      {
+        "path": "mkdocs.yml",
+        "git_blob_sha": "66f6c17760e3f9af6637222974091c31f016b935",
+        "sha256": "610dee4106bce7d4c65ce6d3cf8146f78641c211cb8c8cdb8415a3e810eb753a",
+        "bytes": 9171,
+        "base_blob_sha": "fb1924c06d63b461a992457fa1c1e71d41e12b25"
+      },
+      {
+        "path": "pyproject.toml",
+        "git_blob_sha": "426ee4b2b143d843945c1c6dca9dab4e2423cab4",
+        "sha256": "d07a932cd9017a473c510569eb2efd01320f0ff693f9cb68086650edd98ade08",
+        "bytes": 4766,
+        "base_blob_sha": "ba0dddfa1a584c4b5b9ad24738b4e756abd87e3e"
+      },
+      {
+        "path": "src/seeknal/cli/docs.py",
+        "git_blob_sha": "477d2cd76c53b9ee79d11ed6aaf810d36039a01a",
+        "sha256": "542d33570e8ea3b976297aad5a6b2353a8ae8d84e22d791521a1971c539b8f2d",
+        "bytes": 16394,
+        "base_blob_sha": "fff16c9e9ab2786ee01ad67a4c9c7cfe9a9a8aaf"
+      },
+      {
+        "path": "src/seeknal/featurestore/featurestore.py",
+        "git_blob_sha": "cca22fc93720639bb3eaae66ec4a9c37db70dbf7",
+        "sha256": "2a8e35aa56b2a54bd81c965006ec190ab5795a6a58d1793b547aab3c96d0b324",
+        "bytes": 47364,
+        "base_blob_sha": "f1793059a62cab6be1c57a92048fa1ed6d4f3af4"
+      },
+      {
+        "path": "src/seeknal/workflow/materialization/config.py",
+        "git_blob_sha": "16f9a58dc9a6032c4e0a4f44dce6752b51423f92",
+        "sha256": "db2dcdeef5de9addead6d07a5e00e0373bfe97a18e93e0722dbe40c7bbeeb6d4",
+        "bytes": 21548,
+        "base_blob_sha": "0326a7a82a66c884d4228d13081a255d4985f76d"
+      },
+      {
+        "path": "src/seeknal/workflow/materialization/decorator.py",
+        "git_blob_sha": "7f5f2bb382d4962d82cc0664277cf851d5fd2b6f",
+        "sha256": "cf4ddd6af2ab2aaa1c2d5c6473cc4ee3811d8a78016b73cc54ca89b2a69174f1",
+        "bytes": 17145,
+        "base_blob_sha": "1f2ec4537023fc6bb90787e93fb7278c1c9a10ef"
+      },
+      {
+        "path": "src/seeknal/workflow/materialization/dispatcher.py",
+        "git_blob_sha": "0ff25ea884aa32f4202845316b019def29040314",
+        "sha256": "666ab70b1da98b561d6ee5bd2110c3e94d8bb3da775dbabab5c5475c6195db48",
+        "bytes": 16753,
+        "base_blob_sha": "056b164f5c7a7e8e4361f88e906ca096823b1fb2"
+      },
+      {
+        "path": "src/seeknal/workflow/materialization/iceberg_mutations.py",
+        "git_blob_sha": "6843765154d37b6df76ab149106cf406b4a788ee",
+        "sha256": "7c7f38f53317b3b7fc07d244e227652fc47f1f00107e22e66d46b7276b718f15",
+        "bytes": 24452,
+        "base_blob_sha": "544d90eab84f0210b7665f72859c292782029d37"
+      },
+      {
+        "path": "src/seeknal/workflow/materialization/operations.py",
+        "git_blob_sha": "efcf69b444cb53d27a2ff3b4a370dba5f134b67d",
+        "sha256": "b8b31132e412a29db8e39adcad4242e116f14769cf458e03bb187ea88e741769",
+        "bytes": 42213,
+        "base_blob_sha": "a9b71e46f2e9ea3bb78bef975847f375fc8d9f93"
+      },
+      {
+        "path": "src/seeknal/workflow/materialization/profile_loader.py",
+        "git_blob_sha": "abde3a2a36a0a3f0045d910d548807ff390bc598",
+        "sha256": "cb4b7020629e59e9b4b853d84bbadc007def602087128459f8237049fb5a1baa",
+        "bytes": 27594,
+        "base_blob_sha": "d4a40833ae15f201c6aa3156e62f01ed27dbe533"
+      },
+      {
+        "path": "src/seeknal/workflow/materialization/yaml_integration.py",
+        "git_blob_sha": "b8f802a567a6208d4da58d11fc3092c4b5fec1dc",
+        "sha256": "cdc3206efafcfbe150740e0d90cd44b1c6cf4b0356e3f82ade7be48d83975ab6",
+        "bytes": 32016,
+        "base_blob_sha": "d310d573c3ee4f47e54ed6d4064650ae00d5b996"
+      },
+      {
+        "path": "tests/cli/test_docs.py",
+        "git_blob_sha": "2031643a933c325b2dd215d4eeae4227a50c863f",
+        "sha256": "91463aa4082700628a9417e8e3fb4627c340e1936b8e4ca960d1dc7e16e4a877",
+        "bytes": 31514,
+        "base_blob_sha": "0b27a59476dbadfe03a606dc4f3af7a81a323d31"
+      },
+      {
+        "path": "tests/integration/iceberg_rest_fixture.py",
+        "git_blob_sha": "8d5eacbee0f4f7adfc2ae5af05bcbacdfa421c79",
+        "sha256": "03ab14f07657c06a7457b2acf204abf7a476c43cacabddac55b59ab4203720b9",
+        "bytes": 10339,
+        "base_blob_sha": "5685769d680a087b2a20e7568ebcd978db3e4f9f"
+      },
+      {
+        "path": "tests/integration/test_iceberg_conditional_upsert_e2e.py",
+        "git_blob_sha": "0d44552c3a066e9823c15c2309ef4d25d2a8b120",
+        "sha256": "ce01b00d7f0c7a431ead99c148caf1edfa2306e53a8798327ed04aaba6dd0201",
+        "bytes": 1127,
+        "base_blob_sha": "0000000000000000000000000000000000000000"
+      },
+      {
+        "path": "tests/integration/test_iceberg_mutation_modes_rest.py",
+        "git_blob_sha": "b6b4bc61f22ac20c3ae07667561e9ce29676f919",
+        "sha256": "34283ad10e67582948c589998b3833a82c12157f01959f789f84c25098959c11",
+        "bytes": 17526,
+        "base_blob_sha": "765e11d6044b3ee34d1e1a8013b2daf1644ca0e2"
+      },
+      {
+        "path": "tests/workflow/test_conditional_upsert_config.py",
+        "git_blob_sha": "525a105c8c37715000efb0d25cac704a58ae728e",
+        "sha256": "03d7c76d7e300aa4acc04d1b6065ceb0e885feaa92a2dfa20b8306e3ccae3f50",
+        "bytes": 2186,
+        "base_blob_sha": "0000000000000000000000000000000000000000"
+      },
+      {
+        "path": "tests/workflow/test_iceberg_mode_routing.py",
+        "git_blob_sha": "cd5278eb1e11fec43d90876f6b10446fa699a977",
+        "sha256": "338fc7afa8809b0d45c5844f746439a9bc718b872a6ba4650e0a6851294b1c26",
+        "bytes": 30433,
+        "base_blob_sha": "25ba562016108b3110c2ae42d3bcab13a94a13f8"
+      },
+      {
+        "path": "tests/workflow/test_iceberg_mutation_modes.py",
+        "git_blob_sha": "c218f0666d89b5494c2839db7a3f57de9a84ff8f",
+        "sha256": "d54d0d11a047212ef828a03f8a6a4ba715b604d4701ae241bb907e9de8d09f7d",
+        "bytes": 17219,
+        "base_blob_sha": "abaa8417568e9ce8c800a7f6c019c25b2b7dd445"
+      },
+      {
+        "path": "tests/workflow/test_materialization_dispatcher.py",
+        "git_blob_sha": "3c6e6a207684c102c1237e24ae6db7b5e38b43d6",
+        "sha256": "31cfd577ef447f1290c77514859364413e8bf5e734d1b1318ddb154b9c9fcb61",
+        "bytes": 26883,
+        "base_blob_sha": "a501f688dc1e225d645061f4d01a6a0ceb3b8ad2"
+      },
+      {
+        "path": "tools/validate_conditional_upsert.py",
+        "git_blob_sha": "012067a07d639a8a05cb66f2f109bad248d2a04b",
+        "sha256": "ffe07bb5616b20d38be5337bda4146bcc95d48cfcaecb9539e209a741a6908a7",
+        "bytes": 20191,
+        "base_blob_sha": "0000000000000000000000000000000000000000"
+      }
+    ]
+  },
+  "integration_adjustments": [
+    "Consolidate CHANGELOG and canonical version metadata to2.13.0.",
+    "Require resolved session child paths to be strict descendants, including self-link deletion regression.",
+    "Preserve conditional options in public typed pipeline config and validate both decorator forms; test policy roundtrip and DAG discovery.",
+    "Add real loopback CLI backfill-date\u2192empty-transform\u2192conditional-upsert noop snapshot regression."
+  ],
+  "publication_scope": "Draft branch PR only. No main merge, tag, release, deploy, or closure of component PRs."
+}

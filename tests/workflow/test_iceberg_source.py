@@ -120,6 +120,7 @@ class TestIcebergConnectionConfig:
 
         # Will fail at connection step but proves catalog_uri was accepted
         env = {
+            "LAKEKEEPER_URI": "",
             "LAKEKEEPER_URL": "",
             "KEYCLOAK_TOKEN_URL": "",
             "KEYCLOAK_CLIENT_ID": "",

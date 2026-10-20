@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.13.0] - 2026-09-18
+## [2.14.0] - Unreleased
 
 ### Added
 - Configurable per-turn tool-call limits for read-only Seeknal Ask analysis, including synchronous and streaming execution.
@@ -14,6 +14,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Preserve explicit empty model settings instead of restoring YAML sampling overrides.
 - Ignore malformed or out-of-range YAML sampling values before calling the model provider.
+
+## [2.13.0] - Unreleased
+
+Integration candidate in [draft PR #111](https://github.com/mta-tech/seeknal/pull/111),
+based on 2.12.1. No 2.13.0 release date is assigned. See the
+[candidate notes](docs/releases/2.13.0.md) and [upgrade guide](docs/cli/upgrade.md).
+
+### Added
+- Conditional Iceberg upserts with `when_matched_update_if`, declared target `compare_columns`, and independent `when_not_matched: insert|skip` across profiles, YAML, decorators, and feature-store output. False or NULL predicates preserve existing rows; skipped-row metrics appear in materialization results and run state.
+- Bundled `seeknal docs iceberg-upsert` guidance, including version ordering, backfills, defaults, and synthetic verification examples. Installed CLI documentation is included in wheel/sdist and takes precedence over the current project's docs.
+- `seeknal docs upgrade` covers 2.12.1-to-candidate migration, configuration precedence, changed rerun behavior, and compatibility limits.
+
+### Fixed
+- Contain broker-supplied tenant and session identifiers within their storage directories, rejecting malformed, absolute, traversal, and symlink paths resolving to or outside the storage base in session and pairing stores.
+- Preserve the observed Iceberg snapshot when committing conditional upserts, so an intervening writer produces a conflict rather than committing a stale predicate decision; internal PyIceberg commit retries are disabled for this guarded transaction.
+- `seeknal run --date` now sets "today" for every date function: `{{ today(-1) }}`, `{{ yesterday }}`, `{{ month_start }}` and `{{ year_start }}` counted from the real date and ignored `--date`, which broke backfills. `--date` uses the existing date validation (years 2000-2100, at most 365 days ahead).
+- YAML transform SQL is resolved even when the node has no `params:` block and no CLI flags are given; `{{ today }}` used to reach DuckDB unresolved.
+- A source's `table:` (YAML) / `table=` (Python `@source`) is now templated, so `data/orders_{{ today }}.csv` works.
+- Python `@transform` / `@feature_group` keyword params (e.g. `run_day="{{ today }}"`) now reach `ctx.params` / `ctx.get_param()`, with CLI values (`--date`, `--params`) replacing declared keys. They were dropped before, so Python nodes could not see run parameters. Python `@source` params are now resolved too. Only `{{ }}` strings change; other values keep their Python types.
+- Feature groups and second-order aggregations re-run when their resolved `params` change (e.g. a new `--date`), like transforms and sources already did.
+- A non-string `--params` value (e.g. `{"limit": 5}`) for a declared param no longer crashes DAG parsing, and an unknown function such as `{{ foo(1) }}` is left as written instead of losing its braces. A `today` passed via `--params` is validated like `--date`.
+- The Lakekeeper catalog URI env var is now read consistently. The Iceberg source, REPL, dry-run preview and snapshot metadata read only `LAKEKEEPER_URL`, while Iceberg materialization and the credential manager read only `LAKEKEEPER_URI`, so setting one name left the other path without a catalog. Every path now accepts both: `LAKEKEEPER_URI` is canonical and `LAKEKEEPER_URL` is an alias (used when `LAKEKEEPER_URI` is unset or empty).
+- SQL transforms publish schema-preserving intermediate parquet files for zero-row results, replacing stale output and allowing downstream transforms to process empty batches.
+- Capture the last SELECT result once and bind the transform view to its published parquet, preventing recursive `input_0` references and preserving results when later SQL drops a temporary input table.
+- Publish intermediate files through an atomic replacement and fail the node on publication errors instead of continuing with stale data.
+
+### Changed
+- Because transform SQL is now always resolved, `{{ env:VAR }}` without a default fails the build when `VAR` is unset (it previously reached DuckDB as literal text when the node had no `params:` and no CLI flags were given). Use `{{ env:VAR|default }}`.
+- One-time re-run after upgrading for Python nodes that declare decorator params, and for feature groups / second-order aggregations with `params`, since those params are now part of the node fingerprint.
+
+## [2.12.1] - 2026-09-23
+
+### Fixed
+- Iceberg `append`/`overwrite` materialization now honours each node's `warehouse:`. A run attached every write under one fixed DuckDB alias (`iceberg_catalog`), so the first warehouse attached bound the whole run: later nodes' rows landed in that warehouse and overwrote same-named tables (FIX-11 b). Each (catalog endpoint, warehouse) now gets its own alias, and an existing alias is verified before reuse (re-attached if it points at another warehouse; refused if it is not an Iceberg attachment).
+- Iceberg `overwrite` is now atomic: `DELETE` + `INSERT` run in one transaction, so a failed insert (e.g. a schema mismatch) keeps the previous rows instead of leaving the table empty. A failed commit is logged as an unknown outcome.
+- Materialization logs now name the target warehouse (`Iceberg target: warehouse=… table=… alias=…`).
+- Quote-escape warehouse, endpoint and token values in Iceberg `ATTACH` statements, and escape embedded double quotes in quoted identifiers.
+- Feature-store Iceberg writes and deletes (`OfflineStore`, basic modes) called a non-existent `DuckDBIcebergExtension.create_rest_catalog` and always raised `AttributeError`; they now attach the catalog with the existing API.
+- Out-of-the-box install without the optional `spark` extra: DuckDB feature groups no longer import Spark, so `seeknal run` pipelines with feature groups work on a default install. `engine: spark` feature groups work again (they raised `NameError`) and report a clear `seeknal[spark]` hint when Spark is missing; Spark-only CLI commands (`version list/show/diff`, `delete feature-group`, `clean`, `debug`, `validate-features`) print the same hint instead of a `ModuleNotFoundError`.
+- Dependencies: `duckdb>=1.4.4` (1.4.3 could not read pandas 3 text columns) and `sqlmodel<0.0.45` (0.0.45 rejects the naive timestamps stored by Seeknal's metadata models).
+
+### Changed
+- `seeknal run` refuses `--full` combined with `--tags`, `--nodes` or `--types` (it silently ran every node) and lists the upstream nodes that `--tags` adds to a run. The Ask `run_pipeline` tool no longer combines `full=True` with `nodes`.
 
 ## [2.12.0] - 2026-09-17
 

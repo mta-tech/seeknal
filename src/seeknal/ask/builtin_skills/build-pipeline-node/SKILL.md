@@ -158,7 +158,8 @@ If the user wants to actually execute the pipeline:
 
 Pass `nodes='transform.<name>'` (with the `kind.` prefix) to run JUST the new
 node and its dependencies. Use `full=True` only when the user explicitly
-asks for a cache-invalidating re-run.
+asks for a cache-invalidating re-run; it re-runs EVERY node, so never combine
+it with `nodes` (the tool refuses that combination).
 
 The default timeout is 300 seconds (override via `SEEKNAL_RUN_TIMEOUT`).
 

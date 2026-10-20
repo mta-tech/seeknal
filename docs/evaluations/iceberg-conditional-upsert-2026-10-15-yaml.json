@@ -1,0 +1,15 @@
+{
+  "case": "yaml_profile_and_node_override_dispatcher_rest",
+  "final_rows": 13,
+  "profile_round": {
+    "input": 3,
+    "accepted": 2,
+    "skipped_by_condition": 1
+  },
+  "node_override_round": {
+    "input": 2,
+    "accepted": 1,
+    "skipped_not_matched": 1
+  },
+  "digest": "b7ef2d1582eee4c9c5729045c5d42099bf3136e6e66b8c9d13d7ef7cb367beda"
+}

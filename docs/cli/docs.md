@@ -21,6 +21,12 @@ The `docs` command provides searchable access to CLI documentation directly from
 
 When given an exact topic name (matching a filename stem like `repl`, `env`, `run`), it displays that topic directly. Otherwise, it performs a full-text search across all documentation files.
 
+Candidate 2.13.0 wheels bundle these topics under the installed package.
+Installed topics take precedence over a current project's `docs/cli`, so the
+command works outside a repository. Source checkouts fall back to repository
+topics when bundled topics are absent. This does not fetch newer docs from
+GitHub or update the installed package.
+
 ## Options
 
 | Flag | Type | Default | Description |
@@ -28,7 +34,7 @@ When given an exact topic name (matching a filename stem like `repl`, `env`, `ru
 | `QUERY` | TEXT | None | Search query or exact topic name |
 | `--list`, `-l` | FLAG | False | List all available documentation topics |
 | `--json` | FLAG | False | Output results as JSON (useful for tooling) |
-| `--max-results`, `-n` | INTEGER | 10 | Maximum number of search results |
+| `--max-results`, `-n` | INTEGER | 50 | Maximum number of search results |
 
 ## Examples
 
@@ -42,6 +48,8 @@ seeknal docs --list
 
 ```bash
 seeknal docs repl
+seeknal docs iceberg-upsert
+seeknal docs upgrade
 ```
 
 ### Full-text search
@@ -54,6 +62,7 @@ seeknal docs "materialization"
 
 ```bash
 seeknal docs --json "environment"
+seeknal docs --json iceberg-upsert
 ```
 
 ### Limit results

@@ -32,13 +32,14 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import duckdb
 import requests
 
+from seeknal.utils.lakekeeper import lakekeeper_uri_from_env
 from seeknal.workflow.materialization.config import (
     MaterializationConfig,
     CatalogConfig,
@@ -78,6 +79,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+_UNSET = object()
+
+
 @dataclass
 class YAMLMaterializationConfig:
     """
@@ -100,6 +104,9 @@ class YAMLMaterializationConfig:
     unique_keys: Optional[List[str]] = None
     partition_by: Optional[List[str]] = None
     max_batch_bytes: Optional[int] = None
+    when_matched_update_if: Optional[str] = None
+    compare_columns: List[str] = field(default_factory=list)
+    when_not_matched: str = "insert"
 
 
 class IcebergMaterializationError(Exception):
@@ -126,10 +133,7 @@ class IcebergMaterializationHelper:
 
     # Default catalog configuration (can be overridden by .env or profiles.yml)
     # Use direct Lakekeeper access (port 8181) instead of API Gateway (port 80)
-    DEFAULT_CATALOG_URI = os.getenv(
-        "LAKEKEEPER_URI",
-        "http://172.19.0.9:8181"
-    )
+    DEFAULT_CATALOG_URI = lakekeeper_uri_from_env("http://172.19.0.9:8181")
     DEFAULT_WAREHOUSE = os.getenv(
         "LAKEKEEPER_WAREHOUSE",
         "s3://warehouse"
@@ -293,6 +297,7 @@ class IcebergMaterializationHelper:
         node_config: Dict[str, Any],
         *,
         default_mode: MaterializationMode = MaterializationMode.APPEND,
+        default_when_matched_update_if: Optional[str] = None,
     ) -> YAMLMaterializationConfig:
         """
         Extract materialization configuration from YAML node config.
@@ -378,6 +383,11 @@ class IcebergMaterializationHelper:
                 create_table=create_table,
                 max_batch_bytes=mat_config.get("max_batch_bytes", DEFAULT_MAX_BATCH_BYTES),
                 require_fields=False,
+                when_matched_update_if=mat_config.get(
+                    "when_matched_update_if", default_when_matched_update_if
+                ),
+                compare_columns=mat_config.get("compare_columns", []),
+                when_not_matched=mat_config.get("when_not_matched", "insert"),
             )
         except ConfigurationError as exc:
             raise config_error(str(exc)) from exc
@@ -392,6 +402,9 @@ class IcebergMaterializationHelper:
             unique_keys=mat_config.get("unique_keys"),
             partition_by=mat_config.get("partition_by"),
             max_batch_bytes=mat_config.get("max_batch_bytes"),
+            when_matched_update_if=mat_config.get("when_matched_update_if"),
+            compare_columns=mat_config.get("compare_columns", []),
+            when_not_matched=mat_config.get("when_not_matched", "insert"),
         )
 
     @classmethod
@@ -409,6 +422,9 @@ class IcebergMaterializationHelper:
         create_table: Optional[bool] = None,
         max_batch_bytes: Optional[int] = None,
         profile_path: Optional[Path] = None,
+        when_matched_update_if: Any = _UNSET,
+        compare_columns: Optional[List[str]] = None,
+        when_not_matched: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Materialize a DuckDB view to an Iceberg table.
@@ -443,12 +459,24 @@ class IcebergMaterializationHelper:
         if mode is None:
             mode = loader.load_profile().default_mode
         mode = MaterializationMode(mode)
+        conditional = {
+            key: value for key, value in {
+                "compare_columns": compare_columns,
+                "when_not_matched": when_not_matched,
+            }.items() if value is not None
+        }
+        if when_matched_update_if is not _UNSET:
+            conditional["when_matched_update_if"] = when_matched_update_if
+        # Advanced options are validated after dispatcher merges profile defaults.
+        if mode.value not in ADVANCED_MODES:
+            validate_iceberg_write_options(mode, require_fields=False, **conditional)
         if mode.value in ADVANCED_MODES:
             from seeknal.workflow.materialization.dispatcher import MaterializationDispatcher
 
             target = {
                 "table": table_name,
                 "mode": mode.value,
+                **conditional,
                 **{key: value for key, value in {
                     "catalog_uri": catalog_uri,
                     "warehouse": warehouse,
@@ -687,14 +715,25 @@ class IcebergMaterializationHelper:
         # Extract materialization config from node
         try:
             default_mode = MaterializationMode.APPEND
+            default_predicate = None
             mat_section = node.config.get("materialization", {})
             if isinstance(mat_section, dict) and mat_section.get("enabled") and "mode" not in mat_section:
                 from seeknal.workflow.materialization.profile_loader import ProfileLoader
 
                 loader = ProfileLoader(profile_path=profile_path) if profile_path else ProfileLoader()
                 default_mode = loader.load_profile().default_mode
+            if (
+                isinstance(mat_section, dict) and mat_section.get("enabled")
+                and mat_section.get("compare_columns")
+                and "when_matched_update_if" not in mat_section
+            ):
+                from seeknal.workflow.materialization.profile_loader import ProfileLoader
+
+                loader = ProfileLoader(profile_path=profile_path) if profile_path else ProfileLoader()
+                default_predicate = loader.load_profile().when_matched_update_if
             mat_config = cls.extract_materialization_config(
-                node.config, default_mode=default_mode
+                node.config, default_mode=default_mode,
+                default_when_matched_update_if=default_predicate,
             )
         except Exception as e:
             logger.error(f"Failed to extract materialization config from node '{node.id}': {e}")
@@ -725,6 +764,11 @@ class IcebergMaterializationHelper:
             create_table=node.config["materialization"].get("create_table"),
             max_batch_bytes=mat_config.max_batch_bytes,
             profile_path=profile_path,
+            **{
+                key: node.config["materialization"][key]
+                for key in ("when_matched_update_if", "compare_columns", "when_not_matched")
+                if key in node.config["materialization"]
+            },
         )
 
 

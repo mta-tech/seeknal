@@ -16,6 +16,17 @@ from typer.testing import CliRunner
 from seeknal.cli.main import app, OutputFormat
 
 
+@pytest.fixture(autouse=True)
+def _stub_spark_feature_group(monkeypatch):
+    """Stub the Spark feature-group module (optional spark extra) for these
+    tests, which patch ``FeatureGroup``; restored after each test."""
+    import sys
+
+    if "seeknal.featurestore.feature_group" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "seeknal.featurestore.feature_group", mock.MagicMock())
+    yield
+
+
 runner = CliRunner()
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")

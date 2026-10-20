@@ -3,10 +3,24 @@
 Comprehensive guides for migrating to Seeknal from other platforms and between Seeknal engines.
 
 > **Navigation:**
+> - [Upgrading a 2.12.1 project to the 2.13.0 candidate](#upgrading-a-2121-project-to-the-2130-candidate)
 > - [Migrating from Spark to DuckDB](#migrating-from-spark-to-duckdb)
 > - [Migrating from dbt to Seeknal](#migrating-from-dbt-to-seeknal)
 > - [Migrating from Feast to Seeknal](#migrating-from-feast-to-seeknal)
 > - [Migrating from Featuretools to Seeknal](#migrating-from-featuretools-to-seeknal)
+
+---
+
+## Upgrading a 2.12.1 project to the 2.13.0 candidate
+
+2.13.0 is an unreleased candidate in [draft PR #111](https://github.com/mta-tech/seeknal/pull/111).
+Follow the [upgrade guide](../cli/upgrade.md), also available in a candidate
+installation as `seeknal docs upgrade`. It covers catalog URI aliases,
+date-templated backfills, parameter fingerprints, empty transform outputs,
+conditional Iceberg write policies, and valid custom session identifiers.
+
+Review the [release verification and known limits](../releases/2.13.0.md#compatibility-and-verification)
+before evaluation. An ordinary PyPI install does not install this draft branch.
 
 ---
 

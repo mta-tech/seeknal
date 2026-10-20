@@ -832,8 +832,11 @@ seeknal run --retry 3
 You can combine multiple flags:
 
 ```bash
-# Show plan for only sources, with full refresh
-seeknal run --show-plan --types source --full
+# Show plan for only sources
+seeknal run --show-plan --types source
+
+# Full refresh of everything (--full cannot be combined with --nodes/--tags/--types)
+seeknal run --show-plan --full
 
 # Dry run with specific nodes
 seeknal run --dry-run --nodes active_customers

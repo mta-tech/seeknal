@@ -16,6 +16,12 @@
 
 Seeknal is an all-in-one platform for data and AI/ML engineering. Define pipelines in YAML or Python, run them through a safe `draft → dry-run → apply` workflow, and materialize outputs to PostgreSQL and Apache Iceberg simultaneously. Python 3.11+ required.
 
+**This branch documents the unreleased 2.13.0 integration candidate in
+[draft PR #111](https://github.com/mta-tech/seeknal/pull/111).** The published
+baseline is 2.12.1. Read the [candidate notes](docs/releases/2.13.0.md) and
+[upgrade guide](docs/cli/upgrade.md) when evaluating the branch; the PyPI badge
+and `pip install seeknal` refer to published packages.
+
 ## Quick Start
 
 ```bash
@@ -72,6 +78,7 @@ materializations:
     unique_keys: [id]
   - type: iceberg
     table: atlas.namespace.my_table
+    warehouse: silver   # optional; each target writes to its own warehouse
 ```
 
 **Environment Management** — Isolated namespaces with per-environment profiles:
@@ -156,10 +163,41 @@ Supports Google Gemini (default), OpenAI-compatible providers, Anthropic-compati
 | **[CLI Docs Search](docs/cli/docs.md)** | Search documentation from the terminal (`seeknal docs`) |
 | **Tutorials** | [YAML Pipelines](docs/tutorials/yaml-pipeline-tutorial.md) · [Python Pipelines](docs/tutorials/python-pipelines-tutorial.md) · [Mixed](docs/tutorials/mixed-yaml-python-pipelines.md) · [Seeknal Ask Agent](docs/tutorials/seeknal-ask-agent.md) · [Report Exposures](docs/tutorials/report-exposures.md) |
 | **Guides** | [Python Pipelines](docs/guides/python-pipelines.md) · [Testing & Audits](docs/guides/testing-and-audits.md) · [Iceberg Materialization](docs/iceberg-materialization.md) · [Training to Serving](docs/guides/training-to-serving.md) |
+| **2.13.0 candidate** | [Release notes](docs/releases/2.13.0.md) · [Upgrade guidance](docs/cli/upgrade.md) · [Conditional Iceberg upsert](docs/cli/iceberg-upsert.md) |
 | **Servers** | [Gateway Server](docs/cli/gateway.md) · [Report Server](docs/cli/report-server.md) |
 | **Concepts** | [Point-in-Time Joins](docs/concepts/point-in-time-joins.md) · [Virtual Environments](docs/concepts/virtual-environments.md) · [Exposures](docs/concepts/exposures.md) · [Glossary](docs/concepts/glossary.md) |
 
 ## Changelog
+
+### 2.13.0 integration candidate (unreleased)
+
+- Conditional Iceberg upserts with explicit target comparison columns,
+  NULL-aware project predicates, an independent insert/skip policy for new
+  keys, and skipped-row metrics. Complete incoming rows and unique non-null
+  keys remain required; concurrent snapshot changes fail with a conflict.
+- Date-anchored backfill templates, templated source paths, and Python
+  decorator parameters; `LAKEKEEPER_URI` is canonical with `LAKEKEEPER_URL`
+  accepted as a fallback alias.
+- Typed empty transform outputs replace stale intermediate files, and
+  broker-supplied session paths are contained within their storage directories.
+- Bundled CLI topics, including `seeknal docs iceberg-upsert` and
+  `seeknal docs upgrade`, work from installed wheels outside a checkout.
+
+See the [candidate notes](docs/releases/2.13.0.md) for upgrade behavior,
+verification evidence, and the unresolved macOS ARM large-batch limitation.
+
+### v2.12.1 (September 2026)
+
+**Iceberg warehouse binding fix** — Iceberg `append`/`overwrite` materializations now always write to the warehouse each node declares.
+
+- **Per-node `warehouse:` honoured**: previously the first warehouse attached in a `seeknal run` captured every later Iceberg write, so silver/gold rows could land in (and overwrite tables in) bronze. Each catalog endpoint + warehouse now gets its own connection alias, and a reused alias is checked before writing.
+- **Atomic overwrite**: `mode: overwrite` replaces rows in one transaction; if the new data fails to insert (e.g. a schema mismatch), the previous rows are kept instead of the table being left empty.
+- **Clearer logs**: every Iceberg write logs its target warehouse (`Iceberg target: warehouse=… table=…`).
+- `upsert` and `insert_overwrite` were not affected.
+- **Works without Spark out of the box**: a default install (no `seeknal[spark]` extra) runs pipelines with sources, transforms, feature groups and rules; Spark-only commands explain how to install the extra.
+- **Feature-store Iceberg fix**: `OfflineStore` Iceberg writes/deletes no longer fail with `AttributeError`.
+- **Safer run selection**: `--full` can no longer be combined with `--tags`/`--nodes`/`--types` (it silently ran everything), and `--tags` lists the upstream nodes it adds.
+- Dependencies: `duckdb>=1.4.4` (pandas 3 support), `sqlmodel<0.0.45`.
 
 ### v2.9.1 (April 2026)
 

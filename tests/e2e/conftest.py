@@ -18,13 +18,41 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Spark autouse override (E2E tests don't use Spark)
+# Spark (optional `spark` extra)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
 def clean_spark_state_between_tests():
-    """No-op override: E2E tests don't use Spark."""
+    """No-op override of the root autouse fixture; e2e tests opt into Spark
+    explicitly through ``spark_session``."""
     yield
+
+
+@pytest.fixture(scope="function")
+def spark_session(tmp_path):
+    """Local Spark session; skips when the optional `spark` extra is absent.
+
+    Reuses an already active session (e.g. the root session-scoped ``spark``
+    fixture) and only stops a session this fixture created.
+    """
+    pytest.importorskip("pyspark", reason="optional `spark` extra not installed")
+    from pyspark.sql import SparkSession
+
+    existing = SparkSession.getActiveSession()
+    if existing is not None:
+        yield existing
+        return
+    try:
+        spark = (
+            SparkSession.builder.master("local[1]")
+            .appName("seeknal-e2e")
+            .config("spark.sql.warehouse.dir", str(tmp_path / "warehouse"))
+            .getOrCreate()
+        )
+    except Exception as exc:  # noqa: BLE001 - e.g. no Java runtime
+        pytest.skip(f"Spark session unavailable: {exc}")
+    yield spark
+    spark.stop()
 
 
 # ---------------------------------------------------------------------------

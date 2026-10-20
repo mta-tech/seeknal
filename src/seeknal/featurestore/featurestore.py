@@ -151,6 +151,9 @@ class IcebergStoreOutput:
     partition_by: Optional[List[str]] = None
     create_table: Optional[bool] = None
     max_batch_bytes: Optional[int] = None
+    when_matched_update_if: Optional[str] = None
+    compare_columns: Optional[List[str]] = None
+    when_not_matched: Optional[str] = None
 
     def to_dict(self):
         """Convert the configuration to a dictionary representation.
@@ -169,6 +172,9 @@ class IcebergStoreOutput:
                 "partition_by": self.partition_by,
                 "create_table": self.create_table,
                 "max_batch_bytes": self.max_batch_bytes,
+                "when_matched_update_if": self.when_matched_update_if,
+                "compare_columns": self.compare_columns,
+                "when_not_matched": self.when_not_matched,
             }.items() if value is not None},
         }
 
@@ -423,15 +429,17 @@ class OfflineStore:
                 try:
                     # Load Iceberg extension
                     DuckDBIcebergExtension.load_extension(con)
+                    DuckDBIcebergExtension.configure_s3(con)
 
                     # Setup REST catalog
                     catalog_name = "seeknal_catalog"
-                    DuckDBIcebergExtension.create_rest_catalog(
+                    DuckDBIcebergExtension.attach_rest_catalog(
                         con=con,
                         catalog_name=catalog_name,
                         uri=catalog_uri,
                         warehouse_path=warehouse_path,
-                        bearer_token=bearer_token,
+                        bearer_token=bearer_token
+                        or DuckDBIcebergExtension.get_oauth2_token(),
                     )
 
                     # Create table reference and drop
@@ -527,9 +535,18 @@ class OfflineStore:
                 key: getattr(iceberg_config, key)
                 if getattr(iceberg_config, key) is not None
                 else getattr(profile_config, key)
-                for key in ("unique_keys", "partition_by", "create_table", "max_batch_bytes")
+                for key in ("unique_keys", "partition_by", "create_table", "max_batch_bytes",
+                            "when_matched_update_if", "compare_columns", "when_not_matched")
             }
-        validate_iceberg_write_options(write_mode, **options)
+        if not advanced:
+            options_for_validation = {
+                key: getattr(iceberg_config, key)
+                for key in ("when_matched_update_if", "compare_columns", "when_not_matched")
+                if getattr(iceberg_config, key) is not None
+            }
+        else:
+            options_for_validation = options
+        validate_iceberg_write_options(write_mode, **options_for_validation)
         catalog = (
             profile_config.catalog.interpolate_env_vars()
             if advanced else profile_config.catalog
@@ -575,12 +592,14 @@ class OfflineStore:
             catalog_name = "seeknal_catalog"
             if not advanced:
                 DuckDBIcebergExtension.load_extension(con)
-                DuckDBIcebergExtension.create_rest_catalog(
+                DuckDBIcebergExtension.configure_s3(con)
+                DuckDBIcebergExtension.attach_rest_catalog(
                     con=con,
                     catalog_name=catalog_name,
                     uri=catalog_uri,
                     warehouse_path=warehouse_path,
-                    bearer_token=bearer_token,
+                    bearer_token=bearer_token
+                    or DuckDBIcebergExtension.get_oauth2_token(),
                 )
             else:
                 options["catalog_config"] = replace(

@@ -993,6 +993,8 @@ tags:
 ## Materialization
 
 Materialization enables persisting transform outputs as Apache Iceberg tables.
+The conditional fields below are part of the **2.13.0 integration candidate** in
+[draft PR #111](https://github.com/mta-tech/seeknal/pull/111), pending release.
 
 !!! warning "DuckDB HUGEINT Compatibility"
     DuckDB returns `HUGEINT` for `COUNT(*)` and `SUM()` by default, which Iceberg does not support. Always cast aggregation results in transforms that write to Iceberg:
@@ -1001,19 +1003,81 @@ Materialization enables persisting transform outputs as Apache Iceberg tables.
 
 ### Fields
 
+These Iceberg options also apply to a target in the plural `materializations:` list.
+
 | Field | Type | Required | Description | Default |
 |-------|------|----------|-------------|---------|
-| `enabled` | boolean | **Yes** | Enable/disable materialization | - |
-| `table` | string | **Yes** | Fully qualified Iceberg table name (e.g., `warehouse.prod.table`) | - |
-| `mode` | string | **Yes** | Write mode: `append` or `overwrite` | - |
-| `create_table` | boolean | No | Auto-create table if it doesn't exist | `true` |
+| `enabled` | boolean | No | Legacy single-target enable/disable setting | Profile setting |
+| `table` | string | **Yes** | Fully qualified Iceberg target, e.g. `atlas.analytics.customers` | - |
+| `mode` | string | No | `append`, `overwrite`, `upsert`, or `insert_overwrite` | Profile `default_mode`, otherwise `append` |
+| `unique_keys` | list[string] | For `upsert` | Non-empty matching-key columns | Profile setting |
+| `partition_by` | list[string] | For `insert_overwrite` | Complete incoming identity-partition tuples to replace | Profile setting |
+| `create_table` | boolean | No | Allow advanced modes to create a missing target | `true` |
+| `max_batch_bytes` | integer | No | Maximum logical Arrow input size for advanced modes | `268435456` |
+| `when_matched_update_if` | string or null | No | SQL predicate accepting matched rows; `upsert` only | Profile setting, otherwise absent |
+| `compare_columns` | list[string] | No | Extra target columns exposed to the predicate; requires a predicate | Profile setting, otherwise `[]` |
+| `when_not_matched` | string | No | New-key policy: `insert` or `skip`; `upsert` only | Profile setting, otherwise `insert` |
 
 ### Modes
 
-| Mode | Behavior | SQL Equivalent | Use Case |
-|------|----------|----------------|----------|
-| `overwrite` | Drop and recreate table | `DROP TABLE` + `CREATE TABLE` | Full refresh, daily snapshots |
-| `append` | Insert into existing table | `INSERT INTO` | Incremental updates, time-series |
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| `overwrite` | Replace existing contents with transactional `DELETE` + `INSERT`; create a missing target from the result | Full refresh, daily snapshots |
+| `append` | Insert new rows into the existing target | Incremental batches, time-series |
+| `upsert` | Insert new keys and replace complete matching rows; optionally filter replacements | Keyed dimensions, version-ordered backfills |
+| `insert_overwrite` | Replace only identity-partition tuples represented in the batch | Complete incoming partitions |
+
+`upsert` keys must be non-null, finite, and unique within each incoming batch.
+Seeknal rejects duplicate matching target keys rather than selecting a row
+arbitrarily. Deduplicate incoming versions in the transform SQL first.
+
+### Conditional upsert example
+
+```yaml
+kind: transform
+name: silver_customers
+inputs:
+  - ref: source.customers
+transform: |
+  SELECT * FROM ref('source.customers')
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY customer_id ORDER BY updated_at DESC NULLS LAST
+  ) = 1
+materializations:
+  - type: iceberg
+    table: atlas.analytics.customers
+    mode: upsert
+    unique_keys: [customer_id]
+    when_matched_update_if: >-
+      target.updated_at IS NULL OR source.updated_at > target.updated_at
+    compare_columns: [updated_at]
+    when_not_matched: insert
+```
+
+`source` contains the complete incoming row; `target` contains the unique keys
+and `compare_columns`. A matched row is replaced only for a true predicate;
+false or SQL NULL preserves the existing row. The example accepts a row when
+the existing timestamp is NULL; an incoming NULL against a non-NULL timestamp
+is skipped. `when_not_matched: skip` independently rejects new keys.
+
+These fields may be inherited from `profiles.yml` under `materialization:`.
+Omitting a field inherits its default. Explicitly clear an inherited predicate
+with `when_matched_update_if: null` **and** `compare_columns: []`; set
+`when_not_matched: insert` as well if the inherited new-key policy was `skip`.
+The typed Python configuration omits `None`, so use a dictionary/YAML target to
+express that explicit clear.
+
+Upsert results distinguish original input, accepted rows, inserts, updates,
+condition skips (`skipped_by_condition`) and skipped new keys
+(`skipped_not_matched`). An empty or completely rejected batch is a noop;
+accepted identical rows can also avoid a new snapshot. For a missing target,
+`when_not_matched: skip` with `create_table: true` is a noop without table or
+namespace creation; `create_table: false` still fails. Predicates bind before
+staging, including for empty input. Conflicting or uncertain commits are surfaced
+without automatic retry; inspect the target before an operator retry.
+
+See [Conditional Iceberg upsert](../cli/iceberg-upsert.md) for ordering multiple
+version columns and [configuration precedence](configuration.md#conditional-iceberg-upsert-defaults).
 
 ### Example
 
@@ -1063,7 +1127,11 @@ Write pipeline outputs to multiple storage targets simultaneously using the plur
 | `connection` | string | For PostgreSQL | Named connection from `profiles.yml` | - |
 | `table` | string | **Yes** | Target table name | - |
 | `mode` | string | **Yes** | Write mode (see modes below) | - |
-| `unique_keys` | list[string] | For `upsert_by_key` | Columns for upsert matching | - |
+| `unique_keys` | list[string] | For Iceberg `upsert` or PostgreSQL `upsert_by_key` | Columns for upsert matching | - |
+| `partition_by` | list[string] | For Iceberg `insert_overwrite` | Identity partition columns | - |
+| `when_matched_update_if` | string or null | No | Iceberg `upsert` matched-row predicate | Profile setting |
+| `compare_columns` | list[string] | With a predicate using extra target columns | Iceberg target columns exposed to the predicate | Profile setting |
+| `when_not_matched` | string | No | Iceberg `upsert` new-key policy: `insert` or `skip` | `insert` |
 | `time_column` | string | For `incremental_by_time` | Time column for range-based incremental | - |
 | `lookback` | string | No | Lookback window for incremental (e.g., `7d`) | - |
 
@@ -1071,8 +1139,10 @@ Write pipeline outputs to multiple storage targets simultaneously using the plur
 
 | Mode | Target | Behavior |
 |------|--------|----------|
-| `overwrite` | Both | Drop and recreate table |
+| `overwrite` | Iceberg | Transactional replacement of existing contents |
 | `append` | Both | Insert new rows |
+| `upsert` | Iceberg | Whole-row replacement by explicit unique keys, with optional conditional updates |
+| `insert_overwrite` | Iceberg | Replace the complete incoming identity-partition tuples |
 | `full` | PostgreSQL | DROP + CREATE (alias for overwrite) |
 | `incremental_by_time` | PostgreSQL | DELETE time range + INSERT |
 | `upsert_by_key` | PostgreSQL | Match by unique keys, update or insert |
@@ -1246,7 +1316,7 @@ my-project/
 
 ---
 
-**Last Updated:** February 2026
+**Last Updated:** October 2026 (2.13.0 integration candidate)
 
 
 ---

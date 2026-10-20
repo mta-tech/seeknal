@@ -8,10 +8,10 @@ import difflib
 import re
 import uuid
 import warnings
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
-from .functions import get_function, env_var
+from .functions import DATE_FUNCTIONS, get_function, env_var
 from .type_conversion import convert_to_bool
 
 # Reserved parameter names that cannot be overridden by user parameters
@@ -56,6 +56,9 @@ class ParameterResolver:
         """
         self.cli_overrides = cli_overrides or {}
         self.run_id = run_id or str(uuid.uuid4())
+        # Date functions ({{ today(-1) }}, {{ month_start }}, ...) count from the
+        # overridden "today" (set by ``seeknal run --date``), not the wall clock.
+        self._base_date = self._parse_base_date(self.cli_overrides.get("today"))
         self.run_date = datetime.now().isoformat()
         self._common_config: Optional[Dict[str, str]] = common_config
 
@@ -78,6 +81,25 @@ class ParameterResolver:
         except Exception:
             # Context may not be initialized yet
             pass
+
+    @staticmethod
+    def _parse_base_date(value: Any) -> Optional[date]:
+        """Parse the "today" override into a date, or None if not overridden."""
+        if value is None or value == "":
+            return None
+        try:
+            return datetime.fromisoformat(str(value)).date()
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid 'today' override {value!r}: expected YYYY-MM-DD"
+            ) from e
+
+    def _call_function(self, func_name: str, args: list) -> str:
+        """Call a built-in function, anchoring date functions to the base date."""
+        func, _ = get_function(func_name)
+        if func_name in DATE_FUNCTIONS and self._base_date is not None:
+            return str(func(*args, base_date=self._base_date))
+        return str(func(*args))
 
     def resolve(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Resolve all parameters in a dictionary.
@@ -160,13 +182,13 @@ class ParameterResolver:
 
             # Check for function call with args: func(arg1, arg2)
             if '(' in expr and expr.endswith(')'):
-                return self._resolve_function(expr)
+                resolved = self._resolve_function(expr)
+                # Unknown function: leave the original {{ }} text in place
+                return match.group(0) if resolved == expr else resolved
 
             # Check for simple function name
-            func_info = get_function(expr)
-            if func_info:
-                func, _ = func_info
-                return str(func())
+            if get_function(expr):
+                return self._call_function(expr, [])
 
             # Check for env:VAR|default syntax
             if expr.startswith('env:'):
@@ -212,10 +234,8 @@ class ParameterResolver:
         args = self._parse_args(args_str) if args_str else []
 
         # Call built-in function
-        func_info = get_function(func_name)
-        if func_info:
-            func, _ = func_info
-            return str(func(*args))
+        if get_function(func_name):
+            return self._call_function(func_name, args)
 
         return expr
 
@@ -358,6 +378,9 @@ class ParameterResolver:
             >>> resolver._type_convert("hello")
             'hello'
         """
+        if not isinstance(value, str):
+            return value
+
         # Boolean - use shared utility for consistency
         if value.lower() in ('true', 'false', '1', '0', 'yes', 'no', 'on', 'off'):
             return convert_to_bool(value)
@@ -402,12 +425,12 @@ class ParameterResolver:
                 return self._context_values[expr]
 
             if '(' in expr and expr.endswith(')'):
-                return self._resolve_function(expr)
+                resolved = self._resolve_function(expr)
+                # Unknown function: leave the original {{ }} text in place
+                return match.group(0) if resolved == expr else resolved
 
-            func_info = get_function(expr)
-            if func_info:
-                func, _ = func_info
-                return str(func())
+            if get_function(expr):
+                return self._call_function(expr, [])
 
             if expr.startswith('env:'):
                 return self._resolve_env_var(expr[4:])

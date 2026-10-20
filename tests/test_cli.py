@@ -24,10 +24,20 @@ from seeknal.cli.main import (
     _echo_info,
 )
 
-# Pre-populate sys.modules with mock to enable patching without triggering full import chain
 import sys
-if "seeknal.featurestore.feature_group" not in sys.modules:
-    sys.modules["seeknal.featurestore.feature_group"] = mock.MagicMock()
+
+
+@pytest.fixture(autouse=True)
+def _stub_spark_feature_group(monkeypatch):
+    """Stub the Spark feature-group module for these CLI tests only.
+
+    Lets the tests patch ``seeknal.featurestore.feature_group.FeatureGroup``
+    without the optional spark extra, and is undone after each test so other
+    test modules keep the real module.
+    """
+    if "seeknal.featurestore.feature_group" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "seeknal.featurestore.feature_group", mock.MagicMock())
+    yield
 
 
 runner = CliRunner()

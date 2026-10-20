@@ -7,6 +7,8 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
+from seeknal.utils.lakekeeper import lakekeeper_uri_from_env
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,7 +34,7 @@ def get_current_snapshot_id(
         _, namespace, table_name = parts
 
         params = params or {}
-        catalog_uri = params.get("catalog_uri", os.getenv("LAKEKEEPER_URL", ""))
+        catalog_uri = params.get("catalog_uri", lakekeeper_uri_from_env())
         warehouse = params.get("warehouse", os.getenv("LAKEKEEPER_WAREHOUSE", "seeknal-warehouse"))
 
         if not catalog_uri:
