@@ -473,6 +473,46 @@ def test_concurrent_snapshot_conflict_preserves_winner_without_retry(
 
 
 @pytest.mark.integration
+def test_conditional_upsert_does_not_commit_a_stale_decision(con, rest_fixture):
+    replace_view(con, "(1, 'base', DATE '2026-09-13')")
+    options = dict(unique_keys=["id"], catalog_config=catalog_config(rest_fixture))
+    write_to_iceberg(con, "local_rest", "analytics.conditional_race", "incoming", "upsert", **options)
+    table = rest_fixture.backend.load_table("analytics.conditional_race")
+    # Even a table explicitly requesting retries must retain Seeknal's snapshot guard.
+    with table.transaction() as transaction:
+        transaction.set_properties(**{"commit.retry.num-retries": "7"})
+    rest_fixture.state.concurrent_upsert = pa.Table.from_pylist(
+        [{"id": 1, "value": "winner", "business_date": date(2026, 9, 15)}],
+        schema=table.scan().to_arrow().schema,
+    )
+    attempts_before = rest_fixture.state.commit_attempts
+    replace_view(con, "(1, 'stale candidate', DATE '2026-09-14')")
+    with pytest.raises(WriteError) as error:
+        write_to_iceberg(
+            con, "local_rest", "analytics.conditional_race", "incoming", "upsert", **options,
+            when_matched_update_if="source.business_date > target.business_date",
+            compare_columns=["business_date"],
+        )
+    assert error.value.failure_category == "conflict"
+    assert rest_fixture.state.commit_attempts - attempts_before == 1
+    assert table_rows(rest_fixture, "analytics.conditional_race") == [
+        {"id": 1, "value": "winner", "business_date": date(2026, 9, 15)}
+    ]
+    table = rest_fixture.backend.load_table("analytics.conditional_race")
+    assert table.properties["commit.retry.num-retries"] == "7"
+
+    # A fresh invocation evaluates the predicate against the winner, then skips.
+    result = write_to_iceberg(
+        con, "local_rest", "analytics.conditional_race", "incoming", "upsert", **options,
+        when_matched_update_if="source.business_date > target.business_date",
+        compare_columns=["business_date"],
+    )
+    assert result.outcome == "noop"
+    assert result.skipped_by_condition == 1
+    assert rest_fixture.state.commit_attempts - attempts_before == 1
+
+
+@pytest.mark.integration
 def test_every_rest_request_uses_explicit_fixture_token(
     con: Any,
     rest_fixture: RunningRestFixture,

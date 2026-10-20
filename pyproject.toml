@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "seeknal"
-version = "2.12.1"
+version = "2.13.0"
 description = "All-in-one platform for data and AI/ML engineering"
 authors = [
     {name = "Fitra Kacamarga"}
@@ -148,8 +148,11 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/seeknal"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"docs/cli" = "seeknal/docs/cli"
+
 [tool.hatch.build.targets.sdist]
-include = ["src/seeknal", "LICENSE", "README.md", "pyproject.toml"]
+include = ["src/seeknal", "docs/cli", "LICENSE", "README.md", "pyproject.toml"]
 
 # Pytest configuration
 [tool.pytest.ini_options]

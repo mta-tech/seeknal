@@ -78,6 +78,26 @@ class TestGetDocsCliPath:
         path_str = str(result)
         assert path_str.endswith("docs/cli")
 
+    def test_installed_docs_take_precedence_over_current_project(self, tmp_path, monkeypatch):
+        installed_package = tmp_path / "site-packages" / "seeknal"
+        bundled = installed_package / "docs" / "cli"
+        bundled.mkdir(parents=True)
+        project = tmp_path / "project"
+        (project / "docs" / "cli").mkdir(parents=True)
+        monkeypatch.chdir(project)
+        monkeypatch.setattr("seeknal.cli.docs.__file__", str(installed_package / "cli" / "docs.py"))
+
+        assert get_docs_cli_path() == bundled
+
+    def test_source_checkout_docs_work_without_bundled_topics(self, tmp_path, monkeypatch):
+        checkout = tmp_path / "checkout"
+        docs_path = checkout / "docs" / "cli"
+        docs_path.mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("seeknal.cli.docs.__file__", str(checkout / "src" / "seeknal" / "cli" / "docs.py"))
+
+        assert get_docs_cli_path() == docs_path
+
 
 class TestFindExactTopicMatch:
     """Tests for find_exact_topic_match function."""

@@ -72,8 +72,10 @@ class TestGetCurrentSnapshotId:
 
     def test_no_catalog_uri(self):
         with patch.dict("os.environ", {**OAUTH_ENV}, clear=False):
-            # Ensure LAKEKEEPER_URL is absent
-            with patch.dict("os.environ", {"LAKEKEEPER_URL": ""}, clear=False):
+            # Ensure LAKEKEEPER_URI / LAKEKEEPER_URL are absent
+            with patch.dict(
+                "os.environ", {"LAKEKEEPER_URI": "", "LAKEKEEPER_URL": ""}, clear=False
+            ):
                 result = get_current_snapshot_id("atlas.myns.mytable", {})
         assert result == (None, None)
 

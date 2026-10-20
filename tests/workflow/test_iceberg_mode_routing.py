@@ -409,6 +409,9 @@ def test_featurestore_typed_and_dict_configs_forward_identical_advanced_options(
         unique_keys=["customer_id"],
         create_table=False,
         max_batch_bytes=2048,
+        when_matched_update_if="source.updated_at > target.updated_at",
+        compare_columns=["updated_at"],
+        when_not_matched="skip",
     )
     value = output.to_dict() if as_dict else output
     store = OfflineStore(kind=OfflineStoreEnum.ICEBERG, value=value)
@@ -439,6 +442,9 @@ def test_featurestore_typed_and_dict_configs_forward_identical_advanced_options(
     assert call["partition_by"] == []
     assert call["create_table"] is False
     assert call["max_batch_bytes"] == 2048
+    assert call["when_matched_update_if"] == "source.updated_at > target.updated_at"
+    assert call["compare_columns"] == ["updated_at"]
+    assert call["when_not_matched"] == "skip"
     assert call["catalog_config"].warehouse == "s3://target/warehouse"
     assert result["write_result"]["success"] is True
     connect.return_value.register.assert_called_once()
@@ -778,3 +784,85 @@ def test_feature_group_post_execute_dispatches_normalized_table_targets(tmp_path
         "results": dispatched.serializable_results,
     }
     json.dumps(result.metadata)
+
+
+@pytest.mark.parametrize('clear', [False, True])
+def test_dispatch_conditional_profile_and_explicit_clear(clear):
+    profile = _profile(unique_keys=['id'])
+    profile.default_mode = MaterializationMode.UPSERT
+    profile.when_matched_update_if = 'source.v > target.v'
+    profile.compare_columns = ['v']
+    profile.when_not_matched = 'skip'
+    loader = MagicMock()
+    loader.load_profile.return_value = profile
+    target = {'table': 'lake.ns.rows', 'mode': 'upsert'}
+    if clear:
+        target.update(when_matched_update_if=None, compare_columns=[], when_not_matched='insert')
+    with patch('seeknal.workflow.materialization.operations.write_to_iceberg', return_value=_successful_write()) as write:
+        MaterializationDispatcher(loader)._materialize_iceberg(MagicMock(), 'rows', target)
+    assert write.call_args.kwargs['when_matched_update_if'] == (None if clear else profile.when_matched_update_if)
+    assert write.call_args.kwargs['compare_columns'] == ([] if clear else ['v'])
+    assert write.call_args.kwargs['when_not_matched'] == ('insert' if clear else 'skip')
+
+
+def test_dispatch_rejects_conditional_append_before_catalog_setup():
+    loader = MagicMock()
+    loader.load_profile.return_value = _profile()
+    with patch('seeknal.workflow.materialization.operations.write_to_iceberg') as write:
+        with pytest.raises(ConfigurationError, match='upsert'):
+            MaterializationDispatcher(loader)._materialize_iceberg(
+                MagicMock(), 'rows', {'mode': 'append', 'when_matched_update_if': 'TRUE'},
+            )
+    write.assert_not_called()
+
+
+def test_legacy_helper_preserves_explicit_null_predicate():
+    node = SimpleNamespace(
+        name='rows', node_type=SimpleNamespace(value='transform'),
+        config={'materialization': {
+            'enabled': True, 'table': 'lake.ns.rows', 'mode': 'upsert',
+            'unique_keys': ['id'], 'when_matched_update_if': None,
+            'compare_columns': [], 'when_not_matched': 'skip',
+        }},
+    )
+    with patch.object(MaterializationDispatcher, '_materialize_iceberg', return_value=_successful_write()) as route:
+        IcebergMaterializationHelper.materialize_node(node, source_con=MagicMock())
+    target = route.call_args.args[2]
+    assert 'when_matched_update_if' in target
+    assert target['when_matched_update_if'] is None
+    assert target['compare_columns'] == []
+    assert target['when_not_matched'] == 'skip'
+
+
+@pytest.mark.parametrize('direct_helper', [False, True])
+def test_legacy_comparison_override_inherits_profile_condition(tmp_path, direct_helper):
+    profile_path = tmp_path / 'profiles.yml'
+    profile_path.write_text('''materialization:
+  default_mode: upsert
+  unique_keys: [id]
+  when_matched_update_if: source.v > target.v
+  compare_columns: [old_v]
+  catalog:
+    uri: http://profile:8181
+    warehouse: s3://profile/warehouse
+    bearer_token: token
+''')
+    with patch('seeknal.workflow.materialization.operations.write_to_iceberg', return_value=_successful_write()) as write:
+        if direct_helper:
+            IcebergMaterializationHelper.materialize_view(
+                'transform.rows', 'lake.ns.rows', mode=MaterializationMode.UPSERT,
+                source_con=MagicMock(), compare_columns=['v'], profile_path=profile_path,
+            )
+        else:
+            node = SimpleNamespace(
+                name='rows', node_type=SimpleNamespace(value='transform'),
+                config={'materialization': {
+                    'enabled': True, 'table': 'lake.ns.rows', 'mode': 'upsert',
+                    'compare_columns': ['v'],
+                }},
+            )
+            IcebergMaterializationHelper.materialize_node(
+                node, source_con=MagicMock(), profile_path=profile_path,
+            )
+    assert write.call_args.kwargs['when_matched_update_if'] == 'source.v > target.v'
+    assert write.call_args.kwargs['compare_columns'] == ['v']

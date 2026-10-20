@@ -1926,9 +1926,12 @@ def run(
             raise typer.Exit(1)
         cli_overrides.update(parsed)
     if param_date:
+        parse_date_safely(param_date, "--date")
         cli_overrides["date"] = param_date
         cli_overrides["run_date"] = param_date
         cli_overrides["today"] = param_date
+    elif "today" in cli_overrides:
+        parse_date_safely(str(cli_overrides["today"]), "today in --params")
     if param_run_id:
         cli_overrides["run_id"] = param_run_id
     if start_date:

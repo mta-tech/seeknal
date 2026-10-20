@@ -4,6 +4,12 @@
 
 Seeknal is an all-in-one platform for data and AI/ML engineering. Define transformations in YAML or Python, run them with DuckDB or Spark, and deploy features to production with a single CLI.
 
+!!! note "2.13.0 candidate documentation"
+    This branch describes the unreleased integration in
+    [draft PR #111](https://github.com/mta-tech/seeknal/pull/111), based on 2.12.1.
+    Start with the [candidate notes](releases/2.13.0.md) and
+    [upgrade guide](cli/upgrade.md); published packages may expose earlier behavior.
+
 ---
 
 ## What Can You Build With Seeknal?

@@ -2,6 +2,10 @@
 
 This guide covers using Apache Iceberg table format for materializing Seeknal pipeline outputs, including append, full-table replacement, key-based upsert, and dynamic partition replacement.
 
+Conditional predicates and skip reporting described here belong to the
+unreleased [2.13.0 integration candidate](releases/2.13.0.md). Start with the
+[upgrade guide](cli/upgrade.md) when evaluating it from 2.12.1.
+
 ## Overview
 
 Apache Iceberg is an open table format for huge analytic datasets. Iceberg adds tables to compute engines like Spark, Trino, Flink, and DuckDB using a high-performance table format that works just like a SQL table.
@@ -283,10 +287,11 @@ schema_evolution:
 
 ## Write Modes
 
-Seeknal supports four Iceberg write modes. `append` remains the default. The
-existing `append` and `overwrite` execution paths retain their previous
-behavior; the transaction guarantees described below apply specifically to
-`upsert` and `insert_overwrite`.
+Seeknal supports four Iceberg write modes. `append` remains the default.
+`append` and `overwrite` use the native DuckDB Iceberg path; `upsert` and
+`insert_overwrite` use PyIceberg. Existing-table overwrite wraps DELETE and
+INSERT in a transaction. The advanced modes have their own snapshot-conflict
+and no-retry behavior described below.
 
 ### OVERWRITE Mode
 
@@ -302,7 +307,9 @@ materialization:
 - Correcting bad data
 - Rebuilding from scratch
 
-**Warning:** Deletes all existing data before writing new data.
+**Warning:** Replaces the whole table. For an existing table, a failed INSERT
+rolls back the DELETE; a failed COMMIT can have an unknown outcome and must be
+checked against the target. An empty overwrite is not an append/upsert noop.
 
 ### APPEND Mode (Default)
 
@@ -340,6 +347,82 @@ non-null, finite when numeric, and unique within the batch. NaN and infinity
 are rejected. Composite keys are supported by listing
 all key columns. Ambiguous duplicate target keys among the rows touched by the
 batch are rejected.
+
+#### Conditional updates
+
+Read the focused guide from your terminal with `seeknal docs iceberg-upsert`
+or `seeknal docs --json iceberg-upsert`. The [CLI topic](cli/iceberg-upsert.md)
+includes profile overrides, window ordering, and skipped-row reporting.
+
+An optional SQL predicate decides whether each matched row can be replaced:
+
+```yaml
+materialization:
+  - type: iceberg
+    table: atlas.production.dim_customer
+    mode: upsert
+    unique_keys: [customer_id]
+    when_matched_update_if: |
+      target.updated_at IS NULL OR source.updated_at > target.updated_at
+    compare_columns: [updated_at]
+    when_not_matched: insert
+```
+
+`source` exposes the complete incoming row. `target` exposes the unique keys
+and the declared `compare_columns`. A matched row is retained only when the
+predicate is true; false and NULL preserve the existing row. New keys are
+inserted independently of the predicate unless `when_not_matched: skip` is set.
+Omit the predicate for the existing update behavior. `compare_columns` requires
+a predicate; a predicate using only source columns or target keys may omit it.
+These options also work as defaults under `materialization:` in `profiles.yml`.
+Node options override profile defaults. To clear an inherited predicate in YAML,
+set `when_matched_update_if: null` and `compare_columns: []` together.
+
+For data without a business update time, order by a stable extraction window
+before the extraction time, so an older backfill cannot win just by running later:
+
+```yaml
+when_matched_update_if: |
+  source._partition_timestamp > target._partition_timestamp
+  OR (source._partition_timestamp = target._partition_timestamp
+      AND source._extract_timestamp > target._extract_timestamp)
+compare_columns: [_partition_timestamp, _extract_timestamp]
+```
+
+To avoid rewriting rows solely because load metadata changed, compare business
+columns with NULL-safe expressions such as
+`source.status IS DISTINCT FROM target.status`. Equal versions are skipped by a
+strict `>` predicate; use an explicit tie-breaker if equal versions can carry
+legitimate changes. There is no `version_column` shorthand.
+
+Seeknal binds the predicate against empty Arrow tables before staging a write,
+including when the batch is empty or the target does not exist. Referencing an
+undeclared target column fails preflight. Value-dependent expression errors also
+fail before staging. The predicate is trusted project SQL, with the same trust
+expectation as transform SQL.
+
+Comparison columns share the target uniqueness scan. This adds projected data,
+DuckDB join work, and memory use; it does not eliminate PyIceberg's internal
+upsert scan or guarantee partition/file pruning. `max_batch_bytes` limits the
+original input batch, not the total working memory of the join and writer.
+
+With `when_not_matched: skip`, a missing target and `create_table: true` produce
+a no-op without creating a table or namespace. `create_table: false` still fails
+for a missing table. If every input row is filtered out, an existing table keeps
+its snapshot and no commit is attempted. Source/target uniqueness and schema
+validation still apply before filtering; conditions do not deduplicate keys.
+
+Write results and dispatcher logs expose `skipped_by_condition` (matched rows
+rejected by the predicate) and `skipped_not_matched` (new keys rejected by `skip`).
+`input_row_count` is the original batch size; `row_count` is the accepted batch
+size. An accepted row identical to its target may still be a PyIceberg no-op,
+so accepted rows need not equal inserted plus updated rows.
+
+Advanced writes disable PyIceberg's internal snapshot-rebase retries for that
+commit without changing stored table properties. If the target snapshot changes
+after preflight, the commit fails with `conflict`; reconciling and invoking the
+write again re-evaluates the condition against the new target. This preserves
+the comparison snapshot instead of committing a stale predicate decision.
 
 Use this mode for SCD Type 1 dimensions or keyed fact corrections. Seeknal does
 not infer keys from entity metadata. Generate surrogate keys and manage
@@ -555,6 +638,9 @@ materialization:
 | `mode` | string | No | `append` | `append`, `overwrite`, `upsert`, or `insert_overwrite` |
 | `create_table` | boolean | No | `true` | Auto-create table if it doesn't exist |
 | `unique_keys` | list[string] | For `upsert` | - | Stable source/target key columns |
+| `when_matched_update_if` | string | No | - | Upsert SQL predicate over `source` and projected `target` |
+| `compare_columns` | list[string] | No | `[]` | Additional target columns exposed to the predicate |
+| `when_not_matched` | string | No | `insert` | Upsert new keys: `insert` or `skip` |
 | `partition_by` | list[string] | For `insert_overwrite` | - | Identity partition columns; must match the target spec |
 | `max_batch_bytes` | integer | No | `268435456` | Maximum logical Arrow input bytes for the two new modes |
 

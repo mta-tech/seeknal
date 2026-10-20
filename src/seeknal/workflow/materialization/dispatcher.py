@@ -156,7 +156,10 @@ class MaterializationDispatcher:
                     "write_result": write_result,
                 })
                 logger.info(
-                    "Materialized %s: %d rows", target_label, write_result.row_count
+                    "Materialized %s: %d rows; skipped_by_condition=%d skipped_not_matched=%d",
+                    target_label, write_result.row_count,
+                    getattr(write_result, "skipped_by_condition", 0),
+                    getattr(write_result, "skipped_not_matched", 0)
                 )
 
             except Exception as exc:
@@ -295,6 +298,7 @@ class MaterializationDispatcher:
         """Route to Iceberg materialization via operations module."""
         import os
 
+        from seeknal.utils.lakekeeper import lakekeeper_uri_from_env
         from seeknal.workflow.materialization.operations import (  # ty: ignore[unresolved-import]
             DuckDBIcebergExtension,
             iceberg_catalog_alias,
@@ -321,7 +325,13 @@ class MaterializationDispatcher:
                 "create_table": target_config.get("create_table", profile_config.create_table),
                 "max_batch_bytes": target_config.get("max_batch_bytes", profile_config.max_batch_bytes),
             }
-        validate_iceberg_write_options(mode, **options)
+        conditional_options = {
+            key: target_config.get(key, getattr(profile_config, key))
+            for key in ("when_matched_update_if", "compare_columns", "when_not_matched")
+        }
+        validate_iceberg_write_options(mode, **options, **conditional_options)
+        if advanced:
+            options.update(conditional_options)
 
         # Get OAuth2 token from Keycloak
         catalog = profile_config.catalog.interpolate_env_vars()
@@ -333,7 +343,7 @@ class MaterializationDispatcher:
         # 1. target_config overrides (per-materialization YAML) — highest priority
         # 2. materialization.catalog section (from profile_config / profiles.yml)
         # 3. source_defaults.iceberg section
-        # 4. environment variables (LAKEKEEPER_URI, LAKEKEEPER_WAREHOUSE)
+        # 4. environment variables (LAKEKEEPER_URI or LAKEKEEPER_URL, LAKEKEEPER_WAREHOUSE)
         uri = target_config.get("catalog_uri", "")
         warehouse_path = target_config.get("warehouse", "")
 
@@ -353,7 +363,7 @@ class MaterializationDispatcher:
 
         # Fall back to environment variables
         if not uri:
-            uri = os.environ.get("LAKEKEEPER_URI", "")
+            uri = lakekeeper_uri_from_env()
         if not warehouse_path:
             warehouse_path = os.environ.get("LAKEKEEPER_WAREHOUSE", "")
 

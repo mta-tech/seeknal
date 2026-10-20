@@ -100,6 +100,8 @@ The Seeknal CLI (`seeknal`) provides commands for managing data pipelines, featu
 
 ### Integration
 
+- `seeknal docs iceberg-upsert` - Configure conditional Iceberg updates, window ordering, and skipped-row reporting
+
 - `atlas` - Manage Apache Iceberg tables
 - `connection-test` - Test database connectivity
 - `download-sample-data` - Download sample datasets

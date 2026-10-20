@@ -280,6 +280,8 @@ seeknal run [OPTIONS]
 | `--end` | TEXT | None | End date for the pipeline (YYYY-MM-DD) |
 | `--date` | TEXT | None | Set date context (overrides run_date, date, today params) |
 | `--run-id` | TEXT | None | Custom run identifier |
+| `--params` | JSON object | None | Custom template/decorator parameters; dedicated date/run flags take precedence |
+| `--start-date` / `--end-date` | TEXT | None | Template values for `{{ start_date }}` / `{{ end_date }}`; separate from interval `--start` / `--end` |
 | `--dry-run` | FLAG | False | Show what would be executed without running |
 | `--full`, `-f` | FLAG | False | Run all nodes regardless of state (ignore incremental run cache). Cannot be combined with `--tags`, `--nodes` or `--types` |
 | `--nodes`, `-n` | TEXT (multiple) | None | Run specific nodes only (e.g., --nodes transform.clean_data) |
@@ -312,7 +314,7 @@ seeknal run --dry-run
 seeknal run --show-plan
 
 # Run specific nodes
-seeknal run --nodes transform.clean_data feature_group.user_features
+seeknal run --nodes transform.clean_data --nodes feature_group.user_features
 
 # Run only transforms and feature_groups
 seeknal run --types transform,feature_group
@@ -338,6 +340,9 @@ seeknal run --start 2024-01-01 --end 2024-01-31
 # Run with date context
 seeknal run --date 2024-06-15
 
+# Resolve a backfill window and override a declared parameter
+seeknal run --date 2026-10-12 --params '{"region": "US"}'
+
 # Run with custom run ID and profile
 seeknal run --run-id daily-2024-01-15 --profile profiles.yml
 
@@ -347,6 +352,14 @@ seeknal run --env dev
 # Run in environment with parallel execution
 seeknal run --env dev --parallel
 ```
+
+In the unreleased 2.13.0 candidate, date functions such as
+`{{ today(-1) }}` follow `--date`, source paths are templated, and Python
+decorator parameters reach `ctx.params`. Resolved functional parameters
+affect caching; an empty SQL SELECT publishes a typed empty intermediate
+instead of keeping an earlier run's rows. See the
+[run topic](../cli/run.md#parameters), [conditional Iceberg upsert](../cli/iceberg-upsert.md),
+and [candidate upgrade guide](../cli/upgrade.md) for details.
 
 **See Also:** [Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md)
 

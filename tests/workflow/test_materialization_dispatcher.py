@@ -459,6 +459,9 @@ class TestIcebergCatalogFallback:
         catalog.interpolate_env_vars.return_value = catalog
         config = MagicMock()
         config.catalog = catalog
+        config.when_matched_update_if = None
+        config.compare_columns = []
+        config.when_not_matched = "insert"
         return config
 
     def test_iceberg_falls_back_to_source_defaults(self, mock_con):
@@ -523,6 +526,34 @@ class TestIcebergCatalogFallback:
         call_kwargs = mock_ext.attach_rest_catalog.call_args[1]
         assert call_kwargs["uri"] == "http://from-env:8181"
         assert call_kwargs["warehouse_path"] == "env-warehouse"
+
+    def test_iceberg_falls_back_to_lakekeeper_url_alias(self, mock_con, monkeypatch):
+        """LAKEKEEPER_URL (used by the Iceberg source) also works for materialization."""
+        monkeypatch.delenv("LAKEKEEPER_URI", raising=False)
+        monkeypatch.setenv("LAKEKEEPER_URL", "http://from-url-env:8181")
+        monkeypatch.setenv("LAKEKEEPER_WAREHOUSE", "env-warehouse")
+
+        loader = MagicMock()
+        loader.load_profile.return_value = self._make_profile_config(uri="", warehouse="")
+        loader.load_source_defaults.return_value = {}
+        dispatcher = MaterializationDispatcher(profile_loader=loader)
+
+        mock_ext = MagicMock()
+        mock_ext.get_oauth2_token.return_value = "token123"
+        mock_write = MagicMock(return_value=_ok_result(5))
+
+        with patch.dict("sys.modules", {
+            "seeknal.workflow.materialization.operations": MagicMock(
+                DuckDBIcebergExtension=mock_ext,
+                write_to_iceberg=mock_write,
+            ),
+        }):
+            dispatcher._materialize_iceberg(
+                mock_con, "my_view", {"table": "atlas.ns.tbl", "mode": "append"}
+            )
+
+        call_kwargs = mock_ext.attach_rest_catalog.call_args[1]
+        assert call_kwargs["uri"] == "http://from-url-env:8181"
 
     def test_iceberg_catalog_section_takes_precedence(self, mock_con, monkeypatch):
         """When materialization.catalog has values, they take precedence over defaults."""

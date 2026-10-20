@@ -421,6 +421,55 @@ class DAGBuilder:
         self._profile_loader = ProfileLoader(profile_path=self.profile_path)
         return self._profile_loader
 
+    def _resolve_node_templates(
+        self, data: dict[str, Any], kind_str: str, *, convert_types: bool = True
+    ) -> None:
+        """Resolve {{ }} expressions in a node's params, transform SQL and source table.
+
+        ``params:`` values are resolved, and a CLI override replaces a declared
+        key. Transform SQL and a source's ``table:`` are then resolved using:
+        1. CLI overrides (highest precedence)
+        2. Resolved params from the node's params: section (defaults)
+        3. Common config, functions, env vars
+
+        Args:
+            data: Parsed YAML data dict (mutated in place)
+            kind_str: Node kind (e.g., "source", "transform")
+            convert_types: Convert resolved param strings to bool/int/float, as
+                YAML params always have. Python decorator params pass False so
+                only ``{{ }}`` strings change and other values stay as written.
+        """
+        from seeknal.workflow.parameters.resolver import ParameterResolver  # ty: ignore[unresolved-import]
+
+        resolved_params: dict[str, Any] = {}
+        if "params" in data:
+            resolver = ParameterResolver(
+                cli_overrides=self.cli_overrides,
+                run_id=self.run_id,
+                common_config=self._common_config,
+            )
+            if convert_types:
+                resolved_params = resolver.resolve(data["params"])
+            else:
+                for key, value in (data["params"] or {}).items():
+                    if key in self.cli_overrides:
+                        value = self.cli_overrides[key]
+                    elif isinstance(value, str) and "{{" in value:
+                        value = resolver.resolve_string(value)
+                    resolved_params[key] = value
+            data["params"] = resolved_params
+
+        # Merge resolved params as base, CLI overrides take precedence
+        resolver = ParameterResolver(
+            cli_overrides={**resolved_params, **self.cli_overrides},
+            run_id=self.run_id,
+            common_config=self._common_config,
+        )
+        if isinstance(data.get("transform"), str):
+            data["transform"] = resolver.resolve_string(data["transform"])
+        if kind_str == "source" and isinstance(data.get("table"), str):
+            data["table"] = resolver.resolve_string(data["table"])
+
     def _merge_source_defaults(self, data: dict[str, Any], source_type: str) -> None:
         """Merge source_defaults from profile into a source node's params.
 
@@ -593,32 +642,8 @@ class DAGBuilder:
                 )
                 return
 
-            # Resolve parameters if present
-            resolved_params: dict[str, Any] = {}
-            if "params" in data:
-                from seeknal.workflow.parameters.resolver import ParameterResolver  # ty: ignore[unresolved-import]
-                resolver = ParameterResolver(
-                    cli_overrides=self.cli_overrides,
-                    run_id=self.run_id,
-                    common_config=self._common_config,
-                )
-                resolved_params = resolver.resolve(data["params"])
-                data["params"] = resolved_params
-
-            # Resolve {{ }} expressions in transform SQL using:
-            # 1. CLI overrides (highest precedence)
-            # 2. Resolved params from the node's params: section (defaults)
-            # 3. Common config, functions, env vars
-            if "transform" in data and (self.cli_overrides or self._common_config or resolved_params):
-                from seeknal.workflow.parameters.resolver import ParameterResolver  # ty: ignore[unresolved-import]
-                # Merge resolved params as base, CLI overrides take precedence
-                transform_overrides = {**resolved_params, **self.cli_overrides}
-                resolver = ParameterResolver(
-                    cli_overrides=transform_overrides,
-                    run_id=self.run_id,
-                    common_config=self._common_config,
-                )
-                data["transform"] = resolver.resolve_string(data["transform"])
+            # Resolve {{ }} expressions in params, transform SQL and source table
+            self._resolve_node_templates(data, kind_str)
 
             # Merge source_defaults from profile into source nodes
             if kind_str == "source":
@@ -710,6 +735,7 @@ class DAGBuilder:
                     # Copy params (e.g., catalog_uri, warehouse for iceberg sources)
                     if "params" in node_meta:
                         yaml_data["params"] = node_meta["params"]
+                    self._resolve_node_templates(yaml_data, kind_str, convert_types=False)
                     # Merge source_defaults from profile
                     source_type = yaml_data.get("source")
                     if source_type:
@@ -753,6 +779,12 @@ class DAGBuilder:
                     else:
                         yaml_data["entity"] = entity_raw
                     yaml_data["features"] = node_meta.get("features", {})
+
+                # Decorator keyword params (e.g. run_day="{{ today }}") reach
+                # ctx.params; a CLI override replaces a declared key.
+                if kind_str != "source" and node_meta.get("params"):
+                    yaml_data["params"] = node_meta["params"]
+                    self._resolve_node_templates(yaml_data, kind_str, convert_types=False)
 
                 # Handle materialization for all node types (source, transform, feature_group)
                 decorator_mat = node_meta.get("materialization")

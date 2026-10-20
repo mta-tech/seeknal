@@ -1,0 +1,56 @@
+{
+  "dataset": "deterministic synthetic; no production data",
+  "rows_per_base_table": 2400,
+  "catalog": "authenticated loopback REST backed by PyIceberg SqlCatalog and local Parquet",
+  "readers": [
+    "PyIceberg",
+    "separate DuckDB iceberg_scan connection"
+  ],
+  "versions": {
+    "duckdb": "1.5.0",
+    "pyarrow": "23.0.1",
+    "pyiceberg": "0.12.0"
+  },
+  "elapsed_seconds": 210.03,
+  "cases": [
+    {
+      "case": "version_condition",
+      "input": 2700,
+      "accepted": 1500,
+      "skipped_by_condition": 1200,
+      "digest": "a26dc3701738f73e58f7f24e2bfebda01e6f054ea400310a62a555b3a22ef799"
+    },
+    {
+      "case": "all_rejected_snapshot_unchanged",
+      "input": 2000,
+      "snapshot": 4579636192261148934,
+      "digest": "a26dc3701738f73e58f7f24e2bfebda01e6f054ea400310a62a555b3a22ef799"
+    },
+    {
+      "case": "window_extract_order_and_skip_new",
+      "input": 2700,
+      "accepted": 1200,
+      "skipped_by_condition": 1200,
+      "skipped_not_matched": 300,
+      "digest": "fe39d5c03f5e3fdb0411ea4360f2a59a2e6cd5a714298eccefff5d80fa003ea6"
+    },
+    {
+      "case": "business_unchanged_no_rewrite",
+      "input": 2400,
+      "digest": "fe39d5c03f5e3fdb0411ea4360f2a59a2e6cd5a714298eccefff5d80fa003ea6"
+    },
+    {
+      "case": "duplicate_source_rejected",
+      "snapshot": 5263859294534509540
+    },
+    {
+      "case": "duplicate_target_rejected",
+      "snapshot": 5042731147662870278
+    },
+    {
+      "case": "missing_table_skip_no_create",
+      "input": 12
+    }
+  ],
+  "rest_commit_attempts": 5
+}

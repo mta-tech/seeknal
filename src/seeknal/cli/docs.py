@@ -308,6 +308,11 @@ def get_docs_cli_path() -> Path:
     Returns:
         Path to docs/cli/ directory.
     """
+    # Wheels bundle CLI topics within the package, independently of cwd.
+    bundled_docs = Path(__file__).parent.parent / "docs" / "cli"
+    if bundled_docs.exists():
+        return bundled_docs
+
     # Get the seeknal package directory and go up to project root
     # __file__ is src/seeknal/cli/docs.py
     # .parent = cli, .parent.parent = seeknal, .parent.parent.parent = src, .parent.parent.parent.parent = project root

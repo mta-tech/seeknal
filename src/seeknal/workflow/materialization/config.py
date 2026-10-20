@@ -57,6 +57,9 @@ def validate_iceberg_write_options(
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
     *,
     require_fields: bool = True,
+    when_matched_update_if: Optional[str] = None,
+    compare_columns: Optional[List[str]] = None,
+    when_not_matched: str = "insert",
 ) -> None:
     """Validate Iceberg write configuration shared by all entry points."""
     mode_value = mode.value if isinstance(mode, MaterializationMode) else mode
@@ -90,6 +93,19 @@ def validate_iceberg_write_options(
 
     validate_identifiers("unique_keys", unique_keys)
     validate_identifiers("partition_by", partition_by)
+    validate_identifiers("compare_columns", compare_columns)
+    if when_matched_update_if is not None and (
+        not isinstance(when_matched_update_if, str) or not when_matched_update_if.strip()
+    ):
+        raise ConfigurationError("when_matched_update_if must be a non-empty SQL predicate")
+    if when_not_matched not in ("insert", "skip"):
+        raise ConfigurationError("when_not_matched must be 'insert' or 'skip'")
+    if compare_columns and when_matched_update_if is None:
+        raise ConfigurationError("compare_columns requires when_matched_update_if")
+    if mode_value != "upsert" and (
+        when_matched_update_if is not None or compare_columns or when_not_matched != "insert"
+    ):
+        raise ConfigurationError("Conditional Iceberg settings require mode 'upsert'")
 
     if not isinstance(create_table, bool):
         raise ConfigurationError("create_table must be a boolean")
@@ -389,6 +405,9 @@ class MaterializationConfig:
     create_table: bool = True
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES
     table: Optional[str] = None
+    when_matched_update_if: Optional[str] = None
+    compare_columns: List[str] = field(default_factory=list)
+    when_not_matched: str = "insert"
 
     def merge_with_node_config(
         self,
@@ -416,6 +435,10 @@ class MaterializationConfig:
         node_partition_by = node_config.get("partition_by")
         node_create_table = node_config.get("create_table")
         node_max_batch_bytes = node_config.get("max_batch_bytes")
+        conditional = {
+            key: node_config.get(key, getattr(self, key))
+            for key in ("when_matched_update_if", "compare_columns", "when_not_matched")
+        }
 
         validate_iceberg_write_options(
             node_mode if node_mode is not None else self.default_mode,
@@ -432,6 +455,7 @@ class MaterializationConfig:
                 else self.max_batch_bytes
             ),
             require_fields=False,
+            **conditional,
         )
 
         # Catalog config (usually not overridden at node level)
@@ -488,6 +512,7 @@ class MaterializationConfig:
                 else self.max_batch_bytes
             ),
             table=node_table if node_table else self.table,
+            **conditional,
         )
 
     def validate(self, *, require_fields: bool = True) -> None:
@@ -504,6 +529,9 @@ class MaterializationConfig:
             create_table=self.create_table,
             max_batch_bytes=self.max_batch_bytes,
             require_fields=require_fields,
+            when_matched_update_if=self.when_matched_update_if,
+            compare_columns=self.compare_columns,
+            when_not_matched=self.when_not_matched,
         )
 
         if not self.enabled:

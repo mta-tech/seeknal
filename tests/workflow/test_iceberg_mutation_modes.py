@@ -330,3 +330,126 @@ def test_mutation_failure_categories_are_explicit():
     assert IcebergMutationError("invalid input").failure_category == "preflight_failed"
     assert IcebergCommitError("conflict", "conflict").failure_category == "conflict"
     assert IcebergCommitError("unknown", "commit_unknown").failure_category == "commit_unknown"
+
+
+@pytest.mark.parametrize("policy,expected_ids", [("insert", [1, 2, 6]), ("skip", [2, 6])])
+def test_conditional_upsert_nulls_and_skip_metrics(connection, catalog, policy, expected_ids):
+    schema = pa.schema([pa.field("id", pa.int64()), pa.field("v", pa.int64())])
+    catalog.create_namespace("analytics")
+    table = catalog.create_table("analytics.target", schema=schema)
+    table.append(pa.table({"id": [2, 3, 4, 5, 6], "v": [2, 2, 2, 2, None]}, schema=schema))
+    batch = pa.table({"id": [1, 2, 3, 4, 5, 6], "v": [1, 3, 2, 1, None, 9]}, schema=schema)
+    result = run_write(
+        connection, catalog, batch, "upsert", unique_keys=["id"],
+        when_matched_update_if="target.v IS NULL OR source.v > target.v",
+        compare_columns=["v"], when_not_matched=policy,
+    )
+    assert result.input_row_count == 6
+    assert result.row_count == len(expected_ids)
+    assert result.updated_row_count == 2
+    assert result.inserted_row_count == (policy == "insert")
+    assert result.skipped_by_condition == 3
+    assert result.skipped_not_matched == (policy == "skip")
+    actual = {row["id"]: row["v"] for row in catalog.load_table("analytics.target").scan().to_arrow().to_pylist()}
+    assert actual == {**({1: 1} if policy == "insert" else {}), 2: 3, 3: 2, 4: 2, 5: 2, 6: 9}
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_condition_binding_precedes_table_creation(connection, catalog, empty):
+    batch = arrow([] if empty else [{"id": 1, "region": "id", "value": "x", "business_date": date(2026, 10, 15)}])
+    with pytest.raises(WriteError, match="(?i)(condition|column)"):
+        run_write(connection, catalog, batch, "upsert", unique_keys=["id"],
+                  when_matched_update_if="source.value <> target.value", compare_columns=[])
+    assert catalog.list_namespaces() == []
+
+
+def test_skip_missing_table_is_noop_without_creation(connection, catalog):
+    batch = arrow([{"id": 1, "region": "id", "value": "x", "business_date": date(2026, 10, 15)}])
+    result = run_write(connection, catalog, batch, "upsert", unique_keys=["id"], when_not_matched="skip")
+    assert result.outcome == "noop"
+    assert result.input_row_count == 1
+    assert result.row_count == 0
+    assert result.skipped_not_matched == 1
+    assert catalog.list_namespaces() == []
+
+
+def test_condition_rejection_is_noop_and_preserves_input_count(connection, catalog):
+    create_table(catalog, [{"id": 1, "region": "id", "value": "current", "business_date": date(2026, 10, 15)}])
+    before = catalog.load_table("analytics.target").metadata.current_snapshot_id
+    result = run_write(connection, catalog, arrow([{"id": 1, "region": "id", "value": "old", "business_date": date(2026, 10, 14)}]),
+                       "upsert", unique_keys=["id"], when_matched_update_if="FALSE")
+    assert result.outcome == "noop"
+    assert result.row_count == 0
+    assert result.input_row_count == 1
+    assert result.skipped_by_condition == 1
+    assert catalog.load_table("analytics.target").metadata.current_snapshot_id == before
+
+
+def test_condition_helper_columns_do_not_collide_and_keys_are_quoted(connection, catalog):
+    batch = pa.table({"select": [1], "__seeknal_row_index": [99], "__seeknal_matched": [False], "v": [2]})
+    catalog.create_namespace("analytics")
+    table = catalog.create_table("analytics.target", schema=batch.schema)
+    table.append(batch)
+    result = run_write(connection, catalog, batch.set_column(3, "v", pa.array([3])), "upsert",
+                       unique_keys=["select"], compare_columns=["v"], when_matched_update_if="source.v > target.v")
+    assert result.updated_row_count == 1
+    assert catalog.load_table("analytics.target").scan().to_arrow()["__seeknal_row_index"].to_pylist() == [99]
+
+
+@pytest.mark.parametrize("condition,comparisons", [
+    ("NULL", []),
+    ("source.id < target.id", []),
+    ("source.value <> 'old'", []),
+])
+def test_null_key_only_and_source_only_conditions(connection, catalog, condition, comparisons):
+    create_table(catalog, [{"id": 1, "region": "id", "value": "current", "business_date": date(2026, 10, 15)}])
+    result = run_write(
+        connection, catalog,
+        arrow([{"id": 1, "region": "id", "value": "old", "business_date": date(2026, 10, 14)}]),
+        "upsert", unique_keys=["id"], when_matched_update_if=condition, compare_columns=comparisons,
+    )
+    assert result.outcome == "noop"
+    assert result.skipped_by_condition == 1
+
+
+def test_condition_projection_reuses_the_uniqueness_scan(connection, catalog):
+    from pyiceberg.table import Table
+
+    create_table(catalog, [{"id": 1, "region": "id", "value": "current", "business_date": date(2026, 10, 14)}])
+    original_scan = Table.scan
+    with patch.object(Table, "scan", autospec=True, side_effect=original_scan) as scan:
+        result = run_write(
+            connection, catalog,
+            arrow([{"id": 1, "region": "id", "value": "new", "business_date": date(2026, 10, 15)}]),
+            "upsert", unique_keys=["id"], compare_columns=["id", "business_date"],
+            when_matched_update_if="source.business_date > target.business_date",
+        )
+    assert result.updated_row_count == 1
+    assert scan.call_count == 1
+    assert scan.call_args.kwargs["selected_fields"] == ("id", "business_date")
+
+
+@pytest.mark.parametrize("condition", ["source IS NOT DISTINCT FROM target", "hash(source) = hash(target)"])
+def test_whole_row_predicates_do_not_observe_internal_columns(connection, catalog, condition):
+    batch = arrow([{"id": 1, "region": "id", "value": "current", "business_date": date(2026, 10, 15)}])
+    create_table(catalog, batch.to_pylist())
+    result = run_write(
+        connection, catalog, batch, "upsert", unique_keys=["id"],
+        compare_columns=["region", "value", "business_date"], when_matched_update_if=condition,
+    )
+    assert result.row_count == 1
+    assert result.skipped_by_condition == 0
+    assert result.outcome == "noop"  # Accepted but identical: PyIceberg need not rewrite it.
+
+
+def test_target_record_projection_order_matches_binding(connection, catalog):
+    batch = pa.table({"v": [2], "id": [1]})
+    catalog.create_namespace("analytics")
+    table = catalog.create_table("analytics.target", schema=batch.schema)
+    table.append(batch)
+    result = run_write(
+        connection, catalog, batch, "upsert", unique_keys=["id"], compare_columns=["v"],
+        when_matched_update_if="struct_extract_at(target, 1) = source.id",
+    )
+    assert result.row_count == 1
+    assert result.skipped_by_condition == 0

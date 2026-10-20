@@ -41,6 +41,7 @@ class RestFixtureState:
     unauthorized_requests: int = 0
     forced_commit_status: int | None = None
     concurrent_append: pa.Table | None = None
+    concurrent_upsert: pa.Table | None = None
     received_authorization: list[str | None] = field(default_factory=list)
     staged_tables: dict[tuple[str, ...], Any] = field(default_factory=dict)
 
@@ -178,6 +179,10 @@ def _make_app(state: RestFixtureState, warehouse: str) -> Starlette:
                 competing_table = state.backend.load_table(identifier)
                 competing_table.append(state.concurrent_append)
                 state.concurrent_append = None
+            if state.concurrent_upsert is not None:
+                competing_table = state.backend.load_table(identifier)
+                competing_table.upsert(state.concurrent_upsert, join_cols=["id"])
+                state.concurrent_upsert = None
             response = state.backend.commit_table(
                 stale_table,
                 requirements=tuple(payload.requirements),

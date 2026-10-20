@@ -114,6 +114,50 @@ class TestParameterResolver:
         assert result["ratio"] == 3.14
 
 
+class TestDateOverrideAnchorsFunctions:
+    """`seeknal run --date` (the "today" override) anchors every date function."""
+
+    OVERRIDES = {"date": "2026-10-12", "run_date": "2026-10-12", "today": "2026-10-12"}
+
+    def test_date_functions_follow_override(self):
+        resolver = ParameterResolver(cli_overrides=self.OVERRIDES)
+        result = resolver.resolve_string(
+            "{{ today }} {{ today(-1) }} {{ yesterday }} "
+            "{{ month_start }} {{ month_start(-1) }} {{ year_start(-1) }}"
+        )
+        assert result == "2026-10-12 2026-10-11 2026-10-11 2026-10-01 2026-09-01 2025-01-01"
+
+    def test_params_follow_override(self):
+        resolver = ParameterResolver(cli_overrides=self.OVERRIDES)
+        result = resolver.resolve({"prev_day": "{{ today(-7) }}", "y": "{{yesterday}}"})
+        assert result == {"prev_day": "2026-10-05", "y": "2026-10-11"}
+
+    def test_no_override_uses_wall_clock(self):
+        resolver = ParameterResolver()
+        expected = (date.today() - timedelta(days=1)).isoformat()
+        assert resolver.resolve_string("{{ today(-1) }}") == expected
+
+    def test_invalid_override_raises(self):
+        with pytest.raises(ValueError, match="expected YYYY-MM-DD"):
+            ParameterResolver(cli_overrides={"today": "not-a-date"})
+
+    def test_non_string_override_passes_through(self):
+        # e.g. seeknal run --params '{"limit": 5}' against a declared param
+        resolver = ParameterResolver(cli_overrides={"limit": 5})
+        assert resolver.resolve({"limit": 10}) == {"limit": 5}
+
+    def test_unknown_function_keeps_original_text(self):
+        resolver = ParameterResolver()
+        assert resolver.resolve_string("x {{ foo(1) }} y") == "x {{ foo(1) }} y"
+
+    def test_functions_accept_base_date(self):
+        base = date(2026, 3, 1)
+        assert today(-1, base_date=base) == "2026-02-28"
+        assert yesterday(base_date=base) == "2026-02-28"
+        assert month_start(-3, base_date=base) == "2025-12-01"
+        assert year_start(base_date=base) == "2026-01-01"
+
+
 class TestReservedParameterNames:
     """Test reserved parameter name collision detection."""
 

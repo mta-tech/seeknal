@@ -3,7 +3,9 @@
 .claude
 .worktrees
 tests
-docs
+docs/*
+!docs/cli
+!docs/cli/**
 qa
 dist
 *.egg-info

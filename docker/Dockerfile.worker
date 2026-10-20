@@ -31,6 +31,7 @@ RUN apt-get update \
 
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
+COPY docs/cli/ ./docs/cli/
 
 # Install Seeknal with Temporal support. Worker deployments primarily use
 # network databases, so the image intentionally skips libsql-only dependencies

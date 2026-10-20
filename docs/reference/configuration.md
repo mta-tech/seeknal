@@ -164,7 +164,9 @@ starrocks:
 
 ## Materialization Configuration
 
-Iceberg materialization settings for persisting pipeline outputs.
+Iceberg materialization settings for persisting pipeline outputs. The conditional
+options below describe the **2.13.0 integration candidate** in [draft PR #111](https://github.com/mta-tech/seeknal/pull/111).
+They are not a claim that 2.13.0 has been published.
 
 ### Profile-Level Configuration
 
@@ -203,14 +205,20 @@ materialization:
 | `catalog.verify_tls` | boolean | true | Verify TLS certificates |
 | `catalog.connection_timeout` | integer | 10 | Connection timeout in seconds |
 | `catalog.request_timeout` | integer | 30 | Request timeout in seconds |
-| `default_mode` | string | "append" | Default write mode ("append" or "overwrite") |
+| `default_mode` | string | "append" | Iceberg mode: `append`, `overwrite`, `upsert`, or `insert_overwrite` |
 | `schema_evolution.mode` | string | "safe" | Schema evolution mode ("safe", "auto", "strict") |
 | `schema_evolution.allow_column_add` | boolean | false | Allow adding new columns |
 | `schema_evolution.allow_column_type_change` | boolean | false | Allow changing column types |
 | `duckdb.iceberg_extension` | boolean | true | Load DuckDB Iceberg extension |
 | `duckdb.threads` | integer | 4 | DuckDB thread count |
 | `duckdb.memory_limit` | string | "1GB" | DuckDB memory limit |
-| `partition_by` | list | [] | Default partition columns |
+| `unique_keys` | list[string] | `[]` | Non-empty matching keys required by `upsert` |
+| `partition_by` | list[string] | `[]` | Identity partition columns required by `insert_overwrite` |
+| `create_table` | boolean | `true` | Allow advanced modes to create a missing table |
+| `max_batch_bytes` | integer | `268435456` | Maximum logical Arrow input size for advanced writes (256 MiB) |
+| `when_matched_update_if` | string or null | `null` | Optional matched-row predicate; only for `upsert` |
+| `compare_columns` | list[string] | `[]` | Extra target columns available to the predicate; requires a predicate |
+| `when_not_matched` | string | `insert` | New-key policy for `upsert`: `insert` or `skip` |
 
 ### Node-Level Configuration
 
@@ -226,6 +234,76 @@ materialization:
   partition_by:
     - order_date
 ```
+
+### Conditional Iceberg upsert defaults
+
+Profile defaults and per-target options use the same three conditional fields:
+
+```yaml
+# profiles.yml: add this block to the existing profile/catalog configuration
+materialization:
+  default_mode: upsert
+  unique_keys: [customer_id]
+  when_matched_update_if: >-
+    target.updated_at IS NULL OR source.updated_at > target.updated_at
+  compare_columns: [updated_at]
+  when_not_matched: insert
+```
+
+A target can inherit these settings or override individual fields:
+
+```yaml
+materializations:
+  - type: iceberg
+    table: atlas.analytics.customers
+    mode: upsert
+    unique_keys: [customer_id]
+    when_not_matched: skip
+```
+
+`source` exposes the complete incoming row. `target` exposes the unique keys
+plus the declared `compare_columns`. A matched row is accepted only when the
+predicate is **true**; false and SQL NULL preserve its existing target row.
+New keys follow `when_not_matched` independently of the predicate. Omit the
+predicate for ordinary whole-row upsert behavior. Input keys must be unique,
+non-null and finite within the batch; deduplicate source rows before writing.
+
+Node/target fields take precedence over profile defaults. An omitted conditional
+field inherits its profile value. To remove an inherited predicate in a YAML
+or dictionary target, clear the predicate and its comparison columns together:
+
+```yaml
+materializations:
+  - type: iceberg
+    table: atlas.analytics.customers
+    mode: upsert
+    when_matched_update_if: null
+    compare_columns: []
+    when_not_matched: insert
+```
+
+The public Python `seeknal.pipeline.materialization_config.MaterializationConfig`
+keeps the same fields through decorator discovery. Its `None` values are omitted
+when converted to a dictionary, so `None` means **inherit**, not explicit clearing.
+Use the dictionary/YAML form above to clear a profile predicate. Explicit `[]`
+and `"insert"` remain overrides in the typed Python form.
+
+For dispatcher writes, catalog endpoint and warehouse resolution is:
+
+1. Per-target `catalog_uri` / `warehouse`.
+2. Profile `materialization.catalog.uri` / `warehouse`.
+3. Profile `source_defaults.iceberg.catalog_uri` / `warehouse`.
+4. Environment fallback (`LAKEKEEPER_URI`, then `LAKEKEEPER_URL`; `LAKEKEEPER_WAREHOUSE`).
+
+Write results expose `input_row_count` (before the conditional filter),
+`row_count` (accepted input), `inserted_row_count`, `updated_row_count`,
+`skipped_by_condition`, and `skipped_not_matched`. Accepted but identical rows
+can still produce a `noop`. Predicate rejection and empty upsert batches do not
+publish a replacement snapshot. A conflicting or uncertain commit is surfaced
+without automatic retry; inspect the table state before retrying a run yourself.
+
+See [Conditional Iceberg upsert](../cli/iceberg-upsert.md) for version ordering,
+NULL examples, missing-table behavior, and `seeknal docs iceberg-upsert`.
 
 ## Environment Variables
 
@@ -257,9 +335,17 @@ Environment variables provide flexible configuration, especially for sensitive v
 
 | Variable | Description | Usage |
 |----------|-------------|-------|
-| `LAKEKEEPER_URI` | Lakekeeper REST catalog endpoint | Reference in profiles.yml with `${LAKEKEEPER_URI}` |
+| `LAKEKEEPER_URI` | Canonical Lakekeeper REST catalog endpoint | Preferred environment fallback across source, materialization, REPL, preview and snapshot metadata paths |
+| `LAKEKEEPER_URL` | Backward-compatible catalog endpoint alias | Used only when `LAKEKEEPER_URI` is unset, empty, or whitespace-only |
 | `LAKEKEEPER_TOKEN` | Lakekeeper bearer token (optional) | Reference in profiles.yml with `${LAKEKEEPER_TOKEN}` |
 | `LAKEKEEPER_WAREHOUSE` | Warehouse path (alternative to profiles.yml) | Direct environment variable access |
+
+When both endpoint variables have non-empty values, `LAKEKEEPER_URI` wins.
+This changes the old Iceberg source behavior if the variables point to different
+catalogs: align the values before upgrading. Explicit per-source/per-target or
+profile endpoints still take precedence over environment fallback. Catalog URI
+lookup accepts the two names above; arbitrary `${VAR}` placeholders elsewhere
+in a profile still resolve the variable they name.
 
 ### Application Configuration Overrides
 

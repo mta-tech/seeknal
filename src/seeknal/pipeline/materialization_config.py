@@ -18,6 +18,7 @@ class MaterializationConfig:
 
     This configures Iceberg table materialization for pipeline nodes.
     Configuration priority: Decorator > YAML > Profile > Defaults
+    None values are omitted so lower-priority defaults remain active.
 
     Args:
         enabled: Enable/disable materialization (None uses lower-priority config)
@@ -28,6 +29,9 @@ class MaterializationConfig:
         unique_keys: Key columns required by upsert
         partition_by: Identity partition columns required by insert_overwrite
         max_batch_bytes: Maximum logical Arrow batch size for advanced modes
+        when_matched_update_if: SQL predicate required to accept matched rows
+        compare_columns: Additional target columns exposed to the predicate
+        when_not_matched: Insert new keys or skip them
 
     Example:
         from seeknal.pipeline.materialization_config import MaterializationConfig
@@ -63,6 +67,9 @@ class MaterializationConfig:
     unique_keys: Optional[list[str]] = None
     partition_by: Optional[list[str]] = None
     max_batch_bytes: Optional[int] = None
+    when_matched_update_if: Optional[str] = None
+    compare_columns: Optional[list[str]] = None
+    when_not_matched: Optional[str] = None
 
     # schema_evolution: Optional[str] = None  # "safe", "auto", "strict"
 
@@ -81,6 +88,9 @@ class MaterializationConfig:
                 ("unique_keys", self.unique_keys),
                 ("partition_by", self.partition_by),
                 ("max_batch_bytes", self.max_batch_bytes),
+                ("when_matched_update_if", self.when_matched_update_if),
+                ("compare_columns", self.compare_columns),
+                ("when_not_matched", self.when_not_matched),
             ] if v is not None
         }
 

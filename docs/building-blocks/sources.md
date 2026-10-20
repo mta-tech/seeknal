@@ -77,7 +77,7 @@ params:
 ```
 
 The `table` must use 3-part format: `catalog.namespace.table`. Connection details:
-- `catalog_uri`: Lakekeeper URL (or set `LAKEKEEPER_URL` env var)
+- `catalog_uri`: Lakekeeper URL (or set the `LAKEKEEPER_URI` env var; `LAKEKEEPER_URL` is accepted as an alias)
 - `warehouse`: Warehouse name (default: `seeknal-warehouse`, or set `LAKEKEEPER_WAREHOUSE` env var)
 
 S3 and OAuth2 credentials are read from environment variables:
