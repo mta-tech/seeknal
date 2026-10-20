@@ -8,6 +8,7 @@ WORKDIR /build
 # Copy source for local install
 COPY pyproject.toml README.md ./
 COPY src/ src/
+COPY docs/cli/ docs/cli/
 
 # Pin prefect version to match your server (override at build time if needed)
 ARG PREFECT_VERSION=3.6.13

@@ -207,8 +207,9 @@ nav:
       - Deployment: semantic-layer/deployment.md
       - Querying: semantic-layer/querying.md
   - Reference:
-      - 2.13.0 Candidate Notes: releases/2.13.0.md
-      - Upgrade to 2.13.0 Candidate: cli/upgrade.md
+      - 2.13.1 Patch Candidate: releases/2.13.1.md
+      - 2.13.0 Release Notes: releases/2.13.0.md
+      - Upgrade to 2.13.x: cli/upgrade.md
       - CLI Commands: reference/cli.md
       - YAML Schema: reference/yaml-schema.md
       - Configuration: reference/configuration.md

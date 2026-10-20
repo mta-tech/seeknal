@@ -184,7 +184,7 @@ seeknal run --date 2026-10-12 --params '{"region": "US"}'
 A node reruns when its resolved functional configuration changes. Python
 decorator parameters and feature-group/SOA parameters participate in that
 fingerprint; undeclared Python CLI keys do not invalidate every Python node.
-Expect a one-time rerun when moving an existing project to the 2.13.0 candidate.
+Expect a one-time rerun when moving a pre-2.13.0 project to 2.13.x.
 
 ## Empty SQL outputs and materialization
 
@@ -219,7 +219,7 @@ Use `seeknal entity list` and `seeknal entity show` to inspect consolidated enti
 
 ## See Also
 
-- [2.13.0 upgrade guidance](upgrade.md) - Evaluate the unreleased candidate
+- [2.13.x upgrade guidance](upgrade.md) - Migrate existing pipeline configuration
 - [Conditional Iceberg upsert](iceberg-upsert.md) - Protect matched rows from older versions or backfills
 - [seeknal plan](plan.md) - Preview changes and execution plan
 - [seeknal validate](validate.md) - Validate configuration

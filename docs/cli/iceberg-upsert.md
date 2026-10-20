@@ -8,8 +8,8 @@ related:
 
 # Conditional Iceberg upsert
 
-These conditional options are part of the unreleased 2.13.0 integration
-candidate in [draft PR #111](https://github.com/mta-tech/seeknal/pull/111).
+These conditional options are available starting with
+[2.13.0](../releases/2.13.0.md).
 See [upgrade guidance](upgrade.md) before moving an existing 2.12.1 project.
 
 Use `mode: upsert` with explicit `unique_keys` to replace matched rows and
@@ -213,7 +213,7 @@ limits the original Arrow input, not total join/writer working memory.
 
 Advanced writes require PyIceberg 0.10+ at runtime. The large macOS ARM
 composite-key scan crash is still unresolved although the same workload
-passes Linux CI. See the [candidate verification notes](../releases/2.13.0.md#known-limits)
+passes Linux CI. See the [2.13.0 verification notes](../releases/2.13.0.md#known-limits)
 for the tested versions and platform boundary.
 
 ## See also
