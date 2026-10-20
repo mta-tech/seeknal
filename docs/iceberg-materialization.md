@@ -2,9 +2,9 @@
 
 This guide covers using Apache Iceberg table format for materializing Seeknal pipeline outputs, including append, full-table replacement, key-based upsert, and dynamic partition replacement.
 
-Conditional predicates and skip reporting described here belong to the
-unreleased [2.13.0 integration candidate](releases/2.13.0.md). Start with the
-[upgrade guide](cli/upgrade.md) when evaluating it from 2.12.1.
+Conditional predicates and skip reporting described here are available starting
+with [2.13.0](releases/2.13.0.md). Start with the
+[upgrade guide](cli/upgrade.md) when upgrading from 2.12.1.
 
 ## Overview
 

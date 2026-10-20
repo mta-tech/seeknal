@@ -993,8 +993,8 @@ tags:
 ## Materialization
 
 Materialization enables persisting transform outputs as Apache Iceberg tables.
-The conditional fields below are part of the **2.13.0 integration candidate** in
-[draft PR #111](https://github.com/mta-tech/seeknal/pull/111), pending release.
+The conditional fields below are available starting with
+[2.13.0](../releases/2.13.0.md).
 
 !!! warning "DuckDB HUGEINT Compatibility"
     DuckDB returns `HUGEINT` for `COUNT(*)` and `SUM()` by default, which Iceberg does not support. Always cast aggregation results in transforms that write to Iceberg:
@@ -1316,7 +1316,7 @@ my-project/
 
 ---
 
-**Last Updated:** October 2026 (2.13.0 integration candidate)
+**Last Updated:** October 2026 (2.13.0)
 
 
 ---

@@ -165,8 +165,7 @@ starrocks:
 ## Materialization Configuration
 
 Iceberg materialization settings for persisting pipeline outputs. The conditional
-options below describe the **2.13.0 integration candidate** in [draft PR #111](https://github.com/mta-tech/seeknal/pull/111).
-They are not a claim that 2.13.0 has been published.
+options below are available starting with [2.13.0](../releases/2.13.0.md).
 
 ### Profile-Level Configuration
 

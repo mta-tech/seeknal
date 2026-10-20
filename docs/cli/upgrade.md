@@ -1,5 +1,5 @@
 ---
-summary: Evaluate the unreleased 2.13.0 integration and migrate existing pipeline configuration
+summary: Upgrade to Seeknal 2.13.x and migrate existing pipeline configuration
 read_when: You are upgrading a 2.12.1 project or checking conditional Iceberg backfill behavior
 related:
   - run
@@ -7,15 +7,15 @@ related:
   - docs
 ---
 
-# Upgrading to the 2.13.0 candidate
+# Upgrading to 2.13.x
 
-2.13.0 is an **unreleased integration candidate** in
-[draft PR #111](https://github.com/mta-tech/seeknal/pull/111), based on 2.12.1.
-The branch has 2.13.0 package metadata; this does not mean a 2.13.0 release or
-PyPI upload exists. Evaluate a wheel built from the candidate or an isolated
-source checkout. `pip install seeknal` continues to select a published package.
+2.13.0 was [released on 2026-10-20](https://github.com/mta-tech/seeknal/releases/tag/v2.13.0),
+based on 2.12.1. This branch prepares the unreleased 2.13.1 patch, which changes
+version metadata and release documentation without runtime or dependency changes.
+No additional configuration migration is required from 2.13.0 to this patch.
+`pip install seeknal` continues to select a published package.
 
-Read this guide from a candidate installation with `seeknal docs upgrade`.
+Read this guide from an installation with `seeknal docs upgrade`.
 This topic does not add an upgrade command.
 
 ## 1. Align catalog environment variables
@@ -139,4 +139,4 @@ seeknal docs --json upgrade
 Advanced Iceberg writes require PyIceberg 0.10+ at runtime. Conditional joins
 can use more memory than the input batch cap. The 2,400-row macOS ARM native
 crash remains unresolved although that case passes Linux CI. Consult the
-[candidate notes](../releases/2.13.0.md) for tested versions and validation limits.
+[2.13.0 release notes](../releases/2.13.0.md) for tested versions and validation limits.

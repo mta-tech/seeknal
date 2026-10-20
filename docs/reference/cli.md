@@ -353,13 +353,13 @@ seeknal run --env dev
 seeknal run --env dev --parallel
 ```
 
-In the unreleased 2.13.0 candidate, date functions such as
+Starting with 2.13.0, date functions such as
 `{{ today(-1) }}` follow `--date`, source paths are templated, and Python
 decorator parameters reach `ctx.params`. Resolved functional parameters
 affect caching; an empty SQL SELECT publishes a typed empty intermediate
 instead of keeping an earlier run's rows. See the
 [run topic](../cli/run.md#parameters), [conditional Iceberg upsert](../cli/iceberg-upsert.md),
-and [candidate upgrade guide](../cli/upgrade.md) for details.
+and [upgrade guide](../cli/upgrade.md) for details.
 
 **See Also:** [Pipeline Tutorial](../tutorials/yaml-pipeline-tutorial.md)
 

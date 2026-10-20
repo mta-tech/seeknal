@@ -5,16 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.13.0] - Unreleased
+## [2.13.1] - Unreleased
 
-Integration candidate in [draft PR #111](https://github.com/mta-tech/seeknal/pull/111),
-based on 2.12.1. No 2.13.0 release date is assigned. See the
-[candidate notes](docs/releases/2.13.0.md) and [upgrade guide](docs/cli/upgrade.md).
+### Changed
+- Bump package and lock metadata to 2.13.1, with no runtime or dependency changes from 2.13.0.
+- Update release and upgrade documentation to reflect the published 2.13.0 baseline. See the [unreleased patch notes](docs/releases/2.13.1.md).
+
+## [2.13.0] - 2026-10-20
+
+Released from [PR #111](https://github.com/mta-tech/seeknal/pull/111).
+See the [release notes](docs/releases/2.13.0.md) and [upgrade guide](docs/cli/upgrade.md).
 
 ### Added
 - Conditional Iceberg upserts with `when_matched_update_if`, declared target `compare_columns`, and independent `when_not_matched: insert|skip` across profiles, YAML, decorators, and feature-store output. False or NULL predicates preserve existing rows; skipped-row metrics appear in materialization results and run state.
 - Bundled `seeknal docs iceberg-upsert` guidance, including version ordering, backfills, defaults, and synthetic verification examples. Installed CLI documentation is included in wheel/sdist and takes precedence over the current project's docs.
-- `seeknal docs upgrade` covers 2.12.1-to-candidate migration, configuration precedence, changed rerun behavior, and compatibility limits.
+- `seeknal docs upgrade` covers 2.12.1-to-2.13.0 migration, configuration precedence, changed rerun behavior, and compatibility limits.
 
 ### Fixed
 - Contain broker-supplied tenant and session identifiers within their storage directories, rejecting malformed, absolute, traversal, and symlink paths resolving to or outside the storage base in session and pairing stores.
