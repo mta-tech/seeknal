@@ -93,6 +93,7 @@ PYTHONPATH=src:. .venv/bin/python tools/validate_dependency_real_data.py \
 | Ask suite + Iceberg mutation/config/REST regressions | 1,419 passed, 67 skipped, 22 warnings |
 | Optional Prefect regression suite | 32 passed, 3 skipped |
 | Public real-data workload on main and candidate | Passed with identical assertions |
+| Mac CI suite excluding the native-crashing module | 5,009 passed, 75 skipped, 23 warnings (450.50 seconds) |
 | Full Mac CI command / large synthetic conditional-upsert test | Native illegal-instruction exit 132; reproduced on unchanged main |
 | Gateway Docker build and runtime imports | Passed; installs patched versions independently of the lock |
 | Worker Docker build | Passed |
@@ -100,7 +101,10 @@ PYTHONPATH=src:. .venv/bin/python tools/validate_dependency_real_data.py \
 | Non-executing fsspec template introspection | Old version exposes a module name; patched version does not generate that reference |
 
 The Mac native crash is an existing limitation, not a passing test. The four-test
-synthetic end-to-end module is evaluated separately on Linux. Spark-specific tests
+synthetic end-to-end module remains part of remote Linux CI. A local Linux test
+container and worker runtime container stayed in Docker `Created` state with no
+process started; those local executions are unrun, not passed. Both image builds
+completed; gateway runtime imports/version inspection completed. Spark-specific tests
 and external-provider QA are skipped when their optional infrastructure is absent.
 No live Lakekeeper, production cloud IAM, real provider inference, or Windows
 execution is claimed. The bounded dataset verifies correctness, not throughput.
