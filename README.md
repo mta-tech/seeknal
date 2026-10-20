@@ -171,9 +171,12 @@ Supports Google Gemini (default), OpenAI-compatible providers, Anthropic-compati
 
 ### 2.13.1 patch candidate (unreleased)
 
-- Bump package and lock metadata to 2.13.1 and correct stale release labels.
-  Runtime behavior and dependency versions are unchanged from 2.13.0.
-  See the [patch notes](docs/releases/2.13.1.md).
+- Enforce patched dependency floors and refresh the required lock closure,
+  retaining pydantic-ai 1.x compatibility.
+- Include CLI docs in Prefect and gateway image builds; enforce the patched
+  aiohttp floor in gateway/worker installs.
+- Bump package metadata and correct stale release labels. See the
+  [patch notes](docs/releases/2.13.1.md) for included changes and validation limits.
 
 ### 2.13.0 (October 2026)
 

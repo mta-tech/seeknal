@@ -8,8 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [2.13.1] - Unreleased
 
 ### Changed
-- Bump package and lock metadata to 2.13.1, with no runtime or dependency changes from 2.13.0.
+- Bump package and lock metadata to 2.13.1 and consolidate the committed patches from PRs #112 and #113.
+- Enforce patched dependency floors for pydantic-ai-slim (1.107.4, retaining the 1.x cap), fsspec/s3fs (2026.6.0), aiohttp (3.14.4), multidict (6.9.1), Mako (1.4.2), and optional Prefect's Apprise (1.11.0). Refresh their required lock closure and enforce the aiohttp floor in gateway/worker image installs.
 - Update release and upgrade documentation to reflect the published 2.13.0 baseline. See the [unreleased patch notes](docs/releases/2.13.1.md).
+
+### Fixed
+- Include CLI documentation in Prefect and gateway Docker build contexts so Hatch can package the wheel's required documentation files.
 
 ## [2.13.0] - 2026-10-20
 

@@ -1,0 +1,90 @@
+{
+  "baseline_commit": "9211d60",
+  "candidate": {
+    "source": "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/penguins.csv",
+    "sha256": "e07636bd8af74260099ea2f8678e2eabbf35def579940cc76f67061ee16c06c1",
+    "bytes": 13478,
+    "rows": 344,
+    "columns": 7,
+    "s3_objects": 17,
+    "iceberg": {
+      "initial_inserts": 300,
+      "new_inserts": 44,
+      "equal_skips": 300,
+      "newer_updates": 20,
+      "older_skips": 20,
+      "noop_snapshot_unchanged": true,
+      "readers": [
+        "PyIceberg FsspecFileIO",
+        "DuckDB iceberg_scan"
+      ],
+      "exact_rows_equal": true
+    },
+    "agent_and_callback": {
+      "species_counts": {
+        "Adelie": 152,
+        "Chinstrap": 68,
+        "Gentoo": 124
+      },
+      "agent_sql_tool_calls": 1,
+      "model": "local FunctionModel; no provider requests",
+      "temporal": "real dev server, workflow and activity; deterministic stream boundary",
+      "callback_events": 2
+    },
+    "versions": {
+      "s3fs": "2026.6.0",
+      "fsspec": "2026.6.0",
+      "aiohttp": "3.14.4",
+      "multidict": "6.9.1",
+      "pydantic-ai-slim": "1.107.4",
+      "Mako": "1.4.2",
+      "apprise": "1.11.0",
+      "duckdb": "1.4.4",
+      "pyiceberg": "0.10.0"
+    }
+  },
+  "baseline": {
+    "source": "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/penguins.csv",
+    "sha256": "e07636bd8af74260099ea2f8678e2eabbf35def579940cc76f67061ee16c06c1",
+    "bytes": 13478,
+    "rows": 344,
+    "columns": 7,
+    "s3_objects": 17,
+    "iceberg": {
+      "initial_inserts": 300,
+      "new_inserts": 44,
+      "equal_skips": 300,
+      "newer_updates": 20,
+      "older_skips": 20,
+      "noop_snapshot_unchanged": true,
+      "readers": [
+        "PyIceberg FsspecFileIO",
+        "DuckDB iceberg_scan"
+      ],
+      "exact_rows_equal": true
+    },
+    "agent_and_callback": {
+      "species_counts": {
+        "Adelie": 152,
+        "Chinstrap": 68,
+        "Gentoo": 124
+      },
+      "agent_sql_tool_calls": 1,
+      "model": "local FunctionModel; no provider requests",
+      "temporal": "real dev server, workflow and activity; deterministic stream boundary",
+      "callback_events": 2
+    },
+    "versions": {
+      "s3fs": "2026.1.0",
+      "fsspec": "2026.1.0",
+      "aiohttp": "3.13.5",
+      "multidict": "6.7.0",
+      "pydantic-ai-slim": "1.87.0",
+      "Mako": "1.3.10",
+      "apprise": "1.9.7",
+      "duckdb": "1.4.4",
+      "pyiceberg": "0.10.0"
+    }
+  },
+  "same_functional_assertions": true
+}

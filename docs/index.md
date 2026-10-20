@@ -8,7 +8,8 @@ Seeknal is an all-in-one platform for data and AI/ML engineering. Define transfo
     This branch prepares an unreleased patch based on the released 2.13.0.
     Start with the [patch notes](releases/2.13.1.md),
     [2.13.0 release notes](releases/2.13.0.md), and
-    [upgrade guide](cli/upgrade.md). Runtime behavior is unchanged from 2.13.0.
+    [upgrade guide](cli/upgrade.md). The patch combines dependency updates and
+    Docker packaging fixes; the recorded macOS ARM native crash remains unresolved.
 
 ---
 

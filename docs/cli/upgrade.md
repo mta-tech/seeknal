@@ -10,10 +10,16 @@ related:
 # Upgrading to 2.13.x
 
 2.13.0 was [released on 2026-10-20](https://github.com/mta-tech/seeknal/releases/tag/v2.13.0),
-based on 2.12.1. This branch prepares the unreleased 2.13.1 patch, which changes
-version metadata and release documentation without runtime or dependency changes.
+based on 2.12.1. This branch prepares the unreleased 2.13.1 patch, combining
+dependency security floors and Docker packaging fixes. See the
+[patch notes](../releases/2.13.1.md) for included versions and validation limits.
 No additional configuration migration is required from 2.13.0 to this patch.
 `pip install seeknal` continues to select a published package.
+
+The optional Prefect extra requires Apprise 1.11.0 or newer. Its redirect
+controls do not disable redirects by default; deployments with untrusted
+notification destinations must explicitly configure `redirect=no` or
+`AppriseAsset(http_redirects=False)`.
 
 Read this guide from an installation with `seeknal docs upgrade`.
 This topic does not add an upgrade command.
