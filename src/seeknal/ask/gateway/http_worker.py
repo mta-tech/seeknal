@@ -66,6 +66,10 @@ class HttpWorkerBroker:
         self._pending: list[HttpWorkerItem] = []
         self._inflight: dict[str, HttpWorkerItem] = {}
         self._futures: dict[str, asyncio.Future[HttpWorkerResult]] = {}
+        # Event-idempotency ledger (GW1): with at-least-once worker delivery,
+        # a replayed POST (server accepted the request, response was lost)
+        # must not double-publish to SSE. Scoped to in-flight work only.
+        self._seen_events: dict[str, set[str]] = {}
 
     async def reset(self) -> None:
         """Clear broker state. Intended for tests and controlled shutdown."""
@@ -76,6 +80,7 @@ class HttpWorkerBroker:
             self._pending.clear()
             self._inflight.clear()
             self._futures.clear()
+            self._seen_events.clear()
             self._condition.notify_all()
 
     async def enqueue_and_wait(
@@ -128,6 +133,7 @@ class HttpWorkerBroker:
                     if item.tenant_id == tenant_id:
                         claimed = self._pending.pop(index)
                         self._inflight[claimed.work_id] = claimed
+                        self._seen_events[claimed.work_id] = set()
                         return claimed
 
                 remaining = deadline - time.monotonic()
@@ -151,6 +157,7 @@ class HttpWorkerBroker:
             if item is None or item.tenant_id != tenant_id:
                 return False
             self._inflight.pop(work_id, None)
+            self._seen_events.pop(work_id, None)
             future = self._futures.pop(work_id, None)
             if future is not None and not future.done():
                 future.set_result(result)
@@ -169,6 +176,7 @@ class HttpWorkerBroker:
         async with self._condition:
             self._pending = [item for item in self._pending if item.work_id != work_id]
             self._inflight.pop(work_id, None)
+            self._seen_events.pop(work_id, None)
             future = self._futures.pop(work_id, None)
             if future is not None and not future.done():
                 future.cancel()
@@ -181,6 +189,30 @@ class HttpWorkerBroker:
             if item is not None and item.tenant_id == tenant_id:
                 return item
             return None
+
+    async def mark_event_seen(
+        self,
+        *,
+        work_id: str,
+        tenant_id: str,
+        event_id: str,
+    ) -> bool:
+        """Record ``event_id`` for an in-flight work item.
+
+        Returns ``True`` the first time the id is seen (publish it) and
+        ``False`` on replay (suppress — a retry of an already-delivered
+        event). Missing id / unknown work behave like ``owns()``: unknown
+        work yields ``False``; that is safe because the caller 404s it.
+        """
+        async with self._condition:
+            item = self._inflight.get(work_id)
+            if item is None or item.tenant_id != tenant_id:
+                return False
+            seen = self._seen_events.setdefault(work_id, set())
+            if event_id in seen:
+                return False
+            seen.add(event_id)
+            return True
 
 
 http_worker_broker = HttpWorkerBroker()

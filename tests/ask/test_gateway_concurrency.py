@@ -86,6 +86,69 @@ async def _single_answer():
     yield {"type": "answer", "data": "ok"}
 
 
+# ---------------------------------------------------------------------------
+# Generator lifecycle (GW1): no terminal yield inside `finally`
+# ---------------------------------------------------------------------------
+
+
+async def _two_events_slow(*_args, **_kwargs):
+    yield {"type": "token", "data": "one"}
+    await asyncio.sleep(0.2)
+    yield {"type": "answer", "data": "two"}
+
+
+async def _collect_one_then_close():
+    """Consume exactly one event, then abandon (aclose) the generator."""
+    agen = _run_agent_streaming(Path("/tmp/does-not-matter"), "s1", "question")
+    events: list[dict] = []
+    async for event in agen:
+        events.append(event)
+        break
+    await agen.aclose()
+    return events
+
+
+@pytest.mark.asyncio
+async def test_aclose_after_first_event_releases_session_lock(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Closing a half-consumed stream must release the session lock.
+
+    Regression for GW1/G2: `_run_agent_streaming` used to yield `done` from a
+    `finally` block. When a consumer closed the generator mid-stream, Python
+    re-raised `GeneratorExit` at that terminal yield as
+    `RuntimeError: async generator ignored GeneratorExit` and truncated the
+    `_session_lock_context` before release — leaving `_session_locks[...]
+    locked() == True` for the rest of the idle-TTL (30 min). Today's
+    production logs show exactly that RuntimeError (`seeknal-neo.log`).
+    """
+    monkeypatch.setattr("seeknal.ask.gateway.server._run_agent_inner", _two_events_slow)
+    from seeknal.ask.gateway.server import _get_session_lock
+
+    events = await _collect_one_then_close()
+
+    assert events and events[0]["type"] == "token"
+    assert not _get_session_lock("s1").locked(), (
+        "session lock stayed held after the stream was closed mid-turn"
+    )
+
+
+@pytest.mark.asyncio
+async def test_second_turn_can_start_after_half_consumed_stream(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The session's next turn must not block on a leaked lock (GW1 P1 core)."""
+    monkeypatch.setattr("seeknal.ask.gateway.server._run_agent_inner", _two_events_slow)
+    from seeknal.ask.gateway.server import _get_session_lock
+
+    await _collect_one_then_close()
+
+    lock = _get_session_lock("s1")
+    # If the lock were still held this would time out with TimeoutError.
+    await asyncio.wait_for(lock.acquire(), timeout=1.0)
+    lock.release()
+
+
 def test_cancel_session_endpoint(tmp_path: Path):
     pytest.importorskip("starlette")
     from starlette.testclient import TestClient

@@ -5,14 +5,70 @@ Starts the seeknal ask HTTP gateway (WebSocket + SSE + REST + Telegram + Tempora
 
 from __future__ import annotations
 
+import logging
 import os
-from contextlib import asynccontextmanager
+import random
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 import typer
 
 from seeknal.ask.project import find_project_path
+
+logger = logging.getLogger(__name__)
+
+# --- Event/completion delivery retry policy (GW1) ---------------------------
+# One transient DNS/connect blip must never kill an in-flight turn: the LLM
+# cost is already spent by the time events stream back. See
+# iba-deploy-runbook/specs/2026-10-21-spec-gw1-seeknal-ask-limits-gateway-resilience.md
+_EVENT_MAX_ATTEMPTS = 3
+_EVENT_RETRY_BASE_S = 0.5
+_EVENT_RETRY_CAP_S = 30.0
+_TERMINAL_MAX_ATTEMPTS = 2
+
+# --- Polling retry policy (GW1) --------------------------------------------
+_POLL_RETRY_BASE_S = 2.0
+_POLL_RETRY_CAP_S = 30.0
+_POLL_LOG_VERBOSE_ATTEMPTS = 3
+
+_EVENT_ID_HEADER = "X-Seeknal-Event-Id"
+
+
+def _retry_jitter() -> float:
+    """Multiplicative jitter (1.0..1.25) applied to retry sleeps.
+
+    Module-level so tests can pin it to 1.0 for deterministic assertions.
+    """
+    return 1.0 + random.random() * 0.25
+
+
+def _retry_after_seconds(response) -> Optional[float]:
+    """Extract a capped Retry-After hint from a 429/5xx response, if any."""
+    try:
+        raw = response.headers.get("retry-after")
+    except AttributeError:
+        return None
+    if not raw:
+        return None
+    try:
+        return max(0.0, min(float(raw.strip()), _EVENT_RETRY_CAP_S))
+    except (TypeError, ValueError):
+        return None
+
+
+def _poll_retry_delay(attempt: int) -> float:
+    """Exponential poll backoff: 2,4,8,… capped, with jitter."""
+    delay = min(_POLL_RETRY_CAP_S, _POLL_RETRY_BASE_S * 2 ** max(attempt - 1, 0))
+    return delay * _retry_jitter()
+
+
+def _log_poll_failure(attempt: int, message: str) -> None:
+    """WARNING for the first few poll failures, DEBUG after that (log-storm control)."""
+    if attempt <= _POLL_LOG_VERBOSE_ATTEMPTS:
+        logger.warning("%s", message)
+    else:
+        logger.debug("%s (attempt=%d)", message, attempt)
 
 gateway_app = typer.Typer(
     name="gateway",
@@ -438,80 +494,242 @@ async def _process_http_work_item(
     answer = ""
     error: Optional[str] = None
     event_count = 0
+    event_seq = 0
+    dropped_events = 0
+    terminal_sent = False
 
     class _WorkVanished(Exception):
         """Gateway no longer knows this work (404/410) — stop streaming."""
 
+    async def _post_with_retry(
+        url: str,
+        *,
+        json_body: dict,
+        extra_headers: Optional[dict] = None,
+        timeout: float = 15.0,
+        abort_on_gone: bool = True,
+        max_attempts: int = _EVENT_MAX_ATTEMPTS,
+        base_delay: float = _EVENT_RETRY_BASE_S,
+    ) -> Optional[object]:
+        """POST with transient-failure retry (GW1 §3.3).
+
+        Per-attempt classification:
+          - 2xx            → success (response returned)
+          - 404/410        → work already discarded by the gateway; raises
+                             ``_WorkVanished`` when ``abort_on_gone`` (the
+                             streaming path must stop burning LLM tokens),
+                             logs at debug otherwise (the completion path).
+          - 429 / 5xx      → retried, honouring ``Retry-After`` when present.
+          - other 4xx      → logged, returned without retry.
+          - network errors → retried; on exhaustion the LAST response (or
+                             ``None``) is returned — the caller decides
+                             whether that is fatal. The turn is never aborted
+                             by a delivery failure alone.
+
+        ``extra_headers`` must carry the idempotency key (``X-Seeknal-Event-Id``)
+        for any delivery that may be replayed after server-side acceptance.
+        """
+        nonlocal dropped_events
+        delay = base_delay
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await client.post(
+                    url,
+                    headers={**headers, **(extra_headers or {})},
+                    json=json_body,
+                    timeout=timeout,
+                )
+                last_exc = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — httpx.RequestError/timeout/DNS/OSError
+                last_exc = exc
+                if attempt < max_attempts:
+                    logger.warning(
+                        "[work=%s session=%s] delivery attempt=%d/%d failed: %s:%s",
+                        short_id, session_id, attempt, max_attempts,
+                        type(exc).__name__, exc,
+                    )
+                    await asyncio.sleep(
+                        min(delay, _EVENT_RETRY_CAP_S) * _retry_jitter()
+                    )
+                    delay *= 2
+                    continue
+                logger.exception(
+                    "[work=%s session=%s] delivery failed permanently after %d attempts — "
+                    "continuing turn (event dropped)",
+                    short_id, session_id, max_attempts,
+                )
+                dropped_events += 1
+                return None
+            status = response.status_code
+            if status in (404, 410):
+                if abort_on_gone:
+                    raise _WorkVanished(
+                        f"gateway no longer knows work {work_id} "
+                        f"(HTTP {status}) after {event_count} events"
+                    )
+                logger.debug(
+                    "[work=%s session=%s] gateway already discarded work (HTTP %d)",
+                    short_id, session_id, status,
+                )
+                return response
+            if 200 <= status < 300:
+                return response
+            if status == 429 or status >= 500:
+                if attempt < max_attempts:
+                    retry_after = _retry_after_seconds(response)
+                    server_hint = (
+                        f" (Retry-After={retry_after:.0f}s)" if retry_after is not None else ""
+                    )
+                    logger.warning(
+                        "[work=%s session=%s] gateway %d on attempt=%d/%d%s — retrying",
+                        short_id, session_id, status, attempt, max_attempts, server_hint,
+                    )
+                    await asyncio.sleep(
+                        (retry_after if retry_after is not None else delay)
+                        * _retry_jitter()
+                    )
+                    delay *= 2
+                    continue
+                logger.warning(
+                    "[work=%s session=%s] gateway %d persisted after %d attempts — "
+                    "event dropped",
+                    short_id, session_id, status, max_attempts,
+                )
+                dropped_events += 1
+                return response
+            logger.warning(
+                "[work=%s session=%s] gateway returned HTTP %d — not retryable, event dropped",
+                short_id, session_id, status,
+            )
+            dropped_events += 1
+            return response
+        return None
+
     async def post_event(event: dict) -> object:
-        return await client.post(
+        nonlocal event_seq
+        event_seq += 1
+        return await _post_with_retry(
             f"{base_url}/internal/worker/work/{work_id}/event",
-            headers=headers,
-            json=event,
-            timeout=15.0,
+            json_body=event,
+            extra_headers={_EVENT_ID_HEADER: f"{work_id}:{event_seq}"},
         )
+
+    async def _send_terminal_best_effort(*terminal_events: dict) -> None:
+        """Short, capped delivery of terminal error/done events; never raises.
+
+        During shutdown cancellation the task sits in a cancelled frame —
+        per-attempt CancelledError is swallowed so the ORIGINAL error is
+        never masked by delivery mechanics.
+        """
+        nonlocal event_seq, dropped_events
+        for terminal_event in terminal_events:
+            event_seq += 1
+            extra_headers = {_EVENT_ID_HEADER: f"{work_id}:{event_seq}"}
+            for attempt in range(1, _TERMINAL_MAX_ATTEMPTS + 1):
+                try:
+                    response = await client.post(
+                        f"{base_url}/internal/worker/work/{work_id}/event",
+                        headers={**headers, **extra_headers},
+                        json=terminal_event,
+                        timeout=15.0,
+                    )
+                except asyncio.CancelledError:
+                    pass  # best-effort under shutdown
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "[work=%s session=%s] terminal %s attempt=%d failed",
+                        short_id, session_id, terminal_event.get("type"), attempt,
+                    )
+                else:
+                    if response.status_code in (404, 410):
+                        return  # work gone — further terminal sends are pointless
+                    if 200 <= response.status_code < 300:
+                        break
+                if attempt < _TERMINAL_MAX_ATTEMPTS:
+                    try:
+                        await asyncio.sleep(0.5 * _retry_jitter())
+                    except asyncio.CancelledError:
+                        continue
+            else:
+                dropped_events += 1
 
     try:
         try:
-            async for event in _run_agent_streaming(
+            async with aclosing(_run_agent_streaming(
                 project_path,
                 session_id,
                 question,
                 provider=work.get("provider"),
                 model=work.get("model"),
                 tenant_id=tenant_id,
-            ):
-                event_count += 1
-                if event.get("type") == "answer":
-                    answer = str(event.get("data") or "")
-                elif event.get("type") == "error":
-                    error = str(event.get("data") or "")
-                resp = await post_event(event)
-                # Fire-and-forget delivery used to keep streaming hundreds of
-                # events into a work the gateway had already expired
-                # (observed: 411× event 404 on 29–30 Sep). Abort on the first
-                # sign the work record is gone instead of burning LLM tokens.
-                if resp.status_code in (404, 410):
-                    raise _WorkVanished(
-                        f"gateway no longer knows work {work_id} "
-                        f"(HTTP {resp.status_code}) after {event_count} events"
-                    )
+            )) as stream:
+                async for event in stream:
+                    event_count += 1
+                    if event.get("type") == "answer":
+                        answer = str(event.get("data") or "")
+                    elif event.get("type") == "error":
+                        error = str(event.get("data") or "")
+                    elif event.get("type") == "done":
+                        # The generator emits done as its terminal event
+                        # (before re-raising); the except handlers below must
+                        # not post a second error/done pair on top of it.
+                        terminal_sent = True
+                    await post_event(event)
+        except _WorkVanished as exc:
+            # The work record is gone on the gateway side (expired/discarded).
+            # Abort promptly; sending error/done events back is pointless —
+            # both would 404. Still attempt the completion POST below.
+            dropped_events += 1  # the in-flight event was never delivered
+            error = error or str(exc)
+            logger.warning(
+                "[work=%s session=%s] work vanished — aborting run: %s",
+                short_id, session_id, exc,
+            )
         except asyncio.CancelledError:
             error = error or "worker shutting down"
-            try:
-                await post_event({"type": "error", "data": error})
-                await post_event({"type": "done"})
-            except Exception:  # noqa: BLE001
-                pass
+            if not terminal_sent:
+                await _send_terminal_best_effort(
+                    {"type": "error", "data": error},
+                    {"type": "done"},
+                )
             raise
         except Exception as exc:  # noqa: BLE001 - surface worker failures to gateway
-            error = str(exc)
-            try:
-                await post_event({"type": "error", "data": error})
-                await post_event({"type": "done"})
-            except Exception:  # noqa: BLE001
-                pass
+            logger.exception(
+                "[work=%s session=%s] unhandled failure",
+                short_id, session_id,
+            )
+            error = error or str(exc)
+            if not terminal_sent:
+                await _send_terminal_best_effort(
+                    {"type": "error", "data": error},
+                    {"type": "done"},
+                )
     finally:
         try:
-            await client.post(
+            await _post_with_retry(
                 f"{base_url}/internal/worker/work/{work_id}/complete",
-                headers=headers,
-                json={
+                json_body={
                     "answer": answer,
                     "event_count": event_count,
+                    "dropped_event_count": dropped_events,
                     "error": error,
                 },
+                abort_on_gone=False,
                 timeout=15.0,
             )
-        except Exception as exc:  # noqa: BLE001
-            typer.echo(typer.style(
-                f"[work={short_id} session={session_id}] complete POST failed: {exc}",
-                fg=typer.colors.YELLOW,
-            ))
+        except Exception as exc:  # noqa: BLE001 — never mask the turn outcome
+            logger.exception(
+                "[work=%s session=%s] completion POST crashed", short_id, session_id
+            )
         finally:
             semaphore.release()
             status = "error" if error else "ok"
             typer.echo(
-                f"[work={short_id} session={session_id}] complete events={event_count} status={status}"
+                f"[work={short_id} session={session_id}] complete "
+                f"events={event_count} dropped={dropped_events} status={status}"
             )
 
 
@@ -584,6 +802,7 @@ async def _run_http_only_worker(
 
     semaphore = asyncio.Semaphore(max_concurrency)
     live_tasks: set[asyncio.Task] = set()
+    poll_attempt = 0  # failing polls in a row; reset on any healthy response
 
     # Install explicit signal handlers that cancel the main task. This is
     # more reliable than asyncio.run's default SIGINT path under Python
@@ -620,13 +839,19 @@ async def _run_http_only_worker(
                             timeout=poll_timeout + 10,
                         )
                     except httpx.RequestError as exc:
-                        typer.echo(typer.style(
-                            f"Gateway poll failed: {exc}; retrying",
-                            fg=typer.colors.YELLOW,
-                        ))
-                        await asyncio.sleep(5)
+                        # DNS/connect storm: exponential backoff (2,4,8,… cap 30s
+                        # ± jitter) instead of a fixed 5s, with WARNING only for
+                        # the first few attempts so episodes don't flood logs.
+                        poll_attempt += 1
+                        delay = _poll_retry_delay(poll_attempt)
+                        _log_poll_failure(
+                            poll_attempt,
+                            f"Gateway poll failed: {exc}; retrying in {delay:.1f}s",
+                        )
+                        await asyncio.sleep(delay)
                         continue
                     if response.status_code == 204:
+                        poll_attempt = 0
                         continue
                     # A gateway error response (5xx during deploys, 429 rate
                     # limit, 401 bad token, …) must never kill the worker
@@ -634,22 +859,28 @@ async def _run_http_only_worker(
                     # crash-loops on 28 Sep while the gateway returned 500s.
                     # Log, back off, and keep polling instead.
                     if response.status_code != 200:
-                        typer.echo(typer.style(
+                        poll_attempt += 1
+                        delay = _poll_retry_delay(poll_attempt)
+                        _log_poll_failure(
+                            poll_attempt,
                             f"Gateway poll returned HTTP {response.status_code}; "
-                            "retrying in 15s",
-                            fg=typer.colors.YELLOW,
-                        ))
-                        await asyncio.sleep(15)
+                            f"retrying in {delay:.1f}s",
+                        )
+                        await asyncio.sleep(delay)
                         continue
                     try:
                         work = response.json()
                     except ValueError as exc:
-                        typer.echo(typer.style(
-                            f"Gateway poll returned non-JSON body: {exc}; retrying",
-                            fg=typer.colors.YELLOW,
-                        ))
-                        await asyncio.sleep(5)
+                        poll_attempt += 1
+                        delay = _poll_retry_delay(poll_attempt)
+                        _log_poll_failure(
+                            poll_attempt,
+                            f"Gateway poll returned non-JSON body: {exc}; "
+                            f"retrying in {delay:.1f}s",
+                        )
+                        await asyncio.sleep(delay)
                         continue
+                    poll_attempt = 0
                     task = asyncio.create_task(_process_http_work_item(
                         work,
                         client=client,
