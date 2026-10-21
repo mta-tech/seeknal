@@ -58,6 +58,185 @@ def test_project_model_settings_are_used_when_argument_is_none(tmp_path):
     }
 
 
+def _create_agent_capture_context(
+    tmp_path: Path,
+    yaml_text: str,
+    *,
+    analysis_mode: bool,
+):
+    """Create an agent from a real seeknal_agent.yml and return its ToolContext."""
+    (tmp_path / "seeknal_agent.yml").write_text(yaml_text)
+
+    with (
+        patch("seeknal.cli.repl.REPL") as repl_cls,
+        patch("seeknal.ask.security.configure_safe_connection"),
+        patch("seeknal.ask.modules.artifact_discovery.service.ArtifactDiscovery"),
+        patch(
+            "seeknal.ask.agents.providers.get_model_string",
+            return_value="test:model",
+        ),
+        patch("seeknal.ask.agents.context_toolset.SeeknaContextToolset"),
+        patch("seeknal.ask.agents.tools.toolset.create_ask_toolset"),
+        patch("pydantic_deep.create_deep_agent") as create_deep_agent,
+        patch("pydantic_deep.DeepAgentDeps") as deps_cls,
+        patch(
+            "seeknal.ask.config.get_ask_toolset_mode",
+            return_value="analysis" if analysis_mode else "full",
+        ),
+    ):
+        repl_cls.return_value = MagicMock(conn=MagicMock())
+        create_deep_agent.return_value = MagicMock()
+        deps_cls.return_value = MagicMock()
+        create_agent(project_path=tmp_path)
+
+    from seeknal.ask.agents.tools._context import get_tool_context
+
+    return get_tool_context()
+
+
+def test_yaml_tool_call_limit_reaches_tool_context(tmp_path):
+    """A small configured limit (5) must flow from YAML into the tool context."""
+    ctx = _create_agent_capture_context(
+        tmp_path,
+        "tool_call_limit: 5\n",
+        analysis_mode=True,
+    )
+    assert ctx.tool_call_limit == 5
+
+
+def test_tool_call_limit_is_ignored_in_full_mode_with_warning(tmp_path, caplog):
+    """Full mode has no tool-call ceiling; a configured value must not be
+    silently dropped without a trace."""
+    with caplog.at_level("WARNING"):
+        ctx = _create_agent_capture_context(
+            tmp_path,
+            "tool_call_limit: 5\n",
+            analysis_mode=False,
+        )
+    assert ctx.tool_call_limit is None
+    assert "full toolset mode" in caplog.text
+
+
+def test_sync_ask_degrades_to_evidence_when_budget_5_is_spent():
+    """Limit=5 spent → evidence answer, not UsageLimitExceeded (GW1 gap fix)."""
+    from pydantic_ai.exceptions import UsageLimitExceeded
+
+    from seeknal.ask.agents.tools._context import ToolContext
+
+    agent = MagicMock()
+    observed_limits = []
+
+    def run_sync(*_args, **kwargs):
+        observed_limits.append(kwargs["usage_limits"])
+        if len(observed_limits) == 1:
+            raise UsageLimitExceeded("tool-call budget reached after 5 tool calls")
+        return _result("Answer synthesized from gathered evidence.")
+
+    agent.run_sync.side_effect = run_sync
+    tool_ctx = ToolContext(
+        repl=MagicMock(),
+        artifact_discovery=MagicMock(),
+        project_path=Path("/tmp/does-not-matter"),
+        request_limit=33,
+        tool_call_limit=5,
+        disable_quality_gate=True,
+        current_question="count rows",
+        evidence_snippets_this_turn=["tool result: 12 rows"],
+    )
+
+    with patch(
+        "seeknal.ask.agents.tools._context.get_tool_context",
+        return_value=tool_ctx,
+    ):
+        assert ask(agent, MagicMock(), [], "count rows") == (
+            "Answer synthesized from gathered evidence."
+        )
+
+    assert observed_limits[0].tool_calls_limit == 5
+    assert observed_limits[1].tool_calls_limit == 0, (
+        "evidence-synthesis pass must run without tools"
+    )
+
+
+def test_sync_ask_returns_deterministic_text_if_synthesis_also_hits_limit():
+    from pydantic_ai.exceptions import UsageLimitExceeded
+
+    from seeknal.ask.agents.tools._context import ToolContext
+
+    agent = MagicMock()
+    agent.run_sync.side_effect = UsageLimitExceeded("tool-call budget reached")
+    tool_ctx = ToolContext(
+        repl=MagicMock(),
+        artifact_discovery=MagicMock(),
+        project_path=Path("/tmp/does-not-matter"),
+        request_limit=33,
+        tool_call_limit=5,
+        disable_quality_gate=True,
+        current_question="count rows",
+    )
+
+    with patch(
+        "seeknal.ask.agents.tools._context.get_tool_context",
+        return_value=tool_ctx,
+    ):
+        answer = ask(agent, MagicMock(), [], "count rows")
+    assert "stopping further tool use" in answer.lower()
+    assert "tool-call budget" in answer
+
+
+@pytest.mark.asyncio
+async def test_quiet_stream_uses_configured_tool_call_limit():
+    """Quiet/non-TTY streaming used to pass only request_limit, silently
+    ignoring the configured tool-call ceiling (GW1 gap fix)."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from seeknal.ask.agents.tools._context import ToolContext
+    from seeknal.ask.streaming import stream_ask
+
+    agent = MagicMock()
+    captured = {}
+
+    async def _run(*_args, **kwargs):
+        captured["usage_limits"] = kwargs["usage_limits"]
+        return _result("ok")
+
+    agent.run = _run
+    tool_ctx = ToolContext(
+        repl=MagicMock(),
+        artifact_discovery=MagicMock(),
+        project_path=Path("/tmp/does-not-matter"),
+        request_limit=33,
+        tool_call_limit=5,
+        disable_quality_gate=True,
+    )
+
+    with (
+        patch("seeknal.ask.streaming.lookup_prior_turn_answer", return_value=None),
+        patch("seeknal.ask.streaming.reset_report_approval"),
+        patch("seeknal.ask.streaming.reset_turn_governor"),
+        patch("seeknal.ask.streaming.record_prior_turn_answer"),
+        patch("seeknal.ask.streaming.compact_history_for_analysis_mode"),
+        patch(
+            "seeknal.ask.agents.tools._context.get_tool_context",
+            return_value=tool_ctx,
+        ),
+    ):
+        answer = await stream_ask(
+            agent,
+            MagicMock(),
+            [],
+            "count rows",
+            Console(file=StringIO()),
+            quiet=True,
+        )
+
+    assert answer == "ok"
+    assert captured["usage_limits"].request_limit == 33
+    assert captured["usage_limits"].tool_calls_limit == 5
+
+
 def test_sync_ask_applies_tool_call_limit_to_initial_and_ralph_retry():
     agent = MagicMock()
     observed_usage = []
@@ -147,7 +326,10 @@ def test_quality_gate_direct_caller_does_not_require_usage():
 
 @pytest.mark.parametrize("quality_retry", [False, True])
 def test_retry_cannot_exceed_cumulative_tool_budget(quality_retry):
+    """The budget guard still raises inside the loop; `ask()` then degrades."""
     from pydantic_ai.exceptions import UsageLimitExceeded
+
+    from seeknal.ask.agents.agent import _ask_with_budget
 
     agent = MagicMock()
     calls = 0
@@ -170,5 +352,5 @@ def test_retry_cannot_exceed_cumulative_tool_budget(quality_retry):
     )
     with patch("seeknal.ask.agents.tools._context.get_tool_context", return_value=ctx):
         with pytest.raises(UsageLimitExceeded):
-            ask(agent, MagicMock(), [], "summarize")
+            _ask_with_budget(agent, MagicMock(), [], "summarize")
     assert calls == 2

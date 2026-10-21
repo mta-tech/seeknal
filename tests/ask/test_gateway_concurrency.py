@@ -201,3 +201,110 @@ def test_gateway_app_wires_redis_lock_backend(tmp_path: Path, monkeypatch):
     with TestClient(app) as client:
         assert client.app.state.redis_enabled is True
         assert client.app.state.session_lock is not None
+
+
+@pytest.mark.asyncio
+async def test_gateway_streaming_passes_configured_tool_call_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The gateway path must forward the configured limit (5), not a default."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import seeknal.ask.gateway.server as server
+    from seeknal.ask.agents.tools._context import ToolContext
+
+    captured: dict = {}
+
+    class _FakeRun:
+        result = SimpleNamespace(output="ok", all_messages=lambda: [])
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _FakeAgent:
+        def iter(self, *_args, **kwargs):
+            captured["usage_limits"] = kwargs["usage_limits"]
+            return _FakeRun()
+
+        async def run(self, *_args, **_kwargs):
+            return SimpleNamespace(output="ok", all_messages=lambda: [])
+
+    class _FakeStore:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get(self, *_args):
+            return object()
+
+        def create(self, *_args, **_kwargs):
+            return None
+
+        def load_messages(self, *_args):
+            return []
+
+        def save_messages(self, *_args):
+            pass
+
+        def update(self, *_args, **_kwargs):
+            pass
+
+    async def _no_directive(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("seeknal.ask.sessions.SessionStore", _FakeStore)
+    monkeypatch.setattr(
+        "seeknal.ask.agents.agent.create_agent",
+        lambda *_a, **_k: (_FakeAgent(), MagicMock(), [], None),
+    )
+    monkeypatch.setattr(
+        "seeknal.ask.agents.agent.compact_history_for_analysis_mode",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        "seeknal.ask.directives.try_direct_tool_directive", _no_directive
+    )
+    for name, value in {
+        "lookup_prior_turn_answer": None,
+        "record_prior_turn_answer": None,
+        "reset_report_approval": None,
+        "reset_turn_governor": None,
+        "seed_prior_turn_from_history": None,
+    }.items():
+        monkeypatch.setattr(
+            f"seeknal.ask.agents.tools._context.{name}", lambda *a, **k: value
+        )
+
+    tool_ctx = ToolContext(
+        repl=MagicMock(),
+        artifact_discovery=MagicMock(),
+        project_path=tmp_path,
+        request_limit=33,
+        tool_call_limit=5,
+        disable_quality_gate=True,
+    )
+    monkeypatch.setattr(
+        "seeknal.ask.agents.tools._context.get_tool_context",
+        lambda: tool_ctx,
+    )
+
+    events = [
+        event
+        async for event in server._run_agent_inner(
+            tmp_path, "s-limit", "count rows", tenant_id="default",
+        )
+    ]
+
+    assert captured["usage_limits"].request_limit == 33
+    assert captured["usage_limits"].tool_calls_limit == 5
+    assert any(event["type"] == "answer" for event in events)

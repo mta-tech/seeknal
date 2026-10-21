@@ -5,12 +5,15 @@ LLM generates SQL -> execute_sql tool -> hook validates -> error? -> LLM retries
 For complex analyses, the agent decomposes tasks via the planning tool.
 """
 
+import logging
 import uuid
 from pathlib import Path
 from typing import Optional
 
 from seeknal.ask.agents.tools._context import ToolContext, set_tool_context
 from seeknal.ask.modules.artifact_discovery.service import ArtifactDiscovery
+
+logger = logging.getLogger(__name__)
 
 
 # System prompt is now assembled by prompt_builder.py via create_default_builder().
@@ -291,6 +294,13 @@ def create_agent(
     tool_ctx.sql_pair_mode = get_sql_pair_mode(agent_config)
     if analysis_toolset:
         tool_ctx.tool_call_limit = get_tool_call_limit(agent_config)
+    elif agent_config.get("tool_call_limit") is not None:
+        logger.warning(
+            "seeknal_agent.yml sets tool_call_limit=%r but the project is in "
+            "full toolset mode; read-only analysis mode is required for the "
+            "tool-call ceiling to apply",
+            agent_config.get("tool_call_limit"),
+        )
 
     # IBA engine connection: resolved once here (session init),
     # never inside run_forecast/detect_anomaly themselves. See
@@ -788,6 +798,21 @@ def ask(
     Returns:
         The agent's text response.
     """
+    from pydantic_ai.exceptions import UsageLimitExceeded
+
+    try:
+        return _ask_with_budget(agent, deps, message_history, question)
+    except UsageLimitExceeded as exc:
+        return _sync_evidence_fallback(agent, deps, message_history, exc)
+
+
+def _ask_with_budget(
+    agent,
+    deps,
+    message_history: list,
+    question: str,
+) -> str:
+    """Run the synchronous Ralph/quality loop under the configured budget."""
     from pydantic_ai.usage import RunUsage, UsageLimits
     from seeknal.ask.agents.tools._context import get_tool_context
 
@@ -865,6 +890,69 @@ def ask(
             return _DIMINISHING_RETURNS_MSG
 
     return _NO_RESPONSE
+
+
+def _sync_evidence_fallback(
+    agent,
+    deps,
+    message_history: list,
+    exc: BaseException,
+) -> str:
+    """Answer from gathered evidence after the per-turn budget is spent.
+
+    Mirrors the streaming/gateway degradation: one final no-tool model pass
+    over the evidence collected this turn, then a deterministic text fallback
+    if even that cannot run. Never raises for a spent budget.
+    """
+    from pydantic_ai.exceptions import UsageLimitExceeded
+    from pydantic_ai.usage import UsageLimits
+
+    from seeknal.ask.agents.tools._context import (
+        build_evidence_synthesis_prompt,
+        get_tool_context,
+        synthesize_evidence_fallback,
+    )
+
+    message = str(exc)
+    if "authoritative sql pair" in message:
+        reason = "authoritative SQL pair produced the answer for this business question"
+    elif "terminal tool error" in message:
+        reason = "terminal tool error after sufficient evidence"
+    else:
+        reason = "tool-call budget reached before the model produced a final answer"
+
+    try:
+        ctx = get_tool_context()
+        request_limit = ctx.request_limit
+        prompt = build_evidence_synthesis_prompt(reason, allow_chart=False)
+        deterministic = synthesize_evidence_fallback(reason)
+    except RuntimeError:
+        # No session context (unit-test/standalone call): there is no
+        # evidence to synthesize, so answer deterministically.
+        return (
+            "I am stopping further tool use to keep this answer bounded. "
+            f"Stop reason: {reason}."
+        )
+
+    if prompt == deterministic:
+        return deterministic
+
+    try:
+        result = agent.run_sync(
+            prompt,
+            deps=deps,
+            message_history=message_history,
+            usage_limits=UsageLimits(
+                request_limit=request_limit,
+                tool_calls_limit=0,
+            ),
+        )
+    except UsageLimitExceeded:
+        return deterministic
+
+    message_history.clear()
+    message_history.extend(result.all_messages())
+    return result.output or deterministic
 
 
 def _quality_gate(
