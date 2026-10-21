@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.7
+# Seeknal test image — mirrors the hosted CI test job.
+#
+# Build/run through scripts/test-in-docker.sh so the build context includes
+# tests/ and docs/ (the production .dockerignore intentionally excludes them).
+#
+#   scripts/test-in-docker.sh
+#   scripts/test-in-docker.sh tests/cli/test_gateway_worker_resilience.py
+#
+# The image installs the same dependency set as CI:
+#   uv sync --dev --extra ask
+# and runs pytest against a wheel-installed project (no host .venv).
+
+FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    UV_NO_PROGRESS=1
+
+WORKDIR /opt/seeknal
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Dependency layer: cached until pyproject.toml / uv.lock change.
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --dev --extra ask --no-install-project
+
+# Source + test fixtures. The project is installed on the second sync.
+COPY . .
+RUN uv sync --frozen --dev --extra ask
+
+ENTRYPOINT ["uv", "run", "--no-sync", "pytest"]
+CMD ["tests/", "-x", "--ignore=tests/workflow/test_prefect_integration.py", "--ignore=tests/e2e"]

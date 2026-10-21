@@ -11,6 +11,7 @@ context so the Dockerfiles can copy `pyproject.toml`, `README.md`, and `src/`.
 | `docker/Dockerfile.gateway` | Seeknal Ask HTTP gateway for REST, SSE, WebSocket, Telegram, and Temporal client mode | `seeknal gateway start --project /app/project --port 8000 --host 0.0.0.0 --temporal --no-worker` |
 | `docker/Dockerfile.worker` | Standalone Ask worker. Supports Temporal SDK mode and HTTP-only gateway-routed mode | `seeknal gateway worker` |
 | `docker/Dockerfile.prefect` | Prefect deployment runner for Seeknal pipeline projects | `seeknal prefect serve --project-path /app` |
+| `docker/Dockerfile.test` | CI-equivalent test runner (`uv sync --dev --extra ask` + pytest) | `pytest tests/ -x --ignore=tests/workflow/test_prefect_integration.py --ignore=tests/e2e` |
 | `docker/report-server/Dockerfile` | Report server for published Evidence-style reports | `seeknal report-server` |
 
 ## Build
@@ -20,6 +21,28 @@ docker build -f docker/Dockerfile.gateway -t seeknal-gateway:local .
 docker build -f docker/Dockerfile.worker -t seeknal-worker:local .
 docker build -f docker/Dockerfile.prefect -t seeknal-prefect:local .
 ```
+
+## Test in Docker
+
+`docker/Dockerfile.test` mirrors the hosted CI test job (`uv sync --dev --extra
+ask` + `pytest`). Use the script rather than a direct `docker build`: the
+production `.dockerignore` excludes `tests/` and `docs/`, while the script
+prepares a temporary build context that includes them.
+
+```bash
+# Full CI-equivalent suite
+scripts/test-in-docker.sh
+
+# Focused files / pytest flags
+scripts/test-in-docker.sh tests/cli/test_gateway_worker_resilience.py -q
+scripts/test-in-docker.sh tests/ask tests/cli
+
+# Same thing through just
+just test-docker tests/cli/test_gateway.py
+```
+
+Set `SEEKNAL_TEST_IMAGE` to use a different tag; layer caching keeps subsequent
+builds fast when `pyproject.toml` / `uv.lock` do not change.
 
 ## Published images
 
