@@ -265,6 +265,34 @@ async def test_completion_post_retries_on_transient_failure():
     assert len(complete_calls) >= 3, "completion must retry until delivered"
 
 
+@pytest.mark.asyncio
+async def test_completion_failure_does_not_inflate_event_loss_counter():
+    """A failed completion POST must not be counted as a dropped EVENT.
+
+    Regression guard for the `record_drop=False` path: before this, every
+    completion retry exhaustion incremented `dropped_event_count`, mixing
+    "SSE event lost" with "completion delivery lost".
+    """
+
+    class _CompleteDown(_RecordingClient):
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            self.calls += 1
+            self.posts.append({"url": url, "headers": dict(headers or {}), "json": json})
+            if url.endswith("/complete"):
+                raise httpx.ConnectError("[Errno -2] Name or service not known")
+            return _response(200)
+
+    client = _CompleteDown()
+    task = await asyncio.wait_for(_run_handler(client), timeout=15.0)
+    assert task.done() and task.exception() is None
+
+    complete_calls = [p for p in client.posts if p["url"].endswith("/complete")]
+    assert len(complete_calls) == 3, "completion retried all attempts"
+    assert all(
+        p["json"].get("dropped_event_count") == 0 for p in complete_calls
+    ), "completion failure must not count as a dropped event"
+
+
 # ---------------------------------------------------------------------------
 # Poll backoff (deterministic, jitter pinned)
 # ---------------------------------------------------------------------------
@@ -350,10 +378,14 @@ async def test_broker_mark_event_seen_dedupes_then_cleans():
     await broker.complete(
         work_id=claimed.work_id,
         tenant_id="default",
-        result=http_worker_module.HttpWorkerResult(answer="a", event_count=1),
+        result=http_worker_module.HttpWorkerResult(
+            answer="a", event_count=1, dropped_event_count=2,
+        ),
     )
-    assert (await asyncio.wait_for(
+    result = await asyncio.wait_for(
         asyncio.wait_for(waiter, timeout=1.0), timeout=1.0,
-    )).answer == "a"
+    )
+    assert result.answer == "a"
+    assert result.dropped_event_count == 2, "loss metric must survive the broker hop"
     # ledger is cleaned with the work item (could be re-claimed fresh after)
     assert broker._seen_events.get(claimed.work_id) is None

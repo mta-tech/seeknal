@@ -1833,6 +1833,15 @@ async def http_worker_work_complete(request: Request) -> JSONResponse:
     body = await request.json()
     from seeknal.ask.gateway.http_worker import HttpWorkerResult, http_worker_broker
 
+    dropped_event_count = int(body.get("dropped_event_count") or 0)
+    if dropped_event_count:
+        # Delivery losses are operational signal (GW1): the turn may still
+        # succeed, but the SSE client missed that many events.
+        logger.warning(
+            "[gateway] work=%s completed with dropped_event_count=%d",
+            work_id[:8],
+            dropped_event_count,
+        )
     ok = await http_worker_broker.complete(
         work_id=work_id,
         tenant_id=auth.tenant_id,
@@ -1840,6 +1849,7 @@ async def http_worker_work_complete(request: Request) -> JSONResponse:
             answer=str(body.get("answer") or ""),
             event_count=int(body.get("event_count") or 0),
             error=body.get("error"),
+            dropped_event_count=dropped_event_count,
         ),
     )
     if not ok:

@@ -26,6 +26,8 @@ _EVENT_MAX_ATTEMPTS = 3
 _EVENT_RETRY_BASE_S = 0.5
 _EVENT_RETRY_CAP_S = 30.0
 _TERMINAL_MAX_ATTEMPTS = 2
+_TERMINAL_RETRY_DELAY_S = 0.5
+_DELIVERY_TIMEOUT_S = 15.0
 
 # --- Polling retry policy (GW1) --------------------------------------------
 _POLL_RETRY_BASE_S = 2.0
@@ -33,6 +35,10 @@ _POLL_RETRY_CAP_S = 30.0
 _POLL_LOG_VERBOSE_ATTEMPTS = 3
 
 _EVENT_ID_HEADER = "X-Seeknal-Event-Id"
+
+
+class _WorkVanished(Exception):
+    """Gateway no longer knows this work (404/410) — stop streaming."""
 
 
 def _retry_jitter() -> float:
@@ -479,6 +485,7 @@ async def _process_http_work_item(
     drainer sees the task as cancelled.
     """
     import asyncio
+    import httpx
 
     from seeknal.ask.gateway.server import _run_agent_streaming
     from seeknal.ask.gateway.tenant import DEFAULT_TENANT
@@ -498,40 +505,42 @@ async def _process_http_work_item(
     dropped_events = 0
     terminal_sent = False
 
-    class _WorkVanished(Exception):
-        """Gateway no longer knows this work (404/410) — stop streaming."""
-
     async def _post_with_retry(
         url: str,
         *,
         json_body: dict,
         extra_headers: Optional[dict] = None,
-        timeout: float = 15.0,
+        timeout: float = _DELIVERY_TIMEOUT_S,
         abort_on_gone: bool = True,
         max_attempts: int = _EVENT_MAX_ATTEMPTS,
         base_delay: float = _EVENT_RETRY_BASE_S,
-    ) -> Optional[object]:
+    ) -> tuple[bool, Optional[object]]:
         """POST with transient-failure retry (GW1 §3.3).
 
-        Per-attempt classification:
-          - 2xx            → success (response returned)
-          - 404/410        → work already discarded by the gateway; raises
-                             ``_WorkVanished`` when ``abort_on_gone`` (the
-                             streaming path must stop burning LLM tokens),
-                             logs at debug otherwise (the completion path).
-          - 429 / 5xx      → retried, honouring ``Retry-After`` when present.
-          - other 4xx      → logged, returned without retry.
-          - network errors → retried; on exhaustion the LAST response (or
-                             ``None``) is returned — the caller decides
-                             whether that is fatal. The turn is never aborted
-                             by a delivery failure alone.
+        Args:
+            url: Absolute gateway endpoint.
+            json_body: Event or completion payload.
+            extra_headers: Extra headers; must include the idempotency key for
+                deliveries that may be replayed after server-side acceptance.
+            timeout: Per-attempt timeout in seconds.
+            abort_on_gone: Raise ``_WorkVanished`` on HTTP 404/410. The
+                streaming path sets this so a discarded work stops burning
+                LLM tokens; the completion path clears it and logs at debug.
+            max_attempts: Total attempts, including the first one.
+            base_delay: First backoff delay; doubles per attempt.
 
-        ``extra_headers`` must carry the idempotency key (``X-Seeknal-Event-Id``)
-        for any delivery that may be replayed after server-side acceptance.
+        Returns:
+            ``(delivered, response)``. ``delivered`` is True for any 2xx.
+            A failed delivery returns ``False`` plus the last response (or
+            ``None`` for transport exhaustion); the caller decides whether
+            that should affect the turn (it never should by itself).
+
+        Raises:
+            _WorkVanished: When the gateway replies 404/410 and
+                ``abort_on_gone`` is true.
+            asyncio.CancelledError: Propagated unchanged (task cancellation).
         """
-        nonlocal dropped_events
         delay = base_delay
-        last_exc: Optional[BaseException] = None
         for attempt in range(1, max_attempts + 1):
             try:
                 response = await client.post(
@@ -540,11 +549,12 @@ async def _process_http_work_item(
                     json=json_body,
                     timeout=timeout,
                 )
-                last_exc = None
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 — httpx.RequestError/timeout/DNS/OSError
-                last_exc = exc
+            except (httpx.RequestError, OSError) as exc:
+                # Transport-level only: DNS, connect, read/write timeout.
+                # Programming errors must propagate (fail fast) instead of
+                # being retried as if they were network blips.
                 if attempt < max_attempts:
                     logger.warning(
                         "[work=%s session=%s] delivery attempt=%d/%d failed: %s:%s",
@@ -561,22 +571,20 @@ async def _process_http_work_item(
                     "continuing turn (event dropped)",
                     short_id, session_id, max_attempts,
                 )
-                dropped_events += 1
-                return None
+                return False, None
             status = response.status_code
             if status in (404, 410):
                 if abort_on_gone:
                     raise _WorkVanished(
-                        f"gateway no longer knows work {work_id} "
-                        f"(HTTP {status}) after {event_count} events"
+                        f"gateway no longer knows work {work_id} (HTTP {status})"
                     )
                 logger.debug(
                     "[work=%s session=%s] gateway already discarded work (HTTP %d)",
                     short_id, session_id, status,
                 )
-                return response
+                return False, response
             if 200 <= status < 300:
-                return response
+                return True, response
             if status == 429 or status >= 500:
                 if attempt < max_attempts:
                     retry_after = _retry_after_seconds(response)
@@ -598,31 +606,33 @@ async def _process_http_work_item(
                     "event dropped",
                     short_id, session_id, status, max_attempts,
                 )
-                dropped_events += 1
-                return response
+                return False, response
             logger.warning(
                 "[work=%s session=%s] gateway returned HTTP %d — not retryable, event dropped",
                 short_id, session_id, status,
             )
-            dropped_events += 1
-            return response
-        return None
+            return False, response
+        return False, None
 
-    async def post_event(event: dict) -> object:
-        nonlocal event_seq
+    async def post_event(event: dict) -> None:
+        """Deliver one streamed event, counting it as dropped if undeliverable."""
+        nonlocal event_seq, dropped_events
         event_seq += 1
-        return await _post_with_retry(
+        delivered, _ = await _post_with_retry(
             f"{base_url}/internal/worker/work/{work_id}/event",
             json_body=event,
             extra_headers={_EVENT_ID_HEADER: f"{work_id}:{event_seq}"},
         )
+        if not delivered:
+            dropped_events += 1
 
     async def _send_terminal_best_effort(*terminal_events: dict) -> None:
-        """Short, capped delivery of terminal error/done events; never raises.
+        """Deliver terminal error/done events best-effort; never raise.
 
-        During shutdown cancellation the task sits in a cancelled frame —
-        per-attempt CancelledError is swallowed so the ORIGINAL error is
-        never masked by delivery mechanics.
+        Capped at ``_TERMINAL_MAX_ATTEMPTS`` per event. During shutdown the
+        task sits in a cancelled frame, so a per-attempt CancelledError is
+        logged at debug and swallowed — the ORIGINAL turn error must never be
+        masked by delivery mechanics.
         """
         nonlocal event_seq, dropped_events
         for terminal_event in terminal_events:
@@ -634,10 +644,13 @@ async def _process_http_work_item(
                         f"{base_url}/internal/worker/work/{work_id}/event",
                         headers={**headers, **extra_headers},
                         json=terminal_event,
-                        timeout=15.0,
+                        timeout=_DELIVERY_TIMEOUT_S,
                     )
                 except asyncio.CancelledError:
-                    pass  # best-effort under shutdown
+                    logger.debug(
+                        "[work=%s session=%s] terminal %s attempt=%d cancelled",
+                        short_id, session_id, terminal_event.get("type"), attempt,
+                    )
                 except Exception:  # noqa: BLE001
                     logger.debug(
                         "[work=%s session=%s] terminal %s attempt=%d failed",
@@ -650,7 +663,9 @@ async def _process_http_work_item(
                         break
                 if attempt < _TERMINAL_MAX_ATTEMPTS:
                     try:
-                        await asyncio.sleep(0.5 * _retry_jitter())
+                        await asyncio.sleep(
+                            _TERMINAL_RETRY_DELAY_S * _retry_jitter()
+                        )
                     except asyncio.CancelledError:
                         continue
             else:
@@ -685,8 +700,8 @@ async def _process_http_work_item(
             dropped_events += 1  # the in-flight event was never delivered
             error = error or str(exc)
             logger.warning(
-                "[work=%s session=%s] work vanished — aborting run: %s",
-                short_id, session_id, exc,
+                "[work=%s session=%s] work vanished after %d events — aborting run: %s",
+                short_id, session_id, event_count, exc,
             )
         except asyncio.CancelledError:
             error = error or "worker shutting down"
@@ -718,7 +733,7 @@ async def _process_http_work_item(
                     "error": error,
                 },
                 abort_on_gone=False,
-                timeout=15.0,
+                timeout=_DELIVERY_TIMEOUT_S,
             )
         except Exception as exc:  # noqa: BLE001 — never mask the turn outcome
             logger.exception(

@@ -50,6 +50,7 @@ class HttpWorkerResult:
     answer: str = ""
     event_count: int = 0
     error: str | None = None
+    dropped_event_count: int = 0
 
 
 class HttpWorkerBroker:
