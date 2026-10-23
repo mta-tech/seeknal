@@ -222,7 +222,12 @@ async def test_post_event_retries_on_dns_error_then_succeeds():
 @pytest.mark.asyncio
 async def test_permanent_delivery_failure_does_not_abort_turn():
     """All attempts fail with DNS for every POST — the turn still completes
-    with error=None and a positive dropped count (finding §9.2-1: non-fatal)."""
+    with error=None and a positive dropped count (finding §9.2-1: non-fatal).
+
+    The completion POST now gets a time-boxed persistence window; with the
+    window already exhausted by the event retries it gives up after the
+    first attempt and reports `answer_dropped=True` so the gateway can
+    reconcile the answer from the completion payload."""
 
     class _AlwaysFail(_RecordingClient):
         async def post(self, url, *, headers=None, json=None, timeout=None):
@@ -231,19 +236,25 @@ async def test_permanent_delivery_failure_does_not_abort_turn():
             raise httpx.ConnectError("[Errno -3] Temporary failure in name resolution")
 
     failing = _AlwaysFail()
-    task = await asyncio.wait_for(_run_handler(failing), timeout=20.0)
+    with (
+        patch.object(gateway_module, "_COMPLETE_MAX_WAIT_S", 0.5),
+        patch.object(gateway_module, "_COMPLETE_RETRY_DELAY_S", 0.01),
+    ):
+        task = await asyncio.wait_for(_run_handler(failing), timeout=20.0)
     assert task.done() and task.exception() is None
 
     complete_calls = [p for p in failing.posts if p["url"].endswith("/complete")]
     body = complete_calls[0]["json"]
     assert body["event_count"] == 4
     assert body["dropped_event_count"] == 4  # all four events (incl. done) dropped
+    assert body["answer_dropped"] is True  # answers lost — gateway must reconcile
     assert body["error"] is None, "delivery failure alone must not fail the run"
 
 
 @pytest.mark.asyncio
 async def test_completion_post_retries_on_transient_failure():
-    """The `complete` POST itself gets retried against DNS blips."""
+    """The `complete` POST itself gets retried against DNS blips within the
+    time-boxed window (delay patched small for a fast test)."""
     # Event POSTs succeed (implicit 200s); the FIRST two complete attempts fail.
     client = _RecordingClient()
     original_post = _RecordingClient.post
@@ -258,20 +269,25 @@ async def test_completion_post_retries_on_transient_failure():
             return _response(200)
         return await original_post(self, url, headers=headers, json=json, timeout=timeout)
 
-    with patch.object(type(client), "post", script):
+    with (
+        patch.object(gateway_module, "_COMPLETE_RETRY_DELAY_S", 0.01),
+        patch.object(type(client), "post", script),
+    ):
         await asyncio.wait_for(_run_handler(client), timeout=15.0)
 
     complete_calls = [p for p in client.posts if p["url"].endswith("/complete")]
     assert len(complete_calls) >= 3, "completion must retry until delivered"
+    assert complete_calls[-1]["json"]["answer_dropped"] is False
 
 
 @pytest.mark.asyncio
 async def test_completion_failure_does_not_inflate_event_loss_counter():
     """A failed completion POST must not be counted as a dropped EVENT.
 
-    Regression guard for the `record_drop=False` path: before this, every
-    completion retry exhaustion incremented `dropped_event_count`, mixing
-    "SSE event lost" with "completion delivery lost".
+    Regression guard: completion retries are time-boxed, not counted, and a
+    lost completion must not mix "SSE event lost" with "completion delivery
+    lost". Here every EVENT is delivered (`answer_dropped=False`) while the
+    completion itself is undeliverable.
     """
 
     class _CompleteDown(_RecordingClient):
@@ -283,14 +299,45 @@ async def test_completion_failure_does_not_inflate_event_loss_counter():
             return _response(200)
 
     client = _CompleteDown()
-    task = await asyncio.wait_for(_run_handler(client), timeout=15.0)
+    with patch.object(gateway_module, "_COMPLETE_MAX_WAIT_S", 0.5):
+        task = await asyncio.wait_for(_run_handler(client), timeout=15.0)
     assert task.done() and task.exception() is None
 
     complete_calls = [p for p in client.posts if p["url"].endswith("/complete")]
-    assert len(complete_calls) == 3, "completion retried all attempts"
+    assert len(complete_calls) >= 2, "completion retried within its window"
     assert all(
         p["json"].get("dropped_event_count") == 0 for p in complete_calls
     ), "completion failure must not count as a dropped event"
+    assert all(
+        p["json"].get("answer_dropped") is False for p in complete_calls
+    ), "delivered events must not be flagged as answer_dropped"
+
+
+@pytest.mark.asyncio
+async def test_answer_dropped_flag_marks_lost_answer_event():
+    """The completion body reports whether the answer event reached the
+    gateway — the signal the gateway uses to reconcile a final answer."""
+
+    class _EventsFail(_RecordingClient):
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            self.calls += 1
+            self.posts.append({"url": url, "headers": dict(headers or {}), "json": json})
+            if url.endswith("/event"):
+                raise httpx.ConnectError("[Errno -2] Name or service not known")
+            return _response(200)
+
+    client = _EventsFail()
+    with (
+        patch.object(gateway_module, "_COMPLETE_MAX_WAIT_S", 0.5),
+        patch.object(gateway_module, "_COMPLETE_RETRY_DELAY_S", 0.01),
+    ):
+        task = await asyncio.wait_for(_run_handler(client), timeout=15.0)
+    assert task.done() and task.exception() is None
+
+    complete_calls = [p for p in client.posts if p["url"].endswith("/complete")]
+    assert complete_calls, "completion must still be attempted"
+    assert complete_calls[0]["json"]["answer_dropped"] is True
+    assert complete_calls[0]["json"]["answer"] == "final"
 
 
 # ---------------------------------------------------------------------------

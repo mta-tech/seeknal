@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import time
 from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -28,6 +29,14 @@ _EVENT_RETRY_CAP_S = 30.0
 _TERMINAL_MAX_ATTEMPTS = 2
 _TERMINAL_RETRY_DELAY_S = 0.5
 _DELIVERY_TIMEOUT_S = 15.0
+# The completion POST carries the full turn answer — the one payload the
+# user must not lose to a connectivity outage. Retry well past the
+# event-delivery budget, but bounded: the gateway broker item expires
+# (timeout + 60s from enqueue), so past ~90s a late completion would only
+# 404. A turn whose completion never lands costs a full LLM re-run via
+# the Temporal retry.
+_COMPLETE_MAX_WAIT_S = 90.0
+_COMPLETE_RETRY_DELAY_S = 8.0
 
 # --- Polling retry policy (GW1) --------------------------------------------
 _POLL_RETRY_BASE_S = 2.0
@@ -503,6 +512,7 @@ async def _process_http_work_item(
     event_count = 0
     event_seq = 0
     dropped_events = 0
+    answer_dropped = False
     terminal_sent = False
 
     async def _post_with_retry(
@@ -614,8 +624,8 @@ async def _process_http_work_item(
             return False, response
         return False, None
 
-    async def post_event(event: dict) -> None:
-        """Deliver one streamed event, counting it as dropped if undeliverable."""
+    async def post_event(event: dict) -> bool:
+        """Deliver one streamed event; report whether it reached the gateway."""
         nonlocal event_seq, dropped_events
         event_seq += 1
         delivered, _ = await _post_with_retry(
@@ -625,6 +635,7 @@ async def _process_http_work_item(
         )
         if not delivered:
             dropped_events += 1
+        return delivered
 
     async def _send_terminal_best_effort(*terminal_events: dict) -> None:
         """Deliver terminal error/done events best-effort; never raise.
@@ -671,6 +682,91 @@ async def _process_http_work_item(
             else:
                 dropped_events += 1
 
+    async def _post_completion_persistent(payload: dict) -> bool:
+        """POST the turn completion with a time-boxed persistence window.
+
+        The completion carries the full turn answer — the one payload the user
+        must not lose to a connectivity outage — so it keeps retrying
+        transport errors and 429/5xx until ``_COMPLETE_MAX_WAIT_S`` elapses
+        instead of using the short event-delivery budget. 404/410 stops
+        immediately: the gateway already discarded the work and a late
+        completion would only fail again.
+
+        Args:
+            payload: Completion body (answer, event_count, dropped_event_count,
+                answer_dropped, error).
+
+        Returns:
+            True if the gateway accepted the completion (2xx), False otherwise.
+
+        Raises:
+            asyncio.CancelledError: Propagated unchanged (task cancellation);
+                the caller's ``finally`` still releases the semaphore.
+        """
+        deadline = time.monotonic() + _COMPLETE_MAX_WAIT_S
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                response = await client.post(
+                    f"{base_url}/internal/worker/work/{work_id}/complete",
+                    headers=headers,
+                    json=payload,
+                    timeout=_DELIVERY_TIMEOUT_S,
+                )
+            except asyncio.CancelledError:
+                logger.debug(
+                    "[work=%s session=%s] completion POST cancelled",
+                    short_id, session_id,
+                )
+                raise
+            except (httpx.RequestError, OSError) as exc:
+                if time.monotonic() >= deadline:
+                    logger.exception(
+                        "[work=%s session=%s] completion undelivered after %.0fs "
+                        "(%d attempts) — answer lost, Temporal will retry the turn",
+                        short_id, session_id, _COMPLETE_MAX_WAIT_S, attempt,
+                    )
+                    return False
+                logger.warning(
+                    "[work=%s session=%s] completion attempt=%d failed: %s:%s — "
+                    "retrying within %.0fs window",
+                    short_id, session_id, attempt,
+                    type(exc).__name__, exc, _COMPLETE_MAX_WAIT_S,
+                )
+                await asyncio.sleep(_COMPLETE_RETRY_DELAY_S * _retry_jitter())
+                continue
+            status = response.status_code
+            if 200 <= status < 300:
+                return True
+            if status in (404, 410):
+                logger.debug(
+                    "[work=%s session=%s] gateway already discarded work "
+                    "(HTTP %d) — completion pointless",
+                    short_id, session_id, status,
+                )
+                return False
+            if status == 429 or status >= 500:
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "[work=%s session=%s] gateway %d persisted past the "
+                        "completion window (%d attempts)",
+                        short_id, session_id, status, attempt,
+                    )
+                    return False
+                retry_after = _retry_after_seconds(response)
+                await asyncio.sleep(
+                    (retry_after if retry_after is not None else _COMPLETE_RETRY_DELAY_S)
+                    * _retry_jitter()
+                )
+                continue
+            logger.warning(
+                "[work=%s session=%s] gateway returned HTTP %d on completion "
+                "— not retryable",
+                short_id, session_id, status,
+            )
+            return False
+
     try:
         try:
             async with aclosing(_run_agent_streaming(
@@ -692,7 +788,12 @@ async def _process_http_work_item(
                         # (before re-raising); the except handlers below must
                         # not post a second error/done pair on top of it.
                         terminal_sent = True
-                    await post_event(event)
+                    delivered = await post_event(event)
+                    if not delivered and event.get("type") == "answer":
+                        # The gateway never received the final answer — flag it
+                        # so the gateway can reconcile from the completion
+                        # payload instead of leaving the user empty-handed.
+                        answer_dropped = True
         except _WorkVanished as exc:
             # The work record is gone on the gateway side (expired/discarded).
             # Abort promptly; sending error/done events back is pointless —
@@ -723,28 +824,24 @@ async def _process_http_work_item(
                     {"type": "done"},
                 )
     finally:
+        # The completion POST is the last-chance delivery of the turn answer;
+        # ``_post_completion_persistent`` owns the retry window. Every exit
+        # path below releases the semaphore.
         try:
-            await _post_with_retry(
-                f"{base_url}/internal/worker/work/{work_id}/complete",
-                json_body={
-                    "answer": answer,
-                    "event_count": event_count,
-                    "dropped_event_count": dropped_events,
-                    "error": error,
-                },
-                abort_on_gone=False,
-                timeout=_DELIVERY_TIMEOUT_S,
-            )
-        except Exception as exc:  # noqa: BLE001 — never mask the turn outcome
-            logger.exception(
-                "[work=%s session=%s] completion POST crashed", short_id, session_id
-            )
+            await _post_completion_persistent({
+                "answer": answer,
+                "event_count": event_count,
+                "dropped_event_count": dropped_events,
+                "answer_dropped": answer_dropped,
+                "error": error,
+            })
         finally:
             semaphore.release()
             status = "error" if error else "ok"
             typer.echo(
                 f"[work={short_id} session={session_id}] complete "
-                f"events={event_count} dropped={dropped_events} status={status}"
+                f"events={event_count} dropped={dropped_events} "
+                f"answer_dropped={answer_dropped} status={status}"
             )
 
 
