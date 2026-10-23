@@ -14,6 +14,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import json
+import logging
 import re
 import time
 from pathlib import Path
@@ -62,6 +63,7 @@ _IMAGE_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
 
 session_manager = SessionManager()
 sse_broadcaster = SSEBroadcaster()
+logger = logging.getLogger(__name__)
 
 # Per-session locks to serialize concurrent runs on the same (tenant, session_id).
 # Prevents message history corruption (last-writer-wins on JSON files)
@@ -360,9 +362,18 @@ async def _run_agent_streaming(
 
     A per-(tenant, session) ``asyncio.Lock`` serializes concurrent runs
     to prevent message history corruption.
+
+    Lifecycle contract (GW1): ``finally`` must never yield. A terminal
+    yield inside ``finally`` raises ``RuntimeError: async generator
+    ignored GeneratorExit`` when a consumer closes/cancels the generator,
+    and truncates ``_session_lock_context`` before the lock is released.
+    ``done`` is therefore yielded from the normal/exception paths after
+    the loop; when the consumer closes the generator, ``done`` is simply
+    not produced and the lock releases via ``async with``.
     """
     turn_started = time.monotonic()
     _clear_cancel(session_id, tenant_id=tenant_id)
+    error_exc: BaseException | None = None
     async with _session_lock_context(
         session_id,
         tenant_id=tenant_id,
@@ -394,7 +405,18 @@ async def _run_agent_streaming(
                     broadcaster=broadcaster,
                 )
                 yield event
+        except GeneratorExit:
+            # Consumer closed the generator (aclose/disconnect/abort).
+            # Propagate immediately — do not publish a terminal event;
+            # `async with` releases the lock on the way out.
+            raise
         except Exception as exc:
+            error_exc = exc
+            logger.exception(
+                "[gateway] run failed session=%s tenant=%s",
+                session_id,
+                tenant_id,
+            )
             error_event = {"type": "error", "data": str(exc)}
             await _publish_event_async(
                 session_id,
@@ -403,21 +425,25 @@ async def _run_agent_streaming(
                 broadcaster=broadcaster,
             )
             yield error_event
-            raise
         finally:
             _clear_cancel(session_id, tenant_id=tenant_id)
-            done_event = {
-                "type": "done",
-                "data": "",
-                "elapsed_ms": int((time.monotonic() - turn_started) * 1000),
-            }
-            await _publish_event_async(
-                session_id,
-                done_event,
-                tenant_id=tenant_id,
-                broadcaster=broadcaster,
-            )
-            yield done_event
+        done_event = {
+            "type": "done",
+            "data": "",
+            "elapsed_ms": int((time.monotonic() - turn_started) * 1000),
+        }
+        await _publish_event_async(
+            session_id,
+            done_event,
+            tenant_id=tenant_id,
+            broadcaster=broadcaster,
+        )
+        yield done_event
+    # Preserve the established worker contract: the exception reaches the
+    # consumer AFTER the error + done terminal events, from outside the
+    # lock context (lock already released).
+    if error_exc is not None:
+        raise error_exc
 
 
 async def _run_agent_inner(
@@ -1776,6 +1802,18 @@ async def http_worker_work_event(request: Request) -> JSONResponse:
         return JSONResponse({"error": "unknown work_id"}, status_code=404)
 
     body = await request.json()
+    # Idempotency (GW1): worker delivery is at-least-once once retries exist.
+    # A replayed POST (server accepted it, the TCP response was lost) must not
+    # double-publish to SSE. Events without the header keep the old behaviour.
+    event_id = request.headers.get("x-seeknal-event-id")
+    if event_id:
+        is_new = await http_worker_broker.mark_event_seen(
+            work_id=work_id,
+            tenant_id=auth.tenant_id,
+            event_id=event_id,
+        )
+        if not is_new:
+            return JSONResponse({"status": "duplicate"})
     event_json = json.dumps(body)
     await request.app.state.broadcaster.publish(
         item.session_id,
@@ -1795,6 +1833,15 @@ async def http_worker_work_complete(request: Request) -> JSONResponse:
     body = await request.json()
     from seeknal.ask.gateway.http_worker import HttpWorkerResult, http_worker_broker
 
+    dropped_event_count = int(body.get("dropped_event_count") or 0)
+    if dropped_event_count:
+        # Delivery losses are operational signal (GW1): the turn may still
+        # succeed, but the SSE client missed that many events.
+        logger.warning(
+            "[gateway] work=%s completed with dropped_event_count=%d",
+            work_id[:8],
+            dropped_event_count,
+        )
     ok = await http_worker_broker.complete(
         work_id=work_id,
         tenant_id=auth.tenant_id,
@@ -1802,6 +1849,7 @@ async def http_worker_work_complete(request: Request) -> JSONResponse:
             answer=str(body.get("answer") or ""),
             event_count=int(body.get("event_count") or 0),
             error=body.get("error"),
+            dropped_event_count=dropped_event_count,
         ),
     )
     if not ok:

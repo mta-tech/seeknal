@@ -86,6 +86,69 @@ async def _single_answer():
     yield {"type": "answer", "data": "ok"}
 
 
+# ---------------------------------------------------------------------------
+# Generator lifecycle (GW1): no terminal yield inside `finally`
+# ---------------------------------------------------------------------------
+
+
+async def _two_events_slow(*_args, **_kwargs):
+    yield {"type": "token", "data": "one"}
+    await asyncio.sleep(0.2)
+    yield {"type": "answer", "data": "two"}
+
+
+async def _collect_one_then_close():
+    """Consume exactly one event, then abandon (aclose) the generator."""
+    agen = _run_agent_streaming(Path("/tmp/does-not-matter"), "s1", "question")
+    events: list[dict] = []
+    async for event in agen:
+        events.append(event)
+        break
+    await agen.aclose()
+    return events
+
+
+@pytest.mark.asyncio
+async def test_aclose_after_first_event_releases_session_lock(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Closing a half-consumed stream must release the session lock.
+
+    Regression for GW1/G2: `_run_agent_streaming` used to yield `done` from a
+    `finally` block. When a consumer closed the generator mid-stream, Python
+    re-raised `GeneratorExit` at that terminal yield as
+    `RuntimeError: async generator ignored GeneratorExit` and truncated the
+    `_session_lock_context` before release — leaving `_session_locks[...]
+    locked() == True` for the rest of the idle-TTL (30 min). Today's
+    production logs show exactly that RuntimeError (`seeknal-neo.log`).
+    """
+    monkeypatch.setattr("seeknal.ask.gateway.server._run_agent_inner", _two_events_slow)
+    from seeknal.ask.gateway.server import _get_session_lock
+
+    events = await _collect_one_then_close()
+
+    assert events and events[0]["type"] == "token"
+    assert not _get_session_lock("s1").locked(), (
+        "session lock stayed held after the stream was closed mid-turn"
+    )
+
+
+@pytest.mark.asyncio
+async def test_second_turn_can_start_after_half_consumed_stream(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The session's next turn must not block on a leaked lock (GW1 P1 core)."""
+    monkeypatch.setattr("seeknal.ask.gateway.server._run_agent_inner", _two_events_slow)
+    from seeknal.ask.gateway.server import _get_session_lock
+
+    await _collect_one_then_close()
+
+    lock = _get_session_lock("s1")
+    # If the lock were still held this would time out with TimeoutError.
+    await asyncio.wait_for(lock.acquire(), timeout=1.0)
+    lock.release()
+
+
 def test_cancel_session_endpoint(tmp_path: Path):
     pytest.importorskip("starlette")
     from starlette.testclient import TestClient
@@ -138,3 +201,110 @@ def test_gateway_app_wires_redis_lock_backend(tmp_path: Path, monkeypatch):
     with TestClient(app) as client:
         assert client.app.state.redis_enabled is True
         assert client.app.state.session_lock is not None
+
+
+@pytest.mark.asyncio
+async def test_gateway_streaming_passes_configured_tool_call_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The gateway path must forward the configured limit (5), not a default."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import seeknal.ask.gateway.server as server
+    from seeknal.ask.agents.tools._context import ToolContext
+
+    captured: dict = {}
+
+    class _FakeRun:
+        result = SimpleNamespace(output="ok", all_messages=lambda: [])
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _FakeAgent:
+        def iter(self, *_args, **kwargs):
+            captured["usage_limits"] = kwargs["usage_limits"]
+            return _FakeRun()
+
+        async def run(self, *_args, **_kwargs):
+            return SimpleNamespace(output="ok", all_messages=lambda: [])
+
+    class _FakeStore:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get(self, *_args):
+            return object()
+
+        def create(self, *_args, **_kwargs):
+            return None
+
+        def load_messages(self, *_args):
+            return []
+
+        def save_messages(self, *_args):
+            pass
+
+        def update(self, *_args, **_kwargs):
+            pass
+
+    async def _no_directive(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("seeknal.ask.sessions.SessionStore", _FakeStore)
+    monkeypatch.setattr(
+        "seeknal.ask.agents.agent.create_agent",
+        lambda *_a, **_k: (_FakeAgent(), MagicMock(), [], None),
+    )
+    monkeypatch.setattr(
+        "seeknal.ask.agents.agent.compact_history_for_analysis_mode",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        "seeknal.ask.directives.try_direct_tool_directive", _no_directive
+    )
+    for name, value in {
+        "lookup_prior_turn_answer": None,
+        "record_prior_turn_answer": None,
+        "reset_report_approval": None,
+        "reset_turn_governor": None,
+        "seed_prior_turn_from_history": None,
+    }.items():
+        monkeypatch.setattr(
+            f"seeknal.ask.agents.tools._context.{name}", lambda *a, **k: value
+        )
+
+    tool_ctx = ToolContext(
+        repl=MagicMock(),
+        artifact_discovery=MagicMock(),
+        project_path=tmp_path,
+        request_limit=33,
+        tool_call_limit=5,
+        disable_quality_gate=True,
+    )
+    monkeypatch.setattr(
+        "seeknal.ask.agents.tools._context.get_tool_context",
+        lambda: tool_ctx,
+    )
+
+    events = [
+        event
+        async for event in server._run_agent_inner(
+            tmp_path, "s-limit", "count rows", tenant_id="default",
+        )
+    ]
+
+    assert captured["usage_limits"].request_limit == 33
+    assert captured["usage_limits"].tool_calls_limit == 5
+    assert any(event["type"] == "answer" for event in events)

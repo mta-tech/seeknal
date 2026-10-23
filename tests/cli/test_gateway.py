@@ -54,6 +54,7 @@ async def test_http_only_worker_retry_path_does_not_raise_nameerror():
 
     with (
         patch("asyncio.sleep", _fake_sleep),
+        patch.object(gateway_module, "_retry_jitter", lambda: 1.0),
         patch("httpx.AsyncClient", return_value=_FakeClient()),
     ):
         with pytest.raises(_StopLoop):
@@ -64,8 +65,10 @@ async def test_http_only_worker_retry_path_does_not_raise_nameerror():
                 poll_timeout=1.0,
             )
 
-    # The retry branch must have run exactly once and slept for 5s.
-    assert sleep_calls == [5]
+    # The retry branch must have run exactly once with the first backoff step
+    # (base 2s; GW1 exponential poll backoff, jitter pinned to 1.0).
+    assert sleep_calls == [2.0]
+    assert sleep_calls[0] < gateway_module._POLL_RETRY_CAP_S
 
 
 # ---------------------------------------------------------------------------
