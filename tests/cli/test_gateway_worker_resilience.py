@@ -95,7 +95,12 @@ async def _stub_inner(*_args, **_kwargs):
     yield {"type": "answer", "data": "final"}
 
 
-async def _run_handler(client, work_id="w-10010010", session_id="sess-1"):
+async def _run_handler(client, work_id="w-10010010", session_id="sess-1", inner=None):
+    """Run the real worker handler with a stubbed agent stream.
+
+    ``inner`` optionally replaces the default answer/token stub — custom
+    event shapes (clarification turns, charts) need their own event script.
+    """
     semaphore = asyncio.Semaphore(1)
     started = asyncio.Event()
 
@@ -104,7 +109,10 @@ async def _run_handler(client, work_id="w-10010010", session_id="sess-1"):
 
     with (
         patch.object(gateway_module, "_retry_jitter", lambda: 1.0),
-        patch("seeknal.ask.gateway.server._run_agent_inner", _stub_inner),
+        patch(
+            "seeknal.ask.gateway.server._run_agent_inner",
+            inner if inner is not None else _stub_inner,
+        ),
     ):
         task = asyncio.create_task(_process_http_work_item(
             _work(work_id, session_id),
@@ -436,3 +444,78 @@ async def test_broker_mark_event_seen_dedupes_then_cleans():
     assert result.dropped_event_count == 2, "loss metric must survive the broker hop"
     # ledger is cleaned with the work item (could be re-claimed fresh after)
     assert broker._seen_events.get(claimed.work_id) is None
+
+
+@pytest.mark.asyncio
+async def test_lost_side_channel_event_is_replayed_in_completion():
+    """F8: a dropped ask_user/visualization/upload_complete event carries its
+    full payload in the completion so the gateway can replay it to the UI."""
+
+    async def _clarify_inner(*_args, **_kwargs):
+        yield {"type": "tool_start", "data": {"name": "read_skill"}}
+        yield {"type": "tool_end", "data": {"name": "read_skill"}}
+        yield {"type": "ask_user", "data": {"prompts": [{"question": "ERBA/ERLA?", "options": []}]}}
+        yield {"type": "done", "data": ""}
+
+    class _DropTypes(_RecordingClient):
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            self.calls += 1
+            self.posts.append({"url": url, "headers": dict(headers or {}), "json": json})
+            if url.endswith("/event") and json.get("type") in ("ask_user", "done"):
+                raise httpx.ConnectError("[Errno -2] lost")
+            return _response(200)
+
+    client = _DropTypes()
+    with (
+        patch.object(gateway_module, "_retry_jitter", lambda: 1.0),
+        patch("seeknal.ask.gateway.server._run_agent_inner", _clarify_inner),
+    ):
+        task = await asyncio.wait_for(_run_handler(client, inner=_clarify_inner), timeout=15.0)
+
+    complete_calls = [p for p in client.posts if p["url"].endswith("/complete")]
+    body = complete_calls[0]["json"]
+    assert body["answer_dropped"] is False, "no answer event existed in clarify turns"
+    assert body["done_dropped"] is True
+    replay = body["undelivered_events"]
+    assert [e["type"] for e in replay] == ["ask_user"]
+    assert replay[0]["data"]["prompts"][0]["question"] == "ERBA/ERLA?"
+
+
+@pytest.mark.asyncio
+async def test_delivered_side_channel_is_not_replayed():
+    """When the chart event was delivered but later events dropped, no replay
+    payload for it may appear in the completion."""
+    class _DropAnswerDone(_RecordingClient):
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            self.calls += 1
+            self.posts.append({"url": url, "headers": dict(headers or {}), "json": json})
+            if url.endswith("/event") and json.get("type") in ("answer", "done"):
+                raise httpx.ConnectError("[Errno -2] lost")
+            return _response(200)
+
+    client = _DropAnswerDone()
+
+    async def _chart_inner(*_args, **_kwargs):
+        yield {"type": "visualization", "data": {"chart": "x"}}
+        yield {"type": "answer", "data": "final"}
+        yield {"type": "done", "data": ""}
+
+    with (
+        patch.object(gateway_module, "_retry_jitter", lambda: 1.0),
+        patch("seeknal.ask.gateway.server._run_agent_inner", _chart_inner),
+    ):
+        task = await asyncio.wait_for(_run_handler(client, inner=_chart_inner), timeout=15.0)
+
+    complete_calls = [p for p in client.posts if p["url"].endswith("/complete")]
+    body = complete_calls[0]["json"]
+    assert "undelivered_events" not in body, "delivered events must not replay"
+    assert body["answer_dropped"] is True
+    assert body["done_dropped"] is True
+
+
+def test_bound_event_size_caps_oversized_payload():
+    big = {"type": "visualization", "data": {"blob": "x" * 100_000}}
+    bounded = gateway_module._bound_event_size(big)
+    assert bounded.get("payload_truncated") is True
+    assert len(str(bounded["data"])) < gateway_module._UNDELIVERED_EVENT_MAX_BYTES
+    assert gateway_module._bound_event_size({"type": "done", "data": ""})["data"] == ""

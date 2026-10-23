@@ -38,6 +38,16 @@ _DELIVERY_TIMEOUT_S = 15.0
 _COMPLETE_MAX_WAIT_S = 90.0
 _COMPLETE_RETRY_DELAY_S = 8.0
 
+# Interaction-critical side-channel events: if one of these is lost, the
+# UI is stuck or visually incomplete (ask_user -> clarification popup
+# never appears; visualization -> answer references a missing chart;
+# upload_complete -> answer references a missing download link). Their
+# full payloads are replayed via the completion POST so the gateway can
+# re-emit them (S6 answer-reconciliation generalized; F8).
+_REPLAYABLE_EVENT_TYPES = frozenset({"ask_user", "visualization", "upload_complete"})
+_UNDELIVERED_MAX_EVENTS = 5
+_UNDELIVERED_EVENT_MAX_BYTES = 16_384
+
 # --- Polling retry policy (GW1) --------------------------------------------
 _POLL_RETRY_BASE_S = 2.0
 _POLL_RETRY_CAP_S = 30.0
@@ -48,6 +58,31 @@ _EVENT_ID_HEADER = "X-Seeknal-Event-Id"
 
 class _WorkVanished(Exception):
     """Gateway no longer knows this work (404/410) — stop streaming."""
+
+
+def _bound_event_size(event: dict) -> dict:
+    """Cap a replayable event's payload so completion POSTs stay small.
+
+    Args:
+        event: The original side-channel event dict.
+
+    Returns:
+        The event, with ``data`` truncated when its serialized form
+        exceeds ``_UNDELIVERED_EVENT_MAX_BYTES``.
+    """
+    import json
+
+    try:
+        raw = json.dumps(event, default=str)
+        if len(raw.encode("utf-8")) <= _UNDELIVERED_EVENT_MAX_BYTES:
+            return event
+        truncated = dict(event)
+        data = event.get("data")
+        truncated["data"] = str(data)[: _UNDELIVERED_EVENT_MAX_BYTES // 2]
+        truncated["payload_truncated"] = True
+        return truncated
+    except Exception:  # noqa: BLE001 — replay sizing must never break the turn
+        return event
 
 
 def _retry_jitter() -> float:
@@ -513,6 +548,8 @@ async def _process_http_work_item(
     event_seq = 0
     dropped_events = 0
     answer_dropped = False
+    done_dropped = False
+    undelivered_events: list[dict] = []
     terminal_sent = False
 
     async def _post_with_retry(
@@ -789,11 +826,23 @@ async def _process_http_work_item(
                         # not post a second error/done pair on top of it.
                         terminal_sent = True
                     delivered = await post_event(event)
-                    if not delivered and event.get("type") == "answer":
-                        # The gateway never received the final answer — flag it
-                        # so the gateway can reconcile from the completion
-                        # payload instead of leaving the user empty-handed.
-                        answer_dropped = True
+                    if not delivered:
+                        event_type = event.get("type")
+                        if event_type == "answer":
+                            # The gateway never received the final answer —
+                            # flag it so the gateway can reconcile from the
+                            # completion payload instead of leaving the user
+                            # empty-handed.
+                            answer_dropped = True
+                        elif event_type == "done":
+                            done_dropped = True
+                        elif event_type in _REPLAYABLE_EVENT_TYPES:
+                            # Side-channel payloads are interaction-critical
+                            # and cannot be reconstructed by the gateway —
+                            # carry the original event in the completion body.
+                            undelivered_events.append(event)
+                            if len(undelivered_events) > _UNDELIVERED_MAX_EVENTS:
+                                undelivered_events.pop(0)
         except _WorkVanished as exc:
             # The work record is gone on the gateway side (expired/discarded).
             # Abort promptly; sending error/done events back is pointless —
@@ -828,20 +877,28 @@ async def _process_http_work_item(
         # ``_post_completion_persistent`` owns the retry window. Every exit
         # path below releases the semaphore.
         try:
-            await _post_completion_persistent({
+            completion_payload = {
                 "answer": answer,
                 "event_count": event_count,
                 "dropped_event_count": dropped_events,
                 "answer_dropped": answer_dropped,
                 "error": error,
-            })
+            }
+            if undelivered_events:
+                completion_payload["undelivered_events"] = [
+                    _bound_event_size(event) for event in undelivered_events
+                ]
+            if done_dropped:
+                completion_payload["done_dropped"] = True
+            await _post_completion_persistent(completion_payload)
         finally:
             semaphore.release()
             status = "error" if error else "ok"
             typer.echo(
                 f"[work={short_id} session={session_id}] complete "
                 f"events={event_count} dropped={dropped_events} "
-                f"answer_dropped={answer_dropped} status={status}"
+                f"answer_dropped={answer_dropped} replay={len(undelivered_events)} "
+                f"status={status}"
             )
 
 
