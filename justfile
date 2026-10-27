@@ -41,6 +41,10 @@ test-cli:
 test-e2e:
     pytest tests/e2e/ -v
 
+# Run tests in Docker with the CI dependency set
+test-docker *ARGS:
+    ./scripts/test-in-docker.sh {{ARGS}}
+
 # --- Documentation ---
 
 # Serve docs locally (live reload)

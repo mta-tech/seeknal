@@ -1003,9 +1003,12 @@ async def stream_ask(
         from seeknal.ask.agents.agent import compact_history_for_analysis_mode
 
         try:
-            request_limit = get_tool_context().request_limit
+            ctx = get_tool_context()
+            request_limit = ctx.request_limit
+            tool_call_limit = ctx.tool_call_limit
         except RuntimeError:
             request_limit = 100
+            tool_call_limit = None
         compact_history_for_analysis_mode(message_history)
 
         with console.status("[spinner.active]Thinking..."):
@@ -1013,7 +1016,10 @@ async def stream_ask(
                 question,
                 deps=deps,
                 message_history=message_history,
-                usage_limits=UsageLimits(request_limit=request_limit),
+                usage_limits=UsageLimits(
+                    request_limit=request_limit,
+                    tool_calls_limit=tool_call_limit,
+                ),
             )
         message_history.clear()
         message_history.extend(result.all_messages())

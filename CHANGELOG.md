@@ -5,14 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.13.1] - Unreleased
+## [2.14.0] - Unreleased
+
+### Added
+- Configurable per-turn tool-call limits for read-only Seeknal Ask analysis, including synchronous and streaming execution.
+- Optional LLM sampling settings (`temperature`, `max_tokens`, `top_p`, and `seed`) under `agent_harness.model_settings`, with explicit Python caller overrides.
+- Idempotent event delivery for HTTP workers: every event POST carries `X-Seeknal-Event-Id`; the gateway broker records seen event ids per in-flight work and suppresses replays, so retried deliveries cannot double-publish to SSE. Optional `dropped_event_count` field on the completion payload.
+- Persisted turn completion: the HTTP worker retries the completion POST — which carries the full turn answer — inside a time-boxed 90-second window instead of the 3-attempt event budget. The completion payload gains `answer_dropped` so a gateway can reconcile the final answer when the streamed answer event never arrived.
+- Replay of lost interaction-critical events: the worker reports undelivered `ask_user`, `visualization`, and `upload_complete` payloads (bounded to 5 events, ~16 KB each) plus `done_dropped` in the completion, so a gateway can re-emit them on the same SSE channel. A dropped clarification form previously left the user waiting for a popup that never appeared, and a dropped chart/upload left answers referencing missing artifacts.
 
 ### Changed
-- Bump package and lock metadata to 2.13.1 and consolidate the committed patches from PRs #112 and #113.
+- Fold the unreleased 2.13.1 patch (PRs #112, #113, #114) into 2.14.0: dependency floors and Docker build fixes ship with this minor release.
 - Enforce patched dependency floors for pydantic-ai-slim (1.107.4, retaining the 1.x cap), fsspec/s3fs (2026.6.0), aiohttp (3.14.4), multidict (6.9.1), Mako (1.4.2), and optional Prefect's Apprise (1.11.0). Refresh their required lock closure and enforce the aiohttp floor in gateway/worker image installs.
 - Update release and upgrade documentation to reflect the published 2.13.0 baseline. See the [unreleased patch notes](docs/releases/2.13.1.md).
 
 ### Fixed
+- Spending the configured `tool_call_limit` no longer surfaces as a raw `UsageLimitExceeded` in synchronous Ask/Prefect paths: the turn now degrades to an evidence-synthesis answer (no-tool final pass, then deterministic text), matching the streaming and gateway behaviour. Quiet/non-TTY streaming also forwards the configured `tool_call_limit` instead of only `request_limit`. Setting `tool_call_limit` while the project is in full toolset mode logs a warning instead of silently ignoring it.
+- HTTP-only worker never dies from transient gateway transport failures: event and completion POSTs retry (3 attempts, exponential backoff with jitter), non-fatal classify statuses (`404/410` aborts a vanished work immediately; other errors log and continue the turn), and the gateway poll loop backs off exponentially (2/4/8/…s, capped 30s ± jitter) with log escalation WARNING→DEBUG — replacing the fixed 5s/15s sleeps.
+- Abort of a vanished work item no longer leaks the per-session lock: `_run_agent_streaming` no longer yields its terminal `done` event from a `finally` block (`RuntimeError: async generator ignored GeneratorExit` and "exit cancel scope in a different task" crashes seen in production logs), terminal events are yielded from normal/exception paths, and the worker closes the stream explicitly (`aclosing`) on abort.
+- Gateway run failures now log full tracebacks (`logger.exception`) with session/tenant context, so DNS/connect errors can be attributed to the failing call (event POST vs LLM) instead of surfacing as an opaque `[Errno -2]`.
+- Preserve explicit empty model settings instead of restoring YAML sampling overrides.
+- Ignore malformed or out-of-range YAML sampling values before calling the model provider.
 - Include CLI documentation in Prefect and gateway Docker build contexts so Hatch can package the wheel's required documentation files.
 
 ## [2.13.0] - 2026-10-20
