@@ -1,0 +1,122 @@
+{
+  "source": "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/penguins.csv",
+  "sha256": "e07636bd8af74260099ea2f8678e2eabbf35def579940cc76f67061ee16c06c1",
+  "bytes": 13478,
+  "rows": 344,
+  "columns": 7,
+  "s3_objects": 17,
+  "iceberg": {
+    "initial_inserts": 300,
+    "new_inserts": 44,
+    "equal_skips": 300,
+    "newer_updates": 20,
+    "older_skips": 20,
+    "noop_snapshot_unchanged": true,
+    "readers": [
+      "PyIceberg FsspecFileIO",
+      "DuckDB iceberg_scan"
+    ],
+    "exact_rows_equal": true
+  },
+  "agent_and_callback": {
+    "species_counts": {
+      "Adelie": 152,
+      "Chinstrap": 68,
+      "Gentoo": 124
+    },
+    "agent_sql_tool_calls": 1,
+    "model": "local FunctionModel; no provider requests",
+    "temporal": "real dev server, workflow and activity; deterministic stream boundary",
+    "callback_events": 2
+  },
+  "versions": {
+    "s3fs": "2026.6.0",
+    "fsspec": "2026.6.0",
+    "aiohttp": "3.14.4",
+    "multidict": "6.9.1",
+    "pydantic-ai-slim": "1.107.4",
+    "Mako": "1.4.2",
+    "apprise": "1.11.0",
+    "duckdb": "1.4.4",
+    "pyiceberg": "0.10.0"
+  },
+  "tested_code_commit": "fd367da030256c1a9a02313cbc0078c8c22313de",
+  "seeknal_version": "2.13.1",
+  "included_pr_heads": {
+    "112": "f7afa6e89f81a4d716f9848285cd2a78fd23fe4d",
+    "113": "a5cd1f5c77173d4832d98278438268662fa2fcde",
+    "114_original": "006112a6d39210d97411c297f915cf7ed1814f4a"
+  },
+  "scope": "combined candidate; no production mutation, hosted model request, or native crash reproducer",
+  "checks": {
+    "linux_ci": {
+      "passed": 5008,
+      "skipped": 80,
+      "warnings": 25,
+      "run": "https://github.com/mta-tech/seeknal/actions/runs/39452777389"
+    },
+    "prefect_build": {
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ],
+      "result": "passed",
+      "output": "cacheonly; no image publication"
+    },
+    "worker_build": {
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ],
+      "result": "passed",
+      "push": false,
+      "run": "https://github.com/mta-tech/seeknal/actions/runs/39452777377"
+    },
+    "documentation": {
+      "local": "passed; existing warnings",
+      "remote": "passed; deployment skipped",
+      "run": "https://github.com/mta-tech/seeknal/actions/runs/39452777388"
+    },
+    "package": {
+      "code_commit": "fd367da030256c1a9a02313cbc0078c8c22313de",
+      "version": "2.13.1",
+      "wheel_sdist_metadata": "pass",
+      "cli_docs_matching_source": 40,
+      "required_dependency_floors": "pass",
+      "pydantic_ai_1x_cap": "pass"
+    },
+    "installed_wheel": {
+      "installed_wheel_version": "2.13.1",
+      "cli_version_outside_checkout": "pass",
+      "installed_docs_list_and_json_topics": "pass"
+    },
+    "lock_freshness": "passed",
+    "frozen_install": "passed: dev+ask+temporal+prefect",
+    "installed_dependencies": "all compatible",
+    "focused_mac_regressions": {
+      "passed": 1630,
+      "skipped": 70,
+      "warnings": 22,
+      "seconds": 261.32,
+      "coverage": [
+        "Ask",
+        "Iceberg mutation/routing/config/REST",
+        "Iceberg feature-store output",
+        "optional Prefect",
+        "CLI version/docs"
+      ],
+      "optional_prefect_subset": {
+        "passed": 32,
+        "skipped": 3
+      }
+    }
+  },
+  "limits": [
+    "macOS ARM native crash remains unresolved; blocked native reproducer not run",
+    "local selection excludes the large synthetic conditional-upsert native module; Linux CI passed its existing suite",
+    "deterministic local model and stream boundaries; no hosted model quality claim",
+    "no production cloud IAM, Windows, throughput or publication claim",
+    "Apprise redirects remain enabled by default; operators must configure redirect controls for untrusted destinations"
+  ],
+  "environment_note": "Initial Documents-checkout runs stalled on macOS dataless/offloaded files and were stopped; they are not counted as passes. Completed local results use a separate non-offloaded checkout of the tested code commit."
+}

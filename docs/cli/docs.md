@@ -21,7 +21,7 @@ The `docs` command provides searchable access to CLI documentation directly from
 
 When given an exact topic name (matching a filename stem like `repl`, `env`, `run`), it displays that topic directly. Otherwise, it performs a full-text search across all documentation files.
 
-Candidate 2.13.0 wheels bundle these topics under the installed package.
+Starting with 2.13.0, wheels bundle these topics under the installed package.
 Installed topics take precedence over a current project's `docs/cli`, so the
 command works outside a repository. Source checkouts fall back to repository
 topics when bundled topics are absent. This does not fetch newer docs from

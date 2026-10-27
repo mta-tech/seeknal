@@ -80,7 +80,9 @@ def _namespace_tuple(namespace: str) -> tuple[str, ...]:
     return tuple(namespace.split("\x1f"))
 
 
-def _make_app(state: RestFixtureState, warehouse: str) -> Starlette:
+def _make_app(
+    state: RestFixtureState, warehouse: str, properties: dict[str, str] | None = None
+) -> Starlette:
     async def require_bearer(request: Request, call_next: Any) -> Any:
         authorization = request.headers.get("authorization")
         state.received_authorization.append(authorization)
@@ -91,7 +93,9 @@ def _make_app(state: RestFixtureState, warehouse: str) -> Starlette:
 
     async def config(request: Request) -> Response:
         return JSONResponse(
-            _model_json(ConfigResponse(defaults={"warehouse": warehouse}, overrides={}))
+            _model_json(
+                ConfigResponse(defaults={"warehouse": warehouse, **(properties or {})}, overrides={})
+            )
         )
 
     async def namespace_exists(request: Request) -> Response:
@@ -228,18 +232,21 @@ def _listening_socket() -> tuple[socket.socket, int]:
 
 
 @contextmanager
-def run_rest_fixture(tmp_path: Path) -> Iterator[RunningRestFixture]:
+def run_rest_fixture(
+    tmp_path: Path, *, warehouse: str | None = None, properties: dict[str, str] | None = None
+) -> Iterator[RunningRestFixture]:
     warehouse_path = tmp_path / "warehouse"
     warehouse_path.mkdir()
-    warehouse = f"file://{warehouse_path}"
+    warehouse = warehouse or f"file://{warehouse_path}"
     token = "local-integration-token"
     backend = SqlCatalog(
         "integration_backend",
         uri=f"sqlite:///{tmp_path / 'catalog.db'}",
         warehouse=warehouse,
+        **(properties or {}),
     )
     state = RestFixtureState(backend=backend, token=token)
-    app = _make_app(state, warehouse)
+    app = _make_app(state, warehouse, properties)
     sock, port = _listening_socket()
     server = uvicorn.Server(uvicorn.Config(app, log_level="error", lifespan="off"))
     thread = threading.Thread(
