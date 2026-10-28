@@ -369,9 +369,9 @@ async def _run_agent_streaming(
     and truncates ``_session_lock_context`` before the lock is released.
     The inner generator is closed in this task before releasing the lock.
     Cleanup failures during consumer shutdown are logged without replacing
-    the exit or yielding. Terminal publication runs once with a short timeout
-    and is shielded from consumer cancellation; shutdown awaits the same
-    operation without yielding.
+    the exit or yielding. Terminal publication runs once and is shielded from
+    consumer cancellation. Only close/cancel applies a short shutdown deadline;
+    shutdown cancels and awaits any unfinished publication without yielding.
     """
     turn_started = time.monotonic()
     _clear_cancel(session_id, tenant_id=tenant_id)
@@ -384,10 +384,9 @@ async def _run_agent_streaming(
             "data": "",
             "elapsed_ms": int((time.monotonic() - turn_started) * 1000),
         }
-        async with asyncio.timeout(1.0):
-            await _publish_event_async(
-                session_id, event, tenant_id=tenant_id, broadcaster=broadcaster,
-            )
+        await _publish_event_async(
+            session_id, event, tenant_id=tenant_id, broadcaster=broadcaster,
+        )
         return event
 
     async def finish_done():
@@ -477,31 +476,51 @@ async def _run_agent_streaming(
                     broadcaster=broadcaster,
                 )
                 yield error_event
-            yield await finish_done()
+            try:
+                done_event = await finish_done()
+            except Exception:
+                if error_exc is None:
+                    raise
+                logger.warning(
+                    "[gateway] terminal publish failed session=%s tenant=%s",
+                    session_id,
+                    tenant_id,
+                    exc_info=True,
+                )
+            else:
+                yield done_event
         except (GeneratorExit, asyncio.CancelledError) as exit_exc:
-            while True:
-                try:
-                    await finish_done()
-                    break
-                except asyncio.CancelledError as publish_cancel:
-                    if done_task.cancelled():
+            if done_task is None:
+                done_task = asyncio.create_task(publish_done())
+            # One deadline for shutdown, independent of the normal publish age
+            # and unchanged by additional consumer cancellation requests.
+            shutdown_timer = asyncio.get_running_loop().call_later(1.0, done_task.cancel)
+            try:
+                while True:
+                    try:
+                        await finish_done()
+                        break
+                    except asyncio.CancelledError as publish_cancel:
+                        if done_task.cancelled():
+                            logger.warning(
+                                "[gateway] terminal publish cancelled session=%s tenant=%s",
+                                session_id,
+                                tenant_id,
+                            )
+                            break
+                        # Further consumer cancellation must not leave the terminal
+                        # task publishing after the next turn acquires this lock.
+                        if isinstance(exit_exc, GeneratorExit):
+                            exit_exc = publish_cancel
+                    except Exception:
                         logger.warning(
-                            "[gateway] terminal publish cancelled session=%s tenant=%s",
+                            "[gateway] terminal publish failed session=%s tenant=%s",
                             session_id,
                             tenant_id,
                         )
                         break
-                    # Further consumer cancellation must not leave the terminal
-                    # task publishing after the next turn acquires this lock.
-                    if isinstance(exit_exc, GeneratorExit):
-                        exit_exc = publish_cancel
-                except Exception:
-                    logger.warning(
-                        "[gateway] terminal publish failed session=%s tenant=%s",
-                        session_id,
-                        tenant_id,
-                    )
-                    break
+            finally:
+                shutdown_timer.cancel()
             raise exit_exc
         finally:
             _clear_cancel(session_id, tenant_id=tenant_id)

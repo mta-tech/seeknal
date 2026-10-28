@@ -328,6 +328,114 @@ async def test_aclose_terminal_publish_is_bounded_best_effort(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exit_mode", ["normal", "error", "user_cancel"])
+async def test_slow_terminal_publication_preserves_normal_completion(
+    tmp_path, monkeypatch, exit_mode,
+):
+    import seeknal.ask.gateway.server as server
+
+    original_error = ValueError("original agent failure")
+    accepted = []
+    yielded = []
+    session_id = f"slow-terminal-{exit_mode}"
+
+    async def inner(*args, **kwargs):
+        yield {"type": "token", "data": "one"}
+        if exit_mode == "error":
+            raise original_error
+        yield {"type": "answer", "data": "answer"}
+
+    async def publish(session_id, event, **kwargs):
+        if event["type"] == "done":
+            await asyncio.sleep(1.05)
+        accepted.append(event)
+
+    monkeypatch.setattr(server, "_run_agent_inner", inner)
+    monkeypatch.setattr(server, "_publish_event_async", publish)
+
+    async def consume():
+        async for event in server._run_agent_streaming(tmp_path, session_id, "question"):
+            yielded.append(event)
+            if event["type"] == "token" and exit_mode == "user_cancel":
+                server._request_cancel(session_id)
+
+    if exit_mode == "error":
+        with pytest.raises(ValueError) as exc_info:
+            await consume()
+        assert exc_info.value is original_error
+    else:
+        await consume()
+    assert [event["type"] for event in accepted].count("done") == 1
+    assert [event["type"] for event in yielded].count("done") == 1
+    assert not server._get_session_lock(session_id).locked()
+
+
+@pytest.mark.asyncio
+async def test_terminal_publish_failure_does_not_mask_original_agent_error(tmp_path, monkeypatch):
+    import seeknal.ask.gateway.server as server
+
+    original_error = ValueError("original agent failure")
+    yielded = []
+
+    async def inner(*args, **kwargs):
+        raise original_error
+        yield  # pragma: no cover - make this an async generator
+
+    async def publish(session_id, event, **kwargs):
+        if event["type"] == "done":
+            raise RuntimeError("terminal delivery failed")
+
+    monkeypatch.setattr(server, "_run_agent_inner", inner)
+    monkeypatch.setattr(server, "_publish_event_async", publish)
+    with pytest.raises(ValueError) as exc_info:
+        async for event in server._run_agent_streaming(tmp_path, "terminal-failure", "question"):
+            yielded.append(event)
+    assert exc_info.value is original_error
+    assert [event["type"] for event in yielded] == ["error"]
+    assert not server._get_session_lock("terminal-failure").locked()
+
+
+@pytest.mark.asyncio
+async def test_cancel_terminal_timeout_drains_publisher_before_unlock(tmp_path, monkeypatch):
+    import seeknal.ask.gateway.server as server
+
+    session_id = "cancel-terminal-timeout"
+    lock = server._get_session_lock(session_id)
+    publishing = asyncio.Event()
+    publisher_finished = asyncio.Event()
+    lock_held_at_publisher_exit = []
+
+    async def publish(session_id, event, **kwargs):
+        if event["type"] == "done":
+            publishing.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                lock_held_at_publisher_exit.append(lock.locked())
+                publisher_finished.set()
+
+    monkeypatch.setattr(server, "_run_agent_inner", lambda *a, **k: _single_answer())
+    monkeypatch.setattr(server, "_publish_event_async", publish)
+
+    async def consume():
+        async for _ in server._run_agent_streaming(tmp_path, session_id, "question"):
+            pass
+
+    task = asyncio.create_task(consume())
+    await publishing.wait()
+    task.cancel("first shutdown request")
+    await asyncio.sleep(0)
+    task.cancel("second shutdown request")
+    async with asyncio.timeout(2):
+        with pytest.raises(asyncio.CancelledError, match="first shutdown request"):
+            await task
+    assert publisher_finished.is_set()
+    assert lock_held_at_publisher_exit == [True]
+    assert not lock.locked()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("exit_mode", ["aclose", "cancel"])
 async def test_failing_inner_cleanup_preserves_consumer_exit_and_unlocks(
     tmp_path, monkeypatch, caplog, exit_mode,
