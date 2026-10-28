@@ -857,6 +857,10 @@ async def _process_http_work_item(
                             {"type": "done"},
                         )
                 except TimeoutError:
+                    # The terminal helper may time out on error before even
+                    # attempting done. Let completion reconcile that missing end.
+                    done_dropped = True
+                    dropped_events += 1
                     logger.debug("[work=%s] shutdown terminal delivery timed out", short_id)
             raise
         except Exception as exc:  # noqa: BLE001 - surface worker failures to gateway

@@ -703,6 +703,54 @@ async def test_shutdown_bounds_stalled_terminal_and_completion_posts():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stalled_type", ["error", "done", None])
+async def test_shutdown_terminal_timeout_requests_done_reconciliation(stalled_type):
+    """Request terminal replay when shutdown times out before done is acknowledged."""
+    waiting = asyncio.Event()
+
+    async def inner(*_args, **_kwargs):
+        waiting.set()
+        await asyncio.Event().wait()
+        yield {}  # pragma: no cover
+
+    class Client(_RecordingClient):
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            if url.endswith("/event") and json["type"] == stalled_type:
+                self.posts.append({"url": url, "json": json})
+                await asyncio.Event().wait()
+            return await super().post(url, headers=headers, json=json, timeout=timeout)
+
+    client = Client()
+    semaphore = asyncio.Semaphore(0)
+    with (
+        patch("seeknal.ask.gateway.server._run_agent_inner", inner),
+        patch.object(gateway_module, "_SHUTDOWN_DELIVERY_TIMEOUT_S", 0.02),
+    ):
+        task = asyncio.create_task(_process_http_work_item(
+            _work("w-terminal", "sess-terminal"), client=client,
+            base_url="http://gateway.example", headers={},
+            project_path=Path("/tmp/does-not-matter"), semaphore=semaphore,
+        ))
+        await asyncio.wait_for(waiting.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+
+    completions = [p["json"] for p in client.posts if p["url"].endswith("/complete")]
+    assert len(completions) == 1, "completion must succeed in one shutdown attempt"
+    payload = completions[0]
+    if stalled_type is not None:
+        assert payload.get("done_dropped") is True
+        assert payload["dropped_event_count"] == 1
+        events = [p["json"]["type"] for p in client.posts if p["url"].endswith("/event")]
+        assert events == (["error"] if stalled_type == "error" else ["error", "done"])
+    else:
+        assert "done_dropped" not in payload
+        assert payload["dropped_event_count"] == 0
+    assert semaphore._value == 1
+
+
+@pytest.mark.asyncio
 async def test_drainer_bounds_final_gather_for_slow_cancellation():
     started = asyncio.Event()
     release = asyncio.Event()
