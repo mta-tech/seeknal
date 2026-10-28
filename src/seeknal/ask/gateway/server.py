@@ -798,17 +798,9 @@ async def _run_agent_inner(
             synthesize_evidence_fallback,
         )
 
-        if "authoritative sql pair" in str(exc):
-            reason = (
-                "authoritative SQL pair produced the answer for this "
-                "business question"
-            )
-        elif "terminal tool error" in str(exc):
-            reason = "terminal tool error after sufficient evidence"
-        else:
-            reason = (
-                "tool-call budget reached before the model produced a final answer"
-            )
+        from seeknal.ask.agents.tools._context import usage_limit_stop_reason
+
+        reason = usage_limit_stop_reason(exc)
         deterministic = synthesize_evidence_fallback(reason)
         try:
             ctx = get_tool_context()

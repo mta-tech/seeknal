@@ -117,6 +117,23 @@ def test_tool_call_limit_is_ignored_in_full_mode_with_warning(tmp_path, caplog):
     assert "full toolset mode" in caplog.text
 
 
+def test_full_mode_tool_call_limit_warns_once_per_project(tmp_path, caplog):
+    """Repeated agent creation warns once, while another project still warns."""
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            _create_agent_capture_context(
+                tmp_path, "tool_call_limit: 5\n", analysis_mode=False,
+            )
+        other_project = tmp_path / "other"
+        other_project.mkdir()
+        _create_agent_capture_context(
+            other_project, "tool_call_limit: 5\n", analysis_mode=False,
+        )
+
+    warnings = [r for r in caplog.records if "full toolset mode" in r.message]
+    assert len(warnings) == 2
+
+
 def test_sync_ask_degrades_to_evidence_when_budget_5_is_spent():
     """Limit=5 spent → evidence answer, not UsageLimitExceeded (GW1 gap fix)."""
     from pydantic_ai.exceptions import UsageLimitExceeded
@@ -235,6 +252,103 @@ async def test_quiet_stream_uses_configured_tool_call_limit():
     assert answer == "ok"
     assert captured["usage_limits"].request_limit == 33
     assert captured["usage_limits"].tool_calls_limit == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("synthesis", ["answer", "limit", "empty", "no-evidence"])
+async def test_quiet_stream_degrades_when_tool_budget_is_spent(synthesis):
+    """Spent budgets yield evidence, with no tools allowed during synthesis."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from seeknal.ask.agents.tools._context import ToolContext
+    from seeknal.ask.streaming import stream_ask
+
+    agent = MagicMock()
+    observed_limits = []
+    history = ["existing history"]
+    new_history = ["evidence answer history"]
+
+    async def run(prompt, **kwargs):
+        limits = kwargs["usage_limits"]
+        observed_limits.append(limits)
+        if len(observed_limits) == 1:
+            limits.check_before_tool_call(RunUsage(tool_calls=6))
+        assert "12 rows" in prompt
+        assert "Do not call any tools" in prompt
+        assert kwargs["message_history"] is history
+        if synthesis == "limit":
+            limits.check_before_tool_call(RunUsage(tool_calls=1))
+        result = _result("Found 12 rows." if synthesis == "answer" else "")
+        result.all_messages.return_value = new_history
+        return result
+
+    agent.run = run
+    ctx = ToolContext(
+        repl=MagicMock(), artifact_discovery=MagicMock(), project_path=Path("/tmp"),
+        request_limit=33, tool_call_limit=5, current_question="count rows",
+        evidence_snippets_this_turn=(
+            [] if synthesis == "no-evidence" else ["tool result: 12 rows"]
+        ),
+    )
+    console = Console(file=StringIO(), force_terminal=False)
+    with (
+        patch("seeknal.ask.streaming.lookup_prior_turn_answer", return_value=None),
+        patch("seeknal.ask.streaming.reset_report_approval"),
+        patch("seeknal.ask.streaming.reset_turn_governor"),
+        patch("seeknal.ask.streaming.record_prior_turn_answer") as record,
+        patch("seeknal.ask.streaming.compact_history_for_analysis_mode"),
+        patch("seeknal.ask.agents.tools._context.get_tool_context", return_value=ctx),
+    ):
+        answer = await stream_ask(
+            agent, MagicMock(), history, "count rows", console, quiet=True,
+        )
+
+    assert observed_limits[0].tool_calls_limit == 5
+    if synthesis == "no-evidence":
+        assert len(observed_limits) == 1
+    else:
+        assert len(observed_limits) == 2
+        assert observed_limits[1].request_limit == 33
+        assert observed_limits[1].tool_calls_limit == 0
+        assert "12 rows" in answer
+    if synthesis == "answer":
+        assert answer == "Found 12 rows."
+    else:
+        assert "stopping further tool use" in answer
+        assert "tool-call budget" in answer
+    if synthesis in ("answer", "empty"):
+        assert history == new_history
+    else:
+        assert history == ["existing history"]
+    record.assert_called_once_with(question="count rows", answer=answer)
+    agent.run_sync.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "authoritative sql pair result",
+            "authoritative SQL pair produced the answer for this business question",
+        ),
+        (
+            "terminal tool error after sufficient evidence",
+            "terminal tool error after sufficient evidence",
+        ),
+        (
+            "tool-call budget reached",
+            "tool-call budget reached before the model produced a final answer",
+        ),
+    ],
+)
+def test_usage_limit_stop_reason_preserves_existing_strings(message, expected):
+    from pydantic_ai.exceptions import UsageLimitExceeded
+
+    from seeknal.ask.agents.tools._context import usage_limit_stop_reason
+
+    assert usage_limit_stop_reason(UsageLimitExceeded(message)) == expected
 
 
 def test_sync_ask_applies_tool_call_limit_to_initial_and_ralph_retry():

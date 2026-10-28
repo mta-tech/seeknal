@@ -179,6 +179,32 @@ def test_tool_call_limit_default_and_overrides():
     assert get_tool_call_limit({"tool_call_limit": "abc"}) == 24
 
 
+@pytest.mark.parametrize(
+    ("yaml_value", "expected"),
+    [
+        ("true", 24),
+        ("5.9", 24),
+        (".inf", 24),
+        (".nan", 24),
+        ('"7"', 7),
+        ("5.0", 5),
+        ("0", 24),
+        ("-3", 24),
+    ],
+)
+def test_tool_call_limit_validates_values_loaded_from_yaml(
+    tmp_path: Path, yaml_value: str, expected: int
+):
+    """Only positive integral limits survive real YAML loading."""
+    (tmp_path / "seeknal_agent.yml").write_text(
+        f"tool_call_limit: {yaml_value}\n"
+    )
+
+    config = load_agent_config(tmp_path)
+
+    assert get_tool_call_limit(config) == expected
+
+
 def test_model_settings_are_normalized_and_unknown_keys_are_dropped():
     config = {
         "agent_harness": {
