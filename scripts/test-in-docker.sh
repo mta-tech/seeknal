@@ -3,7 +3,7 @@
 #
 # The production .dockerignore excludes tests/ and docs/, so this script builds
 # from a temporary context that includes them while still excluding the host
-# virtualenv, VCS data, caches, and build output.
+# secrets, local agent state, virtualenvs, VCS data, caches, and build output.
 #
 # Usage:
 #   scripts/test-in-docker.sh                          # full CI-equivalent suite
@@ -24,32 +24,41 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Copy the repository into the temporary context. Excludes mirror the intent of
-# .dockerignore but keep tests/, docs/, examples/, and qa/ available to tests.
-tar \
-    --exclude='.git' \
-    --exclude='.venv' \
-    --exclude='.pytest_cache' \
-    --exclude='.ruff_cache' \
-    --exclude='__pycache__' \
-    --exclude='*.egg-info' \
-    --exclude='dist' \
-    --exclude='target' \
-    --exclude='.worktrees' \
-    -C "$ROOT_DIR" -cf - . | tar -C "$BUILD_CONTEXT" -xf -
+# One list controls both the archive and Docker COPY. Tests generate their own
+# .env.example fixtures, so no host .env files need to enter the build context.
+CONTEXT_EXCLUDES=(
+    '.git'
+    '.env'
+    '.env.*'
+    '.claude'
+    '.omc'
+    '.omx'
+    '.codex'
+    '.agents'
+    'node_modules'
+    '.venv*'
+    '.pytest_cache'
+    '.ruff_cache'
+    '__pycache__'
+    '*.egg-info'
+    'dist'
+    'target'
+    '.worktrees'
+    'LANE_REPORT.md'
+)
+TAR_EXCLUDES=()
+for pattern in "${CONTEXT_EXCLUDES[@]}"; do
+    TAR_EXCLUDES+=("--exclude=$pattern")
+done
 
-# The temporary context owns its ignore rules so tests/ and docs/ are copied.
-cat > "$BUILD_CONTEXT/.dockerignore" <<'EOF'
-.git
-.venv
-.pytest_cache
-.ruff_cache
-__pycache__
-*.egg-info
-dist
-target
-.worktrees
-EOF
+# Keep tests/, docs/, examples/, and qa/ available to tests.
+tar "${TAR_EXCLUDES[@]}" -C "$ROOT_DIR" -cf - . | tar -C "$BUILD_CONTEXT" -xf -
+
+# Docker patterns need an explicit recursive form for nested paths such as the
+# TUI's node_modules. The tar excludes already match at every directory depth.
+for pattern in "${CONTEXT_EXCLUDES[@]}"; do
+    printf '%s\n' "$pattern" "**/$pattern"
+done > "$BUILD_CONTEXT/.dockerignore"
 
 echo "Building $IMAGE from a CI-equivalent dependency set..."
 DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" docker build \
