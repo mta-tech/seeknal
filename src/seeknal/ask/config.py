@@ -240,12 +240,16 @@ def get_tool_call_limit(config: dict[str, Any]) -> int:
     mode leaves tool calls unbounded (see ``create_agent``).
     """
     value = config.get("tool_call_limit")
-    if value is None:
+    if value is None or isinstance(value, bool):
+        return _DEFAULT_TOOL_CALL_LIMIT
+    if isinstance(value, float) and (
+        not math.isfinite(value) or not value.is_integer()
+    ):
         return _DEFAULT_TOOL_CALL_LIMIT
     try:
         limit = int(value)
         return limit if limit > 0 else _DEFAULT_TOOL_CALL_LIMIT
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return _DEFAULT_TOOL_CALL_LIMIT
 
 
@@ -740,14 +744,6 @@ def get_visualize_chart_auto_emit(config: dict[str, Any]) -> bool:
     agent_section = _get_mapping(config, "agent")
     chart_section = _get_mapping(agent_section, "visualize_chart")
     return _coerce_bool(chart_section.get("auto_emit"), default=False)
-
-
-# Whitelist of model_settings keys allowed through to the LLM API request.
-# See pydantic_ai/settings.py for the full list of fields pydantic-ai honours;
-# MS1 intentionally exposes only the four most common determinism controls.
-# Provider-specific keys (anthropic_thinking, openai_reasoning_effort, ...) are
-# deferred to a later spec -- adding them requires per-provider validation.
-_ALLOWED_MODEL_SETTINGS = ("temperature", "max_tokens", "top_p", "seed")
 
 
 def get_model_settings_config(config: dict[str, Any]) -> dict[str, Any] | None:

@@ -17,6 +17,7 @@ from rich.console import Console  # type annotation only
 from rich.markup import escape
 
 from seeknal.ask.agents.agent import (
+    _async_evidence_fallback,
     _DIMINISHING_RETURNS_MSG,
     _LOW_OUTPUT_RETRIES,
     _LOW_OUTPUT_THRESHOLD,
@@ -35,6 +36,7 @@ from seeknal.ask.agents.tools._context import (
     reset_turn_governor,
     should_synthesize_after_authoritative_sql_pair,
     synthesize_evidence_fallback,
+    usage_limit_stop_reason,
 )
 
 # Strip raw ANSI escape sequences from tool output to prevent terminal injection
@@ -998,6 +1000,7 @@ async def stream_ask(
         # Quiet mode still runs inside this async function, so call the
         # pydantic-ai async API directly instead of nesting run_sync inside an
         # already-running event loop.
+        from pydantic_ai.exceptions import UsageLimitExceeded
         from pydantic_ai.usage import UsageLimits
         from seeknal.ask.agents.tools._context import get_tool_context
         from seeknal.ask.agents.agent import compact_history_for_analysis_mode
@@ -1012,18 +1015,24 @@ async def stream_ask(
         compact_history_for_analysis_mode(message_history)
 
         with console.status("[spinner.active]Thinking..."):
-            result = await agent.run(
-                question,
-                deps=deps,
-                message_history=message_history,
-                usage_limits=UsageLimits(
-                    request_limit=request_limit,
-                    tool_calls_limit=tool_call_limit,
-                ),
-            )
-        message_history.clear()
-        message_history.extend(result.all_messages())
-        output = result.output or ""
+            try:
+                result = await agent.run(
+                    question,
+                    deps=deps,
+                    message_history=message_history,
+                    usage_limits=UsageLimits(
+                        request_limit=request_limit,
+                        tool_calls_limit=tool_call_limit,
+                    ),
+                )
+            except UsageLimitExceeded as exc:
+                output = await _async_evidence_fallback(
+                    agent, deps, message_history, exc,
+                )
+            else:
+                message_history.clear()
+                message_history.extend(result.all_messages())
+                output = result.output or ""
         if output:
             console.print(output)
         record_prior_turn_answer(question=question, answer=output)
@@ -1049,18 +1058,7 @@ async def stream_ask(
             from pydantic_ai.exceptions import UsageLimitExceeded
 
             if isinstance(exc, UsageLimitExceeded):
-                if "authoritative sql pair" in str(exc):
-                    reason = (
-                        "authoritative SQL pair produced the answer for this "
-                        "business question"
-                    )
-                elif "terminal tool error" in str(exc):
-                    reason = "terminal tool error after sufficient evidence"
-                else:
-                    reason = (
-                        "tool-call budget reached before the model produced "
-                        "a final answer"
-                    )
+                reason = usage_limit_stop_reason(exc)
                 fallback = await _stream_evidence_synthesis(
                     agent,
                     deps,
