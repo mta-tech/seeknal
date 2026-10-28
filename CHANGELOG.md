@@ -8,25 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [2.14.0] - Unreleased
 
 ### Added
-- Configurable per-turn tool-call limits for read-only Seeknal Ask analysis, including synchronous and streaming execution.
+- Configurable per-turn tool-call limits for read-only Seeknal Ask analysis across synchronous, streaming, quiet/non-TTY, Prefect, and gateway paths.
 - Optional LLM sampling settings (`temperature`, `max_tokens`, `top_p`, and `seed`) under `agent_harness.model_settings`, with explicit Python caller overrides.
-- Idempotent event delivery for HTTP workers: every event POST carries `X-Seeknal-Event-Id`; the gateway broker records seen event ids per in-flight work and suppresses replays, so retried deliveries cannot double-publish to SSE. Optional `dropped_event_count` field on the completion payload.
-- Persisted turn completion: the HTTP worker retries the completion POST — which carries the full turn answer — inside a time-boxed 90-second window instead of the 3-attempt event budget. The completion payload gains `answer_dropped` so a gateway can reconcile the final answer when the streamed answer event never arrived.
-- Replay of lost interaction-critical events: the worker reports undelivered `ask_user`, `visualization`, and `upload_complete` payloads (bounded to 5 events, ~16 KB each) plus `done_dropped` in the completion, so a gateway can re-emit them on the same SSE channel. A dropped clarification form previously left the user waiting for a popup that never appeared, and a dropped chart/upload left answers referencing missing artifacts.
+- HTTP worker event IDs (`X-Seeknal-Event-Id`) and completion loss fields: `dropped_event_count`, `answer_dropped`, `done_dropped`, `undelivered_events`, and `undelivered_evicted_count`.
+- Persistent completion delivery carrying the full answer, with an absolute 90-second deadline across requests and sleeps. Shutdown uses one completion attempt bounded to five seconds.
+- Built-in gateway reconciliation: replay undelivered `ask_user`, `visualization`, and `upload_complete` events in order, then a dropped non-empty answer, then dropped `done`. Partial replay retries skip already accepted entries; results retain replay metadata.
+- CI-equivalent Docker test runner and [HTTP worker protocol documentation](docs/reference/gateway-worker-protocol.md).
 
 ### Changed
 - Fold the unreleased 2.13.1 patch (PRs #112, #113, #114) into 2.14.0: dependency floors and Docker build fixes ship with this minor release.
 - Enforce patched dependency floors for pydantic-ai-slim (1.107.4, retaining the 1.x cap), fsspec/s3fs (2026.6.0), aiohttp (3.14.4), multidict (6.9.1), Mako (1.4.2), and optional Prefect's Apprise (1.11.0). Refresh their required lock closure and enforce the aiohttp floor in gateway/worker image installs.
+- Bound replay to five events and 16,384 UTF-8 JSON bytes per event. Preserve fitting payloads; oversized or unserializable payloads become `{type, payload_truncated: true, original_bytes}` placeholders without `data`. Evict charts before clarifications and report evictions.
 - Update release and upgrade documentation for 2.14.0. See the [2.14.0 release notes](docs/releases/2.14.0.md).
 
 ### Fixed
-- Spending the configured `tool_call_limit` no longer surfaces as a raw `UsageLimitExceeded` in synchronous Ask/Prefect paths: the turn now degrades to an evidence-synthesis answer (no-tool final pass, then deterministic text), matching the streaming and gateway behaviour. Quiet/non-TTY streaming also forwards the configured `tool_call_limit` instead of only `request_limit`. Setting `tool_call_limit` while the project is in full toolset mode logs a warning instead of silently ignoring it.
-- HTTP-only worker never dies from transient gateway transport failures: event and completion POSTs retry (3 attempts, exponential backoff with jitter), non-fatal classify statuses (`404/410` aborts a vanished work immediately; other errors log and continue the turn), and the gateway poll loop backs off exponentially (2/4/8/…s, capped 30s ± jitter) with log escalation WARNING→DEBUG — replacing the fixed 5s/15s sleeps.
-- Abort of a vanished work item no longer leaks the per-session lock: `_run_agent_streaming` no longer yields its terminal `done` event from a `finally` block (`RuntimeError: async generator ignored GeneratorExit` and "exit cancel scope in a different task" crashes seen in production logs), terminal events are yielded from normal/exception paths, and the worker closes the stream explicitly (`aclosing`) on abort.
-- Gateway run failures now log full tracebacks (`logger.exception`) with session/tenant context, so DNS/connect errors can be attributed to the failing call (event POST vs LLM) instead of surfacing as an opaque `[Errno -2]`.
-- Preserve explicit empty model settings instead of restoring YAML sampling overrides.
-- Ignore malformed or out-of-range YAML sampling values before calling the model provider.
+- Synchronous Ask/Prefect and quiet/non-TTY execution now handle exhausted tool budgets with a no-tool evidence-synthesis pass and deterministic fallback.
+- Accept positive integers, integral floats, and integer strings for `tool_call_limit`; default invalid, boolean, fractional, non-finite, or non-positive values to 24. Full-mode tool calls remain unbounded, with a warning once per process per project when the setting is ignored.
+- Retry transient event delivery failures for up to three attempts with backoff and jitter; retry `429`/`5xx`, abort vanished work on `404`/`410`, and do not retry other `4xx`. After delivery fails, degraded mode drops non-critical events while preserving critical retries until a successful POST restores normal delivery.
+- Keep initial and periodic poll failures at WARNING, or ERROR for rejected worker tokens, and log recovery. Polling retains exponential backoff capped at 30 seconds plus jitter.
+- Reserve event IDs before publication and commit only after acceptance, including Redis publication. Failed publishes release reservations; in-flight duplicates receive retryable `503`, while accepted duplicates return success without republishing.
+- Close the inner agent generator in its owning task before releasing the session lock, including abort and cancellation. Cleanup failures during consumer shutdown no longer yield or replace the exit.
+- Use one shielded terminal `done` publication across cancellation races. Only close/hard cancellation applies a one-second deadline and drains the publisher before unlocking; slow normal completion remains supported and terminal delivery failures preserve original agent errors.
+- Bound worker shutdown terminal delivery and cancellation draining. If terminal delivery times out, count the missing `done` and request reconciliation through completion.
+- Log gateway run failures with full tracebacks and session/tenant context.
+- Preserve explicit empty model settings and ignore malformed or out-of-range YAML sampling values before provider calls.
 - Include CLI documentation in Prefect and gateway Docker build contexts so Hatch can package the wheel's required documentation files.
+- Exclude `.env`, `.env.*`, local agent state, virtual environments, `node_modules`, worktrees, and lane reports from Docker test contexts using shared tar/ignore rules; remove temporary contexts on exit.
 
 ## [2.13.0] - 2026-10-20
 
