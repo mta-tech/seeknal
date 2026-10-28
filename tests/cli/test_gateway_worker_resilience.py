@@ -307,7 +307,10 @@ async def test_completion_failure_does_not_inflate_event_loss_counter():
             return _response(200)
 
     client = _CompleteDown()
-    with patch.object(gateway_module, "_COMPLETE_MAX_WAIT_S", 0.5):
+    with (
+        patch.object(gateway_module, "_COMPLETE_MAX_WAIT_S", 0.5),
+        patch.object(gateway_module, "_COMPLETE_RETRY_DELAY_S", 0.01),
+    ):
         task = await asyncio.wait_for(_run_handler(client), timeout=15.0)
     assert task.done() and task.exception() is None
 
@@ -470,7 +473,7 @@ async def test_lost_side_channel_event_is_replayed_in_completion():
         patch.object(gateway_module, "_retry_jitter", lambda: 1.0),
         patch("seeknal.ask.gateway.server._run_agent_inner", _clarify_inner),
     ):
-        task = await asyncio.wait_for(_run_handler(client, inner=_clarify_inner), timeout=15.0)
+        await asyncio.wait_for(_run_handler(client, inner=_clarify_inner), timeout=15.0)
 
     complete_calls = [p for p in client.posts if p["url"].endswith("/complete")]
     body = complete_calls[0]["json"]
@@ -504,7 +507,7 @@ async def test_delivered_side_channel_is_not_replayed():
         patch.object(gateway_module, "_retry_jitter", lambda: 1.0),
         patch("seeknal.ask.gateway.server._run_agent_inner", _chart_inner),
     ):
-        task = await asyncio.wait_for(_run_handler(client, inner=_chart_inner), timeout=15.0)
+        await asyncio.wait_for(_run_handler(client, inner=_chart_inner), timeout=15.0)
 
     complete_calls = [p for p in client.posts if p["url"].endswith("/complete")]
     body = complete_calls[0]["json"]
@@ -517,5 +520,371 @@ def test_bound_event_size_caps_oversized_payload():
     big = {"type": "visualization", "data": {"blob": "x" * 100_000}}
     bounded = gateway_module._bound_event_size(big)
     assert bounded.get("payload_truncated") is True
-    assert len(str(bounded["data"])) < gateway_module._UNDELIVERED_EVENT_MAX_BYTES
+    assert "data" not in bounded
     assert gateway_module._bound_event_size({"type": "done", "data": ""})["data"] == ""
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "visualization", "data": [{"x": i, "y": "x" * 40} for i in range(1000)]},
+    {"type": "ask_user", "data": {"prompts": [{"question": "q" * 20000, "options": []}]}},
+    {"type": "visualization", "data": {"title": "漢😀" * 10000}},
+    {"type": "upload_complete", "data": {"url": "x" * 20000}},
+])
+def test_replay_payload_bound_preserves_schema_or_explicit_placeholder(event):
+    import json
+
+    bounded = gateway_module._bound_event_size(event)
+    encoded = json.dumps(bounded, ensure_ascii=False).encode("utf-8")
+    assert len(encoded) <= gateway_module._UNDELIVERED_EVENT_MAX_BYTES
+    assert bounded["type"] == event["type"]
+    assert bounded["payload_truncated"] is True
+    assert bounded["original_bytes"] == len(
+        json.dumps(event, ensure_ascii=False).encode("utf-8")
+    )
+    # Explicit omitted-data placeholders are allowed; strings replacing objects aren't.
+    assert "data" not in bounded or type(bounded["data"]) is type(event["data"])
+    if "data" in bounded and event["type"] == "ask_user":
+        assert isinstance(bounded["data"]["prompts"], list)
+        assert all(isinstance(p, dict) for p in bounded["data"]["prompts"])
+    assert event["data"], "sizing must not mutate the source event"
+
+
+def test_unicode_replay_within_utf8_bound_is_preserved():
+    event = {"type": "ask_user", "data": {"prompts": [
+        {"question": "漢" * 3000, "options": []},
+    ]}}
+    assert gateway_module._bound_event_size(event) == event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["transport", "http"])
+@pytest.mark.parametrize("first_duration", [80.0, 89.9, 90.0])
+async def test_completion_absolute_deadline(failure, first_duration):
+    from types import SimpleNamespace
+
+    now = 0.0
+    requests = []
+    sleeps = []
+
+    async def sleep(seconds):
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    class Client(_RecordingClient):
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            nonlocal now
+            if not url.endswith("/complete"):
+                return _response(200)
+            requests.append((now, timeout))
+            now += first_duration if len(requests) == 1 else timeout
+            if failure == "transport":
+                raise httpx.ConnectError("offline")
+            return httpx.Response(503, headers={"retry-after": "30"})
+
+    with (
+        patch.object(gateway_module, "time", SimpleNamespace(monotonic=lambda: now)),
+        patch("asyncio.sleep", sleep),
+    ):
+        await _run_handler(Client())
+    assert requests
+    assert all(start < 90 and timeout <= 90 - start for start, timeout in requests)
+    assert now <= 90.0
+    assert all(seconds <= 90.0 - first_duration for seconds in sleeps)
+
+
+@pytest.mark.asyncio
+async def test_completion_deadline_rechecked_after_sleep_overhead():
+    from types import SimpleNamespace
+
+    now = 0.0
+    attempts = []
+
+    async def sleep(seconds):
+        nonlocal now
+        # The scheduler resumes us after the deadline, despite a short sleep.
+        now += seconds + 90.0
+
+    class Client(_RecordingClient):
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            if url.endswith("/complete"):
+                attempts.append(now)
+                raise httpx.ConnectError("offline")
+            return _response(200)
+
+    with (
+        patch.object(gateway_module, "time", SimpleNamespace(monotonic=lambda: now)),
+        patch("asyncio.sleep", sleep),
+    ):
+        await _run_handler(Client())
+    assert attempts == [0.0], "no new request may start after the deadline"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_work_attempts_completion_once_with_short_timeout():
+    waiting = asyncio.Event()
+    calls = []
+
+    async def inner(*_args, **_kwargs):
+        yield {"type": "token", "data": "started"}
+        waiting.set()
+        await asyncio.Event().wait()
+
+    class Client(_RecordingClient):
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            calls.append((url, timeout, waiting.is_set()))
+            raise httpx.ConnectError("offline")
+
+    semaphore = asyncio.Semaphore(0)
+    with (
+        patch("seeknal.ask.gateway.server._run_agent_inner", inner),
+        patch.object(gateway_module, "_EVENT_RETRY_BASE_S", 0.001),
+        patch.object(gateway_module, "_TERMINAL_RETRY_DELAY_S", 0.001),
+        patch.object(gateway_module, "_COMPLETE_MAX_WAIT_S", 0.08),
+        patch.object(gateway_module, "_COMPLETE_RETRY_DELAY_S", 0.001),
+    ):
+        task = asyncio.create_task(_process_http_work_item(
+            _work("w-cancel", "sess-cancel"), client=Client(),
+            base_url="http://gateway.example", headers={},
+            project_path=Path("/tmp/does-not-matter"), semaphore=semaphore,
+        ))
+        await asyncio.wait_for(waiting.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+    completions = [c for c in calls if c[0].endswith("/complete")]
+    assert len(completions) == 1
+    assert all(timeout <= 5 for _, timeout, cancelled in calls if cancelled)
+    assert semaphore._value == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_bounds_stalled_terminal_and_completion_posts():
+    waiting = asyncio.Event()
+    shutdown_calls = []
+    real_sleep = asyncio.sleep
+
+    async def inner(*_args, **_kwargs):
+        waiting.set()
+        await asyncio.Event().wait()
+        yield {}  # pragma: no cover
+
+    class Client(_RecordingClient):
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            shutdown_calls.append(url)
+            await real_sleep(10)  # ignores the httpx timeout argument
+
+    semaphore = asyncio.Semaphore(0)
+    with (
+        patch("seeknal.ask.gateway.server._run_agent_inner", inner),
+        patch.object(gateway_module, "_SHUTDOWN_DELIVERY_TIMEOUT_S", 0.02, create=True),
+    ):
+        task = asyncio.create_task(_process_http_work_item(
+            _work("w-stalled", "sess-stalled"), client=Client(),
+            base_url="http://gateway.example", headers={},
+            project_path=Path("/tmp/does-not-matter"), semaphore=semaphore,
+        ))
+        await asyncio.wait_for(waiting.wait(), 1)
+        task.cancel()
+        try:
+            done, _ = await asyncio.wait({task}, timeout=0.2)
+            assert task in done, "shutdown delivery exceeded its short total budget"
+            assert task.cancelled()
+            assert len([u for u in shutdown_calls if u.endswith('/complete')]) == 1
+            assert semaphore._value == 1
+        finally:
+            # Even baseline code needs a clean test teardown after the assertion fails.
+            for _ in range(6):
+                if task.done():
+                    break
+                task.cancel()
+                await real_sleep(0)
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stalled_type", ["error", "done", None])
+async def test_shutdown_terminal_timeout_requests_done_reconciliation(stalled_type):
+    """Request terminal replay when shutdown times out before done is acknowledged."""
+    waiting = asyncio.Event()
+
+    async def inner(*_args, **_kwargs):
+        waiting.set()
+        await asyncio.Event().wait()
+        yield {}  # pragma: no cover
+
+    class Client(_RecordingClient):
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            if url.endswith("/event") and json["type"] == stalled_type:
+                self.posts.append({"url": url, "json": json})
+                await asyncio.Event().wait()
+            return await super().post(url, headers=headers, json=json, timeout=timeout)
+
+    client = Client()
+    semaphore = asyncio.Semaphore(0)
+    with (
+        patch("seeknal.ask.gateway.server._run_agent_inner", inner),
+        patch.object(gateway_module, "_SHUTDOWN_DELIVERY_TIMEOUT_S", 0.02),
+    ):
+        task = asyncio.create_task(_process_http_work_item(
+            _work("w-terminal", "sess-terminal"), client=client,
+            base_url="http://gateway.example", headers={},
+            project_path=Path("/tmp/does-not-matter"), semaphore=semaphore,
+        ))
+        await asyncio.wait_for(waiting.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+
+    completions = [p["json"] for p in client.posts if p["url"].endswith("/complete")]
+    assert len(completions) == 1, "completion must succeed in one shutdown attempt"
+    payload = completions[0]
+    if stalled_type is not None:
+        assert payload.get("done_dropped") is True
+        assert payload["dropped_event_count"] == 1
+        events = [p["json"]["type"] for p in client.posts if p["url"].endswith("/event")]
+        assert events == (["error"] if stalled_type == "error" else ["error", "done"])
+    else:
+        assert "done_dropped" not in payload
+        assert payload["dropped_event_count"] == 0
+    assert semaphore._value == 1
+
+
+@pytest.mark.asyncio
+async def test_drainer_bounds_final_gather_for_slow_cancellation():
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_cleanup():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    task = asyncio.create_task(slow_cleanup())
+    await started.wait()
+    with patch.object(gateway_module, "_CANCEL_DRAIN_TIMEOUT_S", 0.02, create=True):
+        drainer = asyncio.create_task(gateway_module._drain_or_cancel_tasks({task}, 0))
+        try:
+            done, _ = await asyncio.wait({drainer}, timeout=0.2)
+            assert drainer in done, "drainer's final gather has no upper bound"
+            await drainer
+        finally:
+            release.set()
+            await asyncio.gather(task, drainer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_delivery_degraded_mode_drops_tokens_and_recovers():
+    posts = []
+    slept = []
+    recovered = False
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    async def inner(*_args, **_kwargs):
+        for i in range(50):
+            yield {"type": "token", "data": str(i)}
+        yield {"type": "answer", "data": "answer"}
+        yield {"type": "ask_user", "data": {"prompts": [{"question": "q"}]}}
+        yield {"type": "token", "data": "after recovery"}
+
+    class Client(_RecordingClient):
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            nonlocal recovered
+            if url.endswith("/complete"):
+                self.completion = json
+                return _response(200)
+            posts.append(json)
+            if json["type"] == "ask_user":
+                recovered = True
+            if recovered:
+                return _response(200)
+            raise httpx.ConnectError("offline")
+
+    client = Client()
+    with patch("asyncio.sleep", sleep):
+        await _run_handler(client, inner=inner)
+    tokens = [p["data"] for p in posts if p["type"] == "token"]
+    assert tokens == ["0"] * 3 + ["after recovery"]
+    assert len([p for p in posts if p["type"] == "answer"]) == 3
+    assert len(slept) == 4
+    assert sum(slept) == 3.0
+    assert client.completion["dropped_event_count"] == 51
+    assert client.completion["answer_dropped"] is True
+
+
+@pytest.mark.parametrize("status, level", [(401, "ERROR"), (403, "ERROR"), (503, "WARNING")])
+def test_poll_failures_remain_visible_and_log_recovery(caplog, status, level):
+    import logging
+
+    class StopLoop(Exception):
+        pass
+
+    class Client(_RecordingClient):
+        async def get(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls <= 11:
+                return _response(status)
+            if self.calls <= 13:
+                return _response(204)
+            raise StopLoop()
+
+    async def sleep(_seconds):
+        pass
+
+    client = Client()
+    with (
+        caplog.at_level(logging.INFO, logger=gateway_module.__name__),
+        patch("httpx.AsyncClient", return_value=client),
+        patch("asyncio.sleep", sleep),
+        patch.object(gateway_module, "_retry_jitter", lambda: 1),
+    ):
+        with pytest.raises(StopLoop):
+            asyncio.run(gateway_module._run_http_only_worker(
+                project_path=Path("/tmp/does-not-matter"),
+                gateway_url="http://gateway.example", api_token="t",
+            ))
+    failures = [r for r in caplog.records if "retrying" in r.message and r.levelname == level]
+    assert len(failures) >= 4, "initial failures and every tenth attempt must remain visible"
+    assert any("attempt=10" in r.message for r in failures)
+    if status in (401, 403):
+        assert all("worker token rejected" in r.message for r in failures)
+        assert all("SEEKNAL_API_TOKEN" in r.message for r in failures)
+    recovered = [r for r in caplog.records if "poll recovered after 11 attempts" in r.message]
+    assert len(recovered) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("types, expected, evicted", [
+    (["ask_user"] + ["visualization"] * 6, ["ask_user", "3", "4", "5", "6"], 2),
+    (["upload_complete", "visualization"] + ["upload_complete"] * 4,
+     ["0", "2", "3", "4", "5"], 1),
+    (["ask_user"] * 6, ["1", "2", "3", "4", "5"], 1),
+])
+async def test_replay_buffer_evicts_charts_before_clarifications(types, expected, evicted):
+    async def inner(*_args, **_kwargs):
+        for i, event_type in enumerate(types):
+            yield {"type": event_type, "data": {"id": str(i)}}
+
+    class Client(_RecordingClient):
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            if url.endswith("/event") and json["type"] in gateway_module._REPLAYABLE_EVENT_TYPES:
+                raise httpx.ConnectError("offline")
+            if url.endswith("/complete"):
+                self.completion = json
+            return _response(200)
+
+    async def sleep(_seconds):
+        pass
+
+    client = Client()
+    with patch("asyncio.sleep", sleep):
+        await _run_handler(client, inner=inner)
+    replay = client.completion["undelivered_events"]
+    actual = [e["type"] if e["type"] == "ask_user" and types.count("ask_user") == 1
+              else e["data"]["id"] for e in replay]
+    assert actual == expected
+    assert client.completion["undelivered_evicted_count"] == evicted
