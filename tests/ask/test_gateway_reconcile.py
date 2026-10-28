@@ -273,6 +273,19 @@ async def test_completion_reconciles_to_session_in_order_and_retains_fields(work
     assert result.undelivered_events == payload.get("undelivered_events", [])
 
 
+@pytest.mark.parametrize("original_bytes", [36040, None])
+async def test_completion_preserves_exact_worker_placeholder(work, original_bytes):
+    client, _, queue, task, url = work
+    placeholder = {
+        "type": "visualization", "payload_truncated": True, "original_bytes": original_bytes,
+    }
+    response = await client.post(f"{url}/complete", json={"undelivered_events": [placeholder]})
+    assert response.status_code == 200
+    assert json.loads(queue.get_nowait()) == placeholder
+    assert queue.empty()
+    assert (await task).undelivered_events == [placeholder]
+
+
 @pytest.mark.parametrize("value", ["malformed", {}, [], {"bad": 1}, [1], None, "", -1])
 async def test_completion_malformed_dropped_count_defaults_to_zero(work, value):
     client, _, _, task, url = work

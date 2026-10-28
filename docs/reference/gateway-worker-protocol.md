@@ -121,12 +121,20 @@ The completion body supports these fields:
 
 The worker includes `ask_user`, `visualization`, and `upload_complete` events in
 `undelivered_events`. It retains at most five replay events and bounds each
-event to at most 16 KB of serialized JSON bytes. When bounding removes payload
-content, the event includes `"payload_truncated": true`; consumers must treat
-that marker as an explicit incomplete payload rather than the original event.
-The gateway preserves the entire replay event, including its truncation marker
-and any placeholder or error data supplied by the worker. Replay eviction is
-reported separately in `undelivered_evicted_count`.
+event to at most 16 KB of serialized JSON bytes. An oversized or unserializable
+event becomes this metadata-only placeholder, with the original event `type`:
+
+```json
+{"type":"visualization","payload_truncated":true,"original_bytes":36040}
+```
+
+The placeholder has no `data` field. `original_bytes` is the original event's
+serialized UTF-8 JSON byte count, or `null` when serialization fails. Consumers
+must treat `payload_truncated: true` as an explicit missing payload; they must
+not interpret it as an ordinary chart, clarification, or upload response.
+The gateway preserves this exact shape and metadata in both the SSE replay and
+`HttpWorkerResult.undelivered_events`. Replay eviction is reported separately
+in `undelivered_evicted_count`.
 
 Before resolving the work, the gateway reconciles dropped events to the work's
 session SSE channel in this order:

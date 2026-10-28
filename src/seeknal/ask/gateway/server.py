@@ -11,7 +11,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-from contextlib import aclosing, asynccontextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import json
 import logging
@@ -368,26 +368,33 @@ async def _run_agent_streaming(
     ignored GeneratorExit`` when a consumer closes/cancels the generator,
     and truncates ``_session_lock_context`` before the lock is released.
     The inner generator is closed in this task before releasing the lock.
-    Closing/cancelling the consumer publishes ``done`` best-effort without
-    yielding; other paths publish and yield it once.
+    Cleanup failures during consumer shutdown are logged without replacing
+    the exit or yielding. Terminal publication runs once with a short timeout
+    and is shielded from consumer cancellation; shutdown awaits the same
+    operation without yielding.
     """
     turn_started = time.monotonic()
     _clear_cancel(session_id, tenant_id=tenant_id)
     error_exc: BaseException | None = None
-    done_started = False
+    done_task: asyncio.Task | None = None
 
     async def publish_done():
-        nonlocal done_started
-        done_started = True
         event = {
             "type": "done",
             "data": "",
             "elapsed_ms": int((time.monotonic() - turn_started) * 1000),
         }
-        await _publish_event_async(
-            session_id, event, tenant_id=tenant_id, broadcaster=broadcaster,
-        )
+        async with asyncio.timeout(1.0):
+            await _publish_event_async(
+                session_id, event, tenant_id=tenant_id, broadcaster=broadcaster,
+            )
         return event
+
+    async def finish_done():
+        nonlocal done_task
+        if done_task is None:
+            done_task = asyncio.create_task(publish_done())
+        return await asyncio.shield(done_task)
 
     async with _session_lock_context(
         session_id,
@@ -396,11 +403,13 @@ async def _run_agent_streaming(
     ):
         try:
             try:
-                async with aclosing(_run_agent_inner(
+                inner = _run_agent_inner(
                     project_path, session_id, question, provider, model,
                     tenant_id=tenant_id, auto_approve=auto_approve,
                     include_web=include_web,
-                )) as inner:
+                )
+                consumer_exiting = False
+                try:
                     async for event in inner:
                         if _is_cancelled(session_id, tenant_id=tenant_id):
                             cancel_event = {
@@ -422,6 +431,37 @@ async def _run_agent_streaming(
                             broadcaster=broadcaster,
                         )
                         yield event
+                except (GeneratorExit, asyncio.CancelledError):
+                    consumer_exiting = True
+                    raise
+                finally:
+                    cancellations_before_close = asyncio.current_task().cancelling()
+                    cleanup_error: BaseException | None = None
+                    try:
+                        await inner.aclose()
+                    except (Exception, asyncio.CancelledError) as cleanup_exc:
+                        cleanup_error = cleanup_exc
+                    fresh_cancellation = (
+                        asyncio.current_task().cancelling() > cancellations_before_close
+                    )
+                    if cleanup_error is not None:
+                        if not consumer_exiting and not fresh_cancellation:
+                            raise cleanup_error
+                        logger.warning(
+                            "[gateway] inner cleanup failed session=%s tenant=%s",
+                            session_id,
+                            tenant_id,
+                            exc_info=cleanup_error,
+                        )
+                    if fresh_cancellation:
+                        # Cleanup may transform or suppress an injected cancel.
+                        # Recover its original exception when it is still chained.
+                        cause = cleanup_error
+                        while cause is not None:
+                            if isinstance(cause, asyncio.CancelledError):
+                                raise cause
+                            cause = cause.__context__
+                        raise asyncio.CancelledError() from cleanup_error
             except Exception as exc:
                 error_exc = exc
                 logger.exception(
@@ -437,19 +477,32 @@ async def _run_agent_streaming(
                     broadcaster=broadcaster,
                 )
                 yield error_event
-            yield await publish_done()
-        except (GeneratorExit, asyncio.CancelledError):
-            if not done_started:
+            yield await finish_done()
+        except (GeneratorExit, asyncio.CancelledError) as exit_exc:
+            while True:
                 try:
-                    async with asyncio.timeout(1.0):
-                        await publish_done()
-                except (Exception, asyncio.CancelledError):
+                    await finish_done()
+                    break
+                except asyncio.CancelledError as publish_cancel:
+                    if done_task.cancelled():
+                        logger.warning(
+                            "[gateway] terminal publish cancelled session=%s tenant=%s",
+                            session_id,
+                            tenant_id,
+                        )
+                        break
+                    # Further consumer cancellation must not leave the terminal
+                    # task publishing after the next turn acquires this lock.
+                    if isinstance(exit_exc, GeneratorExit):
+                        exit_exc = publish_cancel
+                except Exception:
                     logger.warning(
                         "[gateway] terminal publish failed session=%s tenant=%s",
                         session_id,
                         tenant_id,
                     )
-            raise
+                    break
+            raise exit_exc
         finally:
             _clear_cancel(session_id, tenant_id=tenant_id)
     # Preserve the established worker contract: the exception reaches the
