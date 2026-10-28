@@ -367,78 +367,163 @@ async def _run_agent_streaming(
     yield inside ``finally`` raises ``RuntimeError: async generator
     ignored GeneratorExit`` when a consumer closes/cancels the generator,
     and truncates ``_session_lock_context`` before the lock is released.
-    ``done`` is therefore yielded from the normal/exception paths after
-    the loop; when the consumer closes the generator, ``done`` is simply
-    not produced and the lock releases via ``async with``.
+    The inner generator is closed in this task before releasing the lock.
+    Cleanup failures during consumer shutdown are logged without replacing
+    the exit or yielding. Terminal publication runs once and is shielded from
+    consumer cancellation. Only close/cancel applies a short shutdown deadline;
+    shutdown cancels and awaits any unfinished publication without yielding.
     """
     turn_started = time.monotonic()
     _clear_cancel(session_id, tenant_id=tenant_id)
     error_exc: BaseException | None = None
+    done_task: asyncio.Task | None = None
+
+    async def publish_done():
+        event = {
+            "type": "done",
+            "data": "",
+            "elapsed_ms": int((time.monotonic() - turn_started) * 1000),
+        }
+        await _publish_event_async(
+            session_id, event, tenant_id=tenant_id, broadcaster=broadcaster,
+        )
+        return event
+
+    async def finish_done():
+        nonlocal done_task
+        if done_task is None:
+            done_task = asyncio.create_task(publish_done())
+        return await asyncio.shield(done_task)
+
     async with _session_lock_context(
         session_id,
         tenant_id=tenant_id,
         lock_backend=lock_backend,
     ):
         try:
-            async for event in _run_agent_inner(
-                project_path, session_id, question, provider, model,
-                tenant_id=tenant_id, auto_approve=auto_approve,
-                include_web=include_web,
-            ):
-                if _is_cancelled(session_id, tenant_id=tenant_id):
-                    cancel_event = {
-                        "type": "cancelled",
-                        "data": "Run cancelled by user.",
-                    }
-                    await _publish_event_async(
-                        session_id,
-                        cancel_event,
-                        tenant_id=tenant_id,
-                        broadcaster=broadcaster,
+            try:
+                inner = _run_agent_inner(
+                    project_path, session_id, question, provider, model,
+                    tenant_id=tenant_id, auto_approve=auto_approve,
+                    include_web=include_web,
+                )
+                consumer_exiting = False
+                try:
+                    async for event in inner:
+                        if _is_cancelled(session_id, tenant_id=tenant_id):
+                            cancel_event = {
+                                "type": "cancelled",
+                                "data": "Run cancelled by user.",
+                            }
+                            await _publish_event_async(
+                                session_id,
+                                cancel_event,
+                                tenant_id=tenant_id,
+                                broadcaster=broadcaster,
+                            )
+                            yield cancel_event
+                            break
+                        await _publish_event_async(
+                            session_id,
+                            event,
+                            tenant_id=tenant_id,
+                            broadcaster=broadcaster,
+                        )
+                        yield event
+                except (GeneratorExit, asyncio.CancelledError):
+                    consumer_exiting = True
+                    raise
+                finally:
+                    cancellations_before_close = asyncio.current_task().cancelling()
+                    cleanup_error: BaseException | None = None
+                    try:
+                        await inner.aclose()
+                    except (Exception, asyncio.CancelledError) as cleanup_exc:
+                        cleanup_error = cleanup_exc
+                    fresh_cancellation = (
+                        asyncio.current_task().cancelling() > cancellations_before_close
                     )
-                    yield cancel_event
-                    break
+                    if cleanup_error is not None:
+                        if not consumer_exiting and not fresh_cancellation:
+                            raise cleanup_error
+                        logger.warning(
+                            "[gateway] inner cleanup failed session=%s tenant=%s",
+                            session_id,
+                            tenant_id,
+                            exc_info=cleanup_error,
+                        )
+                    if fresh_cancellation:
+                        # Cleanup may transform or suppress an injected cancel.
+                        # Recover its original exception when it is still chained.
+                        cause = cleanup_error
+                        while cause is not None:
+                            if isinstance(cause, asyncio.CancelledError):
+                                raise cause
+                            cause = cause.__context__
+                        raise asyncio.CancelledError() from cleanup_error
+            except Exception as exc:
+                error_exc = exc
+                logger.exception(
+                    "[gateway] run failed session=%s tenant=%s",
+                    session_id,
+                    tenant_id,
+                )
+                error_event = {"type": "error", "data": str(exc)}
                 await _publish_event_async(
                     session_id,
-                    event,
+                    error_event,
                     tenant_id=tenant_id,
                     broadcaster=broadcaster,
                 )
-                yield event
-        except GeneratorExit:
-            # Consumer closed the generator (aclose/disconnect/abort).
-            # Propagate immediately — do not publish a terminal event;
-            # `async with` releases the lock on the way out.
-            raise
-        except Exception as exc:
-            error_exc = exc
-            logger.exception(
-                "[gateway] run failed session=%s tenant=%s",
-                session_id,
-                tenant_id,
-            )
-            error_event = {"type": "error", "data": str(exc)}
-            await _publish_event_async(
-                session_id,
-                error_event,
-                tenant_id=tenant_id,
-                broadcaster=broadcaster,
-            )
-            yield error_event
+                yield error_event
+            try:
+                done_event = await finish_done()
+            except Exception:
+                if error_exc is None:
+                    raise
+                logger.warning(
+                    "[gateway] terminal publish failed session=%s tenant=%s",
+                    session_id,
+                    tenant_id,
+                    exc_info=True,
+                )
+            else:
+                yield done_event
+        except (GeneratorExit, asyncio.CancelledError) as exit_exc:
+            if done_task is None:
+                done_task = asyncio.create_task(publish_done())
+            # One deadline for shutdown, independent of the normal publish age
+            # and unchanged by additional consumer cancellation requests.
+            shutdown_timer = asyncio.get_running_loop().call_later(1.0, done_task.cancel)
+            try:
+                while True:
+                    try:
+                        await finish_done()
+                        break
+                    except asyncio.CancelledError as publish_cancel:
+                        if done_task.cancelled():
+                            logger.warning(
+                                "[gateway] terminal publish cancelled session=%s tenant=%s",
+                                session_id,
+                                tenant_id,
+                            )
+                            break
+                        # Further consumer cancellation must not leave the terminal
+                        # task publishing after the next turn acquires this lock.
+                        if isinstance(exit_exc, GeneratorExit):
+                            exit_exc = publish_cancel
+                    except Exception:
+                        logger.warning(
+                            "[gateway] terminal publish failed session=%s tenant=%s",
+                            session_id,
+                            tenant_id,
+                        )
+                        break
+            finally:
+                shutdown_timer.cancel()
+            raise exit_exc
         finally:
             _clear_cancel(session_id, tenant_id=tenant_id)
-        done_event = {
-            "type": "done",
-            "data": "",
-            "elapsed_ms": int((time.monotonic() - turn_started) * 1000),
-        }
-        await _publish_event_async(
-            session_id,
-            done_event,
-            tenant_id=tenant_id,
-            broadcaster=broadcaster,
-        )
-        yield done_event
     # Preserve the established worker contract: the exception reaches the
     # consumer AFTER the error + done terminal events, from outside the
     # lock context (lock already released).
@@ -1788,6 +1873,43 @@ async def http_worker_work_stream(request: Request) -> Response:
     return JSONResponse(item.public_dict())
 
 
+async def _publish_http_worker_event(
+    request: Request, item: Any, event: dict, event_id: str | None,
+) -> JSONResponse:
+    """Publish once, committing the idempotency key only after acceptance."""
+    from seeknal.ask.gateway.http_worker import http_worker_broker
+
+    key = {
+        "work_id": item.work_id,
+        "tenant_id": item.tenant_id,
+        "event_id": event_id,
+    }
+    if event_id:
+        status = await http_worker_broker.reserve_event(**key)
+        if status == "missing":
+            return JSONResponse({"error": "unknown work_id"}, status_code=404)
+        if status == "duplicate":
+            return JSONResponse({"status": "duplicate"})
+        if status == "pending":
+            return JSONResponse(
+                {"error": "event publish in progress"}, status_code=503,
+                headers={"Retry-After": "1"},
+            )
+    try:
+        accepted = await request.app.state.broadcaster.publish(
+            item.session_id, json.dumps(event), tenant_id=item.tenant_id,
+        )
+        if accepted is False:
+            raise RuntimeError("SSE broadcaster did not accept event")
+    except BaseException:
+        if event_id:
+            await http_worker_broker.release_event(**key)
+        raise
+    if event_id and not await http_worker_broker.commit_event(**key):
+        return JSONResponse({"error": "unknown work_id"}, status_code=404)
+    return JSONResponse({"status": "published"})
+
+
 async def http_worker_work_event(request: Request) -> JSONResponse:
     """Receive a streaming event from an HTTP-only worker and publish it to SSE."""
     auth, err = _safe_auth_context(request)
@@ -1802,25 +1924,11 @@ async def http_worker_work_event(request: Request) -> JSONResponse:
         return JSONResponse({"error": "unknown work_id"}, status_code=404)
 
     body = await request.json()
-    # Idempotency (GW1): worker delivery is at-least-once once retries exist.
-    # A replayed POST (server accepted it, the TCP response was lost) must not
-    # double-publish to SSE. Events without the header keep the old behaviour.
     event_id = request.headers.get("x-seeknal-event-id")
-    if event_id:
-        is_new = await http_worker_broker.mark_event_seen(
-            work_id=work_id,
-            tenant_id=auth.tenant_id,
-            event_id=event_id,
-        )
-        if not is_new:
-            return JSONResponse({"status": "duplicate"})
-    event_json = json.dumps(body)
-    await request.app.state.broadcaster.publish(
-        item.session_id,
-        event_json,
-        tenant_id=item.tenant_id,
+    # Separate worker-supplied IDs from completion replay IDs in the ledger.
+    return await _publish_http_worker_event(
+        request, item, body, f"event:{event_id}" if event_id else None,
     )
-    return JSONResponse({"status": "published"})
 
 
 async def http_worker_work_complete(request: Request) -> JSONResponse:
@@ -1833,7 +1941,32 @@ async def http_worker_work_complete(request: Request) -> JSONResponse:
     body = await request.json()
     from seeknal.ask.gateway.http_worker import HttpWorkerResult, http_worker_broker
 
-    dropped_event_count = int(body.get("dropped_event_count") or 0)
+    item = await http_worker_broker.owns(work_id=work_id, tenant_id=auth.tenant_id)
+    if item is None:
+        return JSONResponse({"error": "unknown work_id"}, status_code=404)
+
+    loss_counts = {}
+    for field_name in ("dropped_event_count", "undelivered_evicted_count"):
+        try:
+            loss_counts[field_name] = max(0, int(body.get(field_name) or 0))
+        except (TypeError, ValueError, OverflowError):
+            loss_counts[field_name] = 0
+    dropped_event_count = loss_counts["dropped_event_count"]
+    undelivered_events = body.get("undelivered_events") or []
+    if not isinstance(undelivered_events, list) or any(
+        not isinstance(event, dict) for event in undelivered_events
+    ):
+        return JSONResponse({"error": "invalid undelivered_events"}, status_code=400)
+    result = HttpWorkerResult(
+        answer=str(body.get("answer") or ""),
+        event_count=int(body.get("event_count") or 0),
+        error=body.get("error"),
+        dropped_event_count=dropped_event_count,
+        answer_dropped=body.get("answer_dropped") is True,
+        done_dropped=body.get("done_dropped") is True,
+        undelivered_events=undelivered_events,
+        undelivered_evicted_count=loss_counts["undelivered_evicted_count"],
+    )
     if dropped_event_count:
         # Delivery losses are operational signal (GW1): the turn may still
         # succeed, but the SSE client missed that many events.
@@ -1842,15 +1975,22 @@ async def http_worker_work_complete(request: Request) -> JSONResponse:
             work_id[:8],
             dropped_event_count,
         )
+    replay_events = [
+        (f"completion:replay:{index}", event)
+        for index, event in enumerate(result.undelivered_events)
+    ]
+    if result.answer_dropped and result.answer:
+        replay_events.append(("completion:answer", {"type": "answer", "data": result.answer}))
+    if result.done_dropped:
+        replay_events.append(("completion:done", {"type": "done"}))
+    for event_id, event in replay_events:
+        response = await _publish_http_worker_event(request, item, event, event_id)
+        if response.status_code >= 400:
+            return response
     ok = await http_worker_broker.complete(
         work_id=work_id,
         tenant_id=auth.tenant_id,
-        result=HttpWorkerResult(
-            answer=str(body.get("answer") or ""),
-            event_count=int(body.get("event_count") or 0),
-            error=body.get("error"),
-            dropped_event_count=dropped_event_count,
-        ),
+        result=result,
     )
     if not ok:
         return JSONResponse({"error": "unknown work_id"}, status_code=404)

@@ -41,7 +41,9 @@ class Broadcaster(Protocol):
 
     async def publish(
         self, session_id: str, event: str, tenant_id: str = DEFAULT_TENANT
-    ) -> None: ...
+    ) -> bool | None:
+        """Return False on failure; legacy None means no failure was reported."""
+        ...
     def subscribe(
         self, session_id: str, tenant_id: str = DEFAULT_TENANT
     ) -> asyncio.Queue: ...
@@ -108,8 +110,13 @@ class RedisSSEBroadcaster:
 
     async def publish(
         self, session_id: str, event: str, tenant_id: str = DEFAULT_TENANT
-    ) -> None:
-        """Publish an event to the Redis channel (fans out to all replicas)."""
+    ) -> bool:
+        """Publish an event to the Redis channel (fans out to all replicas).
+
+        Returns:
+            Whether Redis accepted the publication, even with no subscribers.
+            Failures are logged; best-effort callers may ignore the outcome.
+        """
         channel = self._channel(tenant_id, session_id)
         try:
             await self._redis.publish(channel, event)
@@ -119,6 +126,8 @@ class RedisSSEBroadcaster:
                 tenant_id,
                 session_id,
             )
+            return False
+        return True
 
     async def start_listener(self) -> None:
         """Start background task that relays Redis messages to local queues."""

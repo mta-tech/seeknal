@@ -51,6 +51,10 @@ class HttpWorkerResult:
     event_count: int = 0
     error: str | None = None
     dropped_event_count: int = 0
+    answer_dropped: bool = False
+    done_dropped: bool = False
+    undelivered_events: list[dict[str, Any]] = field(default_factory=list)
+    undelivered_evicted_count: int = 0
 
 
 class HttpWorkerBroker:
@@ -71,6 +75,7 @@ class HttpWorkerBroker:
         # a replayed POST (server accepted the request, response was lost)
         # must not double-publish to SSE. Scoped to in-flight work only.
         self._seen_events: dict[str, set[str]] = {}
+        self._reserved_events: dict[str, set[str]] = {}
 
     async def reset(self) -> None:
         """Clear broker state. Intended for tests and controlled shutdown."""
@@ -82,6 +87,7 @@ class HttpWorkerBroker:
             self._inflight.clear()
             self._futures.clear()
             self._seen_events.clear()
+            self._reserved_events.clear()
             self._condition.notify_all()
 
     async def enqueue_and_wait(
@@ -135,6 +141,7 @@ class HttpWorkerBroker:
                         claimed = self._pending.pop(index)
                         self._inflight[claimed.work_id] = claimed
                         self._seen_events[claimed.work_id] = set()
+                        self._reserved_events[claimed.work_id] = set()
                         return claimed
 
                 remaining = deadline - time.monotonic()
@@ -159,6 +166,7 @@ class HttpWorkerBroker:
                 return False
             self._inflight.pop(work_id, None)
             self._seen_events.pop(work_id, None)
+            self._reserved_events.pop(work_id, None)
             future = self._futures.pop(work_id, None)
             if future is not None and not future.done():
                 future.set_result(result)
@@ -178,6 +186,7 @@ class HttpWorkerBroker:
             self._pending = [item for item in self._pending if item.work_id != work_id]
             self._inflight.pop(work_id, None)
             self._seen_events.pop(work_id, None)
+            self._reserved_events.pop(work_id, None)
             future = self._futures.pop(work_id, None)
             if future is not None and not future.done():
                 future.cancel()
@@ -198,22 +207,57 @@ class HttpWorkerBroker:
         tenant_id: str,
         event_id: str,
     ) -> bool:
-        """Record ``event_id`` for an in-flight work item.
+        """Record an already-delivered ``event_id`` for an in-flight work item.
 
-        Returns ``True`` the first time the id is seen (publish it) and
-        ``False`` on replay (suppress — a retry of an already-delivered
-        event). Missing id / unknown work behave like ``owns()``: unknown
-        work yields ``False``; that is safe because the caller 404s it.
+        Legacy direct-ledger API. HTTP publishing uses reserve/commit/release
+        instead so a failed publish cannot be mistaken for successful delivery.
         """
         async with self._condition:
             item = self._inflight.get(work_id)
             if item is None or item.tenant_id != tenant_id:
                 return False
             seen = self._seen_events.setdefault(work_id, set())
-            if event_id in seen:
+            if event_id in seen or event_id in self._reserved_events.get(work_id, set()):
                 return False
             seen.add(event_id)
             return True
+
+    async def reserve_event(
+        self, *, work_id: str, tenant_id: str, event_id: str,
+    ) -> str:
+        """Reserve a publish, returning reserved, duplicate, pending, or missing."""
+        async with self._condition:
+            item = self._inflight.get(work_id)
+            if item is None or item.tenant_id != tenant_id:
+                return "missing"
+            if event_id in self._seen_events.get(work_id, set()):
+                return "duplicate"
+            reserved = self._reserved_events.setdefault(work_id, set())
+            if event_id in reserved:
+                return "pending"
+            reserved.add(event_id)
+            return "reserved"
+
+    async def commit_event(
+        self, *, work_id: str, tenant_id: str, event_id: str,
+    ) -> bool:
+        """Commit a reservation only after its publish has succeeded."""
+        async with self._condition:
+            item = self._inflight.get(work_id)
+            if item is None or item.tenant_id != tenant_id:
+                return False
+            self._reserved_events[work_id].discard(event_id)
+            self._seen_events[work_id].add(event_id)
+            return True
+
+    async def release_event(
+        self, *, work_id: str, tenant_id: str, event_id: str,
+    ) -> None:
+        """Release a failed publish reservation so the event can be retried."""
+        async with self._condition:
+            item = self._inflight.get(work_id)
+            if item is not None and item.tenant_id == tenant_id:
+                self._reserved_events.get(work_id, set()).discard(event_id)
 
 
 http_worker_broker = HttpWorkerBroker()
