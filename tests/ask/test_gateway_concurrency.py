@@ -149,6 +149,184 @@ async def test_second_turn_can_start_after_half_consumed_stream(
     lock.release()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_mode", ["aclose", "cancel", "cancel_inner", "user_cancel", "error"])
+async def test_inner_task_bound_cleanup_precedes_session_unlock(
+    tmp_path, monkeypatch, exit_mode,
+):
+    """Close the inner cancel scope in its owner task before another turn starts."""
+    import anyio
+    import seeknal.ask.gateway.server as server
+
+    session_id = f"cleanup-{exit_mode}"
+    lock = server._get_session_lock(session_id)
+    first_event = asyncio.Event()
+    continue_turn = asyncio.Event()
+    cleanup = {}
+
+    async def inner(*args, **kwargs):
+        owner = asyncio.current_task()
+        with anyio.CancelScope():
+            try:
+                yield {"type": "token", "data": "one"}
+                if exit_mode == "error":
+                    raise ValueError("inner failed")
+                if exit_mode == "cancel_inner":
+                    first_event.set()
+                    await asyncio.Event().wait()
+                yield {"type": "answer", "data": "two"}
+            finally:
+                cleanup["same_task"] = asyncio.current_task() is owner
+                cleanup["lock_held"] = lock.locked()
+                await asyncio.sleep(0)
+                cleanup["finished"] = True
+
+    monkeypatch.setattr(server, "_run_agent_inner", inner)
+
+    async def consume():
+        stream = server._run_agent_streaming(tmp_path, session_id, "question")
+        await anext(stream)
+        if exit_mode != "cancel_inner":
+            first_event.set()
+        try:
+            if exit_mode != "cancel_inner":
+                await continue_turn.wait()
+            if exit_mode == "aclose":
+                await stream.aclose()
+            else:
+                if exit_mode == "user_cancel":
+                    server._request_cancel(session_id)
+                async for _ in stream:
+                    pass
+        finally:
+            await stream.aclose()
+        assert cleanup.get("finished"), "aclose returned before inner cleanup"
+
+    task = asyncio.create_task(consume())
+    await first_event.wait()
+
+    async def next_turn():
+        async with lock:
+            return cleanup.get("finished", False)
+
+    waiter = asyncio.create_task(next_turn())
+    await asyncio.sleep(0)
+    if exit_mode in {"cancel", "cancel_inner"}:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif exit_mode == "error":
+        continue_turn.set()
+        with pytest.raises(ValueError, match="inner failed"):
+            await task
+    else:
+        continue_turn.set()
+        await task
+
+    assert await waiter, "next turn acquired the lock before inner cleanup"
+    assert cleanup == {"same_task": True, "lock_held": True, "finished": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_mode", ["aclose", "cancel", "normal", "error", "user_cancel"])
+async def test_stream_terminal_done_is_published_once(tmp_path, monkeypatch, exit_mode):
+    """Hard cancellation and consumer close still terminate the SSE stream."""
+    import seeknal.ask.gateway.server as server
+
+    published = []
+
+    async def publish(session_id, event, **kwargs):
+        published.append(event)
+
+    async def inner(*args, **kwargs):
+        yield {"type": "token", "data": "one"}
+        if exit_mode == "error":
+            raise ValueError("inner failed")
+        if exit_mode == "cancel":
+            await asyncio.Event().wait()
+        yield {"type": "answer", "data": "two"}
+
+    monkeypatch.setattr(server, "_run_agent_inner", inner)
+    monkeypatch.setattr(server, "_publish_event_async", publish)
+    started = asyncio.Event()
+    yielded = []
+
+    async def consume():
+        stream = server._run_agent_streaming(tmp_path, f"done-{exit_mode}", "question")
+        try:
+            yielded.append(await anext(stream))
+            started.set()
+            if exit_mode == "aclose":
+                await stream.aclose()
+                return
+            if exit_mode == "user_cancel":
+                server._request_cancel(f"done-{exit_mode}")
+            async for event in stream:
+                yielded.append(event)
+        finally:
+            await stream.aclose()
+
+    task = asyncio.create_task(consume())
+    await started.wait()
+    if exit_mode == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif exit_mode == "error":
+        with pytest.raises(ValueError, match="inner failed"):
+            await task
+    else:
+        await task
+
+    assert [e["type"] for e in published].count("done") == 1
+    assert [e["type"] for e in yielded].count("done") == (
+        0 if exit_mode in {"aclose", "cancel"} else 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_aclose_after_done_does_not_publish_another_done(tmp_path, monkeypatch):
+    import seeknal.ask.gateway.server as server
+
+    published = []
+
+    async def publish(session_id, event, **kwargs):
+        published.append(event)
+
+    monkeypatch.setattr(server, "_run_agent_inner", lambda *a, **k: _single_answer())
+    monkeypatch.setattr(server, "_publish_event_async", publish)
+    stream = server._run_agent_streaming(tmp_path, "close-after-done", "question")
+    assert (await anext(stream))["type"] == "answer"
+    assert (await anext(stream))["type"] == "done"
+    await stream.aclose()
+    assert [e["type"] for e in published] == ["answer", "done"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publish_mode", ["failure", "timeout"])
+async def test_aclose_terminal_publish_is_bounded_best_effort(tmp_path, monkeypatch, publish_mode):
+    import seeknal.ask.gateway.server as server
+
+    attempts = []
+
+    async def publish(session_id, event, **kwargs):
+        if event["type"] == "done":
+            attempts.append(event)
+            if publish_mode == "failure":
+                raise RuntimeError("publisher unavailable")
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(server, "_run_agent_inner", _two_events_slow)
+    monkeypatch.setattr(server, "_publish_event_async", publish)
+    stream = server._run_agent_streaming(tmp_path, "close-best-effort", "question")
+    await anext(stream)
+    # asyncio.timeout keeps aclose and its cleanup in the consuming task.
+    async with asyncio.timeout(2):
+        await stream.aclose()
+    assert len(attempts) == 1
+    assert not server._get_session_lock("close-best-effort").locked()
+
+
 def test_cancel_session_endpoint(tmp_path: Path):
     pytest.importorskip("starlette")
     from starlette.testclient import TestClient
