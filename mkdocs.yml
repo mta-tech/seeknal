@@ -207,12 +207,13 @@ nav:
       - Deployment: semantic-layer/deployment.md
       - Querying: semantic-layer/querying.md
   - Reference:
-      - 2.13.1 Patch Candidate: releases/2.13.1.md
+      - 2.14.0 Release Notes: releases/2.14.0.md
       - 2.13.0 Release Notes: releases/2.13.0.md
-      - Upgrade to 2.13.x: cli/upgrade.md
+      - Upgrade to 2.14.0: cli/upgrade.md
       - CLI Commands: reference/cli.md
       - YAML Schema: reference/yaml-schema.md
       - Configuration: reference/configuration.md
+      - Gateway Worker Protocol: reference/gateway-worker-protocol.md
       - Troubleshooting: reference/troubleshooting.md
       - Migration Guide: reference/migration.md
   - API:

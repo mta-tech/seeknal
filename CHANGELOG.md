@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Fold the unreleased 2.13.1 patch (PRs #112, #113, #114) into 2.14.0: dependency floors and Docker build fixes ship with this minor release.
 - Enforce patched dependency floors for pydantic-ai-slim (1.107.4, retaining the 1.x cap), fsspec/s3fs (2026.6.0), aiohttp (3.14.4), multidict (6.9.1), Mako (1.4.2), and optional Prefect's Apprise (1.11.0). Refresh their required lock closure and enforce the aiohttp floor in gateway/worker image installs.
-- Update release and upgrade documentation to reflect the published 2.13.0 baseline. See the [unreleased patch notes](docs/releases/2.13.1.md).
+- Update release and upgrade documentation for 2.14.0. See the [2.14.0 release notes](docs/releases/2.14.0.md).
 
 ### Fixed
 - Spending the configured `tool_call_limit` no longer surfaces as a raw `UsageLimitExceeded` in synchronous Ask/Prefect paths: the turn now degrades to an evidence-synthesis answer (no-tool final pass, then deterministic text), matching the streaming and gateway behaviour. Quiet/non-TTY streaming also forwards the configured `tool_call_limit` instead of only `request_limit`. Setting `tool_call_limit` while the project is in full toolset mode logs a warning instead of silently ignoring it.

@@ -1,20 +1,20 @@
 ---
-summary: Upgrade to Seeknal 2.13.x and migrate existing pipeline configuration
-read_when: You are upgrading a 2.12.1 project or checking conditional Iceberg backfill behavior
+summary: Upgrade to Seeknal 2.14.0 and migrate existing pipeline configuration
+read_when: You are upgrading a 2.13.0 or 2.12.1 project, or checking conditional Iceberg backfill behavior
 related:
   - run
   - iceberg-upsert
   - docs
 ---
 
-# Upgrading to 2.13.x
+# Upgrading to 2.14.0
 
 2.13.0 was [released on 2026-10-20](https://github.com/mta-tech/seeknal/releases/tag/v2.13.0),
-based on 2.12.1. This branch prepares the unreleased 2.13.1 patch, combining
-dependency security floors and Docker packaging fixes. See the
-[patch notes](../releases/2.13.1.md) for included versions and validation limits.
-No additional configuration migration is required from 2.13.0 to this patch.
-`pip install seeknal` continues to select a published package.
+based on 2.12.1. This branch prepares 2.14.0, which combines the dependency and
+Docker fixes formerly planned for 2.13.1 with configurable Ask limits/model
+settings and resilient HTTP worker delivery. See the
+[2.14.0 release notes](../releases/2.14.0.md) for scope and validation limits.
+`pip install seeknal` continues to select a published package until 2.14.0 is published.
 
 The optional Prefect extra requires Apprise 1.11.0 or newer. Its redirect
 controls do not disable redirects by default; deployments with untrusted
@@ -23,6 +23,40 @@ notification destinations must explicitly configure `redirect=no` or
 
 Read this guide from an installation with `seeknal docs upgrade`.
 This topic does not add an upgrade command.
+
+## Upgrading from 2.13.0 to 2.14.0
+
+No database, catalog, or project-file migration is required. Existing
+`seeknal_agent.yml` files remain valid. Two optional Ask settings are available:
+
+```yaml
+tool_call_limit: 40
+agent_harness:
+  model_settings:
+    temperature: 0.2
+    max_tokens: 4096
+    top_p: 0.9
+    seed: 7
+```
+
+`tool_call_limit` bounds tool calls in read-only analysis mode. The optional
+`agent_harness.model_settings` keys control model sampling; omitted settings
+retain existing defaults. See the [configuration reference](../reference/configuration.md)
+for validation, precedence, and full-mode behavior.
+
+HTTP worker protocol changes are additive. Event requests may carry
+`X-Seeknal-Event-Id`; completion bodies may include `dropped_event_count`,
+`answer_dropped`, `done_dropped`, and bounded `undelivered_events`. Existing
+workers and gateways can continue to send or accept the earlier fields. Upgrade
+both sides to obtain idempotent event delivery, persistent completion delivery,
+and replay of interaction events. See the
+[gateway worker protocol](../reference/gateway-worker-protocol.md) for limits
+and retry/deduplication semantics.
+
+The dependency/Docker fixes formerly planned for 2.13.1 are included directly
+in 2.14.0; there was no published 2.13.1 release to install first.
+
+## Upgrading from 2.12.1
 
 ## 1. Align catalog environment variables
 

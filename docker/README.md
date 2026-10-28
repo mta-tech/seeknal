@@ -29,6 +29,13 @@ ask` + `pytest`). Use the script rather than a direct `docker build`: the
 production `.dockerignore` excludes `tests/` and `docs/`, while the script
 prepares a temporary build context that includes them.
 
+The script excludes `.env` and all `.env.*` files (including `.env.example`),
+local agent directories (`.claude`, `.omc`, `.omx`, `.codex`, `.agents`),
+`node_modules`, `.venv*`, `.worktrees`, and `LANE_REPORT.md` at every depth.
+One exclusion list supplies both the tar copy and generated `.dockerignore`.
+Tests create their own environment-file fixtures. The private `mktemp` context
+is removed on exit, including build or test failures.
+
 ```bash
 # Full CI-equivalent suite
 scripts/test-in-docker.sh

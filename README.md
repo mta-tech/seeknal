@@ -16,9 +16,10 @@
 
 Seeknal is an all-in-one platform for data and AI/ML engineering. Define pipelines in YAML or Python, run them through a safe `draft → dry-run → apply` workflow, and materialize outputs to PostgreSQL and Apache Iceberg simultaneously. Python 3.11+ required.
 
-**This branch prepares the unreleased 2.13.1 patch.** The released baseline is
-[2.13.0](https://github.com/mta-tech/seeknal/releases/tag/v2.13.0).
-Read the [patch notes](docs/releases/2.13.1.md) and
+**This branch prepares Seeknal 2.14.0.** The minor release combines the
+dependency and Docker fixes originally planned for 2.13.1 with configurable
+Ask limits/model settings and resilient HTTP worker event delivery. Read the
+[2.14.0 release notes](docs/releases/2.14.0.md) and
 [upgrade guide](docs/cli/upgrade.md); the PyPI badge and `pip install seeknal`
 refer to published packages.
 
@@ -163,20 +164,20 @@ Supports Google Gemini (default), OpenAI-compatible providers, Anthropic-compati
 | **[CLI Docs Search](docs/cli/docs.md)** | Search documentation from the terminal (`seeknal docs`) |
 | **Tutorials** | [YAML Pipelines](docs/tutorials/yaml-pipeline-tutorial.md) · [Python Pipelines](docs/tutorials/python-pipelines-tutorial.md) · [Mixed](docs/tutorials/mixed-yaml-python-pipelines.md) · [Seeknal Ask Agent](docs/tutorials/seeknal-ask-agent.md) · [Report Exposures](docs/tutorials/report-exposures.md) |
 | **Guides** | [Python Pipelines](docs/guides/python-pipelines.md) · [Testing & Audits](docs/guides/testing-and-audits.md) · [Iceberg Materialization](docs/iceberg-materialization.md) · [Training to Serving](docs/guides/training-to-serving.md) |
-| **Releases** | [2.13.1 patch candidate](docs/releases/2.13.1.md) · [2.13.0 release notes](docs/releases/2.13.0.md) · [Upgrade guidance](docs/cli/upgrade.md) · [Conditional Iceberg upsert](docs/cli/iceberg-upsert.md) |
+| **Releases** | [2.14.0 release notes](docs/releases/2.14.0.md) · [2.13.0 release notes](docs/releases/2.13.0.md) · [Upgrade guidance](docs/cli/upgrade.md) · [Conditional Iceberg upsert](docs/cli/iceberg-upsert.md) |
 | **Servers** | [Gateway Server](docs/cli/gateway.md) · [Report Server](docs/cli/report-server.md) |
 | **Concepts** | [Point-in-Time Joins](docs/concepts/point-in-time-joins.md) · [Virtual Environments](docs/concepts/virtual-environments.md) · [Exposures](docs/concepts/exposures.md) · [Glossary](docs/concepts/glossary.md) |
 
 ## Changelog
 
-### 2.13.1 patch candidate (unreleased)
+### 2.14.0 (unreleased)
 
-- Enforce patched dependency floors and refresh the required lock closure,
-  retaining pydantic-ai 1.x compatibility.
-- Include CLI docs in Prefect and gateway image builds; enforce the patched
-  aiohttp floor in gateway/worker installs.
-- Bump package metadata and correct stale release labels. See the
-  [patch notes](docs/releases/2.13.1.md) for included changes and validation limits.
+- Configure per-turn Ask tool-call limits and optional model sampling settings.
+- Make HTTP worker event delivery idempotent, persist completion delivery, and
+  replay bounded interaction events that were not delivered during streaming.
+- Include the dependency and Docker fixes originally planned for 2.13.1, plus
+  a CI-equivalent Docker test runner. See the
+  [2.14.0 release notes](docs/releases/2.14.0.md) for scope and validation limits.
 
 ### 2.13.0 (October 2026)
 
