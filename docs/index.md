@@ -4,11 +4,13 @@
 
 Seeknal is an all-in-one platform for data and AI/ML engineering. Define transformations in YAML or Python, run them with DuckDB or Spark, and deploy features to production with a single CLI.
 
-!!! note "2.13.0 candidate documentation"
-    This branch describes the unreleased integration in
-    [draft PR #111](https://github.com/mta-tech/seeknal/pull/111), based on 2.12.1.
-    Start with the [candidate notes](releases/2.13.0.md) and
-    [upgrade guide](cli/upgrade.md); published packages may expose earlier behavior.
+!!! note "2.14.0 release documentation"
+    This branch prepares the 2.14.0 minor release based on the released 2.13.0.
+    Start with the [2.14.0 release notes](releases/2.14.0.md),
+    [2.13.0 release notes](releases/2.13.0.md), and
+    [upgrade guide](cli/upgrade.md). The release combines configurable Ask
+    limits, resilient HTTP worker delivery, and the dependency/Docker fixes
+    formerly planned for 2.13.1. The recorded macOS ARM native crash remains unresolved.
 
 ---
 

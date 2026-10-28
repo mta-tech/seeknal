@@ -3,7 +3,7 @@
 Comprehensive guides for migrating to Seeknal from other platforms and between Seeknal engines.
 
 > **Navigation:**
-> - [Upgrading a 2.12.1 project to the 2.13.0 candidate](#upgrading-a-2121-project-to-the-2130-candidate)
+> - [Upgrading to 2.14.0](#upgrading-to-2140)
 > - [Migrating from Spark to DuckDB](#migrating-from-spark-to-duckdb)
 > - [Migrating from dbt to Seeknal](#migrating-from-dbt-to-seeknal)
 > - [Migrating from Feast to Seeknal](#migrating-from-feast-to-seeknal)
@@ -11,16 +11,21 @@ Comprehensive guides for migrating to Seeknal from other platforms and between S
 
 ---
 
-## Upgrading a 2.12.1 project to the 2.13.0 candidate
+## Upgrading to 2.14.0
 
-2.13.0 is an unreleased candidate in [draft PR #111](https://github.com/mta-tech/seeknal/pull/111).
-Follow the [upgrade guide](../cli/upgrade.md), also available in a candidate
+2.14.0 follows 2.13.0 and includes the dependency/Docker work formerly planned
+for 2.13.1. Upgrading from 2.13.0 requires no database, catalog, or project-file
+migration. New Ask YAML settings and HTTP worker reconciliation fields are optional
+and additive. Projects on 2.12.1 also inherit the 2.13.0 behavior described below.
+Follow the [upgrade guide](../cli/upgrade.md), also available in an
 installation as `seeknal docs upgrade`. It covers catalog URI aliases,
 date-templated backfills, parameter fingerprints, empty transform outputs,
-conditional Iceberg write policies, and valid custom session identifiers.
+conditional Iceberg write policies, valid custom session identifiers, Ask limits,
+model settings, and the HTTP worker protocol.
 
-Review the [release verification and known limits](../releases/2.13.0.md#compatibility-and-verification)
-before evaluation. An ordinary PyPI install does not install this draft branch.
+Review the [2.14.0 release notes](../releases/2.14.0.md) and the
+[2.13.0 verification and known limits](../releases/2.13.0.md#compatibility-and-verification)
+before upgrading. An ordinary PyPI install selects a published package.
 
 ---
 

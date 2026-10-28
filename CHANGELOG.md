@@ -5,16 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.13.0] - Unreleased
+## [2.14.0] - Unreleased
 
-Integration candidate in [draft PR #111](https://github.com/mta-tech/seeknal/pull/111),
-based on 2.12.1. No 2.13.0 release date is assigned. See the
-[candidate notes](docs/releases/2.13.0.md) and [upgrade guide](docs/cli/upgrade.md).
+### Added
+- Configurable per-turn tool-call limits for read-only Seeknal Ask analysis across synchronous, streaming, quiet/non-TTY, Prefect, and gateway paths.
+- Optional LLM sampling settings (`temperature`, `max_tokens`, `top_p`, and `seed`) under `agent_harness.model_settings`, with explicit Python caller overrides.
+- HTTP worker event IDs (`X-Seeknal-Event-Id`) and completion loss fields: `dropped_event_count`, `answer_dropped`, `done_dropped`, `undelivered_events`, and `undelivered_evicted_count`.
+- Persistent completion delivery carrying the full answer, with an absolute 90-second deadline across requests and sleeps. Shutdown uses one completion attempt bounded to five seconds.
+- Built-in gateway reconciliation: replay undelivered `ask_user`, `visualization`, and `upload_complete` events in order, then a dropped non-empty answer, then dropped `done`. Partial replay retries skip already accepted entries; results retain replay metadata.
+- CI-equivalent Docker test runner and [HTTP worker protocol documentation](docs/reference/gateway-worker-protocol.md).
+
+### Changed
+- Fold the unreleased 2.13.1 patch (PRs #112, #113, #114) into 2.14.0: dependency floors and Docker build fixes ship with this minor release.
+- Enforce patched dependency floors for pydantic-ai-slim (1.107.4, retaining the 1.x cap), fsspec/s3fs (2026.6.0), aiohttp (3.14.4), multidict (6.9.1), Mako (1.4.2), and optional Prefect's Apprise (1.11.0). Refresh their required lock closure and enforce the aiohttp floor in gateway/worker image installs.
+- Bound replay to five events and 16,384 UTF-8 JSON bytes per event. Preserve fitting payloads; oversized or unserializable payloads become `{type, payload_truncated: true, original_bytes}` placeholders without `data`. Evict charts before clarifications and report evictions.
+- Update release and upgrade documentation for 2.14.0. See the [2.14.0 release notes](docs/releases/2.14.0.md).
+
+### Fixed
+- Synchronous Ask/Prefect and quiet/non-TTY execution now handle exhausted tool budgets with a no-tool evidence-synthesis pass and deterministic fallback.
+- Accept positive integers, integral floats, and integer strings for `tool_call_limit`; default invalid, boolean, fractional, non-finite, or non-positive values to 24. Full-mode tool calls remain unbounded, with a warning once per process per project when the setting is ignored.
+- Retry transient event delivery failures for up to three attempts with backoff and jitter; retry `429`/`5xx`, abort vanished work on `404`/`410`, and do not retry other `4xx`. After delivery fails, degraded mode drops non-critical events while preserving critical retries until a successful POST restores normal delivery.
+- Keep initial and periodic poll failures at WARNING, or ERROR for rejected worker tokens, and log recovery. Polling retains exponential backoff capped at 30 seconds plus jitter.
+- Reserve event IDs before publication and commit only after acceptance, including Redis publication. Failed publishes release reservations; in-flight duplicates receive retryable `503`, while accepted duplicates return success without republishing.
+- Close the inner agent generator in its owning task before releasing the session lock, including abort and cancellation. Cleanup failures during consumer shutdown no longer yield or replace the exit.
+- Use one shielded terminal `done` publication across cancellation races. Only close/hard cancellation applies a one-second deadline and drains the publisher before unlocking; slow normal completion remains supported and terminal delivery failures preserve original agent errors.
+- Bound worker shutdown terminal delivery and cancellation draining. If terminal delivery times out, count the missing `done` and request reconciliation through completion.
+- Log gateway run failures with full tracebacks and session/tenant context.
+- Preserve explicit empty model settings and ignore malformed or out-of-range YAML sampling values before provider calls.
+- Include CLI documentation in Prefect and gateway Docker build contexts so Hatch can package the wheel's required documentation files.
+- Exclude `.env`, `.env.*`, local agent state, virtual environments, `node_modules`, worktrees, and lane reports from Docker test contexts using shared tar/ignore rules; remove temporary contexts on exit.
+
+## [2.13.0] - 2026-10-20
+
+Released from [PR #111](https://github.com/mta-tech/seeknal/pull/111).
+See the [release notes](docs/releases/2.13.0.md) and [upgrade guide](docs/cli/upgrade.md).
 
 ### Added
 - Conditional Iceberg upserts with `when_matched_update_if`, declared target `compare_columns`, and independent `when_not_matched: insert|skip` across profiles, YAML, decorators, and feature-store output. False or NULL predicates preserve existing rows; skipped-row metrics appear in materialization results and run state.
 - Bundled `seeknal docs iceberg-upsert` guidance, including version ordering, backfills, defaults, and synthetic verification examples. Installed CLI documentation is included in wheel/sdist and takes precedence over the current project's docs.
-- `seeknal docs upgrade` covers 2.12.1-to-candidate migration, configuration precedence, changed rerun behavior, and compatibility limits.
+- `seeknal docs upgrade` covers 2.12.1-to-2.13.0 migration, configuration precedence, changed rerun behavior, and compatibility limits.
 
 ### Fixed
 - Contain broker-supplied tenant and session identifiers within their storage directories, rejecting malformed, absolute, traversal, and symlink paths resolving to or outside the storage base in session and pairing stores.

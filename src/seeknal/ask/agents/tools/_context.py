@@ -710,6 +710,16 @@ def has_sufficient_evidence() -> bool:
     )
 
 
+def usage_limit_stop_reason(exc: BaseException) -> str:
+    """Return the shared evidence-synthesis reason for a stop exception."""
+    message = str(exc)
+    if "authoritative sql pair" in message:
+        return "authoritative SQL pair produced the answer for this business question"
+    if "terminal tool error" in message:
+        return "terminal tool error after sufficient evidence"
+    return "tool-call budget reached before the model produced a final answer"
+
+
 def synthesize_evidence_fallback(reason: str) -> str:
     """Create a deterministic final answer from collected evidence snippets."""
     ctx = get_tool_context()
