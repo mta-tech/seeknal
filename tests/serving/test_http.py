@@ -3,19 +3,18 @@
 from __future__ import annotations
 
 import datetime
-from decimal import Decimal
 import hashlib
 import time
+from decimal import Decimal
 
-from cryptography.hazmat.primitives.asymmetric import ec
 import duckdb
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
 from starlette.testclient import TestClient
 
 from seeknal.serving import Placement, ServingPipeline, sign_grant_token
 from seeknal.serving.adapters import (
     DuckDBAdapter,
-    EngineAdapter,
     EngineError,
     EngineTimeout,
     QueryResult,

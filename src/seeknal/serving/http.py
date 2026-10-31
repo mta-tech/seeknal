@@ -23,7 +23,7 @@ from seeknal.serving.adapters import EngineAdapter, EngineError, EngineTimeout
 from seeknal.serving.enforce import EnforcementError
 from seeknal.serving.grant_token import GrantTokenError
 from seeknal.serving.router import RoutingError
-from seeknal.serving.service import PreparedQuery, ServingPipeline
+from seeknal.serving.service import ServingPipeline
 
 logger = logging.getLogger(__name__)
 

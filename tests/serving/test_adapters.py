@@ -8,7 +8,6 @@ import pytest
 from seeknal.serving.adapters import (
     DBAPIAdapter,
     DuckDBAdapter,
-    EngineAdapter,
     EngineError,
     EngineTimeout,
     QueryResult,
