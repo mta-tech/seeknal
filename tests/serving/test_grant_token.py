@@ -247,3 +247,17 @@ def test_malformed_token(ec_key_pair):
     with pytest.raises(GrantTokenError) as exc_info:
         verify_grant_token("bad base64!.payload.signature", {"key-1": public_key})
     assert "base64" in str(exc_info.value).lower()
+
+
+@pytest.mark.parametrize("claim_name", ["iat", "exp", "nbf", "max_rows"])
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf"), True, False])
+def test_non_finite_and_boolean_claims(ec_key_pair, valid_claims, claim_name, bad_value):
+    private_key, public_key = ec_key_pair
+    claims = dict(valid_claims)
+    claims[claim_name] = bad_value
+    token = sign_grant_token(claims, private_key, kid="key-1")
+
+    with pytest.raises(GrantTokenError) as exc_info:
+        verify_grant_token(token, {"key-1": public_key})
+    assert claim_name in str(exc_info.value).lower()
+
