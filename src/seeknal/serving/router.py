@@ -11,7 +11,7 @@ import sqlglot
 from sqlglot import exp
 
 from seeknal.serving.features import QueryFeatures, extract_features
-from seeknal.serving.placement import Placement, TableEntry
+from seeknal.serving.placement import Engine, Placement, TableEntry
 
 HINT_PATTERN = re.compile(
     r"^\s*seeknal:engine\s*=\s*([a-zA-Z0-9_\-]+)\s*$", re.IGNORECASE
@@ -67,7 +67,7 @@ def _remove_hint_comment(statement: exp.Expression) -> None:
 def _select_engine_by_kinds(
     feasible: Sequence[str],
     kinds_order: Sequence[str],
-    engines: Mapping[str, any],
+    engines: Mapping[str, Engine],
 ) -> str | None:
     """Select the first feasible engine matching kind order."""
     for kind in kinds_order:
@@ -83,6 +83,50 @@ class Router:
     def __init__(self, placement: Placement) -> None:
         self.placement = placement
 
+    def rewrite(self, statement: exp.Expression, engine: str) -> str:
+        """Replace logical table references with that engine's physical names and render in engine dialect."""
+        if engine not in self.placement.engines:
+            raise RoutingError(f"Unknown engine '{engine}'")
+        target_engine = self.placement.engines[engine]
+
+        _remove_hint_comment(statement)
+
+        # Rewrite table references
+        cte_names = {
+            cte.alias_or_name.lower() for cte in statement.find_all(exp.CTE)
+        }
+        for tbl in statement.find_all(exp.Table):
+            if tbl.name.lower() in cte_names and not tbl.db and not tbl.catalog:
+                continue
+            parts = []
+            if tbl.catalog:
+                parts.append(tbl.catalog)
+            if tbl.db:
+                parts.append(tbl.db)
+            if tbl.name:
+                parts.append(tbl.name)
+            dotted = ".".join(parts).lower()
+            if self.placement.find_cube(dotted) is not None:
+                continue
+            t_entry = self.placement.find_table(dotted)
+            if t_entry is None:
+                continue
+            serve = next(
+                (s for s in t_entry.serves if s.engine == engine), None
+            )
+            if serve is None:
+                continue
+
+            new_tbl = sqlglot.to_table(serve.physical_name)
+            orig_alias = tbl.alias
+            alias_to_use = orig_alias if orig_alias else tbl.name
+            new_tbl.set(
+                "alias", exp.TableAlias(this=exp.to_identifier(alias_to_use))
+            )
+            tbl.replace(new_tbl)
+
+        return statement.sql(dialect=target_engine.dialect)
+
     def route(
         self,
         sql: str,
@@ -92,6 +136,22 @@ class Router:
         max_staleness_seconds: float | None = None,
     ) -> RoutingDecision:
         """Route and rewrite a SQL statement for the best execution engine."""
+        return self.decide(
+            sql,
+            dialect=dialect,
+            hint=hint,
+            max_staleness_seconds=max_staleness_seconds,
+        )
+
+    def decide(
+        self,
+        sql: str,
+        *,
+        dialect: str = "postgres",
+        hint: str | None = None,
+        max_staleness_seconds: float | None = None,
+    ) -> RoutingDecision:
+        """Route a SQL statement, picking the best engine and returning a RoutingDecision."""
         # 1. Parse statement
         try:
             statements = sqlglot.parse(sql, read=dialect)
@@ -191,6 +251,13 @@ class Router:
         if resolved_hint is not None:
             if resolved_hint not in self.placement.engines:
                 raise RoutingError(f"Hint specifies unknown engine '{resolved_hint}'")
+            if (
+                features.kind in ("insert", "update", "delete", "merge")
+                and self.placement.engines[resolved_hint].kind != "lakebase"
+            ):
+                raise RoutingError(
+                    f"Writes go only to Lakebase; hinted engine '{resolved_hint}' is of kind '{self.placement.engines[resolved_hint].kind}'"
+                )
             if resolved_hint not in feasible:
                 rej_msg = rejected.get(resolved_hint, "infeasible")
                 raise RoutingError(
@@ -348,46 +415,9 @@ class Router:
                 raise RoutingError("No feasible engine available for routing")
 
             # 7. Rewrite statement for chosen engine
-            rewritten = statement.copy()
-            _remove_hint_comment(rewritten)
-
-            # Rewrite table references
-            cte_names = {
-                cte.alias_or_name.lower() for cte in rewritten.find_all(exp.CTE)
-            }
-            for tbl in rewritten.find_all(exp.Table):
-                if tbl.name.lower() in cte_names and not tbl.db and not tbl.catalog:
-                    continue
-                parts = []
-                if tbl.catalog:
-                    parts.append(tbl.catalog)
-                if tbl.db:
-                    parts.append(tbl.db)
-                if tbl.name:
-                    parts.append(tbl.name)
-                dotted = ".".join(parts).lower()
-                if self.placement.find_cube(dotted) is not None:
-                    continue
-                t_entry = self.placement.find_table(dotted)
-                if t_entry is None:
-                    continue
-                serve = next(
-                    (s for s in t_entry.serves if s.engine == chosen_engine), None
-                )
-                if serve is None:
-                    continue
-
-                new_tbl = sqlglot.to_table(serve.physical_name)
-                orig_alias = tbl.alias
-                alias_to_use = orig_alias if orig_alias else tbl.name
-                new_tbl.set(
-                    "alias", exp.TableAlias(this=exp.to_identifier(alias_to_use))
-                )
-                tbl.replace(new_tbl)
-
             target_engine = self.placement.engines[chosen_engine]
             try:
-                rendered_sql = rewritten.sql(dialect=target_engine.dialect)
+                rendered_sql = self.rewrite(statement.copy(), chosen_engine)
                 return RoutingDecision(
                     engine=chosen_engine,
                     sql=rendered_sql,
