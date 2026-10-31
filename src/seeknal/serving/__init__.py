@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+from seeknal.serving.adapters import (
+    DBAPIAdapter,
+    DuckDBAdapter,
+    EngineAdapter,
+    EngineError,
+    EngineTimeout,
+    QueryResult,
+    build_adapter,
+)
 from seeknal.serving.enforce import EnforcementError, Grant, enforce
 from seeknal.serving.features import QueryFeatures, extract_features
 from seeknal.serving.grant_token import (
@@ -9,6 +18,7 @@ from seeknal.serving.grant_token import (
     sign_grant_token,
     verify_grant_token,
 )
+from seeknal.serving.http import create_app
 from seeknal.serving.placement import (
     CubeEntry,
     Engine,
@@ -23,8 +33,13 @@ from seeknal.serving.service import PreparedQuery, ServingPipeline
 
 __all__ = [
     "CubeEntry",
-    "EnforcementError",
+    "DBAPIAdapter",
+    "DuckDBAdapter",
     "Engine",
+    "EngineAdapter",
+    "EngineError",
+    "EngineTimeout",
+    "EnforcementError",
     "Grant",
     "GrantTokenError",
     "Placement",
@@ -32,12 +47,15 @@ __all__ = [
     "Policy",
     "PreparedQuery",
     "QueryFeatures",
+    "QueryResult",
     "Router",
     "RoutingDecision",
     "RoutingError",
     "ServingPipeline",
     "TableEntry",
     "TableServe",
+    "build_adapter",
+    "create_app",
     "enforce",
     "extract_features",
     "sign_grant_token",

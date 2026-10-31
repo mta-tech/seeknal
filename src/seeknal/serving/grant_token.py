@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 import time
 from collections.abc import Mapping
@@ -41,6 +42,19 @@ def _b64url_decode(s: str) -> bytes:
         return base64.urlsafe_b64decode(padded.encode("ascii"))
     except Exception as exc:
         raise GrantTokenError("Failed to decode base64url segment") from exc
+
+
+def _parse_numeric_claim(val: Any, name: str) -> float:
+    """Parse and validate numeric claim, rejecting booleans, non-numbers, NaN and infinity."""
+    if isinstance(val, bool):
+        raise GrantTokenError(f"'{name}' claim must be a number, not boolean")
+    try:
+        f = float(val)
+    except (ValueError, TypeError):
+        raise GrantTokenError(f"'{name}' claim must be a number")
+    if math.isnan(f) or math.isinf(f):
+        raise GrantTokenError(f"'{name}' claim must be finite")
+    return f
 
 
 def _load_private_key(key: Any) -> ec.EllipticCurvePrivateKey:
@@ -200,20 +214,14 @@ def verify_grant_token(
     # iat
     if "iat" not in claims:
         raise GrantTokenError("Missing required 'iat' claim")
-    try:
-        iat = float(claims["iat"])
-    except (ValueError, TypeError):
-        raise GrantTokenError("'iat' claim must be a number")
+    iat = _parse_numeric_claim(claims["iat"], "iat")
     if iat > current_time + leeway_seconds:
         raise GrantTokenError("Token 'iat' is in the future beyond leeway")
 
     # exp
     if "exp" not in claims:
         raise GrantTokenError("Missing required 'exp' claim")
-    try:
-        exp = float(claims["exp"])
-    except (ValueError, TypeError):
-        raise GrantTokenError("'exp' claim must be a number")
+    exp = _parse_numeric_claim(claims["exp"], "exp")
     if exp < current_time - leeway_seconds:
         raise GrantTokenError("Token has expired")
 
@@ -226,11 +234,12 @@ def verify_grant_token(
 
     # nbf
     if "nbf" in claims:
-        try:
-            nbf = float(claims["nbf"])
-        except (ValueError, TypeError):
-            raise GrantTokenError("'nbf' claim must be a number")
+        nbf = _parse_numeric_claim(claims["nbf"], "nbf")
         if nbf > current_time + leeway_seconds:
             raise GrantTokenError("Token is not yet valid ('nbf' is in the future)")
+
+    # max_rows
+    if "max_rows" in claims:
+        _parse_numeric_claim(claims["max_rows"], "max_rows")
 
     return claims
