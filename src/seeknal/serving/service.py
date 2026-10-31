@@ -12,7 +12,7 @@ from sqlglot import exp
 from seeknal.serving.enforce import EnforcementError, Grant, enforce
 from seeknal.serving.grant_token import verify_grant_token
 from seeknal.serving.placement import Placement
-from seeknal.serving.router import Router, RoutingError
+from seeknal.serving.router import Router
 
 PARAM_MARKER_PATTERN = re.compile(r"__SEEKNAL_PARAM_\d+__")
 
