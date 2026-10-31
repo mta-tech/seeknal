@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 import sqlglot
 
 from seeknal.serving.features import extract_features

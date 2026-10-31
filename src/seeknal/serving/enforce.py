@@ -6,10 +6,11 @@ row filters, and row cap) on client SQL before engine execution.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import hashlib
 import time
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
 
 import sqlglot
 from sqlglot import exp

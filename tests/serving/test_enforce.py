@@ -12,8 +12,6 @@ import sqlglot
 
 from seeknal.serving.enforce import (
     MASK_TEMPLATES,
-    VALID_MASKS,
-    EnforcedQuery,
     EnforcementError,
     Grant,
     RowFilter,
