@@ -20,6 +20,29 @@ VALID_ACTIONS = frozenset({"select", "insert", "update", "delete"})
 VALID_TARGET_KINDS = frozenset({"starrocks", "lakebase", "duckdb", "cube"})
 VALID_TARGET_DIALECTS = frozenset({"postgres", "starrocks", "duckdb"})
 
+ANONYMOUS_FUNCTION_ALLOWLIST: dict[str, set[str]] = {
+    "cube": {"measure"},
+    "starrocks": set(),
+    "lakebase": set(),
+    "duckdb": set(),
+}
+
+DISALLOWED_FUNCTION_PREFIXES: tuple[str, ...] = (
+    "pg_",
+    "read_",
+    "lo_",
+    "dblink",
+    "glob",
+    "sniff_",
+    "query",
+    "getenv",
+    "current_setting",
+    "set_config",
+    "system",
+    "load_file",
+    "copy",
+)
+
 MASK_TEMPLATES: dict[str, dict[str, str]] = {
     "redact": {
         "postgres": "'****'",
@@ -318,6 +341,12 @@ def _find_statement_defined_column_names(statement: exp.Expression) -> set[str]:
                 elif isinstance(e, exp.Column) and not isinstance(e.this, exp.Star):
                     names.add(e.name.lower())
 
+    for val in statement.find_all(exp.Values):
+        table_alias = val.args.get("alias")
+        if table_alias and hasattr(table_alias, "columns") and table_alias.columns:
+            for col in table_alias.columns:
+                names.add(col.name.lower())
+
     return names
 
 
@@ -327,7 +356,7 @@ def _expand_stars(
     schemas_ci: Mapping[str, tuple[str, list[str]]],
     cte_names: set[str],
 ) -> None:
-    """Expand '*' and 't.*' projections to granted columns in schema order."""
+    """Expand '*' and 't.*' projections only when they refer to granted tables."""
     selects = list(statement.find_all(exp.Select))
     # Process bottom-up (innermost selects first)
     for s in reversed(selects):
@@ -342,74 +371,60 @@ def _expand_stars(
             if j.this:
                 sources.append(j.this)
 
-        # Map source identifiers/aliases to granted columns
-        source_granted_cols: dict[str, list[str]] = {}
-        for src in sources:
-            if isinstance(src, exp.Table):
-                tbl_key = _table_full_name(src).lower()
-                if tbl_key in cte_names:
-                    # CTE reference: resolve to CTE's projected columns
-                    for cte in statement.find_all(exp.CTE):
-                        if cte.alias_or_name.lower() == tbl_key:
-                            cols = []
-                            table_alias = cte.args.get("alias")
-                            if table_alias and hasattr(table_alias, "columns") and table_alias.columns:
-                                cols = [c.name for c in table_alias.columns]
-                            elif isinstance(cte.this, exp.Select):
-                                for ce in cte.this.expressions:
-                                    if isinstance(ce, exp.Alias):
-                                        cols.append(ce.alias)
-                                    elif isinstance(ce, exp.Column) and not isinstance(ce.this, exp.Star):
-                                        cols.append(ce.name)
-                            alias_key = (src.alias or src.name).lower()
-                            source_granted_cols[alias_key] = cols
-                            source_granted_cols[tbl_key] = cols
-                            break
-                elif tbl_key in grant_tables_ci:
+        new_expressions: list[exp.Expression] = []
+        for expr in s.expressions:
+            if isinstance(expr, exp.Star):
+                if not sources:
+                    new_expressions.append(expr)
+                    continue
+                for src in sources:
+                    is_granted_table = False
+                    if isinstance(src, exp.Table):
+                        tbl_key = _table_full_name(src).lower()
+                        if tbl_key in grant_tables_ci and src.name.lower() not in cte_names:
+                            is_granted_table = True
+                    if is_granted_table:
+                        tbl_key = _table_full_name(src).lower()
+                        _, tg = grant_tables_ci[tbl_key]
+                        sch_cols = schemas_ci[tbl_key][1]
+                        granted_set = {c.lower() for c in tg.columns} | {m.lower() for m in tg.masks}
+                        granted_in_order = [c for c in sch_cols if c.lower() in granted_set]
+                        qualifier = src.alias or (src.name if len(sources) > 1 else None)
+                        for c in granted_in_order:
+                            new_expressions.append(exp.column(c, table=qualifier))
+                    else:
+                        # Non-table source (CTE, subquery, VALUES): leave as * or alias.*
+                        if len(sources) > 1 and getattr(src, "alias", None):
+                            new_expressions.append(exp.column(exp.Star(), table=src.alias))
+                        else:
+                            new_expressions.append(exp.Star())
+            elif isinstance(expr, exp.Column) and isinstance(expr.this, exp.Star):
+                qual = expr.table.lower() if expr.table else ""
+                matched_src = None
+                for src in sources:
+                    alias = getattr(src, "alias", None) or getattr(src, "name", None)
+                    if alias and alias.lower() == qual:
+                        matched_src = src
+                        break
+                    if isinstance(src, exp.Table) and _table_full_name(src).lower() == qual:
+                        matched_src = src
+                        break
+                is_granted_table = False
+                if matched_src and isinstance(matched_src, exp.Table):
+                    tbl_key = _table_full_name(matched_src).lower()
+                    if tbl_key in grant_tables_ci and matched_src.name.lower() not in cte_names:
+                        is_granted_table = True
+                if is_granted_table:
+                    tbl_key = _table_full_name(matched_src).lower()
                     _, tg = grant_tables_ci[tbl_key]
                     sch_cols = schemas_ci[tbl_key][1]
                     granted_set = {c.lower() for c in tg.columns} | {m.lower() for m in tg.masks}
                     granted_in_order = [c for c in sch_cols if c.lower() in granted_set]
-                    alias_key = (src.alias or src.name).lower()
-                    source_granted_cols[alias_key] = granted_in_order
-                    source_granted_cols[tbl_key] = granted_in_order
-            elif isinstance(src, exp.Subquery):
-                if isinstance(src.this, exp.Select):
-                    sub_cols = []
-                    for se in src.this.expressions:
-                        if isinstance(se, exp.Alias):
-                            sub_cols.append(se.alias)
-                        elif isinstance(se, exp.Column) and not isinstance(se.this, exp.Star):
-                            sub_cols.append(se.name)
-                    if src.alias:
-                        source_granted_cols[src.alias.lower()] = sub_cols
-
-        new_expressions: list[exp.Expression] = []
-        for expr in s.expressions:
-            if isinstance(expr, exp.Star):
-                # Expand '*' across all sources in this select
-                for src in sources:
-                    if isinstance(src, exp.Table):
-                        alias_key = (src.alias or src.name).lower()
-                        cols = source_granted_cols.get(alias_key, [])
-                        qualifier = src.alias or (src.name if len(sources) > 1 else None)
-                        for c in cols:
-                            new_expressions.append(exp.column(c, table=qualifier))
-                    elif isinstance(src, exp.Subquery):
-                        alias_key = src.alias.lower() if src.alias else ""
-                        cols = source_granted_cols.get(alias_key, [])
-                        qualifier = src.alias if len(sources) > 1 else None
-                        for c in cols:
-                            new_expressions.append(exp.column(c, table=qualifier))
-            elif isinstance(expr, exp.Column) and isinstance(expr.this, exp.Star):
-                # Expand 't.*'
-                qual = expr.table.lower() if expr.table else ""
-                full_qual = f"{expr.db.lower()}.{qual}" if expr.db else qual
-                cols = source_granted_cols.get(qual) or source_granted_cols.get(full_qual)
-                if cols is None:
-                    raise EnforcementError(f"unknown table qualifier '{expr.table}' for star expansion")
-                for c in cols:
-                    new_expressions.append(exp.column(c, table=expr.table))
+                    for c in granted_in_order:
+                        new_expressions.append(exp.column(c, table=expr.table))
+                else:
+                    # Non-table source (CTE, subquery, VALUES): leave as alias.*
+                    new_expressions.append(expr)
             else:
                 new_expressions.append(expr)
 
@@ -461,6 +476,18 @@ def enforce(
     target_dialect_lower = target_dialect.lower()
     if target_dialect_lower not in VALID_TARGET_DIALECTS:
         raise EnforcementError(f"unsupported target dialect '{target_dialect}'")
+
+    # Validate function calls anywhere in the statement
+    allowlist = ANONYMOUS_FUNCTION_ALLOWLIST.get(target_kind_lower, set())
+    for f in statement.find_all(exp.Func):
+        if isinstance(f, exp.Anonymous):
+            fn_name = f.name
+            if fn_name.lower() not in allowlist:
+                raise EnforcementError(f"function '{fn_name}' is not permitted")
+        else:
+            sql_name = f.sql_name().lower()
+            if isinstance(f, exp.ReadCSV) or sql_name.startswith(DISALLOWED_FUNCTION_PREFIXES):
+                raise EnforcementError(f"function '{sql_name}' is not permitted")
 
     # Case-insensitive maps for grant.tables and schemas
     grant_tables_ci: dict[str, tuple[str, TableGrant]] = {
@@ -614,10 +641,13 @@ def enforce(
     # First expand '*' and 't.*'
     _expand_stars(statement, grant_tables_ci, schemas_ci, cte_names)
 
-    # Collect statement-defined names (CTEs, subqueries, projection aliases)
+    # Collect statement-defined names (CTEs, subqueries, values, projection aliases)
     statement_defined_names = _find_statement_defined_column_names(statement)
     subquery_aliases = {
         sub.alias.lower() for sub in statement.find_all(exp.Subquery) if sub.alias
+    }
+    values_aliases = {
+        val.alias.lower() for val in statement.find_all(exp.Values) if val.alias
     }
 
     # Validate every column reference
@@ -636,8 +666,8 @@ def enforce(
             qual = col.table.lower()
             full_qual = f"{col.db.lower()}.{qual}" if col.db else qual
 
-            if qual in cte_names or qual in subquery_aliases:
-                # Allowed if defined or produced by CTE/subquery
+            if qual in cte_names or qual in subquery_aliases or qual in values_aliases:
+                # Allowed if defined or produced by CTE/subquery/values
                 continue
 
             # Must match a referenced table or table alias
@@ -671,7 +701,7 @@ def enforce(
                 )
         else:
             # Unqualified column reference: resolve against schemas of tables in scope
-            scopes = _get_tables_in_scope_chain(col, statement, referenced_table_keys)
+            scopes = _get_tables_in_scope_chain(col, statement, referenced_table_keys or set(grant_tables_ci.keys()))
             found = False
             for scope_tables in scopes:
                 matching_tables: list[str] = []

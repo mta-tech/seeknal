@@ -598,3 +598,137 @@ def test_duckdb_execution_limit_capping(duckdb_con):
     cursor = duckdb_con.execute(res.sql)
     rows = cursor.fetchall()
     assert len(rows) == 3
+
+
+# ==============================================================================
+# Function Restrictions & Security Rules
+# ==============================================================================
+
+def test_function_pg_read_file_refused():
+    sql = "SELECT pg_read_file('/etc/passwd') AS x"
+    grant, schemas = _claims_fixture(sql)
+    with pytest.raises(EnforcementError, match="function 'pg_read_file' is not permitted"):
+        enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="lakebase")
+
+
+def test_function_getenv_refused():
+    sql = "SELECT getenv('HOME') AS h"
+    grant, schemas = _claims_fixture(sql)
+    with pytest.raises(EnforcementError, match="function 'getenv' is not permitted"):
+        enforce(sql, grant, schemas=schemas, target_dialect="duckdb", target_kind="duckdb")
+
+
+def test_function_current_setting_refused():
+    sql = "SELECT claim_id FROM claims.claim WHERE current_setting('is_superuser') = 'on'"
+    grant, schemas = _claims_fixture(sql)
+    with pytest.raises(EnforcementError, match="function 'current_setting' is not permitted"):
+        enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="lakebase")
+
+
+def test_function_read_csv_refused():
+    sql = "SELECT read_csv('data.csv')"
+    grant, schemas = _claims_fixture(sql)
+    with pytest.raises(EnforcementError, match="function 'read_csv' is not permitted"):
+        enforce(sql, grant, schemas=schemas, target_dialect="duckdb", target_kind="duckdb")
+
+
+def test_select_1_no_table_allowed():
+    sql = "SELECT 1"
+    grant, schemas = _claims_fixture(sql)
+    res = enforce(sql, grant, schemas=schemas, target_dialect="duckdb", target_kind="duckdb")
+    assert "SELECT 1" in res.sql
+    assert res.tables == ()
+
+
+def test_allowed_functions():
+    sql = (
+        "SELECT lower(patient_name), upper(province), coalesce(amount, 0), "
+        "date_trunc('year', admit_date), sum(amount), count(*), "
+        "row_number() over (order by claim_id) FROM claims.claim GROUP BY patient_name, province, amount, admit_date, claim_id"
+    )
+    grant, schemas = _claims_fixture(sql)
+    res = enforce(sql, grant, schemas=schemas, target_dialect="duckdb", target_kind="duckdb")
+    assert "LOWER" in res.sql
+    assert "UPPER" in res.sql
+    assert "COALESCE" in res.sql
+    assert "SUM" in res.sql
+    assert "COUNT" in res.sql
+
+
+def test_cube_measure_function_allowed_on_cube():
+    sql = "SELECT MEASURE(total_amount)"
+    claims = {
+        "sub": "user:7f3c", "ws": "claims-jabar", "jti": "aud-0192",
+        "sql_sha256": hashlib.sha256(sql.encode()).hexdigest(),
+        "max_rows": 100, "exp": time.time() + 3600.0,
+        "tables": {
+            "claims.claim": {
+                "columns": ["total_amount"],
+                "masks": {},
+                "actions": ["select"]
+            }
+        }
+    }
+    schemas = {"claims.claim": ["total_amount"]}
+    grant = Grant.from_claims(claims)
+    res = enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube")
+    assert "MEASURE(total_amount)" in res.sql
+
+
+def test_cube_measure_function_refused_on_non_cube():
+    sql = "SELECT MEASURE(total_amount) FROM claims.claim"
+    claims = {
+        "sub": "user:7f3c", "ws": "claims-jabar", "jti": "aud-0192",
+        "sql_sha256": hashlib.sha256(sql.encode()).hexdigest(),
+        "max_rows": 100, "exp": time.time() + 3600.0,
+        "tables": {
+            "claims.claim": {
+                "columns": ["total_amount"],
+                "masks": {},
+                "actions": ["select"]
+            }
+        }
+    }
+    schemas = {"claims.claim": ["total_amount"]}
+    grant = Grant.from_claims(claims)
+    with pytest.raises(EnforcementError, match="function 'MEASURE' is not permitted"):
+        enforce(sql, grant, schemas=schemas, target_dialect="duckdb", target_kind="duckdb")
+
+
+# ==============================================================================
+# Star over Non-Table Sources (VALUES, CTE, Subquery)
+# ==============================================================================
+
+def test_star_over_values_renders_valid_sql_and_executes(duckdb_con):
+    sql = "SELECT * FROM (VALUES (1)) AS v(a)"
+    grant, schemas = _claims_fixture(sql)
+    res = enforce(sql, grant, schemas=schemas, target_dialect="duckdb", target_kind="duckdb")
+    assert "SELECT * FROM (VALUES (1)) AS v(a)" in res.sql
+
+    rows = duckdb_con.execute(res.sql).fetchall()
+    assert rows == [(1,)]
+
+
+def test_star_over_cte_renders_valid_sql_and_executes(duckdb_con):
+    sql = "WITH cte AS (SELECT claim_id FROM claims.claim) SELECT * FROM cte"
+    grant, schemas = _claims_fixture(sql)
+    res = enforce(sql, grant, schemas=schemas, target_dialect="duckdb", target_kind="duckdb")
+    assert "SELECT * FROM cte" in res.sql
+
+    rows = duckdb_con.execute(res.sql).fetchall()
+    # 4 rows from JB
+    assert len(rows) == 4
+    assert rows[0] == (1,)
+
+
+def test_star_over_derived_table_renders_valid_sql_and_executes(duckdb_con):
+    sql = "SELECT * FROM (SELECT claim_id FROM claims.claim) AS t"
+    grant, schemas = _claims_fixture(sql)
+    res = enforce(sql, grant, schemas=schemas, target_dialect="duckdb", target_kind="duckdb")
+    assert "SELECT * FROM" in res.sql
+    assert ") AS t" in res.sql
+
+    rows = duckdb_con.execute(res.sql).fetchall()
+    assert len(rows) == 4
+    assert rows[0] == (1,)
+

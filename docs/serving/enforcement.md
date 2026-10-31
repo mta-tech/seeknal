@@ -93,10 +93,20 @@ Every referenced table (excluding statement-defined CTEs) must be in `grant.tabl
 
 ---
 
-### Rule 3: Actions
+### Rule 3: Actions & Function Call Restrictions
 - `SELECT` queries require `select` on all referenced tables.
 - `INSERT`, `UPDATE`, and `DELETE` require the respective write action on the target table, and `select` on any read tables.
 - DDL (`CREATE`, `DROP`, `ALTER`), `MERGE`, `SET`, and `COPY` statements are refused.
+- **Function Call Security:** Function calls are strictly checked anywhere in the statement (projections, WHERE, GROUP BY, ORDER BY, subqueries, CTEs):
+  - **Anonymous functions (`exp.Anonymous`):** Unmodeled function names are rejected unless explicitly allowed per target:
+    - `ANONYMOUS_FUNCTION_ALLOWLIST = {"cube": {"measure"}, "starrocks": set(), "lakebase": set(), "duckdb": set()}`.
+    - *Refusal Example:* `SELECT pg_read_file('/etc/passwd') AS x` raises `EnforcementError: function 'pg_read_file' is not permitted`.
+    - *Refusal Example:* `SELECT getenv('HOME') AS h` raises `EnforcementError: function 'getenv' is not permitted`.
+    - *Refusal Example:* `... WHERE current_setting('is_superuser') = 'on'` raises `EnforcementError: function 'current_setting' is not permitted`.
+  - **Typed sqlglot functions:** Disallowed if the SQL name starts with dangerous prefixes (`pg_`, `read_`, `lo_`, `dblink`, `glob`, `sniff_`, `query`, `getenv`, `current_setting`, `set_config`, `system`, `load_file`, `copy`) or is an instance of `exp.ReadCSV`.
+    - *Refusal Example:* `SELECT read_csv('data.csv')` raises `EnforcementError: function 'read_csv' is not permitted`.
+  - **Allowed functions:** Standard analytical functions like `lower`, `upper`, `coalesce`, `date_trunc`, `sum`, `count`, and `row_number() over (...)` are permitted. `MEASURE(...)` is permitted for `target_kind="cube"`.
+  - **Tableless Queries:** Harmless statements without tables (e.g. `SELECT 1` used as BI tool connection health-checks) are permitted.
 
 ---
 
@@ -104,7 +114,11 @@ Every referenced table (excluding statement-defined CTEs) must be in `grant.tabl
 - Every column reference must resolve to a granted column (visible or masked).
 - Columns in schema that are neither visible nor masked are rejected.
   - *Refusal Example:* `SELECT confidential_note FROM claims.claim` raises `EnforcementError: column 'confidential_note' in table 'claims.claim' is neither visible nor masked`.
-- `*` and `t.*` expand into that table's granted columns in schema order.
+- `*` and `t.*` expand into that table's granted columns in schema order **only** when referring to granted tables.
+- **Star over Non-Table Sources:** A star referring to a non-table source (a `VALUES` list, a subquery, or a CTE) remains as `*` (or `alias.*`) because those projections have already been validated and enforced at their origin.
+  - `SELECT * FROM (VALUES (1)) AS v(a)` remains `SELECT * FROM (VALUES (1)) AS v(a)`.
+  - `WITH cte AS (SELECT claim_id FROM claims.claim) SELECT * FROM cte` keeps `*` on `cte`.
+  - `SELECT * FROM (SELECT claim_id FROM claims.claim) AS t` keeps `*` on derived table `t`.
 
 #### Example: Star Expansion
 **Before SQL:**
