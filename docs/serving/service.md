@@ -45,7 +45,7 @@ The pipeline operates in-memory with zero network overhead, no active database c
 5. **Parameter Binding & Paramstyle Compilation:**
    Maps PostgreSQL-style placeholders (`$1..$n`) to the target engine's native parameter style (`%s` for format engines, `?` for qmark engines), escapes literal `%` characters to `%%` for format drivers, and constructs the final positional `params` tuple in exact appearance order.
 
-The output `PreparedQuery` includes `workload: str` (taken from `grant.workload`, defaulting to `"interactive"`), enabling engine adapters to dispatch queries to appropriate engine service accounts.
+The output `PreparedQuery` includes `workload: str` (taken from `grant.workload`, defaulting to `"interactive"`) and `binding: Mapping[str, Any]` (capturing optional catalog binding claims `publication_id`, `revision`, and `digest`), enabling engine adapters to dispatch queries to appropriate engine service accounts and echo audit bindings into request logs. ServingPipeline also accepts `cube_mode` (`"refuse"` by default, or `"jwt"`).
 
 ### Why Routing Reads the Original SQL
 

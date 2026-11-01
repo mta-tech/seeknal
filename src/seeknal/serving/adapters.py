@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import inspect
+import json
 import logging
 import re
 import threading
@@ -44,6 +48,71 @@ class EngineConfigError(EngineError):
 
 class EngineCancelled(EngineError):
     """Raised when engine query execution is cancelled."""
+
+
+@dataclass(frozen=True)
+class CubeSecurityConfig:
+    """Security configuration for Cube context token generation."""
+
+    secret: bytes
+    issuer: str = "seeknal-serving"
+    audience: str = "cube-sql"
+    ttl_seconds: int = 60
+    sql_user: str = "seeknal"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.secret, (bytes, bytearray)):
+            raise ValueError("secret must be bytes")
+        if not isinstance(self.issuer, str):
+            raise ValueError("issuer must be string")
+        if not isinstance(self.audience, str):
+            raise ValueError("audience must be string")
+        if not isinstance(self.sql_user, str):
+            raise ValueError("sql_user must be string")
+        if isinstance(self.ttl_seconds, bool) or not isinstance(self.ttl_seconds, (int, float)):
+            raise ValueError("ttl_seconds must be a number")
+        if not (0 < self.ttl_seconds <= 300):
+            raise ValueError(f"ttl_seconds must be between 1 and 300, got {self.ttl_seconds}")
+
+
+def make_cube_context_token(
+    prepared: PreparedQuery,
+    cfg: CubeSecurityConfig,
+    now: float | None = None,
+) -> str:
+    """Build a compact HS256 JWT containing Cube security context using standard library only."""
+    if prepared.cube_security_context is None:
+        raise EngineError("Cube engine query requires cube_security_context")
+
+    iat = int(now if now is not None else time.time())
+    ttl = int(cfg.ttl_seconds)
+    if ttl <= 0 or ttl > 300:
+        raise ValueError(f"ttl_seconds must be between 1 and 300, got {ttl}")
+    exp = iat + ttl
+
+    header = {"alg": "HS256", "typ": "JWT"}
+    claims = {
+        "iss": cfg.issuer,
+        "aud": cfg.audience,
+        "iat": iat,
+        "exp": exp,
+        "sub": prepared.subject,
+        "audit_id": prepared.audit_id,
+        "masks": prepared.cube_security_context.get("masks", {}),
+        "row_filters": prepared.cube_security_context.get("row_filters", {}),
+    }
+
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    payload_bytes = json.dumps(claims, separators=(",", ":")).encode("utf-8")
+
+    header_b64 = base64.urlsafe_b64encode(header_bytes).rstrip(b"=").decode("ascii")
+    payload_b64 = base64.urlsafe_b64encode(payload_bytes).rstrip(b"=").decode("ascii")
+
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    signature = hmac.new(cfg.secret, signing_input, hashlib.sha256).digest()
+    sig_b64 = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+
+    return f"{header_b64}.{payload_b64}.{sig_b64}"
 
 
 class EngineAdapter(Protocol):
@@ -359,8 +428,10 @@ class DBAPIAdapter:
             raise EngineError("Engine connection failed") from exc
 
         cancel_event = threading.Event()
+        timed_out = threading.Event()
         cancel_called = False
         cancel_lock = threading.Lock()
+        cube_timer: threading.Timer | None = None
 
         try:
             cursor = conn.cursor()
@@ -430,7 +501,39 @@ class DBAPIAdapter:
                         cursor.execute("SET TRANSACTION READ ONLY")
                     cursor.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
 
+                elif self._kind == "cube":
+                    def cancel_cube() -> None:
+                        nonlocal cancel_called
+                        with cancel_lock:
+                            if cancel_called:
+                                return
+                            cancel_called = True
+                        cancel_event.set()
+                        try:
+                            conn.cancel()
+                        except Exception:
+                            pass
+
+                    if on_cancel_handle is not None:
+                        on_cancel_handle(cancel_cube)
+
+                    def timeout_cube() -> None:
+                        timed_out.set()
+                        try:
+                            conn.cancel()
+                        except Exception:
+                            pass
+
+                    cube_timer = threading.Timer(timeout_seconds, timeout_cube)
+                    cube_timer.start()
+
                 cursor.execute(prepared.sql, prepared.params)
+                if cancel_event.is_set():
+                    logger.error("engine=%s error=%s audit_id=%s", self._kind, "EngineCancelled", prepared.audit_id)
+                    raise EngineCancelled("Engine query execution cancelled")
+                if timed_out.is_set():
+                    logger.warning("engine=%s error=%s audit_id=%s", self._kind, "EngineTimeout", prepared.audit_id)
+                    raise EngineTimeout("Engine query timed out")
 
                 if prepared.row_limit is None:
                     conn.commit()
@@ -457,6 +560,8 @@ class DBAPIAdapter:
                         rows = [tuple(r) for r in fetched]
                         truncated = False
             finally:
+                if cube_timer is not None:
+                    cube_timer.cancel()
                 try:
                     cursor.close()
                 except Exception:
@@ -465,15 +570,160 @@ class DBAPIAdapter:
             if cancel_event.is_set():
                 logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
                 raise EngineCancelled("Engine query execution cancelled") from exc
+            if timed_out.is_set():
+                logger.warning("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
+                raise EngineTimeout("Engine query timed out") from exc
             logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
             if _is_timeout_error(exc):
                 raise EngineTimeout("Engine query timed out") from exc
+            if isinstance(exc, (EngineTimeout, EngineCancelled, EngineError)):
+                raise
             raise EngineError("Engine query execution failed") from exc
         finally:
             try:
                 conn.close()
             except Exception as exc:
                 logger.warning("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
+
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return QueryResult(
+            columns=columns,
+            rows=rows,
+            truncated=truncated,
+            engine=prepared.engine,
+            elapsed_ms=elapsed_ms,
+            column_types=column_types,
+        )
+
+
+class CubeAdapter:
+    """Adapter for Cube SQL API execution with JWT security context."""
+
+    def __init__(
+        self,
+        connect: Callable[..., Any],
+        security: CubeSecurityConfig,
+        *,
+        connect_timeout_seconds: float = 10,
+    ) -> None:
+        self._connect = connect
+        self._security = security
+        self._connect_timeout_seconds = connect_timeout_seconds
+
+    def execute(
+        self,
+        prepared: PreparedQuery,
+        *,
+        timeout_seconds: float,
+        on_cancel_handle: Callable[[Callable[[], None]], None] | None = None,
+    ) -> QueryResult:
+        if prepared.cube_security_context is None:
+            raise EngineError("Cube engine query requires cube_security_context")
+
+        token = make_cube_context_token(prepared, self._security)
+        start = time.perf_counter()
+
+        try:
+            conn = self._connect(
+                user=self._security.sql_user,
+                password=token,
+                connect_timeout=self._connect_timeout_seconds,
+            )
+        except Exception as exc:
+            logger.error("engine=%s error=%s audit_id=%s", "cube", type(exc).__name__, prepared.audit_id)
+            if _is_timeout_error(exc):
+                raise EngineTimeout("Engine query timed out") from None
+            raise EngineError("Engine connection failed") from None
+
+        cancel_event = threading.Event()
+        timed_out = threading.Event()
+        cancel_called = False
+        cancel_lock = threading.Lock()
+
+        def cancel_cube() -> None:
+            nonlocal cancel_called
+            with cancel_lock:
+                if cancel_called:
+                    return
+                cancel_called = True
+            cancel_event.set()
+            try:
+                conn.cancel()
+            except Exception:
+                pass
+
+        if on_cancel_handle is not None:
+            on_cancel_handle(cancel_cube)
+
+        def timeout_cube() -> None:
+            timed_out.set()
+            try:
+                conn.cancel()
+            except Exception:
+                pass
+
+        timer = threading.Timer(timeout_seconds, timeout_cube)
+        timer.start()
+
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(prepared.sql, prepared.params)
+                if cancel_event.is_set():
+                    logger.error("engine=%s error=%s audit_id=%s", "cube", "EngineCancelled", prepared.audit_id)
+                    raise EngineCancelled("Engine query execution cancelled")
+                if timed_out.is_set():
+                    logger.warning("engine=%s error=%s audit_id=%s", "cube", "EngineTimeout", prepared.audit_id)
+                    raise EngineTimeout("Engine query timed out")
+
+                if prepared.row_limit is None:
+                    conn.commit()
+                    columns: tuple[str, ...] = ()
+                    column_types: tuple[str, ...] = ()
+                    rows: list[tuple] = []
+                    truncated = False
+                else:
+                    columns = (
+                        tuple(d[0] for d in cursor.description)
+                        if cursor.description
+                        else ()
+                    )
+                    column_types = (
+                        tuple(normalize_column_type("cube", d) for d in cursor.description)
+                        if cursor.description
+                        else ()
+                    )
+                    fetched = cursor.fetchmany(prepared.row_limit)
+                    if len(fetched) == prepared.row_limit:
+                        rows = [tuple(r) for r in fetched[:-1]]
+                        truncated = True
+                    else:
+                        rows = [tuple(r) for r in fetched]
+                        truncated = False
+            finally:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            if cancel_event.is_set():
+                logger.error("engine=%s error=%s audit_id=%s", "cube", type(exc).__name__, prepared.audit_id)
+                raise EngineCancelled("Engine query execution cancelled") from None
+            if timed_out.is_set():
+                logger.warning("engine=%s error=%s audit_id=%s", "cube", type(exc).__name__, prepared.audit_id)
+                raise EngineTimeout("Engine query timed out") from None
+            logger.error("engine=%s error=%s audit_id=%s", "cube", type(exc).__name__, prepared.audit_id)
+            if _is_timeout_error(exc):
+                raise EngineTimeout("Engine query timed out") from None
+            if isinstance(exc, (EngineTimeout, EngineCancelled, EngineError)):
+                raise
+            raise EngineError("Engine query execution failed") from None
+        finally:
+            timer.cancel()
+            try:
+                conn.close()
+            except Exception as exc:
+                logger.warning("engine=%s error=%s audit_id=%s", "cube", type(exc).__name__, prepared.audit_id)
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return QueryResult(
@@ -529,12 +779,17 @@ def build_workload_adapters(
 
 def build_adapter(
     kind: str,
-    connect: Callable[[], Any],
+    connect: Callable[..., Any],
     **kw: Any,
 ) -> EngineAdapter:
     """Small factory to build an engine adapter for a given engine kind."""
     if kind == "duckdb":
         return DuckDBAdapter(connect, **kw)
-    if kind in ("starrocks", "lakebase", "cube"):
+    if kind == "cube":
+        if "security" in kw and kw["security"] is not None:
+            security = kw.pop("security")
+            return CubeAdapter(connect, security=security, **kw)
+        return DBAPIAdapter(connect, kind=kind, **kw)
+    if kind in ("starrocks", "lakebase"):
         return DBAPIAdapter(connect, kind=kind, **kw)
     raise ValueError(f"Unsupported engine kind: '{kind}'")

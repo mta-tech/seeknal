@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from seeknal.serving.adapters import (
+    CubeAdapter,
+    CubeSecurityConfig,
     DBAPIAdapter,
     DuckDBAdapter,
     EngineAdapter,
@@ -14,6 +16,7 @@ from seeknal.serving.adapters import (
     WorkloadRoutedAdapter,
     build_adapter,
     build_workload_adapters,
+    make_cube_context_token,
     normalize_column_type,
 )
 from seeknal.serving.discovery import (
@@ -44,7 +47,9 @@ from seeknal.serving.router import Router, RoutingDecision, RoutingError
 from seeknal.serving.service import PreparedQuery, ServingPipeline
 
 __all__ = [
+    "CubeAdapter",
     "CubeEntry",
+    "CubeSecurityConfig",
     "DBAPIAdapter",
     "DiscoveryConfig",
     "DuckDBAdapter",
@@ -77,6 +82,7 @@ __all__ = [
     "discover",
     "enforce",
     "extract_features",
+    "make_cube_context_token",
     "normalize_column_type",
     "sign_cancel_token",
     "sign_grant_token",
