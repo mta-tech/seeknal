@@ -15,10 +15,11 @@ Atlas Data Catalog
        ▼
 Seeknal Serving (service.py)
   ├── 1. verify_grant_token (validates ES256 signature, expiry, audience, issuer)
-  ├── 2. router.decide (inspects original SQL AST shape; selects engine)
-  ├── 3. enforce (applies masks, row filters, row cap, column checks)
-  ├── 4. router.rewrite (maps logical table names to physical placement names)
-  └── 5. parameter compilation (swaps markers to driver style: %s or ?, escapes % to %%)
+  ├── 2. parse & canonicalise (parses once with grant.sql_dialect; applies default_catalog)
+  ├── 3. router.decide_statement (inspects canonical AST shape; selects engine)
+  ├── 4. enforce (applies masks, row filters, row cap, column checks on canonical AST)
+  ├── 5. router.rewrite (maps logical table names to physical placement names)
+  └── 6. parameter compilation (swaps markers to driver style: %s or ?, escapes % to %%)
        │
        │ (PreparedQuery: engine, engine_kind, sql, params, paramstyle, audit metadata)
        ▼
@@ -114,12 +115,48 @@ Seeknal Serving enables parameterized queries where client SQL uses standard Pos
 3. **Escaping `%` for Format Drivers:**
    For engines using `paramstyle="format"` (`starrocks`, `lakebase`, `cube`), python database drivers (such as `pymysql` or `psycopg2`) interpret `%` as format specifiers. Every literal `%` in the SQL (e.g., in `LIKE 'JB%'` or date format patterns) is escaped to `%%` before the parameter markers are substituted with `%s`.
 4. **Validation:**
-   - Referencing a placeholder index greater than the number of supplied parameters raises `EnforcementError`.
-   - Passing parameters that are never referenced in the SQL statement raises `EnforcementError`.
+    - Referencing a placeholder index greater than the number of supplied parameters raises `EnforcementError`.
+    - Passing parameters that are never referenced in the SQL statement raises `EnforcementError`.
 
 ---
 
-## 5. End-to-End Example: Provincial Analyst Query Routed to StarRocks
+## 5. Default Catalog
+
+The Atlas Data Catalog canonically names tables as `<catalog>.<namespace>.<table>` (e.g. `lakekeeper.analytics.customers`) and issues grant `tables` keys with those canonical three-part names. However, users, BI tools, and Superset frequently write two-part names (`analytics.customers`).
+
+Because the Catalog grant is cryptographically bound to the SHA-256 of the exact SQL string submitted by the client, the Catalog cannot rewrite the SQL string prior to signing. Serving therefore performs canonicalisation after signature and hash verification, but before routing and enforcement:
+
+1. **Configuration:** `ServingPipeline` accepts an optional `default_catalog: str | None = None` keyword argument.
+2. **Canonicalisation Rules:**
+   - Every `exp.Table` reference with a `db` and a `name` but no `catalog` is assigned `default_catalog`.
+   - One-part names (e.g. `users`) are left alone.
+   - Names that correspond to CTEs defined by the statement are skipped and never qualified.
+   - Already three-part names (e.g. `lakekeeper.claims.claim`) are left untouched.
+3. **AST Preservation:** The canonical statement is passed directly to `router.decide_statement` and `enforce(..., statement=canonical)`. The original `sql` string is retained for SHA-256 integrity checks, guaranteeing that grant token validation succeeds while routing and enforcement operate on canonical names.
+4. **Default Behaviour:** When `default_catalog` is `None` (the default), two-part table references are preserved exactly as written.
+
+---
+
+## 6. Source Dialect
+
+By default, Serving parses incoming queries using the PostgreSQL dialect. However, the Catalog and Superset often send SQL written in StarRocks or MySQL dialects (such as queries with backtick-quoted identifiers like `` `claims`.`claim` ``) or DuckDB SQL.
+
+### Signed Dialect Selection
+- **Signed Claim:** The Catalog specifies the dialect by including an optional `sql_dialect` claim in the signed grant JWT. Allowed values are `"postgres"`, `"starrocks"`, `"mysql"`, and `"duckdb"`. If the claim is absent, it defaults to `"postgres"`. Non-string values or unknown dialects raise `EnforcementError`.
+- **Security:** Because `sql_dialect` is signed by the Catalog, the HTTP caller cannot override or forge the dialect. Serving does not accept an unauthenticated dialect field in the HTTP request.
+
+### Single-Parse Pipeline
+- In `ServingPipeline.prepare`, the client SQL is parsed once with `read=grant.sql_dialect`, enforcing single-statement integrity.
+- Both routing (`router.decide_statement`) and policy enforcement (`enforce(..., statement=canonical, dialect=grant.sql_dialect)`) operate on the identical parsed statement AST, ensuring routing and enforcement can never diverge.
+- Target engine rendering converts the enforced AST to the target engine's dialect (e.g. rendering StarRocks-syntax queries to valid PostgreSQL without backticks when routed to Lakebase).
+
+### Parameters & Security Constraints
+- **Parameters:** `$n` positional parameter placeholders are only defined for `postgres` and `duckdb`. Supplying non-empty `params` when `sql_dialect` is `starrocks` or `mysql` raises `EnforcementError`.
+- **Function Allowlist / Denylist:** Denied functions (including `load_file`, `getenv`, `pg_read_file`) remain strictly forbidden regardless of source dialect.
+
+---
+
+## 7. End-to-End Example: Provincial Analyst Query Routed to StarRocks
 
 An analyst in West Java (`JB`) runs a parameterized summary query from Superset.
 

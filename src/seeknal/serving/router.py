@@ -167,7 +167,20 @@ class Router:
             )
 
         statement = valid_statements[0]
+        return self.decide_statement(
+            statement,
+            hint=hint,
+            max_staleness_seconds=max_staleness_seconds,
+        )
 
+    def decide_statement(
+        self,
+        statement: exp.Expression,
+        *,
+        hint: str | None = None,
+        max_staleness_seconds: float | None = None,
+    ) -> RoutingDecision:
+        """Route a SQL statement AST, picking the best engine and returning a RoutingDecision."""
         # 2. Extract features
         features = extract_features(statement)
         if features.kind in ("ddl", "other"):

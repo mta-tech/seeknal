@@ -20,6 +20,7 @@ VALID_OPS = frozenset({"eq", "in", "gte", "lte"})
 VALID_ACTIONS = frozenset({"select", "insert", "update", "delete"})
 VALID_TARGET_KINDS = frozenset({"starrocks", "lakebase", "duckdb", "cube"})
 VALID_TARGET_DIALECTS = frozenset({"postgres", "starrocks", "duckdb"})
+VALID_SQL_DIALECTS = frozenset({"postgres", "starrocks", "mysql", "duckdb"})
 
 ANONYMOUS_FUNCTION_ALLOWLIST: dict[str, set[str]] = {
     "cube": {"measure"},
@@ -181,12 +182,17 @@ class Grant:
     max_rows: int
     expires_at: float
     tables: Mapping[str, TableGrant]
+    sql_dialect: str = "postgres"
 
     def __post_init__(self) -> None:
         if self.max_rows <= 0:
             raise EnforcementError(f"max_rows must be positive, got {self.max_rows}")
         if not self.tables:
             raise EnforcementError("empty table list in grant")
+        if not isinstance(self.sql_dialect, str) or self.sql_dialect not in VALID_SQL_DIALECTS:
+            raise EnforcementError(
+                f"invalid sql_dialect '{self.sql_dialect}', must be one of {sorted(VALID_SQL_DIALECTS)}"
+            )
 
     @classmethod
     def from_claims(cls, claims: Mapping[str, Any]) -> Grant:
@@ -202,6 +208,15 @@ class Grant:
         tables_raw = claims["tables"]
         if not tables_raw:
             raise EnforcementError("empty table list in grant claims")
+
+        if "sql_dialect" in claims:
+            sql_dialect = claims["sql_dialect"]
+            if not isinstance(sql_dialect, str) or sql_dialect not in VALID_SQL_DIALECTS:
+                raise EnforcementError(
+                    f"invalid sql_dialect '{sql_dialect}', must be one of {sorted(VALID_SQL_DIALECTS)}"
+                )
+        else:
+            sql_dialect = "postgres"
 
         table_grants: dict[str, TableGrant] = {}
         for tbl_name, tbl_spec in tables_raw.items():
@@ -229,6 +244,7 @@ class Grant:
             max_rows=max_rows,
             expires_at=float(claims["exp"]),
             tables=table_grants,
+            sql_dialect=sql_dialect,
         )
 
 
@@ -440,6 +456,7 @@ def enforce(
     target_dialect: str,
     target_kind: str,
     dialect: str = "postgres",
+    statement: exp.Expression | None = None,
     now: float | None = None,
 ) -> EnforcedQuery:
     """Enforce a data catalog grant on a SQL query."""
@@ -456,17 +473,21 @@ def enforce(
             f"grant expired at {grant.expires_at}, current time is {check_now}"
         )
 
-    try:
-        parsed_statements = sqlglot.parse(sql, read=dialect)
-    except Exception as exc:
-        raise EnforcementError(f"SQL parse error: {exc}") from exc
+    if statement is not None:
+        statement = statement.copy()
+    else:
+        try:
+            parsed_statements = sqlglot.parse(sql, read=dialect)
+        except Exception as exc:
+            raise EnforcementError(f"SQL parse error: {exc}") from exc
 
-    if len(parsed_statements) != 1 or parsed_statements[0] is None:
-        raise EnforcementError(
-            f"expected exactly one statement, got {len(parsed_statements)}"
-        )
+        if len(parsed_statements) != 1 or parsed_statements[0] is None:
+            raise EnforcementError(
+                f"expected exactly one statement, got {len(parsed_statements)}"
+            )
 
-    statement = parsed_statements[0]
+        statement = parsed_statements[0]
+
     original_statement = statement.copy()
 
     # Target kind & dialect validation
@@ -665,7 +686,12 @@ def enforce(
         if col.table:
             # Qualified column reference
             qual = col.table.lower()
-            full_qual = f"{col.db.lower()}.{qual}" if col.db else qual
+            if col.catalog:
+                full_qual = f"{col.catalog.lower()}.{col.db.lower()}.{qual}"
+            elif col.db:
+                full_qual = f"{col.db.lower()}.{qual}"
+            else:
+                full_qual = qual
 
             if qual in cte_names or qual in subquery_aliases or qual in values_aliases:
                 # Allowed if defined or produced by CTE/subquery/values
@@ -679,7 +705,12 @@ def enforce(
                     break
                 if not tbl.alias:
                     tbl_full = _table_full_name(tbl).lower()
-                    if tbl.name.lower() == qual or tbl_full == full_qual or tbl_full == qual:
+                    if (
+                        tbl_full == full_qual
+                        or tbl_full.endswith("." + full_qual)
+                        or tbl.name.lower() == qual
+                        or tbl_full == qual
+                    ):
                         matched_key = tbl_full
                         break
 
@@ -773,7 +804,7 @@ def enforce(
 
         # Clear catalog/db qualifications on outer columns matching unaliased tables
         for col in statement.find_all(exp.Column):
-            if col.db:
+            if col.db or col.catalog:
                 col.set("catalog", None)
                 col.set("db", None)
 
