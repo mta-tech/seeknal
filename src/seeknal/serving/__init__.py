@@ -55,6 +55,12 @@ from seeknal.serving.proving import (
     setup_synthetic_claims_table,
 )
 from seeknal.serving.router import Router, RoutingDecision, RoutingError
+from seeknal.serving.server import (
+    ServerConfig,
+    ServerConfigError,
+    ServerHandle,
+    build_server,
+)
 from seeknal.serving.service import PreparedQuery, ServingPipeline
 
 __all__ = [
@@ -87,11 +93,15 @@ __all__ = [
     "RoutingDecision",
     "RoutingError",
     "RuleStats",
+    "ServerConfig",
+    "ServerConfigError",
+    "ServerHandle",
     "ServingPipeline",
     "TableEntry",
     "TableServe",
     "WorkloadRoutedAdapter",
     "build_adapter",
+    "build_server",
     "build_workload_adapters",
     "create_app",
     "default_cases",
