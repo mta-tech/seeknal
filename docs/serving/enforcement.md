@@ -213,7 +213,10 @@ Cube SQL API operates on pre-aggregated cubes and does not support derived subqu
 When `target_kind == "cube"`:
 1. Rules 1–4 and 7 run as normal.
 2. Table secure-view rewrites are skipped.
-3. `EnforcedQuery.cube_security_context` is populated:
+3. Enforcement mode controls policy handling:
+   - **`cube_mode == "refuse"` (Default):** Fails closed if any referenced cube has masks or row filters, raising `EnforcementError("cube target has masks or row filters; cube enforcement is not enabled")`. Only queries with clear granted columns and no row filters proceed.
+   - **`cube_mode == "jwt"`:** Masks and row filters are permitted and delivered via `CubeAdapter` in a signed HS256 JWT. Masked members are strictly prohibited in `WHERE`, `HAVING`, `JOIN ... ON`, `GROUP BY`, `ORDER BY`, functions, or expressions, and may only appear as bare top-level projections (optionally aliased).
+4. `EnforcedQuery.cube_security_context` is populated:
 ```python
 {
     "subject": "user:7f3c",
@@ -231,7 +234,7 @@ When `target_kind == "cube"`:
     }
 }
 ```
-Cube's native access policies consume this context from a signed token to enforce masking and row filters during cube query generation.
+Cube's native access policies consume this context from a signed token to enforce masking and row filters during cube query generation. See `docs/serving/cube.md` for full reference configuration.
 
 ---
 

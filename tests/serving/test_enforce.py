@@ -363,7 +363,7 @@ def test_row_cap_none_for_writes():
 def test_cube_path_skips_table_rewrite_and_builds_security_context():
     sql = "SELECT claim_id, province FROM claims.claim WHERE amount > 10"
     grant, schemas = _claims_fixture(sql)
-    res = enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube")
+    res = enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="jwt")
     # Cube does not rewrite tables to derived tables
     assert "FROM claims.claim WHERE" in res.sql
     assert "AS claim" not in res.sql

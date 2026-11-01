@@ -175,9 +175,32 @@ def _log_request(
     status: int = 200,
     elapsed_ms: float = 0.0,
     row_count: int | str = "-",
+    publication_id: str | None = None,
+    revision: int | str | None = None,
+    digest: str | None = None,
+    binding: Mapping[str, Any] | None = None,
 ) -> None:
+    if binding:
+        if publication_id is None and "publication_id" in binding:
+            publication_id = binding["publication_id"]
+        if revision is None and "revision" in binding:
+            revision = binding["revision"]
+        if digest is None and "digest" in binding:
+            digest = binding["digest"]
+
+    extra_parts = []
+    if publication_id is not None:
+        extra_parts.append(f"publication_id={publication_id}")
+    if revision is not None:
+        extra_parts.append(f"revision={revision}")
+    if digest is not None:
+        extra_parts.append(f"digest={digest}")
+
+    extra_str = (" " + " ".join(extra_parts)) if extra_parts else ""
+
     logger.info(
-        "request audit_id=%s subject=%s engine=%s rule=%s status=%d elapsed_ms=%.2f row_count=%s",
+        "request audit_id=%s subject=%s engine=%s rule=%s status=%d elapsed_ms=%.2f row_count=%s"
+        + extra_str,
         audit_id or "-",
         subject or "-",
         engine or "-",
@@ -398,6 +421,7 @@ def create_app(
             status=200,
             elapsed_ms=elapsed_ms,
             row_count="-",
+            binding=prepared.binding,
         )
 
         return JSONResponse({
@@ -451,6 +475,7 @@ def create_app(
                 rule=prepared.rule,
                 status=503,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                binding=prepared.binding,
             )
             return _error_response(
                 503,
@@ -474,6 +499,7 @@ def create_app(
                 rule=prepared.rule,
                 status=409,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                binding=prepared.binding,
             )
             return _error_response(409, "duplicate_query_id", exc, token=token, sql=sql, params=params)
 
@@ -529,6 +555,7 @@ def create_app(
                 rule=prepared.rule,
                 status=504,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                binding=prepared.binding,
             )
             return _error_response(504, "engine_timeout", exc, token=token, sql=sql, params=params)
         except EngineConfigError as exc:
@@ -539,6 +566,7 @@ def create_app(
                 rule=prepared.rule,
                 status=503,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                binding=prepared.binding,
             )
             return _error_response(503, "workload_account_missing", exc, token=token, sql=sql, params=params)
         except EngineCancelled as exc:
@@ -549,6 +577,7 @@ def create_app(
                 rule=prepared.rule,
                 status=499,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                binding=prepared.binding,
             )
             return _error_response(499, "query_cancelled", exc, token=token, sql=sql, params=params)
         except EngineError as exc:
@@ -559,6 +588,7 @@ def create_app(
                 rule=prepared.rule,
                 status=502,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                binding=prepared.binding,
             )
             return _error_response(502, "engine_error", exc, token=token, sql=sql, params=params)
         except Exception as exc:
@@ -570,6 +600,7 @@ def create_app(
                 rule=prepared.rule,
                 status=500,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                binding=prepared.binding,
             )
             return _error_response(500, "internal_error", "Internal server error", token=token, sql=sql, params=params)
         finally:
@@ -586,6 +617,7 @@ def create_app(
                 rule=prepared.rule,
                 status=413,
                 elapsed_ms=result.elapsed_ms,
+                binding=prepared.binding,
             )
             return _error_response(413, "result_too_large", "Result size exceeds limit", token=token, sql=sql, params=params)
 
@@ -597,6 +629,7 @@ def create_app(
             status=200,
             elapsed_ms=result.elapsed_ms,
             row_count=len(safe_rows),
+            binding=prepared.binding,
         )
 
         col_types = list(result.column_types)

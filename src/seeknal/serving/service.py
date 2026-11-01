@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import sqlglot
@@ -38,6 +38,7 @@ class PreparedQuery:
     audit_id: str
     cube_security_context: Mapping | None
     workload: str = "interactive"
+    binding: Mapping[str, Any] = field(default_factory=dict)
 
 
 def _extract_placeholder_index(node: exp.Expression) -> int:
@@ -67,7 +68,10 @@ class ServingPipeline:
         audience: str = "seeknal-serving",
         issuer: str = "atlas-catalog",
         default_catalog: str | None = None,
+        cube_mode: str = "refuse",
     ) -> None:
+        if cube_mode not in ("refuse", "jwt"):
+            raise EnforcementError(f"invalid cube_mode '{cube_mode}', must be 'refuse' or 'jwt'")
         self._lock = threading.Lock()
         self.placement = placement
         self.schemas = schemas
@@ -75,6 +79,7 @@ class ServingPipeline:
         self.audience = audience
         self.issuer = issuer
         self.default_catalog = default_catalog
+        self.cube_mode = cube_mode
         self.router = Router(placement)
 
     def update_catalog(
@@ -171,6 +176,7 @@ class ServingPipeline:
             statement=statement,
             now=now,
             max_rows=max_rows,
+            cube_mode=self.cube_mode,
         )
 
         # 4. Table rewrite for chosen engine physical names
@@ -247,4 +253,5 @@ class ServingPipeline:
             audit_id=grant.audit_id,
             cube_security_context=enforced.cube_security_context,
             workload=grant.workload,
+            binding=grant.binding,
         )

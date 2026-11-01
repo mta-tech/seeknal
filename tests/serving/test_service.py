@@ -167,6 +167,12 @@ def test_routing_and_enforcement_lakebase_point_lookup(standard_pipeline):
 def test_routing_and_enforcement_cube(standard_pipeline):
     """Test semantic query routing to Cube with cube_security_context generation."""
     pipeline, priv = standard_pipeline
+    pipeline = ServingPipeline(
+        placement=pipeline.placement,
+        schemas=pipeline.schemas,
+        public_keys=pipeline.public_keys,
+        cube_mode="jwt",
+    )
     sql = "SELECT province, total_amount FROM claims_cube"
     token = _make_token(
         priv,

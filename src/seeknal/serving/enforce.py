@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import sqlglot
@@ -185,6 +185,7 @@ class Grant:
     tables: Mapping[str, TableGrant]
     sql_dialect: str = "postgres"
     workload: str = "interactive"
+    binding: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.max_rows <= 0:
@@ -199,6 +200,10 @@ class Grant:
             raise EnforcementError(
                 f"invalid workload '{self.workload}', must be one of {sorted(VALID_WORKLOADS)}"
             )
+        if self.binding is None:
+            object.__setattr__(self, "binding", {})
+        elif not isinstance(self.binding, dict):
+            object.__setattr__(self, "binding", dict(self.binding))
 
     @classmethod
     def from_claims(cls, claims: Mapping[str, Any]) -> Grant:
@@ -233,6 +238,25 @@ class Grant:
         else:
             workload = "interactive"
 
+        binding: dict[str, Any] = {}
+        if "publication_id" in claims:
+            pub_id = claims["publication_id"]
+            if not isinstance(pub_id, str):
+                raise EnforcementError("publication_id claim must be a string")
+            binding["publication_id"] = pub_id
+
+        if "revision" in claims:
+            rev = claims["revision"]
+            if isinstance(rev, bool) or not isinstance(rev, (int, str)):
+                raise EnforcementError("revision claim must be an int or string")
+            binding["revision"] = rev
+
+        if "digest" in claims:
+            dig = claims["digest"]
+            if not isinstance(dig, str):
+                raise EnforcementError("digest claim must be a string")
+            binding["digest"] = dig
+
         table_grants: dict[str, TableGrant] = {}
         for tbl_name, tbl_spec in tables_raw.items():
             cols = tuple(tbl_spec.get("columns", ()))
@@ -261,6 +285,7 @@ class Grant:
             tables=table_grants,
             sql_dialect=sql_dialect,
             workload=workload,
+            binding=binding,
         )
 
 
@@ -475,8 +500,11 @@ def enforce(
     statement: exp.Expression | None = None,
     now: float | None = None,
     max_rows: int | None = None,
+    cube_mode: str = "refuse",
 ) -> EnforcedQuery:
     """Enforce a data catalog grant on a SQL query."""
+    if cube_mode not in ("refuse", "jwt"):
+        raise EnforcementError(f"invalid cube_mode '{cube_mode}', must be 'refuse' or 'jwt'")
     # Step 1: Integrity
     computed_sha256 = hashlib.sha256(sql.encode("utf-8")).hexdigest()
     if computed_sha256.lower() != grant.sql_sha256.lower():
@@ -553,6 +581,15 @@ def enforce(
             raise EnforcementError(f"table '{_table_full_name(tbl)}' is not in schemas")
         referenced_table_nodes.append(tbl)
         referenced_table_keys.add(tbl_key)
+
+    # Fail closed for Cube target in refuse mode if any referenced cube has masks or row filters
+    if target_kind_lower == "cube" and cube_mode == "refuse":
+        for tbl_key in referenced_table_keys:
+            _, tg = grant_tables_ci[tbl_key]
+            if tg.masks or tg.row_filters:
+                raise EnforcementError(
+                    "cube target has masks or row filters; cube enforcement is not enabled"
+                )
 
     # Step 3: Action
     target_table_ref: exp.Table | None = None
@@ -680,6 +717,75 @@ def enforce(
     # First expand '*' and 't.*'
     _expand_stars(statement, grant_tables_ci, schemas_ci, cte_names)
 
+    # Pre-scan for Cube jwt mode: collect aliases of masked columns and check ordinals
+    masked_alias_names: set[str] = set()
+    if target_kind_lower == "cube" and cube_mode == "jwt" and isinstance(statement, exp.Select):
+        for expr in statement.expressions:
+            if isinstance(expr, exp.Alias) and isinstance(expr.this, exp.Column):
+                col_n = expr.this.name.lower()
+                is_masked = False
+                if expr.this.table:
+                    tbl_qual = expr.this.table.lower()
+                    for t_key in referenced_table_keys:
+                        t_canon, t_grant = grant_tables_ci[t_key]
+                        t_alias = None
+                        for t_node in referenced_table_nodes:
+                            if _table_full_name(t_node).lower() == t_key and t_node.alias:
+                                t_alias = t_node.alias.lower()
+                                break
+                        if (
+                            tbl_qual == t_key
+                            or tbl_qual == t_canon.lower()
+                            or tbl_qual == t_alias
+                            or t_key.endswith("." + tbl_qual)
+                        ):
+                            if col_n in {m.lower() for m in t_grant.masks}:
+                                is_masked = True
+                            break
+                else:
+                    for t_key in referenced_table_keys:
+                        _, t_grant = grant_tables_ci[t_key]
+                        if col_n in {m.lower() for m in t_grant.masks}:
+                            is_masked = True
+                            break
+                if is_masked:
+                    masked_alias_names.add(expr.alias.lower())
+
+        order_clause = statement.args.get("order")
+        if order_clause:
+            for ordered in order_clause.expressions:
+                tgt = ordered.this if isinstance(ordered, exp.Ordered) else ordered
+                if isinstance(tgt, exp.Literal) and tgt.is_int:
+                    idx = int(tgt.this)
+                    if 1 <= idx <= len(statement.expressions):
+                        expr = statement.expressions[idx - 1]
+                        inner = expr.this if isinstance(expr, exp.Alias) else expr
+                        if isinstance(inner, exp.Column):
+                            c_n = inner.name.lower()
+                            for t_key in referenced_table_keys:
+                                _, t_grant = grant_tables_ci[t_key]
+                                if c_n in {m.lower() for m in t_grant.masks}:
+                                    raise EnforcementError(
+                                        f"masked member '{inner.name}' in ORDER BY is not permitted"
+                                    )
+
+        group_clause = statement.args.get("group")
+        if group_clause:
+            for grp in group_clause.expressions:
+                if isinstance(grp, exp.Literal) and grp.is_int:
+                    idx = int(grp.this)
+                    if 1 <= idx <= len(statement.expressions):
+                        expr = statement.expressions[idx - 1]
+                        inner = expr.this if isinstance(expr, exp.Alias) else expr
+                        if isinstance(inner, exp.Column):
+                            c_n = inner.name.lower()
+                            for t_key in referenced_table_keys:
+                                _, t_grant = grant_tables_ci[t_key]
+                                if c_n in {m.lower() for m in t_grant.masks}:
+                                    raise EnforcementError(
+                                        f"masked member '{inner.name}' in GROUP BY is not permitted"
+                                    )
+
     # Collect statement-defined names (CTEs, subqueries, values, projection aliases)
     statement_defined_names = _find_statement_defined_column_names(statement)
     subquery_aliases = {
@@ -744,6 +850,23 @@ def enforce(
                     raise EnforcementError(
                         f"column '{col.name}' in table '{canonical_tbl}' is neither visible nor masked"
                     )
+                if target_kind_lower == "cube" and cube_mode == "jwt":
+                    if col_name in {m.lower() for m in table_grant.masks}:
+                        is_bare_top = (
+                            isinstance(statement, exp.Select)
+                            and (
+                                col in statement.expressions
+                                or (
+                                    isinstance(col.parent, exp.Alias)
+                                    and col.parent.this is col
+                                    and col.parent in statement.expressions
+                                )
+                            )
+                        )
+                        if not is_bare_top:
+                            raise EnforcementError(
+                                f"masked member '{col.name}' may only appear as a bare top-level projection"
+                            )
             else:
                 raise EnforcementError(
                     f"column '{col.name}' not found in table '{canonical_tbl}'"
@@ -772,12 +895,33 @@ def enforce(
                         raise EnforcementError(
                             f"column '{col.name}' in table '{canonical_tbl}' is neither visible nor masked"
                         )
+                    if target_kind_lower == "cube" and cube_mode == "jwt":
+                        if col_name in {m.lower() for m in table_grant.masks}:
+                            is_bare_top = (
+                                isinstance(statement, exp.Select)
+                                and (
+                                    col in statement.expressions
+                                    or (
+                                        isinstance(col.parent, exp.Alias)
+                                        and col.parent.this is col
+                                        and col.parent in statement.expressions
+                                    )
+                                )
+                            )
+                            if not is_bare_top:
+                                raise EnforcementError(
+                                    f"masked member '{col.name}' may only appear as a bare top-level projection"
+                                )
                     found = True
                     break
 
             if not found:
                 # Not in any referenced schema in scope: check statement-defined names
                 if col_name in statement_defined_names:
+                    if target_kind_lower == "cube" and cube_mode == "jwt" and col_name in masked_alias_names:
+                        raise EnforcementError(
+                            f"masked member alias '{col.name}' may only appear as a bare top-level projection"
+                        )
                     continue
                 raise EnforcementError(
                     f"column '{col.name}' does not resolve to any granted column"
