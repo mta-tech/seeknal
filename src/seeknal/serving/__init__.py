@@ -11,6 +11,11 @@ from seeknal.serving.adapters import (
     QueryResult,
     build_adapter,
 )
+from seeknal.serving.discovery import (
+    DiscoveryConfig,
+    PlacementRefresher,
+    discover,
+)
 from seeknal.serving.enforce import EnforcementError, Grant, enforce
 from seeknal.serving.features import QueryFeatures, extract_features
 from seeknal.serving.grant_token import (
@@ -34,6 +39,7 @@ from seeknal.serving.service import PreparedQuery, ServingPipeline
 __all__ = [
     "CubeEntry",
     "DBAPIAdapter",
+    "DiscoveryConfig",
     "DuckDBAdapter",
     "EnforcementError",
     "Engine",
@@ -44,6 +50,7 @@ __all__ = [
     "GrantTokenError",
     "Placement",
     "PlacementError",
+    "PlacementRefresher",
     "Policy",
     "PreparedQuery",
     "QueryFeatures",
@@ -56,6 +63,7 @@ __all__ = [
     "TableServe",
     "build_adapter",
     "create_app",
+    "discover",
     "enforce",
     "extract_features",
     "sign_grant_token",
