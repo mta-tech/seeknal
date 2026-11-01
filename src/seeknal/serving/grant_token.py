@@ -124,6 +124,7 @@ def verify_grant_token(
     now: float | None = None,
     leeway_seconds: float = 5,
     max_lifetime_seconds: float = 300,
+    require_grant_typ: bool = False,
 ) -> dict[str, Any]:
     """Verify an ES256 compact JWS grant token and return its claims dictionary."""
     if not isinstance(token, str):
@@ -196,6 +197,9 @@ def verify_grant_token(
     # 4. Validate claims
     if claims.get("typ") == "cancel" or header.get("typ") == "cancel":
         raise GrantTokenError("Cancel token cannot be used to run a query")
+
+    if require_grant_typ and claims.get("typ") != "grant":
+        raise GrantTokenError("Missing or invalid 'typ' claim, expected 'grant'")
 
     current_time = time.time() if now is None else float(now)
 

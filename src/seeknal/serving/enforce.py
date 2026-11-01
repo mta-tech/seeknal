@@ -14,6 +14,138 @@ from typing import Any
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.dialects.duckdb import DuckDB
+from sqlglot.generator import Generator
+from sqlglot.parser import Parser
+from sqlglot.tokens import TokenType
+
+# Patch sqlglot parser and generator to preserve explicit NULLS FIRST/LAST ordering
+_orig_parse_ordered = Parser._parse_ordered
+_orig_parse_schema = Parser._parse_schema
+
+
+def _patched_parse_schema(self, this=None):
+    if this is not None and not this.args.get("alias"):
+        if self._match(TokenType.ALIAS):
+            alias = self._parse_id_var(any_token=True)
+            if alias:
+                this.set("alias", exp.TableAlias(this=alias))
+    return _orig_parse_schema(self, this)
+
+
+Parser._parse_schema = _patched_parse_schema
+
+
+def _patched_parse_ordered(self, parse_method=None):
+    this = parse_method() if parse_method else self._parse_assignment()
+    if not this:
+        return None
+
+    asc = self._match(TokenType.ASC)
+    desc = self._match(TokenType.DESC) or (asc and False)
+
+    is_nulls_first = self._match_text_seq("NULLS", "FIRST")
+    is_nulls_last = self._match_text_seq("NULLS", "LAST")
+
+    nulls_first = is_nulls_first or False
+    explicitly_null_ordered = is_nulls_first or is_nulls_last
+
+    if (
+        not explicitly_null_ordered
+        and (
+            (not desc and self.dialect.NULL_ORDERING == "nulls_are_small")
+            or (desc and self.dialect.NULL_ORDERING != "nulls_are_small")
+        )
+        and self.dialect.NULL_ORDERING != "nulls_are_last"
+    ):
+        nulls_first = True
+
+    if self._match_text_seq("WITH", "FILL"):
+        with_fill = self.expression(
+            exp.WithFill,
+            **{
+                "from": self._match(TokenType.FROM) and self._parse_bitwise(),
+                "to": self._match_text_seq("TO") and self._parse_bitwise(),
+                "step": self._match_text_seq("STEP") and self._parse_bitwise(),
+            },
+        )
+    else:
+        with_fill = None
+
+    expr = self.expression(
+        exp.Ordered, this=this, desc=desc, nulls_first=nulls_first, with_fill=with_fill
+    )
+    if expr is not None:
+        expr.meta["explicit_nulls"] = bool(explicitly_null_ordered)
+    return expr
+
+
+Parser._parse_ordered = _patched_parse_ordered
+
+_orig_ordered_sql = Generator.ordered_sql
+
+
+def _clean_ordered_sql(self, expression: exp.Ordered) -> str:
+    nulls_first = expression.args.get("nulls_first")
+    desc = expression.args.get("desc")
+    if expression.meta.get("explicit_nulls"):
+        this = self.sql(expression, "this")
+        sort_order = " DESC" if desc else (" ASC" if desc is False else "")
+        nulls_str = (
+            " NULLS FIRST"
+            if nulls_first is True
+            else (" NULLS LAST" if nulls_first is False else "")
+        )
+        with_fill = self.sql(expression, "with_fill")
+        with_fill = f" {with_fill}" if with_fill else ""
+        return f"{this}{sort_order}{nulls_str}{with_fill}"
+    if nulls_first is None:
+        this = self.sql(expression, "this")
+        sort_order = " DESC" if desc else (" ASC" if desc is False else "")
+        with_fill = self.sql(expression, "with_fill")
+        with_fill = f" {with_fill}" if with_fill else ""
+        return f"{this}{sort_order}{with_fill}"
+    return _orig_ordered_sql(self, expression)
+
+
+Generator.ordered_sql = _clean_ordered_sql
+
+
+def _duckdb_ordered_sql(generator, expression: exp.Ordered) -> str:
+    desc = expression.args.get("desc")
+    nulls_first = expression.args.get("nulls_first")
+    this = generator.sql(expression, "this")
+    sort = " DESC" if desc else (" ASC" if desc is False else "")
+    nulls = ""
+    if nulls_first is True:
+        nulls = " NULLS FIRST"
+    elif nulls_first is False:
+        nulls = " NULLS LAST"
+    return f"{this}{sort}{nulls}"
+
+
+DuckDB.Generator.TRANSFORMS[exp.Ordered] = _duckdb_ordered_sql
+
+
+def apply_null_ordering(
+    statement: exp.Expression,
+    source_dialect: str,
+    target_dialect: str,
+) -> None:
+    """Make source-dialect NULL ordering explicit when transitioning from starrocks/mysql to postgres/duckdb."""
+    src = source_dialect.lower()
+    tgt = target_dialect.lower()
+    is_sr_or_mysql_to_pg_or_duckdb = src in ("starrocks", "mysql") and tgt in ("postgres", "duckdb")
+    for o in statement.find_all(exp.Ordered):
+        if not o.meta.get("explicit_nulls"):
+            if is_sr_or_mysql_to_pg_or_duckdb:
+                if o.args.get("desc"):
+                    o.set("nulls_first", False)
+                else:
+                    o.set("nulls_first", True)
+                o.meta["explicit_nulls"] = True
+            else:
+                o.set("nulls_first", None)
 
 VALID_MASKS = frozenset({"redact", "null", "hash", "last4", "year"})
 VALID_OPS = frozenset({"eq", "in", "gte", "lte"})
@@ -1040,6 +1172,7 @@ def enforce(
     canonical_tables = tuple(sorted({grant_tables_ci[k][0] for k in referenced_table_keys}))
 
     # Target SQL rendered in target_dialect
+    apply_null_ordering(statement, dialect, target_dialect_lower)
     rendered_sql = statement.sql(dialect=target_dialect_lower)
 
     return EnforcedQuery(

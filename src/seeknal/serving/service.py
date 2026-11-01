@@ -11,7 +11,13 @@ from typing import Any
 import sqlglot
 from sqlglot import exp
 
-from seeknal.serving.enforce import EnforcementError, Grant, enforce
+from seeknal.serving.enforce import (
+    EnforcementError,
+    Grant,
+    _table_full_name,
+    apply_null_ordering,
+    enforce,
+)
 from seeknal.serving.grant_token import verify_grant_token
 from seeknal.serving.placement import Placement
 from seeknal.serving.router import Router
@@ -56,6 +62,100 @@ def _extract_placeholder_index(node: exp.Expression) -> int:
     return idx
 
 
+def _check_round_trip(
+    enforced_stmt: exp.Expression,
+    rendered_sql: str,
+    target_dialect: str,
+) -> None:
+    """Re-parse rendered_sql with read=<target dialect> and verify tables/columns/literals."""
+    try:
+        reparsed_stmts = sqlglot.parse(rendered_sql, read=target_dialect)
+    except Exception as exc:
+        raise EnforcementError(
+            "rendered SQL does not round-trip to the checked statement"
+        ) from exc
+
+    if len(reparsed_stmts) != 1 or reparsed_stmts[0] is None:
+        raise EnforcementError(
+            "rendered SQL does not round-trip to the checked statement"
+        )
+
+    reparsed = reparsed_stmts[0]
+
+    # Tables: referenced physical names must be a subset
+    cte_names_reparsed = {cte.alias_or_name.lower() for cte in reparsed.find_all(exp.CTE)}
+    reparsed_tables = {
+        _table_full_name(tbl).lower()
+        for tbl in reparsed.find_all(exp.Table)
+        if tbl.name.lower() not in cte_names_reparsed
+    }
+
+    cte_names_enforced = {cte.alias_or_name.lower() for cte in enforced_stmt.find_all(exp.CTE)}
+    enforced_tables = {
+        _table_full_name(tbl).lower()
+        for tbl in enforced_stmt.find_all(exp.Table)
+        if tbl.name.lower() not in cte_names_enforced
+    }
+
+    if not (reparsed_tables <= enforced_tables):
+        raise EnforcementError(
+            "rendered SQL does not round-trip to the checked statement"
+        )
+
+    # Columns: column names must be a subset
+    reparsed_cols = {
+        col.name.lower()
+        for col in reparsed.find_all(exp.Column)
+        if not isinstance(col.this, exp.Star) and not PARAM_MARKER_PATTERN.match(col.name)
+    }
+
+    enforced_cols = {
+        col.name.lower()
+        for col in enforced_stmt.find_all(exp.Column)
+        if not isinstance(col.this, exp.Star) and not PARAM_MARKER_PATTERN.match(col.name)
+    }
+    enforced_cols |= {
+        alias.alias.lower()
+        for alias in enforced_stmt.find_all(exp.Alias)
+        if not PARAM_MARKER_PATTERN.match(alias.alias)
+    }
+
+    if not (reparsed_cols <= enforced_cols):
+        raise EnforcementError(
+            "rendered SQL does not round-trip to the checked statement"
+        )
+
+    # Literals: literal values must never become identifiers
+    enforced_literals = {
+        lit.this
+        for lit in enforced_stmt.find_all(exp.Literal)
+        if lit.is_string
+    }
+    reparsed_literals = {
+        lit.this
+        for lit in reparsed.find_all(exp.Literal)
+        if lit.is_string
+    }
+    lost_literals = enforced_literals - reparsed_literals
+
+    if lost_literals:
+        enforced_identifiers = {
+            ident.name.lower()
+            for ident in enforced_stmt.find_all((exp.Identifier, exp.Column))
+            if not PARAM_MARKER_PATTERN.match(ident.name)
+        }
+        reparsed_identifiers = {
+            ident.name.lower()
+            for ident in reparsed.find_all((exp.Identifier, exp.Column))
+            if not PARAM_MARKER_PATTERN.match(ident.name)
+        }
+        new_identifiers = reparsed_identifiers - enforced_identifiers
+        if new_identifiers:
+            raise EnforcementError(
+                "rendered SQL does not round-trip to the checked statement"
+            )
+
+
 class ServingPipeline:
     """Pipelines grant verification, routing, policy enforcement, and parameter binding."""
 
@@ -69,6 +169,7 @@ class ServingPipeline:
         issuer: str = "atlas-catalog",
         default_catalog: str | None = None,
         cube_mode: str = "refuse",
+        require_grant_typ: bool = False,
     ) -> None:
         if cube_mode not in ("refuse", "jwt"):
             raise EnforcementError(f"invalid cube_mode '{cube_mode}', must be 'refuse' or 'jwt'")
@@ -80,6 +181,7 @@ class ServingPipeline:
         self.issuer = issuer
         self.default_catalog = default_catalog
         self.cube_mode = cube_mode
+        self.require_grant_typ = require_grant_typ
         self.router = Router(placement)
 
     def update_catalog(
@@ -118,6 +220,7 @@ class ServingPipeline:
             audience=self.audience,
             issuer=self.issuer,
             now=now,
+            require_grant_typ=self.require_grant_typ,
         )
         grant = Grant.from_claims(claims)
 
@@ -181,6 +284,7 @@ class ServingPipeline:
 
         # 4. Table rewrite for chosen engine physical names
         router.rewrite(enforced.statement, decision.engine)
+        apply_null_ordering(enforced.statement, grant.sql_dialect, target_dialect)
 
         # 5. Parameters and dialect rendering
         if target_kind == "duckdb":
@@ -203,6 +307,7 @@ class ServingPipeline:
                 )
             final_params: tuple = ()
             rendered_sql = enforced.statement.sql(dialect=target_dialect)
+            _check_round_trip(enforced.statement, rendered_sql, target_dialect)
             if paramstyle == "format":
                 rendered_sql = rendered_sql.replace("%", "%%")
             final_sql = rendered_sql
@@ -226,6 +331,7 @@ class ServingPipeline:
                     )
 
             rendered_sql = enforced.statement.sql(dialect=target_dialect)
+            _check_round_trip(enforced.statement, rendered_sql, target_dialect)
             matches = PARAM_MARKER_PATTERN.findall(rendered_sql)
             ordered_indices = [marker_to_idx[m] for m in matches]
             final_params = tuple(raw_params[idx - 1] for idx in ordered_indices)
