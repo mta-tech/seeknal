@@ -184,8 +184,12 @@ def build_server(
                         lb_conn_cfg.dsn_env, cfg, env
                     )()
 
+            effective_env = dict(env)
+            if cfg.secrets_env:
+                effective_env.update(cfg.secrets_env)
+
             disc_call = lambda: _run_discovery(
-                cfg.placement.discovery, client=None, lb_connect=lb_connect, env=env
+                cfg.placement.discovery, client=None, lb_connect=lb_connect, env=effective_env
             )
 
         refresher = PlacementRefresher(

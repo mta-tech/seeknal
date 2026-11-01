@@ -370,18 +370,72 @@ class ServerConfig:
         # Discovery config
         if self.placement.discovery_config is not None:
             disc = self.placement.discovery_config
-            if disc.lakekeeper and disc.lakekeeper.token_env:
-                referenced.append(disc.lakekeeper.token_env)
+            if disc.lakekeeper:
+                if disc.lakekeeper.token_env:
+                    referenced.append(disc.lakekeeper.token_env)
+                if disc.lakekeeper.oauth and disc.lakekeeper.oauth.client_secret_env:
+                    referenced.append(disc.lakekeeper.oauth.client_secret_env)
             for eng in disc.engines.values():
                 if eng.token_env:
                     referenced.append(eng.token_env)
+                if eng.api_secret_env:
+                    referenced.append(eng.api_secret_env)
 
         return referenced
 
+    def check_secret_files(self) -> None:
+        """Verify that all referenced secret files exist and have safe permissions."""
+        secret_files: list[tuple[str, str]] = []
+
+        # Connections
+        for eng_name, conn in self.connections.items():
+            if isinstance(conn, StarRocksConnectionConfig):
+                for acc_name, acc in conn.accounts.items():
+                    if acc.password_file:
+                        secret_files.append(
+                            (
+                                acc.password_file,
+                                f"StarRocks account '{acc_name}' password_file",
+                            )
+                        )
+
+        # Discovery config
+        if self.placement.discovery_config is not None:
+            disc = self.placement.discovery_config
+            if (
+                disc.lakekeeper
+                and disc.lakekeeper.oauth
+                and disc.lakekeeper.oauth.client_secret_file
+            ):
+                secret_files.append(
+                    (
+                        disc.lakekeeper.oauth.client_secret_file,
+                        "Lakekeeper oauth client_secret_file",
+                    )
+                )
+            for eng in disc.engines.values():
+                if eng.api_secret_file:
+                    secret_files.append(
+                        (
+                            eng.api_secret_file,
+                            f"Cube engine '{eng.name}' api_secret_file",
+                        )
+                    )
+
+        for path, desc in secret_files:
+            if not os.path.exists(path):
+                raise ServerConfigError(f"{desc} not found: '{path}'")
+            st = os.stat(path)
+            if (st.st_mode & 0o044) != 0:
+                raise ServerConfigError(
+                    f"{desc} '{path}' is group- or world-readable"
+                )
+
     def check_env(self, env: Mapping[str, str] | None = None) -> None:
-        """Verify that every referenced environment variable exists without revealing values."""
+        """Verify that every referenced environment variable exists and secret files are safe."""
         for var in self.get_referenced_env_vars():
             self.get_env(var, env)
+        self.check_secret_files()
 
     @classmethod
     def from_dict(

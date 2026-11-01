@@ -46,7 +46,7 @@ class PlacementRefresher:
 
     @property
     def last_error(self) -> str | None:
-        """Last error formatted as '<ErrorClass>: <message>', or None."""
+        """Last error formatted as '<ErrorClass>', or None."""
         with self._lock:
             return self._last_error
 
@@ -68,11 +68,10 @@ class PlacementRefresher:
                 self._consecutive_failures = 0
             return True
         except Exception as exc:
-            err_msg = str(exc)
-            short_msg = f"{type(exc).__name__}: {err_msg}"
-            logger.warning("Catalog refresh failed: %s", short_msg)
+            exc_class = type(exc).__name__
+            logger.warning("Catalog refresh failed: %s", exc_class)
             with self._lock:
-                self._last_error = short_msg
+                self._last_error = exc_class
                 self._consecutive_failures += 1
             return False
 

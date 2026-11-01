@@ -50,7 +50,16 @@ placement:
     lakekeeper:
       url: https://lakekeeper.internal.net:8181
       warehouse: main
-      token_env: LAKEKEEPER_TOKEN
+      # Option A: OAuth2 client credentials (recommended for Keycloak)
+      oauth:
+        token_url: https://keycloak.internal.net/realms/atlas/protocol/openid-connect/token
+        client_id: seeknal-serving-discovery
+        client_secret_env: LAKEKEEPER_CLIENT_SECRET
+        # Alternatively: client_secret_file: /etc/seeknal/secrets/lk-oauth.secret
+        scope: catalog:read
+        audience: lakekeeper
+      # Option B: Static token (mutually exclusive with oauth)
+      # token_env: LAKEKEEPER_TOKEN
     engines:
       sr:
         kind: starrocks
@@ -63,7 +72,12 @@ placement:
         kind: cube
         dialect: postgres
         url: https://cube.internal.net:4000/cubejs-api/v1
-        token_env: CUBE_API_TOKEN
+        # Option A: Minted HS256 JWT using CUBEJS_API_SECRET
+        api_secret_env: CUBEJS_API_SECRET
+        # Alternatively: api_secret_file: /etc/seeknal/secrets/cube-api.secret
+        api_claims: {role: seeknal-discovery}
+        # Option B: Static token (mutually exclusive with api_secret_env/file)
+        # token_env: CUBE_API_TOKEN
     lakebase:
       engine: lb
       synced_tables:
@@ -132,9 +146,26 @@ The optional `secrets_env_file` allows loading key-value secrets from a dotenv-f
 - **No Shell Expansion:** Values are read literally without shell variable substitution.
 
 ### `password_file` / `*_file`
-Secret files specified by `password_file` (such as Kubernetes secret volumes):
-- Are read at connection time, stripping exactly one trailing newline.
-- Must not be group- or world-readable (`0o044` permissions raise `ServerConfigError`).
+Secret files specified by `password_file`, `client_secret_file`, or `api_secret_file` (such as Kubernetes secret volumes):
+- Are read at connection/discovery time, stripping exactly one trailing newline.
+- Must not be group- or world-readable (`0o044` permissions raise `ServerConfigError` or `DiscoveryConfigError`).
+
+### Discovery Credentials & Minting
+
+#### Lakekeeper OAuth2 Client Credentials
+When Lakekeeper is deployed behind Keycloak or another OAuth2 identity provider, access tokens expire quickly. Rather than relying on a static token that will expire and silently halt catalog refreshes:
+- Configure `placement.discovery.lakekeeper.oauth` with `token_url`, `client_id`, and `client_secret_env` (e.g. `LAKEKEEPER_CLIENT_SECRET`) or `client_secret_file`.
+- A dedicated, read-only Keycloak client is recommended (for example `seeknal-serving-discovery`).
+- Tokens are requested via POST `grant_type=client_credentials` and cached until `expires_at − 30 s` (or 60 s if `expires_in` is missing).
+- **401 Retry**: Upon receiving an HTTP 401 from Lakekeeper, discovery invalidates the cached token and immediately retries the request once with a freshly fetched token. A second 401 raises `DiscoveryError`.
+
+#### Minted Cube Meta Token vs. Cube SQL Context Secret
+- **Cube REST Discovery (`placement.discovery.engines.<cube>.api_secret_env` | `api_secret_file`)**:
+  - Holds Cube's `CUBEJS_API_SECRET` (e.g. via environment variable `CUBEJS_API_SECRET`).
+  - Discovery automatically mints a compact HS256 JWT per `discover()` call with claims `iat`, `exp = iat + 300`, and optional `api_claims`. This token is sent as `Authorization: <token>` to Cube's HTTP `/cubejs-api/v1/meta` endpoint to discover cubes, measures, and dimensions.
+  - The token is never exposed in logs or exception messages.
+- **Cube SQL API Secret (`connections.cube.secret_env`)**:
+  - In `cube_mode: jwt`, `connections.cube.secret_env` (e.g. `CUBE_SQL_SECRET`) is used to sign database-level HMAC tokens passed during client SQL connection handshake over Cube's Postgres wire protocol (port 15432). Those tokens carry tenant row filters and column masking rules for query execution, completely distinct from discovery metadata API access.
 
 ### Summary of Environment Variables
 | Variable Name | Purpose | Configuration Location |
@@ -142,9 +173,11 @@ Secret files specified by `password_file` (such as Kubernetes secret volumes):
 | `SEEKNAL_DEMO_QUERY_PASSWORD` | StarRocks password for interactive queries | `connections.sr.accounts.interactive.password_env` |
 | `ATLAS_BI_PASSWORD` | StarRocks password for BI workloads | `connections.sr.accounts.bi.password_env` |
 | `LAKEBASE_DSN` | PostgreSQL connection string for Lakebase | `connections.lb.dsn_env` |
-| `CUBE_SQL_SECRET` | Shared HMAC secret for Cube JWT context (mode `jwt`) | `connections.cube.secret_env` |
-| `LAKEKEEPER_TOKEN` | Bearer token for Iceberg REST catalog discovery | `placement.discovery.lakekeeper.token_env` |
-| `CUBE_API_TOKEN` | Bearer token for Cube REST meta discovery | `placement.discovery.engines.cube.token_env` |
+| `CUBE_SQL_SECRET` | Shared HMAC secret for Cube SQL JWT query context (mode `jwt`) | `connections.cube.secret_env` |
+| `LAKEKEEPER_TOKEN` | Static bearer token for Iceberg REST catalog discovery | `placement.discovery.lakekeeper.token_env` |
+| `LAKEKEEPER_CLIENT_SECRET` | OAuth2 client secret for Lakekeeper discovery | `placement.discovery.lakekeeper.oauth.client_secret_env` |
+| `CUBE_API_TOKEN` | Static bearer token for Cube REST meta discovery | `placement.discovery.engines.cube.token_env` |
+| `CUBEJS_API_SECRET` | Secret for minting Cube REST `/meta` HS256 JWT tokens | `placement.discovery.engines.cube.api_secret_env` |
 
 ---
 
@@ -245,14 +278,15 @@ Seeknal Serving exposes two distinct probe endpoints:
 ## 7. Operational Deployment
 
 ### Pre-flight Configuration Check (`--check`)
-Before launching the service, validate the configuration, grant keys, and environment variables:
+Before launching the service, validate the configuration, grant keys, environment variables, and secret files:
 
 ```bash
 python -m seeknal.serving --config /etc/seeknal/serving.yaml --check
 ```
 - Exits with code `0` and outputs `config ok` if valid.
 - Exits with code `2` and outputs a safe diagnostic error message (without stack traces or secret leakage) if invalid.
-- Performs no network I/O or database connections.
+- Validates that `client_secret_env` and `api_secret_env` exist (in `secrets_env_file` or the process environment) and that all `*_file` secret paths exist with safe permissions (mode `0600` or stricter).
+- Performs no network I/O, token minting requests, or database connections.
 
 ### Systemd Service Unit Example
 Create `/etc/systemd/system/seeknal-serving.service`:
