@@ -12,7 +12,7 @@ import math
 import re
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
 from typing import Any
 
@@ -218,6 +218,8 @@ def create_app(
     timeout_seconds: float = 30,
     max_body_bytes: int = 1_000_000,
     max_result_bytes: int = 64 * 1024 * 1024,
+    extra_routes: Sequence[Route] | None = None,
+    lifespan: Any = None,
 ) -> Starlette:
     """Create a Starlette serving application."""
     running_queries = RunningQueries()
@@ -225,34 +227,61 @@ def create_app(
     async def healthz(request: Request) -> Response:
         return JSONResponse({"status": "ok"})
 
-    async def _parse_common_request(
-        request: Request, req_start: float
-    ) -> tuple[str, str, tuple, str | None, float | None, float | None, int | None, int | None] | JSONResponse:
+    async def _parse_common_request(request: Request, req_start: float) -> (
+        tuple[
+            str,
+            str,
+            tuple,
+            str | None,
+            float | None,
+            float | None,
+            int | None,
+            int | None,
+        ]
+        | JSONResponse
+    ):
         # 1. Check body size limit before parsing
         content_length_hdr = request.headers.get("content-length")
         if content_length_hdr is not None:
             try:
                 if int(content_length_hdr) > max_body_bytes:
-                    _log_request(status=413, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-                    return _error_response(413, "payload_too_large", "Request body exceeds size limit")
+                    _log_request(
+                        status=413,
+                        elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                    )
+                    return _error_response(
+                        413, "payload_too_large", "Request body exceeds size limit"
+                    )
             except ValueError:
                 pass
 
         raw_body = await request.body()
         if len(raw_body) > max_body_bytes:
-            _log_request(status=413, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(413, "payload_too_large", "Request body exceeds size limit")
+            _log_request(
+                status=413, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                413, "payload_too_large", "Request body exceeds size limit"
+            )
 
         # 2. Check Authorization header
         auth_header = request.headers.get("authorization")
         if not auth_header:
-            _log_request(status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(401, "grant_token_error", "Missing Authorization header")
+            _log_request(
+                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                401, "grant_token_error", "Missing Authorization header"
+            )
 
         parts = auth_header.split()
         if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
-            _log_request(status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(401, "grant_token_error", "Malformed Authorization header")
+            _log_request(
+                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                401, "grant_token_error", "Malformed Authorization header"
+            )
 
         token = parts[1].strip()
 
@@ -260,12 +289,18 @@ def create_app(
         try:
             payload = json.loads(raw_body.decode("utf-8"))
         except Exception:
-            _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
+            _log_request(
+                status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
             return _error_response(400, "bad_request", "Invalid JSON body", token=token)
 
         if not isinstance(payload, dict):
-            _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(400, "bad_request", "JSON body must be an object", token=token)
+            _log_request(
+                status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                400, "bad_request", "JSON body must be an object", token=token
+            )
 
         unknown_fields = set(payload.keys()) - {
             "sql",
@@ -277,7 +312,9 @@ def create_app(
             "max_result_bytes",
         }
         if unknown_fields:
-            _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
+            _log_request(
+                status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
             return _error_response(
                 400,
                 "bad_request",
@@ -285,9 +322,20 @@ def create_app(
                 token=token,
             )
 
-        if "sql" not in payload or not isinstance(payload["sql"], str) or not payload["sql"].strip():
-            _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(400, "bad_request", "Field 'sql' must be a non-empty string", token=token)
+        if (
+            "sql" not in payload
+            or not isinstance(payload["sql"], str)
+            or not payload["sql"].strip()
+        ):
+            _log_request(
+                status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                400,
+                "bad_request",
+                "Field 'sql' must be a non-empty string",
+                token=token,
+            )
 
         sql = payload["sql"]
 
@@ -296,19 +344,41 @@ def create_app(
             raw_params = payload["params"]
             if raw_params is not None:
                 if not isinstance(raw_params, list):
-                    _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-                    return _error_response(400, "bad_request", "Field 'params' must be a list", token=token, sql=sql)
+                    _log_request(
+                        status=400,
+                        elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                    )
+                    return _error_response(
+                        400,
+                        "bad_request",
+                        "Field 'params' must be a list",
+                        token=token,
+                        sql=sql,
+                    )
                 params = tuple(raw_params)
 
         hint = payload.get("hint")
         if hint is not None and not isinstance(hint, str):
-            _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(400, "bad_request", "Field 'hint' must be a string", token=token, sql=sql, params=params)
+            _log_request(
+                status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                400,
+                "bad_request",
+                "Field 'hint' must be a string",
+                token=token,
+                sql=sql,
+                params=params,
+            )
 
         max_staleness = payload.get("max_staleness_seconds")
         if max_staleness is not None:
-            if isinstance(max_staleness, bool) or not isinstance(max_staleness, (int, float)):
-                _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
+            if isinstance(max_staleness, bool) or not isinstance(
+                max_staleness, (int, float)
+            ):
+                _log_request(
+                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                )
                 return _error_response(
                     400,
                     "bad_request",
@@ -318,7 +388,9 @@ def create_app(
                     params=params,
                 )
             if math.isnan(max_staleness) or math.isinf(max_staleness):
-                _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
+                _log_request(
+                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                )
                 return _error_response(
                     400,
                     "bad_request",
@@ -332,7 +404,9 @@ def create_app(
         timeout_s = payload.get("timeout_s")
         if timeout_s is not None:
             if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
-                _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
+                _log_request(
+                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                )
                 return _error_response(
                     400,
                     "bad_request",
@@ -342,7 +416,9 @@ def create_app(
                     params=params,
                 )
             if math.isnan(timeout_s) or math.isinf(timeout_s) or timeout_s <= 0:
-                _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
+                _log_request(
+                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                )
                 return _error_response(
                     400,
                     "bad_request",
@@ -355,8 +431,14 @@ def create_app(
 
         max_rows = payload.get("max_rows")
         if max_rows is not None:
-            if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows <= 0:
-                _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
+            if (
+                isinstance(max_rows, bool)
+                or not isinstance(max_rows, int)
+                or max_rows <= 0
+            ):
+                _log_request(
+                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                )
                 return _error_response(
                     400,
                     "bad_request",
@@ -368,8 +450,14 @@ def create_app(
 
         req_max_result_bytes = payload.get("max_result_bytes")
         if req_max_result_bytes is not None:
-            if isinstance(req_max_result_bytes, bool) or not isinstance(req_max_result_bytes, int) or req_max_result_bytes <= 0:
-                _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
+            if (
+                isinstance(req_max_result_bytes, bool)
+                or not isinstance(req_max_result_bytes, int)
+                or req_max_result_bytes <= 0
+            ):
+                _log_request(
+                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                )
                 return _error_response(
                     400,
                     "bad_request",
@@ -379,7 +467,16 @@ def create_app(
                     params=params,
                 )
 
-        return token, sql, params, hint, max_staleness, timeout_s, max_rows, req_max_result_bytes
+        return (
+            token,
+            sql,
+            params,
+            hint,
+            max_staleness,
+            timeout_s,
+            max_rows,
+            req_max_result_bytes,
+        )
 
     async def explain(request: Request) -> Response:
         req_start = time.perf_counter()
@@ -387,7 +484,16 @@ def create_app(
         if isinstance(parsed, JSONResponse):
             return parsed
 
-        token, sql, params, hint, max_staleness, timeout_s, max_rows, req_max_result_bytes = parsed
+        (
+            token,
+            sql,
+            params,
+            hint,
+            max_staleness,
+            timeout_s,
+            max_rows,
+            req_max_result_bytes,
+        ) = parsed
 
         try:
             prepared = pipeline.prepare(
@@ -399,18 +505,39 @@ def create_app(
                 max_rows=max_rows,
             )
         except GrantTokenError as exc:
-            _log_request(status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(401, "grant_token_error", exc, token=token, sql=sql, params=params)
+            _log_request(
+                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                401, "grant_token_error", exc, token=token, sql=sql, params=params
+            )
         except EnforcementError as exc:
-            _log_request(status=403, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(403, "enforcement_error", exc, token=token, sql=sql, params=params)
+            _log_request(
+                status=403, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                403, "enforcement_error", exc, token=token, sql=sql, params=params
+            )
         except RoutingError as exc:
-            _log_request(status=422, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(422, "routing_error", exc, token=token, sql=sql, params=params)
+            _log_request(
+                status=422, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                422, "routing_error", exc, token=token, sql=sql, params=params
+            )
         except Exception as exc:
             logger.error("engine=%s error=%s audit_id=%s", "-", type(exc).__name__, "-")
-            _log_request(status=500, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(500, "internal_error", "Internal server error", token=token, sql=sql, params=params)
+            _log_request(
+                status=500, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                500,
+                "internal_error",
+                "Internal server error",
+                token=token,
+                sql=sql,
+                params=params,
+            )
 
         elapsed_ms = (time.perf_counter() - req_start) * 1000.0
         _log_request(
@@ -424,16 +551,18 @@ def create_app(
             binding=prepared.binding,
         )
 
-        return JSONResponse({
-            "engine": prepared.engine,
-            "rule": prepared.rule,
-            "reason": prepared.reason,
-            "sql": prepared.sql,
-            "paramstyle": prepared.paramstyle,
-            "masked_columns": list(prepared.masked_columns),
-            "row_limit": prepared.row_limit,
-            "redacted_sql": prepared.redacted_sql,
-        })
+        return JSONResponse(
+            {
+                "engine": prepared.engine,
+                "rule": prepared.rule,
+                "reason": prepared.reason,
+                "sql": prepared.sql,
+                "paramstyle": prepared.paramstyle,
+                "masked_columns": list(prepared.masked_columns),
+                "row_limit": prepared.row_limit,
+                "redacted_sql": prepared.redacted_sql,
+            }
+        )
 
     async def query(request: Request) -> Response:
         req_start = time.perf_counter()
@@ -441,7 +570,16 @@ def create_app(
         if isinstance(parsed, JSONResponse):
             return parsed
 
-        token, sql, params, hint, max_staleness, timeout_s, max_rows, req_max_result_bytes = parsed
+        (
+            token,
+            sql,
+            params,
+            hint,
+            max_staleness,
+            timeout_s,
+            max_rows,
+            req_max_result_bytes,
+        ) = parsed
 
         try:
             prepared = pipeline.prepare(
@@ -453,18 +591,39 @@ def create_app(
                 max_rows=max_rows,
             )
         except GrantTokenError as exc:
-            _log_request(status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(401, "grant_token_error", exc, token=token, sql=sql, params=params)
+            _log_request(
+                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                401, "grant_token_error", exc, token=token, sql=sql, params=params
+            )
         except EnforcementError as exc:
-            _log_request(status=403, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(403, "enforcement_error", exc, token=token, sql=sql, params=params)
+            _log_request(
+                status=403, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                403, "enforcement_error", exc, token=token, sql=sql, params=params
+            )
         except RoutingError as exc:
-            _log_request(status=422, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(422, "routing_error", exc, token=token, sql=sql, params=params)
+            _log_request(
+                status=422, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                422, "routing_error", exc, token=token, sql=sql, params=params
+            )
         except Exception as exc:
             logger.error("engine=%s error=%s audit_id=%s", "-", type(exc).__name__, "-")
-            _log_request(status=500, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(500, "internal_error", "Internal server error", token=token, sql=sql, params=params)
+            _log_request(
+                status=500, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                500,
+                "internal_error",
+                "Internal server error",
+                token=token,
+                sql=sql,
+                params=params,
+            )
 
         adapter = adapters.get(prepared.engine)
         if adapter is None:
@@ -486,8 +645,16 @@ def create_app(
                 params=params,
             )
 
-        effective_timeout = min(timeout_seconds, timeout_s) if timeout_s is not None else timeout_seconds
-        effective_max_result_bytes = min(max_result_bytes, req_max_result_bytes) if req_max_result_bytes is not None else max_result_bytes
+        effective_timeout = (
+            min(timeout_seconds, timeout_s)
+            if timeout_s is not None
+            else timeout_seconds
+        )
+        effective_max_result_bytes = (
+            min(max_result_bytes, req_max_result_bytes)
+            if req_max_result_bytes is not None
+            else max_result_bytes
+        )
 
         try:
             running_queries.register(prepared.audit_id, prepared.subject)
@@ -501,7 +668,9 @@ def create_app(
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 binding=prepared.binding,
             )
-            return _error_response(409, "duplicate_query_id", exc, token=token, sql=sql, params=params)
+            return _error_response(
+                409, "duplicate_query_id", exc, token=token, sql=sql, params=params
+            )
 
         cancel_handle: list[Callable[[], None] | None] = [None]
 
@@ -557,7 +726,9 @@ def create_app(
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 binding=prepared.binding,
             )
-            return _error_response(504, "engine_timeout", exc, token=token, sql=sql, params=params)
+            return _error_response(
+                504, "engine_timeout", exc, token=token, sql=sql, params=params
+            )
         except EngineConfigError as exc:
             _log_request(
                 audit_id=prepared.audit_id,
@@ -568,7 +739,14 @@ def create_app(
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 binding=prepared.binding,
             )
-            return _error_response(503, "workload_account_missing", exc, token=token, sql=sql, params=params)
+            return _error_response(
+                503,
+                "workload_account_missing",
+                exc,
+                token=token,
+                sql=sql,
+                params=params,
+            )
         except EngineCancelled as exc:
             _log_request(
                 audit_id=prepared.audit_id,
@@ -579,7 +757,9 @@ def create_app(
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 binding=prepared.binding,
             )
-            return _error_response(499, "query_cancelled", exc, token=token, sql=sql, params=params)
+            return _error_response(
+                499, "query_cancelled", exc, token=token, sql=sql, params=params
+            )
         except EngineError as exc:
             _log_request(
                 audit_id=prepared.audit_id,
@@ -590,9 +770,16 @@ def create_app(
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 binding=prepared.binding,
             )
-            return _error_response(502, "engine_error", exc, token=token, sql=sql, params=params)
+            return _error_response(
+                502, "engine_error", exc, token=token, sql=sql, params=params
+            )
         except Exception as exc:
-            logger.error("engine=%s error=%s audit_id=%s", prepared.engine_kind, type(exc).__name__, prepared.audit_id)
+            logger.error(
+                "engine=%s error=%s audit_id=%s",
+                prepared.engine_kind,
+                type(exc).__name__,
+                prepared.audit_id,
+            )
             _log_request(
                 audit_id=prepared.audit_id,
                 subject=prepared.subject,
@@ -602,7 +789,14 @@ def create_app(
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 binding=prepared.binding,
             )
-            return _error_response(500, "internal_error", "Internal server error", token=token, sql=sql, params=params)
+            return _error_response(
+                500,
+                "internal_error",
+                "Internal server error",
+                token=token,
+                sql=sql,
+                params=params,
+            )
         finally:
             running_queries.unregister(prepared.audit_id)
 
@@ -619,7 +813,14 @@ def create_app(
                 elapsed_ms=result.elapsed_ms,
                 binding=prepared.binding,
             )
-            return _error_response(413, "result_too_large", "Result size exceeds limit", token=token, sql=sql, params=params)
+            return _error_response(
+                413,
+                "result_too_large",
+                "Result size exceeds limit",
+                token=token,
+                sql=sql,
+                params=params,
+            )
 
         _log_request(
             audit_id=prepared.audit_id,
@@ -636,33 +837,43 @@ def create_app(
         if len(col_types) < len(result.columns):
             col_types.extend(["unknown"] * (len(result.columns) - len(col_types)))
         elif len(col_types) > len(result.columns):
-            col_types = col_types[:len(result.columns)]
+            col_types = col_types[: len(result.columns)]
 
-        return JSONResponse({
-            "columns": list(result.columns),
-            "column_types": col_types,
-            "rows": safe_rows,
-            "truncated": result.truncated,
-            "engine": result.engine,
-            "rule": prepared.rule,
-            "reason": prepared.reason,
-            "masked_columns": list(prepared.masked_columns),
-            "audit_id": prepared.audit_id,
-            "redacted_sql": prepared.redacted_sql,
-            "elapsed_ms": result.elapsed_ms,
-        })
+        return JSONResponse(
+            {
+                "columns": list(result.columns),
+                "column_types": col_types,
+                "rows": safe_rows,
+                "truncated": result.truncated,
+                "engine": result.engine,
+                "rule": prepared.rule,
+                "reason": prepared.reason,
+                "masked_columns": list(prepared.masked_columns),
+                "audit_id": prepared.audit_id,
+                "redacted_sql": prepared.redacted_sql,
+                "elapsed_ms": result.elapsed_ms,
+            }
+        )
 
     async def cancel(request: Request) -> Response:
         req_start = time.perf_counter()
         auth_header = request.headers.get("authorization")
         if not auth_header:
-            _log_request(status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(401, "grant_token_error", "Missing Authorization header")
+            _log_request(
+                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                401, "grant_token_error", "Missing Authorization header"
+            )
 
         parts = auth_header.split()
         if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
-            _log_request(status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-            return _error_response(401, "grant_token_error", "Malformed Authorization header")
+            _log_request(
+                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
+            return _error_response(
+                401, "grant_token_error", "Malformed Authorization header"
+            )
 
         token = parts[1].strip()
 
@@ -671,11 +882,19 @@ def create_app(
             try:
                 body_json = json.loads(raw_body.decode("utf-8"))
             except Exception:
-                _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-                return _error_response(400, "bad_request", "Invalid JSON body", token=token)
+                _log_request(
+                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                )
+                return _error_response(
+                    400, "bad_request", "Invalid JSON body", token=token
+                )
             if not isinstance(body_json, dict) or body_json != {}:
-                _log_request(status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
-                return _error_response(400, "bad_request", "Body must be empty or {}", token=token)
+                _log_request(
+                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                )
+                return _error_response(
+                    400, "bad_request", "Body must be empty or {}", token=token
+                )
 
         try:
             claims = verify_cancel_token(
@@ -685,17 +904,29 @@ def create_app(
                 issuer=pipeline.issuer,
             )
         except GrantTokenError as exc:
-            _log_request(status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
+            _log_request(
+                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+            )
             return _error_response(401, "grant_token_error", exc, token=token)
 
         jti = claims["jti"]
         sub = claims["sub"]
         matched = running_queries.cancel(jti, sub)
         if not matched:
-            _log_request(audit_id=jti, subject=sub, status=404, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
+            _log_request(
+                audit_id=jti,
+                subject=sub,
+                status=404,
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+            )
             return _error_response(404, "not_found", "Query not found", token=token)
 
-        _log_request(audit_id=jti, subject=sub, status=202, elapsed_ms=(time.perf_counter() - req_start) * 1000.0)
+        _log_request(
+            audit_id=jti,
+            subject=sub,
+            status=202,
+            elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+        )
         return JSONResponse({"cancelled": True, "query_id": jti}, status_code=202)
 
     routes = [
@@ -704,5 +935,7 @@ def create_app(
         Route("/v1/explain", explain, methods=["POST"]),
         Route("/v1/cancel", cancel, methods=["POST"]),
     ]
+    if extra_routes:
+        routes.extend(extra_routes)
 
-    return Starlette(routes=routes)
+    return Starlette(routes=routes, lifespan=lifespan)
