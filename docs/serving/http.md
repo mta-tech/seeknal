@@ -38,6 +38,9 @@ JSON object with the following fields:
 - `params` (list, optional): Positional parameter values corresponding to `$1..$n`.
 - `hint` (string, optional): Routing override hint (e.g., target engine name).
 - `max_staleness_seconds` (number, optional): Maximum allowable replication lag in seconds.
+- `timeout_s` (number, optional): Positive finite execution timeout in seconds. Effective timeout is `min(server timeout, timeout_s)`.
+- `max_rows` (integer, optional): Positive integer lowering the result row cap. Effective cap is `min(grant.max_rows, max_rows)`.
+- `max_result_bytes` (integer, optional): Positive integer upper bound on the JSON-encoded `rows` size. Effective cap is `min(server max_result_bytes, max_result_bytes)`. Exceeding this returns `413 result_too_large`.
 
 *Note: Any unrecognized fields in the JSON body will trigger a `400 Bad Request`.*
 
@@ -50,19 +53,23 @@ Content-Type: application/json
 
 {
   "sql": "SELECT id, name, salary FROM users WHERE salary >= $1",
-  "params": [60000]
+  "params": [60000],
+  "timeout_s": 15.0,
+  "max_rows": 500,
+  "max_result_bytes": 10485760
 }
 ```
 
 #### Response (200 OK)
 Returns a JSON object with:
 - `columns` (`list[str]`): Output column names in projection order.
+- `column_types` (`list[str]`): Output column data types in projection order, matching the length of `columns`. Normalized to contract v2 types: `boolean, smallint, integer, bigint, float, double, decimal(p,s), varchar, date, timestamp, timestamptz, time, binary, json, unknown`.
 - `rows` (`list[list]`): Query result rows converted to JSON-safe representations:
   - `datetime`, `date`, `time`: ISO 8601 formatted strings (e.g., `"2026-10-31T12:00:00"`).
   - `Decimal`: Exact numeric string representation (e.g., `"123.45"`).
   - `bytes`: Base64 encoded string.
   - `float` `NaN`, `+Infinity`, `-Infinity`: Encoded as `null`.
-- `truncated` (`bool`): `true` if results exceeded the grant's `max_rows` cap.
+- `truncated` (`bool`): `true` if results exceeded the effective row cap.
 - `engine` (`str`): Identifier of the engine where the query executed.
 - `rule` (`str`): Placement routing rule selected (e.g., `analytics`, `point_lookup`, `small_scan`).
 - `reason` (`str`): Diagnostic rationale for engine selection.
@@ -75,6 +82,7 @@ Returns a JSON object with:
 ```json
 {
   "columns": ["id", "name", "salary"],
+  "column_types": ["integer", "varchar", "integer"],
   "rows": [
     [2, "****", 80000]
   ],
@@ -125,6 +133,42 @@ Returns a JSON object with:
 
 ---
 
+### 1.4 `POST /v1/cancel`
+
+Cancels an actively executing query identified by `jti` in the cancel token.
+
+#### Request Headers
+- `Authorization: Bearer <cancel token>` (required): Compact ES256 JWS cancel token issued by the Catalog.
+
+#### Request Body
+Empty body or `{}`.
+
+#### Cancel Token Format
+- ES256 compact JWS using the same trusted `kid` public keys as grant tokens.
+- Claims:
+  - `typ` (string, required): Must be `"cancel"`.
+  - `iss` (string, required): Expected Catalog issuer (`"atlas-catalog"`).
+  - `aud` (string or list, required): Must match or contain `"seeknal-serving"`.
+  - `iat`, `exp` (number, required): Token lifetime `exp - iat <= 60` seconds.
+  - `jti` (string, required): Non-empty query audit ID matching the executing query.
+  - `sub` (string, required): Non-empty user subject matching the executing query.
+
+#### Response (202 Accepted)
+```json
+{
+  "cancelled": true,
+  "query_id": "jti-claim-9012"
+}
+```
+
+#### Status Codes
+- **202 Accepted:** Query matched and cancel signal sent to the engine adapter.
+- **401 Unauthorized:** Invalid or expired cancel token, missing `typ: "cancel"`, or bad signature.
+- **404 Not Found:** Query ID not currently running, or running query's subject differs from `sub` (never reveals which).
+- **400 Bad Request:** Malformed request body (non-empty and not `{}`).
+
+---
+
 ## 2. Error Handling & Privacy Guarantees
 
 All error responses have an HTTP status code $\ge 400$ and return a consistent JSON payload:
@@ -147,9 +191,14 @@ All error responses have an HTTP status code $\ge 400$ and return a consistent J
 |:---|:---:|:---|:---|
 | `GrantTokenError` | **401** | `grant_token_error` | Missing/malformed Authorization header, invalid signature, expired token, or invalid claims. |
 | `EnforcementError` | **403** | `enforcement_error` | Query policy violation: ungranted table, ungranted column, disallowed SQL function, or write violation. |
+| Query not found / subject mismatch | **404** | `not_found` | In `/v1/cancel`: query `jti` not found in running queries, or subject does not match running query. |
+| Duplicate query execution | **409** | `duplicate_query_id` | A query with the same `jti` is already actively running. |
+| Result rows exceed byte cap | **413** | `result_too_large` | JSON-encoded result rows exceed `max_result_bytes` (no partial rows returned). |
 | `RoutingError` | **422** | `routing_error` | No feasible engine available to satisfy query constraints (e.g. invalid hint, unserved table). |
 | Malformed JSON or invalid types | **400** | `bad_request` | Non-JSON body, missing `sql`, invalid field types, or unrecognized extra fields. |
 | Request body exceeds size limit | **413** | `payload_too_large` | Body exceeds `max_body_bytes` (checked prior to JSON parsing). |
+| Query cancelled | **499** | `query_cancelled` | Query execution cancelled via `/v1/cancel` or client disconnect. |
+| Missing workload account | **503** | `workload_account_missing` | Routed engine has no configured account matching the grant's `workload` claim. |
 | No adapter for chosen engine | **503** | `engine_unavailable` | Placement routed to an engine that is not registered in the application's adapters mapping. |
 | `EngineTimeout` | **504** | `engine_timeout` | Query execution exceeded the allotted timeout threshold. |
 | `EngineError` | **502** | `engine_error` | Database engine driver failed during connection or query execution. |

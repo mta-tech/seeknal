@@ -32,18 +32,20 @@ The pipeline operates in-memory with zero network overhead, no active database c
 
 ## 2. Pipeline Execution Order
 
-`ServingPipeline.prepare(sql, token, params=..., hint=..., max_staleness_seconds=..., now=...)` executes five distinct phases in strict sequential order:
+`ServingPipeline.prepare(sql, token, params=..., hint=..., max_staleness_seconds=..., now=..., max_rows=...)` executes five distinct phases in strict sequential order:
 
 1. **Token Verification (`verify_grant_token` & `Grant.from_claims`):**
-   Decodes and cryptographically verifies the compact JWS token from the Catalog using ES256 public keys. Converts validated claims into an immutable `Grant` object.
+   Decodes and cryptographically verifies the compact JWS token from the Catalog using ES256 public keys. Converts validated claims into an immutable `Grant` object containing policy rules and the `workload` claim (`"interactive"`, `"bi"`, or `"report"`).
 2. **Engine Routing (`router.decide`):**
    Parses the client's *original* SQL statement and extracts structural query features (statement kind, table references, joins, aggregations, key equality lookups). Determines feasible engines and selects the target engine based on placement rules and hints.
 3. **Policy Enforcement (`enforce`):**
-   Validates query integrity against `grant.sql_sha256`, enforces column allowlists, injects column masking expressions, wraps tables with row filter predicates, limits result rows (`max_rows + 1`), and generates audit/redaction structures.
+   Validates query integrity against `grant.sql_sha256`, enforces column allowlists, injects column masking expressions, wraps tables with row filter predicates, limits result rows (`min(grant.max_rows, max_rows) + 1`), and generates audit/redaction structures.
 4. **Physical Placement Rewriting (`router.rewrite`):**
    Replaces logical table references within the enforced AST with the target engine's physical table paths (e.g., `claims.claim` → `lakekeeper.claims.claim AS claim`), while preserving table aliases and leaving semantic cubes untouched.
 5. **Parameter Binding & Paramstyle Compilation:**
    Maps PostgreSQL-style placeholders (`$1..$n`) to the target engine's native parameter style (`%s` for format engines, `?` for qmark engines), escapes literal `%` characters to `%%` for format drivers, and constructs the final positional `params` tuple in exact appearance order.
+
+The output `PreparedQuery` includes `workload: str` (taken from `grant.workload`, defaulting to `"interactive"`), enabling engine adapters to dispatch queries to appropriate engine service accounts.
 
 ### Why Routing Reads the Original SQL
 
@@ -156,7 +158,36 @@ By default, Serving parses incoming queries using the PostgreSQL dialect. Howeve
 
 ---
 
-## 7. End-to-End Example: Provincial Analyst Query Routed to StarRocks
+## 7. Workload-Routed Adapters
+
+Deployments requiring isolated compute accounts per query workload (e.g., separate StarRocks service accounts for interactive queries, BI dashboards, and heavy batch reporting) use `WorkloadRoutedAdapter`:
+
+```python
+from seeknal.serving import WorkloadRoutedAdapter, build_workload_adapters
+
+# Building manually with distinct engine adapters
+routed_adapter = WorkloadRoutedAdapter({
+    "interactive": sr_interactive_adapter,
+    "bi": sr_bi_adapter,
+    "report": sr_report_adapter,
+})
+
+# Or building with the factory helper from connect callables
+routed_adapter = build_workload_adapters(
+    "starrocks",
+    {
+        "interactive": connect_sr_interactive,
+        "bi": connect_sr_bi,
+        "report": connect_sr_report,
+    },
+)
+```
+
+When executing a query, `WorkloadRoutedAdapter` delegates execution to `by_workload[prepared.workload]`. If no adapter is configured for the requested workload, it raises `EngineConfigError`, mapped by HTTP serving to **503** `workload_account_missing`.
+
+---
+
+## 8. End-to-End Example: Provincial Analyst Query Routed to StarRocks
 
 An analyst in West Java (`JB`) runs a parameterized summary query from Superset.
 

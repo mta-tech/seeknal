@@ -6,10 +6,15 @@ from seeknal.serving.adapters import (
     DBAPIAdapter,
     DuckDBAdapter,
     EngineAdapter,
+    EngineCancelled,
+    EngineConfigError,
     EngineError,
     EngineTimeout,
     QueryResult,
+    WorkloadRoutedAdapter,
     build_adapter,
+    build_workload_adapters,
+    normalize_column_type,
 )
 from seeknal.serving.discovery import (
     DiscoveryConfig,
@@ -20,7 +25,9 @@ from seeknal.serving.enforce import EnforcementError, Grant, enforce
 from seeknal.serving.features import QueryFeatures, extract_features
 from seeknal.serving.grant_token import (
     GrantTokenError,
+    sign_cancel_token,
     sign_grant_token,
+    verify_cancel_token,
     verify_grant_token,
 )
 from seeknal.serving.http import create_app
@@ -44,6 +51,8 @@ __all__ = [
     "EnforcementError",
     "Engine",
     "EngineAdapter",
+    "EngineCancelled",
+    "EngineConfigError",
     "EngineError",
     "EngineTimeout",
     "Grant",
@@ -61,11 +70,16 @@ __all__ = [
     "ServingPipeline",
     "TableEntry",
     "TableServe",
+    "WorkloadRoutedAdapter",
     "build_adapter",
+    "build_workload_adapters",
     "create_app",
     "discover",
     "enforce",
     "extract_features",
+    "normalize_column_type",
+    "sign_cancel_token",
     "sign_grant_token",
+    "verify_cancel_token",
     "verify_grant_token",
 ]
