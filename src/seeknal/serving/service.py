@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -66,6 +67,7 @@ class ServingPipeline:
         issuer: str = "atlas-catalog",
         default_catalog: str | None = None,
     ) -> None:
+        self._lock = threading.Lock()
         self.placement = placement
         self.schemas = schemas
         self.public_keys = public_keys
@@ -73,6 +75,18 @@ class ServingPipeline:
         self.issuer = issuer
         self.default_catalog = default_catalog
         self.router = Router(placement)
+
+    def update_catalog(
+        self,
+        placement: Placement,
+        schemas: Mapping[str, Sequence[str]],
+    ) -> None:
+        """Atomically update placement, schemas, and router under a lock."""
+        new_router = Router(placement)
+        with self._lock:
+            self.placement = placement
+            self.schemas = schemas
+            self.router = new_router
 
     def prepare(
         self,
@@ -85,6 +99,11 @@ class ServingPipeline:
         now: float | None = None,
     ) -> PreparedQuery:
         """Prepare an engine-ready query from a client SQL and signed grant token."""
+        with self._lock:
+            placement = self.placement
+            schemas = self.schemas
+            router = self.router
+
         # 1. Verify token and decode Grant
         claims = verify_grant_token(
             token,
@@ -130,12 +149,12 @@ class ServingPipeline:
                     tbl.set("catalog", exp.to_identifier(self.default_catalog))
 
         # 2. Routing decision on canonical statement
-        decision = self.router.decide_statement(
+        decision = router.decide_statement(
             statement,
             hint=hint,
             max_staleness_seconds=max_staleness_seconds,
         )
-        target_engine = self.placement.engines[decision.engine]
+        target_engine = placement.engines[decision.engine]
         target_dialect = target_engine.dialect
         target_kind = target_engine.kind
 
@@ -143,7 +162,7 @@ class ServingPipeline:
         enforced = enforce(
             sql,
             grant,
-            schemas=self.schemas,
+            schemas=schemas,
             target_dialect=target_dialect,
             target_kind=target_kind,
             dialect=grant.sql_dialect,
@@ -152,7 +171,7 @@ class ServingPipeline:
         )
 
         # 4. Table rewrite for chosen engine physical names
-        self.router.rewrite(enforced.statement, decision.engine)
+        router.rewrite(enforced.statement, decision.engine)
 
         # 5. Parameters and dialect rendering
         if target_kind == "duckdb":
