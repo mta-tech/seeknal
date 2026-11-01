@@ -95,6 +95,10 @@ def test_duckdb_other_types():
     assert desc is not None
     types = [normalize_column_type("duckdb", d) for d in desc]
     assert types == ["smallint", "float", "timestamptz", "time", "binary"]
+    # unconstrained decimal without precision/scale
+    assert normalize_column_type("duckdb", "DECIMAL") == "decimal"
+    assert normalize_column_type("duckdb", "NUMERIC") == "decimal"
+    assert normalize_column_type("duckdb", ("dec", "DECIMAL", None, None, None, None, None)) == "decimal"
 
 
 def test_pymysql_field_type_codes():
@@ -120,10 +124,12 @@ def test_pymysql_field_type_codes():
     assert normalize_column_type("pymysql", FT.FLOAT) == "float"
     assert normalize_column_type("pymysql", FT.DOUBLE) == "double"
 
-    # decimal with precision and scale
+    # decimal with precision and scale or unconstrained
     assert normalize_column_type("pymysql", ("dec", FT.DECIMAL, None, None, 10, 2, None)) == "decimal(10,2)"
     assert normalize_column_type("starrocks", ("dec", FT.NEWDECIMAL, None, None, 18, 4, None)) == "decimal(18,4)"
-    assert normalize_column_type("pymysql", FT.DECIMAL) == "unknown"
+    assert normalize_column_type("pymysql", FT.DECIMAL) == "decimal"
+    assert normalize_column_type("pymysql", FT.NEWDECIMAL) == "decimal"
+    assert normalize_column_type("pymysql", ("dec", FT.DECIMAL, None, None, None, None, None)) == "decimal"
 
     # varchar
     assert normalize_column_type("pymysql", FT.VARCHAR) == "varchar"
@@ -160,7 +166,9 @@ def test_psycopg2_type_oids():
     assert normalize_column_type("psycopg2", 700) == "float"
     assert normalize_column_type("psycopg2", 701) == "double"
     assert normalize_column_type("psycopg2", ("num", 1700, None, None, 10, 2, None)) == "decimal(10,2)"
-    assert normalize_column_type("psycopg2", 1700) == "unknown"
+    assert normalize_column_type("psycopg2", 1700) == "decimal"
+    assert normalize_column_type("lakebase", ("num", 1700, None, None, None, None, None)) == "decimal"
+    assert normalize_column_type("cube", ("num", 1700, None, None, None, None, None)) == "decimal"
     assert normalize_column_type("psycopg2", 25) == "varchar"
     assert normalize_column_type("psycopg2", 1043) == "varchar"
     assert normalize_column_type("psycopg2", 1082) == "date"

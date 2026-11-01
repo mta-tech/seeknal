@@ -105,8 +105,10 @@ def normalize_column_type(kind: str, description_entry: Any) -> str:
         dec_match = re.match(r"^(?:decimal|numeric)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$", type_str)
         if dec_match:
             return f"decimal({dec_match.group(1)},{dec_match.group(2)})"
-        if (type_str.startswith("decimal") or type_str.startswith("numeric")) and precision is not None and scale is not None:
-            return f"decimal({precision},{scale})"
+        if (type_str.startswith("decimal") or type_str.startswith("numeric")):
+            if precision is not None and scale is not None:
+                return f"decimal({precision},{scale})"
+            return "decimal"
         if type_str in ("boolean", "bool"):
             return "boolean"
         if type_str in ("smallint", "tinyint", "int2", "short"):
@@ -144,7 +146,7 @@ def normalize_column_type(kind: str, description_entry: Any) -> str:
         if code in (0, 246):  # DECIMAL, NEWDECIMAL
             if precision is not None and scale is not None:
                 return f"decimal({precision},{scale})"
-            return "unknown"
+            return "decimal"
         if code == 16:  # BIT
             return "boolean"
         if code == 1:  # TINY
@@ -196,7 +198,7 @@ def normalize_column_type(kind: str, description_entry: Any) -> str:
         if oid == 1700:
             if precision is not None and scale is not None:
                 return f"decimal({precision},{scale})"
-            return "unknown"
+            return "decimal"
         if oid in (25, 1043):
             return "varchar"
         if oid == 1082:

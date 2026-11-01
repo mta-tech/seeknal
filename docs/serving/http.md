@@ -63,7 +63,7 @@ Content-Type: application/json
 #### Response (200 OK)
 Returns a JSON object with:
 - `columns` (`list[str]`): Output column names in projection order.
-- `column_types` (`list[str]`): Output column data types in projection order, matching the length of `columns`. Normalized to contract v2 types: `boolean, smallint, integer, bigint, float, double, decimal(p,s), varchar, date, timestamp, timestamptz, time, binary, json, unknown`.
+- `column_types` (`list[str]`): Output column data types in projection order, matching the length of `columns`. Normalized to contract v2 types: `boolean, smallint, integer, bigint, float, double, decimal, decimal(p,s), varchar, date, timestamp, timestamptz, time, binary, json, unknown`. Bare `decimal` denotes an unconstrained decimal with unknown or arbitrary precision.
 - `rows` (`list[list]`): Query result rows converted to JSON-safe representations:
   - `datetime`, `date`, `time`: ISO 8601 formatted strings (e.g., `"2026-10-31T12:00:00"`).
   - `Decimal`: Exact numeric string representation (e.g., `"123.45"`).
