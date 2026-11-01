@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import sqlglot
 from sqlglot import exp
 
 from seeknal.serving.enforce import EnforcementError, Grant, enforce
@@ -63,12 +64,14 @@ class ServingPipeline:
         *,
         audience: str = "seeknal-serving",
         issuer: str = "atlas-catalog",
+        default_catalog: str | None = None,
     ) -> None:
         self.placement = placement
         self.schemas = schemas
         self.public_keys = public_keys
         self.audience = audience
         self.issuer = issuer
+        self.default_catalog = default_catalog
         self.router = Router(placement)
 
     def prepare(
@@ -92,9 +95,43 @@ class ServingPipeline:
         )
         grant = Grant.from_claims(claims)
 
-        # 2. Routing decision on original SQL to preserve client statement shape
-        decision = self.router.decide(
-            sql,
+        # Parameters: $n placeholders are only defined for postgres and duckdb.
+        # If params is non-empty and the dialect is starrocks or mysql, raise EnforcementError.
+        if params and grant.sql_dialect in ("starrocks", "mysql"):
+            raise EnforcementError(
+                f"Parameters are not supported for '{grant.sql_dialect}' source dialect"
+            )
+
+        # Parse SQL once with read=<grant.sql_dialect>, applying single-statement rules
+        try:
+            parsed_statements = sqlglot.parse(sql, read=grant.sql_dialect)
+        except Exception as exc:
+            raise EnforcementError(f"SQL parse error: {exc}") from exc
+
+        if len(parsed_statements) != 1 or parsed_statements[0] is None:
+            raise EnforcementError(
+                f"expected exactly one statement, got {len(parsed_statements)}"
+            )
+
+        statement = parsed_statements[0]
+
+        # Canonicalize default catalog on two-part table references
+        if self.default_catalog is not None:
+            cte_names = {cte.alias_or_name.lower() for cte in statement.find_all(exp.CTE)}
+            for tbl in statement.find_all(exp.Table):
+                # skip names that are CTEs defined by the statement
+                if (tbl.name.lower() in cte_names and not tbl.db and not tbl.catalog) or (
+                    tbl.parts and ".".join(p.name for p in tbl.parts).lower() in cte_names
+                ):
+                    continue
+                # give every exp.Table reference that has a db and a name but no catalog the catalog default_catalog
+                # leave one-part names alone
+                if tbl.db and tbl.name and not tbl.catalog:
+                    tbl.set("catalog", exp.to_identifier(self.default_catalog))
+
+        # 2. Routing decision on canonical statement
+        decision = self.router.decide_statement(
+            statement,
             hint=hint,
             max_staleness_seconds=max_staleness_seconds,
         )
@@ -109,7 +146,8 @@ class ServingPipeline:
             schemas=self.schemas,
             target_dialect=target_dialect,
             target_kind=target_kind,
-            dialect="postgres",
+            dialect=grant.sql_dialect,
+            statement=statement,
             now=now,
         )
 

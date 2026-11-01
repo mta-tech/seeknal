@@ -38,6 +38,7 @@ The Catalog evaluates user authorization and issues a grant (decoded from a Cata
   "sql_sha256": "4b9e017ec59a9a111c96fcd87536a0d641ba39b77f0d380652919eed3999ce3d",
   "max_rows": 10000,
   "exp": 1793430000,
+  "sql_dialect": "postgres",
   "tables": {
     "claims.claim": {
       "columns": ["claim_id", "province", "idrg_code", "amount", "admit_date"],
@@ -59,7 +60,15 @@ The Catalog evaluates user authorization and issues a grant (decoded from a Cata
 
 - `RowFilter(column: str, op: str, values: tuple)`: `op` is one of `eq`, `in`, `gte`, `lte`.
 - `TableGrant(table: str, columns: tuple[str, ...], masks: Mapping[str, str], row_filters: tuple[RowFilter, ...] = (), actions: tuple[str, ...] = ("select",))`.
-- `Grant(subject: str, workspace: str, audit_id: str, sql_sha256: str, max_rows: int, expires_at: float, tables: Mapping[str, TableGrant])`.
+- `Grant(subject: str, workspace: str, audit_id: str, sql_sha256: str, max_rows: int, expires_at: float, tables: Mapping[str, TableGrant], sql_dialect: str = "postgres")`.
+
+### Source SQL Dialect Claim (`sql_dialect`)
+
+The Catalog evaluates client dialects and issues an optional `sql_dialect` claim in the grant token.
+- **Allowed values:** `"postgres"`, `"starrocks"`, `"mysql"`, and `"duckdb"`.
+- **Default:** When absent from the claims payload, `sql_dialect` defaults to `"postgres"`.
+- **Validation:** Any unrecognized dialect string or non-string value (such as numbers, booleans, lists, or `null`) immediately raises `EnforcementError`.
+- **Integrity & Security:** Because `sql_dialect` is signed by the Catalog in the grant JWT, clients cannot manipulate the dialect interpretation at runtime. In `enforce()`, SQL parsing and redaction use this dialect when evaluating statement structure.
 
 ---
 
