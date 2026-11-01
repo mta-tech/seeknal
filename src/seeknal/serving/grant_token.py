@@ -194,6 +194,9 @@ def verify_grant_token(
         raise GrantTokenError("Token claims must be a JSON object")
 
     # 4. Validate claims
+    if claims.get("typ") == "cancel" or header.get("typ") == "cancel":
+        raise GrantTokenError("Cancel token cannot be used to run a query")
+
     current_time = time.time() if now is None else float(now)
 
     # iss
@@ -241,5 +244,157 @@ def verify_grant_token(
     # max_rows
     if "max_rows" in claims:
         _parse_numeric_claim(claims["max_rows"], "max_rows")
+
+    return claims
+
+
+def sign_cancel_token(claims: Mapping[str, Any], private_key: Any, *, kid: str) -> str:
+    """Sign a cancel token as an ES256 compact JWS."""
+    payload = dict(claims)
+    if "typ" not in payload:
+        payload["typ"] = "cancel"
+    return sign_grant_token(payload, private_key, kid=kid)
+
+
+def verify_cancel_token(
+    token: str,
+    keys: Mapping[str, Any] | None = None,
+    *,
+    public_keys: Mapping[str, Any] | None = None,
+    audience: str = "seeknal-serving",
+    issuer: str = "atlas-catalog",
+    now: float | None = None,
+    leeway_seconds: float = 5,
+    max_lifetime_seconds: float = 60,
+) -> dict[str, Any]:
+    """Verify an ES256 compact JWS cancel token and return its claims dictionary."""
+    if not isinstance(token, str):
+        raise GrantTokenError("Token must be a string")
+
+    key_dict = keys if keys is not None else public_keys
+    if key_dict is None:
+        raise GrantTokenError("Missing public keys for token verification")
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise GrantTokenError(f"Expected 3 segments in token, got {len(parts)}")
+
+    header_b64, payload_b64, sig_b64 = parts
+
+    # 1. Decode and validate header
+    header_bytes = _b64url_decode(header_b64)
+    try:
+        header = json.loads(header_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise GrantTokenError("Invalid token header JSON") from exc
+
+    if not isinstance(header, dict):
+        raise GrantTokenError("Token header must be a JSON object")
+
+    if "alg" not in header:
+        raise GrantTokenError("Missing 'alg' in token header")
+    if header["alg"] != "ES256":
+        raise GrantTokenError(f"Unsupported algorithm '{header['alg']}', only ES256 permitted")
+
+    typ = header.get("typ")
+    if typ is not None and typ not in ("JWT", "cancel"):
+        raise GrantTokenError(f"Unsupported token type '{typ}', expected JWT or cancel")
+
+    kid = header.get("kid")
+    if not kid or not isinstance(kid, str):
+        raise GrantTokenError("Missing or invalid 'kid' in token header")
+
+    if kid not in key_dict:
+        raise GrantTokenError(f"Unknown key ID '{kid}'")
+
+    pub_key = _load_public_key(key_dict[kid], kid)
+
+    # 2. Decode signature and verify
+    raw_sig = _b64url_decode(sig_b64)
+    if len(raw_sig) != 64:
+        raise GrantTokenError(f"Signature must be exactly 64 bytes, got {len(raw_sig)}")
+
+    r = int.from_bytes(raw_sig[:32], "big")
+    s = int.from_bytes(raw_sig[32:], "big")
+    try:
+        dss_sig = encode_dss_signature(r, s)
+    except Exception as exc:
+        raise GrantTokenError("Invalid signature format") from exc
+
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    try:
+        pub_key.verify(dss_sig, signing_input, ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        raise GrantTokenError("Invalid token signature")
+    except Exception as exc:
+        raise GrantTokenError(f"Signature verification failed: {exc}")
+
+    # 3. Decode and validate payload
+    payload_bytes = _b64url_decode(payload_b64)
+    try:
+        claims = json.loads(payload_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise GrantTokenError("Invalid token payload JSON") from exc
+
+    if not isinstance(claims, dict):
+        raise GrantTokenError("Token claims must be a JSON object")
+
+    # 4. Validate claims
+    if claims.get("typ") != "cancel":
+        raise GrantTokenError("Missing or invalid 'typ' claim, expected 'cancel'")
+
+    current_time = time.time() if now is None else float(now)
+
+    # iss
+    iss = claims.get("iss")
+    if iss != issuer:
+        raise GrantTokenError(f"Invalid issuer '{iss}', expected '{issuer}'")
+
+    # aud
+    aud = claims.get("aud")
+    aud_match = False
+    if isinstance(aud, str):
+        aud_match = (aud == audience)
+    elif isinstance(aud, (list, tuple)):
+        aud_match = (audience in aud)
+    if not aud_match:
+        raise GrantTokenError(f"Invalid audience '{aud}', expected '{audience}'")
+
+    # iat
+    if "iat" not in claims:
+        raise GrantTokenError("Missing required 'iat' claim")
+    iat = _parse_numeric_claim(claims["iat"], "iat")
+    if iat > current_time + leeway_seconds:
+        raise GrantTokenError("Token 'iat' is in the future beyond leeway")
+
+    # exp
+    if "exp" not in claims:
+        raise GrantTokenError("Missing required 'exp' claim")
+    exp = _parse_numeric_claim(claims["exp"], "exp")
+    if exp < current_time - leeway_seconds:
+        raise GrantTokenError("Token has expired")
+
+    if exp - iat > max_lifetime_seconds:
+        raise GrantTokenError(
+            f"Token lifetime of {exp - iat:.1f}s exceeds maximum {max_lifetime_seconds}s"
+        )
+    if exp < iat:
+        raise GrantTokenError("Token 'exp' must not be before 'iat'")
+
+    # nbf
+    if "nbf" in claims:
+        nbf = _parse_numeric_claim(claims["nbf"], "nbf")
+        if nbf > current_time + leeway_seconds:
+            raise GrantTokenError("Token is not yet valid ('nbf' is in the future)")
+
+    # jti
+    jti = claims.get("jti")
+    if not jti or not isinstance(jti, str):
+        raise GrantTokenError("Missing or invalid 'jti' claim")
+
+    # sub
+    sub = claims.get("sub")
+    if not sub or not isinstance(sub, str):
+        raise GrantTokenError("Missing or invalid 'sub' claim")
 
     return claims

@@ -21,6 +21,7 @@ VALID_ACTIONS = frozenset({"select", "insert", "update", "delete"})
 VALID_TARGET_KINDS = frozenset({"starrocks", "lakebase", "duckdb", "cube"})
 VALID_TARGET_DIALECTS = frozenset({"postgres", "starrocks", "duckdb"})
 VALID_SQL_DIALECTS = frozenset({"postgres", "starrocks", "mysql", "duckdb"})
+VALID_WORKLOADS = frozenset({"interactive", "bi", "report"})
 
 ANONYMOUS_FUNCTION_ALLOWLIST: dict[str, set[str]] = {
     "cube": {"measure"},
@@ -183,6 +184,7 @@ class Grant:
     expires_at: float
     tables: Mapping[str, TableGrant]
     sql_dialect: str = "postgres"
+    workload: str = "interactive"
 
     def __post_init__(self) -> None:
         if self.max_rows <= 0:
@@ -192,6 +194,10 @@ class Grant:
         if not isinstance(self.sql_dialect, str) or self.sql_dialect not in VALID_SQL_DIALECTS:
             raise EnforcementError(
                 f"invalid sql_dialect '{self.sql_dialect}', must be one of {sorted(VALID_SQL_DIALECTS)}"
+            )
+        if not isinstance(self.workload, str) or self.workload not in VALID_WORKLOADS:
+            raise EnforcementError(
+                f"invalid workload '{self.workload}', must be one of {sorted(VALID_WORKLOADS)}"
             )
 
     @classmethod
@@ -217,6 +223,15 @@ class Grant:
                 )
         else:
             sql_dialect = "postgres"
+
+        if "workload" in claims:
+            workload = claims["workload"]
+            if not isinstance(workload, str) or workload not in VALID_WORKLOADS:
+                raise EnforcementError(
+                    f"invalid workload '{workload}', must be one of {sorted(VALID_WORKLOADS)}"
+                )
+        else:
+            workload = "interactive"
 
         table_grants: dict[str, TableGrant] = {}
         for tbl_name, tbl_spec in tables_raw.items():
@@ -245,6 +260,7 @@ class Grant:
             expires_at=float(claims["exp"]),
             tables=table_grants,
             sql_dialect=sql_dialect,
+            workload=workload,
         )
 
 
@@ -458,6 +474,7 @@ def enforce(
     dialect: str = "postgres",
     statement: exp.Expression | None = None,
     now: float | None = None,
+    max_rows: int | None = None,
 ) -> EnforcedQuery:
     """Enforce a data catalog grant on a SQL query."""
     # Step 1: Integrity
@@ -831,7 +848,10 @@ def enforce(
                 existing_val = int(existing_limit.expression.this)
             except (ValueError, TypeError):
                 existing_val = None
-        cap = grant.max_rows + 1
+        effective_max_rows = (
+            min(grant.max_rows, max_rows) if max_rows is not None else grant.max_rows
+        )
+        cap = effective_max_rows + 1
         new_limit = min(existing_val, cap) if existing_val is not None else cap
         statement.set("limit", exp.Limit(expression=exp.Literal.number(new_limit)))
         row_limit = new_limit

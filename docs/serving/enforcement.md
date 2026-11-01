@@ -60,7 +60,15 @@ The Catalog evaluates user authorization and issues a grant (decoded from a Cata
 
 - `RowFilter(column: str, op: str, values: tuple)`: `op` is one of `eq`, `in`, `gte`, `lte`.
 - `TableGrant(table: str, columns: tuple[str, ...], masks: Mapping[str, str], row_filters: tuple[RowFilter, ...] = (), actions: tuple[str, ...] = ("select",))`.
-- `Grant(subject: str, workspace: str, audit_id: str, sql_sha256: str, max_rows: int, expires_at: float, tables: Mapping[str, TableGrant], sql_dialect: str = "postgres")`.
+- `Grant(subject: str, workspace: str, audit_id: str, sql_sha256: str, max_rows: int, expires_at: float, tables: Mapping[str, TableGrant], sql_dialect: str = "postgres", workload: str = "interactive")`.
+
+### Workload Claim (`workload`)
+
+The Catalog evaluates user queries and assigns an optional `workload` claim to route execution to appropriate engine accounts.
+- **Allowed values:** `"interactive"`, `"bi"`, and `"report"`.
+- **Default:** When absent from the claims payload, `workload` defaults to `"interactive"`.
+- **Validation:** Any non-string or unknown value raises `EnforcementError`.
+- **Engine Delegation:** Stored as `Grant.workload` and propagated to `PreparedQuery.workload` for engine adapter routing.
 
 ### Source SQL Dialect Claim (`sql_dialect`)
 

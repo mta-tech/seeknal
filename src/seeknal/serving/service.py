@@ -37,6 +37,7 @@ class PreparedQuery:
     workspace: str
     audit_id: str
     cube_security_context: Mapping | None
+    workload: str = "interactive"
 
 
 def _extract_placeholder_index(node: exp.Expression) -> int:
@@ -97,6 +98,7 @@ class ServingPipeline:
         hint: str | None = None,
         max_staleness_seconds: float | None = None,
         now: float | None = None,
+        max_rows: int | None = None,
     ) -> PreparedQuery:
         """Prepare an engine-ready query from a client SQL and signed grant token."""
         with self._lock:
@@ -168,6 +170,7 @@ class ServingPipeline:
             dialect=grant.sql_dialect,
             statement=statement,
             now=now,
+            max_rows=max_rows,
         )
 
         # 4. Table rewrite for chosen engine physical names
@@ -243,4 +246,5 @@ class ServingPipeline:
             workspace=grant.workspace,
             audit_id=grant.audit_id,
             cube_security_context=enforced.cube_security_context,
+            workload=grant.workload,
         )
