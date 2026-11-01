@@ -204,7 +204,13 @@ UPDATE claims.claim SET amount = 6000 WHERE claim_id = 42 AND province IN ('JB')
 ---
 
 ### Rule 7: Row Cap
-Outermost `LIMIT` is set to `min(existing_limit, grant.max_rows + 1)`. If `LIMIT` is absent, it is set to `grant.max_rows + 1`. The extra row enables clients to detect truncation without issuing an additional count query. Writes have `row_limit = None`.
+For every read statement (`exp.Query`), the row cap enforces truncation detection while strictly preserving user limit semantics:
+- **Truncation Probe:** `EnforcedQuery.row_limit` is always set to the truncation probe `cap = effective_max_rows + 1`, where `effective_max_rows = min(grant.max_rows, max_rows)` if a request `max_rows` is specified, else `grant.max_rows`. It is the probe limit passed to engine adapters, never the user's LIMIT.
+- **Top-Level Limit Rewrite:** The outermost statement `LIMIT` sent to the engine is set to `min(user_limit, cap)` when a user limit is specified, or `cap` if absent. `OFFSET` clauses are preserved unchanged. Subquery and CTE limits are untouched.
+- **Engine Execution & Truncation Semantics:** Engine adapters fetch up to `row_limit` rows (`cap`). If `len(fetched) == row_limit`, the probe detects truncation, drops the extra probe row (`fetched[:-1]`), and marks `truncated = True`. When a user provides `LIMIT n` with $n \le \text{effective\_max\_rows}$, the engine produces at most $n$ rows, so `len(fetched) < cap`, returning all $n$ rows with `truncated = False`. `LIMIT 0` returns 0 rows with `truncated = False`.
+- **FETCH Handling:** Standard SQL `FETCH FIRST n ROWS ONLY` / `FETCH NEXT n ROWS ONLY` (sqlglot `exp.Fetch` in the statement's `limit` arg) with an integer literal $n$ is treated identically to `LIMIT n` and rewritten to `LIMIT min(n, cap)`. `FETCH ... PERCENT` or `WITH TIES` raise `EnforcementError`.
+- **Non-Literal Limit Refusal:** A top-level limit that is not a non-negative integer literal (such as expressions like `1 + 1`, subqueries, bound parameters/placeholders, string literals, negative values, or floats) raises `EnforcementError` ("LIMIT must be a non-negative integer literal").
+- **Writes:** Writes (`UPDATE`/`DELETE`/`INSERT`) keep `row_limit = None`, unchanged.
 
 ---
 

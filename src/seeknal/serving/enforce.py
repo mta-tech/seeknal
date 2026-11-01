@@ -1117,20 +1117,43 @@ def enforce(
     # Step 7: Row cap
     row_limit: int | None = None
     if isinstance(statement, exp.Query):
-        existing_limit = statement.args.get("limit")
-        existing_val: int | None = None
-        if existing_limit is not None and isinstance(existing_limit.expression, exp.Literal):
-            try:
-                existing_val = int(existing_limit.expression.this)
-            except (ValueError, TypeError):
-                existing_val = None
         effective_max_rows = (
             min(grant.max_rows, max_rows) if max_rows is not None else grant.max_rows
         )
         cap = effective_max_rows + 1
+        row_limit = cap
+
+        existing_limit = statement.args.get("limit")
+        existing_val: int | None = None
+        if existing_limit is not None:
+            limit_node: exp.Expression | None
+            if isinstance(existing_limit, exp.Fetch):
+                if existing_limit.args.get("percent") or existing_limit.args.get("with_ties"):
+                    raise EnforcementError("FETCH ... PERCENT or WITH TIES is not supported")
+                limit_node = existing_limit.args.get("count")
+            elif isinstance(existing_limit, exp.Limit):
+                limit_node = existing_limit.expression
+            else:
+                raise EnforcementError("LIMIT must be a non-negative integer literal")
+
+            if (
+                isinstance(limit_node, exp.Literal)
+                and not limit_node.is_string
+                and limit_node.is_int
+            ):
+                try:
+                    parsed_val = int(limit_node.this)
+                    if parsed_val >= 0:
+                        existing_val = parsed_val
+                    else:
+                        raise EnforcementError("LIMIT must be a non-negative integer literal")
+                except (ValueError, TypeError) as exc:
+                    raise EnforcementError("LIMIT must be a non-negative integer literal") from exc
+            else:
+                raise EnforcementError("LIMIT must be a non-negative integer literal")
+
         new_limit = min(existing_val, cap) if existing_val is not None else cap
         statement.set("limit", exp.Limit(expression=exp.Literal.number(new_limit)))
-        row_limit = new_limit
 
     # Step 8: Cube security context
     cube_security_context: dict[str, Any] | None = None
