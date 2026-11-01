@@ -6,6 +6,7 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 import yaml
 
@@ -19,6 +20,18 @@ class DiscoveryConfigError(DiscoveryError):
 
 
 @dataclass(frozen=True)
+class LakekeeperOAuthConfig:
+    """Configuration for Lakekeeper OAuth2 client credentials."""
+
+    token_url: str
+    client_id: str
+    client_secret_env: str | None = None
+    client_secret_file: str | None = None
+    scope: str | None = None
+    audience: str | None = None
+
+
+@dataclass(frozen=True)
 class LakekeeperConfig:
     """Configuration for Iceberg REST catalog (Lakekeeper)."""
 
@@ -26,6 +39,7 @@ class LakekeeperConfig:
     warehouse: str
     token_env: str | None = None
     namespaces: tuple[str, ...] | None = None
+    oauth: LakekeeperOAuthConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -38,6 +52,9 @@ class EngineConfig:
     catalog: str | None = None
     url: str | None = None
     token_env: str | None = None
+    api_secret_env: str | None = None
+    api_secret_file: str | None = None
+    api_claims: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -179,6 +196,52 @@ class DiscoveryConfig:
                     )
                 token_env_str = token_env.strip() if token_env else None
 
+                api_secret_env = eng_data.get("api_secret_env")
+                if api_secret_env is not None and (
+                    not isinstance(api_secret_env, str) or not api_secret_env.strip()
+                ):
+                    raise DiscoveryConfigError(
+                        f"Engine '{eng_name_str}' has invalid 'api_secret_env'"
+                    )
+                api_secret_env_str = api_secret_env.strip() if api_secret_env else None
+
+                api_secret_file = eng_data.get("api_secret_file")
+                if api_secret_file is not None and (
+                    not isinstance(api_secret_file, str) or not api_secret_file.strip()
+                ):
+                    raise DiscoveryConfigError(
+                        f"Engine '{eng_name_str}' has invalid 'api_secret_file'"
+                    )
+                api_secret_file_str = api_secret_file.strip() if api_secret_file else None
+
+                api_claims = eng_data.get("api_claims")
+                if api_claims is not None and not isinstance(api_claims, Mapping):
+                    raise DiscoveryConfigError(
+                        f"Engine '{eng_name_str}' 'api_claims' must be a mapping"
+                    )
+
+                if token_env_str and (api_secret_env_str or api_secret_file_str):
+                    raise DiscoveryConfigError(
+                        f"Engine '{eng_name_str}' cannot have both 'token_env' and 'api_secret_env'/'api_secret_file'"
+                    )
+                if api_secret_env_str and api_secret_file_str:
+                    raise DiscoveryConfigError(
+                        f"Engine '{eng_name_str}' cannot have both 'api_secret_env' and 'api_secret_file'"
+                    )
+                if api_secret_file_str and os.path.exists(api_secret_file_str):
+                    st = os.stat(api_secret_file_str)
+                    if (st.st_mode & 0o044) != 0:
+                        raise DiscoveryConfigError(
+                            f"Engine '{eng_name_str}' api_secret_file '{api_secret_file_str}' is group- or world-readable"
+                        )
+
+                if kind_str != "cube" and (
+                    api_secret_env_str or api_secret_file_str or api_claims is not None
+                ):
+                    raise DiscoveryConfigError(
+                        f"Engine '{eng_name_str}' of kind '{kind_str}' cannot specify 'api_secret_env'/'api_secret_file'/'api_claims'"
+                    )
+
                 if kind_str == "starrocks":
                     starrocks_count += 1
                     if catalog_str is None:
@@ -197,6 +260,9 @@ class DiscoveryConfig:
                     catalog=catalog_str,
                     url=url_str,
                     token_env=token_env_str,
+                    api_secret_env=api_secret_env_str,
+                    api_secret_file=api_secret_file_str,
+                    api_claims=api_claims,
                 )
 
             if starrocks_count > 1:
@@ -229,6 +295,117 @@ class DiscoveryConfig:
                 raise DiscoveryConfigError(
                     "Lakekeeper 'token_env' must be a non-empty string"
                 )
+            token_env_str = token_env.strip() if token_env else None
+
+            oauth_raw = lk_raw.get("oauth")
+            oauth_cfg: LakekeeperOAuthConfig | None = None
+            if oauth_raw is not None:
+                if not isinstance(oauth_raw, Mapping):
+                    raise DiscoveryConfigError("Lakekeeper 'oauth' must be a mapping")
+                if token_env_str:
+                    raise DiscoveryConfigError(
+                        "Lakekeeper cannot have both 'token_env' and 'oauth'"
+                    )
+                allowed_oauth = {
+                    "token_url",
+                    "client_id",
+                    "client_secret_env",
+                    "client_secret_file",
+                    "scope",
+                    "audience",
+                }
+                unknown_oauth = set(oauth_raw.keys()) - allowed_oauth
+                if unknown_oauth:
+                    raise DiscoveryConfigError(
+                        f"Unknown key(s) in lakekeeper 'oauth': {sorted(unknown_oauth)}"
+                    )
+
+                token_url = oauth_raw.get("token_url")
+                if (
+                    not token_url
+                    or not isinstance(token_url, str)
+                    or not token_url.strip()
+                ):
+                    raise DiscoveryConfigError(
+                        "Lakekeeper oauth requires non-empty 'token_url'"
+                    )
+
+                client_id = oauth_raw.get("client_id")
+                if (
+                    not client_id
+                    or not isinstance(client_id, str)
+                    or not client_id.strip()
+                ):
+                    raise DiscoveryConfigError(
+                        "Lakekeeper oauth requires non-empty 'client_id'"
+                    )
+
+                has_cs_env = (
+                    "client_secret_env" in oauth_raw
+                    and oauth_raw["client_secret_env"] is not None
+                )
+                has_cs_file = (
+                    "client_secret_file" in oauth_raw
+                    and oauth_raw["client_secret_file"] is not None
+                )
+                if has_cs_env and has_cs_file:
+                    raise DiscoveryConfigError(
+                        "Lakekeeper oauth cannot have both 'client_secret_env' and 'client_secret_file'"
+                    )
+                if not has_cs_env and not has_cs_file:
+                    raise DiscoveryConfigError(
+                        "Lakekeeper oauth must specify either 'client_secret_env' or 'client_secret_file'"
+                    )
+
+                cs_env_str = None
+                cs_file_str = None
+                if has_cs_env:
+                    cs_env = oauth_raw["client_secret_env"]
+                    if not isinstance(cs_env, str) or not cs_env.strip():
+                        raise DiscoveryConfigError(
+                            "Lakekeeper oauth 'client_secret_env' must be a non-empty string"
+                        )
+                    cs_env_str = cs_env.strip()
+                else:
+                    cs_file = oauth_raw["client_secret_file"]
+                    if not isinstance(cs_file, str) or not cs_file.strip():
+                        raise DiscoveryConfigError(
+                            "Lakekeeper oauth 'client_secret_file' must be a non-empty string"
+                        )
+                    cs_file_str = cs_file.strip()
+                    if os.path.exists(cs_file_str):
+                        st = os.stat(cs_file_str)
+                        if (st.st_mode & 0o044) != 0:
+                            raise DiscoveryConfigError(
+                                f"Lakekeeper client_secret_file '{cs_file_str}' is group- or world-readable"
+                            )
+
+                scope = oauth_raw.get("scope")
+                if scope is not None and (
+                    not isinstance(scope, str) or not scope.strip()
+                ):
+                    raise DiscoveryConfigError(
+                        "Lakekeeper oauth 'scope' must be a non-empty string"
+                    )
+                scope_str = scope.strip() if scope else None
+
+                audience = oauth_raw.get("audience")
+                if audience is not None and (
+                    not isinstance(audience, str) or not audience.strip()
+                ):
+                    raise DiscoveryConfigError(
+                        "Lakekeeper oauth 'audience' must be a non-empty string"
+                    )
+                audience_str = audience.strip() if audience else None
+
+                oauth_cfg = LakekeeperOAuthConfig(
+                    token_url=token_url.strip(),
+                    client_id=client_id.strip(),
+                    client_secret_env=cs_env_str,
+                    client_secret_file=cs_file_str,
+                    scope=scope_str,
+                    audience=audience_str,
+                )
 
             ns_raw = lk_raw.get("namespaces")
             namespaces: tuple[str, ...] | None = None
@@ -249,8 +426,9 @@ class DiscoveryConfig:
             lakekeeper_cfg = LakekeeperConfig(
                 url=url.strip().rstrip("/"),
                 warehouse=warehouse.strip(),
-                token_env=token_env.strip() if token_env else None,
+                token_env=token_env_str,
                 namespaces=namespaces,
+                oauth=oauth_cfg,
             )
 
         # 6. lakebase

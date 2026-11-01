@@ -367,3 +367,55 @@ def test_cube_mode_adapters(ec_key_pair, jwks_path, static_catalog_files):
     cube_adapter_refuse = handle_refuse.adapters["cube"]
     assert isinstance(cube_adapter_refuse, DBAPIAdapter)
     assert cube_adapter_refuse._kind == "cube"
+
+
+def test_build_server_discovery_with_secrets_env_file(
+    tmp_path, ec_key_pair, jwks_path
+):
+    import stat
+
+    sec_env_file = tmp_path / "workloads.env"
+    sec_env_file.write_text(
+        "LK_CLIENT_SEC=oauth-sec-123\nCUBE_API_SEC=cube-api-sec-456\n"
+    )
+    sec_env_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+    cfg_dict = {
+        "listen": {"host": "127.0.0.1", "port": 8765},
+        "grant_keys": {"jwks_file": jwks_path},
+        "secrets_env_file": str(sec_env_file),
+        "placement": {
+            "discovery": {
+                "default_catalog": "lakekeeper",
+                "lakekeeper": {
+                    "url": "https://lk.internal",
+                    "warehouse": "atlas",
+                    "oauth": {
+                        "token_url": "https://auth.internal/token",
+                        "client_id": "seeknal-serving-discovery",
+                        "client_secret_env": "LK_CLIENT_SEC",
+                    },
+                },
+                "engines": {
+                    "cube": {
+                        "kind": "cube",
+                        "dialect": "postgres",
+                        "url": "http://cube.internal:4000",
+                        "api_secret_env": "CUBE_API_SEC",
+                    }
+                },
+            }
+        },
+        "connections": {
+            "duck": {"kind": "duckdb", "path": ":memory:"},
+        },
+    }
+    config = ServerConfig.from_dict(cfg_dict)
+    handle = build_server(config, discover_fn=lambda: DiscoveryResult(
+        placement={"engines": {}, "tables": {}, "cubes": {}},
+        schemas={},
+        warnings=(),
+        discovered_at=datetime.datetime.now(datetime.timezone.utc),
+    ))
+    assert handle.refresher is not None
+    assert handle.refresher.refresh_once() is True

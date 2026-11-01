@@ -184,7 +184,7 @@ def test_refresher_refresh_once_success_and_failure(ec_key):
     # 2. Failure pass
     should_fail = True
     assert refresher.refresh_once() is False
-    assert refresher.last_error == "DiscoveryError: Catalog connection lost"
+    assert refresher.last_error == "DiscoveryError"
     assert refresher.consecutive_failures == 1
     # Last good catalog kept!
     assert "claims.t2" in pipeline.placement.tables

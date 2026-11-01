@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +15,7 @@ from seeknal.serving.discovery.config import (
     DiscoveryError,
     LakekeeperConfig,
 )
+from seeknal.serving.discovery.oauth import ClientCredentialsTokenSource
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,8 @@ class LakekeeperSource:
         env: Mapping[str, str] = os.environ,
         *,
         timeout: float | None = None,
+        clock: Callable[[], float] = time.time,
+        token_source: ClientCredentialsTokenSource | None = None,
     ) -> None:
         if isinstance(config, DiscoveryConfig):
             if config.lakekeeper is None:
@@ -58,19 +62,61 @@ class LakekeeperSource:
 
         self.client = client
         self.env = env
+        self.clock = clock
         self.warnings: list[str] = []
 
-        # Read bearer token if configured
         self._token: str | None = None
-        if self.config.token_env:
+        self._token_source: ClientCredentialsTokenSource | None = None
+
+        if token_source is not None:
+            self._token_source = token_source
+        elif self.config.oauth is not None:
+            self._token_source = ClientCredentialsTokenSource(
+                self.config.oauth,
+                client=self.client,
+                env=self.env,
+                clock=self.clock,
+            )
+        elif self.config.token_env:
             self._token = self.env.get(self.config.token_env)
 
     @property
     def _headers(self) -> dict[str, str]:
         headers = {}
-        if self._token:
+        if self._token_source is not None:
+            token = self._token_source.token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        elif self._token:
             headers["Authorization"] = f"Bearer {self._token}"
         return headers
+
+    def _sanitize(self, msg: str) -> str:
+        """Remove token value from error messages."""
+        if self._token and self._token in msg:
+            msg = msg.replace(self._token, "***")
+        if self._token_source is not None and self._token_source._cached_token:
+            cached = self._token_source._cached_token
+            if cached and cached in msg:
+                msg = msg.replace(cached, "***")
+        return msg
+
+    def _get(self, url: str, params: dict | None = None) -> httpx.Response:
+        """Issue GET request to Lakekeeper, retrying once on 401 with token invalidation."""
+        headers = self._headers
+        resp = self.client.get(
+            url, params=params, headers=headers, timeout=self.timeout
+        )
+        if resp.status_code == 401 and self._token_source is not None:
+            self._token_source.invalidate()
+            headers = self._headers
+            resp = self.client.get(
+                url, params=params, headers=headers, timeout=self.timeout
+            )
+        if resp.status_code == 401:
+            raise DiscoveryError("Lakekeeper request unauthorized (401)")
+        resp.raise_for_status()
+        return resp
 
     def discover(self) -> list[IcebergTable]:
         """Discover Iceberg tables following steps 1-4 of the Iceberg REST spec."""
@@ -79,16 +125,15 @@ class LakekeeperSource:
 
         # 1. GET {url}/v1/config?warehouse=<warehouse>
         try:
-            resp = self.client.get(
+            resp = self._get(
                 f"{base_url}/v1/config",
                 params={"warehouse": self.config.warehouse},
-                headers=self._headers,
-                timeout=self.timeout,
             )
-            resp.raise_for_status()
             cfg_data = resp.json()
+        except DiscoveryError:
+            raise
         except Exception as exc:
-            msg = _sanitize(str(exc), self._token)
+            msg = self._sanitize(str(exc))
             raise DiscoveryError(f"Failed to fetch Lakekeeper config: {msg}") from exc
 
         overrides = cfg_data.get("overrides") or {}
@@ -106,16 +151,15 @@ class LakekeeperSource:
             if page_token:
                 params["pageToken"] = page_token
             try:
-                resp = self.client.get(
+                resp = self._get(
                     f"{v1_base}/namespaces",
                     params=params,
-                    headers=self._headers,
-                    timeout=self.timeout,
                 )
-                resp.raise_for_status()
                 ns_data = resp.json()
+            except DiscoveryError:
+                raise
             except Exception as exc:
-                msg = _sanitize(str(exc), self._token)
+                msg = self._sanitize(str(exc))
                 raise DiscoveryError(f"Failed to list namespaces: {msg}") from exc
 
             raw_namespaces.extend(ns_data.get("namespaces") or [])
@@ -159,16 +203,15 @@ class LakekeeperSource:
                 if page_token:
                     params["pageToken"] = page_token
                 try:
-                    resp = self.client.get(
+                    resp = self._get(
                         f"{v1_base}/namespaces/{ns_name}/tables",
                         params=params,
-                        headers=self._headers,
-                        timeout=self.timeout,
                     )
-                    resp.raise_for_status()
                     tbl_data = resp.json()
+                except DiscoveryError:
+                    raise
                 except Exception as exc:
-                    msg = _sanitize(str(exc), self._token)
+                    msg = self._sanitize(str(exc))
                     raise DiscoveryError(
                         f"Failed to list tables in namespace '{ns_name}': {msg}"
                     ) from exc
@@ -190,12 +233,9 @@ class LakekeeperSource:
         discovered_tables: list[IcebergTable] = []
         for ns_name, tbl_name in tables_to_fetch:
             try:
-                resp = self.client.get(
+                resp = self._get(
                     f"{v1_base}/namespaces/{ns_name}/tables/{tbl_name}",
-                    headers=self._headers,
-                    timeout=self.timeout,
                 )
-                resp.raise_for_status()
                 data = resp.json()
                 metadata = data.get("metadata") or data
 
@@ -266,8 +306,16 @@ class LakekeeperSource:
                         snapshot_ms=snapshot_ms,
                     )
                 )
+            except DiscoveryError as exc:
+                if "401" in str(exc):
+                    raise
+                msg = self._sanitize(str(exc))
+                self.warnings.append(
+                    f"Failed to read metadata for table '{ns_name}.{tbl_name}': {msg}"
+                )
+                continue
             except Exception as exc:
-                msg = _sanitize(str(exc), self._token)
+                msg = self._sanitize(str(exc))
                 self.warnings.append(
                     f"Failed to read metadata for table '{ns_name}.{tbl_name}': {msg}"
                 )

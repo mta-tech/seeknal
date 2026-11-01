@@ -28,6 +28,14 @@ Discovers Iceberg tables using the standard Iceberg REST API over HTTP GET:
 
 Tables whose metadata fails to load or parse are skipped with a warning so discovery continues uninterrupted. Failures in namespace listing or catalog config raise `DiscoveryError`.
 
+#### Lakekeeper Authentication (OAuth2 Client Credentials & Static Token)
+- **OAuth2 Client Credentials (`lakekeeper.oauth`)**: When Lakekeeper runs behind Keycloak or another OAuth2 identity provider where bearer tokens expire in minutes, configure `oauth` with `token_url`, `client_id`, `client_secret_env` (e.g., `LAKEKEEPER_CLIENT_SECRET`) or `client_secret_file`, and optional `scope` / `audience`.
+  - A dedicated read-only Keycloak client is recommended (for example `seeknal-serving-discovery`).
+  - Tokens are fetched via POST `application/x-www-form-urlencoded` to `token_url` with `grant_type=client_credentials`. This POST request to `token_url` is the **only** non-GET request discovery may make; all Lakekeeper catalog calls remain strictly HTTP GET.
+  - The token is cached until `expires_at − 30 s` (or for 60 s if `expires_in` is omitted in the response).
+  - **401 Retry**: If Lakekeeper responds with an HTTP 401 Unauthorized, `LakekeeperSource` invalidates the cached token and immediately retries the request once with a fresh token. If the second attempt also returns 401, a `DiscoveryError` is raised.
+- **Static Bearer Token (`lakekeeper.token_env`)**: For legacy deployments with long-lived tokens, `token_env` specifies the environment variable containing the static token. `token_env` and `oauth` are mutually exclusive.
+
 ### Lakebase (`LakebaseSyncSource`)
 Queries the Lakebase replication metadata table:
 ```sql
@@ -48,6 +56,15 @@ Authorization: <token>
 - Produces `CubeMeta(name, measures, dimensions)`.
 - Endpoint or JSON parsing failures raise `DiscoveryError`.
 
+#### Cube Authentication (Minted Token & Static Token)
+- **Minted Meta Token (`api_secret_env` | `api_secret_file`)**: Cube `/cubejs-api/v1/meta` can be authenticated by minting an HS256 JWT using Cube's `CUBEJS_API_SECRET` (configured via `api_secret_env`, e.g., `CUBEJS_API_SECRET`, or `api_secret_file`).
+  - `CubeSource` mints a compact HS256 JWT per `discover()` call using the Python standard library.
+  - JWT claims include `iat` (current timestamp) and `exp = iat + 300` (valid for 5 minutes).
+  - Optional `api_claims: {..}` can supply additional claims (such as `role`), but cannot override `iat` or `exp`.
+  - The token is sent in the `Authorization: <token>` header without leaking to logs or error messages.
+  - **Difference from Cube SQL `secret_env`**: Discovery `api_secret_env` authenticates against Cube's HTTP REST metadata endpoint (`/cubejs-api/v1/meta`). In contrast, `connections.cube.secret_env` (used in `cube_mode: jwt`) signs database authorization context tokens containing row filters and column masking for SQL execution over Cube's Postgres wire protocol.
+- **Static Token (`token_env`)**: Transmits a static token from the specified environment variable. Mutually exclusive with `api_secret_env`/`api_secret_file`.
+
 ---
 
 ## 3. Configuration Model (`config.py`)
@@ -62,13 +79,31 @@ timeout_seconds: 10.0
 lakekeeper:
   url: https://lakekeeper.example/catalog   # Iceberg REST base (without /v1)
   warehouse: atlas
-  token_env: LAKEKEEPER_TOKEN               # Optional environment variable name
+  # Option A: OAuth2 Client Credentials (recommended for Keycloak)
+  oauth:
+    token_url: https://keycloak.example/realms/atlas/protocol/openid-connect/token
+    client_id: seeknal-serving-discovery
+    client_secret_env: LAKEKEEPER_CLIENT_SECRET
+    # Alternatively: client_secret_file: /etc/seeknal/secrets/lk-oauth.secret
+    scope: catalog:read
+    audience: lakekeeper
+  # Option B: Static token (mutually exclusive with oauth)
+  # token_env: LAKEKEEPER_TOKEN
   namespaces: [claims, analytics]           # Optional allowlist
 
 engines:
   sr:   {kind: starrocks, dialect: starrocks, catalog: lakekeeper}
   lb:   {kind: lakebase,  dialect: postgres}
-  cube: {kind: cube,      dialect: postgres, url: http://cube:4000, token_env: CUBE_API_TOKEN}
+  cube:
+    kind: cube
+    dialect: postgres
+    url: http://cube:4000
+    # Option A: Minted HS256 JWT using CUBEJS_API_SECRET
+    api_secret_env: CUBEJS_API_SECRET
+    # Alternatively: api_secret_file: /etc/seeknal/secrets/cube-api.secret
+    api_claims: {role: seeknal-discovery}
+    # Option B: Static token (mutually exclusive with api_secret_env/file)
+    # token_env: CUBE_API_TOKEN
   duck: {kind: duckdb,    dialect: duckdb}
 
 lakebase:
@@ -83,7 +118,7 @@ lakebase:
 - `timeout_seconds`: HTTP request timeout in seconds (default: 10.0). Must be positive.
 - Engines: Only one `starrocks` engine and at most one `cube` engine are allowed. `duckdb` engines are copied as-is into placement.
 - `lakebase.engine` must reference a defined engine with kind `lakebase`.
-- Tokens come strictly from environment variables named by `token_env`. Token values are never stored in the config model.
+- Tokens come strictly from environment variables named by `token_env` / `*_env` or safe secret files named by `*_file`. Secret files must not be group- or world-readable (`0600` or stricter required).
 - Validation failures raise `DiscoveryConfigError` without leaking credentials.
 
 ---
@@ -121,7 +156,7 @@ Adding `refresh_interval_seconds` is deliberate. Catalog discovery executes peri
 ### Refresher Lifecycle (`PlacementRefresher`)
 `PlacementRefresher(discover_fn, pipeline, interval_seconds=..., clock=time.monotonic)` manages periodic refresh:
 - `refresh_once() -> bool`: Executes `discover_fn()` and swaps the pipeline catalog via `update_catalog()`.
-- **Fault Tolerance**: If an error occurs during discovery, the refresher keeps the last good catalog in service, increments `consecutive_failures`, records `last_error` (`<ErrorClass>: <message>`), and logs a warning.
+- **Fault Tolerance & Redaction**: If an error occurs during discovery, the refresher keeps the last good catalog in service, increments `consecutive_failures`, records `last_error` (`<ExceptionClassName>` only), and logs a warning formatted as `Catalog refresh failed: <ExceptionClassName>` with no error message and no traceback.
 - `start()`: Spawns a background daemon thread that calls `refresh_once()` every interval.
 - `stop()`: Signals thread shutdown and joins cleanly within $2 \times \text{interval\_seconds}$.
 
