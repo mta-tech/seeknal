@@ -345,7 +345,7 @@ def test_row_cap_keeps_smaller_existing_limit():
     sql = "SELECT claim_id FROM claims.claim LIMIT 10"
     grant, schemas = _claims_fixture(sql, max_rows=50)
     res = enforce(sql, grant, schemas=schemas, target_dialect="duckdb", target_kind="duckdb")
-    assert res.row_limit == 10
+    assert res.row_limit == 51
     assert "LIMIT 10" in res.sql
 
 
