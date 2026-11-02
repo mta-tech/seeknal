@@ -14,7 +14,7 @@ from seeknal.serving.discovery.config import (
     DiscoveryConfig,
     EngineConfig,
 )
-from seeknal.serving.discovery.cube import CubeMeta, CubeSource
+from seeknal.serving.discovery.cube import CubeMeta, CubeSource, _sanitize
 from seeknal.serving.discovery.lakebase import LakebaseSyncSource, SyncState
 from seeknal.serving.discovery.lakekeeper import IcebergTable, LakekeeperSource
 from seeknal.serving.placement import Placement
@@ -86,13 +86,32 @@ def discover(
             break
 
     if cube_engine_name is not None:
-        cube_source = CubeSource(
-            cfg.engines[cube_engine_name],
-            http_client,
-            env=env,
-            timeout=cfg.timeout_seconds,
-        )
-        cube_metas = cube_source.discover()
+        try:
+            cube_source = CubeSource(
+                cfg.engines[cube_engine_name],
+                http_client,
+                env=env,
+                timeout=cfg.timeout_seconds,
+            )
+            cube_metas = cube_source.discover()
+            warnings.extend(cube_source.warnings)
+        except Exception as exc:
+            cube_metas = []
+            eng = cfg.engines[cube_engine_name]
+            tok = env.get(eng.token_env) if eng.token_env else None
+            sec = None
+            if eng.api_secret_env:
+                sec = env.get(eng.api_secret_env)
+            elif eng.api_secret_file and os.path.exists(eng.api_secret_file):
+                try:
+                    with open(eng.api_secret_file, "r", encoding="utf-8") as f:
+                        sec = f.read().strip()
+                except Exception:
+                    pass
+            clean_err = _sanitize(str(exc), tok, sec)
+            warnings.append(
+                f"Cube metadata was unavailable ({clean_err}); cubes were omitted from placement and schemas"
+            )
 
     # 6. Locate StarRocks engine
     starrocks_engine: EngineConfig | None = None

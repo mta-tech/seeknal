@@ -176,6 +176,11 @@ def normalize_column_type(kind: str, description_entry: Any) -> str:
         display_size = description_entry[2] if len(description_entry) > 2 else None
         precision = description_entry[4] if len(description_entry) > 4 else None
         scale = description_entry[5] if len(description_entry) > 5 else None
+    elif hasattr(description_entry, "type_code"):
+        type_code = getattr(description_entry, "type_code", None)
+        display_size = getattr(description_entry, "display_size", None)
+        precision = getattr(description_entry, "precision", None)
+        scale = getattr(description_entry, "scale", None)
     else:
         type_code = description_entry
         display_size = None

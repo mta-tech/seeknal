@@ -54,10 +54,11 @@ Authorization: <token>
 - The engine `url` is configured as the bare base (e.g. `http://cube:4000`), because `/cubejs-api/v1/meta` is appended automatically.
 - All cubes and views are parsed.
 - Member names have the leading cube name prefix stripped (e.g., `orders.revenue` becomes `revenue`).
-- **Twins and Mask Variants:** Dimensions are inspected for twin masking dimensions `<base>__<method>` where `<method>` is one of `redact`, `null`, `year`, `last4` and `<base>` is another dimension of the same cube. Dimensions are split into ordinary dimensions (no twins) and `mask_variants` mapping `{base: [method, ...]}`.
+- **Twins and Mask Variants:** Dimensions are inspected for twin masking dimensions `<base>__<method>` where `<method>` is one of `redact`, `null`, `year`, `last4` and `<base>` is another (non-twin) dimension of the same cube. Valid twins are recorded in `mask_variants` and excluded from `dimensions` and `schemas`.
+- **Reserved Suffixes & Member Omission:** Suffixes `__redact`, `__null`, `__last4`, `__year`, and `__hash` are reserved for masking. Any member (dimension or measure) whose name ends in a reserved suffix and is not a valid twin dimension is omitted everywhere: from `dimensions`, `measures`, `schemas`, and `mask_variants`. A warning names each omitted member as `<cube>.<member>` (e.g. `x__hash`, `product__hash`, `orphan__last4`, or a measure `total__null`). Names with `__` but a non-reserved suffix (e.g. `nik__weird`) stay ordinary members.
 - **Placement and Schemas:** `placement["cubes"][name]` receives `measures`, ordinary `dimensions`, and `mask_variants`. `schemas[name]` is populated with ordinary dimensions + measures (no twins) so cube queries resolve without table-not-found errors.
+- **Cube Failure Isolation:** While `CubeSource.discover()` raises `DiscoveryError` upon HTTP or parsing failures, `discover()` isolates Cube failures so that discovery continues: `placement["cubes"]` is empty, no cube appears in `schemas`, and a warning is appended to `DiscoveryResult.warnings` mentioning that Cube metadata was unavailable and that cubes were omitted. The warehouse catalog (Iceberg/Lakekeeper tables and Lakebase synced tables) still loads successfully.
 - Produces `CubeMeta(name, measures, dimensions, mask_variants)`.
-- Endpoint or JSON parsing failures raise `DiscoveryError`.
 
 #### Cube Authentication (Minted Token & Static Token)
 - **Minted Meta Token (`api_secret_env` | `api_secret_file`)**: Cube `/cubejs-api/v1/meta` can be authenticated by minting an HS256 JWT using Cube's `CUBEJS_API_SECRET` (configured via `api_secret_env`, e.g., `CUBEJS_API_SECRET`, or `api_secret_file`).
