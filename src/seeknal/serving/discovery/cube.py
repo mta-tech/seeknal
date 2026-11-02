@@ -22,6 +22,7 @@ from seeknal.serving.discovery.config import (
 
 
 VALID_TWIN_METHODS = frozenset({"redact", "null", "year", "last4"})
+RESERVED_SUFFIXES = frozenset({"__redact", "__null", "__last4", "__year", "__hash"})
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,7 @@ class CubeSource:
         self.env = env
         self.timeout = timeout
         self.clock = clock
+        self.warnings: list[str] = []
 
         self._token: str | None = None
         if self.engine_config.token_env:
@@ -123,6 +125,7 @@ class CubeSource:
 
     def discover(self) -> list[CubeMeta]:
         """Fetch /cubejs-api/v1/meta and return list of CubeMeta."""
+        self.warnings = []
         if not self.engine_config.url:
             raise DiscoveryError(
                 f"Cube engine '{self.engine_config.name}' has no URL configured"
@@ -178,6 +181,11 @@ class CubeSource:
                 m_name = str(m_name).strip()
                 if m_name.startswith(prefix):
                     m_name = m_name[len(prefix) :]
+                if any(m_name.endswith(sfx) for sfx in RESERVED_SUFFIXES):
+                    self.warnings.append(
+                        f"Cube member '{cube_name}.{m_name}' has reserved suffix and was omitted"
+                    )
+                    continue
                 measures.append(m_name)
 
             raw_dims: list[str] = []
@@ -190,20 +198,34 @@ class CubeSource:
                     d_name = d_name[len(prefix) :]
                 raw_dims.append(d_name)
 
-            raw_dims_set = set(raw_dims)
+            non_twin_dim_set = {
+                d for d in raw_dims if not any(d.endswith(sfx) for sfx in RESERVED_SUFFIXES)
+            }
             twin_map: dict[str, list[str]] = {}
             twin_dims: set[str] = set()
-            for d in raw_dims:
-                if "__" in d:
-                    base, method = d.rsplit("__", 1)
-                    if method in VALID_TWIN_METHODS and base in raw_dims_set and base != d:
-                        twin_dims.add(d)
-                        if base not in twin_map:
-                            twin_map[base] = []
-                        if method not in twin_map[base]:
-                            twin_map[base].append(method)
+            omitted_dims: set[str] = set()
 
-            ordinary_dims = [d for d in raw_dims if d not in twin_dims]
+            for d in raw_dims:
+                if any(d.endswith(sfx) for sfx in RESERVED_SUFFIXES):
+                    is_valid_twin = False
+                    if "__" in d:
+                        base, method = d.rsplit("__", 1)
+                        if method in VALID_TWIN_METHODS and base in non_twin_dim_set and base != d:
+                            is_valid_twin = True
+                            twin_dims.add(d)
+                            if base not in twin_map:
+                                twin_map[base] = []
+                            if method not in twin_map[base]:
+                                twin_map[base].append(method)
+                    if not is_valid_twin:
+                        omitted_dims.add(d)
+                        self.warnings.append(
+                            f"Cube member '{cube_name}.{d}' has reserved suffix and was omitted"
+                        )
+
+            ordinary_dims = [
+                d for d in raw_dims if d not in twin_dims and d not in omitted_dims
+            ]
             mask_variants = {b: tuple(methods) for b, methods in twin_map.items()}
 
             result.append(

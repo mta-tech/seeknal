@@ -184,6 +184,7 @@ def test_cube_source_discovery_splits_twins_and_preserves_non_twins():
                     {"name": "products_cube.x__hash"},
                     {"name": "products_cube.created_date"},
                     {"name": "products_cube.created_date__year"},
+                    {"name": "products_cube.nik__weird"},
                 ],
             }
         ]
@@ -208,13 +209,15 @@ def test_cube_source_discovery_splits_twins_and_preserves_non_twins():
     cm = cubes[0]
     assert cm.name == "products_cube"
     assert cm.measures == ("total_sales",)
-    # Ordinary dimensions only (no twins). orphan__redact and x__hash are ordinary because
-    # orphan has no base dimension and hash is not a twin method.
-    assert cm.dimensions == ("product", "orphan__redact", "x__hash", "created_date")
+    # Ordinary dimensions only (no twins, and members ending in reserved suffixes omitted).
+    # orphan__redact and x__hash are omitted with warnings. nik__weird has non-reserved suffix and is kept.
+    assert cm.dimensions == ("product", "created_date", "nik__weird")
     assert cm.mask_variants == {
         "product": ("redact", "null"),
         "created_date": ("year",),
     }
+    assert any("products_cube.orphan__redact" in w for w in source.warnings)
+    assert any("products_cube.x__hash" in w for w in source.warnings)
 
 
 def test_discovery_build_populates_cubes_and_schemas_without_twins():
