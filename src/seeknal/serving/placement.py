@@ -5,10 +5,12 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 import yaml
 
 VALID_ENGINE_KINDS = frozenset({"starrocks", "cube", "lakebase", "duckdb"})
+VALID_TWIN_METHODS = frozenset({"redact", "null", "year", "last4"})
 
 
 class PlacementError(ValueError):
@@ -51,6 +53,32 @@ class CubeEntry:
     engine: str
     measures: tuple[str, ...]
     dimensions: tuple[str, ...]
+    mask_variants: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.measures, tuple):
+            object.__setattr__(self, "measures", tuple(self.measures))
+        if not isinstance(self.dimensions, tuple):
+            object.__setattr__(self, "dimensions", tuple(self.dimensions))
+        mv: dict[str, tuple[str, ...]] = {}
+        if self.mask_variants:
+            if not isinstance(self.mask_variants, Mapping):
+                raise PlacementError(f"Cube '{self.name}' mask_variants must be a mapping")
+            dim_set = set(self.dimensions)
+            for base, methods in self.mask_variants.items():
+                base_str = str(base)
+                if base_str not in dim_set:
+                    raise PlacementError(
+                        f"Cube '{self.name}' mask_variants base '{base_str}' is not a dimension of that cube"
+                    )
+                methods_tuple = tuple(str(m) for m in methods)
+                for m in methods_tuple:
+                    if m not in VALID_TWIN_METHODS:
+                        raise PlacementError(
+                            f"Cube '{self.name}' mask_variants has invalid method '{m}' for base '{base_str}'"
+                        )
+                mv[base_str] = methods_tuple
+        object.__setattr__(self, "mask_variants", MappingProxyType(mv))
 
 
 @dataclass(frozen=True)
@@ -136,6 +164,19 @@ class Placement:
                 raise PlacementError(
                     f"Cube '{cube.name}' engine '{cube.engine}' is not of kind 'cube'"
                 )
+
+            # Validate mask_variants on cube
+            dim_set = set(cube.dimensions)
+            for base, methods in cube.mask_variants.items():
+                if base not in dim_set:
+                    raise PlacementError(
+                        f"Cube '{cube.name}' mask_variants base '{base}' is not a dimension of that cube"
+                    )
+                for m in methods:
+                    if m not in VALID_TWIN_METHODS:
+                        raise PlacementError(
+                            f"Cube '{cube.name}' mask_variants has invalid method '{m}' for base '{base}'"
+                        )
 
         # Build fast case-insensitive lookup indices
         object.__setattr__(
@@ -228,11 +269,22 @@ class Placement:
             cube_eng = str(cube_spec.get("engine", ""))
             measures = tuple(str(m) for m in (cube_spec.get("measures") or []))
             dimensions = tuple(str(d) for d in (cube_spec.get("dimensions") or []))
+            mv_raw = cube_spec.get("mask_variants")
+            if mv_raw is not None:
+                if not isinstance(mv_raw, Mapping):
+                    raise PlacementError(f"Cube '{cube_name}' mask_variants must be a mapping")
+                mask_variants = {
+                    str(k): tuple(str(m) for m in v)
+                    for k, v in mv_raw.items()
+                }
+            else:
+                mask_variants = {}
             cubes[str(cube_name)] = CubeEntry(
                 name=str(cube_name),
                 engine=cube_eng,
                 measures=measures,
                 dimensions=dimensions,
+                mask_variants=mask_variants,
             )
 
         # 4. Policy

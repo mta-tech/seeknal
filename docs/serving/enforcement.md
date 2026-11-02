@@ -221,26 +221,32 @@ When `target_kind == "cube"`:
 2. Table secure-view rewrites are skipped.
 3. Enforcement mode controls policy handling:
    - **`cube_mode == "refuse"` (Default):** Fails closed if any referenced cube has masks or row filters, raising `EnforcementError("cube target has masks or row filters; cube enforcement is not enabled")`. Only queries with clear granted columns and no row filters proceed.
-   - **`cube_mode == "jwt"`:** Masks and row filters are permitted and delivered via `CubeAdapter` in a signed HS256 JWT. Masked members are strictly prohibited in `WHERE`, `HAVING`, `JOIN ... ON`, `GROUP BY`, `ORDER BY`, functions, or expressions, and may only appear as bare top-level projections (optionally aliased).
+   - **`cube_mode == "jwt"`:** Masks and row filters are permitted and delivered via `CubeAdapter` in a signed HS256 JWT:
+     - **Twin Masking Rewrite:** Masked members appearing as bare top-level projections (or expanded `*`) are rewritten to their twin dimension `<member>__<method> AS <member>` (preserving qualifiers and aliases). Supported twin methods: `redact`, `null`, `year`, `last4`.
+     - **Hash Unsupported:** `hash` is not supported on cube targets (HMAC keys cannot live in Cube model SQL) and raises `EnforcementError`.
+     - **Measures:** Measures cannot be masked; any attempt raises `EnforcementError`.
+     - **Missing Twins:** If a masked member does not have a matching twin in the cube's `mask_variants`, enforcement fails closed with `EnforcementError` naming the member and method.
+     - **GROUP BY:** Allowed for a masked member **only** when referring to a member projected bare in the same SELECT: named/qualified member names (`m` / `t.m`) are rewritten to twins (`m__k` / `t.m__k`), while aliases and ordinals are left as they are. Any other GROUP BY use (such as `upper(m)` or unprojected masked members) is refused with `EnforcementError`.
+     - **Probe Refusal:** Masked members are strictly prohibited in `WHERE`, `HAVING`, `JOIN ... ON`, `ORDER BY` (named, aliased, or ordinal), and any functions or expressions. Node identity (`is`) is enforced to eliminate structural equality bypasses.
+     - **No Raw Masked Member:** After rewriting, the engine SQL contains no raw `exp.Column` references to masked members.
 4. `EnforcedQuery.cube_security_context` is populated:
 ```python
 {
     "subject": "user:7f3c",
     "masks": {
-        "claims.claim": {
-            "patient_nik": "hash",
-            "patient_name": "redact",
+        "claims_cube": {
+            "patient_nik": "redact",
             "birth_date": "year"
         }
     },
     "row_filters": {
-        "claims.claim": [
+        "claims_cube": [
             {"column": "province", "op": "in", "values": ["JB"]}
         ]
     }
 }
 ```
-Cube's native access policies consume this context from a signed token to enforce masking and row filters during cube query generation. See `docs/serving/cube.md` for full reference configuration.
+Cube's native access policies consume this context from a signed token to enforce row filters and reject any raw masked members. See `docs/serving/cube.md` for full reference configuration.
 
 ---
 

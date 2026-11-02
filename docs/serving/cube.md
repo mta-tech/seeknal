@@ -90,81 +90,121 @@ const jwt = require('jsonwebtoken');
 const CUBE_SQL_SECRET = process.env.CUBE_SQL_SECRET;
 const CUBE_ISSUER = 'seeknal-serving';
 const CUBE_AUDIENCE = 'cube-sql';
+const SERVING_SQL_USER = 'seeknal';
 
 module.exports = {
-  // 1. Authenticate connection and extract securityContext
+  // 1. Authenticate connection with two branches split by SQL username
   checkSqlAuth: (req, user, password) => {
-    if (!password) {
-      throw new Error('Authentication required');
-    }
-
-    try {
-      const decoded = jwt.verify(password, CUBE_SQL_SECRET, {
-        algorithms: ['HS256'],
-        issuer: CUBE_ISSUER,
-        audience: CUBE_AUDIENCE,
-      });
-
-      return {
-        password,
-        securityContext: decoded,
-      };
-    } catch (err) {
-      throw new Error(`Invalid or expired token: ${err.message}`);
-    }
-  },
-
-  // 2. Rewrite query to inject mandatory row filters
-  queryRewrite: (query, { securityContext }) => {
-    if (!securityContext || !securityContext.row_filters) {
-      return query;
-    }
-
-    const filters = query.filters || [];
-
-    for (const [cubeName, cubeFilters] of Object.entries(securityContext.row_filters)) {
-      for (const rf of cubeFilters) {
-        let operator;
-        let values = rf.values;
-
-        if (rf.op === 'eq') {
-          operator = 'equals';
-        } else if (rf.op === 'in') {
-          operator = 'equals';
-        } else if (rf.op === 'gte') {
-          operator = 'gte';
-        } else if (rf.op === 'lte') {
-          operator = 'lte';
-        } else {
-          throw new Error(`Unsupported filter operator: ${rf.op}`);
-        }
-
-        filters.push({
-          member: `${cubeName}.${rf.column}`,
-          operator: operator,
-          values: values,
+    if (user === SERVING_SQL_USER) {
+      if (!password) {
+        throw new Error('Authentication token required for Serving user');
+      }
+      try {
+        const decoded = jwt.verify(password, CUBE_SQL_SECRET, {
+          algorithms: ['HS256'],
+          issuer: CUBE_ISSUER,
+          audience: CUBE_AUDIENCE,
         });
+        return {
+          password,
+          securityContext: decoded,
+        };
+      } catch (err) {
+        throw new Error(`Invalid or expired token: ${err.message}`);
       }
     }
 
-    query.filters = filters;
-    return query;
+    // Direct-user password branch (for development/testing only; must be removed before production jwt)
+    if (process.env.NODE_ENV !== 'production' && password === process.env.CUBE_DEV_PASSWORD) {
+      return { password, securityContext: {} };
+    }
+    throw new Error('Invalid credentials');
   },
 
-  // 3. Member-level masking via access control or context variables
-  // Cube data models inspect securityContext.masks to return masked dimensions:
-  // e.g., in cube definition:
-  // patient_nik: {
-  //   sql: (CUBE, { securityContext }) => {
-  //     const mask = securityContext?.masks?.[CUBE._name]?.patient_nik;
-  //     if (mask === 'hash') return `SHA256(${CUBE}.patient_nik)`;
-  //     if (mask === 'redact') return `'****'`;
-  //     return `${CUBE}.patient_nik`;
-  //   },
-  //   type: 'string',
-  // }
+  // 2. Query rewrite: apply row filters and reject raw masked members
+  queryRewrite: (query, { securityContext }) => {
+    if (!securityContext) {
+      return query;
+    }
+
+    // Reject any query referencing a raw masked member
+    if (securityContext.masks) {
+      for (const [cubeName, cubeMasks] of Object.entries(securityContext.masks)) {
+        for (const rawCol of Object.keys(cubeMasks)) {
+          const rawMember = `${cubeName}.${rawCol}`;
+          const isReferenced = (
+            (query.dimensions || []).includes(rawMember) ||
+            (query.measures || []).includes(rawMember) ||
+            (query.filters || []).some(f => f.member === rawMember) ||
+            (query.order || []).some(o => (Array.isArray(o) ? o[0] : o) === rawMember)
+          );
+          if (isReferenced) {
+            throw new Error(`Access to raw masked member '${rawMember}' is forbidden`);
+          }
+        }
+      }
+    }
+
+    // Inject mandatory row filters
+    if (securityContext.row_filters) {
+      const filters = query.filters || [];
+      for (const [cubeName, cubeFilters] of Object.entries(securityContext.row_filters)) {
+        for (const rf of cubeFilters) {
+          let operator;
+          if (rf.op === 'eq') {
+            operator = 'equals';
+          } else if (rf.op === 'in') {
+            operator = 'equals';
+          } else if (rf.op === 'gte') {
+            operator = 'gte';
+          } else if (rf.op === 'lte') {
+            operator = 'lte';
+          } else {
+            throw new Error(`Unsupported filter operator: ${rf.op}`);
+          }
+          filters.push({
+            member: `${cubeName}.${rf.column}`,
+            operator: operator,
+            values: rf.values,
+          });
+        }
+      }
+      query.filters = filters;
+    }
+
+    return query;
+  },
 };
 ```
+
+### Twin Dimension Convention
+Cube cannot mask per request inside `queryRewrite`: substituting a member there is mapped back by the original member key, so values come out NULL.
+What works on a real Cube: the model defines *twin* dimensions `<member>__<method>` (supported methods: `redact`, `null`, `year`, `last4`), and the SQL sent to Cube projects `member__method AS member`. The result column keeps the name `member` and the masked value.
+
+Example cube model definition:
+```javascript
+cube(`claims_cube`, {
+  dimensions: {
+    patient_nik: {
+      sql: `patient_nik`,
+      type: `string`,
+    },
+    patient_nik__redact: {
+      sql: `'****'`,
+      type: `string`,
+    },
+    patient_nik__null: {
+      sql: `NULL`,
+      type: `string`,
+    },
+  },
+});
+```
+
+**Hash is Unsupported on Cube:** Keyed HMAC cannot live in Cube model SQL. The `hash` mask method is not supported on cube targets and is rejected with `EnforcementError`.
+
+### Backend Engine Execution Bounds
+Note that cancelling a Cube SQL connection may not stop the backend engine query. Cube targets need an engine-side bound (such as a StarRocks resource group or `query_timeout`).
 
 ---
 
@@ -172,11 +212,12 @@ module.exports = {
 
 `jwt` mode must **not** be enabled in production until every item on this checklist passes against a real Cube deployment:
 
-1. [ ] **Masking:** A masked member requested in a bare top-level projection comes back masked according to the granted mask rule.
+1. [ ] **Twin Masking:** A masked member requested in a bare top-level projection is rewritten by Serving to `member__method AS member` and returned with masked values.
 2. [ ] **Row filtering:** Row filters always apply, including with `MEASURE()` aggregations, views, and pre-aggregations.
-3. [ ] **Probe refusal:** Any attempt to filter, join, group, order, or wrap a masked member in an expression is refused by Seeknal Serving with `EnforcementError`.
+3. [ ] **Probe refusal & security:** Any attempt to filter, join, order, or wrap a masked member in an expression is refused by Seeknal Serving with `EnforcementError`. A masked member in `GROUP BY` is permitted only when referring to a bare-projected masked member (bare/qualified member name rewritten to twin, alias or ordinal left as is).
 4. [ ] **Token integrity:** An expired token, forged signature, wrong issuer, or wrong audience is rejected by Cube's `checkSqlAuth`.
 5. [ ] **Watchdog deadline:** Queries exceeding the configured timeout are cancelled via `conn.cancel` and raise `EngineTimeout`.
 6. [ ] **Client cancel:** Client cancellation invokes `conn.cancel` via the cancel handle and raises `EngineCancelled`.
+7. [ ] **Backend execution bound:** StarRocks resource group or `query_timeout` is configured because Cube SQL cancellation may not kill the underlying backend engine query.
 
 Do not enable `cube_mode="jwt"` until every item above passes in staging validation.

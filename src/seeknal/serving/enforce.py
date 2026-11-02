@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -621,6 +621,26 @@ def _expand_stars(
         s.set("expressions", new_expressions)
 
 
+def _is_member_projected_bare(col: exp.Column, statement: exp.Expression) -> bool:
+    """Check if col references a member that is projected bare in statement.expressions."""
+    if not isinstance(statement, exp.Select):
+        return False
+    target_name = col.name.lower()
+    target_table = col.table.lower() if col.table else None
+    for e in statement.expressions:
+        if isinstance(e, exp.Column):
+            if e.name.lower() == target_name:
+                e_tbl = e.table.lower() if e.table else None
+                if target_table is None or e_tbl is None or target_table == e_tbl:
+                    return True
+        elif isinstance(e, exp.Alias) and isinstance(e.this, exp.Column):
+            if e.this.name.lower() == target_name:
+                e_tbl = e.this.table.lower() if e.this.table else None
+                if target_table is None or e_tbl is None or target_table == e_tbl:
+                    return True
+    return False
+
+
 def enforce(
     sql: str,
     grant: Grant,
@@ -633,6 +653,8 @@ def enforce(
     now: float | None = None,
     max_rows: int | None = None,
     cube_mode: str = "refuse",
+    cube_mask_variants: Mapping[str, Mapping[str, Collection[str]]] | None = None,
+    cube_measures: Mapping[str, Collection[str]] | None = None,
 ) -> EnforcedQuery:
     """Enforce a data catalog grant on a SQL query."""
     if cube_mode not in ("refuse", "jwt"):
@@ -849,6 +871,42 @@ def enforce(
     # First expand '*' and 't.*'
     _expand_stars(statement, grant_tables_ci, schemas_ci, cte_names)
 
+    # For Cube target in jwt mode, validate mask methods, measures, and twin existence for referenced members
+    if target_kind_lower == "cube" and cube_mode == "jwt":
+        referenced_col_names = {c.name.lower() for c in statement.find_all(exp.Column)}
+        for tbl_key in referenced_table_keys:
+            canonical_name, tg = grant_tables_ci[tbl_key]
+            cube_meas: set[str] = set()
+            if cube_measures is not None:
+                for k, v in cube_measures.items():
+                    if k.lower() in (tbl_key, canonical_name.lower()):
+                        cube_meas.update(str(x).lower() for x in v)
+            cube_vars: dict[str, set[str]] = {}
+            if cube_mask_variants is not None:
+                for k, v in cube_mask_variants.items():
+                    if k.lower() in (tbl_key, canonical_name.lower()):
+                        for base_k, methods in v.items():
+                            cube_vars[str(base_k).lower()] = {str(m).lower() for m in methods}
+
+            for m, k in tg.masks.items():
+                m_lower = m.lower()
+                k_lower = k.lower()
+                if m_lower in referenced_col_names:
+                    if k_lower == "hash":
+                        raise EnforcementError(
+                            f"hash mask method is not supported on cube target '{canonical_name}'"
+                        )
+                    if m_lower in cube_meas:
+                        raise EnforcementError(
+                            f"measure '{m}' cannot be masked on cube target '{canonical_name}'"
+                        )
+                    twin_name = f"{m}__{k}"
+                    allowed_methods = cube_vars.get(m_lower, set())
+                    if k_lower not in allowed_methods:
+                        raise EnforcementError(
+                            f"twin member '{twin_name}' for member '{m}' with method '{k}' not found in mask variants for cube '{canonical_name}'"
+                        )
+
     # Pre-scan for Cube jwt mode: collect aliases of masked columns and check ordinals
     masked_alias_names: set[str] = set()
     if target_kind_lower == "cube" and cube_mode == "jwt" and isinstance(statement, exp.Select):
@@ -899,23 +957,6 @@ def enforce(
                                 if c_n in {m.lower() for m in t_grant.masks}:
                                     raise EnforcementError(
                                         f"masked member '{inner.name}' in ORDER BY is not permitted"
-                                    )
-
-        group_clause = statement.args.get("group")
-        if group_clause:
-            for grp in group_clause.expressions:
-                if isinstance(grp, exp.Literal) and grp.is_int:
-                    idx = int(grp.this)
-                    if 1 <= idx <= len(statement.expressions):
-                        expr = statement.expressions[idx - 1]
-                        inner = expr.this if isinstance(expr, exp.Alias) else expr
-                        if isinstance(inner, exp.Column):
-                            c_n = inner.name.lower()
-                            for t_key in referenced_table_keys:
-                                _, t_grant = grant_tables_ci[t_key]
-                                if c_n in {m.lower() for m in t_grant.masks}:
-                                    raise EnforcementError(
-                                        f"masked member '{inner.name}' in GROUP BY is not permitted"
                                     )
 
     # Collect statement-defined names (CTEs, subqueries, values, projection aliases)
@@ -987,15 +1028,21 @@ def enforce(
                         is_bare_top = (
                             isinstance(statement, exp.Select)
                             and (
-                                col in statement.expressions
+                                any(col is e for e in statement.expressions)
                                 or (
                                     isinstance(col.parent, exp.Alias)
                                     and col.parent.this is col
-                                    and col.parent in statement.expressions
+                                    and any(col.parent is e for e in statement.expressions)
                                 )
                             )
                         )
-                        if not is_bare_top:
+                        is_bare_group = (
+                            isinstance(statement, exp.Select)
+                            and statement.args.get("group") is not None
+                            and any(col is grp for grp in statement.args["group"].expressions)
+                            and _is_member_projected_bare(col, statement)
+                        )
+                        if not is_bare_top and not is_bare_group:
                             raise EnforcementError(
                                 f"masked member '{col.name}' may only appear as a bare top-level projection"
                             )
@@ -1032,15 +1079,21 @@ def enforce(
                             is_bare_top = (
                                 isinstance(statement, exp.Select)
                                 and (
-                                    col in statement.expressions
+                                    any(col is e for e in statement.expressions)
                                     or (
                                         isinstance(col.parent, exp.Alias)
                                         and col.parent.this is col
-                                        and col.parent in statement.expressions
+                                        and any(col.parent is e for e in statement.expressions)
                                     )
                                 )
                             )
-                            if not is_bare_top:
+                            is_bare_group = (
+                                isinstance(statement, exp.Select)
+                                and statement.args.get("group") is not None
+                                and any(col is grp for grp in statement.args["group"].expressions)
+                                and _is_member_projected_bare(col, statement)
+                            )
+                            if not is_bare_top and not is_bare_group:
                                 raise EnforcementError(
                                     f"masked member '{col.name}' may only appear as a bare top-level projection"
                                 )
@@ -1051,9 +1104,15 @@ def enforce(
                 # Not in any referenced schema in scope: check statement-defined names
                 if col_name in statement_defined_names:
                     if target_kind_lower == "cube" and cube_mode == "jwt" and col_name in masked_alias_names:
-                        raise EnforcementError(
-                            f"masked member alias '{col.name}' may only appear as a bare top-level projection"
+                        is_bare_group_alias = (
+                            isinstance(statement, exp.Select)
+                            and statement.args.get("group") is not None
+                            and any(col is grp for grp in statement.args["group"].expressions)
                         )
+                        if not is_bare_group_alias:
+                            raise EnforcementError(
+                                f"masked member alias '{col.name}' may only appear as a bare top-level projection"
+                            )
                     continue
                 raise EnforcementError(
                     f"column '{col.name}' does not resolve to any granted column"
@@ -1100,6 +1159,87 @@ def enforce(
             if col.db or col.catalog:
                 col.set("catalog", None)
                 col.set("db", None)
+    elif cube_mode == "jwt" and isinstance(statement, exp.Select):
+        # 1. Rewrite bare top-level projections to twins
+        new_select_exprs: list[exp.Expression] = []
+        for expr in statement.expressions:
+            if isinstance(expr, exp.Column):
+                col_n = expr.name.lower()
+                matched_mask = None
+                for t_key in referenced_table_keys:
+                    _, tg = grant_tables_ci[t_key]
+                    for m_name, method in tg.masks.items():
+                        if m_name.lower() == col_n:
+                            matched_mask = (m_name, method)
+                            break
+                    if matched_mask:
+                        break
+                if matched_mask:
+                    _, method = matched_mask
+                    twin_name = f"{expr.name}__{method}"
+                    twin_col = exp.column(twin_name, table=expr.table or None)
+                    new_select_exprs.append(exp.alias_(twin_col, expr.name))
+                else:
+                    new_select_exprs.append(expr)
+            elif isinstance(expr, exp.Alias) and isinstance(expr.this, exp.Column):
+                col_n = expr.this.name.lower()
+                matched_mask = None
+                for t_key in referenced_table_keys:
+                    _, tg = grant_tables_ci[t_key]
+                    for m_name, method in tg.masks.items():
+                        if m_name.lower() == col_n:
+                            matched_mask = (m_name, method)
+                            break
+                    if matched_mask:
+                        break
+                if matched_mask:
+                    _, method = matched_mask
+                    twin_name = f"{expr.this.name}__{method}"
+                    twin_col = exp.column(twin_name, table=expr.this.table or None)
+                    expr.set("this", twin_col)
+                    new_select_exprs.append(expr)
+                else:
+                    new_select_exprs.append(expr)
+            else:
+                new_select_exprs.append(expr)
+        statement.set("expressions", new_select_exprs)
+
+        # 2. Rewrite named/qualified members in GROUP BY to twins
+        group_clause = statement.args.get("group")
+        if group_clause:
+            new_grp_exprs: list[exp.Expression] = []
+            for grp in group_clause.expressions:
+                if isinstance(grp, exp.Column):
+                    col_n = grp.name.lower()
+                    matched_mask = None
+                    for t_key in referenced_table_keys:
+                        _, tg = grant_tables_ci[t_key]
+                        for m_name, method in tg.masks.items():
+                            if m_name.lower() == col_n:
+                                matched_mask = (m_name, method)
+                                break
+                        if matched_mask:
+                            break
+                    if matched_mask:
+                        _, method = matched_mask
+                        twin_name = f"{grp.name}__{method}"
+                        new_grp_exprs.append(exp.column(twin_name, table=grp.table or None))
+                    else:
+                        new_grp_exprs.append(grp)
+                else:
+                    new_grp_exprs.append(grp)
+            group_clause.set("expressions", new_grp_exprs)
+
+        # 3. Assert no raw masked exp.Column remains
+        all_masked_names: set[str] = set()
+        for t_key in referenced_table_keys:
+            _, tg = grant_tables_ci[t_key]
+            all_masked_names.update(m.lower() for m in tg.masks)
+        for col in statement.find_all(exp.Column):
+            if col.name.lower() in all_masked_names:
+                raise EnforcementError(
+                    f"raw masked member '{col.name}' remained in enforced SQL"
+                )
 
     # Step 6: Writes (AND-in row filters into WHERE clause for UPDATE/DELETE)
     if isinstance(statement, (exp.Update, exp.Delete)):

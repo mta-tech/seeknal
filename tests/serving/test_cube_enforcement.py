@@ -30,6 +30,9 @@ from seeknal.serving.placement import Placement
 from seeknal.serving.service import ServingPipeline
 
 
+CUBE_MASK_VARIANTS = {"claims_cube": {"patient_nik": ("redact",)}}
+
+
 def _cube_claims_fixture(
     sql: str,
     *,
@@ -42,7 +45,7 @@ def _cube_claims_fixture(
     if columns is None:
         columns = ["claim_id", "province", "idrg_code", "amount", "total_amount"]
     if masks is None:
-        masks = {"patient_nik": "hash"}
+        masks = {"patient_nik": "redact"}
     if row_filters is None:
         row_filters = [{"column": "province", "op": "in", "values": ["JB"]}]
 
@@ -78,7 +81,7 @@ def _cube_claims_fixture(
 
 def test_cube_refuse_is_default_in_enforce_and_pipeline():
     sql = "SELECT province, total_amount FROM claims_cube"
-    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "hash"}, row_filters=[])
+    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "redact"}, row_filters=[])
 
     # enforce defaults to refuse mode
     with pytest.raises(EnforcementError, match="cube target has masks or row filters; cube enforcement is not enabled"):
@@ -106,7 +109,7 @@ def test_cube_refuse_is_default_in_enforce_and_pipeline():
 
 def test_cube_query_with_masks_refused_in_refuse_mode():
     sql = "SELECT province, total_amount FROM claims_cube"
-    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "hash"}, row_filters=[])
+    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "redact"}, row_filters=[])
 
     with pytest.raises(EnforcementError, match="cube target has masks or row filters; cube enforcement is not enabled"):
         enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="refuse")
@@ -139,15 +142,23 @@ def test_cube_jwt_mode_masks_and_filters_pass_and_context_populated():
     sql = "SELECT province, total_amount, patient_nik FROM claims_cube"
     grant, schemas = _cube_claims_fixture(
         sql,
-        masks={"patient_nik": "hash"},
+        masks={"patient_nik": "redact"},
         row_filters=[{"column": "province", "op": "in", "values": ["JB"]}],
     )
 
-    res = enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="jwt")
+    res = enforce(
+        sql,
+        grant,
+        schemas=schemas,
+        target_dialect="postgres",
+        target_kind="cube",
+        cube_mode="jwt",
+        cube_mask_variants=CUBE_MASK_VARIANTS,
+    )
     assert res.cube_security_context is not None
     assert res.cube_security_context["subject"] == "user:cube-analyst"
     assert "claims_cube" in res.cube_security_context["masks"]
-    assert res.cube_security_context["masks"]["claims_cube"]["patient_nik"] == "hash"
+    assert res.cube_security_context["masks"]["claims_cube"]["patient_nik"] == "redact"
     assert "claims_cube" in res.cube_security_context["row_filters"]
     assert len(res.cube_security_context["row_filters"]["claims_cube"]) == 1
     assert res.cube_security_context["row_filters"]["claims_cube"][0]["column"] == "province"
@@ -155,91 +166,179 @@ def test_cube_jwt_mode_masks_and_filters_pass_and_context_populated():
 
 def test_cube_jwt_mode_masked_member_in_where_refused():
     sql = "SELECT total_amount FROM claims_cube WHERE patient_nik = 'probe'"
-    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "hash"}, row_filters=[])
+    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "redact"}, row_filters=[])
 
     with pytest.raises(EnforcementError, match="masked member 'patient_nik'"):
-        enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="jwt")
+        enforce(
+            sql,
+            grant,
+            schemas=schemas,
+            target_dialect="postgres",
+            target_kind="cube",
+            cube_mode="jwt",
+            cube_mask_variants=CUBE_MASK_VARIANTS,
+        )
 
 
 def test_cube_jwt_mode_masked_member_in_having_refused():
     sql = "SELECT province, sum(amount) FROM claims_cube GROUP BY province HAVING patient_nik = 'probe'"
-    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "hash"}, row_filters=[])
+    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "redact"}, row_filters=[])
 
     with pytest.raises(EnforcementError, match="masked member 'patient_nik'"):
-        enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="jwt")
+        enforce(
+            sql,
+            grant,
+            schemas=schemas,
+            target_dialect="postgres",
+            target_kind="cube",
+            cube_mode="jwt",
+            cube_mask_variants=CUBE_MASK_VARIANTS,
+        )
 
 
 def test_cube_jwt_mode_masked_member_in_group_by_refused():
     sql = "SELECT province FROM claims_cube GROUP BY patient_nik"
-    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "hash"}, row_filters=[])
+    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "redact"}, row_filters=[])
 
     with pytest.raises(EnforcementError, match="masked member 'patient_nik'"):
-        enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="jwt")
+        enforce(
+            sql,
+            grant,
+            schemas=schemas,
+            target_dialect="postgres",
+            target_kind="cube",
+            cube_mode="jwt",
+            cube_mask_variants=CUBE_MASK_VARIANTS,
+        )
 
 
 def test_cube_jwt_mode_masked_member_in_order_by_refused():
     sql = "SELECT province FROM claims_cube ORDER BY patient_nik"
-    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "hash"}, row_filters=[])
+    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "redact"}, row_filters=[])
 
     with pytest.raises(EnforcementError, match="masked member 'patient_nik'"):
-        enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="jwt")
+        enforce(
+            sql,
+            grant,
+            schemas=schemas,
+            target_dialect="postgres",
+            target_kind="cube",
+            cube_mode="jwt",
+            cube_mask_variants=CUBE_MASK_VARIANTS,
+        )
 
 
 def test_cube_jwt_mode_masked_member_in_join_on_refused():
     sql = "SELECT c1.claim_id FROM claims_cube c1 JOIN claims_cube c2 ON c1.patient_nik = c2.patient_nik"
-    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "hash"}, row_filters=[])
+    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "redact"}, row_filters=[])
 
     with pytest.raises(EnforcementError, match="masked member 'patient_nik'"):
-        enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="jwt")
+        enforce(
+            sql,
+            grant,
+            schemas=schemas,
+            target_dialect="postgres",
+            target_kind="cube",
+            cube_mode="jwt",
+            cube_mask_variants=CUBE_MASK_VARIANTS,
+        )
 
 
 def test_cube_jwt_mode_masked_member_inside_function_refused():
     sql = "SELECT count(patient_nik) FROM claims_cube"
-    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "hash"}, row_filters=[])
+    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "redact"}, row_filters=[])
 
     with pytest.raises(EnforcementError, match="masked member 'patient_nik'"):
-        enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="jwt")
+        enforce(
+            sql,
+            grant,
+            schemas=schemas,
+            target_dialect="postgres",
+            target_kind="cube",
+            cube_mode="jwt",
+            cube_mask_variants=CUBE_MASK_VARIANTS,
+        )
 
 
 def test_cube_jwt_mode_masked_member_inside_expression_refused():
     sql = "SELECT patient_nik || '-masked' FROM claims_cube"
-    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "hash"}, row_filters=[])
+    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "redact"}, row_filters=[])
 
     with pytest.raises(EnforcementError, match="masked member 'patient_nik'"):
-        enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="jwt")
+        enforce(
+            sql,
+            grant,
+            schemas=schemas,
+            target_dialect="postgres",
+            target_kind="cube",
+            cube_mode="jwt",
+            cube_mask_variants=CUBE_MASK_VARIANTS,
+        )
 
 
 def test_cube_jwt_mode_masked_member_alias_used_in_clause_refused():
     sql = "SELECT patient_nik AS p_nik FROM claims_cube ORDER BY p_nik"
-    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "hash"}, row_filters=[])
+    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "redact"}, row_filters=[])
 
     with pytest.raises(EnforcementError, match="masked member"):
-        enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="jwt")
+        enforce(
+            sql,
+            grant,
+            schemas=schemas,
+            target_dialect="postgres",
+            target_kind="cube",
+            cube_mode="jwt",
+            cube_mask_variants=CUBE_MASK_VARIANTS,
+        )
 
 
 def test_cube_jwt_mode_masked_member_ordinal_order_by_refused():
     sql = "SELECT patient_nik, total_amount FROM claims_cube ORDER BY 1"
-    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "hash"}, row_filters=[])
+    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "redact"}, row_filters=[])
 
     with pytest.raises(EnforcementError, match="masked member 'patient_nik' in ORDER BY is not permitted"):
-        enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="jwt")
+        enforce(
+            sql,
+            grant,
+            schemas=schemas,
+            target_dialect="postgres",
+            target_kind="cube",
+            cube_mode="jwt",
+            cube_mask_variants=CUBE_MASK_VARIANTS,
+        )
 
 
 def test_cube_jwt_mode_bare_top_level_projection_allowed():
     sql = "SELECT claim_id, patient_nik FROM claims_cube"
-    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "hash"}, row_filters=[])
+    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "redact"}, row_filters=[])
 
-    res = enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="jwt")
-    assert "patient_nik" in res.sql
+    res = enforce(
+        sql,
+        grant,
+        schemas=schemas,
+        target_dialect="postgres",
+        target_kind="cube",
+        cube_mode="jwt",
+        cube_mask_variants=CUBE_MASK_VARIANTS,
+    )
+    assert "patient_nik__redact AS patient_nik" in res.sql
     assert "claims_cube" in res.sql
 
 
 def test_cube_jwt_mode_aliased_top_level_projection_allowed():
     sql = "SELECT claim_id, patient_nik AS masked_nik FROM claims_cube"
-    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "hash"}, row_filters=[])
+    grant, schemas = _cube_claims_fixture(sql, masks={"patient_nik": "redact"}, row_filters=[])
 
-    res = enforce(sql, grant, schemas=schemas, target_dialect="postgres", target_kind="cube", cube_mode="jwt")
-    assert "masked_nik" in res.sql
+    res = enforce(
+        sql,
+        grant,
+        schemas=schemas,
+        target_dialect="postgres",
+        target_kind="cube",
+        cube_mode="jwt",
+        cube_mask_variants=CUBE_MASK_VARIANTS,
+    )
+    assert "patient_nik__redact AS masked_nik" in res.sql
 
 
 def test_non_cube_targets_unaffected():

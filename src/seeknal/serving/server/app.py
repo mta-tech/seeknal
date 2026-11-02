@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import math
 import os
 import sys
 from collections.abc import Callable, Mapping
@@ -392,13 +393,14 @@ def _make_cube_connect(
         u = kwargs.get("user", user)
         p = kwargs.get("password", "")
         to = kwargs.get("connect_timeout", connect_timeout)
+        to_int = max(1, math.ceil(float(to)))
         return psycopg2.connect(
             host=host,
             port=port,
             dbname=dbname,
             user=u,
             password=p,
-            connect_timeout=to,
+            connect_timeout=to_int,
         )
 
     return connect
