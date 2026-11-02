@@ -9,7 +9,7 @@ import json
 import os
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -21,6 +21,9 @@ from seeknal.serving.discovery.config import (
 )
 
 
+VALID_TWIN_METHODS = frozenset({"redact", "null", "year", "last4"})
+
+
 @dataclass(frozen=True)
 class CubeMeta:
     """Discovered semantic cube or view metadata."""
@@ -28,6 +31,7 @@ class CubeMeta:
     name: str
     measures: tuple[str, ...]
     dimensions: tuple[str, ...]
+    mask_variants: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 def _sanitize(msg: str, *secrets: str | None) -> str:
@@ -176,7 +180,7 @@ class CubeSource:
                     m_name = m_name[len(prefix) :]
                 measures.append(m_name)
 
-            dimensions: list[str] = []
+            raw_dims: list[str] = []
             for d in entry.get("dimensions") or []:
                 d_name = d.get("name") if isinstance(d, dict) else str(d)
                 if not d_name:
@@ -184,13 +188,30 @@ class CubeSource:
                 d_name = str(d_name).strip()
                 if d_name.startswith(prefix):
                     d_name = d_name[len(prefix) :]
-                dimensions.append(d_name)
+                raw_dims.append(d_name)
+
+            raw_dims_set = set(raw_dims)
+            twin_map: dict[str, list[str]] = {}
+            twin_dims: set[str] = set()
+            for d in raw_dims:
+                if "__" in d:
+                    base, method = d.rsplit("__", 1)
+                    if method in VALID_TWIN_METHODS and base in raw_dims_set and base != d:
+                        twin_dims.add(d)
+                        if base not in twin_map:
+                            twin_map[base] = []
+                        if method not in twin_map[base]:
+                            twin_map[base].append(method)
+
+            ordinary_dims = [d for d in raw_dims if d not in twin_dims]
+            mask_variants = {b: tuple(methods) for b, methods in twin_map.items()}
 
             result.append(
                 CubeMeta(
                     name=cube_name,
                     measures=tuple(measures),
-                    dimensions=tuple(dimensions),
+                    dimensions=tuple(ordinary_dims),
+                    mask_variants=mask_variants,
                 )
             )
 

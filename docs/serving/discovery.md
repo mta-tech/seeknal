@@ -51,9 +51,12 @@ Discovers semantic cubes and views using:
 GET {url}/cubejs-api/v1/meta
 Authorization: <token>
 ```
+- The engine `url` is configured as the bare base (e.g. `http://cube:4000`), because `/cubejs-api/v1/meta` is appended automatically.
 - All cubes and views are parsed.
 - Member names have the leading cube name prefix stripped (e.g., `orders.revenue` becomes `revenue`).
-- Produces `CubeMeta(name, measures, dimensions)`.
+- **Twins and Mask Variants:** Dimensions are inspected for twin masking dimensions `<base>__<method>` where `<method>` is one of `redact`, `null`, `year`, `last4` and `<base>` is another dimension of the same cube. Dimensions are split into ordinary dimensions (no twins) and `mask_variants` mapping `{base: [method, ...]}`.
+- **Placement and Schemas:** `placement["cubes"][name]` receives `measures`, ordinary `dimensions`, and `mask_variants`. `schemas[name]` is populated with ordinary dimensions + measures (no twins) so cube queries resolve without table-not-found errors.
+- Produces `CubeMeta(name, measures, dimensions, mask_variants)`.
 - Endpoint or JSON parsing failures raise `DiscoveryError`.
 
 #### Cube Authentication (Minted Token & Static Token)

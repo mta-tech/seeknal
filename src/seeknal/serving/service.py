@@ -20,7 +20,7 @@ from seeknal.serving.enforce import (
 )
 from seeknal.serving.grant_token import verify_grant_token
 from seeknal.serving.placement import Placement
-from seeknal.serving.router import Router
+from seeknal.serving.router import Router, RoutingError
 
 PARAM_MARKER_PATTERN = re.compile(r"__SEEKNAL_PARAM_\d+__")
 
@@ -222,142 +222,161 @@ class ServingPipeline:
             now=now,
             require_grant_typ=self.require_grant_typ,
         )
-        grant = Grant.from_claims(claims)
+        audit_id = claims.get("jti")
+        subject = claims.get("sub")
 
-        # Parameters: $n placeholders are only defined for postgres and duckdb.
-        # If params is non-empty and the dialect is starrocks or mysql, raise EnforcementError.
-        if params and grant.sql_dialect in ("starrocks", "mysql"):
-            raise EnforcementError(
-                f"Parameters are not supported for '{grant.sql_dialect}' source dialect"
-            )
-
-        # Parse SQL once with read=<grant.sql_dialect>, applying single-statement rules
         try:
-            parsed_statements = sqlglot.parse(sql, read=grant.sql_dialect)
-        except Exception as exc:
-            raise EnforcementError(f"SQL parse error: {exc}") from exc
+            grant = Grant.from_claims(claims)
 
-        if len(parsed_statements) != 1 or parsed_statements[0] is None:
-            raise EnforcementError(
-                f"expected exactly one statement, got {len(parsed_statements)}"
+            # Parameters: $n placeholders are only defined for postgres and duckdb.
+            # If params is non-empty and the dialect is starrocks or mysql, raise EnforcementError.
+            if params and grant.sql_dialect in ("starrocks", "mysql"):
+                raise EnforcementError(
+                    f"Parameters are not supported for '{grant.sql_dialect}' source dialect"
+                )
+
+            # Parse SQL once with read=<grant.sql_dialect>, applying single-statement rules
+            try:
+                parsed_statements = sqlglot.parse(sql, read=grant.sql_dialect)
+            except Exception as exc:
+                raise EnforcementError(f"SQL parse error: {exc}") from exc
+
+            if len(parsed_statements) != 1 or parsed_statements[0] is None:
+                raise EnforcementError(
+                    f"expected exactly one statement, got {len(parsed_statements)}"
+                )
+
+            statement = parsed_statements[0]
+
+            # Canonicalize default catalog on two-part table references
+            if self.default_catalog is not None:
+                cte_names = {cte.alias_or_name.lower() for cte in statement.find_all(exp.CTE)}
+                for tbl in statement.find_all(exp.Table):
+                    # skip names that are CTEs defined by the statement
+                    if (tbl.name.lower() in cte_names and not tbl.db and not tbl.catalog) or (
+                        tbl.parts and ".".join(p.name for p in tbl.parts).lower() in cte_names
+                    ):
+                        continue
+                    # give every exp.Table reference that has a db and a name but no catalog the catalog default_catalog
+                    # leave one-part names alone
+                    if tbl.db and tbl.name and not tbl.catalog:
+                        tbl.set("catalog", exp.to_identifier(self.default_catalog))
+
+            # 2. Routing decision on canonical statement
+            decision = router.decide_statement(
+                statement,
+                hint=hint,
+                max_staleness_seconds=max_staleness_seconds,
+            )
+            target_engine = placement.engines[decision.engine]
+            target_dialect = target_engine.dialect
+            target_kind = target_engine.kind
+
+            cube_mask_variants = {
+                c.name.lower(): c.mask_variants
+                for c in placement.cubes.values()
+            }
+            cube_measures = {
+                c.name.lower(): set(c.measures)
+                for c in placement.cubes.values()
+            }
+
+            # 3. Policy enforcement (masks, row filters, row cap, column allowlists)
+            enforced = enforce(
+                sql,
+                grant,
+                schemas=schemas,
+                target_dialect=target_dialect,
+                target_kind=target_kind,
+                dialect=grant.sql_dialect,
+                statement=statement,
+                now=now,
+                max_rows=max_rows,
+                cube_mode=self.cube_mode,
+                cube_mask_variants=cube_mask_variants,
+                cube_measures=cube_measures,
             )
 
-        statement = parsed_statements[0]
+            # 4. Table rewrite for chosen engine physical names
+            router.rewrite(enforced.statement, decision.engine)
+            apply_null_ordering(enforced.statement, grant.sql_dialect, target_dialect)
 
-        # Canonicalize default catalog on two-part table references
-        if self.default_catalog is not None:
-            cte_names = {cte.alias_or_name.lower() for cte in statement.find_all(exp.CTE)}
-            for tbl in statement.find_all(exp.Table):
-                # skip names that are CTEs defined by the statement
-                if (tbl.name.lower() in cte_names and not tbl.db and not tbl.catalog) or (
-                    tbl.parts and ".".join(p.name for p in tbl.parts).lower() in cte_names
-                ):
-                    continue
-                # give every exp.Table reference that has a db and a name but no catalog the catalog default_catalog
-                # leave one-part names alone
-                if tbl.db and tbl.name and not tbl.catalog:
-                    tbl.set("catalog", exp.to_identifier(self.default_catalog))
-
-        # 2. Routing decision on canonical statement
-        decision = router.decide_statement(
-            statement,
-            hint=hint,
-            max_staleness_seconds=max_staleness_seconds,
-        )
-        target_engine = placement.engines[decision.engine]
-        target_dialect = target_engine.dialect
-        target_kind = target_engine.kind
-
-        # 3. Policy enforcement (masks, row filters, row cap, column allowlists)
-        enforced = enforce(
-            sql,
-            grant,
-            schemas=schemas,
-            target_dialect=target_dialect,
-            target_kind=target_kind,
-            dialect=grant.sql_dialect,
-            statement=statement,
-            now=now,
-            max_rows=max_rows,
-            cube_mode=self.cube_mode,
-        )
-
-        # 4. Table rewrite for chosen engine physical names
-        router.rewrite(enforced.statement, decision.engine)
-        apply_null_ordering(enforced.statement, grant.sql_dialect, target_dialect)
-
-        # 5. Parameters and dialect rendering
-        if target_kind == "duckdb":
-            paramstyle = "qmark"
-        elif target_kind in ("starrocks", "lakebase", "cube"):
-            paramstyle = "format"
-        else:
-            paramstyle = "format"
-
-        raw_params = tuple(params)
-        num_params = len(raw_params)
-        placeholder_nodes = list(
-            enforced.statement.find_all((exp.Parameter, exp.Placeholder))
-        )
-
-        if not placeholder_nodes:
-            if num_params > 0:
-                raise EnforcementError(
-                    f"Provided {num_params} parameters, but SQL query contains no placeholders"
-                )
-            final_params: tuple = ()
-            rendered_sql = enforced.statement.sql(dialect=target_dialect)
-            _check_round_trip(enforced.statement, rendered_sql, target_dialect)
-            if paramstyle == "format":
-                rendered_sql = rendered_sql.replace("%", "%%")
-            final_sql = rendered_sql
-        else:
-            marker_to_idx: dict[str, int] = {}
-            for i, node in enumerate(placeholder_nodes):
-                idx = _extract_placeholder_index(node)
-                if idx > num_params:
-                    raise EnforcementError(
-                        f"Placeholder ${idx} has no matching parameter ({num_params} provided)"
-                    )
-                marker = f"__SEEKNAL_PARAM_{i}__"
-                marker_to_idx[marker] = idx
-                node.replace(exp.var(marker))
-
-            used_indices = set(marker_to_idx.values())
-            for p_idx in range(1, num_params + 1):
-                if p_idx not in used_indices:
-                    raise EnforcementError(
-                        f"Parameter ${p_idx} is never used in the query"
-                    )
-
-            rendered_sql = enforced.statement.sql(dialect=target_dialect)
-            _check_round_trip(enforced.statement, rendered_sql, target_dialect)
-            matches = PARAM_MARKER_PATTERN.findall(rendered_sql)
-            ordered_indices = [marker_to_idx[m] for m in matches]
-            final_params = tuple(raw_params[idx - 1] for idx in ordered_indices)
-
-            if paramstyle == "format":
-                # Escape every literal % as %% so driver format strings survive
-                rendered_sql = rendered_sql.replace("%", "%%")
-                final_sql = PARAM_MARKER_PATTERN.sub("%s", rendered_sql)
+            # 5. Parameters and dialect rendering
+            if target_kind == "duckdb":
+                paramstyle = "qmark"
+            elif target_kind in ("starrocks", "lakebase", "cube"):
+                paramstyle = "format"
             else:
-                final_sql = PARAM_MARKER_PATTERN.sub("?", rendered_sql)
+                paramstyle = "format"
 
-        return PreparedQuery(
-            engine=decision.engine,
-            engine_kind=target_kind,
-            sql=final_sql,
-            params=final_params,
-            paramstyle=paramstyle,
-            rule=decision.rule,
-            reason=decision.reason,
-            row_limit=enforced.row_limit,
-            masked_columns=enforced.masked_columns,
-            redacted_sql=enforced.redacted_sql,
-            subject=grant.subject,
-            workspace=grant.workspace,
-            audit_id=grant.audit_id,
-            cube_security_context=enforced.cube_security_context,
-            workload=grant.workload,
-            binding=grant.binding,
-        )
+            raw_params = tuple(params)
+            num_params = len(raw_params)
+            placeholder_nodes = list(
+                enforced.statement.find_all((exp.Parameter, exp.Placeholder))
+            )
+
+            if not placeholder_nodes:
+                if num_params > 0:
+                    raise EnforcementError(
+                        f"Provided {num_params} parameters, but SQL query contains no placeholders"
+                    )
+                final_params: tuple = ()
+                rendered_sql = enforced.statement.sql(dialect=target_dialect)
+                _check_round_trip(enforced.statement, rendered_sql, target_dialect)
+                if paramstyle == "format":
+                    rendered_sql = rendered_sql.replace("%", "%%")
+                final_sql = rendered_sql
+            else:
+                marker_to_idx: dict[str, int] = {}
+                for i, node in enumerate(placeholder_nodes):
+                    idx = _extract_placeholder_index(node)
+                    if idx > num_params:
+                        raise EnforcementError(
+                            f"Placeholder ${idx} has no matching parameter ({num_params} provided)"
+                        )
+                    marker = f"__SEEKNAL_PARAM_{i}__"
+                    marker_to_idx[marker] = idx
+                    node.replace(exp.var(marker))
+
+                used_indices = set(marker_to_idx.values())
+                for p_idx in range(1, num_params + 1):
+                    if p_idx not in used_indices:
+                        raise EnforcementError(
+                            f"Parameter ${p_idx} is never used in the query"
+                        )
+
+                rendered_sql = enforced.statement.sql(dialect=target_dialect)
+                _check_round_trip(enforced.statement, rendered_sql, target_dialect)
+                matches = PARAM_MARKER_PATTERN.findall(rendered_sql)
+                ordered_indices = [marker_to_idx[m] for m in matches]
+                final_params = tuple(raw_params[idx - 1] for idx in ordered_indices)
+
+                if paramstyle == "format":
+                    # Escape every literal % as %% so driver format strings survive
+                    rendered_sql = rendered_sql.replace("%", "%%")
+                    final_sql = PARAM_MARKER_PATTERN.sub("%s", rendered_sql)
+                else:
+                    final_sql = PARAM_MARKER_PATTERN.sub("?", rendered_sql)
+
+            return PreparedQuery(
+                engine=decision.engine,
+                engine_kind=target_kind,
+                sql=final_sql,
+                params=final_params,
+                paramstyle=paramstyle,
+                rule=decision.rule,
+                reason=decision.reason,
+                row_limit=enforced.row_limit,
+                masked_columns=enforced.masked_columns,
+                redacted_sql=enforced.redacted_sql,
+                subject=grant.subject,
+                workspace=grant.workspace,
+                audit_id=grant.audit_id,
+                cube_security_context=enforced.cube_security_context,
+                workload=grant.workload,
+                binding=grant.binding,
+            )
+        except (EnforcementError, RoutingError) as exc:
+            exc.audit_id = getattr(exc, "audit_id", None) or audit_id
+            exc.subject = getattr(exc, "subject", None) or subject
+            raise

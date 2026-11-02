@@ -8,6 +8,7 @@ import hmac
 import inspect
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -128,8 +129,16 @@ class EngineAdapter(Protocol):
         ...
 
 
+TIMEOUT_PHRASES: tuple[str, ...] = (
+    "statement timeout",
+    "query timeout",
+    "exceeded time limit",
+    "execution was interrupted",
+)
+
+
 def _is_timeout_error(exc: BaseException) -> bool:
-    """Check if an exception represents a driver query timeout."""
+    """Check if an exception represents a driver query timeout during execution."""
     # Check psycopg2 QueryCanceled
     if type(exc).__name__ == "QueryCanceled":
         return True
@@ -141,16 +150,21 @@ def _is_timeout_error(exc: BaseException) -> bool:
     except (ImportError, AttributeError):
         pass
 
-    # Check pymysql error code 1317 or message containing "timeout"
+    # Check pymysql error codes 1317 and 3024
     if hasattr(exc, "args") and exc.args:
-        if exc.args[0] == 1317:
+        if exc.args[0] in (1317, 3024):
             return True
         for arg in exc.args:
-            if isinstance(arg, str) and "timeout" in arg.lower():
-                return True
+            if isinstance(arg, str):
+                arg_lower = arg.lower()
+                for phrase in TIMEOUT_PHRASES:
+                    if phrase in arg_lower:
+                        return True
 
-    if "timeout" in str(exc).lower():
-        return True
+    msg = str(exc).lower()
+    for phrase in TIMEOUT_PHRASES:
+        if phrase in msg:
+            return True
 
     return False
 
@@ -414,8 +428,6 @@ class DBAPIAdapter:
                 self._before_connect()
             except Exception as exc:
                 logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
-                if _is_timeout_error(exc):
-                    raise EngineTimeout("Engine query timed out") from exc
                 raise EngineError("Engine connection preparation failed") from exc
 
         start = time.perf_counter()
@@ -423,8 +435,6 @@ class DBAPIAdapter:
             conn = self._connect()
         except Exception as exc:
             logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
-            if _is_timeout_error(exc):
-                raise EngineTimeout("Engine query timed out") from exc
             raise EngineError("Engine connection failed") from exc
 
         cancel_event = threading.Event()
@@ -623,16 +633,15 @@ class CubeAdapter:
         token = make_cube_context_token(prepared, self._security)
         start = time.perf_counter()
 
+        timeout_int = max(1, math.ceil(float(self._connect_timeout_seconds)))
         try:
             conn = self._connect(
                 user=self._security.sql_user,
                 password=token,
-                connect_timeout=self._connect_timeout_seconds,
+                connect_timeout=timeout_int,
             )
         except Exception as exc:
             logger.error("engine=%s error=%s audit_id=%s", "cube", type(exc).__name__, prepared.audit_id)
-            if _is_timeout_error(exc):
-                raise EngineTimeout("Engine query timed out") from None
             raise EngineError("Engine connection failed") from None
 
         cancel_event = threading.Event()

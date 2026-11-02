@@ -30,7 +30,11 @@ from seeknal.serving.adapters import (
     EngineTimeout,
 )
 from seeknal.serving.enforce import EnforcementError
-from seeknal.serving.grant_token import GrantTokenError, verify_cancel_token
+from seeknal.serving.grant_token import (
+    GrantTokenError,
+    verify_cancel_token,
+    verify_grant_token,
+)
 from seeknal.serving.router import RoutingError
 from seeknal.serving.service import ServingPipeline
 
@@ -512,15 +516,51 @@ def create_app(
                 401, "grant_token_error", exc, token=token, sql=sql, params=params
             )
         except EnforcementError as exc:
+            audit_id = getattr(exc, "audit_id", None)
+            subject = getattr(exc, "subject", None)
+            if audit_id is None or subject is None:
+                try:
+                    claims = verify_grant_token(
+                        token,
+                        pipeline.public_keys,
+                        audience=pipeline.audience,
+                        issuer=pipeline.issuer,
+                        require_grant_typ=pipeline.require_grant_typ,
+                    )
+                    audit_id = audit_id or claims.get("jti")
+                    subject = subject or claims.get("sub")
+                except Exception:
+                    pass
             _log_request(
-                status=403, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                audit_id=audit_id,
+                subject=subject,
+                status=403,
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
             )
             return _error_response(
                 403, "enforcement_error", exc, token=token, sql=sql, params=params
             )
         except RoutingError as exc:
+            audit_id = getattr(exc, "audit_id", None)
+            subject = getattr(exc, "subject", None)
+            if audit_id is None or subject is None:
+                try:
+                    claims = verify_grant_token(
+                        token,
+                        pipeline.public_keys,
+                        audience=pipeline.audience,
+                        issuer=pipeline.issuer,
+                        require_grant_typ=pipeline.require_grant_typ,
+                    )
+                    audit_id = audit_id or claims.get("jti")
+                    subject = subject or claims.get("sub")
+                except Exception:
+                    pass
             _log_request(
-                status=422, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                audit_id=audit_id,
+                subject=subject,
+                status=422,
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
             )
             return _error_response(
                 422, "routing_error", exc, token=token, sql=sql, params=params
@@ -598,15 +638,51 @@ def create_app(
                 401, "grant_token_error", exc, token=token, sql=sql, params=params
             )
         except EnforcementError as exc:
+            audit_id = getattr(exc, "audit_id", None)
+            subject = getattr(exc, "subject", None)
+            if audit_id is None or subject is None:
+                try:
+                    claims = verify_grant_token(
+                        token,
+                        pipeline.public_keys,
+                        audience=pipeline.audience,
+                        issuer=pipeline.issuer,
+                        require_grant_typ=pipeline.require_grant_typ,
+                    )
+                    audit_id = audit_id or claims.get("jti")
+                    subject = subject or claims.get("sub")
+                except Exception:
+                    pass
             _log_request(
-                status=403, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                audit_id=audit_id,
+                subject=subject,
+                status=403,
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
             )
             return _error_response(
                 403, "enforcement_error", exc, token=token, sql=sql, params=params
             )
         except RoutingError as exc:
+            audit_id = getattr(exc, "audit_id", None)
+            subject = getattr(exc, "subject", None)
+            if audit_id is None or subject is None:
+                try:
+                    claims = verify_grant_token(
+                        token,
+                        pipeline.public_keys,
+                        audience=pipeline.audience,
+                        issuer=pipeline.issuer,
+                        require_grant_typ=pipeline.require_grant_typ,
+                    )
+                    audit_id = audit_id or claims.get("jti")
+                    subject = subject or claims.get("sub")
+                except Exception:
+                    pass
             _log_request(
-                status=422, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                audit_id=audit_id,
+                subject=subject,
+                status=422,
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
             )
             return _error_response(
                 422, "routing_error", exc, token=token, sql=sql, params=params

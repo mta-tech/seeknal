@@ -162,6 +162,9 @@ def test_discovery_build_full_and_starrocks_physical_names():
     assert cube_entry.measures == ("total_amount",)
     assert cube_entry.dimensions == ("claim_id",)
     assert cube_entry.engine == "cube"
+    assert cube_entry.mask_variants == {}
+    assert "claims_cube" in result.schemas
+    assert result.schemas["claims_cube"] == ["claim_id", "total_amount"]
 
 
 def test_lakebase_lag_calculation_matching_and_differing():

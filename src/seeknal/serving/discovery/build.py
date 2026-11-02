@@ -186,7 +186,7 @@ def discover(
                     f"Synced table '{synced_logical}' not found in discovered Iceberg tables"
                 )
 
-    # 9. Build cubes placement dict
+    # 9. Build cubes placement dict and schemas
     cubes_placement: dict[str, Any] = {}
     if cube_engine_name is not None:
         for cm in cube_metas:
@@ -194,7 +194,9 @@ def discover(
                 "engine": cube_engine_name,
                 "measures": list(cm.measures),
                 "dimensions": list(cm.dimensions),
+                "mask_variants": {k: list(v) for k, v in cm.mask_variants.items()},
             }
+            schemas_placement[cm.name] = list(cm.dimensions) + list(cm.measures)
 
     # 10. Assemble and validate Placement
     placement_dict = {
