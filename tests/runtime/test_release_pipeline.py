@@ -230,10 +230,28 @@ class TestDockerfileStaticChecks:
                     parts = stripped.split()[1:]
                     assert parts[0] != ".", f"{name}: whole-repo COPY . is forbidden: {line}"
 
-    def test_extensions_installed_at_build_time_in_rt(self, rt_content: str):
+    def test_extensions_installed_at_build_time_after_user_in_rt(self, rt_content: str):
         assert "INSTALL iceberg" in rt_content
         assert "INSTALL httpfs" in rt_content
-        assert "DUCKDB_EXTENSION_DIRECTORY" in rt_content
+        # Ensure HOME is set
+        assert "HOME=/home/atlas" in rt_content or "HOME" in _parse_env_keys(rt_content), (
+            "HOME=/home/atlas must be set in ENV"
+        )
+
+        # Ensure install step comes AFTER the USER line
+        lines = rt_content.splitlines()
+        user_line_idx = None
+        install_line_idx = None
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("USER ") and "10001" in stripped:
+                user_line_idx = i
+            if "INSTALL iceberg" in stripped and "INSTALL httpfs" in stripped:
+                install_line_idx = i
+
+        assert user_line_idx is not None, "USER 10001 line not found in Dockerfile.rt"
+        assert install_line_idx is not None, "DuckDB install line not found in Dockerfile.rt"
+        assert install_line_idx > user_line_idx, "DuckDB extension install must occur AFTER USER instruction"
 
     def test_atlas_ask_mode_governed_in_agent(self, agent_content: str):
         assert "ATLAS_ASK_MODE=governed" in agent_content
@@ -296,6 +314,28 @@ class TestWorkflowStaticChecks:
                 assert ":latest" not in line, "cosign sign step must never reference :latest"
                 found_sign = True
         assert found_sign, "cosign sign command for images not found"
+
+    def test_version_sanitizing_step_exists(self, workflow_data: dict, workflow_text: str):
+        steps = workflow_data.get("jobs", {}).get("release", {}).get("steps", [])
+        version_steps = [
+            s for s in steps if s.get("id") == "version" or "sanitize" in s.get("name", "").lower()
+        ]
+        assert len(version_steps) >= 1, "Workflow must contain a version-sanitizing step"
+        run_script = version_steps[0].get("run", "")
+        assert "sed" in run_script or "python" in run_script, "Sanitizing step must strip prefix/v"
+        assert re.search(r"\^\\?d\+\\?\.\\?d\+\\?\.\\?d\+|\^\[0-9\]\+\\?\.\[0-9\]\+\\?\.\[0-9\]\+", run_script), (
+            "Sanitizing step must validate version against ^\\d+\\.\\d+\\.\\d+$"
+        )
+
+    def test_no_tags_use_github_ref_name_directly(self, workflow_data: dict):
+        steps = workflow_data.get("jobs", {}).get("release", {}).get("steps", [])
+        build_steps = [s for s in steps if "docker/build-push-action" in s.get("uses", "")]
+        for s in build_steps:
+            with_block = s.get("with", {})
+            tags = with_block.get("tags", "")
+            assert "github.ref_name" not in str(tags), (
+                f"Step '{s.get('name')}' must not use github.ref_name directly in tags"
+            )
 
     def test_build_manifest_invoked_with_image_digests(self, workflow_text: str):
         assert "scripts/release/build_manifest.py" in workflow_text

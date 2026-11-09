@@ -18,16 +18,20 @@ The runtime consists of three purpose-built images:
 | `atlas-rt-serving` | `docker/Dockerfile.serving` | Governed online feature and model serving | Non-root `10001:10001`, minimal serving dependencies |
 | `atlas-rt-agent` | `docker/Dockerfile.agent` | Governed Seeknal Ask gateway & worker | Non-root `10001:10001`, `ATLAS_ASK_MODE=governed` |
 
-### DuckDB Extension Pre-Installation
+### DuckDB Extension Pre-Installation and Read-Only Root Compatibility
 
 The `atlas-rt` image pre-installs DuckDB extensions (`iceberg` and `httpfs`) at container build time so that workloads never download extensions over the network during runtime:
 
 ```dockerfile
-ENV DUCKDB_EXTENSION_DIRECTORY=/opt/duckdb/extensions
-RUN python -c "import duckdb; con = duckdb.connect(); con.execute(\"SET extension_directory='/opt/duckdb/extensions'; INSTALL iceberg; INSTALL httpfs;\")"
+ENV HOME=/home/atlas
+RUN mkdir -p /home/atlas && chown -R 10001:10001 /home/atlas
+USER 10001:10001
+RUN python -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL iceberg; INSTALL httpfs;')"
 ```
 
-The runtime environment variable `DUCKDB_EXTENSION_DIRECTORY=/opt/duckdb/extensions` points DuckDB directly to this directory.
+Because DuckDB resolves extensions from `$HOME/.duckdb/extensions/` of the running user, pre-installing extensions under `USER 10001:10001` with `HOME=/home/atlas` places the extension binaries directly into the default per-user directory DuckDB loads from.
+
+At runtime, a governed pod operates in an isolated environment with no external egress and a read-only root filesystem. This design is fully compatible with read-only root filesystems because DuckDB only **loads** existing local extensions (`LOAD iceberg; LOAD httpfs;`) from `/home/atlas/.duckdb/extensions/` and never attempts to download or install extensions over the network. Convenience tags like `atlas-rt:1.0.0` serve as human-readable labels, while all cell executions pin by exact `@sha256:` digest.
 
 ### Governed Agent Configuration
 

@@ -22,27 +22,29 @@ LABEL org.opencontainers.image.title="atlas-rt" \
 
 ENV PYTHONUNBUFFERED=1 \
     UV_SYSTEM_PYTHON=1 \
-    DUCKDB_EXTENSION_DIRECTORY=/opt/duckdb/extensions
+    HOME=/home/atlas
 
 WORKDIR /opt/seeknal
 
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src/ ./src/
 
-RUN mkdir -p docs/cli /opt/duckdb/extensions \
+RUN mkdir -p docs/cli \
     && uv export --frozen --no-hashes --no-emit-project --format requirements-txt -o /tmp/constraints.txt \
     && uv pip install --system --no-deps . \
     && uv pip install --system -r /tmp/constraints.txt \
-    && python -c "import duckdb; con = duckdb.connect(); con.execute(\"SET extension_directory='/opt/duckdb/extensions'; INSTALL iceberg; INSTALL httpfs;\")" \
-    && chmod -R 755 /opt/duckdb/extensions \
     && rm -rf /root/.cache /tmp/* docs/cli
 
-RUN mkdir -p /work /tmp \
+RUN mkdir -p /home/atlas /work /tmp \
+    && chown -R 10001:10001 /home/atlas \
     && chmod 777 /work \
     && chmod 1777 /tmp
 
 WORKDIR /work
 
 USER 10001:10001
+
+# DuckDB extensions are pre-installed at build time into $HOME/.duckdb/extensions
+RUN python -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL iceberg; INSTALL httpfs;')"
 
 ENTRYPOINT ["seeknal"]
