@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1.7
+# Atlas Runtime Ask agent image (atlas-rt-agent).
+#
+# Build from repository root:
+#   docker build -f docker/Dockerfile.agent -t atlas-rt-agent:local .
+#
+# Build with custom base image or commit revision:
+#   docker build -f docker/Dockerfile.agent \
+#     --build-arg BASE_IMAGE=ghcr.io/astral-sh/uv:python3.11-bookworm-slim \
+#     --build-arg SEEKNAL_COMMIT=$(git rev-parse HEAD) \
+#     -t atlas-rt-agent:local .
+
+ARG BASE_IMAGE=ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+FROM ${BASE_IMAGE} AS runtime
+
+ARG SEEKNAL_COMMIT=unknown
+
+LABEL org.opencontainers.image.title="atlas-rt-agent" \
+      org.opencontainers.image.source="https://github.com/mta-tech/seeknal" \
+      org.opencontainers.image.revision="${SEEKNAL_COMMIT}" \
+      io.atlas.runtime.image="atlas-rt-agent"
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_SYSTEM_PYTHON=1 \
+    ATLAS_ASK_MODE=governed \
+    SEEKNAL_PROJECT_PATH=/app/project
+
+WORKDIR /opt/seeknal
+
+COPY pyproject.toml uv.lock README.md LICENSE ./
+COPY src/ ./src/
+
+RUN mkdir -p docs/cli \
+    && uv export --frozen --no-hashes --no-emit-project --format requirements-txt -o /tmp/constraints.txt \
+    && uv pip install --system --no-deps . \
+    && uv pip install --system -r /tmp/constraints.txt \
+    && rm -rf /root/.cache /tmp/* docs/cli
+
+RUN mkdir -p /app/project /work /tmp \
+    && chmod 777 /app/project /work \
+    && chmod 1777 /tmp
+
+WORKDIR /app/project
+
+USER 10001:10001
+
+EXPOSE 8000
+
+ENTRYPOINT ["seeknal", "gateway", "start"]
+CMD ["--project", "/app/project", "--port", "8000", "--host", "0.0.0.0", "--temporal", "--no-worker"]

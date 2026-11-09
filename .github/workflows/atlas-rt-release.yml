@@ -1,0 +1,141 @@
+name: Atlas Runtime Release
+
+on:
+  push:
+    tags:
+      - "atlas-rt/v*"
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release name override (e.g. atlas-rt/1.0.0)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push atlas-rt
+        id: build_rt
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.rt
+          push: true
+          provenance: true
+          sbom: true
+          tags: ghcr.io/${{ github.repository_owner }}/atlas-rt:${{ github.ref_name }}
+          build-args: |
+            SEEKNAL_COMMIT=${{ github.sha }}
+
+      - name: Build and push atlas-rt-serving
+        id: build_serving
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.serving
+          push: true
+          provenance: true
+          sbom: true
+          tags: ghcr.io/${{ github.repository_owner }}/atlas-rt-serving:${{ github.ref_name }}
+          build-args: |
+            SEEKNAL_COMMIT=${{ github.sha }}
+
+      - name: Build and push atlas-rt-agent
+        id: build_agent
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.agent
+          push: true
+          provenance: true
+          sbom: true
+          tags: ghcr.io/${{ github.repository_owner }}/atlas-rt-agent:${{ github.ref_name }}
+          build-args: |
+            SEEKNAL_COMMIT=${{ github.sha }}
+
+      - name: Sign container images with Cosign
+        run: |
+          cosign sign --yes ghcr.io/${{ github.repository_owner }}/atlas-rt@${{ steps.build_rt.outputs.digest }}
+          cosign sign --yes ghcr.io/${{ github.repository_owner }}/atlas-rt-serving@${{ steps.build_serving.outputs.digest }}
+          cosign sign --yes ghcr.io/${{ github.repository_owner }}/atlas-rt-agent@${{ steps.build_agent.outputs.digest }}
+
+      - name: Licence scan
+        id: licence_scan
+        run: |
+          uv export --frozen --no-hashes --no-emit-project --format requirements-txt -o /tmp/constraints.txt
+          python -m venv /tmp/licence-venv
+          /tmp/licence-venv/bin/pip install --upgrade pip pip-licenses
+          /tmp/licence-venv/bin/pip install -r /tmp/constraints.txt
+          if /tmp/licence-venv/bin/pip-licenses | grep -iE 'AGPL|SSPL|RSAL'; then
+            echo "ERROR: Disallowed licence detected in dependencies!"
+            exit 1
+          fi
+          echo "scan_result=clean" >> "$GITHUB_OUTPUT"
+
+      - name: Build and sign release manifest
+        run: |
+          mkdir -p dist
+          TAG="${{ github.ref_name }}"
+          # Format tag: atlas-rt/v1.0.0 -> atlas-rt/1.0.0
+          RELEASE_NAME="${TAG/v/}"
+          if [ -n "${{ github.event.inputs.release }}" ]; then
+            RELEASE_NAME="${{ github.event.inputs.release }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [[ "$RELEASE_NAME" != atlas-rt/* ]]; then
+            RELEASE_NAME="atlas-rt/$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")"
+          fi
+
+          python3 scripts/release/build_manifest.py \
+            --release "${RELEASE_NAME}" \
+            --channel stable \
+            --commit "${{ github.sha }}" \
+            --lock uv.lock \
+            --image "atlas-rt=ghcr.io/${{ github.repository_owner }}/atlas-rt@${{ steps.build_rt.outputs.digest }}" \
+            --image "atlas-rt-serving=ghcr.io/${{ github.repository_owner }}/atlas-rt-serving@${{ steps.build_serving.outputs.digest }}" \
+            --image "atlas-rt-agent=ghcr.io/${{ github.repository_owner }}/atlas-rt-agent@${{ steps.build_agent.outputs.digest }}" \
+            --licence-scan "${{ steps.licence_scan.outputs.scan_result }}" \
+            --out dist/manifest.yaml
+
+          sha256sum dist/manifest.yaml | awk '{print $1}' > dist/manifest.yaml.sha256
+          cosign sign-blob --yes --bundle dist/manifest.yaml.bundle dist/manifest.yaml
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/manifest.yaml
+            dist/manifest.yaml.sha256
+            dist/manifest.yaml.bundle
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

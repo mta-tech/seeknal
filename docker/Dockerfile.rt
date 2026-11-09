@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1.7
+# Atlas Runtime job and session image (atlas-rt).
+#
+# Build from repository root:
+#   docker build -f docker/Dockerfile.rt -t atlas-rt:local .
+#
+# Build with custom base image or commit revision:
+#   docker build -f docker/Dockerfile.rt \
+#     --build-arg BASE_IMAGE=ghcr.io/astral-sh/uv:python3.11-bookworm-slim \
+#     --build-arg SEEKNAL_COMMIT=$(git rev-parse HEAD) \
+#     -t atlas-rt:local .
+
+ARG BASE_IMAGE=ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+FROM ${BASE_IMAGE} AS runtime
+
+ARG SEEKNAL_COMMIT=unknown
+
+LABEL org.opencontainers.image.title="atlas-rt" \
+      org.opencontainers.image.source="https://github.com/mta-tech/seeknal" \
+      org.opencontainers.image.revision="${SEEKNAL_COMMIT}" \
+      io.atlas.runtime.image="atlas-rt"
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_SYSTEM_PYTHON=1 \
+    DUCKDB_EXTENSION_DIRECTORY=/opt/duckdb/extensions
+
+WORKDIR /opt/seeknal
+
+COPY pyproject.toml uv.lock README.md LICENSE ./
+COPY src/ ./src/
+
+RUN mkdir -p docs/cli /opt/duckdb/extensions \
+    && uv export --frozen --no-hashes --no-emit-project --format requirements-txt -o /tmp/constraints.txt \
+    && uv pip install --system --no-deps . \
+    && uv pip install --system -r /tmp/constraints.txt \
+    && python -c "import duckdb; con = duckdb.connect(); con.execute(\"SET extension_directory='/opt/duckdb/extensions'; INSTALL iceberg; INSTALL httpfs;\")" \
+    && chmod -R 755 /opt/duckdb/extensions \
+    && rm -rf /root/.cache /tmp/* docs/cli
+
+RUN mkdir -p /work /tmp \
+    && chmod 777 /work \
+    && chmod 1777 /tmp
+
+WORKDIR /work
+
+USER 10001:10001
+
+ENTRYPOINT ["seeknal"]

@@ -1,0 +1,12 @@
+grant:
+  - v2
+  - v3
+run_grant:
+  - v1
+engine_api:
+  - v1
+lineage:
+  - openlineage-1
+cube_mode:
+  - refuse
+  - jwt
