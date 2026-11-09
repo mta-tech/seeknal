@@ -1,0 +1,48 @@
+apiVersion: atlas.io/v1
+kind: RuntimeRelease
+metadata:
+  name: atlas-rt/1.0.0
+  channel: stable
+seeknal:
+  version: 2.14.0
+  commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  lock_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+python: 3.11.9
+images:
+  atlas-rt:
+    digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    sbom: https://atlas.io/sbom/atlas-rt/1.0.0
+    signature: cosign
+  atlas-rt-serving:
+    digest: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  atlas-rt-agent:
+    digest: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  atlas-rt-sql:
+    digest: sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+    starrocks: 4.0.2
+engines:
+  duckdb: 1.4.4
+  duckdb_extensions:
+    iceberg: 0123456789abcdef
+    httpfs: fedcba9876543210
+contracts:
+  grant:
+    - v2
+    - v3
+  run_grant:
+    - v1
+  engine_api:
+    - v1
+  lineage:
+    - openlineage-1
+  cube_mode:
+    - refuse
+    - jwt
+serving:
+  grant_max_lifetime_seconds: 60
+acu_weights:
+  job: 1.0
+  session: 1.5
+  warehouse: 2.0
+  sandbox: 1.0
+licence_scan: clean
