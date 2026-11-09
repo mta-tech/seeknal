@@ -436,3 +436,88 @@ class GovernedAskContext:
             client=client,
             repl=repl,
         )
+
+
+MAX_GOVERNED_FILE_SIZE = 256 * 1024  # 256 KiB
+ALLOWED_GOVERNED_SUFFIXES = {".yml", ".yaml", ".sql", ".md", ".py"}
+PROHIBITED_GOVERNED_DIRS = {"target", ".seeknal", "data", "seeds"}
+
+
+def read_project_file_governed(
+    path: str,
+    start_line: int = 1,
+    max_lines: int | None = None,
+) -> str:
+    """Read a project file under governed mode constraints.
+
+    Allows only:
+    - Suffixes: .yml, .yaml, .sql, .md, .py
+    - Locations: nothing under target/, .seeknal/, data/, seeds/, or hidden directories
+    - YAML: only files under seeknal/ or the root seeknal_project.yml
+    - Size: at most 256 KiB
+    """
+    from seeknal.ask.agents.tools._context import get_tool_context
+    from seeknal.ask.agents.tools._security import validate_project_path
+    from seeknal.ask.agents.tools.read_project_file import _do_read
+
+    ctx = get_tool_context()
+    project_path = ctx.project_path
+    if max_lines is None:
+        max_lines = getattr(ctx, "read_max_lines", 200)
+
+    try:
+        resolved = validate_project_path(path, project_path)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    if not resolved.exists():
+        return f"File not found: {path}"
+
+    if not resolved.is_file():
+        return f"Not a file: {path}"
+
+    rel = resolved.relative_to(project_path.resolve())
+
+    # 1. Suffix restriction
+    suffix = resolved.suffix.lower()
+    if suffix not in ALLOWED_GOVERNED_SUFFIXES:
+        return (
+            f"Error: Suffix '{suffix}' is not permitted in governed mode. "
+            f"Allowed suffixes: {sorted(ALLOWED_GOVERNED_SUFFIXES)}"
+        )
+
+    # 2. Directory restriction: nothing under target/, .seeknal/, data/, seeds/, or hidden dirs
+    for part in rel.parts[:-1]:
+        if part in PROHIBITED_GOVERNED_DIRS or part.startswith("."):
+            return f"Error: Access to directory '{part}' is prohibited in governed mode."
+
+    # Hidden file check
+    if rel.parts[-1].startswith("."):
+        return "Error: Access to hidden files is prohibited in governed mode."
+
+    # 3. YAML restriction: only under seeknal/ or root seeknal_project.yml
+    if suffix in {".yml", ".yaml"}:
+        is_root_project_yml = (
+            len(rel.parts) == 1
+            and rel.parts[0] in ("seeknal_project.yml", "seeknal_project.yaml")
+        )
+        is_under_seeknal = len(rel.parts) > 1 and rel.parts[0] == "seeknal"
+        if not (is_root_project_yml or is_under_seeknal):
+            return (
+                "Error: YAML files in governed mode are restricted to "
+                "seeknal_project.yml or files under the seeknal/ directory."
+            )
+
+    # 4. File size restriction (at most 256 KiB)
+    try:
+        size = resolved.stat().st_size
+    except OSError as e:
+        return f"Cannot read file: {e}"
+
+    if size > MAX_GOVERNED_FILE_SIZE:
+        return (
+            f"File too large ({size:,} bytes, max {MAX_GOVERNED_FILE_SIZE:,} bytes): {path}"
+        )
+
+    return _do_read(path, project_path, start_line, max_lines)
+

@@ -175,9 +175,23 @@ _VISUALIZATION_TOOLS = [
     visualize_chart,
 ]
 
+from seeknal.ask.governed import read_project_file_governed
+
+_GOVERNED_CONTEXT_TOOLS = [
+    list_source_context,
+    list_sql_pairs,
+    read_sql_pair,
+    execute_sql_pair,
+    list_ask_tests,
+    read_ask_test,
+    run_ask_test,
+    list_ask_test_results,
+    read_ask_test_result,
+]
+
 _GOVERNED_MEMORY_READ_TOOLS = [
     list_context_files,
-    read_project_file,
+    read_project_file_governed,
 ]
 
 # Explicit allowlist of tools permitted in governed mode (Atlas Runtime P2-S1).
@@ -185,7 +199,7 @@ _GOVERNED_MEMORY_READ_TOOLS = [
 GOVERNED_TOOL_ALLOWLIST = [
     *_DATABASE_ANALYSIS_TOOLS,
     visualize_chart,
-    *_READ_ONLY_CONTEXT_TOOLS,
+    *_GOVERNED_CONTEXT_TOOLS,
     *_GOVERNED_MEMORY_READ_TOOLS,
 ]
 

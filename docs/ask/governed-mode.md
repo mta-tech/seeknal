@@ -40,7 +40,7 @@ If any prohibited variable is present in the environment, `GovernedAskContext.fr
 
 ## Tool Allowlist
 
-Governed mode replaces open-ended tool discovery with an explicit, strict allowlist. Only the following 17 tools are permitted:
+Governed mode replaces open-ended tool discovery with an explicit, strict allowlist. Only the following 16 tools are permitted:
 
 ### 1. Database Analysis Tools
 - `execute_sql`: Sends queries to `POST /api/ask/v1/query` with `maxRows`. Does not perform local unhardened DuckDB execution or secondary row counting.
@@ -52,18 +52,20 @@ Governed mode replaces open-ended tool discovery with an explicit, strict allowl
 - `visualize_chart`: Chat chart generator operating purely over in-memory row data already retrieved from the Catalog.
 
 ### 3. Read-Only Context Tools
-- `list_source_context` / `read_source_context`: Read generated documentation and context notes.
+- `list_source_context`: List generated context file paths and descriptions (without sample rows).
 - `list_sql_pairs` / `read_sql_pair` / `execute_sql_pair`: Read and execute pre-approved SQL examples.
 - `list_ask_tests` / `read_ask_test` / `run_ask_test`: QA regression test inspection and execution.
 - `list_ask_test_results` / `read_ask_test_result`: QA regression test result inspection.
 
 ### 4. Memory Read Tools
 - `list_context_files`: List project-local context files.
-- `read_project_file`: Read project-local context notes.
+- `read_project_file_governed`: Hardened file reader replacing `read_project_file`. Permits only `.yml`, `.yaml`, `.sql`, `.md`, `.py` files up to 256 KiB outside `target/`, `.seeknal/`, `data/`, `seeds/`, and hidden folders, restricting YAML files to `seeknal/` or root `seeknal_project.yml`.
 
 ### Excluded Tools
 
 Any tool not explicitly listed in the allowlist is excluded. Specifically:
+- `read_source_context`: Excluded because generated source context files contain sample rows captured by the ungoverned preview path.
+- `read_project_file`: Excluded in favor of `read_project_file_governed`.
 - `execute_python`: Excluded because its sandbox rebuilds a credentialed REPL.
 - Write tools (`write_project_file`, `save_preference`, `write_ingested_table`, `save_metric`, `save_ingestion_skill`, `save_report_exposure`): Excluded; the sandbox pod has no local or remote write authority.
 - Pipeline and transformation tools (`run_pipeline`, `plan_pipeline`, `draft_node`, `edit_node`, `dry_run_draft`, `apply_draft`): Excluded.
