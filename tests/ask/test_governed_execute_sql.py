@@ -50,8 +50,8 @@ def governed_setup(tmp_path: Path, token_file: Path, monkeypatch: pytest.MonkeyP
                 200,
                 json={
                     "columns": [
-                        {"name": "id", "type": "INTEGER"},
-                        {"name": "customer", "type": "VARCHAR"},
+                        {"name": "id", "type": "INTEGER", "classification": None, "masked": False},
+                        {"name": "customer", "type": "VARCHAR", "classification": None, "masked": False},
                     ],
                     "rows": [
                         {"id": 1, "customer": "Acme Corp"},
@@ -133,3 +133,55 @@ def test_execute_sql_never_touches_duckdb_connect_attachments(governed_setup, mo
     # In governed mode, execute_sql routes exclusively to the Catalog;
     # it must never touch duckdb.connect or attach database/storage credentials.
     assert len(connect_calls) == 0
+
+
+def test_execute_sql_response_without_labels_at_tier_e1_returns_no_values_and_withheld_message(
+    tmp_path: Path, token_file: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("ATLAS_ASK_MODE", "governed")
+    monkeypatch.setenv("ATLAS_ASK_EGRESS_TIER", "E1")
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "columns": [
+                    {"name": "id", "type": "INTEGER"},
+                    {"name": "customer", "type": "VARCHAR"},
+                ],
+                "rows": [
+                    {"id": 1, "customer": "Acme Corp"},
+                    {"id": 2, "customer": "Beta LLC"},
+                ],
+                "rowCount": 2,
+                "elapsedMs": 8,
+                "truncated": False,
+                "queryId": "q-unlabeled-1",
+            },
+        )
+
+    transport = httpx.MockTransport(handle_request)
+    client = AskCatalogClient("https://catalog.atlas.local", token_file, transport=transport)
+    repl = GovernedRepl(client)
+
+    ctx = ToolContext(
+        repl=repl,
+        artifact_discovery=MagicMock(),
+        project_path=tmp_path,
+        is_governed=True,
+    )
+    set_tool_context(ctx)
+
+    result = execute_sql("SELECT id, customer FROM orders")
+
+    # Returns no values
+    assert "Acme Corp" not in result
+    assert "Beta LLC" not in result
+    assert "|  |" not in result
+
+    # Says columns were withheld
+    assert "withheld" in result
+    assert "All result columns were withheld by egress tier E1: `id` (phi), `customer` (phi)." in result
+    assert "2 rows" in result
+    assert "Ask an administrator about the egress policy if you need these values." in result
+

@@ -207,6 +207,39 @@ def visualize_chart(
         has_injection = detect_instruction_text(chart_rows)
 
     # ── STEP 2: VALIDATE SHAPE ─────────────────────────────────────────────
+    if is_gov and not chart_columns and dropped:
+        from seeknal.ask.agents.tools.execute_sql import (
+            _repair_common_sql_before_execution,
+            _sql_cache_key,
+            format_all_withheld_message,
+        )
+        meta = getattr(getattr(ctx, "repl", None), "last_result_meta", None) or {}
+        row_count = meta.get("rowCount")
+        if row_count is None and sql:
+            from seeknal.ask.agents.tools._context import get_structured_sql_cache
+            s, _ = _repair_common_sql_before_execution(str(sql).strip().rstrip(";").strip())
+            c_entry = get_structured_sql_cache(ctx).get(_sql_cache_key(s))
+            if c_entry:
+                row_count = c_entry.get("rowCount")
+        if row_count is None and chart_rows is not None:
+            row_count = len(chart_rows)
+        tier = getattr(ctx, "egress_tier", None)
+        if tier is None:
+            repl = getattr(ctx, "repl", None)
+            tier = getattr(repl, "tier", None)
+        if tier is None:
+            from seeknal.ask.egress import tier_from_env
+            tier = tier_from_env()
+        result = format_all_withheld_message(
+            tier=tier,
+            dropped_report=dropped,
+            row_count=row_count,
+        )
+        if has_injection:
+            result += f"\n\n{INJECTION_NOTICE}"
+        record_tool_result("visualize_chart", result, args=signature_args)
+        return result
+
     if not chart_rows:
         result = "No rows to chart."
         if dropped:

@@ -343,6 +343,29 @@ def execute_sql(
             if truncated or (row_count is not None and row_count > effective_limit):
                 has_more_rows = True
             total_rows = row_count
+
+        if not columns:
+            actual_count = row_count if row_count is not None else len(trimmed_rows)
+            result = format_all_withheld_message(
+                tier=tier,
+                dropped_report=dropped_report,
+                row_count=actual_count,
+            )
+            if has_injection:
+                result += f"\n\n{INJECTION_NOTICE}"
+            if lint_notices:
+                result += "\n\n" + "\n".join(f"ℹ SQL lint: {notice}" for notice in lint_notices)
+            if drift_notice:
+                result += "\n\n" + drift_notice
+            success_cache[cache_key] = result
+            get_structured_sql_cache(ctx)[cache_key] = {
+                "columns": [],
+                "rows": [],
+                "dropped": dropped_report,
+                "rowCount": actual_count,
+            }
+            record_tool_result("execute_sql", result, args={"sql": sql})
+            return result
     else:
         if has_more_rows:
             try:
@@ -381,6 +404,32 @@ def execute_sql(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def format_all_withheld_message(
+    tier: Any,
+    dropped_report: list[Any],
+    row_count: int | None = None,
+) -> str:
+    """Format a clear notification when every result column is withheld by egress tier."""
+    tier_name = tier.value if hasattr(tier, "value") else str(tier)
+    if dropped_report:
+        cols: list[str] = []
+        for d in dropped_report:
+            col = getattr(d, "column", None) or (d.get("column") if isinstance(d, dict) else str(d))
+            reason = getattr(d, "reason", None) or (d.get("reason") if isinstance(d, dict) else "")
+            match = re.search(r"classified\s+(\w+)", reason)
+            classification = match.group(1) if match else "phi"
+            cols.append(f"`{col}` ({classification})")
+        cols_str = ", ".join(cols)
+    else:
+        cols_str = "all columns"
+    count_part = f" ({row_count:,} row{'s' if row_count != 1 else ''})" if row_count is not None else ""
+    return (
+        f"All result columns were withheld by egress tier {tier_name}: {cols_str}."
+        f"{count_part} Ask an administrator about the egress policy if you need these values."
+    )
+
 
 
 # ---------------------------------------------------------------------------
@@ -1165,4 +1214,4 @@ def _format_table(
     return result
 
 
-__all__ = ["execute_sql"]
+__all__ = ["execute_sql", "format_all_withheld_message"]

@@ -402,3 +402,108 @@ def test_invalid_tier_env_refuses_startup(tmp_path: Path, monkeypatch: pytest.Mo
     with pytest.raises(GovernedAskConfigError) as exc_info:
         GovernedAskContext.from_env()
     assert "Invalid ATLAS_ASK_EGRESS_TIER" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# 8. All columns withheld returns clear message and row count
+# ---------------------------------------------------------------------------
+
+
+def test_governed_execute_sql_all_columns_withheld_renders_short_message(
+    tmp_path: Path, token_file: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("ATLAS_ASK_MODE", "governed")
+    monkeypatch.setenv("ATLAS_ASK_EGRESS_TIER", "E1")
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "columns": [
+                    {"name": "id", "type": "INTEGER", "classification": "phi", "masked": False},
+                    {"name": "customer", "type": "VARCHAR", "classification": "phi", "masked": False},
+                ],
+                "rows": [
+                    {"id": 1, "customer": "Acme Corp"},
+                    {"id": 2, "customer": "Beta LLC"},
+                ],
+                "rowCount": 2,
+                "elapsedMs": 4,
+                "truncated": False,
+                "queryId": "q-all-phi",
+            },
+        )
+
+    transport = httpx.MockTransport(handle_request)
+    client = AskCatalogClient("https://catalog.atlas.local", token_file, transport=transport)
+    repl = GovernedRepl(client)
+
+    ctx = ToolContext(
+        repl=repl,
+        artifact_discovery=MagicMock(),
+        project_path=tmp_path,
+        is_governed=True,
+    )
+    set_tool_context(ctx)
+
+    result = execute_sql("SELECT id, customer FROM orders")
+
+    # Short message instead of table
+    assert "|  |" not in result
+    assert "Acme Corp" not in result
+    assert "All result columns were withheld by egress tier E1: `id` (phi), `customer` (phi)." in result
+    assert "2 rows" in result
+    assert "Ask an administrator about the egress policy if you need these values." in result
+
+
+def test_governed_visualize_chart_all_columns_withheld_returns_message_no_chart(
+    tmp_path: Path, token_file: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("ATLAS_ASK_MODE", "governed")
+    monkeypatch.setenv("ATLAS_ASK_EGRESS_TIER", "E1")
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "columns": [
+                    {"name": "patient", "type": "VARCHAR", "classification": "phi", "masked": False},
+                    {"name": "diagnosis", "type": "VARCHAR", "classification": "phi", "masked": False},
+                ],
+                "rows": [
+                    {"patient": "P1", "diagnosis": "D1"},
+                    {"patient": "P2", "diagnosis": "D2"},
+                    {"patient": "P3", "diagnosis": "D3"},
+                ],
+                "rowCount": 3,
+                "elapsedMs": 4,
+                "truncated": False,
+                "queryId": "q-chart-withheld",
+            },
+        )
+
+    transport = httpx.MockTransport(handle_request)
+    client = AskCatalogClient("https://catalog.atlas.local", token_file, transport=transport)
+    repl = GovernedRepl(client)
+
+    ctx = ToolContext(
+        repl=repl,
+        artifact_discovery=MagicMock(),
+        project_path=tmp_path,
+        is_governed=True,
+    )
+    set_tool_context(ctx)
+
+    result = visualize_chart(
+        widget_type="bar_chart",
+        widget_title="Patient Diagnoses",
+        sql="SELECT patient, diagnosis FROM records",
+    )
+
+    # Returns withheld message instead of error or chart
+    assert "All result columns were withheld by egress tier E1: `patient` (phi), `diagnosis` (phi)." in result
+    assert "3 rows" in result
+    assert "Ask an administrator about the egress policy if you need these values." in result
+    # No chart payload is registered
+    assert ctx.pending_visualization is None
+

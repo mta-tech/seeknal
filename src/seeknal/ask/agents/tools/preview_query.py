@@ -179,7 +179,10 @@ def preview_query(sql: str, run_hooks: bool = True) -> str:
         cols = ["decision"]
         rows = [(decision,)]
         labels = [{"name": "decision", "classification": None, "masked": False}]
-        filter_result(cols, rows, labels, tier, is_schema=True)
+        cols, rows, dropped = filter_result(cols, rows, labels, tier, is_schema=True)
+        if not cols:
+            from seeknal.ask.agents.tools.execute_sql import format_all_withheld_message
+            return format_all_withheld_message(tier, dropped, row_count=total_rows)
 
         has_injection = detect_instruction_text([[trimmed]] + [[n] for n in notices])
         report = _format_report(decision, notices, row_count=total_rows, column_count=column_count)
