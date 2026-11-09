@@ -5,11 +5,18 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Sequence
 
 from seeknal.serving.server.config import parse_jwks
 
+from .metering import (
+    UsageRecord,
+    export_monthly,
+    rollup,
+    sign_rollups,
+)
 from .project_pin import PinError, read_runtime_pin, resolve_pin
 from .release import ManifestError, image_reference, load_manifest, manifest_sha256
 from .run_grant import RunGrantError, require_plan_covered, verify_run_grant
@@ -88,6 +95,29 @@ def create_parser() -> argparse.ArgumentParser:
     )
     vg_parser.add_argument(
         "--plan", default=None, help="Path to canonical plan JSON file."
+    )
+
+    # meter --records FILE.jsonl --manifest MANIFEST.yaml [--sign-key PEM --kid KID --cell CELL] [--month YYYY-MM]
+    meter_parser = subparsers.add_parser(
+        "meter", help="Calculate ACU metering rollups from usage records."
+    )
+    meter_parser.add_argument(
+        "--records", required=True, help="Path to JSON Lines usage records file."
+    )
+    meter_parser.add_argument(
+        "--manifest", required=True, help="Path to runtime release manifest YAML file."
+    )
+    meter_parser.add_argument(
+        "--sign-key", default=None, help="Path to EC private key PEM file or PEM string."
+    )
+    meter_parser.add_argument(
+        "--kid", default=None, help="Key ID for signing rollups."
+    )
+    meter_parser.add_argument(
+        "--cell", default=None, help="Cell ID (issuer) for signing rollups."
+    )
+    meter_parser.add_argument(
+        "--month", default=None, help="Export monthly CSV for YYYY-MM."
     )
 
     return parser
@@ -224,6 +254,98 @@ def main(argv: Sequence[str] | None = None) -> int:
         except Exception as exc:
             print(f"ERR: {exc}", file=sys.stderr)
             return 1
+
+    if args.command == "meter":
+        if args.sign_key and args.month:
+            print("ERR: --sign-key and --month cannot be used together", file=sys.stderr)
+            return 2
+
+        if args.sign_key and (not args.kid or not args.cell):
+            print("ERR: --sign-key requires both --kid and --cell", file=sys.stderr)
+            return 2
+
+        month_parts: tuple[int, int] | None = None
+        if args.month:
+            parts = args.month.split("-")
+            if len(parts) != 2:
+                print(
+                    f"ERR: Invalid month format '{args.month}', expected YYYY-MM",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                year = int(parts[0])
+                month = int(parts[1])
+                if month < 1 or month > 12:
+                    raise ValueError("Month must be between 1 and 12")
+                month_parts = (year, month)
+            except Exception as exc:
+                print(f"ERR: Invalid month format '{args.month}': {exc}", file=sys.stderr)
+                return 2
+
+        records_path = Path(args.records)
+        if not records_path.is_file():
+            print(f"ERR: Records file not found: {args.records}", file=sys.stderr)
+            return 1
+
+        manifest_path = Path(args.manifest)
+        if not manifest_path.is_file():
+            print(f"ERR: Manifest file not found: {args.manifest}", file=sys.stderr)
+            return 1
+
+        try:
+            release = load_manifest(manifest_path)
+        except Exception as exc:
+            print(f"ERR: Failed to load manifest: {exc}", file=sys.stderr)
+            return 1
+
+        records = []
+        try:
+            with open(records_path, "r", encoding="utf-8") as f:
+                for line_num, line in enumerate(f, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec_dict = json.loads(line)
+                    records.append(UsageRecord.from_dict(rec_dict))
+        except Exception as exc:
+            print(f"ERR: Failed to read usage records: {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            rollups = rollup(records, release.acu_weights)
+        except Exception as exc:
+            print(f"ERR: Failed to compute rollups: {exc}", file=sys.stderr)
+            return 1
+
+        if month_parts is not None:
+            csv_str = export_monthly(rollups, month_parts[0], month_parts[1])
+            sys.stdout.write(csv_str)
+            return 0
+
+        if args.sign_key:
+            try:
+                sign_key_p = Path(args.sign_key)
+                if sign_key_p.is_file():
+                    key_data = sign_key_p.read_text("utf-8")
+                else:
+                    key_data = args.sign_key
+                token = sign_rollups(
+                    rollups,
+                    key_data,
+                    kid=args.kid,
+                    cell_id=args.cell,
+                    issued_at=int(time.time()),
+                )
+                print(token)
+                return 0
+            except Exception as exc:
+                print(f"ERR: Failed to sign rollups: {exc}", file=sys.stderr)
+                return 1
+
+        output_list = [r.to_dict() for r in rollups]
+        print(json.dumps(output_list, indent=2))
+        return 0
 
     return 2
 
