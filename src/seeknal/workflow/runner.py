@@ -138,6 +138,16 @@ class DAGRunner:
         else:
             self.diff = None
 
+        # Governed runtime initialization
+        from seeknal.runtime.catalog_io import get_catalog_io
+
+        catalog_io = get_catalog_io(
+            project_path=getattr(self.exec_context, "workspace_path", None) or Path.cwd()
+        )
+        if catalog_io is not None:
+            if hasattr(self, "manifest") and self.manifest and getattr(self.manifest, "project", None):
+                catalog_io.project = self.manifest.project
+
     def _get_topological_order(self) -> List[str]:
         """
         Get nodes in topological order using Kahn's algorithm.
@@ -762,6 +772,48 @@ class DAGRunner:
         Returns:
             ExecutionSummary with results
         """
+        try:
+            return self._run_internal(
+                full=full,
+                dry_run=dry_run,
+                node_types=node_types,
+                nodes=nodes,
+                tags=tags,
+                exclude_tags=exclude_tags,
+                continue_on_error=continue_on_error,
+                retry=retry,
+            )
+        finally:
+            self._flush_lineage()
+
+    def _flush_lineage(self) -> None:
+        """Flush buffered lineage events and log statistics at end of governed run."""
+        from seeknal.runtime.catalog_io import get_catalog_io
+
+        catalog_io = get_catalog_io()
+        if catalog_io is not None:
+            try:
+                catalog_io.lineage_emitter.flush()
+                stats = catalog_io.lineage_emitter.stats()
+                logger.info("Lineage delivery stats: %s", stats)
+                buffered = stats.get("buffered", 0) if isinstance(stats, dict) else 0
+                if buffered > 0:
+                    logger.warning("Lineage events remain buffered after flush: %d", buffered)
+                    _echo_warning(f"Lineage events remain buffered after flush: {buffered}")
+            except Exception as exc:
+                logger.warning("Failed to flush lineage emitter: %s", exc)
+
+    def _run_internal(
+        self,
+        full: bool = False,
+        dry_run: bool = False,
+        node_types: Optional[List[str]] = None,
+        nodes: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        exclude_tags: Optional[List[str]] = None,
+        continue_on_error: bool = False,
+        retry: int = 0,
+    ) -> ExecutionSummary:
         start_time = time.time()
         self._full_refresh = full
 

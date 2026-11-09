@@ -12,6 +12,7 @@ Design:
 - Error handling: failed nodes cause downstream to be skipped
 """
 
+import logging
 import os
 import threading
 import time
@@ -25,6 +26,8 @@ from seeknal.workflow.runner import DAGRunner, ExecutionStatus, NodeResult
 from seeknal.workflow.state import (
     NodeStatus, update_node_state, save_state, find_downstream_nodes,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -70,6 +73,29 @@ class ParallelDAGRunner:
         Returns:
             ParallelExecutionSummary with results
         """
+        try:
+            return self._run_internal(nodes_to_run, dry_run=dry_run)
+        finally:
+            self._flush_lineage()
+
+    def _flush_lineage(self) -> None:
+        """Flush buffered lineage events and log statistics at end of governed run."""
+        from seeknal.runtime.catalog_io import get_catalog_io
+
+        catalog_io = get_catalog_io()
+        if catalog_io is not None:
+            try:
+                catalog_io.lineage_emitter.flush()
+                stats = catalog_io.lineage_emitter.stats()
+                logger.info("Lineage delivery stats: %s", stats)
+                buffered = stats.get("buffered", 0) if isinstance(stats, dict) else 0
+                if buffered > 0:
+                    logger.warning("Lineage events remain buffered after flush: %d", buffered)
+                    _echo_warning(f"Lineage events remain buffered after flush: {buffered}")
+            except Exception as exc:
+                logger.warning("Failed to flush lineage emitter: %s", exc)
+
+    def _run_internal(self, nodes_to_run: Set[str], dry_run: bool = False) -> ParallelExecutionSummary:
         start_time = time.time()
         layers = self.runner._get_topological_layers()
 

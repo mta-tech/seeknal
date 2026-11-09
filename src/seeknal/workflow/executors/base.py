@@ -484,8 +484,8 @@ class BaseExecutor(ABC):
         from seeknal.runtime.controller_client import NodeNotAuthorized, RunRevoked
 
         catalog_io = get_catalog_io()
+        node_name = getattr(self.node, "qualified_name", None) or getattr(self.node, "id", str(self.node))
         if catalog_io is not None:
-            node_name = getattr(self.node, "qualified_name", None) or getattr(self.node, "id", str(self.node))
             try:
                 catalog_io.node_start(node_name)
             except (RunRevoked, NodeNotAuthorized) as exc:
@@ -495,11 +495,20 @@ class BaseExecutor(ABC):
                     error_message=str(exc),
                     metadata={"error": str(exc), "governed_stop": True},
                 )
+            try:
+                catalog_io.emit_node_event("START", node_name)
+            except Exception:
+                pass
 
         # Pre-execution setup
         try:
             self.pre_execute()
         except Exception as e:
+            if catalog_io is not None:
+                try:
+                    catalog_io.emit_node_event("FAIL", node_name, error=e)
+                except Exception:
+                    pass
             raise ExecutorExecutionError(
                 self.node.id,
                 f"Pre-execution setup failed: {str(e)}",
@@ -519,9 +528,19 @@ class BaseExecutor(ABC):
             if not result.is_dry_run:
                 result.is_dry_run = self.context.dry_run
 
-        except ExecutorExecutionError:
+        except ExecutorExecutionError as e:
+            if catalog_io is not None:
+                try:
+                    catalog_io.emit_node_event("FAIL", node_name, error=e)
+                except Exception:
+                    pass
             raise
         except Exception as e:
+            if catalog_io is not None:
+                try:
+                    catalog_io.emit_node_event("FAIL", node_name, error=e)
+                except Exception:
+                    pass
             raise ExecutorExecutionError(
                 self.node.id,
                 f"Execution failed: {str(e)}",
@@ -544,7 +563,143 @@ class BaseExecutor(ABC):
             result.status = ExecutionStatus.FAILED
             result.error_message = "Required Iceberg materialization failed; inspect materialization results"
 
+        if catalog_io is not None:
+            if result.status == ExecutionStatus.FAILED or result.is_failed():
+                try:
+                    catalog_io.emit_node_event(
+                        "FAIL",
+                        node_name,
+                        error=result.error_message or "Node execution failed",
+                    )
+                except Exception:
+                    pass
+            else:
+                schema = self._extract_lineage_schema(result)
+                snapshot_ids = self._extract_lineage_snapshot_ids(result, catalog_io, node_name)
+                sql = self._extract_lineage_sql()
+                input_refs = getattr(self.node, "config", {}).get("inputs") if hasattr(self.node, "config") else None
+                try:
+                    catalog_io.emit_node_event(
+                        "COMPLETE",
+                        node_name,
+                        schema=schema,
+                        snapshot_ids=snapshot_ids,
+                        sql=sql,
+                        input_refs=input_refs,
+                    )
+                except Exception:
+                    pass
+
         return result
+
+    def _extract_lineage_schema(self, result: ExecutorResult) -> Any:
+        """Extract output schema from executor result or node."""
+        raw_cols = None
+        if isinstance(result.metadata, dict):
+            raw_cols = result.metadata.get("columns") or result.metadata.get("schema")
+        if raw_cols is None and hasattr(result, "columns"):
+            raw_cols = getattr(result, "columns")
+        if raw_cols is None and getattr(self.node, "columns", None):
+            raw_cols = self.node.columns
+        if raw_cols is None:
+            return None
+        if isinstance(raw_cols, dict):
+            return raw_cols
+        if isinstance(raw_cols, (list, tuple)):
+            normalized = []
+            for item in raw_cols:
+                if isinstance(item, str):
+                    entry = {"name": item}
+                    if getattr(self.node, "columns", None) and item in self.node.columns:
+                        entry["type"] = self.node.columns[item]
+                    normalized.append(entry)
+                else:
+                    normalized.append(item)
+            return normalized
+        return raw_cols
+
+    def _extract_lineage_snapshot_ids(
+        self,
+        result: ExecutorResult,
+        catalog_io: Any,
+        node_name: str,
+    ) -> dict[str, Any] | None:
+        """Extract Iceberg snapshot IDs from executor result and materializations."""
+        from seeknal.workflow.materialization.dispatcher import iceberg_commit_requires_reconciliation
+
+        meta = result.metadata or {}
+        snapshot_ids: dict[str, Any] = {}
+
+        # 1. Direct snapshot_ids in metadata
+        if isinstance(meta.get("snapshot_ids"), dict):
+            snapshot_ids.update(meta["snapshot_ids"])
+
+        # 2. Source node iceberg_snapshot_id
+        if meta.get("iceberg_snapshot_id") and meta["iceberg_snapshot_id"] != "unknown":
+            snap_val = meta["iceberg_snapshot_id"]
+            tbl = meta.get("iceberg_table_ref") or (
+                getattr(self.node, "config", {}).get("table") if hasattr(self.node, "config") else None
+            )
+            if not tbl and hasattr(catalog_io, "ctx") and getattr(catalog_io.ctx, "plan", None):
+                for pn in catalog_io.ctx.plan.nodes:
+                    if pn.id == node_name:
+                        tbl = pn.reads[0] if pn.reads else (pn.writes[0] if pn.writes else None)
+                        break
+            if tbl:
+                snapshot_ids[tbl] = snap_val
+
+        # 3. Materialization result
+        if not iceberg_commit_requires_reconciliation(meta):
+            mat = meta.get("materialization")
+            if mat:
+                res_list = getattr(mat, "results", None) or (mat.get("results") if isinstance(mat, dict) else None)
+                if isinstance(res_list, list):
+                    for idx, item in enumerate(res_list):
+                        if isinstance(item, dict) and item.get("success"):
+                            wr = item.get("write_result")
+                            snap = getattr(wr, "snapshot_id", None) or (
+                                wr.get("snapshot_id") if isinstance(wr, dict) else None
+                            ) or item.get("snapshot_id")
+                            if snap and snap != "unknown":
+                                tbl = item.get("table") or (
+                                    wr.get("table") if isinstance(wr, dict) else getattr(wr, "table", None)
+                                )
+                                if not tbl:
+                                    mat_targets = getattr(self.node, "config", {}).get("materializations", [])
+                                    if idx < len(mat_targets):
+                                        tbl = mat_targets[idx].get("table")
+                                if not tbl:
+                                    tbl = getattr(self.node, "config", {}).get("materialization", {}).get("table")
+                                if not tbl and hasattr(catalog_io, "ctx") and getattr(catalog_io.ctx, "plan", None):
+                                    for pn in catalog_io.ctx.plan.nodes:
+                                        if pn.id == node_name and pn.writes and idx < len(pn.writes):
+                                            tbl = pn.writes[idx]
+                                            break
+                                if tbl:
+                                    snapshot_ids[tbl] = snap
+                elif isinstance(mat, dict) and mat.get("success"):
+                    tbl = mat.get("table") or mat.get("iceberg_table")
+                    wr = mat.get("write_result")
+                    snap = mat.get("snapshot_id") or (
+                        wr.get("snapshot_id") if isinstance(wr, dict) else getattr(wr, "snapshot_id", None)
+                    )
+                    if tbl and snap and snap != "unknown":
+                        snapshot_ids[tbl] = snap
+
+        return snapshot_ids if snapshot_ids else None
+
+    def _extract_lineage_sql(self) -> str | None:
+        """Extract transform SQL for column lineage if available."""
+        is_transform = (
+            getattr(self.node, "node_type", None) == NodeType.TRANSFORM
+            or getattr(getattr(self.node, "node_type", None), "value", None) == "transform"
+            or str(getattr(self.node, "id", "")).startswith("transform.")
+        )
+        if is_transform and hasattr(self.node, "config") and isinstance(self.node.config, dict):
+            sql = self.node.config.get("sql") or self.node.config.get("transform")
+            if isinstance(sql, str) and sql.strip():
+                return sql
+        return None
 
 
 class ExecutorRegistry:

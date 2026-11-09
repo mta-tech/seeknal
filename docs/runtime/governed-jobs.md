@@ -86,7 +86,25 @@ When `ATLAS_RUNTIME_MODE` is unset or not `"governed"`, execution behavior is **
 
 ---
 
-## 4. Unsupported Features (v1)
+## 4. Lineage
+
+Governed runs emit OpenLineage 2.0 RunEvents (`START`, `COMPLETE`, `FAIL`) to the Atlas Run Controller lineage endpoint (`POST /api/runtime/v1/lineage`) using the run grant bearer token.
+
+### Lifecycle Events
+- **START**: Emitted immediately following successful node authorization via `CatalogIO.node_start`. If a node start is revoked or unauthorized, no `START` event is emitted.
+- **COMPLETE**: Emitted upon successful node execution and target materialization. Exposes output schema fields when the executor result provides them, and Iceberg snapshot IDs (dataset versions) from successful materialization results.
+- **FAIL**: Emitted on execution or materialization failure with the error message (redacted of credentials and truncated to 2000 characters).
+
+### Lineage Facets & Guarantees
+- **Deterministic Identity**: Node runs are assigned deterministic UUIDv5 identifiers generated from `(RUN_NAMESPACE, f"{grant_jti}:{node_id}")`.
+- **Dataset Identification**: 3-part Iceberg tables (`<catalog>.<namespace>.<table>`) are mapped to canonical OpenLineage dataset identifiers (`namespace: iceberg://<host>/<catalog>`, `name: <namespace>.<table>`).
+- **Column-Level Lineage**: For transform nodes with SQL definitions, column-level lineage is derived via SQLGlot AST parsing when the node reads Iceberg tables directly.
+- **Best-Effort & Non-Blocking**: Event emission is buffered in-memory and best-effort; lineage delivery failures never fail the node or raise into the workflow run.
+- **End-of-Run Flush**: At the end of a governed run (success, failure, or revoked stop), `CatalogIO.lineage_emitter.flush()` is invoked once by the runner (`DAGRunner` or `ParallelDAGRunner`) and delivery statistics are logged. If un-emitted events remain buffered after flush, a warning is logged.
+
+---
+
+## 5. Unsupported Features (v1)
 
 The following features are intentionally not supported in Governed Mode v1:
 1. **PyIceberg Advanced Mutation Modes**: Modes requiring PyIceberg (e.g. conditional upsert, merge, complex delete mutations) are refused with a clear error (`PyIceberg advanced mutation modes are not supported in governed mode (v1)`). Governed mode currently uses DuckDB's native Iceberg integration with vended credentials.
