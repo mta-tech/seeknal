@@ -1,0 +1,13 @@
+# Minimal runtime dependencies for seeknal.serving
+attrs
+cryptography
+duckdb
+httpx
+pygments
+python-multipart
+pyyaml
+rich
+sniffio
+sqlglot
+starlette
+uvicorn

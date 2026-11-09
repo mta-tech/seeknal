@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.7
+# Atlas Runtime Serving image (atlas-rt-serving).
+#
+# Build from repository root:
+#   docker build -f docker/Dockerfile.serving -t atlas-rt-serving:local .
+#
+# Build with custom base image or commit revision:
+#   docker build -f docker/Dockerfile.serving \
+#     --build-arg BASE_IMAGE=ghcr.io/astral-sh/uv:python3.11-bookworm-slim \
+#     --build-arg SEEKNAL_COMMIT=$(git rev-parse HEAD) \
+#     -t atlas-rt-serving:local .
+
+ARG BASE_IMAGE=ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+FROM ${BASE_IMAGE} AS runtime
+
+ARG SEEKNAL_COMMIT=unknown
+
+LABEL org.opencontainers.image.title="atlas-rt-serving" \
+      org.opencontainers.image.source="https://github.com/mta-tech/seeknal" \
+      org.opencontainers.image.revision="${SEEKNAL_COMMIT}" \
+      io.atlas.runtime.image="atlas-rt-serving"
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_SYSTEM_PYTHON=1
+
+WORKDIR /opt/seeknal
+
+COPY pyproject.toml uv.lock README.md LICENSE ./
+COPY docker/serving-requirements.txt ./docker/serving-requirements.txt
+COPY src/ ./src/
+
+RUN mkdir -p docs/cli \
+    && uv export --frozen --no-hashes --no-emit-project --format requirements-txt -o /tmp/constraints.txt \
+    && uv pip install --system --no-deps . \
+    && uv pip install --system -r docker/serving-requirements.txt -c /tmp/constraints.txt \
+    && rm -rf /root/.cache /tmp/* docs/cli
+
+RUN mkdir -p /etc/seeknal && chmod 755 /etc/seeknal
+
+USER 10001:10001
+
+EXPOSE 8765
+
+ENTRYPOINT ["python", "-m", "seeknal.serving"]
+CMD ["--config", "/etc/seeknal/serving.yaml"]
