@@ -176,7 +176,7 @@ Load Test Report (30.00s, 2450 requests, 0 errors):
 
 ### Per-Request Grant Minting & Replay Protection
 
-Hardened Seeknal Serving maintains an in-memory grant replay cache (`GrantReplayCache`). Each grant token carries a unique `jti` (JWT ID). When a `/v1/query` call begins execution, its `jti` is recorded in the replay cache until expiry (plus leeway).
+Hardened Seeknal Serving maintains an in-memory grant replay cache (`GrantReplayCache`). Each grant token carries a unique `jti` (JWT ID). When a `/v1/query` call is received and verified, its `jti` is recorded in the replay cache until expiry (plus leeway).
 
 A subsequent `/v1/query` request presenting the same `jti` is immediately refused with HTTP **401 `grant_replayed`**:
 ```json
