@@ -290,9 +290,12 @@ def test_max_rows_lowers_cap_and_clamped_to_grant(http_setup):
     assert resp_exp.json()["row_limit"] == 6
 
     # 2. Request asks for 200 rows, but grant is 50: clamped to 50
+    token_clamped = sign_grant_token(
+        _base_claims(sql, max_rows=50, jti="jti-types-02"), priv, kid="key-1"
+    )
     resp_clamped = client.post(
         "/v1/query",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={"Authorization": f"Bearer {token_clamped}"},
         json={"sql": sql, "max_rows": 200},
     )
     assert resp_clamped.status_code == 200
@@ -331,14 +334,14 @@ def test_timeout_s_reaches_adapter_as_minimum():
     client = TestClient(app)
 
     sql = "SELECT id FROM users"
-    token = sign_grant_token(_base_claims(sql), priv, kid="key-1")
-
     # Lower than server timeout: 5.5 s
-    client.post("/v1/query", headers={"Authorization": f"Bearer {token}"}, json={"sql": sql, "timeout_s": 5.5})
+    token1 = sign_grant_token(_base_claims(sql, jti="jti-timeout-01"), priv, kid="key-1")
+    client.post("/v1/query", headers={"Authorization": f"Bearer {token1}"}, json={"sql": sql, "timeout_s": 5.5})
     assert adapter.recorded_timeouts[-1] == 5.5
 
     # Higher than server timeout: 100.0 s clamped to 30.0 s
-    client.post("/v1/query", headers={"Authorization": f"Bearer {token}"}, json={"sql": sql, "timeout_s": 100.0})
+    token2 = sign_grant_token(_base_claims(sql, jti="jti-timeout-02"), priv, kid="key-1")
+    client.post("/v1/query", headers={"Authorization": f"Bearer {token2}"}, json={"sql": sql, "timeout_s": 100.0})
     assert adapter.recorded_timeouts[-1] == 30.0
 
 

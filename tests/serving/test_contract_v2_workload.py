@@ -226,7 +226,9 @@ def test_http_workload_routed_execution_and_503_missing_account():
     assert adapter_bi.executed_queries[0].workload == "bi"
 
     # 2. Query with workload="report" gives 503 workload_account_missing
-    token_report = sign_grant_token(_base_claims(sql=sql, workload="report"), priv, kid="key-1")
+    token_report = sign_grant_token(
+        _base_claims(sql=sql, workload="report", jti="jti-workload-02"), priv, kid="key-1"
+    )
     resp_report = client.post(
         "/v1/query",
         headers={"Authorization": f"Bearer {token_report}"},

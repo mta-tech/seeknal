@@ -173,3 +173,86 @@ Load Test Report (30.00s, 2450 requests, 0 errors):
   Rule: analytics        count=1200   errors=0             p50=12.40ms p95=24.50ms p99=32.10ms
   Rule: point_lookup     count=1250   errors=0             p50=3.20ms  p95=6.80ms  p99=9.50ms
 ```
+
+### Per-Request Grant Minting & Replay Protection
+
+Hardened Seeknal Serving maintains an in-memory grant replay cache (`GrantReplayCache`). Each grant token carries a unique `jti` (JWT ID). When a `/v1/query` call begins execution, its `jti` is recorded in the replay cache until expiry (plus leeway).
+
+A subsequent `/v1/query` request presenting the same `jti` is immediately refused with HTTP **401 `grant_replayed`**:
+```json
+{
+  "error": "grant_replayed",
+  "message": "Grant '...' has already been used"
+}
+```
+
+Because load testing repeatedly executes queries over a test duration, reusing static pre-signed grant tokens causes every request after the first to fail with HTTP 401 `grant_replayed`.
+
+To support load testing against hardened Serving instances, the harness supports dynamic per-request grant minting via `make_grant_minter`:
+
+#### Python API with `make_grant_minter`
+```python
+from seeknal.serving.proving.load import make_grant_minter, run_load
+
+minter = make_grant_minter(
+    private_key_pem=open("signing_key.pem", "rb").read(),
+    kid="prod-key-1",
+    claims_template={
+        "sub": "loadtest@example.com",
+        "ws": "analytics",
+        "iss": "atlas-catalog",
+        "aud": "seeknal-serving",
+        "max_rows": 1000,
+        "tables": {
+            "users": {
+                "columns": ["id", "name", "amount"],
+                "masks": {},
+                "row_filters": [],
+                "actions": ["select"],
+            }
+        },
+    },
+    lifetime_seconds=30,
+)
+
+report = await run_load(
+    url="http://localhost:8000",
+    cases=[
+        {"name": "lookup", "sql": "SELECT id FROM users WHERE id = 1"},
+        {"name": "aggregate", "sql": "SELECT count(*) FROM users"},
+    ],
+    mint_token=minter,
+    concurrency=8,
+    duration=30.0,
+)
+
+print(report.format_summary())
+```
+
+Each query execution invokes `minter(case)` immediately before sending the request. The minter copies the claims template, generates a fresh `jti` (`uuid.uuid4().hex`), refreshes `iat` and `exp` (`iat + lifetime_seconds`), computes the `sql_sha256` digest of the case's SQL, and signs the grant with ES256.
+
+#### CLI Invocation with Per-Request Minting
+The CLI accepts `--signing-key`, `--kid`, and `--claims-template` as an alternative to `--token-file`:
+
+```bash
+python -m seeknal.serving.proving.load \
+  --url http://dev-serving:8000 \
+  --signing-key /etc/seeknal/keys/loadtest_private.pem \
+  --kid prod-key-1 \
+  --claims-template claims_template.json \
+  --cases cases.yaml \
+  --concurrency 8 \
+  --duration 30
+```
+
+**Security Requirement:** The key file passed to `--signing-key` must have strict permissions (mode 0600 or stricter). If the file is group- or world-readable (any of mode bits `0o044`), execution is refused with a `ServerConfigError`.
+
+#### Replay Error Reporting in Static Mode
+Static-token mode remains supported (e.g. against older Serving instances without the replay cache). When static tokens are used against a hardened Serving instance, HTTP 401 `grant_replayed` responses are tracked under their own key (`"grant_replayed"`) in `errors_by_status`:
+
+```text
+Load Test Report (5.00s, 120 requests, 118 errors):
+  Rule: unknown          count=118    errors={'grant_replayed': 118} p50=1.20ms p95=2.10ms p99=2.80ms
+  Rule: point_lookup     count=2      errors=0             p50=3.20ms p95=4.10ms p99=4.50ms
+```
+This makes misconfigured test runs immediately distinguishable from generic 401 authentication or authorization failures.

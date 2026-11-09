@@ -8,15 +8,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
+import hashlib
 import json
 import math
+import os
 import sys
 import time
-from collections.abc import Mapping, Sequence
+import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+
+from seeknal.serving.grant_token import _load_private_key, sign_grant_token
+from seeknal.serving.server.config import check_file_not_group_world_readable
 
 
 @dataclass
@@ -25,11 +32,15 @@ class RuleStats:
 
     rule: str
     request_count: int = 0
-    errors_by_status: dict[int, int] = field(default_factory=dict)
+    errors_by_status: dict[int | str, int] = field(default_factory=dict)
     latencies_ms: list[float] = field(default_factory=list)
     p50_ms: float = 0.0
     p95_ms: float = 0.0
     p99_ms: float = 0.0
+
+    @property
+    def grant_replayed_errors(self) -> int:
+        return self.errors_by_status.get("grant_replayed", 0)
 
 
 @dataclass
@@ -40,6 +51,10 @@ class LoadReport:
     total_errors: int
     by_rule: dict[str, RuleStats]
     duration_seconds: float
+
+    @property
+    def grant_replayed_errors(self) -> int:
+        return sum(stats.errors_by_status.get("grant_replayed", 0) for stats in self.by_rule.values())
 
     def format_summary(self) -> str:
         """Format a human-readable summary of load test metrics."""
@@ -106,11 +121,50 @@ def load_cases(cases_file: str) -> list[dict[str, Any]]:
     return list(data)
 
 
+def load_claims_template(path: str) -> dict[str, Any]:
+    """Load claims template from a JSON or YAML file."""
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+    try:
+        data = json.loads(content)
+    except Exception:
+        import yaml
+        data = yaml.safe_load(content)
+
+    if not isinstance(data, dict):
+        raise ValueError("claims template file must contain a JSON or YAML mapping")
+    return data
+
+
+def make_grant_minter(
+    private_key_pem: str | bytes,
+    *,
+    kid: str,
+    claims_template: Mapping[str, Any],
+    lifetime_seconds: float = 30,
+) -> Callable[[dict], str]:
+    """Return a callable that mints a fresh signed grant token for a query case."""
+    priv_key = _load_private_key(private_key_pem)
+
+    def _minter(case: dict) -> str:
+        claims = copy.deepcopy(dict(claims_template))
+        sql = case.get("sql", "") if isinstance(case, dict) else ""
+        now = time.time()
+        claims["jti"] = uuid.uuid4().hex
+        claims["iat"] = now
+        claims["exp"] = now + float(lifetime_seconds)
+        claims["sql_sha256"] = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+        return sign_grant_token(claims, priv_key, kid=kid)
+
+    return _minter
+
+
 async def run_load(
     url: str | None = None,
     *,
     cases: Sequence[dict[str, Any]],
     tokens: Mapping[str, str] | None = None,
+    mint_token: Callable[[dict], str] | None = None,
     concurrency: int = 1,
     duration: float = 1.0,
     transport: httpx.AsyncBaseTransport | None = None,
@@ -123,23 +177,24 @@ async def run_load(
 
     tokens_dict = dict(tokens or {})
 
-    # Prepare cases with resolved tokens
+    # Prepare cases with resolved tokens if mint_token is not provided
     prepared_cases: list[dict[str, Any]] = []
     for c in cases:
         c_dict = dict(c)
-        tok = c_dict.get("token")
-        if not tok:
-            name = c_dict.get("name")
-            key = c_dict.get("token_key") or name
-            if key and key in tokens_dict:
-                tok = tokens_dict[key]
-            elif "default" in tokens_dict:
-                tok = tokens_dict["default"]
-            elif len(tokens_dict) == 1:
-                tok = next(iter(tokens_dict.values()))
-        if not tok:
-            raise ValueError(f"No token found for case: {c_dict.get('name', 'unnamed')}")
-        c_dict["token"] = tok
+        if mint_token is None:
+            tok = c_dict.get("token")
+            if not tok:
+                name = c_dict.get("name")
+                key = c_dict.get("token_key") or name
+                if key and key in tokens_dict:
+                    tok = tokens_dict[key]
+                elif "default" in tokens_dict:
+                    tok = tokens_dict["default"]
+                elif len(tokens_dict) == 1:
+                    tok = next(iter(tokens_dict.values()))
+            if not tok:
+                raise ValueError(f"No token found for case: {c_dict.get('name', 'unnamed')}")
+            c_dict["token"] = tok
         prepared_cases.append(c_dict)
 
     by_rule: dict[str, RuleStats] = {}
@@ -155,11 +210,15 @@ async def run_load(
 
             sql = case_item["sql"]
             params = case_item.get("params", [])
-            token = case_item["token"]
+            if mint_token is not None:
+                token = mint_token(case_item)
+            else:
+                token = case_item["token"]
 
             req_start = time.perf_counter()
             status = 200
-            rule = "unknown"
+            rule = case_item.get("rule") or "unknown"
+            error_code = None
             try:
                 resp = await cli.post(
                     "/v1/query",
@@ -171,8 +230,11 @@ async def run_load(
                 status = resp.status_code
                 try:
                     body = resp.json()
-                    if isinstance(body, dict) and "rule" in body:
-                        rule = body["rule"]
+                    if isinstance(body, dict):
+                        if "rule" in body:
+                            rule = body["rule"]
+                        if "error" in body:
+                            error_code = body["error"]
                 except Exception:
                     pass
             except Exception:
@@ -187,7 +249,11 @@ async def run_load(
                 stats.request_count += 1
                 stats.latencies_ms.append(latency_ms)
                 if status != 200:
-                    stats.errors_by_status[status] = stats.errors_by_status.get(status, 0) + 1
+                    if status == 401 and error_code == "grant_replayed":
+                        err_key: int | str = "grant_replayed"
+                    else:
+                        err_key = status
+                    stats.errors_by_status[err_key] = stats.errors_by_status.get(err_key, 0) + 1
 
     async def _run_with_client(cli: httpx.AsyncClient) -> None:
         tasks = [
@@ -230,25 +296,57 @@ async def run_load(
     )
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """CLI entrypoint for running load test harness."""
     parser = argparse.ArgumentParser(description="Seeknal Serving load testing harness")
     parser.add_argument("--url", required=True, help="Base URL of the serving instance (e.g. http://localhost:8000)")
-    parser.add_argument("--token-file", required=True, help="Path to token JSON or YAML file")
+    parser.add_argument("--token-file", help="Path to token JSON or YAML file (static-token mode)")
+    parser.add_argument("--signing-key", help="Path to EC private key PEM file for minting grants")
+    parser.add_argument("--kid", help="Key ID for minting grants (used with --signing-key)")
+    parser.add_argument("--claims-template", help="Path to claims template JSON or YAML file (used with --signing-key)")
     parser.add_argument("--cases", required=True, help="Path to cases YAML or JSON file")
     parser.add_argument("--concurrency", type=int, default=1, help="Number of concurrent workers")
     parser.add_argument("--duration", type=float, default=5.0, help="Test duration in seconds")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    tokens = load_tokens(args.token_file)
+    has_token_file = bool(args.token_file)
+    has_minter = bool(args.signing_key or args.kid or args.claims_template)
+
+    if has_token_file and has_minter:
+        parser.error("Cannot specify both --token-file and --signing-key/--kid/--claims-template")
+    if not has_token_file and not has_minter:
+        parser.error("Either --token-file or (--signing-key, --kid, --claims-template) must be specified")
+
     cases = load_cases(args.cases)
+    mint_token = None
+    tokens = None
+
+    if has_minter:
+        if not (args.signing_key and args.kid and args.claims_template):
+            parser.error("--signing-key, --kid, and --claims-template must all be specified together")
+
+        if not os.path.exists(args.signing_key):
+            raise FileNotFoundError(f"Signing key file not found: '{args.signing_key}'")
+        check_file_not_group_world_readable(args.signing_key, "Signing key file")
+
+        with open(args.signing_key, "rb") as f:
+            key_pem = f.read()
+        claims_template = load_claims_template(args.claims_template)
+        mint_token = make_grant_minter(
+            key_pem,
+            kid=args.kid,
+            claims_template=claims_template,
+        )
+    else:
+        tokens = load_tokens(args.token_file)
 
     report = asyncio.run(
         run_load(
             url=args.url,
             cases=cases,
             tokens=tokens,
+            mint_token=mint_token,
             concurrency=args.concurrency,
             duration=args.duration,
         )

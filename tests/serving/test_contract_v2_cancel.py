@@ -383,13 +383,22 @@ def test_duplicate_running_jti_gives_409():
     t1.start()
     query1_started.wait(2.0)
 
-    # Second query with the same jti is submitted while the first is running -> 409
+    # Second query with the same jti is submitted while the first is running -> 401 grant_replayed
     resp_dup = client.post("/v1/query", headers={"Authorization": f"Bearer {token}"}, json={"sql": sql})
-    assert resp_dup.status_code == 409
-    assert resp_dup.json()["error"] == "duplicate_query_id"
+    assert resp_dup.status_code == 401
+    assert resp_dup.json()["error"] == "grant_replayed"
 
     query1_release.set()
     t1.join(timeout=5.0)
+
+
+def test_running_queries_register_duplicate_raises():
+    from seeknal.serving.http import DuplicateQueryIdError, RunningQueries
+
+    rq = RunningQueries()
+    rq.register("jti-dup-reg", "user@example.com")
+    with pytest.raises(DuplicateQueryIdError):
+        rq.register("jti-dup-reg", "user@example.com")
 
 
 # -------------------------------------------------------------------------
