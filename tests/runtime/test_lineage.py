@@ -252,6 +252,139 @@ def test_schema_version_and_column_lineage_facets(test_node):
     ]
 
 
+def test_schema_normalization_forms_and_rejections(test_node):
+    grant = DummyGrant()
+
+    # 1. Tuple form schema: (name, type)
+    tuple_schema = [("d", "date"), ("n", "bigint")]
+    event_tuple = build_node_event(
+        "COMPLETE",
+        grant=grant,
+        node=test_node,
+        project="analytics",
+        lakekeeper_uri="http://lakekeeper:8181",
+        schema=tuple_schema,
+    )
+    assert event_tuple["outputs"][0]["facets"]["schema"]["fields"] == [
+        {"name": "d", "type": "date"},
+        {"name": "n", "type": "bigint"},
+    ]
+
+    # 2-list form schema: [name, type]
+    list_schema = [["d", "date"], ["n", "bigint"]]
+    event_list = build_node_event(
+        "COMPLETE",
+        grant=grant,
+        node=test_node,
+        project="analytics",
+        lakekeeper_uri="http://lakekeeper:8181",
+        schema=list_schema,
+    )
+    assert event_list["outputs"][0]["facets"]["schema"]["fields"] == [
+        {"name": "d", "type": "date"},
+        {"name": "n", "type": "bigint"},
+    ]
+
+    # 2. Dict-item form schema with extra fields and description
+    dict_item_schema = [
+        {"name": "d", "type": "date", "extra_attr": 42},
+        {"name": "n", "type": "bigint", "description": "counter column", "ignored": "yes"},
+    ]
+    event_dict_items = build_node_event(
+        "COMPLETE",
+        grant=grant,
+        node=test_node,
+        project="analytics",
+        lakekeeper_uri="http://lakekeeper:8181",
+        schema=dict_item_schema,
+    )
+    assert event_dict_items["outputs"][0]["facets"]["schema"]["fields"] == [
+        {"name": "d", "type": "date"},
+        {"name": "n", "type": "bigint", "description": "counter column"},
+    ]
+
+    # 3. Dict schema: {"name": "type"}
+    dict_schema = {"d": "date", "n": "bigint"}
+    event_dict = build_node_event(
+        "COMPLETE",
+        grant=grant,
+        node=test_node,
+        project="analytics",
+        lakekeeper_uri="http://lakekeeper:8181",
+        schema=dict_schema,
+    )
+    assert event_dict["outputs"][0]["facets"]["schema"]["fields"] == [
+        {"name": "d", "type": "date"},
+        {"name": "n", "type": "bigint"},
+    ]
+
+    # 4. Rejected malformed items (naming bad item in ValueError)
+    # 3-tuple
+    with pytest.raises(ValueError, match=r"\('a', 'b', 'c'\)"):
+        build_node_event(
+            "COMPLETE",
+            grant=grant,
+            node=test_node,
+            project="analytics",
+            lakekeeper_uri="http://lakekeeper:8181",
+            schema=[("a", "b", "c")],
+        )
+
+    # String item in list
+    with pytest.raises(ValueError, match="not_a_tuple_or_dict"):
+        build_node_event(
+            "COMPLETE",
+            grant=grant,
+            node=test_node,
+            project="analytics",
+            lakekeeper_uri="http://lakekeeper:8181",
+            schema=["not_a_tuple_or_dict"],
+        )
+
+    # Mapping with empty string name
+    with pytest.raises(ValueError, match="name"):
+        build_node_event(
+            "COMPLETE",
+            grant=grant,
+            node=test_node,
+            project="analytics",
+            lakekeeper_uri="http://lakekeeper:8181",
+            schema=[{"name": "", "type": "int"}],
+        )
+
+    # Mapping with non-string type
+    with pytest.raises(ValueError, match="type"):
+        build_node_event(
+            "COMPLETE",
+            grant=grant,
+            node=test_node,
+            project="analytics",
+            lakekeeper_uri="http://lakekeeper:8181",
+            schema=[{"name": "col1", "type": 123}],
+        )
+
+    # Tuple with non-string column name or type
+    with pytest.raises(ValueError, match="123"):
+        build_node_event(
+            "COMPLETE",
+            grant=grant,
+            node=test_node,
+            project="analytics",
+            lakekeeper_uri="http://lakekeeper:8181",
+            schema=[(123, "date")],
+        )
+
+    with pytest.raises(ValueError, match="123"):
+        build_node_event(
+            "COMPLETE",
+            grant=grant,
+            node=test_node,
+            project="analytics",
+            lakekeeper_uri="http://lakekeeper:8181",
+            schema=[("col", 123)],
+        )
+
+
 def test_fail_redaction_and_truncation(test_node):
     grant = DummyGrant()
 

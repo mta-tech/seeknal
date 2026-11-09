@@ -84,6 +84,52 @@ def _redact_and_truncate_error(error: Any) -> str:
     return redacted
 
 
+def _normalize_schema(schema: Any) -> list[dict[str, Any]]:
+    """Normalize schema definition to a list of OpenLineage field objects.
+
+    Supported formats:
+    - Dict of name -> type: {"d": "date", "n": "bigint"}
+    - List of mappings: [{"name": "d", "type": "date"}, ...]
+    - List of 2-tuples/2-lists: [("d", "date"), ["n", "bigint"]]
+
+    Raises:
+        ValueError: If any list item is malformed.
+    """
+    if isinstance(schema, dict):
+        return [{"name": str(k), "type": str(v)} for k, v in schema.items()]
+
+    if not isinstance(schema, (list, tuple)):
+        raise ValueError(f"Invalid schema type: {type(schema).__name__}, expected list or dict")
+
+    normalized_fields: list[dict[str, Any]] = []
+    for item in schema:
+        if isinstance(item, Mapping):
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"Invalid schema item {item!r}: 'name' must be a non-empty string")
+            col_type = item.get("type")
+            if col_type is not None and not isinstance(col_type, str):
+                raise ValueError(f"Invalid schema item {item!r}: 'type' must be a string")
+
+            field_obj: dict[str, Any] = {"name": name}
+            if col_type is not None:
+                field_obj["type"] = col_type
+            if "description" in item:
+                field_obj["description"] = item["description"]
+            normalized_fields.append(field_obj)
+        elif isinstance(item, (tuple, list)) and len(item) == 2:
+            name, col_type = item
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"Invalid schema item {item!r}: column name must be a non-empty string")
+            if not isinstance(col_type, str):
+                raise ValueError(f"Invalid schema item {item!r}: column type must be a string")
+            normalized_fields.append({"name": name, "type": col_type})
+        else:
+            raise ValueError(f"Invalid schema item: {item!r}")
+
+    return normalized_fields
+
+
 def build_node_event(
     event_type: str,
     *,
@@ -187,6 +233,8 @@ def build_node_event(
             ds["facets"] = ds_facets
         inputs.append(ds)
 
+    normalized_schema_fields = _normalize_schema(schema) if schema is not None else None
+
     # Outputs from node.writes
     writes = node.writes if hasattr(node, "writes") else node.get("writes", ())
     outputs: list[dict[str, Any]] = []
@@ -194,17 +242,11 @@ def build_node_event(
         ds = dict(dataset_for_table(tbl, lakekeeper_uri=lakekeeper_uri))
         ds_facets = {}
 
-        if schema is not None:
-            if isinstance(schema, list):
-                fields = schema
-            elif isinstance(schema, dict):
-                fields = [{"name": k, "type": v} for k, v in schema.items()]
-            else:
-                fields = []
+        if normalized_schema_fields is not None:
             ds_facets["schema"] = {
                 "_producer": PRODUCER,
                 "_schemaURL": SCHEMA_DATASET_FACET_SCHEMA_URL,
-                "fields": fields,
+                "fields": list(normalized_schema_fields),
             }
 
         if snapshot_ids and tbl in snapshot_ids:
