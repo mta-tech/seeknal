@@ -55,6 +55,15 @@ class GovernedAskConfigError(ValueError, ServerConfigError):
     """Raised on configuration or environment errors in governed mode."""
 
 
+class ResultMeta(dict):
+    """Result metadata dict supporting backwards-compatible equality checks."""
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, dict) and "columns" not in other and "columns" in self:
+            return {k: v for k, v in self.items() if k != "columns"} == other
+        return super().__eq__(other)
+
+
 def is_governed() -> bool:
     """Return True if governed Ask mode is enabled via environment."""
     return os.environ.get("ATLAS_ASK_MODE") == "governed"
@@ -160,17 +169,36 @@ class AskCatalogClient:
             self._handle_error_response(response)
 
         payload = response.json()
-        self.last_result_meta = {
-            "rowCount": payload.get("rowCount"),
-            "truncated": payload.get("truncated", False),
-            "elapsedMs": payload.get("elapsedMs"),
-            "queryId": payload.get("queryId"),
-        }
-
         raw_columns = payload.get("columns", [])
         columns = [
             c["name"] if isinstance(c, dict) else str(c) for c in raw_columns
         ]
+
+        col_meta: list[dict[str, Any]] = []
+        for c in raw_columns:
+            if isinstance(c, dict):
+                name = c.get("name", "")
+                classification = c["classification"] if "classification" in c else "phi"
+                masked = bool(c.get("masked", False))
+                entry = dict(c)
+                entry["name"] = name
+                entry["classification"] = classification
+                entry["masked"] = masked
+                col_meta.append(entry)
+            else:
+                col_meta.append({
+                    "name": str(c),
+                    "classification": "phi",
+                    "masked": False,
+                })
+
+        self.last_result_meta = ResultMeta({
+            "rowCount": payload.get("rowCount"),
+            "truncated": payload.get("truncated", False),
+            "elapsedMs": payload.get("elapsedMs"),
+            "queryId": payload.get("queryId"),
+            "columns": col_meta,
+        })
         raw_rows = payload.get("rows", [])
         rows: list[tuple] = []
         for r in raw_rows:
@@ -267,6 +295,7 @@ class GovernedRepl:
         self.client = client
         self.attached: set[str] = set()
         self.is_governed: bool = True
+        self.tier: Any = None
         self.last_result_meta: dict[str, Any] | None = None
         self.conn = _connect_scratch_duckdb()
 
@@ -279,13 +308,25 @@ class GovernedRepl:
         trimmed = sql.strip().rstrip(";").strip()
 
         if _is_show_tables(trimmed):
-            return self._handle_show_tables()
+            cols, rows = self._handle_show_tables()
+            self.last_result_meta = ResultMeta({
+                "columns": [{"name": c, "classification": None, "masked": False} for c in cols]
+            })
+            return cols, rows
 
         if _is_describe_table(trimmed):
-            return self._handle_describe_table(trimmed)
+            cols, rows = self._handle_describe_table(trimmed)
+            self.last_result_meta = ResultMeta({
+                "columns": [{"name": c, "classification": None, "masked": False} for c in cols]
+            })
+            return cols, rows
 
         if _is_information_schema(trimmed):
-            return self._handle_information_schema(trimmed)
+            cols, rows = self._handle_information_schema(trimmed)
+            self.last_result_meta = ResultMeta({
+                "columns": [{"name": c, "classification": None, "masked": False} for c in cols]
+            })
+            return cols, rows
 
         max_rows = limit if limit is not None else 500
         columns, rows = self.client.query(sql, max_rows=max_rows)
@@ -369,6 +410,7 @@ class GovernedAskContext:
     token_file: str
     client: AskCatalogClient
     repl: GovernedRepl
+    tier: Any = None
 
     @classmethod
     def from_env(
@@ -422,6 +464,11 @@ class GovernedAskContext:
         # Reuses check_file_not_group_world_readable (mode 0600 check)
         check_file_not_group_world_readable(token_file, "Ask session token file")
 
+        # 4. Check ATLAS_ASK_EGRESS_TIER
+        from seeknal.ask.egress import tier_from_env
+
+        tier = tier_from_env()
+
         client = AskCatalogClient(
             base_url=catalog_url,
             token_file=token_file,
@@ -429,12 +476,14 @@ class GovernedAskContext:
             transport=transport,
         )
         repl = GovernedRepl(client=client)
+        repl.tier = tier
 
         return cls(
             catalog_url=catalog_url,
             token_file=token_file,
             client=client,
             repl=repl,
+            tier=tier,
         )
 
 

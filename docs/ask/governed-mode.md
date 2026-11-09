@@ -94,7 +94,28 @@ Any newly added tool is blocked by default unless explicitly added to `GOVERNED_
 4. **Credential Leak Prevention:**
    The bearer session token is never included in exceptions, logs, or error payloads.
 
+## Egress Tiers
+
+In governed mode (`ATLAS_ASK_MODE=governed`), every Ask data tool gets rows from the Catalog through `seeknal.ask.governed.GovernedRepl`/`AskCatalogClient`.
+
+The Catalog's Ask query response labels each column with `classification` (`"phi" | "pii" | "mask" | null`) and `masked` (`bool`). Workspace policy picks one **egress tier** per model provider; the session controller passes it as environment variable `ATLAS_ASK_EGRESS_TIER`.
+
+| Tier | What may reach the model |
+|---|---|
+| `E0` | Schema, descriptions and metric definitions; **no values** |
+| `E1` (default) | E0 plus values only from columns with `classification == null`. Any `pii`, `phi` or `mask` column is **dropped entirely**, not sent masked |
+| `E2` | E1 plus masked values of sensitive columns (`masked: true`); unmasked sensitive values are dropped |
+| `E3` | All values the user may read (the Catalog already applied the user's rights) |
+
+### Filtering and Fail-Safe Semantics
+
+1. **Fail-safe classification:** Any response without labels is treated as `classification="phi"` for every column.
+2. **Tool layer filtering:** In governed mode, every data tool output that goes to the model passes through `filter_result` before formatting: `execute_sql`, `preview_query`, `visualize_chart`, and `describe_table` / `list_tables` values. Schema itself is allowed in every tier.
+3. **Withholding notifications:** When columns are dropped by the active tier, the tool output explicitly reports which columns were withheld and why (e.g., `column `email` withheld: classified pii, egress tier E1`).
+4. **Visualization and SQL cache:** The structured SQL cache and UI visualization payloads store and emit only filtered data.
+5. **Instruction-like text detection:** Any string cell matching common prompt-injection phrasing (`(?i)ignore (all|any|previous|prior) instructions`, `(?i)you are now`, `(?i)system prompt`, `(?i)call the .* tool`) is flagged in the tool result footer as `possible instruction-like text in data; treated as data`.
+
 ## What is Deferred
 
 - **Write Approvals:** Human-in-the-loop or automated approval workflows for write actions (pipeline execution, report creation, preference saving) are deferred to subsequent Atlas Runtime milestones.
-- **Model Gateway and Egress Tiers:** Network egress filtering and LLM model gateway routing are managed by the surrounding Kubernetes pod network policies and Atlas egress proxies.
+- **Model Gateway:** Network egress filtering and LLM model gateway routing are managed by the surrounding Kubernetes pod network policies and Atlas egress proxies.

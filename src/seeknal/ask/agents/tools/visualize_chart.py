@@ -192,11 +192,27 @@ def visualize_chart(
     if isinstance(resolved, str):
         record_tool_result("visualize_chart", resolved, args=signature_args)
         return resolved
-    chart_columns, chart_rows, fingerprint = resolved
+    chart_columns, chart_rows, fingerprint = resolved[:3]
+    dropped = resolved[3] if len(resolved) > 3 else []
+
+    from seeknal.ask.governed import is_governed
+    is_gov = (
+        getattr(ctx, "is_governed", False)
+        or getattr(getattr(ctx, "repl", None), "is_governed", False)
+        or is_governed()
+    )
+    has_injection = False
+    if is_gov:
+        from seeknal.ask.egress import detect_instruction_text, INJECTION_NOTICE
+        has_injection = detect_instruction_text(chart_rows)
 
     # ── STEP 2: VALIDATE SHAPE ─────────────────────────────────────────────
     if not chart_rows:
         result = "No rows to chart."
+        if dropped:
+            result += "\n\n" + "\n".join(str(d) for d in dropped)
+        if has_injection:
+            result += f"\n\n{INJECTION_NOTICE}"
         record_tool_result("visualize_chart", result, args=signature_args)
         return result
 
@@ -211,6 +227,10 @@ def visualize_chart(
                 "the tool again -- or pick a type that fits this shape."
             ),
         )
+        if dropped:
+            result += "\n\n" + "\n".join(str(d) for d in dropped)
+        if has_injection:
+            result += f"\n\n{INJECTION_NOTICE}"
         record_tool_result("visualize_chart", result, args=signature_args)
         return result
 
@@ -227,6 +247,10 @@ def visualize_chart(
                 "Do not chart data the chosen type cannot show."
             ),
         )
+        if dropped:
+            result += "\n\n" + "\n".join(str(d) for d in dropped)
+        if has_injection:
+            result += f"\n\n{INJECTION_NOTICE}"
         record_tool_result("visualize_chart", result, args=signature_args)
         return result
 
@@ -242,6 +266,10 @@ def visualize_chart(
     ctx.pending_visualization = payload
 
     result = _format_confirmation(payload, notices)
+    if dropped:
+        result += "\n\n" + "\n".join(str(d) for d in dropped)
+    if has_injection:
+        result += f"\n\n{INJECTION_NOTICE}"
     record_tool_result("visualize_chart", result, args=signature_args)
     return result
 
@@ -305,7 +333,26 @@ def _resolve_exported_dataset(
         selected = [source_columns[index] for index in indexes]
 
     rows = [[row[index] for index in indexes] for row in source_rows if len(row) > max(indexes, default=0)]
-    return selected, rows, f"export:{name}:{','.join(selected)}"
+    ctx = get_tool_context()
+    from seeknal.ask.governed import is_governed
+    is_gov = (
+        getattr(ctx, "is_governed", False)
+        or getattr(getattr(ctx, "repl", None), "is_governed", False)
+        or is_governed()
+    )
+    dropped = []
+    if is_gov:
+        from seeknal.ask.egress import EgressTier, filter_result, tier_from_env
+        tier = getattr(ctx, "egress_tier", None)
+        if tier is None:
+            repl = getattr(ctx, "repl", None)
+            tier = getattr(repl, "tier", None)
+        if tier is None:
+            tier = tier_from_env()
+        elif isinstance(tier, str):
+            tier = EgressTier(tier.upper())
+        selected, rows, dropped = filter_result(selected, rows, None, tier)
+    return selected, rows, f"export:{name}:{','.join(selected)}", dropped
 
 
 def _resolve_mode(
@@ -341,6 +388,8 @@ def _resolve_mode(
         _sql_cache_key,
     )
 
+    ctx = get_tool_context()
+
     has_sql = bool(sql and sql.strip())
     has_data = data is not None
     has_columns = bool(columns)
@@ -370,10 +419,30 @@ def _resolve_mode(
                 f"Every row must have exactly {len(columns or [])} values to match "
                 "``columns=``; otherwise values bind to the wrong axis."
             )
+        from seeknal.ask.governed import is_governed
+        is_gov = (
+            getattr(ctx, "is_governed", False)
+            or getattr(getattr(ctx, "repl", None), "is_governed", False)
+            or is_governed()
+        )
+        dropped = []
+        col_list = list(columns or [])
+        if is_gov:
+            from seeknal.ask.egress import EgressTier, filter_result, tier_from_env
+            tier = getattr(ctx, "egress_tier", None)
+            if tier is None:
+                repl = getattr(ctx, "repl", None)
+                tier = getattr(repl, "tier", None)
+            if tier is None:
+                tier = tier_from_env()
+            elif isinstance(tier, str):
+                tier = EgressTier(tier.upper())
+            col_list, rows, dropped = filter_result(col_list, rows, None, tier)
+
         # Fingerprint from the column names plus the row count: stable across
         # repeated calls with the same computed series, without hashing the
         # whole dataset.
-        return list(columns or []), rows, f"{','.join(columns or [])}:{len(rows)}"
+        return col_list, rows, f"{','.join(col_list)}:{len(rows)}", dropped
 
     if not has_sql:
         return _resolve_exported_dataset(columns)
@@ -388,7 +457,10 @@ def _resolve_mode(
     cache_key = _sql_cache_key(sql)
     cached = get_structured_sql_cache(ctx).get(cache_key)
     if cached is not None:
-        return list(cached.get("columns") or []), list(cached.get("rows") or []), sql
+        cached_cols = list(cached.get("columns") or [])
+        cached_rows = list(cached.get("rows") or [])
+        cached_dropped = list(cached.get("dropped") or [])
+        return cached_cols, cached_rows, sql, cached_dropped
 
     # Cache miss: the agent is charting a query it has not shown. Pull up to the
     # chart's own row ceiling -- enough for top-N bucketing to be accurate,
@@ -400,7 +472,36 @@ def _resolve_mode(
     except Exception as exc:
         return format_tool_error(classify_duckdb_error(str(exc)), str(exc))
 
-    return list(sql_columns), [list(row) for row in sql_rows], sql
+    dropped = []
+    from seeknal.ask.governed import is_governed
+    is_gov = (
+        getattr(ctx, "is_governed", False)
+        or getattr(getattr(ctx, "repl", None), "is_governed", False)
+        or is_governed()
+    )
+    if is_gov:
+        from seeknal.ask.egress import EgressTier, filter_result, tier_from_env
+        tier = getattr(ctx, "egress_tier", None)
+        if tier is None:
+            repl = getattr(ctx, "repl", None)
+            tier = getattr(repl, "tier", None)
+        if tier is None:
+            tier = tier_from_env()
+        elif isinstance(tier, str):
+            tier = EgressTier(tier.upper())
+        meta = getattr(getattr(ctx, "repl", None), "last_result_meta", None) or {}
+        raw_labels = meta.get("columns", [])
+        sql_columns, sql_rows, dropped = filter_result(
+            sql_columns, sql_rows, raw_labels, tier
+        )
+        get_structured_sql_cache(ctx)[cache_key] = {
+            "columns": list(sql_columns),
+            "rows": [list(row) for row in sql_rows],
+            "labels": raw_labels,
+            "dropped": dropped,
+        }
+
+    return list(sql_columns), [list(row) for row in sql_rows], sql, dropped
 
 
 def _coerce_widget_size(widget_size: Any) -> int:

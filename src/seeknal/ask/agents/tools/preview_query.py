@@ -151,6 +151,42 @@ def preview_query(sql: str, run_hooks: bool = True) -> str:
             )
             decision = _escalate(decision, "WARN")
 
+    from seeknal.ask.governed import is_governed
+    is_gov = (
+        getattr(ctx, "is_governed", False)
+        or getattr(getattr(ctx, "repl", None), "is_governed", False)
+        or is_governed()
+    )
+    if is_gov:
+        from seeknal.ask.egress import (
+            EgressTier,
+            INJECTION_NOTICE,
+            detect_instruction_text,
+            filter_result,
+            tier_from_env,
+        )
+
+        tier = getattr(ctx, "egress_tier", None)
+        if tier is None:
+            repl = getattr(ctx, "repl", None)
+            tier = getattr(repl, "tier", None)
+        if tier is None:
+            tier = tier_from_env()
+        elif isinstance(tier, str):
+            tier = EgressTier(tier.upper())
+
+        # Schema and diagnostics allowed in every tier
+        cols = ["decision"]
+        rows = [(decision,)]
+        labels = [{"name": "decision", "classification": None, "masked": False}]
+        filter_result(cols, rows, labels, tier, is_schema=True)
+
+        has_injection = detect_instruction_text([[trimmed]] + [[n] for n in notices])
+        report = _format_report(decision, notices, row_count=total_rows, column_count=column_count)
+        if has_injection:
+            report += f"\n\n{INJECTION_NOTICE}"
+        return report
+
     return _format_report(decision, notices, row_count=total_rows, column_count=column_count)
 
 

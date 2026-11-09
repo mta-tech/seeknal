@@ -42,13 +42,54 @@ def list_tables(query: str | None = None) -> str:
 
         unique_entries = [(name, kind) for name, kind in unique_entries if matches(name)]
 
+    from seeknal.ask.governed import is_governed
+    is_gov = (
+        getattr(ctx, "is_governed", False)
+        or getattr(getattr(ctx, "repl", None), "is_governed", False)
+        or is_governed()
+    )
+    has_injection = False
+    if is_gov:
+        from seeknal.ask.egress import (
+            EgressTier,
+            INJECTION_NOTICE,
+            detect_instruction_text,
+            filter_result,
+            tier_from_env,
+        )
+
+        tier = getattr(ctx, "egress_tier", None)
+        if tier is None:
+            repl = getattr(ctx, "repl", None)
+            tier = getattr(repl, "tier", None)
+        if tier is None:
+            tier = tier_from_env()
+        elif isinstance(tier, str):
+            tier = EgressTier(tier.upper())
+
+        cols = ["name", "kind"]
+        labels = [{"name": c, "classification": None, "masked": False} for c in cols]
+        cols, unique_entries, _dropped = filter_result(
+            cols, unique_entries, labels, tier, is_schema=True
+        )
+        has_injection = detect_instruction_text(unique_entries)
+
     if not unique_entries:
         if errors:
             prefix = f"No tables found matching '{query}'." if query else "No tables found."
-            return prefix + " Discovery errors:\n" + "\n".join(f"- {err}" for err in errors)
+            out = prefix + " Discovery errors:\n" + "\n".join(f"- {err}" for err in errors)
+            if has_injection:
+                out += f"\n\n{INJECTION_NOTICE}"
+            return out
         if query:
-            return f"No tables found matching '{query}'."
-        return "No tables found. The project may not have been run yet."
+            out = f"No tables found matching '{query}'."
+            if has_injection:
+                out += f"\n\n{INJECTION_NOTICE}"
+            return out
+        out = "No tables found. The project may not have been run yet."
+        if has_injection:
+            out += f"\n\n{INJECTION_NOTICE}"
+        return out
 
     if query:
         lines = [f"Available tables and views matching '{query}':"]
@@ -61,7 +102,10 @@ def list_tables(query: str | None = None) -> str:
         lines.append("\nPartial discovery warnings:")
         lines.extend(f"- {err}" for err in errors)
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if has_injection:
+        result += f"\n\n{INJECTION_NOTICE}"
+    return result
 
 
 def _discover_tables(ctx) -> tuple[list[tuple[str, str]], list[str]]:

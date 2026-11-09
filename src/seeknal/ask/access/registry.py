@@ -26,6 +26,7 @@ _VIEWER_TOOLS = {
     "read_ask_test_result",
     "read_pipeline",
     "read_project_file",
+    "read_project_file_governed",
     "read_source_context",
     "read_sql_pair",
     "list_sql_pairs",

@@ -305,13 +305,44 @@ def execute_sql(
     # Resolve the real total: in governed mode, read rowCount/truncated from
     # Catalog response metadata to avoid an unbounded second query execution.
     total_rows: int | None = None
+    dropped_report = []
+    has_injection = False
+
     if is_governed_mode:
+        from seeknal.ask.egress import (
+            EgressTier,
+            INJECTION_NOTICE,
+            detect_instruction_text,
+            filter_result,
+            tier_from_env,
+        )
+
+        tier = getattr(ctx, "egress_tier", None)
+        if tier is None:
+            repl = getattr(ctx, "repl", None)
+            tier = getattr(repl, "tier", None)
+        if tier is None:
+            tier = tier_from_env()
+        elif isinstance(tier, str):
+            tier = EgressTier(tier.upper())
+
         meta = getattr(getattr(ctx, "repl", None), "last_result_meta", None) or {}
+        raw_labels = meta.get("columns", [])
+
+        columns, trimmed_rows, dropped_report = filter_result(
+            columns, trimmed_rows, raw_labels, tier
+        )
+        has_injection = detect_instruction_text(trimmed_rows)
+
         row_count = meta.get("rowCount")
         truncated = meta.get("truncated", False)
-        if truncated or (row_count is not None and row_count > effective_limit):
-            has_more_rows = True
-        total_rows = row_count
+        if tier == EgressTier.E0:
+            total_rows = 0
+            has_more_rows = False
+        else:
+            if truncated or (row_count is not None and row_count > effective_limit):
+                has_more_rows = True
+            total_rows = row_count
     else:
         if has_more_rows:
             try:
@@ -326,6 +357,10 @@ def execute_sql(
         has_more_rows=has_more_rows,
         requested_limit=asked,
     )
+    if dropped_report:
+        result += "\n\n" + "\n".join(str(d) for d in dropped_report)
+    if has_injection:
+        result += f"\n\n{INJECTION_NOTICE}"
     if lint_notices:
         result += "\n\n" + "\n".join(f"ℹ SQL lint: {notice}" for notice in lint_notices)
     if drift_notice:

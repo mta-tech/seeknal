@@ -37,6 +37,40 @@ def describe_table(table_name: str) -> str:
     if not rows:
         return f"Table '{table_name}' not found or has no columns."
 
+    from seeknal.ask.governed import is_governed
+    is_gov = (
+        getattr(ctx, "is_governed", False)
+        or getattr(getattr(ctx, "repl", None), "is_governed", False)
+        or is_governed()
+    )
+    has_injection = False
+    if is_gov:
+        from seeknal.ask.egress import (
+            EgressTier,
+            INJECTION_NOTICE,
+            detect_instruction_text,
+            filter_result,
+            tier_from_env,
+        )
+
+        tier = getattr(ctx, "egress_tier", None)
+        if tier is None:
+            repl = getattr(ctx, "repl", None)
+            tier = getattr(repl, "tier", None)
+        if tier is None:
+            tier = tier_from_env()
+        elif isinstance(tier, str):
+            tier = EgressTier(tier.upper())
+
+        labels = [
+            {"name": c, "classification": None, "masked": False}
+            for c in (columns or ["column_name", "column_type", "null"])
+        ]
+        columns, rows, _dropped = filter_result(
+            columns, rows, labels, tier, is_schema=True
+        )
+        has_injection = detect_instruction_text(rows)
+
     lines = [f"Schema for `{table_name}`:\n"]
     for row in rows:
         col_name = row[0]
@@ -45,6 +79,8 @@ def describe_table(table_name: str) -> str:
         lines.append(f"- `{col_name}` ({col_type}){' NULL' if nullable == 'YES' else ''}")
 
     output = "\n".join(lines)
+    if has_injection:
+        output += f"\n\n{INJECTION_NOTICE}"
     set_discovery_cache_value(cache_key, output)
     return output
 
