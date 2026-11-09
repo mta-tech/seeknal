@@ -255,16 +255,23 @@ def create_agent(
     agent_config = dict(agent_config)
     agent_config["__project_path"] = str(project_path)
 
-    # Create singleton REPL with safe connection
-    repl = REPL(project_path=project_path, skip_history=True)
-    configure_safe_connection(repl.conn)
+    from seeknal.ask.governed import GovernedAskContext, is_governed
+
+    governed_mode = is_governed()
+    if governed_mode:
+        gov_ctx = GovernedAskContext.from_env()
+        repl = gov_ctx.repl
+    else:
+        # Create singleton REPL with safe connection
+        repl = REPL(project_path=project_path, skip_history=True)
+        configure_safe_connection(repl.conn)
 
     # Discover project artifacts for context
     discovery = ArtifactDiscovery(project_path)
 
     # Set tool context (per-session via ContextVar — safe for concurrent sessions)
     session_id = uuid.uuid4().hex[:8]
-    ask_toolset_mode = get_ask_toolset_mode(agent_config)
+    ask_toolset_mode = "analysis" if governed_mode else get_ask_toolset_mode(agent_config)
     analysis_toolset = ask_toolset_mode == "analysis"
 
     set_tool_context(
@@ -274,6 +281,7 @@ def create_agent(
             project_path=project_path,
             session_id=session_id,
             disable_quality_gate=analysis_toolset,
+            is_governed=governed_mode,
         )
     )
 
@@ -286,7 +294,21 @@ def create_agent(
     tool_ctx.sql_timeout_seconds = get_sql_timeout_seconds(agent_config)
     from seeknal.ask.config import get_pg_passthrough_enabled, get_read_max_lines
 
-    tool_ctx.pg_passthrough = get_pg_passthrough_enabled(agent_config)
+    if governed_mode:
+        tool_ctx.pg_passthrough = False
+        tool_ctx.iba_engine_url = None
+        tool_ctx.iba_engine_api_key = ""
+        tool_ctx.iba_storage_presign_url = None
+        tool_ctx.iba_storage_api_key = ""
+    else:
+        tool_ctx.pg_passthrough = get_pg_passthrough_enabled(agent_config)
+        import os as _os
+
+        tool_ctx.iba_engine_url = _resolve_engine_base_url()
+        tool_ctx.iba_engine_api_key = _os.environ.get("IBA_ENGINE_API_KEY", "")
+        tool_ctx.iba_storage_presign_url = _resolve_storage_presign_url()
+        tool_ctx.iba_storage_api_key = _os.environ.get("IBA_STORAGE_API_KEY", "")
+
     tool_ctx.read_max_lines = get_read_max_lines(agent_config)
     tool_ctx.discovery_cache_ttl_seconds = get_discovery_cache_ttl_seconds(agent_config)
     tool_ctx.background_threshold = get_background_threshold(agent_config)
@@ -305,20 +327,6 @@ def create_agent(
                 "tool-call ceiling to apply",
                 agent_config.get("tool_call_limit"),
             )
-
-    # IBA engine connection: resolved once here (session init),
-    # never inside run_forecast/detect_anomaly themselves. See
-    # ToolContext.iba_engine_url docstring in _context.py.
-    import os as _os
-
-    tool_ctx.iba_engine_url = _resolve_engine_base_url()
-    tool_ctx.iba_engine_api_key = _os.environ.get("IBA_ENGINE_API_KEY", "")
-
-    # IBA storage connection: resolved once here (session init),
-    # never inside upload_to_s3 itself. See ToolContext.iba_storage_presign_url
-    # docstring in _context.py.
-    tool_ctx.iba_storage_presign_url = _resolve_storage_presign_url()
-    tool_ctx.iba_storage_api_key = _os.environ.get("IBA_STORAGE_API_KEY", "")
 
     # Build final system prompt via section registry (4-layer architecture)
     from seeknal.ask.prompt_builder import create_default_builder
@@ -449,6 +457,7 @@ in the final response.
     toolsets_list = [
         create_ask_toolset(
             mode=ask_toolset_mode,
+            governed=governed_mode,
             include_ask_user=(environment == "interactive"),
             include_request_clarification=(
                 environment in ("gateway", "telegram")
@@ -476,6 +485,10 @@ in the final response.
 
     # Add web tools if requested. Prefers Firecrawl (search + scrape) when
     # FIRECRAWL_API_KEY is set, otherwise falls back to DuckDuckGo search-only.
+    # In governed mode, web tools are always disabled.
+    if governed_mode:
+        include_web = False
+
     if include_web:
         import os
         from pydantic_ai.toolsets import FunctionToolset

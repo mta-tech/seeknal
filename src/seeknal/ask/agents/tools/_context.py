@@ -41,7 +41,7 @@ class ToolContext:
     concurrent access — pydantic-ai may invoke tools in parallel threads.
     """
 
-    repl: REPL
+    repl: Any
     artifact_discovery: ArtifactDiscovery
     project_path: Path
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -146,6 +146,7 @@ class ToolContext:
     # proxy path (via iba-service) already includes the endpoint path.
     iba_storage_presign_url: str | None = None
     iba_storage_api_key: str = ""
+    is_governed: bool = False
 
 
 def _resolve_engine_base_url() -> str | None:

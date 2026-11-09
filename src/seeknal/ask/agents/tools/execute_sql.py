@@ -216,6 +216,14 @@ def execute_sql(
     try:
         columns, rows = _execute_oneshot_with_timeout(ctx, sql, limit=fetch_limit)
     except Exception as e:
+        from seeknal.ask.governed import AskAccessDenied
+
+        if isinstance(e, AskAccessDenied) or isinstance(getattr(e, "__cause__", None), AskAccessDenied):
+            cause = e if isinstance(e, AskAccessDenied) else e.__cause__
+            result = f"Access denied by Atlas governance policy: {cause}"
+            record_tool_result("execute_sql", result, args={"sql": sql})
+            return result
+
         from seeknal.ask.agents.tools.errors import (
             classify_duckdb_error,
             format_tool_error,
@@ -263,35 +271,53 @@ def execute_sql(
     has_more_rows = len(rows) > effective_limit
     trimmed_rows = rows[:effective_limit]
 
-    # Runtime governance: when Atlas is configured (ATLAS_API_URL), access-check the
-    # tables this query references and mask sensitive columns before results reach the
-    # model. Inactive (passthrough) when Atlas is not configured. A denial is surfaced
-    # to the agent as a tool message rather than raising.
-    from seeknal.integrations.atlas_client import AtlasPolicyDenied
-    from seeknal.integrations.atlas_governance import (
-        create_governance_gate_from_env,
-        govern_query,
+    import os
+    from seeknal.ask.governed import is_governed
+
+    is_governed_mode = (
+        getattr(ctx, "is_governed", False)
+        or getattr(getattr(ctx, "repl", None), "is_governed", False)
+        or is_governed()
     )
 
-    _gov_gate = create_governance_gate_from_env()
-    if _gov_gate is not None:
-        try:
-            trimmed_rows = govern_query(
-                _gov_gate, sql=sql, columns=columns, rows=trimmed_rows
-            )
-        except AtlasPolicyDenied as denial:
-            result = f"Access denied by Atlas governance policy: {denial}"
-            record_tool_result("execute_sql", result, args={"sql": sql})
-            return result
+    if not is_governed_mode:
+        # Runtime governance: when Atlas is configured (ATLAS_API_URL), access-check the
+        # tables this query references and mask sensitive columns before results reach the
+        # model. Inactive (passthrough) when Atlas is not configured. A denial is surfaced
+        # to the agent as a tool message rather than raising.
+        from seeknal.integrations.atlas_client import AtlasPolicyDenied
+        from seeknal.integrations.atlas_governance import (
+            create_governance_gate_from_env,
+            govern_query,
+        )
 
-    # Resolve the real total only when we actually hit the cap — saves the
-    # round-trip for normal-sized results.
+        _gov_gate = create_governance_gate_from_env()
+        if _gov_gate is not None:
+            try:
+                trimmed_rows = govern_query(
+                    _gov_gate, sql=sql, columns=columns, rows=trimmed_rows
+                )
+            except AtlasPolicyDenied as denial:
+                result = f"Access denied by Atlas governance policy: {denial}"
+                record_tool_result("execute_sql", result, args={"sql": sql})
+                return result
+
+    # Resolve the real total: in governed mode, read rowCount/truncated from
+    # Catalog response metadata to avoid an unbounded second query execution.
     total_rows: int | None = None
-    if has_more_rows:
-        try:
-            total_rows = _count_total(ctx, sql)
-        except Exception:
-            total_rows = None
+    if is_governed_mode:
+        meta = getattr(getattr(ctx, "repl", None), "last_result_meta", None) or {}
+        row_count = meta.get("rowCount")
+        truncated = meta.get("truncated", False)
+        if truncated or (row_count is not None and row_count > effective_limit):
+            has_more_rows = True
+        total_rows = row_count
+    else:
+        if has_more_rows:
+            try:
+                total_rows = _count_total(ctx, sql)
+            except Exception:
+                total_rows = None
 
     result = _format_table(
         columns=columns,
@@ -950,9 +976,11 @@ def _execute_oneshot_with_timeout(ctx, sql: str, limit: int | None = None):
 
     from seeknal.ask.agents.tools._context import record_timing_event
 
-    routed = _try_pg_route(ctx, sql, limit)
-    if routed is not None:
-        return routed
+    is_gov = getattr(ctx, "is_governed", False) or getattr(getattr(ctx, "repl", None), "is_governed", False)
+    if not is_gov and getattr(ctx, "pg_passthrough", False):
+        routed = _try_pg_route(ctx, sql, limit)
+        if routed is not None:
+            return routed
 
     timeout = int(getattr(ctx, "sql_timeout_seconds", 0) or 0)
     started = time.monotonic()

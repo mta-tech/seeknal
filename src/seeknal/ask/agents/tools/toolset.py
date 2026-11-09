@@ -175,10 +175,30 @@ _VISUALIZATION_TOOLS = [
     visualize_chart,
 ]
 
+_GOVERNED_MEMORY_READ_TOOLS = [
+    list_context_files,
+    read_project_file,
+]
+
+# Explicit allowlist of tools permitted in governed mode (Atlas Runtime P2-S1).
+# Any tool added later is strictly excluded unless explicitly allowlisted here.
+GOVERNED_TOOL_ALLOWLIST = [
+    *_DATABASE_ANALYSIS_TOOLS,
+    visualize_chart,
+    *_READ_ONLY_CONTEXT_TOOLS,
+    *_GOVERNED_MEMORY_READ_TOOLS,
+]
+
+GOVERNED_TOOL_NAMES = frozenset(
+    tool.__name__ if hasattr(tool, "__name__") else str(tool)
+    for tool in GOVERNED_TOOL_ALLOWLIST
+)
+
 
 def create_ask_toolset(
     *,
     mode: str = "full",
+    governed: bool | None = None,
     include_ask_user: bool = True,
     include_request_clarification: bool = False,
     include_forecast: bool = False,
@@ -191,7 +211,10 @@ def create_ask_toolset(
     Args:
         mode: ``"full"`` keeps the legacy all-tools surface. ``"analysis"``
             exposes only read/discovery/analysis tools for connected-source or
-            other read-only analyst sessions.
+            other read-only analyst sessions. ``"governed"`` activates the
+            hardened allowlist.
+        governed: When True, enforces the governed mode allowlist. When None,
+            checks if ATLAS_ASK_MODE=governed is set in the environment.
         include_ask_user: Include the direct interactive ``ask_user`` tool.
             Headless channels pass ``False`` so tool schemas cannot trigger
             blocking user input.
@@ -211,6 +234,17 @@ def create_ask_toolset(
             Registered only in non-interactive environments when
             ``agent.visualize_chart.enabled`` is true in ``seeknal_agent.yml``.
     """
+    from seeknal.ask.governed import is_governed
+
+    is_governed_mode = governed if governed is not None else (is_governed() or mode == "governed")
+
+    if is_governed_mode:
+        tools = [t for t in GOVERNED_TOOL_ALLOWLIST if getattr(t, "__name__", "") in GOVERNED_TOOL_NAMES]
+        return FunctionToolset(
+            tools=tools,
+            id="seeknal-ask-governed",
+            max_retries=3,
+        )
     if mode == "analysis":
         # Keep the connected-source/read-only surface deliberately thin:
         # database discovery/query tools, read-only context lookup, and Python
