@@ -154,6 +154,55 @@ class TestPrefectAvailability:
                 return 99
             assert my_task() == 99
 
+    def test_fallback_decorators_expose_fn(self, monkeypatch):
+        """Fallback decorators expose .fn as undecorated callable when Prefect is absent."""
+        import importlib
+        import sys
+
+        for mod in list(sys.modules):
+            if mod == "prefect" or mod.startswith("prefect."):
+                monkeypatch.setitem(sys.modules, mod, None)
+        monkeypatch.setitem(sys.modules, "prefect", None)
+
+        from seeknal.workflow import prefect_integration
+
+        try:
+            mod = importlib.reload(prefect_integration)
+            assert not mod.PREFECT_AVAILABLE
+            assert mod.run_node_task.fn is mod.run_node_task
+
+            # Verify both bare and called usages of task and flow
+            @mod.task
+            def bare_task():
+                return "bare_task"
+
+            assert bare_task.fn is bare_task
+            assert bare_task() == "bare_task"
+
+            @mod.task(name="called-task")
+            def called_task():
+                return "called_task"
+
+            assert called_task.fn is called_task
+            assert called_task() == "called_task"
+
+            @mod.flow
+            def bare_flow():
+                return "bare_flow"
+
+            assert bare_flow.fn is bare_flow
+            assert bare_flow() == "bare_flow"
+
+            @mod.flow(name="called-flow")
+            def called_flow():
+                return "called_flow"
+
+            assert called_flow.fn is called_flow
+            assert called_flow() == "called_flow"
+        finally:
+            monkeypatch.undo()
+            importlib.reload(prefect_integration)
+
     def test_exports_available(self):
         """Expected exports are available."""
         from seeknal.workflow import prefect_integration

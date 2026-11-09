@@ -38,16 +38,18 @@ except ImportError:
     # No-op decorators when Prefect is not installed
     def flow(*args, **kwargs):  # type: ignore[misc]
         def decorator(func):
+            func.fn = func
             return func
         if len(args) == 1 and callable(args[0]):
-            return args[0]
+            return decorator(args[0])
         return decorator
 
     def task(*args, **kwargs):  # type: ignore[misc]
         def decorator(func):
+            func.fn = func
             return func
         if len(args) == 1 and callable(args[0]):
-            return args[0]
+            return decorator(args[0])
         return decorator
 
     NO_CACHE = None  # type: ignore[assignment]
