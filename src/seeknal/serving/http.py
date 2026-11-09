@@ -220,6 +220,25 @@ def _error_response(
     )
 
 
+def _extract_token_claims(token: str | None) -> dict[str, Any]:
+    if not token or not isinstance(token, str):
+        return {}
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {}
+    try:
+        payload_b64 = parts[1]
+        pad = len(payload_b64) % 4
+        if pad:
+            payload_b64 += "=" * (4 - pad)
+        data = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
 def _log_request(
     *,
     audit_id: str | None = None,
@@ -233,6 +252,12 @@ def _log_request(
     revision: int | str | None = None,
     digest: str | None = None,
     binding: Mapping[str, Any] | None = None,
+    workload: str | None = None,
+    azp: str | None = None,
+    origin: str | None = None,
+    act_sub: str | None = None,
+    act_typ: str | None = None,
+    token: str | None = None,
 ) -> None:
     if binding:
         if publication_id is None and "publication_id" in binding:
@@ -241,6 +266,31 @@ def _log_request(
             revision = binding["revision"]
         if digest is None and "digest" in binding:
             digest = binding["digest"]
+        if workload is None and "workload" in binding:
+            workload = binding["workload"]
+        if azp is None and "azp" in binding:
+            azp = binding["azp"]
+        if origin is None and "origin" in binding:
+            origin = binding["origin"]
+        if act_sub is None and "act_sub" in binding:
+            act_sub = binding["act_sub"]
+        if act_typ is None and "act_typ" in binding:
+            act_typ = binding["act_typ"]
+
+    if token and isinstance(token, str):
+        claims = _extract_token_claims(token)
+        if workload is None and "workload" in claims and isinstance(claims["workload"], str):
+            workload = claims["workload"]
+        if azp is None and "azp" in claims and isinstance(claims["azp"], str):
+            azp = claims["azp"]
+        if origin is None and "origin" in claims and isinstance(claims["origin"], str):
+            origin = claims["origin"]
+        act = claims.get("act")
+        if isinstance(act, Mapping):
+            if act_sub is None and "sub" in act and isinstance(act["sub"], str):
+                act_sub = act["sub"]
+            if act_typ is None and "typ" in act and isinstance(act["typ"], str):
+                act_typ = act["typ"]
 
     extra_parts = []
     if publication_id is not None:
@@ -249,6 +299,16 @@ def _log_request(
         extra_parts.append(f"revision={revision}")
     if digest is not None:
         extra_parts.append(f"digest={digest}")
+    if workload is not None:
+        extra_parts.append(f"workload={workload}")
+    if azp is not None:
+        extra_parts.append(f"azp={azp}")
+    if origin is not None:
+        extra_parts.append(f"origin={origin}")
+    if act_sub is not None:
+        extra_parts.append(f"act_sub={act_sub}")
+    if act_typ is not None:
+        extra_parts.append(f"act_typ={act_typ}")
 
     extra_str = (" " + " ".join(extra_parts)) if extra_parts else ""
 
@@ -563,7 +623,7 @@ def create_app(
             )
         except GrantTokenError as exc:
             _log_request(
-                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0, token=token
             )
             return _error_response(
                 401, "grant_token_error", exc, token=token, sql=sql, params=params
@@ -590,6 +650,7 @@ def create_app(
                 subject=subject,
                 status=403,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                token=token,
             )
             return _error_response(
                 403, "enforcement_error", exc, token=token, sql=sql, params=params
@@ -616,6 +677,7 @@ def create_app(
                 subject=subject,
                 status=422,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                token=token,
             )
             return _error_response(
                 422, "routing_error", exc, token=token, sql=sql, params=params
@@ -623,7 +685,7 @@ def create_app(
         except Exception as exc:
             logger.error("engine=%s error=%s audit_id=%s", "-", type(exc).__name__, "-")
             _log_request(
-                status=500, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                status=500, elapsed_ms=(time.perf_counter() - req_start) * 1000.0, token=token
             )
             return _error_response(
                 500,
@@ -644,6 +706,7 @@ def create_app(
             elapsed_ms=elapsed_ms,
             row_count="-",
             binding=prepared.binding,
+            token=token,
         )
 
         return JSONResponse(
@@ -687,7 +750,7 @@ def create_app(
             )
         except GrantTokenError as exc:
             _log_request(
-                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0, token=token
             )
             return _error_response(
                 401, "grant_token_error", exc, token=token, sql=sql, params=params
@@ -714,6 +777,7 @@ def create_app(
                 subject=subject,
                 status=403,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                token=token,
             )
             return _error_response(
                 403, "enforcement_error", exc, token=token, sql=sql, params=params
@@ -740,6 +804,7 @@ def create_app(
                 subject=subject,
                 status=422,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                token=token,
             )
             return _error_response(
                 422, "routing_error", exc, token=token, sql=sql, params=params
@@ -747,7 +812,7 @@ def create_app(
         except Exception as exc:
             logger.error("engine=%s error=%s audit_id=%s", "-", type(exc).__name__, "-")
             _log_request(
-                status=500, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                status=500, elapsed_ms=(time.perf_counter() - req_start) * 1000.0, token=token
             )
             return _error_response(
                 500,
@@ -764,6 +829,7 @@ def create_app(
                 subject=prepared.subject,
                 status=401,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                token=token,
             )
             return _error_response(
                 401,
@@ -782,6 +848,7 @@ def create_app(
                 subject=prepared.subject,
                 status=401,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                token=token,
             )
             return _error_response(
                 401,
@@ -797,6 +864,7 @@ def create_app(
                 subject=prepared.subject,
                 status=503,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                token=token,
             )
             return _error_response(
                 503,
@@ -817,6 +885,7 @@ def create_app(
                 status=503,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 binding=prepared.binding,
+                token=token,
             )
             return _error_response(
                 503,
@@ -849,6 +918,7 @@ def create_app(
                 status=409,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 binding=prepared.binding,
+                token=token,
             )
             return _error_response(
                 409, "duplicate_query_id", exc, token=token, sql=sql, params=params
@@ -907,6 +977,7 @@ def create_app(
                 status=504,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 binding=prepared.binding,
+                token=token,
             )
             return _error_response(
                 504, "engine_timeout", exc, token=token, sql=sql, params=params
@@ -920,6 +991,7 @@ def create_app(
                 status=503,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 binding=prepared.binding,
+                token=token,
             )
             return _error_response(
                 503,
@@ -938,6 +1010,7 @@ def create_app(
                 status=499,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 binding=prepared.binding,
+                token=token,
             )
             return _error_response(
                 499, "query_cancelled", exc, token=token, sql=sql, params=params
@@ -951,6 +1024,7 @@ def create_app(
                 status=502,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 binding=prepared.binding,
+                token=token,
             )
             return _error_response(
                 502, "engine_error", exc, token=token, sql=sql, params=params
@@ -970,6 +1044,7 @@ def create_app(
                 status=500,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 binding=prepared.binding,
+                token=token,
             )
             return _error_response(
                 500,
@@ -994,6 +1069,7 @@ def create_app(
                 status=413,
                 elapsed_ms=result.elapsed_ms,
                 binding=prepared.binding,
+                token=token,
             )
             return _error_response(
                 413,
@@ -1013,6 +1089,7 @@ def create_app(
             elapsed_ms=result.elapsed_ms,
             row_count=len(safe_rows),
             binding=prepared.binding,
+            token=token,
         )
 
         col_types = list(result.column_types)

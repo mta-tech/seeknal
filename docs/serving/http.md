@@ -32,6 +32,21 @@ Executes a prepared and policy-enforced query on the routed engine.
 #### Request Headers
 - `Authorization: Bearer <grant token>` (required): Compact ES256 JWS issued by the Catalog.
 
+#### Grant Token Contract v3 & Audit Logging
+The Catalog signs every grant token presented in the `Authorization` header. In contract v3, the grant supports workloads `ask` and `job` (in addition to `interactive`, `bi`, and `report`) and optional audit-only claims:
+- `workload` (`str`): Target execution account workload (`"interactive"`, `"bi"`, `"report"`, `"ask"`, `"job"`). Defaults to `"interactive"`.
+- `act` (`dict`): Actor claim `{"sub": str, "typ": "ask_session" | "run"}` representing an acting session or job run.
+- `azp` (`str`): Authorized party client ID (non-empty string or absent).
+- `origin` (`str`): Request origin; one of `"superset"`, `"ask"`, `"job"`, `"portal"`, or absent.
+
+##### Consistency Rules
+- Workload `ask` **requires** `act.typ == "ask_session"` and `origin == "ask"`.
+- Workload `job` **requires** `act.typ == "run"` and `origin == "job"`.
+- `act` supplied with any other workload is refused (`403 enforcement_error`).
+
+##### Audit Log Record
+Each request emits a per-request audit log line. When present in the token/grant, `workload`, `azp`, `origin`, `act_sub`, and `act_typ` are included in the audit log line (e.g., `workload=ask azp=seeknal-client origin=ask act_sub=session-01 act_typ=ask_session`). These claims are strictly audit-only and do not alter table permissions, row limits, or masking policies.
+
 #### Request Body
 JSON object with the following fields:
 - `sql` (string, required): The client SQL statement using standard `$1..$n` parameter placeholders.

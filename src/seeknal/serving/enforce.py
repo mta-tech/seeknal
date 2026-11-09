@@ -153,7 +153,9 @@ VALID_ACTIONS = frozenset({"select", "insert", "update", "delete"})
 VALID_TARGET_KINDS = frozenset({"starrocks", "lakebase", "duckdb", "cube"})
 VALID_TARGET_DIALECTS = frozenset({"postgres", "starrocks", "duckdb"})
 VALID_SQL_DIALECTS = frozenset({"postgres", "starrocks", "mysql", "duckdb"})
-VALID_WORKLOADS = frozenset({"interactive", "bi", "report"})
+VALID_WORKLOADS = frozenset({"interactive", "bi", "report", "ask", "job"})
+VALID_ORIGINS = frozenset({"superset", "ask", "job", "portal"})
+VALID_ACT_TYPES = frozenset({"ask_session", "run"})
 
 ANONYMOUS_FUNCTION_ALLOWLIST: dict[str, set[str]] = {
     "cube": {"measure"},
@@ -318,6 +320,9 @@ class Grant:
     sql_dialect: str = "postgres"
     workload: str = "interactive"
     binding: Mapping[str, Any] = field(default_factory=dict)
+    act: Mapping[str, str] | None = None
+    azp: str | None = None
+    origin: str | None = None
 
     def __post_init__(self) -> None:
         if self.max_rows <= 0:
@@ -336,6 +341,49 @@ class Grant:
             object.__setattr__(self, "binding", {})
         elif not isinstance(self.binding, dict):
             object.__setattr__(self, "binding", dict(self.binding))
+
+        if self.act is not None:
+            if not isinstance(self.act, Mapping):
+                raise EnforcementError("act claim must be an object")
+            if set(self.act.keys()) != {"sub", "typ"}:
+                raise EnforcementError("act claim must have exactly 'sub' and 'typ' fields")
+            sub_val = self.act.get("sub")
+            if not isinstance(sub_val, str) or isinstance(sub_val, bool) or not sub_val:
+                raise EnforcementError("act.sub must be a non-empty string")
+            typ_val = self.act.get("typ")
+            if typ_val not in VALID_ACT_TYPES:
+                raise EnforcementError(
+                    f"invalid act.typ '{typ_val}', must be one of {sorted(VALID_ACT_TYPES)}"
+                )
+            if not isinstance(self.act, dict):
+                object.__setattr__(self, "act", dict(self.act))
+
+        if self.azp is not None:
+            if not isinstance(self.azp, str) or isinstance(self.azp, bool) or not self.azp:
+                raise EnforcementError("azp claim must be a non-empty string")
+
+        if self.origin is not None:
+            if not isinstance(self.origin, str) or self.origin not in VALID_ORIGINS:
+                raise EnforcementError(
+                    f"invalid origin '{self.origin}', must be one of {sorted(VALID_ORIGINS)}"
+                )
+
+        # Consistency rules, fail-closed:
+        if self.workload == "ask":
+            if self.act is None or self.act.get("typ") != "ask_session" or self.origin != "ask":
+                raise EnforcementError(
+                    "workload 'ask' requires act.typ == 'ask_session' and origin == 'ask'"
+                )
+        elif self.workload == "job":
+            if self.act is None or self.act.get("typ") != "run" or self.origin != "job":
+                raise EnforcementError(
+                    "workload 'job' requires act.typ == 'run' and origin == 'job'"
+                )
+        else:
+            if self.act is not None:
+                raise EnforcementError(
+                    f"act claim is not allowed for workload '{self.workload}'"
+                )
 
     @classmethod
     def from_claims(cls, claims: Mapping[str, Any]) -> Grant:
@@ -369,6 +417,39 @@ class Grant:
                 )
         else:
             workload = "interactive"
+
+        act: dict[str, str] | None = None
+        if "act" in claims:
+            act_raw = claims["act"]
+            if not isinstance(act_raw, Mapping):
+                raise EnforcementError("act claim must be an object")
+            if set(act_raw.keys()) != {"sub", "typ"}:
+                raise EnforcementError("act claim must have exactly 'sub' and 'typ' fields")
+            sub_val = act_raw.get("sub")
+            if not isinstance(sub_val, str) or isinstance(sub_val, bool) or not sub_val:
+                raise EnforcementError("act.sub must be a non-empty string")
+            typ_val = act_raw.get("typ")
+            if typ_val not in VALID_ACT_TYPES:
+                raise EnforcementError(
+                    f"invalid act.typ '{typ_val}', must be one of {sorted(VALID_ACT_TYPES)}"
+                )
+            act = {"sub": sub_val, "typ": typ_val}
+
+        azp: str | None = None
+        if "azp" in claims:
+            azp_val = claims["azp"]
+            if not isinstance(azp_val, str) or isinstance(azp_val, bool) or not azp_val:
+                raise EnforcementError("azp claim must be a non-empty string")
+            azp = azp_val
+
+        origin: str | None = None
+        if "origin" in claims:
+            origin_val = claims["origin"]
+            if not isinstance(origin_val, str) or origin_val not in VALID_ORIGINS:
+                raise EnforcementError(
+                    f"invalid origin '{origin_val}', must be one of {sorted(VALID_ORIGINS)}"
+                )
+            origin = origin_val
 
         binding: dict[str, Any] = {}
         if "publication_id" in claims:
@@ -418,6 +499,9 @@ class Grant:
             sql_dialect=sql_dialect,
             workload=workload,
             binding=binding,
+            act=act,
+            azp=azp,
+            origin=origin,
         )
 
 

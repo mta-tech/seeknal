@@ -766,6 +766,8 @@ class ServerConfig:
                     "interactive",
                     "bi",
                     "report",
+                    "ask",
+                    "job",
                 }
                 if invalid_accs:
                     raise ServerConfigError(

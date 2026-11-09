@@ -60,7 +60,7 @@ The Catalog evaluates user authorization and issues a grant (decoded from a Cata
 
 - `RowFilter(column: str, op: str, values: tuple)`: `op` is one of `eq`, `in`, `gte`, `lte`.
 - `TableGrant(table: str, columns: tuple[str, ...], masks: Mapping[str, str], row_filters: tuple[RowFilter, ...] = (), actions: tuple[str, ...] = ("select",))`.
-- `Grant(subject: str, workspace: str, audit_id: str, sql_sha256: str, max_rows: int, expires_at: float, tables: Mapping[str, TableGrant], sql_dialect: str = "postgres", workload: str = "interactive")`.
+- `Grant(subject: str, workspace: str, audit_id: str, sql_sha256: str, max_rows: int, expires_at: float, tables: Mapping[str, TableGrant], sql_dialect: str = "postgres", workload: str = "interactive", binding: Mapping[str, Any] = {}, act: Mapping[str, str] | None = None, azp: str | None = None, origin: str | None = None)`.
 
 ### Grant Lifetime & Replay Protection
 
@@ -69,10 +69,25 @@ Grants issued by the Catalog are short-lived (`exp - iat <= 60` seconds by defau
 ### Workload Claim (`workload`)
 
 The Catalog evaluates user queries and assigns an optional `workload` claim to route execution to appropriate engine accounts.
-- **Allowed values:** `"interactive"`, `"bi"`, and `"report"`.
+- **Allowed values:** `"interactive"`, `"bi"`, `"report"`, `"ask"`, and `"job"`.
 - **Default:** When absent from the claims payload, `workload` defaults to `"interactive"`.
 - **Validation:** Any non-string or unknown value raises `EnforcementError`.
 - **Engine Delegation:** Stored as `Grant.workload` and propagated to `PreparedQuery.workload` for engine adapter routing.
+
+### Contract v3 Claims (`act`, `azp`, `origin`)
+
+Grant contract v3 introduces optional claims parsed into `Grant` and emitted into per-request audit logs:
+- `act`: An object `{"sub": str, "typ": "ask_session" | "run"}`. Any other structure or value raises `EnforcementError`.
+- `azp`: Non-empty authorized party client identifier string (or absent).
+- `origin`: Originating client channel; one of `"superset"`, `"ask"`, `"job"`, `"portal"`, or absent. Any other value raises `EnforcementError`.
+
+#### Consistency Rules (Fail-Closed)
+- Workload `ask` **requires** `act.typ == "ask_session"` and `origin == "ask"`.
+- Workload `job` **requires** `act.typ == "run"` and `origin == "job"`.
+- `act` with any other workload (`interactive`, `bi`, `report`) is refused with `EnforcementError`.
+
+#### Audit-Only Semantics
+These claims are **audit-only**; they are logged in request records and never widen or narrow what the grant allows. Table grants, column projections, mask functions, and row filters remain the sole authorization inputs.
 
 ### Source SQL Dialect Claim (`sql_dialect`)
 
