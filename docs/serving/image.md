@@ -15,6 +15,7 @@ The image is built from the unified `uv.lock` lockfile without modifying `pyproj
 - **Core serving framework:** `starlette`, `uvicorn` (ASGI HTTP server and routing)
 - **SQL parsing and dialect translation:** `sqlglot`
 - **Embedded query engine:** `duckdb`
+- **Engine database drivers:** `pymysql` (StarRocks MySQL protocol), `psycopg2-binary` (Lakebase PostgreSQL, Cube SQL API)
 - **Discovery and catalog HTTP clients:** `httpx`
 - **Configuration parsing:** `pyyaml`
 - **Security and token cryptography:** `cryptography` (ES256 ECDSA grant token validation)

@@ -3,7 +3,9 @@ attrs
 cryptography
 duckdb
 httpx
+psycopg2-binary
 pygments
+pymysql
 python-multipart
 pyyaml
 rich

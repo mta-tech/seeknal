@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.metadata
 import json
 import os
@@ -134,6 +135,57 @@ def test_import_closure():
             f"Distribution '{dist}' (normalized: '{norm_dist}') loaded during import closure "
             f"is neither in serving-requirements.txt nor in its transitive dependency closure."
         )
+
+
+def test_ast_import_closure():
+    """Scan all serving files and starrocks.py for imports with AST and verify requirement coverage."""
+    repo_root = Path(__file__).resolve().parents[2]
+    serving_dir = repo_root / "src" / "seeknal" / "serving"
+    starrocks_file = repo_root / "src" / "seeknal" / "connections" / "starrocks.py"
+    reqs_path = repo_root / "docker" / "serving-requirements.txt"
+
+    assert serving_dir.is_dir(), f"Missing {serving_dir}"
+    assert starrocks_file.is_file(), f"Missing {starrocks_file}"
+    assert reqs_path.is_file(), f"Missing {reqs_path}"
+
+    files_to_scan = sorted(serving_dir.rglob("*.py")) + [starrocks_file]
+
+    imported_top_levels = set()
+    for py_file in files_to_scan:
+        source_code = py_file.read_text(encoding="utf-8")
+        tree = ast.parse(source_code, filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top_name = alias.name.split(".")[0]
+                    imported_top_levels.add(top_name)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and node.level == 0:
+                    top_name = node.module.split(".")[0]
+                    imported_top_levels.add(top_name)
+
+    pkg_dist = importlib.metadata.packages_distributions()
+
+    direct_reqs = set()
+    with open(reqs_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#")[0].strip()
+            if line:
+                direct_reqs.add(normalize_pep503(line))
+
+    closure = get_transitive_requirements(direct_reqs)
+
+    for top in sorted(imported_top_levels):
+        if top in sys.stdlib_module_names or top == "seeknal":
+            continue
+        dists = pkg_dist.get(top, [])
+        assert dists, f"Top-level module '{top}' could not be mapped to any installed distribution"
+        for dist in dists:
+            norm_dist = normalize_pep503(dist)
+            assert norm_dist in closure, (
+                f"Distribution '{dist}' (providing '{top}') required by serving codebase "
+                f"is neither in serving-requirements.txt nor in its transitive dependency closure."
+            )
 
 
 def test_serving_requirements_file():
