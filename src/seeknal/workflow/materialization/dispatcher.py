@@ -163,6 +163,9 @@ class MaterializationDispatcher:
                 )
 
             except Exception as exc:
+                from seeknal.runtime.catalog_io import GovernedConfigError
+                if isinstance(exc, GovernedConfigError):
+                    raise
                 result.failed += 1
                 result.required_failed |= (
                     target_type == "iceberg"
@@ -273,10 +276,15 @@ class MaterializationDispatcher:
 
         # Load connection profile
         connection_name = mat_config.connection
-        from seeknal.runtime.catalog_io import get_catalog_io
+        from seeknal.runtime.catalog_io import GovernedConfigError, get_catalog_io
 
         catalog_io = get_catalog_io()
         if catalog_io is not None:
+            forbidden = ("host", "port", "database", "user", "password", "sslmode")
+            params = target_config.get("params", {}) if isinstance(target_config.get("params"), dict) else {}
+            for key in forbidden:
+                if key in target_config or key in params:
+                    raise GovernedConfigError(f"governed mode: inline '{key}' is not allowed")
             conn_dict = catalog_io.connection(connection_name, "write")
         elif self._profile_loader is not None:
             conn_dict = self._profile_loader.load_connection_profile(connection_name)

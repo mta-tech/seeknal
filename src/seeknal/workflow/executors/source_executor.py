@@ -48,6 +48,7 @@ from seeknal.workflow.executors.base import (  # ty: ignore[unresolved-import]
 )
 
 # Materialization support
+from seeknal.runtime.catalog_io import GovernedConfigError, get_catalog_io
 from seeknal.workflow.materialization.yaml_integration import materialize_node_if_enabled  # ty: ignore[unresolved-import]
 from seeknal.workflow.materialization.dispatcher import MaterializationDispatcher  # ty: ignore[unresolved-import]
 
@@ -348,7 +349,7 @@ class SourceExecutor(BaseExecutor):
                 metadata=result_metadata,
             )
 
-        except ExecutorExecutionError:
+        except (ExecutorExecutionError, GovernedConfigError):
             raise
         except FileNotFoundError as e:
             raise ExecutorExecutionError(
@@ -374,7 +375,8 @@ class SourceExecutor(BaseExecutor):
         Resolve a file path to absolute path.
 
         Handles both absolute and relative paths.
-        Relative paths are resolved relative to the current working directory.
+        In governed mode, refuses URL schemes and paths outside the project root.
+        In non-governed mode, relative paths are resolved relative to the current working directory.
 
         Args:
             path: File path to resolve
@@ -382,6 +384,38 @@ class SourceExecutor(BaseExecutor):
         Returns:
             Absolute path as string
         """
+        catalog_io = get_catalog_io()
+        if catalog_io is not None:
+            path_str = str(path)
+            if re.match(r"^[a-z][a-z0-9+.-]*://", path_str, re.IGNORECASE):
+                raise GovernedConfigError(
+                    f"governed mode: URL schemes not allowed in file sources: '{path_str}'"
+                )
+
+            project_root = (
+                getattr(self.context, "project_path", None)
+                or getattr(self.context, "workspace_path", None)
+            )
+            if project_root is not None:
+                project_root = Path(project_root).resolve()
+            else:
+                project_root = Path.cwd().resolve()
+
+            path_obj = Path(path_str)
+            if not path_obj.is_absolute():
+                resolved = (project_root / path_obj).resolve()
+            else:
+                resolved = path_obj.resolve()
+
+            try:
+                resolved.relative_to(project_root)
+            except ValueError:
+                raise GovernedConfigError(
+                    f"governed mode: path '{path_str}' falls outside project root"
+                )
+
+            return str(resolved)
+
         path_obj = Path(path)
 
         if not path_obj.is_absolute():
@@ -704,6 +738,8 @@ class SourceExecutor(BaseExecutor):
                     f"Unsupported database type: {source_type}"
                 )
 
+        except (ExecutorExecutionError, GovernedConfigError):
+            raise
         except Exception as e:
             raise ExecutorExecutionError(
                 self.node.id,
@@ -820,32 +856,42 @@ class SourceExecutor(BaseExecutor):
             PostgreSQLConfig instance
         """
         from seeknal.connections.postgresql import parse_postgresql_config  # ty: ignore[unresolved-import]
+        from seeknal.runtime.catalog_io import get_catalog_io, GovernedConfigError
 
-        connection_name = params.get("connection")
+        catalog_io = get_catalog_io()
+        connection_name = params.get("connection") or (
+            getattr(self, "node", None) and getattr(self.node, "config", {}).get("connection")
+        )
+
+        if catalog_io is not None:
+            if not connection_name:
+                raise GovernedConfigError("governed mode: database sources must name a granted connection")
+
+            forbidden = ("host", "port", "database", "user", "password", "sslmode")
+            for key in forbidden:
+                if key in params:
+                    raise GovernedConfigError(f"governed mode: inline '{key}' is not allowed")
+
+            profile = dict(catalog_io.connection(connection_name, "read"))
+            for key in ("schema", "connect_timeout"):
+                if key in params:
+                    profile[key] = params[key]
+            config = parse_postgresql_config(profile)
+            return config
+
         if connection_name:
-            from seeknal.runtime.catalog_io import get_catalog_io
+            from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
 
-            catalog_io = get_catalog_io()
-            if catalog_io is not None:
-                profile = dict(catalog_io.connection(connection_name, "read"))
-                for key in ("host", "port", "database", "user", "password", "schema",
-                            "sslmode", "connect_timeout"):
-                    if key in params:
-                        profile[key] = params[key]
-                config = parse_postgresql_config(profile)
-            else:
-                from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
-
-                profile_path = getattr(self.context, 'profile_path', None)
-                loader = ProfileLoader(profile_path=profile_path)
-                profile = loader.load_connection_profile(connection_name)
-                # Inline params override profile defaults
-                for key in ("host", "port", "database", "user", "password", "schema",
-                            "sslmode", "connect_timeout"):
-                    if key in params:
-                        profile[key] = params[key]
-                config = parse_postgresql_config(profile)
-                loader.clear_connection_credentials(profile)
+            profile_path = getattr(self.context, 'profile_path', None)
+            loader = ProfileLoader(profile_path=profile_path)
+            profile = loader.load_connection_profile(connection_name)
+            # Inline params override profile defaults
+            for key in ("host", "port", "database", "user", "password", "schema",
+                        "sslmode", "connect_timeout"):
+                if key in params:
+                    profile[key] = params[key]
+            config = parse_postgresql_config(profile)
+            loader.clear_connection_credentials(profile)
         else:
             config = parse_postgresql_config(params)
 
@@ -1044,6 +1090,37 @@ class SourceExecutor(BaseExecutor):
         Returns:
             Number of rows loaded
         """
+        catalog_io = get_catalog_io()
+        if catalog_io is not None:
+            connection_name = params.get("connection") or (
+                getattr(self, "node", None) and getattr(self.node, "config", {}).get("connection")
+            )
+            if not connection_name:
+                raise GovernedConfigError("governed mode: database sources must name a granted connection")
+
+            forbidden = ("host", "port", "database", "user", "password", "sslmode")
+            for key in forbidden:
+                if key in params:
+                    raise GovernedConfigError(f"governed mode: inline '{key}' is not allowed")
+
+            vended = dict(catalog_io.connection(connection_name, "read"))
+            conn_config = dict(vended)
+            conn_config.setdefault("host", "localhost")
+            conn_config.setdefault("port", 9030)
+            conn_config.setdefault("user", "root")
+            conn_config.setdefault("password", "")
+            conn_config.setdefault("database", "")
+            conn_config["port"] = int(conn_config["port"])
+        else:
+            # Build connection config from params
+            conn_config = {
+                "host": params.get("host", "localhost"),
+                "port": params.get("port", 9030),
+                "user": params.get("user", "root"),
+                "password": params.get("password", ""),
+                "database": params.get("database", ""),
+            }
+
         try:
             from seeknal.connections.starrocks import create_starrocks_connection  # ty: ignore[unresolved-import]
         except ImportError:
@@ -1051,15 +1128,6 @@ class SourceExecutor(BaseExecutor):
                 self.node.id,
                 "pymysql is required for StarRocks sources. Install with: pip install pymysql"
             )
-
-        # Build connection config from params
-        conn_config = {
-            "host": params.get("host", "localhost"),
-            "port": params.get("port", 9030),
-            "user": params.get("user", "root"),
-            "password": params.get("password", ""),
-            "database": params.get("database", ""),
-        }
 
         # Create schema and view names from node qualified name
         node_id = self.node.id
@@ -1103,6 +1171,8 @@ class SourceExecutor(BaseExecutor):
 
             return len(rows)
 
+        except (ExecutorExecutionError, GovernedConfigError):
+            raise
         except Exception as e:
             raise ExecutorExecutionError(
                 self.node.id,
