@@ -380,6 +380,11 @@ class DuckDBIcebergExtension:
     @staticmethod
     def configure_s3(con: Any) -> None:
         """Configure S3/MinIO credentials from environment variables."""
+        from seeknal.runtime.catalog_io import get_catalog_io
+
+        if get_catalog_io() is not None:
+            return
+
         import os
 
         minio_endpoint = os.getenv("AWS_ENDPOINT_URL", "")
@@ -455,6 +460,13 @@ class DuckDBIcebergExtension:
         Raises:
             MaterializationOperationError: If catalog attachment fails
         """
+        from seeknal.runtime.catalog_io import get_catalog_io
+
+        catalog_io = get_catalog_io()
+        if catalog_io is not None:
+            catalog_io.attach_iceberg(con, catalog_name)
+            return
+
         try:
             catalog_url = _rest_catalog_url(uri)
 
@@ -865,6 +877,13 @@ def write_to_iceberg(
     table_name = validate_table_name(table_name)
 
     if mode in ADVANCED_MODES:
+        from seeknal.runtime.catalog_io import get_catalog_io
+
+        if get_catalog_io() is not None:
+            raise MaterializationOperationError(
+                "PyIceberg advanced mutation modes are not supported in governed mode (v1)"
+            )
+
         if catalog_config is None:
             raise WriteError(
                 f"catalog_config is required for Iceberg {mode} writes",

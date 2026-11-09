@@ -273,7 +273,12 @@ class MaterializationDispatcher:
 
         # Load connection profile
         connection_name = mat_config.connection
-        if self._profile_loader is not None:
+        from seeknal.runtime.catalog_io import get_catalog_io
+
+        catalog_io = get_catalog_io()
+        if catalog_io is not None:
+            conn_dict = catalog_io.connection(connection_name, "write")
+        elif self._profile_loader is not None:
             conn_dict = self._profile_loader.load_connection_profile(connection_name)
         else:
             from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
@@ -317,6 +322,17 @@ class MaterializationDispatcher:
         mode = target_config.get("mode", profile_config.default_mode.value)
         target_config["mode"] = mode
         advanced = mode in ADVANCED_MODES
+
+        from seeknal.runtime.catalog_io import get_catalog_io
+        from seeknal.workflow.materialization.operations import MaterializationOperationError
+
+        catalog_io = get_catalog_io()
+        if catalog_io is not None:
+            catalog_io.check_write(target_config.get("table", ""))
+            if advanced:
+                raise MaterializationOperationError(
+                    "PyIceberg advanced mutation modes are not supported in governed mode (v1)"
+                )
         options = {}
         if advanced:
             options = {

@@ -479,6 +479,23 @@ class BaseExecutor(ABC):
                 f"Validation error: {str(e)}"
             ) from e
 
+        # Governed node start check
+        from seeknal.runtime.catalog_io import get_catalog_io
+        from seeknal.runtime.controller_client import NodeNotAuthorized, RunRevoked
+
+        catalog_io = get_catalog_io()
+        if catalog_io is not None:
+            node_name = getattr(self.node, "qualified_name", None) or getattr(self.node, "id", str(self.node))
+            try:
+                catalog_io.node_start(node_name)
+            except (RunRevoked, NodeNotAuthorized) as exc:
+                return ExecutorResult(
+                    node_id=self.node.id,
+                    status=ExecutionStatus.FAILED,
+                    error_message=str(exc),
+                    metadata={"error": str(exc), "governed_stop": True},
+                )
+
         # Pre-execution setup
         try:
             self.pre_execute()

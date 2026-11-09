@@ -153,6 +153,10 @@ class ParallelDAGRunner:
                     downstream = find_downstream_nodes(downstream_adj, {r.node_id})
                     self._failed_nodes.update(downstream)
 
+                if any((r.metadata or {}).get("governed_stop") for r in layer_failures):
+                    _echo_error("Stopping execution due to revoked or unauthorized node start")
+                    break
+
                 if not self.continue_on_error:
                     _echo_error(
                         f"Stopping: {len(layer_failures)} node(s) failed in layer {layer_idx + 1}"

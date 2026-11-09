@@ -823,18 +823,29 @@ class SourceExecutor(BaseExecutor):
 
         connection_name = params.get("connection")
         if connection_name:
-            from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
+            from seeknal.runtime.catalog_io import get_catalog_io
 
-            profile_path = getattr(self.context, 'profile_path', None)
-            loader = ProfileLoader(profile_path=profile_path)
-            profile = loader.load_connection_profile(connection_name)
-            # Inline params override profile defaults
-            for key in ("host", "port", "database", "user", "password", "schema",
-                        "sslmode", "connect_timeout"):
-                if key in params:
-                    profile[key] = params[key]
-            config = parse_postgresql_config(profile)
-            loader.clear_connection_credentials(profile)
+            catalog_io = get_catalog_io()
+            if catalog_io is not None:
+                profile = dict(catalog_io.connection(connection_name, "read"))
+                for key in ("host", "port", "database", "user", "password", "schema",
+                            "sslmode", "connect_timeout"):
+                    if key in params:
+                        profile[key] = params[key]
+                config = parse_postgresql_config(profile)
+            else:
+                from seeknal.workflow.materialization.profile_loader import ProfileLoader  # ty: ignore[unresolved-import]
+
+                profile_path = getattr(self.context, 'profile_path', None)
+                loader = ProfileLoader(profile_path=profile_path)
+                profile = loader.load_connection_profile(connection_name)
+                # Inline params override profile defaults
+                for key in ("host", "port", "database", "user", "password", "schema",
+                            "sslmode", "connect_timeout"):
+                    if key in params:
+                        profile[key] = params[key]
+                config = parse_postgresql_config(profile)
+                loader.clear_connection_credentials(profile)
         else:
             config = parse_postgresql_config(params)
 
@@ -1154,31 +1165,6 @@ class SourceExecutor(BaseExecutor):
         catalog_alias = _qi(catalog_alias_raw)
         namespace = _qi(namespace_raw)
 
-        # Get connection config from params or env vars
-        catalog_uri = params.get("catalog_uri", lakekeeper_uri_from_env())
-        if not catalog_uri:
-            raise ExecutorExecutionError(
-                self.node.id,
-                "Iceberg source requires 'catalog_uri' in params or "
-                "LAKEKEEPER_URI (or LAKEKEEPER_URL) environment variable"
-            )
-
-        warehouse = params.get(
-            "warehouse",
-            os.getenv("LAKEKEEPER_WAREHOUSE", "seeknal-warehouse")
-        )
-
-        # S3 credentials from env
-        minio_endpoint = os.getenv("AWS_ENDPOINT_URL", "")
-        s3_region = os.getenv("AWS_REGION", "us-east-1")
-        s3_access_key = os.getenv("AWS_ACCESS_KEY_ID", "")
-        s3_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "")
-
-        # OAuth2 credentials from env
-        token_url = os.getenv("KEYCLOAK_TOKEN_URL", "")
-        client_id = os.getenv("KEYCLOAK_CLIENT_ID", "")
-        client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET", "")
-
         # Create schema and view names from node qualified name
         node_id = self.node.id
         if "." in node_id:
@@ -1187,68 +1173,100 @@ class SourceExecutor(BaseExecutor):
             schema, view_name = "source", node_id
 
         try:
-            # Install and load required extensions
-            con.execute("INSTALL httpfs")
-            con.execute("LOAD httpfs")
-            con.execute("INSTALL iceberg")
-            con.execute("LOAD iceberg")
+            from seeknal.runtime.catalog_io import get_catalog_io
 
-            # Configure S3 if endpoint is provided
-            if minio_endpoint:
-                # Strip protocol for endpoint
-                endpoint = minio_endpoint.replace("http://", "").replace("https://", "")
-                con.execute(f"SET s3_region = '{s3_region}'")
-                con.execute(f"SET s3_endpoint = '{endpoint}'")
-                con.execute("SET s3_url_style = 'path'")
-                con.execute("SET s3_use_ssl = false")
-                con.execute(f"SET s3_access_key_id = '{s3_access_key}'")
-                con.execute(f"SET s3_secret_access_key = '{s3_secret_key}'")
-
-            # Get OAuth2 token (optional — skip if no Keycloak credentials)
-            token = None
-            if token_url and client_id and client_secret:
-                token_data = (
-                    f"grant_type=client_credentials"
-                    f"&client_id={client_id}"
-                    f"&client_secret={client_secret}"
-                ).encode()
-                req = urllib.request.Request(token_url, data=token_data)
-                token_response = json.loads(
-                    urllib.request.urlopen(req).read()
-                )
-                token = token_response["access_token"]
-
-            # Build catalog URL
-            base_url = catalog_uri.rstrip("/")
-            if "/catalog" not in base_url:
-                catalog_url = f"{base_url}/catalog"
+            catalog_io = get_catalog_io()
+            if catalog_io is not None:
+                catalog_io.check_read(table)
+                catalog_io.attach_iceberg(con, catalog_alias_raw)
             else:
-                catalog_url = base_url
+                # Get connection config from params or env vars
+                catalog_uri = params.get("catalog_uri", lakekeeper_uri_from_env())
+                if not catalog_uri:
+                    raise ExecutorExecutionError(
+                        self.node.id,
+                        "Iceberg source requires 'catalog_uri' in params or "
+                        "LAKEKEEPER_URI (or LAKEKEEPER_URL) environment variable"
+                    )
 
-            # Attach Lakekeeper catalog (skip if already attached)
-            try:
-                if token:
-                    con.execute(f"""
-                        ATTACH '{warehouse}' AS {catalog_alias} (
-                            TYPE ICEBERG,
-                            ENDPOINT '{catalog_url}',
-                            AUTHORIZATION_TYPE 'oauth2',
-                            TOKEN '{token}'
-                        )
-                    """)
+                warehouse = params.get(
+                    "warehouse",
+                    os.getenv("LAKEKEEPER_WAREHOUSE", "seeknal-warehouse")
+                )
+
+                # S3 credentials from env
+                minio_endpoint = os.getenv("AWS_ENDPOINT_URL", "")
+                s3_region = os.getenv("AWS_REGION", "us-east-1")
+                s3_access_key = os.getenv("AWS_ACCESS_KEY_ID", "")
+                s3_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+
+                # OAuth2 credentials from env
+                token_url = os.getenv("KEYCLOAK_TOKEN_URL", "")
+                client_id = os.getenv("KEYCLOAK_CLIENT_ID", "")
+                client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET", "")
+
+                # Install and load required extensions
+                con.execute("INSTALL httpfs")
+                con.execute("LOAD httpfs")
+                con.execute("INSTALL iceberg")
+                con.execute("LOAD iceberg")
+
+                # Configure S3 if endpoint is provided
+                if minio_endpoint:
+                    # Strip protocol for endpoint
+                    endpoint = minio_endpoint.replace("http://", "").replace("https://", "")
+                    con.execute(f"SET s3_region = '{s3_region}'")
+                    con.execute(f"SET s3_endpoint = '{endpoint}'")
+                    con.execute("SET s3_url_style = 'path'")
+                    con.execute("SET s3_use_ssl = false")
+                    con.execute(f"SET s3_access_key_id = '{s3_access_key}'")
+                    con.execute(f"SET s3_secret_access_key = '{s3_secret_key}'")
+
+                # Get OAuth2 token (optional — skip if no Keycloak credentials)
+                token = None
+                if token_url and client_id and client_secret:
+                    token_data = (
+                        f"grant_type=client_credentials"
+                        f"&client_id={client_id}"
+                        f"&client_secret={client_secret}"
+                    ).encode()
+                    req = urllib.request.Request(token_url, data=token_data)
+                    token_response = json.loads(
+                        urllib.request.urlopen(req).read()
+                    )
+                    token = token_response["access_token"]
+
+                # Build catalog URL
+                base_url = catalog_uri.rstrip("/")
+                if "/catalog" not in base_url:
+                    catalog_url = f"{base_url}/catalog"
                 else:
-                    con.execute(f"""
-                        ATTACH '{warehouse}' AS {catalog_alias} (
-                            TYPE ICEBERG,
-                            ENDPOINT '{catalog_url}',
-                            AUTHORIZATION_TYPE 'none'
-                        )
-                    """)
-                logger.info(f"Attached Iceberg catalog: {catalog_alias}")
-            except Exception as attach_err:
-                # Catalog may already be attached from a previous source
-                if "already exists" not in str(attach_err).lower():
-                    raise
+                    catalog_url = base_url
+
+                # Attach Lakekeeper catalog (skip if already attached)
+                try:
+                    if token:
+                        con.execute(f"""
+                            ATTACH '{warehouse}' AS {catalog_alias} (
+                                TYPE ICEBERG,
+                                ENDPOINT '{catalog_url}',
+                                AUTHORIZATION_TYPE 'oauth2',
+                                TOKEN '{token}'
+                            )
+                        """)
+                    else:
+                        con.execute(f"""
+                            ATTACH '{warehouse}' AS {catalog_alias} (
+                                TYPE ICEBERG,
+                                ENDPOINT '{catalog_url}',
+                                AUTHORIZATION_TYPE 'none'
+                            )
+                        """)
+                    logger.info(f"Attached Iceberg catalog: {catalog_alias}")
+                except Exception as attach_err:
+                    # Catalog may already be attached from a previous source
+                    if "already exists" not in str(attach_err).lower():
+                        raise
 
             # Validate time_column if provided
             if time_column:

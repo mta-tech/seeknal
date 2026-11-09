@@ -878,6 +878,11 @@ class DAGRunner:
                         metadata={**result.metadata, "error": result.error_message},
                     )
 
+                if (result.metadata or {}).get("governed_stop"):
+                    _echo_error("Stopping execution due to revoked or unauthorized node start")
+                    summary.results.append(result)
+                    break
+
                 if not continue_on_error:
                     _echo_error("Stopping execution due to failure")
                     summary.results.append(result)
