@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime
+import heapq
 import inspect
 import json
 import logging
@@ -45,6 +46,55 @@ SQL_LITERAL_PATTERN = re.compile(r"'([^']*)'")
 
 class DuplicateQueryIdError(ValueError):
     """Raised when a query with the same jti is already running."""
+
+
+class GrantReplayedError(ValueError):
+    """Raised when a grant token with the same jti is replayed."""
+
+
+class GrantReplayCacheFull(RuntimeError):
+    """Raised when the grant replay cache has reached maximum capacity."""
+
+
+class GrantReplayCache:
+    """Thread-safe cache mapping grant jti to expiry time with leeway."""
+
+    def __init__(self, max_entries: int = 100_000, leeway_seconds: float = 5.0) -> None:
+        self.max_entries = int(max_entries)
+        self.leeway_seconds = float(leeway_seconds)
+        self._lock = threading.Lock()
+        self._cache: dict[str, float] = {}
+        self._heap: list[tuple[float, str]] = []
+
+    def check_and_record(
+        self, jti: str, expires_at: float, now: float | None = None
+    ) -> None:
+        current_time = time.time() if now is None else float(now)
+        record_expiry = float(expires_at) + self.leeway_seconds
+
+        with self._lock:
+            # 1. Prune expired entries from the top of the min-heap
+            while self._heap and self._heap[0][0] <= current_time:
+                exp, old_jti = heapq.heappop(self._heap)
+                if self._cache.get(old_jti) == exp:
+                    del self._cache[old_jti]
+
+            # 2. Check if jti is present and not yet expired
+            if jti in self._cache:
+                if self._cache[jti] > current_time:
+                    raise GrantReplayedError(f"Grant '{jti}' has already been used")
+                else:
+                    del self._cache[jti]
+
+            # 3. Check capacity after pruning (fail closed)
+            if len(self._cache) >= self.max_entries:
+                raise GrantReplayCacheFull(
+                    f"Grant replay cache is full (max {self.max_entries} entries)"
+                )
+
+            # 4. Record entry
+            self._cache[jti] = record_expiry
+            heapq.heappush(self._heap, (record_expiry, jti))
 
 
 class _RunningQueryEntry:
@@ -224,8 +274,11 @@ def create_app(
     max_result_bytes: int = 64 * 1024 * 1024,
     extra_routes: Sequence[Route] | None = None,
     lifespan: Any = None,
+    replay_cache: GrantReplayCache | None = None,
 ) -> Starlette:
     """Create a Starlette serving application."""
+    if replay_cache is None:
+        replay_cache = GrantReplayCache()
     running_queries = RunningQueries()
 
     async def healthz(request: Request) -> Response:
@@ -526,6 +579,7 @@ def create_app(
                         audience=pipeline.audience,
                         issuer=pipeline.issuer,
                         require_grant_typ=pipeline.require_grant_typ,
+                        max_lifetime_seconds=pipeline.max_grant_lifetime_seconds,
                     )
                     audit_id = audit_id or claims.get("jti")
                     subject = subject or claims.get("sub")
@@ -551,6 +605,7 @@ def create_app(
                         audience=pipeline.audience,
                         issuer=pipeline.issuer,
                         require_grant_typ=pipeline.require_grant_typ,
+                        max_lifetime_seconds=pipeline.max_grant_lifetime_seconds,
                     )
                     audit_id = audit_id or claims.get("jti")
                     subject = subject or claims.get("sub")
@@ -648,6 +703,7 @@ def create_app(
                         audience=pipeline.audience,
                         issuer=pipeline.issuer,
                         require_grant_typ=pipeline.require_grant_typ,
+                        max_lifetime_seconds=pipeline.max_grant_lifetime_seconds,
                     )
                     audit_id = audit_id or claims.get("jti")
                     subject = subject or claims.get("sub")
@@ -673,6 +729,7 @@ def create_app(
                         audience=pipeline.audience,
                         issuer=pipeline.issuer,
                         require_grant_typ=pipeline.require_grant_typ,
+                        max_lifetime_seconds=pipeline.max_grant_lifetime_seconds,
                     )
                     audit_id = audit_id or claims.get("jti")
                     subject = subject or claims.get("sub")
@@ -696,6 +753,55 @@ def create_app(
                 500,
                 "internal_error",
                 "Internal server error",
+                token=token,
+                sql=sql,
+                params=params,
+            )
+
+        if prepared.expires_at is None:
+            _log_request(
+                audit_id=prepared.audit_id,
+                subject=prepared.subject,
+                status=401,
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+            )
+            return _error_response(
+                401,
+                "grant_token_error",
+                "Missing 'exp' claim in verified grant",
+                token=token,
+                sql=sql,
+                params=params,
+            )
+
+        try:
+            replay_cache.check_and_record(prepared.audit_id, prepared.expires_at)
+        except GrantReplayedError as exc:
+            _log_request(
+                audit_id=prepared.audit_id,
+                subject=prepared.subject,
+                status=401,
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+            )
+            return _error_response(
+                401,
+                "grant_replayed",
+                exc,
+                token=token,
+                sql=sql,
+                params=params,
+            )
+        except GrantReplayCacheFull as exc:
+            _log_request(
+                audit_id=prepared.audit_id,
+                subject=prepared.subject,
+                status=503,
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+            )
+            return _error_response(
+                503,
+                "replay_cache_full",
+                exc,
                 token=token,
                 sql=sql,
                 params=params,

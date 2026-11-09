@@ -45,6 +45,7 @@ class PreparedQuery:
     cube_security_context: Mapping | None
     workload: str = "interactive"
     binding: Mapping[str, Any] = field(default_factory=dict)
+    expires_at: float | None = None
 
 
 def _extract_placeholder_index(node: exp.Expression) -> int:
@@ -170,6 +171,7 @@ class ServingPipeline:
         default_catalog: str | None = None,
         cube_mode: str = "refuse",
         require_grant_typ: bool = False,
+        max_grant_lifetime_seconds: float = 300,
     ) -> None:
         if cube_mode not in ("refuse", "jwt"):
             raise EnforcementError(f"invalid cube_mode '{cube_mode}', must be 'refuse' or 'jwt'")
@@ -182,6 +184,7 @@ class ServingPipeline:
         self.default_catalog = default_catalog
         self.cube_mode = cube_mode
         self.require_grant_typ = require_grant_typ
+        self.max_grant_lifetime_seconds = float(max_grant_lifetime_seconds)
         self.router = Router(placement)
 
     def update_catalog(
@@ -221,9 +224,12 @@ class ServingPipeline:
             issuer=self.issuer,
             now=now,
             require_grant_typ=self.require_grant_typ,
+            max_lifetime_seconds=self.max_grant_lifetime_seconds,
         )
         audit_id = claims.get("jti")
         subject = claims.get("sub")
+        exp_val = claims.get("exp")
+        expires_at = float(exp_val) if exp_val is not None else None
 
         try:
             grant = Grant.from_claims(claims)
@@ -375,6 +381,7 @@ class ServingPipeline:
                 cube_security_context=enforced.cube_security_context,
                 workload=grant.workload,
                 binding=grant.binding,
+                expires_at=expires_at,
             )
         except (EnforcementError, RoutingError) as exc:
             exc.audit_id = getattr(exc, "audit_id", None) or audit_id

@@ -309,6 +309,9 @@ class CubeConnectionConfig:
 class DuckDBConnectionConfig:
     kind: str = "duckdb"
     path: str = ""
+    allowed_directories: tuple[str, ...] = ()
+    memory_limit: str | None = None
+    threads: int | None = None
 
 
 @dataclass(frozen=True)
@@ -334,6 +337,8 @@ class ServerConfig:
     cube_mode: str = "refuse"
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     secrets_env: dict[str, str] = field(default_factory=dict)
+    grant_max_lifetime_seconds: float = 60.0
+    replay_cache_max_entries: int = 100_000
 
     def load_grant_keys(self) -> dict[str, str]:
         """Load and return parsed PEM public keys."""
@@ -464,6 +469,8 @@ class ServerConfig:
             "placement",
             "connections",
             "limits",
+            "grant_max_lifetime_seconds",
+            "replay_cache_max_entries",
         }
         unknown_top = set(d.keys()) - allowed_top
         if unknown_top:
@@ -967,7 +974,13 @@ class ServerConfig:
                 )
 
             elif kind == "duckdb":
-                unknown_duck = set(eng_spec.keys()) - {"kind", "path"}
+                unknown_duck = set(eng_spec.keys()) - {
+                    "kind",
+                    "path",
+                    "allowed_directories",
+                    "memory_limit",
+                    "threads",
+                }
                 if unknown_duck:
                     raise ServerConfigError(
                         f"Unknown key(s) in duckdb connection '{eng_name_str}': {sorted(unknown_duck)}"
@@ -977,7 +990,45 @@ class ServerConfig:
                     raise ServerConfigError(
                         f"DuckDB connection '{eng_name_str}' missing required 'path'"
                     )
-                connections[eng_name_str] = DuckDBConnectionConfig(path=path.strip())
+
+                raw_allowed = eng_spec.get("allowed_directories", ())
+                if not isinstance(raw_allowed, (list, tuple)):
+                    raise ServerConfigError(
+                        f"DuckDB connection '{eng_name_str}' 'allowed_directories' must be a list of strings"
+                    )
+                validated_allowed: list[str] = []
+                for ad in raw_allowed:
+                    if not isinstance(ad, str):
+                        raise ServerConfigError(
+                            f"DuckDB connection '{eng_name_str}' 'allowed_directories' entries must be strings"
+                        )
+                    if not (os.path.isabs(ad) and ad.endswith("/") and (ad == "/" or os.path.normpath(ad) + "/" == ad)):
+                        raise ServerConfigError(
+                            f"DuckDB connection '{eng_name_str}' allowed directory '{ad}' must be an absolute, normalized path ending with '/'"
+                        )
+                    validated_allowed.append(ad)
+
+                mem_limit = eng_spec.get("memory_limit")
+                if mem_limit is not None:
+                    if not isinstance(mem_limit, str) or not mem_limit.strip():
+                        raise ServerConfigError(
+                            f"DuckDB connection '{eng_name_str}' 'memory_limit' must be a non-empty string"
+                        )
+                    mem_limit = mem_limit.strip()
+
+                threads = eng_spec.get("threads")
+                if threads is not None:
+                    if isinstance(threads, bool) or not isinstance(threads, int) or threads <= 0:
+                        raise ServerConfigError(
+                            f"DuckDB connection '{eng_name_str}' 'threads' must be a positive integer"
+                        )
+
+                connections[eng_name_str] = DuckDBConnectionConfig(
+                    path=path.strip(),
+                    allowed_directories=tuple(validated_allowed),
+                    memory_limit=mem_limit,
+                    threads=threads,
+                )
 
         # 12. limits
         lim_raw = d.get("limits")
@@ -1023,6 +1074,42 @@ class ServerConfig:
                 max_result_bytes=mr_val,
             )
 
+        # 13. grant_max_lifetime_seconds
+        grant_max_lifetime_raw = d.get("grant_max_lifetime_seconds", 60.0)
+        if isinstance(grant_max_lifetime_raw, bool) or not isinstance(
+            grant_max_lifetime_raw, (int, float)
+        ):
+            raise ServerConfigError(
+                "'grant_max_lifetime_seconds' must be a finite number"
+            )
+        try:
+            grant_max_lifetime = float(grant_max_lifetime_raw)
+        except (ValueError, TypeError) as exc:
+            raise ServerConfigError(
+                "'grant_max_lifetime_seconds' must be a finite number"
+            ) from exc
+        if (
+            math.isnan(grant_max_lifetime)
+            or math.isinf(grant_max_lifetime)
+            or grant_max_lifetime <= 0
+            or grant_max_lifetime > 300
+        ):
+            raise ServerConfigError(
+                f"'grant_max_lifetime_seconds' must be a finite number with 0 < x <= 300, got {grant_max_lifetime}"
+            )
+
+        # 14. replay_cache_max_entries
+        replay_cache_max_raw = d.get("replay_cache_max_entries", 100_000)
+        if (
+            isinstance(replay_cache_max_raw, bool)
+            or not isinstance(replay_cache_max_raw, int)
+            or replay_cache_max_raw <= 0
+        ):
+            raise ServerConfigError(
+                "'replay_cache_max_entries' must be a positive integer"
+            )
+        replay_cache_max_entries = replay_cache_max_raw
+
         server_config = cls(
             listen=listen_cfg,
             tls=tls_cfg,
@@ -1036,6 +1123,8 @@ class ServerConfig:
             connections=connections,
             limits=limits_cfg,
             secrets_env=secrets_env,
+            grant_max_lifetime_seconds=grant_max_lifetime,
+            replay_cache_max_entries=replay_cache_max_entries,
         )
 
         if load_keys:

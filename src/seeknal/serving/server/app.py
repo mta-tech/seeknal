@@ -32,7 +32,8 @@ from seeknal.serving.adapters import (
 )
 from seeknal.serving.discovery import PlacementRefresher, discover
 from seeknal.serving.discovery.build import DiscoveryResult
-from seeknal.serving.http import create_app
+from seeknal.serving.duckdb_policy import connect_hardened
+from seeknal.serving.http import GrantReplayCache, create_app
 from seeknal.serving.placement import Placement
 from seeknal.serving.server.config import (
     CubeConnectionConfig,
@@ -154,6 +155,7 @@ def build_server(
             default_catalog=cfg.default_catalog,
             cube_mode=cfg.cube_mode,
             require_grant_typ=cfg.require_grant_typ,
+            max_grant_lifetime_seconds=cfg.grant_max_lifetime_seconds,
         )
     else:
         empty_placement = Placement(engines={}, tables={}, cubes={})
@@ -164,6 +166,7 @@ def build_server(
             default_catalog=cfg.default_catalog,
             cube_mode=cfg.cube_mode,
             require_grant_typ=cfg.require_grant_typ,
+            max_grant_lifetime_seconds=cfg.grant_max_lifetime_seconds,
         )
 
         disc_cfg = cfg.placement.discovery_config
@@ -267,8 +270,13 @@ def build_server(
             if connect_factories and eng_name in connect_factories:
                 conn_fn = connect_factories[eng_name]
             else:
-                p = conn_cfg.path
-                conn_fn = lambda: duckdb.connect(p, read_only=True)
+                conn_fn = lambda c=conn_cfg: connect_hardened(
+                    c.path,
+                    read_only=True,
+                    allowed_directories=c.allowed_directories,
+                    memory_limit=c.memory_limit,
+                    threads=c.threads,
+                )
             adapters[eng_name] = DuckDBAdapter(conn_fn)
 
     # 7. Add /readyz route and Lifespan
@@ -308,6 +316,7 @@ def build_server(
         max_result_bytes=cfg.limits.max_result_bytes,
         extra_routes=extra_routes,
         lifespan=lifespan,
+        replay_cache=GrantReplayCache(max_entries=cfg.replay_cache_max_entries),
     )
 
     return ServerHandle(

@@ -190,6 +190,7 @@ All error responses have an HTTP status code $\ge 400$ and return a consistent J
 | Condition | Status | Error Category | Description |
 |:---|:---:|:---|:---|
 | `GrantTokenError` | **401** | `grant_token_error` | Missing/malformed Authorization header, invalid signature, expired token, or invalid claims. |
+| `GrantReplayedError` | **401** | `grant_replayed` | Grant token with this `jti` has already been used (replay detected). |
 | `EnforcementError` | **403** | `enforcement_error` | Query policy violation: ungranted table, ungranted column, disallowed SQL function, or write violation. |
 | Query not found / subject mismatch | **404** | `not_found` | In `/v1/cancel`: query `jti` not found in running queries, or subject does not match running query. |
 | Duplicate query execution | **409** | `duplicate_query_id` | A query with the same `jti` is already actively running. |
@@ -198,6 +199,7 @@ All error responses have an HTTP status code $\ge 400$ and return a consistent J
 | Malformed JSON or invalid types | **400** | `bad_request` | Non-JSON body, missing `sql`, invalid field types, or unrecognized extra fields. |
 | Request body exceeds size limit | **413** | `payload_too_large` | Body exceeds `max_body_bytes` (checked prior to JSON parsing). |
 | Query cancelled | **499** | `query_cancelled` | Query execution cancelled via `/v1/cancel` or client disconnect. |
+| `GrantReplayCacheFull` | **503** | `replay_cache_full` | Grant replay cache has reached capacity; query refused to fail closed. |
 | Missing workload account | **503** | `workload_account_missing` | Routed engine has no configured account matching the grant's `workload` claim. |
 | No adapter for chosen engine | **503** | `engine_unavailable` | Placement routed to an engine that is not registered in the application's adapters mapping. |
 | `EngineTimeout` | **504** | `engine_timeout` | Query execution exceeded the allotted timeout threshold. |

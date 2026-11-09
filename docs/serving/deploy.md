@@ -38,6 +38,9 @@ logging:
 
 require_grant_typ: true
 
+grant_max_lifetime_seconds: 60  # Maximum allowable grant token lifetime in seconds (default 60, max 300)
+replay_cache_max_entries: 100000  # Size limit for the grant replay cache (default 100000)
+
 default_catalog: lakekeeper
 
 cube_mode: refuse  # refuse | jwt
@@ -124,6 +127,10 @@ connections:
   duck:
     kind: duckdb
     path: /data/serving/dev.duckdb
+    allowed_directories:
+      - /data/serving/
+    memory_limit: 4GB
+    threads: 4
 
 limits:
   timeout_seconds: 30.0
@@ -333,4 +340,31 @@ docker run -d \
   --env-file /etc/seeknal/secrets/starrocks-workloads.env \
   seeknal-serving:latest \
   python -m seeknal.serving --config /etc/seeknal/serving.yaml
+```
+
+---
+
+## 5. DuckDB Engine Hardening & Conformance Probe
+
+When using the embedded DuckDB engine (`kind: duckdb`), Seeknal Serving locks down database connections to prevent external access, unauthorized file reads, extension downloads, and configuration tampering.
+
+The probe command verifies that a DuckDB database connection complies with the locked-down runtime policy:
+
+```bash
+python -m seeknal.serving.duckdb_policy probe --path /path/to/database.duckdb [--allowed-dir /data/serving/ ...]
+```
+
+The probe outputs a JSON report with conformance check results and exits with code `0` if all checks pass, or `1` if any check fails:
+
+```json
+{
+  "external_access_disabled": true,
+  "config_locked": true,
+  "read_text_outside_refused": true,
+  "copy_to_refused": true,
+  "attach_refused": true,
+  "install_refused": true,
+  "load_refused": true,
+  "select_ok": true
+}
 ```

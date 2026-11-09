@@ -62,6 +62,10 @@ The Catalog evaluates user authorization and issues a grant (decoded from a Cata
 - `TableGrant(table: str, columns: tuple[str, ...], masks: Mapping[str, str], row_filters: tuple[RowFilter, ...] = (), actions: tuple[str, ...] = ("select",))`.
 - `Grant(subject: str, workspace: str, audit_id: str, sql_sha256: str, max_rows: int, expires_at: float, tables: Mapping[str, TableGrant], sql_dialect: str = "postgres", workload: str = "interactive")`.
 
+### Grant Lifetime & Replay Protection
+
+Grants issued by the Catalog are short-lived (`exp - iat <= 60` seconds by default in the serving configuration, with a library maximum of 300 seconds) and protected against replay at `/v1/query`. Each grant's `jti` is single-use and recorded in an in-memory replay cache until expiry plus leeway. Replayed grants are rejected with `401 grant_replayed`.
+
 ### Workload Claim (`workload`)
 
 The Catalog evaluates user queries and assigns an optional `workload` claim to route execution to appropriate engine accounts.
