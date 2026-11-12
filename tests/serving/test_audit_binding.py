@@ -200,7 +200,7 @@ def test_audit_echo_in_request_log(caplog):
         schemas={"users": ["id", "name"]},
         public_keys={"k1": pub},
     )
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
     app = create_app(pipeline, {"duck": adapter})
     client = TestClient(app)
 

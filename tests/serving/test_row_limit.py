@@ -70,7 +70,7 @@ def _run_enforced(
         dialect=dialect,
         max_rows=request_max_rows,
     )
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
     prep = PreparedQuery(
         engine="duck",
         engine_kind="duckdb",

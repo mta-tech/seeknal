@@ -228,7 +228,7 @@ def test_running_duckdb_query_cancelled_via_v1_cancel():
         schemas={"users": ["id"]},
         public_keys={"key-1": pub},
     )
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
     app = create_app(pipeline, {"duck": adapter}, timeout_seconds=30.0)
     client = TestClient(app)
 

@@ -67,7 +67,7 @@ def serving_setup(ec_key_pair):
         schemas=schemas,
         public_keys={"key-1": pub},
     )
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
     # "missing_eng" is in placement but not in adapters, for testing 503
     app = create_app(
         pipeline,

@@ -99,7 +99,7 @@ def test_setup(ec_key_pair):
         schemas=schemas,
         public_keys={"key-1": pub},
     )
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
     return priv, pipeline, adapter
 
 

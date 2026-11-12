@@ -230,7 +230,7 @@ def http_setup():
         schemas=schemas,
         public_keys={"key-1": pub},
     )
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
     app = create_app(pipeline, {"duck": adapter}, timeout_seconds=10.0)
     client = TestClient(app)
     return client, priv, pipeline

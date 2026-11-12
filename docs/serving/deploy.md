@@ -455,6 +455,14 @@ docker run -d \
 
 When using the embedded DuckDB engine (`kind: duckdb`), Seeknal Serving locks down database connections to prevent external access, unauthorized file reads, extension downloads, and configuration tampering.
 
+### Owned Per-Query Lifecycle, Serialization & Operational Limits
+- **Fresh Owned Connection per Acquired Query:** `DuckDBAdapter` opens and hardens a fresh read-only connection via `connect_hardened` for each acquired query, cancels and joins any started watchdog timer, and deterministically closes the connection (`conn.close()`) before releasing its execution lock. It does not retain a persistent root connection or connection pool, preserving per-query file-reopen and replacement freshness semantics.
+- **Per-Adapter Execution Lock & Shared Deadline:** Because DuckDB's `SET lock_configuration = true` and `allowed_directories` apply to the underlying database instance while any connection is open, `DuckDBAdapter` serializes execution per adapter instance (`connect -> harden -> query/fetch -> timer cleanup -> close`).
+  - Request cancellation handles are registered before waiting for the adapter lock.
+  - A single monotonic deadline (`timeout_seconds`) spans both queue wait and query execution (not reset after acquiring the lock); queued requests that are cancelled or expire before acquiring the lock fail fast (`499 query_cancelled` or `504 engine_timeout`) without calling the connection factory or executing SQL.
+  - Connection-factory failures map to secret-safe `EngineError("Engine connection failed")` (`502 engine_error`).
+- **One Configured Adapter per DuckDB File per Process:** Serialization is local to each `DuckDBAdapter` instance. Multiple independent `DuckDBAdapter` instances or external connections targeting the same locked DuckDB file in the same process are not coordinated and are unsupported. Configure at most one `DuckDBAdapter` per DuckDB database file per process.
+
 The probe command verifies that a DuckDB database connection complies with the locked-down runtime policy:
 
 ```bash

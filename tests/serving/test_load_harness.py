@@ -67,7 +67,7 @@ def test_app(ec_keys):
         schemas=schemas,
         public_keys={"k1": pub},
     )
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
     app = create_app(pipeline, {"duck": adapter})
     return app, priv
 

@@ -78,7 +78,7 @@ def test_starrocks_null_ordering_execution_on_duckdb(ec_keys):
         schemas=schemas,
         public_keys={"k1": pub},
     )
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
 
     # 1. ASC: StarRocks default is NULLs first.
     sql_asc = "SELECT val FROM items ORDER BY val ASC"
@@ -135,7 +135,7 @@ def test_starrocks_explicit_nulls_preserved_on_duckdb_and_postgres(ec_keys):
         schemas=schemas,
         public_keys={"k1": pub},
     )
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
 
     # 1. Explicit ASC NULLS LAST -> preserved on DuckDB
     sql_explicit_asc = "SELECT val FROM items ORDER BY val ASC NULLS LAST"

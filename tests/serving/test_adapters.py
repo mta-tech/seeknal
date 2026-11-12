@@ -105,7 +105,7 @@ def test_duckdb_adapter_rows():
     con.execute("CREATE TABLE users (id INT, name VARCHAR)")
     con.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
 
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
     prep = _make_prepared(
         engine="duck",
         engine_kind="duckdb",
@@ -130,7 +130,7 @@ def test_duckdb_adapter_truncation():
     con.execute("CREATE TABLE items (id INT)")
     con.execute("INSERT INTO items VALUES (1), (2), (3), (4)")
 
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
     # row_limit is 3 (max_rows 2 + 1). 4 rows exist, so fetchmany(3) returns 3 rows.
     # It should drop the 3rd and set truncated=True.
     prep = _make_prepared(
@@ -153,7 +153,7 @@ def test_duckdb_adapter_write():
     con = duckdb.connect()
     con.execute("CREATE TABLE logs (msg VARCHAR)")
 
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
     prep = _make_prepared(
         engine="duck",
         engine_kind="duckdb",
@@ -176,7 +176,7 @@ def test_duckdb_adapter_write():
 def test_duckdb_adapter_timeout():
     """Test DuckDBAdapter raises EngineTimeout on slow queries."""
     con = duckdb.connect()
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
 
     # Large cross join that will take much longer than 0.2 seconds
     prep = _make_prepared(
@@ -195,7 +195,7 @@ def test_duckdb_adapter_timeout():
 def test_duckdb_adapter_wrong_paramstyle():
     """Test DuckDBAdapter rejects paramstyle other than 'qmark'."""
     con = duckdb.connect()
-    adapter = DuckDBAdapter(lambda: con)
+    adapter = DuckDBAdapter(lambda: con.cursor())
     prep = _make_prepared(
         engine="duck",
         engine_kind="duckdb",

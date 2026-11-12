@@ -268,6 +268,7 @@ from seeknal.serving import (
     build_adapter,
     create_app,
 )
+from seeknal.serving.duckdb_policy import connect_hardened
 
 # 1. StarRocks with PyMySQL
 def connect_starrocks():
@@ -317,9 +318,17 @@ def connect_cube():
 
 cube_adapter = DBAPIAdapter(connect_cube, kind="cube")
 
-# 4. In-process DuckDB fallback
-duck_conn = duckdb.connect()
-duck_adapter = DuckDBAdapter(lambda: duck_conn)
+# 4. In-process DuckDB fallback (fresh owned connection per acquired query)
+def connect_duckdb():
+    return connect_hardened(
+        "/data/serving/analytics.duckdb",
+        read_only=True,
+        allowed_directories=["/data/serving/"],
+        memory_limit="4GB",
+        threads=4,
+    )
+
+duck_adapter = DuckDBAdapter(connect_duckdb)
 
 # 5. Assemble Serving Application
 adapters = {
@@ -336,6 +345,17 @@ app = create_app(
     max_body_bytes=1_000_000,
 )
 ```
+
+### 3.1 Embedded DuckDB Lifecycle, Serialization, Queueing & Limitations
+
+- **Owned Per-Query Connection Factory:** `DuckDBAdapter(connect)` treats `connect` as an owned per-query factory. Once a request acquires the adapter's execution lock, it calls `connect()` exactly once, executes the query, stops and joins any started watchdog timer, and calls `conn.close()` before releasing the lock. Connection-factory exceptions are wrapped into secret-safe `EngineError("Engine connection failed")` (`502 engine_error`) without exposing file paths, DSNs, SQL, parameters, or driver internals.
+  - *In-memory test fixtures:* Do not pass `lambda: parent` when retaining an in-memory parent connection across queries, as the adapter closes each returned connection. Instead, pass `lambda: parent.cursor()` so each query owns and closes a child cursor while the caller-owned `parent` fixture stays inspectable until the caller explicitly calls `parent.close()`. Production deployments must not retain a persistent root connection.
+- **Per-Adapter Execution Serialization:** Because DuckDB hardening (`SET lock_configuration = true`, `allowed_directories`, `enable_external_access = false`) locks database-level configuration while any connection to that database instance remains open, each `DuckDBAdapter` serializes execution under a single per-adapter lock spanning `connect -> harden -> execute/fetch -> watchdog cleanup -> close`.
+- **Pre-Lock Cancellation & Shared Monotonic Deadline:**
+  - `DuckDBAdapter.execute()` registers its per-request cancellation handle via `on_cancel_handle` *before* waiting for the execution lock.
+  - A single monotonic deadline (`timeout_seconds`) covers both queue wait and SQL execution; the timeout budget is **not** reset after acquiring the lock, and the execution watchdog timer receives only the remaining budget after `connect()` completes.
+  - If a queued request is cancelled or its deadline expires while waiting for the lock, it raises `EngineCancelled` (`499 query_cancelled`) or `EngineTimeout` (`504 engine_timeout`) without calling `connect()` or executing SQL. If `connect()` finishes after the deadline, the acquired connection is closed immediately without executing SQL.
+- **Single Adapter per DuckDB File Limitation:** Execution serialization is scoped to a single `DuckDBAdapter` instance. Independent `DuckDBAdapter` instances or external connections opening the same locked DuckDB file concurrently within the process are not coordinated and may conflict with `lock_configuration`. Keep at most **one configured `DuckDBAdapter` per DuckDB database file per process**.
 
 ---
 
