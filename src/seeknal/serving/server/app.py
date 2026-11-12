@@ -125,32 +125,25 @@ def build_server(
     else:
         raise TypeError(f"Unsupported config type: {type(config).__name__}")
 
-    # 2. Check that all referenced environment variables exist at startup
-    cfg.check_env(env=env)
+    # 2. Run offline preflight (env, secret files, static placement/schemas, engine-connection wiring)
+    # before configuring a file logger or constructing adapters/refresher
+    preflight = cfg.validate_runtime_wiring(env=env)
 
-    # 3. Configure logging
-    configure_logging(cfg.logging)
-
-    # 4. Load grant keys
+    # 3. Load grant keys before configuring file logging
     public_keys = cfg.load_grant_keys()
+
+    # 4. Configure logging
+    configure_logging(cfg.logging)
 
     # 5. Build ServingPipeline and PlacementRefresher
     refresher: PlacementRefresher | None = None
     if cfg.placement.is_static:
-        static_cfg = cfg.placement.static
-        assert static_cfg is not None
-        placement = Placement.from_yaml(static_cfg.placement_file)
-        try:
-            with open(static_cfg.schemas_file, "r", encoding="utf-8") as f:
-                schemas = json.load(f)
-        except Exception as exc:
-            raise ServerConfigError(
-                f"Failed to load schemas file '{static_cfg.schemas_file}': {exc}"
-            ) from exc
+        assert preflight.placement is not None
+        assert preflight.schemas is not None
 
         pipeline = ServingPipeline(
-            placement=placement,
-            schemas=schemas,
+            placement=preflight.placement,
+            schemas=preflight.schemas,
             public_keys=public_keys,
             default_catalog=cfg.default_catalog,
             cube_mode=cfg.cube_mode,

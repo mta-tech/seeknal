@@ -284,16 +284,122 @@ Seeknal Serving exposes two distinct probe endpoints:
 
 ## 7. Operational Deployment
 
-### Pre-flight Configuration Check (`--check`)
-Before launching the service, validate the configuration, grant keys, environment variables, and secret files:
+### Pre-flight Configuration & Runtime-Wiring Check (`--check`)
+Before launching the service (in CI pipelines, container entrypoints, or `systemd` `ExecStartPre`), run the offline preflight check:
 
 ```bash
 python -m seeknal.serving --config /etc/seeknal/serving.yaml --check
 ```
-- Exits with code `0` and outputs `config ok` if valid.
-- Exits with code `2` and outputs a safe diagnostic error message (without stack traces or secret leakage) if invalid.
-- Validates that `client_secret_env` and `api_secret_env` exist (in `secrets_env_file` or the process environment) and that all `*_file` secret paths exist with safe permissions (mode `0600` or stricter).
-- Performs no network I/O, token minting requests, or database connections.
+
+`--check` shares the exact cross-artifact offline validation (`ServerConfig.validate_runtime_wiring()`) executed at the beginning of `build_server()` before any file logger, refresher, or database adapter is constructed:
+
+- **Exit codes & output:**
+  - Exits with code `0` and prints `config ok` to `stdout` when valid.
+  - Exits with code `2` and prints a secret-safe, actionable `Error: ...` diagnostic to `stderr` (never stack traces, raw YAML/JSON snippets, DSNs, or secret values) when invalid.
+- **What `--check` validates offline:**
+  1. **Server config & TLS/limits/Cube mode:** Structural validation of `serving.yaml`, including `cube_mode` (`refuse` vs. `jwt` `secret_env` rules) and `grant_max_lifetime_seconds`.
+  2. **Grant public keys:** Loads and validates EC P-256 public keys (`jwks_file` or `pem_files`) and rejects private key material.
+  3. **Environment variables & secret file permissions:** Verifies that every referenced `*_env` variable (such as `dsn_env`, `password_env`, `url_env`, `secret_env`, `token_env`, `client_secret_env`, `api_secret_env`) exists in `secrets_env_file` or `os.environ`, and that `secrets_env_file` (`0600`) and all `*_file` secret paths (not group/world-readable) exist with safe permissions.
+  4. **Static placement & engine-connection wiring (`placement.static`):**
+     - Parses `placement_file` with `Placement` validation.
+     - Verifies that **every** engine declared in `placement.engines` (even if not referenced by a table or when `cube_mode: refuse` is set, since bare `SELECT`, hints, or fallback routing can select declared engines) has an exact same-name entry in `connections` with a matching `kind` (`duckdb`, `lakebase`, `starrocks`, or `cube`). Extra connections in `connections` are allowed.
+  5. **Static schemas alignment (`placement.static.schemas_file`):**
+     - Parses `schemas_file` as a JSON object, rejecting malformed JSON and exact duplicate JSON keys.
+     - Verifies that the case-insensitive (`casefold`) set of schema keys equals the logical names of `placement.tables` union `placement.cubes`—rejecting missing schema entries, stale/extra schema keys, and case-insensitive key collisions.
+     - Verifies that each schema value is a JSON list of unique (case-insensitively), non-empty column/member strings (empty lists `[]` are allowed), while preserving original logical-name and column casing/order.
+  6. **Discovery engine-connection wiring (`placement.discovery`):**
+     - Verifies that every engine declared in `placement.discovery.engines` has an exact same-name entry in `connections` with a matching `kind`, and validates `placement.discovery.lakebase.engine` against `connections`.
+- **Strictly offline:** Performs no network I/O, DNS lookups, OAuth token exchanges, discovery HTTP requests, database connections, secret generation, or file writes.
+- **Single-process reuse vs. multi-process boundary:** Within `build_server()`, the parsed static `Placement` and validated `schemas` returned by `validate_runtime_wiring()` are reused directly so static files are read only once per process startup. Note that running `--check` in a separate `ExecStartPre` process and then starting the server in `ExecStart` are two OS processes; `build_server()` re-runs the same offline preflight at startup to fail fast before `/readyz` can ever report ready.
+
+#### Valid Matching Static Configuration Example
+
+`serving.yaml`:
+```yaml
+listen:
+  host: 127.0.0.1
+  port: 8765
+
+grant_keys:
+  jwks_file: /etc/seeknal/keys/catalog-grants.jwks.json
+
+placement:
+  static:
+    placement_file: /etc/seeknal/placement.yaml
+    schemas_file: /etc/seeknal/schemas.json
+
+connections:
+  duck:
+    kind: duckdb
+    path: /data/serving/analytics.duckdb
+    allowed_directories:
+      - /data/serving/
+  lb:
+    kind: lakebase
+    dsn_env: LAKEBASE_DSN
+```
+
+`placement.yaml`:
+```yaml
+engines:
+  duck:
+    kind: duckdb
+    dialect: duckdb
+  lb:
+    kind: lakebase
+    dialect: postgres
+tables:
+  lakekeeper.analytics.users:
+    keys: [id]
+    row_count: 5000
+    serve:
+      lb: public.users
+      duck: main.users
+cubes: {}
+```
+
+`schemas.json`:
+```json
+{
+  "lakekeeper.analytics.users": ["id", "email", "created_at"]
+}
+```
+
+#### Actionable Error Examples (Placeholders Only)
+
+- **Missing runtime connection for a declared placement engine:**
+  ```text
+  Error: Static placement file '/etc/seeknal/placement.yaml' declares engine 'duck' (kind 'duckdb') in 'placement.engines', but no matching entry 'connections.duck' is configured — add 'connections.duck' with kind 'duckdb' or remove the unused engine from placement
+  ```
+- **Engine `kind` mismatch between placement/discovery and `connections`:**
+  ```text
+  Error: Engine 'lb' kind mismatch between static placement ('/etc/seeknal/placement.yaml', kind 'lakebase') and 'connections.lb' (kind 'duckdb') — align both to 'lakebase'
+  ```
+- **Missing or stale schema keys in `schemas.json`:**
+  ```text
+  Error: Static schemas file '/etc/seeknal/schemas.json' is missing schema entry for placement table/cube: 'lakekeeper.analytics.users' — add matching column list(s) to '/etc/seeknal/schemas.json' or remove the table/cube from placement
+  ```
+- **Malformed YAML or JSON (reports path and line/column, never raw file snippets or secrets):**
+  ```text
+  Error: Invalid JSON in static schemas file '/etc/seeknal/schemas.json' at line 4, column 12 (Expecting ',' delimiter) — fix JSON syntax
+  ```
+- **Missing environment variable:**
+  ```text
+  Error: Missing required environment variable '<ENV_VAR_NAME>'
+  ```
+
+#### Migration Note: Unused Engine Declarations & Mismatched Names
+Earlier configurations that left unused engine declarations in `placement.yaml` (for example, declaring `sr`, `cube`, and `duck` in `placement.engines` while only configuring `connections.duck` or `connections.lb`) previously passed `--check` and only failed at query time with `503 engine_unavailable`. Both `--check` and `build_server()` now reject any declared placement or discovery engine that lacks a same-name, same-kind entry in `connections`. When upgrading:
+1. Remove unused engine entries from `placement.engines` (or `placement.discovery.engines`), **or** add the corresponding runtime connection under `connections.<engine_name>`.
+2. Ensure engine names and `kind` values match identically between `placement` and `connections`.
+3. Remove stale table/cube keys from `schemas.json` and ensure every table and cube in `placement.yaml` has a matching key in `schemas.json`.
+
+#### Configuration Validity vs. Runtime Backend Health
+- **Configuration & Wiring Validity (`--check` and startup preflight):** Guarantees that all configuration files, keys, environment variables, static placement/schemas, and engine-to-adapter mappings are structurally consistent offline before the server starts.
+- **Runtime Backend Health (`/readyz` and query execution):** Neither `--check` nor `/readyz` opens live TCP connections to StarRocks, Lakebase, or Cube to probe backend database health. In static mode, `/readyz` reports `200 {"ready": true}` once the validated static catalog is loaded; in discovery mode, `/readyz` reports `200` after at least one discovery refresh succeeds. Live backend unreachability during query execution is handled by per-query timeouts and circuit/error handling (`503` / timeout errors).
+
+#### Why UI, Scaffolding, and JSON CLI Output Are Deferred
+Seeknal Serving is an internal service-to-service (S2S) SQL execution gateway deployed behind the Atlas Data Catalog over mTLS—not an end-user or browser-facing application. The existing `python -m seeknal.serving --config PATH --check` CLI and `build_server()` startup preflight are the primary operator and CI/CD developer-experience surfaces; web UIs, project scaffolding subcommands, and machine-readable JSON CLI flags are intentionally deferred to keep the serving surface minimal and hardened.
 
 ### Systemd Service Unit Example
 Create `/etc/systemd/system/seeknal-serving.service`:

@@ -8,6 +8,7 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import re
 from typing import Any
 
 import yaml
@@ -16,10 +17,66 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from seeknal.serving.discovery.config import DiscoveryConfig
 from seeknal.serving.grant_token import _load_public_key
+from seeknal.serving.placement import Placement, PlacementError
 
 
 class ServerConfigError(Exception):
     """Raised when server configuration is invalid or missing."""
+
+
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:\-]{1,80}$")
+_SUSPICIOUS_TOKEN_RE = re.compile(
+    r"(://|@|secret|password|passwd|token|bearer|private|BEGIN\s+|eyJ)",
+    re.IGNORECASE,
+)
+
+
+def _safe_label(value: Any, fallback: str = "<redacted>") -> str:
+    """Return a safe diagnostic label for an identifier, redacting URI/secret-like strings."""
+    if not isinstance(value, str):
+        return f"<{type(value).__name__}>"
+    s = value.strip()
+    if not s:
+        return "<empty>"
+    if _SUSPICIOUS_TOKEN_RE.search(s) or not _SAFE_IDENTIFIER_RE.match(s):
+        return fallback
+    return s
+
+
+def _format_yaml_error(exc: yaml.YAMLError, role: str, path: str | os.PathLike) -> str:
+    """Format a PyYAML error with file path and line/column, never raw file snippets."""
+    mark = getattr(exc, "problem_mark", None)
+    if mark is not None:
+        return (
+            f"Invalid YAML in {role} '{path}' at line {mark.line + 1}, "
+            f"column {mark.column + 1} — fix YAML syntax"
+        )
+    return f"Invalid YAML in {role} '{path}' — fix YAML syntax"
+
+
+def _format_json_error(exc: json.JSONDecodeError, role: str, path: str | os.PathLike) -> str:
+    """Format a JSONDecodeError with file path and line/column, never raw file snippets."""
+    return (
+        f"Invalid JSON in {role} '{path}' at line {exc.lineno}, "
+        f"column {exc.colno} ({exc.msg}) — fix JSON syntax"
+    )
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    """Validated offline runtime-wiring artifacts ready for server assembly."""
+
+    mode: str
+    placement: Placement | None = None
+    schemas: dict[str, list[str]] | None = None
+
+    @property
+    def is_static(self) -> bool:
+        return self.mode == "static"
+
+    def __iter__(self):
+        yield self.placement
+        yield self.schemas
 
 
 def _b64url_decode(s: str) -> bytes:
@@ -33,8 +90,12 @@ def parse_jwks(data_or_str: dict | list | str) -> dict[str, str]:
     if isinstance(data_or_str, str):
         try:
             raw = json.loads(data_or_str)
+        except json.JSONDecodeError as exc:
+            raise ServerConfigError(
+                f"Invalid JSON in JWKS at line {exc.lineno}, column {exc.colno} ({exc.msg})"
+            ) from exc
         except Exception as exc:
-            raise ServerConfigError(f"Invalid JSON in JWKS: {exc}") from exc
+            raise ServerConfigError("Invalid JSON in JWKS") from exc
     else:
         raw = data_or_str
 
@@ -104,12 +165,12 @@ def parse_jwks(data_or_str: dict | list | str) -> dict[str, str]:
             y_bytes = _b64url_decode(y_b64)
         except Exception as exc:
             raise ServerConfigError(
-                f"JWK '{kid_str}' invalid base64url coordinate: {exc}"
+                f"JWK '{_safe_label(kid_str)}' has invalid base64url coordinate"
             ) from exc
 
         if len(x_bytes) != 32 or len(y_bytes) != 32:
             raise ServerConfigError(
-                f"JWK '{kid_str}' coordinates must each be 32 bytes for P-256"
+                f"JWK '{_safe_label(kid_str)}' coordinates must each be 32 bytes for P-256"
             )
 
         try:
@@ -124,7 +185,7 @@ def parse_jwks(data_or_str: dict | list | str) -> dict[str, str]:
             result[kid_str] = pem_bytes.decode("ascii")
         except Exception as exc:
             raise ServerConfigError(
-                f"Failed to load EC public key for kid '{kid_str}': {exc}"
+                f"Failed to load EC public key for kid '{_safe_label(kid_str)}'"
             ) from exc
 
     if not result:
@@ -219,7 +280,9 @@ def load_grant_keys(grant_keys: GrantKeysConfig | Mapping) -> dict[str, str]:
         pems = grant_keys.get("pem_files")
         cfg = GrantKeysConfig(jwks_file=jwks, pem_files=pems)
     else:
-        raise ServerConfigError(f"Invalid grant_keys configuration: {grant_keys}")
+        raise ServerConfigError(
+            f"Invalid grant_keys configuration: expected mapping, got {type(grant_keys).__name__}"
+        )
 
     if cfg.jwks_file:
         if not os.path.exists(cfg.jwks_file):
@@ -230,14 +293,16 @@ def load_grant_keys(grant_keys: GrantKeysConfig | Mapping) -> dict[str, str]:
         result: dict[str, str] = {}
         for kid, path in cfg.pem_files.items():
             if not os.path.exists(path):
-                raise ServerConfigError(f"PEM file for kid '{kid}' not found: '{path}'")
+                raise ServerConfigError(
+                    f"PEM file for kid '{_safe_label(kid)}' not found: '{path}'"
+                )
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
             try:
                 _load_public_key(content, kid)
             except Exception as exc:
                 raise ServerConfigError(
-                    f"Invalid PEM public key for kid '{kid}': {exc}"
+                    f"Invalid PEM public key for kid '{_safe_label(kid)}' in '{path}'"
                 ) from exc
             result[kid] = content
         if not result:
@@ -442,6 +507,92 @@ class ServerConfig:
             self.get_env(var, env)
         self.check_secret_files()
 
+    def validate_runtime_wiring(
+        self,
+        *,
+        env: Mapping[str, str] | None = None,
+    ) -> PreflightResult:
+        """Offline preflight validation of env, static placement/schemas, and engine-connection wiring.
+
+        Returns a PreflightResult so callers (such as build_server) can reuse parsed
+        static Placement and schemas without re-reading files.
+        """
+        self.check_env(env=env)
+
+        if self.placement.is_static:
+            static_cfg = self.placement.static
+            assert static_cfg is not None
+            placement = _load_static_placement(static_cfg.placement_file)
+
+            # Every declared placement engine must have an exact same-name connection with matching kind
+            for eng_name, eng in placement.engines.items():
+                safe_eng = _safe_label(eng_name)
+                if eng_name not in self.connections:
+                    raise ServerConfigError(
+                        f"Static placement file '{static_cfg.placement_file}' declares engine "
+                        f"'{safe_eng}' (kind '{eng.kind}') in 'placement.engines', but no matching "
+                        f"entry 'connections.{safe_eng}' is configured — add 'connections.{safe_eng}' "
+                        f"with kind '{eng.kind}' or remove the unused engine from placement"
+                    )
+                conn = self.connections[eng_name]
+                conn_kind = getattr(conn, "kind", None)
+                if conn_kind != eng.kind:
+                    raise ServerConfigError(
+                        f"Engine '{safe_eng}' kind mismatch between static placement "
+                        f"('{static_cfg.placement_file}', kind '{eng.kind}') and "
+                        f"'connections.{safe_eng}' (kind '{conn_kind}') — align both to '{eng.kind}'"
+                    )
+
+            schemas = _load_and_validate_static_schemas(
+                static_cfg.schemas_file,
+                placement,
+            )
+            return PreflightResult(
+                mode="static",
+                placement=placement,
+                schemas=schemas,
+            )
+
+        disc_cfg = self.placement.discovery_config
+        assert disc_cfg is not None
+
+        for eng_name, eng_cfg in disc_cfg.engines.items():
+            safe_eng = _safe_label(eng_name)
+            if eng_name not in self.connections:
+                raise ServerConfigError(
+                    f"Discovery engine 'placement.discovery.engines.{safe_eng}' "
+                    f"(kind '{eng_cfg.kind}') has no matching entry 'connections.{safe_eng}' — "
+                    f"add 'connections.{safe_eng}' with kind '{eng_cfg.kind}' or remove the "
+                    f"engine from 'placement.discovery.engines'"
+                )
+            conn = self.connections[eng_name]
+            conn_kind = getattr(conn, "kind", None)
+            if conn_kind != eng_cfg.kind:
+                raise ServerConfigError(
+                    f"Discovery engine 'placement.discovery.engines.{safe_eng}' has kind "
+                    f"'{eng_cfg.kind}', but 'connections.{safe_eng}' has kind '{conn_kind}' — "
+                    f"align both to '{eng_cfg.kind}'"
+                )
+
+        if disc_cfg.lakebase is not None:
+            lb_eng = disc_cfg.lakebase.engine
+            safe_lb = _safe_label(lb_eng)
+            if lb_eng not in self.connections:
+                raise ServerConfigError(
+                    f"Discovery 'placement.discovery.lakebase.engine' references '{safe_lb}', "
+                    f"but 'connections.{safe_lb}' is not configured — add a lakebase connection "
+                    f"named '{safe_lb}'"
+                )
+            lb_conn = self.connections[lb_eng]
+            lb_kind = getattr(lb_conn, "kind", None)
+            if lb_kind != "lakebase":
+                raise ServerConfigError(
+                    f"Discovery 'placement.discovery.lakebase.engine' ('{safe_lb}') requires "
+                    f"'connections.{safe_lb}' to have kind 'lakebase', got '{lb_kind}'"
+                )
+
+        return PreflightResult(mode="discovery", placement=None, schemas=None)
+
     @classmethod
     def from_dict(
         cls,
@@ -500,8 +651,9 @@ class ServerConfig:
                 or port < 1
                 or port > 65535
             ):
+                port_desc = port if isinstance(port, int) and not isinstance(port, bool) else type(port).__name__
                 raise ServerConfigError(
-                    f"'listen.port' must be an integer between 1 and 65535, got {port}"
+                    f"'listen.port' must be an integer between 1 and 65535, got {port_desc}"
                 )
             listen_cfg = ListenConfig(host=host.strip(), port=port)
 
@@ -623,11 +775,11 @@ class ServerConfig:
                 )
             level = str(log_raw.get("level", "INFO")).upper()
             if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
-                raise ServerConfigError(f"Invalid log level '{level}'")
+                raise ServerConfigError(f"Invalid log level '{_safe_label(level)}'")
             fmt = str(log_raw.get("format", "json")).lower()
             if fmt not in {"json", "text"}:
                 raise ServerConfigError(
-                    f"Invalid log format '{fmt}', must be 'json' or 'text'"
+                    f"Invalid log format '{_safe_label(fmt)}', must be 'json' or 'text'"
                 )
             f_val = log_raw.get("file")
             if f_val is not None and not isinstance(f_val, str):
@@ -648,7 +800,7 @@ class ServerConfig:
         cube_mode = d.get("cube_mode", "refuse")
         if cube_mode not in ("refuse", "jwt"):
             raise ServerConfigError(
-                f"Invalid cube_mode '{cube_mode}', must be 'refuse' or 'jwt'"
+                f"Invalid cube_mode '{_safe_label(cube_mode)}', must be 'refuse' or 'jwt'"
             )
 
         # 10. placement
@@ -1149,12 +1301,205 @@ class ServerConfig:
         except FileNotFoundError as exc:
             raise ServerConfigError(f"Config file not found: '{path}'") from exc
         except yaml.YAMLError as exc:
-            raise ServerConfigError(f"Invalid YAML in config file: {exc}") from exc
-        except Exception as exc:
-            raise ServerConfigError(f"Failed to read config file: {exc}") from exc
+            raise ServerConfigError(_format_yaml_error(exc, "config file", path)) from exc
+        except OSError as exc:
+            raise ServerConfigError(
+                f"Failed to read config file '{path}': {exc.strerror or type(exc).__name__}"
+            ) from exc
 
         if not isinstance(data, Mapping):
             raise ServerConfigError(
-                f"Config file must contain a mapping, got {type(data).__name__}"
+                f"Config file '{path}' must contain a mapping, got {type(data).__name__}"
             )
         return cls.from_dict(data, load_keys=load_keys, env=env)
+
+
+def _load_static_placement(path: str | os.PathLike) -> Placement:
+    """Load and validate a static placement YAML file with secret-safe error reporting."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+    except FileNotFoundError as exc:
+        raise ServerConfigError(
+            f"Static placement file not found: '{path}' — verify 'placement.static.placement_file'"
+        ) from exc
+    except yaml.YAMLError as exc:
+        raise ServerConfigError(
+            _format_yaml_error(exc, "static placement file", path)
+        ) from exc
+    except OSError as exc:
+        raise ServerConfigError(
+            f"Failed to read static placement file '{path}': {exc.strerror or type(exc).__name__}"
+        ) from exc
+
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ServerConfigError(
+            f"Static placement file '{path}' must contain a YAML mapping at root, "
+            f"got {type(raw).__name__}"
+        )
+
+    for section in ("engines", "tables", "cubes", "policy"):
+        sec_val = raw.get(section)
+        if sec_val is not None and not isinstance(sec_val, Mapping):
+            raise ServerConfigError(
+                f"Static placement file '{path}' section '{section}' must be a mapping, "
+                f"got {type(sec_val).__name__}"
+            )
+
+    for section in ("engines", "tables", "cubes"):
+        sec_val = raw.get(section) or {}
+        for entry_name, entry_spec in sec_val.items():
+            if not isinstance(entry_spec, Mapping):
+                raise ServerConfigError(
+                    f"Static placement file '{path}' entry '{section}.{_safe_label(entry_name)}' "
+                    f"must be a mapping, got {type(entry_spec).__name__}"
+                )
+
+    try:
+        return Placement.from_dict(raw)
+    except PlacementError as exc:
+        raise ServerConfigError(
+            f"Invalid static placement in '{path}': {exc}"
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise ServerConfigError(
+            f"Invalid field value in static placement file '{path}': {type(exc).__name__}"
+        ) from exc
+
+
+class _DuplicateJsonKeyError(Exception):
+    def __init__(self, key: str) -> None:
+        super().__init__(key)
+        self.key = key
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: set[str] = set()
+    obj: dict[str, Any] = {}
+    for k, v in pairs:
+        if k in seen:
+            raise _DuplicateJsonKeyError(k)
+        seen.add(k)
+        obj[k] = v
+    return obj
+
+
+def _load_and_validate_static_schemas(
+    path: str | os.PathLike,
+    placement: Placement,
+) -> dict[str, list[str]]:
+    """Load and validate static schemas JSON against static Placement tables and cubes."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except FileNotFoundError as exc:
+        raise ServerConfigError(
+            f"Static schemas file not found: '{path}' — verify 'placement.static.schemas_file'"
+        ) from exc
+    except OSError as exc:
+        raise ServerConfigError(
+            f"Failed to read static schemas file '{path}': {exc.strerror or type(exc).__name__}"
+        ) from exc
+
+    try:
+        raw = json.loads(content, object_pairs_hook=_reject_duplicate_json_keys)
+    except _DuplicateJsonKeyError as exc:
+        raise ServerConfigError(
+            f"Static schemas file '{path}' contains duplicate JSON key "
+            f"'{_safe_label(exc.key)}' — remove duplicate key entry"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ServerConfigError(
+            _format_json_error(exc, "static schemas file", path)
+        ) from exc
+
+    if not isinstance(raw, dict):
+        raise ServerConfigError(
+            f"Static schemas file '{path}' root must be a JSON object mapping logical "
+            f"table/cube names to column lists, got {type(raw).__name__}"
+        )
+
+    # Check non-empty keys and case-insensitive key collisions in schemas
+    schemas_by_casefold: dict[str, str] = {}
+    validated_schemas: dict[str, list[str]] = {}
+
+    for key, cols in raw.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ServerConfigError(
+                f"Static schemas file '{path}' contains an empty or non-string table/cube key "
+                f"— all schema keys must be non-empty logical names"
+            )
+        folded_key = key.casefold()
+        if folded_key in schemas_by_casefold:
+            prev_key = schemas_by_casefold[folded_key]
+            raise ServerConfigError(
+                f"Static schemas file '{path}' has case-insensitive key collision between "
+                f"'{_safe_label(prev_key)}' and '{_safe_label(key)}' — keep only one canonical key"
+            )
+        schemas_by_casefold[folded_key] = key
+
+        safe_tbl = _safe_label(key)
+        if not isinstance(cols, list):
+            raise ServerConfigError(
+                f"Static schemas file '{path}' entry for '{safe_tbl}' must be a JSON list "
+                f"of column names, got {type(cols).__name__}"
+            )
+
+        seen_cols_casefold: dict[str, str] = {}
+        clean_cols: list[str] = []
+        for idx, col in enumerate(cols):
+            if not isinstance(col, str) or not col.strip():
+                raise ServerConfigError(
+                    f"Static schemas file '{path}' entry '{safe_tbl}' has invalid column at "
+                    f"index {idx} — every column name must be a non-empty string"
+                )
+            col_folded = col.casefold()
+            if col_folded in seen_cols_casefold:
+                prev_col = seen_cols_casefold[col_folded]
+                raise ServerConfigError(
+                    f"Static schemas file '{path}' entry '{safe_tbl}' has duplicate column "
+                    f"'{_safe_label(col)}' (collides with '{_safe_label(prev_col)}') — "
+                    f"column names must be unique case-insensitively"
+                )
+            seen_cols_casefold[col_folded] = col
+            clean_cols.append(col)
+
+        validated_schemas[key] = clean_cols
+
+    # Expected logical names from placement tables + cubes
+    expected_by_casefold: dict[str, str] = {}
+    for tbl_name in placement.tables.keys():
+        expected_by_casefold[tbl_name.casefold()] = tbl_name
+    for cube_name in placement.cubes.keys():
+        expected_by_casefold[cube_name.casefold()] = cube_name
+
+    missing_folded = sorted(set(expected_by_casefold.keys()) - set(schemas_by_casefold.keys()))
+    if missing_folded:
+        missing_names = [_safe_label(expected_by_casefold[k]) for k in missing_folded]
+        raise ServerConfigError(
+            f"Static schemas file '{path}' is missing schema entry for placement "
+            f"table/cube: {', '.join(repr(n) for n in missing_names)} — add matching column list(s) "
+            f"to '{path}' or remove the table/cube from placement"
+        )
+
+    extra_folded = sorted(set(schemas_by_casefold.keys()) - set(expected_by_casefold.keys()))
+    if extra_folded:
+        extra_names = [_safe_label(schemas_by_casefold[k]) for k in extra_folded]
+        raise ServerConfigError(
+            f"Static schemas file '{path}' contains stale/extra schema key(s) not present in "
+            f"placement tables or cubes: {', '.join(repr(n) for n in extra_names)} — remove stale "
+            f"schema key(s) from '{path}' or declare them in placement"
+        )
+
+    return validated_schemas
+
+
+def validate_runtime_wiring(
+    config: ServerConfig,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> PreflightResult:
+    """Shared offline runtime-wiring validation for --check and build_server."""
+    return config.validate_runtime_wiring(env=env)

@@ -72,6 +72,7 @@ placement:
     placement_file: {pf}
     schemas_file: {sf}
 connections:
+  duck: {{kind: duckdb, path: ":memory:"}}
   lb: {{kind: lakebase, dsn_env: TEST_LAKEBASE_DSN}}
 """)
     monkeypatch.setenv("TEST_LAKEBASE_DSN", "postgresql://user:pass@host/db")
@@ -80,6 +81,35 @@ connections:
     assert ret == 0
     captured = capsys.readouterr()
     assert "config ok" in captured.out
+
+
+def test_cli_check_rejects_placement_engine_missing_from_connections(
+    tmp_path, jwks_file, placement_files, monkeypatch, capsys
+):
+    pf, sf = placement_files
+    secret_dsn = "postgresql://user:SUPER_SECRET_DSN_PW_999@host/db"
+    monkeypatch.setenv("TEST_LAKEBASE_DSN", secret_dsn)
+
+    cfg_file = tmp_path / "serving.yaml"
+    cfg_file.write_text(f"""
+listen: {{host: 127.0.0.1, port: 8765}}
+grant_keys: {{jwks_file: {jwks_file}}}
+placement:
+  static:
+    placement_file: {pf}
+    schemas_file: {sf}
+connections:
+  lb: {{kind: lakebase, dsn_env: TEST_LAKEBASE_DSN}}
+""")
+
+    ret = main(["--config", str(cfg_file), "--check"])
+    assert ret == 2
+    captured = capsys.readouterr()
+    assert "duck" in captured.err
+    assert "connections.duck" in captured.err
+    assert secret_dsn not in captured.err
+    assert "SUPER_SECRET_DSN_PW_999" not in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_cli_check_missing_env_var(
@@ -149,3 +179,85 @@ connections:
     assert kwargs["ssl_keyfile"] == key
     assert kwargs["ssl_ca_certs"] == ca
     assert kwargs["ssl_cert_reqs"] == ssl.CERT_REQUIRED
+
+
+def test_cli_check_does_not_call_build_server_or_adapters_or_network(
+    tmp_path, jwks_file, placement_files, monkeypatch, capsys
+):
+    import seeknal.serving.__main__ as cli_mod
+    import seeknal.serving.adapters as adapters_mod
+    import seeknal.serving.discovery as discovery_mod
+
+    pf, sf = placement_files
+    cfg_file = tmp_path / "serving.yaml"
+    cfg_file.write_text(f"""
+listen: {{host: 127.0.0.1, port: 8765}}
+grant_keys: {{jwks_file: {jwks_file}}}
+placement:
+  static:
+    placement_file: {pf}
+    schemas_file: {sf}
+connections:
+  duck: {{kind: duckdb, path: ":memory:"}}
+""")
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("Must not be called during --check")
+
+    monkeypatch.setattr(cli_mod, "build_server", _forbidden)
+    monkeypatch.setattr(adapters_mod, "DuckDBAdapter", _forbidden)
+    monkeypatch.setattr(adapters_mod, "build_adapter", _forbidden)
+    monkeypatch.setattr(discovery_mod, "discover", _forbidden)
+    monkeypatch.setattr(discovery_mod, "PlacementRefresher", _forbidden)
+
+    ret = main(["--config", str(cfg_file), "--check"])
+    assert ret == 0
+    assert "config ok" in capsys.readouterr().out
+
+
+def test_cli_malformed_yaml_and_unexpected_exception_never_leak_secrets(
+    tmp_path, jwks_file, placement_files, monkeypatch, capsys
+):
+    import seeknal.serving.__main__ as cli_mod
+
+    sentinel = "ULTRA_SECRET_SENTINEL_YAML_888"
+    bad_cfg = tmp_path / "bad_serving.yaml"
+    bad_cfg.write_text(
+        f"listen: [unterminated_list_with_{sentinel}\n",
+        encoding="utf-8",
+    )
+
+    ret = main(["--config", str(bad_cfg), "--check"])
+    assert ret == 2
+    captured = capsys.readouterr()
+    assert "Invalid YAML in config file" in captured.err
+    assert "line 2, column 1" in captured.err
+    assert sentinel not in captured.err
+    assert sentinel not in captured.out
+    assert "Traceback" not in captured.err
+
+    # Unexpected runtime exception produces a generic error without leaking exception message or traceback
+    pf, sf = placement_files
+    good_cfg = tmp_path / "good_serving.yaml"
+    good_cfg.write_text(f"""
+listen: {{host: 127.0.0.1, port: 8765}}
+grant_keys: {{jwks_file: {jwks_file}}}
+placement:
+  static:
+    placement_file: {pf}
+    schemas_file: {sf}
+connections:
+  duck: {{kind: duckdb, path: ":memory:"}}
+""")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError(f"internal explosion with {sentinel}")
+
+    monkeypatch.setattr(cli_mod.ServerConfig, "from_yaml", _boom)
+    ret_boom = main(["--config", str(good_cfg), "--check"])
+    assert ret_boom == 2
+    captured_boom = capsys.readouterr()
+    assert sentinel not in captured_boom.err
+    assert sentinel not in captured_boom.out
+    assert "Traceback" not in captured_boom.err
+    assert "Error:" in captured_boom.err

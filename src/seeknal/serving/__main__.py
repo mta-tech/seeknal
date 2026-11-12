@@ -11,7 +11,7 @@ from typing import Any
 import uvicorn
 
 from seeknal.serving.server.app import build_server
-from seeknal.serving.server.config import ServerConfig
+from seeknal.serving.server.config import ServerConfig, ServerConfigError
 
 
 def main(
@@ -31,7 +31,7 @@ def main(
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Validate configuration, grant keys, and environment variables without starting the server",
+        help="Validate configuration, grant keys, environment variables, and runtime wiring without starting the server",
     )
 
     if argv is None:
@@ -45,18 +45,27 @@ def main(
     if args.check:
         try:
             cfg = ServerConfig.from_yaml(args.config, load_keys=True)
-            cfg.check_env()
+            cfg.validate_runtime_wiring()
             print("config ok")
             return 0
-        except Exception as exc:
+        except ServerConfigError as exc:
             print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        except Exception:
+            print(
+                "Error: Unexpected failure during configuration check",
+                file=sys.stderr,
+            )
             return 2
 
     try:
         cfg = ServerConfig.from_yaml(args.config, load_keys=True)
         handle = build_server(cfg)
-    except Exception as exc:
+    except ServerConfigError as exc:
         print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    except Exception:
+        print("Error: Unexpected failure during server startup", file=sys.stderr)
         return 2
 
     run_kwargs: dict[str, Any] = {

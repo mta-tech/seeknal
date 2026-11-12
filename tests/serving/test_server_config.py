@@ -11,10 +11,12 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from seeknal.serving.server.config import (
+    PreflightResult,
     ServerConfig,
     ServerConfigError,
     load_grant_keys,
     parse_jwks,
+    validate_runtime_wiring,
 )
 
 
@@ -472,3 +474,351 @@ def test_static_vs_discovery_exclusivity(
     }
     with pytest.raises(ServerConfigError, match="got both"):
         ServerConfig.from_dict(d)
+
+
+def test_validate_runtime_wiring_static_and_extra_connections(
+    tmp_path, valid_jwks_file
+):
+    pf = tmp_path / "placement.yaml"
+    pf.write_text("""
+engines:
+  duck: {kind: duckdb, dialect: duckdb}
+  cube: {kind: cube, dialect: postgres}
+tables:
+  Lakekeeper.Users:
+    keys: [Id]
+    row_count: 10
+    serve:
+      duck: users
+  lakekeeper.empty_tbl:
+    keys: []
+    row_count: 0
+    serve:
+      duck: empty_tbl
+cubes:
+  SalesCube:
+    engine: cube
+    measures: [total_amount]
+    dimensions: [region]
+""")
+    sf = tmp_path / "schemas.json"
+    sf.write_text(
+        json.dumps(
+            {
+                "lakekeeper.users": ["Id", "UserName"],
+                "lakekeeper.empty_tbl": [],
+                "salescube": ["region", "total_amount"],
+            }
+        )
+    )
+
+    cfg = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": valid_jwks_file},
+            "cube_mode": "refuse",
+            "placement": {
+                "static": {
+                    "placement_file": str(pf),
+                    "schemas_file": str(sf),
+                }
+            },
+            "connections": {
+                "duck": {"kind": "duckdb", "path": ":memory:"},
+                "cube": {
+                    "kind": "cube",
+                    "host": "cube",
+                    "port": 15432,
+                    "dbname": "db",
+                    "sql_user": "seeknal",
+                },
+                # Extra unreferenced connection is allowed
+                "extra_lb": {"kind": "lakebase", "dsn_env": "EXTRA_LB_DSN"},
+            },
+        }
+    )
+
+    res = validate_runtime_wiring(
+        cfg, env={"EXTRA_LB_DSN": "postgresql://u:p@localhost/db"}
+    )
+    assert isinstance(res, PreflightResult)
+    assert res.is_static is True
+    assert res.placement is not None
+    assert res.schemas is not None
+    # Original casing and order preserved
+    assert res.schemas["lakekeeper.users"] == ["Id", "UserName"]
+    assert res.schemas["lakekeeper.empty_tbl"] == []
+    assert res.schemas["salescube"] == ["region", "total_amount"]
+
+
+def test_validate_runtime_wiring_static_engine_errors(tmp_path, valid_jwks_file):
+    # Declared engine in placement (even if unused by tables or cube_mode=refuse) must exist in connections
+    pf = tmp_path / "placement.yaml"
+    pf.write_text("""
+engines:
+  duck: {kind: duckdb, dialect: duckdb}
+  cube: {kind: cube, dialect: postgres}
+tables:
+  users:
+    keys: [id]
+    row_count: 1
+    serve:
+      duck: users
+cubes: {}
+""")
+    sf = tmp_path / "schemas.json"
+    sf.write_text(json.dumps({"users": ["id"]}))
+
+    # 1. Missing cube connection even when cube_mode=refuse and no cubes exist
+    cfg_missing = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": valid_jwks_file},
+            "cube_mode": "refuse",
+            "placement": {
+                "static": {"placement_file": str(pf), "schemas_file": str(sf)}
+            },
+            "connections": {
+                "duck": {"kind": "duckdb", "path": ":memory:"},
+            },
+        }
+    )
+    with pytest.raises(ServerConfigError, match="connections.cube"):
+        cfg_missing.validate_runtime_wiring()
+
+    # 2. Kind mismatch between placement engine and connection
+    cfg_mismatch = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": valid_jwks_file},
+            "cube_mode": "refuse",
+            "placement": {
+                "static": {"placement_file": str(pf), "schemas_file": str(sf)}
+            },
+            "connections": {
+                "duck": {"kind": "duckdb", "path": ":memory:"},
+                "cube": {"kind": "duckdb", "path": ":memory:"},
+            },
+        }
+    )
+    with pytest.raises(ServerConfigError, match="kind mismatch"):
+        cfg_mismatch.validate_runtime_wiring()
+
+
+def test_validate_runtime_wiring_static_schemas_errors(tmp_path, valid_jwks_file):
+    pf = tmp_path / "placement.yaml"
+    pf.write_text("""
+engines:
+  duck: {kind: duckdb, dialect: duckdb}
+tables:
+  users:
+    keys: [id]
+    row_count: 1
+    serve:
+      duck: users
+cubes: {}
+""")
+    sf = tmp_path / "schemas.json"
+
+    def _make_cfg() -> ServerConfig:
+        return ServerConfig.from_dict(
+            {
+                "grant_keys": {"jwks_file": valid_jwks_file},
+                "placement": {
+                    "static": {"placement_file": str(pf), "schemas_file": str(sf)}
+                },
+                "connections": {
+                    "duck": {"kind": "duckdb", "path": ":memory:"},
+                },
+            }
+        )
+
+    # 1. Missing schema key for 'users'
+    sf.write_text("{}")
+    with pytest.raises(ServerConfigError, match="missing schema entry.*'users'"):
+        _make_cfg().validate_runtime_wiring()
+
+    # 2. Stale/extra schema key
+    sf.write_text(json.dumps({"users": ["id"], "stale_orders": ["order_id"]}))
+    with pytest.raises(ServerConfigError, match="stale/extra schema key.*'stale_orders'"):
+        _make_cfg().validate_runtime_wiring()
+
+    # 3. Case-insensitive key collision in schemas.json
+    sf.write_text('{"users": ["id"], "USERS": ["id"]}')
+    with pytest.raises(ServerConfigError, match="case-insensitive key collision"):
+        _make_cfg().validate_runtime_wiring()
+
+    # 4. Exact duplicate JSON key in schemas.json
+    sf.write_text('{"users": ["id"], "users": ["id", "name"]}')
+    with pytest.raises(ServerConfigError, match="duplicate JSON key 'users'"):
+        _make_cfg().validate_runtime_wiring()
+
+    # 5. Root not a mapping
+    sf.write_text('["users"]')
+    with pytest.raises(ServerConfigError, match="root must be a JSON object"):
+        _make_cfg().validate_runtime_wiring()
+
+    # 6. Value not a list
+    sf.write_text('{"users": {"id": "int"}}')
+    with pytest.raises(ServerConfigError, match="must be a JSON list"):
+        _make_cfg().validate_runtime_wiring()
+
+    # 7. Invalid column entries (empty string / non-string)
+    sf.write_text('{"users": ["id", "   "]}')
+    with pytest.raises(ServerConfigError, match="invalid column at index 1"):
+        _make_cfg().validate_runtime_wiring()
+
+    sf.write_text('{"users": ["id", 123]}')
+    with pytest.raises(ServerConfigError, match="invalid column at index 1"):
+        _make_cfg().validate_runtime_wiring()
+
+    # 8. Case-insensitive duplicate columns
+    sf.write_text('{"users": ["UserId", "userid"]}')
+    with pytest.raises(ServerConfigError, match="duplicate column"):
+        _make_cfg().validate_runtime_wiring()
+
+
+def test_validate_runtime_wiring_discovery_mode(tmp_path, valid_jwks_file):
+    # 1. Valid discovery mode with empty engines and extra connection
+    cfg_empty = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": valid_jwks_file},
+            "placement": {
+                "discovery": {
+                    "default_catalog": "lakekeeper",
+                }
+            },
+            "connections": {
+                "duck": {"kind": "duckdb", "path": ":memory:"},
+            },
+        }
+    )
+    res_empty = cfg_empty.validate_runtime_wiring()
+    assert res_empty.is_static is False
+    assert res_empty.placement is None
+    assert res_empty.schemas is None
+
+    # 2. Valid discovery mode with engines + lakebase + extra connection
+    cfg_valid = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": valid_jwks_file},
+            "placement": {
+                "discovery": {
+                    "default_catalog": "lakekeeper",
+                    "engines": {
+                        "lb": {"kind": "lakebase", "dialect": "postgres"},
+                        "cube": {
+                            "kind": "cube",
+                            "dialect": "postgres",
+                            "url": "http://cube:4000",
+                            "api_secret_env": "CUBE_META_SEC",
+                        },
+                    },
+                    "lakebase": {
+                        "engine": "lb",
+                    },
+                }
+            },
+            "connections": {
+                "lb": {"kind": "lakebase", "dsn_env": "LB_DSN"},
+                "cube": {
+                    "kind": "cube",
+                    "host": "cube",
+                    "port": 15432,
+                    "dbname": "db",
+                    "sql_user": "seeknal",
+                },
+                "extra_duck": {"kind": "duckdb", "path": ":memory:"},
+            },
+        }
+    )
+    res_valid = cfg_valid.validate_runtime_wiring(
+        env={"LB_DSN": "postgresql://u:p@h/db", "CUBE_META_SEC": "sec"}
+    )
+    assert res_valid.is_static is False
+
+    # 3. Missing discovery engine in connections
+    cfg_missing_eng = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": valid_jwks_file},
+            "placement": {
+                "discovery": {
+                    "default_catalog": "lakekeeper",
+                    "engines": {
+                        "lb": {"kind": "lakebase", "dialect": "postgres"},
+                    },
+                }
+            },
+            "connections": {
+                "duck": {"kind": "duckdb", "path": ":memory:"},
+            },
+        }
+    )
+    with pytest.raises(ServerConfigError, match="connections.lb"):
+        cfg_missing_eng.validate_runtime_wiring()
+
+    # 4. Discovery engine kind mismatch in connections
+    cfg_kind_mismatch = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": valid_jwks_file},
+            "placement": {
+                "discovery": {
+                    "default_catalog": "lakekeeper",
+                    "engines": {
+                        "lb": {"kind": "lakebase", "dialect": "postgres"},
+                    },
+                }
+            },
+            "connections": {
+                "lb": {"kind": "duckdb", "path": ":memory:"},
+            },
+        }
+    )
+    with pytest.raises(ServerConfigError, match="has kind 'duckdb'"):
+        cfg_kind_mismatch.validate_runtime_wiring()
+
+
+def test_malformed_files_and_secret_sentinels_never_leak(tmp_path, valid_jwks_file):
+    sentinel = "SUPER_SECRET_SENTINEL_TOKEN_777"
+
+    # 1. Malformed config YAML
+    bad_cfg = tmp_path / "bad_cfg.yaml"
+    bad_cfg.write_text(f"connections: {{bad: [{sentinel}\n", encoding="utf-8")
+    with pytest.raises(ServerConfigError) as exc_cfg:
+        ServerConfig.from_yaml(bad_cfg)
+    assert "line 2, column 1" in str(exc_cfg.value)
+    assert sentinel not in str(exc_cfg.value)
+
+    # 2. Malformed placement YAML
+    pf = tmp_path / "bad_placement.yaml"
+    pf.write_text(f"engines: {{duck: [{sentinel}\n", encoding="utf-8")
+    sf = tmp_path / "schemas.json"
+    sf.write_text("{}")
+
+    cfg = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": valid_jwks_file},
+            "placement": {
+                "static": {"placement_file": str(pf), "schemas_file": str(sf)}
+            },
+            "connections": {"duck": {"kind": "duckdb", "path": ":memory:"}},
+        }
+    )
+    with pytest.raises(ServerConfigError) as exc_pl:
+        cfg.validate_runtime_wiring()
+    assert "Invalid YAML in static placement file" in str(exc_pl.value)
+    assert "line 2, column 1" in str(exc_pl.value)
+    assert sentinel not in str(exc_pl.value)
+
+    # 3. Malformed schemas JSON
+    pf.write_text("engines:\n  duck: {kind: duckdb, dialect: duckdb}\ntables: {}\ncubes: {}\n")
+    sf.write_text(f'{{"users": ["{sentinel}"\n')
+    with pytest.raises(ServerConfigError) as exc_sc:
+        cfg.validate_runtime_wiring()
+    assert "Invalid JSON in static schemas file" in str(exc_sc.value)
+    assert "line" in str(exc_sc.value)
+    assert sentinel not in str(exc_sc.value)
+
+    # 4. Secret-like / URI-like value in stale schema key or column is redacted
+    sf.write_text(json.dumps({f"postgresql://user:{sentinel}@host/db": ["id"]}))
+    with pytest.raises(ServerConfigError) as exc_uri:
+        cfg.validate_runtime_wiring()
+    assert sentinel not in str(exc_uri.value)
+    assert "<redacted>" in str(exc_uri.value)

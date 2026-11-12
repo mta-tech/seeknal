@@ -18,7 +18,7 @@ from seeknal.serving.adapters import CubeAdapter, DBAPIAdapter, WorkloadRoutedAd
 from seeknal.serving.discovery.build import DiscoveryResult
 from seeknal.serving.grant_token import sign_grant_token
 from seeknal.serving.server.app import ServerHandle, build_server
-from seeknal.serving.server.config import ServerConfig
+from seeknal.serving.server.config import ServerConfig, ServerConfigError
 
 
 @pytest.fixture
@@ -56,8 +56,6 @@ def static_catalog_files(tmp_path):
     pf.write_text("""
 engines:
   duck: {kind: duckdb, dialect: duckdb}
-  sr: {kind: starrocks, dialect: starrocks}
-  cube: {kind: cube, dialect: postgres}
 tables:
   users:
     keys: [id]
@@ -238,16 +236,30 @@ def test_discovery_mode_readyz_and_error_handling(ec_key_pair, jwks_path):
 
 
 def test_starrocks_workload_routing_fake_factories(
-    ec_key_pair, jwks_path, static_catalog_files
+    tmp_path, ec_key_pair, jwks_path
 ):
-    pf, sf = static_catalog_files
+    pf = tmp_path / "sr_placement.yaml"
+    pf.write_text("""
+engines:
+  sr: {kind: starrocks, dialect: starrocks}
+tables:
+  users:
+    keys: [id]
+    row_count: 2
+    serve:
+      sr: users
+cubes: {}
+""")
+    sf = tmp_path / "sr_schemas.json"
+    sf.write_text(json.dumps({"users": ["id", "name"]}))
+
     cfg_dict = {
         "listen": {"host": "127.0.0.1", "port": 8765},
         "grant_keys": {"jwks_file": jwks_path},
         "placement": {
             "static": {
-                "placement_file": pf,
-                "schemas_file": sf,
+                "placement_file": str(pf),
+                "schemas_file": str(sf),
             }
         },
         "connections": {
@@ -300,8 +312,21 @@ def test_starrocks_workload_routing_fake_factories(
     assert adapter_bi._connect == fake_factory_bi
 
 
-def test_cube_mode_adapters(ec_key_pair, jwks_path, static_catalog_files):
-    pf, sf = static_catalog_files
+def test_cube_mode_adapters(tmp_path, ec_key_pair, jwks_path):
+    pf = tmp_path / "cube_placement.yaml"
+    pf.write_text("""
+engines:
+  cube: {kind: cube, dialect: postgres}
+tables: {}
+cubes:
+  orders_cube:
+    engine: cube
+    measures: [total]
+    dimensions: [region]
+""")
+    sf = tmp_path / "cube_schemas.json"
+    sf.write_text(json.dumps({"orders_cube": ["region", "total"]}))
+
     fake_cube_conn = MagicMock()
     fake_factory = MagicMock(return_value=fake_cube_conn)
 
@@ -312,8 +337,8 @@ def test_cube_mode_adapters(ec_key_pair, jwks_path, static_catalog_files):
         "cube_mode": "jwt",
         "placement": {
             "static": {
-                "placement_file": pf,
-                "schemas_file": sf,
+                "placement_file": str(pf),
+                "schemas_file": str(sf),
             }
         },
         "connections": {
@@ -345,8 +370,8 @@ def test_cube_mode_adapters(ec_key_pair, jwks_path, static_catalog_files):
         "cube_mode": "refuse",
         "placement": {
             "static": {
-                "placement_file": pf,
-                "schemas_file": sf,
+                "placement_file": str(pf),
+                "schemas_file": str(sf),
             }
         },
         "connections": {
@@ -407,6 +432,13 @@ def test_build_server_discovery_with_secrets_env_file(
             }
         },
         "connections": {
+            "cube": {
+                "kind": "cube",
+                "host": "cube.internal",
+                "port": 15432,
+                "dbname": "cube",
+                "sql_user": "seeknal",
+            },
             "duck": {"kind": "duckdb", "path": ":memory:"},
         },
     }
@@ -419,3 +451,88 @@ def test_build_server_discovery_with_secrets_env_file(
     ))
     assert handle.refresher is not None
     assert handle.refresher.refresh_once() is True
+
+
+def test_build_server_fails_early_before_logger_refresher_or_adapters(
+    tmp_path, jwks_path, monkeypatch
+):
+    import seeknal.serving.server.app as app_mod
+
+    pf = tmp_path / "placement.yaml"
+    pf.write_text("""
+engines:
+  duck: {kind: duckdb, dialect: duckdb}
+  sr: {kind: starrocks, dialect: starrocks}
+tables: {}
+cubes: {}
+""")
+    sf = tmp_path / "schemas.json"
+    sf.write_text("{}")
+    log_file = tmp_path / "should_not_be_created.log"
+
+    cfg_dict = {
+        "grant_keys": {"jwks_file": jwks_path},
+        "logging": {"level": "INFO", "format": "json", "file": str(log_file)},
+        "placement": {
+            "static": {
+                "placement_file": str(pf),
+                "schemas_file": str(sf),
+            }
+        },
+        "connections": {
+            "duck": {"kind": "duckdb", "path": ":memory:"},
+        },
+    }
+    config = ServerConfig.from_dict(cfg_dict)
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("Should not be called when preflight fails")
+
+    monkeypatch.setattr(app_mod, "configure_logging", _forbidden)
+    monkeypatch.setattr(app_mod, "DuckDBAdapter", _forbidden)
+    monkeypatch.setattr(app_mod, "PlacementRefresher", _forbidden)
+
+    with pytest.raises(ServerConfigError, match="connections.sr"):
+        build_server(config)
+
+    assert not log_file.exists()
+
+
+def test_build_server_loads_static_artifacts_once(
+    tmp_path, jwks_path, static_catalog_files, monkeypatch
+):
+    import builtins
+
+    pf, sf = static_catalog_files
+    real_open = builtins.open
+    open_counts = {pf: 0, sf: 0}
+
+    def _counting_open(file, *args, **kwargs):
+        path_str = str(file)
+        if path_str in open_counts:
+            open_counts[path_str] += 1
+        return real_open(file, *args, **kwargs)
+
+    cfg = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "placement": {
+                "static": {
+                    "placement_file": pf,
+                    "schemas_file": sf,
+                }
+            },
+            "connections": {
+                "duck": {"kind": "duckdb", "path": ":memory:"},
+            },
+        }
+    )
+    # Structural from_dict must not have read static placement/schemas files yet
+    assert open_counts[pf] == 0
+    assert open_counts[sf] == 0
+
+    monkeypatch.setattr(builtins, "open", _counting_open)
+    handle = build_server(cfg, connect_factories={"duck": lambda: duckdb.connect()})
+    assert isinstance(handle, ServerHandle)
+    assert open_counts[pf] == 1
+    assert open_counts[sf] == 1
