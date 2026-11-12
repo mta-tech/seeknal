@@ -305,23 +305,28 @@ _DUCKDB_QUEUE_POLL_SECONDS = 0.005
 
 
 class _DuckDBRequestState:
-    """Per-execute cancellation, timeout, and owned-connection state for DuckDBAdapter."""
+    """Per-execute first-wins terminal outcome, cancellation, watchdog, and owned-connection state."""
 
     def __init__(self) -> None:
         self._state_lock = threading.Lock()
-        self.cancel_event = threading.Event()
-        self.timed_out_event = threading.Event()
+        self._outcome: str | None = None
         self._conn: Any = None
+        self._owned_conn: Any = None
         self._closed = False
+
+    @property
+    def outcome(self) -> str | None:
+        with self._state_lock:
+            return self._outcome
 
     def cancel(self) -> None:
         with self._state_lock:
-            if self.timed_out_event.is_set():
+            if self._outcome is not None:
                 return
-            self.cancel_event.set()
-            if self._closed or self._conn is None:
-                return
+            self._outcome = "cancel"
             conn = self._conn
+            if self._closed or conn is None:
+                return
             try:
                 conn.interrupt()
             except Exception:
@@ -329,27 +334,57 @@ class _DuckDBRequestState:
 
     def timeout_interrupt(self) -> None:
         with self._state_lock:
-            if self._closed or self._conn is None or self.cancel_event.is_set():
+            if self._outcome is not None:
                 return
-            self.timed_out_event.set()
+            self._outcome = "timeout"
             conn = self._conn
+            if self._closed or conn is None:
+                return
             try:
                 conn.interrupt()
             except Exception:
                 pass
 
-    def attach_connection(self, conn: Any) -> bool:
+    def check_or_expire(self, deadline: float) -> str | None:
         with self._state_lock:
-            self._conn = conn
-            return not self.cancel_event.is_set()
+            if self._outcome is not None:
+                return self._outcome
+            if deadline - time.perf_counter() <= 0:
+                self._outcome = "timeout"
+                self._conn = None
+                return "timeout"
+            return None
 
-    def close_connection(self, audit_id: str) -> None:
+    def attach_connection(self, conn: Any) -> str | None:
+        with self._state_lock:
+            self._owned_conn = conn
+            if self._outcome is not None:
+                return self._outcome
+            self._conn = conn
+            return None
+
+    def finalize_outcome(self, candidate: str) -> str:
+        with self._state_lock:
+            if self._outcome is None:
+                self._outcome = candidate
+            self._conn = None
+            return self._outcome
+
+    def disarm(self, default_outcome: str = "error") -> str:
+        with self._state_lock:
+            if self._outcome is None:
+                self._outcome = default_outcome
+            self._conn = None
+            return self._outcome
+
+    def close_connection(self, audit_id: str) -> Exception | None:
         with self._state_lock:
             if self._closed:
-                return
+                return None
             self._closed = True
-            conn = self._conn
             self._conn = None
+            conn = self._owned_conn
+            self._owned_conn = None
         if conn is not None:
             try:
                 conn.close()
@@ -360,6 +395,8 @@ class _DuckDBRequestState:
                     type(exc).__name__,
                     audit_id,
                 )
+                return exc
+        return None
 
 
 class DuckDBAdapter:
@@ -397,7 +434,8 @@ class DuckDBAdapter:
 
         acquired = False
         while not acquired:
-            if req_state.cancel_event.is_set():
+            pre_outcome = req_state.check_or_expire(deadline)
+            if pre_outcome == "cancel":
                 logger.error(
                     "engine=%s error=%s audit_id=%s",
                     "duckdb",
@@ -405,8 +443,7 @@ class DuckDBAdapter:
                     prepared.audit_id,
                 )
                 raise EngineCancelled("Engine query execution cancelled")
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
+            if pre_outcome == "timeout":
                 logger.warning(
                     "engine=%s error=%s audit_id=%s",
                     "duckdb",
@@ -414,14 +451,19 @@ class DuckDBAdapter:
                     prepared.audit_id,
                 )
                 raise EngineTimeout("Engine query timed out")
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                continue
             acquired = self._lock.acquire(
                 timeout=min(remaining, _DUCKDB_QUEUE_POLL_SECONDS)
             )
 
         timer: threading.Timer | None = None
-        timer_started = False
+        timer_start_attempted = False
+        completed_ok = False
         try:
-            if req_state.cancel_event.is_set():
+            post_lock_outcome = req_state.check_or_expire(deadline)
+            if post_lock_outcome == "cancel":
                 logger.error(
                     "engine=%s error=%s audit_id=%s",
                     "duckdb",
@@ -429,7 +471,7 @@ class DuckDBAdapter:
                     prepared.audit_id,
                 )
                 raise EngineCancelled("Engine query execution cancelled")
-            if deadline - time.perf_counter() <= 0:
+            if post_lock_outcome == "timeout":
                 logger.warning(
                     "engine=%s error=%s audit_id=%s",
                     "duckdb",
@@ -441,7 +483,8 @@ class DuckDBAdapter:
             try:
                 con = self._connect()
             except Exception as exc:
-                if req_state.cancel_event.is_set():
+                conn_err_outcome = req_state.finalize_outcome("error")
+                if conn_err_outcome == "cancel":
                     logger.error(
                         "engine=%s error=%s audit_id=%s",
                         "duckdb",
@@ -462,6 +505,7 @@ class DuckDBAdapter:
                 or not callable(getattr(con, "execute", None))
                 or not callable(getattr(con, "close", None))
             ):
+                req_state.finalize_outcome("error")
                 if con is not None and callable(getattr(con, "close", None)):
                     try:
                         con.close()
@@ -480,7 +524,9 @@ class DuckDBAdapter:
                 )
                 raise EngineError("Engine connection failed")
 
-            if not req_state.attach_connection(con):
+            attach_outcome = req_state.attach_connection(con)
+            if attach_outcome == "cancel":
+                req_state.disarm("cancel")
                 logger.error(
                     "engine=%s error=%s audit_id=%s",
                     "duckdb",
@@ -489,8 +535,18 @@ class DuckDBAdapter:
                 )
                 raise EngineCancelled("Engine query execution cancelled")
 
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
+            post_connect_outcome = req_state.check_or_expire(deadline)
+            if post_connect_outcome == "cancel":
+                req_state.disarm("cancel")
+                logger.error(
+                    "engine=%s error=%s audit_id=%s",
+                    "duckdb",
+                    "EngineCancelled",
+                    prepared.audit_id,
+                )
+                raise EngineCancelled("Engine query execution cancelled")
+            if post_connect_outcome == "timeout":
+                req_state.disarm("timeout")
                 logger.warning(
                     "engine=%s error=%s audit_id=%s",
                     "duckdb",
@@ -499,13 +555,26 @@ class DuckDBAdapter:
                 )
                 raise EngineTimeout("Engine query timed out")
 
-            try:
-                timer = threading.Timer(remaining, req_state.timeout_interrupt)
-                timer.daemon = True
-                timer.start()
-                timer_started = True
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                req_state.disarm("timeout")
+                logger.warning(
+                    "engine=%s error=%s audit_id=%s",
+                    "duckdb",
+                    "EngineTimeout",
+                    prepared.audit_id,
+                )
+                raise EngineTimeout("Engine query timed out")
 
-                if req_state.cancel_event.is_set():
+            timer = threading.Timer(remaining, req_state.timeout_interrupt)
+            timer.daemon = True
+            timer_start_attempted = True
+            timer.start()
+
+            try:
+                pre_exec_outcome = req_state.outcome
+                if pre_exec_outcome == "cancel":
+                    req_state.disarm("cancel")
                     logger.error(
                         "engine=%s error=%s audit_id=%s",
                         "duckdb",
@@ -513,9 +582,21 @@ class DuckDBAdapter:
                         prepared.audit_id,
                     )
                     raise EngineCancelled("Engine query execution cancelled")
+                if pre_exec_outcome == "timeout":
+                    req_state.disarm("timeout")
+                    logger.warning(
+                        "engine=%s error=%s audit_id=%s",
+                        "duckdb",
+                        "EngineTimeout",
+                        prepared.audit_id,
+                    )
+                    raise EngineTimeout("Engine query timed out")
 
                 con.execute(prepared.sql, prepared.params)
-                if req_state.cancel_event.is_set():
+
+                mid_outcome = req_state.outcome
+                if mid_outcome == "cancel":
+                    req_state.disarm("cancel")
                     logger.error(
                         "engine=%s error=%s audit_id=%s",
                         "duckdb",
@@ -523,7 +604,8 @@ class DuckDBAdapter:
                         prepared.audit_id,
                     )
                     raise EngineCancelled("Engine query execution cancelled")
-                if req_state.timed_out_event.is_set():
+                if mid_outcome == "timeout":
+                    req_state.disarm("timeout")
                     logger.warning(
                         "engine=%s error=%s audit_id=%s",
                         "duckdb",
@@ -560,7 +642,8 @@ class DuckDBAdapter:
                         rows = [tuple(r) for r in fetched]
                         truncated = False
 
-                if req_state.cancel_event.is_set():
+                final_outcome = req_state.finalize_outcome("success")
+                if final_outcome == "cancel":
                     logger.error(
                         "engine=%s error=%s audit_id=%s",
                         "duckdb",
@@ -568,7 +651,7 @@ class DuckDBAdapter:
                         prepared.audit_id,
                     )
                     raise EngineCancelled("Engine query execution cancelled")
-                if req_state.timed_out_event.is_set():
+                if final_outcome == "timeout":
                     logger.warning(
                         "engine=%s error=%s audit_id=%s",
                         "duckdb",
@@ -576,8 +659,10 @@ class DuckDBAdapter:
                         prepared.audit_id,
                     )
                     raise EngineTimeout("Engine query timed out")
+                completed_ok = True
             except duckdb.InterruptException as exc:
-                if req_state.cancel_event.is_set():
+                int_outcome = req_state.finalize_outcome("timeout")
+                if int_outcome == "cancel":
                     logger.error(
                         "engine=%s error=%s audit_id=%s",
                         "duckdb",
@@ -593,9 +678,11 @@ class DuckDBAdapter:
                 )
                 raise EngineTimeout("Engine query timed out") from None
             except (EngineTimeout, EngineCancelled, EngineError):
+                req_state.disarm("error")
                 raise
             except Exception as exc:
-                if req_state.cancel_event.is_set():
+                err_outcome = req_state.finalize_outcome("error")
+                if err_outcome == "cancel":
                     logger.error(
                         "engine=%s error=%s audit_id=%s",
                         "duckdb",
@@ -603,7 +690,7 @@ class DuckDBAdapter:
                         prepared.audit_id,
                     )
                     raise EngineCancelled("Engine query execution cancelled") from None
-                if req_state.timed_out_event.is_set():
+                if err_outcome == "timeout":
                     logger.warning(
                         "engine=%s error=%s audit_id=%s",
                         "duckdb",
@@ -619,13 +706,17 @@ class DuckDBAdapter:
                 )
                 raise EngineError("Engine query execution failed") from None
         finally:
+            req_state.disarm("error")
             if timer is not None:
                 try:
                     timer.cancel()
                 except Exception:
                     pass
                 if (
-                    timer_started
+                    (
+                        timer_start_attempted
+                        or getattr(timer, "is_alive", lambda: False)()
+                    )
                     and hasattr(timer, "join")
                     and threading.current_thread() is not timer
                 ):
@@ -633,8 +724,10 @@ class DuckDBAdapter:
                         timer.join()
                     except Exception:
                         pass
-            req_state.close_connection(prepared.audit_id)
+            close_exc = req_state.close_connection(prepared.audit_id)
             self._lock.release()
+            if close_exc is not None and completed_ok:
+                raise EngineError("Engine connection cleanup failed") from None
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return QueryResult(

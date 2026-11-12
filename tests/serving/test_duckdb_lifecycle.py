@@ -6,6 +6,7 @@ import hashlib
 import logging
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import duckdb
@@ -20,7 +21,6 @@ from seeknal.serving import (
     EngineError,
     EngineTimeout,
     Placement,
-    QueryResult,
     ServerConfig,
     ServingPipeline,
     build_server,
@@ -416,6 +416,7 @@ def test_resource_cleanup_across_all_execution_paths(monkeypatch, caplog):
 
     events: list[str] = []
     created_wrappers: list[Any] = []
+    unclosed_raw_cursors: list[duckdb.DuckDBPyConnection] = []
 
     class InstrumentedConn:
         def __init__(
@@ -430,6 +431,7 @@ def test_resource_cleanup_across_all_execution_paths(monkeypatch, caplog):
             self._fail_execute = fail_execute
             self._fail_close = fail_close
             self.closed = False
+            self.close_attempted = False
             self.interrupted = False
             if delay_connect_s > 0:
                 time.sleep(delay_connect_s)
@@ -456,11 +458,13 @@ def test_resource_cleanup_across_all_execution_paths(monkeypatch, caplog):
             self._cur.interrupt()
 
         def close(self) -> None:
-            self.closed = True
+            self.close_attempted = True
             events.append("close")
-            self._cur.close()
             if self._fail_close is not None:
+                unclosed_raw_cursors.append(self._cur)
                 raise self._fail_close
+            self.closed = True
+            self._cur.close()
 
     next_fail_execute: Exception | None = None
     next_fail_close: Exception | None = None
@@ -480,142 +484,329 @@ def test_resource_cleanup_across_all_execution_paths(monkeypatch, caplog):
     adapter = DuckDBAdapter(factory)
     baseline_timers = set(_active_timer_threads())
 
-    # 1. Success path
-    events.clear()
-    res = adapter.execute(_make_prepared(), timeout_seconds=5.0)
-    assert res.rows == [(1, "Alice"), (2, "Bob")]
-    assert created_wrappers[-1].closed is True
-    assert events == ["connect", "execute", "close"]
-    assert set(_active_timer_threads()) - baseline_timers == set()
-
-    # 2. SQL execution error path
-    events.clear()
-    next_fail_execute = RuntimeError("SQL_EXEC_SECRET_SENTINEL_444")
     try:
-        with caplog.at_level(logging.DEBUG):
-            caplog.clear()
-            with pytest.raises(EngineError) as exc_info:
-                adapter.execute(_make_prepared(), timeout_seconds=5.0)
-        assert "SQL_EXEC_SECRET_SENTINEL_444" not in str(exc_info.value)
-        assert "SQL_EXEC_SECRET_SENTINEL_444" not in caplog.text
-        assert exc_info.value.__cause__ is None
+        # 1. Success path
+        events.clear()
+        res = adapter.execute(_make_prepared(), timeout_seconds=5.0)
+        assert res.rows == [(1, "Alice"), (2, "Bob")]
         assert created_wrappers[-1].closed is True
         assert events == ["connect", "execute", "close"]
         assert set(_active_timer_threads()) - baseline_timers == set()
+
+        # 2. SQL execution error path
+        events.clear()
+        next_fail_execute = RuntimeError("SQL_EXEC_SECRET_SENTINEL_444")
+        try:
+            with caplog.at_level(logging.DEBUG):
+                caplog.clear()
+                with pytest.raises(EngineError) as exc_info:
+                    adapter.execute(_make_prepared(), timeout_seconds=5.0)
+            assert "SQL_EXEC_SECRET_SENTINEL_444" not in str(exc_info.value)
+            assert "SQL_EXEC_SECRET_SENTINEL_444" not in caplog.text
+            assert exc_info.value.__cause__ is None
+            assert created_wrappers[-1].closed is True
+            assert events == ["connect", "execute", "close"]
+            assert set(_active_timer_threads()) - baseline_timers == set()
+        finally:
+            next_fail_execute = None
+
+        # 3. Callback registration error path: does not call factory, leak lock, or map to EngineError
+        events.clear()
+
+        class CustomCallbackError(Exception):
+            pass
+
+        def bad_on_cancel(_cancel_fn: Callable[[], None]) -> None:
+            raise CustomCallbackError("callback registration failed")
+
+        with pytest.raises(CustomCallbackError):
+            adapter.execute(
+                _make_prepared(),
+                timeout_seconds=5.0,
+                on_cancel_handle=bad_on_cancel,
+            )
+        assert events == []
+
+        # 4. Timeout path: watchdog fires, interrupts, joins before close
+        events.clear()
+        slow_prep = _make_prepared(
+            sql="SELECT count(*) FROM range(100000000) t1, range(1000) t2"
+        )
+        with pytest.raises(EngineTimeout):
+            adapter.execute(slow_prep, timeout_seconds=0.1)
+        assert created_wrappers[-1].closed is True
+        assert created_wrappers[-1].interrupted is True
+        assert events.index("interrupt") < events.index("close")
+        assert set(_active_timer_threads()) - baseline_timers == set()
+
+        # 5. Active cancel path: cancel handle interrupts active query, closes connection, does not affect next query
+        events.clear()
+        captured_cancel: list[Callable[[], None]] = []
+        with pytest.raises(EngineCancelled):
+
+            def trigger_cancel_soon(cancel_fn: Callable[[], None]) -> None:
+                captured_cancel.append(cancel_fn)
+                t = threading.Timer(0.08, cancel_fn)
+                t.daemon = True
+                t.start()
+
+            adapter.execute(
+                slow_prep,
+                timeout_seconds=10.0,
+                on_cancel_handle=trigger_cancel_soon,
+            )
+        assert created_wrappers[-1].closed is True
+        assert set(_active_timer_threads()) - baseline_timers == set()
+
+        # Calling the stale cancel callback after cleanup must not affect a subsequent request
+        assert len(captured_cancel) == 1
+        captured_cancel[0]()
+        res_after_cancel = adapter.execute(_make_prepared(), timeout_seconds=5.0)
+        assert res_after_cancel.rows == [(1, "Alice"), (2, "Bob")]
+
+        # 6. Connect returning after deadline closes connection without executing SQL
+        events.clear()
+        next_delay_connect_s = 0.08
+        try:
+            with pytest.raises(EngineTimeout):
+                adapter.execute(_make_prepared(), timeout_seconds=0.03)
+            assert created_wrappers[-1].closed is True
+            assert events == ["connect", "close"]
+            assert set(_active_timer_threads()) - baseline_timers == set()
+        finally:
+            next_delay_connect_s = 0.0
+
+        # 7a. Truly unstarted Timer.start failure preserves setup RuntimeError, closes connection, and releases lock
+        events.clear()
+        real_timer_start = threading.Timer.start
+
+        def failing_timer_start(self: threading.Timer) -> None:
+            raise RuntimeError("TIMER_START_SETUP_FAIL_555")
+
+        monkeypatch.setattr(threading.Timer, "start", failing_timer_start)
+        try:
+            with pytest.raises(RuntimeError, match="TIMER_START_SETUP_FAIL_555"):
+                adapter.execute(_make_prepared(), timeout_seconds=5.0)
+            assert created_wrappers[-1].closed is True
+            assert events == ["connect", "close"]
+            assert not adapter._lock.locked()
+        finally:
+            monkeypatch.setattr(threading.Timer, "start", real_timer_start)
+
+        # 7b. Partially started timer that fails during start still gets cancelled/joined before close and preserves RuntimeError
+        events.clear()
+        partial_timer_events: list[str] = []
+
+        class PartialStartTimer:
+            def __init__(self, interval: float, function: Callable[[], None]) -> None:
+                self.interval = interval
+                self.function = function
+                self.daemon = False
+                self._alive = False
+
+            def start(self) -> None:
+                self._alive = True
+                partial_timer_events.append("timer_partial_start")
+                raise RuntimeError("PARTIAL_TIMER_START_FAIL_556")
+
+            def is_alive(self) -> bool:
+                return self._alive
+
+            def cancel(self) -> None:
+                partial_timer_events.append("timer_cancel")
+
+            def join(self) -> None:
+                self._alive = False
+                partial_timer_events.append("timer_join")
+
+        monkeypatch.setattr(threading, "Timer", PartialStartTimer)
+        try:
+            with pytest.raises(RuntimeError, match="PARTIAL_TIMER_START_FAIL_556"):
+                adapter.execute(_make_prepared(), timeout_seconds=5.0)
+            assert partial_timer_events == [
+                "timer_partial_start",
+                "timer_cancel",
+                "timer_join",
+            ]
+            assert created_wrappers[-1].closed is True
+            assert events == ["connect", "close"]
+            assert not adapter._lock.locked()
+        finally:
+            monkeypatch.undo()
+
+        # 8. Close failure (raising BEFORE actually closing):
+        # 8a. Sole close failure raises secret-safe EngineError('Engine connection cleanup failed') after releasing lock
+        events.clear()
+        next_fail_close = RuntimeError("CLOSE_SECRET_SENTINEL_888")
+        try:
+            with caplog.at_level(logging.DEBUG):
+                caplog.clear()
+                with pytest.raises(EngineError) as exc_info:
+                    adapter.execute(_make_prepared(), timeout_seconds=5.0)
+            assert str(exc_info.value) == "Engine connection cleanup failed"
+            assert exc_info.value.__cause__ is None
+            assert "CLOSE_SECRET_SENTINEL_888" not in str(exc_info.value)
+            assert "CLOSE_SECRET_SENTINEL_888" not in caplog.text
+            assert created_wrappers[-1].close_attempted is True
+            assert created_wrappers[-1].closed is False
+            assert not adapter._lock.locked()
+
+            # 8b. Primary execute failure + close failure preserves primary EngineError('Engine query execution failed')
+            next_fail_execute = RuntimeError("PRIMARY_EXEC_FAIL_111")
+            with caplog.at_level(logging.DEBUG):
+                caplog.clear()
+                with pytest.raises(EngineError) as exc_info:
+                    adapter.execute(_make_prepared(), timeout_seconds=5.0)
+            assert str(exc_info.value) == "Engine query execution failed"
+            assert exc_info.value.__cause__ is None
+            assert "CLOSE_SECRET_SENTINEL_888" not in str(exc_info.value)
+            assert "PRIMARY_EXEC_FAIL_111" not in str(exc_info.value)
+            assert "CLOSE_SECRET_SENTINEL_888" not in caplog.text
+            assert "PRIMARY_EXEC_FAIL_111" not in caplog.text
+            assert not adapter._lock.locked()
+        finally:
+            next_fail_close = None
+            next_fail_execute = None
+
+        # Adapter remains healthy for subsequent queries
+        final_res = adapter.execute(_make_prepared(), timeout_seconds=5.0)
+        assert final_res.rows == [(1, "Alice"), (2, "Bob")]
     finally:
-        next_fail_execute = None
+        for raw_cur in unclosed_raw_cursors:
+            try:
+                raw_cur.close()
+            except Exception:
+                pass
+        parent.close()
 
-    # 3. Callback registration error path: does not call factory, leak lock, or map to EngineError
-    events.clear()
 
-    class CustomCallbackError(Exception):
-        pass
+def test_first_wins_terminal_latch_ignores_late_cancel_and_watchdog_in_timer_join(
+    monkeypatch,
+):
+    """Late cancel or watchdog callbacks triggered during Timer.join after query outcome is latched must no-op without interrupting or reclassifying."""
+    parent = duckdb.connect()
+    parent.execute("CREATE TABLE users (id INT, name VARCHAR)")
+    parent.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
 
-    def bad_on_cancel(_cancel_fn):
-        raise CustomCallbackError("callback registration failed")
+    created_conns: list[Any] = []
+    fail_execute_exc: Exception | None = None
+    captured_cancel_handles: list[Callable[[], None]] = []
+    join_trigger_mode: str = "watchdog_then_cancel"
 
-    with pytest.raises(CustomCallbackError):
-        adapter.execute(
+    class DeterministicConn:
+        def __init__(self, cur: duckdb.DuckDBPyConnection) -> None:
+            self._cur = cur
+            self.interrupted = False
+            self.closed = False
+
+        def execute(self, sql: str, params: tuple = ()) -> Any:
+            if fail_execute_exc is not None:
+                raise fail_execute_exc
+            return self._cur.execute(sql, params)
+
+        @property
+        def description(self) -> Any:
+            return self._cur.description
+
+        def fetchmany(self, size: int) -> Any:
+            return self._cur.fetchmany(size)
+
+        def commit(self) -> None:
+            self._cur.commit()
+
+        def interrupt(self) -> None:
+            self.interrupted = True
+            self._cur.interrupt()
+
+        def close(self) -> None:
+            self.closed = True
+            self._cur.close()
+
+    class JoinFiringTimer:
+        def __init__(self, interval: float, function: Callable[[], None]) -> None:
+            self.interval = interval
+            self.function = function
+            self.daemon = False
+            self.started = False
+            self.cancelled = False
+            self.joined = False
+
+        def start(self) -> None:
+            self.started = True
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+        def join(self) -> None:
+            self.joined = True
+            if join_trigger_mode == "watchdog_then_cancel":
+                self.function()
+                if captured_cancel_handles:
+                    captured_cancel_handles[-1]()
+            elif join_trigger_mode == "cancel_then_watchdog":
+                if captured_cancel_handles:
+                    captured_cancel_handles[-1]()
+                self.function()
+
+    def factory() -> DeterministicConn:
+        c = DeterministicConn(parent.cursor())
+        created_conns.append(c)
+        return c
+
+    monkeypatch.setattr(threading, "Timer", JoinFiringTimer)
+    adapter = DuckDBAdapter(factory)
+
+    try:
+        # 1. After successful query + fetch, Timer.join triggers watchdog then cancel -> still returns success, no interrupt
+        join_trigger_mode = "watchdog_then_cancel"
+        res_ok1 = adapter.execute(
             _make_prepared(),
             timeout_seconds=5.0,
-            on_cancel_handle=bad_on_cancel,
+            on_cancel_handle=captured_cancel_handles.append,
         )
-    assert events == []
+        assert res_ok1.rows == [(1, "Alice"), (2, "Bob")]
+        assert created_conns[-1].interrupted is False
+        assert created_conns[-1].closed is True
 
-    # 4. Timeout path: watchdog fires, interrupts, joins before close
-    events.clear()
-    slow_prep = _make_prepared(
-        sql="SELECT count(*) FROM range(100000000) t1, range(1000) t2"
-    )
-    with pytest.raises(EngineTimeout):
-        adapter.execute(slow_prep, timeout_seconds=0.1)
-    assert created_wrappers[-1].closed is True
-    assert created_wrappers[-1].interrupted is True
-    assert events.index("interrupt") < events.index("close")
-    assert set(_active_timer_threads()) - baseline_timers == set()
-
-    # 5. Active cancel path: cancel handle interrupts active query, closes connection, does not affect next query
-    events.clear()
-    captured_cancel: list[Any] = []
-    with pytest.raises(EngineCancelled):
-        def trigger_cancel_soon(cancel_fn):
-            captured_cancel.append(cancel_fn)
-            t = threading.Timer(0.08, cancel_fn)
-            t.daemon = True
-            t.start()
-
-        adapter.execute(
-            slow_prep,
-            timeout_seconds=10.0,
-            on_cancel_handle=trigger_cancel_soon,
+        # 2. After successful query + fetch, Timer.join triggers cancel then watchdog -> still returns success, no interrupt
+        join_trigger_mode = "cancel_then_watchdog"
+        res_ok2 = adapter.execute(
+            _make_prepared(),
+            timeout_seconds=5.0,
+            on_cancel_handle=captured_cancel_handles.append,
         )
-    assert created_wrappers[-1].closed is True
-    assert set(_active_timer_threads()) - baseline_timers == set()
+        assert res_ok2.rows == [(1, "Alice"), (2, "Bob")]
+        assert created_conns[-1].interrupted is False
+        assert created_conns[-1].closed is True
 
-    # Calling the stale cancel callback after cleanup must not affect a subsequent request
-    assert len(captured_cancel) == 1
-    captured_cancel[0]()
-    res_after_cancel = adapter.execute(_make_prepared(), timeout_seconds=5.0)
-    assert res_after_cancel.rows == [(1, "Alice"), (2, "Bob")]
-
-    # 6. Connect returning after deadline closes connection without executing SQL
-    events.clear()
-    next_delay_connect_s = 0.08
-    try:
-        with pytest.raises(EngineTimeout):
-            adapter.execute(_make_prepared(), timeout_seconds=0.03)
-        assert created_wrappers[-1].closed is True
-        assert events == ["connect", "close"]
-        assert set(_active_timer_threads()) - baseline_timers == set()
-    finally:
-        next_delay_connect_s = 0.0
-
-    # 7. Timer-start failure path: closes connection, releases lock, maps to EngineError
-    events.clear()
-    real_timer_start = threading.Timer.start
-
-    def failing_timer_start(self):
-        raise RuntimeError("TIMER_START_SECRET_555")
-
-    monkeypatch.setattr(threading.Timer, "start", failing_timer_start)
-    try:
-        with caplog.at_level(logging.DEBUG):
-            caplog.clear()
-            with pytest.raises(EngineError) as exc_info:
-                adapter.execute(_make_prepared(), timeout_seconds=5.0)
-        assert "TIMER_START_SECRET_555" not in str(exc_info.value)
-        assert "TIMER_START_SECRET_555" not in caplog.text
-        assert created_wrappers[-1].closed is True
-        assert events == ["connect", "close"]
-    finally:
-        monkeypatch.setattr(threading.Timer, "start", real_timer_start)
-
-    # 8. Close failure path does not hide primary result or primary error and does not leak sentinel
-    events.clear()
-    next_fail_close = RuntimeError("CLOSE_SECRET_SENTINEL_888")
-    try:
-        with caplog.at_level(logging.DEBUG):
-            caplog.clear()
-            res_close_err = adapter.execute(_make_prepared(), timeout_seconds=5.0)
-        assert res_close_err.rows == [(1, "Alice"), (2, "Bob")]
-        assert "CLOSE_SECRET_SENTINEL_888" not in caplog.text
-
-        next_fail_execute = RuntimeError("PRIMARY_EXEC_FAIL_111")
-        with caplog.at_level(logging.DEBUG):
-            caplog.clear()
-            with pytest.raises(EngineError) as exc_info:
-                adapter.execute(_make_prepared(), timeout_seconds=5.0)
+        # 3. After SQL execution error, Timer.join triggers cancel then watchdog -> remains EngineError, not reclassified as EngineCancelled/EngineTimeout
+        fail_execute_exc = RuntimeError("DB_FAILURE_BEFORE_LATE_CANCEL")
+        join_trigger_mode = "cancel_then_watchdog"
+        with pytest.raises(EngineError) as exc_info:
+            adapter.execute(
+                _make_prepared(),
+                timeout_seconds=5.0,
+                on_cancel_handle=captured_cancel_handles.append,
+            )
+        assert not isinstance(exc_info.value, (EngineCancelled, EngineTimeout))
         assert str(exc_info.value) == "Engine query execution failed"
-        assert "CLOSE_SECRET_SENTINEL_888" not in caplog.text
-        assert "PRIMARY_EXEC_FAIL_111" not in caplog.text
-    finally:
-        next_fail_close = None
-        next_fail_execute = None
+        assert created_conns[-1].interrupted is False
+        assert created_conns[-1].closed is True
 
-    # Adapter remains healthy for subsequent queries
-    final_res = adapter.execute(_make_prepared(), timeout_seconds=5.0)
-    assert final_res.rows == [(1, "Alice"), (2, "Bob")]
-    parent.close()
+        # 4. After SQL execution error, Timer.join triggers watchdog then cancel -> remains EngineError, not reclassified as EngineTimeout/EngineCancelled
+        join_trigger_mode = "watchdog_then_cancel"
+        with pytest.raises(EngineError) as exc_info2:
+            adapter.execute(
+                _make_prepared(),
+                timeout_seconds=5.0,
+                on_cancel_handle=captured_cancel_handles.append,
+            )
+        assert not isinstance(exc_info2.value, (EngineCancelled, EngineTimeout))
+        assert str(exc_info2.value) == "Engine query execution failed"
+        assert created_conns[-1].interrupted is False
+        assert created_conns[-1].closed is True
+    finally:
+        parent.close()
 
 
 def test_queued_cancellation_and_queue_timeout_without_factory_call(
@@ -693,7 +884,7 @@ def test_queued_cancellation_and_queue_timeout_without_factory_call(
     # Start Request 1, which acquires the lock and blocks inside execute()
     r1_outcomes: list[Any] = []
 
-    def run_r1():
+    def run_r1() -> None:
         tok1 = sign_grant_token(
             _make_grant_claims(sql, jti="jti-q1"), priv, kid="key-1"
         )
@@ -715,7 +906,7 @@ def test_queued_cancellation_and_queue_timeout_without_factory_call(
     jti_q2 = "jti-q2-queued-cancel"
     sub_q2 = "analyst@example.com"
 
-    def run_r2():
+    def run_r2() -> None:
         tok2 = sign_grant_token(
             _make_grant_claims(sql, jti=jti_q2, sub=sub_q2), priv, kid="key-1"
         )
@@ -808,19 +999,10 @@ def test_total_timeout_includes_queue_and_execution_without_reset():
     parent.execute("INSERT INTO users VALUES (1, 'Alice')")
 
     first_started = threading.Event()
-    adapter = DuckDBAdapter(lambda: parent.cursor())
-
-    def hold_lock_briefly():
-        def on_cancel(_fn):
-            first_started.set()
-
-        # Hold adapter lock for ~0.12s using a sleep inside connect factory for the first call
-        pass
-
     call_count = 0
     call_lock = threading.Lock()
 
-    def timed_factory():
+    def timed_factory() -> duckdb.DuckDBPyConnection:
         nonlocal call_count
         with call_lock:
             call_count += 1
