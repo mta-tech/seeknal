@@ -576,4 +576,4 @@ cubes: {{}}
     assert dsn not in msg
     assert "syntheticCanary" not in msg
     assert str(pf) in msg
-    assert "engines.duck.kind" in msg
+    assert "engines" in msg

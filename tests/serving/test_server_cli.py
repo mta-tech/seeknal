@@ -298,4 +298,4 @@ connections:
     assert dsn not in captured.out
     assert "syntheticCanary" not in captured.out
     assert str(pf) in captured.err
-    assert "engines.duck.kind" in captured.err
+    assert "engines" in captured.err

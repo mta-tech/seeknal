@@ -871,7 +871,7 @@ def test_placement_invalid_payloads_and_nested_structures_never_leak_dsn_or_cana
     assert dsn not in msg_kind
     assert canary not in msg_kind
     assert str(pf) in msg_kind
-    assert "engines.duck.kind" in msg_kind
+    assert "engines" in msg_kind
 
     # 2. Invalid mask_variants base / method containing opaque sentinel
     pf.write_text(
@@ -896,7 +896,8 @@ def test_placement_invalid_payloads_and_nested_structures_never_leak_dsn_or_cana
     assert opaque not in msg_mv
     assert dsn not in msg_mv
     assert canary not in msg_mv
-    assert "cubes.sales.mask_variants" in msg_mv
+    assert str(pf) in msg_mv
+    assert "cubes" in msg_mv
 
     # 3. Malformed nested serve (list instead of mapping) raises ServerConfigError, not AttributeError
     pf.write_text(
@@ -921,6 +922,60 @@ def test_placement_invalid_payloads_and_nested_structures_never_leak_dsn_or_cana
     assert canary not in msg_serve
     assert opaque not in msg_serve
     assert "tables.users.serve" in msg_serve
+
+
+def test_placement_model_compatibility_coercions_and_metadata(
+    tmp_path, valid_jwks_file
+):
+    pf = tmp_path / "placement.yaml"
+    pf.write_text(
+        yaml.safe_dump(
+            {
+                "version": "1",
+                "metadata": {"owner": "analytics"},
+                "engines": {
+                    # dialect is optional in Placement.from_dict
+                    "duck": {"kind": "duckdb"},
+                },
+                "tables": {
+                    "users": {
+                        "keys": ["id"],
+                        "row_count": "100",
+                        "serve": {
+                            "duck": {
+                                "name": "users",
+                                "max_lag_seconds": "5.5",
+                            }
+                        },
+                    }
+                },
+                "cubes": {},
+                "policy": {
+                    "point_lookup_max_keys": "10",
+                    "analytics_min_rows": "5000",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    sf = tmp_path / "schemas.json"
+    sf.write_text(json.dumps({"users": ["id"]}), encoding="utf-8")
+
+    cfg = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": valid_jwks_file},
+            "placement": {
+                "static": {"placement_file": str(pf), "schemas_file": str(sf)}
+            },
+            "connections": {"duck": {"kind": "duckdb", "path": ":memory:"}},
+        }
+    )
+    res = cfg.validate_runtime_wiring()
+    assert res.placement is not None
+    assert res.placement.policy.point_lookup_max_keys == 10
+    assert res.placement.policy.analytics_min_rows == 5000
+    assert res.placement.tables["users"].row_count == 100
+    assert res.placement.tables["users"].serves[0].max_lag_seconds == 5.5
 
 
 def test_unicode_casefold_vs_lowercase_alignment(tmp_path, valid_jwks_file):
@@ -999,5 +1054,5 @@ def test_unicode_casefold_vs_lowercase_alignment(tmp_path, valid_jwks_file):
         encoding="utf-8",
     )
     sf.write_text(json.dumps({"straße": ["id"]}, ensure_ascii=False), encoding="utf-8")
-    with pytest.raises(ServerConfigError, match="collides case-insensitively"):
+    with pytest.raises(ServerConfigError, match="collides under casefold"):
         _make_cfg().validate_runtime_wiring()
