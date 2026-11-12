@@ -601,6 +601,34 @@ cubes: {}
     with pytest.raises(ServerConfigError, match="kind mismatch"):
         cfg_mismatch.validate_runtime_wiring()
 
+    # 3. Missing declared engines with alphanumeric/hyphenated names (duck2, duck-prod) are named in error
+    for eng_id in ("duck2", "duck-prod"):
+        pf.write_text(f"""
+engines:
+  {eng_id}: {{kind: duckdb, dialect: duckdb}}
+tables:
+  users:
+    keys: [id]
+    row_count: 1
+    serve:
+      {eng_id}: users
+cubes: {{}}
+""")
+        cfg_eng = ServerConfig.from_dict(
+            {
+                "grant_keys": {"jwks_file": valid_jwks_file},
+                "placement": {
+                    "static": {"placement_file": str(pf), "schemas_file": str(sf)}
+                },
+                "connections": {
+                    "duck": {"kind": "duckdb", "path": ":memory:"},
+                },
+            }
+        )
+        with pytest.raises(ServerConfigError) as exc_eng:
+            cfg_eng.validate_runtime_wiring()
+        assert f"connections.{eng_id}" in str(exc_eng.value)
+
 
 def test_validate_runtime_wiring_static_schemas_errors(tmp_path, valid_jwks_file):
     pf = tmp_path / "placement.yaml"

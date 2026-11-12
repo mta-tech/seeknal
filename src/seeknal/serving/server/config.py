@@ -24,7 +24,7 @@ class ServerConfigError(Exception):
     """Raised when server configuration is invalid or missing."""
 
 
-_SAFE_IDENTIFIER_RE = re.compile(r"^[a-z][a-z_.]{0,31}$")
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,79}$")
 _SUSPICIOUS_TOKEN_RE = re.compile(
     r"(://|@|secret|password|passwd|token|bearer|private|canary|sentinel|opaque|dsn|credential)",
     re.IGNORECASE,
