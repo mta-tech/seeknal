@@ -476,3 +476,95 @@ def test_error_bodies_never_leak_secrets(serving_setup):
     assert secret_literal not in body_text
     assert secret_param not in body_text
     assert token not in body_text
+
+
+def test_http_named_operation_parameter_digest_and_compilation_cache(serving_setup):
+    """Test /v1/query and /v1/explain with signed named-operation claims, cache hits, and tampering refusal."""
+    from seeknal.serving.parameter_binding import parameter_digest
+
+    client, priv, _, pipeline = serving_setup
+    sql = "SELECT id, name, salary FROM users WHERE salary >= $1 LIMIT 10"
+
+    def make_named_token(params: list, *, jti: str, include_digest: bool = True) -> str:
+        now = time.time()
+        claims = {
+            "sub": "analyst@example.com",
+            "ws": "ws-test",
+            "jti": jti,
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": now,
+            "exp": now + 60,
+            "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            "operation_id": "orders_by_month",
+            "operation_version": 1,
+            "max_rows": 10,
+            "tables": {
+                "users": {
+                    "columns": ["id", "salary"],
+                    "masks": {"name": "redact"},
+                    "row_filters": [{"column": "role", "op": "eq", "values": ["analyst"]}],
+                    "actions": ["select"],
+                }
+            },
+        }
+        if include_digest:
+            claims["params_sha256"] = parameter_digest(params)
+        return sign_grant_token(claims, priv, kid="key-1")
+
+    # 1. First request misses compilation cache and populates it
+    t1 = make_named_token([60000], jti="jti-named-1")
+    r1 = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {t1}"},
+        json={"sql": sql, "params": [60000]},
+    )
+    assert r1.status_code == 200
+    assert r1.json()["rows"] == [[2, "****", 80000]]
+    assert pipeline.compilation_cache_info()["misses"] == 1
+    assert pipeline.compilation_cache_info()["hits"] == 0
+    assert pipeline.compilation_cache_info()["size"] == 1
+
+    # 2. Second request with distinct parameter [40000] hits compilation cache and binds fresh params
+    t2 = make_named_token([40000], jti="jti-named-2")
+    r2 = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {t2}"},
+        json={"sql": sql, "params": [40000]},
+    )
+    assert r2.status_code == 200
+    assert r2.json()["rows"] == [[2, "****", 80000], [3, "****", 50000]]
+    assert pipeline.compilation_cache_info()["hits"] == 1
+
+    # 3. /v1/explain also hits compilation cache and verifies parameter digest
+    t3 = make_named_token([75000], jti="jti-named-3")
+    r3 = client.post(
+        "/v1/explain",
+        headers={"Authorization": f"Bearer {t3}"},
+        json={"sql": sql, "params": [75000]},
+    )
+    assert r3.status_code == 200
+    assert pipeline.compilation_cache_info()["hits"] == 2
+
+    # 4. Tampered parameter value returns 403 enforcement_error without leaking parameter value
+    t4 = make_named_token([60000], jti="jti-named-4")
+    r4 = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {t4}"},
+        json={"sql": sql, "params": [987654321]},
+    )
+    assert r4.status_code == 403
+    assert r4.json()["error"] == "enforcement_error"
+    assert "987654321" not in r4.text
+    assert pipeline.compilation_cache_info()["hits"] == 2  # Failed before cache lookup!
+
+    # 5. Missing params_sha256 on named operation returns 403 enforcement_error
+    t5 = make_named_token([60000], jti="jti-named-5", include_digest=False)
+    r5 = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {t5}"},
+        json={"sql": sql, "params": [60000]},
+    )
+    assert r5.status_code == 403
+    assert r5.json()["error"] == "enforcement_error"
+

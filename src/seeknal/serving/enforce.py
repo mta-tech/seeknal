@@ -7,6 +7,7 @@ row filters, and row cap) on client SQL before engine execution.
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -156,6 +157,9 @@ VALID_SQL_DIALECTS = frozenset({"postgres", "starrocks", "mysql", "duckdb"})
 VALID_WORKLOADS = frozenset({"interactive", "bi", "report", "ask", "job"})
 VALID_ORIGINS = frozenset({"superset", "ask", "job", "portal"})
 VALID_ACT_TYPES = frozenset({"ask_session", "run"})
+OPERATION_ID_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+PARAMS_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+MAX_SAFE_INT = 9_007_199_254_740_991
 
 ANONYMOUS_FUNCTION_ALLOWLIST: dict[str, set[str]] = {
     "cube": {"measure"},
@@ -323,6 +327,18 @@ class Grant:
     act: Mapping[str, str] | None = None
     azp: str | None = None
     origin: str | None = None
+    params_sha256: str | None = None
+    operation_id: str | None = None
+    operation_version: int | None = None
+
+    @property
+    def is_named_operation(self) -> bool:
+        """Return True iff complete valid named-operation claims are present."""
+        return (
+            self.operation_id is not None
+            and self.operation_version is not None
+            and self.params_sha256 is not None
+        )
 
     def __post_init__(self) -> None:
         if self.max_rows <= 0:
@@ -383,6 +399,45 @@ class Grant:
             if self.act is not None:
                 raise EnforcementError(
                     f"act claim is not allowed for workload '{self.workload}'"
+                )
+
+        if self.params_sha256 is not None:
+            if (
+                isinstance(self.params_sha256, bool)
+                or not isinstance(self.params_sha256, str)
+                or not PARAMS_SHA256_RE.fullmatch(self.params_sha256)
+            ):
+                raise EnforcementError(
+                    "params_sha256 claim must be a lower-case 64-character hex string"
+                )
+
+        if self.operation_id is not None:
+            if (
+                isinstance(self.operation_id, bool)
+                or not isinstance(self.operation_id, str)
+                or not OPERATION_ID_RE.fullmatch(self.operation_id)
+            ):
+                raise EnforcementError(
+                    "operation_id claim must match ^[a-z][a-z0-9_.-]{0,63}$"
+                )
+
+        if self.operation_version is not None:
+            if (
+                isinstance(self.operation_version, bool)
+                or not isinstance(self.operation_version, int)
+                or self.operation_version < 1
+                or self.operation_version > MAX_SAFE_INT
+            ):
+                raise EnforcementError(
+                    "operation_version claim must be a positive safe integer"
+                )
+
+        has_op_id = self.operation_id is not None
+        has_op_ver = self.operation_version is not None
+        if has_op_id or has_op_ver:
+            if not (has_op_id and has_op_ver and self.params_sha256 is not None):
+                raise EnforcementError(
+                    "named operation grant requires 'operation_id', 'operation_version', and 'params_sha256'"
                 )
 
     @classmethod
@@ -470,6 +525,54 @@ class Grant:
                 raise EnforcementError("digest claim must be a string")
             binding["digest"] = dig
 
+        params_sha256: str | None = None
+        if "params_sha256" in claims:
+            ps_val = claims["params_sha256"]
+            if (
+                isinstance(ps_val, bool)
+                or not isinstance(ps_val, str)
+                or not PARAMS_SHA256_RE.fullmatch(ps_val)
+            ):
+                raise EnforcementError(
+                    "params_sha256 claim must be a lower-case 64-character hex string"
+                )
+            params_sha256 = ps_val
+
+        operation_id: str | None = None
+        if "operation_id" in claims:
+            op_id_val = claims["operation_id"]
+            if (
+                isinstance(op_id_val, bool)
+                or not isinstance(op_id_val, str)
+                or not OPERATION_ID_RE.fullmatch(op_id_val)
+            ):
+                raise EnforcementError(
+                    "operation_id claim must match ^[a-z][a-z0-9_.-]{0,63}$"
+                )
+            operation_id = op_id_val
+
+        operation_version: int | None = None
+        if "operation_version" in claims:
+            op_ver_val = claims["operation_version"]
+            if (
+                isinstance(op_ver_val, bool)
+                or not isinstance(op_ver_val, int)
+                or op_ver_val < 1
+                or op_ver_val > MAX_SAFE_INT
+            ):
+                raise EnforcementError(
+                    "operation_version claim must be a positive safe integer"
+                )
+            operation_version = op_ver_val
+
+        has_op_id = operation_id is not None
+        has_op_ver = operation_version is not None
+        if has_op_id or has_op_ver:
+            if not (has_op_id and has_op_ver and params_sha256 is not None):
+                raise EnforcementError(
+                    "named operation grant requires 'operation_id', 'operation_version', and 'params_sha256'"
+                )
+
         table_grants: dict[str, TableGrant] = {}
         for tbl_name, tbl_spec in tables_raw.items():
             cols = tuple(tbl_spec.get("columns", ()))
@@ -502,6 +605,9 @@ class Grant:
             act=act,
             azp=azp,
             origin=origin,
+            params_sha256=params_sha256,
+            operation_id=operation_id,
+            operation_version=operation_version,
         )
 
 
@@ -739,6 +845,7 @@ def enforce(
     cube_mode: str = "refuse",
     cube_mask_variants: Mapping[str, Mapping[str, Collection[str]]] | None = None,
     cube_measures: Mapping[str, Collection[str]] | None = None,
+    params: Sequence[Any] | None = None,
 ) -> EnforcedQuery:
     """Enforce a data catalog grant on a SQL query."""
     if cube_mode not in ("refuse", "jwt"):
@@ -749,6 +856,11 @@ def enforce(
         raise EnforcementError(
             f"SQL SHA256 mismatch: expected {grant.sql_sha256}, got {computed_sha256}"
         )
+
+    if grant.params_sha256 is not None and params is not None:
+        from seeknal.serving.parameter_binding import verify_parameter_digest
+
+        verify_parameter_digest(params, grant.params_sha256)
 
     check_now = time.time() if now is None else float(now)
     if check_now >= grant.expires_at:

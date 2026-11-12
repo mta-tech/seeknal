@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import threading
 from collections.abc import Mapping, Sequence
@@ -11,6 +12,12 @@ from typing import Any
 import sqlglot
 from sqlglot import exp
 
+from seeknal.serving.compilation_cache import (
+     DEFAULT_COMPILATION_CACHE_MAX_ENTRIES,
+    MAX_CACHEABLE_SQL_BYTES,
+    CompilationCache,
+    CompilationCacheKey,
+)
 from seeknal.serving.enforce import (
     EnforcementError,
     Grant,
@@ -19,6 +26,7 @@ from seeknal.serving.enforce import (
     enforce,
 )
 from seeknal.serving.grant_token import verify_grant_token
+from seeknal.serving.parameter_binding import verify_parameter_digest
 from seeknal.serving.placement import Placement
 from seeknal.serving.router import Router, RoutingError
 
@@ -54,6 +62,8 @@ def _extract_placeholder_index(node: exp.Expression) -> int:
     if raw is None:
         raise EnforcementError(f"Anonymous placeholder node without index is not supported: {node}")
     raw_str = str(raw).lstrip("$")
+    if raw_str != "0" and raw_str.startswith("0"):
+        raise EnforcementError(f"Leading-zero placeholder '${raw_str}' is not supported")
     try:
         idx = int(raw_str)
     except ValueError as exc:
@@ -172,9 +182,14 @@ class ServingPipeline:
         cube_mode: str = "refuse",
         require_grant_typ: bool = False,
         max_grant_lifetime_seconds: float = 300,
+        compilation_cache_max_entries: int = DEFAULT_COMPILATION_CACHE_MAX_ENTRIES,
     ) -> None:
         if cube_mode not in ("refuse", "jwt"):
             raise EnforcementError(f"invalid cube_mode '{cube_mode}', must be 'refuse' or 'jwt'")
+        self._compilation_cache = CompilationCache(
+            max_entries=compilation_cache_max_entries
+        )
+        self.compilation_cache_max_entries = self._compilation_cache.max_entries
         self._lock = threading.Lock()
         self.placement = placement
         self.schemas = schemas
@@ -186,18 +201,24 @@ class ServingPipeline:
         self.require_grant_typ = require_grant_typ
         self.max_grant_lifetime_seconds = float(max_grant_lifetime_seconds)
         self.router = Router(placement)
+        self._catalog_generation = self._compilation_cache.generation
+
+    def compilation_cache_info(self) -> dict[str, int]:
+        """Return read-only numeric compilation cache counters."""
+        return self._compilation_cache.info()
 
     def update_catalog(
         self,
         placement: Placement,
         schemas: Mapping[str, Sequence[str]],
     ) -> None:
-        """Atomically update placement, schemas, and router under a lock."""
+        """Atomically update placement, schemas, router, and invalidate compilation cache."""
         new_router = Router(placement)
         with self._lock:
             self.placement = placement
             self.schemas = schemas
             self.router = new_router
+            self._catalog_generation = self._compilation_cache.invalidate()
 
     def prepare(
         self,
@@ -215,6 +236,7 @@ class ServingPipeline:
             placement = self.placement
             schemas = self.schemas
             router = self.router
+            catalog_generation = self._catalog_generation
 
         # 1. Verify token and decode Grant
         claims = verify_grant_token(
@@ -234,25 +256,64 @@ class ServingPipeline:
         try:
             grant = Grant.from_claims(claims)
 
+            if not isinstance(sql, str):
+                raise EnforcementError("SQL query must be a string")
+
+            # Verify SQL SHA-256 and parameter digest before any compilation-cache lookup
+            sql_bytes = sql.encode("utf-8")
+            computed_sql_sha256 = hashlib.sha256(sql_bytes).hexdigest()
+            if computed_sql_sha256.lower() != grant.sql_sha256.lower():
+                raise EnforcementError(
+                    f"SQL SHA256 mismatch: expected {grant.sql_sha256}, got {computed_sql_sha256}"
+                )
+
+            if isinstance(
+                params, (str, bytes, bytearray, memoryview, Mapping)
+            ) or not isinstance(params, Sequence):
+                raise EnforcementError("Parameters must be a sequence")
+            raw_params = tuple(params)
+
+            if grant.params_sha256 is not None:
+                verify_parameter_digest(raw_params, grant.params_sha256)
+
             # Parameters: $n placeholders are only defined for postgres and duckdb.
             # If params is non-empty and the dialect is starrocks or mysql, raise EnforcementError.
-            if params and grant.sql_dialect in ("starrocks", "mysql"):
+            if raw_params and grant.sql_dialect in ("starrocks", "mysql"):
                 raise EnforcementError(
                     f"Parameters are not supported for '{grant.sql_dialect}' source dialect"
                 )
 
-            # Parse SQL once with read=<grant.sql_dialect>, applying single-statement rules
-            try:
-                parsed_statements = sqlglot.parse(sql, read=grant.sql_dialect)
-            except Exception as exc:
-                raise EnforcementError(f"SQL parse error: {exc}") from exc
+            cache_eligible = (
+                grant.is_named_operation and len(sql_bytes) <= MAX_CACHEABLE_SQL_BYTES
+            )
+            cache_key: CompilationCacheKey | None = None
+            statement: exp.Expression | None = None
 
-            if len(parsed_statements) != 1 or parsed_statements[0] is None:
-                raise EnforcementError(
-                    f"expected exactly one statement, got {len(parsed_statements)}"
+            if cache_eligible:
+                cache_key = CompilationCacheKey(
+                    sql_sha256=computed_sql_sha256,
+                    sql_dialect=grant.sql_dialect,
+                    default_catalog=self.default_catalog,
+                    catalog_generation=catalog_generation,
                 )
+                statement = self._compilation_cache.get(cache_key)
 
-            statement = parsed_statements[0]
+            if statement is None:
+                # Parse SQL once with read=<grant.sql_dialect>, applying single-statement rules
+                try:
+                    parsed_statements = sqlglot.parse(sql, read=grant.sql_dialect)
+                except Exception as exc:
+                    raise EnforcementError(f"SQL parse error: {exc}") from exc
+
+                if len(parsed_statements) != 1 or parsed_statements[0] is None:
+                    raise EnforcementError(
+                        f"expected exactly one statement, got {len(parsed_statements)}"
+                    )
+
+                raw_statement = parsed_statements[0]
+                if cache_eligible and cache_key is not None:
+                    self._compilation_cache.put(cache_key, raw_statement)
+                statement = raw_statement.copy()
 
             # Canonicalize default catalog on two-part table references
             if self.default_catalog is not None:
@@ -301,6 +362,7 @@ class ServingPipeline:
                 cube_mode=self.cube_mode,
                 cube_mask_variants=cube_mask_variants,
                 cube_measures=cube_measures,
+                params=raw_params,
             )
 
             # 4. Table rewrite for chosen engine physical names
@@ -315,7 +377,6 @@ class ServingPipeline:
             else:
                 paramstyle = "format"
 
-            raw_params = tuple(params)
             num_params = len(raw_params)
             placeholder_nodes = list(
                 enforced.statement.find_all((exp.Parameter, exp.Placeholder))

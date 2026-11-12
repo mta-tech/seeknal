@@ -399,3 +399,350 @@ def test_duckdb_end_to_end_execution(ec_key):
     # Row 3 filtered out: province 'JK' != 'JB'
     assert len(rows) == 1
     assert rows[0] == (1, "****", 100)
+
+
+def _pilot_orders_pipeline(ec_key, *, cache_max_entries: int = 256):
+    priv, pub = ec_key
+    placement = Placement.from_dict(
+        {
+            "engines": {
+                "sr": {"kind": "starrocks", "dialect": "starrocks"},
+                "lb": {"kind": "lakebase", "dialect": "postgres"},
+                "duck": {"kind": "duckdb", "dialect": "duckdb"},
+            },
+            "tables": {
+                "lakekeeper.analytics.orders": {
+                    "keys": ["id"],
+                    "row_count": 5_000_000,
+                    "serve": {
+                        "sr": "lakekeeper.analytics.orders",
+                        "lb": "public.orders",
+                        "duck": "orders_tbl",
+                    },
+                }
+            },
+            "cubes": {},
+        }
+    )
+    schemas = {
+        "lakekeeper.analytics.orders": [
+            "id",
+            "customer_id",
+            "region",
+            "order_month",
+            "total",
+        ]
+    }
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas=schemas,
+        public_keys={"key-atlas": pub},
+        default_catalog="lakekeeper",
+        compilation_cache_max_entries=cache_max_entries,
+    )
+    return pipeline, priv
+
+
+def test_sealed_pilots_order_by_id_and_orders_by_month_with_cache_and_duckdb(
+    ec_key, monkeypatch
+):
+    """Verify both sealed pilot operations (order_by_id v1, orders_by_month v1), cache reuse, and DuckDB execution."""
+    import sqlglot
+    from seeknal.serving.parameter_binding import parameter_digest
+
+    pipeline, priv = _pilot_orders_pipeline(ec_key)
+
+    sql_point = "SELECT id, customer_id, total FROM lakekeeper.analytics.orders WHERE id = $1 LIMIT 1"
+    sql_report = (
+        "SELECT region, SUM(total) AS total "
+        "FROM lakekeeper.analytics.orders "
+        "WHERE order_month = $1 "
+        "GROUP BY region ORDER BY region LIMIT 100"
+    )
+
+    real_parse = sqlglot.parse
+    template_parse_calls = 0
+
+    def counting_parse(sql_str, *args, **kwargs):
+        nonlocal template_parse_calls
+        if sql_str in (sql_point, sql_report):
+            template_parse_calls += 1
+        return real_parse(sql_str, *args, **kwargs)
+
+    monkeypatch.setattr(sqlglot, "parse", counting_parse)
+
+    con = duckdb.connect()
+    con.execute(
+        "CREATE TABLE orders_tbl (id INT, customer_id VARCHAR, region VARCHAR, order_month INT, total INT)"
+    )
+    con.execute(
+        "INSERT INTO orders_tbl VALUES "
+        "(10, 'cust-a', 'WEST', 11, 150), "
+        "(11, 'cust-b', 'WEST', 11, 250), "
+        "(12, 'cust-c', 'EAST', 11, 300), "
+        "(13, 'cust-d', 'WEST', 12, 500)"
+    )
+
+    def make_named_grant(
+        sql: str,
+        params: list,
+        *,
+        op_id: str,
+        op_ver: int = 1,
+        workload: str,
+        max_rows: int,
+        jti: str,
+        sub: str = "analyst@atlas.org",
+        masks: dict | None = None,
+        row_filters: list | None = None,
+    ) -> str:
+        now = time.time()
+        claims = {
+            "sub": sub,
+            "ws": "ws-orders",
+            "jti": jti,
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": now,
+            "exp": now + 120,
+            "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            "params_sha256": parameter_digest(params),
+            "operation_id": op_id,
+            "operation_version": op_ver,
+            "sql_dialect": "postgres",
+            "workload": workload,
+            "max_rows": max_rows,
+            "tables": {
+                "lakekeeper.analytics.orders": {
+                    "columns": [
+                        c
+                        for c in ["id", "customer_id", "region", "order_month", "total"]
+                        if not masks or c not in masks
+                    ],
+                    "masks": masks or {},
+                    "row_filters": row_filters or [],
+                    "actions": ["select"],
+                }
+            },
+        }
+        return sign_grant_token(claims, priv, kid="key-atlas")
+
+    # 1. Pilot 1: order_by_id v1 (point_lookup -> routes to lb by default, or duck with hint)
+    tok_p1 = make_named_grant(
+        sql_point, [10], op_id="order_by_id", workload="interactive", max_rows=1, jti="j-p1"
+    )
+    prep_p1 = pipeline.prepare(sql_point, tok_p1, params=[10])
+    assert prep_p1.engine == "lb"
+    assert prep_p1.rule == "point_lookup"
+    assert prep_p1.params == (10,)
+    assert prep_p1.row_limit == 2
+    assert template_parse_calls == 1
+    assert pipeline.compilation_cache_info() == {
+        "hits": 0,
+        "misses": 1,
+        "evictions": 0,
+        "size": 1,
+        "max_entries": 256,
+    }
+
+    # Execute same template with a different parameter value [11] and DuckDB hint -> cache hit!
+    tok_p2 = make_named_grant(
+        sql_point,
+        [11],
+        op_id="order_by_id",
+        workload="interactive",
+        max_rows=1,
+        jti="j-p2",
+        masks={"customer_id": "redact"},
+    )
+    prep_p2 = pipeline.prepare(sql_point, tok_p2, params=[11], hint="duck")
+    assert prep_p2.engine == "duck"
+    assert prep_p2.params == (11,)
+    assert template_parse_calls == 1  # No second parse of sql_point!
+    assert pipeline.compilation_cache_info()["hits"] == 1
+    rows_p2 = con.execute(prep_p2.sql, prep_p2.params).fetchall()
+    assert rows_p2 == [(11, "****", 250)]
+
+    # 2. Pilot 2: orders_by_month v1 (report -> routes to sr by default, or duck with hint)
+    tok_r1 = make_named_grant(
+        sql_report, [11], op_id="orders_by_month", workload="report", max_rows=100, jti="j-r1"
+    )
+    prep_r1 = pipeline.prepare(sql_report, tok_r1, params=[11], hint="duck")
+    assert prep_r1.workload == "report"
+    assert prep_r1.params == (11,)
+    assert template_parse_calls == 2
+    rows_r1 = con.execute(prep_r1.sql, prep_r1.params).fetchall()
+    assert rows_r1 == [("EAST", 300), ("WEST", 400)]
+
+    # Second execution of orders_by_month with row filter for a different subject -> cache hit + fresh policy!
+    tok_r2 = make_named_grant(
+        sql_report,
+        [11],
+        op_id="orders_by_month",
+        workload="report",
+        max_rows=100,
+        jti="j-r2",
+        sub="west-only@atlas.org",
+        row_filters=[{"column": "region", "op": "eq", "values": ["WEST"]}],
+    )
+    prep_r2 = pipeline.prepare(sql_report, tok_r2, params=[11], hint="duck")
+    assert prep_r2.subject == "west-only@atlas.org"
+    assert template_parse_calls == 2  # Cache hit!
+    assert pipeline.compilation_cache_info()["hits"] == 2
+    rows_r2 = con.execute(prep_r2.sql, prep_r2.params).fetchall()
+    assert rows_r2 == [("WEST", 400)]
+
+
+def test_tampering_and_missing_digest_rejected_before_cache_lookup(ec_key):
+    """SQL or parameter tampering and incomplete operation claims fail before any cache lookup."""
+    from seeknal.serving.parameter_binding import parameter_digest
+
+    pipeline, priv = _pilot_orders_pipeline(ec_key)
+    sql = "SELECT id, customer_id, total FROM lakekeeper.analytics.orders WHERE id = $1 LIMIT 1"
+    now = time.time()
+
+    base_claims = {
+        "sub": "analyst@atlas.org",
+        "ws": "ws-orders",
+        "jti": "j-tamper-1",
+        "iss": "atlas-catalog",
+        "aud": "seeknal-serving",
+        "iat": now,
+        "exp": now + 120,
+        "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+        "params_sha256": parameter_digest([10]),
+        "operation_id": "order_by_id",
+        "operation_version": 1,
+        "sql_dialect": "postgres",
+        "max_rows": 1,
+        "tables": {
+            "lakekeeper.analytics.orders": {
+                "columns": ["id", "customer_id", "total"],
+                "masks": {},
+                "row_filters": [],
+                "actions": ["select"],
+            }
+        },
+    }
+    token = sign_grant_token(base_claims, priv, kid="key-atlas")
+
+    # 1. Parameter value tampered ([999] instead of signed [10])
+    with pytest.raises(EnforcementError, match="parameter SHA256 mismatch") as exc_info:
+        pipeline.prepare(sql, token, params=[999])
+    assert "999" not in str(exc_info.value)
+    assert pipeline.compilation_cache_info() == {
+        "hits": 0,
+        "misses": 0,
+        "evictions": 0,
+        "size": 0,
+        "max_entries": 256,
+    }
+
+    # 2. SQL text tampered
+    with pytest.raises(EnforcementError, match="SQL SHA256 mismatch"):
+        pipeline.prepare(sql + " ", token, params=[10])
+    assert pipeline.compilation_cache_info()["misses"] == 0
+
+    # 3. Downgrade attempt: operation_id + operation_version without params_sha256
+    downgraded_claims = dict(base_claims)
+    del downgraded_claims["params_sha256"]
+    downgraded_token = sign_grant_token(downgraded_claims, priv, kid="key-atlas")
+    with pytest.raises(EnforcementError, match="named operation grant requires"):
+        pipeline.prepare(sql, downgraded_token, params=[10])
+    assert pipeline.compilation_cache_info()["misses"] == 0
+
+
+def test_legacy_and_oversized_and_invalid_sql_cache_admission_rules(ec_key):
+    """Legacy grants, digest-only grants, >32KiB SQL, and invalid/multi-statement SQL do not enter cache."""
+    from seeknal.serving.parameter_binding import parameter_digest
+
+    pipeline, priv = _pilot_orders_pipeline(ec_key)
+    sql = "SELECT id, total FROM lakekeeper.analytics.orders WHERE id = $1 LIMIT 1"
+    now = time.time()
+    tables_grant = {
+        "lakekeeper.analytics.orders": {
+            "columns": ["id", "total"],
+            "masks": {},
+            "row_filters": [],
+            "actions": ["select"],
+        }
+    }
+
+    # 1. Legacy parameterized query without new claims works and bypasses compilation cache
+    tok_legacy = _make_token(priv, sql, tables_grant, max_rows=1)
+    prep_legacy = pipeline.prepare(sql, tok_legacy, params=[42])
+    assert prep_legacy.params == (42,)
+    assert pipeline.compilation_cache_info()["misses"] == 0
+    assert pipeline.compilation_cache_info()["size"] == 0
+
+    # 2. Claimed params_sha256 without operation_id/operation_version is verified but not cached
+    claims_digest_only = {
+        "sub": "analyst@atlas.org",
+        "ws": "ws-orders",
+        "jti": "j-digest-only",
+        "iss": "atlas-catalog",
+        "aud": "seeknal-serving",
+        "iat": now,
+        "exp": now + 120,
+        "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+        "params_sha256": parameter_digest([42]),
+        "max_rows": 1,
+        "tables": tables_grant,
+    }
+    tok_digest_only = sign_grant_token(claims_digest_only, priv, kid="key-atlas")
+    prep_do = pipeline.prepare(sql, tok_digest_only, params=[42])
+    assert prep_do.params == (42,)
+    assert pipeline.compilation_cache_info()["size"] == 0
+    with pytest.raises(EnforcementError, match="parameter SHA256 mismatch"):
+        pipeline.prepare(sql, tok_digest_only, params=[43])
+
+    # 3. Named operation with SQL > 32KiB executes but is not admitted to compilation cache
+    padding = " " * 33_000
+    big_sql = f"SELECT id, total FROM lakekeeper.analytics.orders WHERE id = $1{padding}LIMIT 1"
+    assert len(big_sql.encode("utf-8")) > 32_768
+    claims_big = {
+        **claims_digest_only,
+        "sql_sha256": hashlib.sha256(big_sql.encode("utf-8")).hexdigest(),
+        "operation_id": "order_by_id",
+        "operation_version": 1,
+    }
+    tok_big = sign_grant_token(claims_big, priv, kid="key-atlas")
+    prep_big = pipeline.prepare(big_sql, tok_big, params=[42])
+    assert prep_big.params == (42,)
+    assert pipeline.compilation_cache_info()["size"] == 0
+    assert pipeline.compilation_cache_info()["misses"] == 0
+
+    # 4. Multi-statement SQL with valid named operation claims is rejected and not cached
+    multi_sql = "SELECT id FROM lakekeeper.analytics.orders WHERE id = $1; SELECT id FROM lakekeeper.analytics.orders"
+    claims_multi = {
+        **claims_digest_only,
+        "sql_sha256": hashlib.sha256(multi_sql.encode("utf-8")).hexdigest(),
+        "operation_id": "order_by_id",
+        "operation_version": 1,
+    }
+    tok_multi = sign_grant_token(claims_multi, priv, kid="key-atlas")
+    with pytest.raises(EnforcementError, match="expected exactly one statement"):
+        pipeline.prepare(multi_sql, tok_multi, params=[42])
+    assert pipeline.compilation_cache_info()["size"] == 0
+
+
+def test_leading_zero_and_zero_placeholders_rejected(ec_key):
+    """$0 and leading-zero $01 placeholders are rejected with EnforcementError."""
+    pipeline, priv = _pilot_orders_pipeline(ec_key)
+    tables_grant = {
+        "lakekeeper.analytics.orders": {
+            "columns": ["id"],
+            "masks": {},
+            "row_filters": [],
+            "actions": ["select"],
+        }
+    }
+
+    for bad_sql in (
+        "SELECT id FROM lakekeeper.analytics.orders WHERE id = $0",
+        "SELECT id FROM lakekeeper.analytics.orders WHERE id = $01",
+    ):
+        tok = _make_token(priv, bad_sql, tables_grant)
+        with pytest.raises(EnforcementError):
+            pipeline.prepare(bad_sql, tok, params=[1])
+

@@ -40,6 +40,7 @@ require_grant_typ: true
 
 grant_max_lifetime_seconds: 60  # Maximum allowable grant token lifetime in seconds (default 60, max 300)
 replay_cache_max_entries: 100000  # Size limit for the grant replay cache (default 100000)
+compilation_cache_max_entries: 256  # Bounded LRU of raw parsed SQLGlot AST templates for named operations (default 256, max 1024, 0 disables; parse/compilation reuse only, never caches grants, policies, routes, DB physical plans, or query results)
 
 default_catalog: lakekeeper
 

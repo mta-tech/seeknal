@@ -730,3 +730,137 @@ def test_star_over_derived_table_renders_valid_sql_and_executes(duckdb_con):
     assert len(rows) == 4
     assert rows[0] == (1,)
 
+
+# ==============================================================================
+# Rule 10: Signed Parameter Digest & Named Operation Grant Claims
+# ==============================================================================
+
+
+def test_grant_named_operation_claims_validation():
+    from seeknal.serving.parameter_binding import parameter_digest
+
+    sql = "SELECT claim_id FROM claims.claim WHERE claim_id = $1 LIMIT 1"
+    digest = parameter_digest([42])
+    base_claims = {
+        "sub": "user:7f3c",
+        "ws": "claims-jabar",
+        "jti": "aud-op-01",
+        "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+        "max_rows": 1,
+        "exp": time.time() + 3600.0,
+        "tables": {
+            "claims.claim": {
+                "columns": ["claim_id"],
+                "masks": {},
+                "row_filters": [],
+                "actions": ["select"],
+            }
+        },
+    }
+
+    # 1. Legacy grant (no new claims)
+    g_legacy = Grant.from_claims(base_claims)
+    assert g_legacy.params_sha256 is None
+    assert g_legacy.operation_id is None
+    assert g_legacy.operation_version is None
+    assert g_legacy.is_named_operation is False
+
+    # 2. Claimed params_sha256 alone (valid, verified, not a named operation)
+    g_digest_only = Grant.from_claims({**base_claims, "params_sha256": digest})
+    assert g_digest_only.params_sha256 == digest
+    assert g_digest_only.is_named_operation is False
+
+    # 3. Complete valid named operation claims
+    g_named = Grant.from_claims(
+        {
+            **base_claims,
+            "params_sha256": digest,
+            "operation_id": "order_by_id",
+            "operation_version": 1,
+        }
+    )
+    assert g_named.is_named_operation is True
+    assert g_named.operation_id == "order_by_id"
+    assert g_named.operation_version == 1
+    assert g_named.params_sha256 == digest
+
+    # 4. Missing co-required claims when operation_id or operation_version is present
+    for incomplete in (
+        {"operation_id": "order_by_id"},
+        {"operation_version": 1},
+        {"operation_id": "order_by_id", "operation_version": 1},
+        {"operation_id": "order_by_id", "params_sha256": digest},
+        {"operation_version": 1, "params_sha256": digest},
+    ):
+        with pytest.raises(EnforcementError, match="named operation grant requires"):
+            Grant.from_claims({**base_claims, **incomplete})
+
+    # 5. Malformed operation_id values
+    for bad_op_id in ("", "Order_By_Id", "1order", "_order", "a" * 65, "bad id!", True, 123, None):
+        with pytest.raises(EnforcementError):
+            Grant.from_claims(
+                {
+                    **base_claims,
+                    "params_sha256": digest,
+                    "operation_id": bad_op_id,
+                    "operation_version": 1,
+                }
+            )
+
+    # 6. Malformed operation_version values
+    for bad_ver in (0, -1, True, False, 1.5, 9_007_199_254_740_992, "1", None):
+        with pytest.raises(EnforcementError):
+            Grant.from_claims(
+                {
+                    **base_claims,
+                    "params_sha256": digest,
+                    "operation_id": "order_by_id",
+                    "operation_version": bad_ver,
+                }
+            )
+
+    # 7. Malformed params_sha256 values
+    for bad_digest in (digest.upper(), "a" * 63, "a" * 65, "g" * 64, "", True, 123, None):
+        with pytest.raises(EnforcementError):
+            Grant.from_claims({**base_claims, "params_sha256": bad_digest})
+
+
+def test_enforce_defense_in_depth_params_digest_check():
+    from seeknal.serving.parameter_binding import parameter_digest
+
+    sql = "SELECT claim_id FROM claims.claim WHERE claim_id = $1"
+    grant, schemas = _claims_fixture(sql)
+    signed_grant = Grant(
+        subject=grant.subject,
+        workspace=grant.workspace,
+        audit_id=grant.audit_id,
+        sql_sha256=grant.sql_sha256,
+        max_rows=grant.max_rows,
+        expires_at=grant.expires_at,
+        tables=grant.tables,
+        params_sha256=parameter_digest([42]),
+        operation_id="order_by_id",
+        operation_version=1,
+    )
+
+    res = enforce(
+        sql,
+        signed_grant,
+        schemas=schemas,
+        target_dialect="duckdb",
+        target_kind="duckdb",
+        params=[42],
+    )
+    assert "claim_id" in res.sql
+
+    with pytest.raises(EnforcementError, match="parameter SHA256 mismatch"):
+        enforce(
+            sql,
+            signed_grant,
+            schemas=schemas,
+            target_dialect="duckdb",
+            target_kind="duckdb",
+            params=[99],
+        )
+
+

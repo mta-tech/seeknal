@@ -316,3 +316,111 @@ def test_cli_config_error_clean_exit_2_and_no_token(tmp_path, capsys):
     assert "Error:" in captured.err
     assert "Traceback" not in captured.err
     assert secret_token not in captured.err
+
+
+def test_update_catalog_invalidates_compilation_cache_and_fences_in_flight_parse(
+    ec_key, monkeypatch
+):
+    """update_catalog clears compilation cache and fences concurrent stale parses from repopulating it."""
+    import sqlglot
+    from seeknal.serving.parameter_binding import parameter_digest
+
+    priv, pub = ec_key
+    cat1_placement = Placement.from_dict(
+        {
+            "engines": {"sr": {"kind": "starrocks", "dialect": "starrocks"}},
+            "tables": {
+                "lakekeeper.analytics.orders": {
+                    "keys": ["id"],
+                    "row_count": 1000,
+                    "serve": {"sr": "lakekeeper.analytics.orders_v1"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    cat2_placement = Placement.from_dict(
+        {
+            "engines": {"sr": {"kind": "starrocks", "dialect": "starrocks"}},
+            "tables": {
+                "lakekeeper.analytics.orders": {
+                    "keys": ["id"],
+                    "row_count": 1000,
+                    "serve": {"sr": "lakekeeper.analytics.orders_v2"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    schemas = {"lakekeeper.analytics.orders": ["id", "total"]}
+    pipeline = ServingPipeline(
+        placement=cat1_placement,
+        schemas=schemas,
+        public_keys={"test-key": pub},
+        default_catalog="lakekeeper",
+    )
+
+    sql1 = "SELECT id, total FROM lakekeeper.analytics.orders WHERE id = $1 LIMIT 1"
+    sql2 = "SELECT id FROM lakekeeper.analytics.orders WHERE id = $1 LIMIT 1"
+    now = time.time()
+
+    def make_op_token(sql_str: str, param_val: int, jti: str) -> str:
+        return sign_grant_token(
+            {
+                "sub": "analyst@atlas.org",
+                "ws": "ws-test",
+                "jti": jti,
+                "iss": "atlas-catalog",
+                "aud": "seeknal-serving",
+                "iat": now,
+                "exp": now + 120,
+                "sql_sha256": hashlib.sha256(sql_str.encode("utf-8")).hexdigest(),
+                "params_sha256": parameter_digest([param_val]),
+                "operation_id": "order_by_id",
+                "operation_version": 1,
+                "sql_dialect": "postgres",
+                "max_rows": 1,
+                "tables": {
+                    "lakekeeper.analytics.orders": {
+                        "columns": ["id", "total"],
+                        "masks": {},
+                        "row_filters": [],
+                        "actions": ["select"],
+                    }
+                },
+            },
+            priv,
+            kid="test-key",
+        )
+
+    # 1. Populate cache in generation 0
+    prep1 = pipeline.prepare(sql1, make_op_token(sql1, 10, "j-1"), params=[10])
+    assert "orders_v1" in prep1.sql
+    assert pipeline.compilation_cache_info()["size"] == 1
+
+    # 2. Simulate an in-flight parse of sql2 during which update_catalog swaps to cat2_placement
+    real_parse = sqlglot.parse
+    swapped_mid_parse = False
+
+    def hooked_parse(s, *args, **kwargs):
+        nonlocal swapped_mid_parse
+        res = real_parse(s, *args, **kwargs)
+        if s == sql2 and not swapped_mid_parse:
+            swapped_mid_parse = True
+            pipeline.update_catalog(cat2_placement, schemas)
+        return res
+
+    monkeypatch.setattr(sqlglot, "parse", hooked_parse)
+
+    # In-flight request begun before update_catalog completes with its cat1 snapshot,
+    # AND its stale generation-0 parse is fenced from repopulating the generation-1 cache!
+    prep_inflight = pipeline.prepare(sql2, make_op_token(sql2, 20, "j-2"), params=[20])
+    assert swapped_mid_parse is True
+    assert "orders_v1" in prep_inflight.sql
+    assert pipeline.compilation_cache_info()["size"] == 0
+
+    # Subsequent request in generation 1 parses and caches under generation 1 and routes to orders_v2
+    prep_gen1 = pipeline.prepare(sql2, make_op_token(sql2, 21, "j-3"), params=[21])
+    assert "orders_v2" in prep_gen1.sql
+    assert pipeline.compilation_cache_info()["size"] == 1
+

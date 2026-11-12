@@ -15,6 +15,10 @@ import yaml
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from seeknal.serving.compilation_cache import (
+    DEFAULT_COMPILATION_CACHE_MAX_ENTRIES,
+    validate_compilation_cache_max_entries,
+)
 from seeknal.serving.discovery.config import DiscoveryConfig
 from seeknal.serving.grant_token import _load_public_key
 from seeknal.serving.placement import Placement, PlacementError
@@ -396,6 +400,13 @@ class ServerConfig:
     secrets_env: dict[str, str] = field(default_factory=dict)
     grant_max_lifetime_seconds: float = 60.0
     replay_cache_max_entries: int = 100_000
+    compilation_cache_max_entries: int = DEFAULT_COMPILATION_CACHE_MAX_ENTRIES
+
+    def __post_init__(self) -> None:
+        validate_compilation_cache_max_entries(
+            self.compilation_cache_max_entries,
+            error_cls=ServerConfigError,
+        )
 
     def load_grant_keys(self) -> dict[str, str]:
         """Load and return parsed PEM public keys."""
@@ -614,6 +625,7 @@ class ServerConfig:
             "limits",
             "grant_max_lifetime_seconds",
             "replay_cache_max_entries",
+            "compilation_cache_max_entries",
         }
         unknown_top = set(d.keys()) - allowed_top
         if unknown_top:
@@ -1256,6 +1268,15 @@ class ServerConfig:
             )
         replay_cache_max_entries = replay_cache_max_raw
 
+        # 15. compilation_cache_max_entries
+        compilation_cache_max_raw = d.get(
+            "compilation_cache_max_entries", DEFAULT_COMPILATION_CACHE_MAX_ENTRIES
+        )
+        compilation_cache_max_entries = validate_compilation_cache_max_entries(
+            compilation_cache_max_raw,
+            error_cls=ServerConfigError,
+        )
+
         server_config = cls(
             listen=listen_cfg,
             tls=tls_cfg,
@@ -1271,6 +1292,7 @@ class ServerConfig:
             secrets_env=secrets_env,
             grant_max_lifetime_seconds=grant_max_lifetime,
             replay_cache_max_entries=replay_cache_max_entries,
+            compilation_cache_max_entries=compilation_cache_max_entries,
         )
 
         if load_keys:

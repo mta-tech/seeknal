@@ -44,6 +44,33 @@ The Catalog signs every grant token presented in the `Authorization` header. In 
 - Workload `job` **requires** `act.typ == "run"` and `origin == "job"`.
 - `act` supplied with any other workload is refused (`403 enforcement_error`).
 
+#### Signed Parameter Digest (`seeknal-params-v1`) & Named Operations
+Grants may include three optional signed claims for governed named operations and parameter integrity:
+- `params_sha256` (`str`): Lower-case 64-character hexadecimal SHA-256 digest of the positional `params` array encoded under `seeknal-params-v1`.
+- `operation_id` (`str`): Server-owned operation identifier matching `^[a-z][a-z0-9_.-]{0,63}$` (for example, `"order_by_id"` or `"orders_by_month"`).
+- `operation_version` (`int`): Positive safe integer (`1..9007199254740991`).
+
+##### Co-presence & Verification Invariants
+- **Legacy callers:** Requests whose grant omits all three claims retain existing uncached behavior.
+- **Claimed digest without operation claims:** If `params_sha256` is present without `operation_id`/`operation_version`, the parameter digest is still verified against `params`, though the query is not eligible for the compilation cache.
+- **Named operations require all three claims:** If either `operation_id` or `operation_version` is present in the grant, all three (`operation_id`, `operation_version`, `params_sha256`) must be present and valid; omitting `params_sha256` is rejected (`403 enforcement_error`).
+- **Pre-cache verification:** Both `sql_sha256` and `params_sha256` are verified after JWS signature verification and **before** any compilation-cache lookup.
+- **Wire encoding (`seeknal-params-v1`):**
+  - Header: ASCII `seeknal-params-v1\n`, decimal parameter count, `\n`.
+  - Scalars concatenated in array order:
+    - `null`: `n;`
+    - `boolean`: `t;` or `f;`
+    - safe integer (`[-9007199254740991, 9007199254740991]`, `-0` normalized to `0`): `i<base10>;`
+    - UTF-8 string: `s<byte_length>:<utf8_bytes>;`
+  - Limits: at most 32 parameters, at most 16,384 UTF-8 bytes per string, and at most 65,536 total frame bytes (including header and framing). Floats, unsafe integers, unpaired surrogates, binary values, arrays, and objects are rejected without echoing parameter values in error messages.
+
+#### Parse-Template Compilation Cache
+For requests carrying complete valid named-operation claims (`operation_id`, `operation_version`, `params_sha256`) and SQL $\le 32\text{ KiB}$, `ServingPipeline` reuses raw parsed SQLGlot AST templates across requests via a bounded thread-safe LRU cache (`compilation_cache_max_entries`, default `256`, max `1024`, `0` disables):
+- **Parse/compilation reuse only:** The cache stores **only** raw parsed logical SQLGlot ASTs keyed by `(sql_sha256, sql_dialect, default_catalog, catalog_generation)`. It is **not** a database physical execution plan cache or a query result cache.
+- **Fresh per-request governance:** Every request verifies its own grant token, clones a fresh copy of the raw AST, and runs default-catalog canonicalization, routing, table/column/mask/row-filter enforcement, physical table rewriting, and driver parameter binding from scratch.
+- **Catalog refresh fencing:** `ServingPipeline.update_catalog()` atomically increments `catalog_generation` and clears cached AST entries; any concurrent parse begun under an older generation is fenced from repopulating the new generation.
+- **Read-only numeric diagnostics:** `pipeline.compilation_cache_info()` returns only `{"hits", "misses", "evictions", "size", "max_entries"}` and never exposes SQL text, cache keys, subjects, grants, or parameter values.
+
 ##### Audit Log Record
 Each request emits a per-request audit log line. When present in the token/grant, `workload`, `azp`, `origin`, `act_sub`, and `act_typ` are included in the audit log line (e.g., `workload=ask azp=seeknal-client origin=ask act_sub=session-01 act_typ=ask_session`). These claims are strictly audit-only and do not alter table permissions, row limits, or masking policies.
 

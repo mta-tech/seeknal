@@ -577,3 +577,41 @@ cubes: {{}}
     assert "syntheticCanary" not in msg
     assert str(pf) in msg
     assert "engines" in msg
+
+
+def test_build_server_propagates_compilation_cache_max_entries(
+    jwks_path, static_catalog_files
+):
+    """build_server passes compilation_cache_max_entries to ServingPipeline in both static and discovery modes."""
+    pf, sf = static_catalog_files
+
+    # 1. Default capacity 256
+    cfg_default = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "placement": {"static": {"placement_file": pf, "schemas_file": sf}},
+            "connections": {"duck": {"kind": "duckdb", "path": ":memory:"}},
+        }
+    )
+    h_default = build_server(cfg_default, connect_factories={"duck": lambda: duckdb.connect()})
+    assert h_default.pipeline.compilation_cache_info() == {
+        "hits": 0,
+        "misses": 0,
+        "evictions": 0,
+        "size": 0,
+        "max_entries": 256,
+    }
+
+    # 2. Custom capacity 64 and disabled 0
+    for cap in (64, 0, 1024):
+        cfg_cap = ServerConfig.from_dict(
+            {
+                "grant_keys": {"jwks_file": jwks_path},
+                "compilation_cache_max_entries": cap,
+                "placement": {"static": {"placement_file": pf, "schemas_file": sf}},
+                "connections": {"duck": {"kind": "duckdb", "path": ":memory:"}},
+            }
+        )
+        h_cap = build_server(cfg_cap, connect_factories={"duck": lambda: duckdb.connect()})
+        assert h_cap.pipeline.compilation_cache_info()["max_entries"] == cap
+

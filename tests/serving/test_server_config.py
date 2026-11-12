@@ -1084,3 +1084,39 @@ def test_unicode_casefold_vs_lowercase_alignment(tmp_path, valid_jwks_file):
     sf.write_text(json.dumps({"straße": ["id"]}, ensure_ascii=False), encoding="utf-8")
     with pytest.raises(ServerConfigError, match="collides under casefold"):
         _make_cfg().validate_runtime_wiring()
+
+
+def test_compilation_cache_max_entries_config_and_constructor_agreement(
+    valid_jwks_file,
+    valid_placement_files,
+    valid_secrets_file,
+    valid_password_file,
+):
+    """ServerConfig YAML/dict and constructor agree on compilation_cache_max_entries (default 256, 0..1024)."""
+    pf, sf = valid_placement_files
+    base_d = _build_full_valid_dict(
+        valid_jwks_file, pf, sf, valid_secrets_file, valid_password_file
+    )
+
+    # Default is 256
+    cfg_default = ServerConfig.from_dict(base_d)
+    assert cfg_default.compilation_cache_max_entries == 256
+
+    # Valid values: 0 (disabled), 1, 256, 1024
+    for valid_val in (0, 1, 128, 256, 1024):
+        cfg = ServerConfig.from_dict({**base_d, "compilation_cache_max_entries": valid_val})
+        assert cfg.compilation_cache_max_entries == valid_val
+
+    # Invalid values: bool, float, negative, >1024, string, None rejected in both from_dict and constructor
+    for bad_val in (True, False, -1, -50, 1025, 2000, 1.5, 0.0, "256", None):
+        with pytest.raises(ServerConfigError, match="compilation_cache_max_entries"):
+            ServerConfig.from_dict({**base_d, "compilation_cache_max_entries": bad_val})
+        with pytest.raises(ServerConfigError, match="compilation_cache_max_entries"):
+            ServerConfig(
+                listen=cfg_default.listen,
+                grant_keys=cfg_default.grant_keys,
+                placement=cfg_default.placement,
+                connections=cfg_default.connections,
+                compilation_cache_max_entries=bad_val,  # type: ignore[arg-type]
+            )
+

@@ -148,6 +148,7 @@ def build_server(
             cube_mode=cfg.cube_mode,
             require_grant_typ=cfg.require_grant_typ,
             max_grant_lifetime_seconds=cfg.grant_max_lifetime_seconds,
+            compilation_cache_max_entries=cfg.compilation_cache_max_entries,
         )
     else:
         empty_placement = Placement(engines={}, tables={}, cubes={})
@@ -159,6 +160,7 @@ def build_server(
             cube_mode=cfg.cube_mode,
             require_grant_typ=cfg.require_grant_typ,
             max_grant_lifetime_seconds=cfg.grant_max_lifetime_seconds,
+            compilation_cache_max_entries=cfg.compilation_cache_max_entries,
         )
 
         disc_cfg = cfg.placement.discovery_config
