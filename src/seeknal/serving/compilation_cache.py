@@ -110,6 +110,12 @@ class CompilationCache:
         if not isinstance(statement, exp.Expression):
             raise EnforcementError("cached statement must be a sqlglot Expression")
 
+        if self._max_entries == 0:
+            return False
+        with self._lock:
+            if key.catalog_generation != self._generation:
+                return False
+
         cloned = statement.copy()
         with self._lock:
             if self._max_entries == 0 or key.catalog_generation != self._generation:

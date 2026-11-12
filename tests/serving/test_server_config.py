@@ -1119,4 +1119,3 @@ def test_compilation_cache_max_entries_config_and_constructor_agreement(
                 connections=cfg_default.connections,
                 compilation_cache_max_entries=bad_val,  # type: ignore[arg-type]
             )
-

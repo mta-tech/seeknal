@@ -237,15 +237,19 @@ def test_total_frame_byte_limit_includes_prefix_and_framing():
 
 
 def test_verify_parameter_digest_validation_and_mismatch():
-    """verify_parameter_digest rejects malformed expected hex and mismatches."""
+    """verify_parameter_digest rejects malformed expected hex and mismatches without hash fingerprint or values."""
     digest = parameter_digest([42])
     assert verify_parameter_digest([42], digest) == digest
 
-    # Mismatch with different parameter value must not print the parameter value
+    # Mismatch with different parameter value must not print the parameter value or hash fingerprints
     secret_val = "TOP_SECRET_STRING_98765"
+    secret_digest = parameter_digest([secret_val])
     with pytest.raises(ParameterBindingError, match="parameter SHA256 mismatch") as exc_info:
         verify_parameter_digest([secret_val], digest)
-    assert secret_val not in str(exc_info.value)
+    err_msg = str(exc_info.value)
+    assert secret_val not in err_msg
+    assert digest not in err_msg
+    assert secret_digest not in err_msg
 
     # Uppercase hex is rejected (contract requires lower-case 64-hex)
     with pytest.raises(ParameterBindingError, match="lower-case 64-character hex"):

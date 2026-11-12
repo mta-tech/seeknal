@@ -842,17 +842,60 @@ def test_enforce_defense_in_depth_params_digest_check():
         operation_id="order_by_id",
         operation_version=1,
     )
+    digest_only_grant = Grant(
+        subject=grant.subject,
+        workspace=grant.workspace,
+        audit_id=grant.audit_id,
+        sql_sha256=grant.sql_sha256,
+        max_rows=grant.max_rows,
+        expires_at=grant.expires_at,
+        tables=grant.tables,
+        params_sha256=parameter_digest([42]),
+    )
 
-    res = enforce(
+    # 1. Legacy unbound grant with params=None (omitted) continues to pass
+    res_legacy = enforce(
         sql,
-        signed_grant,
+        grant,
         schemas=schemas,
         target_dialect="duckdb",
         target_kind="duckdb",
-        params=[42],
     )
-    assert "claim_id" in res.sql
+    assert "claim_id" in res_legacy.sql
 
+    # 2. Matching params sequence passes for both bound named grant and digest-only grant
+    for bound_grant in (signed_grant, digest_only_grant):
+        res = enforce(
+            sql,
+            bound_grant,
+            schemas=schemas,
+            target_dialect="duckdb",
+            target_kind="duckdb",
+            params=[42],
+        )
+        assert "claim_id" in res.sql
+
+    # 3. Omitted params (params=None) on a grant claiming params_sha256 MUST fail closed
+    for bound_grant in (signed_grant, digest_only_grant):
+        with pytest.raises(EnforcementError, match="requires 'params' sequence"):
+            enforce(
+                sql,
+                bound_grant,
+                schemas=schemas,
+                target_dialect="duckdb",
+                target_kind="duckdb",
+            )
+        with pytest.raises(EnforcementError, match="requires 'params' sequence"):
+            enforce(
+                sql,
+                bound_grant,
+                schemas=schemas,
+                target_dialect="duckdb",
+                target_kind="duckdb",
+                params=None,
+            )
+
+    # 4. Mismatched params sequence fails closed
     with pytest.raises(EnforcementError, match="parameter SHA256 mismatch"):
         enforce(
             sql,
@@ -862,5 +905,3 @@ def test_enforce_defense_in_depth_params_digest_check():
             target_kind="duckdb",
             params=[99],
         )
-
-

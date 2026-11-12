@@ -567,4 +567,3 @@ def test_http_named_operation_parameter_digest_and_compilation_cache(serving_set
     )
     assert r5.status_code == 403
     assert r5.json()["error"] == "enforcement_error"
-

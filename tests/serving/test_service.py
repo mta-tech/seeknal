@@ -726,8 +726,8 @@ def test_legacy_and_oversized_and_invalid_sql_cache_admission_rules(ec_key):
     assert pipeline.compilation_cache_info()["size"] == 0
 
 
-def test_leading_zero_and_zero_placeholders_rejected(ec_key):
-    """$0 and leading-zero $01 placeholders are rejected with EnforcementError."""
+def test_zero_placeholder_rejected_and_legacy_leading_zero_compatible(ec_key):
+    """$0 is rejected while legacy $01 placeholder compatibility is preserved."""
     pipeline, priv = _pilot_orders_pipeline(ec_key)
     tables_grant = {
         "lakekeeper.analytics.orders": {
@@ -738,11 +738,130 @@ def test_leading_zero_and_zero_placeholders_rejected(ec_key):
         }
     }
 
-    for bad_sql in (
-        "SELECT id FROM lakekeeper.analytics.orders WHERE id = $0",
-        "SELECT id FROM lakekeeper.analytics.orders WHERE id = $01",
-    ):
-        tok = _make_token(priv, bad_sql, tables_grant)
-        with pytest.raises(EnforcementError):
-            pipeline.prepare(bad_sql, tok, params=[1])
+    zero_sql = "SELECT id FROM lakekeeper.analytics.orders WHERE id = $0"
+    tok_zero = _make_token(priv, zero_sql, tables_grant)
+    with pytest.raises(EnforcementError, match=r"Placeholder index must be >= 1, got \$0"):
+        pipeline.prepare(zero_sql, tok_zero, params=[1])
 
+    legacy_leading_zero_sql = "SELECT id FROM lakekeeper.analytics.orders WHERE id = $01"
+    tok_legacy = _make_token(priv, legacy_leading_zero_sql, tables_grant)
+    prep = pipeline.prepare(legacy_leading_zero_sql, tok_legacy, params=[42])
+    assert prep.params == (42,)
+
+
+def test_disabled_cache_bypasses_get_put_and_ast_copy_budget_controls(
+    ec_key, monkeypatch
+):
+    """Verify capacity=0 bypasses cache get/put completely and check AST copy budget across legacy/disabled/miss/hit."""
+    from sqlglot import exp
+    from seeknal.serving.parameter_binding import parameter_digest
+
+    pipeline_disabled, priv = _pilot_orders_pipeline(ec_key, cache_max_entries=0)
+    pipeline_enabled, _ = _pilot_orders_pipeline(ec_key, cache_max_entries=256)
+
+    # Use two-part table name 'analytics.orders' to also exercise default_catalog canonicalization
+    sql = "SELECT id, total FROM analytics.orders WHERE id = $1 LIMIT 1"
+    now = time.time()
+    tables_grant = {
+        "lakekeeper.analytics.orders": {
+            "columns": ["id", "total"],
+            "masks": {},
+            "row_filters": [],
+            "actions": ["select"],
+        }
+    }
+
+    def make_tok(params: list, *, named: bool, jti: str) -> str:
+        claims = {
+            "sub": "analyst@atlas.org",
+            "ws": "ws-orders",
+            "jti": jti,
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": now,
+            "exp": now + 120,
+            "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            "sql_dialect": "postgres",
+            "max_rows": 1,
+            "tables": tables_grant,
+        }
+        if named:
+            claims["params_sha256"] = parameter_digest(params)
+            claims["operation_id"] = "order_by_id"
+            claims["operation_version"] = 1
+        return sign_grant_token(claims, priv, kid="key-atlas")
+
+    real_copy = exp.Expression.copy
+    copy_count = 0
+
+    def counting_copy(self, *args, **kwargs):
+        nonlocal copy_count
+        copy_count += 1
+        return real_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(exp.Expression, "copy", counting_copy)
+
+    # 1. Legacy path (no named operation claims)
+    copy_count = 0
+    prep_legacy = pipeline_enabled.prepare(
+        sql, make_tok([10], named=False, jti="j-leg"), params=[10]
+    )
+    legacy_copies = copy_count
+    assert prep_legacy.params == (10,)
+    assert pipeline_enabled.compilation_cache_info() == {
+        "hits": 0,
+        "misses": 0,
+        "evictions": 0,
+        "size": 0,
+        "max_entries": 256,
+    }
+
+    # 2. Disabled cache mode (compilation_cache_max_entries=0) with valid named operation claims:
+    # Must bypass cache get/put completely (misses == 0, hits == 0, size == 0) and match legacy copy budget!
+    copy_count = 0
+    prep_disabled = pipeline_disabled.prepare(
+        sql, make_tok([10], named=True, jti="j-dis"), params=[10]
+    )
+    disabled_copies = copy_count
+    assert prep_disabled.params == (10,)
+    assert disabled_copies == legacy_copies
+    assert pipeline_disabled.compilation_cache_info() == {
+        "hits": 0,
+        "misses": 0,
+        "evictions": 0,
+        "size": 0,
+        "max_entries": 0,
+    }
+
+    # 3. Enabled cache miss: stores 1 copy in cache.put before canonicalization, no extra pipeline copy!
+    copy_count = 0
+    prep_miss = pipeline_enabled.prepare(
+        sql, make_tok([10], named=True, jti="j-miss"), params=[10]
+    )
+    miss_copies = copy_count
+    assert prep_miss.params == (10,)
+    assert miss_copies == legacy_copies + 1
+    assert pipeline_enabled.compilation_cache_info() == {
+        "hits": 0,
+        "misses": 1,
+        "evictions": 0,
+        "size": 1,
+        "max_entries": 256,
+    }
+
+    # Verify cached raw AST in _compilation_cache was NOT mutated by default_catalog canonicalization
+    cached_key = next(iter(pipeline_enabled._compilation_cache._entries.keys()))
+    cached_raw_ast = pipeline_enabled._compilation_cache._entries[cached_key]
+    cached_tables = list(cached_raw_ast.find_all(exp.Table))
+    assert len(cached_tables) == 1
+    assert cached_tables[0].catalog == ""  # Raw two-part table preserved before canonicalization!
+
+    # 4. Enabled cache hit: 1 copy in cache.get + same downstream enforce copies as legacy
+    copy_count = 0
+    prep_hit = pipeline_enabled.prepare(
+        sql, make_tok([20], named=True, jti="j-hit"), params=[20]
+    )
+    hit_copies = copy_count
+    assert prep_hit.params == (20,)
+    assert hit_copies == legacy_copies + 1
+    assert pipeline_enabled.compilation_cache_info()["hits"] == 1

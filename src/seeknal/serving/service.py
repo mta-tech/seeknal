@@ -62,8 +62,6 @@ def _extract_placeholder_index(node: exp.Expression) -> int:
     if raw is None:
         raise EnforcementError(f"Anonymous placeholder node without index is not supported: {node}")
     raw_str = str(raw).lstrip("$")
-    if raw_str != "0" and raw_str.startswith("0"):
-        raise EnforcementError(f"Leading-zero placeholder '${raw_str}' is not supported")
     try:
         idx = int(raw_str)
     except ValueError as exc:
@@ -284,7 +282,9 @@ class ServingPipeline:
                 )
 
             cache_eligible = (
-                grant.is_named_operation and len(sql_bytes) <= MAX_CACHEABLE_SQL_BYTES
+                self.compilation_cache_max_entries > 0
+                and grant.is_named_operation
+                and len(sql_bytes) <= MAX_CACHEABLE_SQL_BYTES
             )
             cache_key: CompilationCacheKey | None = None
             statement: exp.Expression | None = None
@@ -310,10 +310,9 @@ class ServingPipeline:
                         f"expected exactly one statement, got {len(parsed_statements)}"
                     )
 
-                raw_statement = parsed_statements[0]
+                statement = parsed_statements[0]
                 if cache_eligible and cache_key is not None:
-                    self._compilation_cache.put(cache_key, raw_statement)
-                statement = raw_statement.copy()
+                    self._compilation_cache.put(cache_key, statement)
 
             # Canonicalize default catalog on two-part table references
             if self.default_catalog is not None:

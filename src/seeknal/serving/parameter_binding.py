@@ -167,9 +167,7 @@ def verify_parameter_digest(params: Sequence[Any], expected_sha256: str) -> str:
         )
     actual_sha256 = parameter_digest(params)
     if not hmac.compare_digest(actual_sha256, expected_sha256):
-        raise ParameterBindingError(
-            f"parameter SHA256 mismatch: expected {expected_sha256}, got {actual_sha256}"
-        )
+        raise ParameterBindingError("parameter SHA256 mismatch")
     return actual_sha256
 
 

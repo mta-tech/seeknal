@@ -614,4 +614,3 @@ def test_build_server_propagates_compilation_cache_max_entries(
         )
         h_cap = build_server(cfg_cap, connect_factories={"duck": lambda: duckdb.connect()})
         assert h_cap.pipeline.compilation_cache_info()["max_entries"] == cap
-

@@ -423,4 +423,3 @@ def test_update_catalog_invalidates_compilation_cache_and_fences_in_flight_parse
     prep_gen1 = pipeline.prepare(sql2, make_op_token(sql2, 21, "j-3"), params=[21])
     assert "orders_v2" in prep_gen1.sql
     assert pipeline.compilation_cache_info()["size"] == 1
-

@@ -857,7 +857,11 @@ def enforce(
             f"SQL SHA256 mismatch: expected {grant.sql_sha256}, got {computed_sha256}"
         )
 
-    if grant.params_sha256 is not None and params is not None:
+    if grant.params_sha256 is not None:
+        if params is None:
+            raise EnforcementError(
+                "parameter SHA256 verification requires 'params' sequence when grant claims 'params_sha256'"
+            )
         from seeknal.serving.parameter_binding import verify_parameter_digest
 
         verify_parameter_digest(params, grant.params_sha256)

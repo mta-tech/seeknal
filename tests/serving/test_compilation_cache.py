@@ -98,15 +98,26 @@ def test_lru_hits_misses_evictions_and_exact_info_contract():
     }
 
 
-def test_disabled_mode_zero_capacity():
-    """Capacity 0 disables caching completely while preserving exact numeric info()."""
+def test_disabled_mode_zero_capacity(monkeypatch):
+    """Capacity 0 disables caching completely and rejects put() before cloning AST."""
     cache = CompilationCache(max_entries=0)
     sql = "SELECT id FROM lakekeeper.analytics.orders WHERE id = $1 LIMIT 1"
     k = _make_key(sql)
     ast = sqlglot.parse_one(sql, read="postgres")
 
+    copy_calls = 0
+    real_copy = exp.Expression.copy
+
+    def counting_copy(self, *args, **kwargs):
+        nonlocal copy_calls
+        copy_calls += 1
+        return real_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(exp.Expression, "copy", counting_copy)
+
     assert cache.get(k) is None
     assert cache.put(k, ast) is False
+    assert copy_calls == 0  # Disabled put() must not clone AST
     assert cache.get(k) is None
 
     assert cache.info() == {
@@ -171,8 +182,8 @@ def test_key_dimensions_separate_entries():
     assert cache.get(k_none_cat) is None
 
 
-def test_invalidate_clears_cache_and_fences_stale_generation_put():
-    """invalidate() advances generation, clears entries, and fences stale-generation put/get."""
+def test_invalidate_clears_cache_and_fences_stale_generation_put(monkeypatch):
+    """invalidate() advances generation, clears entries, and fences stale-generation put before cloning."""
     cache = CompilationCache(max_entries=16)
     sql = "SELECT id FROM lakekeeper.analytics.orders WHERE id = $1 LIMIT 1"
     ast = sqlglot.parse_one(sql, read="postgres")
@@ -189,16 +200,29 @@ def test_invalidate_clears_cache_and_fences_stale_generation_put():
     assert cache.generation == 1
     assert cache.info()["size"] == 0
 
-    # Stale generation lookup misses, and stale generation put is fenced (rejected)
+    copy_calls = 0
+    real_copy = exp.Expression.copy
+
+    def counting_copy(self, *args, **kwargs):
+        nonlocal copy_calls
+        copy_calls += 1
+        return real_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(exp.Expression, "copy", counting_copy)
+
+    # Stale generation lookup misses, and stale generation put is fenced BEFORE copying
     assert cache.get(k_gen0) is None
     assert cache.put(k_gen0, ast) is False
+    assert copy_calls == 0
     assert cache.info()["size"] == 0
 
     # New generation put and get succeed
     k_gen1 = _make_key(sql, generation=gen1)
     assert cache.put(k_gen1, ast) is True
+    assert copy_calls == 1
     assert cache.info()["size"] == 1
     assert cache.get(k_gen1) is not None
+    assert copy_calls == 2
 
 
 def test_thread_safety_under_concurrent_access_and_invalidation():
