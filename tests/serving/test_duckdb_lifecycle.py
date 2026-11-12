@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 import pytest
@@ -233,7 +233,9 @@ def test_retained_connection_reference_sequential_hardened_file_reproducer(
         assert resp.json()["rows"] == [[1, "Alice"], [2, "Bob"]]
 
     # Security hardening remains intact
-    probe_conn = default_handle.adapters["duck"]._connect()
+    duck_adapter = default_handle.adapters["duck"]
+    assert isinstance(duck_adapter, DuckDBAdapter)
+    probe_conn = duck_adapter._connect()
     try:
         probe_res = probe(probe_conn)
         assert all(probe_res.values())
@@ -481,7 +483,9 @@ def test_resource_cleanup_across_all_execution_paths(monkeypatch, caplog):
         created_wrappers.append(w)
         return w
 
-    adapter = DuckDBAdapter(factory)
+    adapter = DuckDBAdapter(
+        cast(Callable[[], duckdb.DuckDBPyConnection], factory)
+    )
     baseline_timers = set(_active_timer_threads())
 
     try:
@@ -754,7 +758,9 @@ def test_first_wins_terminal_latch_ignores_late_cancel_and_watchdog_in_timer_joi
         return c
 
     monkeypatch.setattr(threading, "Timer", JoinFiringTimer)
-    adapter = DuckDBAdapter(factory)
+    adapter = DuckDBAdapter(
+        cast(Callable[[], duckdb.DuckDBPyConnection], factory)
+    )
 
     try:
         # 1. After successful query + fetch, Timer.join triggers watchdog then cancel -> still returns success, no interrupt
@@ -861,7 +867,9 @@ def test_queued_cancellation_and_queue_timeout_without_factory_call(
             call_no = factory_calls
         return ControlledConn(parent.cursor(), call_no)
 
-    adapter = DuckDBAdapter(controlled_factory)
+    adapter = DuckDBAdapter(
+        cast(Callable[[], duckdb.DuckDBPyConnection], controlled_factory)
+    )
     placement = Placement.from_dict(
         {
             "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
