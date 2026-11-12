@@ -41,7 +41,6 @@ from seeknal.serving.server.config import (
     LakebaseConnectionConfig,
     LoggingConfig,
     ServerConfig,
-    ServerConfigError,
     StarRocksAccountConfig,
     StarRocksConnectionConfig,
     read_secret_file,

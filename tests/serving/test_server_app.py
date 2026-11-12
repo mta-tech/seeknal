@@ -536,3 +536,44 @@ def test_build_server_loads_static_artifacts_once(
     assert isinstance(handle, ServerHandle)
     assert open_counts[pf] == 1
     assert open_counts[sf] == 1
+
+
+def test_build_server_invalid_placement_never_leaks_dsn_or_canary(
+    tmp_path, jwks_path
+):
+    dsn = "postgresql://demo:syntheticCanary@host/db"
+    pf = tmp_path / "placement.yaml"
+    pf.write_text(f"""
+engines:
+  duck:
+    kind: "{dsn}"
+    dialect: duckdb
+tables: {{}}
+cubes: {{}}
+""")
+    sf = tmp_path / "schemas.json"
+    sf.write_text("{}")
+
+    cfg = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "placement": {
+                "static": {
+                    "placement_file": str(pf),
+                    "schemas_file": str(sf),
+                }
+            },
+            "connections": {
+                "duck": {"kind": "duckdb", "path": ":memory:"},
+            },
+        }
+    )
+
+    with pytest.raises(ServerConfigError) as exc_info:
+        build_server(cfg)
+
+    msg = str(exc_info.value)
+    assert dsn not in msg
+    assert "syntheticCanary" not in msg
+    assert str(pf) in msg
+    assert "engines.duck.kind" in msg

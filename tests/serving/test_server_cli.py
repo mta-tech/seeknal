@@ -261,3 +261,41 @@ connections:
     assert sentinel not in captured_boom.out
     assert "Traceback" not in captured_boom.err
     assert "Error:" in captured_boom.err
+
+
+def test_cli_check_invalid_placement_kind_never_leaks_dsn_or_canary(
+    tmp_path, jwks_file, capsys
+):
+    dsn = "postgresql://demo:syntheticCanary@host/db"
+    pf = tmp_path / "placement.yaml"
+    pf.write_text(f"""
+engines:
+  duck:
+    kind: "{dsn}"
+    dialect: duckdb
+tables: {{}}
+cubes: {{}}
+""")
+    sf = tmp_path / "schemas.json"
+    sf.write_text("{}")
+    cfg_file = tmp_path / "serving.yaml"
+    cfg_file.write_text(f"""
+listen: {{host: 127.0.0.1, port: 8765}}
+grant_keys: {{jwks_file: {jwks_file}}}
+placement:
+  static:
+    placement_file: {pf}
+    schemas_file: {sf}
+connections:
+  duck: {{kind: duckdb, path: ":memory:"}}
+""")
+
+    ret = main(["--config", str(cfg_file), "--check"])
+    assert ret == 2
+    captured = capsys.readouterr()
+    assert dsn not in captured.err
+    assert "syntheticCanary" not in captured.err
+    assert dsn not in captured.out
+    assert "syntheticCanary" not in captured.out
+    assert str(pf) in captured.err
+    assert "engines.duck.kind" in captured.err

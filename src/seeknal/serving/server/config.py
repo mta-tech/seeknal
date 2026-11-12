@@ -17,16 +17,21 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from seeknal.serving.discovery.config import DiscoveryConfig
 from seeknal.serving.grant_token import _load_public_key
-from seeknal.serving.placement import Placement, PlacementError
+from seeknal.serving.placement import (
+    VALID_ENGINE_KINDS,
+    VALID_TWIN_METHODS,
+    Placement,
+    PlacementError,
+)
 
 
 class ServerConfigError(Exception):
     """Raised when server configuration is invalid or missing."""
 
 
-_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:\-]{1,80}$")
+_SAFE_IDENTIFIER_RE = re.compile(r"^[a-z][a-z_.]{0,31}$")
 _SUSPICIOUS_TOKEN_RE = re.compile(
-    r"(://|@|secret|password|passwd|token|bearer|private|BEGIN\s+|eyJ)",
+    r"(://|@|secret|password|passwd|token|bearer|private|canary|sentinel|opaque|dsn|credential)",
     re.IGNORECASE,
 )
 
@@ -69,14 +74,6 @@ class PreflightResult:
     mode: str
     placement: Placement | None = None
     schemas: dict[str, list[str]] | None = None
-
-    @property
-    def is_static(self) -> bool:
-        return self.mode == "static"
-
-    def __iter__(self):
-        yield self.placement
-        yield self.schemas
 
 
 def _b64url_decode(s: str) -> bytes:
@@ -896,7 +893,7 @@ class ServerConfig:
             kind = kind.strip()
             if kind not in ("starrocks", "lakebase", "cube", "duckdb"):
                 raise ServerConfigError(
-                    f"Unsupported connection kind '{kind}' for engine '{eng_name_str}'"
+                    f"Unsupported connection kind '{_safe_label(kind)}' for engine '{_safe_label(eng_name_str)}'"
                 )
 
             if kind == "starrocks":
@@ -1340,6 +1337,15 @@ def _load_static_placement(path: str | os.PathLike) -> Placement:
             f"got {type(raw).__name__}"
         )
 
+    allowed_sections = {"engines", "tables", "cubes", "policy"}
+    unknown_sections = set(raw.keys()) - allowed_sections
+    if unknown_sections:
+        safe_unknown = sorted(_safe_label(k) for k in unknown_sections)
+        raise ServerConfigError(
+            f"Static placement file '{path}' contains unknown top-level section(s): "
+            f"{safe_unknown} — allowed sections are 'engines', 'tables', 'cubes', 'policy'"
+        )
+
     for section in ("engines", "tables", "cubes", "policy"):
         sec_val = raw.get(section)
         if sec_val is not None and not isinstance(sec_val, Mapping):
@@ -1348,24 +1354,255 @@ def _load_static_placement(path: str | os.PathLike) -> Placement:
                 f"got {type(sec_val).__name__}"
             )
 
-    for section in ("engines", "tables", "cubes"):
-        sec_val = raw.get(section) or {}
-        for entry_name, entry_spec in sec_val.items():
-            if not isinstance(entry_spec, Mapping):
+    # 1. Validate engines
+    engines_raw = raw.get("engines") or {}
+    declared_engine_kinds: dict[str, str] = {}
+    for eng_name, eng_spec in engines_raw.items():
+        if not isinstance(eng_name, str) or not eng_name.strip():
+            raise ServerConfigError(
+                f"Static placement file '{path}' section 'engines' contains an empty or "
+                f"non-string engine name — engine names must be non-empty strings"
+            )
+        safe_eng = _safe_label(eng_name)
+        if not isinstance(eng_spec, Mapping):
+            raise ServerConfigError(
+                f"Static placement file '{path}' entry 'engines.{safe_eng}' "
+                f"must be a mapping, got {type(eng_spec).__name__}"
+            )
+        kind = eng_spec.get("kind")
+        if not isinstance(kind, str) or kind not in VALID_ENGINE_KINDS:
+            raise ServerConfigError(
+                f"Static placement file '{path}' field 'engines.{safe_eng}.kind' is invalid "
+                f"— must be one of {sorted(VALID_ENGINE_KINDS)}"
+            )
+        dialect = eng_spec.get("dialect")
+        if not isinstance(dialect, str) or not dialect.strip():
+            raise ServerConfigError(
+                f"Static placement file '{path}' field 'engines.{safe_eng}.dialect' "
+                f"must be a non-empty string"
+            )
+        declared_engine_kinds[eng_name] = kind
+
+    # 2. Validate tables (including both lower and casefold collision checks)
+    tables_raw = raw.get("tables") or {}
+    seen_tables_casefold: dict[str, str] = {}
+    seen_tables_lower: dict[str, str] = {}
+    for tbl_name, tbl_spec in tables_raw.items():
+        if not isinstance(tbl_name, str) or not tbl_name.strip():
+            raise ServerConfigError(
+                f"Static placement file '{path}' section 'tables' contains an empty or "
+                f"non-string table name — table names must be non-empty strings"
+            )
+        safe_tbl = _safe_label(tbl_name)
+        tbl_lower = tbl_name.lower()
+        tbl_folded = tbl_name.casefold()
+        if tbl_lower in seen_tables_lower or tbl_folded in seen_tables_casefold:
+            prev = seen_tables_casefold.get(tbl_folded) or seen_tables_lower.get(tbl_lower, "")
+            raise ServerConfigError(
+                f"Static placement file '{path}' section 'tables' has case-insensitive "
+                f"table name collision between '{_safe_label(prev)}' and '{safe_tbl}' — "
+                f"keep only one canonical logical table name"
+            )
+        seen_tables_lower[tbl_lower] = tbl_name
+        seen_tables_casefold[tbl_folded] = tbl_name
+
+        if not isinstance(tbl_spec, Mapping):
+            raise ServerConfigError(
+                f"Static placement file '{path}' entry 'tables.{safe_tbl}' "
+                f"must be a mapping, got {type(tbl_spec).__name__}"
+            )
+
+        keys_val = tbl_spec.get("keys")
+        if keys_val is not None:
+            if not isinstance(keys_val, (list, tuple)) or any(
+                not isinstance(k, str) or not k.strip() for k in keys_val
+            ):
                 raise ServerConfigError(
-                    f"Static placement file '{path}' entry '{section}.{_safe_label(entry_name)}' "
-                    f"must be a mapping, got {type(entry_spec).__name__}"
+                    f"Static placement file '{path}' field 'tables.{safe_tbl}.keys' "
+                    f"must be a list of non-empty column name strings"
                 )
+
+        row_count_val = tbl_spec.get("row_count")
+        if row_count_val is not None and (
+            isinstance(row_count_val, bool) or not isinstance(row_count_val, int)
+        ):
+            raise ServerConfigError(
+                f"Static placement file '{path}' field 'tables.{safe_tbl}.row_count' "
+                f"must be an integer or null, got {type(row_count_val).__name__}"
+            )
+
+        serve_raw = tbl_spec.get("serve")
+        if not isinstance(serve_raw, Mapping) or not serve_raw:
+            raise ServerConfigError(
+                f"Static placement file '{path}' field 'tables.{safe_tbl}.serve' "
+                f"must be a non-empty mapping of engine name to physical table spec"
+            )
+        for s_eng, sval in serve_raw.items():
+            if not isinstance(s_eng, str) or not s_eng.strip():
+                raise ServerConfigError(
+                    f"Static placement file '{path}' field 'tables.{safe_tbl}.serve' "
+                    f"contains an empty or non-string engine key"
+                )
+            safe_s_eng = _safe_label(s_eng)
+            if s_eng not in declared_engine_kinds:
+                raise ServerConfigError(
+                    f"Static placement file '{path}' field 'tables.{safe_tbl}.serve.{safe_s_eng}' "
+                    f"references undeclared engine '{safe_s_eng}' — declare it in 'engines' "
+                    f"or remove the serve entry"
+                )
+            if isinstance(sval, str):
+                if not sval.strip():
+                    raise ServerConfigError(
+                        f"Static placement file '{path}' field 'tables.{safe_tbl}.serve.{safe_s_eng}' "
+                        f"physical table name must be a non-empty string"
+                    )
+            elif isinstance(sval, Mapping):
+                phys_name = sval.get("name")
+                if not isinstance(phys_name, str) or not phys_name.strip():
+                    raise ServerConfigError(
+                        f"Static placement file '{path}' field "
+                        f"'tables.{safe_tbl}.serve.{safe_s_eng}.name' must be a non-empty string"
+                    )
+                lag_val = sval.get("max_lag_seconds")
+                if lag_val is not None:
+                    if isinstance(lag_val, bool) or not isinstance(lag_val, (int, float)):
+                        raise ServerConfigError(
+                            f"Static placement file '{path}' field "
+                            f"'tables.{safe_tbl}.serve.{safe_s_eng}.max_lag_seconds' "
+                            f"must be a finite number"
+                        )
+                    if math.isnan(float(lag_val)) or math.isinf(float(lag_val)):
+                        raise ServerConfigError(
+                            f"Static placement file '{path}' field "
+                            f"'tables.{safe_tbl}.serve.{safe_s_eng}.max_lag_seconds' "
+                            f"must be a finite number"
+                        )
+            else:
+                raise ServerConfigError(
+                    f"Static placement file '{path}' field 'tables.{safe_tbl}.serve.{safe_s_eng}' "
+                    f"must be a physical name string or mapping, got {type(sval).__name__}"
+                )
+
+    # 3. Validate cubes (including lower and casefold collision checks against cubes and tables)
+    cubes_raw = raw.get("cubes") or {}
+    seen_cubes_casefold: dict[str, str] = {}
+    seen_cubes_lower: dict[str, str] = {}
+    for cube_name, cube_spec in cubes_raw.items():
+        if not isinstance(cube_name, str) or not cube_name.strip():
+            raise ServerConfigError(
+                f"Static placement file '{path}' section 'cubes' contains an empty or "
+                f"non-string cube name — cube names must be non-empty strings"
+            )
+        safe_cube = _safe_label(cube_name)
+        cube_lower = cube_name.lower()
+        cube_folded = cube_name.casefold()
+        if cube_lower in seen_cubes_lower or cube_folded in seen_cubes_casefold:
+            prev = seen_cubes_casefold.get(cube_folded) or seen_cubes_lower.get(cube_lower, "")
+            raise ServerConfigError(
+                f"Static placement file '{path}' section 'cubes' has case-insensitive "
+                f"cube name collision between '{_safe_label(prev)}' and '{safe_cube}' — "
+                f"keep only one canonical cube name"
+            )
+        if cube_lower in seen_tables_lower or cube_folded in seen_tables_casefold:
+            prev_tbl = (
+                seen_tables_casefold.get(cube_folded)
+                or seen_tables_lower.get(cube_lower, "")
+            )
+            raise ServerConfigError(
+                f"Static placement file '{path}' cube '{safe_cube}' collides "
+                f"case-insensitively with table '{_safe_label(prev_tbl)}' — "
+                f"table and cube logical names must be distinct"
+            )
+        seen_cubes_lower[cube_lower] = cube_name
+        seen_cubes_casefold[cube_folded] = cube_name
+
+        if not isinstance(cube_spec, Mapping):
+            raise ServerConfigError(
+                f"Static placement file '{path}' entry 'cubes.{safe_cube}' "
+                f"must be a mapping, got {type(cube_spec).__name__}"
+            )
+
+        cube_eng = cube_spec.get("engine")
+        if not isinstance(cube_eng, str) or not cube_eng.strip():
+            raise ServerConfigError(
+                f"Static placement file '{path}' field 'cubes.{safe_cube}.engine' "
+                f"must be a non-empty engine name string"
+            )
+        safe_cube_eng = _safe_label(cube_eng)
+        if cube_eng not in declared_engine_kinds:
+            raise ServerConfigError(
+                f"Static placement file '{path}' field 'cubes.{safe_cube}.engine' "
+                f"references undeclared engine '{safe_cube_eng}' — declare it in 'engines'"
+            )
+        if declared_engine_kinds[cube_eng] != "cube":
+            raise ServerConfigError(
+                f"Static placement file '{path}' field 'cubes.{safe_cube}.engine' "
+                f"references engine '{safe_cube_eng}' of kind '{declared_engine_kinds[cube_eng]}' "
+                f"— cube engine must have kind 'cube'"
+            )
+
+        for list_field in ("measures", "dimensions"):
+            f_val = cube_spec.get(list_field)
+            if f_val is not None and (
+                not isinstance(f_val, (list, tuple))
+                or any(not isinstance(x, str) or not x.strip() for x in f_val)
+            ):
+                raise ServerConfigError(
+                    f"Static placement file '{path}' field 'cubes.{safe_cube}.{list_field}' "
+                    f"must be a list of non-empty strings"
+                )
+
+        dims_set = set(cube_spec.get("dimensions") or ())
+        mv_raw = cube_spec.get("mask_variants")
+        if mv_raw is not None:
+            if not isinstance(mv_raw, Mapping):
+                raise ServerConfigError(
+                    f"Static placement file '{path}' field 'cubes.{safe_cube}.mask_variants' "
+                    f"must be a mapping, got {type(mv_raw).__name__}"
+                )
+            for base, methods in mv_raw.items():
+                if not isinstance(base, str) or base not in dims_set:
+                    raise ServerConfigError(
+                        f"Static placement file '{path}' field "
+                        f"'cubes.{safe_cube}.mask_variants' contains a base key not declared "
+                        f"in 'cubes.{safe_cube}.dimensions'"
+                    )
+                if not isinstance(methods, (list, tuple)) or any(
+                    not isinstance(m, str) or m not in VALID_TWIN_METHODS for m in methods
+                ):
+                    raise ServerConfigError(
+                        f"Static placement file '{path}' field "
+                        f"'cubes.{safe_cube}.mask_variants' "
+                        f"must be a list of valid twin mask methods {sorted(VALID_TWIN_METHODS)}"
+                    )
+
+    # 4. Validate policy
+    policy_raw = raw.get("policy")
+    if policy_raw is not None:
+        for int_field in ("point_lookup_max_keys", "analytics_min_rows"):
+            if int_field in policy_raw:
+                iv = policy_raw[int_field]
+                if isinstance(iv, bool) or not isinstance(iv, int):
+                    raise ServerConfigError(
+                        f"Static placement file '{path}' field 'policy.{int_field}' "
+                        f"must be an integer, got {type(iv).__name__}"
+                    )
+        for order_field in ("small_scan_order", "analytics_order"):
+            if order_field in policy_raw:
+                ov = policy_raw[order_field]
+                if not isinstance(ov, (list, tuple)) or any(
+                    not isinstance(x, str) or not x.strip() for x in ov
+                ):
+                    raise ServerConfigError(
+                        f"Static placement file '{path}' field 'policy.{order_field}' "
+                        f"must be a list of engine kind strings"
+                    )
 
     try:
         return Placement.from_dict(raw)
-    except PlacementError as exc:
+    except (PlacementError, TypeError, ValueError, AttributeError) as exc:
         raise ServerConfigError(
-            f"Invalid static placement in '{path}': {exc}"
-        ) from exc
-    except (TypeError, ValueError) as exc:
-        raise ServerConfigError(
-            f"Invalid field value in static placement file '{path}': {type(exc).__name__}"
+            f"Invalid static placement in '{path}' — verify engines, tables, cubes, and policy fields"
         ) from exc
 
 
@@ -1448,6 +1685,7 @@ def _load_and_validate_static_schemas(
             )
 
         seen_cols_casefold: dict[str, str] = {}
+        seen_cols_lower: dict[str, str] = {}
         clean_cols: list[str] = []
         for idx, col in enumerate(cols):
             if not isinstance(col, str) or not col.strip():
@@ -1456,24 +1694,40 @@ def _load_and_validate_static_schemas(
                     f"index {idx} — every column name must be a non-empty string"
                 )
             col_folded = col.casefold()
-            if col_folded in seen_cols_casefold:
-                prev_col = seen_cols_casefold[col_folded]
+            col_lower = col.lower()
+            if col_folded in seen_cols_casefold or col_lower in seen_cols_lower:
                 raise ServerConfigError(
                     f"Static schemas file '{path}' entry '{safe_tbl}' has duplicate column "
-                    f"'{_safe_label(col)}' (collides with '{_safe_label(prev_col)}') — "
-                    f"column names must be unique case-insensitively"
+                    f"at index {idx} — column names must be unique case-insensitively"
                 )
             seen_cols_casefold[col_folded] = col
+            seen_cols_lower[col_lower] = col
             clean_cols.append(col)
 
         validated_schemas[key] = clean_cols
 
-    # Expected logical names from placement tables + cubes
+    # Expected logical names from placement tables + cubes (rejecting ambiguous casefold/lower collisions)
     expected_by_casefold: dict[str, str] = {}
-    for tbl_name in placement.tables.keys():
-        expected_by_casefold[tbl_name.casefold()] = tbl_name
-    for cube_name in placement.cubes.keys():
-        expected_by_casefold[cube_name.casefold()] = cube_name
+    expected_by_lower: dict[str, str] = {}
+    for kind_label, names_iter in (
+        ("table", placement.tables.keys()),
+        ("cube", placement.cubes.keys()),
+    ):
+        for logical_name in names_iter:
+            folded = logical_name.casefold()
+            lowered = logical_name.lower()
+            if folded in expected_by_casefold or lowered in expected_by_lower:
+                prev_name = (
+                    expected_by_casefold.get(folded)
+                    or expected_by_lower.get(lowered, "")
+                )
+                raise ServerConfigError(
+                    f"Static placement defines ambiguous {kind_label} name "
+                    f"'{_safe_label(logical_name)}' that collides under casefold with "
+                    f"'{_safe_label(prev_name)}' — use distinct logical names"
+                )
+            expected_by_casefold[folded] = logical_name
+            expected_by_lower[lowered] = logical_name
 
     missing_folded = sorted(set(expected_by_casefold.keys()) - set(schemas_by_casefold.keys()))
     if missing_folded:
@@ -1493,13 +1747,23 @@ def _load_and_validate_static_schemas(
             f"schema key(s) from '{path}' or declare them in placement"
         )
 
+    # Require actual runtime lower-normalized schema-key set to equal lower-normalized
+    # placement tables+cubes key set so runtime enforcer/Placement .lower() lookup and
+    # preflight .casefold() check never diverge on Unicode edge cases (e.g. 'straße' vs 'STRASSE').
+    schemas_lower_set = {k.lower() for k in validated_schemas.keys()}
+    expected_lower_set = set(expected_by_lower.keys())
+    if schemas_lower_set != expected_lower_set:
+        for folded, pl_name in expected_by_casefold.items():
+            sch_name = schemas_by_casefold[folded]
+            if pl_name.lower() != sch_name.lower():
+                raise ServerConfigError(
+                    f"Static schemas file '{path}' key '{_safe_label(sch_name)}' matches placement "
+                    f"name '{_safe_label(pl_name)}' by casefold but differs under lowercase — "
+                    f"use matching casing in '{path}'"
+                )
+        raise ServerConfigError(
+            f"Static schemas file '{path}' lowercase key coverage does not match "
+            f"placement tables and cubes — align schema key casing with placement"
+        )
+
     return validated_schemas
-
-
-def validate_runtime_wiring(
-    config: ServerConfig,
-    *,
-    env: Mapping[str, str] | None = None,
-) -> PreflightResult:
-    """Shared offline runtime-wiring validation for --check and build_server."""
-    return config.validate_runtime_wiring(env=env)

@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import pytest
+import yaml
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -16,7 +17,6 @@ from seeknal.serving.server.config import (
     ServerConfigError,
     load_grant_keys,
     parse_jwks,
-    validate_runtime_wiring,
 )
 
 
@@ -537,11 +537,11 @@ cubes:
         }
     )
 
-    res = validate_runtime_wiring(
-        cfg, env={"EXTRA_LB_DSN": "postgresql://u:p@localhost/db"}
+    res = cfg.validate_runtime_wiring(
+        env={"EXTRA_LB_DSN": "postgresql://u:p@localhost/db"}
     )
     assert isinstance(res, PreflightResult)
-    assert res.is_static is True
+    assert res.mode == "static"
     assert res.placement is not None
     assert res.schemas is not None
     # Original casing and order preserved
@@ -691,7 +691,7 @@ def test_validate_runtime_wiring_discovery_mode(tmp_path, valid_jwks_file):
         }
     )
     res_empty = cfg_empty.validate_runtime_wiring()
-    assert res_empty.is_static is False
+    assert res_empty.mode == "discovery"
     assert res_empty.placement is None
     assert res_empty.schemas is None
 
@@ -732,7 +732,7 @@ def test_validate_runtime_wiring_discovery_mode(tmp_path, valid_jwks_file):
     res_valid = cfg_valid.validate_runtime_wiring(
         env={"LB_DSN": "postgresql://u:p@h/db", "CUBE_META_SEC": "sec"}
     )
-    assert res_valid.is_static is False
+    assert res_valid.mode == "discovery"
 
     # 3. Missing discovery engine in connections
     cfg_missing_eng = ServerConfig.from_dict(
@@ -822,3 +822,182 @@ def test_malformed_files_and_secret_sentinels_never_leak(tmp_path, valid_jwks_fi
         cfg.validate_runtime_wiring()
     assert sentinel not in str(exc_uri.value)
     assert "<redacted>" in str(exc_uri.value)
+
+
+def test_placement_invalid_payloads_and_nested_structures_never_leak_dsn_or_canary(
+    tmp_path, valid_jwks_file
+):
+    dsn = "postgresql://demo:syntheticCanary@host/db"
+    canary = "syntheticCanary"
+    opaque = "opaqueValueX91z"
+
+    pf = tmp_path / "placement.yaml"
+    sf = tmp_path / "schemas.json"
+    sf.write_text(json.dumps({"users": ["id"]}))
+
+    def _make_cfg() -> ServerConfig:
+        return ServerConfig.from_dict(
+            {
+                "grant_keys": {"jwks_file": valid_jwks_file},
+                "placement": {
+                    "static": {"placement_file": str(pf), "schemas_file": str(sf)}
+                },
+                "connections": {
+                    "duck": {"kind": "duckdb", "path": ":memory:"},
+                    "cube": {
+                        "kind": "cube",
+                        "host": "cube",
+                        "port": 15432,
+                        "dbname": "db",
+                        "sql_user": "seeknal",
+                    },
+                },
+            }
+        )
+
+    # 1. Invalid engine kind containing a full DSN
+    pf.write_text(
+        yaml.safe_dump(
+            {
+                "engines": {"duck": {"kind": dsn, "dialect": "duckdb"}},
+                "tables": {},
+                "cubes": {},
+            }
+        )
+    )
+    with pytest.raises(ServerConfigError) as exc_kind:
+        _make_cfg().validate_runtime_wiring()
+    msg_kind = str(exc_kind.value)
+    assert dsn not in msg_kind
+    assert canary not in msg_kind
+    assert str(pf) in msg_kind
+    assert "engines.duck.kind" in msg_kind
+
+    # 2. Invalid mask_variants base / method containing opaque sentinel
+    pf.write_text(
+        yaml.safe_dump(
+            {
+                "engines": {"cube": {"kind": "cube", "dialect": "postgres"}},
+                "tables": {},
+                "cubes": {
+                    "sales": {
+                        "engine": "cube",
+                        "measures": ["m1"],
+                        "dimensions": ["d1"],
+                        "mask_variants": {"d1": [opaque, dsn]},
+                    }
+                },
+            }
+        )
+    )
+    with pytest.raises(ServerConfigError) as exc_mv:
+        _make_cfg().validate_runtime_wiring()
+    msg_mv = str(exc_mv.value)
+    assert opaque not in msg_mv
+    assert dsn not in msg_mv
+    assert canary not in msg_mv
+    assert "cubes.sales.mask_variants" in msg_mv
+
+    # 3. Malformed nested serve (list instead of mapping) raises ServerConfigError, not AttributeError
+    pf.write_text(
+        yaml.safe_dump(
+            {
+                "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+                "tables": {
+                    "users": {
+                        "keys": ["id"],
+                        "row_count": 1,
+                        "serve": [dsn, opaque],
+                    }
+                },
+                "cubes": {},
+            }
+        )
+    )
+    with pytest.raises(ServerConfigError) as exc_serve:
+        _make_cfg().validate_runtime_wiring()
+    msg_serve = str(exc_serve.value)
+    assert dsn not in msg_serve
+    assert canary not in msg_serve
+    assert opaque not in msg_serve
+    assert "tables.users.serve" in msg_serve
+
+
+def test_unicode_casefold_vs_lowercase_alignment(tmp_path, valid_jwks_file):
+    pf = tmp_path / "placement.yaml"
+    sf = tmp_path / "schemas.json"
+
+    def _make_cfg() -> ServerConfig:
+        return ServerConfig.from_dict(
+            {
+                "grant_keys": {"jwks_file": valid_jwks_file},
+                "cube_mode": "refuse",
+                "placement": {
+                    "static": {"placement_file": str(pf), "schemas_file": str(sf)}
+                },
+                "connections": {
+                    "duck": {"kind": "duckdb", "path": ":memory:"},
+                    "cube": {
+                        "kind": "cube",
+                        "host": "cube",
+                        "port": 15432,
+                        "dbname": "db",
+                        "sql_user": "seeknal",
+                    },
+                },
+            }
+        )
+
+    # 1. Single table 'straße' in placement with only 'STRASSE' in schemas.json:
+    # .casefold() matches ('strasse' == 'strasse'), but runtime .lower() differs ('straße' != 'strasse')
+    pf.write_text(
+        yaml.safe_dump(
+            {
+                "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+                "tables": {
+                    "straße": {
+                        "keys": ["id"],
+                        "row_count": 1,
+                        "serve": {"duck": "strasse_tbl"},
+                    }
+                },
+                "cubes": {},
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    sf.write_text(json.dumps({"STRASSE": ["id"]}), encoding="utf-8")
+    with pytest.raises(ServerConfigError, match="differs under lowercase"):
+        _make_cfg().validate_runtime_wiring()
+
+    # 2. Table 'straße' + cube 'STRASSE' in placement collides under casefold
+    pf.write_text(
+        yaml.safe_dump(
+            {
+                "engines": {
+                    "duck": {"kind": "duckdb", "dialect": "duckdb"},
+                    "cube": {"kind": "cube", "dialect": "postgres"},
+                },
+                "tables": {
+                    "straße": {
+                        "keys": ["id"],
+                        "row_count": 1,
+                        "serve": {"duck": "strasse_tbl"},
+                    }
+                },
+                "cubes": {
+                    "STRASSE": {
+                        "engine": "cube",
+                        "measures": ["m1"],
+                        "dimensions": ["d1"],
+                    }
+                },
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    sf.write_text(json.dumps({"straße": ["id"]}, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ServerConfigError, match="collides case-insensitively"):
+        _make_cfg().validate_runtime_wiring()
