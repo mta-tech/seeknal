@@ -512,3 +512,150 @@ def test_result_drives_real_serving_pipeline(ec_key):
         max_staleness_seconds=30.0,
     )
     assert prep_stale.engine == "sr"
+
+
+def test_cli_emit_with_standalone_and_full_serving_yaml(tmp_path, capsys):
+    import json
+    import yaml
+
+    from seeknal.serving.discovery.__main__ import main as discovery_main
+    from seeknal.serving.placement import VALID_ENGINE_KINDS
+    from tests.serving.fake_postgres_catalog import FakePostgresCatalog
+
+    lb_cat = FakePostgresCatalog()
+    lb_cat.add_table(
+        "ops",
+        "ticket_open",
+        reltuples=500,
+        columns=[("ticket_id", "text", True), ("status", "text", True)],
+        indexes=[
+            {
+                "index_name": "ticket_open_pkey",
+                "amname": "btree",
+                "columns": ["ticket_id"],
+                "is_primary": True,
+            }
+        ],
+    )
+
+    # 1. Full serving.yaml with top-level placement.discovery -> --emit writes loadable static placement YAML
+    serving_cfg = {
+        "default_catalog": "ops",
+        "connections": {
+            "lb_ops": {
+                "kind": "lakebase",
+                "dsn_env": "LB_OPS_DSN",
+                "lakebase": {
+                    "project_id": "prj_aaaaaaaaaaaaaaaaaaaa",
+                    "branch_id": "br_aaaaaaaaaaaaaaaaaaaa",
+                    "endpoint_id": "ep_aaaaaaaaaaaaaaaaaaaa",
+                    "endpoint_type": "read_write",
+                },
+            }
+        },
+        "placement": {
+            "discovery": {
+                "refresh_interval_seconds": 120,
+                "engines": {
+                    "lb_ops": {"kind": "lakebase", "dialect": "postgres"},
+                },
+                "postgres_sources": {
+                    "lb_ops": {
+                        "logical_catalog": "ops",
+                        "schemas": {"ops": {"include": ["ticket_*"]}},
+                    }
+                },
+            }
+        },
+    }
+    serving_yaml = tmp_path / "serving.yaml"
+    serving_yaml.write_text(yaml.safe_dump(serving_cfg), encoding="utf-8")
+    emitted_yaml = tmp_path / "emitted_placement.yaml"
+
+    rc = discovery_main(
+        ["--config", str(serving_yaml), "--emit", str(emitted_yaml)],
+        postgres_connects={"lb_ops": lb_cat.connect},
+    )
+    assert rc == 0
+    assert emitted_yaml.exists()
+
+    loaded = Placement.from_yaml(emitted_yaml)
+    assert "ops.ops.ticket_open" in loaded.tables
+    assert loaded.tables["ops.ops.ticket_open"].keys == ("ticket_id",)
+    assert loaded.tables["ops.ops.ticket_open"].serves[0].physical_name == "ops.ticket_open"
+
+    raw_emitted = yaml.safe_load(emitted_yaml.read_text(encoding="utf-8"))
+    assert raw_emitted["tables"]["ops.ops.ticket_open"]["access"]["pattern"] == "scan"
+
+    # 2. --emit with --schemas-out writes both files; standalone discovery YAML with kind: postgres
+    pg_cat = FakePostgresCatalog()
+    pg_cat.add_table(
+        "src_pii",
+        "customer",
+        reltuples=1000,
+        columns=[("customer_id", "text", True), ("full_name", "text", True)],
+        indexes=[
+            {
+                "index_name": "customer_pkey",
+                "amname": "btree",
+                "columns": ["customer_id"],
+                "is_primary": True,
+            }
+        ],
+    )
+    standalone_yaml = tmp_path / "disc.yaml"
+    standalone_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "default_catalog": "cbn",
+                "engines": {"pg_report": {"kind": "postgres", "dialect": "postgres"}},
+                "postgres_sources": {
+                    "pg_report": {
+                        "logical_catalog": "cbn",
+                        "schemas": {"src_pii": {"include": ["customer"]}},
+                    }
+                },
+                "pii_tables": ["cbn.src_pii.customer"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pg_emit = tmp_path / "pg_placement.yaml"
+    pg_schemas = tmp_path / "pg_schemas.json"
+    # Also test lakebase_connect fallback for single postgres_sources engine
+    rc2 = discovery_main(
+        [
+            "--config",
+            str(standalone_yaml),
+            "--emit",
+            str(pg_emit),
+            "--schemas-out",
+            str(pg_schemas),
+        ],
+        lakebase_connect=pg_cat.connect,
+    )
+    assert rc2 == 0
+    raw_pg = yaml.safe_load(pg_emit.read_text(encoding="utf-8"))
+    assert raw_pg["engines"]["pg_report"]["kind"] == "postgres"
+    assert raw_pg["tables"]["cbn.src_pii.customer"]["pii"] is True
+    assert json.loads(pg_schemas.read_text(encoding="utf-8")) == {
+        "cbn.src_pii.customer": ["customer_id", "full_name"]
+    }
+    if "postgres" in VALID_ENGINE_KINDS:
+        Placement.from_yaml(pg_emit)
+
+    # 3. Passing both --emit and --placement-out fails cleanly with exit 2
+    capsys.readouterr()
+    rc_conflict = discovery_main(
+        [
+            "--config",
+            str(serving_yaml),
+            "--emit",
+            str(tmp_path / "a.yaml"),
+            "--placement-out",
+            str(tmp_path / "b.yaml"),
+        ]
+    )
+    assert rc_conflict == 2
+    assert "Cannot specify both --emit and --placement-out" in capsys.readouterr().err
+

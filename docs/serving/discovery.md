@@ -5,7 +5,8 @@
 Seeknal Serving routes incoming SQL queries using a `Placement` model and a `schemas` mapping (`logical table name → column names`). In earlier versions, both structures were hand-written. The discovery subsystem (`seeknal.serving.discovery`) automates this process by discovering tables, physical bindings, schemas, and semantic cubes directly from live upstream systems:
 
 - **Lakekeeper (Iceberg REST catalog)**: Discovers canonical tables, schemas, primary keys, snapshot IDs, and row counts.
-- **Lakebase (`_lakebase_sync_state`)**: Discovers replication sync state, timestamps, and target tables for transactional point-lookup serving.
+- **Postgres & Lakebase (`pg_catalog` introspection via `postgres_sources`)**: Discovers allowlisted schemas, tables, views, materialized views, columns, indexes, derived `access` metadata, and freshness lag across both plain PostgreSQL (`kind: postgres`) and Atlas Lakebase (`kind: lakebase`).
+- **Lakebase (`public._lakebase_sync_state`)**: Discovers replication sync state, timestamps, and target tables (schema-qualified by default).
 - **Cube REST API (`/cubejs-api/v1/meta`)**: Discovers semantic cubes, measures, and dimensions.
 
 Discovery generates valid `Placement` configurations and schema dictionaries, calculates replication lag guarantees, and supports live periodic background catalog refreshes without query downtime.
@@ -36,14 +37,35 @@ Tables whose metadata fails to load or parse are skipped with a warning so disco
   - **401 Retry**: If Lakekeeper responds with an HTTP 401 Unauthorized, `LakekeeperSource` invalidates the cached token and immediately retries the request once with a fresh token. If the second attempt also returns 401, a `DiscoveryError` is raised.
 - **Static Bearer Token (`lakekeeper.token_env`)**: For legacy deployments with long-lived tokens, `token_env` specifies the environment variable containing the static token. `token_env` and `oauth` are mutually exclusive.
 
-### Lakebase (`LakebaseSyncSource`)
-Queries the Lakebase replication metadata table:
+### Lakebase Sync State (`LakebaseSyncSource`)
+Queries the schema-qualified replication metadata table (`public._lakebase_sync_state` by default, configurable via `sync_state_table` matching `^[a-z_][a-z0-9_]{0,62}(\.[a-z_][a-z0-9_]{0,62})?$`):
 ```sql
-SELECT target_table, snapshot_id, synced_at FROM _lakebase_sync_state
+SELECT target_table, snapshot_id, synced_at FROM public._lakebase_sync_state
 ```
-- `synced_at` supports standard Python datetimes or ISO-8601 formatted timestamp strings. Naive datetimes are interpreted as UTC.
+- `synced_at` supports Python `datetime`, `date`, or ISO-8601 formatted timestamp strings. Naive datetimes are interpreted as UTC.
 - Maps `target_table` to `SyncState(snapshot_id, synced_at)`.
-- Database query failures raise `DiscoveryError`.
+- Database query failures raise `DiscoveryError` (invalid `sync_state_table` identifiers raise `DiscoveryConfigError`).
+
+### Postgres & Lakebase `pg_catalog` Introspection (`postgres_introspect.py`)
+For engines configured under `postgres_sources` (`kind: postgres` or `kind: lakebase`), discovery runs four read-only `pg_catalog` queries parameterised by the allowlisted physical schemas (`n.nspname = ANY(%s)`):
+1. **Server facts**: `SHOW server_version_num` and `SHOW default_transaction_read_only`. Read-only sources (`kind: postgres` with `mode: read_only`, or `kind: lakebase` with `endpoint_type: read_only`) fail closed with `DiscoveryError` unless `default_transaction_read_only = on`.
+2. **Relations**: `pg_class` + `pg_namespace` (`relkind IN ('r','p','v','m')`) with `SELECT` privilege. Unanalyzed tables (`reltuples < 0`) and views (`relkind = 'v'`) yield `row_count: None`.
+3. **Columns**: `pg_attribute` (`attnum > 0`, not dropped, `has_column_privilege(..., 'SELECT')`), `format_type`, and `attnotnull`.
+4. **Indexes**: valid and ready `pg_index` + `pg_am` (`btree`, `hash`, `brin`, etc.), `indisprimary`, `indisunique`, key columns, opclasses, collations, expression flags, and partial predicates.
+
+#### Deny-by-Default & Access Metadata Derivation
+- Only schemas listed in `postgres_sources.<engine>.schemas`, tables passing `include`/`exclude` globs and `^[a-z_][a-z0-9_]{0,62}$` with `SELECT` privilege, and columns matching `^[a-z_][a-z0-9_]{0,62}$` with column `SELECT` privilege are exposed.
+- Physical name is `<physical_schema>.<table>`; logical name is `<logical_catalog>.<mapped_schema>.<table>`.
+- Partial, expression, and invalid/unready indexes are ignored for automatic derivation:
+  - `keys`: Primary key, else narrowest unique non-partial non-expression index with all `NOT NULL` columns.
+  - `filterable`: Leading column of valid non-partial non-expression `btree` or `hash` index, plus `keys`.
+  - `range_filterable`: Leading column of valid non-partial non-expression `btree` index.
+  - `prefix_filterable`: Leading `btree` column with `text_pattern_ops` / `varchar_pattern_ops` / `bpchar_pattern_ops` or `COLLATE "C"`.
+  - `sortable`: `NOT NULL` columns forming a leading prefix of any valid non-partial non-expression `btree` index, plus `keys`.
+  - `pattern`: For `pii` tables, `point` when `keys` exist else `filter`. Otherwise `scan` when `relkind != 'v'` and `row_count < require_filter_min_rows`, else `filter`.
+  - `require_filter`: `True` for `point` and `filter`, `False` for `scan`.
+  - `max_rows`: `50` for `pii` tables, else `None`.
+- Per-table overrides (`postgres_sources.<engine>.tables`) win over derived fields. Missing tables, unknown/unprivileged columns, `point` pattern without `keys`, or nullable `sortable` columns raise `DiscoveryError`. Declaring an unindexed column in `filterable` / `range_filterable` / `prefix_filterable` / `sortable` emits a warning.
 
 ### Cube (`CubeSource`)
 Discovers semantic cubes and views using:
@@ -96,8 +118,9 @@ lakekeeper:
   namespaces: [claims, analytics]           # Optional allowlist
 
 engines:
-  sr:   {kind: starrocks, dialect: starrocks, catalog: lakekeeper}
-  lb:   {kind: lakebase,  dialect: postgres}
+  sr:        {kind: starrocks, dialect: starrocks, catalog: lakekeeper}
+  pg_report: {kind: postgres,  dialect: postgres}
+  lb:        {kind: lakebase,  dialect: postgres}
   cube:
     kind: cube
     dialect: postgres
@@ -110,6 +133,29 @@ engines:
     # token_env: CUBE_API_TOKEN
   duck: {kind: duckdb,    dialect: duckdb}
 
+postgres_sources:
+  pg_report:
+    account: interactive
+    logical_catalog: lakekeeper
+    freshness:
+      sync_state_table: public._lakebase_sync_state
+      freshness_sql: "select max(as_of_date) from stg.load_control"
+    schemas:
+      rpt:     {include: ["rpt_*"], exclude: ["rpt_*_stg"]}
+      src_pii: {include: [customer], pii: true}
+    tables:
+      lakekeeper.src_pii.customer:
+        access: {pattern: point, keys: [customer_id], filterable: [customer_id], max_rows: 50}
+
+policy:
+  require_filter_min_rows: 100000
+  max_in_list: 1000
+  max_offset: 10000
+  guard_mode: enforce
+  pii_engines: []
+  pii_object_storage_engines: []
+
+# Legacy sync-state-only block remains supported:
 lakebase:
   engine: lb
   synced_tables:
@@ -120,7 +166,14 @@ lakebase:
 - `default_catalog`: Required non-empty string. Canonical logical names follow `<default_catalog>.<namespace>.<table>`.
 - `refresh_interval_seconds`: Refresh period in seconds (default: 60.0). Must be positive.
 - `timeout_seconds`: HTTP request timeout in seconds (default: 10.0). Must be positive.
-- Engines: Only one `starrocks` engine and at most one `cube` engine are allowed. `duckdb` engines default to `profile: local_file` (copied into placement `engines` without emitting Lakekeeper table serves); setting `profile: iceberg_direct` (with optional `alias` and `pin_current_snapshot: true`) emits `<alias>.<namespace>.<table>` serves with `max_lag_seconds` derived from the Lakekeeper current-snapshot timestamp age plus `refresh_interval_seconds` (see [`docs/serving/iceberg-direct.md`](iceberg-direct.md)).
+- Engines: Allowed kinds are `starrocks`, `cube`, `lakebase`, `postgres`, and `duckdb`. Engines in `placement.discovery.engines` cannot declare `storage_class` (declare `storage_class` on `connections.<name>` instead). Only one `starrocks` engine and at most one `cube` engine are allowed. `duckdb` engines default to `profile: local_file`; setting `profile: iceberg_direct` emits `<alias>.<namespace>.<table>` serves with `max_lag_seconds` derived from the Lakekeeper current-snapshot timestamp age plus `refresh_interval_seconds` (see [`docs/serving/iceberg-direct.md`](iceberg-direct.md)).
+- `postgres_sources`: Keys must reference engines of kind `postgres` or `lakebase`, with valid `account` (`interactive`, `bi`, `report`, `ask`, `job`), `schemas`, optional `schema_map`, `freshness`, and `tables` overrides.
+- **Storage-Class PII Rule**: Plaintext `pii: true` tables (where `tokenized` is not `true`) must be served on an engine with effective `storage_class: local` (such as `kind: postgres` by default), unless the engine is explicitly listed in `policy.pii_object_storage_engines`.
+- **Lakekeeper Merge Rules**:
+  - `pii: true` tables never merge: lake serves (`duckdb` / `starrocks`) are dropped and only the Postgres-wire serve is kept.
+  - Non-PII tables with identical column lists merge into one table entry carrying both lake and Postgres-wire serves plus the Postgres-wire `access` metadata and `keys`.
+  - Non-PII tables with differing column lists drop the Postgres-wire serve and emit a warning.
+- **Freshness Cascade**: For `postgres_sources`, `max_lag_seconds` tries in order: (1) `sync_state_table` row for `<physical_schema>.<table>` (default ON for `lakebase`, opt-in for `postgres`), (2) `freshness_sql` executed inside `BEGIN READ ONLY ... ROLLBACK` (must return 1 non-null timestamp/date), (3) `SELECT pg_catalog.pg_postmaster_start_time()` on `read_only` `lakebase` endpoints, (4) `None`.
 - `lakebase.engine` must reference a defined engine with kind `lakebase`.
 - Tokens come strictly from environment variables named by `token_env` / `*_env` or safe secret files named by `*_file`. Secret files must not be group- or world-readable (`0600` or stricter required).
 - Validation failures raise `DiscoveryConfigError` without leaking credentials.
@@ -168,9 +221,15 @@ Adding `refresh_interval_seconds` is deliberate. Catalog discovery executes peri
 
 ## 6. CLI Usage (`__main__.py`)
 
-Discovery can be executed as a one-shot CLI command:
+Discovery can be executed as a one-shot CLI command against either a standalone discovery YAML or a full `serving.yaml` (`placement.discovery`):
 
 ```bash
+# Emit reviewable static placement YAML directly (go-live fallback):
+python -m seeknal.serving.discovery \
+  --config serving.yaml \
+  --emit placement.yaml
+
+# Or emit both placement YAML and schemas JSON:
 python -m seeknal.serving.discovery \
   --config cfg.yaml \
   --placement-out placement.yaml \
@@ -178,12 +237,12 @@ python -m seeknal.serving.discovery \
 ```
 
 - Emits discovery diagnostics and warnings to `stderr`.
-- Writes valid placement YAML (loadable with `Placement.from_yaml`) and schemas JSON.
+- Writes valid placement YAML (loadable with `Placement.from_yaml`) and optional schemas JSON.
 - **Exit Codes**:
   - `0`: Discovery succeeded.
   - `2`: `DiscoveryError` or `DiscoveryConfigError` encountered. Clean error message printed to `stderr` with no traceback and no credential leaks.
 
-For programmatic testing, `main(argv, *, http_client=None, lakebase_connect=None, env=None)` is exposed directly.
+For programmatic testing, `main(argv, *, http_client=None, lakebase_connect=None, postgres_connects=None, storage_classes=None, env=None)` is exposed directly.
 
 ---
 
