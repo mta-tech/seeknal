@@ -2210,6 +2210,41 @@ def create_app(
 
     async def cancel(request: Request) -> Response:
         req_start = time.perf_counter()
+        content_length_hdr = request.headers.get("content-length")
+        if content_length_hdr is not None:
+            try:
+                if int(content_length_hdr) > max_body_bytes:
+                    return await _finish(
+                        _error_response("payload_too_large"),
+                        route="/v1/cancel",
+                        status=413,
+                        code="payload_too_large",
+                        elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                    )
+            except ValueError:
+                pass
+
+        try:
+            raw_body = await request.body()
+        except ClientDisconnect:
+            return await _finish(
+                _error_response("query_cancelled"),
+                route="/v1/cancel",
+                status=499,
+                code="query_cancelled",
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                log_request_line=False,
+            )
+
+        if len(raw_body) > max_body_bytes:
+            return await _finish(
+                _error_response("payload_too_large"),
+                route="/v1/cancel",
+                status=413,
+                code="payload_too_large",
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+            )
+
         auth_header = request.headers.get("authorization")
         if not auth_header:
             if metrics is not None:
@@ -2236,35 +2271,18 @@ def create_app(
 
         token = parts[1].strip()
 
-        try:
-            raw_body = await request.body()
-        except ClientDisconnect:
-            return await _finish(
-                _error_response("query_cancelled"),
-                route="/v1/cancel",
-                status=499,
-                code="query_cancelled",
-                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                log_request_line=False,
+        stripped_body = raw_body.strip(b" \t\r\n")
+        if stripped_body:
+            is_empty_json_obj = (
+                len(stripped_body) >= 2
+                and stripped_body[0:1] == b"{"
+                and stripped_body[-1:] == b"}"
+                and stripped_body[1:-1].strip(b" \t\r\n") == b""
             )
-
-        if raw_body.strip():
-            c_claims, c_jti, c_sub = _extract_verified_cancel_claims(token, pipeline)
-            try:
-                body_json = json.loads(raw_body.decode("utf-8"))
-            except Exception:
-                return await _finish(
-                    _error_response("invalid_sql", token=token),
-                    route="/v1/cancel",
-                    status=400,
-                    code="invalid_sql",
-                    elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                    audit_id=c_jti,
-                    subject=c_sub,
-                    token=token,
-                    claims=c_claims,
+            if not is_empty_json_obj:
+                c_claims, c_jti, c_sub = _extract_verified_cancel_claims(
+                    token, pipeline
                 )
-            if not isinstance(body_json, dict) or body_json != {}:
                 return await _finish(
                     _error_response("invalid_sql", token=token),
                     route="/v1/cancel",
