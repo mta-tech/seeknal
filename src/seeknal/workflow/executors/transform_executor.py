@@ -453,14 +453,21 @@ class TransformExecutor(BaseExecutor):
                             f"{dispatch_result.succeeded}/{dispatch_result.total} succeeded"
                         )
                 except Exception as e:
+                    from seeknal.workflow.materialization.dispatcher import (
+                        scrub_secrets,
+                        target_is_required,
+                    )
+
+                    safe_error = scrub_secrets(str(e))
                     logger.warning(
-                        f"Failed to materialize node '{self.node.id}': {e}"
+                        f"Failed to materialize node '{self.node.id}': {safe_error}"
                     )
                     result.metadata["materialization"] = {
                         "enabled": True,
                         "success": False,
-                        "error": str(e),
-                        "required_failed": bool(getattr(e, "required_materialization", False)),
+                        "error": safe_error,
+                        "required_failed": bool(getattr(e, "required_materialization", False))
+                        or any(target_is_required(t) for t in mat_targets if isinstance(t, dict)),
                         "failure_category": getattr(e, "failure_category", None),
                     }
             elif not mat_targets:
@@ -492,17 +499,21 @@ class TransformExecutor(BaseExecutor):
                             f"'{mat_result.get('table')}' ({mat_result.get('row_count')} rows)"
                         )
                 except Exception as e:
+                    from seeknal.workflow.materialization.dispatcher import scrub_secrets
+
+                    safe_error = scrub_secrets(str(e))
                     logger.warning(
-                        f"Failed to materialize node '{self.node.id}' to Iceberg: {e}"
+                        f"Failed to materialize node '{self.node.id}' to Iceberg: {safe_error}"
                     )
                     result.metadata["materialization"] = {
                         "enabled": True,
                         "success": False,
-                        "error": str(e),
+                        "error": safe_error,
                         "required_failed": bool(getattr(e, "required_materialization", False)),
                         "failure_category": getattr(e, "failure_category", None),
                     }
 
+        self._apply_materialization_status(result)
         return result
 
     # --- Helper Methods ---

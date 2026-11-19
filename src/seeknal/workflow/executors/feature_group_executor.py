@@ -694,17 +694,25 @@ class FeatureGroupExecutor(BaseExecutor):
                         "results": dispatched.serializable_results,
                     }
                 except Exception as exc:
+                    from seeknal.workflow.materialization.dispatcher import (
+                        scrub_secrets,
+                        target_is_required,
+                    )
+
+                    safe_error = scrub_secrets(str(exc))
                     result.metadata["materialization"] = {
                         "enabled": True,
                         "success": False,
-                        "error": str(exc),
+                        "error": safe_error,
                         "required_failed": bool(
                             getattr(exc, "required_materialization", False)
-                        ),
+                        )
+                        or any(target_is_required(t) for t in targets if isinstance(t, dict)),
                         "failure_category": getattr(
                             exc, "failure_category", None
                         ),
                     }
+                self._apply_materialization_status(result)
                 return result
             try:
                 # Get the context's DuckDB connection (has the view)
@@ -735,17 +743,20 @@ class FeatureGroupExecutor(BaseExecutor):
                         f"'{mat_result.get('table')}' ({mat_result.get('row_count')} rows)"
                     )
             except Exception as e:
-                # Log materialization error but don't fail the executor
-                # Materialization is optional/augmentation, not core functionality
+                from seeknal.workflow.materialization.dispatcher import scrub_secrets
+
+                safe_error = scrub_secrets(str(e))
+                # Log materialization error; required failures are applied below
                 logger.warning(
-                    f"Failed to materialize node '{self.node.id}' to Iceberg: {e}"
+                    f"Failed to materialize node '{self.node.id}' to Iceberg: {safe_error}"
                 )
                 result.metadata["materialization"] = {
                     "enabled": True,
                     "success": False,
-                    "error": str(e),
+                    "error": safe_error,
                     "required_failed": bool(getattr(e, "required_materialization", False)),
                     "failure_category": getattr(e, "failure_category", None),
                 }
 
+        self._apply_materialization_status(result)
         return result

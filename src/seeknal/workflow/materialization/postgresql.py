@@ -27,16 +27,21 @@ logger = logging.getLogger(__name__)
 
 
 def _mask_password(conn_str: str) -> str:
-    """Lazily import and call mask_password from the connections module."""
+    """Scrub passwords and DSN credentials for safe logging and error messages."""
     from seeknal.connections.postgresql import mask_password  # ty: ignore[unresolved-import]
+    from seeknal.workflow.materialization.dispatcher import scrub_secrets  # ty: ignore[unresolved-import]
 
-    return mask_password(conn_str)
+    return scrub_secrets(mask_password(conn_str))
 
 
 class PostgresMaterializationError(Exception):
     """Raised when a PostgreSQL materialization operation fails."""
 
-    pass
+    failure_category: str = "write_failed"
+
+    def __init__(self, message: str, *, failure_category: str = "write_failed") -> None:
+        super().__init__(_mask_password(message))
+        self.failure_category = failure_category
 
 
 class PostgresMaterializationHelper:
@@ -158,14 +163,15 @@ class PostgresMaterializationHelper:
         qualified = self._qualified_table()
         cascade = " CASCADE" if self.mat_config.cascade else ""
 
-        self._attach(con)
         try:
+            self._attach(con)
             row_count = self._row_count(con, view_name)
 
             if not self.mat_config.create_table and not self._table_exists(con):
                 raise PostgresMaterializationError(
                     f"Table {self.mat_config.table} does not exist and "
-                    f"create_table is disabled."
+                    f"create_table is disabled.",
+                    failure_category="preflight_failed",
                 )
 
             con.execute(f"DROP TABLE IF EXISTS {qualified}{cascade}")
@@ -187,7 +193,7 @@ class PostgresMaterializationHelper:
             raise
         except Exception as exc:
             raise PostgresMaterializationError(
-                f"Full materialization failed for {self.mat_config.table}: {exc}"
+                f"Full materialization failed for {self.mat_config.table}: {_mask_password(str(exc))}"
             ) from exc
         finally:
             self._detach(con)
@@ -207,14 +213,15 @@ class PostgresMaterializationHelper:
         time_column = self.mat_config.time_column
         lookback = self.mat_config.lookback
 
-        self._attach(con)
         try:
+            self._attach(con)
             # Auto-create if table does not exist
             if not self._table_exists(con):
                 if not self.mat_config.create_table:
                     raise PostgresMaterializationError(
                         f"Table {self.mat_config.table} does not exist and "
-                        f"create_table is disabled."
+                        f"create_table is disabled.",
+                        failure_category="preflight_failed",
                     )
                 con.execute(
                     f"CREATE TABLE {qualified} AS SELECT * FROM {view_name} WHERE 1=0"
@@ -251,7 +258,7 @@ class PostgresMaterializationHelper:
             raise
         except Exception as exc:
             raise PostgresMaterializationError(
-                f"Incremental materialization failed for {self.mat_config.table}: {exc}"
+                f"Incremental materialization failed for {self.mat_config.table}: {_mask_password(str(exc))}"
             ) from exc
         finally:
             self._detach(con)
@@ -271,14 +278,15 @@ class PostgresMaterializationHelper:
         unique_keys = self.mat_config.unique_keys
         temp_table = "_seeknal_upsert"
 
-        self._attach(con)
         try:
+            self._attach(con)
             # Auto-create if table does not exist
             if not self._table_exists(con):
                 if not self.mat_config.create_table:
                     raise PostgresMaterializationError(
                         f"Table {self.mat_config.table} does not exist and "
-                        f"create_table is disabled."
+                        f"create_table is disabled.",
+                        failure_category="preflight_failed",
                     )
                 con.execute(
                     f"CREATE TABLE {qualified} AS SELECT * FROM {view_name} WHERE 1=0"
@@ -322,7 +330,7 @@ class PostgresMaterializationHelper:
             except Exception:
                 pass
             raise PostgresMaterializationError(
-                f"Upsert materialization failed for {self.mat_config.table}: {exc}"
+                f"Upsert materialization failed for {self.mat_config.table}: {_mask_password(str(exc))}"
             ) from exc
         finally:
             self._detach(con)

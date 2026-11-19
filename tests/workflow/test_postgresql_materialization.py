@@ -428,3 +428,30 @@ class TestPostgresMaterializationHelper:
 
         for record in caplog.records:
             assert "testpass" not in record.getMessage()
+
+    def test_attach_failure_scrubs_password_and_detaches(
+        self, pg_config, mat_config_full
+    ):
+        """An ATTACH failure containing DSN/password credentials scrubs them in PostgresMaterializationError."""
+        con = MagicMock()
+
+        def side_effect(sql):
+            if "ATTACH" in sql:
+                raise RuntimeError(
+                    "Unable to connect: postgresql://testuser:testpass@localhost:5432/testdb "
+                    "password=testpass"
+                )
+            res = MagicMock()
+            res.fetchone.return_value = (1,)
+            return res
+
+        con.execute.side_effect = side_effect
+        helper = PostgresMaterializationHelper(pg_config, mat_config_full)
+
+        with pytest.raises(PostgresMaterializationError) as exc_info:
+            helper.materialize_full(con, "v")
+
+        assert "testpass" not in str(exc_info.value)
+        assert "testuser:" not in str(exc_info.value)
+        assert exc_info.value.failure_category == "write_failed"
+

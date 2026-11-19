@@ -22,12 +22,50 @@ Usage::
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
 from seeknal.workflow.materialization.operations import WriteResult  # ty: ignore[unresolved-import]
 
 logger = logging.getLogger(__name__)
+
+_URI_CREDENTIALS_RE = re.compile(
+    r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s'\"]+)@"
+)
+_KV_CREDENTIALS_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd|secret|token|auth_token|authtoken|api_key|apikey|"
+    r"access_key|secret_key|client_secret|bearer_token)(\s*[=:]\s*)"
+    r"('[^']*'|\"[^\"]*\"|[^\s&'\",;)]+)"
+)
+_SQL_QUOTED_SECRET_RE = re.compile(
+    r"(?i)\b(TOKEN|SECRET)(\s+)('[^']*'|\"[^\"]*\")"
+)
+_BEARER_TOKEN_RE = re.compile(
+    r"(?i)\b(Bearer\s+)([A-Za-z0-9._~+/=-]+)"
+)
+
+
+def scrub_secrets(text: Any) -> str:
+    """Scrub DSN userinfo, password=... key-values, and URI/token credentials from text."""
+    s = text if isinstance(text, str) else str(text)
+    s = _URI_CREDENTIALS_RE.sub(r"\1***@", s)
+    s = _KV_CREDENTIALS_RE.sub(r"\1\2***", s)
+    s = _SQL_QUOTED_SECRET_RE.sub(r"\1\2'***'", s)
+    s = _BEARER_TOKEN_RE.sub(r"\1***", s)
+    return s
+
+
+def target_is_required(target: Dict[str, Any]) -> bool:
+    """Return True if a failure on *target* must mark the node FAILED."""
+    if target.get("enabled") is False:
+        return False
+    target_type = target.get("type", "iceberg")
+    if target_type == "postgresql":
+        return target.get("required", True) is not False
+    if target_type == "iceberg":
+        return target.get("mode") not in (None, "append", "overwrite")
+    return False
 
 
 def iceberg_commit_requires_reconciliation(metadata: Dict[str, Any]) -> bool:
@@ -140,6 +178,12 @@ class MaterializationDispatcher:
                 logger.info("Materializing %s", target_label)
 
                 if target_type == "postgresql":
+                    if "required" in target and not isinstance(target["required"], bool):
+                        from seeknal.workflow.materialization.pg_config import PostgresConfigError
+
+                        raise PostgresConfigError(
+                            f"'required' must be a boolean, got {type(target['required']).__name__}"
+                        )
                     write_result = self._materialize_postgresql(con, view_name, target)
                 elif target_type == "iceberg":
                     write_result = self._materialize_iceberg(con, view_name, target)
@@ -164,20 +208,24 @@ class MaterializationDispatcher:
 
             except Exception as exc:
                 result.failed += 1
-                result.required_failed |= (
-                    target_type == "iceberg"
-                    and target.get("mode") not in (None, "append", "overwrite")
-                )
+                is_required = target_is_required(target)
+                result.required_failed |= is_required
+                safe_error = scrub_secrets(str(exc))
+                failure_category = getattr(exc, "failure_category", None)
+                if not failure_category:
+                    if target_type == "iceberg":
+                        failure_category = "preflight_failed"
+                    elif target_type == "postgresql":
+                        failure_category = "write_failed"
                 result.results.append({
                     "target": target_label,
                     "type": target_type,
                     "success": False,
-                    "error": str(exc),
-                    "failure_category": getattr(exc, "failure_category", None) or (
-                        "preflight_failed" if target_type == "iceberg" else None
-                    ),
+                    "required": is_required,
+                    "error": safe_error,
+                    "failure_category": failure_category,
                 })
-                logger.error("Failed to materialize %s: %s", target_label, exc)
+                logger.error("Failed to materialize %s: %s", target_label, safe_error)
 
         return result
 
@@ -252,7 +300,11 @@ class MaterializationDispatcher:
                 except Exception:
                     pass
         except Exception as exc:
-            logger.warning("Could not ensure schema '%s' exists: %s", schema_name, exc)
+            logger.warning(
+                "Could not ensure schema '%s' exists: %s",
+                schema_name,
+                scrub_secrets(str(exc)),
+            )
 
     # ------------------------------------------------------------------
     # Backend-specific routing

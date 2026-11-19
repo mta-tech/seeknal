@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 class PostgresConfigError(Exception):
     """Raised when PostgreSQL materialization configuration is invalid."""
 
-    pass
+    failure_category: str = "preflight_failed"
 
 
 class PostgresMaterializationMode(str, Enum):
@@ -66,6 +66,7 @@ class PostgresMaterializationConfig:
     unique_keys: List[str] = field(default_factory=list)
     create_table: bool = True
     cascade: bool = False
+    required: bool = True
 
     def validate(self) -> None:
         """
@@ -74,6 +75,11 @@ class PostgresMaterializationConfig:
         Raises:
             PostgresConfigError: If configuration is invalid
         """
+        if not isinstance(self.required, bool):
+            raise PostgresConfigError(
+                f"'required' must be a boolean, got {type(self.required).__name__}"
+            )
+
         # connection must not be empty
         if not self.connection:
             raise PostgresConfigError(
@@ -156,6 +162,12 @@ class PostgresMaterializationConfig:
                 f"Valid modes: {', '.join(valid_modes)}"
             )
 
+        required = data.get("required", True)
+        if not isinstance(required, bool):
+            raise PostgresConfigError(
+                f"'required' must be a boolean, got {type(required).__name__}"
+            )
+
         return cls(
             type=data.get("type", "postgresql"),
             connection=data.get("connection", ""),
@@ -166,4 +178,5 @@ class PostgresMaterializationConfig:
             unique_keys=data.get("unique_keys", []),
             create_table=data.get("create_table", True),
             cascade=data.get("cascade", False),
+            required=required,
         )

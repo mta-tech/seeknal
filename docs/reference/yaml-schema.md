@@ -1130,6 +1130,14 @@ Write pipeline outputs to multiple storage targets simultaneously using the plur
 | `when_not_matched` | string | No | Iceberg `upsert` new-key policy: `insert` or `skip` | `insert` |
 | `time_column` | string | For `incremental_by_time` | Time column for range-based incremental | - |
 | `lookback` | string | No | Lookback window for incremental (e.g., `7d`) | - |
+| `required` | boolean | No | For `postgresql` targets: whether a target failure marks the node `FAILED` (`false` opts into best-effort execution) | `true` |
+
+### Failure Semantics, Execution Order, and Partial Success
+
+- **PostgreSQL targets are required by default (`required: true`).** When a `postgresql` target fails, the node ends `FAILED` with an error message naming the failed target label (e.g., `transform.enriched_orders[0]:postgresql`) and its `failure_category`, and `seeknal run` (both sequential and `--parallel`) exits non-zero. DSN userinfo and `password=...` credentials are scrubbed from logs, metadata, and error messages.
+- **Opt-out (`required: false`).** Set `required: false` on a `postgresql` target to keep best-effort behaviour for that target: the node stays `SUCCESS` and the failure is recorded in `metadata.materialization.results`.
+- **Asymmetry with Iceberg targets.** Iceberg `append` and `overwrite` targets remain best-effort by default, whereas Iceberg advanced modes (`upsert` and `insert_overwrite`) and `postgresql` targets are required by default.
+- **Execution order and partial success (no cross-target rollback).** All targets in `materializations:` still run in YAML list order even if an earlier target fails. Targets that succeeded are **not** rolled back when another target on the same node fails; `metadata.materialization.results` reports each target's outcome so partial success is visible.
 
 ### Write Modes
 

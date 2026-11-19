@@ -1,34 +1,42 @@
-"""Characterisation tests for dual Iceberg + PostgreSQL materialization on a single node.
+"""Tests for dual Iceberg + PostgreSQL materialization on a single node.
 
-Pins current behaviour with mocks (no real PostgreSQL or Iceberg connections):
+Verifies behaviour with mocks (no real PostgreSQL or Iceberg connections):
 1. YAML parsing/validation of `materializations: [{type: iceberg, ...}, {type: postgresql, ...}]`
-   for transform (and source / feature_group / python nodes).
+   for transform, source, feature_group, and python nodes, including boolean `required`.
 2. Both targets are written from the same DuckDB view in list order during a single run.
 3. Supported PostgreSQL modes (`full`, `incremental_by_time`, `upsert_by_key`; not `append`/`overwrite`).
 4. Failure handling & `required_failed` semantics:
-   - A failed `postgresql` target is best-effort and sets `required_failed=False`, so the node
-     itself still finishes with `ExecutionStatus.SUCCESS` (silent at node status level).
-   - A failed `iceberg` target with basic `append`/`overwrite` also leaves `required_failed=False`
-     (node status `ExecutionStatus.SUCCESS`), whereas a failed `iceberg` target with advanced
-     mode (`upsert` or `insert_overwrite`) sets `required_failed=True` and flips node status to
-     `ExecutionStatus.FAILED` in `BaseExecutor.run()`.
-5. Environment / namespace prefixing differences (`MaterializationDispatcher._prefix_target`).
+   - A failed `postgresql` target is required by default (`required_failed=True`) and marks the
+     node `ExecutionStatus.FAILED` with an error message naming the target label and failure category.
+   - Setting `required: false` on a `postgresql` target opts back into best-effort behaviour
+     (`required_failed=False`, node status `ExecutionStatus.SUCCESS` with failure in metadata).
+   - A failed `iceberg` target with basic `append`/`overwrite` leaves `required_failed=False`
+     (node status `ExecutionStatus.SUCCESS`), whereas an advanced mode (`upsert` or `insert_overwrite`)
+     sets `required_failed=True` and marks the node `ExecutionStatus.FAILED`.
+5. Secret scrubbing across dispatcher logs, result metadata, and node error messages.
+6. CLI-level `seeknal run` (sequential and `--parallel`) exits non-zero when a PostgreSQL target fails.
+7. Environment / namespace prefixing differences (`MaterializationDispatcher._prefix_target`).
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import duckdb
 import pandas as pd
 import pytest
+import typer
+from typer.testing import CliRunner
 
+from seeknal.cli.main import app
 from seeknal.dag.manifest import Node, NodeType
 from seeknal.workflow.dag import DAGBuilder
 from seeknal.workflow.executors.base import ExecutionContext, ExecutionStatus, ExecutorResult
 from seeknal.workflow.executors.feature_group_executor import FeatureGroupExecutor
 from seeknal.workflow.executors.python_executor import PythonExecutor
+from seeknal.workflow.executors.source_executor import SourceExecutor
 from seeknal.workflow.executors.transform_executor import TransformExecutor
 from seeknal.workflow.materialization.dispatcher import MaterializationDispatcher
 from seeknal.workflow.materialization.operations import WriteResult
@@ -144,6 +152,59 @@ class TestPostgresMaterializationModes:
                 }
             )
 
+    def test_postgresql_required_defaults_true_and_validates_boolean(self):
+        default_cfg = PostgresMaterializationConfig.from_dict(
+            {
+                "type": "postgresql",
+                "connection": "pg_local",
+                "table": "public.orders",
+                "mode": "full",
+                "extra_unknown_key": "ignored",
+            }
+        )
+        default_cfg.validate()
+        assert default_cfg.required is True
+
+        opt_out_cfg = PostgresMaterializationConfig.from_dict(
+            {
+                "type": "postgresql",
+                "connection": "pg_local",
+                "table": "public.orders",
+                "mode": "full",
+                "required": False,
+            }
+        )
+        opt_out_cfg.validate()
+        assert opt_out_cfg.required is False
+
+        for invalid_required in ["false", "true", 0, 1, None, ["false"]]:
+            with pytest.raises(PostgresConfigError, match="'required' must be a boolean"):
+                PostgresMaterializationConfig.from_dict(
+                    {
+                        "type": "postgresql",
+                        "connection": "pg_local",
+                        "table": "public.orders",
+                        "mode": "full",
+                        "required": invalid_required,
+                    }
+                )
+            with pytest.raises(typer.Exit):
+                validate_schema(
+                    {
+                        "kind": "transform",
+                        "name": "curated_orders",
+                        "materializations": [
+                            {
+                                "type": "postgresql",
+                                "connection": "pg_local",
+                                "table": "public.orders",
+                                "mode": "full",
+                                "required": invalid_required,
+                            }
+                        ],
+                    }
+                )
+
 
 class TestDualTargetExecutionOrderAndFailureSemantics:
     """Both targets are written from the same DuckDB view in order; check failure statuses."""
@@ -214,9 +275,81 @@ class TestDualTargetExecutionOrderAndFailureSemantics:
         assert mat_meta["required_failed"] is False
         assert [r["type"] for r in mat_meta["results"]] == ["iceberg", "postgresql"]
 
-    def test_failed_postgresql_target_is_silent_at_node_status_level(self, tmp_path: Path):
-        """Characterises current behaviour: when PostgreSQL target fails, required_failed is False
-        and TransformExecutor.run() still returns ExecutionStatus.SUCCESS."""
+    def test_failed_postgresql_target_fails_node_by_default_and_attempts_iceberg(
+        self, tmp_path: Path
+    ):
+        """A dual iceberg+postgresql node where postgresql fails ends FAILED with the target
+        label, target type, and failure category named, while the iceberg target is still attempted."""
+        ctx = _make_exec_context(tmp_path)
+        node = Node(
+            id="transform.curated_orders",
+            name="curated_orders",
+            node_type=NodeType.TRANSFORM,
+            config={
+                "kind": "transform",
+                "name": "curated_orders",
+                "transform": "SELECT 1 AS order_id, 42.5 AS amount",
+                "materializations": [
+                    {
+                        "type": "postgresql",
+                        "connection": "pg_local",
+                        "table": "public.curated_orders",
+                        "mode": "upsert_by_key",
+                        "unique_keys": ["order_id"],
+                    },
+                    {
+                        "type": "iceberg",
+                        "table": "warehouse.curated.orders",
+                        "mode": "append",
+                    },
+                ],
+            },
+        )
+
+        attempted: list[str] = []
+
+        def fake_pg_fail(self_disp, con, view_name, target_cfg):
+            attempted.append("postgresql")
+            raise RuntimeError("PostgreSQL connection refused")
+
+        def fake_iceberg_ok(self_disp, con, view_name, target_cfg):
+            attempted.append("iceberg")
+            return WriteResult(success=True, row_count=1, duration_seconds=0.05)
+
+        with (
+            patch.object(MaterializationDispatcher, "_materialize_postgresql", fake_pg_fail),
+            patch.object(MaterializationDispatcher, "_materialize_iceberg", fake_iceberg_ok),
+        ):
+            executor = TransformExecutor(node, ctx)
+            result = executor.run()
+
+        assert attempted == ["postgresql", "iceberg"]
+        assert result.status == ExecutionStatus.FAILED
+        assert result.is_failed() is True
+        assert result.error_message is not None
+        assert "Required postgresql materialization failed" in result.error_message
+        assert "transform.curated_orders[0]:postgresql" in result.error_message
+        assert "failure_category=write_failed" in result.error_message
+        assert "Iceberg" not in result.error_message
+
+        mat_meta = result.metadata["materialization"]
+        assert mat_meta["success"] is False
+        assert mat_meta["total"] == 2
+        assert mat_meta["succeeded"] == 1
+        assert mat_meta["failed"] == 1
+        assert mat_meta["required_failed"] is True
+        assert mat_meta["results"][0]["type"] == "postgresql"
+        assert mat_meta["results"][0]["success"] is False
+        assert mat_meta["results"][0]["failure_category"] == "write_failed"
+        assert "PostgreSQL connection refused" in mat_meta["results"][0]["error"]
+        assert mat_meta["results"][1]["type"] == "iceberg"
+        assert mat_meta["results"][1]["success"] is True
+
+    def test_failed_postgresql_target_with_required_false_keeps_node_success(
+        self, tmp_path: Path
+    ):
+        """Setting `required: false` on a postgresql target keeps best-effort behaviour:
+        node status is SUCCESS while the failure is recorded in result metadata."""
         ctx = _make_exec_context(tmp_path)
         node = Node(
             id="transform.curated_orders",
@@ -238,6 +371,7 @@ class TestDualTargetExecutionOrderAndFailureSemantics:
                         "table": "public.curated_orders",
                         "mode": "upsert_by_key",
                         "unique_keys": ["order_id"],
+                        "required": False,
                     },
                 ],
             },
@@ -258,7 +392,6 @@ class TestDualTargetExecutionOrderAndFailureSemantics:
             executor = TransformExecutor(node, ctx)
             result = executor.run()
 
-        # Node status remains SUCCESS because required_failed is only set for Iceberg advanced modes
         assert result.status == ExecutionStatus.SUCCESS
         assert result.is_success() is True
         assert result.error_message is None
@@ -273,11 +406,68 @@ class TestDualTargetExecutionOrderAndFailureSemantics:
         assert mat_meta["results"][0]["success"] is True
         assert mat_meta["results"][1]["type"] == "postgresql"
         assert mat_meta["results"][1]["success"] is False
+        assert mat_meta["results"][1]["required"] is False
         assert "PostgreSQL connection refused" in mat_meta["results"][1]["error"]
 
+    def test_postgresql_success_and_iceberg_append_failure_behaves_as_before(
+        self, tmp_path: Path
+    ):
+        """Iceberg append/overwrite failures remain best-effort when PostgreSQL succeeds."""
+        ctx = _make_exec_context(tmp_path)
+        node = Node(
+            id="transform.curated_orders",
+            name="curated_orders",
+            node_type=NodeType.TRANSFORM,
+            config={
+                "kind": "transform",
+                "name": "curated_orders",
+                "transform": "SELECT 1 AS order_id, 42.5 AS amount",
+                "materializations": [
+                    {
+                        "type": "iceberg",
+                        "table": "warehouse.curated.orders",
+                        "mode": "append",
+                    },
+                    {
+                        "type": "postgresql",
+                        "connection": "pg_local",
+                        "table": "public.curated_orders",
+                        "mode": "full",
+                    },
+                ],
+            },
+        )
+
+        with (
+            patch.object(
+                MaterializationDispatcher,
+                "_materialize_iceberg",
+                side_effect=RuntimeError("Iceberg catalog unreachable"),
+            ),
+            patch.object(
+                MaterializationDispatcher,
+                "_materialize_postgresql",
+                return_value=WriteResult(success=True, row_count=1, duration_seconds=0.05),
+            ),
+        ):
+            executor = TransformExecutor(node, ctx)
+            result = executor.run()
+
+        assert result.status == ExecutionStatus.SUCCESS
+        assert result.is_success() is True
+        assert result.error_message is None
+        mat_meta = result.metadata["materialization"]
+        assert mat_meta["required_failed"] is False
+        assert mat_meta["succeeded"] == 1
+        assert mat_meta["failed"] == 1
+        assert mat_meta["results"][0]["type"] == "iceberg"
+        assert mat_meta["results"][0]["success"] is False
+        assert mat_meta["results"][1]["type"] == "postgresql"
+        assert mat_meta["results"][1]["success"] is True
+
     def test_failed_iceberg_advanced_mode_fails_node_via_required_failed(self, tmp_path: Path):
-        """Contrast with PostgreSQL failure: an Iceberg `upsert` failure sets required_failed=True
-        and BaseExecutor.run() flips the node status to ExecutionStatus.FAILED."""
+        """An Iceberg `upsert` failure sets required_failed=True and BaseExecutor.run()
+        flips the node status to ExecutionStatus.FAILED."""
         ctx = _make_exec_context(tmp_path)
         node = Node(
             id="transform.curated_orders",
@@ -319,20 +509,23 @@ class TestDualTargetExecutionOrderAndFailureSemantics:
             executor = TransformExecutor(node, ctx)
             result = executor.run()
 
-        # PostgreSQL still ran (best-effort), but Iceberg upsert failure sets required_failed=True
+        # PostgreSQL still ran, and Iceberg upsert failure sets required_failed=True
         # which causes BaseExecutor.run() to mark the node FAILED.
         assert result.status == ExecutionStatus.FAILED
         assert result.is_failed() is True
         assert "Required Iceberg materialization failed" in (result.error_message or "")
+        assert "transform.curated_orders[0]:iceberg" in (result.error_message or "")
         assert result.metadata["materialization"]["required_failed"] is True
         assert result.metadata["materialization"]["succeeded"] == 1
         assert result.metadata["materialization"]["failed"] == 1
 
-    def test_python_and_feature_group_executors_dispatch_dual_targets(self, tmp_path: Path):
-        """Both PythonExecutor.post_execute and FeatureGroupExecutor.post_execute dispatch
-        dual Iceberg + PostgreSQL targets from their respective DuckDB views."""
+    def test_python_feature_group_and_source_executors_honour_postgresql_required_semantics(
+        self, tmp_path: Path
+    ):
+        """PythonExecutor, FeatureGroupExecutor, and SourceExecutor mark the node FAILED when
+        a required postgresql target fails, and keep SUCCESS when `required: false`."""
         ctx = _make_exec_context(tmp_path)
-        targets = [
+        default_targets = [
             {"type": "iceberg", "table": "warehouse.curated.features", "mode": "overwrite"},
             {
                 "type": "postgresql",
@@ -341,20 +534,22 @@ class TestDualTargetExecutionOrderAndFailureSemantics:
                 "mode": "full",
             },
         ]
+        opt_out_targets = [
+            {"type": "iceberg", "table": "warehouse.curated.features", "mode": "overwrite"},
+            {
+                "type": "postgresql",
+                "connection": "pg_local",
+                "table": "public.features",
+                "mode": "full",
+                "required": False,
+            },
+        ]
 
         # 1. PythonExecutor post_execute reads intermediate parquet into `transform.<name>` view
         intermediate_dir = ctx.target_path / "intermediate"
         intermediate_dir.mkdir(parents=True, exist_ok=True)
         py_parquet = intermediate_dir / "python_py_feat.parquet"
         pd.DataFrame({"user_id": [1, 2], "score": [0.8, 0.9]}).to_parquet(py_parquet, index=False)
-
-        py_node = Node(
-            id="python.py_feat",
-            name="py_feat",
-            node_type=NodeType.PYTHON,
-            config={"materializations": targets},
-        )
-        py_exec = PythonExecutor(py_node, ctx)
 
         dispatched_views: list[tuple[str, str]] = []
 
@@ -366,6 +561,14 @@ class TestDualTargetExecutionOrderAndFailureSemantics:
             dispatched_views.append(("postgresql", view_name))
             raise RuntimeError("pg write error")
 
+        py_node = Node(
+            id="python.py_feat",
+            name="py_feat",
+            node_type=NodeType.PYTHON,
+            config={"materializations": default_targets},
+        )
+        py_exec = PythonExecutor(py_node, ctx)
+
         with (
             patch.object(MaterializationDispatcher, "_materialize_iceberg", record_iceberg),
             patch.object(MaterializationDispatcher, "_materialize_postgresql", record_pg_fail),
@@ -374,12 +577,31 @@ class TestDualTargetExecutionOrderAndFailureSemantics:
                 ExecutorResult(node_id=py_node.id, status=ExecutionStatus.SUCCESS, row_count=2)
             )
 
-        assert py_res.status == ExecutionStatus.SUCCESS
-        assert py_res.metadata["materialization"]["required_failed"] is False
+        assert py_res.status == ExecutionStatus.FAILED
+        assert py_res.metadata["materialization"]["required_failed"] is True
+        assert "python.py_feat[1]:postgresql" in (py_res.error_message or "")
+        assert "failure_category=write_failed" in (py_res.error_message or "")
         assert dispatched_views == [
             ("iceberg", "transform.py_feat"),
             ("postgresql", "transform.py_feat"),
         ]
+
+        # PythonExecutor with required: false keeps SUCCESS
+        py_node_opt = Node(
+            id="python.py_feat",
+            name="py_feat",
+            node_type=NodeType.PYTHON,
+            config={"materializations": opt_out_targets},
+        )
+        with (
+            patch.object(MaterializationDispatcher, "_materialize_iceberg", record_iceberg),
+            patch.object(MaterializationDispatcher, "_materialize_postgresql", record_pg_fail),
+        ):
+            py_opt_res = PythonExecutor(py_node_opt, ctx).post_execute(
+                ExecutorResult(node_id=py_node_opt.id, status=ExecutionStatus.SUCCESS, row_count=2)
+            )
+        assert py_opt_res.status == ExecutionStatus.SUCCESS
+        assert py_opt_res.metadata["materialization"]["required_failed"] is False
 
         # 2. FeatureGroupExecutor post_execute dispatches from `feature_group.<name>` view
         con = ctx.get_duckdb_connection()
@@ -390,7 +612,7 @@ class TestDualTargetExecutionOrderAndFailureSemantics:
             id="feature_group.fg_feat",
             name="fg_feat",
             node_type=NodeType.FEATURE_GROUP,
-            config={"materializations": targets},
+            config={"materializations": default_targets},
         )
         fg_exec = FeatureGroupExecutor(fg_node, ctx)
         dispatched_views.clear()
@@ -403,12 +625,146 @@ class TestDualTargetExecutionOrderAndFailureSemantics:
                 ExecutorResult(node_id=fg_node.id, status=ExecutionStatus.SUCCESS, row_count=1)
             )
 
-        assert fg_res.status == ExecutionStatus.SUCCESS
-        assert fg_res.metadata["materialization"]["required_failed"] is False
+        assert fg_res.status == ExecutionStatus.FAILED
+        assert fg_res.metadata["materialization"]["required_failed"] is True
+        assert "feature_group.fg_feat[1]:postgresql" in (fg_res.error_message or "")
         assert dispatched_views == [
             ("iceberg", "feature_group.fg_feat"),
             ("postgresql", "feature_group.fg_feat"),
         ]
+
+        # 3. SourceExecutor post_execute dispatches from `source.<name>` view
+        con.execute("CREATE SCHEMA IF NOT EXISTS source")
+        con.execute("CREATE OR REPLACE VIEW source.src_feat AS SELECT 1 AS user_id")
+        src_node = Node(
+            id="source.src_feat",
+            name="src_feat",
+            node_type=NodeType.SOURCE,
+            config={"source": "csv", "materializations": default_targets},
+        )
+        src_exec = SourceExecutor(src_node, ctx)
+        dispatched_views.clear()
+
+        with (
+            patch.object(MaterializationDispatcher, "_materialize_iceberg", record_iceberg),
+            patch.object(MaterializationDispatcher, "_materialize_postgresql", record_pg_fail),
+        ):
+            src_res = src_exec.post_execute(
+                ExecutorResult(node_id=src_node.id, status=ExecutionStatus.SUCCESS, row_count=1)
+            )
+
+        assert src_res.status == ExecutionStatus.FAILED
+        assert src_res.metadata["materialization"]["required_failed"] is True
+        assert "source.src_feat[1]:postgresql" in (src_res.error_message or "")
+        assert dispatched_views == [
+            ("iceberg", "source.src_feat"),
+            ("postgresql", "source.src_feat"),
+        ]
+
+    def test_secret_scrubbing_in_dispatcher_logs_metadata_and_node_error(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """When a postgresql target fails with a DSN or password=... in the exception,
+        the secret must never appear in caplog records, result metadata, or node error_message."""
+        ctx = _make_exec_context(tmp_path)
+        secret_pw = "Sup3rS3cretP@ssw0rd99!"
+        raw_exc_text = (
+            f"FATAL: password authentication failed for "
+            f"postgresql://svc:{secret_pw}@pg.internal:5432/pii_db "
+            f"host=pg.internal user=svc password={secret_pw} dbname=pii_db"
+        )
+        node = Node(
+            id="transform.pii_report",
+            name="pii_report",
+            node_type=NodeType.TRANSFORM,
+            config={
+                "kind": "transform",
+                "name": "pii_report",
+                "transform": "SELECT 1 AS report_id",
+                "materializations": [
+                    {
+                        "type": "postgresql",
+                        "connection": "pg_pii",
+                        "table": "public.pii_report",
+                        "mode": "full",
+                    }
+                ],
+            },
+        )
+
+        with (
+            caplog.at_level(logging.DEBUG),
+            patch.object(
+                MaterializationDispatcher,
+                "_materialize_postgresql",
+                side_effect=RuntimeError(raw_exc_text),
+            ),
+        ):
+            result = TransformExecutor(node, ctx).run()
+
+        assert result.status == ExecutionStatus.FAILED
+        assert result.error_message is not None
+        assert secret_pw not in result.error_message
+        assert "svc:" not in result.error_message
+        assert "transform.pii_report[0]:postgresql" in result.error_message
+        assert "failure_category=write_failed" in result.error_message
+
+        mat_meta = result.metadata["materialization"]
+        assert secret_pw not in str(mat_meta)
+        assert secret_pw not in mat_meta["results"][0]["error"]
+        assert "svc:" not in mat_meta["results"][0]["error"]
+
+        for record in caplog.records:
+            assert secret_pw not in record.getMessage()
+            assert "svc:" not in record.getMessage()
+
+    @pytest.mark.parametrize("extra_flags", [[], ["--parallel"]])
+    def test_cli_seeknal_run_exits_nonzero_when_postgresql_target_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_flags: list[str]
+    ):
+        """CLI `seeknal run` (sequential and `--parallel`) exits non-zero when a PostgreSQL
+        materialization target fails."""
+        monkeypatch.delenv("ATLAS_API_URL", raising=False)
+        monkeypatch.delenv("ATLAS_PORTAL_URL", raising=False)
+        monkeypatch.delenv("KEYCLOAK_ISSUER", raising=False)
+
+        transforms_dir = tmp_path / "seeknal" / "transforms"
+        transforms_dir.mkdir(parents=True)
+        (transforms_dir / "pii_report.yml").write_text(
+            "kind: transform\n"
+            "name: pii_report\n"
+            "transform: SELECT 1 AS customer_id, 'alice' AS name\n"
+            "materializations:\n"
+            "  - type: iceberg\n"
+            "    table: warehouse.curated.pii_report\n"
+            "    mode: append\n"
+            "  - type: postgresql\n"
+            "    connection: pg_local\n"
+            "    table: public.pii_report\n"
+            "    mode: full\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+        with (
+            patch.object(
+                MaterializationDispatcher,
+                "_materialize_iceberg",
+                return_value=WriteResult(success=True, row_count=1, duration_seconds=0.01),
+            ),
+            patch.object(
+                MaterializationDispatcher,
+                "_materialize_postgresql",
+                side_effect=RuntimeError("PostgreSQL target write failed"),
+            ),
+        ):
+            res = runner.invoke(app, ["run", *extra_flags])
+
+        assert res.exit_code != 0
+        norm_out = " ".join(res.output.split())
+        assert "transform.pii_report[1]:postgresql" in norm_out
+        assert "FAILED" in res.output or "failed" in res.output
 
 
 class TestEnvNamespacePrefixingDifferences:

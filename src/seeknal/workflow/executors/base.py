@@ -520,13 +520,83 @@ class BaseExecutor(ABC):
                 import warnings
                 warnings.warn(f"Post-execution cleanup failed: {str(e)}")
 
+        self._apply_materialization_status(result)
+
+        return result
+
+    @staticmethod
+    def _apply_materialization_status(result: ExecutorResult) -> ExecutorResult:
+        """Flip *result* to FAILED when a required materialization target failed."""
+        from seeknal.workflow.materialization.dispatcher import scrub_secrets
+
         materialization = result.metadata.get("materialization")
         if (
             isinstance(materialization, dict) and materialization.get("required_failed")
         ) or result.metadata.get("required_materialization_failed"):
             result.status = ExecutionStatus.FAILED
-            result.error_message = "Required Iceberg materialization failed; inspect materialization results"
+            results_list = (
+                materialization.get("results", [])
+                if isinstance(materialization, dict)
+                else []
+            )
+            failed_required = [
+                item
+                for item in results_list
+                if isinstance(item, dict)
+                and not item.get("success", True)
+                and item.get("required", True)
+            ]
+            if not failed_required and isinstance(results_list, list):
+                failed_required = [
+                    item
+                    for item in results_list
+                    if isinstance(item, dict) and not item.get("success", True)
+                ]
 
+            if failed_required:
+                types_in_order: list[str] = []
+                details: list[str] = []
+                for item in failed_required:
+                    t_type = str(item.get("type") or "iceberg")
+                    if t_type not in types_in_order:
+                        types_in_order.append(t_type)
+                    t_label = str(item.get("target") or t_type)
+                    f_cat = item.get("failure_category") or (
+                        "preflight_failed" if t_type == "iceberg" else "write_failed"
+                    )
+                    err_text = scrub_secrets(str(item.get("error") or "Materialization failed"))
+                    details.append(f"{t_label} (failure_category={f_cat}): {err_text}")
+
+                if len(types_in_order) == 1:
+                    only_type = types_in_order[0]
+                    type_display = "Iceberg" if only_type == "iceberg" else only_type
+                    result.error_message = (
+                        f"Required {type_display} materialization failed: "
+                        + "; ".join(details)
+                    )
+                else:
+                    types_str = ", ".join(types_in_order)
+                    result.error_message = (
+                        f"Required materialization failed ({types_str}): "
+                        + "; ".join(details)
+                    )
+            else:
+                f_cat = (
+                    materialization.get("failure_category")
+                    if isinstance(materialization, dict)
+                    else None
+                ) or result.metadata.get("failure_category")
+                raw_err = (
+                    materialization.get("error")
+                    if isinstance(materialization, dict)
+                    else None
+                )
+                cat_suffix = f" (failure_category={f_cat})" if f_cat else ""
+                err_suffix = f": {scrub_secrets(str(raw_err))}" if raw_err else ""
+                result.error_message = (
+                    f"Required Iceberg materialization failed{cat_suffix}{err_suffix}; "
+                    "inspect materialization results"
+                )
         return result
 
 
