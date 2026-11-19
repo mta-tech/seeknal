@@ -2000,3 +2000,32 @@ def test_n7_unquoted_secrets_preserve_plus_and_non_delimiter_ampersand():
         scrub_error_detail("https://blob.example.net/c/f?signature=ab+cd/ef==&x=1", env={})
         == "https://blob.example.net/c/f?signature=[REDACTED]&x=1"
     )
+
+
+def test_integer_bound_params_len_ge_4_redacted_at_word_boundaries():
+    from decimal import Decimal
+
+    assert (
+        scrub_error_detail("invalid pin 482913", params=[482913], env={})
+        == "invalid pin [REDACTED]"
+    )
+    assert (
+        scrub_error_detail(
+            "invalid pin 482913 | pin=482913 | (482913) | ref=order_482913_v1 | seq=94829130",
+            params=[482913],
+            env={},
+        )
+        == "invalid pin [REDACTED] | pin=[REDACTED] | ([REDACTED]) | ref=order_482913_v1 | seq=94829130"
+    )
+    assert (
+        scrub_error_detail("amount 1234.56 rejected", params=[Decimal("1234.56")], env={})
+        == "amount [REDACTED] rejected"
+    )
+    assert (
+        scrub_error_detail("Token lifetime of 61.0s", params=[0], env={})
+        == "Token lifetime of 61.0s"
+    )
+    assert (
+        scrub_error_detail("Token lifetime of 61.0s", params=[999, -123, True], env={})
+        == "Token lifetime of 61.0s"
+    )

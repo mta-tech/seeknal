@@ -381,8 +381,8 @@ def _collect_param_redactions(params: Any) -> list[str]:
     return sorted(tokens, key=len, reverse=True)
 
 
-def _collect_numeric_string_param_redactions(params: Any) -> list[str]:
-    """Collect bound numeric-string parameters of length >= 4 for word-boundary redaction."""
+def _collect_numeric_param_redactions(params: Any) -> list[str]:
+    """Collect bound numeric and numeric-string parameters of length >= 4 for word-boundary redaction."""
     if isinstance(params, (list, tuple)):
         param_items: list[Any] = list(params)
     elif isinstance(params, Mapping):
@@ -393,11 +393,19 @@ def _collect_numeric_string_param_redactions(params: Any) -> list[str]:
     stripped_tokens: set[str] = set()
     raw_tokens: set[str] = set()
     for p in param_items:
-        if isinstance(p, str) and _is_purely_numeric_value(p):
-            stripped_p = p.strip()
-            if len(stripped_p) >= 4:
+        if p is None or isinstance(p, bool):
+            continue
+        if isinstance(p, (int, float, Decimal)) or (
+            isinstance(p, str) and _is_purely_numeric_value(p)
+        ):
+            p_str = str(p)
+            stripped_p = p_str.strip()
+            unsigned_p = stripped_p.lstrip("+-")
+            if len(unsigned_p) >= 4:
                 stripped_tokens.add(stripped_p)
-                if p != stripped_p:
+                if unsigned_p != stripped_p:
+                    stripped_tokens.add(unsigned_p)
+                if isinstance(p, str) and p != stripped_p:
                     raw_tokens.add(p)
 
     return sorted(stripped_tokens, key=len, reverse=True) + sorted(
@@ -405,12 +413,15 @@ def _collect_numeric_string_param_redactions(params: Any) -> list[str]:
     )
 
 
+_collect_numeric_string_param_redactions = _collect_numeric_param_redactions
+
+
 def _redact_bound_params(text: str, params: Any) -> str:
-    """Redact bound parameter tokens (quoted, non-numeric len >= 3, and word-bounded numeric strings len >= 4)."""
+    """Redact bound parameter tokens (quoted, non-numeric len >= 3, and word-bounded numeric values len >= 4)."""
     for param_tok in _collect_param_redactions(params):
         if param_tok in text:
             text = text.replace(param_tok, "[REDACTED]")
-    for num_tok in _collect_numeric_string_param_redactions(params):
+    for num_tok in _collect_numeric_param_redactions(params):
         if num_tok in text:
             text = re.sub(
                 rf"(?<![A-Za-z0-9_]){re.escape(num_tok)}(?![A-Za-z0-9_])",

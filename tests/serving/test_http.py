@@ -1118,3 +1118,119 @@ def test_n5_numeric_string_params_redacted_in_safe_message_and_http_errors(
             resp_61s.json()["message"]
             == "Token lifetime of 61.0s exceeds maximum 60.0s"
         )
+
+
+def test_integer_params_redacted_in_safe_message_and_http_errors(
+    ec_key_pair, caplog: pytest.LogCaptureFixture
+):
+    """Integer bound params of length >= 4 redact at word boundaries while params=[0] preserves 61.0s."""
+    import logging
+    from seeknal.serving.http import _safe_message
+
+    assert (
+        _safe_message("invalid pin 482913", params=[482913])
+        == "invalid pin [REDACTED]"
+    )
+    assert (
+        _safe_message(
+            "invalid pin 482913; ref=order_482913_v1; big=94829130",
+            params=[482913],
+        )
+        == "invalid pin [REDACTED]; ref=order_482913_v1; big=94829130"
+    )
+    assert (
+        _safe_message("Token lifetime of 61.0s", params=[0])
+        == "Token lifetime of 61.0s"
+    )
+
+    priv, pub = ec_key_pair
+
+    class IntPinFailingAdapter:
+        def execute(
+            self, prepared: PreparedQuery, *, timeout_seconds: float
+        ) -> QueryResult:
+            raise EngineError("invalid pin 482913 for order_482913_v1 seq 94829130")
+
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "users": {
+                    "keys": ["id"],
+                    "row_count": 1,
+                    "serve": {"duck": "users"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas={"users": ["id", "pin"]},
+        public_keys={"key-1": pub},
+        max_grant_lifetime_seconds=60.0,
+    )
+    client = TestClient(create_app(pipeline, {"duck": IntPinFailingAdapter()}))
+
+    sql = "SELECT id FROM users WHERE pin = $1"
+    tables_claim = {
+        "users": {"columns": ["id", "pin"], "masks": {}, "actions": ["select"]}
+    }
+    tok_valid = sign_grant_token(
+        {
+            "sub": "analyst@example.com",
+            "ws": "ws-test",
+            "jti": "jti-int-pin-001",
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": time.time(),
+            "exp": time.time() + 30.0,
+            "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            "max_rows": 100,
+            "tables": tables_claim,
+        },
+        priv,
+        kid="key-1",
+    )
+
+    with caplog.at_level(logging.ERROR):
+        caplog.clear()
+        resp_eng = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_valid}"},
+            json={"sql": sql, "params": [482913]},
+        )
+
+    assert resp_eng.status_code == 502
+    assert "482913" not in resp_eng.text
+    assert "invalid pin [REDACTED]" in caplog.text
+    assert "order_482913_v1" in caplog.text
+    assert "94829130" in caplog.text
+    assert "invalid pin 482913" not in caplog.text
+
+    tok_61s = sign_grant_token(
+        {
+            "sub": "analyst@example.com",
+            "ws": "ws-test",
+            "jti": "jti-int-61s-0",
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": time.time(),
+            "exp": time.time() + 61.0,
+            "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            "max_rows": 100,
+            "tables": tables_claim,
+        },
+        priv,
+        kid="key-1",
+    )
+    resp_61s = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok_61s}"},
+        json={"sql": sql, "params": [0]},
+    )
+    assert resp_61s.status_code == 401
+    assert (
+        resp_61s.json()["message"]
+        == "Token lifetime of 61.0s exceeds maximum 60.0s"
+    )
