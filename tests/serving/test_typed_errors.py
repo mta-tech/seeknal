@@ -1881,7 +1881,41 @@ def test_n4_duckdb_space_separated_secret_tokens_and_azure_account_key():
         assert leaked not in out_az, f"Leaked '{leaked}' in: {out_az}"
 
 
+def test_n5_bound_numeric_string_params_len_ge_4_redacted_at_word_boundaries():
+    # 1. Exact unquoted occurrence of 6-digit PIN "482913" and 4-digit PIN "0042"
+    assert (
+        scrub_error_detail("invalid pin 482913", params=["482913"], env={})
+        == "invalid pin [REDACTED]"
+    )
+    assert (
+        scrub_error_detail("invalid pin 0042.", params=["0042"], env={})
+        == "invalid pin [REDACTED]."
+    )
 
+    # 2. Word boundaries respected: embedded tokens stay intact; bounded forms are redacted
+    mixed = (
+        "invalid pin 482913 | pin=482913 | (482913) | quoted='482913' | "
+        "ref=order_482913_v1 | acct_seq=94829130 | dur=61.0s"
+    )
+    scrubbed_mixed = scrub_error_detail(mixed, params=["482913"], env={})
+    assert "invalid pin [REDACTED]" in scrubbed_mixed
+    assert "pin=[REDACTED]" in scrubbed_mixed
+    assert "([REDACTED])" in scrubbed_mixed
+    assert "quoted=[REDACTED]" in scrubbed_mixed
+    assert "ref=order_482913_v1" in scrubbed_mixed
+    assert "acct_seq=94829130" in scrubbed_mixed
+    assert "dur=61.0s" in scrubbed_mixed
 
+    # Whitespace-padded numeric string param >= 4 chars
+    assert (
+        scrub_error_detail("pin: 482913, retry", params=[" 482913 "], env={})
+        == "pin: [REDACTED], retry"
+    )
 
-
+    # 3. Short values and non-parameter numbers stay intact
+    lifetime_msg = "Token lifetime of 61.0s exceeds maximum 60.0s"
+    for short_or_other_params in ([0], ["0"], ["61"], ["999"], ["482913"]):
+        assert (
+            scrub_error_detail(lifetime_msg, params=short_or_other_params, env={})
+            == lifetime_msg
+        )

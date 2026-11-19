@@ -365,6 +365,9 @@ def _collect_param_redactions(params: Any) -> list[str]:
         if isinstance(p, str):
             escaped_p = p.replace("'", "''")
             tokens.add(f"'{escaped_p}'")
+            stripped_p = p.strip()
+            if stripped_p and stripped_p != p:
+                tokens.add(f"'{stripped_p}'")
             if len(p) >= 3 and not _is_purely_numeric_value(p):
                 tokens.add(p)
                 if escaped_p != p:
@@ -373,6 +376,45 @@ def _collect_param_redactions(params: Any) -> list[str]:
             tokens.add(p_str)
 
     return sorted(tokens, key=len, reverse=True)
+
+
+def _collect_numeric_string_param_redactions(params: Any) -> list[str]:
+    """Collect bound numeric-string parameters of length >= 4 for word-boundary redaction."""
+    if isinstance(params, (list, tuple)):
+        param_items: list[Any] = list(params)
+    elif isinstance(params, Mapping):
+        param_items = list(params.values())
+    else:
+        return []
+
+    stripped_tokens: set[str] = set()
+    raw_tokens: set[str] = set()
+    for p in param_items:
+        if isinstance(p, str) and _is_purely_numeric_value(p):
+            stripped_p = p.strip()
+            if len(stripped_p) >= 4:
+                stripped_tokens.add(stripped_p)
+                if p != stripped_p:
+                    raw_tokens.add(p)
+
+    return sorted(stripped_tokens, key=len, reverse=True) + sorted(
+        raw_tokens, key=len, reverse=True
+    )
+
+
+def _redact_bound_params(text: str, params: Any) -> str:
+    """Redact bound parameter tokens (quoted, non-numeric len >= 3, and word-bounded numeric strings len >= 4)."""
+    for param_tok in _collect_param_redactions(params):
+        if param_tok in text:
+            text = text.replace(param_tok, "[REDACTED]")
+    for num_tok in _collect_numeric_string_param_redactions(params):
+        if num_tok in text:
+            text = re.sub(
+                rf"(?<![A-Za-z0-9_]){re.escape(num_tok)}(?![A-Za-z0-9_])",
+                "[REDACTED]",
+                text,
+            )
+    return text
 
 
 def _add_quote_escaped_forms(secret: str, candidates: set[str]) -> None:
@@ -519,9 +561,7 @@ def scrub_error_detail(
             if lit in detail:
                 detail = detail.replace(lit, "[REDACTED]")
 
-    for param_tok in _collect_param_redactions(params):
-        if param_tok in detail:
-            detail = detail.replace(param_tok, "[REDACTED]")
+    detail = _redact_bound_params(detail, params)
 
     detail = _CANARY_SENTINEL_RE.sub("[REDACTED]", detail)
     detail = _sanitize_log_value(detail, default="")

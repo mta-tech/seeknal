@@ -1009,3 +1009,112 @@ def test_chunked_body_within_cap_and_midstream_disconnect(ec_key_pair):
             assert body["code"] == "query_cancelled"
     finally:
         con.close()
+
+
+def test_n5_numeric_string_params_redacted_in_safe_message_and_http_errors(
+    ec_key_pair, caplog: pytest.LogCaptureFixture
+):
+    """N5: Numeric-string params >= 4 chars redact at word boundaries while preserving 61.0s."""
+    import logging
+    from seeknal.serving.http import _safe_message
+
+    # 1. _safe_message unit checks: unquoted PIN redacted, word boundaries respected, 61.0s intact
+    assert (
+        _safe_message("invalid pin 482913", params=["482913"])
+        == "invalid pin [REDACTED]"
+    )
+    bounded = _safe_message(
+        "invalid pin 482913; pin=482913; (482913); ref=order_482913_v1; big=94829130",
+        params=["482913"],
+    )
+    assert (
+        bounded
+        == "invalid pin [REDACTED]; pin=[REDACTED]; ([REDACTED]); ref=order_482913_v1; big=94829130"
+    )
+
+    lifetime_msg = "Token lifetime of 61.0s exceeds maximum 60.0s"
+    for p_list in ([0], ["0"], ["61"], ["999"], ["482913"]):
+        assert _safe_message(lifetime_msg, params=p_list) == lifetime_msg
+
+    # 2. End-to-end HTTP checks:
+    #    (a) Engine error containing 'invalid pin 482913' with params=['482913'] never leaks PIN in HTTP or logs.
+    #    (b) Oversized grant lifetime 61.0s with params=[0], ['0'], ['61'], ['482913'] preserves '61.0s'.
+    priv, pub = ec_key_pair
+
+    class PinFailingAdapter:
+        def execute(
+            self, prepared: PreparedQuery, *, timeout_seconds: float
+        ) -> QueryResult:
+            raise EngineError(
+                "invalid pin 482913 for order_482913_v1 seq 94829130"
+            )
+
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "users": {
+                    "keys": ["id"],
+                    "row_count": 1,
+                    "serve": {"duck": "users"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas={"users": ["id", "pin"]},
+        public_keys={"key-1": pub},
+        max_grant_lifetime_seconds=60.0,
+    )
+    client = TestClient(create_app(pipeline, {"duck": PinFailingAdapter()}))
+
+    sql = "SELECT id FROM users WHERE pin = $1"
+    tables_claim = {
+        "users": {"columns": ["id", "pin"], "masks": {}, "actions": ["select"]}
+    }
+    tok_valid = _make_token(priv, sql, tables=tables_claim)
+
+    with caplog.at_level(logging.ERROR):
+        caplog.clear()
+        resp_eng = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_valid}"},
+            json={"sql": sql, "params": ["482913"]},
+        )
+
+    assert resp_eng.status_code == 502
+    assert "482913" not in resp_eng.text
+    assert "invalid pin [REDACTED]" in caplog.text
+    assert "order_482913_v1" in caplog.text
+    assert "94829130" in caplog.text
+    assert "invalid pin 482913" not in caplog.text
+
+    for idx, p_list in enumerate(([0], ["0"], ["61"], ["482913"])):
+        tok_61s = sign_grant_token(
+            {
+                "sub": "analyst@example.com",
+                "ws": "ws-test",
+                "jti": f"jti-n5-61s-{idx}",
+                "iss": "atlas-catalog",
+                "aud": "seeknal-serving",
+                "iat": time.time(),
+                "exp": time.time() + 61.0,
+                "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+                "max_rows": 100,
+                "tables": tables_claim,
+            },
+            priv,
+            kid="key-1",
+        )
+        resp_61s = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_61s}"},
+            json={"sql": sql, "params": p_list},
+        )
+        assert resp_61s.status_code == 401
+        assert (
+            resp_61s.json()["message"]
+            == "Token lifetime of 61.0s exceeds maximum 60.0s"
+        )

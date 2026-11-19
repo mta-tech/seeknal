@@ -47,8 +47,8 @@ from seeknal.serving.enforce import EnforcementError
 from seeknal.serving.errors import (
     AuditUnavailableError,
     _SQL_SINGLE_QUOTED_RE,
-    _collect_param_redactions,
     _is_purely_numeric_value,
+    _redact_bound_params,
     _sanitize_log_value,
     build_error_payload,
     get_error_spec,
@@ -252,9 +252,7 @@ def _safe_message(
                 if lit in msg:
                     msg = msg.replace(lit, "[REDACTED]")
 
-    for param_tok in _collect_param_redactions(params):
-        if param_tok in msg:
-            msg = msg.replace(param_tok, "[REDACTED]")
+    msg = _redact_bound_params(msg, params)
 
     return msg
 
