@@ -40,6 +40,12 @@ tables:
       sr: lakekeeper.ref.province
       lb: public.province
       duck: province
+  claims.patient_identity:
+    keys: [patient_id]
+    row_count: 500000
+    pii: true
+    serve:
+      lb: public.patient_identity
 
 cubes:
   claims_cube:
@@ -52,6 +58,7 @@ policy:
   analytics_min_rows: 1000000
   small_scan_order: ["lakebase", "starrocks", "duckdb"]
   analytics_order: ["starrocks", "duckdb"]
+  pii_engines: []
 ```
 
 ### Key Principles
@@ -187,6 +194,27 @@ router.route("SELECT * FROM claims.claim WHERE claim_id = 42", max_staleness_sec
 - The router checks each engine's `max_lag_seconds` for all referenced tables.
 - Because Lakebase has 300s lag ($> 10\text{s}$), it is rejected with a reason detailing staleness.
 - The router falls through to the next feasible engine (StarRocks, where lag is fresh/`None`), choosing `sr` under the `analytics` rule.
+
+---
+
+## PII Placement and Cross-Engine Query Isolation
+
+Tables containing personally identifiable information can be marked with `pii: true` in static placement (`tables.<table>.pii: true`) or carried through catalog discovery (`lakebase.synced_tables.<table>.pii: true` or `discovery.pii_tables`).
+
+### Placement Invariants (`PlacementError` / Startup Refusal)
+
+1. **Single Dedicated Serve**: Every table with `pii: true` must declare **exactly one** `serve` (`len(serves) == 1`). Declaring two or more serves for a PII table is rejected at placement load and startup validation.
+2. **DuckDB Prohibition Unless Explicitly Approved**: A `pii: true` table cannot be served on any engine of `kind: duckdb` (including both `local_file` and `iceberg_direct` profiles) unless that specific engine name is listed in `policy.pii_engines` (or `discovery.pii_engines`).
+3. **Validated `policy.pii_engines`**: `policy.pii_engines` defaults to `()` and must be a list/tuple of non-empty engine names declared in `engines`. Referencing an unknown engine raises `PlacementError`.
+
+### Cross-Engine Mixing Guard (`pii_cross_engine`, HTTP 422)
+
+Before any backend engine is called, `check_pii_query_mixing` enforces strict engine isolation on every query referencing a `pii: true` table:
+
+- Let `pii_engine` be the sole engine serving the `pii: true` table.
+- Every other table referenced in the statement **must also be served on `pii_engine`** (including when multiple `pii: true` tables appear in the same query).
+- If an engine hint (argument or `/* seeknal:engine=... */` comment) specifies an engine other than `pii_engine`, the query is rejected.
+- Violations raise a typed `RoutingError` (`PiiCrossEngineError`) with `.code = "pii_cross_engine"`, mapped to **HTTP 422** before any engine adapter is invoked—even when an engine hint is supplied.
 
 ---
 

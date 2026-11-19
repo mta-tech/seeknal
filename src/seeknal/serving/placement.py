@@ -64,6 +64,13 @@ class TableEntry:
     keys: tuple[str, ...]
     row_count: int | None
     serves: tuple[TableServe, ...]
+    pii: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pii, bool):
+            raise PlacementError(
+                f"Table '{self.name}' field 'pii' must be a boolean, got {type(self.pii).__name__}"
+            )
 
 
 @dataclass(frozen=True)
@@ -110,6 +117,21 @@ class Policy:
     analytics_min_rows: int = 1_000_000
     small_scan_order: tuple[str, ...] = ("lakebase", "starrocks", "duckdb")
     analytics_order: tuple[str, ...] = ("starrocks", "duckdb")
+    pii_engines: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pii_engines, (list, tuple)):
+            raise PlacementError(
+                "Policy 'pii_engines' must be a list or tuple of non-empty engine name strings"
+            )
+        cleaned: list[str] = []
+        for item in self.pii_engines:
+            if not isinstance(item, str) or not item.strip():
+                raise PlacementError(
+                    "Policy 'pii_engines' must contain only non-empty engine name strings"
+                )
+            cleaned.append(item.strip())
+        object.__setattr__(self, "pii_engines", tuple(cleaned))
 
 
 @dataclass(frozen=True)
@@ -133,6 +155,13 @@ class Placement:
                     f"Unknown engine kind '{engine.kind}' for engine '{engine.name}'"
                 )
 
+        # Validate policy.pii_engines
+        for pii_eng in self.policy.pii_engines:
+            if pii_eng not in self.engines:
+                raise PlacementError(
+                    f"Policy 'pii_engines' references undefined engine '{pii_eng}'"
+                )
+
         # Validate tables and collision
         seen_tables: dict[str, str] = {}
         for tbl_name, table in self.tables.items():
@@ -147,6 +176,11 @@ class Placement:
                 )
             seen_tables[lower] = table.name
 
+            if not isinstance(table.pii, bool):
+                raise PlacementError(
+                    f"Table '{table.name}' field 'pii' must be a boolean, got {type(table.pii).__name__}"
+                )
+
             if not table.serves:
                 raise PlacementError(f"Table '{table.name}' has no serve")
             for serve in table.serves:
@@ -157,6 +191,20 @@ class Placement:
                 if not serve.physical_name or not serve.physical_name.strip():
                     raise PlacementError(
                         f"Table '{table.name}' has empty physical name for engine '{serve.engine}'"
+                    )
+
+            if table.pii:
+                if len(table.serves) != 1:
+                    raise PlacementError(
+                        f"PII table '{table.name}' must have exactly one serve, got {len(table.serves)}"
+                    )
+                serve_eng = self.engines[table.serves[0].engine]
+                if (
+                    serve_eng.kind == "duckdb"
+                    and serve_eng.name not in self.policy.pii_engines
+                ):
+                    raise PlacementError(
+                        f"PII table '{table.name}' cannot be served on duckdb engine '{serve_eng.name}' unless listed in policy.pii_engines"
                     )
 
         # Validate cubes and collision
@@ -282,11 +330,18 @@ class Placement:
                         f"Table '{tbl_name}' serve has invalid format for engine '{eng_name}'"
                     )
 
+            pii_raw = tbl_spec.get("pii", False)
+            if not isinstance(pii_raw, bool):
+                raise PlacementError(
+                    f"Table '{tbl_name}' field 'pii' must be a boolean, got {type(pii_raw).__name__}"
+                )
+
             tables[str(tbl_name)] = TableEntry(
                 name=str(tbl_name),
                 keys=keys,
                 row_count=row_count,
                 serves=tuple(serves),
+                pii=pii_raw,
             )
 
         # 3. Cubes
@@ -336,6 +391,20 @@ class Placement:
                 kwargs["analytics_order"] = tuple(
                     str(x) for x in policy_raw["analytics_order"]
                 )
+            if "pii_engines" in policy_raw:
+                raw_pii_engines = policy_raw["pii_engines"]
+                if not isinstance(raw_pii_engines, (list, tuple)):
+                    raise PlacementError(
+                        "Policy 'pii_engines' must be a list or tuple of non-empty engine name strings"
+                    )
+                parsed_pii_engines: list[str] = []
+                for item in raw_pii_engines:
+                    if not isinstance(item, str) or not item.strip():
+                        raise PlacementError(
+                            "Policy 'pii_engines' must contain only non-empty engine name strings"
+                        )
+                    parsed_pii_engines.append(item.strip())
+                kwargs["pii_engines"] = tuple(parsed_pii_engines)
             policy = Policy(**kwargs)
 
         return cls(engines=engines, tables=tables, cubes=cubes, policy=policy)

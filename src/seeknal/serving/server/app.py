@@ -44,11 +44,13 @@ from seeknal.serving.server.config import (
     LakebaseConnectionConfig,
     LoggingConfig,
     ServerConfig,
+    ServerConfigError,
     StarRocksAccountConfig,
     StarRocksConnectionConfig,
     read_secret_file,
 )
 from seeknal.serving.service import ServingPipeline
+from seeknal.serving.startup_validation import _ROLE_TOP_KEYS, validate_startup
 
 logger = logging.getLogger(__name__)
 
@@ -121,15 +123,23 @@ def build_server(
     """Build a complete Seeknal Serving server handle from configuration."""
     # 1. Resolve configuration
     if isinstance(config, (str, os.PathLike)):
-        cfg = ServerConfig.from_yaml(config, env=env)
+        try:
+            cfg = ServerConfig.from_yaml(config, env=env)
+        except ServerConfigError as exc:
+            if any(k in str(exc) for k in _ROLE_TOP_KEYS):
+                validate_startup(config, env=env)
+            raise
     elif isinstance(config, Mapping) and not isinstance(config, ServerConfig):
+        if any(k in config for k in _ROLE_TOP_KEYS):
+            validate_startup(config, env=env)
         cfg = ServerConfig.from_dict(config, env=env)
     elif isinstance(config, ServerConfig):
         cfg = config
     else:
         raise TypeError(f"Unsupported config type: {type(config).__name__}")
 
-    # 2. Run offline preflight (env, secret files, static placement/schemas, engine-connection wiring)
+    # 2. Run fail-closed startup validation & offline preflight (env, secret files,
+    # static placement/schemas/columns/roles/PII rules, engine-connection wiring)
     # before configuring a file logger or constructing adapters/refresher
     preflight = cfg.validate_runtime_wiring(env=env)
 

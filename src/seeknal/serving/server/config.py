@@ -597,79 +597,14 @@ class ServerConfig:
         if self.audit is not None:
             verify_audit_config_offline(self.audit, error_cls=AuditStartupError)
 
-        if self.placement.is_static:
-            static_cfg = self.placement.static
-            assert static_cfg is not None
-            placement = _load_static_placement(static_cfg.placement_file)
+        from seeknal.serving.startup_validation import validate_startup
 
-            # Every declared placement engine must have an exact same-name connection with matching kind
-            for eng_name, eng in placement.engines.items():
-                safe_eng = _safe_label(eng_name)
-                if eng_name not in self.connections:
-                    raise ServerConfigError(
-                        f"Static placement file '{static_cfg.placement_file}' declares engine "
-                        f"'{safe_eng}' (kind '{eng.kind}') in 'placement.engines', but no matching "
-                        f"entry 'connections.{safe_eng}' is configured — add 'connections.{safe_eng}' "
-                        f"with kind '{eng.kind}' or remove the unused engine from placement"
-                    )
-                conn = self.connections[eng_name]
-                conn_kind = getattr(conn, "kind", None)
-                if conn_kind != eng.kind:
-                    raise ServerConfigError(
-                        f"Engine '{safe_eng}' kind mismatch between static placement "
-                        f"('{static_cfg.placement_file}', kind '{eng.kind}') and "
-                        f"'connections.{safe_eng}' (kind '{conn_kind}') — align both to '{eng.kind}'"
-                    )
-
-            schemas = _load_and_validate_static_schemas(
-                static_cfg.schemas_file,
-                placement,
-            )
-            return PreflightResult(
-                mode="static",
-                placement=placement,
-                schemas=schemas,
-            )
-
-        disc_cfg = self.placement.discovery_config
-        assert disc_cfg is not None
-
-        for eng_name, eng_cfg in disc_cfg.engines.items():
-            safe_eng = _safe_label(eng_name)
-            if eng_name not in self.connections:
-                raise ServerConfigError(
-                    f"Discovery engine 'placement.discovery.engines.{safe_eng}' "
-                    f"(kind '{eng_cfg.kind}') has no matching entry 'connections.{safe_eng}' — "
-                    f"add 'connections.{safe_eng}' with kind '{eng_cfg.kind}' or remove the "
-                    f"engine from 'placement.discovery.engines'"
-                )
-            conn = self.connections[eng_name]
-            conn_kind = getattr(conn, "kind", None)
-            if conn_kind != eng_cfg.kind:
-                raise ServerConfigError(
-                    f"Discovery engine 'placement.discovery.engines.{safe_eng}' has kind "
-                    f"'{eng_cfg.kind}', but 'connections.{safe_eng}' has kind '{conn_kind}' — "
-                    f"align both to '{eng_cfg.kind}'"
-                )
-
-        if disc_cfg.lakebase is not None:
-            lb_eng = disc_cfg.lakebase.engine
-            safe_lb = _safe_label(lb_eng)
-            if lb_eng not in self.connections:
-                raise ServerConfigError(
-                    f"Discovery 'placement.discovery.lakebase.engine' references '{safe_lb}', "
-                    f"but 'connections.{safe_lb}' is not configured — add a lakebase connection "
-                    f"named '{safe_lb}'"
-                )
-            lb_conn = self.connections[lb_eng]
-            lb_kind = getattr(lb_conn, "kind", None)
-            if lb_kind != "lakebase":
-                raise ServerConfigError(
-                    f"Discovery 'placement.discovery.lakebase.engine' ('{safe_lb}') requires "
-                    f"'connections.{safe_lb}' to have kind 'lakebase', got '{lb_kind}'"
-                )
-
-        return PreflightResult(mode="discovery", placement=None, schemas=None)
+        report = validate_startup(self, env=env, check_grant_keys=False)
+        return PreflightResult(
+            mode=report.mode,
+            placement=report.placement,
+            schemas=report.schemas,
+        )
 
     @classmethod
     def from_dict(

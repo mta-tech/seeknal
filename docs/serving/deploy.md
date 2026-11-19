@@ -88,6 +88,10 @@ placement:
         lakekeeper.analytics.users:
           target: users_sync
           primary_key: [id]
+          pii: false  # Optional boolean; when true, enforces single-serve PII placement rules
+    # Optional discovery-level PII lists:
+    # pii_tables: [lakekeeper.analytics.patient_identity]
+    # pii_engines: []  # Engine names of kind 'duckdb' explicitly permitted to serve pii tables
 
   # Alternatively, static placement:
   # static:
@@ -293,6 +297,26 @@ Seeknal Serving exposes two distinct probe endpoints:
 ---
 
 ## 7. Operational Deployment
+
+### Fail-Closed Startup Validation (`validate` CLI Subcommand)
+In addition to `--check`, Seeknal Serving provides comprehensive fail-closed startup validation via `validate_startup()` (`src/seeknal/serving/startup_validation.py`) and the `validate` subcommand:
+
+```bash
+python -m seeknal.serving validate --config /etc/seeknal/serving.yaml
+```
+
+- **Exit codes & output:**
+  - Exits with code `0` and prints `ok` to `stdout` when all checks pass (in `discovery` mode, also prints a note recording `skipped: live_catalog_discovery` for checks that require live catalog polling).
+  - Exits with code `2` and prints one clear, secret-safe `Error: ...` line per validation problem to `stderr` when any check fails—never leaking DSNs, passwords, tokens, or secret file contents.
+- **Comprehensive fail-closed checks collected in a single pass:**
+  1. **Unknown engine & kind mismatches:** Verifies every engine in `placement.engines` (or `placement.discovery.engines` and `placement.discovery.lakebase.engine`) has a same-name, same-kind entry in `connections`; verifies every table `serve` engine, cube `engine`, and `policy.pii_engines` entry exists in both `placement` and `connections`; and verifies engine kinds in `policy.small_scan_order` / `policy.analytics_order`.
+  2. **Unknown table:** Verifies exact case-insensitive and lowercase alignment between static `schemas.json` and `placement.tables` / `placement.cubes` (rejecting missing or extra/stale schema keys) as well as any table references in `pii_tables` or policy table mappings.
+  3. **Unknown column:** Verifies that every column in `table.keys`, `cube.measures`, `cube.dimensions`, `cube.mask_variants`, and any static table/policy `masks` or `row_filters` exists in `schemas.json`.
+  4. **Unknown role:** Seeknal Serving authorizes requests via per-request signed ES256 grant tokens from Atlas Data Catalog rather than static server roles (`ValidationReport` records `no_static_role_references` when none exist, and rejects any unbacked static role references if present in config or placement policy).
+  5. **PII placement & query isolation rules:**
+     - Any table marked `pii: true` (in static `placement.yaml` or carried through discovery via `lakebase.synced_tables.<table_name>.pii: true` or `pii_tables`) must have **exactly one** `serve` (`len(serves) == 1`).
+     - A `pii: true` table cannot be served on a `duckdb` engine (whether `local_file` or `iceberg_direct`) unless that engine name is explicitly listed in `policy.pii_engines`.
+     - At query time, `check_pii_query_mixing()` rejects any statement that joins or combines a `pii: true` table with a table not served on that PII table's sole engine—or supplies an engine hint targeting another engine—with typed error code `pii_cross_engine` (**HTTP 422**) before any engine is called.
 
 ### Pre-flight Configuration & Runtime-Wiring Check (`--check`)
 Before launching the service (in CI pipelines, container entrypoints, or `systemd` `ExecStartPre`), run the offline preflight check:

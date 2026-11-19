@@ -82,6 +82,13 @@ class SyncedTableConfig:
 
     target: str
     primary_key: tuple[str, ...] = ()
+    pii: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pii, bool):
+            raise DiscoveryConfigError(
+                f"Synced table target '{self.target}' 'pii' must be a boolean"
+            )
 
 
 @dataclass(frozen=True)
@@ -102,6 +109,8 @@ class DiscoveryConfig:
     lakekeeper: LakekeeperConfig | None = None
     engines: Mapping[str, EngineConfig] = field(default_factory=dict)
     lakebase: LakebaseConfig | None = None
+    pii_tables: tuple[str, ...] = ()
+    pii_engines: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, data: Mapping) -> DiscoveryConfig:
@@ -543,14 +552,76 @@ class DiscoveryConfig:
                         raise DiscoveryConfigError(
                             f"Synced table '{tbl_name_str}' 'primary_key' must be a sequence of strings"
                         )
+                    pii_raw = tbl_spec.get("pii", False)
+                    if not isinstance(pii_raw, bool):
+                        raise DiscoveryConfigError(
+                            f"Synced table '{tbl_name_str}' 'pii' must be a boolean"
+                        )
                     synced_tables[tbl_name_str] = SyncedTableConfig(
                         target=target.strip(),
                         primary_key=pk,
+                        pii=pii_raw,
                     )
             lakebase_cfg = LakebaseConfig(
                 engine=lb_eng_str,
                 synced_tables=synced_tables,
             )
+
+        # 7. pii_tables and pii_engines / policy.pii_engines
+        pii_tables_raw = data.get("pii_tables", ())
+        if not isinstance(pii_tables_raw, (list, tuple)):
+            raise DiscoveryConfigError(
+                "'pii_tables' must be a list or tuple of non-empty table name strings"
+            )
+        pii_tables_list: list[str] = []
+        for pt in pii_tables_raw:
+            if not isinstance(pt, str) or not pt.strip():
+                raise DiscoveryConfigError(
+                    "'pii_tables' must contain only non-empty table name strings"
+                )
+            pii_tables_list.append(pt.strip())
+        pii_tables = tuple(pii_tables_list)
+
+        has_top_pe = "pii_engines" in data
+        top_pe_raw = data.get("pii_engines", ())
+        if has_top_pe and not isinstance(top_pe_raw, (list, tuple)):
+            raise DiscoveryConfigError(
+                "'pii_engines' must be a list or tuple of non-empty engine name strings"
+            )
+
+        policy_raw = data.get("policy")
+        has_pol_pe = False
+        pol_pe_raw: Any = ()
+        if policy_raw is not None:
+            if not isinstance(policy_raw, Mapping):
+                raise DiscoveryConfigError("'policy' must be a mapping")
+            if "pii_engines" in policy_raw:
+                has_pol_pe = True
+                pol_pe_raw = policy_raw["pii_engines"]
+                if not isinstance(pol_pe_raw, (list, tuple)):
+                    raise DiscoveryConfigError(
+                        "'policy.pii_engines' must be a list or tuple of non-empty engine name strings"
+                    )
+
+        def _parse_engine_names(seq: Any, label: str) -> tuple[str, ...]:
+            names: list[str] = []
+            for item in seq:
+                if not isinstance(item, str) or not item.strip():
+                    raise DiscoveryConfigError(
+                        f"'{label}' must contain only non-empty engine name strings"
+                    )
+                names.append(item.strip())
+            return tuple(names)
+
+        top_pe = _parse_engine_names(top_pe_raw, "pii_engines") if has_top_pe else ()
+        pol_pe = (
+            _parse_engine_names(pol_pe_raw, "policy.pii_engines") if has_pol_pe else ()
+        )
+        if has_top_pe and has_pol_pe and top_pe != pol_pe:
+            raise DiscoveryConfigError(
+                "Conflicting 'pii_engines' and 'policy.pii_engines' in discovery config"
+            )
+        pii_engines = top_pe if has_top_pe else pol_pe
 
         return cls(
             default_catalog=default_catalog,
@@ -559,6 +630,8 @@ class DiscoveryConfig:
             lakekeeper=lakekeeper_cfg,
             engines=engines_dict,
             lakebase=lakebase_cfg,
+            pii_tables=pii_tables,
+            pii_engines=pii_engines,
         )
 
     @classmethod

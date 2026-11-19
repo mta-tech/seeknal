@@ -136,10 +136,22 @@ def discover(
     tables_placement: dict[str, Any] = {}
     schemas_placement: dict[str, list[str]] = {}
     iceberg_logical_names: set[str] = set()
+    pii_tables_lower = {t.lower() for t in cfg.pii_tables}
+    synced_pii_lower: set[str] = set()
+    if cfg.lakebase is not None:
+        for st_name, st_cfg in cfg.lakebase.synced_tables.items():
+            if st_cfg.pii:
+                synced_pii_lower.add(st_name.lower())
 
     for it in iceberg_tables:
         logical = f"{cfg.default_catalog}.{it.namespace}.{it.name}"
         iceberg_logical_names.add(logical)
+        is_pii = (
+            bool(getattr(it, "pii", False))
+            or logical.lower() in pii_tables_lower
+            or f"{it.namespace}.{it.name}".lower() in pii_tables_lower
+            or logical.lower() in synced_pii_lower
+        )
 
         # Determine keys
         if it.keys:
@@ -208,11 +220,14 @@ def discover(
                 )
 
         if serve:
-            tables_placement[logical] = {
+            tbl_entry_dict: dict[str, Any] = {
                 "keys": keys,
                 "row_count": it.row_count,
                 "serve": serve,
             }
+            if is_pii:
+                tbl_entry_dict["pii"] = True
+            tables_placement[logical] = tbl_entry_dict
             schemas_placement[logical] = list(it.columns)
         else:
             warnings.append(
@@ -240,11 +255,13 @@ def discover(
             schemas_placement[cm.name] = list(cm.dimensions) + list(cm.measures)
 
     # 10. Assemble and validate Placement
-    placement_dict = {
+    placement_dict: dict[str, Any] = {
         "engines": engines_placement,
         "tables": tables_placement,
         "cubes": cubes_placement,
     }
+    if cfg.pii_engines:
+        placement_dict["policy"] = {"pii_engines": list(cfg.pii_engines)}
 
     # Validate by instantiating Placement
     Placement.from_dict(placement_dict)

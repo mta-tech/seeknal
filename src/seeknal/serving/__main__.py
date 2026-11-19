@@ -13,6 +13,10 @@ import uvicorn
 from seeknal.serving.buildinfo import format_build_info, get_build_info
 from seeknal.serving.server.app import build_server
 from seeknal.serving.server.config import ServerConfig, ServerConfigError
+from seeknal.serving.startup_validation import (
+    StartupValidationError,
+    run_validate_cli,
+)
 
 
 def main(
@@ -46,10 +50,37 @@ def main(
     )
 
     if argv is None:
-        argv = sys.argv[1:]
+        argv_list = list(sys.argv[1:])
+    else:
+        argv_list = list(argv)
+
+    if argv_list and argv_list[0] == "validate":
+        val_parser = argparse.ArgumentParser(
+            prog="python -m seeknal.serving validate",
+            description="Validate Seeknal Serving configuration, placement, schemas, columns, and PII rules offline",
+        )
+        val_parser.add_argument(
+            "--config",
+            "-c",
+            required=True,
+            help="Path to server YAML configuration file",
+        )
+        try:
+            val_args = val_parser.parse_args(argv_list[1:])
+        except SystemExit as exc:
+            return exc.code if isinstance(exc.code, int) else 2
+        return run_validate_cli(val_args.config)
+
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["validate"],
+        default=None,
+        help="Optional subcommand ('validate' runs offline startup validation)",
+    )
 
     try:
-        args = parser.parse_args(argv)
+        args = parser.parse_args(argv_list)
         if not args.version and not args.config:
             parser.error("the following arguments are required: --config/-c")
     except SystemExit as exc:
@@ -59,12 +90,19 @@ def main(
         print(format_build_info(get_build_info(), as_json=args.json))
         return 0
 
+    if args.command == "validate":
+        return run_validate_cli(args.config)
+
     if args.check:
         try:
             cfg = ServerConfig.from_yaml(args.config, load_keys=True)
             cfg.validate_runtime_wiring()
             print("config ok")
             return 0
+        except StartupValidationError as exc:
+            for prob in exc.problems:
+                print(f"Error: {prob}", file=sys.stderr)
+            return 2
         except ServerConfigError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
@@ -78,6 +116,10 @@ def main(
     try:
         cfg = ServerConfig.from_yaml(args.config, load_keys=True)
         handle = build_server(cfg)
+    except StartupValidationError as exc:
+        for prob in exc.problems:
+            print(f"Error: {prob}", file=sys.stderr)
+        return 2
     except ServerConfigError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2

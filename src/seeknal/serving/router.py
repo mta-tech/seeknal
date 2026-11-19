@@ -120,12 +120,101 @@ HINT_PATTERN = re.compile(
 )
 
 
+PII_CROSS_ENGINE_CODE = "pii_cross_engine"
+_SAFE_PII_IDENT_RE = re.compile(r"^[\w][\w.-]{0,127}$", re.UNICODE)
+_CANARY_RE = re.compile(r"(canary|sentinel|opaque)", re.IGNORECASE)
+
+
+def _safe_router_ident(value: Any) -> str:
+    if not isinstance(value, str):
+        return f"<{type(value).__name__}>"
+    s = value.strip()
+    if not s:
+        return "<empty>"
+    if "://" in s or "@" in s or _CANARY_RE.search(s) or not _SAFE_PII_IDENT_RE.fullmatch(s):
+        return "<redacted>"
+    return s
+
+
 class RoutingError(Exception):
     """Raised when a SQL statement cannot be routed or served."""
 
     def __init__(self, message: str = "", *, code: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+
+
+class PiiCrossEngineError(RoutingError):
+    """Typed routing error raised when a query violates PII engine isolation."""
+
+    code: str = PII_CROSS_ENGINE_CODE
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code=PII_CROSS_ENGINE_CODE)
+
+
+def check_pii_query_mixing(
+    referenced_tables: Sequence[TableEntry],
+    *,
+    hint: str | None = None,
+    extra_pii_tables: Collection[str] | None = None,
+) -> None:
+    """Enforce rule E.3: PII tables cannot be mixed across engines or forced elsewhere via hint.
+
+    Raises:
+        PiiCrossEngineError: subclass of ``RoutingError`` with ``.code == 'pii_cross_engine'``
+            before any engine is called.
+    """
+    extra_lower = (
+        frozenset(str(p).lower() for p in extra_pii_tables)
+        if extra_pii_tables
+        else frozenset()
+    )
+    pii_tables = [
+        t
+        for t in referenced_tables
+        if bool(getattr(t, "pii", False))
+        or bool(getattr(t, "has_pii", False))
+        or bool(getattr(t, "pii_columns", ()))
+        or t.name.lower() in extra_lower
+    ]
+    if not pii_tables:
+        return
+
+    for pii_tbl in pii_tables:
+        if len(pii_tbl.serves) != 1:
+            raise PiiCrossEngineError(
+                f"PII table '{_safe_router_ident(pii_tbl.name)}' must have exactly one serve, "
+                f"got {len(pii_tbl.serves)}"
+            )
+
+    primary_pii = pii_tables[0]
+    pii_engine = primary_pii.serves[0].engine
+
+    for other_pii in pii_tables[1:]:
+        other_eng = other_pii.serves[0].engine
+        if other_eng != pii_engine:
+            raise PiiCrossEngineError(
+                f"PII query cannot combine PII table '{_safe_router_ident(primary_pii.name)}' "
+                f"(engine '{_safe_router_ident(pii_engine)}') with PII table "
+                f"'{_safe_router_ident(other_pii.name)}' (engine '{_safe_router_ident(other_eng)}')"
+            )
+
+    for tbl in referenced_tables:
+        if not any(s.engine == pii_engine for s in tbl.serves):
+            raise PiiCrossEngineError(
+                f"PII table '{_safe_router_ident(primary_pii.name)}' is served on engine "
+                f"'{_safe_router_ident(pii_engine)}', and cannot be queried together with table "
+                f"'{_safe_router_ident(tbl.name)}' which is not served on '{_safe_router_ident(pii_engine)}'"
+            )
+
+    if hint is not None:
+        clean_hint = hint.strip()
+        if clean_hint != pii_engine:
+            raise PiiCrossEngineError(
+                f"PII table '{_safe_router_ident(primary_pii.name)}' is served only on engine "
+                f"'{_safe_router_ident(pii_engine)}'; engine hint '{_safe_router_ident(clean_hint)}' is not permitted"
+            )
 
 
 @dataclass(frozen=True)
@@ -363,6 +452,27 @@ class Router:
                     code="query_spans_engines",
                 )
 
+        resolved_hint = hint
+        if resolved_hint is None:
+            resolved_hint = _extract_hint_comment(statement)
+
+        pii_sole_engine: str | None = None
+        if has_pii:
+            merged_extra_pii = self._pii_tables | (
+                frozenset(str(p).lower() for p in pii_tables)
+                if pii_tables
+                else frozenset()
+            )
+            check_pii_query_mixing(
+                referenced_tables,
+                hint=resolved_hint,
+                extra_pii_tables=merged_extra_pii,
+            )
+            first_pii_tbl = next(
+                t for t in referenced_tables if self._is_pii_table(t, pii_tables)
+            )
+            pii_sole_engine = first_pii_tbl.serves[0].engine
+
         # 4. Feasible engines
         feasible_list: list[str] = []
         rejected: dict[str, str] = {}
@@ -380,6 +490,12 @@ class Router:
                     )
         else:
             for eng_name in placement_engines:
+                if pii_sole_engine is not None and eng_name != pii_sole_engine:
+                    rejected[eng_name] = (
+                        f"Engine '{eng_name}' is not permitted for PII table (restricted to '{pii_sole_engine}')"
+                    )
+                    continue
+
                 missing_tables: list[str] = []
                 stale_tables: list[str] = []
                 for table in referenced_tables:
@@ -412,10 +528,6 @@ class Router:
         feasible: tuple[str, ...] = tuple(feasible_list)
 
         # 5. Hint
-        resolved_hint = hint
-        if resolved_hint is None:
-            resolved_hint = _extract_hint_comment(statement)
-
         if resolved_hint is not None:
             if resolved_hint not in self.placement.engines:
                 raise RoutingError(f"Hint specifies unknown engine '{resolved_hint}'")
@@ -430,7 +542,7 @@ class Router:
                 rej_msg = rejected.get(resolved_hint, "infeasible")
                 if resolved_hint in stale_rejected_engines:
                     hint_code = "data_stale"
-                elif has_pii and len(referenced_tables) >= 2:
+                elif has_pii:
                     hint_code = "pii_cross_engine"
                 else:
                     hint_code = "query_spans_engines"
