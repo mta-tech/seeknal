@@ -1817,6 +1817,71 @@ def test_n3_known_secrets_replaced_before_and_after_generic_regexes():
         clear_registered_config_secrets()
 
 
+def test_n4_duckdb_space_separated_secret_tokens_and_azure_account_key():
+    duckdb_clauses = (
+        "CREATE SECRET s3_sec (TYPE S3, "
+        "KEY_ID 'AKIAIOSFODNN7EXAMPLE', "
+        "SECRET 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', "
+        "SESSION_TOKEN 'AQoDYXdzEJr123456==', "
+        "TOKEN 'ghp_duck_tok_98765', "
+        "ACCOUNT_KEY 'az_duck_acct_key_4455==', "
+        "CLIENT_SECRET 'az_client_sec''6677', "
+        r"CONNECTION_STRING 'DefaultEndpointsProtocol=https;AccountKey=conn_str_sec\'8899==')"
+    )
+    out_duck = scrub_error_detail(duckdb_clauses, env={})
+    for tok_name in (
+        "KEY_ID",
+        "SECRET",
+        "SESSION_TOKEN",
+        "TOKEN",
+        "ACCOUNT_KEY",
+        "CLIENT_SECRET",
+        "CONNECTION_STRING",
+    ):
+        assert f"{tok_name} '[REDACTED]'" in out_duck
+    for leaked in (
+        "AKIAIOSFODNN7EXAMPLE",
+        "wJalrXUtnFEMI",
+        "AQoDYXdzEJr123456",
+        "ghp_duck_tok_98765",
+        "az_duck_acct_key_4455",
+        "az_client_sec",
+        "6677",
+        "conn_str_sec",
+        "8899",
+    ):
+        assert leaked not in out_duck, f"Leaked '{leaked}' in: {out_duck}"
+
+    # Azure AccountKey=..., account_key=..., connection_string=... (with base64 '=' padding and env KV extract)
+    azure_msg = (
+        "DefaultEndpointsProtocol=https;AccountName=myacct;"
+        "AccountKey=dGhpcyBpcyBhIHNlY3JldCBrZXk==;EndpointSuffix=core.windows.net | "
+        "account_key=az_snake_b64_val= | "
+        "connection_string='BlobEndpoint=https://x;SharedAccessSignature=sv=2022' | "
+        "echoed_raw=env_extracted_az_key_1122=="
+    )
+    out_az = scrub_error_detail(
+        azure_msg,
+        env={
+            "AZURE_STORAGE_SECRET": (
+                "DefaultEndpointsProtocol=https;AccountName=myacct;"
+                "AccountKey=env_extracted_az_key_1122==;EndpointSuffix=core.windows.net"
+            )
+        },
+    )
+    assert "AccountKey=[REDACTED];EndpointSuffix=core.windows.net" in out_az
+    assert "account_key=[REDACTED]" in out_az
+    assert "connection_string=[REDACTED]" in out_az
+    for leaked in (
+        "dGhpcyBpcyBhIHNlY3JldCBrZXk",
+        "az_snake_b64_val",
+        "SharedAccessSignature",
+        "env_extracted_az_key_1122",
+    ):
+        assert leaked not in out_az, f"Leaked '{leaked}' in: {out_az}"
+
+
+
 
 
 

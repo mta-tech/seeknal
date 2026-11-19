@@ -223,11 +223,14 @@ def build_error_payload(
 _SECRET_KEY_NAMES: tuple[str, ...] = (
     "aws_secret_access_key",
     "aws_access_key_id",
+    "connection_string",
     "client_secret",
     "session_token",
+    "account_key",
     "sslpassword",
     "private_key",
     "credentials",
+    "accountkey",
     "credential",
     "secret_key",
     "access_key",
@@ -261,7 +264,7 @@ _DSN_KV_EXTRACT_RE = re.compile(
     rf"(?is)(?<![A-Za-z0-9])(?:{_SECRET_KEYS_ALT})\s*=\s*(?:'((?:''|\\[\s\S]|[^'\\])*)'|\"((?:\"\"|\\[\s\S]|[^\"\\])*)\"|([^\s,;'\"&+)]+))"
 )
 _DUCKDB_SECRET_RE = re.compile(
-    r"(?is)(?<![A-Za-z0-9])SECRET\s+'(?:''|\\[\s\S]|[^'\\])*'"
+    r"(?is)(?<![A-Za-z0-9])(SECRET|KEY_ID|SESSION_TOKEN|TOKEN|ACCOUNT_KEY|CLIENT_SECRET|CONNECTION_STRING)\s+'(?:''|\\[\s\S]|[^'\\])*'"
 )
 _SQL_SINGLE_QUOTED_RE = re.compile(r"'((?:''|[^'])*)'")
 _PURELY_NUMERIC_RE = re.compile(
@@ -489,9 +492,9 @@ def scrub_error_detail(
     detail = _JWT_RE.sub("[REDACTED_JWT]", detail)
     detail = _BEARER_RE.sub("Bearer [REDACTED]", detail)
     detail = _URI_USERINFO_RE.sub("://[REDACTED]@", detail)
+    detail = _DUCKDB_SECRET_RE.sub(r"\1 '[REDACTED]'", detail)
     detail = _DSN_KV_EQ_RE.sub(r"\1=[REDACTED]", detail)
     detail = _SECRET_COLON_KV_RE.sub(r"\1\2: [REDACTED]", detail)
-    detail = _DUCKDB_SECRET_RE.sub("SECRET '[REDACTED]'", detail)
 
     detail = _replace_known_secrets(detail, env_secrets)
 
