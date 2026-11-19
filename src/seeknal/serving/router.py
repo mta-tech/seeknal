@@ -14,8 +14,17 @@ from sqlglot.dialects.duckdb import DuckDB
 from sqlglot.parser import Parser
 from sqlglot.tokens import TokenType
 
-from seeknal.serving.features import QueryFeatures, extract_features
-from seeknal.serving.placement import Engine, Placement, TableEntry
+from seeknal.serving.features import (
+    PredicateFeature,
+    QueryFeatures,
+    _column_qualifier,
+    _extract_predicates,
+    _flatten_and,
+    _is_bare_column,
+    _unwrap_paren,
+    extract_features,
+)
+from seeknal.serving.placement import Engine, Placement, TableEntry, is_postgres_wire
 
 _orig_parse_version = Parser._parse_version
 _orig_parse_table_alias = Parser._parse_table_alias
@@ -175,10 +184,13 @@ def check_pii_query_mixing(
     pii_tables = [
         t
         for t in referenced_tables
-        if bool(getattr(t, "pii", False))
-        or bool(getattr(t, "has_pii", False))
-        or bool(getattr(t, "pii_columns", ()))
-        or t.name.lower() in extra_lower
+        if not bool(getattr(t, "tokenized", False))
+        and (
+            bool(getattr(t, "pii", False))
+            or bool(getattr(t, "has_pii", False))
+            or bool(getattr(t, "pii_columns", ()))
+            or t.name.lower() in extra_lower
+        )
     ]
     if not pii_tables:
         return
@@ -261,17 +273,316 @@ def _remove_hint_comment(statement: exp.Expression) -> None:
         statement.comments.pop(0)
 
 
+def _select_postgres_wire_engine(
+    feasible: Sequence[str],
+    engines: Mapping[str, Engine],
+) -> str | None:
+    """Select a feasible Postgres-wire engine, preferring 'postgres' over 'lakebase', then placement order."""
+    for preferred_kind in ("postgres", "lakebase"):
+        for eng_name in feasible:
+            if engines[eng_name].kind == preferred_kind:
+                return eng_name
+    return None
+
+
 def _select_engine_by_kinds(
     feasible: Sequence[str],
     kinds_order: Sequence[str],
     engines: Mapping[str, Engine],
 ) -> str | None:
-    """Select the first feasible engine matching kind order."""
+    """Select the first feasible engine matching kind order.
+
+    When 'lakebase' appears in *kinds_order* without an explicit 'postgres' entry,
+    'postgres' engines are matched first, then 'lakebase', preserving placement order within each.
+    """
+    explicit_postgres = "postgres" in kinds_order
     for kind in kinds_order:
-        for eng_name in feasible:
-            if engines[eng_name].kind == kind:
-                return eng_name
+        if kind == "lakebase" and not explicit_postgres:
+            candidate = _select_postgres_wire_engine(feasible, engines)
+            if candidate is not None:
+                return candidate
+        else:
+            for eng_name in feasible:
+                if engines[eng_name].kind == kind:
+                    return eng_name
     return None
+
+
+def _inspect_plain_derived_source(
+    src: exp.Expression,
+    placement: Placement,
+    cte_map: Mapping[str, exp.Expression],
+) -> tuple[TableEntry | None, set[str], bool, dict[str, str | None], tuple[PredicateFeature, ...]]:
+    """Inspect a FROM/JOIN relation source (base Table or 1-level plain-projection derived table/CTE).
+
+    Returns ``(table_entry, outer_aliases, has_star, proj_map, inner_predicates)``.
+    """
+    src = _unwrap_paren(src)
+    if isinstance(src, exp.Table):
+        if isinstance(src.this, exp.Func):
+            return (None, set(), False, {}, ())
+        t_name = src.name.lower()
+        if t_name in cte_map and not src.db and not src.catalog:
+            inner_query = cte_map[t_name]
+            outer_alias = src.alias.lower() if src.alias else t_name
+        else:
+            dotted = _table_dotted_name(src).lower()
+            t_entry = placement.find_table(dotted)
+            if t_entry is None:
+                return (None, set(), False, {}, ())
+            aliases: set[str] = set()
+            if src.alias:
+                aliases.add(src.alias.lower())
+            else:
+                aliases.add(_table_leaf_name(src).lower())
+                aliases.add(dotted)
+                aliases.add(t_entry.name.lower())
+            return (t_entry, aliases, True, {}, ())
+    elif isinstance(src, exp.Subquery) and src.this is not None:
+        inner_query = src.this
+        outer_alias = src.alias.lower() if src.alias else ""
+    else:
+        return (None, set(), False, {}, ())
+
+    inner = _unwrap_paren(inner_query)
+    if not isinstance(inner, exp.Select):
+        return (None, set(), False, {}, ())
+    if (
+        inner.args.get("joins")
+        or inner.args.get("group")
+        or inner.args.get("having")
+        or inner.args.get("distinct")
+        or inner.args.get("limit")
+        or inner.args.get("offset")
+        or inner.args.get("with")
+    ):
+        return (None, set(), False, {}, ())
+    if (
+        inner.find(exp.AggFunc)
+        or inner.find(exp.Window)
+        or inner.find(exp.Subquery)
+        or inner.find(exp.Exists)
+        or inner.find((exp.Union, exp.Intersect, exp.Except))
+    ):
+        return (None, set(), False, {}, ())
+
+    from_clause = inner.args.get("from")
+    if from_clause is None or not isinstance(from_clause.this, exp.Table):
+        return (None, set(), False, {}, ())
+    base_node = from_clause.this
+    if isinstance(base_node.this, exp.Func):
+        return (None, set(), False, {}, ())
+    if base_node.name.lower() in cte_map and not base_node.db and not base_node.catalog:
+        return (None, set(), False, {}, ())
+
+    base_entry = placement.find_table(_table_dotted_name(base_node).lower())
+    if base_entry is None:
+        return (None, set(), False, {}, ())
+
+    base_aliases: set[str] = set()
+    if base_node.alias:
+        base_aliases.add(base_node.alias.lower())
+    else:
+        base_aliases.add(_table_leaf_name(base_node).lower())
+        base_aliases.add(_table_dotted_name(base_node).lower())
+        base_aliases.add(base_entry.name.lower())
+
+    has_star = False
+    proj_map: dict[str, str | None] = {}
+    for expr in inner.expressions:
+        if isinstance(expr, exp.Star):
+            has_star = True
+        elif isinstance(expr, exp.Column) and isinstance(expr.this, exp.Star):
+            qual = _column_qualifier(expr)
+            if qual is None or qual in base_aliases:
+                has_star = True
+        elif _is_bare_column(expr):
+            assert isinstance(expr, exp.Column)
+            qual = _column_qualifier(expr)
+            if qual is None or qual in base_aliases:
+                col_l = expr.name.lower()
+                proj_map.setdefault(col_l, col_l)
+            else:
+                proj_map.setdefault(expr.name.lower(), None)
+        elif isinstance(expr, exp.Alias):
+            out_name = expr.alias.lower()
+            target = _unwrap_paren(expr.this)
+            if _is_bare_column(target):
+                assert isinstance(target, exp.Column)
+                qual = _column_qualifier(target)
+                if qual is None or qual in base_aliases:
+                    proj_map[out_name] = target.name.lower()
+                else:
+                    proj_map[out_name] = None
+            else:
+                proj_map[out_name] = None
+
+    outer_aliases = {outer_alias} if outer_alias else set()
+    inner_preds = tuple(
+        PredicateFeature(
+            column=p.column,
+            op=p.op,
+            value_count=p.value_count,
+            table_qualifier=None,
+        )
+        for p in _extract_predicates(inner)
+    )
+    return (base_entry, outer_aliases, has_star, proj_map, inner_preds)
+
+
+def _extract_resolved_table_predicates(
+    statement: exp.Expression,
+    placement: Placement,
+) -> list[tuple[TableEntry, PredicateFeature]]:
+    """Resolve sargable predicates onto referenced TableEntry instances (supporting 1-level plain derived tables)."""
+    if not isinstance(statement, exp.Select):
+        return []
+
+    cte_map: dict[str, exp.Expression] = {}
+    with_clause = statement.args.get("with")
+    if with_clause:
+        for cte in with_clause.expressions:
+            if isinstance(cte, exp.CTE) and cte.this is not None:
+                cte_map[cte.alias_or_name.lower()] = cte.this
+
+    sources: list[exp.Expression] = []
+    from_clause = statement.args.get("from")
+    if from_clause is not None and from_clause.this is not None:
+        sources.append(from_clause.this)
+    for j in statement.args.get("joins") or ():
+        if isinstance(j, exp.Join) and j.this is not None:
+            sources.append(j.this)
+
+    rel_specs: list[tuple[TableEntry, set[str], bool, dict[str, str | None]]] = []
+    resolved: list[tuple[TableEntry, PredicateFeature]] = []
+
+    for src in sources:
+        t_entry, aliases, has_star, proj_map, inner_preds = (
+            _inspect_plain_derived_source(src, placement, cte_map)
+        )
+        if t_entry is None:
+            continue
+        rel_specs.append((t_entry, aliases, has_star, proj_map))
+        for ip in inner_preds:
+            resolved.append((t_entry, ip))
+
+    if not rel_specs:
+        return resolved
+
+    outer_preds = list(_extract_predicates(statement))
+    for j in statement.args.get("joins") or ():
+        if isinstance(j, exp.Join) and (j.side or "INNER").upper() == "INNER":
+            on_expr = j.args.get("on")
+            if on_expr is not None:
+                for conj in _flatten_and(on_expr):
+                    dummy_sel = exp.Select().where(conj, copy=False)
+                    outer_preds.extend(_extract_predicates(dummy_sel))
+
+    def _resolve_on_spec(
+        spec: tuple[TableEntry, set[str], bool, dict[str, str | None]],
+        col_l: str,
+    ) -> str | None:
+        _tbl, _aliases, has_star, proj_map = spec
+        if col_l in proj_map:
+            return proj_map[col_l]
+        if has_star:
+            return col_l
+        return None
+
+    for pred in outer_preds:
+        if pred.table_qualifier is not None:
+            q_l = pred.table_qualifier.lower()
+            for spec in rel_specs:
+                if q_l in spec[1]:
+                    base_col = _resolve_on_spec(spec, pred.column)
+                    if base_col is not None:
+                        resolved.append(
+                            (
+                                spec[0],
+                                PredicateFeature(
+                                    column=base_col,
+                                    op=pred.op,
+                                    value_count=pred.value_count,
+                                ),
+                            )
+                        )
+                    break
+        elif len(rel_specs) == 1:
+            base_col = _resolve_on_spec(rel_specs[0], pred.column)
+            if base_col is not None:
+                resolved.append(
+                    (
+                        rel_specs[0][0],
+                        PredicateFeature(
+                            column=base_col,
+                            op=pred.op,
+                            value_count=pred.value_count,
+                        ),
+                    )
+                )
+        else:
+            for spec in rel_specs:
+                base_col = _resolve_on_spec(spec, pred.column)
+                if base_col is None:
+                    continue
+                t_entry = spec[0]
+                acc = t_entry.access
+                known_cols: set[str] = {k.lower() for k in t_entry.keys}
+                if acc is not None:
+                    known_cols.update(c.lower() for c in acc.keys)
+                    known_cols.update(c.lower() for c in acc.filterable)
+                    known_cols.update(c.lower() for c in acc.range_filterable)
+                    known_cols.update(c.lower() for c in acc.prefix_filterable)
+                if base_col in known_cols or pred.column in spec[3]:
+                    resolved.append(
+                        (
+                            t_entry,
+                            PredicateFeature(
+                                column=base_col,
+                                op=pred.op,
+                                value_count=pred.value_count,
+                            ),
+                        )
+                    )
+
+    return resolved
+
+
+def _match_filter_rule(
+    statement: exp.Expression,
+    placement: Placement,
+) -> list[str]:
+    """Return human-readable matched filter column descriptions if statement matches the §4.3 filter rule."""
+    resolved = _extract_resolved_table_predicates(statement, placement)
+    max_in_list = placement.policy.max_in_list
+    matched: list[str] = []
+
+    for tbl, pred in resolved:
+        acc = tbl.access
+        if acc is None:
+            continue
+        filt_set = {c.lower() for c in acc.filterable}
+        range_set = {c.lower() for c in acc.range_filterable}
+        prefix_set = {c.lower() for c in acc.prefix_filterable}
+
+        is_hit = False
+        if (
+            pred.op in ("eq", "in", "or_eq")
+            and pred.value_count <= max_in_list
+            and pred.column in (filt_set | range_set | prefix_set)
+        ):
+            is_hit = True
+        elif pred.op in ("range", "between") and pred.column in range_set:
+            is_hit = True
+        elif pred.op == "prefix_like" and pred.column in prefix_set:
+            is_hit = True
+
+        if is_hit:
+            desc = f"{tbl.name}.{pred.column}"
+            if desc not in matched:
+                matched.append(desc)
+
+    return matched
 
 
 class Router:
@@ -294,6 +605,8 @@ class Router:
         table: TableEntry,
         extra_pii: Collection[str] | None = None,
     ) -> bool:
+        if bool(getattr(table, "tokenized", False)):
+            return False
         if (
             bool(getattr(table, "pii", False))
             or bool(getattr(table, "has_pii", False))
@@ -564,12 +877,14 @@ class Router:
         if resolved_hint is not None:
             if resolved_hint not in self.placement.engines:
                 raise RoutingError(f"Hint specifies unknown engine '{resolved_hint}'")
+            hint_eng = self.placement.engines[resolved_hint]
             if (
                 features.kind in ("insert", "update", "delete", "merge")
-                and self.placement.engines[resolved_hint].kind != "lakebase"
+                and not hint_eng.is_writable
             ):
                 raise RoutingError(
-                    f"Writes go only to Lakebase; hinted engine '{resolved_hint}' is of kind '{self.placement.engines[resolved_hint].kind}'"
+                    f"Writes go only to Lakebase or writable Postgres engines; "
+                    f"hinted engine '{resolved_hint}' (kind '{hint_eng.kind}') is not writable"
                 )
             if resolved_hint not in feasible:
                 rej_msg = rejected.get(resolved_hint, "infeasible")
@@ -598,29 +913,31 @@ class Router:
                 reason = f"Routing forced to engine '{resolved_hint}' by hint"
             elif features.kind in ("insert", "update", "delete", "merge"):
                 rule = "write"
-                candidate = next(
-                    (
+                candidate = _select_postgres_wire_engine(
+                    [
                         e
                         for e in current_feasible
-                        if self.placement.engines[e].kind == "lakebase"
-                    ),
-                    None,
+                        if self.placement.engines[e].is_writable
+                    ],
+                    self.placement.engines,
                 )
                 if candidate is None:
                     raise RoutingError(
-                        "No feasible engine of kind 'lakebase' available for write statement"
+                        "Writes go only to Lakebase or writable Postgres engines; "
+                        "no feasible writable engine available for write statement"
                     )
                 chosen_engine = candidate
                 reason = (
-                    f"write statement of kind '{features.kind}' routed to lakebase"
+                    f"write statement of kind '{features.kind}' routed to "
+                    f"{self.placement.engines[candidate].kind}"
                 )
             elif referenced_cubes:
                 rule = "semantic"
                 chosen_engine = referenced_cubes[0].engine
                 reason = f"semantic query over cube '{referenced_cubes[0].name}'"
             else:
-                # Check point_lookup
-                point_lookup_matched = False
+                # Rule 4: point_lookup
+                point_lookup_counts: dict[str, int] | None = None
                 if (
                     features.kind == "select"
                     and len(referenced_tables) == 1
@@ -629,37 +946,84 @@ class Router:
                     and not features.has_group_by
                     and not features.has_window
                     and not features.has_join
-                    and not features.has_subquery
                 ):
                     tbl = referenced_tables[0]
-                    if all(k.lower() in features.key_equalities for k in tbl.keys):
-                        key_prod = math.prod(
-                            features.key_equalities[k.lower()] for k in tbl.keys
+                    if not features.has_subquery:
+                        if all(
+                            k.lower() in features.key_equalities
+                            and features.key_equalities[k.lower()]
+                            <= self.placement.policy.max_in_list
+                            for k in tbl.keys
+                        ):
+                            key_prod = math.prod(
+                                features.key_equalities[k.lower()]
+                                for k in tbl.keys
+                            )
+                            if key_prod <= self.placement.policy.point_lookup_max_keys:
+                                point_lookup_counts = {
+                                    k.lower(): features.key_equalities[k.lower()]
+                                    for k in tbl.keys
+                                }
+                    elif not features.has_distinct:
+                        resolved_preds = _extract_resolved_table_predicates(
+                            statement, self.placement
                         )
-                        if key_prod <= self.placement.policy.point_lookup_max_keys:
-                            point_lookup_matched = True
+                        derived_key_eq: dict[str, int] = {}
+                        for r_tbl, r_pred in resolved_preds:
+                            if (
+                                r_tbl.name.lower() == tbl.name.lower()
+                                and r_pred.op in ("eq", "in")
+                                and r_pred.value_count
+                                <= self.placement.policy.max_in_list
+                            ):
+                                prev = derived_key_eq.get(r_pred.column)
+                                if prev is None or r_pred.value_count < prev:
+                                    derived_key_eq[r_pred.column] = r_pred.value_count
+                        if all(k.lower() in derived_key_eq for k in tbl.keys):
+                            key_prod = math.prod(
+                                derived_key_eq[k.lower()] for k in tbl.keys
+                            )
+                            if key_prod <= self.placement.policy.point_lookup_max_keys:
+                                point_lookup_counts = derived_key_eq
 
-                if point_lookup_matched:
-                    lakebase_eng = next(
-                        (
-                            e
-                            for e in current_feasible
-                            if self.placement.engines[e].kind == "lakebase"
-                        ),
-                        None,
+                if point_lookup_counts is not None:
+                    pg_wire_eng = _select_postgres_wire_engine(
+                        current_feasible, self.placement.engines
                     )
-                    if lakebase_eng is not None:
+                    if pg_wire_eng is not None:
                         tbl = referenced_tables[0]
-                        chosen_engine = lakebase_eng
+                        chosen_engine = pg_wire_eng
                         rule = "point_lookup"
                         parts = []
                         for k in tbl.keys:
-                            cnt = features.key_equalities[k.lower()]
+                            cnt = point_lookup_counts[k.lower()]
                             val_word = "1 value" if cnt == 1 else f"{cnt} values"
                             parts.append(f"{k} by {val_word}")
                         reason = f"filters {', '.join(parts)} on table {tbl.name}"
 
-                # If point_lookup not matched or no lakebase engine feasible, fall through
+                # Rule 5: filter
+                if (
+                    chosen_engine is None
+                    and features.kind == "select"
+                    and len(referenced_tables) >= 1
+                    and not features.has_aggregate
+                    and not features.has_group_by
+                    and not features.has_window
+                    and not features.has_distinct
+                ):
+                    pg_wire_eng = _select_postgres_wire_engine(
+                        current_feasible, self.placement.engines
+                    )
+                    if pg_wire_eng is not None:
+                        matched_filters = _match_filter_rule(
+                            statement, self.placement
+                        )
+                        if matched_filters:
+                            chosen_engine = pg_wire_eng
+                            rule = "filter"
+                            reason = f"sargable filter on {', '.join(matched_filters)}"
+
+                # If point_lookup / filter not matched or no Postgres-wire engine feasible, fall through
                 if chosen_engine is None:
                     # Check analytics
                     is_analytics = (

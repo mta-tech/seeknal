@@ -865,3 +865,118 @@ def test_disabled_cache_bypasses_get_put_and_ast_copy_budget_controls(
     assert prep_hit.params == (20,)
     assert hit_copies == legacy_copies + 1
     assert pipeline_enabled.compilation_cache_info()["hits"] == 1
+
+
+def test_split_verify_grant_prepare_statement_and_postgres_guardrails(ec_key):
+    """Verify verify_grant + prepare_statement split, kind='postgres' enforce bridge, and PreparedQuery fields."""
+    import sqlglot
+    from seeknal.serving.guardrails import GuardrailError
+
+    priv, pub = ec_key
+    placement = Placement.from_dict(
+        {
+            "engines": {
+                "pg_report": {"kind": "postgres", "dialect": "postgres"},
+                "lake": {"kind": "duckdb", "dialect": "duckdb"},
+            },
+            "tables": {
+                "cbn.rpt.txn_detail": {
+                    "row_count": 5_000_000,
+                    "serve": {
+                        "pg_report": "rpt.txn_detail",
+                        "lake": "lake.rpt.txn_detail",
+                    },
+                    "access": {
+                        "pattern": "filter",
+                        "keys": ["txn_id"],
+                        "filterable": ["customer_id", "as_of_date"],
+                        "range_filterable": ["as_of_date"],
+                        "sortable": ["as_of_date", "txn_id"],
+                        "max_rows": 50,
+                    },
+                },
+                "cbn.src_pii.customer": {
+                    "pii": True,
+                    "serve": {"pg_report": "src_pii.customer"},
+                    "access": {
+                        "pattern": "point",
+                        "keys": ["customer_id"],
+                        "filterable": ["customer_id"],
+                        "sortable": ["customer_id"],
+                        "max_rows": 25,
+                    },
+                },
+            },
+        }
+    )
+    schemas = {
+        "cbn.rpt.txn_detail": ["txn_id", "customer_id", "as_of_date", "amount"],
+        "cbn.src_pii.customer": ["customer_id", "full_name"],
+    }
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas=schemas,
+        public_keys={"key-atlas": pub},
+        default_catalog="cbn",
+    )
+
+    # 1. Filtered query on kind='postgres' via verify_grant + prepare_statement
+    sql = "SELECT txn_id, amount FROM rpt.txn_detail WHERE customer_id = $1 ORDER BY as_of_date DESC"
+    tok = _make_token(
+        priv,
+        sql,
+        {
+            "cbn.rpt.txn_detail": {
+                "columns": ["txn_id", "customer_id", "as_of_date", "amount"],
+                "masks": {},
+                "row_filters": [],
+                "actions": ["select"],
+            }
+        },
+        max_rows=500,
+    )
+    grant = pipeline.verify_grant(tok, sql=sql, params=("C-1001",))
+    stmt = sqlglot.parse_one(sql, read="postgres")
+    prep = pipeline.prepare_statement(
+        stmt,
+        grant,
+        sql=sql,
+        params=("C-1001",),
+        max_rows=200,
+        api="select.v1",
+    )
+    assert prep.engine == "pg_report"
+    assert prep.engine_kind == "postgres"
+    assert prep.rule == "filter"
+    assert prep.paramstyle == "format"
+    assert prep.params == ("C-1001",)
+    assert prep.tables == ("cbn.rpt.txn_detail",)
+    assert prep.access_pattern == "filter"
+    assert prep.guard == "pass"
+    assert prep.filter_columns == ("customer_id",)
+    # min(grant=500, request=200, table.access.max_rows=50) == 50 -> row_limit = 51
+    assert prep.effective_max_rows == 50
+    assert prep.row_limit == 51
+    assert prep.api == "select.v1"
+
+    # 2. Row filter in grant must NOT satisfy require_filter when client SQL has no filter
+    unfiltered_sql = "SELECT customer_id, full_name FROM src_pii.customer"
+    tok_unfiltered = _make_token(
+        priv,
+        unfiltered_sql,
+        {
+            "cbn.src_pii.customer": {
+                "columns": ["customer_id"],
+                "masks": {"full_name": "redact"},
+                "row_filters": [
+                    {"column": "customer_id", "op": "eq", "values": ["C-1001"]}
+                ],
+                "actions": ["select"],
+            }
+        },
+    )
+    with pytest.raises(GuardrailError) as exc_info:
+        pipeline.prepare(unfiltered_sql, tok_unfiltered)
+    assert exc_info.value.code == "filter_required"
+    assert exc_info.value.audit_id == "jti-service-001"
+
