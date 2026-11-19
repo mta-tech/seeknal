@@ -45,6 +45,7 @@ from seeknal.serving.audit import (
 from seeknal.serving.enforce import EnforcementError
 from seeknal.serving.errors import (
     AuditUnavailableError,
+    _sanitize_log_value,
     build_error_payload,
     get_error_spec,
     scrub_error_detail,
@@ -484,28 +485,6 @@ def _error_response(
         audit_id=safe_audit_id,
     )
     return JSONResponse(body, status_code=resolved_status)
-
-
-def _sanitize_log_value(value: Any, *, default: str = "-") -> str:
-    if value is None:
-        return default
-    raw = _LONE_SURROGATE_RE.sub("\ufffd", str(value))
-    if not raw:
-        return default
-    out_chars: list[str] = []
-    for ch in raw:
-        code = ord(ch)
-        if ch == "\n":
-            out_chars.append("\\n")
-        elif ch == "\r":
-            out_chars.append("\\r")
-        elif ch == "\t":
-            out_chars.append("\\t")
-        elif code < 0x20 or code == 0x7F or (0x80 <= code <= 0x9F):
-            out_chars.append(f"\\x{code:02x}")
-        else:
-            out_chars.append(ch)
-    return "".join(out_chars)
 
 
 def _log_request(

@@ -238,6 +238,38 @@ _SENSITIVE_ENV_NAME_RE = re.compile(
 _CANARY_SENTINEL_RE = re.compile(
     r"(?i)\b[A-Za-z0-9_.-]*(?:canary|sentinel)[A-Za-z0-9_.-]*\b"
 )
+_LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+_MAX_SCRUBBED_DETAIL_CHARS = 2048
+
+
+def _sanitize_log_value(value: Any, *, default: str = "-") -> str:
+    """Sanitize a value for single-line logs, escaping all control and non-printable characters."""
+    if value is None:
+        return default
+    raw = _LONE_SURROGATE_RE.sub("\ufffd", str(value))
+    if not raw:
+        return default
+    out_chars: list[str] = []
+    for ch in raw:
+        code = ord(ch)
+        if ch == "\n":
+            out_chars.append("\\n")
+        elif ch == "\r":
+            out_chars.append("\\r")
+        elif ch == "\t":
+            out_chars.append("\\t")
+        elif code < 0x20 or code == 0x7F or (0x80 <= code <= 0x9F):
+            out_chars.append(f"\\x{code:02x}")
+        elif not ch.isprintable():
+            if code <= 0xFF:
+                out_chars.append(f"\\x{code:02x}")
+            elif code <= 0xFFFF:
+                out_chars.append(f"\\u{code:04x}")
+            else:
+                out_chars.append(f"\\U{code:08x}")
+        else:
+            out_chars.append(ch)
+    return "".join(out_chars)
 
 
 def _extract_env_secrets(env: Mapping[str, str] | None) -> list[str]:
@@ -363,5 +395,5 @@ def scrub_error_detail(
             )
 
     detail = _CANARY_SENTINEL_RE.sub("[REDACTED]", detail)
-    detail = detail.replace("\r", "\\r").replace("\n", "\\n")
-    return detail
+    detail = _sanitize_log_value(detail, default="")
+    return detail[:_MAX_SCRUBBED_DETAIL_CHARS]

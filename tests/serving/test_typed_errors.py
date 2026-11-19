@@ -29,8 +29,10 @@ from seeknal.serving.errors import (
     ERROR_CATALOGUE,
     REQUIRED_ERROR_CODES,
     AuditUnavailableError,
+    _sanitize_log_value,
     scrub_error_detail,
 )
+from seeknal.serving.http import _sanitize_log_value as http_sanitize_log_value
 from seeknal.serving.grant_token import sign_cancel_token, sign_grant_token
 from seeknal.serving.http import GrantReplayCache, create_app
 from seeknal.serving.placement import Placement
@@ -1337,3 +1339,78 @@ def test_f_l2_error_logs_include_scrubbed_exc_detail_and_audit_id(
         and "audit_id=jti-fl2-cancel-err" in rec.getMessage()
         for rec in caplog.records
     )
+
+
+def test_c_n2_log_forging_control_chars_length_cap_and_forged_kid(
+    multi_engine_setup,
+    caplog: pytest.LogCaptureFixture,
+):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+
+    # 1. _sanitize_log_value is exported from errors.py and re-exported in http.py
+    assert http_sanitize_log_value is _sanitize_log_value
+
+    raw_controls = (
+        "head\r\n\t\x1b[2J\x85\x0b\x0c\x00\x1f\x7f\x9f\u2028\u2029\u200btail"
+    )
+    sanitized = _sanitize_log_value(raw_controls)
+    assert "\\r\\n\\t\\x1b[2J\\x85\\x0b\\x0c\\x00\\x1f\\x7f\\x9f\\u2028\\u2029\\u200b" in sanitized
+    assert all(ch.isprintable() for ch in sanitized)
+
+    # Verify every 0x00..0x1f and 0x7f..0x9f byte is escaped
+    all_ctrl = "".join(chr(c) for c in [*range(0x00, 0x20), *range(0x7F, 0xA0)])
+    escaped_all = _sanitize_log_value(all_ctrl)
+    assert all(ch.isprintable() for ch in escaped_all)
+    for c in [*range(0x00, 0x20), *range(0x7F, 0xA0)]:
+        assert chr(c) not in escaped_all
+
+    # 2. scrub_error_detail escapes non-printables and caps length at 2048 chars
+    huge_forged_exc = RuntimeError(
+        "prefix\x1b[31m\x85\x0b\x0c\u2028" + ("X" * 5000)
+    )
+    scrubbed_huge = scrub_error_detail(huge_forged_exc)
+    assert len(scrubbed_huge) == 2048
+    assert all(ch.isprintable() for ch in scrubbed_huge)
+    assert "\\x1b[31m\\x85\\x0b\\x0c\\u2028" in scrubbed_huge
+
+    # 3. Forged kid with ANSI escape, C1 NEL, VT, and fake audit_id on /v1/query and /v1/cancel
+    forged_kid = "k\x1b[2J FAKE audit_id=root\x85x\x0bY"
+    sql = "SELECT id FROM users"
+    bad_grant = _make_grant(priv, sql, jti="jti-unverified", kid=forged_kid)
+    bad_cancel = sign_cancel_token(
+        {
+            "typ": "cancel",
+            "sub": "analyst@atlas.example",
+            "jti": "jti-unverified-cancel",
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": time.time(),
+            "exp": time.time() + 30.0,
+        },
+        priv,
+        kid=forged_kid,
+    )
+
+    client = TestClient(create_app(pipeline, {"duck": duck_adapter}))
+    with caplog.at_level(logging.DEBUG):
+        caplog.clear()
+        rq = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {bad_grant}"},
+            json={"sql": sql},
+        )
+        rc = client.post(
+            "/v1/cancel",
+            headers={"Authorization": f"Bearer {bad_cancel}"},
+        )
+
+    assert rq.status_code == 401
+    assert rc.status_code == 401
+    assert "FAKE" not in rq.text
+    assert "FAKE" not in rc.text
+    assert "FAKE" not in caplog.text
+    assert "audit_id=root" not in caplog.text
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        assert all(ch.isprintable() for ch in msg)
+

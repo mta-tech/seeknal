@@ -171,18 +171,18 @@ def verify_grant_token(
     if "alg" not in header:
         raise GrantTokenError("Missing 'alg' in token header")
     if header["alg"] != "ES256":
-        raise GrantTokenError(f"Unsupported algorithm '{header['alg']}', only ES256 permitted")
+        raise GrantTokenError("Unsupported algorithm, only ES256 permitted")
 
     typ = header.get("typ")
     if typ is not None and typ != "JWT":
-        raise GrantTokenError(f"Unsupported token type '{typ}', expected JWT")
+        raise GrantTokenError("Unsupported token type, expected JWT")
 
     kid = header.get("kid")
     if not kid or not isinstance(kid, str):
         raise GrantTokenError("Missing or invalid 'kid' in token header")
 
     if kid not in public_keys:
-        raise GrantTokenError(f"Unknown key ID '{kid}'")
+        raise GrantTokenError("Unknown key ID")
 
     pub_key = _load_public_key(public_keys[kid], kid)
 
@@ -328,18 +328,18 @@ def verify_cancel_token(
     if "alg" not in header:
         raise GrantTokenError("Missing 'alg' in token header")
     if header["alg"] != "ES256":
-        raise GrantTokenError(f"Unsupported algorithm '{header['alg']}', only ES256 permitted")
+        raise GrantTokenError("Unsupported algorithm, only ES256 permitted")
 
     typ = header.get("typ")
     if typ is not None and typ not in ("JWT", "cancel"):
-        raise GrantTokenError(f"Unsupported token type '{typ}', expected JWT or cancel")
+        raise GrantTokenError("Unsupported token type, expected JWT or cancel")
 
     kid = header.get("kid")
     if not kid or not isinstance(kid, str):
         raise GrantTokenError("Missing or invalid 'kid' in token header")
 
     if kid not in key_dict:
-        raise GrantTokenError(f"Unknown key ID '{kid}'")
+        raise GrantTokenError("Unknown key ID")
 
     pub_key = _load_public_key(key_dict[kid], kid)
 
