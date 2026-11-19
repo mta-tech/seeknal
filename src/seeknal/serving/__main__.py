@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import ssl
 import sys
 import threading
@@ -16,8 +17,11 @@ from seeknal.serving.server.app import build_server
 from seeknal.serving.server.config import ServerConfig, ServerConfigError
 from seeknal.serving.startup_validation import (
     StartupValidationError,
+    run_initial_discovery_refresh_or_raise,
     run_validate_cli,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def main(
@@ -120,6 +124,23 @@ def main(
     try:
         cfg = ServerConfig.from_yaml(args.config, load_keys=True)
         handle = build_server(cfg)
+        if handle.refresher is not None:
+            try:
+                run_initial_discovery_refresh_or_raise(handle.refresher, cfg=cfg)
+            except ServerConfigError as exc:
+                logger.error("%s", exc)
+                for adapter in handle.adapters.values():
+                    if hasattr(adapter, "close"):
+                        try:
+                            adapter.close()
+                        except Exception:
+                            pass
+                if handle.audit_sink is not None and hasattr(handle.audit_sink, "close"):
+                    try:
+                        handle.audit_sink.close()
+                    except Exception:
+                        pass
+                raise
     except StartupValidationError as exc:
         for prob in exc.problems:
             print(f"Error: {prob}", file=sys.stderr)

@@ -34,16 +34,23 @@ from seeknal.serving.server.config import (
     LakebaseConnectionConfig,
     ServerConfig,
     ServerConfigError,
+    UniqueKeySafeLoader,
     _DuplicateJsonKeyError,
     _format_json_error,
     _format_yaml_error,
     _reject_duplicate_json_keys,
     check_and_parse_secrets_env_file,
+    check_extension_files_on_disk,
 )
 
 _SAFE_IDENT_RE = re.compile(r"^[\w][\w.-]{0,127}$", re.UNICODE)
 _SIMPLE_LOWER_ENUM_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_DISC_LOGICAL_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CANARY_TOKEN_RE = re.compile(r"(canary|sentinel|opaque)", re.IGNORECASE)
+_SUSPICIOUS_ENUM_RE = re.compile(
+    r"(://|@|secret|password|passwd|token|bearer|private|canary|sentinel|opaque|dsn|credential)",
+    re.IGNORECASE,
+)
 _URI_USERINFO_RE = re.compile(r"://[^/\s@]+@")
 _SENSITIVE_ENV_KEY_RE = re.compile(
     r"(SECRET|PASSWORD|PASSWD|TOKEN|DSN|CREDENTIAL|CANARY|SENTINEL|PRIVATE|AUTH|KEY)",
@@ -110,6 +117,35 @@ def _collect_secret_values(
                 m = re.search(r"://[^:/\s@]+:([^@\s]+)@", val)
                 if m and len(m.group(1)) >= 3:
                     candidates.add(m.group(1))
+        # Also include contents of any configured secret files
+        sec_file_paths: list[str] = []
+        for conn in cfg.connections.values():
+            accounts = getattr(conn, "accounts", None)
+            if isinstance(accounts, Mapping):
+                for acc in accounts.values():
+                    pf = getattr(acc, "password_file", None)
+                    if isinstance(pf, str) and pf.strip():
+                        sec_file_paths.append(pf.strip())
+        if cfg.placement.discovery_config is not None:
+            disc = cfg.placement.discovery_config
+            if (
+                disc.lakekeeper
+                and disc.lakekeeper.oauth
+                and disc.lakekeeper.oauth.client_secret_file
+            ):
+                sec_file_paths.append(disc.lakekeeper.oauth.client_secret_file)
+            for eng in disc.engines.values():
+                if eng.api_secret_file:
+                    sec_file_paths.append(eng.api_secret_file)
+        for sf_path in sec_file_paths:
+            if os.path.isfile(sf_path):
+                try:
+                    with open(sf_path, "r", encoding="utf-8") as fh:
+                        sf_val = fh.read().strip()
+                    if len(sf_val) >= 3:
+                        candidates.add(sf_val)
+                except Exception:
+                    pass
 
     if raw_cfg is not None and isinstance(raw_cfg, Mapping):
         sef = raw_cfg.get("secrets_env_file")
@@ -126,14 +162,21 @@ def _collect_secret_values(
 
 
 def _scrub(text: str, secret_values: Sequence[str] = ()) -> str:
-    """Scrub secret values, URI credentials, and canary markers from diagnostic text."""
+    """Scrub secret values, URI credentials, bearer/password tokens, and canary markers from diagnostic text."""
     out = str(text)
     for sec in secret_values:
         if sec and sec in out:
             out = out.replace(sec, "<redacted>")
     out = _URI_USERINFO_RE.sub("://<redacted>@", out)
+    out = re.sub(r"\bBearer\s+\S+", "Bearer <redacted>", out, flags=re.IGNORECASE)
     out = re.sub(
-        r"\b[A-Za-z0-9_.-]*(?:canary|sentinel)[A-Za-z0-9_.-]*\b",
+        r"((?:password|passwd|secret|token|auth\s+key)\s*[:=]\s*)([^\s,;'\"]+)",
+        r"\1<redacted>",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"\b[A-Za-z0-9_.-]*(?:canary|sentinel|opaque)[A-Za-z0-9_.-]*\b",
         "<redacted>",
         out,
         flags=re.IGNORECASE,
@@ -168,7 +211,7 @@ def _safe_enum_token(value: Any, secret_values: Sequence[str] = ()) -> str:
     if not isinstance(value, str):
         return "<invalid>"
     s = value.strip()
-    if not s or _CANARY_TOKEN_RE.search(s):
+    if not s or _SUSPICIOUS_ENUM_RE.search(s):
         return "<invalid>"
     for sec in secret_values:
         if sec and sec in s:
@@ -507,7 +550,7 @@ def _load_raw_placement_file(
 ) -> Mapping[str, Any] | None:
     try:
         with open(path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f)
+            raw = yaml.load(f, Loader=UniqueKeySafeLoader)
     except FileNotFoundError:
         problems.append(
             f"Static placement file not found: '{path}' — verify 'placement.static.placement_file'"
@@ -684,7 +727,7 @@ def _validate_static_catalog(
             if kind in VALID_ENGINE_KINDS and conn_kind != kind:
                 problems.append(
                     f"Engine '{safe_eng}' kind mismatch between static placement "
-                    f"('{placement_label}', kind '{kind}') and 'connections.{safe_eng}' "
+                    f"('{placement_label}', kind '{_safe_enum_token(kind, secret_values)}') and 'connections.{safe_eng}' "
                     f"(kind '{_safe_enum_token(str(conn_kind), secret_values)}')"
                 )
 
@@ -731,6 +774,14 @@ def _validate_static_catalog(
                         f"Unknown engine '{safe_pe}' in policy.pii_engines (not configured in connections)"
                     )
 
+    # Pre-collect pii_tables from top-level placement and placement.policy so PII rules fold in
+    effective_pii_lower: set[str] = set()
+    for pii_src_val in (pl_raw.get("pii_tables"), policy_raw.get("pii_tables")):
+        if isinstance(pii_src_val, (list, tuple)):
+            for p_item in pii_src_val:
+                if isinstance(p_item, str) and p_item.strip():
+                    effective_pii_lower.add(p_item.strip().lower())
+
     # 2. Validate tables (serves, PII rules, collisions)
     known_tables_by_lower: dict[str, str] = {}
     known_tables_by_casefold: dict[str, str] = {}
@@ -762,9 +813,9 @@ def _validate_static_catalog(
                 f"Static placement file '{placement_label}' table '{safe_tbl}' field 'pii' "
                 f"must be a boolean, got {type(pii_val).__name__}"
             )
-            is_pii = False
+            is_pii = t_lower in effective_pii_lower
         else:
-            is_pii = pii_val
+            is_pii = pii_val or (t_lower in effective_pii_lower)
 
         serve_raw = tbl_spec.get("serve")
         if serve_raw is not None and not isinstance(serve_raw, Mapping):
@@ -878,6 +929,21 @@ def _validate_static_catalog(
                     f"engine '{safe_c_eng}' has no entry in connections"
                 )
 
+        cube_pii_val = cube_spec.get("pii", False)
+        if not isinstance(cube_pii_val, bool):
+            problems.append(
+                f"Static placement file '{placement_label}' cube '{safe_cube}' field 'pii' "
+                f"must be a boolean, got {type(cube_pii_val).__name__}"
+            )
+            is_cube_pii = c_lower in effective_pii_lower
+        else:
+            is_cube_pii = cube_pii_val or (c_lower in effective_pii_lower)
+
+        if is_cube_pii and cube_eng not in pii_engines_set:
+            problems.append(
+                f"PII cube '{safe_cube}' engine '{safe_c_eng}' must be listed in policy.pii_engines"
+            )
+
         raw_dims_pre = cube_spec.get("dimensions")
         dims_list = (
             [str(d) for d in raw_dims_pre]
@@ -920,8 +986,14 @@ def _validate_static_catalog(
             pt_val = container["pii_tables"]
             if isinstance(pt_val, (list, tuple)):
                 for pt in pt_val:
-                    pt_str = str(pt).strip()
-                    if not pt_str or pt_str.lower() not in known_tables_by_lower:
+                    if not isinstance(pt, str) or not pt.strip():
+                        problems.append(
+                            f"'{container_label}.pii_tables' must contain only non-empty table name strings"
+                        )
+                        continue
+                    pt_str = pt.strip()
+                    pt_low = pt_str.lower()
+                    if pt_low not in known_tables_by_lower and pt_low not in known_cubes_by_lower:
                         problems.append(
                             f"Unknown table '{_safe_ident(pt_str, secret_values)}' referenced in "
                             f"'{container_label}.pii_tables'"
@@ -1142,6 +1214,40 @@ def _validate_static_catalog(
         return None
 
 
+def _validate_discovery_table_ref_offline(
+    raw_name: Any,
+    *,
+    default_catalog: str,
+    field_label: str,
+    problems: list[str],
+    secret_values: Sequence[str],
+) -> None:
+    if not isinstance(raw_name, str) or not raw_name:
+        problems.append(
+            f"Discovery '{field_label}' must contain only non-empty 3-part table name strings"
+        )
+        return
+    if '"' in raw_name or "'" in raw_name or any(ch.isspace() for ch in raw_name):
+        problems.append(
+            f"Invalid table name in discovery '{field_label}': quotes and whitespace are not permitted "
+            f"(expected unquoted '{_safe_ident(default_catalog, secret_values)}.<namespace>.<table>')"
+        )
+        return
+    parts = raw_name.split(".")
+    if len(parts) != 3 or not all(_DISC_LOGICAL_SEGMENT_RE.fullmatch(p) for p in parts):
+        problems.append(
+            f"Invalid table name '{_safe_ident(raw_name, secret_values)}' in discovery '{field_label}': "
+            f"expected 3-part '<default_catalog>.<namespace>.<table>'"
+        )
+        return
+    if parts[0].lower() != default_catalog.lower():
+        problems.append(
+            f"Discovery table '{_safe_ident(raw_name, secret_values)}' in '{field_label}' has catalog "
+            f"prefix '{_safe_ident(parts[0], secret_values)}', expected default_catalog "
+            f"'{_safe_ident(default_catalog, secret_values)}'"
+        )
+
+
 def _validate_discovery_offline(
     *,
     cfg: ServerConfig,
@@ -1154,23 +1260,24 @@ def _validate_discovery_offline(
 
     for eng_name, eng_cfg in disc_cfg.engines.items():
         safe_eng = _safe_ident(eng_name, secret_values)
+        safe_eng_kind = _safe_enum_token(eng_cfg.kind, secret_values)
         if eng_cfg.kind not in VALID_ENGINE_KINDS:
             problems.append(
-                f"Unknown engine kind '{_safe_ident(eng_cfg.kind, secret_values)}' "
+                f"Unknown engine kind '{safe_eng_kind}' "
                 f"for discovery engine '{safe_eng}'"
             )
         if eng_name not in cfg.connections:
             problems.append(
                 f"Discovery engine 'placement.discovery.engines.{safe_eng}' "
-                f"(kind '{eng_cfg.kind}') has no matching entry 'connections.{safe_eng}'"
+                f"(kind '{safe_eng_kind}') has no matching entry 'connections.{safe_eng}'"
             )
         else:
             conn_kind = getattr(cfg.connections[eng_name], "kind", None)
             if conn_kind != eng_cfg.kind:
                 problems.append(
                     f"Discovery engine 'placement.discovery.engines.{safe_eng}' has kind "
-                    f"'{eng_cfg.kind}', but 'connections.{safe_eng}' has kind "
-                    f"'{_safe_ident(str(conn_kind), secret_values)}'"
+                    f"'{safe_eng_kind}', but 'connections.{safe_eng}' has kind "
+                    f"'{_safe_enum_token(conn_kind, secret_values)}'"
                 )
 
     if disc_cfg.lakebase is not None:
@@ -1192,8 +1299,38 @@ def _validate_discovery_offline(
                 problems.append(
                     f"Discovery 'placement.discovery.lakebase.engine' ('{safe_lb}') requires "
                     f"'connections.{safe_lb}' to have kind 'lakebase', got "
-                    f"'{_safe_ident(str(conn_kind), secret_values)}'"
+                    f"'{_safe_enum_token(conn_kind, secret_values)}'"
                 )
+
+        for st_name in disc_cfg.lakebase.synced_tables.keys():
+            _validate_discovery_table_ref_offline(
+                st_name,
+                default_catalog=disc_cfg.default_catalog,
+                field_label="lakebase.synced_tables",
+                problems=problems,
+                secret_values=secret_values,
+            )
+
+    for pt in disc_cfg.pii_tables:
+        _validate_discovery_table_ref_offline(
+            pt,
+            default_catalog=disc_cfg.default_catalog,
+            field_label="pii_tables",
+            problems=problems,
+            secret_values=secret_values,
+        )
+
+    if disc_cfg.lakekeeper is None:
+        if disc_cfg.pii_tables:
+            problems.append(
+                "Discovery 'pii_tables' cannot be configured when 'placement.discovery.lakekeeper' is not configured"
+            )
+        if disc_cfg.lakebase is not None and any(
+            st.pii for st in disc_cfg.lakebase.synced_tables.values()
+        ):
+            problems.append(
+                "Discovery 'synced_tables' with 'pii: true' cannot be configured when 'placement.discovery.lakekeeper' is not configured"
+            )
 
     pii_engines_set = set(disc_cfg.pii_engines)
     for pe in disc_cfg.pii_engines:
@@ -1209,27 +1346,127 @@ def _validate_discovery_offline(
                 f"(not configured in connections)"
             )
 
-    # Offline PII sanity check when discovery declares pii_tables/synced pii tables
-    # but has only unapproved duckdb engines and no non-duckdb serving engines.
-    has_pii_declarations = bool(disc_cfg.pii_tables) or (
-        disc_cfg.lakebase is not None
-        and any(st.pii for st in disc_cfg.lakebase.synced_tables.values())
+    # Offline PII serving feasibility check for discovery pii_tables and synced pii tables
+    synced_lower = (
+        {k.lower() for k in disc_cfg.lakebase.synced_tables.keys()}
+        if disc_cfg.lakebase is not None
+        else set()
     )
-    if has_pii_declarations and disc_cfg.engines:
-        candidate_table_engines = [
-            eng for eng in disc_cfg.engines.values() if eng.kind != "cube"
-        ]
-        if candidate_table_engines and all(
-            eng.kind == "duckdb" and eng.name not in pii_engines_set
-            for eng in candidate_table_engines
-        ):
-            unapproved = ", ".join(
-                _safe_ident(eng.name, secret_values) for eng in candidate_table_engines
+    has_starrocks = any(e.kind == "starrocks" for e in disc_cfg.engines.values())
+    has_approved_duckdb = any(
+        e.kind == "duckdb"
+        and e.profile == "iceberg_direct"
+        and e.name in pii_engines_set
+        for e in disc_cfg.engines.values()
+    )
+    unapproved_duck_names = [
+        _safe_ident(e.name, secret_values)
+        for e in disc_cfg.engines.values()
+        if e.kind == "duckdb" and e.name not in pii_engines_set
+    ]
+
+    for pt in disc_cfg.pii_tables:
+        safe_pt = _safe_ident(pt, secret_values)
+        in_synced = isinstance(pt, str) and pt.lower() in synced_lower
+        if not (in_synced or has_starrocks or has_approved_duckdb):
+            if unapproved_duck_names:
+                unapproved_str = ", ".join(unapproved_duck_names)
+                problems.append(
+                    f"Discovery PII table '{safe_pt}' has no approved serving engine "
+                    f"(not in lakebase.synced_tables, no starrocks engine, and duckdb engine(s) "
+                    f"[{unapproved_str}] are not listed in pii_engines)"
+                )
+            else:
+                problems.append(
+                    f"Discovery PII table '{safe_pt}' has no valid serving engine configured "
+                    f"(not in lakebase.synced_tables and no starrocks or approved iceberg_direct pii_engines)"
+                )
+
+
+def run_initial_discovery_refresh_or_raise(
+    refresher: Any,
+    *,
+    discover_fn: Any = None,
+    cfg: ServerConfig | None = None,
+    env: Mapping[str, str] | None = None,
+    secret_values: Sequence[str] = (),
+) -> None:
+    """Run the initial catalog discovery refresh before serving and fail closed on error."""
+    merged_secrets = tuple(
+        dict.fromkeys((*_collect_secret_values(env, cfg=cfg), *secret_values))
+    )
+    if refresher is None:
+        if discover_fn is not None:
+            try:
+                res = discover_fn()
+                Placement.from_dict(res.placement)
+            except Exception as exc:
+                raise ServerConfigError(
+                    _scrub(
+                        f"Initial discovery refresh failed: {exc}",
+                        merged_secrets,
+                    )
+                ) from exc
+        return
+
+    captured_exc: BaseException | None = None
+    has_discover_attr = hasattr(refresher, "discover_fn")
+    orig_discover_fn = getattr(refresher, "discover_fn", None) if has_discover_attr else None
+    target_fn = discover_fn if discover_fn is not None else orig_discover_fn
+
+    if has_discover_attr and callable(target_fn):
+        def _capturing_discover() -> Any:
+            nonlocal captured_exc
+            try:
+                res = target_fn()
+                Placement.from_dict(res.placement)
+                return res
+            except BaseException as exc:
+                captured_exc = exc
+                raise
+
+        try:
+            refresher.discover_fn = _capturing_discover
+            ok = refresher.refresh_once()
+        except Exception as exc:
+            captured_exc = exc
+            ok = False
+        finally:
+            refresher.discover_fn = orig_discover_fn
+    else:
+        try:
+            ok = refresher.refresh_once()
+        except Exception as exc:
+            captured_exc = exc
+            ok = False
+
+    if not ok:
+        if captured_exc is None:
+            tracked_err = getattr(refresher, "last_refresh_error", None)
+            if isinstance(tracked_err, list) and tracked_err and tracked_err[0] is not None:
+                captured_exc = tracked_err[0]
+        if captured_exc is not None:
+            raise ServerConfigError(
+                _scrub(
+                    f"Initial discovery refresh failed: {captured_exc}",
+                    merged_secrets,
+                )
+            ) from captured_exc
+        scrubbed_arr = getattr(refresher, "last_refresh_error_scrubbed", None)
+        if isinstance(scrubbed_arr, list) and scrubbed_arr and scrubbed_arr[0]:
+            raise ServerConfigError(
+                _scrub(
+                    f"Initial discovery refresh failed: {scrubbed_arr[0]}",
+                    merged_secrets,
+                )
             )
-            problems.append(
-                f"Discovery declares PII table(s) but only unapproved duckdb engine(s) "
-                f"[{unapproved}] are configured and not listed in pii_engines"
+        last_err = getattr(refresher, "last_error", None) or "unknown_error"
+        raise ServerConfigError(
+            _scrub(
+                f"Initial discovery refresh failed ({last_err})",
+                merged_secrets,
             )
+        )
 
 
 def validate_startup(
@@ -1262,7 +1499,7 @@ def validate_startup(
     elif isinstance(config, (str, os.PathLike)):
         try:
             with open(config, "r", encoding="utf-8") as f:
-                loaded = yaml.safe_load(f)
+                loaded = yaml.load(f, Loader=UniqueKeySafeLoader)
         except FileNotFoundError as exc:
             raise StartupValidationError(
                 (_scrub(f"Config file not found: '{config}'", initial_secrets),)
@@ -1295,33 +1532,57 @@ def validate_startup(
 
     if cfg is None:
         assert raw_cfg is not None
-        # Strip static role keys (validated explicitly below) before ServerConfig.from_dict
-        # so role problems and structural server problems can be collected together.
-        cfg_for_parse = {k: v for k, v in raw_cfg.items() if k not in _ROLE_TOP_KEYS}
         try:
-            cfg = ServerConfig.from_dict(cfg_for_parse, load_keys=False, env=env)
+            cfg = ServerConfig.from_dict(raw_cfg, load_keys=False, env=env)
         except ServerConfigError as exc:
             problems.append(_scrub(str(exc), secret_values))
 
     secret_values = _collect_secret_values(env, cfg=cfg, raw_cfg=raw_cfg)
 
-    # If ServerConfig itself could not be parsed, still check any static role references in raw_cfg
+    # If ServerConfig itself could not be parsed, still check any static role references in raw_cfg/placement
     if cfg is None:
         raw_disc = None
+        raw_pl_for_roles = raw_placement
         if isinstance(raw_cfg, Mapping) and isinstance(raw_cfg.get("placement"), Mapping):
             d_sub = raw_cfg["placement"].get("discovery")
             if isinstance(d_sub, Mapping):
                 raw_disc = d_sub
+            st_sub = raw_cfg["placement"].get("static")
+            if (
+                raw_pl_for_roles is None
+                and isinstance(st_sub, Mapping)
+                and isinstance(st_sub.get("placement_file"), str)
+                and st_sub["placement_file"].strip()
+            ):
+                raw_pl_for_roles = _load_raw_placement_file(
+                    st_sub["placement_file"].strip(), problems, secret_values
+                )
         _collect_role_definitions_and_references(
             raw_cfg=raw_cfg,
-            raw_placement=raw_placement,
+            raw_placement=raw_pl_for_roles,
             raw_discovery=raw_disc,
             problems=problems,
             secret_values=secret_values,
         )
         raise StartupValidationError([_scrub(p, secret_values) for p in problems])
 
-    # 2. Validate grant keys, environment variables, and secret file permissions
+    # 2. Validate grant keys, environment variables, secret files, and iceberg_direct extension files
+    for eng_name, conn in cfg.connections.items():
+        if isinstance(conn, DuckDBConnectionConfig) and conn.profile == "iceberg_direct":
+            safe_eng = _safe_ident(eng_name, secret_values)
+            if "iceberg" in conn.extensions and "avro" not in conn.extensions:
+                problems.append(
+                    f"DuckDB iceberg_direct connection '{safe_eng}' requires 'avro' in 'extensions' when 'iceberg' is configured"
+                )
+            try:
+                check_extension_files_on_disk(
+                    conn.extension_directory,
+                    conn.extensions,
+                    eng_name=safe_eng,
+                    only_when_populated=True,
+                )
+            except ServerConfigError as exc:
+                problems.append(_scrub(str(exc), secret_values))
     if check_grant_keys:
         try:
             cfg.load_grant_keys()

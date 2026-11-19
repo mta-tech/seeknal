@@ -6,12 +6,13 @@ import base64
 import json
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import re
 from typing import Any
 
 import yaml
+from yaml.constructor import ConstructorError
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -27,7 +28,7 @@ from seeknal.serving.compilation_cache import (
 from seeknal.serving.discovery.config import DiscoveryConfig
 from seeknal.serving.grant_token import _load_public_key
 from seeknal.serving.ops import OpsConfig
-from seeknal.serving.placement import Placement, PlacementError
+from seeknal.serving.placement import Placement, PlacementError, UniqueKeySafeLoader
 
 
 class ServerConfigError(Exception):
@@ -39,10 +40,11 @@ class AuditStartupError(ServerConfigError, AuditWriteError):
 
 
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,79}$")
+_SIMPLE_LOWER_ENUM_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _ICEBERG_ALIAS_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _S3_PREFIX_RE = re.compile(r"^s3://[A-Za-z0-9._-]+/.+/$")
-_ALLOWED_ICEBERG_EXTENSIONS = frozenset({"iceberg", "httpfs"})
+_ALLOWED_ICEBERG_EXTENSIONS = frozenset({"iceberg", "httpfs", "avro"})
 _SUSPICIOUS_TOKEN_RE = re.compile(
     r"(://|@|secret|password|passwd|token|bearer|private|canary|sentinel|opaque|dsn|credential)",
     re.IGNORECASE,
@@ -61,9 +63,99 @@ def _safe_label(value: Any, fallback: str = "<redacted>") -> str:
     return s
 
 
+def _safe_enum_token(value: Any) -> str:
+    """Return a strictly lowercase simple enum token or '<invalid>'."""
+    if not isinstance(value, str):
+        return "<invalid>"
+    s = value.strip()
+    if not s or _SUSPICIOUS_TOKEN_RE.search(s):
+        return "<invalid>"
+    if not _SIMPLE_LOWER_ENUM_RE.fullmatch(s):
+        return "<invalid>"
+    return s
+
+
+def check_extension_files_on_disk(
+    ext_dir: str | None,
+    extensions: Sequence[str],
+    *,
+    eng_name: str = "duckdb",
+    only_when_populated: bool = False,
+) -> None:
+    """Verify required DuckDB extension files exist on disk under extension_directory."""
+    if not ext_dir or not isinstance(ext_dir, str):
+        return
+    if not os.path.isdir(ext_dir):
+        if only_when_populated:
+            return
+        raise ServerConfigError(
+            f"DuckDB iceberg_direct connection '{_safe_label(eng_name)}' "
+            f"extension_directory '{ext_dir}' does not exist"
+        )
+
+    try:
+        top_entries = os.listdir(ext_dir)
+    except OSError:
+        return
+
+    if only_when_populated and not top_entries:
+        return
+
+    found_ext_files: set[str] = set()
+    missing_avro_in_iceberg_dir = False
+    for _root, _dirs, files in os.walk(ext_dir):
+        file_set = set(files)
+        for fname in file_set:
+            if fname.endswith(".duckdb_extension"):
+                found_ext_files.add(fname)
+        if (
+            "avro" in extensions
+            and "iceberg.duckdb_extension" in file_set
+            and "avro.duckdb_extension" not in file_set
+        ):
+            missing_avro_in_iceberg_dir = True
+
+    if "avro" in extensions and (
+        "avro.duckdb_extension" not in found_ext_files or missing_avro_in_iceberg_dir
+    ):
+        raise ServerConfigError(
+            f"DuckDB iceberg_direct connection '{_safe_label(eng_name)}' is missing required "
+            f"'avro.duckdb_extension' in extension_directory '{ext_dir}'"
+        )
+
+    if not only_when_populated:
+        for ext in extensions:
+            ext_fname = f"{ext}.duckdb_extension"
+            if ext_fname not in found_ext_files:
+                raise ServerConfigError(
+                    f"DuckDB iceberg_direct connection '{_safe_label(eng_name)}' is missing required "
+                    f"'{ext_fname}' in extension_directory '{ext_dir}'"
+                )
+
+
 def _format_yaml_error(exc: yaml.YAMLError, role: str, path: str | os.PathLike) -> str:
     """Format a PyYAML error with file path and line/column, never raw file snippets."""
     mark = getattr(exc, "problem_mark", None)
+    if isinstance(exc, ConstructorError) and (
+        hasattr(exc, "duplicate_key")
+        or "duplicate YAML key" in str(getattr(exc, "problem", ""))
+    ):
+        raw_dup = getattr(exc, "duplicate_key", None)
+        if raw_dup is None:
+            m = re.search(
+                r"duplicate YAML key '(.*)'", str(getattr(exc, "problem", ""))
+            )
+            raw_dup = m.group(1) if m else ""
+        safe_key = _safe_label(str(raw_dup))
+        if mark is not None:
+            return (
+                f"Invalid YAML in {role} '{path}' at line {mark.line + 1}, "
+                f"column {mark.column + 1}: duplicate YAML key '{safe_key}' — remove duplicate key"
+            )
+        return (
+            f"Invalid YAML in {role} '{path}': duplicate YAML key '{safe_key}' "
+            f"— remove duplicate key"
+        )
     if mark is not None:
         return (
             f"Invalid YAML in {role} '{path}' at line {mark.line + 1}, "
@@ -920,7 +1012,7 @@ class ServerConfig:
             kind = kind.strip()
             if kind not in ("starrocks", "lakebase", "cube", "duckdb"):
                 raise ServerConfigError(
-                    f"Unsupported connection kind '{_safe_label(kind)}' for engine '{_safe_label(eng_name_str)}'"
+                    f"Unsupported connection kind '{_safe_enum_token(kind)}' for engine '{_safe_label(eng_name_str)}'"
                 )
 
             if kind == "starrocks":
@@ -1449,10 +1541,26 @@ class ServerConfig:
                         if ext_clean not in _ALLOWED_ICEBERG_EXTENSIONS:
                             raise ServerConfigError(
                                 f"DuckDB iceberg_direct connection '{eng_name_str}' extension "
-                                f"'{_safe_label(ext_clean)}' is not in allowlist {{'httpfs', 'iceberg'}}"
+                                f"'{_safe_label(ext_clean)}' is not in allowlist {{'avro', 'httpfs', 'iceberg'}}"
                             )
                         if ext_clean not in validated_exts:
                             validated_exts.append(ext_clean)
+
+                    if "iceberg" in validated_exts and "avro" not in validated_exts:
+                        raise ServerConfigError(
+                            f"DuckDB iceberg_direct connection '{eng_name_str}' requires 'avro' in 'extensions' when 'iceberg' is configured"
+                        )
+                    if "avro" in validated_exts and "iceberg" in validated_exts:
+                        if validated_exts.index("avro") > validated_exts.index("iceberg"):
+                            validated_exts.remove("avro")
+                            validated_exts.insert(validated_exts.index("iceberg"), "avro")
+
+                    check_extension_files_on_disk(
+                        ext_dir,
+                        validated_exts,
+                        eng_name=eng_name_str,
+                        only_when_populated=True,
+                    )
 
                     raw_prefixes = eng_spec.get("allowed_s3_prefixes")
                     if not isinstance(raw_prefixes, (list, tuple)) or not raw_prefixes:
@@ -1932,7 +2040,7 @@ class ServerConfig:
         """Construct and validate ServerConfig from a YAML file."""
         try:
             with open(path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
+                data = yaml.load(f, Loader=UniqueKeySafeLoader)
         except FileNotFoundError as exc:
             raise ServerConfigError(f"Config file not found: '{path}'") from exc
         except yaml.YAMLError as exc:
@@ -1953,7 +2061,7 @@ def _load_static_placement(path: str | os.PathLike) -> Placement:
     """Load and validate a static placement YAML file with secret-safe error reporting."""
     try:
         with open(path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f)
+            raw = yaml.load(f, Loader=UniqueKeySafeLoader)
     except FileNotFoundError as exc:
         raise ServerConfigError(
             f"Static placement file not found: '{path}' — verify 'placement.static.placement_file'"

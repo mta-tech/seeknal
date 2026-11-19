@@ -305,6 +305,20 @@ class Router:
             return True
         return False
 
+    def _is_pii_cube(
+        self,
+        cube: Any,
+        extra_pii: Collection[str] | None = None,
+    ) -> bool:
+        if bool(getattr(cube, "pii", False)):
+            return True
+        lower = cube.name.lower()
+        if lower in self._pii_tables:
+            return True
+        if extra_pii and any(str(p).lower() == lower for p in extra_pii):
+            return True
+        return False
+
     def rewrite(self, statement: exp.Expression, engine: str) -> str:
         """Replace logical table references with that engine's physical names and render in engine dialect."""
         if engine not in self.placement.engines:
@@ -434,9 +448,13 @@ class Router:
                 else:
                     raise RoutingError(f"Unknown table or cube '{name}'")
 
-        has_pii = any(
+        has_pii_table = any(
             self._is_pii_table(t, pii_tables) for t in referenced_tables
         )
+        has_pii_cube = any(
+            self._is_pii_cube(c, pii_tables) for c in referenced_cubes
+        )
+        has_pii = has_pii_table or has_pii_cube
 
         if referenced_cubes and referenced_tables:
             raise RoutingError(
@@ -449,15 +467,26 @@ class Router:
             if len(cube_engines) > 1:
                 raise RoutingError(
                     f"Cubes on different engines referenced: {cube_engines}",
-                    code="query_spans_engines",
+                    code="pii_cross_engine" if has_pii_cube else "query_spans_engines",
                 )
 
         resolved_hint = hint
         if resolved_hint is None:
             resolved_hint = _extract_hint_comment(statement)
 
+        if has_pii_cube and resolved_hint is not None:
+            pii_cube = next(
+                c for c in referenced_cubes if self._is_pii_cube(c, pii_tables)
+            )
+            clean_hint = resolved_hint.strip()
+            if clean_hint != pii_cube.engine:
+                raise PiiCrossEngineError(
+                    f"PII cube '{_safe_router_ident(pii_cube.name)}' is served only on engine "
+                    f"'{_safe_router_ident(pii_cube.engine)}'; engine hint '{_safe_router_ident(clean_hint)}' is not permitted"
+                )
+
         pii_sole_engine: str | None = None
-        if has_pii:
+        if has_pii_table:
             merged_extra_pii = self._pii_tables | (
                 frozenset(str(p).lower() for p in pii_tables)
                 if pii_tables

@@ -12,7 +12,9 @@ import httpx
 
 from seeknal.serving.discovery.config import (
     DiscoveryConfig,
+    DiscoveryError,
     EngineConfig,
+    _safe_disc_label,
 )
 from seeknal.serving.discovery.cube import CubeMeta, CubeSource, _sanitize
 from seeknal.serving.discovery.lakebase import LakebaseSyncSource, SyncState
@@ -135,33 +137,59 @@ def discover(
     # 8. Build tables placement and schemas
     tables_placement: dict[str, Any] = {}
     schemas_placement: dict[str, list[str]] = {}
-    iceberg_logical_names: set[str] = set()
-    pii_tables_lower = {t.lower() for t in cfg.pii_tables}
-    synced_pii_lower: set[str] = set()
+    iceberg_logical_names = {
+        f"{cfg.default_catalog}.{it.namespace}.{it.name}" for it in iceberg_tables
+    }
+    iceberg_lower = {n.lower(): n for n in iceberg_logical_names}
+
+    # Fail closed if any configured PII table entry matches no discovered Iceberg table
+    unmatched_pii: list[str] = []
+    seen_unmatched_lower: set[str] = set()
+    for pt in cfg.pii_tables:
+        if pt.lower() not in iceberg_lower and pt.lower() not in seen_unmatched_lower:
+            unmatched_pii.append(_safe_disc_label(pt))
+            seen_unmatched_lower.add(pt.lower())
     if cfg.lakebase is not None:
-        for st_name, st_cfg in cfg.lakebase.synced_tables.items():
-            if st_cfg.pii:
-                synced_pii_lower.add(st_name.lower())
+        for logical_name, st_cfg in cfg.lakebase.synced_tables.items():
+            if (
+                st_cfg.pii is True
+                and logical_name.lower() not in iceberg_lower
+                and logical_name.lower() not in seen_unmatched_lower
+            ):
+                unmatched_pii.append(_safe_disc_label(logical_name))
+                seen_unmatched_lower.add(logical_name.lower())
+    if unmatched_pii:
+        unmatched_fmt = ", ".join(f"'{u}'" for u in unmatched_pii)
+        raise DiscoveryError(
+            f"Configured PII table(s) matched no discovered Iceberg table: {unmatched_fmt}"
+        )
+
+    pii_tables_lower = {t.lower() for t in cfg.pii_tables}
+    synced_by_lower = (
+        {k.lower(): v for k, v in cfg.lakebase.synced_tables.items()}
+        if cfg.lakebase is not None
+        else {}
+    )
+    synced_pii_lower = {
+        k_lower for k_lower, st_cfg in synced_by_lower.items() if st_cfg.pii is True
+    }
+    pii_engines_set = set(cfg.pii_engines)
 
     for it in iceberg_tables:
         logical = f"{cfg.default_catalog}.{it.namespace}.{it.name}"
-        iceberg_logical_names.add(logical)
+        logical_lower = logical.lower()
         is_pii = (
             bool(getattr(it, "pii", False))
-            or logical.lower() in pii_tables_lower
-            or f"{it.namespace}.{it.name}".lower() in pii_tables_lower
-            or logical.lower() in synced_pii_lower
+            or logical_lower in pii_tables_lower
+            or logical_lower in synced_pii_lower
         )
 
         # Determine keys
+        synced_entry = synced_by_lower.get(logical_lower)
         if it.keys:
             keys = list(it.keys)
-        elif (
-            cfg.lakebase is not None
-            and logical in cfg.lakebase.synced_tables
-            and cfg.lakebase.synced_tables[logical].primary_key
-        ):
-            keys = list(cfg.lakebase.synced_tables[logical].primary_key)
+        elif synced_entry is not None and synced_entry.primary_key:
+            keys = list(synced_entry.primary_key)
         else:
             keys = []
 
@@ -194,9 +222,8 @@ def discover(
             serve[id_eng.name] = id_serve
 
         # Lakebase serve
-        if cfg.lakebase is not None and logical in cfg.lakebase.synced_tables:
-            synced_cfg = cfg.lakebase.synced_tables[logical]
-            target = synced_cfg.target
+        if cfg.lakebase is not None and synced_entry is not None:
+            target = synced_entry.target
             if target in lakebase_state:
                 sync_state = lakebase_state[target]
                 if (
@@ -219,6 +246,25 @@ def discover(
                     f"Synced table '{logical}' has no state row in _lakebase_sync_state for target '{target}'"
                 )
 
+        # Single-serve selection for PII tables when multiple engines could serve the table
+        if is_pii and len(serve) > 1:
+            chosen_eng: str | None = None
+            if cfg.lakebase is not None and cfg.lakebase.engine in serve:
+                chosen_eng = cfg.lakebase.engine
+            if chosen_eng is None:
+                for s_eng in serve:
+                    if s_eng in cfg.engines and cfg.engines[s_eng].kind != "duckdb":
+                        chosen_eng = s_eng
+                        break
+            if chosen_eng is None:
+                for s_eng in serve:
+                    if s_eng in pii_engines_set:
+                        chosen_eng = s_eng
+                        break
+            if chosen_eng is None:
+                chosen_eng = next(iter(serve))
+            serve = {chosen_eng: serve[chosen_eng]}
+
         if serve:
             tbl_entry_dict: dict[str, Any] = {
                 "keys": keys,
@@ -234,10 +280,10 @@ def discover(
                 f"Table '{logical}' has no serve and was omitted from placement"
             )
 
-    # Check for synced tables missing from Iceberg
+    # Check for non-PII synced tables missing from Iceberg
     if cfg.lakebase is not None:
         for synced_logical in cfg.lakebase.synced_tables:
-            if synced_logical not in iceberg_logical_names:
+            if synced_logical.lower() not in iceberg_lower:
                 warnings.append(
                     f"Synced table '{synced_logical}' not found in discovered Iceberg tables"
                 )

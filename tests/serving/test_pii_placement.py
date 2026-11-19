@@ -9,7 +9,11 @@ import httpx
 import pytest
 
 from seeknal.serving.discovery.build import discover
-from seeknal.serving.discovery.config import DiscoveryConfig, DiscoveryConfigError
+from seeknal.serving.discovery.config import (
+    DiscoveryConfig,
+    DiscoveryConfigError,
+    DiscoveryError,
+)
 from seeknal.serving.placement import (
     Placement,
     PlacementError,
@@ -277,7 +281,8 @@ def test_discovery_carries_pii_from_synced_tables_and_pii_tables():
     pl_lb = Placement.from_dict(res_lb.placement)
     assert pl_lb.tables["lakekeeper.clinical.patients"].pii is True
 
-    # 2. If StarRocks + Lakebase both serve a PII table in discovery -> rejected with PlacementError
+    # 2. If StarRocks + Lakebase both could serve a synced PII table in discovery ->
+    # single-serve selection picks synced Lakebase ('lb') so Placement has 1 serve
     cfg_two_serves = {
         "default_catalog": "lakekeeper",
         "lakekeeper": {"url": "https://lk.test", "warehouse": "wh"},
@@ -296,13 +301,16 @@ def test_discovery_carries_pii_from_synced_tables_and_pii_tables():
             },
         },
     }
-    with pytest.raises(PlacementError, match="must have exactly one serve, got 2"):
-        discover(
-            cfg_two_serves,
-            http_client=_mock_lakekeeper_client(tables=("patients",)),
-            lakebase_connect=lambda: sqlite_conn,
-            now=datetime(2026, 5, 1, 12, 1, 0, tzinfo=timezone.utc),
-        )
+    res_single = discover(
+        cfg_two_serves,
+        http_client=_mock_lakekeeper_client(tables=("patients",)),
+        lakebase_connect=lambda: sqlite_conn,
+        now=datetime(2026, 5, 1, 12, 1, 0, tzinfo=timezone.utc),
+    )
+    assert list(res_single.placement["tables"]["lakekeeper.clinical.patients"]["serve"].keys()) == ["lb"]
+    pl_single = Placement.from_dict(res_single.placement)
+    assert len(pl_single.tables["lakekeeper.clinical.patients"].serves) == 1
+    assert pl_single.tables["lakekeeper.clinical.patients"].serves[0].engine == "lb"
 
 
 def test_discovery_pii_on_duckdb_iceberg_direct_requires_pii_engines():
@@ -700,5 +708,789 @@ def test_http_query_and_explain_return_422_pii_cross_engine_before_any_engine_ca
         assert payload["audit_id"] == jti
 
     assert adapter_calls == []
+
+
+def test_discovery_unmatched_pii_tables_and_synced_pii_raise_discovery_error():
+    # E-H1: typo in pii_tables and/or synced_tables(pii=True) must raise DiscoveryError naming every unmatched entry
+    cfg_typo = {
+        "default_catalog": "lakekeeper",
+        "lakekeeper": {"url": "https://lk.test", "warehouse": "wh"},
+        "engines": {
+            "sr": {"kind": "starrocks", "dialect": "starrocks"},
+            "lb": {"kind": "lakebase", "dialect": "postgres"},
+        },
+        "lakebase": {
+            "engine": "lb",
+            "synced_tables": {
+                "lakekeeper.clinical.patients_synced_typo": {
+                    "target": "public.patients",
+                    "primary_key": ["id"],
+                    "pii": True,
+                }
+            },
+        },
+        "pii_tables": [
+            "lakekeeper.clinical.patients",
+            "lakekeeper.clinical.patients_typo_one",
+            "lakekeeper.clinical.patients_typo_two",
+        ],
+    }
+    with pytest.raises(DiscoveryError) as exc_info:
+        discover(
+            cfg_typo,
+            http_client=_mock_lakekeeper_client(tables=("patients",)),
+            now=datetime(2026, 5, 1, 12, 1, 0, tzinfo=timezone.utc),
+        )
+    msg = str(exc_info.value)
+    assert "lakekeeper.clinical.patients_typo_one" in msg
+    assert "lakekeeper.clinical.patients_typo_two" in msg
+    assert "lakekeeper.clinical.patients_synced_typo" in msg
+
+
+@pytest.mark.parametrize(
+    "bad_pii_name",
+    [
+        "othercat.clinical.patients",  # wrong catalog prefix
+        "clinical.patients",  # missing catalog prefix (2-part)
+        "lakekeeper.clinical.sub.patients",  # 4-part
+        'lakekeeper."clinical".patients',  # double quotes
+        "'lakekeeper.clinical.patients'",  # single quotes
+        " lakekeeper.clinical.patients",  # leading whitespace
+        "lakekeeper.clinical.patients ",  # trailing whitespace
+        "lakekeeper.clinical .patients",  # internal whitespace
+        "lakekeeper.clinical.patients-v2",  # invalid identifier segment
+        "lakekeeper.1clinical.patients",  # segment starting with digit
+    ],
+)
+def test_discovery_rejects_wrong_catalog_quoted_and_malformed_pii_names(bad_pii_name):
+    # Rejected in DiscoveryConfig.from_dict and discover() for both pii_tables and synced_tables
+    with pytest.raises(DiscoveryConfigError):
+        DiscoveryConfig.from_dict(
+            {
+                "default_catalog": "lakekeeper",
+                "lakekeeper": {"url": "https://lk.test", "warehouse": "wh"},
+                "engines": {"sr": {"kind": "starrocks", "dialect": "starrocks"}},
+                "pii_tables": [bad_pii_name],
+            }
+        )
+
+    with pytest.raises(DiscoveryConfigError):
+        DiscoveryConfig.from_dict(
+            {
+                "default_catalog": "lakekeeper",
+                "lakekeeper": {"url": "https://lk.test", "warehouse": "wh"},
+                "engines": {"lb": {"kind": "lakebase", "dialect": "postgres"}},
+                "lakebase": {
+                    "engine": "lb",
+                    "synced_tables": {
+                        bad_pii_name: {"target": "public.patients", "pii": True}
+                    },
+                },
+            }
+        )
+
+    with pytest.raises(DiscoveryConfigError):
+        discover(
+            {
+                "default_catalog": "lakekeeper",
+                "lakekeeper": {"url": "https://lk.test", "warehouse": "wh"},
+                "engines": {"sr": {"kind": "starrocks", "dialect": "starrocks"}},
+                "pii_tables": [bad_pii_name],
+            },
+            http_client=_mock_lakekeeper_client(tables=("patients",)),
+        )
+
+
+def test_discovery_rejects_pii_tables_when_lakekeeper_missing():
+    with pytest.raises(DiscoveryConfigError, match="lakekeeper"):
+        DiscoveryConfig.from_dict(
+            {
+                "default_catalog": "lakekeeper",
+                "engines": {"sr": {"kind": "starrocks", "dialect": "starrocks"}},
+                "pii_tables": ["lakekeeper.clinical.patients"],
+            }
+        )
+
+
+def test_static_placement_top_and_policy_pii_tables_fold_into_table_entry_and_router():
+    from seeknal.serving.router import Router
+
+    # 1. Both top-level pii_tables and policy.pii_tables fold into TableEntry.pii=True (case-insensitively)
+    for container_kind in ("top", "policy"):
+        raw: dict = {
+            "engines": {
+                "lb": {"kind": "lakebase", "dialect": "postgres"},
+                "sr": {"kind": "starrocks", "dialect": "starrocks"},
+            },
+            "tables": {
+                "clinical.patients": {
+                    "keys": ["id"],
+                    "serve": {"lb": "public.patients"},
+                },
+                "claims.fact_claims": {
+                    "keys": ["claim_id"],
+                    "serve": {"sr": "lk.claims.fact_claims"},
+                },
+            },
+        }
+        if container_kind == "top":
+            raw["pii_tables"] = ["CLINICAL.PATIENTS"]
+        else:
+            raw["policy"] = {"pii_tables": ["CLINICAL.PATIENTS"]}
+
+        pl = Placement.from_dict(raw)
+        tbl = pl.find_table("clinical.patients")
+        assert tbl is not None and tbl.pii is True
+
+        # Router enforces pii_cross_engine automatically
+        router = Router(pl)
+        with pytest.raises(RoutingError) as exc_join:
+            router.route(
+                "SELECT p.id, f.claim_id FROM clinical.patients p "
+                "JOIN claims.fact_claims f ON p.id = f.claim_id"
+            )
+        assert exc_join.value.code == "pii_cross_engine"
+
+        with pytest.raises(RoutingError) as exc_hint:
+            router.route("SELECT id FROM clinical.patients", hint="sr")
+        assert exc_hint.value.code == "pii_cross_engine"
+
+    # 2. Refused when folded PII table is on DuckDB without pii_engines
+    for container_kind in ("top", "policy"):
+        raw_duck: dict = {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "clinical.patients": {
+                    "keys": ["id"],
+                    "serve": {"duck": "main.patients"},
+                }
+            },
+        }
+        if container_kind == "top":
+            raw_duck["pii_tables"] = ["clinical.patients"]
+        else:
+            raw_duck["policy"] = {"pii_tables": ["clinical.patients"]}
+        with pytest.raises(PlacementError, match="policy.pii_engines"):
+            Placement.from_dict(raw_duck)
+
+    # 3. Refused when folded PII table has two serves
+    for container_kind in ("top", "policy"):
+        raw_two: dict = {
+            "engines": {
+                "lb": {"kind": "lakebase", "dialect": "postgres"},
+                "sr": {"kind": "starrocks", "dialect": "starrocks"},
+            },
+            "tables": {
+                "clinical.patients": {
+                    "keys": ["id"],
+                    "serve": {"lb": "public.patients", "sr": "lk.clinical.patients"},
+                }
+            },
+        }
+        if container_kind == "top":
+            raw_two["pii_tables"] = ["clinical.patients"]
+        else:
+            raw_two["policy"] = {"pii_tables": ["clinical.patients"]}
+        with pytest.raises(PlacementError, match="must have exactly one serve, got 2"):
+            Placement.from_dict(raw_two)
+
+    # 4. Unknown table or invalid type in pii_tables / policy.pii_tables raises PlacementError
+    with pytest.raises(PlacementError, match="Unknown table 'clinical.ghost' in pii_tables"):
+        Placement.from_dict(
+            {
+                "engines": {"lb": {"kind": "lakebase", "dialect": "postgres"}},
+                "tables": {"clinical.patients": {"keys": ["id"], "serve": {"lb": "public.patients"}}},
+                "pii_tables": ["clinical.ghost"],
+            }
+        )
+    for bad_list in ("clinical.patients", b"clinical.patients", {"a": 1}, [""], [123]):
+        with pytest.raises(PlacementError, match="pii_tables"):
+            Placement.from_dict(
+                {
+                    "engines": {"lb": {"kind": "lakebase", "dialect": "postgres"}},
+                    "tables": {"clinical.patients": {"keys": ["id"], "serve": {"lb": "public.patients"}}},
+                    "policy": {"pii_tables": bad_list},
+                }
+            )
+
+
+def test_placement_from_yaml_rejects_duplicate_table_keys_and_duplicate_pii_keys(tmp_path):
+    # E-M1: Duplicate table key in placement.yaml (first pii: true, second pii: false)
+    dup_tbl_yaml = tmp_path / "dup_table.yaml"
+    dup_tbl_yaml.write_text(
+        "engines:\n"
+        "  lb: {kind: lakebase, dialect: postgres}\n"
+        "  duck: {kind: duckdb, dialect: duckdb}\n"
+        "tables:\n"
+        "  clinical.patients:\n"
+        "    keys: [id]\n"
+        "    pii: true\n"
+        "    serve:\n"
+        "      lb: public.patients\n"
+        "  clinical.patients:\n"
+        "    keys: [id]\n"
+        "    pii: false\n"
+        "    serve:\n"
+        "      duck: main.patients\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(PlacementError, match="duplicate YAML key 'clinical.patients'"):
+        Placement.from_yaml(dup_tbl_yaml)
+
+    # Duplicate pii: key inside the same table mapping (pii: true followed by pii: false)
+    dup_pii_yaml = tmp_path / "dup_pii.yaml"
+    dup_pii_yaml.write_text(
+        "engines:\n"
+        "  duck: {kind: duckdb, dialect: duckdb}\n"
+        "tables:\n"
+        "  clinical.patients:\n"
+        "    keys: [id]\n"
+        "    pii: true\n"
+        "    pii: false\n"
+        "    serve:\n"
+        "      duck: main.patients\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(PlacementError, match="duplicate YAML key 'pii'"):
+        Placement.from_yaml(dup_pii_yaml)
+
+
+def test_discovery_pii_single_serve_selection_priority():
+    # E-M2: Verify priority order:
+    # 1. Synced Lakebase serve ('lb') when synced
+    # 2. First non-DuckDB serve ('sr') when not synced to Lakebase
+    # 3. First serve in cfg.pii_engines when only DuckDB serves exist
+    # 4. Unapproved DuckDB serve kept so Placement.from_dict raises PlacementError
+    sqlite_conn = sqlite3.connect(":memory:")
+    sqlite_conn.execute(
+        "CREATE TABLE _lakebase_sync_state (target_table TEXT PRIMARY KEY, snapshot_id INTEGER, synced_at TEXT)"
+    )
+    sqlite_conn.execute(
+        "INSERT INTO _lakebase_sync_state VALUES (?, ?, ?)",
+        ("public.patients", 700, "2026-05-01T12:00:00+00:00"),
+    )
+    sqlite_conn.commit()
+    now_dt = datetime(2026, 5, 1, 12, 1, 0, tzinfo=timezone.utc)
+
+    # Priority 1: Lakebase chosen when synced (even with StarRocks + DuckDB present)
+    res_1 = discover(
+        {
+            "default_catalog": "lakekeeper",
+            "lakekeeper": {"url": "https://lk.test", "warehouse": "wh"},
+            "engines": {
+                "sr": {"kind": "starrocks", "dialect": "starrocks"},
+                "duck_ice": {
+                    "kind": "duckdb",
+                    "dialect": "duckdb",
+                    "profile": "iceberg_direct",
+                    "alias": "lake",
+                },
+                "lb": {"kind": "lakebase", "dialect": "postgres"},
+            },
+            "lakebase": {
+                "engine": "lb",
+                "synced_tables": {
+                    "lakekeeper.clinical.patients": {
+                        "target": "public.patients",
+                        "primary_key": ["id"],
+                        "pii": True,
+                    }
+                },
+            },
+            "pii_engines": ["duck_ice"],
+        },
+        http_client=_mock_lakekeeper_client(tables=("patients", "provinces")),
+        lakebase_connect=lambda: sqlite_conn,
+        now=now_dt,
+    )
+    assert list(res_1.placement["tables"]["lakekeeper.clinical.patients"]["serve"].keys()) == ["lb"]
+    # Non-PII table still gets all non-Lakebase serves
+    assert set(res_1.placement["tables"]["lakekeeper.clinical.provinces"]["serve"].keys()) == {
+        "sr",
+        "duck_ice",
+    }
+
+    # Priority 2: StarRocks chosen when PII table is NOT synced to Lakebase (even with DuckDB present)
+    res_2 = discover(
+        {
+            "default_catalog": "lakekeeper",
+            "lakekeeper": {"url": "https://lk.test", "warehouse": "wh"},
+            "engines": {
+                "duck_ice": {
+                    "kind": "duckdb",
+                    "dialect": "duckdb",
+                    "profile": "iceberg_direct",
+                    "alias": "lake",
+                },
+                "sr": {"kind": "starrocks", "dialect": "starrocks"},
+                "lb": {"kind": "lakebase", "dialect": "postgres"},
+            },
+            "lakebase": {"engine": "lb", "synced_tables": {}},
+            "pii_tables": ["lakekeeper.clinical.patients"],
+            "pii_engines": ["duck_ice"],
+        },
+        http_client=_mock_lakekeeper_client(tables=("patients",)),
+        lakebase_connect=lambda: sqlite_conn,
+        now=now_dt,
+    )
+    assert list(res_2.placement["tables"]["lakekeeper.clinical.patients"]["serve"].keys()) == ["sr"]
+
+    # Priority 3: Approved DuckDB in pii_engines chosen when multiple DuckDB iceberg_direct engines exist
+    res_3 = discover(
+        {
+            "default_catalog": "lakekeeper",
+            "lakekeeper": {"url": "https://lk.test", "warehouse": "wh"},
+            "engines": {
+                "duck_unapproved": {
+                    "kind": "duckdb",
+                    "dialect": "duckdb",
+                    "profile": "iceberg_direct",
+                    "alias": "lakea",
+                },
+                "duck_approved": {
+                    "kind": "duckdb",
+                    "dialect": "duckdb",
+                    "profile": "iceberg_direct",
+                    "alias": "lakeb",
+                },
+            },
+            "pii_tables": ["lakekeeper.clinical.patients"],
+            "pii_engines": ["duck_approved"],
+        },
+        http_client=_mock_lakekeeper_client(tables=("patients",)),
+        now=now_dt,
+    )
+    assert list(res_3.placement["tables"]["lakekeeper.clinical.patients"]["serve"].keys()) == [
+        "duck_approved"
+    ]
+
+    # Priority 4: Multiple unapproved DuckDB serves -> keeps single unapproved serve and raises PlacementError
+    with pytest.raises(PlacementError, match="policy.pii_engines"):
+        discover(
+            {
+                "default_catalog": "lakekeeper",
+                "lakekeeper": {"url": "https://lk.test", "warehouse": "wh"},
+                "engines": {
+                    "duck_a": {
+                        "kind": "duckdb",
+                        "dialect": "duckdb",
+                        "profile": "iceberg_direct",
+                        "alias": "lakea",
+                    },
+                    "duck_b": {
+                        "kind": "duckdb",
+                        "dialect": "duckdb",
+                        "profile": "iceberg_direct",
+                        "alias": "lakeb",
+                    },
+                },
+                "pii_tables": ["lakekeeper.clinical.patients"],
+            },
+            http_client=_mock_lakekeeper_client(tables=("patients",)),
+            now=now_dt,
+        )
+
+
+def test_cube_pii_requires_pii_engines_and_enforces_pii_cross_engine_in_router():
+    from seeknal.serving.router import Router
+
+    # 1. Default pii is False on CubeEntry
+    pl_default = Placement.from_dict(
+        {
+            "engines": {"cube_eng": {"kind": "cube", "dialect": "postgres"}},
+            "cubes": {
+                "patient_cube": {
+                    "engine": "cube_eng",
+                    "measures": ["cnt"],
+                    "dimensions": ["province"],
+                }
+            },
+        }
+    )
+    assert pl_default.cubes["patient_cube"].pii is False
+
+    # 2. Non-boolean pii on cube rejected
+    with pytest.raises(PlacementError, match="pii.*boolean"):
+        Placement.from_dict(
+            {
+                "engines": {"cube_eng": {"kind": "cube", "dialect": "postgres"}},
+                "cubes": {
+                    "patient_cube": {
+                        "engine": "cube_eng",
+                        "measures": ["cnt"],
+                        "dimensions": ["province"],
+                        "pii": "yes",
+                    }
+                },
+            }
+        )
+
+    # 3. pii: true on cube refused unless cube engine is in policy.pii_engines
+    with pytest.raises(
+        PlacementError,
+        match="PII cube 'patient_cube' engine 'cube_eng' must be listed in policy.pii_engines",
+    ):
+        Placement.from_dict(
+            {
+                "engines": {"cube_eng": {"kind": "cube", "dialect": "postgres"}},
+                "cubes": {
+                    "patient_cube": {
+                        "engine": "cube_eng",
+                        "measures": ["cnt"],
+                        "dimensions": ["province"],
+                        "pii": True,
+                    }
+                },
+            }
+        )
+
+    # Also refused when folded via pii_tables without pii_engines
+    with pytest.raises(
+        PlacementError,
+        match="PII cube 'patient_cube' engine 'cube_eng' must be listed in policy.pii_engines",
+    ):
+        Placement.from_dict(
+            {
+                "engines": {"cube_eng": {"kind": "cube", "dialect": "postgres"}},
+                "cubes": {
+                    "patient_cube": {
+                        "engine": "cube_eng",
+                        "measures": ["cnt"],
+                        "dimensions": ["province"],
+                    }
+                },
+                "pii_tables": ["patient_cube"],
+            }
+        )
+
+    # 4. Accepted when cube engine is listed in policy.pii_engines; router enforces pii_cross_engine
+    pl = Placement.from_dict(
+        {
+            "engines": {
+                "cube_pii": {"kind": "cube", "dialect": "postgres"},
+                "cube_pub": {"kind": "cube", "dialect": "postgres"},
+                "lb": {"kind": "lakebase", "dialect": "postgres"},
+            },
+            "tables": {
+                "ref.provinces": {
+                    "keys": ["code"],
+                    "serve": {"lb": "public.provinces"},
+                }
+            },
+            "cubes": {
+                "patient_cube": {
+                    "engine": "cube_pii",
+                    "measures": ["cnt"],
+                    "dimensions": ["province"],
+                    "pii": True,
+                },
+                "public_cube": {
+                    "engine": "cube_pub",
+                    "measures": ["cnt"],
+                    "dimensions": ["province"],
+                },
+            },
+            "policy": {"pii_engines": ["cube_pii"]},
+        }
+    )
+    assert pl.cubes["patient_cube"].pii is True
+    router = Router(pl)
+
+    # Direct query to PII cube (with or without matching hint) routes to cube_pii
+    dec = router.route("SELECT province, cnt FROM patient_cube")
+    assert dec.engine == "cube_pii"
+    dec_hint = router.route("SELECT province, cnt FROM patient_cube", hint="cube_pii")
+    assert dec_hint.engine == "cube_pii"
+
+    # Mixing PII cube and table -> pii_cross_engine
+    with pytest.raises(RoutingError) as exc_mix_tbl:
+        router.route(
+            "SELECT c.cnt FROM patient_cube c JOIN ref.provinces p ON c.province = p.code"
+        )
+    assert exc_mix_tbl.value.code == "pii_cross_engine"
+
+    # Mixing PII cube with cube on another engine -> pii_cross_engine
+    with pytest.raises(RoutingError) as exc_mix_cubes:
+        router.route(
+            "SELECT a.cnt FROM patient_cube a JOIN public_cube b ON a.province = b.province"
+        )
+    assert exc_mix_cubes.value.code == "pii_cross_engine"
+
+    # Hint targeting different engine on PII cube -> pii_cross_engine
+    for hint_sql_or_arg in (
+        ("SELECT province, cnt FROM patient_cube", "lb"),
+        ("/* seeknal:engine=lb */ SELECT province, cnt FROM patient_cube", None),
+    ):
+        with pytest.raises(RoutingError) as exc_bad_hint:
+            router.route(hint_sql_or_arg[0], hint=hint_sql_or_arg[1])
+        assert exc_bad_hint.value.code == "pii_cross_engine"
+
+
+def test_e_m2_discovery_initial_refresh_failure_exits_2_before_serving(
+    tmp_path, monkeypatch, capsys
+):
+    import base64
+    import json
+    from unittest.mock import MagicMock
+
+    import yaml
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    import seeknal.serving.server.app as app_mod
+    from seeknal.serving.__main__ import main as serving_main
+
+    priv = ec.generate_private_key(ec.SECP256R1())
+    pn = priv.public_key().public_numbers()
+    jwk = {
+        "kty": "EC",
+        "crv": "P-256",
+        "x": base64.urlsafe_b64encode(pn.x.to_bytes(32, "big")).rstrip(b"=").decode("ascii"),
+        "y": base64.urlsafe_b64encode(pn.y.to_bytes(32, "big")).rstrip(b"=").decode("ascii"),
+        "kid": "em2-kid",
+    }
+    jwks_path = tmp_path / "grants.jwks.json"
+    jwks_path.write_text(json.dumps({"keys": [jwk]}), encoding="utf-8")
+
+    lb_secret = "SECRET_LB_PW_EM2_778899"
+    sr_secret = "SECRET_SR_PW_EM2_112233"
+    lk_secret = "SECRET_LK_OAUTH_EM2_445566"
+    s3_secret = "SECRET_S3_KEY_EM2_990011"
+    monkeypatch.setenv(
+        "EM2_LB_DSN", f"postgresql://svc:{lb_secret}@lakebase.internal:5432/atlas"
+    )
+    monkeypatch.setenv("EM2_SR_PW", sr_secret)
+    monkeypatch.setenv("EM2_LK_ID", "lk-id")
+    monkeypatch.setenv("EM2_LK_SECRET", lk_secret)
+    monkeypatch.setenv("EM2_S3_KEY", "AKIAEXAMPLE")
+    monkeypatch.setenv("EM2_S3_SECRET", s3_secret)
+
+    ext_dir = tmp_path / "duck_exts"
+    ext_dir.mkdir()
+
+    # Empty _lakebase_sync_state -> 'lb' serve is omitted at runtime so only unapproved 'duck_ice' remains!
+    empty_sqlite = sqlite3.connect(":memory:")
+    empty_sqlite.execute(
+        "CREATE TABLE _lakebase_sync_state (target_table TEXT PRIMARY KEY, snapshot_id INTEGER, synced_at TEXT)"
+    )
+    empty_sqlite.commit()
+
+    def _fake_run_discovery_unapproved_duck(disc_data, *, client=None, lb_connect=None, env=None):
+        return discover(
+            disc_data,
+            http_client=_mock_lakekeeper_client(tables=("patients",)),
+            lakebase_connect=lambda: empty_sqlite,
+            env=env or {},
+            now=datetime(2026, 5, 1, 12, 1, 0, tzinfo=timezone.utc),
+        )
+
+    monkeypatch.setattr(app_mod, "_run_discovery", _fake_run_discovery_unapproved_duck)
+
+    # 1. PII table falls back to unapproved DuckDB serve during initial discovery refresh -> exit 2, never serve
+    cfg_unapproved_pii = tmp_path / "serving_disc_unapproved_pii.yaml"
+    cfg_unapproved_pii.write_text(
+        yaml.safe_dump(
+            {
+                "listen": {"host": "127.0.0.1", "port": 8765},
+                "grant_keys": {"jwks_file": str(jwks_path)},
+                "placement": {
+                    "discovery": {
+                        "default_catalog": "lakekeeper",
+                        "lakekeeper": {
+                            "url": "https://lk.internal:8181",
+                            "warehouse": "main",
+                        },
+                        "engines": {
+                            "lb": {"kind": "lakebase", "dialect": "postgres"},
+                            "duck_ice": {
+                                "kind": "duckdb",
+                                "dialect": "duckdb",
+                                "profile": "iceberg_direct",
+                                "alias": "lake",
+                            },
+                        },
+                        "lakebase": {
+                            "engine": "lb",
+                            "synced_tables": {
+                                "lakekeeper.clinical.patients": {
+                                    "target": "public.patients",
+                                    "primary_key": ["id"],
+                                    "pii": True,
+                                }
+                            },
+                        },
+                    }
+                },
+                "connections": {
+                    "lb": {"kind": "lakebase", "dsn_env": "EM2_LB_DSN"},
+                    "duck_ice": {
+                        "kind": "duckdb",
+                        "profile": "iceberg_direct",
+                        "extension_directory": str(ext_dir),
+                        "extensions": ["httpfs", "avro", "iceberg"],
+                        "allowed_s3_prefixes": ["s3://atlas-wh/clinical/"],
+                        "recycle_seconds": 120,
+                        "iceberg_catalogs": {
+                            "lake": {
+                                "endpoint": "https://lk.internal:8181",
+                                "warehouse": "main",
+                                "token_uri": "https://idp.internal/token",
+                                "client_id_env": "EM2_LK_ID",
+                                "client_secret_env": "EM2_LK_SECRET",
+                                "access_delegation": "vended",
+                                "s3": {
+                                    "endpoint": "s3.internal:9000",
+                                    "region": "us-east-1",
+                                    "key_id_env": "EM2_S3_KEY",
+                                    "secret_env": "EM2_S3_SECRET",
+                                    "use_ssl": True,
+                                },
+                            }
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    capsys.readouterr()
+    fake_uvicorn_1 = MagicMock()
+    rc_1 = serving_main(["--config", str(cfg_unapproved_pii)], run=fake_uvicorn_1)
+    assert rc_1 == 2
+    assert not fake_uvicorn_1.called
+    cap_1 = capsys.readouterr()
+    assert "Error: Initial discovery refresh failed" in cap_1.err
+    assert "duck_ice" in cap_1.err
+    assert "policy.pii_engines" in cap_1.err
+    for secret in (lb_secret, sr_secret, lk_secret, s3_secret, "Traceback"):
+        assert secret not in cap_1.err
+        assert secret not in cap_1.out
+
+    # 2. Unmatched pii_tables entry in live discovery refresh -> exit 2, never serve, no secret leak
+    cfg_unmatched_pii = tmp_path / "serving_disc_unmatched_pii.yaml"
+    cfg_unmatched_pii.write_text(
+        yaml.safe_dump(
+            {
+                "listen": {"host": "127.0.0.1", "port": 8765},
+                "grant_keys": {"jwks_file": str(jwks_path)},
+                "placement": {
+                    "discovery": {
+                        "default_catalog": "lakekeeper",
+                        "lakekeeper": {
+                            "url": "https://lk.internal:8181",
+                            "warehouse": "main",
+                        },
+                        "engines": {
+                            "sr": {"kind": "starrocks", "dialect": "starrocks"},
+                        },
+                        "pii_tables": ["lakekeeper.clinical.patients_nonexistent"],
+                    }
+                },
+                "connections": {
+                    "sr": {
+                        "kind": "starrocks",
+                        "accounts": {
+                            "interactive": {
+                                "host": "sr.internal",
+                                "port": 9030,
+                                "user": "svc",
+                                "password_env": "EM2_SR_PW",
+                            }
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_uvicorn_2 = MagicMock()
+    rc_2 = serving_main(["--config", str(cfg_unmatched_pii)], run=fake_uvicorn_2)
+    assert rc_2 == 2
+    assert not fake_uvicorn_2.called
+    cap_2 = capsys.readouterr()
+    assert "Error: Initial discovery refresh failed" in cap_2.err
+    assert "lakekeeper.clinical.patients_nonexistent" in cap_2.err
+    for secret in (lb_secret, sr_secret, lk_secret, s3_secret, "Traceback"):
+        assert secret not in cap_2.err
+        assert secret not in cap_2.out
+
+    # 3. Valid discovery PII table with StarRocks + synced Lakebase -> single serve 'lb' chosen, server starts (rc 0)
+    synced_sqlite = sqlite3.connect(":memory:")
+    synced_sqlite.execute(
+        "CREATE TABLE _lakebase_sync_state (target_table TEXT PRIMARY KEY, snapshot_id INTEGER, synced_at TEXT)"
+    )
+    synced_sqlite.execute(
+        "INSERT INTO _lakebase_sync_state VALUES (?, ?, ?)",
+        ("public.patients", 700, "2026-05-01T12:00:00+00:00"),
+    )
+    synced_sqlite.commit()
+
+    monkeypatch.setattr(
+        app_mod,
+        "_run_discovery",
+        lambda disc_data, *, client=None, lb_connect=None, env=None: discover(
+            disc_data,
+            http_client=_mock_lakekeeper_client(tables=("patients",)),
+            lakebase_connect=lambda: synced_sqlite,
+            env=env or {},
+            now=datetime(2026, 5, 1, 12, 1, 0, tzinfo=timezone.utc),
+        ),
+    )
+
+    cfg_valid_pii = tmp_path / "serving_disc_valid_pii.yaml"
+    cfg_valid_pii.write_text(
+        yaml.safe_dump(
+            {
+                "listen": {"host": "127.0.0.1", "port": 8765},
+                "grant_keys": {"jwks_file": str(jwks_path)},
+                "placement": {
+                    "discovery": {
+                        "default_catalog": "lakekeeper",
+                        "lakekeeper": {
+                            "url": "https://lk.internal:8181",
+                            "warehouse": "main",
+                        },
+                        "engines": {
+                            "sr": {"kind": "starrocks", "dialect": "starrocks"},
+                            "lb": {"kind": "lakebase", "dialect": "postgres"},
+                        },
+                        "lakebase": {
+                            "engine": "lb",
+                            "synced_tables": {
+                                "lakekeeper.clinical.patients": {
+                                    "target": "public.patients",
+                                    "primary_key": ["id"],
+                                    "pii": True,
+                                }
+                            },
+                        },
+                    }
+                },
+                "connections": {
+                    "lb": {"kind": "lakebase", "dsn_env": "EM2_LB_DSN"},
+                    "sr": {
+                        "kind": "starrocks",
+                        "accounts": {
+                            "interactive": {
+                                "host": "sr.internal",
+                                "port": 9030,
+                                "user": "svc",
+                                "password_env": "EM2_SR_PW",
+                            }
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_uvicorn_3 = MagicMock()
+    rc_3 = serving_main(["--config", str(cfg_valid_pii)], run=fake_uvicorn_3)
+    assert rc_3 == 0
+    assert fake_uvicorn_3.called
+
+
 
 

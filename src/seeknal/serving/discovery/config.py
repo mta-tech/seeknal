@@ -10,9 +10,73 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
+from yaml.constructor import ConstructorError
+
+from seeknal.serving.placement import UniqueKeySafeLoader
 
 _ICEBERG_ALIAS_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _RESERVED_ICEBERG_ALIASES = frozenset({"main", "system", "temp", "memory"})
+_SIMPLE_LOWER_ENUM_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_LOGICAL_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SAFE_DISC_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
+_SUSPICIOUS_DISC_RE = re.compile(
+    r"(://|@|secret|password|passwd|token|bearer|private|canary|sentinel|opaque|dsn|credential)",
+    re.IGNORECASE,
+)
+
+
+def _safe_enum_token(value: Any) -> str:
+    """Return a strictly lowercase simple enum token or '<invalid>'."""
+    if not isinstance(value, str):
+        return "<invalid>"
+    s = value.strip()
+    if not s or _SUSPICIOUS_DISC_RE.search(s):
+        return "<invalid>"
+    if not _SIMPLE_LOWER_ENUM_RE.fullmatch(s):
+        return "<invalid>"
+    return s
+
+
+def _safe_disc_label(value: Any, fallback: str = "<redacted>") -> str:
+    """Return a safe identifier label for discovery error messages."""
+    if not isinstance(value, str):
+        return f"<{type(value).__name__}>"
+    s = value.strip()
+    if not s:
+        return "<empty>"
+    if _SUSPICIOUS_DISC_RE.search(s) or not _SAFE_DISC_IDENT_RE.fullmatch(s):
+        return fallback
+    return s
+
+
+def _validate_discovery_logical_table_name(
+    raw_name: Any,
+    *,
+    default_catalog: str,
+    field_label: str,
+) -> str:
+    """Validate a 3-part unquoted logical table name '<default_catalog>.<namespace>.<table>'."""
+    if not isinstance(raw_name, str) or not raw_name:
+        raise DiscoveryConfigError(
+            f"'{field_label}' must contain only non-empty 3-part table name strings"
+        )
+    if '"' in raw_name or "'" in raw_name or any(ch.isspace() for ch in raw_name):
+        raise DiscoveryConfigError(
+            f"Invalid table name in '{field_label}': quotes and whitespace are not permitted "
+            f"(expected unquoted '{_safe_disc_label(default_catalog)}.<namespace>.<table>')"
+        )
+    parts = raw_name.split(".")
+    if len(parts) != 3 or not all(_LOGICAL_SEGMENT_RE.fullmatch(p) for p in parts):
+        raise DiscoveryConfigError(
+            f"Invalid table name '{_safe_disc_label(raw_name)}' in '{field_label}': "
+            f"expected 3-part '<default_catalog>.<namespace>.<table>' with valid identifier segments"
+        )
+    if parts[0].lower() != default_catalog.lower():
+        raise DiscoveryConfigError(
+            f"Table '{_safe_disc_label(raw_name)}' in '{field_label}' has catalog prefix "
+            f"'{_safe_disc_label(parts[0])}', expected default_catalog '{_safe_disc_label(default_catalog)}'"
+        )
+    return raw_name
 
 
 def _validate_discovery_alias(alias: Any, eng_name: str) -> str:
@@ -189,7 +253,7 @@ class DiscoveryConfig:
                 kind_str = kind.strip()
                 if kind_str not in ("starrocks", "cube", "lakebase", "duckdb"):
                     raise DiscoveryConfigError(
-                        f"Unknown engine kind '{kind_str}' for engine '{eng_name_str}'"
+                        f"Unknown engine kind '{_safe_enum_token(kind_str)}' for engine '{_safe_disc_label(eng_name_str)}'"
                     )
 
                 dialect = eng_data.get("dialect")
@@ -267,7 +331,7 @@ class DiscoveryConfig:
                     api_secret_env_str or api_secret_file_str or api_claims is not None
                 ):
                     raise DiscoveryConfigError(
-                        f"Engine '{eng_name_str}' of kind '{kind_str}' cannot specify 'api_secret_env'/'api_secret_file'/'api_claims'"
+                        f"Engine '{_safe_disc_label(eng_name_str)}' of kind '{_safe_enum_token(kind_str)}' cannot specify 'api_secret_env'/'api_secret_file'/'api_claims'"
                     )
 
                 if kind_str == "starrocks":
@@ -289,7 +353,7 @@ class DiscoveryConfig:
                 if profile_raw is not None:
                     if kind_str != "duckdb":
                         raise DiscoveryConfigError(
-                            f"Engine '{eng_name_str}' of kind '{kind_str}' cannot specify 'profile'"
+                            f"Engine '{_safe_disc_label(eng_name_str)}' of kind '{_safe_enum_token(kind_str)}' cannot specify 'profile'"
                         )
                     if not isinstance(profile_raw, str) or profile_raw.strip() not in ("local_file", "iceberg_direct"):
                         raise DiscoveryConfigError(
@@ -523,17 +587,24 @@ class DiscoveryConfig:
 
             synced_raw = lb_raw.get("synced_tables")
             synced_tables: dict[str, SyncedTableConfig] = {}
+            seen_synced_lower: dict[str, str] = {}
             if synced_raw is not None:
                 if not isinstance(synced_raw, Mapping):
                     raise DiscoveryConfigError(
                         "Lakebase 'synced_tables' must be a mapping"
                     )
                 for tbl_name, tbl_spec in synced_raw.items():
-                    if not isinstance(tbl_name, str) or not tbl_name.strip():
+                    tbl_name_str = _validate_discovery_logical_table_name(
+                        tbl_name,
+                        default_catalog=default_catalog,
+                        field_label="lakebase.synced_tables",
+                    )
+                    tbl_lower = tbl_name_str.lower()
+                    if tbl_lower in seen_synced_lower:
                         raise DiscoveryConfigError(
-                            "Synced table name must be a non-empty string"
+                            f"Duplicate case-insensitive synced table '{_safe_disc_label(tbl_name_str)}' in 'lakebase.synced_tables'"
                         )
-                    tbl_name_str = tbl_name.strip()
+                    seen_synced_lower[tbl_lower] = tbl_name_str
                     if not isinstance(tbl_spec, Mapping):
                         raise DiscoveryConfigError(
                             f"Synced table spec for '{tbl_name_str}' must be a mapping"
@@ -575,12 +646,26 @@ class DiscoveryConfig:
             )
         pii_tables_list: list[str] = []
         for pt in pii_tables_raw:
-            if not isinstance(pt, str) or not pt.strip():
-                raise DiscoveryConfigError(
-                    "'pii_tables' must contain only non-empty table name strings"
+            pii_tables_list.append(
+                _validate_discovery_logical_table_name(
+                    pt,
+                    default_catalog=default_catalog,
+                    field_label="pii_tables",
                 )
-            pii_tables_list.append(pt.strip())
+            )
         pii_tables = tuple(pii_tables_list)
+
+        if lakekeeper_cfg is None:
+            if pii_tables:
+                raise DiscoveryConfigError(
+                    "'pii_tables' cannot be configured when 'lakekeeper' is not configured"
+                )
+            if lakebase_cfg is not None and any(
+                st.pii for st in lakebase_cfg.synced_tables.values()
+            ):
+                raise DiscoveryConfigError(
+                    "Synced tables with 'pii: true' cannot be configured when 'lakekeeper' is not configured"
+                )
 
         has_top_pe = "pii_engines" in data
         top_pe_raw = data.get("pii_engines", ())
@@ -639,13 +724,25 @@ class DiscoveryConfig:
         """Construct DiscoveryConfig from a YAML file."""
         try:
             with open(path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
+                data = yaml.load(f, Loader=UniqueKeySafeLoader)
         except FileNotFoundError as exc:
             raise DiscoveryConfigError(f"Config file not found: {path}") from exc
+        except ConstructorError as exc:
+            mark = getattr(exc, "problem_mark", None)
+            loc = f" at line {mark.line + 1}, column {mark.column + 1}" if mark is not None else ""
+            if hasattr(exc, "duplicate_key") or "duplicate YAML key" in str(getattr(exc, "problem", "")):
+                dup_key = getattr(exc, "duplicate_key", None)
+                safe_dup = _safe_disc_label(str(dup_key)) if dup_key is not None else "<redacted>"
+                raise DiscoveryConfigError(
+                    f"Invalid YAML in config file '{path}'{loc}: duplicate YAML key '{safe_dup}'"
+                ) from exc
+            raise DiscoveryConfigError(f"Invalid YAML in config file '{path}'{loc}") from exc
         except yaml.YAMLError as exc:
-            raise DiscoveryConfigError(f"Invalid YAML in config file: {exc}") from exc
+            mark = getattr(exc, "problem_mark", None)
+            loc = f" at line {mark.line + 1}, column {mark.column + 1}" if mark is not None else ""
+            raise DiscoveryConfigError(f"Invalid YAML in config file '{path}'{loc}") from exc
         except Exception as exc:
-            raise DiscoveryConfigError(f"Failed to read config file: {exc}") from exc
+            raise DiscoveryConfigError(f"Failed to read config file: {path}") from exc
 
         if not isinstance(data, Mapping):
             raise DiscoveryConfigError(

@@ -57,7 +57,11 @@ from seeknal.serving.server.config import (
     read_secret_file,
 )
 from seeknal.serving.service import ServingPipeline
-from seeknal.serving.startup_validation import _ROLE_TOP_KEYS, validate_startup
+from seeknal.serving.startup_validation import (
+    _collect_secret_values,
+    _scrub,
+    run_initial_discovery_refresh_or_raise,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,19 +133,13 @@ def build_server(
     discover_fn: Callable[[], DiscoveryResult] | None = None,
     audit_failure_callback: Callable[[], Any] | None = None,
     readiness_clock: Callable[[], float] | None = None,
+    run_initial_refresh: bool = False,
 ) -> ServerHandle:
     """Build a complete Seeknal Serving server handle from configuration."""
     # 1. Resolve configuration
     if isinstance(config, (str, os.PathLike)):
-        try:
-            cfg = ServerConfig.from_yaml(config, env=env)
-        except ServerConfigError as exc:
-            if any(k in str(exc) for k in _ROLE_TOP_KEYS):
-                validate_startup(config, env=env)
-            raise
+        cfg = ServerConfig.from_yaml(config, env=env)
     elif isinstance(config, Mapping) and not isinstance(config, ServerConfig):
-        if any(k in config for k in _ROLE_TOP_KEYS):
-            validate_startup(config, env=env)
         cfg = ServerConfig.from_dict(config, env=env)
     elif isinstance(config, ServerConfig):
         cfg = config
@@ -177,6 +175,9 @@ def build_server(
         )
 
     # 5. Build ServingPipeline and PlacementRefresher
+    secret_values = _collect_secret_values(env, cfg=cfg)
+    last_refresh_error: list[Exception | None] = [None]
+    last_refresh_error_scrubbed: list[str | None] = [None]
     refresher: PlacementRefresher | None = None
     if cfg.placement.is_static:
         assert preflight.placement is not None
@@ -209,7 +210,7 @@ def build_server(
         assert disc_cfg is not None
 
         if discover_fn is not None:
-            disc_call = discover_fn
+            raw_disc_call = discover_fn
         else:
             lb_connect = None
             if disc_cfg.lakebase is not None:
@@ -228,15 +229,43 @@ def build_server(
             if cfg.secrets_env:
                 effective_env.update(cfg.secrets_env)
 
-            disc_call = lambda: _run_discovery(
+            raw_disc_call = lambda: _run_discovery(
                 cfg.placement.discovery, client=None, lb_connect=lb_connect, env=effective_env
             )
 
+        def _tracked_disc_call() -> DiscoveryResult:
+            last_refresh_error[0] = None
+            last_refresh_error_scrubbed[0] = None
+            try:
+                res = raw_disc_call()
+                Placement.from_dict(res.placement)
+                return res
+            except Exception as exc:
+                scrubbed = _scrub(str(exc), secret_values)
+                last_refresh_error[0] = exc
+                last_refresh_error_scrubbed[0] = scrubbed
+                logger.error(
+                    "Catalog discovery refresh failed (%s): %s",
+                    type(exc).__name__,
+                    scrubbed,
+                )
+                raise
+
         refresher = PlacementRefresher(
-            discover_fn=disc_call,
+            discover_fn=_tracked_disc_call,
             pipeline=pipeline,
             interval_seconds=disc_cfg.refresh_interval_seconds,
         )
+        setattr(refresher, "last_refresh_error", last_refresh_error)
+        setattr(refresher, "last_refresh_error_scrubbed", last_refresh_error_scrubbed)
+
+        if run_initial_refresh:
+            run_initial_discovery_refresh_or_raise(
+                refresher,
+                cfg=cfg,
+                env=env,
+                secret_values=secret_values,
+            )
 
     # 6. Build adapters from connections
     adapters: dict[str, EngineAdapter] = {}
@@ -344,7 +373,18 @@ def build_server(
     @asynccontextmanager
     async def lifespan(app: Starlette):
         if refresher is not None:
-            refresher.refresh_once()
+            if refresher.last_success_at is None:
+                ok = refresher.refresh_once()
+                if not ok:
+                    reason = (
+                        last_refresh_error_scrubbed[0]
+                        or refresher.last_error
+                        or "unknown_error"
+                    )
+                    logger.error(
+                        "Initial catalog discovery refresh failed on lifespan startup: %s",
+                        reason,
+                    )
             refresher.start()
         try:
             yield

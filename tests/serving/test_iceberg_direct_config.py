@@ -97,7 +97,7 @@ def _base_iceberg_direct_config(
                 "kind": "duckdb",
                 "profile": "iceberg_direct",
                 "extension_directory": str(ext_dir),
-                "extensions": ["httpfs", "iceberg"],
+                "extensions": ["httpfs", "avro", "iceberg"],
                 "allowed_s3_prefixes": [
                     "s3://warehouse-bucket/analytics/",
                     "s3://warehouse-bucket/shared/curated/",
@@ -150,7 +150,7 @@ def test_valid_iceberg_direct_config_and_secrets_env_resolution(
     assert isinstance(conn, DuckDBConnectionConfig)
     assert conn.profile == "iceberg_direct"
     assert conn.path == ":memory:"
-    assert conn.extensions == ("httpfs", "iceberg")
+    assert conn.extensions == ("httpfs", "avro", "iceberg")
     assert conn.allowed_s3_prefixes == (
         "s3://warehouse-bucket/analytics/",
         "s3://warehouse-bucket/shared/curated/",
@@ -502,4 +502,117 @@ def test_secrets_env_scoped_to_referenced_vars_and_hidden_from_repr(
     assert other_engine_secret not in repr(conn)
     assert duck_secret not in repr(cfg)
     assert other_engine_secret not in repr(cfg)
+
+
+def test_iceberg_direct_requires_avro_when_iceberg_configured(
+    tmp_path,
+    pub_pem_file,
+    static_placement_files,
+    secrets_env_file,
+):
+    # 1. Missing 'avro' when 'iceberg' is configured raises exact required ServerConfigError
+    for exts_without_avro in (["httpfs", "iceberg"], ["iceberg"]):
+        raw = _base_iceberg_direct_config(
+            tmp_path, pub_pem_file, static_placement_files, secrets_env_file
+        )
+        raw["connections"]["duck_ice"]["extensions"] = exts_without_avro
+        with pytest.raises(
+            ServerConfigError,
+            match="DuckDB iceberg_direct connection 'duck_ice' requires 'avro' in 'extensions' when 'iceberg' is configured",
+        ):
+            ServerConfig.from_dict(raw)
+
+    # 2. Invalid extension message lists allowlist {'avro', 'httpfs', 'iceberg'}
+    raw_bad = _base_iceberg_direct_config(
+        tmp_path, pub_pem_file, static_placement_files, secrets_env_file
+    )
+    raw_bad["connections"]["duck_ice"]["extensions"] = ["httpfs", "avro", "parquet"]
+    with pytest.raises(
+        ServerConfigError,
+        match=r"DuckDB iceberg_direct connection 'duck_ice' extension 'parquet' is not in allowlist \{'avro', 'httpfs', 'iceberg'\}",
+    ):
+        ServerConfig.from_dict(raw_bad)
+
+
+def test_iceberg_direct_orders_avro_before_iceberg(
+    tmp_path,
+    pub_pem_file,
+    static_placement_files,
+    secrets_env_file,
+):
+    from seeknal.serving.duckdb_policy import plan_iceberg_direct
+
+    for input_exts, expected_exts in (
+        (["httpfs", "iceberg", "avro"], ("httpfs", "avro", "iceberg")),
+        (["iceberg", "avro", "httpfs"], ("avro", "iceberg", "httpfs")),
+        (["iceberg", "httpfs", "avro"], ("avro", "iceberg", "httpfs")),
+        (["httpfs", "avro", "iceberg"], ("httpfs", "avro", "iceberg")),
+        (["avro", "httpfs", "iceberg"], ("avro", "httpfs", "iceberg")),
+        (["iceberg", "avro"], ("avro", "iceberg")),
+    ):
+        raw = _base_iceberg_direct_config(
+            tmp_path, pub_pem_file, static_placement_files, secrets_env_file
+        )
+        raw["connections"]["duck_ice"]["extensions"] = input_exts
+        cfg = ServerConfig.from_dict(raw)
+        conn = cfg.connections["duck_ice"]
+        assert conn.extensions == expected_exts
+        assert conn.extensions.index("avro") < conn.extensions.index("iceberg")
+
+        steps = plan_iceberg_direct(conn)
+        step_names = [s.name for s in steps]
+        assert step_names.index("b_load_extension_avro") < step_names.index(
+            "b_load_extension_iceberg"
+        )
+
+
+def test_iceberg_direct_fails_early_when_avro_file_missing_from_extension_directory(
+    tmp_path,
+    pub_pem_file,
+    static_placement_files,
+    secrets_env_file,
+):
+    from seeknal.serving.startup_validation import StartupValidationError, validate_startup
+
+    populated_ext_dir = tmp_path / "ext_populated"
+    plat_dir = populated_ext_dir / "v2.0.0" / "linux_amd64"
+    plat_dir.mkdir(parents=True)
+    (plat_dir / "httpfs.duckdb_extension").write_bytes(b"fake-httpfs")
+    (plat_dir / "iceberg.duckdb_extension").write_bytes(b"fake-iceberg")
+
+    raw = _base_iceberg_direct_config(
+        tmp_path, pub_pem_file, static_placement_files, secrets_env_file
+    )
+    raw["connections"]["duck_ice"]["extension_directory"] = str(populated_ext_dir)
+    raw["connections"]["duck_ice"]["extensions"] = ["httpfs", "avro", "iceberg"]
+
+    # 1. ServerConfig.from_dict fails early naming avro.duckdb_extension and extension_directory
+    with pytest.raises(ServerConfigError) as exc_cfg:
+        ServerConfig.from_dict(raw)
+    assert "avro.duckdb_extension" in str(exc_cfg.value)
+    assert str(populated_ext_dir) in str(exc_cfg.value)
+
+    # 2. Startup validation fails early naming avro.duckdb_extension
+    with pytest.raises(StartupValidationError) as exc_val:
+        validate_startup(raw, env={})
+    assert "avro.duckdb_extension" in str(exc_val.value)
+    assert str(populated_ext_dir) in str(exc_val.value)
+
+    # 3. Synthetic non-existent path on host is allowed during unit config parsing
+    raw_synthetic = _base_iceberg_direct_config(
+        tmp_path, pub_pem_file, static_placement_files, secrets_env_file
+    )
+    raw_synthetic["connections"]["duck_ice"]["extension_directory"] = (
+        "/opt/nonexistent_synthetic_duckdb_exts"
+    )
+    cfg_syn = ServerConfig.from_dict(raw_synthetic)
+    assert cfg_syn.connections["duck_ice"].extensions == ("httpfs", "avro", "iceberg")
+
+    # 4. Once avro.duckdb_extension is present in populated extension_directory, both succeed
+    (plat_dir / "avro.duckdb_extension").write_bytes(b"fake-avro")
+    cfg_ok = ServerConfig.from_dict(raw)
+    assert cfg_ok.connections["duck_ice"].extensions == ("httpfs", "avro", "iceberg")
+    rep = validate_startup(raw, env={})
+    assert rep.ok is True
+
 

@@ -116,7 +116,7 @@ def _iceberg_direct_conn(tmp_path: Path) -> dict:
         "kind": "duckdb",
         "profile": "iceberg_direct",
         "extension_directory": str(ext_dir),
-        "extensions": ["httpfs", "iceberg"],
+        "extensions": ["httpfs", "avro", "iceberg"],
         "allowed_s3_prefixes": ["s3://atlas-wh/clinical/"],
         "recycle_seconds": 120,
         "iceberg_catalogs": {
@@ -755,6 +755,10 @@ def test_role_policy_unknown_table_and_column_and_discovery_unapproved_duckdb_pi
         "placement": {
             "discovery": {
                 "default_catalog": "lakekeeper",
+                "lakekeeper": {
+                    "url": "https://lk.internal:8181",
+                    "warehouse": "main",
+                },
                 "engines": {
                     "duck_ice": {
                         "kind": "duckdb",
@@ -973,7 +977,7 @@ def test_build_server_and_main_validate_cli_refuse_every_violation_and_accept_va
             {"claims.claim": ["id"]},
             all_connections,
             {"default_role": "unbacked_top_role"},
-            "unbacked_top_role",
+            "default_role",
         ),
         (
             "pii_two_serves",
@@ -1129,5 +1133,474 @@ def test_build_server_and_main_validate_cli_refuse_every_violation_and_accept_va
     capsys.readouterr()
     assert serving_cli_main(["--config", str(valid_static_cfg), "--check"]) == 0
     assert "config ok" in capsys.readouterr().out
+
+
+def test_discovery_validate_rejects_wrong_catalog_quoted_missing_lakekeeper_and_unsynced_pii(
+    tmp_path: Path, jwks_file: str, base_env: dict[str, str], capsys
+):
+    # E-H1 in validate: wrong catalog prefix, quoted form, whitespace, 2-part name, missing lakekeeper
+    for idx, bad_disc in enumerate(
+        [
+            {
+                "default_catalog": "lakekeeper",
+                "lakekeeper": {"url": "https://lk.internal:8181", "warehouse": "main"},
+                "engines": {"sr": {"kind": "starrocks", "dialect": "starrocks"}},
+                "pii_tables": ["wrongcat.clinical.patients"],
+            },
+            {
+                "default_catalog": "lakekeeper",
+                "lakekeeper": {"url": "https://lk.internal:8181", "warehouse": "main"},
+                "engines": {"sr": {"kind": "starrocks", "dialect": "starrocks"}},
+                "pii_tables": ['lakekeeper."clinical".patients'],
+            },
+            {
+                "default_catalog": "lakekeeper",
+                "lakekeeper": {"url": "https://lk.internal:8181", "warehouse": "main"},
+                "engines": {"sr": {"kind": "starrocks", "dialect": "starrocks"}},
+                "pii_tables": ["clinical.patients"],
+            },
+            {
+                # Missing lakekeeper with non-empty pii_tables
+                "default_catalog": "lakekeeper",
+                "engines": {"sr": {"kind": "starrocks", "dialect": "starrocks"}},
+                "pii_tables": ["lakekeeper.clinical.patients"],
+            },
+            {
+                # pii_tables entry NOT in lakebase.synced_tables when only Lakebase + unapproved DuckDB exist
+                "default_catalog": "lakekeeper",
+                "lakekeeper": {"url": "https://lk.internal:8181", "warehouse": "main"},
+                "engines": {
+                    "lb": {"kind": "lakebase", "dialect": "postgres"},
+                    "duck_ice": {
+                        "kind": "duckdb",
+                        "dialect": "duckdb",
+                        "profile": "iceberg_direct",
+                        "alias": "lake",
+                    },
+                },
+                "lakebase": {
+                    "engine": "lb",
+                    "synced_tables": {
+                        "lakekeeper.clinical.other_tbl": {
+                            "target": "public.other_tbl",
+                            "primary_key": ["id"],
+                        }
+                    },
+                },
+                "pii_tables": ["lakekeeper.clinical.patients"],
+            },
+        ]
+    ):
+        cf = tmp_path / f"disc_eh1_{idx}.yaml"
+        cf.write_text(
+            yaml.safe_dump(
+                {
+                    "listen": {"host": "127.0.0.1", "port": 8765},
+                    "grant_keys": {"jwks_file": jwks_file},
+                    "placement": {"discovery": bad_disc},
+                    "connections": {
+                        "lb": {"kind": "lakebase", "dsn_env": "TEST_LB_DSN"},
+                        "sr": {
+                            "kind": "starrocks",
+                            "accounts": {
+                                "interactive": {
+                                    "host": "sr.internal",
+                                    "port": 9030,
+                                    "user": "svc",
+                                    "password_env": "TEST_SR_PW",
+                                }
+                            },
+                        },
+                        "duck_ice": _iceberg_direct_conn(tmp_path),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(StartupValidationError):
+            validate_startup(cf, env=base_env)
+        capsys.readouterr()
+        assert run_validate_cli(cf, env=base_env) == 2
+        err = capsys.readouterr().err
+        assert "Error: " in err
+
+
+def test_static_pii_tables_and_cube_pii_refused_in_validate_and_build_server(
+    tmp_path: Path, jwks_file: str, base_env: dict[str, str], monkeypatch
+):
+    from seeknal.serving.server.app import build_server
+
+    for k, v in base_env.items():
+        monkeypatch.setenv(k, v)
+
+    conns = {
+        "lb": {"kind": "lakebase", "dsn_env": "TEST_LB_DSN"},
+        "sr": {
+            "kind": "starrocks",
+            "accounts": {
+                "interactive": {
+                    "host": "sr.internal",
+                    "port": 9030,
+                    "user": "svc",
+                    "password_env": "TEST_SR_PW",
+                }
+            },
+        },
+        "duck": {"kind": "duckdb", "path": ":memory:"},
+        "cube": {
+            "kind": "cube",
+            "host": "cube.internal",
+            "port": 15432,
+            "dbname": "cube",
+            "sql_user": "seeknal",
+        },
+    }
+
+    # E-H2 & E-M3: top-level pii_tables, policy.pii_tables (DuckDB or 2 serves), and cube pii: true without pii_engines
+    cases = [
+        (
+            "top_pii_on_duck",
+            {
+                "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+                "tables": {"clinical.patients": {"keys": ["id"], "serve": {"duck": "main.patients"}}},
+                "pii_tables": ["clinical.patients"],
+            },
+            {"clinical.patients": ["id"]},
+            "policy.pii_engines",
+        ),
+        (
+            "policy_pii_on_duck",
+            {
+                "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+                "tables": {"clinical.patients": {"keys": ["id"], "serve": {"duck": "main.patients"}}},
+                "policy": {"pii_tables": ["clinical.patients"]},
+            },
+            {"clinical.patients": ["id"]},
+            "policy.pii_engines",
+        ),
+        (
+            "policy_pii_two_serves",
+            {
+                "engines": {
+                    "lb": {"kind": "lakebase", "dialect": "postgres"},
+                    "sr": {"kind": "starrocks", "dialect": "starrocks"},
+                },
+                "tables": {
+                    "clinical.patients": {
+                        "keys": ["id"],
+                        "serve": {"lb": "public.patients", "sr": "lk.clinical.patients"},
+                    }
+                },
+                "policy": {"pii_tables": ["clinical.patients"]},
+            },
+            {"clinical.patients": ["id"]},
+            "exactly one serve, got 2",
+        ),
+        (
+            "cube_pii_without_pii_engines",
+            {
+                "engines": {"cube": {"kind": "cube", "dialect": "postgres"}},
+                "cubes": {
+                    "patient_cube": {
+                        "engine": "cube",
+                        "measures": ["cnt"],
+                        "dimensions": ["province"],
+                        "pii": True,
+                    }
+                },
+            },
+            {"patient_cube": ["province", "cnt"]},
+            "PII cube 'patient_cube' engine 'cube' must be listed in policy.pii_engines",
+        ),
+    ]
+
+    for label, pl_data, sch_data, expected_msg in cases:
+        sub = tmp_path / label
+        sub.mkdir()
+        cf = _write_static_bundle(
+            sub,
+            jwks_file,
+            placement_data=pl_data,
+            schemas_data=sch_data,
+            connections_data=conns,
+        )
+        with pytest.raises(StartupValidationError) as exc_val:
+            validate_startup(cf, env=base_env)
+        assert expected_msg in str(exc_val.value)
+
+        with pytest.raises(ServerConfigError) as exc_bs:
+            build_server(cf, env=base_env)
+        assert expected_msg in str(exc_bs.value)
+
+
+def test_duplicate_yaml_keys_rejected_in_placement_and_serving_config(
+    tmp_path: Path, jwks_file: str, base_env: dict[str, str], capsys
+):
+    from seeknal.serving.server.app import build_server
+
+    # 1. Repeated table key in placement.yaml (first pii: true, second pii: false)
+    d1 = tmp_path / "dup_tbl"
+    d1.mkdir()
+    cf1 = _write_static_bundle(
+        d1,
+        jwks_file,
+        placement_data={
+            "engines": {"lb": {"kind": "lakebase", "dialect": "postgres"}},
+            "tables": {"clinical.patients": {"keys": ["id"], "serve": {"lb": "public.patients"}}},
+        },
+        schemas_data={"clinical.patients": ["id"]},
+    )
+    (d1 / "placement.yaml").write_text(
+        "engines:\n"
+        "  lb: {kind: lakebase, dialect: postgres}\n"
+        "  duck: {kind: duckdb, dialect: duckdb}\n"
+        "tables:\n"
+        "  clinical.patients:\n"
+        "    keys: [id]\n"
+        "    pii: true\n"
+        "    serve:\n"
+        "      lb: public.patients\n"
+        "  clinical.patients:\n"
+        "    keys: [id]\n"
+        "    pii: false\n"
+        "    serve:\n"
+        "      duck: main.patients\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(StartupValidationError, match="duplicate YAML key 'clinical.patients'"):
+        validate_startup(cf1, env=base_env)
+    with pytest.raises(ServerConfigError, match="duplicate YAML key 'clinical.patients'"):
+        build_server(cf1, env=base_env)
+
+    # 2. Repeated pii: key inside the same table mapping (pii: true followed by pii: false)
+    d2 = tmp_path / "dup_pii"
+    d2.mkdir()
+    cf2 = _write_static_bundle(
+        d2,
+        jwks_file,
+        placement_data={
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {"clinical.patients": {"keys": ["id"], "serve": {"duck": "main.patients"}}},
+        },
+        schemas_data={"clinical.patients": ["id"]},
+    )
+    (d2 / "placement.yaml").write_text(
+        "engines:\n"
+        "  duck: {kind: duckdb, dialect: duckdb}\n"
+        "tables:\n"
+        "  clinical.patients:\n"
+        "    keys: [id]\n"
+        "    pii: true\n"
+        "    pii: false\n"
+        "    serve:\n"
+        "      duck: main.patients\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(StartupValidationError, match="duplicate YAML key 'pii'"):
+        validate_startup(cf2, env=base_env)
+    with pytest.raises(ServerConfigError, match="duplicate YAML key 'pii'"):
+        build_server(cf2, env=base_env)
+
+    # 3. Repeated key in serving.yaml (including canary redaction on secret-like duplicate key)
+    d3 = tmp_path / "dup_srv"
+    d3.mkdir()
+    cf3 = _write_static_bundle(
+        d3,
+        jwks_file,
+        placement_data={
+            "engines": {"lb": {"kind": "lakebase", "dialect": "postgres"}},
+            "tables": {"clinical.patients": {"keys": ["id"], "serve": {"lb": "public.patients"}}},
+        },
+        schemas_data={"clinical.patients": ["id"]},
+    )
+    orig_srv_yaml = cf3.read_text(encoding="utf-8")
+    cf3.write_text(orig_srv_yaml + "\ncube_mode: refuse\ncube_mode: jwt\n", encoding="utf-8")
+    with pytest.raises(ServerConfigError, match="duplicate YAML key 'cube_mode'"):
+        ServerConfig.from_yaml(cf3, env=base_env)
+    capsys.readouterr()
+    assert run_validate_cli(cf3, env=base_env) == 2
+    assert "duplicate YAML key 'cube_mode'" in capsys.readouterr().err
+
+    # Canary duplicate key name is redacted
+    cf3.write_text(
+        orig_srv_yaml + "\nsecretCanaryDupKey999: 1\nsecretCanaryDupKey999: 2\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ServerConfigError) as exc_redacted:
+        ServerConfig.from_yaml(cf3, env=base_env)
+    assert "duplicate YAML key '<redacted>'" in str(exc_redacted.value)
+    assert "secretCanaryDupKey999" not in str(exc_redacted.value)
+
+
+def test_top_level_role_keys_fail_both_validate_and_build_server_with_exit_code_2(
+    tmp_path: Path, jwks_file: str, base_env: dict[str, str], monkeypatch, capsys
+):
+    # E-L1: Top-level role keys in serving.yaml must fail BOTH validate AND start/build_server
+    # even when the role definition itself has no unbacked references!
+    from unittest.mock import MagicMock
+
+    from seeknal.serving.__main__ import main as serving_cli_main
+    from seeknal.serving.server.app import build_server
+
+    for k, v in base_env.items():
+        monkeypatch.setenv(k, v)
+
+    for top_role_key, top_role_val in (
+        ("roles", {"analyst": {"tables": {"claims.claim": {"columns": ["id"]}}}}),
+        ("role_policies", {"analyst": {"tables": {"claims.claim": {"columns": ["id"]}}}}),
+        ("default_role", "analyst"),
+        ("role_bindings", {"alice": ["analyst"]}),
+        ("role_grants", {"alice": ["analyst"]}),
+    ):
+        role_dir = tmp_path / f"role_key_{top_role_key}"
+        role_dir.mkdir()
+        extra_srv = {top_role_key: top_role_val}
+        if top_role_key not in ("roles", "role_policies"):
+            extra_srv["roles"] = {"analyst": {"tables": {"claims.claim": {"columns": ["id"]}}}}
+
+        cfg_file = _write_static_bundle(
+            role_dir,
+            jwks_file,
+            placement_data={
+                "engines": {"lb": {"kind": "lakebase", "dialect": "postgres"}},
+                "tables": {"claims.claim": {"keys": ["id"], "serve": {"lb": "public.claim"}}},
+            },
+            schemas_data={"claims.claim": ["id"]},
+            connections_data={"lb": {"kind": "lakebase", "dsn_env": "TEST_LB_DSN"}},
+            extra_server_data=extra_srv,
+        )
+
+        with pytest.raises(StartupValidationError, match="Unknown top-level configuration key"):
+            validate_startup(cfg_file, env=base_env)
+
+        with pytest.raises(ServerConfigError, match="Unknown top-level configuration key"):
+            build_server(cfg_file, env=base_env)
+
+        capsys.readouterr()
+        assert serving_cli_main(["validate", "--config", str(cfg_file)]) == 2
+        val_err = capsys.readouterr().err
+        assert "Unknown top-level configuration key" in val_err
+
+        fake_run = MagicMock()
+        assert serving_cli_main(["--config", str(cfg_file)], run=fake_run) == 2
+        assert not fake_run.called
+        capsys.readouterr()
+
+
+def test_discovery_engine_kind_rendered_through_safe_enum_token(
+    tmp_path: Path, jwks_file: str, base_env: dict[str, str]
+):
+    # E-L3: Mixed-case/canary/invalid engine kind in discovery or server config must never echo raw
+    from seeknal.serving.discovery.config import DiscoveryConfig, DiscoveryConfigError
+    from seeknal.serving.discovery.config import EngineConfig as DiscEngineConfig
+    from seeknal.serving.server.config import ListenConfig, GrantKeysConfig, PlacementConfig
+
+    mixed_kind = "MixedCaseEngineKindXYZ"
+    canary_kind = "postgresCanaryKindSecret"
+
+    for bad_kind in (mixed_kind, canary_kind):
+        with pytest.raises(DiscoveryConfigError) as exc_dc:
+            DiscoveryConfig.from_dict(
+                {
+                    "default_catalog": "lakekeeper",
+                    "engines": {"eng1": {"kind": bad_kind, "dialect": "postgres"}},
+                }
+            )
+        assert bad_kind not in str(exc_dc.value)
+        assert "'<invalid>'" in str(exc_dc.value)
+
+        with pytest.raises(ServerConfigError) as exc_sc:
+            ServerConfig.from_dict(
+                {
+                    "grant_keys": {"jwks_file": jwks_file},
+                    "placement": {"discovery": {"default_catalog": "lakekeeper"}},
+                    "connections": {"eng1": {"kind": bad_kind}},
+                }
+            )
+        assert bad_kind not in str(exc_sc.value)
+        assert "'<invalid>'" in str(exc_sc.value)
+
+    # Also test _validate_discovery_offline directly with pre-built ServerConfig carrying bad kinds
+    disc_direct = DiscoveryConfig(
+        default_catalog="lakekeeper",
+        engines={
+            "eng1": DiscEngineConfig(name="eng1", kind=mixed_kind, dialect="postgres"),
+        },
+    )
+
+    class _FakeConn:
+        kind = canary_kind
+
+    srv_direct = ServerConfig(
+        listen=ListenConfig(),
+        grant_keys=GrantKeysConfig(jwks_file=jwks_file),
+        placement=PlacementConfig(discovery={}, discovery_config=disc_direct),
+        connections={"eng1": _FakeConn()},
+    )
+    with pytest.raises(StartupValidationError) as exc_sv:
+        validate_startup(srv_direct, env=base_env)
+    msg_sv = str(exc_sv.value)
+    assert mixed_kind not in msg_sv
+    assert canary_kind not in msg_sv
+    assert "'<invalid>'" in msg_sv
+
+
+def test_run_initial_discovery_refresh_or_raise_helper():
+    from datetime import datetime, timezone
+
+    from seeknal.serving.discovery.build import DiscoveryResult
+    from seeknal.serving.discovery.config import DiscoveryError
+    from seeknal.serving.discovery.refresh import PlacementRefresher
+    from seeknal.serving.placement import Placement
+    from seeknal.serving.startup_validation import run_initial_discovery_refresh_or_raise
+
+    class _DummyPipeline:
+        def __init__(self) -> None:
+            self.updated: tuple[Placement, dict] | None = None
+
+        def update_catalog(self, pl: Placement, schemas: dict) -> None:
+            self.updated = (pl, schemas)
+
+    # 1. Succeeds and marks refresher ready when initial discovery succeeds
+    pipe_ok = _DummyPipeline()
+    refresher_ok = PlacementRefresher(
+        discover_fn=lambda: DiscoveryResult(
+            placement={
+                "engines": {"lb": {"kind": "lakebase", "dialect": "postgres"}},
+                "tables": {"lk.ns.t": {"keys": ["id"], "serve": {"lb": "public.t"}}},
+                "cubes": {},
+            },
+            schemas={"lk.ns.t": ["id"]},
+            warnings=(),
+            discovered_at=datetime.now(timezone.utc),
+        ),
+        pipeline=pipe_ok,
+        interval_seconds=60.0,
+    )
+    run_initial_discovery_refresh_or_raise(refresher_ok)
+    assert refresher_ok.last_success_at is not None
+    assert pipe_ok.updated is not None
+
+    # 2. Fails closed with scrubbed ServerConfigError when initial discovery raises DiscoveryError / leaks DSN
+    secret_pw = "SUPER_SECRET_INIT_REFRESH_PW"
+
+    def _failing_discover():
+        raise DiscoveryError(
+            f"Unmatched PII table 'lk.ns.typo' while connecting postgresql://svc:{secret_pw}@db:5432/prod"
+        )
+
+    refresher_bad = PlacementRefresher(
+        discover_fn=_failing_discover,
+        pipeline=_DummyPipeline(),
+        interval_seconds=60.0,
+    )
+    with pytest.raises(ServerConfigError) as exc_fail:
+        run_initial_discovery_refresh_or_raise(
+            refresher_bad, secret_values=(secret_pw,)
+        )
+    assert "lk.ns.typo" in str(exc_fail.value)
+    assert secret_pw not in str(exc_fail.value)
+    assert refresher_bad.last_success_at is None
+
 
 
