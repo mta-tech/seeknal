@@ -7,6 +7,7 @@ configurable failure semantics (``refuse`` vs ``log``).
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import socket
 import stat
@@ -25,6 +27,7 @@ import sys
 import threading
 import time
 from typing import Any, TextIO
+import weakref
 
 from seeknal.serving.errors import (
     AuditUnavailableError,
@@ -1142,6 +1145,7 @@ class FileAuditSink(AuditSink):
         retention_age_seconds: float | None = None,
         clock: Callable[[], float] = time.time,
         fsync: bool = True,
+        timeout_seconds: float = 2.0,
     ) -> None:
         path_str = str(path).strip()
         if not path_str or "\x00" in path_str:
@@ -1149,6 +1153,11 @@ class FileAuditSink(AuditSink):
 
         self._path = Path(path_str)
         self._mode = _parse_file_mode(mode, ValueError)
+        parsed_timeout = _parse_optional_positive_float(
+            timeout_seconds, "timeout_seconds", ValueError
+        )
+        assert parsed_timeout is not None
+        self._timeout_seconds = parsed_timeout
 
         eff_max_bytes = max_bytes if max_bytes is not None else rotate_size_bytes
         eff_rotate_interval = (
@@ -1202,6 +1211,10 @@ class FileAuditSink(AuditSink):
     @property
     def mode(self) -> int:
         return self._mode
+
+    @property
+    def timeout_seconds(self) -> float:
+        return self._timeout_seconds
 
     def _discover_max_seq(self) -> int:
         parent = self._path.parent
@@ -1564,9 +1577,23 @@ class FileAuditSink(AuditSink):
 class StdoutAuditSink(AuditSink):
     """Thread-safe JSON-lines writer to ``sys.stdout`` (or an injected text stream)."""
 
-    def __init__(self, stream: TextIO | None = None) -> None:
+    def __init__(
+        self,
+        stream: TextIO | None = None,
+        *,
+        timeout_seconds: float = 2.0,
+    ) -> None:
+        parsed_timeout = _parse_optional_positive_float(
+            timeout_seconds, "timeout_seconds", ValueError
+        )
+        assert parsed_timeout is not None
         self._stream = stream
+        self._timeout_seconds = parsed_timeout
         self._lock = threading.Lock()
+
+    @property
+    def timeout_seconds(self) -> float:
+        return self._timeout_seconds
 
     def _target_stream(self) -> TextIO:
         stream = self._stream if self._stream is not None else sys.stdout
@@ -1689,6 +1716,10 @@ class SyslogAuditSink(AuditSink):
     @property
     def transport(self) -> str:
         return self._transport
+
+    @property
+    def timeout_seconds(self) -> float:
+        return self._timeout_seconds
 
     def format_rfc5424(self, record: AuditRecord | Mapping[str, Any]) -> str:
         """Format an audit record as an RFC 5424 message string."""
@@ -1877,9 +1908,10 @@ def build_audit_sink(
             max_age_seconds=cfg.max_age_seconds,
             clock=clock,
             fsync=fsync,
+            timeout_seconds=cfg.timeout_seconds,
         )
     elif cfg.sink == "stdout":
-        sink = StdoutAuditSink(stream=stream)
+        sink = StdoutAuditSink(stream=stream, timeout_seconds=cfg.timeout_seconds)
     elif cfg.sink == "syslog":
         sink = SyslogAuditSink(
             host=cfg.host,
@@ -1952,6 +1984,10 @@ class AuditManager:
             on_write_failure=on_write_failure,
         )
 
+    @property
+    def timeout_seconds(self) -> float:
+        return float(getattr(self.sink, "timeout_seconds", 2.0))
+
     def verify_writable(self) -> None:
         try:
             self.sink.verify_writable()
@@ -1990,10 +2026,19 @@ class AuditManager:
             else AuditRecord.from_dict(record, strict=False)
         )
 
+        t0 = time.monotonic()
         try:
             self.sink.write_record(validated)
+            if not getattr(_AUDIT_WORKER_LOCAL, "in_audit_pool", False):
+                trk = get_audit_runtime_tracker(self)
+                if trk is not None:
+                    trk.record_sync_outcome(succeeded=True, elapsed=time.monotonic() - t0)
             return True
         except Exception as raw_exc:
+            if not getattr(_AUDIT_WORKER_LOCAL, "in_audit_pool", False):
+                trk = get_audit_runtime_tracker(self)
+                if trk is not None:
+                    trk.record_sync_outcome(succeeded=False, elapsed=time.monotonic() - t0)
             if isinstance(raw_exc, AuditWriteError):
                 exc = raw_exc
             elif isinstance(raw_exc, AuditUnavailableError):
@@ -2080,10 +2125,19 @@ def emit_audit_record(
         else AuditRecord.from_dict(record, strict=False)
     )
 
+    t0 = time.monotonic()
     try:
         sink_or_manager.write_record(validated)
+        if not getattr(_AUDIT_WORKER_LOCAL, "in_audit_pool", False):
+            trk = get_audit_runtime_tracker(sink_or_manager)
+            if trk is not None:
+                trk.record_sync_outcome(succeeded=True, elapsed=time.monotonic() - t0)
         return True
     except Exception as raw_exc:
+        if not getattr(_AUDIT_WORKER_LOCAL, "in_audit_pool", False):
+            trk = get_audit_runtime_tracker(sink_or_manager)
+            if trk is not None:
+                trk.record_sync_outcome(succeeded=False, elapsed=time.monotonic() - t0)
         if isinstance(raw_exc, AuditWriteError):
             exc = raw_exc
         elif isinstance(raw_exc, AuditUnavailableError):
@@ -2146,6 +2200,403 @@ def verify_audit_config_offline(
             )
 
 
+# ---------------------------------------------------------------------------
+# Dedicated Bounded Audit Worker Pool & Runtime Health Tracker (C-N5)
+# ---------------------------------------------------------------------------
+
+_AUDIT_WORKER_LOCAL = threading.local()
+_AUDIT_TRACKER_LOCK = threading.Lock()
+_AUDIT_TRACKER_WEAK_MAP: weakref.WeakKeyDictionary[Any, AuditRuntimeTracker] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _safe_set_future_result(fut: asyncio.Future[Any], val: Any) -> None:
+    if not fut.done():
+        fut.set_result(val)
+
+
+def _safe_set_future_exception(
+    fut: asyncio.Future[Any], exc: BaseException
+) -> None:
+    if not fut.done():
+        fut.set_exception(exc)
+
+
+class _AuditWorkerPool:
+    """Bounded pool of daemon worker threads dedicated exclusively to audit I/O."""
+
+    def __init__(self, max_workers: int = 4) -> None:
+        self._max_workers = max(1, int(max_workers))
+        self._queue: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._spawned = 0
+        self._idle_workers = 0
+
+    @property
+    def max_workers(self) -> int:
+        return self._max_workers
+
+    def set_max_workers(self, max_workers: int) -> None:
+        with self._lock:
+            self._max_workers = max(1, int(max_workers))
+
+    def _worker_loop(self) -> None:
+        _AUDIT_WORKER_LOCAL.in_audit_pool = True
+        while True:
+            with self._lock:
+                self._idle_workers += 1
+            task = self._queue.get()
+            with self._lock:
+                self._idle_workers = max(0, self._idle_workers - 1)
+            try:
+                task()
+            except BaseException:
+                logger.debug("Unhandled error in audit worker task", exc_info=True)
+
+    def submit(self, fn: Callable[[], None]) -> None:
+        need_spawn = False
+        idx = 0
+        with self._lock:
+            if self._idle_workers == 0 and self._spawned < self._max_workers:
+                self._spawned += 1
+                idx = self._spawned
+                need_spawn = True
+        if need_spawn:
+            t = threading.Thread(
+                target=self._worker_loop,
+                name=f"seeknal-audit-io-{idx}",
+                daemon=True,
+            )
+            t.start()
+        self._queue.put(fn)
+
+
+class AuditRuntimeTracker:
+    """Tracks audit sink concurrency, per-write deadlines, fail-fast state, and readiness."""
+
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = 2.0,
+        max_workers: int = 4,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._default_timeout = max(0.01, float(timeout_seconds))
+        self._max_workers = max(1, int(max_workers))
+        self._pool = _AuditWorkerPool(max_workers=self._max_workers)
+        self._active_slots: int = 0
+        self._stalled_threads: int = 0
+        self._last_write_failed: bool = False
+        self._probe_stalled: bool = False
+        self._fast_fail_until: float = 0.0
+        self._next_id: int = 0
+        self._in_flight_starts: dict[int, float] = {}
+        self._all_idle_event = threading.Event()
+        self._all_idle_event.set()
+        self._slot_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
+
+    @property
+    def default_timeout_seconds(self) -> float:
+        with self._lock:
+            return self._default_timeout
+
+    def configure(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        max_workers: int | None = None,
+    ) -> None:
+        with self._lock:
+            if timeout_seconds is not None and timeout_seconds > 0:
+                self._default_timeout = float(timeout_seconds)
+            if max_workers is not None and max_workers > 0:
+                self._max_workers = int(max_workers)
+                self._pool.set_max_workers(self._max_workers)
+
+    def _should_fail_fast_locked(self, now: float) -> bool:
+        return (
+            self._stalled_threads > 0
+            or self._probe_stalled
+            or now < self._fast_fail_until
+        )
+
+    def should_fail_fast(self, now: float | None = None) -> bool:
+        t = time.monotonic() if now is None else float(now)
+        with self._lock:
+            return self._should_fail_fast_locked(t)
+
+    def is_known_down_or_stalled(self) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            return (
+                self._stalled_threads > 0
+                or self._probe_stalled
+                or self._last_write_failed
+                or now < self._fast_fail_until
+            )
+
+    def has_in_flight_writes(self) -> bool:
+        with self._lock:
+            return bool(self._in_flight_starts)
+
+    def wait_for_in_flight(self, timeout_seconds: float) -> bool:
+        return self._all_idle_event.wait(timeout=max(0.001, float(timeout_seconds)))
+
+    def mark_probe_stalled(self) -> None:
+        with self._lock:
+            if self._in_flight_starts:
+                self._probe_stalled = True
+                self._last_write_failed = True
+                self._notify_waiters_locked()
+
+    def record_sync_outcome(self, *, succeeded: bool, elapsed: float = 0.0) -> None:
+        with self._lock:
+            if succeeded:
+                if self._stalled_threads == 0:
+                    self._last_write_failed = False
+                    self._probe_stalled = False
+                    self._fast_fail_until = 0.0
+            else:
+                self._last_write_failed = True
+                if elapsed >= 0.05:
+                    cooldown = min(2.0, max(0.25, self._default_timeout))
+                    self._fast_fail_until = max(
+                        self._fast_fail_until, time.monotonic() + cooldown
+                    )
+
+    def _notify_waiters_locked(self) -> None:
+        for w_loop, w_ev in list(self._slot_waiters):
+            try:
+                w_loop.call_soon_threadsafe(w_ev.set)
+            except RuntimeError:
+                pass
+
+    def _mark_slot_timeout(self, eff_timeout: float) -> None:
+        with self._lock:
+            self._last_write_failed = True
+            cooldown = min(2.0, max(0.25, eff_timeout))
+            self._fast_fail_until = max(
+                self._fast_fail_until, time.monotonic() + cooldown
+            )
+            self._notify_waiters_locked()
+
+    async def run_async(
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        timeout_seconds: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        with self._lock:
+            eff_timeout = (
+                float(timeout_seconds)
+                if timeout_seconds is not None and timeout_seconds > 0
+                else self._default_timeout
+            )
+            now = time.monotonic()
+            if self._should_fail_fast_locked(now):
+                raise AuditWriteError("Audit sink is stalled or unavailable")
+
+        deadline = now + eff_timeout
+        loop = asyncio.get_running_loop()
+
+        acquired = False
+        waiter_ev: asyncio.Event | None = None
+        with self._lock:
+            if self._should_fail_fast_locked(time.monotonic()):
+                raise AuditWriteError("Audit sink is stalled or unavailable")
+            if self._active_slots < self._max_workers:
+                self._active_slots += 1
+                acquired = True
+            else:
+                waiter_ev = asyncio.Event()
+                self._slot_waiters.append((loop, waiter_ev))
+
+        if not acquired:
+            assert waiter_ev is not None
+            try:
+                while True:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0:
+                        self._mark_slot_timeout(eff_timeout)
+                        raise AuditWriteError(
+                            "Audit sink write timed out waiting for worker slot"
+                        )
+                    try:
+                        await asyncio.wait_for(waiter_ev.wait(), timeout=rem)
+                    except asyncio.TimeoutError as exc:
+                        self._mark_slot_timeout(eff_timeout)
+                        raise AuditWriteError(
+                            "Audit sink write timed out waiting for worker slot"
+                        ) from exc
+
+                    with self._lock:
+                        if self._should_fail_fast_locked(time.monotonic()):
+                            raise AuditWriteError(
+                                "Audit sink is stalled or unavailable"
+                            )
+                        if self._active_slots < self._max_workers:
+                            self._active_slots += 1
+                            acquired = True
+                            break
+                        waiter_ev.clear()
+            finally:
+                with self._lock:
+                    try:
+                        self._slot_waiters.remove((loop, waiter_ev))
+                    except ValueError:
+                        pass
+
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            with self._lock:
+                self._active_slots = max(0, self._active_slots - 1)
+                self._notify_waiters_locked()
+            self._mark_slot_timeout(eff_timeout)
+            raise AuditWriteError("Audit sink write timed out")
+
+        result_fut: asyncio.Future[Any] = loop.create_future()
+        task_state = {"caller_timed_out": False, "worker_done": False}
+        with self._lock:
+            self._next_id += 1
+            task_id = self._next_id
+            self._in_flight_starts[task_id] = time.monotonic()
+            self._all_idle_event.clear()
+
+        def _finish_worker(succeeded: bool, elapsed: float) -> bool:
+            with self._lock:
+                task_state["worker_done"] = True
+                self._in_flight_starts.pop(task_id, None)
+                if not self._in_flight_starts:
+                    self._all_idle_event.set()
+                    self._probe_stalled = False
+
+                timed_out = task_state["caller_timed_out"]
+                if timed_out:
+                    self._stalled_threads = max(0, self._stalled_threads - 1)
+                    self._last_write_failed = True
+                elif succeeded:
+                    if self._stalled_threads == 0:
+                        self._last_write_failed = False
+                        self._probe_stalled = False
+                        self._fast_fail_until = 0.0
+                else:
+                    self._last_write_failed = True
+                    if elapsed >= 0.05:
+                        cooldown = min(2.0, max(0.25, eff_timeout))
+                        self._fast_fail_until = max(
+                            self._fast_fail_until, time.monotonic() + cooldown
+                        )
+
+                self._active_slots = max(0, self._active_slots - 1)
+                self._notify_waiters_locked()
+                return timed_out
+
+        def _worker_task() -> None:
+            t_start = time.monotonic()
+            try:
+                res = fn(*args, **kwargs)
+            except BaseException as exc:
+                elapsed = time.monotonic() - t_start
+                timed_out = _finish_worker(False, elapsed)
+                if not timed_out:
+                    try:
+                        loop.call_soon_threadsafe(
+                            _safe_set_future_exception, result_fut, exc
+                        )
+                    except RuntimeError:
+                        pass
+            else:
+                elapsed = time.monotonic() - t_start
+                timed_out = _finish_worker(True, elapsed)
+                if not timed_out:
+                    try:
+                        loop.call_soon_threadsafe(
+                            _safe_set_future_result, result_fut, res
+                        )
+                    except RuntimeError:
+                        pass
+
+        self._pool.submit(_worker_task)
+
+        try:
+            return await asyncio.wait_for(asyncio.shield(result_fut), timeout=rem)
+        except asyncio.TimeoutError as exc:
+            with self._lock:
+                if not task_state["worker_done"]:
+                    task_state["caller_timed_out"] = True
+                    self._stalled_threads += 1
+                self._last_write_failed = True
+                cooldown = min(2.0, max(0.25, eff_timeout))
+                self._fast_fail_until = max(
+                    self._fast_fail_until, time.monotonic() + cooldown
+                )
+                self._notify_waiters_locked()
+            raise AuditWriteError("Audit sink write timed out") from exc
+
+
+def get_audit_runtime_tracker(
+    sink_or_manager: Any,
+    *,
+    timeout_seconds: float | None = None,
+    max_workers: int | None = None,
+) -> AuditRuntimeTracker | None:
+    """Return the shared ``AuditRuntimeTracker`` associated with *sink_or_manager*."""
+    if sink_or_manager is None:
+        return None
+
+    target = (
+        sink_or_manager.sink
+        if isinstance(sink_or_manager, AuditManager)
+        else sink_or_manager
+    )
+    inferred_timeout = getattr(target, "timeout_seconds", None)
+    if not isinstance(inferred_timeout, (int, float)) or isinstance(
+        inferred_timeout, bool
+    ):
+        inferred_timeout = 2.0
+
+    with _AUDIT_TRACKER_LOCK:
+        existing = getattr(target, "_audit_runtime_tracker", None)
+        if isinstance(existing, AuditRuntimeTracker):
+            tracker = existing
+        else:
+            try:
+                existing = _AUDIT_TRACKER_WEAK_MAP.get(target)
+            except TypeError:
+                existing = None
+            if isinstance(existing, AuditRuntimeTracker):
+                tracker = existing
+            else:
+                tracker = AuditRuntimeTracker(
+                    timeout_seconds=float(
+                        timeout_seconds
+                        if timeout_seconds is not None and timeout_seconds > 0
+                        else inferred_timeout
+                    ),
+                    max_workers=int(
+                        max_workers
+                        if max_workers is not None and max_workers > 0
+                        else 4
+                    ),
+                )
+                try:
+                    setattr(target, "_audit_runtime_tracker", tracker)
+                except Exception:
+                    try:
+                        _AUDIT_TRACKER_WEAK_MAP[target] = tracker
+                    except TypeError:
+                        pass
+
+        if timeout_seconds is not None or max_workers is not None:
+            tracker.configure(
+                timeout_seconds=timeout_seconds,
+                max_workers=max_workers,
+            )
+        return tracker
+
+
 __all__ = [
     "ALLOWED_AUDIT_FIELDS",
     "ALLOWED_AUDIT_FIELD_SET",
@@ -2154,6 +2605,7 @@ __all__ = [
     "AuditConfig",
     "AuditManager",
     "AuditRecord",
+    "AuditRuntimeTracker",
     "AuditSink",
     "AuditWriteError",
     "AuditWriter",
@@ -2166,6 +2618,7 @@ __all__ = [
     "compute_sql_sha256",
     "emit_audit_record",
     "format_utc_timestamp",
+    "get_audit_runtime_tracker",
     "serialize_audit_record",
     "verify_audit_config_offline",
 ]

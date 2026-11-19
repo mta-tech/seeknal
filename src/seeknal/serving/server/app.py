@@ -378,10 +378,15 @@ def build_server(
         allowed_engines=tuple(cfg.connections.keys()),
         adapters=adapters,
     )
+    effective_audit_on_failure = (
+        cfg.audit.on_failure if cfg.audit is not None else "refuse"
+    )
     readiness = ReadinessProbe(
         adapters,
         is_static=cfg.placement.is_static,
         refresher=refresher,
+        audit_sink=audit_sink,
+        audit_on_failure=effective_audit_on_failure,
         timeout_seconds=(
             cfg.ops.readyz_timeout_seconds if cfg.ops is not None else 2.0
         ),
@@ -441,7 +446,10 @@ def build_server(
         lifespan=lifespan,
         replay_cache=GrantReplayCache(max_entries=cfg.replay_cache_max_entries),
         audit_sink=audit_sink,
-        audit_on_failure=cfg.audit.on_failure if cfg.audit is not None else "refuse",
+        audit_on_failure=effective_audit_on_failure,
+        audit_timeout_seconds=(
+            cfg.audit.timeout_seconds if cfg.audit is not None else None
+        ),
         audit_failure_callback=audit_failure_callback,
         metrics=metrics,
     )
@@ -462,6 +470,8 @@ def build_server(
             adapters=adapters,
             is_static=cfg.placement.is_static,
             refresher=refresher,
+            audit_sink=audit_sink,
+            audit_on_failure=effective_audit_on_failure,
             env=ops_env,
         )
 

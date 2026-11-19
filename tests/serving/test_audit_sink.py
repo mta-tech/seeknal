@@ -2956,6 +2956,156 @@ def test_c_n4_fsync_eio_single_record_and_partial_write_reopen_trailing_newline(
         con.close()
 
 
+async def test_c_n5_blackholed_audit_sink_isolates_threadpool_fails_fast_and_trips_readyz(
+    tmp_path: Path,
+):
+    import duckdb
+    from starlette.concurrency import run_in_threadpool
+    from seeknal.serving.ops import OpsConfig, ReadinessProbe, build_public_extra_routes, create_ops_app
+
+    priv, pipeline = _build_minimal_pipeline_and_keys(tmp_path)
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR, region VARCHAR)")
+    con.execute("INSERT INTO users VALUES (1, 'CONFIDENTIAL_N5_ROW', 'US')")
+
+    first_entered = threading.Event()
+    unblock_sink = threading.Event()
+    observed_threads: list[str] = []
+    obs_lock = threading.Lock()
+
+    class _BlackHoledAuditSink(AuditSink):
+        timeout_seconds = 0.15
+
+        def verify_writable(self) -> None:
+            return None
+
+        def write_record(self, record: AuditRecord | dict[str, Any]) -> None:
+            with obs_lock:
+                observed_threads.append(threading.current_thread().name)
+            first_entered.set()
+            unblock_sink.wait(timeout=5.0)
+            raise AuditWriteError("black-holed sink unblocked")
+
+    sink = _BlackHoledAuditSink()
+    duck_adapter = DuckDBAdapter(lambda: con.cursor())
+    readiness = ReadinessProbe(
+        {"duck": duck_adapter},
+        audit_sink=sink,
+        audit_on_failure="refuse",
+        timeout_seconds=0.1,
+        cache_seconds=5.0,
+    )
+    ops_app = create_ops_app(
+        ops_config=OpsConfig(enabled=True),
+        readiness=readiness,
+    )
+    app = create_app(
+        pipeline,
+        {"duck": duck_adapter},
+        extra_routes=build_public_extra_routes(
+            OpsConfig(public_readyz=True),
+            readiness=readiness,
+        ),
+        audit_sink=sink,
+        audit_on_failure="refuse",
+        audit_timeout_seconds=0.15,
+        audit_max_concurrency=2,
+    )
+
+    sql = "SELECT id, name FROM users"
+    pub_transport = httpx.ASGITransport(app=app)
+    ops_transport = httpx.ASGITransport(app=ops_app)
+
+    try:
+        async with (
+            httpx.AsyncClient(transport=pub_transport, base_url="http://pub") as pub_ac,
+            httpx.AsyncClient(transport=ops_transport, base_url="http://ops") as ops_ac,
+        ):
+            # Initially ready before sink stalls
+            r_ready_0 = await ops_ac.get("/readyz")
+            assert r_ready_0.status_code == 200
+            assert r_ready_0.json() == {"ready": True, "engines": {"duck": "ok"}}
+
+            # Fire 6 concurrent requests (3x audit_max_concurrency=2) into the black-holed sink
+            burst_tasks = [
+                asyncio.create_task(
+                    pub_ac.post(
+                        "/v1/query",
+                        headers={
+                            "Authorization": f"Bearer {_mint_grant(priv, sql, jti=f'jti-n5-burst-{i}')}"
+                        },
+                        json={"sql": sql},
+                    )
+                )
+                for i in range(6)
+            ]
+
+            while not first_entered.is_set():
+                await asyncio.sleep(0.005)
+
+            # 1) While the audit worker pool is saturated & wedged, run_in_threadpool(pipeline.prepare, ...)
+            #    for other requests still makes fast progress on the unstarved shared threadpool!
+            prep_tok = _mint_grant(priv, sql, jti="jti-n5-prep-progress")
+            prep_t0 = time.perf_counter()
+            prepared_results = await asyncio.gather(
+                *[
+                    run_in_threadpool(pipeline.prepare, sql, prep_tok)
+                    for _ in range(8)
+                ]
+            )
+            prep_elapsed = time.perf_counter() - prep_t0
+            assert len(prepared_results) == 8
+            assert prep_elapsed < 0.25
+
+            # 2) Wait for initial burst to hit the 0.15s audit deadline
+            burst_resps = await asyncio.gather(*burst_tasks)
+            for br in burst_resps:
+                assert br.status_code == 503
+                assert br.json()["code"] == "audit_unavailable"
+                assert "CONFIDENTIAL_N5_ROW" not in br.text
+
+            # Confirm only dedicated audit worker threads were used (capped at max_concurrency=2)
+            with obs_lock:
+                assert 1 <= len(observed_threads) <= 2
+                assert all(
+                    name.startswith("seeknal-audit-io-") for name in observed_threads
+                )
+
+            # 3) Subsequent audit writes fail fast immediately while sink is stalled!
+            ff_tok = _mint_grant(priv, sql, jti="jti-n5-failfast")
+            ff_t0 = time.perf_counter()
+            ff_resp = await pub_ac.post(
+                "/v1/query",
+                headers={"Authorization": f"Bearer {ff_tok}"},
+                json={"sql": sql},
+            )
+            ff_elapsed = time.perf_counter() - ff_t0
+            assert ff_resp.status_code == 503
+            assert ff_resp.json()["code"] == "audit_unavailable"
+            assert "CONFIDENTIAL_N5_ROW" not in ff_resp.text
+            assert ff_elapsed < 0.05
+
+            # 4) Ops /readyz and public /readyz report 503 with reason="audit_sink"!
+            ops_ready_503 = await ops_ac.get("/readyz")
+            assert ops_ready_503.status_code == 503
+            assert ops_ready_503.json() == {
+                "ready": False,
+                "reason": "audit_sink",
+                "engines": {"duck": "ok"},
+            }
+
+            pub_ready_503 = await pub_ac.get("/readyz")
+            assert pub_ready_503.status_code == 503
+            assert pub_ready_503.json() == {
+                "ready": False,
+                "reason": "audit_sink",
+            }
+    finally:
+        unblock_sink.set()
+        con.close()
+
+
+
 
 
 

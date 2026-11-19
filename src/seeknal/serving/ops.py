@@ -29,6 +29,7 @@ from seeknal.serving.adapters import (
     WorkloadRoutedAdapter,
     make_cube_context_token,
 )
+from seeknal.serving.audit import get_audit_runtime_tracker
 from seeknal.serving.metrics import PROMETHEUS_CONTENT_TYPE, MetricsRegistry
 from seeknal.serving.service import PreparedQuery
 
@@ -266,6 +267,9 @@ class ReadinessProbe:
         is_static: bool | None = None,
         refresher: Any = None,
         catalog_loaded_fn: Callable[[], bool] | None = None,
+        audit_sink: Any = None,
+        audit_on_failure: str | None = None,
+        audit_ready_fn: Callable[[], bool] | None = None,
         timeout_seconds: float = 2.0,
         cache_seconds: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
@@ -295,6 +299,13 @@ class ReadinessProbe:
         self._is_static = is_static
         self._refresher = refresher
         self._catalog_loaded_fn = catalog_loaded_fn
+        self._audit_sink = audit_sink
+        self._audit_on_failure = (
+            audit_on_failure
+            if audit_on_failure is not None
+            else getattr(audit_sink, "on_failure", "refuse")
+        )
+        self._audit_ready_fn = audit_ready_fn
         self._timeout_seconds = float(timeout_seconds)
         self._cache_seconds = float(cache_seconds)
         self._clock = clock
@@ -306,11 +317,14 @@ class ReadinessProbe:
         self._cache_lock = self._lock
         self._cache: dict[str, tuple[str, float]] = {}
         self._in_flight: set[str] = set()
+        self._audit_cache: tuple[str, float] | None = None
+        self._audit_probe_in_flight: bool = False
 
     def clear_cache(self) -> None:
         """Invalidate all cached per-engine readiness results."""
         with self._lock:
             self._cache.clear()
+            self._audit_cache = None
 
     def _is_catalog_loaded(self) -> bool:
         if self._catalog_loaded_fn is not None:
@@ -511,9 +525,91 @@ class ReadinessProbe:
                 return "unavailable"
         return outcome[0]
 
+    def _is_audit_ready(self) -> bool:
+        if self._audit_ready_fn is not None:
+            try:
+                return bool(self._audit_ready_fn())
+            except Exception:
+                return False
+
+        if self._audit_sink is None or self._audit_on_failure != "refuse":
+            return True
+
+        tracker = get_audit_runtime_tracker(self._audit_sink)
+        if tracker is not None:
+            if tracker.is_known_down_or_stalled():
+                with self._lock:
+                    self._audit_cache = None
+                return False
+            if tracker.has_in_flight_writes():
+                if not tracker.wait_for_in_flight(self._timeout_seconds):
+                    tracker.mark_probe_stalled()
+                    with self._lock:
+                        self._audit_cache = None
+                    return False
+                if tracker.is_known_down_or_stalled():
+                    with self._lock:
+                        self._audit_cache = None
+                    return False
+
+        verify_fn = getattr(self._audit_sink, "verify_writable", None)
+        if not callable(verify_fn):
+            return True
+
+        with self._lock:
+            now = float(self._clock())
+            if self._cache_seconds > 0 and self._audit_cache is not None:
+                cached_status, cached_ts = self._audit_cache
+                if 0.0 <= (now - cached_ts) < self._cache_seconds:
+                    return cached_status == "ok"
+            if self._audit_probe_in_flight:
+                return False
+            self._audit_probe_in_flight = True
+
+        outcome: list[str] = ["unavailable"]
+        done = threading.Event()
+        timed_out = threading.Event()
+
+        def _audit_worker() -> None:
+            try:
+                verify_fn()
+                outcome[0] = "ok"
+            except Exception:
+                outcome[0] = "unavailable"
+            finally:
+                with self._lock:
+                    if not timed_out.is_set() and self._cache_seconds > 0:
+                        self._audit_cache = (outcome[0], float(self._clock()))
+                    self._audit_probe_in_flight = False
+                    done.set()
+
+        thread = threading.Thread(
+            target=_audit_worker,
+            daemon=True,
+            name="seeknal-readyz-audit",
+        )
+        try:
+            thread.start()
+        except BaseException:
+            with self._lock:
+                self._audit_probe_in_flight = False
+            return False
+
+        thread.join(timeout=self._timeout_seconds)
+        if not done.is_set():
+            with self._lock:
+                if done.is_set():
+                    return outcome[0] == "ok"
+                timed_out.set()
+                if self._cache_seconds > 0:
+                    self._audit_cache = ("unavailable", float(self._clock()))
+                return False
+        return outcome[0] == "ok"
+
     def check(self, *, include_engines: bool = True) -> tuple[int, dict[str, Any]]:
-        """Evaluate catalog and engine readiness, returning (http_status, safe_payload)."""
+        """Evaluate catalog, audit sink, and engine readiness, returning (http_status, safe_payload)."""
         catalog_loaded = self._is_catalog_loaded()
+        audit_ready = self._is_audit_ready()
         engines_status: dict[str, str] = {}
         all_engines_ok = True
 
@@ -527,6 +623,15 @@ class ReadinessProbe:
             payload: dict[str, Any] = {
                 "ready": False,
                 "reason": "catalog_not_loaded",
+            }
+            if include_engines:
+                payload["engines"] = engines_status
+            return 503, payload
+
+        if not audit_ready:
+            payload = {
+                "ready": False,
+                "reason": "audit_sink",
             }
             if include_engines:
                 payload["engines"] = engines_status
@@ -632,11 +737,13 @@ def make_readyz_handler(
         if metrics is not None:
             err_code = None
             if status_code != 200:
-                err_code = (
-                    "catalog_not_loaded"
-                    if payload.get("reason") == "catalog_not_loaded"
-                    else "not_ready"
-                )
+                reason_val = payload.get("reason")
+                if reason_val == "catalog_not_loaded":
+                    err_code = "catalog_not_loaded"
+                elif reason_val == "audit_sink":
+                    err_code = "audit_unavailable"
+                else:
+                    err_code = "not_ready"
             metrics.record_request(
                 "/readyz",
                 status=status_code,
@@ -711,6 +818,8 @@ def create_ops_app(
     adapters: Mapping[str, Any] | None = None,
     is_static: bool | None = None,
     refresher: Any = None,
+    audit_sink: Any = None,
+    audit_on_failure: str | None = None,
     env: Mapping[str, str] | None = None,
     build_info_fn: Callable[[], Mapping[str, Any]] | None = None,
     lifespan: Any = None,
@@ -733,6 +842,8 @@ def create_ops_app(
             adapters,
             is_static=is_static,
             refresher=refresher,
+            audit_sink=audit_sink,
+            audit_on_failure=audit_on_failure,
             timeout_seconds=cfg.readyz_timeout_seconds,
             cache_seconds=cfg.readyz_cache_seconds,
         )

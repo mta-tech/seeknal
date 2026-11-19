@@ -1963,3 +1963,93 @@ def test_d_l2_non_loopback_ops_host_without_auth_token_env_logs_warning(caplog):
     assert not caplog.records
 
 
+def test_c_n5_ops_readyz_reports_audit_sink_not_ready_in_refuse_mode_only(tmp_path):
+    _, jwks_file, db_file, pf, sf = _setup_test_keys_and_catalog(tmp_path)
+    audit_dir = tmp_path / "ops_audit_dir"
+    audit_dir.mkdir()
+    audit_file = audit_dir / "audit.jsonl"
+
+    cfg_refuse = {
+        "listen": {"host": "127.0.0.1", "port": 8765},
+        "grant_keys": {"jwks_file": jwks_file},
+        "placement": {"static": {"placement_file": pf, "schemas_file": sf}},
+        "connections": {
+            "duck": {
+                "kind": "duckdb",
+                "path": db_file,
+                "allowed_directories": [str(tmp_path) + "/"],
+            },
+            "lakebase": {"kind": "lakebase", "dsn_env": "LB_DSN_N5"},
+        },
+        "audit": {
+            "sink": "file",
+            "on_failure": "refuse",
+            "path": str(audit_file),
+            "max_bytes": 65536,
+            "timeout_seconds": 0.2,
+        },
+        "ops": {
+            "enabled": True,
+            "host": "127.0.0.1",
+            "port": 9098,
+            "readyz_timeout_seconds": 0.2,
+            "readyz_cache_seconds": 0.0,
+        },
+    }
+
+    handle = build_server(
+        cfg_refuse,
+        env={"LB_DSN_N5": "postgresql://u:p@localhost:5432/db"},
+        connect_factories={"lakebase": lambda **kw: MagicMock()},
+    )
+    assert handle.ops_app is not None
+
+    with TestClient(handle.app) as pub_c, TestClient(handle.ops_app) as ops_c:
+        assert ops_c.get("/readyz").status_code == 200
+        assert ops_c.get("/readyz").json() == {
+            "ready": True,
+            "engines": {"duck": "ok", "lakebase": "ok"},
+        }
+
+        # Replace audit file with symlink so audit sink goes down at runtime
+        victim = tmp_path / "n5_victim.txt"
+        victim.write_text("safe\n", encoding="utf-8")
+        sym = audit_dir / "sym.tmp"
+        sym.symlink_to(victim)
+        os.replace(sym, audit_file)
+
+        r_ops_down = ops_c.get("/readyz")
+        assert r_ops_down.status_code == 503
+        assert r_ops_down.json() == {
+            "ready": False,
+            "reason": "audit_sink",
+            "engines": {"duck": "ok", "lakebase": "ok"},
+        }
+
+        r_pub_down = pub_c.get("/readyz")
+        assert r_pub_down.status_code == 503
+        assert r_pub_down.json() == {
+            "ready": False,
+            "reason": "audit_sink",
+        }
+
+    # In on_failure="log" mode, a broken audit sink does NOT mark /readyz not-ready
+    class _DownSink(AuditSink):
+        def verify_writable(self) -> None:
+            raise AuditWriteError("down")
+
+        def write_record(self, record: AuditRecord) -> None:
+            raise AuditWriteError("down")
+
+    probe_log = ReadinessProbe(
+        {"duck": DuckDBAdapter(connect=lambda: duckdb.connect())},
+        audit_sink=_DownSink(),
+        audit_on_failure="log",
+        cache_seconds=0.0,
+    )
+    st_log, body_log = probe_log.check()
+    assert st_log == 200
+    assert body_log == {"ready": True, "engines": {"duck": "ok"}}
+
+
+

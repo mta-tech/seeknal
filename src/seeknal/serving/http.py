@@ -41,6 +41,7 @@ from seeknal.serving.audit import (
     build_audit_record,
     build_minimal_audit_record,
     emit_audit_record,
+    get_audit_runtime_tracker,
 )
 from seeknal.serving.enforce import EnforcementError
 from seeknal.serving.errors import (
@@ -601,6 +602,8 @@ def create_app(
     audit_sink: Any = None,
     audit_on_failure: str | None = None,
     audit_failure_callback: Callable[[], Any] | None = None,
+    audit_timeout_seconds: float | None = None,
+    audit_max_concurrency: int = 4,
     on_row_cap: str = "truncate",
     metrics: MetricsRegistry | None = None,
 ) -> Starlette:
@@ -638,6 +641,20 @@ def create_app(
     is_callable_sink = (
         audit_sink is not None and not is_structured_sink and callable(audit_sink)
     )
+    audit_tracker = get_audit_runtime_tracker(
+        audit_sink,
+        timeout_seconds=audit_timeout_seconds,
+        max_workers=audit_max_concurrency,
+    )
+
+    async def _run_audit_io(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        assert audit_tracker is not None
+        return await audit_tracker.run_async(
+            fn,
+            *args,
+            timeout_seconds=audit_timeout_seconds,
+            **kwargs,
+        )
 
     async def healthz(request: Request) -> Response:
         start = time.perf_counter()
@@ -726,7 +743,7 @@ def create_app(
                     )
 
                 try:
-                    await run_in_threadpool(
+                    await _run_audit_io(
                         emit_audit_record,
                         audit_sink,
                         record,
@@ -826,7 +843,7 @@ def create_app(
                     record_dict = minimal_record.to_dict()
 
                 try:
-                    await run_in_threadpool(audit_sink, record_dict)
+                    await _run_audit_io(audit_sink, record_dict)
                 except Exception as exc:
                     _on_audit_write_failure()
                     if effective_audit_on_failure == "log":
@@ -1661,7 +1678,7 @@ def create_app(
                 pre_record_dict = min_pre.to_dict()
 
             try:
-                await run_in_threadpool(audit_sink, pre_record_dict)
+                await _run_audit_io(audit_sink, pre_record_dict)
                 callable_audit_done = True
             except Exception as exc:
                 _on_audit_write_failure()
