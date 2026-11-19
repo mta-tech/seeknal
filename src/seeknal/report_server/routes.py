@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import mimetypes
+import tarfile
 from datetime import datetime, timezone
 
 from starlette.requests import Request
@@ -11,6 +12,35 @@ from seeknal.report_server import owner, slugs
 from seeknal.report_server.auth import AuthError, require_publish_auth
 from seeknal.report_server.models import Publish, get_session
 from seeknal.report_server.storage import TarSafetyError
+
+
+_FILTER_ERROR_TYPE = getattr(tarfile, "FilterError", TarSafetyError)
+_OUTSIDE_DEST_ERROR_TYPE = getattr(tarfile, "OutsideDestinationError", ())
+_LINK_OUTSIDE_ERROR_TYPE = getattr(tarfile, "LinkOutsideDestinationError", ())
+_ABSOLUTE_PATH_ERROR_TYPE = getattr(tarfile, "AbsolutePathError", ())
+_ABSOLUTE_LINK_ERROR_TYPE = getattr(tarfile, "AbsoluteLinkError", ())
+_SPECIAL_FILE_ERROR_TYPE = getattr(tarfile, "SpecialFileError", ())
+
+
+def _classify_tar_error(exc: Exception) -> str:
+    if isinstance(exc, TarSafetyError):
+        msg = str(exc)
+        if ":" in msg:
+            return msg.split(":", 1)[0].strip()
+        return msg or "Tarball failed safety check"
+    if _ABSOLUTE_PATH_ERROR_TYPE and isinstance(exc, _ABSOLUTE_PATH_ERROR_TYPE):
+        return "Tarball entry has absolute path"
+    if _ABSOLUTE_LINK_ERROR_TYPE and isinstance(exc, _ABSOLUTE_LINK_ERROR_TYPE):
+        return "Tarball entry is a symlink"
+    if _LINK_OUTSIDE_ERROR_TYPE and isinstance(exc, _LINK_OUTSIDE_ERROR_TYPE):
+        return "Tarball entry is a symlink"
+    if _OUTSIDE_DEST_ERROR_TYPE and isinstance(exc, _OUTSIDE_DEST_ERROR_TYPE):
+        return "Tarball entry escapes destination"
+    if _SPECIAL_FILE_ERROR_TYPE and isinstance(exc, _SPECIAL_FILE_ERROR_TYPE):
+        return "Tarball entry is a special or device file"
+    if isinstance(exc, _FILTER_ERROR_TYPE):
+        return "Tarball entry rejected by extraction filter"
+    return "Invalid or corrupt tarball archive"
 
 
 async def publish(request: Request) -> JSONResponse:
@@ -44,8 +74,8 @@ async def publish(request: Request) -> JSONResponse:
 
         try:
             asset_relpath = storage.extract_tarball(slug, io.BytesIO(body_bytes))
-        except TarSafetyError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
+        except (TarSafetyError, _FILTER_ERROR_TYPE, tarfile.TarError, EOFError) as exc:
+            return JSONResponse({"error": _classify_tar_error(exc)}, status_code=400)
 
         created_at = datetime.now(timezone.utc)
         pub = Publish(

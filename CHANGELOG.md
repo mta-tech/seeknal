@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Update release and upgrade documentation for 2.14.0. See the [2.14.0 release notes](docs/releases/2.14.0.md).
 
 ### Fixed
+- Enforce version-independent tarball member safety checks in the report server before extraction (rejecting absolute POSIX/Windows/UNC paths, `..` components, symlinks, hardlinks, devices/FIFOs/special files, and resolved destination escapes), layer `tarfile`'s `"data"` filter when available, and return typed 400 responses for `TarSafetyError`, `tarfile.FilterError`, and corrupt `tarfile.TarError` uploads without leaking server filesystem paths.
 - Synchronous Ask/Prefect and quiet/non-TTY execution now handle exhausted tool budgets with a no-tool evidence-synthesis pass and deterministic fallback.
 - Accept positive integers, integral floats, and integer strings for `tool_call_limit`; default invalid, boolean, fractional, non-finite, or non-positive values to 24. Full-mode tool calls remain unbounded, with a warning once per process per project when the setting is ignored.
 - Retry transient event delivery failures for up to three attempts with backoff and jitter; retry `429`/`5xx`, abort vanished work on `404`/`410`, and do not retry other `4xx`. After delivery fails, degraded mode drops non-critical events while preserving critical retries until a successful POST restores normal delivery.

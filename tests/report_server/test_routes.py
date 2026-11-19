@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tarfile
 from pathlib import Path
+from unittest.mock import patch
 
 from starlette.testclient import TestClient
 
@@ -112,6 +114,58 @@ def test_malicious_tarball_rejected(
     assert resp.status_code == 400, (
         f"Malicious tarball must be rejected with 400, got {resp.status_code}: {resp.text}"
     )
+    error_msg = resp.json().get("error", "")
+    assert "Tarball entry" in error_msg
+    assert str(test_client.app.state.config.data_dir) not in error_msg
+
+
+def test_malicious_absolute_tarball_rejected(
+    test_client: TestClient, malicious_tarball_absolute: Path
+) -> None:
+    resp = _publish(test_client, malicious_tarball_absolute)
+    assert resp.status_code == 400
+    error_msg = resp.json().get("error", "")
+    assert error_msg == "Tarball entry has absolute path"
+    assert "/etc/passwd" not in error_msg
+    assert str(test_client.app.state.config.data_dir) not in error_msg
+
+
+def test_corrupt_non_gzip_upload_returns_400(test_client: TestClient) -> None:
+    resp = test_client.post(
+        "/publish",
+        content=b"this is definitely not a valid gzip tarball archive",
+        headers={
+            "Content-Type": "application/gzip",
+            "Authorization": "Bearer test-key-123",
+        },
+    )
+    assert resp.status_code == 400, (
+        f"Corrupt upload must return 400, got {resp.status_code}: {resp.text}"
+    )
+    error_msg = resp.json().get("error", "")
+    assert "corrupt" in error_msg.lower() or "invalid" in error_msg.lower()
+    assert str(test_client.app.state.config.data_dir) not in error_msg
+
+
+def test_filter_error_mapped_to_typed_400_without_server_paths(
+    test_client: TestClient, honest_tarball: Path
+) -> None:
+    filter_err_cls = getattr(tarfile, "OutsideDestinationError", tarfile.TarError)
+
+    def _raise_filter_err(*args, **kwargs):
+        raise filter_err_cls(
+            tarfile.TarInfo(name="../../etc/passwd"),
+            str(test_client.app.state.config.data_dir),
+        )
+
+    with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=_raise_filter_err):
+        resp = _publish(test_client, honest_tarball)
+
+    assert resp.status_code == 400
+    error_msg = resp.json().get("error", "")
+    assert error_msg
+    assert str(test_client.app.state.config.data_dir) not in error_msg
+    assert "/etc/passwd" not in error_msg
 
 
 def test_get_r_path_works_in_api_key_mode_without_bearer(

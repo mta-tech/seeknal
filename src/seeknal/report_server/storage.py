@@ -15,6 +15,43 @@ class TarSafetyError(ValueError):
     pass
 
 
+def _validate_tar_member(member: tarfile.TarInfo, dest_real: str) -> None:
+    name = member.name
+    # Reject absolute paths (POSIX /..., Windows drive C:..., or UNC \\... / //...)
+    if (
+        os.path.isabs(name)
+        or name.startswith(("/", "\\"))
+        or (len(name) >= 2 and name[0].isalpha() and name[1] == ":")
+    ):
+        raise TarSafetyError(f"Tarball entry has absolute path: {name!r}")
+
+    # Reject entries with '..' components (splitting on both POSIX and Windows separators)
+    parts = [p for part in name.split("/") for p in part.split("\\")]
+    if ".." in parts:
+        raise TarSafetyError(f"Tarball entry contains '..': {name!r}")
+
+    # Reject symlinks and hardlinks
+    if member.issym() or member.islnk():
+        kind = "symlink" if member.issym() else "hardlink"
+        raise TarSafetyError(f"Tarball entry is a {kind}: {name!r}")
+
+    # Reject devices, FIFOs, or other special files (allow only regular files and directories)
+    if (
+        member.isdev()
+        or member.ischr()
+        or member.isblk()
+        or member.isfifo()
+        or not (member.isreg() or member.isdir())
+    ):
+        raise TarSafetyError(f"Tarball entry is a special or device file: {name!r}")
+
+    # Verify resolved path stays inside dest
+    normalized_rel = name.replace("\\", os.sep)
+    target = os.path.realpath(os.path.join(dest_real, normalized_rel))
+    if not target.startswith(dest_real + os.sep) and target != dest_real:
+        raise TarSafetyError(f"Tarball entry escapes destination: {name!r}")
+
+
 class Storage(ABC):
     @abstractmethod
     def extract_tarball(self, slug: str, fileobj: BinaryIO) -> str:
@@ -63,35 +100,31 @@ class LocalFilesystemStorage(Storage):
 
     def _safe_extract(self, fileobj: BinaryIO, dest: Path) -> None:
         with tarfile.open(fileobj=fileobj, mode="r:gz") as tf:
-            # Python 3.12+ provides data_filter which enforces tarball safety.
-            # On 3.11 we apply a manual member-by-member sanitizer before extraction.
-            # Rationale: tarballs from untrusted uploaders may contain path traversal
-            # entries (../../etc/passwd), absolute paths (/etc/passwd), or symlinks
-            # pointing outside the destination — any of which could overwrite files
-            # outside the slug directory.
-            if sys.version_info >= (3, 12):
-                tf.extractall(dest, filter="data")  # type: ignore[call-arg]
-            else:
-                self._manual_safe_extract(tf, dest)
+            # 1. Explicit version-independent check runs first before any member is extracted.
+            dest_real = os.path.realpath(dest)
+            members = tf.getmembers()
+            for member in members:
+                _validate_tar_member(member, dest_real)
 
-    def _manual_safe_extract(self, tf: tarfile.TarFile, dest: Path) -> None:
+            # 2. Extract using data_filter when available (3.12+ and backports) as a second layer,
+            # otherwise extract the validated members one by one.
+            if hasattr(tarfile, "data_filter"):
+                tf.extractall(dest, members=members, filter="data")  # type: ignore[call-arg]
+            else:
+                self._manual_safe_extract(tf, dest, members=members)
+
+    def _manual_safe_extract(
+        self,
+        tf: tarfile.TarFile,
+        dest: Path,
+        members: Optional[list[tarfile.TarInfo]] = None,
+    ) -> None:
         dest_real = os.path.realpath(dest)
-        for member in tf.getmembers():
-            # Reject absolute paths
-            if os.path.isabs(member.name):
-                raise TarSafetyError(f"Tarball entry has absolute path: {member.name!r}")
-            # Reject entries with '..' components
-            if ".." in Path(member.name).parts:
-                raise TarSafetyError(f"Tarball entry contains '..': {member.name!r}")
-            # Reject symlinks
-            if member.issym() or member.islnk():
-                raise TarSafetyError(f"Tarball entry is a symlink: {member.name!r}")
-            # Verify resolved path stays inside dest
-            target = os.path.realpath(os.path.join(dest_real, member.name))
-            if not target.startswith(dest_real + os.sep) and target != dest_real:
-                raise TarSafetyError(
-                    f"Tarball entry escapes destination: {member.name!r}"
-                )
+        if members is None:
+            members = tf.getmembers()
+            for member in members:
+                _validate_tar_member(member, dest_real)
+        for member in members:
             tf.extract(member, dest)
 
     def _rewrite_absolute_paths(self, dest: Path, slug: str) -> None:
