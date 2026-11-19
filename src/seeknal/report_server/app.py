@@ -23,6 +23,11 @@ def create_app(config: Optional[ServerConfig] = None) -> Starlette:
         config = ServerConfig.from_env()
 
     config.validate()
+    if config.auth_mode == "open":
+        _log.warning(
+            "report_server auth_mode=open: publish and revoke accept unauthenticated requests; "
+            "do not expose this server beyond localhost"
+        )
     config.data_dir.mkdir(parents=True, exist_ok=True)
 
     storage = LocalFilesystemStorage(

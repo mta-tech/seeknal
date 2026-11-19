@@ -398,3 +398,108 @@ def test_overlong_name_and_file_dir_conflict_return_typed_400_without_paths_in_l
         assert "zzzzzzzz" not in msg
 
 
+def test_server_config_defaults_to_api_key(monkeypatch) -> None:
+    from seeknal.report_server.config import ServerConfig
+
+    assert ServerConfig().auth_mode == "api_key"
+    monkeypatch.delenv("SEEKNAL_REPORT_SERVER_AUTH_MODE", raising=False)
+    assert ServerConfig.from_env().auth_mode == "api_key"
+
+
+def test_default_auth_mode_app_rejects_unauthenticated_publish_without_writing_assets(
+    tmp_path: Path,
+    honest_tarball: Path,
+    monkeypatch,
+) -> None:
+    from seeknal.report_server.app import create_app
+    from seeknal.report_server.config import ServerConfig
+
+    monkeypatch.setattr("seeknal.report_server.config.is_insecure_path", lambda _p: False)
+    monkeypatch.setattr("seeknal.report_server.storage.is_insecure_path", lambda _p: False)
+    data_dir = tmp_path / "default-auth-data"
+    cfg = ServerConfig(data_dir=data_dir, api_keys=["k"])
+    assert cfg.auth_mode == "api_key"
+    app = create_app(cfg)
+    client = TestClient(app, raise_server_exceptions=True)
+
+    resp = _publish(client, honest_tarball, auth=False)
+    assert resp.status_code == 401
+    assets_dir = data_dir / "assets"
+    assert list(assets_dir.iterdir()) == []
+
+
+def test_api_key_mode_without_keys_fails_closed_in_validate_and_create_app(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import pytest
+    from seeknal.report_server.app import create_app
+    from seeknal.report_server.config import ServerConfig
+
+    monkeypatch.setattr("seeknal.report_server.config.is_insecure_path", lambda _p: False)
+    monkeypatch.setattr("seeknal.report_server.storage.is_insecure_path", lambda _p: False)
+    cfg = ServerConfig(data_dir=tmp_path / "no-keys-data", api_keys=[])
+    with pytest.raises(ValueError) as exc_info:
+        cfg.validate()
+    err = str(exc_info.value)
+    assert "SEEKNAL_REPORT_SERVER_KEYS" in err
+    assert "SEEKNAL_REPORT_SERVER_AUTH_MODE=open" in err
+
+    with pytest.raises(ValueError) as app_exc_info:
+        create_app(cfg)
+    app_err = str(app_exc_info.value)
+    assert "SEEKNAL_REPORT_SERVER_KEYS" in app_err
+    assert "SEEKNAL_REPORT_SERVER_AUTH_MODE=open" in app_err
+
+
+def test_explicit_open_mode_allows_unauthenticated_publish_and_logs_warning(
+    tmp_path: Path,
+    honest_tarball: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    import logging
+    from seeknal.report_server.app import create_app
+    from seeknal.report_server.config import ServerConfig
+
+    monkeypatch.setattr("seeknal.report_server.config.is_insecure_path", lambda _p: False)
+    monkeypatch.setattr("seeknal.report_server.storage.is_insecure_path", lambda _p: False)
+
+    # 1. Explicit auth_mode="open" emits WARNING on seeknal.report_server and allows unauth publish
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    open_cfg = ServerConfig(data_dir=tmp_path / "open-mode-data", auth_mode="open")
+    open_app = create_app(open_cfg)
+    open_warnings = [
+        rec for rec in caplog.records
+        if rec.name == "seeknal.report_server"
+        and rec.levelno == logging.WARNING
+        and "auth_mode=open" in rec.getMessage()
+    ]
+    assert len(open_warnings) == 1
+
+    open_client = TestClient(open_app, raise_server_exceptions=True)
+    resp = _publish(open_client, honest_tarball, auth=False)
+    assert resp.status_code == 201
+
+    # 2. api_key mode emits no such warning
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    key_cfg = ServerConfig(
+        data_dir=tmp_path / "key-mode-data",
+        auth_mode="api_key",
+        api_keys=["secret-key-not-logged"],
+    )
+    create_app(key_cfg)
+    key_warnings = [
+        rec for rec in caplog.records
+        if rec.name == "seeknal.report_server"
+        and rec.levelno == logging.WARNING
+        and "auth_mode=open" in rec.getMessage()
+    ]
+    assert key_warnings == []
+    for rec in caplog.records:
+        assert "secret-key-not-logged" not in rec.getMessage()
+
+
+

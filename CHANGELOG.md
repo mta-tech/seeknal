@@ -16,12 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI-equivalent Docker test runner and [HTTP worker protocol documentation](docs/reference/gateway-worker-protocol.md).
 
 ### Changed
+- **Breaking**: `report_server` now requires API-key authentication by default (`ServerConfig.auth_mode = "api_key"`) and refuses to start in `api_key` mode unless `SEEKNAL_REPORT_SERVER_KEYS` is configured; to keep the old unauthenticated behavior, set `SEEKNAL_REPORT_SERVER_AUTH_MODE=open`.
 - Fold the unreleased 2.13.1 patch (PRs #112, #113, #114) into 2.14.0: dependency floors and Docker build fixes ship with this minor release.
 - Enforce patched dependency floors for pydantic-ai-slim (1.107.4, retaining the 1.x cap), fsspec/s3fs (2026.6.0), aiohttp (3.14.4), multidict (6.9.1), Mako (1.4.2), and optional Prefect's Apprise (1.11.0). Refresh their required lock closure and enforce the aiohttp floor in gateway/worker image installs.
 - Bound replay to five events and 16,384 UTF-8 JSON bytes per event. Preserve fitting payloads; oversized or unserializable payloads become `{type, payload_truncated: true, original_bytes}` placeholders without `data`. Evict charts before clarifications and report evictions.
 - Update release and upgrade documentation for 2.14.0. See the [2.14.0 release notes](docs/releases/2.14.0.md).
 
 ### Fixed
+- Enforce streaming tarball resource caps (`max_tar_members=10_000`, `max_unpacked_bytes=512 MiB`, `max_path_depth=32`, `max_member_name_length=1024`) and NUL-byte checks before extraction, stream `/publish` request bodies with early `413` enforcement and `400` validation for invalid `Content-Length`, run extraction off the async event loop, normalise fallback member modes with writable failure cleanup, and map extraction `OSError`/`ValueError` to path-safe `400` responses and logs.
 - Enforce version-independent tarball member safety checks in the report server before extraction (rejecting absolute POSIX/Windows/UNC paths, `..` components, symlinks, hardlinks, devices/FIFOs/special files, and resolved destination escapes), layer `tarfile`'s `"data"` filter when available, and return typed 400 responses for `TarSafetyError`, `tarfile.FilterError`, and corrupt `tarfile.TarError` uploads without leaking server filesystem paths.
 - Synchronous Ask/Prefect and quiet/non-TTY execution now handle exhausted tool budgets with a no-tool evidence-synthesis pass and deterministic fallback.
 - Accept positive integers, integral floats, and integer strings for `tool_call_limit`; default invalid, boolean, fractional, non-finite, or non-positive values to 24. Full-mode tool calls remain unbounded, with a warning once per process per project when the setting is ignored.

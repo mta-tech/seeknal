@@ -379,7 +379,7 @@ def test_server_config_validates_positive_int_caps(
     )
 
     monkeypatch.setattr("seeknal.report_server.config.is_insecure_path", lambda _p: False)
-    cfg = ServerConfig(data_dir=tmp_path / "cfg-data")
+    cfg = ServerConfig(data_dir=tmp_path / "cfg-data", api_keys=["test-key"])
     assert cfg.max_upload_bytes == DEFAULT_MAX_UPLOAD_BYTES == 100 * 1024 * 1024
     assert cfg.max_tar_members == DEFAULT_MAX_TAR_MEMBERS == 10_000
     assert cfg.max_unpacked_bytes == DEFAULT_MAX_UNPACKED_BYTES == 512 * 1024 * 1024
@@ -395,7 +395,11 @@ def test_server_config_validates_positive_int_caps(
         "max_member_name_length",
     ):
         for bad_val in (0, -5, True, "100"):
-            bad_cfg = ServerConfig(data_dir=tmp_path / "cfg-data", **{field_name: bad_val})  # type: ignore[arg-type]
+            bad_cfg = ServerConfig(
+                data_dir=tmp_path / "cfg-data",
+                api_keys=["test-key"],
+                **{field_name: bad_val},  # type: ignore[arg-type]
+            )
             with pytest.raises(ValueError, match=field_name):
                 bad_cfg.validate()
 

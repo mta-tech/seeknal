@@ -41,8 +41,16 @@ def _parse_int_env(env_var: str, default: int) -> int:
 
 @dataclass
 class ServerConfig:
+    """Configuration for the Seeknal Report Server.
+
+    By default, ``auth_mode`` is ``"api_key"`` and requires at least one key in
+    ``api_keys`` (configured via ``SEEKNAL_REPORT_SERVER_KEYS``). To run without
+    authentication for local development, explicitly opt in with
+    ``auth_mode="open"`` or ``SEEKNAL_REPORT_SERVER_AUTH_MODE=open``.
+    """
+
     data_dir: Path = field(default_factory=lambda: Path.home() / ".seeknal" / "report-server")
-    auth_mode: str = "open"
+    auth_mode: str = "api_key"
     api_keys: list[str] = field(default_factory=list)
     max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
     max_tar_members: int = DEFAULT_MAX_TAR_MEMBERS
@@ -54,7 +62,7 @@ class ServerConfig:
     @classmethod
     def from_env(cls) -> ServerConfig:
         data_dir = Path(os.environ.get("SEEKNAL_REPORT_SERVER_DATA_DIR", Path.home() / ".seeknal" / "report-server"))
-        auth_mode = os.environ.get("SEEKNAL_REPORT_SERVER_AUTH_MODE", "open")
+        auth_mode = os.environ.get("SEEKNAL_REPORT_SERVER_AUTH_MODE", "api_key")
         raw_keys = os.environ.get("SEEKNAL_REPORT_SERVER_KEYS", "")
         api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()] if raw_keys else []
         max_upload_bytes = _parse_int_env("SEEKNAL_REPORT_SERVER_MAX_UPLOAD_BYTES", DEFAULT_MAX_UPLOAD_BYTES)
@@ -87,6 +95,12 @@ class ServerConfig:
         if self.auth_mode not in ("open", "api_key"):
             raise ValueError(
                 f"Invalid auth_mode '{self.auth_mode}'. Must be 'open' or 'api_key'."
+            )
+        if self.auth_mode == "api_key" and not [k for k in self.api_keys if k and k.strip()]:
+            raise ValueError(
+                "report_server auth_mode='api_key' requires at least one API key: "
+                "set SEEKNAL_REPORT_SERVER_KEYS, or explicitly opt in to unauthenticated "
+                "mode with SEEKNAL_REPORT_SERVER_AUTH_MODE=open."
             )
         for attr_name, env_var in _POSITIVE_INT_FIELDS:
             val = getattr(self, attr_name)
