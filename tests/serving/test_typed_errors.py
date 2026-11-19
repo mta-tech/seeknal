@@ -17,19 +17,24 @@ from starlette.testclient import TestClient
 from seeknal.serving.adapters import (
     DuckDBAdapter,
     EngineCancelled,
+    EngineConfigError,
     EngineError,
     EnginePoolExhausted,
     EngineTimeout,
     QueryResult,
 )
+from seeknal.serving.audit import AuditSink, AuditWriteError
+from seeknal.serving.enforce import EnforcementError
 from seeknal.serving.errors import (
     ERROR_CATALOGUE,
     REQUIRED_ERROR_CODES,
     AuditUnavailableError,
+    scrub_error_detail,
 )
 from seeknal.serving.grant_token import sign_cancel_token, sign_grant_token
 from seeknal.serving.http import GrantReplayCache, create_app
 from seeknal.serving.placement import Placement
+from seeknal.serving.router import RoutingError
 from seeknal.serving.service import PreparedQuery, ServingPipeline
 
 
@@ -976,3 +981,359 @@ def test_planted_secrets_dsns_hostnames_literals_params_and_tracebacks_never_lea
     )
     assert r7.status_code == 401
     assert_clean(r7, t7)
+
+
+# ---------------------------------------------------------------------------
+# 4. F-L2: Scrubbed exception detail + audit_id logged at ERROR, never in body
+# ---------------------------------------------------------------------------
+
+
+def test_scrub_error_detail_unit_redacts_all_secret_classes_and_preserves_detail():
+    jwt_tok = (
+        "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiJhbmFseXN0QGV4YW1wbGUuY29tIn0."
+        "c2lnbmF0dXJlX3NlY3JldF94eXot"
+    )
+    sql = "SELECT id FROM users WHERE name = 'vip_customer_secret_42' AND note = 'O''Brian_77'"
+    env = {
+        "STARROCKS_SECRET_TOKEN": "env_tok_998877",
+        "QUOTE_PASSWORD": "pw'with'quote",
+        "LAKEBASE_DSN": "postgresql://svc_user:dsn_extracted_pw_4433@db.internal:5432/prod",
+        "SAFE_SHORT_KEY": "abc",  # len < 4 ignored
+        "NON_SENSITIVE_VAR": "orders_mart_v2",  # non-sensitive name preserved
+    }
+    exc = EngineError(
+        "backend table orders_mart_v2 missing partition 202611 | "
+        f"grant=raw_grant_tok_1122 | jwt={jwt_tok} | auth=Bearer opq_tok_5566== | "
+        "uri=postgresql://admin:uri_pass_1234@sr-fe:9030/db | "
+        "kv=password=kv_secret_7890 api_key=ak_live_3344 | "
+        "env1=env_tok_998877 env2=pw''with''quote env3=dsn_extracted_pw_4433 | "
+        "lit='vip_customer_secret_42' esc=O'Brian_77 param=param_secret_6655 num=987654 | "
+        "probe=my_canary_token_88\r\nnext_line_diag"
+    )
+    scrubbed = scrub_error_detail(
+        exc,
+        token="raw_grant_tok_1122",
+        sql=sql,
+        params=["param_secret_6655", 987654, 2],
+        env=env,
+    )
+
+    assert scrubbed.startswith("EngineError: ")
+    assert "backend table orders_mart_v2 missing partition 202611" in scrubbed
+    assert "\\r\\nnext_line_diag" in scrubbed
+    assert "\n" not in scrubbed
+    assert "\r" not in scrubbed
+
+    for forbidden in (
+        "raw_grant_tok_1122",
+        jwt_tok,
+        "c2lnbmF0dXJlX3NlY3JldF94eXot",
+        "opq_tok_5566",
+        "uri_pass_1234",
+        "kv_secret_7890",
+        "ak_live_3344",
+        "env_tok_998877",
+        "pw'with'quote",
+        "pw''with''quote",
+        "dsn_extracted_pw_4433",
+        "vip_customer_secret_42",
+        "O'Brian_77",
+        "O''Brian_77",
+        "param_secret_6655",
+        "987654",
+        "my_canary_token_88",
+    ):
+        assert forbidden not in scrubbed, f"Secret '{forbidden}' leaked in: {scrubbed}"
+
+
+def test_f_l2_error_logs_include_scrubbed_exc_detail_and_audit_id(
+    multi_engine_setup,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+
+    useful_detail = "backend table orders_mart_v2 missing partition 202611"
+    planted_env_secret = "planted_env_s3cr3t_994411"
+    planted_dsn_env_pw = "dsn_env_pw_553311"
+    planted_dsn_inline_pw = "dsn_inline_pw_882244"
+    planted_kv_pw = "kv_pw_665544"
+    planted_jwt = (
+        "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiJsZWFrZWQtdXNlciIsImp0aSI6ImxrazEifQ."
+        "c2lnbmF0dXJlX3NlY3JldF8xMjM-"
+    )
+    planted_bearer_val = "opaque_bearer_tok_334455"
+    planted_sql_lit = "vip_sql_literal_445566"
+    planted_param = "secret_param_val_778899"
+    planted_canary = "canary_probe_token_1199"
+
+    monkeypatch.setenv("STARROCKS_SECRET_KEY", planted_env_secret)
+    monkeypatch.setenv(
+        "LAKEBASE_DSN",
+        f"postgresql://svc_acct:{planted_dsn_env_pw}@db.internal:5432/prod",
+    )
+
+    inline_dsn = (
+        f"postgresql://lake_user:{planted_dsn_inline_pw}@sr-fe.internal:9030/analytics"
+    )
+    sql = f"SELECT id FROM users WHERE name = '{planted_sql_lit}' AND name != $1"
+    params = [planted_param]
+
+    rich_secret_suffix = (
+        f"dsn={inline_dsn} password={planted_kv_pw} env={planted_env_secret} "
+        f"dsn_env_pw={planted_dsn_env_pw} jwt={planted_jwt} "
+        f"auth=Bearer {planted_bearer_val} lit='{planted_sql_lit}' "
+        f"param={planted_param} probe={planted_canary}\nline2_ctx"
+    )
+
+    forbidden_secrets = (
+        planted_env_secret,
+        planted_dsn_env_pw,
+        planted_dsn_inline_pw,
+        planted_kv_pw,
+        planted_jwt,
+        "c2lnbmF0dXJlX3NlY3JldF8xMjM-",
+        planted_bearer_val,
+        planted_sql_lit,
+        planted_param,
+        planted_canary,
+    )
+
+    def _assert_logged_and_scrubbed(
+        resp: Any,
+        tok: str,
+        *,
+        expected_audit_id: str,
+        expected_exc_cls: str,
+        expected_code: str,
+    ) -> None:
+        # 1. Response never contains detail, useful backend message, or any secret
+        body = resp.json()
+        assert "detail" not in body
+        assert useful_detail not in resp.text
+        assert tok not in resp.text
+        for secret in forbidden_secrets:
+            assert secret not in resp.text, (
+                f"Leaked '{secret}' in HTTP response: {resp.text}"
+            )
+
+        # 2. ERROR log record contains audit_id, exception class name, code, and useful detail
+        error_records = [
+            rec
+            for rec in caplog.records
+            if rec.levelno == logging.ERROR and rec.name == "seeknal.serving.http"
+        ]
+        assert error_records, f"Expected ERROR log record, got: {caplog.text}"
+        matching = [
+            rec.getMessage()
+            for rec in error_records
+            if f"audit_id={expected_audit_id}" in rec.getMessage()
+        ]
+        assert matching, (
+            f"Expected audit_id={expected_audit_id} in ERROR logs, got: "
+            f"{[r.getMessage() for r in error_records]}"
+        )
+        msg = matching[0]
+        assert f"code={expected_code}" in msg
+        assert f"error={expected_exc_cls}" in msg
+        assert f"detail={expected_exc_cls}:" in msg
+        assert useful_detail in msg
+        assert "\n" not in msg
+        assert "\r" not in msg
+
+        # 3. Planted secrets, DSN passwords, JWT, SQL literal, param, and grant token absent from logs
+        assert tok not in caplog.text
+        for secret in forbidden_secrets:
+            assert secret not in caplog.text, (
+                f"Leaked '{secret}' in server logs: {caplog.text}"
+            )
+
+    # Case 1: EngineError in /v1/query
+    class DetailedEngineErrorAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            raise EngineError(f"{useful_detail}; {rich_secret_suffix}")
+
+    c_eng = TestClient(create_app(pipeline, {"duck": DetailedEngineErrorAdapter()}))
+    tok_eng = _make_grant(priv, sql, jti="jti-fl2-eng-err")
+    with caplog.at_level(logging.DEBUG):
+        caplog.clear()
+        r_eng = c_eng.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_eng}"},
+            json={"sql": sql, "params": params},
+        )
+    assert r_eng.status_code == 502
+    _assert_logged_and_scrubbed(
+        r_eng,
+        tok_eng,
+        expected_audit_id="jti-fl2-eng-err",
+        expected_exc_cls="EngineError",
+        expected_code="engine_unavailable",
+    )
+
+    # Case 2: EngineConfigError in /v1/query
+    class DetailedConfigErrorAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            raise EngineConfigError(f"{useful_detail}; {rich_secret_suffix}")
+
+    c_cfg = TestClient(create_app(pipeline, {"duck": DetailedConfigErrorAdapter()}))
+    tok_cfg = _make_grant(priv, sql, jti="jti-fl2-cfg-err")
+    with caplog.at_level(logging.DEBUG):
+        caplog.clear()
+        r_cfg = c_cfg.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_cfg}"},
+            json={"sql": sql, "params": params},
+        )
+    assert r_cfg.status_code == 503
+    _assert_logged_and_scrubbed(
+        r_cfg,
+        tok_cfg,
+        expected_audit_id="jti-fl2-cfg-err",
+        expected_exc_cls="EngineConfigError",
+        expected_code="engine_unavailable",
+    )
+
+    # Case 3a: RoutingError in prepare branch
+    orig_prepare = pipeline.prepare
+
+    def raising_routing_prepare(*args: Any, **kwargs: Any) -> PreparedQuery:
+        raise RoutingError(f"{useful_detail}; {rich_secret_suffix}", code="data_stale")
+
+    monkeypatch.setattr(pipeline, "prepare", raising_routing_prepare)
+    c_prep = TestClient(create_app(pipeline, {"duck": duck_adapter}))
+    tok_route = _make_grant(priv, sql, jti="jti-fl2-route-err")
+    with caplog.at_level(logging.DEBUG):
+        caplog.clear()
+        r_route = c_prep.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_route}"},
+            json={"sql": sql, "params": params},
+        )
+    assert r_route.status_code == 422
+    _assert_logged_and_scrubbed(
+        r_route,
+        tok_route,
+        expected_audit_id="jti-fl2-route-err",
+        expected_exc_cls="RoutingError",
+        expected_code="data_stale",
+    )
+
+    # Case 3b: EnforcementError in prepare branch
+    def raising_enforcement_prepare(*args: Any, **kwargs: Any) -> PreparedQuery:
+        raise EnforcementError(
+            f"{useful_detail}; {rich_secret_suffix}", code="access_denied"
+        )
+
+    monkeypatch.setattr(pipeline, "prepare", raising_enforcement_prepare)
+    tok_enf = _make_grant(priv, sql, jti="jti-fl2-enforce-err")
+    with caplog.at_level(logging.DEBUG):
+        caplog.clear()
+        r_enf = c_prep.post(
+            "/v1/explain",
+            headers={"Authorization": f"Bearer {tok_enf}"},
+            json={"sql": sql, "params": params},
+        )
+    assert r_enf.status_code == 403
+    _assert_logged_and_scrubbed(
+        r_enf,
+        tok_enf,
+        expected_audit_id="jti-fl2-enforce-err",
+        expected_exc_cls="EnforcementError",
+        expected_code="access_denied",
+    )
+    monkeypatch.setattr(pipeline, "prepare", orig_prepare)
+
+    # Case 4: Unhandled RuntimeError in /v1/query
+    class DetailedRuntimeErrorAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            raise RuntimeError(f"{useful_detail}; {rich_secret_suffix}")
+
+    c_rt = TestClient(create_app(pipeline, {"duck": DetailedRuntimeErrorAdapter()}))
+    tok_rt = _make_grant(priv, sql, jti="jti-fl2-runtime-err")
+    with caplog.at_level(logging.DEBUG):
+        caplog.clear()
+        r_rt = c_rt.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_rt}"},
+            json={"sql": sql, "params": params},
+        )
+    assert r_rt.status_code == 500
+    _assert_logged_and_scrubbed(
+        r_rt,
+        tok_rt,
+        expected_audit_id="jti-fl2-runtime-err",
+        expected_exc_cls="RuntimeError",
+        expected_code="internal_error",
+    )
+
+    # Case 5: Audit sink failure in _finish & cancel GrantTokenError
+    class BrokenStructuredAuditSink(AuditSink):
+        on_failure = "refuse"
+
+        def verify_writable(self) -> None:
+            pass
+
+        def write_record(self, rec: Any) -> None:
+            raise AuditWriteError(f"{useful_detail}; {rich_secret_suffix}")
+
+        def close(self) -> None:
+            pass
+
+    c_aud = TestClient(
+        create_app(
+            pipeline,
+            {"duck": duck_adapter},
+            audit_sink=BrokenStructuredAuditSink(),
+        )
+    )
+    tok_aud = _make_grant(priv, sql, jti="jti-fl2-audit-err")
+    with caplog.at_level(logging.DEBUG):
+        caplog.clear()
+        r_aud = c_aud.post(
+            "/v1/explain",
+            headers={"Authorization": f"Bearer {tok_aud}"},
+            json={"sql": sql, "params": params},
+        )
+    assert r_aud.status_code == 503
+    _assert_logged_and_scrubbed(
+        r_aud,
+        tok_aud,
+        expected_audit_id="jti-fl2-audit-err",
+        expected_exc_cls="AuditWriteError",
+        expected_code="audit_unavailable",
+    )
+
+    # Cancel endpoint GrantTokenError (expired cancel token carries verified audit_id)
+    tok_bad_cancel = sign_cancel_token(
+        {
+            "typ": "cancel",
+            "sub": "analyst@atlas.example",
+            "jti": "jti-fl2-cancel-err",
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": time.time() - 90.0,
+            "exp": time.time() - 45.0,
+        },
+        priv,
+        kid="key-1",
+    )
+    with caplog.at_level(logging.DEBUG):
+        caplog.clear()
+        r_cancel_err = c_eng.post(
+            "/v1/cancel",
+            headers={"Authorization": f"Bearer {tok_bad_cancel}"},
+        )
+    assert r_cancel_err.status_code == 401
+    assert "detail" not in r_cancel_err.json()
+    assert tok_bad_cancel not in caplog.text
+    assert any(
+        rec.levelno == logging.ERROR
+        and "code=grant_expired" in rec.getMessage()
+        and "error=GrantExpiredError" in rec.getMessage()
+        and "detail=GrantExpiredError:" in rec.getMessage()
+        and "audit_id=jti-fl2-cancel-err" in rec.getMessage()
+        for rec in caplog.records
+    )

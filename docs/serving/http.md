@@ -236,7 +236,7 @@ All error responses have an HTTP status code $\ge 400$ and return a consistent t
 ### Privacy & Leakage Invariants
 - **No Grant Tokens:** Raw grant tokens and signature data are never included in error messages.
 - **No SQL Literals or Parameters:** Client SQL expressions, literals, and supplied parameter values are never included in error messages.
-- **No Driver Internals:** Database driver connection strings, DSNs, hostnames, credentials, raw driver error text, and Python tracebacks are never returned to the HTTP client; operational failure details (`engine`, `code`, `error` class, and `audit_id`) are logged server-side.
+- **No Driver Internals:** Database driver connection strings, DSNs, hostnames, credentials, raw driver error text, and Python tracebacks are never returned to the HTTP client; operational failure details (`engine`, `code`, `error` class, secret-scrubbed single-line `detail`, and `audit_id`) are logged server-side at `ERROR` and never included in HTTP responses.
 
 ### Typed Error Code Catalogue (`ERROR_CATALOGUE`)
 

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import re
+import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -213,3 +216,152 @@ def build_error_payload(
     if isinstance(audit_id, str) and audit_id:
         payload["audit_id"] = audit_id
     return spec.status, payload
+
+
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,4}")
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*")
+_URI_USERINFO_RE = re.compile(r"://[^/\s'\",;]+@")
+_URI_USERINFO_EXTRACT_RE = re.compile(r"://([^/\s'\",;]+)@")
+_DSN_KV_EQ_RE = re.compile(
+    r"(?i)\b(password|passwd|secret|token|client_secret|api_key|apikey|credential|credentials|private_key)\s*=\s*(?:'[^']*'|\"[^\"]*\"|[^\s,;'\"&+)]+)"
+)
+_SECRET_COLON_KV_RE = re.compile(
+    r"(?i)\b(password|passwd|secret|token|client_secret|api_key|apikey|credential|credentials|private_key)\s*:\s*(?:'[^']*'|\"[^\"]*\"|[^\s,;'\"&+)]+)"
+)
+_DSN_KV_EXTRACT_RE = re.compile(
+    r"(?i)\b(?:password|passwd|secret|token|client_secret|api_key|apikey|credential|credentials|private_key)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^\s,;'\"&+)]+))"
+)
+_SQL_SINGLE_QUOTED_RE = re.compile(r"'((?:''|[^'])*)'")
+_SENSITIVE_ENV_NAME_RE = re.compile(
+    r"(?i)(SECRET|PASSWORD|PASSWD|TOKEN|DSN|CREDENTIAL|CANARY|SENTINEL|PRIVATE|KEY)"
+)
+_CANARY_SENTINEL_RE = re.compile(
+    r"(?i)\b[A-Za-z0-9_.-]*(?:canary|sentinel)[A-Za-z0-9_.-]*\b"
+)
+
+
+def _extract_env_secrets(env: Mapping[str, str] | None) -> list[str]:
+    source = os.environ if env is None else env
+    candidates: set[str] = set()
+    for name, val in source.items():
+        if not isinstance(name, str) or not isinstance(val, str):
+            continue
+        if not _SENSITIVE_ENV_NAME_RE.search(name):
+            continue
+        if len(val) >= 4 and val.strip():
+            candidates.add(val)
+            candidates.add(val.replace("'", "''"))
+        for uri_m in _URI_USERINFO_EXTRACT_RE.finditer(val):
+            userinfo = uri_m.group(1)
+            if ":" in userinfo:
+                _, pwd = userinfo.split(":", 1)
+                for candidate_pwd in (pwd, urllib.parse.unquote(pwd)):
+                    if len(candidate_pwd) >= 4 and candidate_pwd.strip():
+                        candidates.add(candidate_pwd)
+                        candidates.add(candidate_pwd.replace("'", "''"))
+            elif len(userinfo) >= 4 and userinfo.strip():
+                candidates.add(userinfo)
+                candidates.add(userinfo.replace("'", "''"))
+        for kv_m in _DSN_KV_EXTRACT_RE.finditer(val):
+            kv_val = kv_m.group(1) or kv_m.group(2) or kv_m.group(3) or ""
+            if len(kv_val) >= 4 and kv_val.strip():
+                candidates.add(kv_val)
+                candidates.add(kv_val.replace("'", "''"))
+    return sorted(candidates, key=len, reverse=True)
+
+
+def scrub_error_detail(
+    exc_or_msg: BaseException | str,
+    *,
+    token: str | None = None,
+    sql: str | None = None,
+    params: Any = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Format *exc_or_msg* for single-line server logs with secrets, DSNs, JWTs, SQL literals, and params scrubbed."""
+    if isinstance(exc_or_msg, BaseException):
+        detail = f"{type(exc_or_msg).__name__}: {exc_or_msg}"
+    else:
+        detail = str(exc_or_msg)
+
+    if isinstance(token, str) and token:
+        detail = detail.replace(token, "[REDACTED]")
+        stripped_tok = token.strip()
+        if stripped_tok and stripped_tok != token:
+            detail = detail.replace(stripped_tok, "[REDACTED]")
+
+    for env_secret in _extract_env_secrets(env):
+        if env_secret in detail:
+            detail = detail.replace(env_secret, "[REDACTED]")
+
+    detail = _JWT_RE.sub("[REDACTED_JWT]", detail)
+    detail = _BEARER_RE.sub("Bearer [REDACTED]", detail)
+    detail = _URI_USERINFO_RE.sub("://[REDACTED]@", detail)
+    detail = _DSN_KV_EQ_RE.sub(r"\1=[REDACTED]", detail)
+    detail = _SECRET_COLON_KV_RE.sub(r"\1: [REDACTED]", detail)
+
+    if isinstance(sql, str) and sql:
+        sql_literals: list[str] = []
+        for m in _SQL_SINGLE_QUOTED_RE.finditer(sql):
+            raw_inner = m.group(1)
+            full_quoted = m.group(0)
+            if full_quoted != "''":
+                sql_literals.append(full_quoted)
+            unescaped = raw_inner.replace("''", "'")
+            if len(raw_inner) >= 3:
+                sql_literals.append(raw_inner)
+            if len(unescaped) >= 3:
+                sql_literals.append(unescaped)
+        if sql in detail:
+            detail = detail.replace(sql, "[REDACTED]")
+        stripped_sql = sql.strip()
+        if stripped_sql and stripped_sql in detail:
+            detail = detail.replace(stripped_sql, "[REDACTED]")
+        for lit in sorted(set(sql_literals), key=len, reverse=True):
+            if lit in detail:
+                detail = detail.replace(lit, "[REDACTED]")
+
+    if isinstance(params, (list, tuple)):
+        param_items: list[Any] = list(params)
+    elif isinstance(params, Mapping):
+        param_items = list(params.values())
+    else:
+        param_items = []
+
+    if param_items:
+        str_param_secrets: list[str] = []
+        boundary_param_secrets: list[str] = []
+        for p in param_items:
+            if p is None or isinstance(p, bool):
+                continue
+            if isinstance(p, str):
+                if not p:
+                    continue
+                str_param_secrets.append(f"'{p}'")
+                escaped_p = p.replace("'", "''")
+                str_param_secrets.append(f"'{escaped_p}'")
+                if len(p) >= 3:
+                    str_param_secrets.append(p)
+                    if escaped_p != p:
+                        str_param_secrets.append(escaped_p)
+                else:
+                    boundary_param_secrets.append(p)
+            else:
+                p_str = str(p)
+                if p_str:
+                    str_param_secrets.append(f"'{p_str}'")
+                    boundary_param_secrets.append(p_str)
+
+        for s in sorted(set(str_param_secrets), key=len, reverse=True):
+            if s in detail:
+                detail = detail.replace(s, "[REDACTED]")
+        for b in sorted(set(boundary_param_secrets), key=len, reverse=True):
+            detail = re.sub(
+                rf"(?<![A-Za-z0-9_]){re.escape(b)}(?![A-Za-z0-9_])",
+                "[REDACTED]",
+                detail,
+            )
+
+    detail = _CANARY_SENTINEL_RE.sub("[REDACTED]", detail)
+    detail = detail.replace("\r", "\\r").replace("\n", "\\n")
+    return detail

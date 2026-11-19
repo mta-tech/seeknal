@@ -45,6 +45,7 @@ from seeknal.serving.errors import (
     AuditUnavailableError,
     build_error_payload,
     get_error_spec,
+    scrub_error_detail,
 )
 from seeknal.serving.features import _extract_tables
 from seeknal.serving.grant_token import (
@@ -606,10 +607,11 @@ def create_app(
                     )
                 except (AuditWriteError, AuditUnavailableError) as exc:
                     logger.error(
-                        "engine=%s code=%s error=%s audit_id=%s",
+                        "engine=%s code=%s error=%s detail=%s audit_id=%s",
                         engine_kind or "-",
                         "audit_unavailable",
                         type(exc).__name__,
+                        scrub_error_detail(exc, token=token, sql=sql, params=params),
                         audit_id or "-",
                     )
                     _log_request(
@@ -644,18 +646,20 @@ def create_app(
                     _on_audit_write_failure()
                     if effective_audit_on_failure == "log":
                         logger.error(
-                            "Audit write failed (on_failure=log, route=%s, audit_id=%s, status=%d): %s",
+                            "Audit write failed (on_failure=log, route=%s, audit_id=%s, status=%d): %s detail=%s",
                             route,
                             audit_id or "-",
                             status,
                             type(exc).__name__,
+                            scrub_error_detail(exc, token=token, sql=sql, params=params),
                         )
                     else:
                         logger.error(
-                            "engine=%s code=%s error=%s audit_id=%s",
+                            "engine=%s code=%s error=%s detail=%s audit_id=%s",
                             engine_kind or "-",
                             "audit_unavailable",
                             type(exc).__name__,
+                            scrub_error_detail(exc, token=token, sql=sql, params=params),
                             audit_id or "-",
                         )
                         _log_request(
@@ -971,16 +975,25 @@ def create_app(
             if metrics is not None:
                 metrics.record_grant_rejected(exc)
             code = getattr(exc, "code", None) or "grant_invalid"
+            spec = get_error_spec(code)
             audit_id = getattr(exc, "audit_id", None) or v_jti
             subject = getattr(exc, "subject", None) or v_sub
             custom_msg = (
                 _safe_grant_invalid_message(exc)
-                if code == "grant_invalid"
+                if spec.code == "grant_invalid"
                 else None
+            )
+            logger.error(
+                "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                "-",
+                spec.code,
+                type(exc).__name__,
+                scrub_error_detail(exc, token=token, sql=sql, params=params),
+                audit_id or "-",
             )
             return _finish(
                 _error_response(
-                    code,
+                    spec.code,
                     message=custom_msg,
                     audit_id=audit_id,
                     token=token,
@@ -989,7 +1002,7 @@ def create_app(
                 ),
                 route=route,
                 status=401,
-                code=code,
+                code=spec.code,
                 elapsed_ms=elapsed,
                 audit_id=audit_id,
                 subject=subject,
@@ -1006,6 +1019,14 @@ def create_app(
             spec = get_error_spec(code)
             audit_id = getattr(exc, "audit_id", None) or v_jti
             subject = getattr(exc, "subject", None) or v_sub
+            logger.error(
+                "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                "-",
+                spec.code,
+                type(exc).__name__,
+                scrub_error_detail(exc, token=token, sql=sql, params=params),
+                audit_id or "-",
+            )
             return _finish(
                 _error_response(
                     spec.code,
@@ -1033,6 +1054,14 @@ def create_app(
             spec = get_error_spec(code)
             audit_id = getattr(exc, "audit_id", None) or v_jti
             subject = getattr(exc, "subject", None) or v_sub
+            logger.error(
+                "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                "-",
+                spec.code,
+                type(exc).__name__,
+                scrub_error_detail(exc, token=token, sql=sql, params=params),
+                audit_id or "-",
+            )
             return _finish(
                 _error_response(
                     spec.code,
@@ -1059,10 +1088,11 @@ def create_app(
         subject = getattr(exc, "subject", None) or v_sub
         if _is_audit_unavailable(exc):
             logger.error(
-                "engine=%s code=%s error=%s audit_id=%s",
+                "engine=%s code=%s error=%s detail=%s audit_id=%s",
                 "-",
                 "audit_unavailable",
                 type(exc).__name__,
+                scrub_error_detail(exc, token=token, sql=sql, params=params),
                 audit_id or "-",
             )
             return _finish(
@@ -1088,10 +1118,11 @@ def create_app(
             )
 
         logger.error(
-            "engine=%s code=%s error=%s audit_id=%s",
+            "engine=%s code=%s error=%s detail=%s audit_id=%s",
             "-",
             "internal_error",
             type(exc).__name__,
+            scrub_error_detail(exc, token=token, sql=sql, params=params),
             audit_id or "-",
         )
         return _finish(
@@ -1390,19 +1421,21 @@ def create_app(
                 _on_audit_write_failure()
                 if effective_audit_on_failure == "log":
                     logger.error(
-                        "Audit write failed (on_failure=log, route=/v1/query, audit_id=%s, status=200): %s",
-                        prepared.audit_id,
+                        "Audit write failed (on_failure=log, route=/v1/query, audit_id=%s, status=200): %s detail=%s",
+                        prepared.audit_id or "-",
                         type(exc).__name__,
+                        scrub_error_detail(exc, token=token, sql=sql, params=params),
                     )
                     callable_audit_done = True
                 else:
                     elapsed_audit_err = (time.perf_counter() - req_start) * 1000.0
                     logger.error(
-                        "engine=%s code=%s error=%s audit_id=%s",
-                        prepared.engine_kind,
+                        "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                        prepared.engine_kind or "-",
                         "audit_unavailable",
                         type(exc).__name__,
-                        prepared.audit_id,
+                        scrub_error_detail(exc, token=token, sql=sql, params=params),
+                        prepared.audit_id or "-",
                     )
                     _log_request(
                         audit_id=prepared.audit_id,
@@ -1539,11 +1572,12 @@ def create_app(
 
         except EngineTimeout as exc:
             logger.error(
-                "engine=%s code=%s error=%s audit_id=%s",
-                prepared.engine_kind,
+                "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                prepared.engine_kind or "-",
                 "engine_timeout",
                 type(exc).__name__,
-                prepared.audit_id,
+                scrub_error_detail(exc, token=token, sql=sql, params=params),
+                prepared.audit_id or "-",
             )
             return _finish(
                 _error_response(
@@ -1574,11 +1608,12 @@ def create_app(
             )
         except EnginePoolExhausted as exc:
             logger.error(
-                "engine=%s code=%s error=%s audit_id=%s",
-                prepared.engine_kind,
+                "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                prepared.engine_kind or "-",
                 "engine_unavailable",
                 type(exc).__name__,
-                prepared.audit_id,
+                scrub_error_detail(exc, token=token, sql=sql, params=params),
+                prepared.audit_id or "-",
             )
             return _finish(
                 _error_response(
@@ -1615,11 +1650,12 @@ def create_app(
                 else None
             )
             logger.error(
-                "engine=%s code=%s error=%s audit_id=%s",
-                prepared.engine_kind,
+                "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                prepared.engine_kind or "-",
                 "engine_unavailable",
                 type(exc).__name__,
-                prepared.audit_id,
+                scrub_error_detail(exc, token=token, sql=sql, params=params),
+                prepared.audit_id or "-",
             )
             return _finish(
                 _error_response(
@@ -1651,7 +1687,15 @@ def create_app(
                 binding=prepared.binding,
                 skip_callable_audit=callable_audit_done,
             )
-        except EngineCancelled:
+        except EngineCancelled as exc:
+            logger.error(
+                "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                prepared.engine_kind or "-",
+                "query_cancelled",
+                type(exc).__name__,
+                scrub_error_detail(exc, token=token, sql=sql, params=params),
+                prepared.audit_id or "-",
+            )
             return _finish(
                 _error_response(
                     "query_cancelled",
@@ -1687,11 +1731,12 @@ def create_app(
                 else "Engine query execution failed"
             )
             logger.error(
-                "engine=%s code=%s error=%s audit_id=%s",
-                prepared.engine_kind,
+                "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                prepared.engine_kind or "-",
                 "engine_unavailable",
                 type(exc).__name__,
-                prepared.audit_id,
+                scrub_error_detail(exc, token=token, sql=sql, params=params),
+                prepared.audit_id or "-",
             )
             return _finish(
                 _error_response(
@@ -1726,11 +1771,12 @@ def create_app(
         except Exception as exc:
             if _is_audit_unavailable(exc):
                 logger.error(
-                    "engine=%s code=%s error=%s audit_id=%s",
-                    prepared.engine_kind,
+                    "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                    prepared.engine_kind or "-",
                     "audit_unavailable",
                     type(exc).__name__,
-                    prepared.audit_id,
+                    scrub_error_detail(exc, token=token, sql=sql, params=params),
+                    prepared.audit_id or "-",
                 )
                 return _finish(
                     _error_response(
@@ -1761,11 +1807,12 @@ def create_app(
                 )
 
             logger.error(
-                "engine=%s code=%s error=%s audit_id=%s",
-                prepared.engine_kind,
+                "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                prepared.engine_kind or "-",
                 "internal_error",
                 type(exc).__name__,
-                prepared.audit_id,
+                scrub_error_detail(exc, token=token, sql=sql, params=params),
+                prepared.audit_id or "-",
             )
             return _finish(
                 _error_response(
@@ -1978,13 +2025,22 @@ def create_app(
             if metrics is not None:
                 metrics.record_grant_rejected(exc)
             code = getattr(exc, "code", None) or "grant_invalid"
+            spec = get_error_spec(code)
             audit_id = getattr(exc, "audit_id", None)
             subject = getattr(exc, "subject", None)
+            logger.error(
+                "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                "-",
+                spec.code,
+                type(exc).__name__,
+                scrub_error_detail(exc, token=token),
+                audit_id or "-",
+            )
             return _finish(
-                _error_response(code, audit_id=audit_id, token=token),
+                _error_response(spec.code, audit_id=audit_id, token=token),
                 route="/v1/cancel",
                 status=401,
-                code=code,
+                code=spec.code,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                 audit_id=audit_id,
                 subject=subject,
