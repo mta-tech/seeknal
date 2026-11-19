@@ -6,7 +6,7 @@ import os
 import re
 import threading
 import urllib.parse
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from types import MappingProxyType
@@ -387,6 +387,15 @@ def _add_quote_escaped_forms(secret: str, candidates: set[str]) -> None:
 def _expand_secret_value(val: str, candidates: set[str]) -> None:
     _add_quote_escaped_forms(val, candidates)
     val = val[:_MAX_RAW_SCRUB_INPUT_CHARS]
+    if "://" in val:
+        after_scheme = val.split("://", 1)[1]
+        if "@" in after_scheme:
+            greedy_userinfo = after_scheme.rsplit("@", 1)[0]
+            _add_quote_escaped_forms(greedy_userinfo, candidates)
+            if ":" in greedy_userinfo:
+                _, pwd = greedy_userinfo.split(":", 1)
+                for candidate_pwd in (pwd, urllib.parse.unquote(pwd)):
+                    _add_quote_escaped_forms(candidate_pwd, candidates)
     for uri_m in _URI_USERINFO_EXTRACT_RE.finditer(val):
         userinfo = uri_m.group(1)
         if ":" in userinfo:
@@ -436,6 +445,21 @@ def _extract_env_secrets(
     return sorted(candidates, key=len, reverse=True)
 
 
+def _replace_known_secrets(detail: str, secrets: Sequence[str]) -> str:
+    for env_secret in secrets:
+        if env_secret not in detail:
+            continue
+        if env_secret.isalpha() and len(env_secret) <= 6:
+            detail = re.sub(
+                rf"(?<![A-Za-z0-9]){re.escape(env_secret)}(?![A-Za-z0-9])",
+                "[REDACTED]",
+                detail,
+            )
+        else:
+            detail = detail.replace(env_secret, "[REDACTED]")
+    return detail
+
+
 def scrub_error_detail(
     exc_or_msg: BaseException | str,
     *,
@@ -459,6 +483,9 @@ def scrub_error_detail(
 
     detail = detail[:_MAX_RAW_SCRUB_INPUT_CHARS]
 
+    env_secrets = _extract_env_secrets(env, extra_secrets=extra_secrets)
+    detail = _replace_known_secrets(detail, env_secrets)
+
     detail = _JWT_RE.sub("[REDACTED_JWT]", detail)
     detail = _BEARER_RE.sub("Bearer [REDACTED]", detail)
     detail = _URI_USERINFO_RE.sub("://[REDACTED]@", detail)
@@ -466,17 +493,7 @@ def scrub_error_detail(
     detail = _SECRET_COLON_KV_RE.sub(r"\1\2: [REDACTED]", detail)
     detail = _DUCKDB_SECRET_RE.sub("SECRET '[REDACTED]'", detail)
 
-    for env_secret in _extract_env_secrets(env, extra_secrets=extra_secrets):
-        if env_secret not in detail:
-            continue
-        if env_secret.isalpha() and len(env_secret) <= 6:
-            detail = re.sub(
-                rf"(?<![A-Za-z0-9]){re.escape(env_secret)}(?![A-Za-z0-9])",
-                "[REDACTED]",
-                detail,
-            )
-        else:
-            detail = detail.replace(env_secret, "[REDACTED]")
+    detail = _replace_known_secrets(detail, env_secrets)
 
     if isinstance(sql, str) and sql:
         sql_literals: list[str] = []

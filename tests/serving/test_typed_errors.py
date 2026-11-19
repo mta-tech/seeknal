@@ -1771,5 +1771,52 @@ def test_n1_scrubber_linear_time_no_catastrophic_backtracking_and_8kib_cap():
     assert elapsed_uri < 0.05, f"24 KB '://' took {elapsed_uri:.4f}s"
 
 
+def test_n3_known_secrets_replaced_before_and_after_generic_regexes():
+    clear_registered_config_secrets()
+    try:
+        # 1. Space-containing secret in bare KV assignment: password=abc def1234
+        register_config_secrets("abc def1234")
+        out_space = scrub_error_detail("password=abc def1234", env={})
+        assert out_space == "password=[REDACTED]"
+        assert "def1234" not in out_space
+        assert "abc" not in out_space
+
+        # 2a. URI userinfo containing '@' with registered 'u:p@ss/w0rd'
+        clear_registered_config_secrets()
+        register_config_secrets("u:p@ss/w0rd")
+        out_ui = scrub_error_detail("postgresql://u:p@ss/w0rd@host/db", env={})
+        assert out_ui == "postgresql://[REDACTED]@host/db"
+        assert "ss/w0rd" not in out_ui
+        assert "p@ss" not in out_ui
+
+        # 2b. URI userinfo containing '@' with registered password 'p@ss/w0rd'
+        clear_registered_config_secrets()
+        register_config_secrets("p@ss/w0rd")
+        out_pw = scrub_error_detail("postgresql://u:p@ss/w0rd@host/db", env={})
+        assert out_pw == "postgresql://[REDACTED]@host/db"
+        assert "ss/w0rd" not in out_pw
+
+        # 2c. URI userinfo containing '@' extracted from a DSN env var
+        clear_registered_config_secrets()
+        out_dsn = scrub_error_detail(
+            "connect failed postgresql://other_u:p@ss/w0rd@host/db and raw p@ss/w0rd",
+            env={"PRIMARY_DSN": "postgresql://u:p@ss/w0rd@cfg-host/db"},
+        )
+        assert out_dsn == "connect failed postgresql://[REDACTED]@host/db and raw [REDACTED]"
+        assert "ss/w0rd" not in out_dsn
+
+        # 3. Short alphabetic password ('pass') never corrupts 'password=' prefix
+        clear_registered_config_secrets()
+        register_config_secrets("pass")
+        out_short = scrub_error_detail(
+            "auth failed password=other_secret_99 (hint: pass)",
+            env={},
+        )
+        assert out_short == "auth failed password=[REDACTED] (hint: [REDACTED])"
+    finally:
+        clear_registered_config_secrets()
+
+
+
 
 
