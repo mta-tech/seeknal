@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import hashlib
+import json
 import time
 from decimal import Decimal
 
 import duckdb
+import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 from starlette.testclient import TestClient
 
-from seeknal.serving import Placement, ServingPipeline, sign_grant_token
+from seeknal.serving import Placement, ServingPipeline, sign_cancel_token, sign_grant_token
 from seeknal.serving.adapters import (
     DuckDBAdapter,
     EngineError,
@@ -771,3 +774,238 @@ def test_c_n1_refuse_mode_never_weakens_record_when_sink_fails_only_full_records
         con.close()
 
 
+@pytest.mark.parametrize("route", ["/v1/query", "/v1/explain", "/v1/cancel"])
+@pytest.mark.parametrize("chunk_size", [1024, 4096])
+def test_chunked_20mb_body_rejected_streaming_on_all_post_routes(
+    ec_key_pair, route: str, chunk_size: int
+):
+    """N2: Chunked 20 MB stream without Content-Length stops reading at max_body_bytes."""
+    _, pub = ec_key_pair
+    max_cap = 1024
+    total_stream_bytes = 20 * 1024 * 1024  # 20 MB
+
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "users": {"keys": ["id"], "row_count": 1, "serve": {"duck": "users"}}
+            },
+            "cubes": {},
+        }
+    )
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas={"users": ["id"]},
+        public_keys={"key-1": pub},
+    )
+    audited: list[dict] = []
+    con = duckdb.connect()
+    try:
+        app = create_app(
+            pipeline,
+            {"duck": DuckDBAdapter(lambda: con.cursor())},
+            max_body_bytes=max_cap,
+            audit_sink=audited.append,
+        )
+
+        bytes_yielded = 0
+        chunk_payload = b"x" * chunk_size
+        num_chunks = total_stream_bytes // chunk_size
+
+        async def _counting_20mb_stream():
+            nonlocal bytes_yielded
+            for _ in range(num_chunks):
+                bytes_yielded += len(chunk_payload)
+                yield chunk_payload
+
+        async def _run() -> httpx.Response:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as async_client:
+                return await async_client.post(
+                    route,
+                    content=_counting_20mb_stream(),
+                )
+
+        resp = asyncio.run(_run())
+
+        assert "content-length" not in resp.request.headers
+        assert resp.status_code == 413
+        payload = resp.json()
+        assert payload["code"] == "payload_too_large"
+        assert payload["error"] == "payload_too_large"
+        assert 0 < bytes_yielded <= max_cap + chunk_size
+        assert bytes_yielded < total_stream_bytes
+        assert len(audited) == 1
+        assert audited[0]["route"] == route
+        assert audited[0]["status"] == 413
+        assert audited[0]["code"] == "payload_too_large"
+    finally:
+        con.close()
+
+
+def test_chunked_body_within_cap_and_midstream_disconnect(ec_key_pair):
+    """N2: Chunked bodies <= max_body_bytes succeed and mid-stream ClientDisconnect returns 499."""
+    priv, pub = ec_key_pair
+    max_cap = 1024
+    con = duckdb.connect()
+    try:
+        con.execute("CREATE TABLE users (id INT, role VARCHAR)")
+        con.execute("INSERT INTO users VALUES (1, 'analyst')")
+        placement = Placement.from_dict(
+            {
+                "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+                "tables": {
+                    "users": {
+                        "keys": ["id"],
+                        "row_count": 1,
+                        "serve": {"duck": "users"},
+                    }
+                },
+                "cubes": {},
+            }
+        )
+        pipeline = ServingPipeline(
+            placement=placement,
+            schemas={"users": ["id", "role"]},
+            public_keys={"key-1": pub},
+        )
+        app = create_app(
+            pipeline,
+            {"duck": DuckDBAdapter(lambda: con.cursor())},
+            max_body_bytes=max_cap,
+        )
+
+        sql = "SELECT id FROM users"
+        tables_claim = {
+            "users": {"columns": ["id"], "masks": {}, "actions": ["select"]}
+        }
+
+        async def _chunked_bytes(raw: bytes, step: int = 17):
+            for idx in range(0, len(raw), step):
+                yield raw[idx : idx + step]
+
+        async def _run_valid_chunked() -> None:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as async_client:
+                # Exact-boundary 1024-byte chunked body on /v1/query
+                base_body = json.dumps({"sql": sql}).encode("utf-8")
+                padded_body = base_body + (b" " * (max_cap - len(base_body)))
+                assert len(padded_body) == max_cap
+                tok_q = sign_grant_token(
+                    {
+                        "jti": "jti-chunk-q",
+                        "sub": "analyst@example.com",
+                        "ws": "ws-test",
+                        "iat": time.time(),
+                        "exp": time.time() + 60,
+                        "aud": "seeknal-serving",
+                        "iss": "atlas-catalog",
+                        "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+                        "tables": tables_claim,
+                        "max_rows": 100,
+                    },
+                    priv,
+                    kid="key-1",
+                )
+                rq = await async_client.post(
+                    "/v1/query",
+                    headers={"Authorization": f"Bearer {tok_q}"},
+                    content=_chunked_bytes(padded_body, step=64),
+                )
+                assert "content-length" not in rq.request.headers
+                assert rq.status_code == 200
+                assert rq.json()["rows"] == [[1]]
+
+                tok_e = sign_grant_token(
+                    {
+                        "jti": "jti-chunk-e",
+                        "sub": "analyst@example.com",
+                        "ws": "ws-test",
+                        "iat": time.time(),
+                        "exp": time.time() + 60,
+                        "aud": "seeknal-serving",
+                        "iss": "atlas-catalog",
+                        "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+                        "tables": tables_claim,
+                        "max_rows": 100,
+                    },
+                    priv,
+                    kid="key-1",
+                )
+                rexp = await async_client.post(
+                    "/v1/explain",
+                    headers={"Authorization": f"Bearer {tok_e}"},
+                    content=_chunked_bytes(base_body, step=7),
+                )
+                assert "content-length" not in rexp.request.headers
+                assert rexp.status_code == 200
+
+                now_ts = time.time()
+                tok_c = sign_cancel_token(
+                    {
+                        "typ": "cancel",
+                        "jti": "jti-chunk-c",
+                        "sub": "analyst@example.com",
+                        "iat": now_ts,
+                        "exp": now_ts + 60,
+                        "aud": "seeknal-serving",
+                        "iss": "atlas-catalog",
+                    },
+                    priv,
+                    kid="key-1",
+                )
+                rc = await async_client.post(
+                    "/v1/cancel",
+                    headers={"Authorization": f"Bearer {tok_c}"},
+                    content=_chunked_bytes(b" { } ", step=2),
+                )
+                assert "content-length" not in rc.request.headers
+                assert rc.status_code == 404
+                assert rc.json()["code"] == "not_found"
+
+        asyncio.run(_run_valid_chunked())
+
+        async def _send_midstream_disconnect(route: str) -> tuple[int, dict]:
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": route,
+                "raw_path": route.encode("ascii"),
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 50000),
+                "server": ("test", 80),
+            }
+            sent_first = False
+            status_holder: list[int] = []
+            body_parts: list[bytes] = []
+
+            async def _receive():
+                nonlocal sent_first
+                if not sent_first:
+                    sent_first = True
+                    return {"type": "http.request", "body": b'{"sql":', "more_body": True}
+                return {"type": "http.disconnect"}
+
+            async def _send(msg):
+                if msg["type"] == "http.response.start":
+                    status_holder.append(msg["status"])
+                elif msg["type"] == "http.response.body":
+                    body_parts.append(msg.get("body", b""))
+
+            await app(scope, _receive, _send)
+            return status_holder[0], json.loads(b"".join(body_parts).decode("utf-8"))
+
+        for post_route in ("/v1/query", "/v1/explain", "/v1/cancel"):
+            st, body = asyncio.run(_send_midstream_disconnect(post_route))
+            assert st == 499
+            assert body["code"] == "query_cancelled"
+    finally:
+        con.close()

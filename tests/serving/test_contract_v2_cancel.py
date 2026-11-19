@@ -516,6 +516,9 @@ def test_disconnect_cancel_calls_cancel_callable_and_finishes():
             self.headers = {"authorization": f"Bearer {token}"}
             self.checks = 0
 
+        async def stream(self):
+            yield f'{{"sql": "{sql}"}}'.encode("utf-8")
+
         async def body(self) -> bytes:
             return f'{{"sql": "{sql}"}}'.encode("utf-8")
 
@@ -627,10 +630,11 @@ def test_cancel_oversized_body_returns_413_payload_too_large_and_audits():
             "content-length": "10",
         }
 
-        async def body(self) -> bytes:
+        async def stream(self):
             nonlocal body_read_called
             body_read_called = True
-            return b"x" * 100
+            for _ in range(10):
+                yield b"x" * 20
 
     cancel_route = [
         r for r in app.routes if getattr(r, "path", None) == "/v1/cancel"

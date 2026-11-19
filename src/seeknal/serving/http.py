@@ -499,6 +499,18 @@ def _error_response(
     return JSONResponse(body, status_code=resolved_status)
 
 
+async def _read_body_bounded(request: Request, max_bytes: int) -> bytes | None:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            return None
+        if chunk:
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _log_request(
     *,
     audit_id: str | None = None,
@@ -996,7 +1008,7 @@ def create_app(
                 pass
 
         try:
-            raw_body = await request.body()
+            raw_body = await _read_body_bounded(request, max_body_bytes)
         except ClientDisconnect:
             return await _finish(
                 _error_response("query_cancelled"),
@@ -1007,7 +1019,7 @@ def create_app(
                 log_request_line=False,
             )
 
-        if len(raw_body) > max_body_bytes:
+        if raw_body is None:
             return await _finish(
                 _error_response("payload_too_large"),
                 route=route,
@@ -2225,7 +2237,7 @@ def create_app(
                 pass
 
         try:
-            raw_body = await request.body()
+            raw_body = await _read_body_bounded(request, max_body_bytes)
         except ClientDisconnect:
             return await _finish(
                 _error_response("query_cancelled"),
@@ -2236,7 +2248,7 @@ def create_app(
                 log_request_line=False,
             )
 
-        if len(raw_body) > max_body_bytes:
+        if raw_body is None:
             return await _finish(
                 _error_response("payload_too_large"),
                 route="/v1/cancel",
