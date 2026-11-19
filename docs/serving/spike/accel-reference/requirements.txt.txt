@@ -1,0 +1,1 @@
+duckdb==2.0.0  # MUST equal the DuckDB version inside the Seeknal Serving image because the file format has to match

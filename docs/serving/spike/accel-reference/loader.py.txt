@@ -1,0 +1,405 @@
+"""Load engine that caches Lakebase mart into DuckDB."""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+from pathlib import Path
+import sys
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional, Sequence, Union
+
+from accel.settings import LIBPQ_ENV_VARS, LOADER_VERSION, get_keep
+from accel.tables import TableSpec, validate_duckdb_type, validate_identifier
+
+SCRUB_PATTERNS = [
+    re.compile(r"(host|user|port|dbname|password)\s*=\s*[^\s,;]+", re.IGNORECASE),
+    re.compile(r"://([^:@\s]+):([^@\s]+)@", re.IGNORECASE),
+]
+
+IP_V4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+IP_V6_RE = re.compile(
+    r"\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b|"
+    r"\b(?:[0-9a-fA-F]{1,4}:){1,7}:|"
+    r"::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}\b"
+)
+
+LOADER_FILE_PATTERN = re.compile(r"^mart-\d{8}T\d{6}Z(?:-[0-9a-fA-F]{8})?\.duckdb$")
+
+
+class AccelerationError(Exception):
+    """Base error for acceleration operations."""
+
+
+class BadInputError(AccelerationError):
+    """Raised on invalid inputs or configuration (exit 2)."""
+
+
+class LoadError(AccelerationError):
+    """Raised on load or execution failure (exit 3)."""
+
+
+class RowCountMismatchError(LoadError):
+    """Raised when source and target table row counts do not match."""
+
+
+def scrub_text(text: str) -> str:
+    """Scrub database connection secrets, libpq settings and IP addresses from exception text."""
+    if not isinstance(text, str):
+        text = str(text)
+    for var in LIBPQ_ENV_VARS:
+        val = os.environ.get(var)
+        if val and len(val) > 1 and val in text:
+            text = text.replace(val, "[REDACTED]")
+    for pat in SCRUB_PATTERNS:
+        text = pat.sub(r"\1=[REDACTED]", text)
+    text = IP_V4_RE.sub("[REDACTED_IP]", text)
+    text = IP_V6_RE.sub("[REDACTED_IP]", text)
+    return text
+
+
+def log_event(step: str, level: str = "INFO", **kwargs: Any) -> None:
+    """Emit a single-line JSON log entry to stderr with UTC timestamp, scrubbing secrets from exception text."""
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    safe_data: dict[str, Any] = {"step": step, "level": level, "timestamp": now_utc}
+
+    for k, v in kwargs.items():
+        if any(secret_term in k.lower() for secret_term in ("pass", "secret", "token", "cred")):
+            continue
+        # Scrub only exception / error message text, NEVER loader's own fields such as file names
+        if k in ("error", "message", "detail", "error_message", "err", "exception"):
+            safe_data[k] = scrub_text(str(v))
+        else:
+            safe_data[k] = str(v)
+
+    line = json.dumps(safe_data)
+    sys.stderr.write(line + "\n")
+    sys.stderr.flush()
+
+
+def plan_sql(specs: Sequence[TableSpec]) -> list[str]:
+    """Return deterministic DuckDB statements for caching the mart, validating types."""
+    statements: list[str] = ["CREATE SCHEMA rpt"]
+
+    for spec in specs:
+        validate_identifier(spec.view)
+
+        col_parts: list[str] = []
+        for col in spec.columns:
+            validate_identifier(col.name)
+            validate_duckdb_type(col.duckdb_type, col.name)
+            if col.is_nulled:
+                col_parts.append(f"CAST(NULL AS {col.duckdb_type}) AS {col.name}")
+            else:
+                col_parts.append(col.name)
+
+        cols_clause = ", ".join(col_parts)
+        stmt = f"CREATE TABLE rpt.{spec.view} AS SELECT {cols_clause} FROM pg.rpt_base.{spec.view}"
+        statements.append(stmt)
+
+    return statements
+
+
+def _prune_older_files(cache_dir: Path, keep: int) -> int:
+    """Delete older mart-*.duckdb files beyond keep matching loader pattern, never the linked one."""
+    symlink_path = cache_dir / "mart.duckdb"
+    linked_target: Optional[Path] = None
+    if symlink_path.is_symlink():
+        try:
+            rel_or_abs = os.readlink(symlink_path)
+            linked_target = (cache_dir / rel_or_abs).resolve()
+        except OSError:
+            pass
+
+    # Before applying keep, delete every file matching loader pattern that is not the link target
+    # AND has a sibling <name>.wal (from a killed/uncheckpointed run), together with that .wal
+    candidates = [
+        f for f in cache_dir.glob("mart-*.duckdb")
+        if f.is_file() and not f.is_symlink() and LOADER_FILE_PATTERN.fullmatch(f.name)
+    ]
+
+    for f in list(candidates):
+        if linked_target is not None and f.resolve() == linked_target:
+            continue
+        wal_file = f.with_name(f"{f.name}.wal")
+        if wal_file.exists():
+            try:
+                wal_file.unlink()
+            except OSError:
+                pass
+            try:
+                f.unlink()
+            except OSError:
+                pass
+            candidates.remove(f)
+
+    # Delete orphan mart-*.duckdb.wal files ONLY if their base name matches loader pattern
+    for wal in cache_dir.glob("mart-*.duckdb.wal"):
+        base_db_name = wal.name[:-4]
+        if LOADER_FILE_PATTERN.fullmatch(base_db_name):
+            base_db = cache_dir / base_db_name
+            if not base_db.exists():
+                try:
+                    wal.unlink()
+                except OSError:
+                    pass
+
+    # Sort newest first by name
+    candidates.sort(key=lambda p: p.name, reverse=True)
+
+    pruned = 0
+    cutoff = max(0, keep)
+    to_delete = candidates[cutoff:]
+    for f in to_delete:
+        try:
+            if linked_target is not None and f.resolve() == linked_target:
+                continue
+            wal_file = f.with_name(f"{f.name}.wal")
+            if wal_file.exists():
+                try:
+                    wal_file.unlink()
+                except OSError:
+                    pass
+            f.unlink()
+            pruned += 1
+        except OSError:
+            pass
+
+    return pruned
+
+
+def run_load(
+    specs: Sequence[TableSpec],
+    source: Any,
+    target_factory: Callable[[Path], Any],
+    cache_dir: Union[str, Path],
+    clock: Any,
+    keep: int = 3,
+    as_of_date: Optional[str] = None,
+    duckdb_version: Optional[str] = None,
+) -> Path:
+    """Run the load-verify-swap sequence to produce a new cached DuckDB file."""
+    cache_path = Path(cache_dir).resolve()
+    cache_dir_existed = cache_path.exists()
+    cache_path.mkdir(parents=True, exist_ok=True)
+    if not cache_dir_existed:
+        try:
+            os.chmod(cache_path, 0o755)
+        except OSError:
+            pass
+
+    # Acquire exclusive non-blocking lock for the whole run
+    lock_file_path = cache_path / ".loader.lock"
+    lock_file = open(lock_file_path, "a")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError) as lock_exc:
+        lock_file.close()
+        log_event(
+            "lock_failed",
+            level="ERROR",
+            error_type=type(lock_exc).__name__,
+            message="Another loader process is currently running; lock held on .loader.lock",
+        )
+        raise LoadError(
+            "Another loader process is currently running; lock held on .loader.lock"
+        ) from lock_exc
+
+    created_file: Optional[Path] = None
+    target = None
+
+    try:
+        # Check pre-existing regular file or directory named mart.duckdb
+        symlink_path = cache_path / "mart.duckdb"
+        if symlink_path.exists() and not symlink_path.is_symlink():
+            raise LoadError(
+                f"Pre-existing regular file or directory at {symlink_path}; refusing load without modifying anything"
+            )
+
+        # Determine execution time in UTC
+        if callable(clock):
+            now = clock()
+        else:
+            now = clock
+
+        if isinstance(now, (int, float)):
+            now = datetime.fromtimestamp(now, tz=timezone.utc)
+        elif isinstance(now, datetime):
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
+            else:
+                now = now.astimezone(timezone.utc)
+        else:
+            now = datetime.now(timezone.utc)
+
+        timestamp_str = now.strftime("%Y%m%dT%H%M%SZ")
+        suffix = uuid.uuid4().hex[:8]
+        file_name = f"mart-{timestamp_str}-{suffix}.duckdb"
+        new_file_path = cache_path / file_name
+
+        if new_file_path.exists():
+            raise LoadError(f"Target file already exists: {new_file_path}")
+
+        date_str = as_of_date if as_of_date else now.strftime("%Y-%m-%d")
+
+        # R2-3: Record actual version from duckdb
+        effective_duckdb_version = duckdb_version
+        if not effective_duckdb_version:
+            try:
+                from accel.engines import get_installed_duckdb_version
+                effective_duckdb_version = get_installed_duckdb_version()
+            except ImportError:
+                effective_duckdb_version = "unknown"
+
+        log_event("load_start", file=file_name, target=str(new_file_path))
+
+        plan = plan_sql(specs)
+        log_event("plan_generated", statement_count=len(plan))
+
+        # R2-1: Set created_file immediately BEFORE calling target_factory
+        created_file = new_file_path
+        target = target_factory(new_file_path)
+
+        # Ensure file permissions are 0644
+        if new_file_path.exists():
+            try:
+                os.chmod(new_file_path, 0o644)
+            except OSError:
+                pass
+        log_event("target_initialized", path=str(new_file_path))
+
+        for stmt in plan:
+            target.execute(stmt)
+        log_event("plan_executed")
+
+        target.execute("CHECKPOINT")
+        log_event("checkpoint_executed")
+
+        # Verify row counts against source
+        row_counts: dict[str, int] = {}
+        for spec in specs:
+            target_count = target.get_row_count(spec.name)
+            try:
+                source_count = source.get_row_count(spec.source)
+            except Exception:
+                source_count = source.get_row_count(spec.view)
+
+            if target_count != source_count:
+                raise RowCountMismatchError(
+                    f"Row count mismatch for {spec.name}: source={source_count}, target={target_count}"
+                )
+            row_counts[spec.name] = target_count
+
+        log_event("row_counts_verified", tables=len(specs))
+
+        # Close target before symlink swap if supported
+        if hasattr(target, "close"):
+            try:
+                target.close()
+            except Exception:
+                pass
+            target = None
+
+        # Repoint symlink atomically via temp symlink (target is bare file name for relative mount)
+        tmp_symlink = cache_path / f".mart.duckdb.tmp.{uuid.uuid4().hex}"
+        try:
+            os.symlink(file_name, tmp_symlink)
+            os.replace(tmp_symlink, symlink_path)
+        finally:
+            if tmp_symlink.is_symlink() or tmp_symlink.exists():
+                try:
+                    tmp_symlink.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        # R2-2: Once link swap succeeded, target file is live and must not be unlinked on subsequent failure
+        created_file = None
+        log_event("symlink_updated", symlink="mart.duckdb", points_to=file_name)
+
+        # Write freshness.json only after the swap succeeded, without duplicate keys
+        freshness_payload = {
+            "file_name": file_name,
+            "tables": row_counts,
+            "as_of_date": date_str,
+            "loaded_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "loader_version": LOADER_VERSION,
+            "duckdb_version": effective_duckdb_version,
+        }
+        tmp_freshness = cache_path / f".freshness.json.tmp.{uuid.uuid4().hex}"
+        try:
+            with open(tmp_freshness, "w", encoding="utf-8") as f:
+                json.dump(freshness_payload, f, indent=2)
+            os.chmod(tmp_freshness, 0o644)
+            os.replace(tmp_freshness, cache_path / "freshness.json")
+            os.chmod(cache_path / "freshness.json", 0o644)
+        except Exception as fresh_exc:
+            log_event(
+                "freshness_write_failed_after_swap",
+                level="ERROR",
+                message=f"Symlink mart.duckdb updated to {file_name}, but freshness.json failed: {fresh_exc}",
+            )
+            raise LoadError(
+                f"Symlink mart.duckdb updated to {file_name}, but freshness.json failed: {fresh_exc}"
+            ) from fresh_exc
+        finally:
+            if tmp_freshness.exists():
+                try:
+                    tmp_freshness.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        log_event("freshness_written", path="freshness.json")
+
+        # Ensure final cache file mode is 0644
+        if new_file_path.exists():
+            try:
+                os.chmod(new_file_path, 0o644)
+            except OSError:
+                pass
+
+        # Prune older files under lock
+        pruned_count = _prune_older_files(cache_path, keep=keep)
+        log_event("old_files_pruned", pruned=pruned_count, keep=keep)
+
+        log_event("load_success", file=file_name)
+        return new_file_path
+
+    except Exception as exc:
+        if target is not None and hasattr(target, "close"):
+            try:
+                target.close()
+            except Exception:
+                pass
+
+        # R2-1: Only unlink file if created_file is still set (has not become live link)
+        if created_file is not None:
+            if created_file.exists():
+                try:
+                    created_file.unlink()
+                except OSError:
+                    pass
+            wal_file = created_file.with_name(f"{created_file.name}.wal")
+            if wal_file.exists():
+                try:
+                    wal_file.unlink()
+                except OSError:
+                    pass
+
+        log_event(
+            "load_failed",
+            level="ERROR",
+            error_type=type(exc).__name__,
+            message=scrub_text(str(exc)),
+        )
+        if isinstance(exc, AccelerationError):
+            raise
+        raise LoadError(f"Load failed: {scrub_text(str(exc))}") from exc
+
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_file.close()

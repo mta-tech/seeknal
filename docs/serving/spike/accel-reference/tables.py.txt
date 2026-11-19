@@ -1,0 +1,273 @@
+"""Table specifications and type mapping for DuckDB acceleration."""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Optional, Sequence, Union
+
+DEFAULT_LIVE_VIEWS: tuple[str, ...] = (
+    "r09_fs_ticket_to_radius_status",
+    "r11_ticket_by_departement",
+)
+
+IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+ALLOWED_DUCKDB_TYPE_RE = re.compile(
+    r"^(VARCHAR|INTEGER|BIGINT|BOOLEAN|DATE|TIMESTAMP|DOUBLE|DECIMAL\(\d+,\d+\))$"
+)
+DECIMAL_RE = re.compile(r"^(?:decimal|numeric)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$", re.IGNORECASE)
+VARCHAR_RE = re.compile(r"^(?:varchar|character\s+varying)(?:\(\s*\d+\s*\))?$", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ColumnSpec:
+    name: str
+    duckdb_type: str
+    is_nulled: bool
+
+    @property
+    def type(self) -> str:
+        return self.duckdb_type
+
+    @property
+    def nulled(self) -> bool:
+        return self.is_nulled
+
+    def __getitem__(self, item: str) -> Any:
+        return getattr(self, item)
+
+
+@dataclass(frozen=True)
+class TableSpec:
+    name: str
+    source: str
+    view: str
+    columns: tuple[ColumnSpec, ...]
+    keys: tuple[str, ...] = ()
+
+    @property
+    def logical_name(self) -> str:
+        return self.name
+
+    def __getitem__(self, item: str) -> Any:
+        return getattr(self, item)
+
+
+def validate_identifier(name: str) -> None:
+    """Validate identifier against ^[a-z][a-z0-9_]*$ with fullmatch and length <= 63."""
+    if not isinstance(name, str) or len(name) == 0 or len(name) > 63 or not IDENTIFIER_RE.fullmatch(name):
+        raise ValueError(
+            f"Invalid identifier: {name!r}; must match ^[a-z][a-z0-9_]*$, contain no whitespace/newlines, and be at most 63 chars"
+        )
+
+
+def validate_duckdb_type(duckdb_type: str, col_name: str) -> None:
+    """Validate that duckdb_type is in the allowed set."""
+    if not isinstance(duckdb_type, str) or not ALLOWED_DUCKDB_TYPE_RE.fullmatch(duckdb_type):
+        raise ValueError(f"Invalid DuckDB type {duckdb_type!r} for column {col_name!r}")
+
+
+def map_type(col_name: str, raw_type: str) -> str:
+    """Map SQL and Postgres column types to supported DuckDB types."""
+    if not isinstance(raw_type, str):
+        raise ValueError(f"Unknown type {raw_type!r} for column {col_name!r}")
+    t = raw_type.strip().lower()
+
+    if t in ("varchar", "text", "character varying") or VARCHAR_RE.fullmatch(t):
+        return "VARCHAR"
+    if t in ("integer", "int", "int4", "smallint", "int2"):
+        return "INTEGER"
+    if t in ("bigint", "int8"):
+        return "BIGINT"
+    if t in ("boolean", "bool"):
+        return "BOOLEAN"
+    if t == "date":
+        return "DATE"
+    if t in (
+        "timestamp",
+        "timestamp without time zone",
+        "timestamp with time zone",
+        "timestamptz",
+    ):
+        return "TIMESTAMP"
+    if t in ("double precision", "real", "float", "float8", "float4", "double"):
+        return "DOUBLE"
+
+    m = DECIMAL_RE.fullmatch(t)
+    if m:
+        p, s = m.group(1), m.group(2)
+        return f"DECIMAL({p},{s})"
+
+    raise ValueError(f"Unknown type {raw_type!r} for column {col_name!r}")
+
+
+def _load_json_data(data_or_path: Any) -> Any:
+    if isinstance(data_or_path, (str, Path)):
+        p = Path(data_or_path)
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return data_or_path
+
+
+def _normalize_registry(registry_raw: Any) -> dict[str, dict[str, Any]]:
+    reg_data = _load_json_data(registry_raw)
+    if not isinstance(reg_data, dict) or "reports" not in reg_data:
+        raise ValueError("Registry must be a JSON object containing a 'reports' key")
+    reports = reg_data["reports"]
+    if not isinstance(reports, list) or len(reports) == 0:
+        raise ValueError("Registry 'reports' must be a non-empty list")
+    result: dict[str, dict[str, Any]] = {}
+    for r in reports:
+        if isinstance(r, dict) and "view" in r:
+            result[r["view"]] = r
+    if not result:
+        raise ValueError("Registry 'reports' list must contain valid report objects with a 'view' field")
+    return result
+
+
+def _normalize_columns(columns_raw: Any) -> list[tuple[str, list[dict[str, Any]], list[str]]]:
+    """Returns list of (view_name, column_dicts, keys)."""
+    col_data = _load_json_data(columns_raw)
+    views_dict: dict[str, Any] = {}
+    if isinstance(col_data, dict):
+        if "views" in col_data:
+            raw_views = col_data["views"]
+            if isinstance(raw_views, dict):
+                views_dict = raw_views
+            elif isinstance(raw_views, list):
+                for item in raw_views:
+                    if isinstance(item, dict):
+                        v_name = item.get("view") or item.get("name")
+                        if v_name:
+                            views_dict[v_name] = item
+        else:
+            views_dict = {k: v for k, v in col_data.items() if not k.startswith("_")}
+    elif isinstance(col_data, list):
+        for item in col_data:
+            if isinstance(item, dict):
+                v_name = item.get("view") or item.get("name")
+                if v_name:
+                    views_dict[v_name] = item
+
+    normalized = []
+    for view_name, val in views_dict.items():
+        keys: list[str] = []
+        columns_list: list[dict[str, Any]] = []
+        if isinstance(val, list):
+            columns_list = val
+        elif isinstance(val, dict):
+            columns_list = val.get("columns", [])
+            keys = val.get("keys", [])
+        normalized.append((view_name, columns_list, keys))
+    return normalized
+
+
+def build_table_specs(
+    columns: Union[dict, list, str, Path],
+    pii_policy: Union[dict, str, Path],
+    registry: Union[dict, list, str, Path],
+    live_views: Optional[Iterable[str]] = DEFAULT_LIVE_VIEWS,
+    allow_non_hashed_pii: bool = False,
+) -> list[TableSpec]:
+    """Build ordered list of table specifications for DuckDB caching."""
+    pii_data = _load_json_data(pii_policy)
+    if not isinstance(pii_data, dict):
+        pii_data = {}
+
+    reg_map = _normalize_registry(registry)
+    if not reg_map:
+        raise ValueError("Registry is empty or has no reports; valid report registry required")
+
+    norm_columns = _normalize_columns(columns)
+    live_set = set(live_views) if live_views is not None else set(DEFAULT_LIVE_VIEWS)
+
+    table_specs: list[TableSpec] = []
+
+    for view_name, col_list, keys in norm_columns:
+        validate_identifier(view_name)
+
+        if view_name not in reg_map:
+            raise ValueError(
+                f"View {view_name!r} listed in columns is missing from registry"
+            )
+        reg_entry = reg_map[view_name]
+        status = str(reg_entry.get("status", "")).lower()
+        if status not in ("ready", "contract"):
+            reason = reg_entry.get("blocked_reason", f"status is {status!r}")
+            raise ValueError(
+                f"View {view_name!r} has registry status {status!r}; only 'ready' or 'contract' views may be cached: {reason}"
+            )
+
+        if view_name in live_set:
+            continue
+
+        column_specs: list[ColumnSpec] = []
+        for col in col_list:
+            col_name = col.get("name")
+            if not col_name:
+                raise ValueError(f"Column in view {view_name!r} missing 'name'")
+            validate_identifier(col_name)
+
+            raw_type = col.get("type")
+            if not raw_type:
+                raise ValueError(f"Column {col_name!r} in view {view_name!r} missing 'type'")
+            duckdb_type = map_type(col_name, raw_type)
+            validate_duckdb_type(duckdb_type, col_name)
+
+            has_explicit_pii = "pii" in col
+            pii_key = col.get("pii") or (col_name if col_name in pii_data else None)
+
+            is_nulled = False
+            if pii_key is not None:
+                if pii_key not in pii_data:
+                    raise ValueError(
+                        f"Column {col_name!r} in view {view_name!r} specifies pii key {pii_key!r} which is missing from pii_columns policy"
+                    )
+
+                policy_entry = pii_data[pii_key]
+                if not isinstance(policy_entry, dict):
+                    raise ValueError(f"Invalid policy entry for key {pii_key!r}")
+
+                source_form = str(policy_entry.get("source_form", "")).lower()
+                mask_kind = str(policy_entry.get("mask", "")).lower()
+
+                if source_form == "sha256":
+                    if mask_kind not in ("redact", "null"):
+                        raise ValueError(
+                            f"Column {col_name!r} in view {view_name!r} uses mask kind {mask_kind!r} which is not engine-neutral. "
+                            "Hashed PII columns are nulled in the cache, so only 'redact' and 'null' masks are permitted."
+                        )
+                    is_nulled = True
+                else:
+                    if not allow_non_hashed_pii:
+                        raise ValueError(
+                            f"Column {col_name!r} in view {view_name!r} has PII source_form {source_form!r} (not sha256). "
+                            "Non-hashed PII must not be cached without --allow-non-hashed-pii."
+                        )
+                    is_nulled = False
+            elif has_explicit_pii:
+                raise ValueError(
+                    f"Column {col_name!r} in view {view_name!r} specifies an empty pii key"
+                )
+
+            column_specs.append(
+                ColumnSpec(
+                    name=col_name,
+                    duckdb_type=duckdb_type,
+                    is_nulled=is_nulled,
+                )
+            )
+
+        table_specs.append(
+            TableSpec(
+                name=f"rpt.{view_name}",
+                source=f"rpt_base.{view_name}",
+                view=view_name,
+                columns=tuple(column_specs),
+                keys=tuple(keys),
+            )
+        )
+
+    return table_specs
