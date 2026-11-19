@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import urllib.parse
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -218,18 +219,46 @@ def build_error_payload(
     return spec.status, payload
 
 
+_SECRET_KEY_NAMES: tuple[str, ...] = (
+    "aws_secret_access_key",
+    "aws_access_key_id",
+    "client_secret",
+    "session_token",
+    "sslpassword",
+    "private_key",
+    "credentials",
+    "credential",
+    "secret_key",
+    "access_key",
+    "password",
+    "api_key",
+    "apikey",
+    "passwd",
+    "secret",
+    "key_id",
+    "token",
+    "pwd",
+)
+_SECRET_KEYS_ALT = "|".join(_SECRET_KEY_NAMES)
+_QUOTED_OR_BARE_VAL_PAT = (
+    r"(?:'(?:''|\\.|[^'])*'|\"(?:\"\"|\\.|[^\"])*\"|[^\s,;'\"&+)]+)"
+)
+
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,4}")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*")
-_URI_USERINFO_RE = re.compile(r"://[^/\s'\",;]+@")
-_URI_USERINFO_EXTRACT_RE = re.compile(r"://([^/\s'\",;]+)@")
+_URI_USERINFO_RE = re.compile(r"://[^@\s]+@")
+_URI_USERINFO_EXTRACT_RE = re.compile(r"://([^@\s]+)@")
 _DSN_KV_EQ_RE = re.compile(
-    r"(?i)\b(password|passwd|secret|token|client_secret|api_key|apikey|credential|credentials|private_key)\s*=\s*(?:'[^']*'|\"[^\"]*\"|[^\s,;'\"&+)]+)"
+    rf"(?is)(?<![A-Za-z0-9])({_SECRET_KEYS_ALT})\s*=\s*{_QUOTED_OR_BARE_VAL_PAT}"
 )
 _SECRET_COLON_KV_RE = re.compile(
-    r"(?i)\b(password|passwd|secret|token|client_secret|api_key|apikey|credential|credentials|private_key)\s*:\s*(?:'[^']*'|\"[^\"]*\"|[^\s,;'\"&+)]+)"
+    rf"(?is)(?<![A-Za-z0-9])({_SECRET_KEYS_ALT})(['\"]?)\s*:\s*{_QUOTED_OR_BARE_VAL_PAT}"
 )
 _DSN_KV_EXTRACT_RE = re.compile(
-    r"(?i)\b(?:password|passwd|secret|token|client_secret|api_key|apikey|credential|credentials|private_key)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^\s,;'\"&+)]+))"
+    rf"(?is)(?<![A-Za-z0-9])(?:{_SECRET_KEYS_ALT})\s*=\s*(?:'((?:''|\\.|[^'])*)'|\"((?:\"\"|\\.|[^\"])*)\"|([^\s,;'\"&+)]+))"
+)
+_DUCKDB_SECRET_RE = re.compile(
+    r"(?is)(?<![A-Za-z0-9])SECRET\s+'(?:''|\\.|[^'])*'"
 )
 _SQL_SINGLE_QUOTED_RE = re.compile(r"'((?:''|[^'])*)'")
 _SENSITIVE_ENV_NAME_RE = re.compile(
@@ -240,6 +269,28 @@ _CANARY_SENTINEL_RE = re.compile(
 )
 _LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _MAX_SCRUBBED_DETAIL_CHARS = 2048
+
+_CONFIG_SECRETS_LOCK = threading.Lock()
+_REGISTERED_CONFIG_SECRETS: set[str] = set()
+
+
+def register_config_secrets(*values: str | None) -> None:
+    """Register resolved configuration, secret-file, or env secret values for log scrubbing."""
+    to_add = [
+        val
+        for val in values
+        if isinstance(val, str) and len(val) >= 4 and val.strip()
+    ]
+    if not to_add:
+        return
+    with _CONFIG_SECRETS_LOCK:
+        _REGISTERED_CONFIG_SECRETS.update(to_add)
+
+
+def clear_registered_config_secrets() -> None:
+    """Clear module-level registered config secrets (primarily for test isolation)."""
+    with _CONFIG_SECRETS_LOCK:
+        _REGISTERED_CONFIG_SECRETS.clear()
 
 
 def _sanitize_log_value(value: Any, *, default: str = "-") -> str:
@@ -272,33 +323,66 @@ def _sanitize_log_value(value: Any, *, default: str = "-") -> str:
     return "".join(out_chars)
 
 
-def _extract_env_secrets(env: Mapping[str, str] | None) -> list[str]:
+def _add_quote_escaped_forms(secret: str, candidates: set[str]) -> None:
+    if len(secret) < 4 or not secret.strip():
+        return
+    candidates.add(secret)
+    candidates.add(secret.replace("'", "''"))
+    candidates.add(secret.replace("'", "\\'"))
+    candidates.add(secret.replace('"', '""'))
+    candidates.add(secret.replace('"', '\\"'))
+    if "\\" in secret:
+        candidates.add(secret.replace("\\", "\\\\"))
+
+
+def _expand_secret_value(val: str, candidates: set[str]) -> None:
+    _add_quote_escaped_forms(val, candidates)
+    for uri_m in _URI_USERINFO_EXTRACT_RE.finditer(val):
+        userinfo = uri_m.group(1)
+        if ":" in userinfo:
+            _, pwd = userinfo.split(":", 1)
+            for candidate_pwd in (pwd, urllib.parse.unquote(pwd)):
+                _add_quote_escaped_forms(candidate_pwd, candidates)
+        else:
+            _add_quote_escaped_forms(userinfo, candidates)
+    for kv_m in _DSN_KV_EXTRACT_RE.finditer(val):
+        kv_val = kv_m.group(1) or kv_m.group(2) or kv_m.group(3) or ""
+        if kv_val:
+            for unesc in (
+                kv_val,
+                kv_val.replace("''", "'"),
+                kv_val.replace("\\'", "'"),
+                kv_val.replace('""', '"'),
+                kv_val.replace('\\"', '"'),
+            ):
+                _add_quote_escaped_forms(unesc, candidates)
+
+
+def _extract_env_secrets(
+    env: Mapping[str, str] | None,
+    *,
+    extra_secrets: Iterable[str] | None = None,
+) -> list[str]:
     source = os.environ if env is None else env
     candidates: set[str] = set()
+
+    with _CONFIG_SECRETS_LOCK:
+        registered_snapshot = tuple(_REGISTERED_CONFIG_SECRETS)
+    for reg_val in registered_snapshot:
+        _expand_secret_value(reg_val, candidates)
+
+    if extra_secrets is not None:
+        for ext_val in extra_secrets:
+            if isinstance(ext_val, str):
+                _expand_secret_value(ext_val, candidates)
+
     for name, val in source.items():
         if not isinstance(name, str) or not isinstance(val, str):
             continue
         if not _SENSITIVE_ENV_NAME_RE.search(name):
             continue
-        if len(val) >= 4 and val.strip():
-            candidates.add(val)
-            candidates.add(val.replace("'", "''"))
-        for uri_m in _URI_USERINFO_EXTRACT_RE.finditer(val):
-            userinfo = uri_m.group(1)
-            if ":" in userinfo:
-                _, pwd = userinfo.split(":", 1)
-                for candidate_pwd in (pwd, urllib.parse.unquote(pwd)):
-                    if len(candidate_pwd) >= 4 and candidate_pwd.strip():
-                        candidates.add(candidate_pwd)
-                        candidates.add(candidate_pwd.replace("'", "''"))
-            elif len(userinfo) >= 4 and userinfo.strip():
-                candidates.add(userinfo)
-                candidates.add(userinfo.replace("'", "''"))
-        for kv_m in _DSN_KV_EXTRACT_RE.finditer(val):
-            kv_val = kv_m.group(1) or kv_m.group(2) or kv_m.group(3) or ""
-            if len(kv_val) >= 4 and kv_val.strip():
-                candidates.add(kv_val)
-                candidates.add(kv_val.replace("'", "''"))
+        _expand_secret_value(val, candidates)
+
     return sorted(candidates, key=len, reverse=True)
 
 
@@ -309,6 +393,7 @@ def scrub_error_detail(
     sql: str | None = None,
     params: Any = None,
     env: Mapping[str, str] | None = None,
+    extra_secrets: Iterable[str] | None = None,
 ) -> str:
     """Format *exc_or_msg* for single-line server logs with secrets, DSNs, JWTs, SQL literals, and params scrubbed."""
     if isinstance(exc_or_msg, BaseException):
@@ -322,7 +407,7 @@ def scrub_error_detail(
         if stripped_tok and stripped_tok != token:
             detail = detail.replace(stripped_tok, "[REDACTED]")
 
-    for env_secret in _extract_env_secrets(env):
+    for env_secret in _extract_env_secrets(env, extra_secrets=extra_secrets):
         if env_secret in detail:
             detail = detail.replace(env_secret, "[REDACTED]")
 
@@ -330,7 +415,8 @@ def scrub_error_detail(
     detail = _BEARER_RE.sub("Bearer [REDACTED]", detail)
     detail = _URI_USERINFO_RE.sub("://[REDACTED]@", detail)
     detail = _DSN_KV_EQ_RE.sub(r"\1=[REDACTED]", detail)
-    detail = _SECRET_COLON_KV_RE.sub(r"\1: [REDACTED]", detail)
+    detail = _SECRET_COLON_KV_RE.sub(r"\1\2: [REDACTED]", detail)
+    detail = _DUCKDB_SECRET_RE.sub("SECRET '[REDACTED]'", detail)
 
     if isinstance(sql, str) and sql:
         sql_literals: list[str] = []

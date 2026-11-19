@@ -42,6 +42,7 @@ from seeknal.serving.audit import (
 from seeknal.serving.discovery import PlacementRefresher, discover
 from seeknal.serving.discovery.build import DiscoveryResult
 from seeknal.serving.duckdb_policy import DuckDBHolder, connect_hardened
+from seeknal.serving.errors import register_config_secrets
 from seeknal.serving.http import GrantReplayCache, create_app
 from seeknal.serving.metrics import MetricsRegistry
 from seeknal.serving.ops import (
@@ -155,7 +156,11 @@ def build_server(
     # 2. Run fail-closed startup validation & offline preflight (env, secret files,
     # static placement/schemas/columns/roles/PII rules, engine-connection wiring)
     # before configuring a file logger or constructing adapters/refresher
+    secret_values = _collect_secret_values(env, cfg=cfg)
+    register_config_secrets(*secret_values)
     preflight = cfg.validate_runtime_wiring(env=env)
+    secret_values = _collect_secret_values(env, cfg=cfg)
+    register_config_secrets(*secret_values)
 
     # 3. Load grant keys before configuring file logging
     public_keys = cfg.load_grant_keys()
@@ -192,7 +197,6 @@ def build_server(
         )
 
     # 5. Build ServingPipeline and PlacementRefresher
-    secret_values = _collect_secret_values(env, cfg=cfg)
     last_refresh_error: list[Exception | None] = [None]
     last_refresh_error_scrubbed: list[str | None] = [None]
     refresher: PlacementRefresher | None = None

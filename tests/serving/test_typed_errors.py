@@ -30,6 +30,8 @@ from seeknal.serving.errors import (
     REQUIRED_ERROR_CODES,
     AuditUnavailableError,
     _sanitize_log_value,
+    clear_registered_config_secrets,
+    register_config_secrets,
     scrub_error_detail,
 )
 from seeknal.serving.http import _sanitize_log_value as http_sanitize_log_value
@@ -1413,4 +1415,251 @@ def test_c_n2_log_forging_control_chars_length_cap_and_forged_kid(
     for rec in caplog.records:
         msg = rec.getMessage()
         assert all(ch.isprintable() for ch in msg)
+
+
+def test_c_n3_scrubber_escaped_quotes_all_keys_duckdb_secret_slash_userinfo_and_config_secrets(
+    tmp_path: pathlib.Path,
+):
+    import json
+    import os
+    from cryptography.hazmat.primitives import serialization
+    from seeknal.serving.server.app import build_server
+    from seeknal.serving.server.config import ServerConfig, read_secret_file
+
+    clear_registered_config_secrets()
+    try:
+        # 1. Quoted values with '', "", \', \" and (?<![A-Za-z0-9]) prefix
+        quoted_msg = (
+            "p1: password='ab''cd1234' "
+            'p2: password="ef""gh5678" '
+            r"p3: password='ij\'kl9012' "
+            r'p4: password="mn\"op3456" '
+            "p5: _password='under_pw_1111' "
+            "p6: db_pwd=bare_pwd_2222 "
+            "p7: my_sslpassword: 'ssl_pw''3333'"
+        )
+        scrubbed_q = scrub_error_detail(quoted_msg, env={})
+        for leaked in (
+            "ab",
+            "cd1234",
+            "ef",
+            "gh5678",
+            "ij",
+            "kl9012",
+            "mn",
+            "op3456",
+            "under_pw_1111",
+            "bare_pwd_2222",
+            "ssl_pw",
+            "3333",
+        ):
+            assert leaked not in scrubbed_q, f"Leaked '{leaked}' in: {scrubbed_q}"
+
+        # 2. Every required key name in both '=' and ':' forms, plus _DSN_KV_EXTRACT_RE
+        all_keys = (
+            "pwd",
+            "sslpassword",
+            "aws_secret_access_key",
+            "aws_access_key_id",
+            "access_key",
+            "secret_key",
+            "key_id",
+            "session_token",
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "client_secret",
+            "api_key",
+            "apikey",
+            "credential",
+            "credentials",
+            "private_key",
+        )
+        for idx, key_name in enumerate(all_keys):
+            sec_eq = f"val_eq_{idx}_s3cr3t"
+            sec_col = f"val_col_{idx}_s3cr3t"
+            sec_env_kv = f"val_env_{idx}''s3cr3t"
+            raw = (
+                f"_{key_name}='{sec_eq}' | {key_name}: \"{sec_col}\" | "
+                f"leaked_from_env=val_env_{idx}'s3cr3t"
+            )
+            out = scrub_error_detail(
+                raw,
+                env={"DB_CREDENTIAL_BLOB": f"{key_name}='{sec_env_kv}'"},
+            )
+            assert sec_eq not in out, f"Failed '=' scrub for {key_name}: {out}"
+            assert sec_col not in out, f"Failed ':' scrub for {key_name}: {out}"
+            assert f"val_env_{idx}" not in out, (
+                f"Failed env KV extract for {key_name}: {out}"
+            )
+
+        # 3. DuckDB SECRET '...' form (including '' and \' escapes and _SECRET)
+        duck_msg = (
+            "Binder Error: CREATE SECRET 'duck_s3_top_secret' failed; "
+            r"also _secret 'esc''quote\'val_77' and SECRET 'x'"
+        )
+        scrubbed_duck = scrub_error_detail(duck_msg, env={})
+        assert "SECRET '[REDACTED]'" in scrubbed_duck
+        assert "duck_s3_top_secret" not in scrubbed_duck
+        assert "esc" not in scrubbed_duck
+        assert "val_77" not in scrubbed_duck
+        assert "SECRET 'x'" not in scrubbed_duck
+
+        # 4. URL userinfo containing '/' (both inline and extracted password)
+        url_msg = (
+            "connect failed for postgresql://u:p/ss_inline@other-host.internal:5432/db "
+            "and echoed raw env pwd p/ss_9988"
+        )
+        scrubbed_url = scrub_error_detail(
+            url_msg,
+            env={"PRIMARY_DSN": "postgresql://u:p/ss_9988@host.internal:5432/db"},
+        )
+        assert "postgresql://[REDACTED]@other-host.internal:5432/db" in scrubbed_url
+        assert "u:p/ss" not in scrubbed_url
+        assert "p/ss_inline" not in scrubbed_url
+        assert "p/ss_9988" not in scrubbed_url
+
+        # Also bare p/ss without env still redacts userinfo inline
+        assert (
+            scrub_error_detail("err postgresql://u:p/ss@host", env={})
+            == "err postgresql://[REDACTED]@host"
+        )
+
+        # 5. extra_secrets parameter on scrub_error_detail
+        extra_out = scrub_error_detail(
+            "failed auth using custom_extra'secret_42 and custom_extra''secret_42",
+            env={},
+            extra_secrets=["custom_extra'secret_42"],
+        )
+        assert "custom_extra" not in extra_out
+        assert "secret_42" not in extra_out
+
+        # 6. Secrets from ServerConfig / YAML / harmless env var names / secret files / build_server
+        priv = ec.generate_private_key(ec.SECP256R1())
+        pub_pem = (
+            priv.public_key()
+            .public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            .decode("ascii")
+        )
+        pem_path = tmp_path / "pub.pem"
+        pem_path.write_text(pub_pem, encoding="utf-8")
+
+        pw_file = tmp_path / "sr_pw.txt"
+        pw_file.write_text("file_secret'pw_5566\n", encoding="utf-8")
+        os.chmod(pw_file, 0o600)
+
+        env_file = tmp_path / "secrets.env"
+        env_file.write_text("HARMLESS_OPS_VAR=ops_envfile_val_3344\n", encoding="utf-8")
+        os.chmod(env_file, 0o600)
+
+        pl_file = tmp_path / "placement.yaml"
+        pl_file.write_text(
+            "engines:\n"
+            "  sr: {kind: starrocks, dialect: starrocks}\n"
+            "  lb: {kind: lakebase, dialect: postgres}\n"
+            "tables:\n"
+            "  t:\n"
+            "    keys: [id]\n"
+            "    row_count: 1\n"
+            "    serve:\n"
+            "      sr: t\n"
+            "cubes: {}\n",
+            encoding="utf-8",
+        )
+        sc_file = tmp_path / "schemas.json"
+        sc_file.write_text(json.dumps({"t": ["id"]}), encoding="utf-8")
+
+        harmless_env = {
+            # Notice NONE of these env var names match _SENSITIVE_ENV_NAME_RE!
+            "HARMLESS_LB_CONN": "postgresql://app_u:lb_slash/pw'8877@lb-host:5432/db",
+            "HARMLESS_SR_BI_INFO": "sr_bi_harmless_val'1122",
+        }
+
+        cfg_dict = {
+            "grant_keys": {"pem_files": {"k1": str(pem_path)}},
+            "secrets_env_file": str(env_file),
+            "placement": {
+                "static": {
+                    "placement_file": str(pl_file),
+                    "schemas_file": str(sc_file),
+                }
+            },
+            "connections": {
+                "sr": {
+                    "kind": "starrocks",
+                    "accounts": {
+                        "interactive": {
+                            "host": "127.0.0.1",
+                            "port": 9030,
+                            "user": "sr_u",
+                            "password_file": str(pw_file),
+                        },
+                        "bi": {
+                            "host": "127.0.0.1",
+                            "port": 9030,
+                            "user": "sr_bi",
+                            "password_env": "HARMLESS_SR_BI_INFO",
+                        },
+                    },
+                },
+                "lb": {
+                    "kind": "lakebase",
+                    "dsn_env": "HARMLESS_LB_CONN",
+                },
+            },
+            "ops": {
+                "enabled": False,
+                "auth_token_env": "HARMLESS_OPS_VAR",
+            },
+        }
+
+        build_server(
+            cfg_dict,
+            env=harmless_env,
+            connect_factories={"sr": lambda: None, "lb": lambda: None},
+        )
+
+        # Also verify direct read_secret_file & ServerConfig.get_env registration
+        direct_sf = tmp_path / "direct_sec.txt"
+        direct_sf.write_text("direct_file_val_9090\n", encoding="utf-8")
+        os.chmod(direct_sf, 0o600)
+        assert read_secret_file(str(direct_sf)) == "direct_file_val_9090"
+
+        cfg_obj = ServerConfig.from_dict(cfg_dict, env=harmless_env)
+        assert (
+            cfg_obj.get_env("HARMLESS_PLAIN_LATE", {"HARMLESS_PLAIN_LATE": "late_cfg_val_7070"})
+            == "late_cfg_val_7070"
+        )
+
+        # Now call scrub_error_detail with empty env={}: ALL config/file/harmless-env secrets
+        # (and their '', \', and URL-userinfo password forms) MUST be scrubbed!
+        config_leak_probe = (
+            "err1=file_secret'pw_5566 err1_dq=file_secret''pw_5566 err1_bs=file_secret\\'pw_5566 "
+            "err2=ops_envfile_val_3344 "
+            "err3=lb_slash/pw'8877 err3_dq=lb_slash/pw''8877 err3_bs=lb_slash/pw\\'8877 "
+            "err4=sr_bi_harmless_val'1122 err4_dq=sr_bi_harmless_val''1122 "
+            "err5=direct_file_val_9090 err6=late_cfg_val_7070"
+        )
+        scrubbed_cfg = scrub_error_detail(config_leak_probe, env={})
+        for secret_frag in (
+            "file_secret",
+            "pw_5566",
+            "ops_envfile_val_3344",
+            "lb_slash/pw",
+            "8877",
+            "sr_bi_harmless_val",
+            "1122",
+            "direct_file_val_9090",
+            "late_cfg_val_7070",
+        ):
+            assert secret_frag not in scrubbed_cfg, (
+                f"Config secret '{secret_frag}' leaked in: {scrubbed_cfg}"
+            )
+    finally:
+        clear_registered_config_secrets()
+
 

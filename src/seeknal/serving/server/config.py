@@ -26,6 +26,7 @@ from seeknal.serving.compilation_cache import (
     validate_compilation_cache_max_entries,
 )
 from seeknal.serving.discovery.config import DiscoveryConfig
+from seeknal.serving.errors import register_config_secrets
 from seeknal.serving.grant_token import _load_public_key
 from seeknal.serving.ops import OpsConfig
 from seeknal.serving.placement import Placement, PlacementError, UniqueKeySafeLoader
@@ -316,10 +317,13 @@ def read_secret_file(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     if content.endswith("\r\n"):
-        return content[:-2]
+        resolved = content[:-2]
     elif content.endswith("\n"):
-        return content[:-1]
-    return content
+        resolved = content[:-1]
+    else:
+        resolved = content
+    register_config_secrets(resolved)
+    return resolved
 
 
 def check_and_parse_secrets_env_file(path: str) -> dict[str, str]:
@@ -350,6 +354,7 @@ def check_and_parse_secrets_env_file(path: str) -> dict[str, str]:
         ):
             v = v[1:-1]
         result[k] = v
+    register_config_secrets(*result.values())
     return result
 
 
@@ -565,6 +570,51 @@ class ServerConfig:
             raise ServerConfigError("'audit' must be an AuditConfig instance or None")
         if self.ops is not None and not isinstance(self.ops, OpsConfig):
             raise ServerConfigError("'ops' must be an OpsConfig instance or None")
+        if self.secrets_env:
+            register_config_secrets(*self.secrets_env.values())
+        for conn in self.connections.values():
+            if isinstance(conn, DuckDBConnectionConfig) and conn.secrets_env:
+                register_config_secrets(*conn.secrets_env.values())
+
+    def _register_resolved_secrets(
+        self, env: Mapping[str, str] | None = None
+    ) -> None:
+        """Register any currently available referenced env and secret-file values for log scrubbing."""
+        proc_env = env if env is not None else os.environ
+        if self.secrets_env:
+            register_config_secrets(*self.secrets_env.values())
+        for var_name in self.get_referenced_env_vars():
+            if var_name in self.secrets_env:
+                register_config_secrets(self.secrets_env[var_name])
+            elif var_name in proc_env:
+                register_config_secrets(proc_env[var_name])
+
+        candidate_files: list[str] = []
+        for conn in self.connections.values():
+            if isinstance(conn, StarRocksConnectionConfig):
+                for acc in conn.accounts.values():
+                    if acc.password_file:
+                        candidate_files.append(acc.password_file)
+        if self.placement.discovery_config is not None:
+            disc = self.placement.discovery_config
+            if (
+                disc.lakekeeper
+                and disc.lakekeeper.oauth
+                and disc.lakekeeper.oauth.client_secret_file
+            ):
+                candidate_files.append(disc.lakekeeper.oauth.client_secret_file)
+            for eng in disc.engines.values():
+                if eng.api_secret_file:
+                    candidate_files.append(eng.api_secret_file)
+
+        for sf_path in candidate_files:
+            if os.path.isfile(sf_path):
+                try:
+                    st = os.stat(sf_path)
+                    if (st.st_mode & 0o044) == 0:
+                        read_secret_file(sf_path)
+                except OSError:
+                    pass
 
     def load_grant_keys(self) -> dict[str, str]:
         """Load and return parsed PEM public keys."""
@@ -573,10 +623,14 @@ class ServerConfig:
     def get_env(self, var_name: str, env: Mapping[str, str] | None = None) -> str:
         """Resolve an environment variable, consulting secrets_env before the process env."""
         if var_name in self.secrets_env:
-            return self.secrets_env[var_name]
+            val = self.secrets_env[var_name]
+            register_config_secrets(val)
+            return val
         process_env = env if env is not None else os.environ
         if var_name in process_env:
-            return process_env[var_name]
+            val = process_env[var_name]
+            register_config_secrets(val)
+            return val
         raise ServerConfigError(f"Missing required environment variable '{var_name}'")
 
     def get_referenced_env_vars(self) -> list[str]:
@@ -676,6 +730,7 @@ class ServerConfig:
                 raise ServerConfigError(
                     f"{desc} '{path}' is group- or world-readable"
                 )
+            read_secret_file(path)
 
     def check_env(self, env: Mapping[str, str] | None = None) -> None:
         """Verify that every referenced environment variable exists and secret files are safe."""
@@ -2023,6 +2078,8 @@ class ServerConfig:
             audit=audit_cfg,
             ops=ops_cfg,
         )
+
+        server_config._register_resolved_secrets(env=env)
 
         if load_keys:
             server_config.load_grant_keys()
