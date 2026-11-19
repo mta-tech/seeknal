@@ -234,6 +234,7 @@ _SECRET_KEY_NAMES: tuple[str, ...] = (
     "credential",
     "secret_key",
     "access_key",
+    "signature",
     "password",
     "api_key",
     "apikey",
@@ -242,10 +243,12 @@ _SECRET_KEY_NAMES: tuple[str, ...] = (
     "key_id",
     "token",
     "pwd",
+    "sig",
 )
 _SECRET_KEYS_ALT = "|".join(_SECRET_KEY_NAMES)
+_BARE_VAL_PAT = r"(?:[^\s,;'\"&)]|&(?!\w+=))+"
 _QUOTED_OR_BARE_VAL_PAT = (
-    r"(?:'(?:''|\\[\s\S]|[^'\\])*'|\"(?:\"\"|\\[\s\S]|[^\"\\])*\"|[^\s,;'\"&+)]+)"
+    rf"(?:'(?:''|\\[\s\S]|[^'\\])*'|\"(?:\"\"|\\[\s\S]|[^\"\\])*\"|{_BARE_VAL_PAT})"
 )
 
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{1,256}(?:\.[A-Za-z0-9_-]+){2,4}")
@@ -261,7 +264,7 @@ _SECRET_COLON_KV_RE = re.compile(
     rf"(?is)(?<![A-Za-z0-9])({_SECRET_KEYS_ALT})(['\"]?)\s*:\s*{_QUOTED_OR_BARE_VAL_PAT}"
 )
 _DSN_KV_EXTRACT_RE = re.compile(
-    rf"(?is)(?<![A-Za-z0-9])(?:{_SECRET_KEYS_ALT})\s*=\s*(?:'((?:''|\\[\s\S]|[^'\\])*)'|\"((?:\"\"|\\[\s\S]|[^\"\\])*)\"|([^\s,;'\"&+)]+))"
+    rf"(?is)(?<![A-Za-z0-9])(?:{_SECRET_KEYS_ALT})\s*=\s*(?:'((?:''|\\[\s\S]|[^'\\])*)'|\"((?:\"\"|\\[\s\S]|[^\"\\])*)\"|({_BARE_VAL_PAT}))"
 )
 _DUCKDB_SECRET_RE = re.compile(
     r"(?is)(?<![A-Za-z0-9])(SECRET|KEY_ID|SESSION_TOKEN|TOKEN|ACCOUNT_KEY|CLIENT_SECRET|CONNECTION_STRING)\s+'(?:''|\\[\s\S]|[^'\\])*'"

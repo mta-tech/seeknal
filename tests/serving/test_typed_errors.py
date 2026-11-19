@@ -1961,3 +1961,42 @@ def test_n5_bound_numeric_string_params_len_ge_4_redacted_at_word_boundaries():
             scrub_error_detail(lifetime_msg, params=short_or_other_params, env={})
             == lifetime_msg
         )
+
+
+def test_n7_unquoted_secrets_preserve_plus_and_non_delimiter_ampersand():
+    azure_key = (
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq"
+        "+K1SZFPTOtr/KBHBeksoGMGw=="
+    )
+    azure_kv = f"AccountKey={azure_key};"
+    out_azure = scrub_error_detail(azure_kv, env={})
+    assert out_azure == "AccountKey=[REDACTED];"
+    assert "K1SZFPTOtr" not in out_azure
+    assert "GMGw" not in out_azure
+    assert "+" not in out_azure
+
+    # Also verify _DSN_KV_EXTRACT_RE extracts full base64 key past '+' from env
+    out_azure_env = scrub_error_detail(
+        f"raw leaked key {azure_key} in driver msg",
+        env={"AZURE_CONN_SECRET": f"DefaultEndpointsProtocol=https;{azure_kv}EndpointSuffix=core.windows.net"},
+    )
+    assert out_azure_env == "raw leaked key [REDACTED] in driver msg"
+    assert "K1SZFPTOtr" not in out_azure_env
+
+    # Unquoted password with '+' and with '&' not followed by \w+=
+    assert scrub_error_detail("password=abc+def", env={}) == "password=[REDACTED]"
+    assert scrub_error_detail("password=ab&cd", env={}) == "password=[REDACTED]"
+    assert (
+        scrub_error_detail("password=ab&cd&host=db.internal", env={})
+        == "password=[REDACTED]&host=db.internal"
+    )
+
+    # URL query with sig/signature and subsequent query parameters
+    assert (
+        scrub_error_detail("https://blob.example.net/c/f?sig=ab+cd&x=1", env={})
+        == "https://blob.example.net/c/f?sig=[REDACTED]&x=1"
+    )
+    assert (
+        scrub_error_detail("https://blob.example.net/c/f?signature=ab+cd/ef==&x=1", env={})
+        == "https://blob.example.net/c/f?signature=[REDACTED]&x=1"
+    )
