@@ -210,6 +210,7 @@ Empty body or `{}`.
 - **401 Unauthorized:** Invalid or expired cancel token, missing `typ: "cancel"`, or bad signature.
 - **404 Not Found:** Query ID not currently running, or running query's subject differs from `sub` (never reveals which).
 - **400 Bad Request:** Malformed request body (non-empty and not `{}`).
+- **413 Payload Too Large:** Request body exceeds `max_body_bytes` (`code: "payload_too_large"`).
 
 ---
 
@@ -234,9 +235,9 @@ All error responses have an HTTP status code $\ge 400$ and return a consistent t
 - `audit_id` (`str`, optional): Included whenever the request's `jti` has been cryptographically verified (omitted when missing or before token verification).
 
 ### Privacy & Leakage Invariants
-- **No Grant Tokens:** Raw grant tokens and signature data are never included in error messages.
-- **No SQL Literals or Parameters:** Client SQL expressions, literals, and supplied parameter values are never included in error messages.
-- **No Driver Internals:** Database driver connection strings, DSNs, hostnames, credentials, raw driver error text, and Python tracebacks are never returned to the HTTP client; operational failure details (`engine`, `code`, `error` class, secret-scrubbed single-line `detail`, and `audit_id`) are logged server-side at `ERROR` and never included in HTTP responses.
+- **No Grant Tokens or Unverified Headers:** Raw grant/cancel tokens, signature data, and unverified JWS header fields (`kid`, `alg`, `typ`) are never echoed in error messages.
+- **No SQL Literals or Sensitive Parameters:** Client SQL expressions, string literals, exact quoted bound-parameter tokens (`'<p>'`), and non-numeric parameter values (`len >= 3`) are never included in error messages or logs, while ordinary numeric diagnostics (such as `"61.0s"`) remain readable.
+- **No Driver Internals, Config Secrets, or Log Forging:** Database driver connection strings, DSNs (including `/` in userinfo), quoted/escaped credentials (`''`, `""`, `\'`, `\"`), DuckDB `SECRET '...'` clauses, secrets loaded from `ServerConfig` / secret files / environment variables, raw driver error text, and Python tracebacks are never returned to the HTTP client; operational failure details (`engine`, `code`, `error` class, secret-scrubbed single-line `detail` with all control/non-printable characters escaped and capped at 2048 characters, and `audit_id`) are logged server-side at `ERROR` and never included in HTTP responses.
 
 ### Typed Error Code Catalogue (`ERROR_CATALOGUE`)
 

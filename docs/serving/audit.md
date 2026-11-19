@@ -63,7 +63,7 @@ audit:
 | `transport` | `protocol` | `"udp" \| "tcp"` | `"udp"` | Syslog transport protocol. |
 | `facility` | — | `int` (`0..23`) | `16` | RFC 5424 facility code (`16` = `local0`). |
 | `app_name` | — | `str` | `"seeknal-serving"` | RFC 5424 `APP-NAME` header token. |
-| `timeout_seconds` | — | `float > 0` | `2.0` | Socket connect/send timeout in seconds for syslog. |
+| `timeout_seconds` | — | `float > 0` | `2.0` | Total per-write audit deadline in seconds across all sinks (and socket connect/send timeout for syslog). |
 
 Specifying both a primary option and its alias simultaneously (for example, both `max_bytes` and `rotate_size_bytes`) is rejected as a configuration error.
 
@@ -113,7 +113,7 @@ Audit serialization enforces a **strict schema allowlist** plus value-level secr
 
 - **Never logged:** Raw SQL statements, redacted SQL templates, SQL string/numeric literals, positional query `params`, result `rows` or column values, compact JWS grant/cancel tokens, `Authorization` headers, engine DSNs/connection URIs, passwords, or API secrets.
 - **SQL correlation without leakage:** Only `sql_sha256` (`SHA-256(sql.encode("utf-8", errors="replace"))`) is recorded, enabling correlation against Catalog grant issuance logs without exposing query predicates or literals and without failing on lone UTF-16 surrogates.
-- **Table & surrogate sanitization:** Blank/whitespace-only table names are dropped, lone UTF-16 surrogates (`U+D800..U+DFFF`) in string fields and table names are replaced with `\ufffd`, table names are truncated to 256 characters, deduplicated in order, and capped at 64 entries. `build_minimal_audit_record()` provides a minimal fallback record if full record construction fails.
+- **Table & surrogate sanitization:** Blank/whitespace-only table names are dropped, lone UTF-16 surrogates (`U+D800..U+DFFF`) in string fields and table names are replaced with `\ufffd`, table names are truncated to 256 characters, deduplicated in order, and capped at 64 entries. `build_minimal_audit_record()` provides a minimal fallback record **only** if full record construction or JSON serialization (`ValueError`, `UnicodeError`, `TypeError`) fails (logging an `ERROR` with scrubbed `detail` and `audit_id`); write or I/O errors from the audit sink never fall back to a minimal record.
 - **Defense in depth:** Any non-allowlisted keys passed to `build_audit_record()` or `serialize_audit_record()` are stripped before serialization, and any accidental Bearer token, compact JWT (`eyJ...`), or database DSN/credential URI in string fields is scrubbed to `[REDACTED]`.
 
 ---
@@ -122,7 +122,8 @@ Audit serialization enforces a **strict schema allowlist** plus value-level secr
 
 ### 3.1 `FileAuditSink` (`sink: file`)
 
-- **Symlink, hardlink, UID & `fchmod` hardening:** Never follows symlinks (`O_NOFOLLOW` + `os.lstat`) and never calls path-based `os.chmod`. Rejects paths that are symlinks, non-regular files, hard-linked (`st_nlink != 1`), or not owned by `os.getuid()` both during offline validation (`verify_audit_config_offline`) and before/after `os.open` (`os.fstat`). Sets permissions (`0600` or `0640`) exclusively via `os.fchmod(fd, mode)` on the verified file descriptor, independent of process `umask`.
+- **Symlink, hardlink, UID, `fchmod` & cached-fd re-verification:** Never follows symlinks (`O_NOFOLLOW` + `os.lstat`) and never calls path-based `os.chmod`. Rejects paths that are symlinks, non-regular files, hard-linked (`st_nlink != 1`), or not owned by `os.getuid()` during offline validation (`verify_audit_config_offline`), during `os.open` (`os.fstat`), and **before every write** by comparing `os.lstat(path)` against `os.fstat(fd)`. If the active path was unlinked or replaced, the stale descriptor is closed and safely reopened (or fails closed with `AuditWriteError` / `503 audit_unavailable` in `refuse` mode if reopening is unsafe or impossible). Sets permissions (`0600` or `0640`) exclusively via `os.fchmod(fd, mode)` on the verified file descriptor, independent of process `umask`.
+- **Partial-write & `fsync` crash safety:** Closes the file descriptor on any `os.write` or `os.fsync` failure and never appends a duplicate minimal record once bytes may have been persisted. On `(re)open`, if the existing file is non-empty and does not end with `\n`, appends a healing `\n` (and `os.fsync` when enabled) before writing the next JSON line.
 - **Unbounded growth warning:** When `max_bytes`, `max_files`, and `max_age_seconds` are all unset (`null`), logs a startup `WARNING` indicating that the audit log may grow unbounded.
 - Flushes writes with `os.fsync` and serializes concurrent writes within a process using a `threading.Lock()`.
 - **Rotation:** Before writing a new record to a non-empty active file, verifies `os.lstat` on both the active path and the target archive path, applies `os.fchmod(fd, mode)` before closing the descriptor, and atomically renames `audit.jsonl` to `audit.jsonl.<UTC_TIMESTAMP>.<SEQ>` via `os.replace` if:
@@ -149,13 +150,13 @@ Audit serialization enforces a **strict schema allowlist** plus value-level secr
 
 ## 4. Failure Semantics (`refuse` vs `log`)
 
-Audit records are always emitted off the event loop (via `run_in_threadpool`) **before** the HTTP response is returned or side effects (such as `/v1/cancel` query cancellation) are committed:
+Audit records are always emitted on a **dedicated bounded audit worker pool** (`seeknal-audit-io-*`, isolated from the shared AnyIO threadpool used by `pipeline.prepare` and engine execution) **before** the HTTP response is returned or side effects (such as `/v1/cancel` query cancellation) are committed:
 
-- **Non-blocking audit I/O & bounded SQL extraction:** Synchronous sink writes and fallback SQL table extraction run in a worker threadpool so `/healthz` and concurrent requests stay responsive. SQL table extraction runs only after token signature/issuer/audience verification (`claims is not None`), skips statements over 64 KiB, and stops at 64 unique tables.
+- **Dedicated bounded audit I/O, deadlines, fail-fast & `/readyz` integration:** Each audit write enforces a total monotonic deadline (`timeout_seconds`, default `2.0s`). If the sink stalls or goes down, in-flight query preparation and `/healthz` remain unstarved, subsequent audit writes fail fast without piling up threads, and `GET /readyz` reports HTTP `503` with `{"ready": false, "reason": "audit_sink", ...}` while a `refuse`-mode sink is down or stalled. SQL table extraction runs only after token signature/issuer/audience verification (`claims is not None`), skips statements over 64 KiB, and stops at 64 unique tables.
 - **Pre-action `/v1/cancel` auditing:** `/v1/cancel` emits the `202` audit record before cancelling the in-flight query; if audit emission fails under `on_failure: refuse`, HTTP `503` `audit_unavailable` is returned and the query is not cancelled.
 - **Rejected method & disconnect coverage:** Disallowed HTTP methods (`405 method_not_allowed`, `code: "invalid_sql"`) and client disconnects during request body reads (`499 query_cancelled`) on `/v1/query`, `/v1/explain`, and `/v1/cancel` return typed JSON payloads and emit audit records.
 
 | Phase | `on_failure: refuse` (Default) | `on_failure: log` |
 | --- | --- | --- |
-| **Startup (`build_server` / `--check`)** | Unwritable file path or unreachable TCP syslog destination raises `AuditStartupError` (`ServerConfigError` & `AuditWriteError`) with a secret-safe message and **refuses startup with exit code `2`**. | Logs an `ERROR` diagnostic, increments the failure callback if wired, and allows the server to start. |
-| **Runtime (`create_app` / `emit_audit_record`)** | Returns HTTP `503` with typed error payload (`error: "audit_unavailable"`, `code: "audit_unavailable"`, `message`, `next_step`, and `audit_id` when known) and **returns NO query rows**. | Logs loudly at `ERROR`, invokes `on_write_failure()` (incrementing `seeknal_serving_audit_write_failures_total`), and **allows the HTTP response to proceed**. |
+| **Startup (`build_server` / `--check`)** | Unwritable file path or unreachable TCP syslog destination raises `AuditStartupError` (`ServerConfigError` & `AuditWriteError`) with a secret-safe message and **refuses startup with exit code `2`**. | Logs an `ERROR` diagnostic (with scrubbed `detail=` and `audit_id=`), increments the failure callback if wired, and allows the server to start. |
+| **Runtime (`create_app` / `emit_audit_record`)** | Logs `ERROR` with scrubbed `detail=` and `audit_id=`, returns HTTP `503` with typed error payload (`error: "audit_unavailable"`, `code: "audit_unavailable"`, `message`, `next_step`, and `audit_id` when known), and **returns NO query rows** (never weakening the record to a minimal fallback). | Logs loudly at `ERROR` (including scrubbed `detail=` and `audit_id=`), invokes `on_write_failure()` (incrementing `seeknal_serving_audit_write_failures_total`), and **allows the HTTP response to proceed**. |

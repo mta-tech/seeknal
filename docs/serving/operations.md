@@ -70,7 +70,8 @@ Lightweight liveness probe confirming that the ASGI event loop is responsive wit
 Verifies both catalog availability and downstream engine reachability out-of-band without competing with tenant query concurrency limits:
 
 1. **Catalog check:** Ready when static placement is loaded or when live discovery has completed at least one refresh (`refresher.last_success_at is not None`).
-2. **Out-of-band engine probes with single-flight guard:** Probes each configured engine within `readyz_timeout_seconds` and caches each engine's status for `readyz_cache_seconds`:
+2. **Audit sink check (`audit.on_failure: refuse`):** When durable audit logging is configured in `refuse` mode, verifies that the audit sink is neither stalled nor down; while the sink is stalled or unreachable, `/readyz` returns HTTP `503` with `"reason": "audit_sink"`.
+3. **Out-of-band engine probes with single-flight guard:** Probes each configured engine within `readyz_timeout_seconds` and caches each engine's status for `readyz_cache_seconds`:
    - **DuckDB (`DuckDBAdapter`):** Opens a short-lived probe cursor directly and executes `SELECT 1` under bounded timeout without acquiring `_slot_semaphore` or touching `in_flight_cursors` / `queue_depth`, so saturated pods remain `Ready` under query load.
    - **Lakebase / StarRocks / DB-API (`DBAPIAdapter`):** Opens a dedicated short-lived probe connection directly with `connect_timeout` (never acquiring from `LakebasePool`), executes `SELECT 1` on a cursor, and closes both cursor and connection immediately so exhausted query pools do not cause cascading `NotReady` transitions.
    - **Cube (`CubeAdapter`):** Connects with a short-lived probe security context and verifies SQL API reachability.
@@ -84,6 +85,7 @@ Both listeners execute the full catalog and engine reachability checks (returnin
 - **Public port (`GET /readyz`):**
   - HTTP `200`: `{"ready": true}`
   - HTTP `503` (catalog not yet loaded): `{"ready": false, "reason": "catalog_not_loaded"}`
+  - HTTP `503` (audit sink stalled or down in `refuse` mode): `{"ready": false, "reason": "audit_sink"}`
   - HTTP `503` (engine unavailable): `{"ready": false}`
 - **Operations listener (`GET /readyz`):**
   - **HTTP 200 (all engines healthy and catalog loaded):**
@@ -104,6 +106,19 @@ Both listeners execute the full catalog and engine reachability checks (returnin
 {
   "ready": false,
   "reason": "catalog_not_loaded",
+  "engines": {
+    "duck": "ok",
+    "lakebase": "ok"
+  }
+}
+```
+
+  - **HTTP 503 (audit sink stalled or down in `refuse` mode):**
+
+```json
+{
+  "ready": false,
+  "reason": "audit_sink",
   "engines": {
     "duck": "ok",
     "lakebase": "ok"
