@@ -98,6 +98,8 @@ DuckDB.Generator.TRANSFORMS[exp.Table] = _duckdb_table_sql
 
 
 def _table_dotted_name(tbl: exp.Table) -> str:
+    if isinstance(tbl.this, exp.Func):
+        return ""
     if tbl.parts:
         return ".".join(part.name for part in tbl.parts)
     parts: list[str] = []
@@ -332,6 +334,8 @@ class Router:
             cte.alias_or_name.lower() for cte in statement.find_all(exp.CTE)
         }
         for tbl in statement.find_all(exp.Table):
+            if isinstance(tbl.this, exp.Func):
+                continue
             if tbl.name.lower() in cte_names and not tbl.db and not tbl.catalog:
                 continue
             dotted = _table_dotted_name(tbl).lower()

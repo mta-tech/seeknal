@@ -171,6 +171,9 @@ ANONYMOUS_FUNCTION_ALLOWLIST: dict[str, set[str]] = {
 DISALLOWED_FUNCTION_PREFIXES: tuple[str, ...] = (
     "pg_",
     "read_",
+    "iceberg_",
+    "parquet_",
+    "delta_",
     "lo_",
     "dblink",
     "glob",
@@ -668,6 +671,8 @@ def _build_mask_expression(method: str, col_name: str, target_dialect: str) -> e
 
 def _table_full_name(table: exp.Table) -> str:
     """Return the dotted name of an exp.Table node."""
+    if isinstance(table.this, exp.Func):
+        return ""
     if table.parts:
         return ".".join(part.name for part in table.parts)
     return table.name
