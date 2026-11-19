@@ -51,7 +51,16 @@ _SUSPICIOUS_ENUM_RE = re.compile(
     r"(://|@|secret|password|passwd|token|bearer|private|canary|sentinel|opaque|dsn|credential)",
     re.IGNORECASE,
 )
-_URI_USERINFO_RE = re.compile(r"://[^/\s@]+@")
+_URI_USERINFO_RE = re.compile(r"://[^@\s/]{0,256}(?:/[^@\s/]{0,256}){0,8}@")
+_DSN_PASSWORD_EXTRACT_RE = re.compile(r"://[^:/\s@]{1,128}:([^@\s]{1,256})@")
+_BEARER_SCRUB_RE = re.compile(r"\bBearer\s+\S+", re.IGNORECASE)
+_KV_SCRUB_RE = re.compile(
+    r"((?:password|passwd|secret|token|auth\s+key)\s*[:=]\s*)([^\s,;'\"]+)",
+    re.IGNORECASE,
+)
+_CANARY_SCRUB_RE = re.compile(
+    r"(?i)[A-Za-z0-9_.-]{0,64}(?:canary|sentinel|opaque)[A-Za-z0-9_.-]{0,64}"
+)
 _SENSITIVE_ENV_KEY_RE = re.compile(
     r"(SECRET|PASSWORD|PASSWD|TOKEN|DSN|CREDENTIAL|CANARY|SENTINEL|PRIVATE|AUTH|KEY)",
     re.IGNORECASE,
@@ -102,9 +111,10 @@ def _collect_secret_values(
         if isinstance(v, str) and len(v) >= 4 and _SENSITIVE_ENV_KEY_RE.search(str(k)):
             candidates.add(v)
             # If DSN has user:password@host, also capture password segment
-            m = re.search(r"://[^:/\s@]+:([^@\s]+)@", v)
-            if m and len(m.group(1)) >= 3:
-                candidates.add(m.group(1))
+            if "://" in v and "@" in v:
+                m = _DSN_PASSWORD_EXTRACT_RE.search(v)
+                if m and len(m.group(1)) >= 3:
+                    candidates.add(m.group(1))
 
     if cfg is not None:
         for v in cfg.secrets_env.values():
@@ -114,9 +124,10 @@ def _collect_secret_values(
             val = cfg.secrets_env.get(ref_var) or proc_env.get(ref_var)
             if isinstance(val, str) and len(val) >= 3:
                 candidates.add(val)
-                m = re.search(r"://[^:/\s@]+:([^@\s]+)@", val)
-                if m and len(m.group(1)) >= 3:
-                    candidates.add(m.group(1))
+                if "://" in val and "@" in val:
+                    m = _DSN_PASSWORD_EXTRACT_RE.search(val)
+                    if m and len(m.group(1)) >= 3:
+                        candidates.add(m.group(1))
         # Also include contents of any configured secret files
         sec_file_paths: list[str] = []
         for conn in cfg.connections.values():
@@ -167,20 +178,15 @@ def _scrub(text: str, secret_values: Sequence[str] = ()) -> str:
     for sec in secret_values:
         if sec and sec in out:
             out = out.replace(sec, "<redacted>")
-    out = _URI_USERINFO_RE.sub("://<redacted>@", out)
-    out = re.sub(r"\bBearer\s+\S+", "Bearer <redacted>", out, flags=re.IGNORECASE)
-    out = re.sub(
-        r"((?:password|passwd|secret|token|auth\s+key)\s*[:=]\s*)([^\s,;'\"]+)",
-        r"\1<redacted>",
-        out,
-        flags=re.IGNORECASE,
-    )
-    out = re.sub(
-        r"\b[A-Za-z0-9_.-]*(?:canary|sentinel|opaque)[A-Za-z0-9_.-]*\b",
-        "<redacted>",
-        out,
-        flags=re.IGNORECASE,
-    )
+    if "://" in out and "@" in out:
+        out = _URI_USERINFO_RE.sub("://<redacted>@", out)
+    if "bearer" in out.lower():
+        out = _BEARER_SCRUB_RE.sub("Bearer <redacted>", out)
+    if ":" in out or "=" in out:
+        out = _KV_SCRUB_RE.sub(r"\1<redacted>", out)
+    out_lower = out.lower()
+    if "canary" in out_lower or "sentinel" in out_lower or "opaque" in out_lower:
+        out = _CANARY_SCRUB_RE.sub("<redacted>", out)
     return out
 
 

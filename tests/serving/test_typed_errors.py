@@ -1770,6 +1770,48 @@ def test_n1_scrubber_linear_time_no_catastrophic_backtracking_and_8kib_cap():
     elapsed_uri = time.perf_counter() - t0
     assert elapsed_uri < 0.05, f"24 KB '://' took {elapsed_uri:.4f}s"
 
+    # N6: Quadratic canary/sentinel & delimiter-restart adversarial inputs (< 50 ms each)
+    from seeknal.serving.audit import _safe_diag_target, _scrub_secret_patterns
+    from seeknal.serving.startup_validation import _scrub as startup_scrub
+
+    n6_payloads = (
+        ("a.*4096", "a." * 4096),
+        ("a-*4096", "a-" * 4096),
+        ("eyJ+.a*4096", "eyJ" + ".a" * 4096),
+        ("canar.*1400", "canar." * 1400),
+        ("a.*12000", "a." * 12000),
+        ("eyJ+.a*10000", "eyJ" + ".a" * 10000),
+    )
+    for label, payload in n6_payloads:
+        t0 = time.perf_counter()
+        scrub_error_detail(payload, env={})
+        elapsed = time.perf_counter() - t0
+        assert elapsed < 0.05, f"scrub_error_detail({label}) took {elapsed:.4f}s"
+
+        t0 = time.perf_counter()
+        startup_scrub(payload)
+        elapsed_sv = time.perf_counter() - t0
+        assert elapsed_sv < 0.05, f"startup_scrub({label}) took {elapsed_sv:.4f}s"
+
+        t0 = time.perf_counter()
+        _scrub_secret_patterns(payload)
+        _safe_diag_target(payload)
+        elapsed_aud = time.perf_counter() - t0
+        assert elapsed_aud < 0.05, f"audit scrub({label}) took {elapsed_aud:.4f}s"
+
+    # Also verify canary/sentinel/opaque redaction still works and stays < 50 ms when keyword is present
+    t0 = time.perf_counter()
+    out_canary = scrub_error_detail(("a." * 3500) + " my_canary_tok.1 and sentinel-val_2", env={})
+    assert (time.perf_counter() - t0) < 0.05
+    assert "my_canary_tok" not in out_canary
+    assert "sentinel-val_2" not in out_canary
+
+    t0 = time.perf_counter()
+    out_sv_canary = startup_scrub(("a." * 3500) + " my_opaque_tok.1 and canary-val_2")
+    assert (time.perf_counter() - t0) < 0.05
+    assert "my_opaque_tok" not in out_sv_canary
+    assert "canary-val_2" not in out_sv_canary
+
 
 def test_n3_known_secrets_replaced_before_and_after_generic_regexes():
     clear_registered_config_secrets()

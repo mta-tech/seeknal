@@ -142,16 +142,18 @@ _MAX_AUDIT_TABLES = 64
 
 # Defense-in-depth patterns to prevent tokens, Bearer headers, or DSNs/credentials
 # from ever appearing in serialized string fields or diagnostic error messages.
-_JWT_COMPACT_RE = re.compile(r"eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
+_JWT_COMPACT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{0,256}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
 _BEARER_HEADER_RE = re.compile(r"(?i)\b(?:authorization\s*:\s*)?bearer\s+\S+")
 _DSN_SCHEME_RE = re.compile(
     r"(?i)\b(?:postgres|postgresql|mysql|mariadb|starrocks|duckdb|sqlite|"
     r"clickhouse|snowflake|bigquery|redshift|mongodb|redis|amqp|mssql|oracle|"
-    r"jdbc:[a-z0-9+]+)://\S+"
+    r"jdbc:[a-z0-9+]{1,32})://\S+"
 )
-_CREDENTIAL_URI_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:[^@\s]+@\S+")
+_CREDENTIAL_URI_RE = re.compile(
+    r"[A-Za-z][A-Za-z0-9+.-]{0,31}://[^/\s:@]{1,128}:[^@\s]{1,256}@\S+"
+)
 _SUSPICIOUS_DIAGNOSTIC_RE = re.compile(
-    r"(://|[^/\s]+:[^@\s]+@|\b(?:secret|password|passwd|token|credential)s?\s*[:=]|\bbearer\s+|eyJ[A-Za-z0-9_-]*\.)",
+    r"(://|[^/\s:@]{1,128}:[^@\s]{1,256}@|\b(?:secret|password|passwd|token|credential)s?\s*[:=]|\bbearer\s+|eyJ[A-Za-z0-9_-]{0,256}\.)",
     re.IGNORECASE,
 )
 
@@ -198,10 +200,15 @@ def _sanitize_surrogates(text: str) -> str:
 def _scrub_secret_patterns(text: str) -> str:
     """Sanitize lone surrogates and redact compact JWTs, Bearer headers, and DSNs/credential URIs."""
     cleaned = _sanitize_surrogates(text)
-    cleaned = _BEARER_HEADER_RE.sub("[REDACTED]", cleaned)
-    cleaned = _JWT_COMPACT_RE.sub("[REDACTED]", cleaned)
-    cleaned = _CREDENTIAL_URI_RE.sub("[REDACTED]", cleaned)
-    cleaned = _DSN_SCHEME_RE.sub("[REDACTED]", cleaned)
+    cleaned_lower = cleaned.lower()
+    if "bearer" in cleaned_lower:
+        cleaned = _BEARER_HEADER_RE.sub("[REDACTED]", cleaned)
+    if "eyj" in cleaned_lower and "." in cleaned:
+        cleaned = _JWT_COMPACT_RE.sub("[REDACTED]", cleaned)
+    if "://" in cleaned:
+        if "@" in cleaned:
+            cleaned = _CREDENTIAL_URI_RE.sub("[REDACTED]", cleaned)
+        cleaned = _DSN_SCHEME_RE.sub("[REDACTED]", cleaned)
     return cleaned
 
 

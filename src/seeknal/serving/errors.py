@@ -248,7 +248,7 @@ _QUOTED_OR_BARE_VAL_PAT = (
     r"(?:'(?:''|\\[\s\S]|[^'\\])*'|\"(?:\"\"|\\[\s\S]|[^\"\\])*\"|[^\s,;'\"&+)]+)"
 )
 
-_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,4}")
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{1,256}(?:\.[A-Za-z0-9_-]+){2,4}")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*")
 _URI_USERINFO_RE = re.compile(r"://[^@\s/]{0,256}(?:/[^@\s/]{0,256}){0,8}@")
 _URI_USERINFO_EXTRACT_RE = re.compile(
@@ -274,7 +274,7 @@ _SENSITIVE_ENV_NAME_RE = re.compile(
     r"(?i)(SECRET|PASSWORD|PASSWD|TOKEN|DSN|CREDENTIAL|CANARY|SENTINEL|PRIVATE|KEY)"
 )
 _CANARY_SENTINEL_RE = re.compile(
-    r"(?i)\b[A-Za-z0-9_.-]*(?:canary|sentinel)[A-Za-z0-9_.-]*\b"
+    r"(?i)[A-Za-z0-9_.-]{0,64}(?:canary|sentinel)[A-Za-z0-9_.-]{0,64}"
 )
 _LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _MAX_RAW_SCRUB_INPUT_CHARS = 8192
@@ -441,25 +441,27 @@ def _expand_secret_value(val: str, candidates: set[str]) -> None:
                 _, pwd = greedy_userinfo.split(":", 1)
                 for candidate_pwd in (pwd, urllib.parse.unquote(pwd)):
                     _add_quote_escaped_forms(candidate_pwd, candidates)
-    for uri_m in _URI_USERINFO_EXTRACT_RE.finditer(val):
-        userinfo = uri_m.group(1)
-        if ":" in userinfo:
-            _, pwd = userinfo.split(":", 1)
-            for candidate_pwd in (pwd, urllib.parse.unquote(pwd)):
-                _add_quote_escaped_forms(candidate_pwd, candidates)
-        else:
-            _add_quote_escaped_forms(userinfo, candidates)
-    for kv_m in _DSN_KV_EXTRACT_RE.finditer(val):
-        kv_val = kv_m.group(1) or kv_m.group(2) or kv_m.group(3) or ""
-        if kv_val:
-            for unesc in (
-                kv_val,
-                kv_val.replace("''", "'"),
-                kv_val.replace("\\'", "'"),
-                kv_val.replace('""', '"'),
-                kv_val.replace('\\"', '"'),
-            ):
-                _add_quote_escaped_forms(unesc, candidates)
+        if "@" in after_scheme:
+            for uri_m in _URI_USERINFO_EXTRACT_RE.finditer(val):
+                userinfo = uri_m.group(1)
+                if ":" in userinfo:
+                    _, pwd = userinfo.split(":", 1)
+                    for candidate_pwd in (pwd, urllib.parse.unquote(pwd)):
+                        _add_quote_escaped_forms(candidate_pwd, candidates)
+                else:
+                    _add_quote_escaped_forms(userinfo, candidates)
+    if "=" in val:
+        for kv_m in _DSN_KV_EXTRACT_RE.finditer(val):
+            kv_val = kv_m.group(1) or kv_m.group(2) or kv_m.group(3) or ""
+            if kv_val:
+                for unesc in (
+                    kv_val,
+                    kv_val.replace("''", "'"),
+                    kv_val.replace("\\'", "'"),
+                    kv_val.replace('""', '"'),
+                    kv_val.replace('\\"', '"'),
+                ):
+                    _add_quote_escaped_forms(unesc, candidates)
 
 
 def _extract_env_secrets(
@@ -531,12 +533,18 @@ def scrub_error_detail(
     env_secrets = _extract_env_secrets(env, extra_secrets=extra_secrets)
     detail = _replace_known_secrets(detail, env_secrets)
 
-    detail = _JWT_RE.sub("[REDACTED_JWT]", detail)
-    detail = _BEARER_RE.sub("Bearer [REDACTED]", detail)
-    detail = _URI_USERINFO_RE.sub("://[REDACTED]@", detail)
+    detail_lower = detail.lower()
+    if "eyj" in detail_lower and "." in detail:
+        detail = _JWT_RE.sub("[REDACTED_JWT]", detail)
+    if "bearer" in detail_lower:
+        detail = _BEARER_RE.sub("Bearer [REDACTED]", detail)
+    if "://" in detail and "@" in detail:
+        detail = _URI_USERINFO_RE.sub("://[REDACTED]@", detail)
     detail = _DUCKDB_SECRET_RE.sub(r"\1 '[REDACTED]'", detail)
-    detail = _DSN_KV_EQ_RE.sub(r"\1=[REDACTED]", detail)
-    detail = _SECRET_COLON_KV_RE.sub(r"\1\2: [REDACTED]", detail)
+    if "=" in detail:
+        detail = _DSN_KV_EQ_RE.sub(r"\1=[REDACTED]", detail)
+    if ":" in detail:
+        detail = _SECRET_COLON_KV_RE.sub(r"\1\2: [REDACTED]", detail)
 
     detail = _replace_known_secrets(detail, env_secrets)
 
@@ -563,6 +571,8 @@ def scrub_error_detail(
 
     detail = _redact_bound_params(detail, params)
 
-    detail = _CANARY_SENTINEL_RE.sub("[REDACTED]", detail)
+    detail_lower = detail.lower()
+    if "canary" in detail_lower or "sentinel" in detail_lower:
+        detail = _CANARY_SENTINEL_RE.sub("[REDACTED]", detail)
     detail = _sanitize_log_value(detail, default="")
     return detail[:_MAX_SCRUBBED_DETAIL_CHARS]
