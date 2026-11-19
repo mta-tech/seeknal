@@ -4,11 +4,27 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
+
+_ICEBERG_ALIAS_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_RESERVED_ICEBERG_ALIASES = frozenset({"main", "system", "temp", "memory"})
+
+
+def _validate_discovery_alias(alias: Any, eng_name: str) -> str:
+    if not isinstance(alias, str) or not _ICEBERG_ALIAS_RE.fullmatch(alias):
+        raise DiscoveryConfigError(
+            f"Engine '{eng_name}' alias must match ^[a-z][a-z0-9_]{{0,31}}$"
+        )
+    if alias in _RESERVED_ICEBERG_ALIASES:
+        raise DiscoveryConfigError(
+            f"Engine '{eng_name}' alias '{alias}' is reserved"
+        )
+    return alias
 
 
 class DiscoveryError(Exception):
@@ -276,15 +292,17 @@ class DiscoveryConfig:
 
                 alias_raw = eng_data.get("alias")
                 if alias_raw is not None:
-                    if not isinstance(alias_raw, str) or not alias_raw.strip():
+                    if not isinstance(alias_raw, str):
                         raise DiscoveryConfigError(
                             f"Engine '{eng_name_str}' has invalid 'alias'"
                         )
-                    alias_str = alias_raw.strip()
+                    alias_str = _validate_discovery_alias(alias_raw.strip(), eng_name_str)
 
                 if kind_str == "duckdb" and profile_str == "iceberg_direct":
                     if alias_str is None:
-                        alias_str = catalog_str or default_catalog
+                        alias_str = _validate_discovery_alias(
+                            catalog_str or default_catalog, eng_name_str
+                        )
                     if catalog_str is None:
                         catalog_str = alias_str
                     pin_raw = eng_data.get("pin_current_snapshot", False)

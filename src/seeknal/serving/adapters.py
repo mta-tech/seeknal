@@ -422,7 +422,7 @@ class DuckDBAdapter:
         max_concurrent_cursors: int | None = None,
         env: Mapping[str, str] | None = None,
         standin_catalogs: Mapping[str, str] | None = None,
-        probe_on_reuse: bool = False,
+        probe_on_reuse: bool = True,
     ) -> None:
         self._connect_fn = connect
         self._config = config

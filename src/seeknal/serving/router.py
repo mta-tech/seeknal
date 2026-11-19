@@ -17,6 +17,8 @@ from seeknal.serving.features import QueryFeatures, extract_features
 from seeknal.serving.placement import Engine, Placement, TableEntry
 
 _orig_parse_version = Parser._parse_version
+_orig_parse_table_alias = Parser._parse_table_alias
+_orig_parse_table = Parser._parse_table
 
 
 def _patched_parse_version(self: Parser) -> exp.Version | None:
@@ -38,7 +40,29 @@ def _patched_parse_version(self: Parser) -> exp.Version | None:
     return None
 
 
+def _patched_parse_table_alias(
+    self: Parser, alias_tokens: Any = None
+) -> exp.Expression | None:
+    alias = _orig_parse_table_alias(self, alias_tokens=alias_tokens)
+    if alias is not None:
+        ver = self._parse_version()
+        if ver is not None:
+            alias.meta["post_alias_version"] = ver
+    return alias
+
+
+def _patched_parse_table(self: Parser, *args: Any, **kwargs: Any) -> exp.Expression | None:
+    this = _orig_parse_table(self, *args, **kwargs)
+    if isinstance(this, exp.Table):
+        alias = this.args.get("alias")
+        if alias is not None and alias.meta.get("post_alias_version") is not None:
+            this.set("version", alias.meta.pop("post_alias_version"))
+    return this
+
+
 Parser._parse_version = _patched_parse_version
+Parser._parse_table_alias = _patched_parse_table_alias
+Parser._parse_table = _patched_parse_table
 
 
 def _duckdb_version_sql(generator: Any, expression: exp.Version) -> str:
@@ -48,7 +72,28 @@ def _duckdb_version_sql(generator: Any, expression: exp.Version) -> str:
     return generator.version_sql(expression)
 
 
+def _duckdb_table_sql(generator: Any, expression: exp.Table, sep: str = " AS ") -> str:
+    ver = expression.args.get("version")
+    if ver is not None and ver.meta.get("duckdb_at_version"):
+        expr_copy = expression.copy()
+        expr_copy.set("version", None)
+        joins = expr_copy.args.get("joins")
+        laterals = expr_copy.args.get("laterals")
+        expr_copy.set("joins", None)
+        expr_copy.set("laterals", None)
+        base_with_alias = generator.table_sql(expr_copy, sep=sep)
+        ver_str = generator.sql(ver)
+        joins_str = generator.indent(
+            generator.expressions(expression, key="joins", sep="", flat=True),
+            skip_first=True,
+        )
+        laterals_str = generator.expressions(expression, key="laterals", sep="")
+        return f"{base_with_alias} {ver_str}{joins_str}{laterals_str}"
+    return generator.table_sql(expression, sep=sep)
+
+
 DuckDB.Generator.TRANSFORMS[exp.Version] = _duckdb_version_sql
+DuckDB.Generator.TRANSFORMS[exp.Table] = _duckdb_table_sql
 
 
 def _table_dotted_name(tbl: exp.Table) -> str:
@@ -168,14 +213,7 @@ class Router:
 
             new_tbl = sqlglot.to_table(serve.physical_name, dialect=target_engine.dialect)
             if serve.snapshot_id is not None and target_engine.dialect == "duckdb":
-                if isinstance(serve.snapshot_id, int) and not isinstance(serve.snapshot_id, bool):
-                    snap_expr: exp.Expression = exp.Literal.number(serve.snapshot_id)
-                else:
-                    snap_str = str(serve.snapshot_id).strip()
-                    if snap_str.lstrip("-").isdigit():
-                        snap_expr = exp.Literal.number(int(snap_str))
-                    else:
-                        snap_expr = exp.Literal.string(snap_str)
+                snap_expr = exp.Literal.number(int(serve.snapshot_id))
                 ver_node = exp.Version(
                     this="VERSION",
                     expression=snap_expr,

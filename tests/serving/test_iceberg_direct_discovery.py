@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import duckdb
 import httpx
 import pytest
 
@@ -183,8 +184,47 @@ def test_discovery_pin_current_snapshot_option():
     router = Router(placement)
     decision = router.route("SELECT event_id FROM lakekeeper.analytics.events")
     assert decision.sql == (
-        "SELECT event_id FROM lake.analytics.events AT (VERSION => 4455667788) AS events"
+        "SELECT event_id FROM lake.analytics.events AS events AT (VERSION => 4455667788)"
     )
+    con = duckdb.connect(":memory:")
+    try:
+        stmts = con.extract_statements(decision.sql)
+        assert len(stmts) == 1
+        assert stmts[0].type == duckdb.StatementType.SELECT
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize(
+    "bad_alias",
+    [
+        "Lake",
+        "1lake",
+        "lake-cat",
+        "lake.cat",
+        "lake;DROP",
+        "main",
+        "system",
+        "temp",
+        "memory",
+        "a" * 33,
+    ],
+)
+def test_discovery_config_validates_alias_regex_and_reserved_names(bad_alias):
+    with pytest.raises(DiscoveryConfigError, match="alias"):
+        DiscoveryConfig.from_dict(
+            {
+                "default_catalog": "lakekeeper",
+                "engines": {
+                    "duck": {
+                        "kind": "duckdb",
+                        "dialect": "duckdb",
+                        "profile": "iceberg_direct",
+                        "alias": bad_alias,
+                    }
+                },
+            }
+        )
 
 
 def test_discovery_config_rejects_invalid_duckdb_profile():

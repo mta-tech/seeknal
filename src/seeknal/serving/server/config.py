@@ -422,7 +422,7 @@ class DuckDBConnectionConfig:
     recycle_seconds: float | None = None
     token_lifetime_seconds: float | None = None
     external_access_after_attach: str = "off"
-    secrets_env: Mapping[str, str] = field(default_factory=dict)
+    secrets_env: Mapping[str, str] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
@@ -447,7 +447,7 @@ class ServerConfig:
     default_catalog: str | None = None
     cube_mode: str = "refuse"
     limits: LimitsConfig = field(default_factory=LimitsConfig)
-    secrets_env: dict[str, str] = field(default_factory=dict)
+    secrets_env: dict[str, str] = field(default_factory=dict, repr=False)
     grant_max_lifetime_seconds: float = 60.0
     replay_cache_max_entries: int = 100_000
     compilation_cache_max_entries: int = DEFAULT_COMPILATION_CACHE_MAX_ENTRIES
@@ -1802,6 +1802,16 @@ class ServerConfig:
                             ),
                         )
 
+                    referenced_duck_vars: set[str] = set()
+                    for cat_obj in parsed_catalogs.values():
+                        referenced_duck_vars.add(cat_obj.client_id_env)
+                        referenced_duck_vars.add(cat_obj.client_secret_env)
+                        referenced_duck_vars.add(cat_obj.s3.key_id_env)
+                        referenced_duck_vars.add(cat_obj.s3.secret_env)
+                    scoped_secrets_env = {
+                        k: v for k, v in secrets_env.items() if k in referenced_duck_vars
+                    }
+
                     connections[eng_name_str] = DuckDBConnectionConfig(
                         profile="iceberg_direct",
                         path=":memory:",
@@ -1817,7 +1827,7 @@ class ServerConfig:
                         temp_directory=temp_dir,
                         max_temp_directory_size=max_temp_sz,
                         max_concurrent_cursors=max_concurrent_cursors,
-                        secrets_env=dict(secrets_env),
+                        secrets_env=scoped_secrets_env,
                     )
 
         # 12. limits

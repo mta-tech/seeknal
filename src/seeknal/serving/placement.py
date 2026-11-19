@@ -11,6 +11,19 @@ import yaml
 
 VALID_ENGINE_KINDS = frozenset({"starrocks", "cube", "lakebase", "duckdb"})
 VALID_TWIN_METHODS = frozenset({"redact", "null", "year", "last4"})
+MAX_SIGNED_INT64 = 9_223_372_036_854_775_807
+
+
+def _validate_snapshot_id(value: object, *, context: str = "TableServe") -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PlacementError(
+            f"{context} has invalid snapshot_id: must be a positive integer within signed 64-bit range"
+        )
+    if value <= 0 or value > MAX_SIGNED_INT64:
+        raise PlacementError(
+            f"{context} has invalid snapshot_id: must be a positive integer within signed 64-bit range (1..{MAX_SIGNED_INT64})"
+        )
+    return value
 
 
 class PlacementError(ValueError):
@@ -33,7 +46,14 @@ class TableServe:
     engine: str
     physical_name: str
     max_lag_seconds: float | None = None
-    snapshot_id: int | str | None = None
+    snapshot_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.snapshot_id is not None:
+            _validate_snapshot_id(
+                self.snapshot_id,
+                context=f"TableServe for engine '{self.engine}'",
+            )
 
 
 @dataclass(frozen=True)
@@ -243,28 +263,12 @@ class Placement:
                     lag_val = sval.get("max_lag_seconds")
                     max_lag = float(lag_val) if lag_val is not None else None
                     snap_raw = sval.get("snapshot_id")
-                    snap_id: int | str | None = None
+                    snap_id: int | None = None
                     if snap_raw is not None:
-                        if isinstance(snap_raw, bool):
-                            raise PlacementError(
-                                f"Table '{tbl_name}' serve for engine '{eng_name}' has invalid boolean snapshot_id"
-                            )
-                        if isinstance(snap_raw, int):
-                            snap_id = snap_raw
-                        elif isinstance(snap_raw, str):
-                            s_clean = snap_raw.strip()
-                            if not s_clean:
-                                raise PlacementError(
-                                    f"Table '{tbl_name}' serve for engine '{eng_name}' has empty snapshot_id"
-                                )
-                            try:
-                                snap_id = int(s_clean)
-                            except ValueError:
-                                snap_id = s_clean
-                        else:
-                            raise PlacementError(
-                                f"Table '{tbl_name}' serve for engine '{eng_name}' has invalid snapshot_id"
-                            )
+                        snap_id = _validate_snapshot_id(
+                            snap_raw,
+                            context=f"Table '{tbl_name}' serve for engine '{eng_name}'",
+                        )
                     serves.append(
                         TableServe(
                             engine=str(eng_name),

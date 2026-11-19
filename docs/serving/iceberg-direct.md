@@ -107,18 +107,21 @@ Alongside the unchanged local-file `probe(conn)`, `probe_iceberg_direct(conn, cf
 | Check Name | Condition Verified |
 |:---|:---|
 | `external_access_disabled` | `current_setting('enable_external_access')` is `false` (or `external_access_after_attach: "on"` is surfaced when explicitly configured) |
-| `config_locked` | `SET threads = 1` is refused |
-| `read_text_outside_refused` | `SELECT * FROM read_text('/etc/hostname')` (outside allowed dirs) is refused |
-| `copy_to_refused` | `COPY (SELECT 1) TO '/tmp/...'` is refused |
-| `install_refused` | `INSTALL httpfs` is refused |
-| `new_attach_refused` | Attaching an unconfigured database file after lock is refused |
-| `detach_refused` | `DETACH <alias>` after lock is refused |
-| `create_secret_refused` | `CREATE PERSISTENT SECRET` and `CREATE TEMPORARY SECRET` after lock are refused |
-| `catalog_set_exact` | `duckdb_databases()` contains only the allowlisted catalog aliases plus `system`/`temp`/`memory` |
-| `load_unlisted_refused` | `LOAD <unlisted_extension>` is refused |
+| `config_locked` | `SET threads = 1` is refused (`InvalidInputException` / `PermissionException`) |
+| `allow_persistent_secrets_disabled` | `current_setting('allow_persistent_secrets')` is `false` |
+| `autoinstall_autoload_disabled` | `autoinstall_known_extensions` and `autoload_known_extensions` are both `false` |
+| `custom_extension_repository_locked` | `custom_extension_repository` is locked to `/nonexistent_extension_repository` |
+| `read_text_outside_refused` | `SELECT * FROM read_text('/etc/hostname')` (outside allowed dirs) is refused with `PermissionException` |
+| `copy_to_refused` | `COPY (SELECT 1) TO '/tmp/...'` is refused with `PermissionException` |
+| `install_refused` | `INSTALL httpfs` is refused with `PermissionException` |
+| `new_attach_refused` | Attaching `:memory:`, an outside file, or a file inside `allowed_directories` after lock is refused with `PermissionException` |
+| `detach_refused` | `DETACH <alias>` (including quoted, comment-prefixed, and multi-statement forms) after lock is refused with `PermissionException` |
+| `create_secret_refused` | `CREATE PERSISTENT/TEMPORARY/TEMP SECRET` and `DROP SECRET` (including comment-prefixed and multi-statement forms) after lock are refused |
+| `catalog_set_exact` | `duckdb_databases()` contains only the allowlisted read-only catalog aliases plus `system`/`temp`/`memory` |
+| `load_unlisted_refused` | `LOAD <unlisted_extension>` is refused with `PermissionException` |
 | `secrets_temporary_only` | Every entry in `duckdb_secrets()` has `persistent == false` |
-| `writes_refused` | DDL/DML writes (`CREATE TABLE`, `INSERT`, `DELETE`) on each attached catalog are refused |
-| `s3_outside_prefix_refused` | Reading an `s3://` URI outside `allowed_s3_prefixes` is refused (or reported `"unsupported"` if the runtime capability is `False`) |
+| `writes_refused` | DDL/DML writes (`CREATE TABLE/VIEW/MACRO`, `INSERT`, `DELETE`) on each attached catalog and the in-memory default catalog are refused |
+| `s3_outside_prefix_refused` | Reading an `s3://` URI outside `allowed_s3_prefixes` is refused with `PermissionException` (or reported `"unsupported"` if the runtime capability is `False`) |
 | `select_ok` | `SELECT 42` returns `42` |
 
 Serving refuses to serve from any generation whose probe fails (`probe_iceberg_direct_ok` fails closed with no fallback).
@@ -137,9 +140,9 @@ Serving refuses to serve from any generation whose probe fails (`probe_iceberg_d
   - `name`: `<alias>.<namespace>.<table>`
   - `max_lag_seconds`: `(now - current_snapshot_timestamp) + refresh_interval_seconds`
   - Optional `snapshot_id` when `pin_current_snapshot: true` or when pinned in static placement (`serve.<engine>.snapshot_id`).
-- When a table serve specifies `snapshot_id: <id>`, `Router.rewrite()` renders DuckDB's Iceberg time-travel syntax:
+- When a table serve specifies `snapshot_id: <id>` (a positive signed 64-bit integer), `Router.rewrite()` renders DuckDB's Iceberg time-travel syntax with the table alias placed before `AT (VERSION => <id>)`:
   ```sql
-  <alias>.<namespace>.<table> AT (VERSION => <id>) AS <table_alias>
+  <alias>.<namespace>.<table> AS <table_alias> AT (VERSION => <id>)
   ```
 
 ---

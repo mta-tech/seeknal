@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import duckdb
@@ -35,7 +35,7 @@ class Step:
 
     phase: str
     name: str
-    sql: str
+    sql: str = field(repr=False)
     redacted_sql: str | None = None
     capability: str | None = None
     capability_value: bool | None = None
@@ -471,6 +471,7 @@ def harden_iceberg_direct(
             _cfg_attr(cfg, "external_access_after_attach", "off")
         ).strip().lower(),
     }
+    failed_step: str | None = None
     try:
         temp_dir_raw = _cfg_attr(cfg, "temp_directory")
         if temp_dir_raw is not None:
@@ -534,18 +535,17 @@ def harden_iceberg_direct(
                 continue
 
             conn.execute(step.sql)
-    except IcebergDirectHardeningError:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        raise
+    except IcebergDirectHardeningError as err:
+        failed_step = err.step_name
     except Exception:
+        failed_step = current_step
+
+    if failed_step is not None:
         try:
             conn.close()
         except Exception:
             pass
-        raise IcebergDirectHardeningError(current_step) from None
+        raise IcebergDirectHardeningError(failed_step)
 
     try:
         setattr(conn, "_iceberg_direct_capabilities", capabilities)
@@ -742,42 +742,178 @@ class DuckDBInstance:
 
 
 def _make_iceberg_locked_cursor(raw_cursor: Any, allowed_aliases: Sequence[str]) -> Any:
-    """Wrap a DuckDB cursor for iceberg_direct to enforce post-lock refusal of DETACH and CREATE SECRET."""
+    """Wrap a DuckDB cursor for iceberg_direct to enforce post-lock single-SELECT allowlist."""
     return _IcebergLockedCursor(raw_cursor, allowed_aliases)
 
 
-_POST_LOCK_FORBIDDEN_SQL_RE = re.compile(
-    r"^\s*(?:DETACH\b|(?:FORCE\s+)?INSTALL\b|CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMPORARY\s+|PERSISTENT\s+)?SECRET\b|DROP\s+(?:TEMPORARY\s+|PERSISTENT\s+)?SECRET\b)",
-    re.IGNORECASE,
+def _check_iceberg_generation_health(conn: Any, cfg: Any = None) -> bool:
+    """Verify catalog-set, secret state, and locked configuration settings on an iceberg_direct connection."""
+    raw = getattr(conn, "_raw", conn)
+    catalogs_raw = _cfg_attr(cfg, "iceberg_catalogs", {}) if cfg is not None else {}
+    allowlisted_aliases = sorted(str(a) for a in (catalogs_raw or {}).keys())
+    ext_after = (
+        str(_cfg_attr(cfg, "external_access_after_attach", "off")).strip().lower()
+        if cfg is not None
+        else "off"
+    )
+    try:
+        # 1. Settings check: lock_configuration, allow_persistent_secrets, autoinstall/autoload, custom_extension_repository, enable_external_access
+        s_row = raw.execute(
+            "SELECT "
+            "current_setting('lock_configuration'), "
+            "current_setting('allow_persistent_secrets'), "
+            "current_setting('autoinstall_known_extensions'), "
+            "current_setting('autoload_known_extensions'), "
+            "current_setting('custom_extension_repository'), "
+            "current_setting('enable_external_access')"
+        ).fetchone()
+        if not s_row or len(s_row) != 6:
+            return False
+        lock_cfg, allow_pers, autoinst, autoload, custom_repo, ext_acc = s_row
+        if not (lock_cfg is True or str(lock_cfg).lower() == "true"):
+            return False
+        if not (allow_pers is False or str(allow_pers).lower() == "false"):
+            return False
+        if not (autoinst is False or str(autoinst).lower() == "false"):
+            return False
+        if not (autoload is False or str(autoload).lower() == "false"):
+            return False
+        if str(custom_repo) != "/nonexistent_extension_repository":
+            return False
+        if ext_after == "off":
+            if not (ext_acc is False or str(ext_acc).lower() == "false"):
+                return False
+
+        # 2. Catalog set exact & all attached catalogs read-only
+        db_rows = raw.execute(
+            "SELECT database_name, readonly FROM duckdb_databases()"
+        ).fetchall()
+        actual_dbs = {str(r[0]): bool(r[1]) for r in db_rows}
+        expected_base = {"system", "temp", "memory"}
+        expected_aliases = set(allowlisted_aliases)
+        if not expected_aliases.issubset(set(actual_dbs.keys())):
+            return False
+        if not set(actual_dbs.keys()).issubset(expected_base | expected_aliases):
+            return False
+        for alias in expected_aliases:
+            if actual_dbs.get(alias) is not True:
+                return False
+
+        # 3. Secrets temporary only & expected secret names intact
+        sec_rows = raw.execute(
+            "SELECT name, persistent FROM duckdb_secrets()"
+        ).fetchall()
+        actual_sec_names = {str(r[0]) for r in sec_rows}
+        if not all(r[1] is False or str(r[1]).lower() == "false" for r in sec_rows):
+            return False
+        for alias in expected_aliases:
+            if f"s3_{alias}" not in actual_sec_names or f"iceberg_{alias}" not in actual_sec_names:
+                return False
+        if len(actual_sec_names) != 2 * len(expected_aliases):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+_SAFE_CURSOR_PASSTHROUGH_ATTRS = frozenset(
+    {
+        "description",
+        "rowcount",
+        "fetchone",
+        "fetchmany",
+        "fetchall",
+        "fetchdf",
+        "fetch_df",
+        "fetch_df_chunk",
+        "fetchnumpy",
+        "df",
+        "to_arrow_table",
+        "to_arrow_reader",
+        "interrupt",
+        "extract_statements",
+        "_iceberg_direct_capabilities",
+    }
 )
 
 
 class _IcebergLockedCursor:
-    """Locked cursor proxy for iceberg_direct that refuses DETACH and CREATE/DROP SECRET after lock_configuration."""
+    """Locked cursor proxy for iceberg_direct enforcing a single-SELECT statement allowlist via DuckDB's parser."""
 
     def __init__(self, raw_cursor: Any, allowed_aliases: Sequence[str] = ()) -> None:
         self._raw = raw_cursor
         self._allowed_aliases = tuple(allowed_aliases)
 
-    def execute(self, query: str, parameters: Any = None) -> Any:
-        if isinstance(query, str) and _POST_LOCK_FORBIDDEN_SQL_RE.match(query):
+    def _validate_single_select(self, query: Any) -> str:
+        if not isinstance(query, str) or not query.strip():
             raise duckdb.PermissionException(
-                "Permission Error: Catalog DETACH and SECRET modifications are disabled after lock_configuration"
+                "Permission Error: Only a single SELECT statement is permitted on a locked iceberg_direct connection"
             )
+        try:
+            stmts = self._raw.extract_statements(query)
+        except duckdb.Error:
+            raise
+        except Exception:
+            raise duckdb.PermissionException(
+                "Permission Error: Failed to parse SQL statement on locked iceberg_direct connection"
+            ) from None
+        if len(stmts) != 1 or stmts[0].type != duckdb.StatementType.SELECT:
+            stmt_types = [getattr(s.type, "name", str(s.type)) for s in stmts] if stmts else ["EMPTY"]
+            raise duckdb.PermissionException(
+                f"Permission Error: Only a single SELECT statement is permitted after lock_configuration (got {len(stmts)} statement(s): {stmt_types})"
+            )
+        return query
+
+    def execute(self, query: Any, parameters: Any = None) -> _IcebergLockedCursor:
+        validated = self._validate_single_select(query)
         if parameters is not None:
-            res = self._raw.execute(query, parameters)
+            self._raw.execute(validated, parameters)
         else:
-            res = self._raw.execute(query)
-        return self if res is self._raw else res
+            self._raw.execute(validated)
+        return self
+
+    def executemany(self, query: Any, parameters: Any = None) -> _IcebergLockedCursor:
+        self._validate_single_select(query)
+        raise duckdb.PermissionException(
+            "Permission Error: executemany is disabled on a locked iceberg_direct connection"
+        )
+
+    def sql(self, query: Any, *args: Any, **kwargs: Any) -> Any:
+        validated = self._validate_single_select(query)
+        if args or kwargs:
+            return self._raw.sql(validated, *args, **kwargs)
+        return self._raw.sql(validated)
+
+    def query(self, query: Any, *args: Any, **kwargs: Any) -> Any:
+        validated = self._validate_single_select(query)
+        if args or kwargs:
+            return self._raw.query(validated, *args, **kwargs)
+        return self._raw.query(validated)
+
+    def from_query(self, query: Any, *args: Any, **kwargs: Any) -> Any:
+        validated = self._validate_single_select(query)
+        if args or kwargs:
+            return self._raw.from_query(validated, *args, **kwargs)
+        return self._raw.from_query(validated)
 
     def cursor(self) -> _IcebergLockedCursor:
         return _IcebergLockedCursor(self._raw.cursor(), self._allowed_aliases)
+
+    def duplicate(self) -> _IcebergLockedCursor:
+        return _IcebergLockedCursor(self._raw.duplicate(), self._allowed_aliases)
+
+    def commit(self) -> None:
+        return None
 
     def close(self) -> None:
         self._raw.close()
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._raw, name)
+        if name in _SAFE_CURSOR_PASSTHROUGH_ATTRS:
+            return getattr(self._raw, name)
+        raise duckdb.PermissionException(
+            f"Permission Error: Method or attribute '{name}' is not permitted on a locked iceberg_direct connection"
+        )
 
 
 class DuckDBCursorWrapper:
@@ -951,9 +1087,9 @@ class DuckDBHolder:
         config_id: str | None = None,
         env: Mapping[str, str] | None = None,
         standin_catalogs: Mapping[str, str] | None = None,
-        probe_on_reuse: bool = False,
+        probe_on_reuse: bool = True,
     ) -> Any:
-        """Acquire a cursor from the current iceberg_direct generation, recycling on expiry or probe failure."""
+        """Acquire a cursor from the current iceberg_direct generation, recycling on expiry or probe/drift failure."""
         with self._lock:
             if self._closed:
                 raise RuntimeError("DuckDBHolder is closed")
@@ -968,6 +1104,7 @@ class DuckDBHolder:
             curr_inst = self._instances_by_dev_ino.get(curr_key) if curr_key is not None else None
 
             needs_recycle = False
+            drift_detected = False
             if curr_inst is None or curr_inst.is_closed:
                 needs_recycle = True
             else:
@@ -977,13 +1114,30 @@ class DuckDBHolder:
                     and (now - curr_inst.created_at) >= recycle_seconds
                 ):
                     needs_recycle = True
+                elif not _check_iceberg_generation_health(curr_inst.connection, cfg):
+                    needs_recycle = True
+                    drift_detected = True
                 elif probe_on_reuse:
                     try:
                         pr = probe_iceberg_direct(curr_inst.connection, cfg)
                         if not probe_iceberg_direct_ok(pr, cfg):
                             needs_recycle = True
+                            drift_detected = True
                     except Exception:
                         needs_recycle = True
+                        drift_detected = True
+
+            if drift_detected and curr_key is not None and curr_inst is not None:
+                # Immediately invalidate and retire a drifted/tampered generation before attempting replacement
+                self._configured_to_dev_ino.pop(cfg_key, None)
+                with curr_inst.lock:
+                    curr_inst.is_retired = True
+                    should_close_drifted = curr_inst.in_flight <= 0
+                if should_close_drifted:
+                    curr_inst.close_instance()
+                    self._instances_by_dev_ino.pop(curr_key, None)
+                curr_key = None
+                curr_inst = None
 
             if not needs_recycle and curr_inst is not None:
                 with curr_inst.lock:
@@ -1292,6 +1446,7 @@ def probe(conn: Any) -> dict[str, bool]:
 def probe_iceberg_direct(conn: Any, cfg: Any = None) -> dict[str, Any]:
     """Run conformance checks for the iceberg_direct profile and return report dict."""
     checks: dict[str, Any] = {}
+    raw_conn = getattr(conn, "_raw", conn)
 
     catalogs_raw = _cfg_attr(cfg, "iceberg_catalogs", {}) if cfg is not None else {}
     allowlisted_aliases = sorted(str(a) for a in (catalogs_raw or {}).keys())
@@ -1300,7 +1455,7 @@ def probe_iceberg_direct(conn: Any, cfg: Any = None) -> dict[str, Any]:
         if cfg is not None
         else "off"
     )
-    caps = getattr(conn, "_iceberg_direct_capabilities", None) or {}
+    caps = getattr(conn, "_iceberg_direct_capabilities", None) or getattr(raw_conn, "_iceberg_direct_capabilities", None) or {}
     s3_confinement_cap = caps.get("s3_prefix_confinement", True)
 
     # 1. external_access_disabled (or report external_access_after_attach="on")
@@ -1314,14 +1469,60 @@ def probe_iceberg_direct(conn: Any, cfg: Any = None) -> dict[str, Any]:
     if ext_after == "on":
         checks["external_access_after_attach"] = "on"
 
-    # 2. config_locked: SET threads = 1 is refused.
+    # 1b. Persistent secrets, autoinstall/autoload, and custom_extension_repository settings
+    try:
+        s_row = conn.execute(
+            "SELECT "
+            "current_setting('allow_persistent_secrets'), "
+            "current_setting('autoinstall_known_extensions'), "
+            "current_setting('autoload_known_extensions'), "
+            "current_setting('custom_extension_repository'), "
+            "current_setting('lock_configuration')"
+        ).fetchone()
+        if s_row and len(s_row) == 5:
+            allow_pers, autoinst, autoload, custom_repo, lock_cfg = s_row
+            checks["allow_persistent_secrets_disabled"] = bool(
+                allow_pers is False or str(allow_pers).lower() == "false"
+            )
+            checks["autoinstall_autoload_disabled"] = bool(
+                (autoinst is False or str(autoinst).lower() == "false")
+                and (autoload is False or str(autoload).lower() == "false")
+            )
+            checks["custom_extension_repository_locked"] = bool(
+                str(custom_repo) == "/nonexistent_extension_repository"
+                and (lock_cfg is True or str(lock_cfg).lower() == "true")
+            )
+        else:
+            checks["allow_persistent_secrets_disabled"] = False
+            checks["autoinstall_autoload_disabled"] = False
+            checks["custom_extension_repository_locked"] = False
+    except Exception:
+        checks["allow_persistent_secrets_disabled"] = False
+        checks["autoinstall_autoload_disabled"] = False
+        checks["custom_extension_repository_locked"] = False
+
+    # 2. config_locked: SET threads = 1 is refused (both via locked cursor and raw DuckDB config lock).
     try:
         conn.execute("SET threads = 1")
-        checks["config_locked"] = False
-    except duckdb.Error:
-        checks["config_locked"] = True
+        cursor_set_refused = False
+    except duckdb.PermissionException:
+        cursor_set_refused = True
+    except duckdb.InvalidInputException as exc:
+        cursor_set_refused = "configuration has been locked" in str(exc)
     except Exception:
-        checks["config_locked"] = False
+        cursor_set_refused = False
+
+    try:
+        raw_conn.execute("SET threads = 1")
+        raw_set_refused = False
+    except duckdb.InvalidInputException as exc:
+        raw_set_refused = "configuration has been locked" in str(exc)
+    except duckdb.PermissionException:
+        raw_set_refused = True
+    except Exception:
+        raw_set_refused = False
+
+    checks["config_locked"] = bool(cursor_set_refused and raw_set_refused)
 
     # Retrieve allowed directories if configured
     try:
@@ -1335,22 +1536,22 @@ def probe_iceberg_direct(conn: Any, cfg: Any = None) -> dict[str, Any]:
     local_allowed = [d for d in allowed if isinstance(d, str) and not d.startswith("s3://")]
     s3_allowed = [d for d in allowed if isinstance(d, str) and d.startswith("s3://")]
 
-    # 3. read_text_outside_refused
+    # 3. read_text_outside_refused: must fail with PermissionException (not IOException / missing file)
     read_path = "/etc/hostname"
     if any(read_path.startswith(d) for d in local_allowed):
-        for candidate in ["/etc/shadow", "/root/outside.txt", "/proc/version"]:
+        for candidate in ["/etc/passwd", "/proc/version", "/etc/hosts"]:
             if not any(candidate.startswith(d) for d in local_allowed):
                 read_path = candidate
                 break
     try:
         conn.execute(f"SELECT * FROM read_text('{read_path}')")
         checks["read_text_outside_refused"] = False
-    except duckdb.Error:
+    except duckdb.PermissionException:
         checks["read_text_outside_refused"] = True
     except Exception:
         checks["read_text_outside_refused"] = False
 
-    # 4. copy_to_refused
+    # 4. copy_to_refused: must fail with PermissionException (including inside allowed/temp dirs)
     copy_dir = "/tmp"
     if any(copy_dir.startswith(d.rstrip("/")) for d in local_allowed):
         for candidate in ["/var/tmp", "/dev/shm", "/opt"]:
@@ -1366,21 +1567,21 @@ def probe_iceberg_direct(conn: Any, cfg: Any = None) -> dict[str, Any]:
                 os.remove(copy_path)
             except Exception:
                 pass
-    except duckdb.Error:
+    except duckdb.PermissionException:
         checks["copy_to_refused"] = True
     except Exception:
         checks["copy_to_refused"] = False
 
-    # 5. install_refused
+    # 5. install_refused: must fail with PermissionException
     try:
         conn.execute("INSTALL httpfs")
         checks["install_refused"] = False
-    except duckdb.Error:
+    except duckdb.PermissionException:
         checks["install_refused"] = True
     except Exception:
         checks["install_refused"] = False
 
-    # 6. new_attach_refused: attaching an outside database file after lock is refused
+    # 6. new_attach_refused: ATTACH ':memory:', outside file, and file inside allowed_directories must all be refused with PermissionException
     attach_dir = "/tmp"
     if any(attach_dir.startswith(d.rstrip("/")) for d in local_allowed):
         for candidate in ["/var/tmp", "/dev/shm", "/opt"]:
@@ -1388,73 +1589,100 @@ def probe_iceberg_direct(conn: Any, cfg: Any = None) -> dict[str, Any]:
                 attach_dir = candidate
                 break
     outside_file = f"{attach_dir}/probe_outside_{uuid.uuid4().hex}.duckdb"
-    try:
-        conn.execute(f"ATTACH '{outside_file}' AS probe_outside_check")
-        checks["new_attach_refused"] = False
+    attach_stmts = [
+        "ATTACH ':memory:' AS probe_mem_check",
+        f"/* leading comment */ ATTACH ':memory:' AS probe_mem_comment_check",
+        f"ATTACH '{outside_file}' AS probe_outside_check",
+    ]
+    if local_allowed:
+        inside_file = f"{local_allowed[0].rstrip('/')}/probe_inside_{uuid.uuid4().hex}.duckdb"
+        attach_stmts.append(f"ATTACH '{inside_file}' AS probe_inside_check")
+
+    new_attach_ok = True
+    for a_stmt in attach_stmts:
         try:
-            conn.execute("DETACH probe_outside_check")
-        except Exception:
+            conn.execute(a_stmt)
+            new_attach_ok = False
+        except duckdb.PermissionException:
             pass
-        if os.path.exists(outside_file):
-            try:
-                os.remove(outside_file)
-            except Exception:
-                pass
-    except duckdb.Error:
-        checks["new_attach_refused"] = True
-    except Exception:
-        checks["new_attach_refused"] = False
+        except Exception:
+            new_attach_ok = False
+    checks["new_attach_refused"] = new_attach_ok
 
-    # 7. detach_refused: detaching an attached catalog (or system/memory) after lock is refused
+    # 7. detach_refused: DETACH (bare, quoted, comment-prefixed, multi-statement) must be refused with PermissionException
     target_detach = allowlisted_aliases[0] if allowlisted_aliases else "memory"
-    try:
-        conn.execute(f"DETACH {target_detach}")
-        checks["detach_refused"] = False
-    except duckdb.Error:
-        checks["detach_refused"] = True
-    except Exception:
-        checks["detach_refused"] = False
+    detach_stmts = [
+        f"DETACH {target_detach}",
+        f'DETACH "{target_detach}"',
+        f"/* comment */ DETACH {target_detach}",
+        f"-- line comment\nDETACH {target_detach}",
+        f"SELECT 1; DETACH {target_detach}",
+    ]
+    detach_ok = True
+    for d_stmt in detach_stmts:
+        try:
+            conn.execute(d_stmt)
+            detach_ok = False
+        except duckdb.PermissionException:
+            pass
+        except Exception:
+            detach_ok = False
+    checks["detach_refused"] = detach_ok
 
-    # 8. create_secret_refused: creating a persistent or temporary secret after lock is refused
-    persistent_refused = False
-    try:
-        conn.execute("CREATE PERSISTENT SECRET probe_pers_sec (TYPE HTTP)")
-    except duckdb.Error:
-        persistent_refused = True
-    except Exception:
-        persistent_refused = False
+    # 8. create_secret_refused: CREATE/DROP SECRET (PERSISTENT, TEMPORARY, TEMP, comment-prefixed, multi-statement) refused with PermissionException
+    secret_stmts = [
+        "CREATE PERSISTENT SECRET probe_pers_sec (TYPE HTTP)",
+        "CREATE TEMPORARY SECRET probe_tmp_sec (TYPE HTTP)",
+        "CREATE TEMP SECRET probe_temp_short_sec (TYPE HTTP)",
+        "/* comment */ CREATE TEMP SECRET probe_comment_sec (TYPE HTTP)",
+        "-- comment\nCREATE TEMPORARY SECRET probe_line_comment_sec (TYPE HTTP)",
+        "SELECT 1; CREATE TEMPORARY SECRET probe_multi_sec (TYPE HTTP)",
+        "DROP SECRET IF EXISTS probe_tmp_sec",
+        "DROP TEMP SECRET IF EXISTS probe_tmp_sec",
+    ]
+    secret_refused_ok = True
+    for s_stmt in secret_stmts:
+        try:
+            conn.execute(s_stmt)
+            secret_refused_ok = False
+        except duckdb.PermissionException:
+            pass
+        except Exception:
+            secret_refused_ok = False
 
-    temp_secret_refused = False
+    # Also verify raw DuckDB rejects persistent secret creation with InvalidInputException (allow_persistent_secrets=false)
     try:
-        conn.execute("CREATE TEMPORARY SECRET probe_tmp_sec (TYPE HTTP)")
-    except duckdb.Error:
-        temp_secret_refused = True
+        raw_conn.execute("CREATE PERSISTENT SECRET probe_raw_pers_sec (TYPE HTTP)")
+        raw_pers_refused = False
+    except (duckdb.InvalidInputException, duckdb.PermissionException):
+        raw_pers_refused = True
     except Exception:
-        temp_secret_refused = False
+        raw_pers_refused = False
 
-    checks["create_secret_refused"] = bool(persistent_refused and temp_secret_refused)
+    checks["create_secret_refused"] = bool(secret_refused_ok and raw_pers_refused)
 
     # 9. catalog_set_exact: duckdb_databases() = allowlisted aliases + system/temp/memory only
     try:
-        rows = conn.execute("SELECT database_name FROM duckdb_databases()").fetchall()
-        actual_dbs = {str(r[0]) for r in rows}
+        rows = conn.execute("SELECT database_name, readonly FROM duckdb_databases()").fetchall()
+        actual_dbs = {str(r[0]): bool(r[1]) for r in rows}
         expected_base = {"system", "temp", "memory"}
         expected_aliases = set(allowlisted_aliases)
         checks["catalog_set_exact"] = bool(
-            expected_aliases.issubset(actual_dbs)
-            and actual_dbs.issubset(expected_base | expected_aliases)
+            expected_aliases.issubset(set(actual_dbs.keys()))
+            and set(actual_dbs.keys()).issubset(expected_base | expected_aliases)
+            and all(actual_dbs.get(a) is True for a in expected_aliases)
         )
     except Exception:
         checks["catalog_set_exact"] = False
 
-    # 10. load_unlisted_refused: loading an unlisted external extension is refused
+    # 10. load_unlisted_refused: loading an unlisted external extension is refused with PermissionException
     unlisted_candidates = ["fts", "spatial", "inet", "tpch", "avro", "excel"]
     configured_exts = set(_cfg_attr(cfg, "extensions", ()) or ()) if cfg is not None else set()
     probe_ext = next((e for e in unlisted_candidates if e not in configured_exts), "fts")
     try:
         conn.execute(f"LOAD {probe_ext}")
         checks["load_unlisted_refused"] = False
-    except duckdb.Error:
+    except duckdb.PermissionException:
         checks["load_unlisted_refused"] = True
     except Exception:
         checks["load_unlisted_refused"] = False
@@ -1468,18 +1696,29 @@ def probe_iceberg_direct(conn: Any, cfg: Any = None) -> dict[str, Any]:
     except Exception:
         checks["secrets_temporary_only"] = False
 
-    # 12. writes_refused on each attached catalog
+    # 12. writes_refused on each attached catalog (and in-memory default catalog)
     if allowlisted_aliases:
         writes_ok = True
         for alias in allowlisted_aliases:
-            try:
-                conn.execute(f"CREATE TABLE {alias}.main.__probe_write_check (id INT)")
-                writes_ok = False
+            # 12a. Locked cursor refuses DDL/DML with PermissionException
+            for w_stmt in (
+                f"CREATE TABLE {alias}.main.__probe_write_check (id INT)",
+                "CREATE TABLE __probe_mem_write_check (id INT)",
+                "CREATE VIEW __probe_mem_view_check AS SELECT 1",
+                "CREATE MACRO __probe_mem_macro(x) AS x + 1",
+            ):
                 try:
-                    conn.execute(f"DROP TABLE {alias}.main.__probe_write_check")
-                except Exception:
+                    conn.execute(w_stmt)
+                    writes_ok = False
+                except duckdb.PermissionException:
                     pass
-            except duckdb.Error:
+                except Exception:
+                    writes_ok = False
+            # 12b. Raw attached catalog is also READ_ONLY at the DuckDB storage layer
+            try:
+                raw_conn.execute(f"CREATE TABLE {alias}.main.__probe_raw_write_check (id INT)")
+                writes_ok = False
+            except (duckdb.InvalidInputException, duckdb.CatalogException, duckdb.BinderException, duckdb.PermissionException):
                 pass
             except Exception:
                 writes_ok = False
@@ -1497,12 +1736,6 @@ def probe_iceberg_direct(conn: Any, cfg: Any = None) -> dict[str, Any]:
             checks["s3_outside_prefix_refused"] = False
         except duckdb.PermissionException:
             checks["s3_outside_prefix_refused"] = True
-        except duckdb.Error as exc:
-            msg = str(exc)
-            if "file system operations are disabled by configuration" in msg or "Permission Error" in msg:
-                checks["s3_outside_prefix_refused"] = True
-            else:
-                checks["s3_outside_prefix_refused"] = False
         except Exception:
             checks["s3_outside_prefix_refused"] = False
 
@@ -1525,6 +1758,9 @@ def probe_iceberg_direct_ok(results: Mapping[str, Any], cfg: Any = None) -> bool
     )
     required_true = [
         "config_locked",
+        "allow_persistent_secrets_disabled",
+        "autoinstall_autoload_disabled",
+        "custom_extension_repository_locked",
         "read_text_outside_refused",
         "copy_to_refused",
         "install_refused",

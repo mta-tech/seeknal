@@ -195,35 +195,45 @@ def test_iceberg_direct_generation_recycle_drains_inflight_and_closes_old(tmp_pa
 
 
 def test_iceberg_direct_recycle_on_probe_failure(tmp_path):
-    """When probe fails on an active generation, holder recycles to a new healthy generation."""
+    """When probe or drift check fails on an active generation, holder invalidates it and recycles (or fails closed if replacement probe fails)."""
     clock = FakeClock(1000.0)
     holder = DuckDBHolder(max_idle_seconds=0, clock=clock)
     try:
         cfg, standins = _build_standin_cfg(tmp_path, recycle_seconds=300.0)
-        cur1 = holder.get_iceberg_cursor(
-            cfg,
-            config_id="duck_ice",
+        adapter = DuckDBAdapter(
+            config=cfg,
+            holder=holder,
             standin_catalogs=standins,
         )
-        gen1_key = holder._configured_to_dev_ino["duck_ice"]
+        # Default DuckDBAdapter wiring has probe_on_reuse=True
+        assert adapter._probe_on_reuse is True
+
+        res1 = adapter.execute(_make_prepared(audit_id="audit-gen1"), timeout_seconds=5.0)
+        assert len(res1.rows) == 3
+        cfg_key = f"iceberg_direct:{id(cfg)}"
+        gen1_key = holder._configured_to_dev_ino[cfg_key]
         gen1_inst = holder._instances_by_dev_ino[gen1_key]
-        cur1.close()
 
-        # Simulate corruption / probe failure on gen1 by closing its underlying connection
-        gen1_inst.connection.close()
+        # Simulate catalog-set/secret tampering on the raw underlying connection
+        gen1_inst.connection._raw.execute("ATTACH ':memory:' AS unauthorized_extra")
 
-        # Next get_iceberg_cursor with probe_on_reuse=True detects probe failure and recycles
-        cur2 = holder.get_iceberg_cursor(
-            cfg,
-            config_id="duck_ice",
-            standin_catalogs=standins,
-            probe_on_reuse=True,
-        )
-        gen2_key = holder._configured_to_dev_ino["duck_ice"]
+        # Next adapter.execute detects catalog drift before reuse, closes gen1, and recycles to gen2
+        res2 = adapter.execute(_make_prepared(audit_id="audit-gen2"), timeout_seconds=5.0)
+        assert len(res2.rows) == 3
+        gen2_key = holder._configured_to_dev_ino[cfg_key]
         assert gen2_key != gen1_key
-        rows = cur2.execute("SELECT count(*) FROM lake.ns.items").fetchall()
-        assert rows == [(3,)]
-        cur2.close()
+        assert gen1_inst.is_closed is True
+        assert gen1_key not in holder._instances_by_dev_ino
+
+        # And if secret drift occurs AND replacement generation fails to build/probe, it fails closed and does NOT serve from tampered gen2
+        gen2_inst = holder._instances_by_dev_ino[gen2_key]
+        gen2_inst.connection._raw.execute("CREATE TEMPORARY SECRET drifted_sec (TYPE HTTP)")
+        adapter._standin_catalogs = {"lake": str(tmp_path / "missing_standin.duckdb")}
+
+        with pytest.raises(EngineError, match="Engine connection failed"):
+            adapter.execute(_make_prepared(audit_id="audit-fail-closed"), timeout_seconds=5.0)
+        assert gen2_inst.is_closed is True
+        assert cfg_key not in holder._configured_to_dev_ino
     finally:
         holder.close_all()
 

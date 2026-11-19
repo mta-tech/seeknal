@@ -462,3 +462,44 @@ def test_yaml_literal_secret_keys_and_values_rejected_without_leaking(
     with pytest.raises(ServerConfigError) as exc3:
         ServerConfig.from_dict(raw3)
     assert sentinel not in str(exc3.value)
+
+
+def test_secrets_env_scoped_to_referenced_vars_and_hidden_from_repr(
+    tmp_path,
+    pub_pem_file,
+    static_placement_files,
+):
+    sec_path = tmp_path / "multi_engine.env"
+    duck_secret = "DUCK_ICEBERG_SECRET_CANARY_111"
+    other_engine_secret = "STARROCKS_ADMIN_PASSWORD_CANARY_222"
+    sec_path.write_text(
+        f"LK_CLIENT_ID=fake_client_id\n"
+        f"LK_CLIENT_SECRET={duck_secret}\n"
+        f"S3_ACCESS_KEY_ID=fake_s3_key\n"
+        f"S3_SECRET_ACCESS_KEY={duck_secret}\n"
+        f"OTHER_ENGINE_PASSWORD={other_engine_secret}\n",
+        encoding="utf-8",
+    )
+    os.chmod(sec_path, stat.S_IRUSR | stat.S_IWUSR)
+
+    raw = _base_iceberg_direct_config(
+        tmp_path, pub_pem_file, static_placement_files, str(sec_path)
+    )
+    cfg = ServerConfig.from_dict(raw)
+    conn = cfg.connections["duck_ice"]
+
+    # 1. Unreferenced variables from secrets_env_file are NOT copied into DuckDBConnectionConfig.secrets_env
+    assert "OTHER_ENGINE_PASSWORD" not in conn.secrets_env
+    assert set(conn.secrets_env.keys()) == {
+        "LK_CLIENT_ID",
+        "LK_CLIENT_SECRET",
+        "S3_ACCESS_KEY_ID",
+        "S3_SECRET_ACCESS_KEY",
+    }
+
+    # 2. Neither repr(conn) nor repr(cfg) contains any secret values
+    assert duck_secret not in repr(conn)
+    assert other_engine_secret not in repr(conn)
+    assert duck_secret not in repr(cfg)
+    assert other_engine_secret not in repr(cfg)
+

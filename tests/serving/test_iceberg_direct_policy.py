@@ -118,7 +118,7 @@ def test_plan_iceberg_direct_exact_phase_ordering_and_redaction(tmp_path):
     for s in steps:
         assert not s.sql.upper().startswith("INSTALL")
 
-    # Secrets must NEVER appear in safe_sql / redacted_sql
+    # Secrets must NEVER appear in safe_sql / redacted_sql or repr(Step)
     sentinels = [
         "FAKE_CLIENT_ID_SENTINEL_111",
         "FAKE_CLIENT_SECRET_SENTINEL_222",
@@ -128,6 +128,7 @@ def test_plan_iceberg_direct_exact_phase_ordering_and_redaction(tmp_path):
     for s in steps:
         for secret in sentinels:
             assert secret not in s.safe_sql
+            assert secret not in repr(s)
 
     # Every secret step uses CREATE TEMPORARY SECRET (never persistent)
     secret_steps = [s for s in steps if s.phase == "c"]
@@ -200,9 +201,12 @@ def test_harden_iceberg_direct_real_duckdb_with_offline_standin_and_probe(tmp_pa
     conn = _IcebergLockedCursor(raw_conn, ("lake",))
     setattr(conn, "_iceberg_direct_capabilities", caps)
     try:
-        # 1. Probe profile passes all checks
+        # 1. Probe profile passes all checks (including persistent secrets, autoinstall/autoload, custom repo lock)
         report = probe_iceberg_direct(conn, cfg)
         assert report["external_access_disabled"] is True
+        assert report["allow_persistent_secrets_disabled"] is True
+        assert report["autoinstall_autoload_disabled"] is True
+        assert report["custom_extension_repository_locked"] is True
         assert report["config_locked"] is True
         assert report["read_text_outside_refused"] is True
         assert report["copy_to_refused"] is True
@@ -322,10 +326,105 @@ def test_harden_failure_closes_connection_and_raises_secret_safe_step_error(tmp_
 
     assert exc_info.value.step_name == "b_load_extension_httpfs"
     assert sentinel not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
     # Connection must already be closed
     with pytest.raises(duckdb.ConnectionException):
         raw_conn.execute("SELECT 1")
+
+
+def test_post_lock_allowlist_blocks_all_bypass_vectors_and_entrypoints(tmp_path):
+    """Verify _IcebergLockedCursor allowlist blocks comments, multi-statements, TEMP SECRET, quoted DETACH, ATTACH ':memory:', DDL in memory, COPY TO inside allowed dirs, and .sql()/.query()/.executemany()."""
+    cat_file = tmp_path / "standin_bypass.duckdb"
+    c_init = duckdb.connect(str(cat_file))
+    c_init.execute("CREATE SCHEMA analytics")
+    c_init.execute("CREATE TABLE analytics.orders (order_id INT, amount DOUBLE)")
+    c_init.execute("INSERT INTO analytics.orders VALUES (1, 10.0)")
+    c_init.close()
+
+    cfg = _sample_iceberg_cfg(tmp_path, extensions=("json", "parquet"))
+    raw_conn = duckdb.connect(":memory:")
+    caps = harden_iceberg_direct(
+        raw_conn,
+        cfg,
+        standin_catalogs={"lake": str(cat_file)},
+    )
+    conn = _IcebergLockedCursor(raw_conn, ("lake",))
+    setattr(conn, "_iceberg_direct_capabilities", caps)
+
+    try:
+        # Allowed single-statement SELECTs (plain, comment-prefixed, CTE) work across execute/sql/query
+        assert conn.execute("/* comment */ SELECT order_id FROM lake.analytics.orders").fetchall() == [(1,)]
+        assert conn.execute("-- line comment\nWITH c AS (SELECT 42 AS v) SELECT v FROM c").fetchall() == [(42,)]
+        assert conn.sql("SELECT 7").fetchall() == [(7,)]
+        assert conn.query("SELECT 9").fetchall() == [(9,)]
+
+        inside_ext_file = f"{cfg.extension_directory}/forged.duckdb"
+        inside_tmp_csv = f"{cfg.temp_directory}/exfil.csv"
+
+        bypass_statements = [
+            "/* leading block comment */ DETACH lake",
+            "-- leading line comment\nDETACH lake",
+            'DETACH "lake"',
+            "SELECT 1; DETACH lake",
+            "ATTACH ':memory:' AS lake2",
+            "/* comment */ ATTACH ':memory:' AS lake",
+            f"ATTACH '{inside_ext_file}' AS forged_ext",
+            "CREATE TEMP SECRET s_temp (TYPE HTTP)",
+            "/* comment */ CREATE TEMP SECRET s_temp2 (TYPE HTTP)",
+            "DROP TEMP SECRET IF EXISTS s3_lake",
+            "DROP SECRET IF EXISTS s3_lake",
+            "SELECT 1; CREATE TEMP SECRET s_multi (TYPE HTTP)",
+            "CREATE TABLE forged_mem_table (id INT)",
+            "CREATE TEMP TABLE forged_temp_table (id INT)",
+            "CREATE VIEW forged_view AS SELECT 1",
+            "CREATE MACRO forged_macro(x) AS x + 1",
+            f"COPY (SELECT 1) TO '{inside_tmp_csv}'",
+            "PRAGMA database_list",
+            "CALL duckdb_databases()",
+            "EXPLAIN SELECT 1",
+            "PREPARE p AS SELECT 1",
+        ]
+
+        for bad_sql in bypass_statements:
+            for method_name in ("execute", "sql", "query", "from_query", "executemany"):
+                fn = getattr(conn, method_name)
+                with pytest.raises(duckdb.PermissionException):
+                    if method_name == "executemany":
+                        fn(bad_sql, [])
+                    else:
+                        fn(bad_sql)
+
+        # executemany is refused even for SELECT
+        with pytest.raises(duckdb.PermissionException):
+            conn.executemany("SELECT ?", [(1,)])
+
+        # Direct extension/table mutation helper methods on DuckDBPyConnection are blocked by __getattr__
+        for forbidden_attr in (
+            "install_extension",
+            "load_extension",
+            "register",
+            "unregister",
+            "create_function",
+            "remove_function",
+            "read_csv",
+            "read_json",
+            "read_parquet",
+            "append",
+            "table",
+            "view",
+            "_raw",
+        ):
+            if forbidden_attr == "_raw":
+                continue
+            with pytest.raises(duckdb.PermissionException):
+                getattr(conn, forbidden_attr)
+
+        # Catalog set and data remain completely intact
+        assert conn.execute("SELECT order_id, amount FROM lake.analytics.orders").fetchall() == [(1, 10.0)]
+    finally:
+        conn.close()
 
 
 def test_holder_refuses_to_serve_when_probe_fails(tmp_path, monkeypatch):
