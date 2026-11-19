@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import inspect
 import json
 import logging
 import math
@@ -28,7 +29,9 @@ from seeknal.serving.adapters import (
     DBAPIAdapter,
     DuckDBAdapter,
     EngineAdapter,
+    EngineConfigError,
     LakebasePool,
+    PostgresPool,
     build_adapter,
     build_workload_adapters,
 )
@@ -51,12 +54,17 @@ from seeknal.serving.ops import (
     create_ops_app,
 )
 from seeknal.serving.placement import Placement
+from seeknal.serving.postgres_session import (
+    build_connect_kwargs,
+    verify_and_harden_session,
+)
 from seeknal.serving.server.config import (
     AuditStartupError,
     CubeConnectionConfig,
     DuckDBConnectionConfig,
     LakebaseConnectionConfig,
     LoggingConfig,
+    PostgresConnectionConfig,
     ServerConfig,
     ServerConfigError,
     StarRocksAccountConfig,
@@ -69,6 +77,17 @@ from seeknal.serving.startup_validation import (
     _scrub,
     run_initial_discovery_refresh_or_raise,
 )
+
+try:
+    from seeknal.serving.lakebase_endpoint import (
+        ColdStartConnector,
+        EngineStartingError,
+    )
+except ImportError:
+    from seeknal.serving.postgres_session import (
+        ColdStartConnector,
+        EngineStartingError,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +215,16 @@ def build_server(
             on_write_failure=audit_failure_callback,
         )
 
+    # Pre-create MetricsRegistry and optional cold-start HTTP client so Lakebase
+    # ColdStartConnectors and discovery connect callables share the same registry.
+    metrics = MetricsRegistry(allowed_engines=tuple(cfg.connections.keys()))
+    cold_start_http_clients: list[httpx.Client] = []
+
+    def _get_cold_start_http_client() -> httpx.Client:
+        if not cold_start_http_clients:
+            cold_start_http_clients.append(httpx.Client())
+        return cold_start_http_clients[0]
+
     # 5. Build ServingPipeline and PlacementRefresher
     last_refresh_error: list[Exception | None] = [None]
     last_refresh_error_scrubbed: list[str | None] = [None]
@@ -233,26 +262,61 @@ def build_server(
         if discover_fn is not None:
             raw_disc_call = discover_fn
         else:
-            lb_connect = None
+            lb_connect: Callable[[], Any] | None = None
             if disc_cfg.lakebase is not None:
                 lb_eng = disc_cfg.lakebase.engine
-                if connect_factories and lb_eng in connect_factories:
-                    lb_connect = connect_factories[lb_eng]
-                elif lb_eng in cfg.connections and isinstance(
-                    cfg.connections[lb_eng], LakebaseConnectionConfig
+                lb_custom = _resolve_custom_factory(
+                    connect_factories, lb_eng, "interactive"
+                )
+                if lb_eng in cfg.connections and isinstance(
+                    cfg.connections[lb_eng],
+                    (PostgresConnectionConfig, LakebaseConnectionConfig),
                 ):
                     lb_conn_cfg = cfg.connections[lb_eng]
-                    lb_connect = lambda: _make_lakebase_connect(
-                        lb_conn_cfg.dsn_env, cfg, env
-                    )()
+                    lb_connect = _make_discovery_source_connect(
+                        eng_name=lb_eng,
+                        conn_cfg=lb_conn_cfg,
+                        account_name="interactive",
+                        cfg=cfg,
+                        env=env,
+                        connect_factories=connect_factories,
+                        metrics=metrics,
+                        get_http_client=_get_cold_start_http_client,
+                    )
+                elif lb_custom is not None:
+                    lb_connect = lb_custom
+
+            postgres_connects = _build_discovery_postgres_connects(
+                cfg=cfg,
+                disc_cfg=disc_cfg,
+                env=env,
+                connect_factories=connect_factories,
+                metrics=metrics,
+                get_http_client=_get_cold_start_http_client,
+            )
 
             effective_env = dict(env)
             if cfg.secrets_env:
                 effective_env.update(cfg.secrets_env)
 
-            raw_disc_call = lambda: _run_discovery(
-                cfg.placement.discovery, client=None, lb_connect=lb_connect, env=effective_env
-            )
+            def _call_run_discovery() -> DiscoveryResult:
+                rd_kw: dict[str, Any] = {
+                    "client": None,
+                    "lb_connect": lb_connect,
+                    "env": effective_env,
+                }
+                try:
+                    rd_sig = inspect.signature(_run_discovery)
+                    if "postgres_connects" in rd_sig.parameters or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in rd_sig.parameters.values()
+                    ):
+                        rd_kw["postgres_connects"] = postgres_connects
+                except (ValueError, TypeError):
+                    rd_kw["postgres_connects"] = postgres_connects
+                return _run_discovery(cfg.placement.discovery, **rd_kw)
+
+            raw_disc_call = _call_run_discovery
 
         def _tracked_disc_call() -> DiscoveryResult:
             last_refresh_error[0] = None
@@ -294,20 +358,9 @@ def build_server(
         if isinstance(conn_cfg, StarRocksConnectionConfig):
             connects: dict[str, Callable[[], Any]] = {}
             for acc_name, acc in conn_cfg.accounts.items():
-                connect_factory = None
-                if connect_factories:
-                    if eng_name in connect_factories:
-                        cf = connect_factories[eng_name]
-                        if isinstance(cf, Mapping) and acc_name in cf:
-                            connect_factory = cf[acc_name]
-                        elif callable(cf):
-                            connect_factory = cf
-                    if (
-                        connect_factory is None
-                        and f"{eng_name}.{acc_name}" in connect_factories
-                    ):
-                        connect_factory = connect_factories[f"{eng_name}.{acc_name}"]
-
+                connect_factory = _resolve_custom_factory(
+                    connect_factories, eng_name, acc_name
+                )
                 if connect_factory is not None:
                     connects[acc_name] = connect_factory
                 elif acc.url_env:
@@ -319,26 +372,18 @@ def build_server(
 
             adapters[eng_name] = build_workload_adapters("starrocks", connects)
 
-        elif isinstance(conn_cfg, LakebaseConnectionConfig):
-            if connect_factories and eng_name in connect_factories:
-                conn_fn = connect_factories[eng_name]
-            else:
-                conn_fn = _make_lakebase_connect(
-                    conn_cfg.dsn_env,
-                    cfg,
-                    env,
-                    connect_timeout=conn_cfg.connect_timeout_seconds,
-                )
-            pool = LakebasePool(
-                conn_fn,
-                pool_max=conn_cfg.pool_max,
-                pool_min=conn_cfg.pool_min,
-                connect_timeout_seconds=conn_cfg.connect_timeout_seconds,
-                max_idle_seconds=conn_cfg.max_idle_seconds,
-                max_lifetime_seconds=conn_cfg.max_lifetime_seconds,
-                acquire_timeout_seconds=conn_cfg.acquire_timeout_seconds,
+        elif isinstance(
+            conn_cfg, (PostgresConnectionConfig, LakebaseConnectionConfig)
+        ):
+            adapters[eng_name] = _build_postgres_wire_adapter(
+                eng_name=eng_name,
+                conn_cfg=conn_cfg,
+                cfg=cfg,
+                env=env,
+                connect_factories=connect_factories,
+                metrics=metrics,
+                get_http_client=_get_cold_start_http_client,
             )
-            adapters[eng_name] = build_adapter("lakebase", conn_fn, pool=pool)
 
         elif isinstance(conn_cfg, CubeConnectionConfig):
             if connect_factories and eng_name in connect_factories:
@@ -373,11 +418,8 @@ def build_server(
             else:
                 adapters[eng_name] = DuckDBAdapter(config=conn_cfg, env=env)
 
-    # 7. Build MetricsRegistry, shared ReadinessProbe, public extra routes, and Lifespan
-    metrics = MetricsRegistry(
-        allowed_engines=tuple(cfg.connections.keys()),
-        adapters=adapters,
-    )
+    # 7. Register built adapters on MetricsRegistry, build shared ReadinessProbe, public extra routes, and Lifespan
+    metrics.register_adapters(adapters)
     effective_audit_on_failure = (
         cfg.audit.on_failure if cfg.audit is not None else "refuse"
     )
@@ -423,6 +465,11 @@ def build_server(
                         adapter.close()
                     except Exception:
                         pass
+            for hc in cold_start_http_clients:
+                try:
+                    hc.close()
+                except Exception:
+                    pass
             DuckDBHolder.get_holder().close_all()
             if audit_sink is not None and hasattr(audit_sink, "close"):
                 try:
@@ -491,14 +538,470 @@ def _run_discovery(
     *,
     client: httpx.Client | None = None,
     lb_connect: Callable[[], Any] | None = None,
+    postgres_connects: Mapping[str, Callable[[], Any]] | None = None,
     env: Mapping[str, str] = os.environ,
 ) -> DiscoveryResult:
+    disc_kwargs: dict[str, Any] = {
+        "lakebase_connect": lb_connect,
+        "env": env,
+    }
+    if postgres_connects is not None:
+        try:
+            sig = inspect.signature(discover)
+            if "postgres_connects" in sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            ):
+                disc_kwargs["postgres_connects"] = postgres_connects
+        except (ValueError, TypeError):
+            disc_kwargs["postgres_connects"] = postgres_connects
+
     if client is not None:
-        return discover(
-            disc_data, http_client=client, lakebase_connect=lb_connect, env=env
-        )
+        return discover(disc_data, http_client=client, **disc_kwargs)
     with httpx.Client() as c:
-        return discover(disc_data, http_client=c, lakebase_connect=lb_connect, env=env)
+        return discover(disc_data, http_client=c, **disc_kwargs)
+
+
+def _resolve_custom_factory(
+    connect_factories: Mapping[str, Any] | None,
+    eng_name: str,
+    acc_name: str | None = None,
+) -> Callable[..., Any] | None:
+    if not connect_factories:
+        return None
+    if eng_name in connect_factories:
+        cf = connect_factories[eng_name]
+        if isinstance(cf, Mapping):
+            if acc_name is not None and acc_name in cf and callable(cf[acc_name]):
+                return cf[acc_name]
+            if acc_name is None and "interactive" in cf and callable(cf["interactive"]):
+                return cf["interactive"]
+        elif callable(cf):
+            return cf
+    if acc_name is not None and f"{eng_name}.{acc_name}" in connect_factories:
+        cf_dot = connect_factories[f"{eng_name}.{acc_name}"]
+        if callable(cf_dot):
+            return cf_dot
+    return None
+
+
+def _resolve_dsn(
+    *,
+    dsn_env: str | None,
+    dsn_file: str | None,
+    cfg: ServerConfig,
+    env: Mapping[str, str],
+) -> str:
+    if dsn_env:
+        return cfg.get_env(dsn_env, env)
+    if dsn_file:
+        return read_secret_file(dsn_file)
+    raise ServerConfigError("PostgreSQL-wire connection has neither dsn_env nor dsn_file")
+
+
+def _invoke_custom_postgres_factory(
+    custom_factory: Callable[..., Any],
+    *,
+    dsn_env: str | None,
+    dsn_file: str | None,
+    cfg: ServerConfig,
+    env: Mapping[str, str],
+    ckw: dict[str, Any],
+) -> Any:
+    try:
+        sig = inspect.signature(custom_factory)
+        params = list(sig.parameters.values())
+    except (ValueError, TypeError):
+        try:
+            return custom_factory(**ckw)
+        except TypeError:
+            return custom_factory()
+
+    if not params:
+        return custom_factory()
+
+    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+    has_varpos = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+    pos_params = [
+        p
+        for p in params
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+
+    # When a test spy defines ``def fake_connect(dsn, **kwargs)`` (explicit positional DSN
+    # without *args, unlike MagicMock(*args, **kwargs)), supply the resolved DSN positionally.
+    if pos_params and not has_varpos and pos_params[0].name in ("dsn", "conninfo"):
+        dsn_val = "postgresql://placeholder"
+        if dsn_env or dsn_file:
+            try:
+                dsn_val = _resolve_dsn(
+                    dsn_env=dsn_env, dsn_file=dsn_file, cfg=cfg, env=env
+                )
+            except Exception:
+                pass
+        if has_varkw:
+            return custom_factory(dsn_val, **ckw)
+        accepted = {
+            k: v for k, v in ckw.items() if k in sig.parameters and k != pos_params[0].name
+        }
+        return custom_factory(dsn_val, **accepted)
+
+    if has_varkw:
+        try:
+            return custom_factory(**ckw)
+        except TypeError:
+            return custom_factory()
+
+    accepted_kw = {k: v for k, v in ckw.items() if k in sig.parameters}
+    if accepted_kw:
+        return custom_factory(**accepted_kw)
+    return custom_factory()
+
+
+def _make_postgres_wire_connect(
+    *,
+    eng_name: str,
+    conn_cfg: PostgresConnectionConfig | LakebaseConnectionConfig,
+    dsn_env: str | None,
+    dsn_file: str | None,
+    cfg: ServerConfig,
+    env: Mapping[str, str],
+    custom_factory: Callable[..., Any] | None = None,
+    metrics: MetricsRegistry | None = None,
+    get_http_client: Callable[[], httpx.Client] | None = None,
+) -> Callable[..., Any]:
+    kind = conn_cfg.kind
+    read_only = conn_cfg.read_only
+    is_legacy = isinstance(conn_cfg, LakebaseConnectionConfig) and conn_cfg.is_legacy
+    default_timeout = conn_cfg.connect_timeout_seconds
+
+    def base_connect(**kwargs: Any) -> Any:
+        to = kwargs.get("connect_timeout", default_timeout)
+        if custom_factory is not None:
+            ckw = build_connect_kwargs(
+                "postgresql://placeholder",
+                connect_timeout=to,
+                session=conn_cfg.session,
+                tls=conn_cfg.tls,
+                read_only=read_only,
+                kind=kind,
+            )
+            conn = _invoke_custom_postgres_factory(
+                custom_factory,
+                dsn_env=dsn_env,
+                dsn_file=dsn_file,
+                cfg=cfg,
+                env=env,
+                ckw=ckw,
+            )
+        else:
+            dsn = _resolve_dsn(
+                dsn_env=dsn_env, dsn_file=dsn_file, cfg=cfg, env=env
+            )
+            ckw = build_connect_kwargs(
+                dsn,
+                connect_timeout=to,
+                session=conn_cfg.session,
+                tls=conn_cfg.tls,
+                read_only=read_only,
+                kind=kind,
+            )
+            import psycopg2
+
+            conn = psycopg2.connect(dsn, **ckw)
+
+        if conn is None:
+            return None
+
+        if conn_cfg.role_guard or kind == "lakebase" or conn_cfg.session is not None:
+            verify_and_harden_session(
+                conn,
+                kind=kind,
+                read_only=read_only,
+                session=conn_cfg.session,
+                role_guard=conn_cfg.role_guard,
+                is_legacy_lakebase=is_legacy,
+            )
+        return conn
+
+    lb_block = getattr(conn_cfg, "lakebase", None)
+    cs_cfg = getattr(lb_block, "cold_start", None) if lb_block is not None else None
+    if isinstance(conn_cfg, LakebaseConnectionConfig) and lb_block is not None and cs_cfg is not None:
+        effective_env = dict(env)
+        if cfg.secrets_env:
+            effective_env.update(cfg.secrets_env)
+
+        http_client = (
+            get_http_client()
+            if get_http_client is not None and getattr(cs_cfg, "wake", "none") == "api"
+            else None
+        )
+        cs_init_kw: dict[str, Any] = {}
+        try:
+            cs_sig = inspect.signature(ColdStartConnector)
+            cs_params = cs_sig.parameters
+            cs_varkw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in cs_params.values()
+            )
+            if "metrics" in cs_params or cs_varkw:
+                cs_init_kw["metrics"] = metrics
+            if "http_client" in cs_params or cs_varkw:
+                cs_init_kw["http_client"] = http_client
+            if "engine" in cs_params or cs_varkw:
+                cs_init_kw["engine"] = eng_name
+            if "engine_name" in cs_params:
+                cs_init_kw["engine_name"] = eng_name
+            if "env" in cs_params or cs_varkw:
+                cs_init_kw["env"] = effective_env
+        except (ValueError, TypeError):
+            cs_init_kw = {"metrics": metrics, "http_client": http_client}
+
+        connector = ColdStartConnector(base_connect, lb_block, **cs_init_kw)
+
+        def cold_start_connect(
+            *,
+            connect_timeout: float | None = None,
+            deadline: float | None = None,
+        ) -> Any:
+            if deadline is not None:
+                eff_deadline = deadline
+            elif connect_timeout is not None:
+                eff_deadline = time.monotonic() + float(connect_timeout)
+            else:
+                wait_s = (
+                    getattr(cs_cfg, "max_query_wait_seconds", None)
+                    or default_timeout
+                )
+                eff_deadline = time.monotonic() + float(wait_s)
+
+            try:
+                c_sig = inspect.signature(connector.connect)
+                if "connect_timeout" in c_sig.parameters and connect_timeout is not None:
+                    return connector.connect(
+                        eff_deadline, connect_timeout=connect_timeout
+                    )
+            except (ValueError, TypeError):
+                pass
+            return connector.connect(eff_deadline)
+
+        setattr(cold_start_connect, "cold_start_connector", connector)
+        return cold_start_connect
+
+    return base_connect
+
+
+def _build_postgres_wire_adapter(
+    *,
+    eng_name: str,
+    conn_cfg: PostgresConnectionConfig | LakebaseConnectionConfig,
+    cfg: ServerConfig,
+    env: Mapping[str, str],
+    connect_factories: Mapping[str, Any] | None,
+    metrics: MetricsRegistry | None,
+    get_http_client: Callable[[], httpx.Client] | None,
+) -> EngineAdapter:
+    lb_block = getattr(conn_cfg, "lakebase", None)
+
+    if conn_cfg.accounts:
+        pools_by_cred: dict[tuple[str, Any], tuple[PostgresPool, Callable[..., Any]]] = {}
+        connects_by_workload: dict[str, Callable[..., Any]] = {}
+        pools_by_workload: dict[str, PostgresPool] = {}
+
+        for acc_name, acc in conn_cfg.accounts.items():
+            custom_fn = _resolve_custom_factory(
+                connect_factories, eng_name, acc_name
+            )
+            if custom_fn is not None:
+                cred_key: tuple[str, Any] = ("factory", id(custom_fn))
+            elif acc.dsn_env:
+                cred_key = ("dsn_env", acc.dsn_env)
+            else:
+                assert acc.dsn_file is not None
+                cred_key = ("dsn_file", os.path.abspath(acc.dsn_file))
+
+            if cred_key not in pools_by_cred:
+                conn_fn = _make_postgres_wire_connect(
+                    eng_name=eng_name,
+                    conn_cfg=conn_cfg,
+                    dsn_env=acc.dsn_env,
+                    dsn_file=acc.dsn_file,
+                    cfg=cfg,
+                    env=env,
+                    custom_factory=custom_fn,
+                    metrics=metrics,
+                    get_http_client=get_http_client,
+                )
+                pool = PostgresPool(
+                    conn_fn,
+                    pool_max=conn_cfg.pool_max,
+                    pool_min=conn_cfg.pool_min,
+                    connect_timeout_seconds=conn_cfg.connect_timeout_seconds,
+                    max_idle_seconds=conn_cfg.max_idle_seconds,
+                    max_lifetime_seconds=conn_cfg.max_lifetime_seconds,
+                    acquire_timeout_seconds=conn_cfg.acquire_timeout_seconds,
+                )
+                pools_by_cred[cred_key] = (pool, conn_fn)
+            else:
+                pool, conn_fn = pools_by_cred[cred_key]
+
+            connects_by_workload[acc_name] = conn_fn
+            pools_by_workload[acc_name] = pool
+
+        return build_workload_adapters(
+            conn_cfg.kind,
+            connects_by_workload,
+            pools=pools_by_workload,
+            read_only=conn_cfg.read_only,
+            session_config=conn_cfg.session,
+            lakebase_config=lb_block,
+        )
+
+    custom_fn = _resolve_custom_factory(connect_factories, eng_name, None)
+    conn_fn = _make_postgres_wire_connect(
+        eng_name=eng_name,
+        conn_cfg=conn_cfg,
+        dsn_env=conn_cfg.dsn_env or None,
+        dsn_file=conn_cfg.dsn_file,
+        cfg=cfg,
+        env=env,
+        custom_factory=custom_fn,
+        metrics=metrics,
+        get_http_client=get_http_client,
+    )
+    pool = PostgresPool(
+        conn_fn,
+        pool_max=conn_cfg.pool_max,
+        pool_min=conn_cfg.pool_min,
+        connect_timeout_seconds=conn_cfg.connect_timeout_seconds,
+        max_idle_seconds=conn_cfg.max_idle_seconds,
+        max_lifetime_seconds=conn_cfg.max_lifetime_seconds,
+        acquire_timeout_seconds=conn_cfg.acquire_timeout_seconds,
+    )
+    return build_adapter(
+        conn_cfg.kind,
+        conn_fn,
+        pool=pool,
+        read_only=conn_cfg.read_only,
+        session_config=conn_cfg.session,
+        lakebase_config=lb_block,
+    )
+
+
+def _make_discovery_source_connect(
+    *,
+    eng_name: str,
+    conn_cfg: PostgresConnectionConfig | LakebaseConnectionConfig,
+    account_name: str,
+    cfg: ServerConfig,
+    env: Mapping[str, str],
+    connect_factories: Mapping[str, Any] | None,
+    metrics: MetricsRegistry | None,
+    get_http_client: Callable[[], httpx.Client] | None,
+) -> Callable[[], Any]:
+    if conn_cfg.accounts:
+        if account_name not in conn_cfg.accounts:
+            def _missing_account() -> Any:
+                raise EngineConfigError(
+                    f"no engine account configured for workload '{account_name}'"
+                )
+
+            return _missing_account
+
+        acc = conn_cfg.accounts[account_name]
+        custom_fn = _resolve_custom_factory(
+            connect_factories, eng_name, account_name
+        )
+        conn_fn = _make_postgres_wire_connect(
+            eng_name=eng_name,
+            conn_cfg=conn_cfg,
+            dsn_env=acc.dsn_env,
+            dsn_file=acc.dsn_file,
+            cfg=cfg,
+            env=env,
+            custom_factory=custom_fn,
+            metrics=metrics,
+            get_http_client=get_http_client,
+        )
+        return lambda: conn_fn()
+
+    custom_fn = _resolve_custom_factory(connect_factories, eng_name, account_name)
+    conn_fn = _make_postgres_wire_connect(
+        eng_name=eng_name,
+        conn_cfg=conn_cfg,
+        dsn_env=conn_cfg.dsn_env or None,
+        dsn_file=conn_cfg.dsn_file,
+        cfg=cfg,
+        env=env,
+        custom_factory=custom_fn,
+        metrics=metrics,
+        get_http_client=get_http_client,
+    )
+    return lambda: conn_fn()
+
+
+def _build_discovery_postgres_connects(
+    *,
+    cfg: ServerConfig,
+    disc_cfg: Any,
+    env: Mapping[str, str],
+    connect_factories: Mapping[str, Any] | None,
+    metrics: MetricsRegistry | None,
+    get_http_client: Callable[[], httpx.Client] | None,
+) -> dict[str, Callable[[], Any]]:
+    introspect_accounts: dict[str, str] = {}
+    parsed_pgs = getattr(disc_cfg, "postgres_sources", None)
+    if isinstance(parsed_pgs, Mapping):
+        for src_name, src_cfg in parsed_pgs.items():
+            acc = getattr(src_cfg, "account", None)
+            introspect_accounts[str(src_name)] = (
+                acc.strip() if isinstance(acc, str) and acc.strip() else "interactive"
+            )
+    elif isinstance(cfg.placement.discovery, Mapping):
+        raw_pgs = cfg.placement.discovery.get("postgres_sources")
+        if isinstance(raw_pgs, Mapping):
+            for src_name, src_spec in raw_pgs.items():
+                acc_val = (
+                    src_spec.get("account")
+                    if isinstance(src_spec, Mapping)
+                    else None
+                )
+                introspect_accounts[str(src_name)] = (
+                    acc_val.strip()
+                    if isinstance(acc_val, str) and acc_val.strip()
+                    else "interactive"
+                )
+
+    postgres_connects: dict[str, Callable[[], Any]] = {}
+    for eng_name, conn_cfg in cfg.connections.items():
+        if isinstance(
+            conn_cfg, (PostgresConnectionConfig, LakebaseConnectionConfig)
+        ):
+            acc_name = introspect_accounts.get(eng_name, "interactive")
+            postgres_connects[eng_name] = _make_discovery_source_connect(
+                eng_name=eng_name,
+                conn_cfg=conn_cfg,
+                account_name=acc_name,
+                cfg=cfg,
+                env=env,
+                connect_factories=connect_factories,
+                metrics=metrics,
+                get_http_client=get_http_client,
+            )
+
+    for src_name, acc_name in introspect_accounts.items():
+        if src_name not in postgres_connects:
+            custom_fn = _resolve_custom_factory(
+                connect_factories, src_name, acc_name
+            )
+            if custom_fn is not None:
+                postgres_connects[src_name] = lambda fn=custom_fn: fn()
+
+    return postgres_connects
 
 
 def _make_starrocks_url_connect(

@@ -12,6 +12,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from seeknal.serving.server.config import (
+    LakebaseConnectionConfig,
+    PostgresConnectionConfig,
     PreflightResult,
     ServerConfig,
     ServerConfigError,
@@ -1236,3 +1238,26 @@ def test_duckdb_temp_directory_config_validation(
     d["connections"]["duck"]["unknown_duck_key"] = "bad"
     with pytest.raises(ServerConfigError, match="Unknown key"):
         ServerConfig.from_dict(d)
+
+
+def test_postgres_and_lakebase_connections_coexist(
+    valid_jwks_file,
+    valid_placement_files,
+    valid_secrets_file,
+    valid_password_file,
+):
+    pf, sf = valid_placement_files
+    d = _build_full_valid_dict(
+        valid_jwks_file, pf, sf, valid_secrets_file, valid_password_file
+    )
+    d["connections"]["pg_report"] = {
+        "kind": "postgres",
+        "dsn_env": "CBN_PG_DSN",
+    }
+    cfg = ServerConfig.from_dict(d)
+    assert isinstance(cfg.connections["pg_report"], PostgresConnectionConfig)
+    assert cfg.connections["pg_report"].mode == "read_only"
+    assert isinstance(cfg.connections["lb"], LakebaseConnectionConfig)
+    assert cfg.connections["lb"].is_legacy is True
+    assert "CBN_PG_DSN" in cfg.get_referenced_env_vars()
+

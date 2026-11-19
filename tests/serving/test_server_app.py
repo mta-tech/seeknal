@@ -6,7 +6,10 @@ import base64
 import datetime
 import hashlib
 import json
+import os
+import stat
 import time
+from typing import Any
 from unittest.mock import MagicMock
 
 import duckdb
@@ -14,11 +17,20 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 from starlette.testclient import TestClient
 
-from seeknal.serving.adapters import CubeAdapter, DBAPIAdapter, WorkloadRoutedAdapter
+from seeknal.serving.adapters import (
+    CubeAdapter,
+    DBAPIAdapter,
+    EngineConfigError,
+    EngineError,
+    PostgresPool,
+    WorkloadRoutedAdapter,
+)
 from seeknal.serving.discovery.build import DiscoveryResult
 from seeknal.serving.grant_token import sign_grant_token
+import seeknal.serving.server.app as app_mod
 from seeknal.serving.server.app import ServerHandle, build_server
 from seeknal.serving.server.config import ServerConfig, ServerConfigError
+from seeknal.serving.service import PreparedQuery
 
 
 @pytest.fixture
@@ -620,3 +632,407 @@ def test_build_server_propagates_compilation_cache_max_entries(
         )
         h_cap = build_server(cfg_cap, connect_factories={"duck": lambda: duckdb.connect()})
         assert h_cap.pipeline.compilation_cache_info()["max_entries"] == cap
+
+
+def test_postgres_accounts_share_one_pool_per_credential_and_harden_session(
+    tmp_path, jwks_path, static_catalog_files, monkeypatch
+):
+    pf, sf = static_catalog_files
+    ask_dsn_file = tmp_path / "pg_ask.dsn"
+    planted_ask_pw = "PLANTED_ASK_DSN_SECRET_9911"
+    planted_bi_pw = "PLANTED_BI_DSN_SECRET_2244"
+    ask_dsn_file.write_text(
+        f"postgresql://seeknal_ask:{planted_ask_pw}@127.0.0.1:5432/cbn\n"
+    )
+    os.chmod(ask_dsn_file, stat.S_IRUSR | stat.S_IWUSR)
+
+    env = {
+        "CBN_PG_REPORT_DSN_BI": f"postgresql://seeknal_bi:{planted_bi_pw}@127.0.0.1:5432/cbn",
+    }
+
+    cfg = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "ops": {"enabled": True, "public_readyz": True},
+            "placement": {"static": {"placement_file": pf, "schemas_file": sf}},
+            "connections": {
+                "duck": {"kind": "duckdb", "path": ":memory:"},
+                "pg_report": {
+                    "kind": "postgres",
+                    "mode": "read_only",
+                    "accounts": {
+                        "interactive": {"dsn_env": "CBN_PG_REPORT_DSN_BI"},
+                        "bi": {"dsn_env": "CBN_PG_REPORT_DSN_BI"},
+                        "report": {"dsn_env": "CBN_PG_REPORT_DSN_BI"},
+                        "ask": {"dsn_file": str(ask_dsn_file)},
+                    },
+                    "pool_max": 6,
+                    "session": {
+                        "statement_timeout_ms": 30000,
+                        "lock_timeout_ms": 2000,
+                        "idle_in_transaction_session_timeout_ms": 10000,
+                        "search_path": "pg_catalog",
+                        "application_name": "seeknal-serving",
+                        "startup_options": True,
+                    },
+                    "tls": {
+                        "sslmode": "verify-full",
+                        "sslrootcert_file": "/etc/seeknal/tls/cbn-ca.pem",
+                    },
+                },
+            },
+        },
+        env=env,
+    )
+
+    connect_calls: list[tuple[str, dict[str, Any]]] = []
+    role_row_holder = [(False, False)]
+
+    class FakePGCursor:
+        def __init__(self, conn: Any) -> None:
+            self.conn = conn
+            self._row: Any = None
+            self.description = (("id", 23, None, None, None, None, None),)
+
+        def execute(self, sql: str, params: Any = None) -> None:
+            self.conn.statements.append((sql, params))
+            s = " ".join(sql.strip().split())
+            if "pg_roles" in s:
+                self._row = role_row_holder[0]
+            elif s == "SHOW default_transaction_read_only":
+                self._row = ("on",)
+            elif s == "SHOW statement_timeout":
+                self._row = ("30s",)
+            elif s == "SHOW lock_timeout":
+                self._row = ("2s",)
+            elif s == "SHOW idle_in_transaction_session_timeout":
+                self._row = ("10s",)
+            elif s == "SHOW search_path":
+                self._row = ("pg_catalog",)
+            else:
+                self._row = (1,)
+
+        def fetchone(self) -> Any:
+            return self._row
+
+        def fetchmany(self, size: int) -> list[tuple]:
+            return [(42,)]
+
+        def close(self) -> None:
+            pass
+
+    class FakePGConn:
+        def __init__(self, dsn: str, kw: dict[str, Any]) -> None:
+            self.dsn = dsn
+            self.kw = kw
+            self.closed = 0
+            self.statements: list[tuple[str, Any]] = []
+
+        def cursor(self) -> FakePGCursor:
+            return FakePGCursor(self)
+
+        def rollback(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = 1
+
+    import psycopg2
+
+    def fake_psycopg2_connect(dsn: str, **kwargs: Any) -> FakePGConn:
+        connect_calls.append((dsn, dict(kwargs)))
+        return FakePGConn(dsn, kwargs)
+
+    monkeypatch.setattr(psycopg2, "connect", fake_psycopg2_connect)
+
+    handle = build_server(
+        cfg,
+        env=env,
+        connect_factories={"duck": lambda: duckdb.connect()},
+    )
+
+    pg_adapter = handle.adapters["pg_report"]
+    assert isinstance(pg_adapter, WorkloadRoutedAdapter)
+    assert set(pg_adapter.by_workload.keys()) == {
+        "interactive",
+        "bi",
+        "report",
+        "ask",
+    }
+
+    ad_int = pg_adapter.by_workload["interactive"]
+    ad_bi = pg_adapter.by_workload["bi"]
+    ad_rep = pg_adapter.by_workload["report"]
+    ad_ask = pg_adapter.by_workload["ask"]
+    assert isinstance(ad_int, DBAPIAdapter)
+    assert isinstance(ad_bi, DBAPIAdapter)
+    assert isinstance(ad_rep, DBAPIAdapter)
+    assert isinstance(ad_ask, DBAPIAdapter)
+
+    # Same credential shares ONE PostgresPool; distinct credential gets its own pool
+    assert isinstance(ad_int.pool, PostgresPool)
+    assert ad_int.pool is ad_bi.pool
+    assert ad_int.pool is ad_rep.pool
+    assert ad_ask.pool is not ad_int.pool
+
+    # Missing workload ('job') raises EngineConfigError
+    missing_prep = PreparedQuery(
+        engine="pg_report",
+        engine_kind="postgres",
+        sql="SELECT 1",
+        params=(),
+        paramstyle="format",
+        rule="point_lookup",
+        reason="test",
+        row_limit=5,
+        masked_columns=(),
+        redacted_sql="SELECT 1",
+        subject="u@test.org",
+        workspace="ws",
+        audit_id="aud-job-1",
+        cube_security_context=None,
+        workload="job",
+    )
+    with pytest.raises(EngineConfigError, match="no engine account configured for workload 'job'"):
+        pg_adapter.execute(missing_prep, timeout_seconds=5.0)
+
+    # Execute on 'bi' and 'interactive' reuses the SAME pooled connection
+    for wl, aid in (("bi", "aud-bi-1"), ("interactive", "aud-int-1")):
+        p = PreparedQuery(
+            engine="pg_report",
+            engine_kind="postgres",
+            sql="SELECT id FROM rpt WHERE id = %s",
+            params=(42,),
+            paramstyle="format",
+            rule="point_lookup",
+            reason="test",
+            row_limit=5,
+            masked_columns=(),
+            redacted_sql="SELECT id FROM rpt WHERE id = %s",
+            subject="u@test.org",
+            workspace="ws",
+            audit_id=aid,
+            cube_security_context=None,
+            workload=wl,
+        )
+        res = pg_adapter.execute(p, timeout_seconds=5.0)
+        assert res.rows == [(42,)]
+
+    assert len(connect_calls) == 1
+    called_dsn, called_kw = connect_calls[0]
+    assert planted_bi_pw in called_dsn
+    assert "dsn" not in called_kw
+    assert called_kw["application_name"] == "seeknal-serving"
+    assert called_kw["sslmode"] == "verify-full"
+    assert called_kw["sslrootcert"] == "/etc/seeknal/tls/cbn-ca.pem"
+    assert "-c default_transaction_read_only=on" in called_kw["options"]
+
+    # Superuser on 'ask' account is refused by role guard without leaking DSN
+    role_row_holder[0] = (True, False)
+    ask_prep = PreparedQuery(
+        engine="pg_report",
+        engine_kind="postgres",
+        sql="SELECT 1",
+        params=(),
+        paramstyle="format",
+        rule="point_lookup",
+        reason="test",
+        row_limit=5,
+        masked_columns=(),
+        redacted_sql="SELECT 1",
+        subject="u@test.org",
+        workspace="ws",
+        audit_id="aud-ask-1",
+        cube_security_context=None,
+        workload="ask",
+    )
+    with pytest.raises(EngineError, match="Role guard refused connection") as exc_rg:
+        pg_adapter.execute(ask_prep, timeout_seconds=5.0)
+    assert planted_ask_pw not in str(exc_rg.value)
+
+    # /readyz never leaks planted DSNs
+    role_row_holder[0] = (False, False)
+    with TestClient(handle.app) as pub_c, TestClient(handle.ops_app) as ops_c:
+        r_ops = ops_c.get("/readyz")
+        assert r_ops.status_code == 200
+        assert planted_bi_pw not in r_ops.text
+        assert planted_ask_pw not in r_ops.text
+        assert pub_c.get("/readyz").status_code == 200
+
+
+def test_discovery_wires_postgres_connects_for_configured_account(
+    jwks_path, monkeypatch
+):
+    captured_postgres_connects: dict[str, Any] = {}
+
+    def fake_discover(
+        disc_data,
+        *,
+        http_client,
+        lakebase_connect=None,
+        postgres_connects=None,
+        env=None,
+    ):
+        if postgres_connects is not None:
+            captured_postgres_connects.update(postgres_connects)
+        return DiscoveryResult(
+            placement={"engines": {}, "tables": {}, "cubes": {}},
+            schemas={},
+            warnings=(),
+            discovered_at=datetime.datetime.now(datetime.timezone.utc),
+        )
+
+    monkeypatch.setattr(app_mod, "discover", fake_discover)
+
+    bi_conn_sentinel = MagicMock(name="bi_conn")
+    int_conn_sentinel = MagicMock(name="int_conn")
+
+    cfg_dict = {
+        "grant_keys": {"jwks_file": jwks_path},
+        "placement": {
+            "discovery": {
+                "default_catalog": "cbn",
+                "refresh_interval_seconds": 60,
+                "engines": {
+                    "pg_report": {"kind": "postgres", "dialect": "postgres"},
+                    "pg_default": {"kind": "postgres", "dialect": "postgres"},
+                },
+                "postgres_sources": {
+                    "pg_report": {
+                        "account": "bi",
+                        "schemas": {"rpt": {"include": ["*"]}},
+                    },
+                },
+            }
+        },
+        "connections": {
+            "pg_report": {
+                "kind": "postgres",
+                "role_guard": False,
+                "accounts": {
+                    "interactive": {"dsn_env": "PG_INT_DSN"},
+                    "bi": {"dsn_env": "PG_BI_DSN"},
+                },
+            },
+            "pg_default": {
+                "kind": "postgres",
+                "role_guard": False,
+                "dsn_env": "PG_DEF_DSN",
+            },
+        },
+    }
+    env = {
+        "PG_INT_DSN": "postgresql://u1:pw1@localhost/db",
+        "PG_BI_DSN": "postgresql://u2:pw2@localhost/db",
+        "PG_DEF_DSN": "postgresql://u3:pw3@localhost/db",
+    }
+    cfg = ServerConfig.from_dict(cfg_dict, env=env)
+    handle = build_server(
+        cfg,
+        env=env,
+        connect_factories={
+            "pg_report": {
+                "interactive": lambda: int_conn_sentinel,
+                "bi": lambda: bi_conn_sentinel,
+            },
+            "pg_default": lambda: int_conn_sentinel,
+        },
+    )
+    assert handle.refresher is not None
+    assert handle.refresher.refresh_once() is True
+
+    assert "pg_report" in captured_postgres_connects
+    assert "pg_default" in captured_postgres_connects
+    assert captured_postgres_connects["pg_report"]() is bi_conn_sentinel
+    assert captured_postgres_connects["pg_default"]() is int_conn_sentinel
+
+
+def test_lakebase_cold_start_connector_wiring_and_engine_starting_propagation(
+    jwks_path, static_catalog_files, monkeypatch
+):
+    pf, sf = static_catalog_files
+    connector_inits: list[tuple[Any, dict[str, Any]]] = []
+
+    class FakeColdStartConnector:
+        def __init__(self, connect_fn: Any, cfg: Any, **kw: Any) -> None:
+            self.connect_fn = connect_fn
+            self.cfg = cfg
+            connector_inits.append((cfg, kw))
+
+        def connect(self, deadline: float | None = None) -> Any:
+            assert deadline is not None
+            raise app_mod.EngineStartingError()
+
+    monkeypatch.setattr(app_mod, "ColdStartConnector", FakeColdStartConnector)
+
+    env = {
+        "CBN_LB_OPS_DSN": "postgresql://lb_role:lb_pw_1122@127.0.0.1:40001/ops",
+        "LB_OPS_PROJECT_TOKEN": "lb_proj_token_secret_3344",
+    }
+    cfg = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "placement": {"static": {"placement_file": pf, "schemas_file": sf}},
+            "connections": {
+                "duck": {"kind": "duckdb", "path": ":memory:"},
+                "lb_ops": {
+                    "kind": "lakebase",
+                    "dsn_env": "CBN_LB_OPS_DSN",
+                    "tls": {
+                        "sslmode": "verify-full",
+                        "sslrootcert_file": "/etc/seeknal/tls/lb-ca.pem",
+                    },
+                    "lakebase": {
+                        "project_id": "prj_xxxxxxxxxxxxxxxxxxxx",
+                        "branch_id": "br_xxxxxxxxxxxxxxxxxxxx",
+                        "endpoint_id": "ep_xxxxxxxxxxxxxxxxxxxx",
+                        "endpoint_type": "read_write",
+                        "cold_start": {
+                            "wake": "api",
+                            "api_url": "https://lakebase-cp.internal.example",
+                            "api_token_env": "LB_OPS_PROJECT_TOKEN",
+                            "connect_timeout_seconds": 5,
+                            "max_query_wait_seconds": 10,
+                            "max_wake_seconds": 60,
+                        },
+                    },
+                },
+            },
+        },
+        env=env,
+    )
+
+    handle = build_server(
+        cfg,
+        env=env,
+        connect_factories={"duck": lambda: duckdb.connect()},
+    )
+    assert len(connector_inits) == 1
+    passed_lb_cfg, passed_kw = connector_inits[0]
+    assert passed_lb_cfg.endpoint_id == "ep_xxxxxxxxxxxxxxxxxxxx"
+    assert passed_kw["metrics"] is handle.metrics
+
+    lb_adapter = handle.adapters["lb_ops"]
+    prep = PreparedQuery(
+        engine="lb_ops",
+        engine_kind="lakebase",
+        sql="SELECT 1",
+        params=(),
+        paramstyle="format",
+        rule="point_lookup",
+        reason="test",
+        row_limit=5,
+        masked_columns=(),
+        redacted_sql="SELECT 1",
+        subject="u@test.org",
+        workspace="ws",
+        audit_id="aud-lb-wake",
+        cube_security_context=None,
+    )
+    with pytest.raises(app_mod.EngineStartingError) as exc_start:
+        lb_adapter.execute(prep, timeout_seconds=5.0)
+    assert exc_start.value.code == "engine_starting"
+    assert "lb_proj_token_secret_3344" not in str(exc_start.value)
+    assert "lb_pw_1122" not in str(exc_start.value)
+
+
