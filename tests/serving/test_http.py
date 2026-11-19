@@ -1234,3 +1234,107 @@ def test_integer_params_redacted_in_safe_message_and_http_errors(
         resp_61s.json()["message"]
         == "Token lifetime of 61.0s exceeds maximum 60.0s"
     )
+
+
+def test_query_and_explain_reject_api_claim_and_query_handles_engine_starting(
+    ec_key_pair,
+):
+    priv, pub = ec_key_pair
+
+    class WakingAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            err = EngineError("Lakebase endpoint waking")
+            err.code = "engine_starting"  # type: ignore[attr-defined]
+            err.retry_after = 4  # type: ignore[attr-defined]
+            raise err
+
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "users": {
+                    "keys": ["id"],
+                    "row_count": 10,
+                    "serve": {"duck": "users"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    schemas = {"users": ["id", "name"]}
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas=schemas,
+        public_keys={"key-1": pub},
+    )
+    client = TestClient(create_app(pipeline, {"duck": WakingAdapter()}))
+
+    sql = "SELECT id FROM users"
+    now = time.time()
+    api_token = sign_grant_token(
+        {
+            "sub": "analyst@example.com",
+            "ws": "ws-test",
+            "jti": "jti-api-cross-01",
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": now,
+            "exp": now + 60.0,
+            "api": "select.v1",
+            "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            "max_rows": 100,
+            "tables": {
+                "users": {
+                    "columns": ["id"],
+                    "masks": {},
+                    "row_filters": [],
+                    "actions": ["select"],
+                }
+            },
+        },
+        priv,
+        kid="key-1",
+    )
+
+    for route in ("/v1/query", "/v1/explain"):
+        resp_cross = client.post(
+            route,
+            headers={"Authorization": f"Bearer {api_token}"},
+            json={"sql": sql},
+        )
+        assert resp_cross.status_code == 401
+        assert resp_cross.json()["code"] == "grant_invalid"
+
+    query_token = sign_grant_token(
+        {
+            "sub": "analyst@example.com",
+            "ws": "ws-test",
+            "jti": "jti-wake-q-01",
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": now,
+            "exp": now + 60.0,
+            "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            "max_rows": 100,
+            "tables": {
+                "users": {
+                    "columns": ["id"],
+                    "masks": {},
+                    "row_filters": [],
+                    "actions": ["select"],
+                }
+            },
+        },
+        priv,
+        kid="key-1",
+    )
+    resp_wake = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {query_token}"},
+        json={"sql": sql},
+    )
+    assert resp_wake.status_code == 503
+    assert resp_wake.headers.get("Retry-After") == "4"
+    assert resp_wake.json()["code"] == "engine_starting"
+    assert resp_wake.json()["audit_id"] == "jti-wake-q-01"
+
