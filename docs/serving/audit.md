@@ -1,6 +1,6 @@
 # Seeknal Serving Durable Audit Logging
 
-Seeknal Serving supports optional durable, structured JSON-lines audit logging across `/v1/query`, `/v1/explain`, and `/v1/cancel` (including rejected requests).
+Seeknal Serving supports optional durable, structured JSON-lines audit logging across `/v1/query`, `/v1/select`, `/v1/explain`, and `/v1/cancel` (including rejected requests).
 
 When the `audit:` section is **absent** from `serving.yaml`, Seeknal Serving behaves identically to existing deployments—no new configuration is required.
 
@@ -71,11 +71,11 @@ Specifying both a primary option and its alias simultaneously (for example, both
 
 ## 2. Audit Record Schema & Strict Allowlist
 
-One single-line JSON object is emitted per request to `/v1/query`, `/v1/explain`, and `/v1/cancel` (both successful and rejected requests).
+One single-line JSON object is emitted per request to `/v1/query`, `/v1/select`, `/v1/explain`, and `/v1/cancel` (both successful and rejected requests).
 
 ### 2.1 Allowlisted Fields
 
-Only the following 21 fields may ever appear in a serialized audit record:
+Only the following 32 fields may ever appear in a serialized audit record (unset fields default to `null`):
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -87,19 +87,30 @@ Only the following 21 fields may ever appear in a serialized audit record:
 | `azp` | `str \| null` | Authorized party (`azp`) claim, or `null`. |
 | `workload` | `str \| null` | Workload claim (`"interactive"`, `"bi"`, `"report"`, `"ask"`, `"job"`), or `null`. |
 | `origin` | `str \| null` | Request origin claim (`"superset"`, `"ask"`, `"job"`, `"portal"`), or `null`. |
-| `route` | `str` | Endpoint path: `"/v1/query"`, `"/v1/explain"`, or `"/v1/cancel"`. |
+| `route` | `str` | Endpoint path: `"/v1/query"`, `"/v1/select"`, `"/v1/explain"`, or `"/v1/cancel"`. |
+| `api` | `str \| null` | API contract identifier (e.g. `"select.v1"` for `POST /v1/select`), or `null`. |
 | `engine` | `str \| null` | Routed execution engine name, or `null` when unrouted/cancelled. |
+| `engine_kind` | `str \| null` | Configured engine kind (`"postgres"`, `"lakebase"`, `"duckdb"`, `"starrocks"`, `"cube"`), or `null`. |
+| `storage_class` | `str \| null` | Effective storage class (`"local"`, `"object_storage"`, `"unknown"`), or `null`. |
+| `account` | `str \| null` | Workload credential account used on the target source, or `null`. |
+| `lakebase_endpoint` | `dict[str, str] \| str \| null` | Lakebase endpoint identifiers (`project_id`, `branch_id`, `endpoint_id`), or `null`. |
+| `cold_start` | `bool \| number \| dict \| null` | Lakebase cold-start/wake indicator or timing metadata, or `null`. |
 | `rule` | `str \| null` | Placement routing rule name, or `null` when unrouted/cancelled. |
+| `access_pattern` | `str \| null` | Effective table access pattern (`"point"`, `"filter"`, `"scan"`), or `null`. |
+| `guard` | `str \| null` | Guardrail evaluation mode or outcome (`"enforce"`, `"warn"`, or rejection code), or `null`. |
+| `filter_columns` | `list[str] \| null` | Scrubbed sargable filter column names only (never predicate values), or `null`. |
+| `effective_max_rows` | `int \| null` | Effective row cap applied across grant, request, and table `access.max_rows`, or `null`. |
+| `paged` | `bool \| null` | Whether cursor pagination (`after` / `next`) was used on `/v1/select`, or `null`. |
 | `tables` | `list[str]` | Logical table or cube names referenced by the request (defaults to `[]`). |
 | `status` | `int` | HTTP response status code (`100..599`). |
-| `code` | `str \| null` | Typed error code when `status >= 400` (e.g. `"grant_token_error"`, `"enforcement_error"`), else `null`. |
+| `code` | `str \| null` | Typed error code when `status >= 400` (e.g. `"grant_token_error"`, `"filter_required"`), else `null`. |
 | `elapsed_ms` | `float` | Request or execution duration in milliseconds rounded to 2 decimal places. |
-| `row_count` | `int \| null` | Returned row count on `200 /v1/query`, or `null`. |
+| `row_count` | `int \| null` | Returned row count on `200 /v1/query` or `/v1/select`, or `null`. |
 | `truncated` | `bool \| null` | Whether query output hit the effective row cap, or `null`. |
 | `publication_id` | `str \| null` | Catalog binding `publication_id` claim, or `null`. |
 | `revision` | `int \| str \| null` | Catalog binding `revision` claim, or `null`. |
 | `digest` | `str \| null` | Catalog binding `digest` claim, or `null`. |
-| `sql_sha256` | `str \| null` | Lowercase 64-character hex SHA-256 of UTF-8 `sql` when non-empty, else `null`. |
+| `sql_sha256` | `str \| null` | Lowercase 64-character hex SHA-256 of UTF-8 `sql` (or exact `/v1/select` body bytes), else `null`. |
 
 ### 2.2 Example Record
 

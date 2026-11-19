@@ -175,6 +175,32 @@ def test_validate_startup_static_ok(tmp_path: Path, jwks_file: str, base_env: di
             "clinical.patients": ["patient_id", "ssn"],
             "claims_cube": ["province", "total_amount"],
         },
+        connections_data={
+            "lb": {
+                "kind": "lakebase",
+                "dsn_env": "TEST_LB_DSN",
+                "storage_class": "local",
+            },
+            "sr": {
+                "kind": "starrocks",
+                "accounts": {
+                    "interactive": {
+                        "host": "sr.internal",
+                        "port": 9030,
+                        "user": "svc",
+                        "password_env": "TEST_SR_PW",
+                    }
+                },
+            },
+            "duck": {"kind": "duckdb", "path": ":memory:"},
+            "cube": {
+                "kind": "cube",
+                "host": "cube.internal",
+                "port": 15432,
+                "dbname": "cube",
+                "sql_user": "seeknal",
+            },
+        },
     )
 
     report = validate_startup(cfg_path, env=base_env)
@@ -564,7 +590,10 @@ def test_pii_rules_in_startup_validation_two_serves_local_file_and_iceberg_direc
                     "serve": {"duck_ice": "lake.clinical.t3"},
                 },
             },
-            "policy": {"pii_engines": ["duck_local", "duck_ice"]},
+            "policy": {
+                "pii_engines": ["duck_local", "duck_ice"],
+                "pii_object_storage_engines": ["duck_ice"],
+            },
         },
         schemas_data={
             "clinical.on_local_duck": ["id"],
@@ -775,13 +804,14 @@ def test_role_policy_unknown_table_and_column_and_discovery_unapproved_duckdb_pi
     with pytest.raises(StartupValidationError, match="duck_ice.*pii_engines"):
         validate_startup(disc_duck_unapproved, env=base_env)
 
-    # Approved when duck_ice is listed in pii_engines
+    # Approved when duck_ice is listed in pii_engines and pii_object_storage_engines
     disc_duck_approved = {
         **disc_duck_unapproved,
         "placement": {
             "discovery": {
                 **disc_duck_unapproved["placement"]["discovery"],
                 "pii_engines": ["duck_ice"],
+                "pii_object_storage_engines": ["duck_ice"],
             }
         },
     }
@@ -1090,7 +1120,7 @@ def test_build_server_and_main_validate_cli_refuse_every_violation_and_accept_va
             },
         },
         schemas_data={"clinical.patients": ["id", "ssn"]},
-        connections_data={"lb": all_connections["lb"]},
+        connections_data={"lb": {**all_connections["lb"], "storage_class": "local"}},
     )
     capsys.readouterr()
     assert serving_cli_main(["validate", "--config", str(valid_static_cfg)]) == 0

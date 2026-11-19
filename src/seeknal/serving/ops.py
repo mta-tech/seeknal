@@ -257,6 +257,47 @@ def resolve_build_info() -> dict[str, str]:
     return {key: str(info.get(key, "unknown")) for key in BUILD_INFO_KEYS}
 
 
+def _is_connector_starting(obj: Any) -> bool:
+    if obj is None:
+        return False
+    try:
+        if getattr(obj, "state", None) == "starting":
+            return True
+    except Exception:
+        pass
+    try:
+        csc = getattr(obj, "cold_start_connector", None)
+        if csc is not None and getattr(csc, "state", None) == "starting":
+            return True
+    except Exception:
+        pass
+    try:
+        bound_self = getattr(obj, "__self__", None)
+        if bound_self is not None and getattr(bound_self, "state", None) == "starting":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_adapter_starting(adapter: Any) -> bool:
+    if adapter is None:
+        return False
+    if isinstance(adapter, WorkloadRoutedAdapter):
+        return any(_is_adapter_starting(sub) for sub in adapter.by_workload.values())
+    if _is_connector_starting(adapter):
+        return True
+    if _is_connector_starting(getattr(adapter, "_connect", None)):
+        return True
+    pool = getattr(adapter, "pool", None) or getattr(adapter, "_pool", None)
+    if pool is not None:
+        if _is_connector_starting(pool):
+            return True
+        if _is_connector_starting(getattr(pool, "_connect_fn", None)):
+            return True
+    return False
+
+
 class ReadinessProbe:
     """Bounded, cached per-engine readiness checker that never leaks internal errors or DSNs."""
 
@@ -343,9 +384,19 @@ class ReadinessProbe:
             return getattr(self._refresher, "last_success_at", None) is not None
         return True
 
-    def _probe_single_adapter(self, eng_name: str, adapter: Any) -> bool:
+    def _probe_single_adapter(self, eng_name: str, adapter: Any) -> bool | str:
         if eng_name in self._custom_probes:
-            return bool(self._custom_probes[eng_name]())
+            raw_custom = self._custom_probes[eng_name]()
+            if isinstance(raw_custom, str) and raw_custom in (
+                "ok",
+                "starting",
+                "unavailable",
+            ):
+                return raw_custom
+            return bool(raw_custom)
+
+        if _is_adapter_starting(adapter):
+            return "starting"
 
         if isinstance(adapter, WorkloadRoutedAdapter):
             if not adapter.by_workload:
@@ -464,7 +515,9 @@ class ReadinessProbe:
 
     _probe_adapter_impl = _probe_single_adapter
 
-    def _get_fresh_cached_locked(self, eng_name: str, now: float) -> str | None:
+    def _get_fresh_cached_locked(
+        self, eng_name: str, now: float, adapter: Any = None
+    ) -> str | None:
         if self._cache_seconds <= 0:
             return None
         cached = self._cache.get(eng_name)
@@ -472,17 +525,29 @@ class ReadinessProbe:
             return None
         cached_status, cached_ts = cached
         if 0.0 <= (now - cached_ts) < self._cache_seconds:
+            if adapter is not None and eng_name not in self._custom_probes:
+                currently_starting = _is_adapter_starting(adapter)
+                if currently_starting and cached_status != "starting":
+                    return "starting"
+                if cached_status == "starting" and not currently_starting:
+                    return None
             return cached_status
         return None
 
     def _probe_engine_with_timeout(self, eng_name: str, adapter: Any) -> str:
+        if eng_name not in self._custom_probes and _is_adapter_starting(adapter):
+            with self._lock:
+                if self._cache_seconds > 0:
+                    self._cache[eng_name] = ("starting", float(self._clock()))
+            return "starting"
+
         with self._lock:
             now = float(self._clock())
-            fresh = self._get_fresh_cached_locked(eng_name, now)
+            fresh = self._get_fresh_cached_locked(eng_name, now, adapter)
             if fresh is not None:
                 return fresh
             if eng_name in self._in_flight:
-                return "unavailable"
+                return "starting" if _is_adapter_starting(adapter) else "unavailable"
             self._in_flight.add(eng_name)
 
         outcome: list[str] = ["unavailable"]
@@ -491,10 +556,26 @@ class ReadinessProbe:
 
         def _worker() -> None:
             try:
-                ok = bool(self._probe_single_adapter(eng_name, adapter))
-                outcome[0] = "ok" if ok else "unavailable"
-            except Exception:
-                outcome[0] = "unavailable"
+                res = self._probe_single_adapter(eng_name, adapter)
+                if res == "starting":
+                    outcome[0] = "starting"
+                elif res == "unavailable":
+                    outcome[0] = (
+                        "starting" if _is_adapter_starting(adapter) else "unavailable"
+                    )
+                elif res == "ok" or bool(res):
+                    outcome[0] = "ok"
+                else:
+                    outcome[0] = (
+                        "starting" if _is_adapter_starting(adapter) else "unavailable"
+                    )
+            except Exception as exc:
+                if getattr(exc, "code", None) == "engine_starting" or _is_adapter_starting(
+                    adapter
+                ):
+                    outcome[0] = "starting"
+                else:
+                    outcome[0] = "unavailable"
             finally:
                 with self._lock:
                     if not timed_out.is_set() and self._cache_seconds > 0:
@@ -512,7 +593,7 @@ class ReadinessProbe:
         except BaseException:
             with self._lock:
                 self._in_flight.discard(eng_name)
-            return "unavailable"
+            return "starting" if _is_adapter_starting(adapter) else "unavailable"
 
         thread.join(timeout=self._timeout_seconds)
         if not done.is_set():
@@ -520,9 +601,12 @@ class ReadinessProbe:
                 if done.is_set():
                     return outcome[0]
                 timed_out.set()
+                fallback_state = (
+                    "starting" if _is_adapter_starting(adapter) else "unavailable"
+                )
                 if self._cache_seconds > 0:
-                    self._cache[eng_name] = ("unavailable", float(self._clock()))
-                return "unavailable"
+                    self._cache[eng_name] = (fallback_state, float(self._clock()))
+                return fallback_state
         return outcome[0]
 
     def _is_audit_ready(self) -> bool:

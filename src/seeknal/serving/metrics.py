@@ -30,6 +30,7 @@ DEFAULT_DURATION_BUCKETS: tuple[float, ...] = (
 
 ALLOWED_ROUTES: tuple[str, ...] = (
     "/v1/query",
+    "/v1/select",
     "/v1/explain",
     "/v1/cancel",
     "/healthz",
@@ -76,6 +77,51 @@ ALLOWED_GRANT_REJECTION_REASONS: tuple[str, ...] = (
     "other",
 )
 _ALLOWED_GRANT_REASONS_SET = frozenset(ALLOWED_GRANT_REJECTION_REASONS)
+
+ALLOWED_GUARD_REJECTION_CODES: tuple[str, ...] = (
+    "filter_required",
+    "sort_not_indexed",
+    "offset_too_large",
+    "other",
+)
+_ALLOWED_GUARD_CODES_SET = frozenset(ALLOWED_GUARD_REJECTION_CODES)
+
+ALLOWED_POSTGRES_POOL_KINDS: tuple[str, ...] = (
+    "postgres",
+    "lakebase",
+)
+_ALLOWED_POSTGRES_POOL_KINDS_SET = frozenset(ALLOWED_POSTGRES_POOL_KINDS)
+
+ALLOWED_POSTGRES_ACCOUNTS: tuple[str, ...] = (
+    "interactive",
+    "bi",
+    "report",
+    "ask",
+    "job",
+    "default",
+)
+_ALLOWED_POSTGRES_ACCOUNTS_SET = frozenset(ALLOWED_POSTGRES_ACCOUNTS)
+
+ALLOWED_DISCOVERY_REFRESH_OUTCOMES: tuple[str, ...] = (
+    "success",
+    "error",
+)
+_ALLOWED_DISCOVERY_OUTCOMES_SET = frozenset(ALLOWED_DISCOVERY_REFRESH_OUTCOMES)
+
+ALLOWED_LAKEBASE_WAKE_OUTCOMES: tuple[str, ...] = (
+    "ok",
+    "success",
+    "error",
+    "timeout",
+)
+_ALLOWED_LAKEBASE_WAKE_OUTCOMES_SET = frozenset(ALLOWED_LAKEBASE_WAKE_OUTCOMES)
+
+ALLOWED_LAKEBASE_STATES: tuple[str, ...] = (
+    "ok",
+    "starting",
+    "unavailable",
+)
+_ALLOWED_LAKEBASE_STATES_SET = frozenset(ALLOWED_LAKEBASE_STATES)
 
 _SAFE_ENGINE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,79}$")
 _SUSPICIOUS_ENGINE_NAME_RE = re.compile(
@@ -134,6 +180,20 @@ def normalize_grant_reason(reason: Any) -> str:
     if isinstance(reason, str) and reason in _ALLOWED_GRANT_REASONS_SET:
         return reason
     return "other"
+
+
+def normalize_guard_code(code: Any) -> str:
+    """Normalize a guardrail rejection code against the bounded enum allowlist."""
+    if isinstance(code, BaseException):
+        code = getattr(code, "code", None)
+    if isinstance(code, str) and code in _ALLOWED_GUARD_CODES_SET:
+        return code
+    return "other"
+
+
+def _format_gauge_float(value: float) -> str:
+    formatted = f"{value:.6f}".rstrip("0").rstrip(".")
+    return formatted if formatted and formatted != "-0" else "0"
 
 
 def classify_grant_rejection(exc_or_reason: BaseException | str | None) -> str:
@@ -263,6 +323,13 @@ class MetricsRegistry:
         self._errors_total: dict[tuple[str, str, str], int] = {}
         self._grants_rejected_total: dict[str, int] = {}
         self._audit_write_failures_total: int = 0
+        self._guard_rejections_total: dict[str, int] = {}
+        self._sync_lag_seconds: dict[str, float] = {}
+        self._discovery_refresh_total: dict[tuple[str, str], int] = {}
+        self._lakebase_wake_total: dict[tuple[str, str], int] = {}
+        self._lakebase_connect_retries_total: dict[str, int] = {}
+        self._lakebase_cold_starts: dict[str, _HistogramSeries] = {}
+        self._lakebase_states: dict[str, str] = {}
 
         self.add_engines(engines)
         self.add_engines(allowed_engines)
@@ -407,6 +474,105 @@ class MetricsRegistry:
         with self._lock:
             self._audit_write_failures_total += count
 
+    def record_guard_rejection(self, code: Any) -> None:
+        """Increment seeknal_serving_guard_rejections_total by bounded guardrail code."""
+        safe_code = normalize_guard_code(code)
+        with self._lock:
+            self._guard_rejections_total[safe_code] = (
+                self._guard_rejections_total.get(safe_code, 0) + 1
+            )
+
+    def inc_guard_rejection(self, code: Any) -> None:
+        """Alias for record_guard_rejection."""
+        self.record_guard_rejection(code)
+
+    def set_sync_lag(self, engine: Any, lag_seconds: float | int | None) -> None:
+        """Set or clear seeknal_serving_sync_lag_seconds{engine}."""
+        with self._lock:
+            safe_engine = self._normalize_engine_locked(engine)
+            if lag_seconds is None:
+                self._sync_lag_seconds.pop(safe_engine, None)
+                return
+            if isinstance(lag_seconds, bool) or not isinstance(
+                lag_seconds, (int, float)
+            ):
+                return
+            fval = float(lag_seconds)
+            if not math.isfinite(fval):
+                return
+            self._sync_lag_seconds[safe_engine] = max(0.0, fval)
+
+    def record_discovery_refresh(self, engine: Any, outcome: Any) -> None:
+        """Increment seeknal_serving_discovery_refresh_total{engine,outcome}."""
+        safe_outcome = (
+            outcome
+            if isinstance(outcome, str) and outcome in _ALLOWED_DISCOVERY_OUTCOMES_SET
+            else "error"
+        )
+        with self._lock:
+            safe_engine = self._normalize_engine_locked(engine)
+            key = (safe_engine, safe_outcome)
+            self._discovery_refresh_total[key] = (
+                self._discovery_refresh_total.get(key, 0) + 1
+            )
+
+    def record_lakebase_wake(self, engine: Any, outcome: Any) -> None:
+        """Increment seeknal_serving_lakebase_wake_total{engine,outcome}."""
+        safe_outcome = (
+            outcome
+            if isinstance(outcome, str)
+            and outcome in _ALLOWED_LAKEBASE_WAKE_OUTCOMES_SET
+            else "error"
+        )
+        with self._lock:
+            safe_engine = self._normalize_engine_locked(engine)
+            key = (safe_engine, safe_outcome)
+            self._lakebase_wake_total[key] = (
+                self._lakebase_wake_total.get(key, 0) + 1
+            )
+
+    def record_lakebase_connect_retry(self, engine: Any, count: int = 1) -> None:
+        """Increment seeknal_serving_lakebase_connect_retries_total{engine}."""
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            return
+        with self._lock:
+            safe_engine = self._normalize_engine_locked(engine)
+            self._lakebase_connect_retries_total[safe_engine] = (
+                self._lakebase_connect_retries_total.get(safe_engine, 0) + count
+            )
+
+    def observe_lakebase_cold_start(
+        self, engine: Any, duration_seconds: float
+    ) -> None:
+        """Observe cold-start duration on seeknal_serving_lakebase_cold_start_seconds{engine}."""
+        if isinstance(duration_seconds, bool) or not isinstance(
+            duration_seconds, (int, float)
+        ):
+            return
+        val = float(duration_seconds)
+        if math.isnan(val) or math.isinf(val):
+            return
+        if val < 0.0:
+            val = 0.0
+        with self._lock:
+            safe_engine = self._normalize_engine_locked(engine)
+            series = self._lakebase_cold_starts.get(safe_engine)
+            if series is None:
+                series = _HistogramSeries(len(self._buckets))
+                self._lakebase_cold_starts[safe_engine] = series
+            series.observe(val, self._buckets)
+
+    def set_lakebase_state(self, engine: Any, state: Any) -> None:
+        """Set seeknal_serving_lakebase_state{engine,state} bounded to ok|starting|unavailable."""
+        safe_state = (
+            state
+            if isinstance(state, str) and state in _ALLOWED_LAKEBASE_STATES_SET
+            else "unavailable"
+        )
+        with self._lock:
+            safe_engine = self._normalize_engine_locked(engine)
+            self._lakebase_states[safe_engine] = safe_state
+
     def reset(self) -> None:
         """Clear recorded counter and histogram values (preserving configured engines/adapters)."""
         with self._lock:
@@ -415,35 +581,100 @@ class MetricsRegistry:
             self._errors_total.clear()
             self._grants_rejected_total.clear()
             self._audit_write_failures_total = 0
+            self._guard_rejections_total.clear()
+            self._sync_lag_seconds.clear()
+            self._discovery_refresh_total.clear()
+            self._lakebase_wake_total.clear()
+            self._lakebase_connect_retries_total.clear()
+            self._lakebase_cold_starts.clear()
+            self._lakebase_states.clear()
 
     @staticmethod
     def _collect_adapter_gauges(
         adapters_snapshot: list[tuple[str, Any]],
-    ) -> tuple[list[tuple[str, dict[str, int]]], list[tuple[str, dict[str, int]]]]:
+    ) -> tuple[
+        list[tuple[str, dict[str, int]]],
+        list[tuple[str, dict[str, int]]],
+        list[tuple[str, str, str, dict[str, int]]],
+    ]:
         duckdb_stats: list[tuple[str, dict[str, int]]] = []
         lakebase_stats: list[tuple[str, dict[str, int]]] = []
+        postgres_pool_stats: list[tuple[str, str, str, dict[str, int]]] = []
 
         for eng_name, adapter in adapters_snapshot:
-            target = adapter
-            if isinstance(target, WorkloadRoutedAdapter) and target.by_workload:
-                target = target.by_workload.get("interactive") or next(
-                    iter(target.by_workload.values())
+            if isinstance(adapter, WorkloadRoutedAdapter) and adapter.by_workload:
+                target = adapter.by_workload.get("interactive") or next(
+                    iter(adapter.by_workload.values())
                 )
+                if isinstance(target, DuckDBAdapter):
+                    try:
+                        duckdb_stats.append((eng_name, target.stats()))
+                    except Exception:
+                        pass
 
-            if isinstance(target, DuckDBAdapter):
+                seen_pool_ids: set[int] = set()
+                agg_in_use = 0
+                agg_idle = 0
+                has_pooled_sub = False
+                for w_key, sub in sorted(
+                    adapter.by_workload.items(), key=lambda kv: str(kv[0])
+                ):
+                    if (
+                        isinstance(sub, DBAPIAdapter)
+                        and sub.kind in _ALLOWED_POSTGRES_POOL_KINDS_SET
+                        and sub.pool is not None
+                    ):
+                        try:
+                            pst = sub.pool_stats()
+                        except Exception:
+                            pst = None
+                        if pst is not None:
+                            acc_label = (
+                                w_key
+                                if isinstance(w_key, str)
+                                and w_key in _ALLOWED_POSTGRES_ACCOUNTS_SET
+                                else "default"
+                            )
+                            postgres_pool_stats.append(
+                                (eng_name, sub.kind, acc_label, pst)
+                            )
+                            pid = id(sub.pool)
+                            if pid not in seen_pool_ids:
+                                seen_pool_ids.add(pid)
+                                agg_in_use += int(pst.get("in_use", 0))
+                                agg_idle += int(pst.get("idle", 0))
+                                has_pooled_sub = True
+                if has_pooled_sub:
+                    lakebase_stats.append(
+                        (eng_name, {"in_use": agg_in_use, "idle": agg_idle})
+                    )
+                continue
+
+            if isinstance(adapter, DuckDBAdapter):
                 try:
-                    duckdb_stats.append((eng_name, target.stats()))
+                    duckdb_stats.append((eng_name, adapter.stats()))
                 except Exception:
                     pass
-            elif isinstance(target, DBAPIAdapter) and target.pool is not None:
+            elif isinstance(adapter, DBAPIAdapter) and adapter.pool is not None:
                 try:
-                    pst = target.pool_stats()
+                    pst = adapter.pool_stats()
                     if pst is not None:
                         lakebase_stats.append((eng_name, pst))
+                        if adapter.kind in _ALLOWED_POSTGRES_POOL_KINDS_SET:
+                            raw_acc = adapter.account
+                            acc_label = (
+                                raw_acc
+                                if isinstance(raw_acc, str)
+                                and raw_acc in _ALLOWED_POSTGRES_ACCOUNTS_SET
+                                else "default"
+                            )
+                            postgres_pool_stats.append(
+                                (eng_name, adapter.kind, acc_label, pst)
+                            )
                 except Exception:
                     pass
 
-        return duckdb_stats, lakebase_stats
+        return duckdb_stats, lakebase_stats, postgres_pool_stats
 
     def render(self) -> str:
         """Render all metrics in Prometheus text exposition format 0.0.4."""
@@ -456,9 +687,21 @@ class MetricsRegistry:
             errors_snap = sorted(self._errors_total.items())
             grants_snap = sorted(self._grants_rejected_total.items())
             audit_failures = self._audit_write_failures_total
+            guard_snap = sorted(self._guard_rejections_total.items())
+            sync_lag_snap = sorted(self._sync_lag_seconds.items())
+            disc_refresh_snap = sorted(self._discovery_refresh_total.items())
+            lb_wake_snap = sorted(self._lakebase_wake_total.items())
+            lb_retries_snap = sorted(self._lakebase_connect_retries_total.items())
+            lb_cold_starts_snap = [
+                (k, list(v.bucket_counts), v.count, v.total)
+                for k, v in sorted(self._lakebase_cold_starts.items())
+            ]
+            lb_states_snap = sorted(self._lakebase_states.items())
             adapters_snap = sorted(self._adapters.items(), key=lambda kv: kv[0])
 
-        duckdb_stats, lakebase_stats = self._collect_adapter_gauges(adapters_snap)
+        duckdb_stats, lakebase_stats, postgres_pool_stats = (
+            self._collect_adapter_gauges(adapters_snap)
+        )
 
         lines: list[str] = []
 
@@ -543,9 +786,33 @@ class MetricsRegistry:
                 f'seeknal_serving_duckdb_generation{{engine="{e_esc}"}} {int(st.get("generation", 0))}'
             )
 
-        # 5. Lakebase pool gauges
+        # 5. Postgres-wire pool gauges (plus deprecated Lakebase pool gauges)
         lines.append(
-            "# HELP seeknal_serving_lakebase_pool_in_use Active borrowed connections in the Lakebase pool."
+            "# HELP seeknal_serving_postgres_pool_in_use Active borrowed connections in the Postgres-wire pool."
+        )
+        lines.append("# TYPE seeknal_serving_postgres_pool_in_use gauge")
+        for eng_name, kind_str, acc_str, pst in postgres_pool_stats:
+            e_esc = _escape_label_value(eng_name)
+            k_esc = _escape_label_value(kind_str)
+            a_esc = _escape_label_value(acc_str)
+            lines.append(
+                f'seeknal_serving_postgres_pool_in_use{{engine="{e_esc}",kind="{k_esc}",account="{a_esc}"}} {int(pst.get("in_use", 0))}'
+            )
+
+        lines.append(
+            "# HELP seeknal_serving_postgres_pool_idle Idle available connections in the Postgres-wire pool."
+        )
+        lines.append("# TYPE seeknal_serving_postgres_pool_idle gauge")
+        for eng_name, kind_str, acc_str, pst in postgres_pool_stats:
+            e_esc = _escape_label_value(eng_name)
+            k_esc = _escape_label_value(kind_str)
+            a_esc = _escape_label_value(acc_str)
+            lines.append(
+                f'seeknal_serving_postgres_pool_idle{{engine="{e_esc}",kind="{k_esc}",account="{a_esc}"}} {int(pst.get("idle", 0))}'
+            )
+
+        lines.append(
+            "# HELP seeknal_serving_lakebase_pool_in_use Deprecated duplicate of seeknal_serving_postgres_pool_in_use."
         )
         lines.append("# TYPE seeknal_serving_lakebase_pool_in_use gauge")
         for eng_name, pst in lakebase_stats:
@@ -555,7 +822,7 @@ class MetricsRegistry:
             )
 
         lines.append(
-            "# HELP seeknal_serving_lakebase_pool_idle Idle available connections in the Lakebase pool."
+            "# HELP seeknal_serving_lakebase_pool_idle Deprecated duplicate of seeknal_serving_postgres_pool_idle."
         )
         lines.append("# TYPE seeknal_serving_lakebase_pool_idle gauge")
         for eng_name, pst in lakebase_stats:
@@ -581,6 +848,97 @@ class MetricsRegistry:
         )
         lines.append("# TYPE seeknal_serving_audit_write_failures_total counter")
         lines.append(f"seeknal_serving_audit_write_failures_total {audit_failures}")
+
+        # 8. Guardrail rejections counter
+        lines.append(
+            "# HELP seeknal_serving_guard_rejections_total Total guardrail rejections by bounded code."
+        )
+        lines.append("# TYPE seeknal_serving_guard_rejections_total counter")
+        for g_code, val in guard_snap:
+            gc_esc = _escape_label_value(g_code)
+            lines.append(
+                f'seeknal_serving_guard_rejections_total{{code="{gc_esc}"}} {val}'
+            )
+
+        # 9. Sync lag gauge
+        lines.append(
+            "# HELP seeknal_serving_sync_lag_seconds Observed source freshness lag in seconds by engine."
+        )
+        lines.append("# TYPE seeknal_serving_sync_lag_seconds gauge")
+        for eng_name, lag_val in sync_lag_snap:
+            e_esc = _escape_label_value(eng_name)
+            lines.append(
+                f'seeknal_serving_sync_lag_seconds{{engine="{e_esc}"}} {_format_gauge_float(lag_val)}'
+            )
+
+        # 10. Discovery refresh counter
+        lines.append(
+            "# HELP seeknal_serving_discovery_refresh_total Total discovery refresh cycles by engine and outcome."
+        )
+        lines.append("# TYPE seeknal_serving_discovery_refresh_total counter")
+        for (eng_name, outcome), val in disc_refresh_snap:
+            e_esc = _escape_label_value(eng_name)
+            o_esc = _escape_label_value(outcome)
+            lines.append(
+                f'seeknal_serving_discovery_refresh_total{{engine="{e_esc}",outcome="{o_esc}"}} {val}'
+            )
+
+        # 11. Lakebase cold-start & wake series
+        lines.append(
+            "# HELP seeknal_serving_lakebase_wake_total Total Lakebase control-plane wake operations by engine and outcome."
+        )
+        lines.append("# TYPE seeknal_serving_lakebase_wake_total counter")
+        for (eng_name, outcome), val in lb_wake_snap:
+            e_esc = _escape_label_value(eng_name)
+            o_esc = _escape_label_value(outcome)
+            lines.append(
+                f'seeknal_serving_lakebase_wake_total{{engine="{e_esc}",outcome="{o_esc}"}} {val}'
+            )
+
+        lines.append(
+            "# HELP seeknal_serving_lakebase_connect_retries_total Total Lakebase bounded connection retries by engine."
+        )
+        lines.append("# TYPE seeknal_serving_lakebase_connect_retries_total counter")
+        for eng_name, val in lb_retries_snap:
+            e_esc = _escape_label_value(eng_name)
+            lines.append(
+                f'seeknal_serving_lakebase_connect_retries_total{{engine="{e_esc}"}} {val}'
+            )
+
+        lines.append(
+            "# HELP seeknal_serving_lakebase_cold_start_seconds Lakebase cold-start resume duration in seconds by engine."
+        )
+        lines.append("# TYPE seeknal_serving_lakebase_cold_start_seconds histogram")
+        for eng_name, bucket_counts, count, total in lb_cold_starts_snap:
+            e_esc = _escape_label_value(eng_name)
+            cumulative = 0
+            for bound, b_count in zip(self._buckets, bucket_counts):
+                cumulative += b_count
+                lines.append(
+                    f'seeknal_serving_lakebase_cold_start_seconds_bucket{{engine="{e_esc}",le="{bound}"}} {cumulative}'
+                )
+            lines.append(
+                f'seeknal_serving_lakebase_cold_start_seconds_bucket{{engine="{e_esc}",le="+Inf"}} {count}'
+            )
+            lines.append(
+                f'seeknal_serving_lakebase_cold_start_seconds_sum{{engine="{e_esc}"}} {total:.6f}'
+            )
+            lines.append(
+                f'seeknal_serving_lakebase_cold_start_seconds_count{{engine="{e_esc}"}} {count}'
+            )
+
+        lines.append(
+            "# HELP seeknal_serving_lakebase_state Current Lakebase endpoint state (1 for active state, 0 otherwise)."
+        )
+        lines.append("# TYPE seeknal_serving_lakebase_state gauge")
+        for eng_name, cur_state in lb_states_snap:
+            e_esc = _escape_label_value(eng_name)
+            for st_name in ALLOWED_LAKEBASE_STATES:
+                st_esc = _escape_label_value(st_name)
+                flag = 1 if st_name == cur_state else 0
+                lines.append(
+                    f'seeknal_serving_lakebase_state{{engine="{e_esc}",state="{st_esc}"}} {flag}'
+                )
 
         return "\n".join(lines) + "\n"
 
