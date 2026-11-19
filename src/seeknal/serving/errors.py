@@ -8,6 +8,7 @@ import threading
 import urllib.parse
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from types import MappingProxyType
 from typing import Any
 
@@ -261,6 +262,9 @@ _DUCKDB_SECRET_RE = re.compile(
     r"(?is)(?<![A-Za-z0-9])SECRET\s+'(?:''|\\.|[^'])*'"
 )
 _SQL_SINGLE_QUOTED_RE = re.compile(r"'((?:''|[^'])*)'")
+_PURELY_NUMERIC_RE = re.compile(
+    r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+)
 _SENSITIVE_ENV_NAME_RE = re.compile(
     r"(?i)(SECRET|PASSWORD|PASSWD|TOKEN|DSN|CREDENTIAL|CANARY|SENTINEL|PRIVATE|KEY)"
 )
@@ -321,6 +325,48 @@ def _sanitize_log_value(value: Any, *, default: str = "-") -> str:
         else:
             out_chars.append(ch)
     return "".join(out_chars)
+
+
+def _is_purely_numeric_value(val: Any) -> bool:
+    """Return True if *val* is a number (excluding bool) or a purely numeric string."""
+    if isinstance(val, bool):
+        return False
+    if isinstance(val, (int, float, Decimal)):
+        return True
+    if isinstance(val, str):
+        s = val.strip()
+        return bool(s and _PURELY_NUMERIC_RE.fullmatch(s))
+    return False
+
+
+def _collect_param_redactions(params: Any) -> list[str]:
+    """Collect bound-parameter redaction tokens: exact quoted ``'<p>'`` or non-numeric len >= 3."""
+    if isinstance(params, (list, tuple)):
+        param_items: list[Any] = list(params)
+    elif isinstance(params, Mapping):
+        param_items = list(params.values())
+    else:
+        return []
+
+    tokens: set[str] = set()
+    for p in param_items:
+        if p is None or isinstance(p, bool):
+            continue
+        p_str = str(p)
+        if not p_str:
+            continue
+        tokens.add(f"'{p_str}'")
+        if isinstance(p, str):
+            escaped_p = p.replace("'", "''")
+            tokens.add(f"'{escaped_p}'")
+            if len(p) >= 3 and not _is_purely_numeric_value(p):
+                tokens.add(p)
+                if escaped_p != p:
+                    tokens.add(escaped_p)
+        elif len(p_str) >= 3 and not _is_purely_numeric_value(p):
+            tokens.add(p_str)
+
+    return sorted(tokens, key=len, reverse=True)
 
 
 def _add_quote_escaped_forms(secret: str, candidates: set[str]) -> None:
@@ -426,9 +472,9 @@ def scrub_error_detail(
             if full_quoted != "''":
                 sql_literals.append(full_quoted)
             unescaped = raw_inner.replace("''", "'")
-            if len(raw_inner) >= 3:
+            if len(raw_inner) >= 3 and not _is_purely_numeric_value(raw_inner):
                 sql_literals.append(raw_inner)
-            if len(unescaped) >= 3:
+            if len(unescaped) >= 3 and not _is_purely_numeric_value(unescaped):
                 sql_literals.append(unescaped)
         if sql in detail:
             detail = detail.replace(sql, "[REDACTED]")
@@ -439,46 +485,9 @@ def scrub_error_detail(
             if lit in detail:
                 detail = detail.replace(lit, "[REDACTED]")
 
-    if isinstance(params, (list, tuple)):
-        param_items: list[Any] = list(params)
-    elif isinstance(params, Mapping):
-        param_items = list(params.values())
-    else:
-        param_items = []
-
-    if param_items:
-        str_param_secrets: list[str] = []
-        boundary_param_secrets: list[str] = []
-        for p in param_items:
-            if p is None or isinstance(p, bool):
-                continue
-            if isinstance(p, str):
-                if not p:
-                    continue
-                str_param_secrets.append(f"'{p}'")
-                escaped_p = p.replace("'", "''")
-                str_param_secrets.append(f"'{escaped_p}'")
-                if len(p) >= 3:
-                    str_param_secrets.append(p)
-                    if escaped_p != p:
-                        str_param_secrets.append(escaped_p)
-                else:
-                    boundary_param_secrets.append(p)
-            else:
-                p_str = str(p)
-                if p_str:
-                    str_param_secrets.append(f"'{p_str}'")
-                    boundary_param_secrets.append(p_str)
-
-        for s in sorted(set(str_param_secrets), key=len, reverse=True):
-            if s in detail:
-                detail = detail.replace(s, "[REDACTED]")
-        for b in sorted(set(boundary_param_secrets), key=len, reverse=True):
-            detail = re.sub(
-                rf"(?<![A-Za-z0-9_]){re.escape(b)}(?![A-Za-z0-9_])",
-                "[REDACTED]",
-                detail,
-            )
+    for param_tok in _collect_param_redactions(params):
+        if param_tok in detail:
+            detail = detail.replace(param_tok, "[REDACTED]")
 
     detail = _CANARY_SENTINEL_RE.sub("[REDACTED]", detail)
     detail = _sanitize_log_value(detail, default="")

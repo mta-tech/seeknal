@@ -567,3 +567,70 @@ def test_http_named_operation_parameter_digest_and_compilation_cache(serving_set
     )
     assert r5.status_code == 403
     assert r5.json()["error"] == "enforcement_error"
+
+
+def test_safe_message_redaction_precision_preserves_61_0s_and_redacts_secret_param(
+    ec_key_pair,
+):
+    """Ensure params=[0] does not corrupt '61.0s' while 'PARAM_SECRET_VALUE' is still redacted."""
+    from seeknal.serving.http import _safe_message
+
+    priv, pub = ec_key_pair
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "users": {
+                    "keys": ["id"],
+                    "row_count": 1,
+                    "serve": {"duck": "users"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas={"users": ["id", "name"]},
+        public_keys={"key-1": pub},
+        max_grant_lifetime_seconds=60.0,
+    )
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR)")
+    try:
+        app = create_app(pipeline, {"duck": DuckDBAdapter(lambda: con.cursor())})
+        client = TestClient(app)
+
+        sql = "SELECT id FROM users WHERE id >= $1 AND name != $2"
+        token_61s = _make_token(
+            priv,
+            sql,
+            exp_offset=61.0,
+            iat_offset=0.0,
+            tables={"users": {"columns": ["id"], "masks": {}, "actions": ["select"]}},
+        )
+
+        resp = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {token_61s}"},
+            json={"sql": sql, "params": [0, "PARAM_SECRET_VALUE"]},
+        )
+        assert resp.status_code == 401
+        msg = resp.json()["message"]
+        assert "61.0s" in msg
+        assert "60.0s" in msg
+        assert "PARAM_SECRET_VALUE" not in resp.text
+
+        direct_msg = _safe_message(
+            "Token lifetime of 61.0s exceeds maximum 60.0s; quoted='0'; secret=PARAM_SECRET_VALUE; lit='LIT_SECRET_VAL'",
+            sql="SELECT id FROM users WHERE name = 'LIT_SECRET_VAL'",
+            params=[0, "PARAM_SECRET_VALUE"],
+        )
+        assert "61.0s" in direct_msg
+        assert "60.0s" in direct_msg
+        assert "'0'" not in direct_msg
+        assert "PARAM_SECRET_VALUE" not in direct_msg
+        assert "LIT_SECRET_VAL" not in direct_msg
+    finally:
+        con.close()
+

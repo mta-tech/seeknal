@@ -1012,19 +1012,20 @@ def test_scrub_error_detail_unit_redacts_all_secret_classes_and_preserves_detail
         "uri=postgresql://admin:uri_pass_1234@sr-fe:9030/db | "
         "kv=password=kv_secret_7890 api_key=ak_live_3344 | "
         "env1=env_tok_998877 env2=pw''with''quote env3=dsn_extracted_pw_4433 | "
-        "lit='vip_customer_secret_42' esc=O'Brian_77 param=param_secret_6655 num=987654 | "
+        "lit='vip_customer_secret_42' esc=O'Brian_77 param=param_secret_6655 quoted_num='987654' dur=61.0s | "
         "probe=my_canary_token_88\r\nnext_line_diag"
     )
     scrubbed = scrub_error_detail(
         exc,
         token="raw_grant_tok_1122",
         sql=sql,
-        params=["param_secret_6655", 987654, 2],
+        params=["param_secret_6655", 987654, 0, 2],
         env=env,
     )
 
     assert scrubbed.startswith("EngineError: ")
     assert "backend table orders_mart_v2 missing partition 202611" in scrubbed
+    assert "dur=61.0s" in scrubbed
     assert "\\r\\nnext_line_diag" in scrubbed
     assert "\n" not in scrubbed
     assert "\r" not in scrubbed
@@ -1045,7 +1046,7 @@ def test_scrub_error_detail_unit_redacts_all_secret_classes_and_preserves_detail
         "O'Brian_77",
         "O''Brian_77",
         "param_secret_6655",
-        "987654",
+        "'987654'",
         "my_canary_token_88",
     ):
         assert forbidden not in scrubbed, f"Secret '{forbidden}' leaked in: {scrubbed}"
@@ -1661,5 +1662,80 @@ def test_c_n3_scrubber_escaped_quotes_all_keys_duckdb_secret_slash_userinfo_and_
             )
     finally:
         clear_registered_config_secrets()
+
+
+def test_redaction_precision_preserves_61_0s_with_params_zero_and_redacts_param_secret(
+    ec_keys,
+    caplog: pytest.LogCaptureFixture,
+):
+    priv, pub = ec_keys
+    parent = duckdb.connect()
+    parent.execute("CREATE TABLE users (id INT, name VARCHAR)")
+    try:
+        placement = Placement.from_dict(
+            {
+                "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+                "tables": {
+                    "users": {
+                        "keys": ["id"],
+                        "row_count": 1,
+                        "serve": {"duck": "users"},
+                    }
+                },
+                "cubes": {},
+            }
+        )
+        pipeline = ServingPipeline(
+            placement=placement,
+            schemas={"users": ["id", "name"]},
+            public_keys={"key-1": pub},
+            max_grant_lifetime_seconds=60.0,
+        )
+        client = TestClient(
+            create_app(pipeline, {"duck": DuckDBAdapter(lambda: parent.cursor())})
+        )
+
+        sql = "SELECT id FROM users WHERE id >= $1 AND name != $2"
+        tok_61s = _make_grant(
+            priv,
+            sql,
+            jti="jti-61s-precision",
+            iat_offset=0.0,
+            exp_offset=61.0,
+            tables={"users": {"columns": ["id"], "masks": {}, "actions": ["select"]}},
+        )
+
+        with caplog.at_level(logging.ERROR):
+            caplog.clear()
+            resp = client.post(
+                "/v1/query",
+                headers={"Authorization": f"Bearer {tok_61s}"},
+                json={"sql": sql, "params": [0, "PARAM_SECRET_VALUE"]},
+            )
+
+        assert resp.status_code == 401
+        body = resp.json()
+        assert "61.0s" in body["message"]
+        assert "60.0s" in body["message"]
+        assert "PARAM_SECRET_VALUE" not in resp.text
+        assert "61.0s" in caplog.text
+        assert "PARAM_SECRET_VALUE" not in caplog.text
+
+        # Unit check on scrub_error_detail: exact quoted '0' IS redacted, bare 61.0s survives,
+        # and PARAM_SECRET_VALUE is redacted.
+        detail = scrub_error_detail(
+            "Token lifetime of 61.0s exceeds maximum 60.0s; bound='0'; p=PARAM_SECRET_VALUE; s='SQL_LIT_SECRET'",
+            sql="SELECT id FROM users WHERE name = 'SQL_LIT_SECRET'",
+            params=[0, "PARAM_SECRET_VALUE"],
+            env={},
+        )
+        assert "61.0s" in detail
+        assert "60.0s" in detail
+        assert "'0'" not in detail
+        assert "PARAM_SECRET_VALUE" not in detail
+        assert "SQL_LIT_SECRET" not in detail
+    finally:
+        parent.close()
+
 
 

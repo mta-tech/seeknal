@@ -45,6 +45,9 @@ from seeknal.serving.audit import (
 from seeknal.serving.enforce import EnforcementError
 from seeknal.serving.errors import (
     AuditUnavailableError,
+    _SQL_SINGLE_QUOTED_RE,
+    _collect_param_redactions,
+    _is_purely_numeric_value,
     _sanitize_log_value,
     build_error_payload,
     get_error_spec,
@@ -233,16 +236,24 @@ def _safe_message(
         if sql in msg:
             msg = "SQL query error"
         else:
-            for lit in SQL_LITERAL_PATTERN.findall(sql):
-                if lit and lit in msg:
+            sql_literals: list[str] = []
+            for m in _SQL_SINGLE_QUOTED_RE.finditer(sql):
+                raw_inner = m.group(1)
+                full_quoted = m.group(0)
+                if full_quoted != "''":
+                    sql_literals.append(full_quoted)
+                unescaped = raw_inner.replace("''", "'")
+                if len(raw_inner) >= 3 and not _is_purely_numeric_value(raw_inner):
+                    sql_literals.append(raw_inner)
+                if len(unescaped) >= 3 and not _is_purely_numeric_value(unescaped):
+                    sql_literals.append(unescaped)
+            for lit in sorted(set(sql_literals), key=len, reverse=True):
+                if lit in msg:
                     msg = msg.replace(lit, "[REDACTED]")
 
-    if params and isinstance(params, (list, tuple)):
-        for p in params:
-            if p is not None:
-                p_str = str(p)
-                if p_str and p_str in msg:
-                    msg = msg.replace(p_str, "[REDACTED]")
+    for param_tok in _collect_param_redactions(params):
+        if param_tok in msg:
+            msg = msg.replace(param_tok, "[REDACTED]")
 
     return msg
 
