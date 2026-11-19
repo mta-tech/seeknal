@@ -31,12 +31,14 @@ from seeknal.serving.adapters import (
     build_adapter,
     build_workload_adapters,
 )
+from seeknal.serving.audit import AuditSink, AuditWriteError, build_audit_sink
 from seeknal.serving.discovery import PlacementRefresher, discover
 from seeknal.serving.discovery.build import DiscoveryResult
 from seeknal.serving.duckdb_policy import DuckDBHolder, connect_hardened
 from seeknal.serving.http import GrantReplayCache, create_app
 from seeknal.serving.placement import Placement
 from seeknal.serving.server.config import (
+    AuditStartupError,
     CubeConnectionConfig,
     DuckDBConnectionConfig,
     LakebaseConnectionConfig,
@@ -100,6 +102,7 @@ class ServerHandle:
     pipeline: ServingPipeline
     refresher: PlacementRefresher | None
     adapters: dict[str, EngineAdapter] = field(default_factory=dict)
+    audit_sink: AuditSink | None = None
 
     def __iter__(self):
         yield self.app
@@ -113,6 +116,7 @@ def build_server(
     env: Mapping[str, str] = os.environ,
     connect_factories: Mapping[str, Any] | None = None,
     discover_fn: Callable[[], DiscoveryResult] | None = None,
+    audit_failure_callback: Callable[[], Any] | None = None,
 ) -> ServerHandle:
     """Build a complete Seeknal Serving server handle from configuration."""
     # 1. Resolve configuration
@@ -132,8 +136,25 @@ def build_server(
     # 3. Load grant keys before configuring file logging
     public_keys = cfg.load_grant_keys()
 
+    # 3b. Construct fail-closed audit sink before file logger / refresher / adapters
+    audit_sink: AuditSink | None = None
+    if cfg.audit is not None and cfg.audit.on_failure == "refuse":
+        try:
+            audit_sink = build_audit_sink(
+                cfg.audit,
+                on_write_failure=audit_failure_callback,
+            )
+        except AuditWriteError as exc:
+            raise AuditStartupError(str(exc)) from exc
+
     # 4. Configure logging
     configure_logging(cfg.logging)
+
+    if cfg.audit is not None and audit_sink is None:
+        audit_sink = build_audit_sink(
+            cfg.audit,
+            on_write_failure=audit_failure_callback,
+        )
 
     # 5. Build ServingPipeline and PlacementRefresher
     refresher: PlacementRefresher | None = None
@@ -313,6 +334,11 @@ def build_server(
                     except Exception:
                         pass
             DuckDBHolder.get_holder().close_all()
+            if audit_sink is not None and hasattr(audit_sink, "close"):
+                try:
+                    audit_sink.close()
+                except Exception:
+                    pass
 
     extra_routes = [
         Route("/readyz", readyz, methods=["GET"]),
@@ -327,10 +353,17 @@ def build_server(
         extra_routes=extra_routes,
         lifespan=lifespan,
         replay_cache=GrantReplayCache(max_entries=cfg.replay_cache_max_entries),
+        audit_sink=audit_sink,
+        audit_on_failure=cfg.audit.on_failure if cfg.audit is not None else "refuse",
+        audit_failure_callback=audit_failure_callback,
     )
 
     return ServerHandle(
-        app=app, pipeline=pipeline, refresher=refresher, adapters=adapters
+        app=app,
+        pipeline=pipeline,
+        refresher=refresher,
+        adapters=adapters,
+        audit_sink=audit_sink,
     )
 
 

@@ -15,6 +15,11 @@ import yaml
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from seeknal.serving.audit import (
+    AuditConfig,
+    AuditWriteError,
+    verify_audit_config_offline,
+)
 from seeknal.serving.compilation_cache import (
     DEFAULT_COMPILATION_CACHE_MAX_ENTRIES,
     validate_compilation_cache_max_entries,
@@ -26,6 +31,10 @@ from seeknal.serving.placement import Placement, PlacementError
 
 class ServerConfigError(Exception):
     """Raised when server configuration is invalid or missing."""
+
+
+class AuditStartupError(ServerConfigError, AuditWriteError):
+    """Raised when a fail-closed audit sink fails startup validation."""
 
 
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,79}$")
@@ -451,12 +460,15 @@ class ServerConfig:
     grant_max_lifetime_seconds: float = 60.0
     replay_cache_max_entries: int = 100_000
     compilation_cache_max_entries: int = DEFAULT_COMPILATION_CACHE_MAX_ENTRIES
+    audit: AuditConfig | None = None
 
     def __post_init__(self) -> None:
         validate_compilation_cache_max_entries(
             self.compilation_cache_max_entries,
             error_cls=ServerConfigError,
         )
+        if self.audit is not None and not isinstance(self.audit, AuditConfig):
+            raise ServerConfigError("'audit' must be an AuditConfig instance or None")
 
     def load_grant_keys(self) -> dict[str, str]:
         """Load and return parsed PEM public keys."""
@@ -582,6 +594,8 @@ class ServerConfig:
         static Placement and schemas without re-reading files.
         """
         self.check_env(env=env)
+        if self.audit is not None:
+            verify_audit_config_offline(self.audit, error_cls=AuditStartupError)
 
         if self.placement.is_static:
             static_cfg = self.placement.static
@@ -687,6 +701,7 @@ class ServerConfig:
             "grant_max_lifetime_seconds",
             "replay_cache_max_entries",
             "compilation_cache_max_entries",
+            "audit",
         }
         unknown_top = set(d.keys()) - allowed_top
         if unknown_top:
@@ -1923,6 +1938,13 @@ class ServerConfig:
             error_cls=ServerConfigError,
         )
 
+        # 16. audit
+        audit_raw = d.get("audit")
+        if audit_raw is None:
+            audit_cfg = None
+        else:
+            audit_cfg = AuditConfig.from_dict(audit_raw, error_cls=ServerConfigError)
+
         server_config = cls(
             listen=listen_cfg,
             tls=tls_cfg,
@@ -1939,6 +1961,7 @@ class ServerConfig:
             grant_max_lifetime_seconds=grant_max_lifetime,
             replay_cache_max_entries=replay_cache_max_entries,
             compilation_cache_max_entries=compilation_cache_max_entries,
+            audit=audit_cfg,
         )
 
         if load_keys:
