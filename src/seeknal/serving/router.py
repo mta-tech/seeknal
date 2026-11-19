@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import sqlglot
 from sqlglot import exp
@@ -122,6 +123,10 @@ HINT_PATTERN = re.compile(
 class RoutingError(Exception):
     """Raised when a SQL statement cannot be routed or served."""
 
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 @dataclass(frozen=True)
 class RoutingDecision:
@@ -181,8 +186,35 @@ def _select_engine_by_kinds(
 class Router:
     """Routes SQL statements to configured database and semantic engines."""
 
-    def __init__(self, placement: Placement) -> None:
+    def __init__(
+        self,
+        placement: Placement,
+        *,
+        pii_tables: Collection[str] = (),
+    ) -> None:
         self.placement = placement
+        placement_pii = getattr(placement, "pii_tables", ()) or ()
+        self._pii_tables = frozenset(
+            str(t).lower() for t in (*placement_pii, *pii_tables)
+        )
+
+    def _is_pii_table(
+        self,
+        table: TableEntry,
+        extra_pii: Collection[str] | None = None,
+    ) -> bool:
+        if (
+            bool(getattr(table, "pii", False))
+            or bool(getattr(table, "has_pii", False))
+            or bool(getattr(table, "pii_columns", ()))
+        ):
+            return True
+        lower = table.name.lower()
+        if lower in self._pii_tables:
+            return True
+        if extra_pii and any(str(p).lower() == lower for p in extra_pii):
+            return True
+        return False
 
     def rewrite(self, statement: exp.Expression, engine: str) -> str:
         """Replace logical table references with that engine's physical names and render in engine dialect."""
@@ -254,20 +286,24 @@ class Router:
         dialect: str = "postgres",
         hint: str | None = None,
         max_staleness_seconds: float | None = None,
+        pii_tables: Collection[str] | None = None,
     ) -> RoutingDecision:
         """Route a SQL statement, picking the best engine and returning a RoutingDecision."""
         # 1. Parse statement
         try:
             statements = sqlglot.parse(sql, read=dialect)
         except Exception as exc:
-            raise RoutingError(f"Failed to parse SQL statement: {exc}") from exc
+            raise RoutingError(
+                f"Failed to parse SQL statement: {exc}", code="invalid_sql"
+            ) from exc
 
         valid_statements = [s for s in statements if s is not None]
         if not valid_statements:
-            raise RoutingError("Empty SQL statement")
+            raise RoutingError("Empty SQL statement", code="invalid_sql")
         if len(valid_statements) > 1:
             raise RoutingError(
-                f"Expected exactly 1 statement, got {len(valid_statements)}"
+                f"Expected exactly 1 statement, got {len(valid_statements)}",
+                code="invalid_sql",
             )
 
         statement = valid_statements[0]
@@ -275,6 +311,7 @@ class Router:
             statement,
             hint=hint,
             max_staleness_seconds=max_staleness_seconds,
+            pii_tables=pii_tables,
         )
 
     def decide_statement(
@@ -283,12 +320,16 @@ class Router:
         *,
         hint: str | None = None,
         max_staleness_seconds: float | None = None,
+        pii_tables: Collection[str] | None = None,
     ) -> RoutingDecision:
         """Route a SQL statement AST, picking the best engine and returning a RoutingDecision."""
         # 2. Extract features
         features = extract_features(statement)
         if features.kind in ("ddl", "other"):
-            raise RoutingError(f"Statement kind '{features.kind}' not served")
+            raise RoutingError(
+                f"Statement kind '{features.kind}' not served",
+                code="invalid_sql",
+            )
 
         # 3. Resolve referenced names
         referenced_cubes = []
@@ -304,19 +345,28 @@ class Router:
                 else:
                     raise RoutingError(f"Unknown table or cube '{name}'")
 
+        has_pii = any(
+            self._is_pii_table(t, pii_tables) for t in referenced_tables
+        )
+
         if referenced_cubes and referenced_tables:
-            raise RoutingError("Cannot mix cubes and tables in the same statement")
+            raise RoutingError(
+                "Cannot mix cubes and tables in the same statement",
+                code="pii_cross_engine" if has_pii else "query_spans_engines",
+            )
 
         if len(referenced_cubes) > 1:
             cube_engines = {c.engine for c in referenced_cubes}
             if len(cube_engines) > 1:
                 raise RoutingError(
-                    f"Cubes on different engines referenced: {cube_engines}"
+                    f"Cubes on different engines referenced: {cube_engines}",
+                    code="query_spans_engines",
                 )
 
         # 4. Feasible engines
         feasible_list: list[str] = []
         rejected: dict[str, str] = {}
+        stale_rejected_engines: set[str] = set()
         placement_engines = tuple(self.placement.engines.keys())
 
         if referenced_cubes:
@@ -352,6 +402,7 @@ class Router:
                         f"Engine '{eng_name}' does not serve: {', '.join(missing_tables)}"
                     )
                 elif stale_tables:
+                    stale_rejected_engines.add(eng_name)
                     rejected[eng_name] = (
                         f"Engine '{eng_name}' rejected due to staleness: {'; '.join(stale_tables)}"
                     )
@@ -377,8 +428,15 @@ class Router:
                 )
             if resolved_hint not in feasible:
                 rej_msg = rejected.get(resolved_hint, "infeasible")
+                if resolved_hint in stale_rejected_engines:
+                    hint_code = "data_stale"
+                elif has_pii and len(referenced_tables) >= 2:
+                    hint_code = "pii_cross_engine"
+                else:
+                    hint_code = "query_spans_engines"
                 raise RoutingError(
-                    f"Hinted engine '{resolved_hint}' is not feasible: {rej_msg}"
+                    f"Hinted engine '{resolved_hint}' is not feasible: {rej_msg}",
+                    code=hint_code,
                 )
 
         # 6. Pick engine and rule with rewrite retry loop
@@ -554,6 +612,14 @@ class Router:
                         f"Hinted engine '{chosen_engine}' failed during SQL rendering: {exc}"
                     )
 
+        if not feasible and stale_rejected_engines:
+            infeasible_code = "data_stale"
+        elif has_pii and len(referenced_tables) >= 2:
+            infeasible_code = "pii_cross_engine"
+        else:
+            infeasible_code = "query_spans_engines"
+
         raise RoutingError(
-            f"No feasible engine could serve the statement: {rejected}"
+            f"No feasible engine could serve the statement: {rejected}",
+            code=infeasible_code,
         )

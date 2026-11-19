@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -181,9 +181,13 @@ class ServingPipeline:
         require_grant_typ: bool = False,
         max_grant_lifetime_seconds: float = 300,
         compilation_cache_max_entries: int = DEFAULT_COMPILATION_CACHE_MAX_ENTRIES,
+        pii_tables: Collection[str] = (),
+        on_row_cap: str = "truncate",
     ) -> None:
         if cube_mode not in ("refuse", "jwt"):
             raise EnforcementError(f"invalid cube_mode '{cube_mode}', must be 'refuse' or 'jwt'")
+        if on_row_cap not in ("truncate", "error"):
+            raise EnforcementError(f"invalid on_row_cap '{on_row_cap}', must be 'truncate' or 'error'")
         self._compilation_cache = CompilationCache(
             max_entries=compilation_cache_max_entries
         )
@@ -198,7 +202,9 @@ class ServingPipeline:
         self.cube_mode = cube_mode
         self.require_grant_typ = require_grant_typ
         self.max_grant_lifetime_seconds = float(max_grant_lifetime_seconds)
-        self.router = Router(placement)
+        self.pii_tables = tuple(pii_tables)
+        self.on_row_cap = on_row_cap
+        self.router = Router(placement, pii_tables=self.pii_tables)
         self._catalog_generation = self._compilation_cache.generation
 
     def compilation_cache_info(self) -> dict[str, int]:
@@ -211,7 +217,7 @@ class ServingPipeline:
         schemas: Mapping[str, Sequence[str]],
     ) -> None:
         """Atomically update placement, schemas, router, and invalidate compilation cache."""
-        new_router = Router(placement)
+        new_router = Router(placement, pii_tables=self.pii_tables)
         with self._lock:
             self.placement = placement
             self.schemas = schemas
@@ -255,7 +261,7 @@ class ServingPipeline:
             grant = Grant.from_claims(claims)
 
             if not isinstance(sql, str):
-                raise EnforcementError("SQL query must be a string")
+                raise EnforcementError("SQL query must be a string", code="invalid_sql")
 
             # Verify SQL SHA-256 and parameter digest before any compilation-cache lookup
             sql_bytes = sql.encode("utf-8")
@@ -303,11 +309,14 @@ class ServingPipeline:
                 try:
                     parsed_statements = sqlglot.parse(sql, read=grant.sql_dialect)
                 except Exception as exc:
-                    raise EnforcementError(f"SQL parse error: {exc}") from exc
+                    raise EnforcementError(
+                        f"SQL parse error: {exc}", code="invalid_sql"
+                    ) from exc
 
                 if len(parsed_statements) != 1 or parsed_statements[0] is None:
                     raise EnforcementError(
-                        f"expected exactly one statement, got {len(parsed_statements)}"
+                        f"expected exactly one statement, got {len(parsed_statements)}",
+                        code="invalid_sql",
                     )
 
                 statement = parsed_statements[0]
@@ -362,6 +371,7 @@ class ServingPipeline:
                 cube_mask_variants=cube_mask_variants,
                 cube_measures=cube_measures,
                 params=raw_params,
+                on_row_cap=self.on_row_cap,
             )
 
             # 4. Table rewrite for chosen engine physical names

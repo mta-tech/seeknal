@@ -28,9 +28,15 @@ from seeknal.serving.adapters import (
     EngineCancelled,
     EngineConfigError,
     EngineError,
+    EnginePoolExhausted,
     EngineTimeout,
 )
 from seeknal.serving.enforce import EnforcementError
+from seeknal.serving.errors import (
+    AuditUnavailableError,
+    build_error_payload,
+    get_error_spec,
+)
 from seeknal.serving.grant_token import (
     GrantTokenError,
     verify_cancel_token,
@@ -42,6 +48,19 @@ from seeknal.serving.service import ServingPipeline
 logger = logging.getLogger(__name__)
 
 SQL_LITERAL_PATTERN = re.compile(r"'([^']*)'")
+WORKLOAD_ACCOUNT_MISSING_RE = re.compile(
+    r"^no engine account configured for workload '[a-zA-Z0-9_-]+'$"
+)
+SAFE_FIELD_NAME_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+SAFE_ENGINE_ERROR_MESSAGES = frozenset(
+    {
+        "Engine connection failed",
+        "Engine query execution failed",
+        "Engine connection cleanup failed",
+        "Engine connection preparation failed",
+        "Engine resource limit exceeded",
+    }
+)
 
 
 class DuplicateQueryIdError(ValueError):
@@ -204,20 +223,82 @@ def _safe_message(
     return msg
 
 
+def _is_audit_unavailable(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, AuditUnavailableError)
+        or getattr(exc, "code", None) == "audit_unavailable"
+        or type(exc).__name__ == "AuditUnavailableError"
+    )
+
+
+def _safe_grant_invalid_message(exc: GrantTokenError) -> str | None:
+    msg = str(exc)
+    if msg == "Missing or invalid 'typ' claim, expected 'grant'":
+        return msg
+    if msg.startswith("Token lifetime of ") and "exceeds maximum" in msg:
+        return msg
+    return None
+
+
+def _extract_verified_identity(
+    token: str | None,
+    pipeline: ServingPipeline,
+) -> tuple[str | None, str | None]:
+    if not token:
+        return None, None
+    try:
+        claims = verify_grant_token(
+            token,
+            pipeline.public_keys,
+            audience=pipeline.audience,
+            issuer=pipeline.issuer,
+            require_grant_typ=pipeline.require_grant_typ,
+            max_lifetime_seconds=pipeline.max_grant_lifetime_seconds,
+        )
+        jti = claims.get("jti")
+        sub = claims.get("sub")
+        return (
+            jti if isinstance(jti, str) and jti else None,
+            sub if isinstance(sub, str) and sub else None,
+        )
+    except GrantTokenError as exc:
+        jti = getattr(exc, "audit_id", None)
+        sub = getattr(exc, "subject", None)
+        return (
+            jti if isinstance(jti, str) and jti else None,
+            sub if isinstance(sub, str) and sub else None,
+        )
+    except Exception:
+        return None, None
+
+
 def _error_response(
-    status_code: int,
-    category: str,
-    message: Exception | str,
+    code: str,
     *,
+    status_code: int | None = None,
+    category: str | None = None,
+    message: Exception | str | None = None,
+    audit_id: str | None = None,
     token: str | None = None,
     sql: str | None = None,
     params: Any = None,
 ) -> JSONResponse:
-    safe_msg = _safe_message(message, token=token, sql=sql, params=params)
-    return JSONResponse(
-        {"error": category, "message": safe_msg},
-        status_code=status_code,
+    spec = get_error_spec(code)
+    resolved_status = status_code if status_code is not None else spec.status
+    resolved_category = category if category is not None else spec.category
+    if message is not None:
+        resolved_msg = _safe_message(
+            message, token=token, sql=sql, params=params
+        )
+    else:
+        resolved_msg = spec.message
+    _, body = build_error_payload(
+        spec.code,
+        category=resolved_category,
+        message=resolved_msg,
+        audit_id=audit_id,
     )
+    return JSONResponse(body, status_code=resolved_status)
 
 
 def _extract_token_claims(token: str | None) -> dict[str, Any]:
@@ -335,6 +416,8 @@ def create_app(
     extra_routes: Sequence[Route] | None = None,
     lifespan: Any = None,
     replay_cache: GrantReplayCache | None = None,
+    audit_sink: Callable[[Mapping[str, Any]], None] | None = None,
+    on_row_cap: str = "truncate",
 ) -> Starlette:
     """Create a Starlette serving application."""
     if replay_cache is None:
@@ -343,6 +426,31 @@ def create_app(
 
     async def healthz(request: Request) -> Response:
         return JSONResponse({"status": "ok"})
+
+    def _bad_request_with_token(
+        token: str,
+        req_start: float,
+        *,
+        custom_message: str | None = None,
+        sql: str | None = None,
+        params: Any = None,
+    ) -> JSONResponse:
+        audit_id, subject = _extract_verified_identity(token, pipeline)
+        _log_request(
+            audit_id=audit_id,
+            subject=subject,
+            status=400,
+            elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+            token=token,
+        )
+        return _error_response(
+            "invalid_sql",
+            message=custom_message,
+            audit_id=audit_id,
+            token=token,
+            sql=sql,
+            params=params,
+        )
 
     async def _parse_common_request(request: Request, req_start: float) -> (
         tuple[
@@ -366,9 +474,7 @@ def create_app(
                         status=413,
                         elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                     )
-                    return _error_response(
-                        413, "payload_too_large", "Request body exceeds size limit"
-                    )
+                    return _error_response("payload_too_large")
             except ValueError:
                 pass
 
@@ -377,9 +483,7 @@ def create_app(
             _log_request(
                 status=413, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
             )
-            return _error_response(
-                413, "payload_too_large", "Request body exceeds size limit"
-            )
+            return _error_response("payload_too_large")
 
         # 2. Check Authorization header
         auth_header = request.headers.get("authorization")
@@ -387,18 +491,14 @@ def create_app(
             _log_request(
                 status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
             )
-            return _error_response(
-                401, "grant_token_error", "Missing Authorization header"
-            )
+            return _error_response("grant_invalid")
 
         parts = auth_header.split()
         if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
             _log_request(
                 status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
             )
-            return _error_response(
-                401, "grant_token_error", "Malformed Authorization header"
-            )
+            return _error_response("grant_invalid")
 
         token = parts[1].strip()
 
@@ -406,18 +506,10 @@ def create_app(
         try:
             payload = json.loads(raw_body.decode("utf-8"))
         except Exception:
-            _log_request(
-                status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
-            )
-            return _error_response(400, "bad_request", "Invalid JSON body", token=token)
+            return _bad_request_with_token(token, req_start)
 
         if not isinstance(payload, dict):
-            _log_request(
-                status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
-            )
-            return _error_response(
-                400, "bad_request", "JSON body must be an object", token=token
-            )
+            return _bad_request_with_token(token, req_start)
 
         unknown_fields = set(payload.keys()) - {
             "sql",
@@ -429,14 +521,16 @@ def create_app(
             "max_result_bytes",
         }
         if unknown_fields:
-            _log_request(
-                status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
-            )
-            return _error_response(
-                400,
-                "bad_request",
-                f"Unknown field(s) in request body: {', '.join(sorted(unknown_fields))}",
-                token=token,
+            custom_unknown_msg = None
+            if all(
+                isinstance(k, str) and SAFE_FIELD_NAME_RE.fullmatch(k)
+                for k in unknown_fields
+            ):
+                custom_unknown_msg = (
+                    f"Unknown field(s) in request body: {', '.join(sorted(unknown_fields))}"
+                )
+            return _bad_request_with_token(
+                token, req_start, custom_message=custom_unknown_msg
             )
 
         if (
@@ -444,15 +538,7 @@ def create_app(
             or not isinstance(payload["sql"], str)
             or not payload["sql"].strip()
         ):
-            _log_request(
-                status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
-            )
-            return _error_response(
-                400,
-                "bad_request",
-                "Field 'sql' must be a non-empty string",
-                token=token,
-            )
+            return _bad_request_with_token(token, req_start)
 
         sql = payload["sql"]
 
@@ -461,31 +547,13 @@ def create_app(
             raw_params = payload["params"]
             if raw_params is not None:
                 if not isinstance(raw_params, list):
-                    _log_request(
-                        status=400,
-                        elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                    )
-                    return _error_response(
-                        400,
-                        "bad_request",
-                        "Field 'params' must be a list",
-                        token=token,
-                        sql=sql,
-                    )
+                    return _bad_request_with_token(token, req_start, sql=sql)
                 params = tuple(raw_params)
 
         hint = payload.get("hint")
         if hint is not None and not isinstance(hint, str):
-            _log_request(
-                status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
-            )
-            return _error_response(
-                400,
-                "bad_request",
-                "Field 'hint' must be a string",
-                token=token,
-                sql=sql,
-                params=params,
+            return _bad_request_with_token(
+                token, req_start, sql=sql, params=params
             )
 
         max_staleness = payload.get("max_staleness_seconds")
@@ -493,56 +561,24 @@ def create_app(
             if isinstance(max_staleness, bool) or not isinstance(
                 max_staleness, (int, float)
             ):
-                _log_request(
-                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
-                )
-                return _error_response(
-                    400,
-                    "bad_request",
-                    "Field 'max_staleness_seconds' must be a number",
-                    token=token,
-                    sql=sql,
-                    params=params,
+                return _bad_request_with_token(
+                    token, req_start, sql=sql, params=params
                 )
             if math.isnan(max_staleness) or math.isinf(max_staleness):
-                _log_request(
-                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
-                )
-                return _error_response(
-                    400,
-                    "bad_request",
-                    "Field 'max_staleness_seconds' must be a finite number",
-                    token=token,
-                    sql=sql,
-                    params=params,
+                return _bad_request_with_token(
+                    token, req_start, sql=sql, params=params
                 )
             max_staleness = float(max_staleness)
 
         timeout_s = payload.get("timeout_s")
         if timeout_s is not None:
             if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
-                _log_request(
-                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
-                )
-                return _error_response(
-                    400,
-                    "bad_request",
-                    "Field 'timeout_s' must be a positive number",
-                    token=token,
-                    sql=sql,
-                    params=params,
+                return _bad_request_with_token(
+                    token, req_start, sql=sql, params=params
                 )
             if math.isnan(timeout_s) or math.isinf(timeout_s) or timeout_s <= 0:
-                _log_request(
-                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
-                )
-                return _error_response(
-                    400,
-                    "bad_request",
-                    "Field 'timeout_s' must be a positive finite number",
-                    token=token,
-                    sql=sql,
-                    params=params,
+                return _bad_request_with_token(
+                    token, req_start, sql=sql, params=params
                 )
             timeout_s = float(timeout_s)
 
@@ -553,16 +589,8 @@ def create_app(
                 or not isinstance(max_rows, int)
                 or max_rows <= 0
             ):
-                _log_request(
-                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
-                )
-                return _error_response(
-                    400,
-                    "bad_request",
-                    "Field 'max_rows' must be a positive integer",
-                    token=token,
-                    sql=sql,
-                    params=params,
+                return _bad_request_with_token(
+                    token, req_start, sql=sql, params=params
                 )
 
         req_max_result_bytes = payload.get("max_result_bytes")
@@ -572,16 +600,8 @@ def create_app(
                 or not isinstance(req_max_result_bytes, int)
                 or req_max_result_bytes <= 0
             ):
-                _log_request(
-                    status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
-                )
-                return _error_response(
-                    400,
-                    "bad_request",
-                    "Field 'max_result_bytes' must be a positive integer",
-                    token=token,
-                    sql=sql,
-                    params=params,
+                return _bad_request_with_token(
+                    token, req_start, sql=sql, params=params
                 )
 
         return (
@@ -593,6 +613,136 @@ def create_app(
             timeout_s,
             max_rows,
             req_max_result_bytes,
+        )
+
+    def _handle_prepare_exception(
+        exc: Exception,
+        *,
+        token: str,
+        sql: str,
+        params: Any,
+        req_start: float,
+    ) -> JSONResponse:
+        elapsed = (time.perf_counter() - req_start) * 1000.0
+        if isinstance(exc, GrantTokenError):
+            code = getattr(exc, "code", None) or "grant_invalid"
+            audit_id = getattr(exc, "audit_id", None)
+            subject = getattr(exc, "subject", None)
+            custom_msg = (
+                _safe_grant_invalid_message(exc)
+                if code == "grant_invalid"
+                else None
+            )
+            _log_request(
+                audit_id=audit_id,
+                subject=subject,
+                status=401,
+                elapsed_ms=elapsed,
+                token=token,
+            )
+            return _error_response(
+                code,
+                message=custom_msg,
+                audit_id=audit_id,
+                token=token,
+                sql=sql,
+                params=params,
+            )
+
+        if isinstance(exc, EnforcementError):
+            code = getattr(exc, "code", None) or "access_denied"
+            spec = get_error_spec(code)
+            audit_id = getattr(exc, "audit_id", None)
+            subject = getattr(exc, "subject", None)
+            if audit_id is None or subject is None:
+                v_jti, v_sub = _extract_verified_identity(token, pipeline)
+                audit_id = audit_id or v_jti
+                subject = subject or v_sub
+            _log_request(
+                audit_id=audit_id,
+                subject=subject,
+                status=spec.status,
+                elapsed_ms=elapsed,
+                token=token,
+            )
+            return _error_response(
+                spec.code,
+                audit_id=audit_id,
+                token=token,
+                sql=sql,
+                params=params,
+            )
+
+        if isinstance(exc, RoutingError):
+            code = getattr(exc, "code", None) or "query_spans_engines"
+            spec = get_error_spec(code)
+            audit_id = getattr(exc, "audit_id", None)
+            subject = getattr(exc, "subject", None)
+            if audit_id is None or subject is None:
+                v_jti, v_sub = _extract_verified_identity(token, pipeline)
+                audit_id = audit_id or v_jti
+                subject = subject or v_sub
+            _log_request(
+                audit_id=audit_id,
+                subject=subject,
+                status=spec.status,
+                elapsed_ms=elapsed,
+                token=token,
+            )
+            return _error_response(
+                spec.code,
+                audit_id=audit_id,
+                token=token,
+                sql=sql,
+                params=params,
+            )
+
+        v_jti, v_sub = _extract_verified_identity(token, pipeline)
+        audit_id = getattr(exc, "audit_id", None) or v_jti
+        subject = getattr(exc, "subject", None) or v_sub
+        if _is_audit_unavailable(exc):
+            logger.error(
+                "engine=%s code=%s error=%s audit_id=%s",
+                "-",
+                "audit_unavailable",
+                type(exc).__name__,
+                audit_id or "-",
+            )
+            _log_request(
+                audit_id=audit_id,
+                subject=subject,
+                status=503,
+                elapsed_ms=elapsed,
+                token=token,
+            )
+            return _error_response(
+                "audit_unavailable",
+                audit_id=audit_id,
+                token=token,
+                sql=sql,
+                params=params,
+            )
+
+        logger.error(
+            "engine=%s code=%s error=%s audit_id=%s",
+            "-",
+            "internal_error",
+            type(exc).__name__,
+            audit_id or "-",
+        )
+        _log_request(
+            audit_id=audit_id,
+            subject=subject,
+            status=500,
+            elapsed_ms=elapsed,
+            token=token,
+        )
+        return _error_response(
+            "internal_error",
+            audit_id=audit_id,
+            token=token,
+            sql=sql,
+            params=params,
         )
 
     async def explain(request: Request) -> Response:
@@ -621,79 +771,9 @@ def create_app(
                 max_staleness_seconds=max_staleness,
                 max_rows=max_rows,
             )
-        except GrantTokenError as exc:
-            _log_request(
-                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0, token=token
-            )
-            return _error_response(
-                401, "grant_token_error", exc, token=token, sql=sql, params=params
-            )
-        except EnforcementError as exc:
-            audit_id = getattr(exc, "audit_id", None)
-            subject = getattr(exc, "subject", None)
-            if audit_id is None or subject is None:
-                try:
-                    claims = verify_grant_token(
-                        token,
-                        pipeline.public_keys,
-                        audience=pipeline.audience,
-                        issuer=pipeline.issuer,
-                        require_grant_typ=pipeline.require_grant_typ,
-                        max_lifetime_seconds=pipeline.max_grant_lifetime_seconds,
-                    )
-                    audit_id = audit_id or claims.get("jti")
-                    subject = subject or claims.get("sub")
-                except Exception:
-                    pass
-            _log_request(
-                audit_id=audit_id,
-                subject=subject,
-                status=403,
-                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                token=token,
-            )
-            return _error_response(
-                403, "enforcement_error", exc, token=token, sql=sql, params=params
-            )
-        except RoutingError as exc:
-            audit_id = getattr(exc, "audit_id", None)
-            subject = getattr(exc, "subject", None)
-            if audit_id is None or subject is None:
-                try:
-                    claims = verify_grant_token(
-                        token,
-                        pipeline.public_keys,
-                        audience=pipeline.audience,
-                        issuer=pipeline.issuer,
-                        require_grant_typ=pipeline.require_grant_typ,
-                        max_lifetime_seconds=pipeline.max_grant_lifetime_seconds,
-                    )
-                    audit_id = audit_id or claims.get("jti")
-                    subject = subject or claims.get("sub")
-                except Exception:
-                    pass
-            _log_request(
-                audit_id=audit_id,
-                subject=subject,
-                status=422,
-                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                token=token,
-            )
-            return _error_response(
-                422, "routing_error", exc, token=token, sql=sql, params=params
-            )
         except Exception as exc:
-            logger.error("engine=%s error=%s audit_id=%s", "-", type(exc).__name__, "-")
-            _log_request(
-                status=500, elapsed_ms=(time.perf_counter() - req_start) * 1000.0, token=token
-            )
-            return _error_response(
-                500,
-                "internal_error",
-                "Internal server error",
-                token=token,
-                sql=sql,
-                params=params,
+            return _handle_prepare_exception(
+                exc, token=token, sql=sql, params=params, req_start=req_start
             )
 
         elapsed_ms = (time.perf_counter() - req_start) * 1000.0
@@ -748,79 +828,9 @@ def create_app(
                 max_staleness_seconds=max_staleness,
                 max_rows=max_rows,
             )
-        except GrantTokenError as exc:
-            _log_request(
-                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0, token=token
-            )
-            return _error_response(
-                401, "grant_token_error", exc, token=token, sql=sql, params=params
-            )
-        except EnforcementError as exc:
-            audit_id = getattr(exc, "audit_id", None)
-            subject = getattr(exc, "subject", None)
-            if audit_id is None or subject is None:
-                try:
-                    claims = verify_grant_token(
-                        token,
-                        pipeline.public_keys,
-                        audience=pipeline.audience,
-                        issuer=pipeline.issuer,
-                        require_grant_typ=pipeline.require_grant_typ,
-                        max_lifetime_seconds=pipeline.max_grant_lifetime_seconds,
-                    )
-                    audit_id = audit_id or claims.get("jti")
-                    subject = subject or claims.get("sub")
-                except Exception:
-                    pass
-            _log_request(
-                audit_id=audit_id,
-                subject=subject,
-                status=403,
-                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                token=token,
-            )
-            return _error_response(
-                403, "enforcement_error", exc, token=token, sql=sql, params=params
-            )
-        except RoutingError as exc:
-            audit_id = getattr(exc, "audit_id", None)
-            subject = getattr(exc, "subject", None)
-            if audit_id is None or subject is None:
-                try:
-                    claims = verify_grant_token(
-                        token,
-                        pipeline.public_keys,
-                        audience=pipeline.audience,
-                        issuer=pipeline.issuer,
-                        require_grant_typ=pipeline.require_grant_typ,
-                        max_lifetime_seconds=pipeline.max_grant_lifetime_seconds,
-                    )
-                    audit_id = audit_id or claims.get("jti")
-                    subject = subject or claims.get("sub")
-                except Exception:
-                    pass
-            _log_request(
-                audit_id=audit_id,
-                subject=subject,
-                status=422,
-                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                token=token,
-            )
-            return _error_response(
-                422, "routing_error", exc, token=token, sql=sql, params=params
-            )
         except Exception as exc:
-            logger.error("engine=%s error=%s audit_id=%s", "-", type(exc).__name__, "-")
-            _log_request(
-                status=500, elapsed_ms=(time.perf_counter() - req_start) * 1000.0, token=token
-            )
-            return _error_response(
-                500,
-                "internal_error",
-                "Internal server error",
-                token=token,
-                sql=sql,
-                params=params,
+            return _handle_prepare_exception(
+                exc, token=token, sql=sql, params=params, req_start=req_start
             )
 
         if prepared.expires_at is None:
@@ -832,9 +842,8 @@ def create_app(
                 token=token,
             )
             return _error_response(
-                401,
-                "grant_token_error",
-                "Missing 'exp' claim in verified grant",
+                "grant_invalid",
+                audit_id=prepared.audit_id,
                 token=token,
                 sql=sql,
                 params=params,
@@ -842,7 +851,7 @@ def create_app(
 
         try:
             replay_cache.check_and_record(prepared.audit_id, prepared.expires_at)
-        except GrantReplayedError as exc:
+        except GrantReplayedError:
             _log_request(
                 audit_id=prepared.audit_id,
                 subject=prepared.subject,
@@ -851,14 +860,13 @@ def create_app(
                 token=token,
             )
             return _error_response(
-                401,
                 "grant_replayed",
-                exc,
+                audit_id=prepared.audit_id,
                 token=token,
                 sql=sql,
                 params=params,
             )
-        except GrantReplayCacheFull as exc:
+        except GrantReplayCacheFull:
             _log_request(
                 audit_id=prepared.audit_id,
                 subject=prepared.subject,
@@ -867,9 +875,10 @@ def create_app(
                 token=token,
             )
             return _error_response(
-                503,
-                "replay_cache_full",
-                exc,
+                "engine_unavailable",
+                status_code=503,
+                category="replay_cache_full",
+                audit_id=prepared.audit_id,
                 token=token,
                 sql=sql,
                 params=params,
@@ -888,13 +897,51 @@ def create_app(
                 token=token,
             )
             return _error_response(
-                503,
                 "engine_unavailable",
-                f"No adapter configured for engine '{prepared.engine}'",
+                audit_id=prepared.audit_id,
                 token=token,
                 sql=sql,
                 params=params,
             )
+
+        if audit_sink is not None:
+            try:
+                audit_sink(
+                    {
+                        "audit_id": prepared.audit_id,
+                        "subject": prepared.subject,
+                        "workspace": prepared.workspace,
+                        "engine": prepared.engine,
+                        "rule": prepared.rule,
+                        "workload": prepared.workload,
+                        "redacted_sql": prepared.redacted_sql,
+                    }
+                )
+            except Exception as exc:
+                logger.error(
+                    "engine=%s code=%s error=%s audit_id=%s",
+                    prepared.engine_kind,
+                    "audit_unavailable",
+                    type(exc).__name__,
+                    prepared.audit_id,
+                )
+                _log_request(
+                    audit_id=prepared.audit_id,
+                    subject=prepared.subject,
+                    engine=prepared.engine,
+                    rule=prepared.rule,
+                    status=503,
+                    elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                    binding=prepared.binding,
+                    token=token,
+                )
+                return _error_response(
+                    "audit_unavailable",
+                    audit_id=prepared.audit_id,
+                    token=token,
+                    sql=sql,
+                    params=params,
+                )
 
         effective_timeout = (
             min(timeout_seconds, timeout_s)
@@ -909,7 +956,7 @@ def create_app(
 
         try:
             running_queries.register(prepared.audit_id, prepared.subject)
-        except DuplicateQueryIdError as exc:
+        except DuplicateQueryIdError:
             _log_request(
                 audit_id=prepared.audit_id,
                 subject=prepared.subject,
@@ -921,7 +968,11 @@ def create_app(
                 token=token,
             )
             return _error_response(
-                409, "duplicate_query_id", exc, token=token, sql=sql, params=params
+                "duplicate_query_id",
+                audit_id=prepared.audit_id,
+                token=token,
+                sql=sql,
+                params=params,
             )
 
         cancel_handle: list[Callable[[], None] | None] = [None]
@@ -969,6 +1020,13 @@ def create_app(
             result = await query_task
 
         except EngineTimeout as exc:
+            logger.error(
+                "engine=%s code=%s error=%s audit_id=%s",
+                prepared.engine_kind,
+                "engine_timeout",
+                type(exc).__name__,
+                prepared.audit_id,
+            )
             _log_request(
                 audit_id=prepared.audit_id,
                 subject=prepared.subject,
@@ -980,9 +1038,20 @@ def create_app(
                 token=token,
             )
             return _error_response(
-                504, "engine_timeout", exc, token=token, sql=sql, params=params
+                "engine_timeout",
+                audit_id=prepared.audit_id,
+                token=token,
+                sql=sql,
+                params=params,
             )
-        except EngineConfigError as exc:
+        except EnginePoolExhausted as exc:
+            logger.error(
+                "engine=%s code=%s error=%s audit_id=%s",
+                prepared.engine_kind,
+                "engine_unavailable",
+                type(exc).__name__,
+                prepared.audit_id,
+            )
             _log_request(
                 audit_id=prepared.audit_id,
                 subject=prepared.subject,
@@ -994,14 +1063,47 @@ def create_app(
                 token=token,
             )
             return _error_response(
-                503,
-                "workload_account_missing",
-                exc,
+                "engine_unavailable",
+                audit_id=prepared.audit_id,
                 token=token,
                 sql=sql,
                 params=params,
             )
-        except EngineCancelled as exc:
+        except EngineConfigError as exc:
+            raw_cfg_msg = str(exc)
+            safe_cfg_msg = (
+                raw_cfg_msg
+                if WORKLOAD_ACCOUNT_MISSING_RE.fullmatch(raw_cfg_msg)
+                else None
+            )
+            logger.error(
+                "engine=%s code=%s error=%s audit_id=%s",
+                prepared.engine_kind,
+                "engine_unavailable",
+                type(exc).__name__,
+                prepared.audit_id,
+            )
+            _log_request(
+                audit_id=prepared.audit_id,
+                subject=prepared.subject,
+                engine=prepared.engine,
+                rule=prepared.rule,
+                status=503,
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                binding=prepared.binding,
+                token=token,
+            )
+            return _error_response(
+                "engine_unavailable",
+                status_code=503,
+                category="workload_account_missing",
+                message=safe_cfg_msg,
+                audit_id=prepared.audit_id,
+                token=token,
+                sql=sql,
+                params=params,
+            )
+        except EngineCancelled:
             _log_request(
                 audit_id=prepared.audit_id,
                 subject=prepared.subject,
@@ -1013,9 +1115,26 @@ def create_app(
                 token=token,
             )
             return _error_response(
-                499, "query_cancelled", exc, token=token, sql=sql, params=params
+                "query_cancelled",
+                audit_id=prepared.audit_id,
+                token=token,
+                sql=sql,
+                params=params,
             )
         except EngineError as exc:
+            raw_eng_msg = str(exc)
+            safe_eng_msg = (
+                raw_eng_msg
+                if raw_eng_msg in SAFE_ENGINE_ERROR_MESSAGES
+                else "Engine query execution failed"
+            )
+            logger.error(
+                "engine=%s code=%s error=%s audit_id=%s",
+                prepared.engine_kind,
+                "engine_unavailable",
+                type(exc).__name__,
+                prepared.audit_id,
+            )
             _log_request(
                 audit_id=prepared.audit_id,
                 subject=prepared.subject,
@@ -1027,12 +1146,46 @@ def create_app(
                 token=token,
             )
             return _error_response(
-                502, "engine_error", exc, token=token, sql=sql, params=params
+                "engine_unavailable",
+                status_code=502,
+                category="engine_error",
+                message=safe_eng_msg,
+                audit_id=prepared.audit_id,
+                token=token,
+                sql=sql,
+                params=params,
             )
         except Exception as exc:
+            if _is_audit_unavailable(exc):
+                logger.error(
+                    "engine=%s code=%s error=%s audit_id=%s",
+                    prepared.engine_kind,
+                    "audit_unavailable",
+                    type(exc).__name__,
+                    prepared.audit_id,
+                )
+                _log_request(
+                    audit_id=prepared.audit_id,
+                    subject=prepared.subject,
+                    engine=prepared.engine,
+                    rule=prepared.rule,
+                    status=503,
+                    elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                    binding=prepared.binding,
+                    token=token,
+                )
+                return _error_response(
+                    "audit_unavailable",
+                    audit_id=prepared.audit_id,
+                    token=token,
+                    sql=sql,
+                    params=params,
+                )
+
             logger.error(
-                "engine=%s error=%s audit_id=%s",
+                "engine=%s code=%s error=%s audit_id=%s",
                 prepared.engine_kind,
+                "internal_error",
                 type(exc).__name__,
                 prepared.audit_id,
             )
@@ -1047,15 +1200,38 @@ def create_app(
                 token=token,
             )
             return _error_response(
-                500,
                 "internal_error",
-                "Internal server error",
+                audit_id=prepared.audit_id,
                 token=token,
                 sql=sql,
                 params=params,
             )
         finally:
             running_queries.unregister(prepared.audit_id)
+
+        effective_row_cap_mode = (
+            on_row_cap
+            if on_row_cap != "truncate"
+            else getattr(pipeline, "on_row_cap", "truncate")
+        )
+        if effective_row_cap_mode == "error" and result.truncated:
+            _log_request(
+                audit_id=prepared.audit_id,
+                subject=prepared.subject,
+                engine=prepared.engine,
+                rule=prepared.rule,
+                status=422,
+                elapsed_ms=result.elapsed_ms,
+                binding=prepared.binding,
+                token=token,
+            )
+            return _error_response(
+                "row_cap_hit",
+                audit_id=prepared.audit_id,
+                token=token,
+                sql=sql,
+                params=params,
+            )
 
         safe_rows = [[_make_json_safe(cell) for cell in row] for row in result.rows]
 
@@ -1072,9 +1248,8 @@ def create_app(
                 token=token,
             )
             return _error_response(
-                413,
                 "result_too_large",
-                "Result size exceeds limit",
+                audit_id=prepared.audit_id,
                 token=token,
                 sql=sql,
                 params=params,
@@ -1104,6 +1279,7 @@ def create_app(
                 "column_types": col_types,
                 "rows": safe_rows,
                 "truncated": result.truncated,
+                "notices": ["row_cap_hit"] if result.truncated else [],
                 "engine": result.engine,
                 "rule": prepared.rule,
                 "reason": prepared.reason,
@@ -1121,18 +1297,14 @@ def create_app(
             _log_request(
                 status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
             )
-            return _error_response(
-                401, "grant_token_error", "Missing Authorization header"
-            )
+            return _error_response("grant_invalid")
 
         parts = auth_header.split()
         if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
             _log_request(
                 status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
             )
-            return _error_response(
-                401, "grant_token_error", "Malformed Authorization header"
-            )
+            return _error_response("grant_invalid")
 
         token = parts[1].strip()
 
@@ -1144,16 +1316,12 @@ def create_app(
                 _log_request(
                     status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
                 )
-                return _error_response(
-                    400, "bad_request", "Invalid JSON body", token=token
-                )
+                return _error_response("invalid_sql", token=token)
             if not isinstance(body_json, dict) or body_json != {}:
                 _log_request(
                     status=400, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
                 )
-                return _error_response(
-                    400, "bad_request", "Body must be empty or {}", token=token
-                )
+                return _error_response("invalid_sql", token=token)
 
         try:
             claims = verify_cancel_token(
@@ -1163,10 +1331,16 @@ def create_app(
                 issuer=pipeline.issuer,
             )
         except GrantTokenError as exc:
+            code = getattr(exc, "code", None) or "grant_invalid"
+            audit_id = getattr(exc, "audit_id", None)
+            subject = getattr(exc, "subject", None)
             _log_request(
-                status=401, elapsed_ms=(time.perf_counter() - req_start) * 1000.0
+                audit_id=audit_id,
+                subject=subject,
+                status=401,
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
             )
-            return _error_response(401, "grant_token_error", exc, token=token)
+            return _error_response(code, audit_id=audit_id, token=token)
 
         jti = claims["jti"]
         sub = claims["sub"]
@@ -1178,7 +1352,7 @@ def create_app(
                 status=404,
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
             )
-            return _error_response(404, "not_found", "Query not found", token=token)
+            return _error_response("not_found", audit_id=jti, token=token)
 
         _log_request(
             audit_id=jti,

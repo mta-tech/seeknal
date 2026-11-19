@@ -418,7 +418,10 @@ def test_factory_error_maps_to_secret_safe_engine_error_and_http_502(
     assert resp.status_code == 502
     assert resp.json() == {
         "error": "engine_error",
+        "code": "engine_unavailable",
         "message": "Engine connection failed",
+        "next_step": "Retry shortly or contact the platform operator if the outage persists.",
+        "audit_id": "jti-factory-fail-http",
     }
     assert sentinel not in resp.text
     assert sentinel not in caplog.text
@@ -973,7 +976,16 @@ def test_queued_cancellation_and_queue_timeout_without_factory_call(
     t2.join(timeout=2.0)
     assert not t2.is_alive()
     assert r2_outcomes == [
-        (499, {"error": "query_cancelled", "message": "Engine query execution cancelled"})
+        (
+            499,
+            {
+                "error": "query_cancelled",
+                "code": "query_cancelled",
+                "message": "Engine query execution cancelled",
+                "next_step": "Re-run the query if the cancellation was unintentional.",
+                "audit_id": jti_q2,
+            },
+        )
     ]
     # Factory was NEVER called for Request 2
     assert factory_calls == 1

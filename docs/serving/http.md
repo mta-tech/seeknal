@@ -112,6 +112,7 @@ Returns a JSON object with:
   - `bytes`: Base64 encoded string.
   - `float` `NaN`, `+Infinity`, `-Infinity`: Encoded as `null`.
 - `truncated` (`bool`): `true` if results exceeded the effective row cap.
+- `notices` (`list[str]`): Machine-readable execution notices; contains `"row_cap_hit"` when `truncated` is `true`, otherwise `[]`.
 - `engine` (`str`): Identifier of the engine where the query executed.
 - `rule` (`str`): Placement routing rule selected (e.g., `analytics`, `point_lookup`, `small_scan`).
 - `reason` (`str`): Diagnostic rationale for engine selection.
@@ -129,6 +130,7 @@ Returns a JSON object with:
     [2, "****", 80000]
   ],
   "truncated": false,
+  "notices": [],
   "engine": "duck",
   "rule": "small_scan",
   "reason": "small table scan without key filter",
@@ -211,42 +213,58 @@ Empty body or `{}`.
 
 ---
 
-## 2. Error Handling & Privacy Guarantees
+## 2. Error Handling, Typed Error Catalogue & Privacy Guarantees
 
-All error responses have an HTTP status code $\ge 400$ and return a consistent JSON payload:
+All error responses have an HTTP status code $\ge 400$ and return a consistent typed JSON payload:
 
 ```json
 {
   "error": "<category>",
-  "message": "<short safe diagnostic text>"
+  "code": "<catalogue_code>",
+  "message": "<short safe diagnostic text>",
+  "next_step": "<user-facing actionable guidance>",
+  "audit_id": "<verified jti when known>"
 }
 ```
 
+- `error` (`str`, always present): Backwards-compatible error category string.
+- `code` (`str`, always present): Stable typed error code from `seeknal.serving.errors.ERROR_CATALOGUE`.
+- `message` (`str`, always present): Short, secret-safe user-facing summary.
+- `next_step` (`str`, always present): Actionable user-facing guidance sentence from `ERROR_CATALOGUE`.
+- `audit_id` (`str`, optional): Included whenever the request's `jti` has been cryptographically verified (omitted when missing or before token verification).
+
 ### Privacy & Leakage Invariants
 - **No Grant Tokens:** Raw grant tokens and signature data are never included in error messages.
-- **No SQL Literals or Parameters:** Client SQL expressions, literals, and supplied parameter values are scrubbed and redacted from error text.
-- **No Driver Internals:** Database driver connection strings, internal stack traces, and data fragments are logged server-side and never returned to the HTTP client.
+- **No SQL Literals or Parameters:** Client SQL expressions, literals, and supplied parameter values are never included in error messages.
+- **No Driver Internals:** Database driver connection strings, DSNs, hostnames, credentials, raw driver error text, and Python tracebacks are never returned to the HTTP client; operational failure details (`engine`, `code`, `error` class, and `audit_id`) are logged server-side.
 
-### Error Status Mapping
+### Typed Error Code Catalogue (`ERROR_CATALOGUE`)
 
-| Condition | Status | Error Category | Description |
-|:---|:---:|:---|:---|
-| `GrantTokenError` | **401** | `grant_token_error` | Missing/malformed Authorization header, invalid signature, expired token, or invalid claims. |
-| `GrantReplayedError` | **401** | `grant_replayed` | Grant token with this `jti` has already been used (replay detected). |
-| `EnforcementError` | **403** | `enforcement_error` | Query policy violation: ungranted table, ungranted column, disallowed SQL function, or write violation. |
-| Query not found / subject mismatch | **404** | `not_found` | In `/v1/cancel`: query `jti` not found in running queries, or subject does not match running query. |
-| Duplicate query execution | **409** | `duplicate_query_id` | A query with the same `jti` is already actively running. |
-| Result rows exceed byte cap | **413** | `result_too_large` | JSON-encoded result rows exceed `max_result_bytes` (no partial rows returned). |
-| `RoutingError` | **422** | `routing_error` | No feasible engine available to satisfy query constraints (e.g. invalid hint, unserved table). |
-| Malformed JSON or invalid types | **400** | `bad_request` | Non-JSON body, missing `sql`, invalid field types, or unrecognized extra fields. |
-| Request body exceeds size limit | **413** | `payload_too_large` | Body exceeds `max_body_bytes` (checked prior to JSON parsing). |
-| Query cancelled | **499** | `query_cancelled` | Query execution cancelled via `/v1/cancel` or client disconnect. |
-| `GrantReplayCacheFull` | **503** | `replay_cache_full` | Grant replay cache has reached capacity; query refused to fail closed. |
-| Missing workload account | **503** | `workload_account_missing` | Routed engine has no configured account matching the grant's `workload` claim. |
-| No adapter for chosen engine | **503** | `engine_unavailable` | Placement routed to an engine that is not registered in the application's adapters mapping. |
-| `EngineTimeout` | **504** | `engine_timeout` | Query execution exceeded the allotted timeout threshold. |
-| `EngineError` | **502** | `engine_error` | Database engine driver failed during connection or query execution. |
-| Unhandled server exception | **500** | `internal_error` | Generic server-side fault. |
+| `code` | Status | `error` Category | `message` | `next_step` |
+|:---|:---:|:---|:---|:---|
+| `grant_expired` | **401** | `grant_token_error` | Grant token has expired. | Sign in again or refresh the dashboard to get a new grant. |
+| `grant_invalid` | **401** | `grant_token_error` | Grant token is missing, malformed, or invalid. | Sign in again or request a valid grant token from the catalog. |
+| `grant_replayed` | **401** | `grant_replayed` | Grant token has already been used. | Request a fresh grant token for each query execution. |
+| `access_denied` | **403** | `enforcement_error` | Query violates data access policy or grant permissions. | Request access to the required tables and columns in the catalog. |
+| `data_stale` | **422** | `routing_error` | No engine meets the requested data freshness constraint. | Relax max_staleness_seconds or wait for replication to catch up. |
+| `engine_unavailable` | **503** | `engine_unavailable` | The target execution engine is currently unavailable. | Retry shortly or contact the platform operator if the outage persists. |
+| `engine_timeout` | **504** | `engine_timeout` | Query execution timed out. | Simplify the query, add selective filters, or increase timeout_s. |
+| `query_spans_engines` | **422** | `routing_error` | Query references tables or cubes across incompatible engines. | Query tables served by a single engine or split the query. |
+| `pii_cross_engine` | **422** | `routing_error` | PII table cannot be queried together with tables not served on its engine. | Query the PII table separately on its designated engine. |
+| `row_cap_hit` | **422** | `enforcement_error` | Query exceeded the maximum permitted row cap. | Add a stricter LIMIT or narrow your query filters. |
+| `result_too_large` | **413** | `result_too_large` | Query result size exceeds the maximum byte limit. | Reduce the number of projected columns or rows returned. |
+| `invalid_sql` | **400** | `bad_request` | The SQL statement or request payload is invalid. | Check the SQL syntax and request fields and try again. |
+| `payload_too_large` | **413** | `payload_too_large` | Request body exceeds the maximum size limit. | Shorten the SQL statement or reduce the request payload size. |
+| `query_cancelled` | **499** | `query_cancelled` | Engine query execution cancelled | Re-run the query if the cancellation was unintentional. |
+| `audit_unavailable` | **503** | `audit_unavailable` | Audit logging destination is unavailable; query refused. | Retry later or contact the platform operator to restore the audit sink. |
+| `internal_error` | **500** | `internal_error` | Internal server error | Retry the request or contact support with the audit_id. |
+| `not_found` | **404** | `not_found` | Query not found | Verify the query_id (jti) and that the query is still running. |
+| `duplicate_query_id` | **409** | `duplicate_query_id` | A query with this audit_id is already running. | Wait for the in-flight query to complete or issue a new grant. |
+
+### Category Compatibility Notes
+- **Row Cap Truncation vs Refusal:** In default truncation mode (`on_row_cap="truncate"`), queries exceeding the effective row cap succeed with `200 OK`, `"truncated": true`, and `"notices": ["row_cap_hit"]`. When configured to refuse (`on_row_cap="error"`) or when a query supplies an invalid `LIMIT`/`FETCH` clause, Serving returns `422` with `error="enforcement_error"` and `code="row_cap_hit"`.
+- **Engine Driver Errors (`502 engine_error`):** When an adapter raises `EngineError` during connection or query execution, Serving preserves HTTP `502` and `error="engine_error"` with `code="engine_unavailable"`, a whitelisted safe message (`"Engine connection failed"` or `"Engine query execution failed"`), and `next_step` from `engine_unavailable`.
+- **Workload Account & Replay Cache (`503`):** Missing workload accounts (`workload_account_missing`) and full grant replay caches (`replay_cache_full`) preserve their existing `error` category and `503` status while setting `code="engine_unavailable"`.
 
 ---
 

@@ -1,0 +1,978 @@
+"""Tests for Seeknal Serving typed error catalogue, HTTP error payloads, notices, and redaction."""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import pathlib
+import threading
+import time
+from typing import Any
+
+import duckdb
+import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
+from starlette.testclient import TestClient
+
+from seeknal.serving.adapters import (
+    DuckDBAdapter,
+    EngineCancelled,
+    EngineError,
+    EnginePoolExhausted,
+    EngineTimeout,
+    QueryResult,
+)
+from seeknal.serving.errors import (
+    ERROR_CATALOGUE,
+    REQUIRED_ERROR_CODES,
+    AuditUnavailableError,
+)
+from seeknal.serving.grant_token import sign_cancel_token, sign_grant_token
+from seeknal.serving.http import GrantReplayCache, create_app
+from seeknal.serving.placement import Placement
+from seeknal.serving.service import PreparedQuery, ServingPipeline
+
+
+@pytest.fixture(scope="module")
+def ec_keys() -> tuple[ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey]:
+    priv = ec.generate_private_key(ec.SECP256R1())
+    return priv, priv.public_key()
+
+
+def _make_grant(
+    priv: ec.EllipticCurvePrivateKey,
+    sql: str,
+    *,
+    jti: str = "jti-typed-001",
+    sub: str = "analyst@atlas.example",
+    tables: dict[str, Any] | None = None,
+    max_rows: int = 100,
+    iat_offset: float = 0.0,
+    exp_offset: float = 60.0,
+    kid: str = "key-1",
+    extra_claims: dict[str, Any] | None = None,
+) -> str:
+    now = time.time()
+    if tables is None:
+        tables = {
+            "users": {
+                "columns": ["id", "name", "salary"],
+                "masks": {},
+                "row_filters": [],
+                "actions": ["select"],
+            }
+        }
+    claims: dict[str, Any] = {
+        "sub": sub,
+        "ws": "ws-typed",
+        "jti": jti,
+        "iss": "atlas-catalog",
+        "aud": "seeknal-serving",
+        "iat": now + iat_offset,
+        "exp": now + exp_offset,
+        "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+        "max_rows": max_rows,
+        "tables": tables,
+    }
+    if extra_claims:
+        claims.update(extra_claims)
+    return sign_grant_token(claims, priv, kid=kid)
+
+
+def _assert_typed_error(
+    resp: Any,
+    expected_code: str,
+    *,
+    expected_audit_id: str | None = None,
+    expected_status: int | None = None,
+    expected_category: str | None = None,
+    expected_message: str | None = None,
+) -> dict[str, Any]:
+    spec = ERROR_CATALOGUE[expected_code]
+    assert resp.status_code == (
+        expected_status if expected_status is not None else spec.status
+    )
+    body = resp.json()
+    assert body["code"] == spec.code
+    assert body["error"] == (
+        expected_category if expected_category is not None else spec.category
+    )
+    assert body["message"] == (
+        expected_message if expected_message is not None else spec.message
+    )
+    assert body["next_step"] == spec.next_step
+    if expected_audit_id is not None:
+        assert body["audit_id"] == expected_audit_id
+    else:
+        assert "audit_id" not in body
+    return body
+
+
+# ---------------------------------------------------------------------------
+# 1. Catalogue invariants & documentation sync
+# ---------------------------------------------------------------------------
+
+
+def test_error_catalogue_contains_all_required_codes_and_is_immutable():
+    assert len(REQUIRED_ERROR_CODES) == 16
+    for code in REQUIRED_ERROR_CODES:
+        assert code in ERROR_CATALOGUE
+        spec = ERROR_CATALOGUE[code]
+        assert spec.code == code
+        assert spec.status >= 400
+        assert spec.category
+        assert spec.message
+        assert spec.next_step
+
+    # Additional HTTP compatibility codes
+    assert "not_found" in ERROR_CATALOGUE
+    assert "duplicate_query_id" in ERROR_CATALOGUE
+
+    with pytest.raises(TypeError):
+        ERROR_CATALOGUE["tamper"] = ERROR_CATALOGUE["internal_error"]  # type: ignore[index]
+
+
+def test_http_docs_document_all_catalogue_codes():
+    doc_path = (
+        pathlib.Path(__file__).resolve().parents[2] / "docs" / "serving" / "http.md"
+    )
+    doc_text = doc_path.read_text(encoding="utf-8")
+    for code, spec in ERROR_CATALOGUE.items():
+        assert f"`{code}`" in doc_text
+        assert str(spec.status) in doc_text
+        assert f"`{spec.category}`" in doc_text
+    assert "`row_cap_hit`" in doc_text
+    assert "`notices`" in doc_text
+    assert "`next_step`" in doc_text
+
+
+# ---------------------------------------------------------------------------
+# 2. HTTP reachability for every code in ERROR_CATALOGUE
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def multi_engine_setup(ec_keys):
+    priv, pub = ec_keys
+    parent = duckdb.connect()
+    parent.execute("CREATE TABLE users (id INT, name VARCHAR, salary INT)")
+    parent.execute(
+        "INSERT INTO users VALUES (1, 'Alice', 90000), (2, 'Bob', 80000), (3, 'Cara', 70000)"
+    )
+
+    placement = Placement.from_dict(
+        {
+            "engines": {
+                "duck": {"kind": "duckdb", "dialect": "duckdb"},
+                "sr": {"kind": "starrocks", "dialect": "starrocks"},
+                "lb": {"kind": "lakebase", "dialect": "postgres"},
+                "cube": {"kind": "cube", "dialect": "postgres"},
+                "unwired": {"kind": "duckdb", "dialect": "duckdb"},
+            },
+            "tables": {
+                "users": {
+                    "keys": ["id"],
+                    "row_count": 3,
+                    "serve": {"duck": "users", "unwired": "users"},
+                },
+                "stale_metrics": {
+                    "keys": ["id"],
+                    "row_count": 100,
+                    "serve": {
+                        "sr": {"name": "lakekeeper.stale_metrics", "max_lag_seconds": 300}
+                    },
+                },
+                "sr_only_events": {
+                    "keys": ["id"],
+                    "row_count": 1000,
+                    "serve": {"sr": "lakekeeper.sr_only_events"},
+                },
+                "lb_only_accounts": {
+                    "keys": ["id"],
+                    "row_count": 50,
+                    "serve": {"lb": "public.lb_only_accounts"},
+                },
+                "patients_pii": {
+                    "keys": ["id"],
+                    "row_count": 50,
+                    "serve": {"lb": "public.patients_pii"},
+                },
+            },
+            "cubes": {
+                "revenue_cube": {
+                    "engine": "cube",
+                    "measures": ["total_revenue"],
+                    "dimensions": ["region"],
+                }
+            },
+        }
+    )
+    schemas = {
+        "users": ["id", "name", "salary"],
+        "stale_metrics": ["id", "val"],
+        "sr_only_events": ["id", "event_type"],
+        "lb_only_accounts": ["id", "owner"],
+        "patients_pii": ["id", "ssn"],
+        "revenue_cube": ["region", "total_revenue"],
+    }
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas=schemas,
+        public_keys={"key-1": pub},
+        pii_tables={"patients_pii"},
+    )
+    duck_adapter = DuckDBAdapter(lambda: parent.cursor())
+    try:
+        yield priv, pub, pipeline, duck_adapter, parent
+    finally:
+        parent.close()
+
+
+def test_code_grant_expired(multi_engine_setup):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+    client = TestClient(create_app(pipeline, {"duck": duck_adapter}))
+
+    sql = "SELECT id FROM users"
+    tok = _make_grant(
+        priv, sql, jti="jti-exp-01", iat_offset=-120.0, exp_offset=-30.0
+    )
+    resp = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(resp, "grant_expired", expected_audit_id="jti-exp-01")
+
+    # Also reachable when token passes JWT leeway (e.g. expired 1s ago < 5s leeway) and enforce() checks grant.expires_at
+    tok_leeway = _make_grant(
+        priv, sql, jti="jti-exp-leeway", iat_offset=-60.0, exp_offset=-1.0
+    )
+    resp_leeway = client.post(
+        "/v1/explain",
+        headers={"Authorization": f"Bearer {tok_leeway}"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(
+        resp_leeway, "grant_expired", expected_audit_id="jti-exp-leeway"
+    )
+
+
+def test_code_grant_invalid(multi_engine_setup):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+    client = TestClient(create_app(pipeline, {"duck": duck_adapter}))
+    sql = "SELECT id FROM users"
+
+    # 1. Missing Authorization header -> no audit_id
+    r_missing = client.post("/v1/query", json={"sql": sql})
+    _assert_typed_error(r_missing, "grant_invalid", expected_audit_id=None)
+
+    # 2. Malformed token -> no audit_id
+    r_malformed = client.post(
+        "/v1/query",
+        headers={"Authorization": "Bearer not.a.jwt"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(r_malformed, "grant_invalid", expected_audit_id=None)
+
+    # 3. Signed with untrusted key -> no audit_id even if payload carries jti
+    rogue_priv = ec.generate_private_key(ec.SECP256R1())
+    rogue_tok = _make_grant(rogue_priv, sql, jti="jti-rogue-untrusted")
+    r_rogue = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {rogue_tok}"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(r_rogue, "grant_invalid", expected_audit_id=None)
+
+    # 4. Cancel token used on /v1/query -> signature+iss+aud verified, so audit_id IS included
+    cancel_tok = sign_cancel_token(
+        {
+            "typ": "cancel",
+            "sub": "analyst@atlas.example",
+            "jti": "jti-cancel-misuse",
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": time.time(),
+            "exp": time.time() + 30.0,
+        },
+        priv,
+        kid="key-1",
+    )
+    r_cancel = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {cancel_tok}"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(
+        r_cancel, "grant_invalid", expected_audit_id="jti-cancel-misuse"
+    )
+
+
+def test_code_grant_replayed(multi_engine_setup):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+    client = TestClient(create_app(pipeline, {"duck": duck_adapter}))
+
+    sql = "SELECT id FROM users ORDER BY id"
+    tok = _make_grant(priv, sql, jti="jti-replay-typed")
+    r1 = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"sql": sql},
+    )
+    assert r1.status_code == 200
+
+    r2 = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(
+        r2, "grant_replayed", expected_audit_id="jti-replay-typed"
+    )
+
+
+def test_code_access_denied(multi_engine_setup):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+    client = TestClient(create_app(pipeline, {"duck": duck_adapter}))
+
+    # Query references ungranted column 'salary'
+    sql = "SELECT id, salary FROM users"
+    tok = _make_grant(
+        priv,
+        sql,
+        jti="jti-denied-01",
+        tables={
+            "users": {
+                "columns": ["id"],
+                "masks": {},
+                "row_filters": [],
+                "actions": ["select"],
+            }
+        },
+    )
+    resp = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(resp, "access_denied", expected_audit_id="jti-denied-01")
+
+
+def test_code_data_stale(multi_engine_setup):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+    client = TestClient(create_app(pipeline, {"duck": duck_adapter}))
+
+    sql = "SELECT id, val FROM stale_metrics"
+    tok = _make_grant(
+        priv,
+        sql,
+        jti="jti-stale-01",
+        tables={
+            "stale_metrics": {
+                "columns": ["id", "val"],
+                "masks": {},
+                "row_filters": [],
+                "actions": ["select"],
+            }
+        },
+    )
+    resp = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"sql": sql, "max_staleness_seconds": 30},
+    )
+    _assert_typed_error(resp, "data_stale", expected_audit_id="jti-stale-01")
+
+
+def test_code_engine_unavailable(multi_engine_setup):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+    client = TestClient(create_app(pipeline, {"duck": duck_adapter}))
+
+    # 1. Missing adapter for hinted engine 'unwired'
+    sql = "SELECT id FROM users"
+    tok = _make_grant(priv, sql, jti="jti-unavail-01")
+    resp = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"sql": sql, "hint": "unwired"},
+    )
+    _assert_typed_error(
+        resp, "engine_unavailable", expected_audit_id="jti-unavail-01"
+    )
+
+    # 2. Adapter raises EnginePoolExhausted -> 503 engine_unavailable
+    class PoolExhaustedAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            raise EnginePoolExhausted("connection pool exhausted")
+
+    client_pool = TestClient(create_app(pipeline, {"duck": PoolExhaustedAdapter()}))
+    tok2 = _make_grant(priv, sql, jti="jti-unavail-pool")
+    resp_pool = client_pool.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok2}"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(
+        resp_pool, "engine_unavailable", expected_audit_id="jti-unavail-pool"
+    )
+
+
+def test_code_engine_timeout(multi_engine_setup, caplog):
+    priv, _, pipeline, _, _ = multi_engine_setup
+
+    class SlowTimeoutAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            raise EngineTimeout("statement timed out")
+
+    client = TestClient(create_app(pipeline, {"duck": SlowTimeoutAdapter()}))
+    sql = "SELECT id FROM users"
+    tok = _make_grant(priv, sql, jti="jti-timeout-typed")
+
+    with caplog.at_level(logging.ERROR):
+        caplog.clear()
+        resp = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok}"},
+            json={"sql": sql},
+        )
+    _assert_typed_error(
+        resp, "engine_timeout", expected_audit_id="jti-timeout-typed"
+    )
+    assert "code=engine_timeout" in caplog.text
+    assert "audit_id=jti-timeout-typed" in caplog.text
+
+
+def test_code_query_spans_engines(multi_engine_setup):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+    client = TestClient(create_app(pipeline, {"duck": duck_adapter}))
+
+    # Join non-PII table on 'sr' with non-PII table on 'lb'
+    sql = (
+        "SELECT e.id, a.owner "
+        "FROM sr_only_events e JOIN lb_only_accounts a ON e.id = a.id"
+    )
+    tok = _make_grant(
+        priv,
+        sql,
+        jti="jti-spans-01",
+        tables={
+            "sr_only_events": {
+                "columns": ["id", "event_type"],
+                "masks": {},
+                "actions": ["select"],
+            },
+            "lb_only_accounts": {
+                "columns": ["id", "owner"],
+                "masks": {},
+                "actions": ["select"],
+            },
+        },
+    )
+    resp = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(
+        resp, "query_spans_engines", expected_audit_id="jti-spans-01"
+    )
+
+    # Mixing cube and table also produces query_spans_engines
+    sql_mix = (
+        "SELECT r.region FROM revenue_cube r JOIN users u ON r.region = u.name"
+    )
+    tok_mix = _make_grant(
+        priv,
+        sql_mix,
+        jti="jti-spans-mix",
+        tables={
+            "revenue_cube": {
+                "columns": ["region", "total_revenue"],
+                "masks": {},
+                "actions": ["select"],
+            },
+            "users": {
+                "columns": ["id", "name"],
+                "masks": {},
+                "actions": ["select"],
+            },
+        },
+    )
+    resp_mix = client.post(
+        "/v1/explain",
+        headers={"Authorization": f"Bearer {tok_mix}"},
+        json={"sql": sql_mix},
+    )
+    _assert_typed_error(
+        resp_mix, "query_spans_engines", expected_audit_id="jti-spans-mix"
+    )
+
+
+def test_code_pii_cross_engine(multi_engine_setup):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+    client = TestClient(create_app(pipeline, {"duck": duck_adapter}))
+
+    # Join PII table 'patients_pii' (only on 'lb') with 'sr_only_events' (only on 'sr')
+    sql = (
+        "SELECT p.id, e.event_type "
+        "FROM patients_pii p JOIN sr_only_events e ON p.id = e.id"
+    )
+    tok = _make_grant(
+        priv,
+        sql,
+        jti="jti-pii-cross-01",
+        tables={
+            "patients_pii": {
+                "columns": ["id"],
+                "masks": {"ssn": "redact"},
+                "actions": ["select"],
+            },
+            "sr_only_events": {
+                "columns": ["id", "event_type"],
+                "masks": {},
+                "actions": ["select"],
+            },
+        },
+    )
+    resp = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(
+        resp, "pii_cross_engine", expected_audit_id="jti-pii-cross-01"
+    )
+
+
+def test_code_row_cap_hit_error_and_truncation_notice(multi_engine_setup):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+
+    # 1. Default truncation mode: HTTP 200 with truncated=True and notices=["row_cap_hit"]
+    client_trunc = TestClient(create_app(pipeline, {"duck": duck_adapter}))
+    sql = "SELECT id, name FROM users ORDER BY id"
+    tok_trunc = _make_grant(priv, sql, jti="jti-rowcap-notice", max_rows=2)
+    r_trunc = client_trunc.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok_trunc}"},
+        json={"sql": sql},
+    )
+    assert r_trunc.status_code == 200
+    data_trunc = r_trunc.json()
+    assert data_trunc["truncated"] is True
+    assert data_trunc["notices"] == ["row_cap_hit"]
+    assert len(data_trunc["rows"]) == 2
+
+    # Untruncated query has notices=[]
+    tok_full = _make_grant(priv, sql, jti="jti-rowcap-ok", max_rows=10)
+    r_full = client_trunc.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok_full}"},
+        json={"sql": sql},
+    )
+    assert r_full.status_code == 200
+    assert r_full.json()["truncated"] is False
+    assert r_full.json()["notices"] == []
+
+    # 2. Strict error mode (on_row_cap="error"): exceeding row cap returns 422 row_cap_hit
+    client_strict = TestClient(
+        create_app(pipeline, {"duck": duck_adapter}, on_row_cap="error")
+    )
+    tok_err = _make_grant(priv, sql, jti="jti-rowcap-err", max_rows=2)
+    r_err = client_strict.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok_err}"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(r_err, "row_cap_hit", expected_audit_id="jti-rowcap-err")
+
+    # 3. Invalid non-literal LIMIT in SQL also produces 422 row_cap_hit
+    sql_bad_lim = "SELECT id FROM users LIMIT -1"
+    tok_bad_lim = _make_grant(priv, sql_bad_lim, jti="jti-rowcap-badlim")
+    r_bad_lim = client_trunc.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok_bad_lim}"},
+        json={"sql": sql_bad_lim},
+    )
+    _assert_typed_error(
+        r_bad_lim, "row_cap_hit", expected_audit_id="jti-rowcap-badlim"
+    )
+
+
+def test_code_result_too_large(multi_engine_setup):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+    client = TestClient(create_app(pipeline, {"duck": duck_adapter}))
+
+    sql = "SELECT id, name, salary FROM users ORDER BY id"
+    tok = _make_grant(priv, sql, jti="jti-too-large-01")
+    resp = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"sql": sql, "max_result_bytes": 10},
+    )
+    body = _assert_typed_error(
+        resp, "result_too_large", expected_audit_id="jti-too-large-01"
+    )
+    assert "rows" not in body
+
+
+def test_code_invalid_sql(multi_engine_setup):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+    client = TestClient(create_app(pipeline, {"duck": duck_adapter}))
+
+    # 1. Malformed SQL syntax with valid grant token -> 400 invalid_sql with audit_id
+    bad_sql = "SELECT FROM WHERE ((( %%%"
+    tok = _make_grant(priv, bad_sql, jti="jti-badsql-01")
+    r_syntax = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"sql": bad_sql},
+    )
+    _assert_typed_error(
+        r_syntax, "invalid_sql", expected_audit_id="jti-badsql-01"
+    )
+
+    # 2. Multi-statement SQL -> 400 invalid_sql with audit_id
+    multi_sql = "SELECT id FROM users; SELECT name FROM users"
+    tok_multi = _make_grant(priv, multi_sql, jti="jti-badsql-multi")
+    r_multi = client.post(
+        "/v1/explain",
+        headers={"Authorization": f"Bearer {tok_multi}"},
+        json={"sql": multi_sql},
+    )
+    _assert_typed_error(
+        r_multi, "invalid_sql", expected_audit_id="jti-badsql-multi"
+    )
+
+    # 3. DDL statement -> 400 invalid_sql with audit_id
+    ddl_sql = "DROP TABLE users"
+    tok_ddl = _make_grant(priv, ddl_sql, jti="jti-badsql-ddl")
+    r_ddl = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok_ddl}"},
+        json={"sql": ddl_sql},
+    )
+    _assert_typed_error(r_ddl, "invalid_sql", expected_audit_id="jti-badsql-ddl")
+
+    # 4. Malformed JSON body with unverified token -> 400 invalid_sql without audit_id
+    r_json = client.post(
+        "/v1/query",
+        headers={"Authorization": "Bearer untrusted.token.value"},
+        content=b"{not-json",
+    )
+    _assert_typed_error(r_json, "invalid_sql", expected_audit_id=None)
+
+
+def test_code_payload_too_large(multi_engine_setup):
+    priv, _, pipeline, duck_adapter, _ = multi_engine_setup
+    client = TestClient(
+        create_app(pipeline, {"duck": duck_adapter}, max_body_bytes=64)
+    )
+    sql = "SELECT id FROM users /* " + ("X" * 200) + " */"
+    tok = _make_grant(priv, sql, jti="jti-payload-big")
+    resp = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(resp, "payload_too_large", expected_audit_id=None)
+
+
+def test_code_query_cancelled(multi_engine_setup):
+    priv, _, pipeline, _, _ = multi_engine_setup
+
+    class CancelledAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            raise EngineCancelled("Engine query execution cancelled")
+
+    client = TestClient(create_app(pipeline, {"duck": CancelledAdapter()}))
+    sql = "SELECT id FROM users"
+    tok = _make_grant(priv, sql, jti="jti-cancelled-01")
+    resp = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(
+        resp, "query_cancelled", expected_audit_id="jti-cancelled-01"
+    )
+
+
+def test_code_audit_unavailable_refuses_query_fail_closed(multi_engine_setup):
+    priv, _, pipeline, _, _ = multi_engine_setup
+    executed_count = 0
+
+    class CountingAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            nonlocal executed_count
+            executed_count += 1
+            return QueryResult(
+                columns=("id",),
+                rows=[(1,)],
+                truncated=False,
+                engine="duck",
+                elapsed_ms=1.0,
+            )
+
+    def broken_audit_sink(record: Any) -> None:
+        raise AuditUnavailableError("audit broker down")
+
+    client = TestClient(
+        create_app(
+            pipeline,
+            {"duck": CountingAdapter()},
+            audit_sink=broken_audit_sink,
+        )
+    )
+    sql = "SELECT id FROM users"
+    tok = _make_grant(priv, sql, jti="jti-audit-down-01")
+    resp = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"sql": sql},
+    )
+    _assert_typed_error(
+        resp, "audit_unavailable", expected_audit_id="jti-audit-down-01"
+    )
+    assert executed_count == 0
+
+
+def test_code_internal_error(multi_engine_setup, caplog):
+    priv, _, pipeline, _, _ = multi_engine_setup
+
+    class CrashingAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            raise RuntimeError("unexpected null pointer in driver C extension")
+
+    client = TestClient(create_app(pipeline, {"duck": CrashingAdapter()}))
+    sql = "SELECT id FROM users"
+    tok = _make_grant(priv, sql, jti="jti-crash-500")
+
+    with caplog.at_level(logging.ERROR):
+        caplog.clear()
+        resp = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok}"},
+            json={"sql": sql},
+        )
+    _assert_typed_error(resp, "internal_error", expected_audit_id="jti-crash-500")
+    assert "code=internal_error" in caplog.text
+    assert "audit_id=jti-crash-500" in caplog.text
+
+
+def test_additional_http_codes_not_found_and_duplicate_query_id(multi_engine_setup):
+    priv, _, pipeline, _, _ = multi_engine_setup
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class HoldAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            started.set()
+            release.wait(timeout=5.0)
+            return QueryResult(
+                columns=("id",),
+                rows=[(1,)],
+                truncated=False,
+                engine="duck",
+                elapsed_ms=1.0,
+            )
+
+    # 1. 404 not_found on /v1/cancel
+    client = TestClient(create_app(pipeline, {"duck": HoldAdapter()}))
+    cancel_tok = sign_cancel_token(
+        {
+            "typ": "cancel",
+            "sub": "analyst@atlas.example",
+            "jti": "jti-missing-999",
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": time.time(),
+            "exp": time.time() + 30.0,
+        },
+        priv,
+        kid="key-1",
+    )
+    r_404 = client.post(
+        "/v1/cancel", headers={"Authorization": f"Bearer {cancel_tok}"}
+    )
+    _assert_typed_error(r_404, "not_found", expected_audit_id="jti-missing-999")
+
+    # 2. 409 duplicate_query_id when RunningQueries already holds the jti
+    # Use a replay cache stub that permits testing the concurrent duplicate guard
+    class NoopReplayCache(GrantReplayCache):
+        def check_and_record(self, jti: str, expires_at: float, now: float | None = None) -> None:
+            return None
+
+    client_dup = TestClient(
+        create_app(
+            pipeline,
+            {"duck": HoldAdapter()},
+            replay_cache=NoopReplayCache(),
+        )
+    )
+    sql = "SELECT id FROM users"
+    tok_dup = _make_grant(priv, sql, jti="jti-dup-409")
+
+    t = threading.Thread(
+        target=lambda: client_dup.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_dup}"},
+            json={"sql": sql},
+        )
+    )
+    t.start()
+    assert started.wait(timeout=2.0)
+    try:
+        r_409 = client_dup.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_dup}"},
+            json={"sql": sql},
+        )
+        _assert_typed_error(
+            r_409, "duplicate_query_id", expected_audit_id="jti-dup-409"
+        )
+    finally:
+        release.set()
+        t.join(timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
+# 3. Zero-leakage guarantees across all error paths
+# ---------------------------------------------------------------------------
+
+
+def test_planted_secrets_dsns_hostnames_literals_params_and_tracebacks_never_leak(
+    multi_engine_setup,
+):
+    priv, _, pipeline, _, _ = multi_engine_setup
+
+    sentinel_sql_lit = "SENTINEL_SQL_LITERAL_847291"
+    sentinel_param = "SENTINEL_PARAM_VALUE_938172"
+    sentinel_dsn = "postgresql://svc_user:SENTINEL_DB_PASS_112233@db-prod-01.internal.corp:5432/lakebase"
+    sentinel_hostname = "db-prod-01.internal.corp"
+    sentinel_driver = "psycopg2.OperationalError"
+    sentinel_audit = "kafka://audit:SENTINEL_AUDIT_778899@broker-01.internal.corp:9092"
+    sentinel_internal = "SENTINEL_TRACEBACK_SECRET_556677"
+
+    forbidden_substrings = (
+        sentinel_sql_lit,
+        sentinel_param,
+        sentinel_dsn,
+        "SENTINEL_DB_PASS_112233",
+        sentinel_hostname,
+        "internal.corp",
+        sentinel_driver,
+        sentinel_audit,
+        "SENTINEL_AUDIT_778899",
+        sentinel_internal,
+        "Traceback",
+    )
+
+    def assert_clean(resp: Any, tok: str) -> None:
+        text = resp.text
+        assert tok not in text
+        for secret in forbidden_substrings:
+            assert secret not in text, f"Leaked '{secret}' in response: {text}"
+        body = resp.json()
+        assert set(body.keys()) <= {"error", "code", "message", "next_step", "audit_id"}
+        assert body["code"] in ERROR_CATALOGUE
+
+    # Case A: EngineError carrying raw driver text, DSN, password, and hostname
+    class LeakyEngineErrorAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            raise EngineError(f"{sentinel_driver}: connection failed for {sentinel_dsn}")
+
+    sql = f"SELECT id FROM users WHERE name = '{sentinel_sql_lit}' AND salary > $1"
+    c1 = TestClient(create_app(pipeline, {"duck": LeakyEngineErrorAdapter()}))
+    t1 = _make_grant(priv, sql, jti="jti-leak-eng")
+    r1 = c1.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {t1}"},
+        json={"sql": sql, "params": [sentinel_param]},
+    )
+    assert r1.status_code == 502
+    assert_clean(r1, t1)
+
+    # Case B: EngineTimeout carrying hostname and SQL
+    class LeakyTimeoutAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            raise EngineTimeout(f"timeout on {sentinel_hostname} running {sql}")
+
+    c2 = TestClient(create_app(pipeline, {"duck": LeakyTimeoutAdapter()}))
+    t2 = _make_grant(priv, sql, jti="jti-leak-timeout")
+    r2 = c2.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {t2}"},
+        json={"sql": sql, "params": [sentinel_param]},
+    )
+    assert r2.status_code == 504
+    assert_clean(r2, t2)
+
+    # Case C: Unhandled RuntimeError with internal secret & stack trace
+    class LeakyCrashAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            raise RuntimeError(f"Crash {sentinel_internal} at {sentinel_dsn}")
+
+    c3 = TestClient(create_app(pipeline, {"duck": LeakyCrashAdapter()}))
+    t3 = _make_grant(priv, sql, jti="jti-leak-crash")
+    r3 = c3.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {t3}"},
+        json={"sql": sql, "params": [sentinel_param]},
+    )
+    assert r3.status_code == 500
+    assert_clean(r3, t3)
+
+    # Case D: Broken audit sink leaking broker credentials
+    def leaky_sink(rec: Any) -> None:
+        raise RuntimeError(f"Failed connecting to {sentinel_audit}")
+
+    c4 = TestClient(
+        create_app(pipeline, {"duck": LeakyCrashAdapter()}, audit_sink=leaky_sink)
+    )
+    t4 = _make_grant(priv, sql, jti="jti-leak-audit")
+    r4 = c4.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {t4}"},
+        json={"sql": sql, "params": [sentinel_param]},
+    )
+    assert r4.status_code == 503
+    assert_clean(r4, t4)
+
+    # Case E: SQL parse error containing secret literal and secret param
+    bad_sql = f"SELECT id FROM users WHERE name = '{sentinel_sql_lit}' AND ((("
+    t5 = _make_grant(priv, bad_sql, jti="jti-leak-parse")
+    r5 = c1.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {t5}"},
+        json={"sql": bad_sql, "params": [sentinel_param]},
+    )
+    assert r5.status_code == 400
+    assert_clean(r5, t5)
+
+    # Case F: Access denied on ungranted column with secret literal in WHERE
+    denied_sql = f"SELECT id, secret_col FROM users WHERE name = '{sentinel_sql_lit}'"
+    t6 = _make_grant(priv, denied_sql, jti="jti-leak-denied")
+    r6 = c1.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {t6}"},
+        json={"sql": denied_sql, "params": [sentinel_param]},
+    )
+    assert r6.status_code == 403
+    assert_clean(r6, t6)
+
+    # Case G: Grant token with secret planted in kid / iss
+    t7 = _make_grant(
+        priv,
+        sql,
+        jti="jti-leak-kid",
+        kid=sentinel_dsn,
+        extra_claims={"iss": sentinel_hostname},
+    )
+    r7 = c1.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {t7}"},
+        json={"sql": sql, "params": [sentinel_param]},
+    )
+    assert r7.status_code == 401
+    assert_clean(r7, t7)
