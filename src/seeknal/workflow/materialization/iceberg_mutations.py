@@ -10,6 +10,7 @@ from copy import copy
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
+from seeknal.utils.duckdb_arrow import result_to_arrow_table
 from seeknal.workflow.materialization.config import CatalogConfig
 
 
@@ -137,9 +138,7 @@ def _load_catalog(catalog_name: str, config: CatalogConfig) -> Any:
 def _freeze_arrow_batch(con: Any, view_name: str) -> Any:
     try:
         result = con.execute(f"SELECT * FROM {_quoted_relation(view_name)}")
-        if hasattr(result, "fetch_arrow_table"):
-            return result.fetch_arrow_table()
-        return result.arrow().read_all()
+        return result_to_arrow_table(result)
     except Exception as exc:
         raise IcebergMutationError(
             f"Failed to freeze source relation {view_name!r} as an Arrow batch: {exc}"
@@ -352,13 +351,15 @@ def _filter_matched_rows(
                 batch.append_column(index, pa.array(range(batch.num_rows), pa.int64())),
             )
             con.register("target", current)
-            decisions = con.execute(
-                f'SELECT numbered.{quoted(index)}, {matched} AS matched, '
-                f'CASE WHEN {matched} THEN (({condition or "TRUE"}) IS TRUE) ELSE FALSE END AS allowed '
-                f'FROM indexed_source AS numbered '
-                f'CROSS JOIN LATERAL (SELECT {source_projection}) AS source '
-                f'LEFT JOIN target ON {join} ORDER BY numbered.{quoted(index)}'
-            ).fetch_arrow_table()
+            decisions = result_to_arrow_table(
+                con.execute(
+                    f'SELECT numbered.{quoted(index)}, {matched} AS matched, '
+                    f'CASE WHEN {matched} THEN (({condition or "TRUE"}) IS TRUE) ELSE FALSE END AS allowed '
+                    f'FROM indexed_source AS numbered '
+                    f'CROSS JOIN LATERAL (SELECT {source_projection}) AS source '
+                    f'LEFT JOIN target ON {join} ORDER BY numbered.{quoted(index)}'
+                )
+            )
         is_matched = decisions.column(1)
         allowed = pc.fill_null(decisions.column(2), False)
         skipped_by_condition = pc.sum(pc.and_(is_matched, pc.invert(allowed))).as_py() or 0

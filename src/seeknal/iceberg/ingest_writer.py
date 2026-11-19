@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
 
+from seeknal.utils.duckdb_arrow import result_to_arrow_table
+
 logger = logging.getLogger("seeknal.iceberg.ingest_writer")
 
 _TABLE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -54,7 +56,7 @@ def _read_source_to_arrow(source_path: Path):
 
     con = duckdb.connect(":memory:")
     try:
-        return con.execute(f"SELECT * FROM {reader}").arrow()
+        return result_to_arrow_table(con.execute(f"SELECT * FROM {reader}"))
     finally:
         con.close()
 
