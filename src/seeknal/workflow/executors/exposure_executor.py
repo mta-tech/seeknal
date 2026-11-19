@@ -151,10 +151,16 @@ class ExposureExecutor(BaseExecutor):
 
         # Check exposure type
         exposure_type = config.get("type")
-        if not exposure_type or not isinstance(exposure_type, str):
+        if exposure_type is None or (isinstance(exposure_type, str) and not exposure_type.strip()):
             raise ExecutorValidationError(
                 self.node.id,
                 "Missing required field 'type' in exposure configuration"
+            )
+        if not isinstance(exposure_type, str):
+            raise ExecutorValidationError(
+                self.node.id,
+                f"Invalid exposure type: expected string, got {type(exposure_type).__name__}. "
+                f"Must be one of: {[t.value for t in ExposureType]}"
             )
 
         normalized_type = exposure_type.strip().lower()
@@ -257,7 +263,8 @@ class ExposureExecutor(BaseExecutor):
         Creates parent directories for file exports if they don't exist.
         """
         config = self.node.config
-        exposure_type = config.get("type", "").lower()
+        raw_type = config.get("type")
+        exposure_type = raw_type.strip().lower() if isinstance(raw_type, str) else ""
 
         if exposure_type == ExposureType.FILE.value:
             params = config.get("params", {})
@@ -286,6 +293,11 @@ class ExposureExecutor(BaseExecutor):
             # Get exposure configuration
             config = self.node.config
             raw_type = config.get("type")
+            if raw_type is not None and not isinstance(raw_type, str):
+                raise ExecutorExecutionError(
+                    self.node.id,
+                    f"Invalid exposure type: expected string, got {type(raw_type).__name__}",
+                )
             exposure_type = raw_type.strip().lower() if isinstance(raw_type, str) else ""
 
             if exposure_type == ExposureType.DATABASE.value:

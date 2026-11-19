@@ -778,17 +778,63 @@ def handle_cli_error(error_message: str = "Operation failed"):
 
 
 def _validate_dag_exposures(dag_builder: Any) -> None:
-    """Reject unsupported exposure configurations (e.g. type: database) in DAG nodes."""
+    """Reject unsupported exposure configurations (e.g. type: database) in DAG or Manifest nodes."""
     from seeknal.workflow.executors.exposure_executor import (
         DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE,
     )
 
     for node_id, node in getattr(dag_builder, "nodes", {}).items():
-        kind_val = getattr(node.kind, "value", str(node.kind)) if hasattr(node, "kind") else ""
+        node_kind = getattr(node, "kind", None) or getattr(node, "node_type", None)
+        kind_val = getattr(node_kind, "value", str(node_kind)) if node_kind is not None else ""
         yaml_data = getattr(node, "yaml_data", None) or getattr(node, "config", None) or {}
         if kind_val == "exposure" or str(yaml_data.get("kind", "")).strip().lower() == "exposure":
             exposure_type = yaml_data.get("type")
+            if exposure_type is not None and not isinstance(exposure_type, str):
+                _echo_error(
+                    f"Validation failed for {node_id}: Invalid field 'type' for exposure: "
+                    f"expected string, got {type(exposure_type).__name__}"
+                )
+                raise typer.Exit(1)
             if isinstance(exposure_type, str) and exposure_type.strip().lower() == "database":
+                _echo_error(
+                    f"Validation failed for {node_id}: {DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE}"
+                )
+                raise typer.Exit(1)
+
+
+def _validate_project_exposures_yaml(scan_root: Path) -> None:
+    """Scan project YAML files for unsupported database exposures without importing Python code."""
+    import yaml
+
+    yaml_files = sorted(
+        p
+        for p in scan_root.rglob("*")
+        if p.is_file() and p.suffix.lower() in {".yml", ".yaml"}
+    )
+    for yml_path in yaml_files:
+        try:
+            with open(yml_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        kind_val = data.get("kind")
+        if isinstance(kind_val, str) and kind_val.strip().lower() == "exposure":
+            name = data.get("name") or yml_path.stem
+            node_id = f"exposure.{name}"
+            exposure_type = data.get("type")
+            if "type" in data and not isinstance(exposure_type, str):
+                _echo_error(
+                    f"Validation failed for {node_id}: Invalid field 'type' for exposure: "
+                    f"expected string, got {type(exposure_type).__name__}"
+                )
+                raise typer.Exit(1)
+            if isinstance(exposure_type, str) and exposure_type.strip().lower() == "database":
+                from seeknal.workflow.executors.exposure_executor import (
+                    DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE,
+                )
+
                 _echo_error(
                     f"Validation failed for {node_id}: {DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE}"
                 )
@@ -2451,6 +2497,9 @@ def _run_yaml_pipeline(
         except Exception:
             pass  # best-effort
 
+        if parallel_summary.failed_nodes > 0:
+            raise typer.Exit(1)
+
         return
 
     # Step 4: Create execution context
@@ -2997,11 +3046,22 @@ def validate(
         _echo_warning(f"Config file not found: {config_file}")
 
     if config_path is not None and config_path.is_file() and config_path.suffix.lower() in {".yml", ".yaml"}:
-        from seeknal.workflow.validators import validate_yaml_syntax, validate_schema
+        import yaml
+        from seeknal.workflow.validators import validate_schema
 
-        yaml_data = validate_yaml_syntax(config_path)
-        if "kind" in yaml_data:
-            validate_schema(yaml_data)
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                yaml_data = yaml.safe_load(f)
+        except Exception:
+            yaml_data = None
+        if (
+            isinstance(yaml_data, dict)
+            and isinstance(yaml_data.get("kind"), str)
+            and yaml_data["kind"].strip().lower() == "exposure"
+        ):
+            normalized = dict(yaml_data)
+            normalized["kind"] = "exposure"
+            validate_schema(normalized)
 
     project_root = (
         config_path
@@ -3009,15 +3069,9 @@ def validate(
         else Path.cwd()
     )
     if (project_root / "seeknal").is_dir():
-        from seeknal.workflow.dag import DAGBuilder
-
-        try:
-            dag_builder = DAGBuilder(project_path=project_root)
-            dag_builder.build()
-        except Exception:
-            dag_builder = None
-        if dag_builder is not None:
-            _validate_dag_exposures(dag_builder)
+        _validate_project_exposures_yaml(project_root / "seeknal")
+    elif config_path is not None and config_path.is_dir():
+        _validate_project_exposures_yaml(config_path)
 
     # Check database connection
     _echo_info("Validating database connection...")
@@ -5740,6 +5794,10 @@ def _run_in_environment(
     nodes_to_execute = apply_info["nodes_to_execute"]
     env_dir = apply_info["env_dir"]
     manifest = apply_info["manifest"]
+
+    _validate_dag_exposures(manifest)
+    if (project_path / "seeknal").is_dir():
+        _validate_project_exposures_yaml(project_path / "seeknal")
 
     # Restore profile_path from plan.json if not explicitly provided
     if profile_path is None and apply_info.get("profile_path"):

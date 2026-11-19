@@ -68,10 +68,9 @@ class ProjectParser:
         # Parse common config
         self._parse_common_config()
 
-        # Parse semantic models, metrics, and exposures
+        # Parse semantic models and metrics
         self._parse_semantic_models()
         self._parse_metrics()
-        self._parse_exposures()
 
         # TODO: Parse Python files for feature groups, models
         # self._parse_python_files()
@@ -277,46 +276,3 @@ class ProjectParser:
                     file_path=str(yml_path),
                 )
                 self.manifest.add_node(node)
-
-    def _parse_exposures(self) -> None:
-        """Parse exposures/*.yml files."""
-        exp_dir = self.project_path / "seeknal" / "exposures"
-        if not exp_dir.exists():
-            return
-
-        for yml_path in sorted(exp_dir.glob("*.yml")):
-            try:
-                with open(yml_path, "r", encoding="utf-8") as f:
-                    data = yaml.safe_load(f) or {}
-            except yaml.YAMLError as e:
-                self._errors.append(f"Invalid YAML in {yml_path.name}: {e}")
-                continue
-
-            if not isinstance(data, dict) or data.get("kind") != "exposure":
-                continue
-
-            name = data.get("name")
-            if not name:
-                self._errors.append(f"Exposure in {yml_path.name} missing 'name'")
-                continue
-
-            exposure_type = data.get("type")
-            if isinstance(exposure_type, str) and exposure_type.strip().lower() == "database":
-                from seeknal.workflow.executors.exposure_executor import (
-                    DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE,
-                )
-
-                self._errors.append(
-                    f"Node 'exposure.{name}' in {yml_path.name}: "
-                    f"{DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE}"
-                )
-
-            node = Node(
-                id=f"exposure.{name}",
-                name=name,
-                node_type=NodeType.EXPOSURE,
-                description=data.get("description"),
-                config=data,
-                file_path=str(yml_path),
-            )
-            self.manifest.add_node(node)

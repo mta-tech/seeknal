@@ -12,7 +12,6 @@ from typer.testing import CliRunner
 
 from seeknal.cli.main import app
 from seeknal.dag.manifest import Node, NodeType
-from seeknal.dag.parser import ProjectParser
 from seeknal.heartbeat.config import HeartbeatConfig
 from seeknal.heartbeat.runner import HeartbeatRunner
 from seeknal.workflow.dry_run import dry_run_command, dry_run_yaml
@@ -159,33 +158,70 @@ class TestExposureDatabaseValidation:
             "type": type_value,
             "params": {"table": "public.results"},
         }
-        with pytest.raises(typer.Exit) as exc_info:
+        with pytest.raises(ValueError) as exc_info:
             execute_exposure(yaml_data, limit=10, timeout=5)
-        assert exc_info.value.exit_code == 1
+        assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in str(exc_info.value)
 
-        with pytest.raises(typer.Exit) as preview_exc:
+        with pytest.raises(ValueError) as preview_exc:
             execute_preview(yaml_data, tmp_path / "draft.yml", limit=10, timeout=5)
-        assert preview_exc.value.exit_code == 1
+        assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in str(preview_exc.value)
 
-    def test_project_parser_rejects_database_exposure(self, tmp_path: Path):
-        exp_dir = tmp_path / "seeknal" / "exposures"
-        exp_dir.mkdir(parents=True)
-        (exp_dir / "db_export.yml").write_text(
-            "kind: exposure\n"
-            "name: db_export\n"
-            "type: Database\n"
-            "params:\n"
-            "  table: public.results\n",
-            encoding="utf-8",
+    def test_legacy_dag_runner_fails_database_exposure_without_exiting(self, tmp_path: Path):
+        from seeknal.dag.manifest import Manifest
+        from seeknal.workflow.runner import DAGRunner
+        from seeknal.workflow.runner import ExecutionStatus as RunnerExecutionStatus
+
+        manifest = Manifest(project="legacy_test")
+        manifest.add_node(
+            Node(
+                id="exposure.export_db",
+                name="export_db",
+                node_type=NodeType.EXPOSURE,
+                config={
+                    "kind": "exposure",
+                    "name": "export_db",
+                    "type": "database",
+                    "params": {"table": "public.results"},
+                },
+            )
         )
-        parser = ProjectParser("test_proj", str(tmp_path))
-        parser.parse()
+        runner = DAGRunner(manifest, target_path=tmp_path / "target", exec_context=None)
+        node_result = runner._execute_node("exposure.export_db")
+        assert node_result.status == RunnerExecutionStatus.FAILED
+        assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in (node_result.error_message or "")
 
-        parse_errors = parser.get_errors()
-        assert any(DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in e for e in parse_errors)
+    @pytest.mark.parametrize("bad_type", [3, ["database"], {"type": "database"}])
+    def test_non_string_exposure_type_gives_specific_error(
+        self, context, capsys, bad_type
+    ):
+        yaml_data = {
+            "kind": "exposure",
+            "name": "bad_exp",
+            "type": bad_type,
+        }
+        with pytest.raises(typer.Exit) as exc_info:
+            validate_schema(yaml_data)
+        assert exc_info.value.exit_code == 1
+        captured = capsys.readouterr()
+        combined = _norm(captured.out + captured.err)
+        assert "expected non-empty string" in combined
+        assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE not in combined
 
-        validation_errors = parser.validate()
-        assert any(DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in e for e in validation_errors)
+        node = Node(
+            id="exposure.bad_exp",
+            name="bad_exp",
+            node_type=NodeType.EXPOSURE,
+            config=yaml_data,
+        )
+        executor = ExposureExecutor(node, context)
+        with pytest.raises(ExecutorValidationError) as val_exc:
+            executor.validate()
+        assert "expected string" in str(val_exc.value)
+        assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE not in str(val_exc.value)
+
+        with pytest.raises(ValueError) as exec_exc:
+            execute_exposure(yaml_data, limit=10, timeout=5)
+        assert "expected non-empty string" in str(exec_exc.value)
 
 
 class TestExposureDatabaseCLIPaths:
@@ -206,7 +242,16 @@ class TestExposureDatabaseCLIPaths:
         )
         return exp_file
 
-    def test_cli_dry_run_rejects_database_exposure(self, tmp_path: Path):
+    @staticmethod
+    def _unset_atlas_env(monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("ATLAS_API_URL", raising=False)
+        monkeypatch.delenv("ATLAS_PORTAL_URL", raising=False)
+        monkeypatch.delenv("KEYCLOAK_ISSUER", raising=False)
+
+    def test_cli_dry_run_rejects_database_exposure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._unset_atlas_env(monkeypatch)
         exp_file = self._create_project_with_db_exposure(tmp_path, type_value="Database")
         runner = CliRunner()
         result = runner.invoke(app, ["dry-run", str(exp_file)])
@@ -215,7 +260,10 @@ class TestExposureDatabaseCLIPaths:
         assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in _norm(result.output)
         assert "Traceback" not in result.output
 
-    def test_cli_plan_rejects_database_exposure(self, tmp_path: Path):
+    def test_cli_plan_rejects_database_exposure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._unset_atlas_env(monkeypatch)
         self._create_project_with_db_exposure(tmp_path, type_value="database")
         runner = CliRunner()
         result = runner.invoke(app, ["plan", "--project-path", str(tmp_path)])
@@ -224,7 +272,10 @@ class TestExposureDatabaseCLIPaths:
         assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in _norm(result.output)
         assert "Traceback" not in result.output
 
-    def test_cli_parse_rejects_database_exposure(self, tmp_path: Path):
+    def test_cli_parse_rejects_database_exposure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._unset_atlas_env(monkeypatch)
         self._create_project_with_db_exposure(tmp_path, type_value="DATABASE")
         runner = CliRunner()
         result = runner.invoke(app, ["parse", "--path", str(tmp_path)])
@@ -233,7 +284,10 @@ class TestExposureDatabaseCLIPaths:
         assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in _norm(result.output)
         assert "Traceback" not in result.output
 
-    def test_cli_validate_rejects_database_exposure(self, tmp_path: Path):
+    def test_cli_validate_rejects_database_exposure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._unset_atlas_env(monkeypatch)
         exp_file = self._create_project_with_db_exposure(tmp_path, type_value="database")
         runner = CliRunner()
 
@@ -247,11 +301,31 @@ class TestExposureDatabaseCLIPaths:
         assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in _norm(res_dir.output)
         assert "Traceback" not in res_dir.output
 
+    def test_cli_validate_does_not_import_project_python_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """`seeknal validate` must use a YAML-only scan and never import project .py files."""
+        self._unset_atlas_env(monkeypatch)
+        self._create_project_with_db_exposure(tmp_path, type_value="  DaTaBaSe  ")
+        pipelines_dir = tmp_path / "seeknal" / "pipelines"
+        pipelines_dir.mkdir(parents=True)
+        (pipelines_dir / "exploding_node.py").write_text(
+            "raise RuntimeError('USER_PYTHON_IMPORTED_DURING_VALIDATE')\n",
+            encoding="utf-8",
+        )
+
+        runner = CliRunner()
+        res = runner.invoke(app, ["validate", "--config", str(tmp_path)])
+        assert res.exit_code != 0
+        assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in _norm(res.output)
+        assert "USER_PYTHON_IMPORTED_DURING_VALIDATE" not in res.output
+        assert "Traceback" not in res.output
+
     def test_cli_run_and_run_dry_run_reject_database_exposure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         self._create_project_with_db_exposure(tmp_path, type_value="database")
-        monkeypatch.delenv("ATLAS_API_URL", raising=False)
+        self._unset_atlas_env(monkeypatch)
         monkeypatch.chdir(tmp_path)
         runner = CliRunner()
 
@@ -269,6 +343,89 @@ class TestExposureDatabaseCLIPaths:
         assert res_run.exit_code != 0
         assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in _norm(res_run.output)
         assert "Traceback" not in res_run.output
+
+        res_parallel = runner.invoke(app, ["run", "--parallel"])
+        assert res_parallel.exit_code != 0
+        assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in _norm(res_parallel.output)
+        assert "Traceback" not in res_parallel.output
+
+        res_nodes = runner.invoke(app, ["run", "--nodes", "exposure.db_out"])
+        assert res_nodes.exit_code != 0
+        assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in _norm(res_nodes.output)
+        assert "Traceback" not in res_nodes.output
+
+    def test_cli_env_apply_and_dry_run_with_saved_plan_reject_database_exposure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """`seeknal env apply` and `seeknal env apply --dry-run` with a saved plan
+        containing a database exposure must fail with DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE."""
+        self._unset_atlas_env(monkeypatch)
+        from seeknal.dag.manifest import Manifest
+        from seeknal.workflow.environment import EnvironmentManager
+
+        manifest = Manifest(project=tmp_path.name)
+        manifest.add_node(
+            Node(
+                id="exposure.db_out",
+                name="db_out",
+                node_type=NodeType.EXPOSURE,
+                config={
+                    "kind": "exposure",
+                    "name": "db_out",
+                    "type": "database",
+                    "params": {"table": "public.orders_out"},
+                },
+            )
+        )
+        manager = EnvironmentManager(tmp_path / "target")
+        manager.plan("dev", manifest)
+
+        runner = CliRunner()
+        res_dry = runner.invoke(
+            app, ["env", "apply", "dev", "--dry-run", "--project-path", str(tmp_path)]
+        )
+        assert res_dry.exit_code != 0
+        assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in _norm(res_dry.output)
+        assert "Would execute" not in res_dry.output
+        assert "Traceback" not in res_dry.output
+
+        res_apply = runner.invoke(
+            app, ["env", "apply", "dev", "--project-path", str(tmp_path)]
+        )
+        assert res_apply.exit_code != 0
+        assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in _norm(res_apply.output)
+        assert "Traceback" not in res_apply.output
+
+    def test_cli_run_dry_run_output_unchanged_for_project_without_exposures(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """`seeknal run --dry-run` output is unchanged for a project without exposures."""
+        self._unset_atlas_env(monkeypatch)
+        sources_dir = tmp_path / "seeknal" / "sources"
+        transforms_dir = tmp_path / "seeknal" / "transforms"
+        sources_dir.mkdir(parents=True)
+        transforms_dir.mkdir(parents=True)
+
+        (sources_dir / "orders.yml").write_text(
+            f"kind: source\nname: orders\nsource: csv\ntable: {tmp_path / 'orders.csv'}\n",
+            encoding="utf-8",
+        )
+        (transforms_dir / "clean_orders.yml").write_text(
+            "kind: transform\n"
+            "name: clean_orders\n"
+            "transform: SELECT * FROM input_0\n"
+            "inputs:\n"
+            "  - ref: source.orders\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+        res_dry = runner.invoke(app, ["run", "--dry-run"])
+        assert res_dry.exit_code == 0
+        assert "Would execute: source.orders" in res_dry.output
+        assert "Would execute: transform.clean_orders" in res_dry.output
+        assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE not in _norm(res_dry.output)
 
     def test_cli_run_dry_run_preserves_base_behavior_for_source_and_valid_exposure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -296,7 +453,7 @@ class TestExposureDatabaseCLIPaths:
             encoding="utf-8",
         )
 
-        monkeypatch.delenv("ATLAS_API_URL", raising=False)
+        self._unset_atlas_env(monkeypatch)
         monkeypatch.chdir(tmp_path)
         runner = CliRunner()
         res_dry = runner.invoke(app, ["run", "--dry-run"])
@@ -305,10 +462,11 @@ class TestExposureDatabaseCLIPaths:
         assert "Would execute: exposure.file_out" in res_dry.output
 
     def test_cli_validate_ignores_dag_build_errors_when_no_database_exposure(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         """Regression test: `seeknal validate` must not add new hard failures for DAG
         build errors on projects without database exposures."""
+        self._unset_atlas_env(monkeypatch)
         transforms_dir = tmp_path / "seeknal" / "transforms"
         transforms_dir.mkdir(parents=True)
         # Cyclic transform dependency without database exposure
@@ -323,6 +481,12 @@ class TestExposureDatabaseCLIPaths:
         runner = CliRunner()
         res = runner.invoke(app, ["validate", "--config", str(tmp_path)])
         assert res.exit_code == 0
+
+        # Non-exposure YAML file passed to --config must also behave as at base
+        other_yml = tmp_path / "profiles.yml"
+        other_yml.write_text("connections: {}\n", encoding="utf-8")
+        res_other = runner.invoke(app, ["validate", "--config", str(other_yml)])
+        assert res_other.exit_code == 0
 
 
 class TestExposureDatabaseRuntimeFailure:
