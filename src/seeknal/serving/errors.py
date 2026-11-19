@@ -57,6 +57,12 @@ REQUIRED_ERROR_CODES: tuple[str, ...] = (
     "query_cancelled",
     "audit_unavailable",
     "internal_error",
+    "filter_required",
+    "sort_not_indexed",
+    "offset_too_large",
+    "select_invalid",
+    "cursor_invalid",
+    "engine_starting",
 )
 
 _CATALOGUE_ENTRIES: tuple[ErrorSpec, ...] = (
@@ -171,6 +177,48 @@ _CATALOGUE_ENTRIES: tuple[ErrorSpec, ...] = (
         category="internal_error",
         message="Internal server error",
         next_step="Retry the request or contact support with the audit_id.",
+    ),
+    ErrorSpec(
+        code="filter_required",
+        status=422,
+        category="enforcement_error",
+        message="Query requires a selective sargable filter on an indexed filterable column.",
+        next_step="Add an equality, IN, range, or prefix filter on a filterable column and try again.",
+    ),
+    ErrorSpec(
+        code="sort_not_indexed",
+        status=422,
+        category="enforcement_error",
+        message="ORDER BY references a column that is not in the table's sortable column list.",
+        next_step="Order only by indexed sortable columns or remove the unindexed ORDER BY.",
+    ),
+    ErrorSpec(
+        code="offset_too_large",
+        status=422,
+        category="enforcement_error",
+        message="Query OFFSET exceeds the maximum permitted offset limit.",
+        next_step="Use keyset pagination or reduce OFFSET within the configured max_offset limit.",
+    ),
+    ErrorSpec(
+        code="select_invalid",
+        status=400,
+        category="bad_request",
+        message="The structured select request payload is invalid.",
+        next_step="Check table, columns, where operators, order_by, and parameter types and try again.",
+    ),
+    ErrorSpec(
+        code="cursor_invalid",
+        status=400,
+        category="bad_request",
+        message="The pagination cursor is malformed, tampered, or does not match this query.",
+        next_step="Restart pagination from the first page or supply the unmodified next cursor.",
+    ),
+    ErrorSpec(
+        code="engine_starting",
+        status=503,
+        category="engine_starting",
+        message="The target database endpoint is starting up.",
+        next_step="The database is waking up; retry in a few seconds.",
     ),
     ErrorSpec(
         code="not_found",

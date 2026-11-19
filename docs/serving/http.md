@@ -259,6 +259,12 @@ All error responses have an HTTP status code $\ge 400$ and return a consistent t
 | `query_cancelled` | **499** | `query_cancelled` | Engine query execution cancelled | Re-run the query if the cancellation was unintentional. |
 | `audit_unavailable` | **503** | `audit_unavailable` | Audit logging destination is unavailable; query refused. | Retry later or contact the platform operator to restore the audit sink. |
 | `internal_error` | **500** | `internal_error` | Internal server error | Retry the request or contact support with the audit_id. |
+| `filter_required` | **422** | `enforcement_error` | Query requires a selective sargable filter on an indexed filterable column. | Add an equality, IN, range, or prefix filter on a filterable column and try again. |
+| `sort_not_indexed` | **422** | `enforcement_error` | ORDER BY references a column that is not in the table's sortable column list. | Order only by indexed sortable columns or remove the unindexed ORDER BY. |
+| `offset_too_large` | **422** | `enforcement_error` | Query OFFSET exceeds the maximum permitted offset limit. | Use keyset pagination or reduce OFFSET within the configured max_offset limit. |
+| `select_invalid` | **400** | `bad_request` | The structured select request payload is invalid. | Check table, columns, where operators, order_by, and parameter types and try again. |
+| `cursor_invalid` | **400** | `bad_request` | The pagination cursor is malformed, tampered, or does not match this query. | Restart pagination from the first page or supply the unmodified next cursor. |
+| `engine_starting` | **503** | `engine_starting` | The target database endpoint is starting up. | The database is waking up; retry in a few seconds. |
 | `not_found` | **404** | `not_found` | Query not found | Verify the query_id (jti) and that the query is still running. |
 | `duplicate_query_id` | **409** | `duplicate_query_id` | A query with this audit_id is already running. | Wait for the in-flight query to complete or issue a new grant. |
 

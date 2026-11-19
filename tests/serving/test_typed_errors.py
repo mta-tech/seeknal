@@ -123,7 +123,7 @@ def _assert_typed_error(
 
 
 def test_error_catalogue_contains_all_required_codes_and_is_immutable():
-    assert len(REQUIRED_ERROR_CODES) == 16
+    assert len(REQUIRED_ERROR_CODES) == 22
     for code in REQUIRED_ERROR_CODES:
         assert code in ERROR_CATALOGUE
         spec = ERROR_CATALOGUE[code]
