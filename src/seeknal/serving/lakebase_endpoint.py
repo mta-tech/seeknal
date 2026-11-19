@@ -1,0 +1,1343 @@
+"""Lakebase-specific configuration, storage class rules, role guard, snapshot freshness, and cold-start wake."""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import re
+import threading
+import time
+import urllib.parse
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+import httpx
+
+from seeknal.serving.adapters import EngineError
+from seeknal.serving.errors import register_config_secrets
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "ColdStartConnector",
+    "EngineStartingError",
+    "LakebaseColdStartConfig",
+    "LakebaseEndpointConfig",
+    "LakebaseFreshnessConfig",
+    "check_role_guard",
+    "effective_storage_class",
+    "parse_lakebase_block",
+    "role_guard_sql",
+    "snapshot_freshness",
+    "validate_lakebase_tls",
+]
+
+_PROJECT_ID_RE = re.compile(r"\Aprj_[a-z0-9]{20}\Z")
+_BRANCH_ID_RE = re.compile(r"\Abr_[a-z0-9]{20}\Z")
+_ENDPOINT_ID_RE = re.compile(r"\Aep_[a-z0-9]{20}\Z")
+_ENV_VAR_NAME_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+_QUALIFIED_TABLE_RE = re.compile(
+    r"\A[a-z_][a-z0-9_]{0,62}(?:\.[a-z_][a-z0-9_]{0,62})?\Z"
+)
+_SAFE_LABEL_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,80}\Z")
+
+_DEFAULT_SYNC_STATE_TABLE = "public._lakebase_sync_state"
+_DEFAULT_RETRY_BACKOFF_MS: tuple[int, ...] = (500, 1000, 2000, 4000)
+
+_LITERAL_SECRET_KEYS = frozenset(
+    {
+        "api_token",
+        "token",
+        "auth_token",
+        "bearer_token",
+        "secret",
+        "password",
+        "passwd",
+        "dsn",
+        "api_key",
+        "apikey",
+        "client_secret",
+    }
+)
+
+_ALLOWED_LAKEBASE_KEYS = frozenset(
+    {
+        "project_id",
+        "branch_id",
+        "endpoint_id",
+        "endpoint_type",
+        "cu",
+        "cold_start",
+        "freshness",
+    }
+)
+
+_ALLOWED_COLD_START_KEYS = frozenset(
+    {
+        "connect_timeout_seconds",
+        "wake",
+        "api_url",
+        "api_token_env",
+        "max_query_wait_seconds",
+        "max_wake_seconds",
+        "retry_backoff_ms",
+    }
+)
+
+_ALLOWED_FRESHNESS_KEYS = frozenset(
+    {
+        "sync_state_table",
+        "freshness_sql",
+    }
+)
+
+_TERMINAL_ENDPOINT_ERROR_STATES = frozenset(
+    {
+        "failed",
+        "error",
+        "broken",
+        "deleted",
+    }
+)
+
+_FIXED_LAKEBASE_STORAGE_CLASS_MSG = (
+    "Lakebase storage_class is fixed to 'object_storage' and cannot be set"
+)
+
+_ROLE_GUARD_REFUSED_MSG = (
+    "Role guard refused connection: role has superuser, BYPASSRLS, or neon_superuser privileges"
+)
+
+
+def _safe_label(value: Any, *, fallback: str = "<invalid>") -> str:
+    if isinstance(value, str) and _SAFE_LABEL_RE.match(value):
+        return value
+    return fallback
+
+
+def _safe_unknown_keys(keys: Sequence[Any] | set[Any]) -> list[str]:
+    cleaned: list[str] = []
+    for k in sorted((str(x) for x in keys)):
+        cleaned.append(_safe_label(k, fallback="<redacted_key>"))
+    return cleaned
+
+
+def _validate_positive_finite_float(
+    value: Any,
+    *,
+    field_name: str,
+    error_cls: type[Exception] = ValueError,
+) -> float:
+    if isinstance(value, (bool, str)) or not isinstance(value, (int, float)):
+        raise error_cls(f"'{field_name}' must be a positive finite number")
+    fval = float(value)
+    if not math.isfinite(fval) or fval <= 0.0:
+        raise error_cls(f"'{field_name}' must be a positive finite number")
+    return fval
+
+
+def _validate_api_url(
+    raw_url: Any,
+    *,
+    error_cls: type[Exception] = ValueError,
+) -> str:
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        raise error_cls("'cold_start.api_url' must be a non-empty http:// or https:// URL")
+    clean = raw_url.strip()
+    if any(ch.isspace() or ord(ch) < 0x20 for ch in clean):
+        raise error_cls("'cold_start.api_url' must not contain whitespace or control characters")
+
+    parsed = urllib.parse.urlsplit(clean)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise error_cls("'cold_start.api_url' must start with http:// or https:// and include a host")
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        raise error_cls("'cold_start.api_url' must not contain credentials or userinfo")
+    if parsed.query or parsed.fragment:
+        raise error_cls("'cold_start.api_url' must not contain query parameters or fragments")
+
+    normalized_path = parsed.path.rstrip("/")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+
+
+def _validate_retry_backoff_ms(
+    raw_backoff: Any,
+    *,
+    error_cls: type[Exception] = ValueError,
+) -> tuple[int, ...]:
+    if isinstance(raw_backoff, (str, bytes, bytearray, Mapping)) or not isinstance(
+        raw_backoff, Sequence
+    ):
+        raise error_cls("'cold_start.retry_backoff_ms' must be a non-empty sequence of positive integers")
+    if len(raw_backoff) == 0:
+        raise error_cls("'cold_start.retry_backoff_ms' must not be empty")
+    items: list[int] = []
+    for item in raw_backoff:
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            raise error_cls(
+                "'cold_start.retry_backoff_ms' entries must be positive integers"
+            )
+        items.append(int(item))
+    return tuple(items)
+
+
+class EngineStartingError(EngineError):
+    """Raised when a Lakebase endpoint wake is in flight and the request wait budget expired."""
+
+    code: str = "engine_starting"
+    status_code: int = 503
+    retry_after: int = 3
+
+    def __init__(
+        self,
+        message: str = "The target database endpoint is starting up.",
+        *,
+        retry_after: int = 3,
+        audit_id: str | None = None,
+    ) -> None:
+        if isinstance(retry_after, bool) or not isinstance(retry_after, (int, float)):
+            clean_retry = 3
+        elif not math.isfinite(float(retry_after)):
+            clean_retry = 3
+        else:
+            clean_retry = max(1, int(math.ceil(float(retry_after))))
+        super().__init__(message)
+        self.code = "engine_starting"
+        self.status_code = 503
+        self.status = 503
+        self.retry_after = clean_retry
+        self.audit_id = audit_id
+        self.headers = {"Retry-After": str(clean_retry)}
+
+
+@dataclass(frozen=True)
+class LakebaseColdStartConfig:
+    """Cold-start and control-plane wake configuration for a Lakebase endpoint."""
+
+    connect_timeout_seconds: float = 5.0
+    wake: str = "none"
+    api_url: str | None = None
+    api_token_env: str | None = None
+    max_query_wait_seconds: float = 10.0
+    max_wake_seconds: float = 60.0
+    retry_backoff_ms: tuple[int, ...] = _DEFAULT_RETRY_BACKOFF_MS
+
+    def __post_init__(self) -> None:
+        ct = _validate_positive_finite_float(
+            self.connect_timeout_seconds,
+            field_name="cold_start.connect_timeout_seconds",
+        )
+        object.__setattr__(self, "connect_timeout_seconds", ct)
+
+        if not isinstance(self.wake, str) or self.wake not in ("api", "none"):
+            raise ValueError("'cold_start.wake' must be 'api' or 'none'")
+
+        if self.api_url is not None:
+            norm_url = _validate_api_url(self.api_url)
+            object.__setattr__(self, "api_url", norm_url)
+        elif self.wake == "api":
+            raise ValueError("'cold_start.api_url' is required when cold_start.wake == 'api'")
+
+        if self.api_token_env is not None:
+            if not isinstance(self.api_token_env, str) or not _ENV_VAR_NAME_RE.match(
+                self.api_token_env
+            ):
+                raise ValueError(
+                    "'cold_start.api_token_env' must be a valid environment variable name "
+                    "matching ^[A-Za-z_][A-Za-z0-9_]{0,127}$"
+                )
+        elif self.wake == "api":
+            raise ValueError(
+                "'cold_start.api_token_env' is required when cold_start.wake == 'api'"
+            )
+
+        mqw = _validate_positive_finite_float(
+            self.max_query_wait_seconds,
+            field_name="cold_start.max_query_wait_seconds",
+        )
+        object.__setattr__(self, "max_query_wait_seconds", mqw)
+
+        mws = _validate_positive_finite_float(
+            self.max_wake_seconds,
+            field_name="cold_start.max_wake_seconds",
+        )
+        object.__setattr__(self, "max_wake_seconds", mws)
+
+        backoff = _validate_retry_backoff_ms(self.retry_backoff_ms)
+        object.__setattr__(self, "retry_backoff_ms", backoff)
+
+
+@dataclass(frozen=True)
+class LakebaseFreshnessConfig:
+    """Data-level freshness marker configuration for a Lakebase endpoint."""
+
+    sync_state_table: str | None = _DEFAULT_SYNC_STATE_TABLE
+    freshness_sql: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.sync_state_table is not None:
+            if not isinstance(self.sync_state_table, str) or not _QUALIFIED_TABLE_RE.match(
+                self.sync_state_table
+            ):
+                raise ValueError(
+                    "'freshness.sync_state_table' must match "
+                    "^[a-z_][a-z0-9_]{0,62}(\\.[a-z_][a-z0-9_]{0,62})?$"
+                )
+        if self.freshness_sql is not None:
+            if not isinstance(self.freshness_sql, str) or not self.freshness_sql.strip():
+                raise ValueError(
+                    "'freshness.freshness_sql' must be None or a non-empty SQL string"
+                )
+            object.__setattr__(self, "freshness_sql", self.freshness_sql.strip())
+
+
+@dataclass(frozen=True)
+class LakebaseEndpointConfig:
+    """Validated Atlas Lakebase endpoint metadata, cold-start, and freshness settings."""
+
+    project_id: str
+    branch_id: str
+    endpoint_id: str
+    endpoint_type: str = "read_write"
+    cu: float | None = None
+    cold_start: LakebaseColdStartConfig = field(default_factory=LakebaseColdStartConfig)
+    freshness: LakebaseFreshnessConfig = field(default_factory=LakebaseFreshnessConfig)
+    storage_class: str = "object_storage"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.project_id, str) or not _PROJECT_ID_RE.match(self.project_id):
+            raise ValueError(
+                "'lakebase.project_id' must match ^prj_[a-z0-9]{20}$"
+            )
+        if not isinstance(self.branch_id, str) or not _BRANCH_ID_RE.match(self.branch_id):
+            raise ValueError(
+                "'lakebase.branch_id' must match ^br_[a-z0-9]{20}$"
+            )
+        if not isinstance(self.endpoint_id, str) or not _ENDPOINT_ID_RE.match(self.endpoint_id):
+            raise ValueError(
+                "'lakebase.endpoint_id' must match ^ep_[a-z0-9]{20}$"
+            )
+        if not isinstance(self.endpoint_type, str) or self.endpoint_type not in (
+            "read_only",
+            "read_write",
+        ):
+            raise ValueError(
+                "'lakebase.endpoint_type' must be 'read_only' or 'read_write'"
+            )
+        if self.cu is not None:
+            cu_f = _validate_positive_finite_float(self.cu, field_name="lakebase.cu")
+            object.__setattr__(self, "cu", cu_f)
+        if not isinstance(self.cold_start, LakebaseColdStartConfig):
+            raise ValueError("'lakebase.cold_start' must be a LakebaseColdStartConfig")
+        if not isinstance(self.freshness, LakebaseFreshnessConfig):
+            raise ValueError("'lakebase.freshness' must be a LakebaseFreshnessConfig")
+        if self.storage_class != "object_storage":
+            raise ValueError(_FIXED_LAKEBASE_STORAGE_CLASS_MSG)
+
+    @property
+    def max_connections(self) -> int | None:
+        """Compute max_connections = max(25, round(cu * 100)) when cu is configured."""
+        if self.cu is None:
+            return None
+        return max(25, int(round(self.cu * 100)))
+
+
+def parse_lakebase_block(
+    raw: Mapping[str, Any],
+    *,
+    eng_name: str = "lakebase",
+    error_cls: type[Exception] = ValueError,
+) -> LakebaseEndpointConfig:
+    """Parse and validate a ``lakebase:`` endpoint configuration mapping."""
+    safe_eng = _safe_label(eng_name)
+    if not isinstance(raw, Mapping):
+        raise error_cls(f"Lakebase endpoint block for '{safe_eng}' must be a mapping")
+
+    if "storage_class" in raw:
+        raise error_cls(_FIXED_LAKEBASE_STORAGE_CLASS_MSG)
+
+    for key in raw.keys():
+        if isinstance(key, str) and key.lower() in _LITERAL_SECRET_KEYS:
+            raise error_cls(
+                f"Literal secret key '{_safe_label(key)}' is forbidden in lakebase block for '{safe_eng}'"
+            )
+
+    unknown = set(raw.keys()) - _ALLOWED_LAKEBASE_KEYS
+    if unknown:
+        raise error_cls(
+            f"Unknown key(s) in lakebase block for '{safe_eng}': {_safe_unknown_keys(unknown)}"
+        )
+
+    project_id = raw.get("project_id")
+    if not isinstance(project_id, str) or not _PROJECT_ID_RE.match(project_id):
+        raise error_cls(
+            f"Lakebase connection '{safe_eng}' 'project_id' must match ^prj_[a-z0-9]{{20}}$"
+        )
+
+    branch_id = raw.get("branch_id")
+    if not isinstance(branch_id, str) or not _BRANCH_ID_RE.match(branch_id):
+        raise error_cls(
+            f"Lakebase connection '{safe_eng}' 'branch_id' must match ^br_[a-z0-9]{{20}}$"
+        )
+
+    endpoint_id = raw.get("endpoint_id")
+    if not isinstance(endpoint_id, str) or not _ENDPOINT_ID_RE.match(endpoint_id):
+        raise error_cls(
+            f"Lakebase connection '{safe_eng}' 'endpoint_id' must match ^ep_[a-z0-9]{{20}}$"
+        )
+
+    endpoint_type = raw["endpoint_type"] if "endpoint_type" in raw else "read_write"
+    if not isinstance(endpoint_type, str) or endpoint_type not in (
+        "read_only",
+        "read_write",
+    ):
+        raise error_cls(
+            f"Lakebase connection '{safe_eng}' 'endpoint_type' must be 'read_only' or 'read_write'"
+        )
+
+    cu_raw = raw.get("cu")
+    cu_val: float | None = None
+    if cu_raw is not None:
+        cu_val = _validate_positive_finite_float(
+            cu_raw, field_name="lakebase.cu", error_cls=error_cls
+        )
+
+    # Parse cold_start sub-block
+    cold_start_raw = raw.get("cold_start")
+    if cold_start_raw is None:
+        cold_start_cfg = LakebaseColdStartConfig()
+    else:
+        if not isinstance(cold_start_raw, Mapping):
+            raise error_cls(
+                f"Lakebase connection '{safe_eng}' 'cold_start' must be a mapping"
+            )
+        for key in cold_start_raw.keys():
+            if isinstance(key, str) and key.lower() in _LITERAL_SECRET_KEYS:
+                raise error_cls(
+                    f"Literal secret key '{_safe_label(key)}' is forbidden in "
+                    f"lakebase.cold_start for '{safe_eng}'; use 'api_token_env'"
+                )
+        unknown_cs = set(cold_start_raw.keys()) - _ALLOWED_COLD_START_KEYS
+        if unknown_cs:
+            raise error_cls(
+                f"Unknown key(s) in lakebase.cold_start for '{safe_eng}': "
+                f"{_safe_unknown_keys(unknown_cs)}"
+            )
+
+        ct_sec = _validate_positive_finite_float(
+            cold_start_raw.get("connect_timeout_seconds", 5.0),
+            field_name="cold_start.connect_timeout_seconds",
+            error_cls=error_cls,
+        )
+        wake_val = cold_start_raw["wake"] if "wake" in cold_start_raw else "api"
+        if not isinstance(wake_val, str) or wake_val not in ("api", "none"):
+            raise error_cls(
+                f"Lakebase connection '{safe_eng}' 'cold_start.wake' must be 'api' or 'none'"
+            )
+
+        raw_api_url = cold_start_raw.get("api_url")
+        if raw_api_url is not None:
+            api_url = _validate_api_url(raw_api_url, error_cls=error_cls)
+        elif wake_val == "api":
+            raise error_cls(
+                f"Lakebase connection '{safe_eng}' requires 'cold_start.api_url' when wake == 'api'"
+            )
+        else:
+            api_url = None
+
+        raw_token_env = cold_start_raw.get("api_token_env")
+        if raw_token_env is not None:
+            if not isinstance(raw_token_env, str) or not _ENV_VAR_NAME_RE.match(
+                raw_token_env
+            ):
+                raise error_cls(
+                    f"Lakebase connection '{safe_eng}' 'cold_start.api_token_env' must match "
+                    "^[A-Za-z_][A-Za-z0-9_]{0,127}$"
+                )
+            api_token_env = raw_token_env
+        elif wake_val == "api":
+            raise error_cls(
+                f"Lakebase connection '{safe_eng}' requires 'cold_start.api_token_env' when wake == 'api'"
+            )
+        else:
+            api_token_env = None
+
+        max_qw = _validate_positive_finite_float(
+            cold_start_raw.get("max_query_wait_seconds", 10.0),
+            field_name="cold_start.max_query_wait_seconds",
+            error_cls=error_cls,
+        )
+        max_wake = _validate_positive_finite_float(
+            cold_start_raw.get("max_wake_seconds", 60.0),
+            field_name="cold_start.max_wake_seconds",
+            error_cls=error_cls,
+        )
+        backoff_ms = _validate_retry_backoff_ms(
+            cold_start_raw.get("retry_backoff_ms", _DEFAULT_RETRY_BACKOFF_MS),
+            error_cls=error_cls,
+        )
+
+        cold_start_cfg = LakebaseColdStartConfig(
+            connect_timeout_seconds=ct_sec,
+            wake=wake_val,
+            api_url=api_url,
+            api_token_env=api_token_env,
+            max_query_wait_seconds=max_qw,
+            max_wake_seconds=max_wake,
+            retry_backoff_ms=backoff_ms,
+        )
+
+    # Parse freshness sub-block
+    freshness_raw = raw.get("freshness")
+    if freshness_raw is None:
+        freshness_cfg = LakebaseFreshnessConfig()
+    else:
+        if not isinstance(freshness_raw, Mapping):
+            raise error_cls(
+                f"Lakebase connection '{safe_eng}' 'freshness' must be a mapping"
+            )
+        unknown_fr = set(freshness_raw.keys()) - _ALLOWED_FRESHNESS_KEYS
+        if unknown_fr:
+            raise error_cls(
+                f"Unknown key(s) in lakebase.freshness for '{safe_eng}': "
+                f"{_safe_unknown_keys(unknown_fr)}"
+            )
+
+        sync_table = (
+            freshness_raw["sync_state_table"]
+            if "sync_state_table" in freshness_raw
+            else _DEFAULT_SYNC_STATE_TABLE
+        )
+        if sync_table is not None:
+            if not isinstance(sync_table, str) or not _QUALIFIED_TABLE_RE.match(sync_table):
+                raise error_cls(
+                    f"Lakebase connection '{safe_eng}' 'freshness.sync_state_table' must match "
+                    "^[a-z_][a-z0-9_]{0,62}(\\.[a-z_][a-z0-9_]{0,62})?$"
+                )
+
+        raw_fsql = freshness_raw.get("freshness_sql")
+        if raw_fsql is not None:
+            if not isinstance(raw_fsql, str) or not raw_fsql.strip():
+                raise error_cls(
+                    f"Lakebase connection '{safe_eng}' 'freshness.freshness_sql' must be "
+                    "None or a non-empty SQL string"
+                )
+            freshness_sql: str | None = raw_fsql.strip()
+        else:
+            freshness_sql = None
+
+        freshness_cfg = LakebaseFreshnessConfig(
+            sync_state_table=sync_table,
+            freshness_sql=freshness_sql,
+        )
+
+    return LakebaseEndpointConfig(
+        project_id=project_id,
+        branch_id=branch_id,
+        endpoint_id=endpoint_id,
+        endpoint_type=endpoint_type,
+        cu=cu_val,
+        cold_start=cold_start_cfg,
+        freshness=freshness_cfg,
+    )
+
+
+def validate_lakebase_tls(
+    tls_cfg: Any,
+    *,
+    eng_name: str = "lakebase",
+    error_cls: type[Exception] = ValueError,
+) -> None:
+    """Verify that Lakebase TLS uses ``sslmode='verify-full'`` with a non-empty CA path."""
+    safe_eng = _safe_label(eng_name)
+    if tls_cfg is None:
+        raise error_cls(
+            f"Lakebase connection '{safe_eng}' requires a 'tls' block with "
+            "sslmode='verify-full' and 'sslrootcert_file'"
+        )
+
+    if isinstance(tls_cfg, Mapping):
+        for key in tls_cfg.keys():
+            if isinstance(key, str) and key.lower() in _LITERAL_SECRET_KEYS:
+                raise error_cls(
+                    f"Literal secret key '{_safe_label(key)}' is forbidden in tls config for '{safe_eng}'"
+                )
+        sslmode = tls_cfg.get("sslmode")
+        sslrootcert_file = tls_cfg.get("sslrootcert_file")
+    elif hasattr(tls_cfg, "sslmode") or hasattr(tls_cfg, "sslrootcert_file"):
+        sslmode = getattr(tls_cfg, "sslmode", None)
+        sslrootcert_file = getattr(tls_cfg, "sslrootcert_file", None)
+    else:
+        raise error_cls(
+            f"Lakebase connection '{safe_eng}' 'tls' configuration must be a mapping or TLS config object"
+        )
+
+    if not isinstance(sslmode, str) or sslmode != "verify-full":
+        raise error_cls(
+            f"Lakebase connection '{safe_eng}' requires tls.sslmode == 'verify-full'"
+        )
+
+    if not isinstance(sslrootcert_file, str) or not sslrootcert_file.strip():
+        raise error_cls(
+            f"Lakebase connection '{safe_eng}' requires a non-empty tls.sslrootcert_file"
+        )
+
+
+def _validate_declared_storage_class(declared: Any, *, kind: str) -> str:
+    if not isinstance(declared, str) or declared not in ("local", "object_storage"):
+        raise ValueError(
+            f"Invalid storage_class '{_safe_label(declared)}' for '{_safe_label(kind)}'; "
+            "expected 'local' or 'object_storage'"
+        )
+    return declared
+
+
+def effective_storage_class(conn_cfg: Any) -> str:
+    """Return effective storage class ('local' | 'object_storage' | 'unknown') for a connection."""
+    if isinstance(conn_cfg, LakebaseEndpointConfig):
+        return "object_storage"
+
+    if isinstance(conn_cfg, Mapping):
+        kind = conn_cfg.get("kind")
+        has_storage_key = "storage_class" in conn_cfg and conn_cfg["storage_class"] is not None
+        declared = conn_cfg.get("storage_class")
+        lb_block = conn_cfg.get("lakebase")
+        profile = conn_cfg.get("profile")
+    else:
+        kind = getattr(conn_cfg, "kind", None)
+        lb_block = getattr(conn_cfg, "lakebase", None)
+        profile = getattr(conn_cfg, "profile", None)
+        cls_attr = getattr(type(conn_cfg), "storage_class", None)
+        if isinstance(cls_attr, property):
+            declared = None
+            has_storage_key = False
+        else:
+            declared = getattr(conn_cfg, "storage_class", None)
+            has_storage_key = declared is not None
+
+    if not isinstance(kind, str) or not kind.strip():
+        raise ValueError("Connection configuration missing valid 'kind'")
+    kind_norm = kind.strip()
+
+    if kind_norm == "postgres":
+        if declared is None:
+            return "local"
+        return _validate_declared_storage_class(declared, kind=kind_norm)
+
+    if kind_norm == "lakebase":
+        if lb_block is not None:
+            if has_storage_key or (
+                isinstance(lb_block, Mapping) and "storage_class" in lb_block
+            ):
+                raise ValueError(_FIXED_LAKEBASE_STORAGE_CLASS_MSG)
+            return "object_storage"
+        if declared is None:
+            return "unknown"
+        return _validate_declared_storage_class(declared, kind=kind_norm)
+
+    if kind_norm == "duckdb":
+        eff_profile = "local_file" if profile is None else profile
+        if not isinstance(eff_profile, str):
+            raise ValueError("DuckDB connection 'profile' must be a string")
+        if eff_profile == "iceberg_direct":
+            if declared is None or declared == "object_storage":
+                return "object_storage"
+            raise ValueError(
+                "DuckDB profile 'iceberg_direct' storage_class is fixed to 'object_storage'"
+            )
+        if eff_profile == "local_file":
+            if declared is None:
+                return "local"
+            return _validate_declared_storage_class(declared, kind=kind_norm)
+        raise ValueError(f"Unsupported DuckDB profile '{_safe_label(eff_profile)}'")
+
+    if kind_norm in ("starrocks", "cube"):
+        if declared is None:
+            return "object_storage"
+        return _validate_declared_storage_class(declared, kind=kind_norm)
+
+    raise ValueError(f"Unsupported connection kind '{_safe_label(kind_norm)}'")
+
+
+def role_guard_sql(kind: str) -> str:
+    """Return the startup/pool role-guard verification SQL for ``kind``."""
+    if not isinstance(kind, str):
+        raise ValueError("kind must be 'lakebase' or 'postgres'")
+    kind_norm = kind.strip()
+    if kind_norm == "lakebase":
+        return (
+            "SELECT r.rolsuper, r.rolbypassrls, "
+            "CASE WHEN EXISTS ("
+            "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'neon_superuser'"
+            ") THEN pg_has_role(current_user, 'neon_superuser', 'MEMBER') "
+            "ELSE FALSE END AS is_neon_superuser "
+            "FROM pg_catalog.pg_roles AS r "
+            "WHERE r.rolname = current_user"
+        )
+    if kind_norm == "postgres":
+        return (
+            "SELECT r.rolsuper, r.rolbypassrls "
+            "FROM pg_catalog.pg_roles AS r "
+            "WHERE r.rolname = current_user"
+        )
+    raise ValueError(
+        f"Unsupported connection kind '{_safe_label(kind_norm)}' for role_guard_sql; "
+        "expected 'lakebase' or 'postgres'"
+    )
+
+
+def _safe_close_conn(conn: Any) -> None:
+    try:
+        close_fn = getattr(conn, "close", None)
+        if callable(close_fn):
+            close_fn()
+    except Exception:
+        pass
+
+
+def check_role_guard(conn: Any, kind: str) -> None:
+    """Execute role guard query on ``conn`` and fail closed if privileged flags are set."""
+    sql = role_guard_sql(kind)
+    kind_norm = kind.strip()
+    row: Any = None
+    cursor: Any = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        row = cursor.fetchone()
+    except Exception as exc:
+        _safe_close_conn(conn)
+        raise EngineError("Role guard check failed") from exc
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+    if row is None or len(row) < 2:
+        _safe_close_conn(conn)
+        raise EngineError("Role guard check returned no role metadata for current_user")
+
+    has_rolsuper = bool(row[0])
+    has_bypassrls = bool(row[1])
+    has_neon_superuser = bool(row[2]) if (kind_norm == "lakebase" and len(row) > 2) else False
+
+    if has_rolsuper or has_bypassrls or has_neon_superuser:
+        _safe_close_conn(conn)
+        raise EngineError(_ROLE_GUARD_REFUSED_MSG)
+
+
+def _resolve_endpoint_type(cfg: Any) -> str | None:
+    if cfg is None:
+        return None
+    if isinstance(cfg, LakebaseEndpointConfig):
+        return cfg.endpoint_type
+    if isinstance(cfg, Mapping):
+        lb_sub = cfg.get("lakebase")
+        if lb_sub is not None:
+            resolved = _resolve_endpoint_type(lb_sub)
+            if resolved is not None:
+                return resolved
+        ep_type = cfg.get("endpoint_type")
+        return ep_type if isinstance(ep_type, str) else None
+
+    lb_attr = getattr(cfg, "lakebase", None)
+    if lb_attr is not None:
+        resolved = _resolve_endpoint_type(lb_attr)
+        if resolved is not None:
+            return resolved
+    ep_type = getattr(cfg, "endpoint_type", None)
+    return ep_type if isinstance(ep_type, str) else None
+
+
+def _coerce_utc_datetime(val: datetime | float | int | None) -> datetime:
+    if val is None:
+        return datetime.now(timezone.utc)
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=timezone.utc)
+        return val.astimezone(timezone.utc)
+    if not isinstance(val, bool) and isinstance(val, (int, float)):
+        fval = float(val)
+        if not math.isfinite(fval):
+            raise ValueError("'now' timestamp must be finite")
+        return datetime.fromtimestamp(fval, tz=timezone.utc)
+    raise TypeError(f"Unsupported 'now' value of type {type(val).__name__}")
+
+
+def snapshot_freshness(
+    conn: Any,
+    cfg: Any,
+    *,
+    now: datetime | float | None = None,
+) -> float | None:
+    """Measure frozen-snapshot age in seconds for a ``read_only`` Lakebase endpoint."""
+    if _resolve_endpoint_type(cfg) != "read_only":
+        return None
+
+    now_utc = _coerce_utc_datetime(now)
+    cursor: Any = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT pg_catalog.pg_postmaster_start_time()")
+        row = cursor.fetchone()
+    except Exception as exc:
+        raise EngineError("Failed to query postmaster start time") from exc
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+    if row is None or len(row) == 0 or row[0] is None:
+        raise EngineError("Postmaster start time query returned empty result")
+
+    raw_ts = row[0]
+    if isinstance(raw_ts, datetime):
+        start_utc = (
+            raw_ts.replace(tzinfo=timezone.utc)
+            if raw_ts.tzinfo is None
+            else raw_ts.astimezone(timezone.utc)
+        )
+    elif isinstance(raw_ts, str):
+        try:
+            parsed = datetime.fromisoformat(raw_ts)
+        except ValueError as exc:
+            raise EngineError("Invalid postmaster start timestamp format") from exc
+        start_utc = (
+            parsed.replace(tzinfo=timezone.utc)
+            if parsed.tzinfo is None
+            else parsed.astimezone(timezone.utc)
+        )
+    else:
+        raise EngineError("Unsupported postmaster start timestamp type")
+
+    return max(0.0, float((now_utc - start_utc).total_seconds()))
+
+
+def _extract_endpoint_and_cold_start(
+    cfg: Any,
+) -> tuple[str | None, str | None, LakebaseColdStartConfig]:
+    """Extract (project_id, endpoint_id, LakebaseColdStartConfig) from supported cfg shapes."""
+    if isinstance(cfg, LakebaseEndpointConfig):
+        return cfg.project_id, cfg.endpoint_id, cfg.cold_start
+    if isinstance(cfg, LakebaseColdStartConfig):
+        return None, None, cfg
+    if isinstance(cfg, Mapping):
+        if "lakebase" in cfg and cfg["lakebase"] is not None:
+            lb_val = cfg["lakebase"]
+            if isinstance(lb_val, Mapping):
+                parsed = parse_lakebase_block(lb_val)
+                return parsed.project_id, parsed.endpoint_id, parsed.cold_start
+            return _extract_endpoint_and_cold_start(lb_val)
+        if "project_id" in cfg or "endpoint_id" in cfg:
+            parsed = parse_lakebase_block(cfg)
+            return parsed.project_id, parsed.endpoint_id, parsed.cold_start
+
+    lb_attr = getattr(cfg, "lakebase", None)
+    if lb_attr is not None:
+        return _extract_endpoint_and_cold_start(lb_attr)
+
+    cs_attr = getattr(cfg, "cold_start", None)
+    proj_id = getattr(cfg, "project_id", None)
+    ep_id = getattr(cfg, "endpoint_id", None)
+    if isinstance(cs_attr, LakebaseColdStartConfig):
+        return proj_id, ep_id, cs_attr
+
+    raise ValueError(
+        "ColdStartConnector requires a LakebaseEndpointConfig, LakebaseColdStartConfig, "
+        "or connection config with a lakebase block"
+    )
+
+
+def _extract_endpoint_state(payload: Any) -> str | None:
+    if not isinstance(payload, Mapping):
+        return None
+    direct = payload.get("state")
+    if isinstance(direct, str) and direct:
+        return direct.lower()
+    nested = payload.get("endpoint")
+    if isinstance(nested, Mapping):
+        nested_state = nested.get("state")
+        if isinstance(nested_state, str) and nested_state:
+            return nested_state.lower()
+    return None
+
+
+class _WakeOperation:
+    """Single-flight state shared by concurrent callers waiting on one endpoint wake."""
+
+    __slots__ = (
+        "active_waiters",
+        "connect_kwargs",
+        "done",
+        "finished_at",
+        "first_conn",
+        "outcome",
+        "started_at",
+        "wake_deadline",
+    )
+
+    def __init__(
+        self,
+        *,
+        started_at: float,
+        wake_deadline: float,
+        connect_kwargs: dict[str, Any],
+    ) -> None:
+        self.started_at = started_at
+        self.wake_deadline = wake_deadline
+        self.connect_kwargs = dict(connect_kwargs)
+        self.active_waiters: int = 0
+        self.done: bool = False
+        self.finished_at: float = float("inf")
+        self.outcome: str = "starting"  # 'ok' | 'error' | 'timeout'
+        self.first_conn: Any = None
+
+
+class ColdStartConnector:
+    """Single-flight control-plane wake and bounded retry connector for Lakebase endpoints."""
+
+    def __init__(
+        self,
+        connect_fn: Callable[..., Any],
+        cfg: Any,
+        metrics: Any = None,
+        http_client: httpx.Client | None = None,
+        *,
+        engine_name: str = "lakebase",
+        api_token: str | None = None,
+        env: Mapping[str, str] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if not callable(connect_fn):
+            raise ValueError("connect_fn must be callable")
+        project_id, endpoint_id, cold_start = _extract_endpoint_and_cold_start(cfg)
+        if cold_start.wake == "api" and (not project_id or not endpoint_id):
+            raise ValueError(
+                "ColdStartConnector with wake == 'api' requires project_id and endpoint_id"
+            )
+
+        self._connect_fn = connect_fn
+        self._project_id = project_id
+        self._endpoint_id = endpoint_id
+        self._cold_start = cold_start
+        self._metrics = metrics
+        self._http_client = http_client
+        self._engine_name = _safe_label(engine_name, fallback="lakebase")
+        self._explicit_api_token = api_token
+        self._env = env
+        self._clock = clock
+        self._sleep_fn = sleep_fn
+        self._uses_real_clock = (clock is time.monotonic) and (sleep_fn is time.sleep)
+
+        if isinstance(api_token, str) and api_token:
+            register_config_secrets(api_token)
+
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._state: str = "ok"
+        self._last_cold_start: bool = False
+        self._active_wake: _WakeOperation | None = None
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    @property
+    def last_cold_start(self) -> bool:
+        with self._lock:
+            return self._last_cold_start
+
+    @property
+    def cold_start_config(self) -> LakebaseColdStartConfig:
+        return self._cold_start
+
+    def _emit_state(self, state: str) -> None:
+        if self._metrics is None:
+            return
+        fn = getattr(self._metrics, "set_lakebase_state", None)
+        if callable(fn):
+            try:
+                fn(self._engine_name, state)
+            except Exception:
+                pass
+
+    def _emit_wake(self, outcome: str) -> None:
+        if self._metrics is None:
+            return
+        fn = getattr(self._metrics, "record_lakebase_wake", None)
+        if callable(fn):
+            try:
+                fn(self._engine_name, outcome)
+            except Exception:
+                pass
+
+    def _emit_connect_retry(self) -> None:
+        if self._metrics is None:
+            return
+        fn = getattr(self._metrics, "record_lakebase_connect_retry", None)
+        if callable(fn):
+            try:
+                fn(self._engine_name)
+            except Exception:
+                pass
+
+    def _emit_cold_start_duration(self, duration_seconds: float) -> None:
+        if self._metrics is None:
+            return
+        fn = getattr(self._metrics, "observe_lakebase_cold_start", None)
+        if callable(fn):
+            try:
+                fn(self._engine_name, max(0.0, float(duration_seconds)))
+            except Exception:
+                pass
+
+    def _resolve_api_token(self) -> str | None:
+        if isinstance(self._explicit_api_token, str) and self._explicit_api_token:
+            register_config_secrets(self._explicit_api_token)
+            return self._explicit_api_token
+        env_name = self._cold_start.api_token_env
+        if not env_name:
+            return None
+        source_env = self._env if self._env is not None else os.environ
+        token = source_env.get(env_name)
+        if isinstance(token, str) and token:
+            register_config_secrets(token)
+            return token
+        return None
+
+    def _wake_sleep(self, seconds: float, wake_deadline: float) -> bool:
+        """Sleep up to ``seconds`` bounded by ``wake_deadline`` and wake condition waiters."""
+        now = self._clock()
+        remaining = wake_deadline - now
+        if remaining <= 0.0:
+            return False
+        delay = min(max(0.0, seconds), remaining)
+        if delay > 0.0:
+            self._sleep_fn(delay)
+        with self._cond:
+            self._cond.notify_all()
+        return self._clock() < wake_deadline
+
+    def _backoff_seconds(self, attempt_idx: int) -> float:
+        seq = self._cold_start.retry_backoff_ms
+        ms = seq[attempt_idx] if attempt_idx < len(seq) else seq[-1]
+        return float(ms) / 1000.0
+
+    def _compute_retry_after(self, op: _WakeOperation) -> int:
+        rem = op.wake_deadline - self._clock()
+        if not math.isfinite(rem) or rem <= 0.0:
+            return 1
+        return max(1, min(5, int(math.ceil(rem))))
+
+    def _wake_via_control_plane(self, wake_deadline: float) -> str:
+        """Execute POST .../start and poll GET ... until state == 'running'.
+
+        Returns ``'running'``, ``'error'``, or ``'timeout'``. Never leaks tokens.
+        """
+        token = self._resolve_api_token()
+        api_url = self._cold_start.api_url
+        if not token or not api_url or not self._project_id or not self._endpoint_id:
+            logger.error(
+                "Lakebase wake error engine=%s endpoint=%s reason=missing_wake_credentials",
+                self._engine_name,
+                self._endpoint_id or "-",
+            )
+            return "error"
+
+        base_ep_url = (
+            f"{api_url}/v1/projects/{self._project_id}/endpoints/{self._endpoint_id}"
+        )
+        start_url = f"{base_ep_url}/start"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+
+        own_client: httpx.Client | None = None
+        client = self._http_client
+        if client is None:
+            req_timeout = min(
+                self._cold_start.connect_timeout_seconds,
+                max(0.5, wake_deadline - self._clock()),
+            )
+            own_client = httpx.Client(timeout=req_timeout)
+            client = own_client
+
+        try:
+            try:
+                start_resp = client.post(start_url, headers=headers)
+            except Exception as exc:
+                logger.error(
+                    "Lakebase wake error engine=%s endpoint=%s phase=start error=%s",
+                    self._engine_name,
+                    self._endpoint_id,
+                    type(exc).__name__,
+                )
+                return "error"
+
+            if start_resp.status_code < 200 or start_resp.status_code >= 300:
+                logger.error(
+                    "Lakebase wake error engine=%s endpoint=%s phase=start status=%d",
+                    self._engine_name,
+                    self._endpoint_id,
+                    int(start_resp.status_code),
+                )
+                return "error"
+
+            poll_idx = 0
+            while True:
+                if self._clock() >= wake_deadline:
+                    return "timeout"
+
+                try:
+                    poll_resp = client.get(base_ep_url, headers=headers)
+                except Exception as exc:
+                    logger.error(
+                        "Lakebase wake error engine=%s endpoint=%s phase=poll error=%s",
+                        self._engine_name,
+                        self._endpoint_id,
+                        type(exc).__name__,
+                    )
+                    return "error"
+
+                if poll_resp.status_code < 200 or poll_resp.status_code >= 300:
+                    logger.error(
+                        "Lakebase wake error engine=%s endpoint=%s phase=poll status=%d",
+                        self._engine_name,
+                        self._endpoint_id,
+                        int(poll_resp.status_code),
+                    )
+                    return "error"
+
+                try:
+                    body = poll_resp.json()
+                except Exception:
+                    logger.error(
+                        "Lakebase wake error engine=%s endpoint=%s phase=poll reason=invalid_json",
+                        self._engine_name,
+                        self._endpoint_id,
+                    )
+                    return "error"
+
+                ep_state = _extract_endpoint_state(body)
+                if ep_state == "running":
+                    return "running"
+                if ep_state in _TERMINAL_ENDPOINT_ERROR_STATES or ep_state is None:
+                    logger.error(
+                        "Lakebase wake error engine=%s endpoint=%s phase=poll endpoint_state=%s",
+                        self._engine_name,
+                        self._endpoint_id,
+                        _safe_label(ep_state, fallback="unknown"),
+                    )
+                    return "error"
+
+                if not self._wake_sleep(self._backoff_seconds(poll_idx), wake_deadline):
+                    return "timeout"
+                poll_idx += 1
+        finally:
+            if own_client is not None:
+                try:
+                    own_client.close()
+                except Exception:
+                    pass
+
+    def _run_wake(self, op: _WakeOperation) -> None:
+        """Background single-flight wake worker."""
+        outcome = "timeout"
+        opened_conn: Any = None
+        try:
+            if self._cold_start.wake == "api":
+                api_status = self._wake_via_control_plane(op.wake_deadline)
+                if api_status != "running":
+                    outcome = api_status  # 'error' or 'timeout'
+                    return
+
+            retry_idx = 0
+            while True:
+                if self._clock() >= op.wake_deadline:
+                    outcome = "timeout"
+                    return
+
+                if self._cold_start.wake == "none" or retry_idx > 0:
+                    if retry_idx > 0 or self._cold_start.wake == "none":
+                        if retry_idx == 0 and self._cold_start.wake == "none":
+                            if not self._wake_sleep(
+                                self._backoff_seconds(0), op.wake_deadline
+                            ):
+                                outcome = "timeout"
+                                return
+                        self._emit_connect_retry()
+
+                try:
+                    opened_conn = self._connect_fn(**op.connect_kwargs)
+                    outcome = "ok"
+                    return
+                except Exception:
+                    opened_conn = None
+
+                backoff_idx = retry_idx + 1 if self._cold_start.wake == "none" else retry_idx
+                if not self._wake_sleep(
+                    self._backoff_seconds(backoff_idx), op.wake_deadline
+                ):
+                    outcome = "timeout"
+                    return
+                retry_idx += 1
+        except Exception as exc:
+            logger.error(
+                "Lakebase wake unexpected failure engine=%s error=%s",
+                self._engine_name,
+                type(exc).__name__,
+            )
+            outcome = "error"
+        finally:
+            finish_now = self._clock()
+            elapsed = max(0.0, finish_now - op.started_at)
+            orphan_conn: Any = None
+            with self._cond:
+                op.finished_at = finish_now
+                op.outcome = outcome
+                if outcome == "ok":
+                    self._state = "ok"
+                    self._last_cold_start = True
+                    if op.active_waiters > 0:
+                        op.first_conn = opened_conn
+                    else:
+                        orphan_conn = opened_conn
+                else:
+                    self._state = "unavailable"
+                    orphan_conn = opened_conn
+
+                op.done = True
+                if self._active_wake is op:
+                    self._active_wake = None
+                new_state = self._state
+                self._cond.notify_all()
+
+            if orphan_conn is not None:
+                _safe_close_conn(orphan_conn)
+
+            self._emit_wake(outcome)
+            if outcome == "ok":
+                self._emit_cold_start_duration(elapsed)
+            else:
+                logger.warning(
+                    "Lakebase outage engine=%s endpoint=%s outcome=%s elapsed_s=%.3f",
+                    self._engine_name,
+                    self._endpoint_id or "-",
+                    outcome,
+                    elapsed,
+                )
+            self._emit_state(new_state)
+
+    def _get_or_start_wake(self, connect_kwargs: dict[str, Any]) -> _WakeOperation:
+        started_new = False
+        with self._cond:
+            if self._active_wake is not None and not self._active_wake.done:
+                return self._active_wake
+            now = self._clock()
+            op = _WakeOperation(
+                started_at=now,
+                wake_deadline=now + self._cold_start.max_wake_seconds,
+                connect_kwargs=connect_kwargs,
+            )
+            self._active_wake = op
+            self._state = "starting"
+            started_new = True
+
+        if started_new:
+            self._emit_state("starting")
+            worker = threading.Thread(
+                target=self._run_wake,
+                args=(op,),
+                daemon=True,
+                name=f"lakebase-wake-{self._engine_name}",
+            )
+            worker.start()
+        return op
+
+    def connect(self, deadline: float | None = None, **connect_kwargs: Any) -> Any:
+        """Open a Lakebase connection, coordinating single-flight cold-start wake on failure."""
+        call_start = self._clock()
+        query_budget_deadline = call_start + self._cold_start.max_query_wait_seconds
+        if deadline is not None:
+            wait_deadline = min(query_budget_deadline, float(deadline))
+        else:
+            wait_deadline = query_budget_deadline
+
+        with self._lock:
+            existing_op = (
+                self._active_wake
+                if (self._active_wake is not None and not self._active_wake.done)
+                else None
+            )
+
+        if existing_op is None:
+            try:
+                conn = self._connect_fn(**connect_kwargs)
+            except Exception:
+                op = self._get_or_start_wake(connect_kwargs)
+            else:
+                with self._lock:
+                    self._state = "ok"
+                    self._last_cold_start = False
+                self._emit_state("ok")
+                return conn
+        else:
+            op = existing_op
+
+        claimed_conn: Any = None
+        orphan_conn: Any = None
+        with self._cond:
+            op.active_waiters += 1
+            try:
+                while not op.done:
+                    remaining = wait_deadline - self._clock()
+                    if remaining <= 0.0:
+                        raise EngineStartingError(
+                            retry_after=self._compute_retry_after(op)
+                        )
+                    wait_slice = (
+                        remaining if self._uses_real_clock else min(remaining, 0.002)
+                    )
+                    self._cond.wait(timeout=wait_slice)
+
+                if op.finished_at > wait_deadline:
+                    raise EngineStartingError(
+                        retry_after=self._compute_retry_after(op)
+                    )
+
+                if op.outcome != "ok":
+                    raise EngineError("Engine connection failed")
+
+                if op.first_conn is not None and op.connect_kwargs == connect_kwargs:
+                    claimed_conn = op.first_conn
+                    op.first_conn = None
+            finally:
+                op.active_waiters -= 1
+                if op.done and op.active_waiters == 0 and op.first_conn is not None:
+                    orphan_conn = op.first_conn
+                    op.first_conn = None
+
+        if orphan_conn is not None:
+            _safe_close_conn(orphan_conn)
+
+        if claimed_conn is not None:
+            return claimed_conn
+
+        try:
+            conn = self._connect_fn(**connect_kwargs)
+        except Exception:
+            with self._lock:
+                self._state = "unavailable"
+            self._emit_state("unavailable")
+            raise EngineError("Engine connection failed") from None
+
+        return conn
