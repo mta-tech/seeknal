@@ -1738,4 +1738,38 @@ def test_redaction_precision_preserves_61_0s_with_params_zero_and_redacts_param_
         parent.close()
 
 
+def test_n1_scrubber_linear_time_no_catastrophic_backtracking_and_8kib_cap():
+    # Unclosed single/double quotes with runs of backslashes across all quoted regexes
+    for n in (32, 64, 1000):
+        payload_sq = "x token: '" + ("\\" * n)
+        t0 = time.perf_counter()
+        out_sq = scrub_error_detail(payload_sq, env={})
+        elapsed_sq = time.perf_counter() - t0
+        assert elapsed_sq < 0.05, f"n={n} single-quote took {elapsed_sq:.4f}s"
+        assert out_sq.startswith("x token: '")
+
+        payload_dq = 'x password="' + ("\\" * n)
+        t0 = time.perf_counter()
+        scrub_error_detail(
+            payload_dq,
+            env={"DB_SECRET_CFG": "password='" + ("\\" * n)},
+        )
+        elapsed_dq = time.perf_counter() - t0
+        assert elapsed_dq < 0.05, f"n={n} double-quote/env took {elapsed_dq:.4f}s"
+
+        payload_duck = "CREATE SECRET '" + ("\\" * n)
+        t0 = time.perf_counter()
+        scrub_error_detail(payload_duck, env={})
+        elapsed_duck = time.perf_counter() - t0
+        assert elapsed_duck < 0.05, f"n={n} duckdb secret took {elapsed_duck:.4f}s"
+
+    # 24 KB of '://' must scrub in linear time (< 50 ms)
+    uri_flood = "://" * 8192
+    t0 = time.perf_counter()
+    scrub_error_detail(uri_flood, env={"BROKEN_DSN": uri_flood})
+    elapsed_uri = time.perf_counter() - t0
+    assert elapsed_uri < 0.05, f"24 KB '://' took {elapsed_uri:.4f}s"
+
+
+
 

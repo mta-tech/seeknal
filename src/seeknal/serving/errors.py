@@ -242,13 +242,15 @@ _SECRET_KEY_NAMES: tuple[str, ...] = (
 )
 _SECRET_KEYS_ALT = "|".join(_SECRET_KEY_NAMES)
 _QUOTED_OR_BARE_VAL_PAT = (
-    r"(?:'(?:''|\\.|[^'])*'|\"(?:\"\"|\\.|[^\"])*\"|[^\s,;'\"&+)]+)"
+    r"(?:'(?:''|\\[\s\S]|[^'\\])*'|\"(?:\"\"|\\[\s\S]|[^\"\\])*\"|[^\s,;'\"&+)]+)"
 )
 
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,4}")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*")
-_URI_USERINFO_RE = re.compile(r"://[^@\s]+@")
-_URI_USERINFO_EXTRACT_RE = re.compile(r"://([^@\s]+)@")
+_URI_USERINFO_RE = re.compile(r"://[^@\s/]{0,256}(?:/[^@\s/]{0,256}){0,8}@")
+_URI_USERINFO_EXTRACT_RE = re.compile(
+    r"://([^@\s/]{0,256}(?:/[^@\s/]{0,256}){0,8})@"
+)
 _DSN_KV_EQ_RE = re.compile(
     rf"(?is)(?<![A-Za-z0-9])({_SECRET_KEYS_ALT})\s*=\s*{_QUOTED_OR_BARE_VAL_PAT}"
 )
@@ -256,10 +258,10 @@ _SECRET_COLON_KV_RE = re.compile(
     rf"(?is)(?<![A-Za-z0-9])({_SECRET_KEYS_ALT})(['\"]?)\s*:\s*{_QUOTED_OR_BARE_VAL_PAT}"
 )
 _DSN_KV_EXTRACT_RE = re.compile(
-    rf"(?is)(?<![A-Za-z0-9])(?:{_SECRET_KEYS_ALT})\s*=\s*(?:'((?:''|\\.|[^'])*)'|\"((?:\"\"|\\.|[^\"])*)\"|([^\s,;'\"&+)]+))"
+    rf"(?is)(?<![A-Za-z0-9])(?:{_SECRET_KEYS_ALT})\s*=\s*(?:'((?:''|\\[\s\S]|[^'\\])*)'|\"((?:\"\"|\\[\s\S]|[^\"\\])*)\"|([^\s,;'\"&+)]+))"
 )
 _DUCKDB_SECRET_RE = re.compile(
-    r"(?is)(?<![A-Za-z0-9])SECRET\s+'(?:''|\\.|[^'])*'"
+    r"(?is)(?<![A-Za-z0-9])SECRET\s+'(?:''|\\[\s\S]|[^'\\])*'"
 )
 _SQL_SINGLE_QUOTED_RE = re.compile(r"'((?:''|[^'])*)'")
 _PURELY_NUMERIC_RE = re.compile(
@@ -272,6 +274,7 @@ _CANARY_SENTINEL_RE = re.compile(
     r"(?i)\b[A-Za-z0-9_.-]*(?:canary|sentinel)[A-Za-z0-9_.-]*\b"
 )
 _LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+_MAX_RAW_SCRUB_INPUT_CHARS = 8192
 _MAX_SCRUBBED_DETAIL_CHARS = 2048
 
 _CONFIG_SECRETS_LOCK = threading.Lock()
@@ -383,6 +386,7 @@ def _add_quote_escaped_forms(secret: str, candidates: set[str]) -> None:
 
 def _expand_secret_value(val: str, candidates: set[str]) -> None:
     _add_quote_escaped_forms(val, candidates)
+    val = val[:_MAX_RAW_SCRUB_INPUT_CHARS]
     for uri_m in _URI_USERINFO_EXTRACT_RE.finditer(val):
         userinfo = uri_m.group(1)
         if ":" in userinfo:
@@ -452,6 +456,8 @@ def scrub_error_detail(
         stripped_tok = token.strip()
         if stripped_tok and stripped_tok != token:
             detail = detail.replace(stripped_tok, "[REDACTED]")
+
+    detail = detail[:_MAX_RAW_SCRUB_INPUT_CHARS]
 
     detail = _JWT_RE.sub("[REDACTED_JWT]", detail)
     detail = _BEARER_RE.sub("Bearer [REDACTED]", detail)
