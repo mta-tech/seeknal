@@ -21,6 +21,13 @@ from pathlib import Path
 
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 SAFE_EXT_NAME_RE = re.compile(r"^[a-z0-9_]+$")
+BUILD_BACKEND_PACKAGES: tuple[str, ...] = (
+    "hatchling",
+    "packaging",
+    "pathspec",
+    "pluggy",
+    "trove-classifiers",
+)
 
 
 class PrefetchError(RuntimeError):
@@ -358,15 +365,44 @@ def _wheel_matches_linux_cp311(filename: str, platforms: set[str]) -> bool:
     return want_amd64 or want_arm64
 
 
-def select_serving_wheels(
-    uv_lock_path: str | Path,
-    *,
-    platforms: Iterable[str] = ("linux_amd64", "linux_arm64"),
-) -> list[WheelArtifact]:
-    """Select all locked wheels required for the serving group on CPython 3.11 Linux."""
-    norm_platforms = {detect_duckdb_platform(p) for p in platforms}
-    _, _, raw_packages = parse_uv_lock_artifacts(uv_lock_path)
+def _resolve_build_backend_closure(raw_packages: Mapping[str, dict]) -> list[str]:
+    """Resolve locked build-backend package closure from uv.lock for --no-build-isolation."""
+    closure: set[str] = set()
+    queue: list[str] = []
+    for pkg_name in BUILD_BACKEND_PACKAGES:
+        norm = normalize_pep503(pkg_name)
+        if norm not in raw_packages:
+            raise PrefetchError(
+                f"Locked build backend package {norm!r} missing from uv.lock"
+            )
+        if norm not in closure:
+            closure.add(norm)
+            queue.append(norm)
 
+    while queue:
+        current = queue.pop(0)
+        pkg = raw_packages.get(current)
+        if pkg is None:
+            raise PrefetchError(
+                f"Build backend dependency {current!r} referenced in closure missing from uv.lock"
+            )
+        for dep in pkg.get("dependencies", []):
+            if not _is_linux_compatible_marker(dep.get("marker")):
+                continue
+            dep_name = normalize_pep503(dep["name"])
+            if dep_name not in closure:
+                closure.add(dep_name)
+                queue.append(dep_name)
+
+    return sorted(closure)
+
+
+def _resolve_serving_closure(
+    raw_packages: Mapping[str, dict],
+    *,
+    include_build_backend: bool = False,
+) -> list[str]:
+    """Resolve Linux-compatible serving (and optional build-backend) package closure from uv.lock."""
     root_pkg = raw_packages.get("seeknal")
     if root_pkg is None:
         raise PrefetchError("Root package 'seeknal' not found in uv.lock")
@@ -387,11 +423,19 @@ def select_serving_wheels(
                 closure.add(dep_name)
                 queue.append(dep_name)
 
+    if include_build_backend:
+        for backend_pkg in _resolve_build_backend_closure(raw_packages):
+            if backend_pkg not in closure:
+                closure.add(backend_pkg)
+                queue.append(backend_pkg)
+
     while queue:
         current = queue.pop(0)
         pkg = raw_packages.get(current)
         if pkg is None:
-            raise PrefetchError(f"Package {current!r} referenced in closure missing from uv.lock")
+            raise PrefetchError(
+                f"Package {current!r} referenced in closure missing from uv.lock"
+            )
         for dep in pkg.get("dependencies", []):
             if not _is_linux_compatible_marker(dep.get("marker")):
                 continue
@@ -400,8 +444,24 @@ def select_serving_wheels(
                 closure.add(dep_name)
                 queue.append(dep_name)
 
+    return sorted(closure)
+
+
+def select_serving_wheels(
+    uv_lock_path: str | Path,
+    *,
+    platforms: Iterable[str] = ("linux_amd64", "linux_arm64"),
+    include_build_backend: bool = False,
+) -> list[WheelArtifact]:
+    """Select locked wheels required for the serving group (and optional build backend) on CPython 3.11 Linux."""
+    norm_platforms = {detect_duckdb_platform(p) for p in platforms}
+    _, _, raw_packages = parse_uv_lock_artifacts(uv_lock_path)
+    closure = _resolve_serving_closure(
+        raw_packages, include_build_backend=include_build_backend
+    )
+
     selected: list[WheelArtifact] = []
-    for pkg_name in sorted(closure):
+    for pkg_name in closure:
         pkg = raw_packages[pkg_name]
         version = str(pkg["version"])
         pkg_wheels: list[WheelArtifact] = []
@@ -429,6 +489,191 @@ def select_serving_wheels(
         selected.extend(pkg_wheels)
 
     return selected
+
+
+def _package_locked_digests(pkg: Mapping[str, object], pkg_name: str) -> list[str]:
+    """Extract all validated SHA-256 digests recorded in uv.lock for a package."""
+    digests: list[str] = []
+    seen: set[str] = set()
+    items = list(pkg.get("wheels", []))  # type: ignore[arg-type]
+    sdist = pkg.get("sdist")
+    if isinstance(sdist, dict) and "hash" in sdist:
+        items.append(sdist)
+    for item in items:
+        if not isinstance(item, dict) or "hash" not in item:
+            continue
+        sha = _validate_sha256_field(item.get("hash"), f"{pkg_name}.hash")
+        if sha not in seen:
+            seen.add(sha)
+            digests.append(sha)
+    if not digests:
+        raise PrefetchError(f"No distribution hashes recorded in uv.lock for {pkg_name!r}")
+    return digests
+
+
+def parse_hashed_requirements_text(
+    text: str,
+) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """Parse a hash-pinned requirements.txt into normalized_pkg -> (version, sha256_tuple)."""
+    logical_lines: list[str] = []
+    buf = ""
+    for raw_line in text.splitlines():
+        comment_match = re.search(r"(?:^|\s)#", raw_line)
+        line = raw_line[: comment_match.start()] if comment_match else raw_line
+        stripped = line.rstrip()
+        if not stripped.strip():
+            if buf.strip():
+                logical_lines.append(buf.strip())
+                buf = ""
+            continue
+        if stripped.endswith("\\"):
+            buf += " " + stripped[:-1].strip()
+        else:
+            buf += " " + stripped.strip()
+            logical_lines.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        logical_lines.append(buf.strip())
+
+    if not logical_lines:
+        raise PrefetchError("Requirements file contains no package pins")
+
+    parsed: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for entry in logical_lines:
+        if entry.startswith("-"):
+            raise PrefetchError(
+                f"Disallowed pip option in hash-pinned requirements file: {entry!r}"
+            )
+        parts = re.split(r"\s+--hash=", entry)
+        req_spec = parts[0].strip()
+        hash_tokens = parts[1:]
+        if not hash_tokens:
+            raise PrefetchError(
+                f"Requirement entry missing --hash=sha256: pin: {entry!r}"
+            )
+        if "--hash" in req_spec:
+            raise PrefetchError(f"Malformed --hash syntax in requirement entry: {entry!r}")
+
+        spec_no_marker = req_spec.split(";", 1)[0].strip()
+        if "==" not in spec_no_marker:
+            raise PrefetchError(
+                f"Requirement entry must be exact '==' version pinned, got: {req_spec!r}"
+            )
+        raw_name, raw_ver = spec_no_marker.split("==", 1)
+        base_name = raw_name.split("[", 1)[0].strip()
+        version = raw_ver.strip()
+        if not base_name or not version or any(ch.isspace() for ch in version):
+            raise PrefetchError(f"Invalid requirement specifier: {req_spec!r}")
+        norm_name = normalize_pep503(base_name)
+
+        hashes: list[str] = []
+        for tok in hash_tokens:
+            cleaned_tok = tok.strip()
+            if not cleaned_tok.startswith("sha256:"):
+                raise PrefetchError(
+                    f"Requirement {norm_name} must use sha256 hashes, got: {cleaned_tok!r}"
+                )
+            if any(ch.isspace() for ch in cleaned_tok):
+                raise PrefetchError(
+                    f"Unexpected trailing token in requirement entry for {norm_name}: {cleaned_tok!r}"
+                )
+            digest = _validate_sha256_field(cleaned_tok, f"{norm_name}.requirements_hash")
+            if digest not in hashes:
+                hashes.append(digest)
+
+        existing = parsed.get(norm_name)
+        if existing is not None:
+            if existing[0] != version:
+                raise PrefetchError(
+                    f"Conflicting versions for {norm_name} in requirements.txt: {existing[0]} vs {version}"
+                )
+            merged = list(existing[1])
+            for h in hashes:
+                if h not in merged:
+                    merged.append(h)
+            parsed[norm_name] = (version, tuple(merged))
+        else:
+            parsed[norm_name] = (version, tuple(hashes))
+
+    return parsed
+
+
+def _append_locked_build_backend_requirements(
+    requirements_path: Path,
+    uv_lock_path: str | Path,
+) -> None:
+    """Append locked hash-pinned build-backend requirements from uv.lock for offline --no-build-isolation."""
+    existing_text = requirements_path.read_text(encoding="utf-8")
+    parsed = parse_hashed_requirements_text(existing_text)
+    _, _, raw_packages = parse_uv_lock_artifacts(uv_lock_path)
+    backend_pkgs = _resolve_build_backend_closure(raw_packages)
+
+    extra_blocks: list[str] = []
+    for pkg_name in backend_pkgs:
+        if pkg_name in parsed:
+            continue
+        pkg = raw_packages[pkg_name]
+        version = str(pkg["version"])
+        digests = _package_locked_digests(pkg, pkg_name)
+        lines = [f"{pkg_name}=={version} \\"]
+        for idx, digest in enumerate(digests):
+            suffix = " \\" if idx < len(digests) - 1 else ""
+            lines.append(f"    --hash=sha256:{digest}{suffix}")
+        extra_blocks.append("\n".join(lines))
+
+    if extra_blocks:
+        sep = "" if existing_text.endswith("\n") else "\n"
+        updated = (
+            existing_text
+            + sep
+            + "# Locked build backend for offline --no-build-isolation\n"
+            + "\n".join(extra_blocks)
+            + "\n"
+        )
+        requirements_path.write_text(updated, encoding="utf-8")
+
+
+def verify_requirements_file(
+    requirements_path: str | Path,
+    uv_lock_path: str | Path,
+) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """Verify requirements.txt pins and SHA-256 digests against uv.lock, including build backend."""
+    path = Path(requirements_path)
+    if not path.is_file():
+        raise PrefetchError(f"Vendor requirements file missing: {path}")
+
+    parsed = parse_hashed_requirements_text(path.read_text(encoding="utf-8"))
+    versions, _, raw_packages = parse_uv_lock_artifacts(uv_lock_path)
+
+    for pkg_name, (ver, req_hashes) in parsed.items():
+        locked_ver = versions.get(pkg_name)
+        if locked_ver is None:
+            raise PrefetchError(
+                f"Package {pkg_name!r} in {path} is not present in uv.lock"
+            )
+        if ver != locked_ver:
+            raise HashMismatchError(
+                f"Version mismatch for {pkg_name!r} in {path}: "
+                f"requirements has {ver!r}, uv.lock has {locked_ver!r}"
+            )
+        allowed_hashes = set(_package_locked_digests(raw_packages[pkg_name], pkg_name))
+        for digest in req_hashes:
+            if digest not in allowed_hashes:
+                raise HashMismatchError(
+                    f"SHA-256 hash {digest} for {pkg_name}=={ver} in {path} does not match uv.lock"
+                )
+
+    required_closure = _resolve_serving_closure(
+        raw_packages, include_build_backend=True
+    )
+    missing_pkgs = [pkg for pkg in required_closure if pkg not in parsed]
+    if missing_pkgs:
+        raise PrefetchError(
+            f"Vendor requirements file {path} missing required locked package(s): "
+            + ", ".join(missing_pkgs)
+        )
+
+    return parsed
 
 
 def verify_wheel_directory(
@@ -479,11 +724,15 @@ def prefetch_wheels(
     platforms: Iterable[str] = ("linux_amd64", "linux_arm64"),
     fetcher: Callable[[str], bytes] = default_https_fetcher,
     export_runner: Callable[[Path], None] | None = None,
-    build_project_runner: Callable[[Path], None] | None = None,
-    build_project_wheel: bool = True,
 ) -> list[Path]:
-    """Prefetch hash-pinned requirements.txt, serving wheels, and local seeknal wheel."""
+    """Prefetch hash-pinned requirements.txt and serving + build-backend wheels (no prebuilt project wheel)."""
     vendor = Path(vendor_dir)
+    project_dir = vendor / "project"
+    if project_dir.exists():
+        raise PrefetchError(
+            f"Refusing to populate vendor directory containing unchecked project artifacts: {project_dir}"
+        )
+
     wheels_dir = vendor / "wheels"
     wheels_dir.mkdir(parents=True, exist_ok=True)
     requirements_out = vendor / "requirements.txt"
@@ -491,6 +740,7 @@ def prefetch_wheels(
     if export_runner is not None:
         export_runner(requirements_out)
     else:
+        project_root = Path(uv_lock_path).resolve().parent
         proc = subprocess.run(
             [
                 "uv",
@@ -501,6 +751,8 @@ def prefetch_wheels(
                 "--no-emit-project",
                 "--format",
                 "requirements-txt",
+                "--project",
+                str(project_root),
                 "-o",
                 str(requirements_out),
             ],
@@ -518,7 +770,12 @@ def prefetch_wheels(
             f"Exported requirements file {requirements_out} missing required --hash=sha256: pins"
         )
 
-    selected_wheels = select_serving_wheels(uv_lock_path, platforms=platforms)
+    _append_locked_build_backend_requirements(requirements_out, uv_lock_path)
+    verify_requirements_file(requirements_out, uv_lock_path)
+
+    selected_wheels = select_serving_wheels(
+        uv_lock_path, platforms=platforms, include_build_backend=True
+    )
     written: list[Path] = []
     for art in selected_wheels:
         data = fetcher(art.url)
@@ -538,35 +795,6 @@ def prefetch_wheels(
         written.append(dest)
 
     verify_wheel_directory(wheels_dir, uv_lock_path)
-
-    if build_project_wheel:
-        project_out = vendor / "project"
-        project_out.mkdir(parents=True, exist_ok=True)
-        if build_project_runner is not None:
-            build_project_runner(project_out)
-        else:
-            project_root = Path(uv_lock_path).resolve().parent
-            docs_cli = project_root / "docs" / "cli"
-            created_docs_cli = False
-            if not docs_cli.exists():
-                docs_cli.mkdir(parents=True, exist_ok=True)
-                created_docs_cli = True
-            try:
-                proc = subprocess.run(
-                    ["uv", "build", "--wheel", "--out-dir", str(project_out), str(project_root)],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-            finally:
-                if created_docs_cli:
-                    try:
-                        docs_cli.rmdir()
-                    except OSError:
-                        pass
-            if proc.returncode != 0:
-                raise PrefetchError(f"uv build --wheel failed:\n{proc.stderr.strip()}")
-
     return written
 
 
@@ -614,13 +842,15 @@ def verify_vendor_directory(
 ) -> None:
     """Fail-closed verification of a prefetched vendor directory before offline install."""
     vendor = Path(vendor_dir)
-    reqs = vendor / "requirements.txt"
-    if not reqs.is_file() or "--hash=sha256:" not in reqs.read_text(encoding="utf-8"):
+    if (vendor / "project").exists():
         raise PrefetchError(
-            f"Vendor requirements file missing or lacks SHA-256 hashes: {reqs}"
+            f"Unchecked prebuilt project directory is forbidden in vendor bundle: {vendor / 'project'}"
         )
 
-    verify_wheel_directory(vendor / "wheels", uv_lock_path)
+    reqs = vendor / "requirements.txt"
+    parsed_reqs = verify_requirements_file(reqs, uv_lock_path)
+    verified_wheel_paths = verify_wheel_directory(vendor / "wheels", uv_lock_path)
+    present_wheel_names = {p.name for p in verified_wheel_paths}
 
     manifest = load_extensions_manifest(extensions_lock_path)
     target_platforms = (
@@ -628,6 +858,27 @@ def verify_vendor_directory(
         if platform
         else {detect_duckdb_platform()}
     )
+
+    required_wheels = select_serving_wheels(
+        uv_lock_path, platforms=target_platforms, include_build_backend=True
+    )
+    wheels_by_pkg: dict[str, list[WheelArtifact]] = {}
+    for art in required_wheels:
+        wheels_by_pkg.setdefault(art.package_name, []).append(art)
+
+    for pkg_name, candidates in sorted(wheels_by_pkg.items()):
+        on_disk = [art for art in candidates if art.filename in present_wheel_names]
+        if not on_disk:
+            raise PrefetchError(
+                f"Missing required wheel in {vendor / 'wheels'} for {pkg_name} "
+                f"on platform(s) {sorted(target_platforms)}"
+            )
+        req_hashes = set(parsed_reqs[pkg_name][1])
+        if not any(art.sha256 in req_hashes for art in on_disk):
+            raise HashMismatchError(
+                f"Wheel on disk for {pkg_name} does not match any --hash=sha256: pin in {reqs}"
+            )
+
     matching = [e for e in manifest.entries if e.platform in target_platforms]
     if not matching:
         raise PrefetchError(f"No extensions found in manifest for {sorted(target_platforms)}")
@@ -714,18 +965,14 @@ def prefetch_all(
     platforms: Iterable[str] = ("linux_amd64", "linux_arm64"),
     fetcher: Callable[[str], bytes] = default_https_fetcher,
     export_runner: Callable[[Path], None] | None = None,
-    build_project_runner: Callable[[Path], None] | None = None,
-    build_project_wheel: bool = True,
 ) -> tuple[list[Path], list[Path]]:
-    """Prefetch both locked Python wheels and pinned DuckDB extensions."""
+    """Prefetch both locked Python wheels (serving + build backend) and pinned DuckDB extensions."""
     wheels = prefetch_wheels(
         vendor_dir,
         uv_lock_path=uv_lock_path,
         platforms=platforms,
         fetcher=fetcher,
         export_runner=export_runner,
-        build_project_runner=build_project_runner,
-        build_project_wheel=build_project_wheel,
     )
     exts = prefetch_extensions(
         vendor_dir,
@@ -763,11 +1010,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="append",
         dest="platforms",
         help="Target platform(s), e.g. linux_amd64, linux_arm64 (default: both)",
-    )
-    p_prefetch.add_argument(
-        "--no-project-wheel",
-        action="store_true",
-        help="Skip building local seeknal wheel into vendor/project",
     )
 
     p_verify = subparsers.add_parser(
@@ -829,7 +1071,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 uv_lock_path=args.uv_lock,
                 extensions_lock_path=args.extensions_lock,
                 platforms=platforms,
-                build_project_wheel=not args.no_project_wheel,
             )
             print(
                 f"Prefetched {len(wheels)} wheel(s) and {len(exts)} extension(s) into {args.vendor_dir}"

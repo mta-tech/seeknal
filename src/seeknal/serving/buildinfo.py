@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 from collections.abc import Mapping
@@ -98,6 +99,55 @@ def get_build_info(
     }
 
 
+def verify_installed_matches_source(
+    source_dir: str | Path,
+    *,
+    installed_package_dir: str | Path | None = None,
+) -> None:
+    """Ensure the installed seeknal package matches copied source files by SHA-256."""
+    src_root = Path(source_dir)
+    if not src_root.is_dir():
+        raise RuntimeError(
+            f"Source directory not found when verifying installed seeknal code: {src_root}"
+        )
+
+    src_files = sorted(p for p in src_root.rglob("*.py") if p.is_file())
+    if not src_files:
+        raise RuntimeError(
+            f"No Python source files found under {src_root} when verifying installed seeknal code"
+        )
+
+    if installed_package_dir is not None:
+        installed_root = Path(installed_package_dir)
+    else:
+        spec = importlib.util.find_spec("seeknal")
+        if spec is None or not spec.submodule_search_locations:
+            raise RuntimeError(
+                "seeknal package is not installed; refusing to record buildinfo git_sha"
+            )
+        installed_root = Path(next(iter(spec.submodule_search_locations)))
+
+    if not installed_root.is_dir():
+        raise RuntimeError(
+            f"Installed seeknal directory not found: {installed_root}"
+        )
+
+    for src_py in src_files:
+        rel = src_py.relative_to(src_root)
+        inst_py = installed_root / rel
+        if not inst_py.is_file():
+            raise RuntimeError(
+                f"Installed seeknal missing file {rel} present in copied source {src_root}"
+            )
+        src_sha = hashlib.sha256(src_py.read_bytes()).hexdigest()
+        inst_sha = hashlib.sha256(inst_py.read_bytes()).hexdigest()
+        if src_sha != inst_sha:
+            raise RuntimeError(
+                f"Installed seeknal file {inst_py} SHA-256 ({inst_sha}) does not match "
+                f"copied source {src_py} ({src_sha}); refusing to record buildinfo git_sha"
+            )
+
+
 def write_build_info(
     output_path: str | Path = DEFAULT_BUILDINFO_PATH,
     *,
@@ -106,8 +156,15 @@ def write_build_info(
     lock_path: str | Path | None = None,
     version: str | None = None,
     duckdb_version: str | None = None,
+    source_dir: str | Path | None = None,
+    installed_package_dir: str | Path | None = None,
 ) -> dict[str, str]:
     """Write build-time metadata JSON file for inclusion in the Serving container."""
+    if source_dir is not None:
+        verify_installed_matches_source(
+            source_dir, installed_package_dir=installed_package_dir
+        )
+
     resolved_git_sha = (git_sha or "").strip() or "unknown"
     resolved_build_time = (build_time or "").strip() or datetime.now(
         timezone.utc

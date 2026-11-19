@@ -198,3 +198,39 @@ def test_format_build_info():
     line = format_build_info(sample, as_json=False)
     assert "\n" not in line
     assert json.loads(format_build_info(sample, as_json=True)) == sample
+
+
+def test_write_build_info_verifies_source_dir_matches_installed_package(tmp_path):
+    fake_lock = tmp_path / "uv.lock"
+    fake_lock.write_bytes(b"version = 1\n")
+
+    src_pkg = tmp_path / "src" / "seeknal"
+    inst_pkg = tmp_path / "installed" / "seeknal"
+    (src_pkg / "serving").mkdir(parents=True)
+    (inst_pkg / "serving").mkdir(parents=True)
+    (src_pkg / "serving" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+    (inst_pkg / "serving" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+
+    ok_meta = tmp_path / "ok_buildinfo.json"
+    written = write_build_info(
+        ok_meta,
+        git_sha="abcdef0123456789",
+        lock_path=fake_lock,
+        source_dir=src_pkg,
+        installed_package_dir=inst_pkg,
+    )
+    assert written["git_sha"] == "abcdef0123456789"
+    assert ok_meta.is_file()
+
+    # Tamper installed code so it no longer matches copied src -> refuses to write SHA
+    (inst_pkg / "serving" / "mod.py").write_text("X = 2\n", encoding="utf-8")
+    bad_meta = tmp_path / "bad_buildinfo.json"
+    with pytest.raises(RuntimeError, match="does not match copied source"):
+        write_build_info(
+            bad_meta,
+            git_sha="abcdef0123456789",
+            lock_path=fake_lock,
+            source_dir=src_pkg,
+            installed_package_dir=inst_pkg,
+        )
+    assert not bad_meta.exists()

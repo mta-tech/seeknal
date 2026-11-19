@@ -16,6 +16,17 @@
     },
     {
       "platform": "linux_amd64",
+      "name": "avro",
+      "source_url": "https://extensions.duckdb.org/v2.0.0/linux_amd64/avro.duckdb_extension.gz",
+      "sha256": "35447cb42ade2f723f53416ee336dc9ee30ba3584f290e01165398c80f56fd92",
+      "gz_sha256": "35447cb42ade2f723f53416ee336dc9ee30ba3584f290e01165398c80f56fd92",
+      "raw_sha256": "3f37797ca9a4ef3b5a07e65278c653fe0a32f7edea1498c801022fed49afedc7",
+      "decompressed_sha256": "3f37797ca9a4ef3b5a07e65278c653fe0a32f7edea1498c801022fed49afedc7",
+      "gz_bytes": 8625644,
+      "install_relpath": "v2.0.0/linux_amd64/avro.duckdb_extension"
+    },
+    {
+      "platform": "linux_amd64",
       "name": "iceberg",
       "source_url": "https://extensions.duckdb.org/v2.0.0/linux_amd64/iceberg.duckdb_extension.gz",
       "sha256": "ddc8e8f4af60e6e3accffa1b38043c328c810db91215d6299f29cc933655bf1a",
@@ -35,6 +46,17 @@
       "decompressed_sha256": "53f7aea1a0448ea62ef9b63f95da37c5766070084f14f14110e275e76382e7b2",
       "gz_bytes": 8620240,
       "install_relpath": "v2.0.0/linux_arm64/httpfs.duckdb_extension"
+    },
+    {
+      "platform": "linux_arm64",
+      "name": "avro",
+      "source_url": "https://extensions.duckdb.org/v2.0.0/linux_arm64/avro.duckdb_extension.gz",
+      "sha256": "1d240802771737ae14695b9d544ecac170832f38dda9a3edcb674ee1d546c2ca",
+      "gz_sha256": "1d240802771737ae14695b9d544ecac170832f38dda9a3edcb674ee1d546c2ca",
+      "raw_sha256": "3e8a61c8ae51851a8c70c49a5972fd3c3302c3ffa798f3286f7dca0746975607",
+      "decompressed_sha256": "3e8a61c8ae51851a8c70c49a5972fd3c3302c3ffa798f3286f7dca0746975607",
+      "gz_bytes": 7637646,
+      "install_relpath": "v2.0.0/linux_arm64/avro.duckdb_extension"
     },
     {
       "platform": "linux_arm64",

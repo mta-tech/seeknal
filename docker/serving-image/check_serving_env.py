@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import importlib.metadata
 import json
+import os
 import platform as py_platform
 import re
 import subprocess
@@ -51,6 +52,14 @@ FORBIDDEN_PACKAGES: tuple[str, ...] = (
 
 SAFE_EXT_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+EXTENSION_LOAD_PRIORITY: dict[str, int] = {
+    "httpfs": 0,
+    "avro": 1,
+    "iceberg": 3,
+}
+EXTENSION_PREREQUISITES: dict[str, tuple[str, ...]] = {
+    "iceberg": ("avro",),
+}
 _UNSET = object()
 
 
@@ -108,19 +117,19 @@ def _load_locked_versions(uv_lock_path: Path) -> dict[str, str]:
     }
 
 
-def _resolve_accel_expected_duckdb_version() -> str | None:
+def _resolve_accel_expected_duckdb_version() -> str:
     try:
         mod = importlib.import_module("seeknal.serving.accel.settings")
-    except ModuleNotFoundError as exc:
-        if exc.name and exc.name.startswith("seeknal.serving.accel"):
-            return None
-        raise
+    except ImportError as exc:
+        raise EnvCheckError(
+            f"Failed to import seeknal.serving.accel.settings to verify DuckDB version pin: {exc}"
+        ) from exc
     val = getattr(mod, "DEFAULT_EXPECTED_DUCKDB_VERSION", None)
-    if val is None:
+    if not isinstance(val, str) or not val.strip():
         raise EnvCheckError(
             "seeknal.serving.accel.settings is importable but missing DEFAULT_EXPECTED_DUCKDB_VERSION"
         )
-    return str(val)
+    return val.strip()
 
 
 def _compute_sha256(path: Path) -> str:
@@ -145,15 +154,23 @@ def _default_extension_loader(extension_dir: Path, ext_name: str) -> None:
             "SET custom_extension_repository = '/nonexistent_extension_repository'"
         )
         con.execute(f"SET extension_directory = '{escaped_dir}'")
+        prereqs = EXTENSION_PREREQUISITES.get(ext_name, ())
+        for prereq in prereqs:
+            if not SAFE_EXT_NAME_RE.fullmatch(prereq):
+                raise EnvCheckError(
+                    f"Unsafe prerequisite extension identifier: {prereq!r}"
+                )
+            con.execute(f"LOAD {prereq}")
         con.execute(f"LOAD {ext_name}")
-        row = con.execute(
-            "SELECT loaded FROM duckdb_extensions() WHERE extension_name = ?",
-            [ext_name],
-        ).fetchone()
-        if not row or not row[0]:
-            raise EnvCheckError(
-                f"Extension {ext_name!r} did not report loaded=true after LOAD"
-            )
+        for expected_loaded in (*prereqs, ext_name):
+            row = con.execute(
+                "SELECT loaded FROM duckdb_extensions() WHERE extension_name = ?",
+                [expected_loaded],
+            ).fetchone()
+            if not row or not row[0]:
+                raise EnvCheckError(
+                    f"Extension {expected_loaded!r} did not report loaded=true after LOAD"
+                )
     except EnvCheckError:
         raise
     except Exception as exc:
@@ -217,8 +234,9 @@ def check_duckdb_version_pin(
     runtime_duckdb_version: str | None = None,
     expected_duckdb_version: str = EXPECTED_DUCKDB_VERSION,
     accel_expected_duckdb_version: object = _UNSET,
+    locked_duckdb_version: object = _UNSET,
 ) -> None:
-    """Verify duckdb.__version__ equals EXPECTED_DUCKDB_VERSION and accel settings."""
+    """Verify duckdb.__version__, buildinfo, accel settings, and uv.lock all agree."""
     actual = str(
         duckdb.__version__ if runtime_duckdb_version is None else runtime_duckdb_version
     )
@@ -239,6 +257,17 @@ def check_duckdb_version_pin(
             f"EXPECTED_DUCKDB_VERSION={expected_duckdb_version!r} != "
             f"DEFAULT_EXPECTED_DUCKDB_VERSION={accel_ver!r}"
         )
+
+    if locked_duckdb_version is not _UNSET:
+        if not isinstance(locked_duckdb_version, str) or not locked_duckdb_version.strip():
+            raise EnvCheckError("DuckDB version missing from uv.lock")
+        locked_str = locked_duckdb_version.strip()
+        if locked_str != expected_duckdb_version:
+            raise EnvCheckError(
+                "DuckDB version pin disagreement between buildinfo and uv.lock: "
+                f"EXPECTED_DUCKDB_VERSION={expected_duckdb_version!r} != "
+                f"uv.lock duckdb={locked_str!r}"
+            )
 
 
 def check_baked_extensions(
@@ -268,24 +297,60 @@ def check_baked_extensions(
             f"!= EXPECTED_DUCKDB_VERSION={expected_duckdb_version!r}"
         )
 
-    ext_root = Path(extension_directory or manifest.get("extension_directory", ""))
+    env_ext_dir = os.environ.get("SEEKNAL_EXTENSION_DIRECTORY", "").strip()
+    resolved_ext_dir = (
+        extension_directory
+        or env_ext_dir
+        or manifest.get("extension_directory", "")
+    )
+    ext_root = Path(resolved_ext_dir)
     if not str(ext_root).startswith("/"):
         raise EnvCheckError(
             f"Extension directory must be an absolute path, got: {ext_root}"
         )
 
     target_platform = detect_duckdb_platform(platform)
-    entries = [
+    raw_entries = [
         item
         for item in manifest.get("extensions", [])
         if detect_duckdb_platform(str(item.get("platform", ""))) == target_platform
     ]
-    if not entries:
+    if not raw_entries:
         raise EnvCheckError(
             f"No extensions listed in {lock_file} for platform {target_platform!r}"
         )
 
-    verified_paths: list[Path] = []
+    entries = [
+        item
+        for _, item in sorted(
+            enumerate(raw_entries),
+            key=lambda pair: (
+                EXTENSION_LOAD_PRIORITY.get(str(pair[1].get("name", "")).strip(), 2),
+                pair[0],
+            ),
+        )
+    ]
+
+    entry_names = {str(item.get("name", "")).strip() for item in entries}
+    if "avro" not in entry_names:
+        raise EnvCheckError(
+            f"extensions.lock.json is missing required 'avro' extension entry for "
+            f"platform {target_platform!r} (required by DuckDB {manifest_duckdb_ver} 'iceberg' extension)"
+        )
+
+    avro_file = (
+        ext_root
+        / f"v{manifest_duckdb_ver}"
+        / target_platform
+        / "avro.duckdb_extension"
+    )
+    if not avro_file.is_file():
+        raise EnvCheckError(
+            f"Required DuckDB extension avro.duckdb_extension is missing from "
+            f"extension_directory {ext_root} (expected {avro_file})"
+        )
+
+    staged_extensions: list[tuple[str, Path]] = []
     for entry in entries:
         name = str(entry.get("name", "")).strip()
         if not SAFE_EXT_NAME_RE.fullmatch(name):
@@ -314,7 +379,10 @@ def check_baked_extensions(
                 f"SHA-256 mismatch for baked extension {ext_file}: "
                 f"expected {expected_raw}, got {actual_raw}"
             )
+        staged_extensions.append((name, ext_file))
 
+    verified_paths: list[Path] = []
+    for name, ext_file in staged_extensions:
         extension_loader(ext_root, name)
         verified_paths.append(ext_file)
 
@@ -344,12 +412,13 @@ def verify_serving_environment(
         else _default_installed_versions()
     )
 
-    check_packages(installed_versions, locked_versions)
     check_duckdb_version_pin(
         runtime_duckdb_version=runtime_duckdb_version,
         expected_duckdb_version=expected_duckdb_version,
         accel_expected_duckdb_version=accel_expected_duckdb_version,
+        locked_duckdb_version=locked_versions.get("duckdb"),
     )
+    check_packages(installed_versions, locked_versions)
     check_baked_extensions(
         extensions_lock_path,
         extension_directory=extension_directory,

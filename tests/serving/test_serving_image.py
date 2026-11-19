@@ -340,6 +340,16 @@ def test_dockerfile_static_checks():
     assert (
         "uv pip install --system --no-deps ." in content
     ), "Dockerfile must install seeknal with --no-deps"
+    assert (
+        "uv pip install --system --offline --no-index --no-deps --no-build-isolation ."
+        in content
+    ), "Offline Dockerfile path must install seeknal from source with --no-build-isolation"
+    assert (
+        "vendor/project" not in content
+    ), "Dockerfile must not install unchecked prebuilt seeknal wheel from vendor/project"
+    assert (
+        not re.search(r"^\s*#\s*syntax\s*=", content, re.MULTILINE | re.IGNORECASE)
+    ), "Dockerfile must not contain a # syntax= directive"
 
     # 6. No ENV key matches (?i)(secret|token|password|passwd|key)
     env_key_pattern = re.compile(

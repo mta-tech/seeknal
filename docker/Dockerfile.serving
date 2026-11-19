@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # Atlas Runtime Serving release image (atlas-rt-serving).
 #
 # Online lock-only build from repository root:
@@ -39,7 +38,7 @@ COPY src/ ./src/
 
 RUN set -eu; \
     mkdir -p docs/cli /opt/seeknal/duckdb_extensions /etc/seeknal; \
-    if [ "${OFFLINE}" = "1" ] || [ -d "docker/serving-image/vendor/wheels" ]; then \
+    if [ "${OFFLINE}" = "1" ]; then \
         python3 docker/serving-image/prefetch.py verify-vendor \
             --vendor-dir docker/serving-image/vendor \
             --uv-lock uv.lock \
@@ -48,9 +47,7 @@ RUN set -eu; \
         uv pip install --system --offline --no-index --require-hashes \
             --find-links docker/serving-image/vendor/wheels \
             -r docker/serving-image/vendor/requirements.txt; \
-        uv pip install --system --offline --no-index --no-deps \
-            --find-links docker/serving-image/vendor/project \
-            seeknal; \
+        uv pip install --system --offline --no-index --no-deps --no-build-isolation .; \
         python3 docker/serving-image/prefetch.py install-extensions \
             --extensions-lock docker/serving-image/extensions.lock.json \
             --extension-directory /opt/seeknal/duckdb_extensions \
@@ -67,7 +64,7 @@ RUN set -eu; \
             --platform "${TARGETARCH:-}"; \
     fi; \
     SEEKNAL_COMMIT="${SEEKNAL_COMMIT}" BUILD_TIME="${BUILD_TIME}" python3 -c \
-        'import os; from seeknal.serving.buildinfo import write_build_info; write_build_info("/opt/seeknal/buildinfo.json", git_sha=os.environ.get("SEEKNAL_COMMIT", "unknown"), build_time=os.environ.get("BUILD_TIME") or None, lock_path="uv.lock")'; \
+        'import os; from seeknal.serving.buildinfo import write_build_info; write_build_info("/opt/seeknal/buildinfo.json", git_sha=os.environ.get("SEEKNAL_COMMIT", "unknown"), build_time=os.environ.get("BUILD_TIME") or None, lock_path="uv.lock", source_dir="src/seeknal")'; \
     python3 docker/serving-image/check_serving_env.py \
         --uv-lock uv.lock \
         --extensions-lock docker/serving-image/extensions.lock.json \
