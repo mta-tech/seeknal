@@ -1746,22 +1746,24 @@ def test_n1_scrubber_linear_time_no_catastrophic_backtracking_and_8kib_cap():
         out_sq = scrub_error_detail(payload_sq, env={})
         elapsed_sq = time.perf_counter() - t0
         assert elapsed_sq < 0.05, f"n={n} single-quote took {elapsed_sq:.4f}s"
-        assert out_sq.startswith("x token: '")
+        assert out_sq == "x token: [REDACTED]"
 
         payload_dq = 'x password="' + ("\\" * n)
         t0 = time.perf_counter()
-        scrub_error_detail(
+        out_dq = scrub_error_detail(
             payload_dq,
             env={"DB_SECRET_CFG": "password='" + ("\\" * n)},
         )
         elapsed_dq = time.perf_counter() - t0
         assert elapsed_dq < 0.05, f"n={n} double-quote/env took {elapsed_dq:.4f}s"
+        assert out_dq == "x password=[REDACTED]"
 
         payload_duck = "CREATE SECRET '" + ("\\" * n)
         t0 = time.perf_counter()
-        scrub_error_detail(payload_duck, env={})
+        out_duck = scrub_error_detail(payload_duck, env={})
         elapsed_duck = time.perf_counter() - t0
         assert elapsed_duck < 0.05, f"n={n} duckdb secret took {elapsed_duck:.4f}s"
+        assert out_duck == "CREATE SECRET '[REDACTED]'"
 
     # 24 KB of '://' must scrub in linear time (< 50 ms)
     uri_flood = "://" * 8192
@@ -2029,3 +2031,55 @@ def test_integer_bound_params_len_ge_4_redacted_at_word_boundaries():
         scrub_error_detail("Token lifetime of 61.0s", params=[999, -123, True], env={})
         == "Token lifetime of 61.0s"
     )
+
+
+def test_unterminated_quoted_secrets_redacted_up_to_end_of_input():
+    # Unterminated single and double quoted secrets across DuckDB, '=' KV, and ':' KV
+    assert scrub_error_detail("TOKEN 'xyz", env={}) == "TOKEN '[REDACTED]'"
+    assert (
+        scrub_error_detail("SECRET 'unclosed_secret", env={})
+        == "SECRET '[REDACTED]'"
+    )
+    assert (
+        scrub_error_detail('SECRET "unclosed_dq_secret', env={})
+        == "SECRET '[REDACTED]'"
+    )
+    assert (
+        scrub_error_detail("password='unclosed_pw", env={})
+        == "password=[REDACTED]"
+    )
+    assert (
+        scrub_error_detail('token: "unclosed_tok', env={})
+        == "token: [REDACTED]"
+    )
+
+    # Trailing lone backslash at EOF on unterminated quotes
+    assert scrub_error_detail("password='unclosed_bs\\", env={}) == "password=[REDACTED]"
+    assert scrub_error_detail('token: "unclosed_bs\\', env={}) == "token: [REDACTED]"
+    assert scrub_error_detail("TOKEN 'unclosed_bs\\", env={}) == "TOKEN '[REDACTED]'"
+
+    # Terminated quotes still stop at the closing quote and preserve subsequent diagnostics
+    assert (
+        scrub_error_detail("TOKEN 'xyz' next=1", env={})
+        == "TOKEN '[REDACTED]' next=1"
+    )
+    assert (
+        scrub_error_detail('TOKEN "xyz" next=1', env={})
+        == "TOKEN '[REDACTED]' next=1"
+    )
+    assert (
+        scrub_error_detail("password='secret' host=db", env={})
+        == "password=[REDACTED] host=db"
+    )
+    assert (
+        scrub_error_detail('token: "secret" host=db', env={})
+        == "token: [REDACTED] host=db"
+    )
+
+    # Unterminated quote in env KV value is also extracted and scrubbed
+    out_env = scrub_error_detail(
+        "raw leaked unclosed_env_pw_9988 in msg",
+        env={"BROKEN_DB_SECRET": "password='unclosed_env_pw_9988"},
+    )
+    assert out_env == "raw leaked [REDACTED] in msg"
+    assert "unclosed_env_pw_9988" not in out_env

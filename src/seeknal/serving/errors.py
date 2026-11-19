@@ -246,9 +246,11 @@ _SECRET_KEY_NAMES: tuple[str, ...] = (
     "sig",
 )
 _SECRET_KEYS_ALT = "|".join(_SECRET_KEY_NAMES)
+_SINGLE_QUOTED_VAL_PAT = r"'(?:''|\\(?:[\s\S]|$)|[^'\\])*(?:'|$)"
+_DOUBLE_QUOTED_VAL_PAT = r'"(?:""|\\(?:[\s\S]|$)|[^"\\])*(?:"|$)'
 _BARE_VAL_PAT = r"(?:[^\s,;'\"&)]|&(?!\w+=))+"
 _QUOTED_OR_BARE_VAL_PAT = (
-    rf"(?:'(?:''|\\[\s\S]|[^'\\])*'|\"(?:\"\"|\\[\s\S]|[^\"\\])*\"|{_BARE_VAL_PAT})"
+    rf"(?:{_SINGLE_QUOTED_VAL_PAT}|{_DOUBLE_QUOTED_VAL_PAT}|{_BARE_VAL_PAT})"
 )
 
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{1,256}(?:\.[A-Za-z0-9_-]+){2,4}")
@@ -264,10 +266,10 @@ _SECRET_COLON_KV_RE = re.compile(
     rf"(?is)(?<![A-Za-z0-9])({_SECRET_KEYS_ALT})(['\"]?)\s*:\s*{_QUOTED_OR_BARE_VAL_PAT}"
 )
 _DSN_KV_EXTRACT_RE = re.compile(
-    rf"(?is)(?<![A-Za-z0-9])(?:{_SECRET_KEYS_ALT})\s*=\s*(?:'((?:''|\\[\s\S]|[^'\\])*)'|\"((?:\"\"|\\[\s\S]|[^\"\\])*)\"|({_BARE_VAL_PAT}))"
+    rf"(?is)(?<![A-Za-z0-9])(?:{_SECRET_KEYS_ALT})\s*=\s*(?:'((?:''|\\(?:[\s\S]|$)|[^'\\])*)(?:'|$)|\"((?:\"\"|\\(?:[\s\S]|$)|[^\"\\])*)(?:\"|$)|({_BARE_VAL_PAT}))"
 )
 _DUCKDB_SECRET_RE = re.compile(
-    r"(?is)(?<![A-Za-z0-9])(SECRET|KEY_ID|SESSION_TOKEN|TOKEN|ACCOUNT_KEY|CLIENT_SECRET|CONNECTION_STRING)\s+'(?:''|\\[\s\S]|[^'\\])*'"
+    rf"(?is)(?<![A-Za-z0-9])(SECRET|KEY_ID|SESSION_TOKEN|TOKEN|ACCOUNT_KEY|CLIENT_SECRET|CONNECTION_STRING)\s+(?:{_SINGLE_QUOTED_VAL_PAT}|{_DOUBLE_QUOTED_VAL_PAT})"
 )
 _SQL_SINGLE_QUOTED_RE = re.compile(r"'((?:''|[^'])*)'")
 _PURELY_NUMERIC_RE = re.compile(
@@ -554,7 +556,8 @@ def scrub_error_detail(
         detail = _BEARER_RE.sub("Bearer [REDACTED]", detail)
     if "://" in detail and "@" in detail:
         detail = _URI_USERINFO_RE.sub("://[REDACTED]@", detail)
-    detail = _DUCKDB_SECRET_RE.sub(r"\1 '[REDACTED]'", detail)
+    if "'" in detail or '"' in detail:
+        detail = _DUCKDB_SECRET_RE.sub(r"\1 '[REDACTED]'", detail)
     if "=" in detail:
         detail = _DSN_KV_EQ_RE.sub(r"\1=[REDACTED]", detail)
     if ":" in detail:
