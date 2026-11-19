@@ -123,6 +123,26 @@ class LocalFilesystemStorage(Storage):
     def _slug_dir(self, slug: str) -> Path:
         return self._root / "assets" / slug
 
+    def _cleanup_dest(self, dest: Path) -> None:
+        if not dest.exists():
+            return
+        try:
+            os.chmod(dest, 0o755)
+        except OSError:
+            pass
+        for root_dir, dirs, files in os.walk(dest, topdown=True):
+            for d in dirs:
+                try:
+                    os.chmod(os.path.join(root_dir, d), 0o755)
+                except OSError:
+                    pass
+            for f in files:
+                try:
+                    os.chmod(os.path.join(root_dir, f), 0o644)
+                except OSError:
+                    pass
+        shutil.rmtree(dest, ignore_errors=True)
+
     def extract_tarball(self, slug: str, fileobj: BinaryIO) -> str:
         dest = self._slug_dir(slug)
         dest.mkdir(parents=True, exist_ok=True)
@@ -130,7 +150,7 @@ class LocalFilesystemStorage(Storage):
             self._safe_extract(fileobj, dest)
             self._rewrite_absolute_paths(dest, slug)  # slug reserved for future basePath
         except Exception:
-            shutil.rmtree(dest, ignore_errors=True)
+            self._cleanup_dest(dest)
             raise
         return f"assets/{slug}"
 
@@ -181,7 +201,13 @@ class LocalFilesystemStorage(Storage):
         if members is None:
             members = self._stream_and_validate_members(tf, dest_real)
         for member in members:
-            tf.extract(member, dest)
+            member.mode = 0o755 if member.isdir() else 0o644
+            tf.extract(member, dest, set_attrs=False)
+            target_path = dest / member.name
+            try:
+                os.chmod(target_path, member.mode)
+            except OSError:
+                pass
 
     def _rewrite_absolute_paths(self, dest: Path, slug: str) -> None:
         """Replace __SEEKNAL_SLUG__ placeholder with the actual slug.

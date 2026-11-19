@@ -427,4 +427,76 @@ def test_rejects_nul_byte_in_member_name(
     assert not (test_storage._root / "assets" / "nul_slug").exists()
 
 
+def test_fallback_path_normalises_modes_and_cleans_up_on_failure(
+    test_storage: LocalFilesystemStorage,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import stat
+
+    monkeypatch.delattr(tarfile, "data_filter", raising=False)
+
+    # 1. Verify mode normalisation on success: dir -> 0o755, file -> 0o644
+    mode_tar = tmp_path / "weird_modes.tar.gz"
+    with tarfile.open(mode_tar, "w:gz") as tf:
+        d_info = tarfile.TarInfo(name="d")
+        d_info.type = tarfile.DIRTYPE
+        d_info.mode = 0o555
+        tf.addfile(d_info)
+
+        f_info = tarfile.TarInfo(name="d/f.txt")
+        f_data = b"hello"
+        f_info.size = len(f_data)
+        f_info.mode = 0o4777
+        tf.addfile(f_info, io.BytesIO(f_data))
+
+    with open(mode_tar, "rb") as f:
+        test_storage.extract_tarball("modes_ok", f)
+
+    mount = test_storage.local_mount_path("modes_ok")
+    assert mount is not None
+    assert stat.S_IMODE((mount / "d").stat().st_mode) == 0o755
+    assert stat.S_IMODE((mount / "d" / "f.txt").stat().st_mode) == 0o644
+
+    # 2. Verify cleanup leaves nothing behind when members d (0755), d/f, d (0555), and a failing member
+    # are extracted on the fallback path (e.g. file "a" followed by "a/b" which fails mid-extraction).
+    fail_tar = tmp_path / "readonly_dir_then_fail.tar.gz"
+    with tarfile.open(fail_tar, "w:gz") as tf:
+        d1 = tarfile.TarInfo(name="d")
+        d1.type = tarfile.DIRTYPE
+        d1.mode = 0o755
+        tf.addfile(d1)
+
+        df = tarfile.TarInfo(name="d/f")
+        df_data = b"inside"
+        df.size = len(df_data)
+        df.mode = 0o444
+        tf.addfile(df, io.BytesIO(df_data))
+
+        d2 = tarfile.TarInfo(name="d")
+        d2.type = tarfile.DIRTYPE
+        d2.mode = 0o555
+        tf.addfile(d2)
+
+        # Failing sequence during extraction: regular file "a" followed by "a/b"
+        a_file = tarfile.TarInfo(name="a")
+        a_data = b"blocker"
+        a_file.size = len(a_data)
+        tf.addfile(a_file, io.BytesIO(a_data))
+
+        ab_file = tarfile.TarInfo(name="a/b")
+        ab_data = b"triggers_oserror"
+        ab_file.size = len(ab_data)
+        tf.addfile(ab_file, io.BytesIO(ab_data))
+
+    with open(fail_tar, "rb") as f:
+        with pytest.raises(OSError):
+            test_storage.extract_tarball("fallback_cleanup_fail", f)
+
+    assert not (test_storage._root / "assets" / "fallback_cleanup_fail").exists(), (
+        "Failed extraction on fallback path must leave nothing behind"
+    )
+
+
+
 
