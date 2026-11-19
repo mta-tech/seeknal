@@ -64,9 +64,30 @@ _STANDIN_AT_VERSION_RE = re.compile(
 )
 
 _RESERVED_ALIASES = frozenset({"system", "temp", "memory", "main"})
-_ALLOWED_ICEBERG_EXTENSIONS = frozenset({"httpfs", "iceberg"})
-_DEFAULT_ICEBERG_EXTENSIONS = ("httpfs", "iceberg")
+_ALLOWED_ICEBERG_EXTENSIONS = frozenset({"httpfs", "avro", "iceberg"})
+_DEFAULT_EXTENSIONS = ("httpfs", "avro", "iceberg")
+_DEFAULT_ICEBERG_EXTENSIONS = _DEFAULT_EXTENSIONS
 _STANDIN_BUILTIN_EXTENSIONS = ("json", "parquet")
+
+
+def _normalize_iceberg_extensions(exts: Iterable[str]) -> tuple[str, ...]:
+    """Deduplicate extensions and ensure 'avro' is always loaded BEFORE 'iceberg'."""
+    deduped: list[str] = []
+    for ext in exts:
+        if ext not in deduped:
+            deduped.append(ext)
+    if "iceberg" in deduped:
+        if "avro" not in deduped:
+            ice_idx = deduped.index("iceberg")
+            deduped.insert(ice_idx, "avro")
+        else:
+            avro_idx = deduped.index("avro")
+            ice_idx = deduped.index("iceberg")
+            if avro_idx > ice_idx:
+                deduped.pop(avro_idx)
+                ice_idx = deduped.index("iceberg")
+                deduped.insert(ice_idx, "avro")
+    return tuple(deduped)
 
 _FORBIDDEN_CATALOG_SECRET_KEYS = frozenset(
     {
@@ -163,6 +184,26 @@ def normalize_extension_directory(path: Any) -> str:
     if raw.rstrip("/") != norm.rstrip("/"):
         raise BadInputError("extension_directory must be a normalized path")
     return "/" if norm == "/" else norm.rstrip("/")
+
+
+def _check_staged_avro_for_iceberg(
+    ext_dir: Optional[str],
+    extensions: Iterable[str],
+) -> None:
+    """Fail early if `iceberg.duckdb_extension` is staged in `ext_dir` without `avro.duckdb_extension`."""
+    if not ext_dir or "iceberg" not in extensions:
+        return
+    root = Path(ext_dir)
+    if not root.is_dir():
+        return
+    for iceberg_ext_file in sorted(root.rglob("iceberg.duckdb_extension")):
+        if iceberg_ext_file.exists():
+            avro_sibling = iceberg_ext_file.parent / "avro.duckdb_extension"
+            if not avro_sibling.exists():
+                raise BadInputError(
+                    f"avro.duckdb_extension is missing from extension_directory '{ext_dir}' "
+                    f"(found '{iceberg_ext_file}' without sibling 'avro.duckdb_extension')"
+                )
 
 
 def check_and_parse_secrets_env_file(path: Union[str, Path]) -> dict[str, str]:
@@ -360,6 +401,26 @@ class IcebergCatalogSpec:
     s3: IcebergS3Spec
     access_delegation: str = "vended"
     scope: Optional[str] = None
+    allow_insecure_http: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.allow_insecure_http, bool):
+            raise BadInputError(
+                f"Catalog '{self.alias}' 'allow_insecure_http' must be a boolean"
+            )
+        if self.endpoint.startswith("http://") and not self.allow_insecure_http:
+            raise BadInputError(
+                f"Catalog '{self.alias}' 'endpoint' uses insecure 'http://'; "
+                "use 'https://' or set 'allow_insecure_http: true'"
+            )
+        if self.token_uri.startswith("http://") and not self.allow_insecure_http:
+            raise BadInputError(
+                f"Catalog '{self.alias}' 'token_uri' uses insecure 'http://'; "
+                "use 'https://' or set 'allow_insecure_http: true'"
+            )
+
+
+AccelIcebergCatalogConfig = IcebergCatalogSpec
 
 
 @dataclass(frozen=True)
@@ -393,6 +454,11 @@ class IcebergSourceConfig:
     target_schema: str = "rpt"
     tables: tuple[IcebergTableEntry, ...] = ()
     pii_columns: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        normalized_exts = _normalize_iceberg_extensions(self.extensions)
+        if tuple(self.extensions) != normalized_exts:
+            object.__setattr__(self, "extensions", normalized_exts)
 
     def referenced_env_vars(self) -> tuple[str, ...]:
         vars_list: list[str] = []
@@ -491,11 +557,14 @@ class IcebergSourceConfig:
                 ext_clean = item.strip().lower()
                 if ext_clean not in _ALLOWED_ICEBERG_EXTENSIONS:
                     raise BadInputError(
-                        f"Extension '{_safe_label(ext_clean)}' is not in allowlist {{'httpfs', 'iceberg'}}"
+                        f"Extension '{_safe_label(ext_clean)}' is not in allowlist {{'httpfs', 'avro', 'iceberg'}}"
                     )
                 if ext_clean not in ext_items:
                     ext_items.append(ext_clean)
-            validated_exts = tuple(ext_items)
+            validated_exts = _normalize_iceberg_extensions(ext_items)
+
+        if ext_dir_val is not None:
+            _check_staged_avro_for_iceberg(ext_dir_val, validated_exts)
 
         raw_prefixes = raw.get("allowed_s3_prefixes")
         validated_prefixes: list[str] = []
@@ -550,12 +619,19 @@ class IcebergSourceConfig:
                 "client_secret_env",
                 "scope",
                 "access_delegation",
+                "allow_insecure_http",
                 "s3",
             }
             if unknown_cat:
                 raise BadInputError(
                     f"Unknown key(s) in iceberg_catalogs.{alias}: "
                     f"{sorted(_safe_label(str(k)) for k in unknown_cat)}"
+                )
+
+            allow_insecure_http = cat_spec.get("allow_insecure_http", False)
+            if not isinstance(allow_insecure_http, bool):
+                raise BadInputError(
+                    f"Catalog '{alias}' 'allow_insecure_http' must be a boolean"
                 )
 
             endpoint = cat_spec.get("endpoint")
@@ -567,6 +643,11 @@ class IcebergSourceConfig:
             ):
                 raise BadInputError(
                     f"Catalog '{alias}' 'endpoint' must start with http:// or https://"
+                )
+            if endpoint.startswith("http://") and not allow_insecure_http:
+                raise BadInputError(
+                    f"Catalog '{alias}' 'endpoint' uses insecure 'http://'; "
+                    "use 'https://' or set 'allow_insecure_http: true'"
                 )
 
             warehouse = cat_spec.get("warehouse")
@@ -583,6 +664,11 @@ class IcebergSourceConfig:
             ):
                 raise BadInputError(
                     f"Catalog '{alias}' 'token_uri' must start with http:// or https://"
+                )
+            if token_uri.startswith("http://") and not allow_insecure_http:
+                raise BadInputError(
+                    f"Catalog '{alias}' 'token_uri' uses insecure 'http://'; "
+                    "use 'https://' or set 'allow_insecure_http: true'"
                 )
 
             cid_env = validate_env_var_name(
@@ -682,6 +768,7 @@ class IcebergSourceConfig:
                 client_secret_env=csec_env,
                 scope=scope_val,
                 access_delegation=access_del,
+                allow_insecure_http=allow_insecure_http,
                 s3=IcebergS3Spec(
                     endpoint=s3_endpoint,
                     region=s3_region,
@@ -1005,6 +1092,7 @@ def _coerce_config(
     if isinstance(cfg, IcebergSourceConfig):
         if extension_dir is not None:
             norm_ext = normalize_extension_directory(extension_dir)
+            _check_staged_avro_for_iceberg(norm_ext, cfg.extensions)
             if norm_ext != cfg.extension_directory:
                 return IcebergSourceConfig(
                     iceberg_catalogs=cfg.iceberg_catalogs,
@@ -1042,7 +1130,7 @@ def plan_iceberg_source_setup(
       3. SET allow_persistent_secrets = false
       4. SET extension_directory = '<extension_dir>'
       5. SET custom_extension_repository = '/nonexistent_extension_repository'
-      6. LOAD httpfs / LOAD iceberg (NEVER INSTALL)
+      6. LOAD httpfs / LOAD avro / LOAD iceberg (avro ALWAYS before iceberg; NEVER INSTALL)
       7. CREATE TEMPORARY SECRET s3_<alias> ... and iceberg_<alias> ...
       8. ATTACH '<warehouse>' AS <alias> (TYPE ICEBERG, ..., READ_ONLY)
     """
@@ -1055,7 +1143,8 @@ def plan_iceberg_source_setup(
     )
     if not raw_ext_dir:
         raise BadInputError(
-            "Iceberg source requires 'extension_directory' (via config, --extension-dir, or ACCEL_EXTENSION_DIR)"
+            "Iceberg source requires 'extension_directory' (via config, --extension-dir, "
+            "ACCEL_EXTENSION_DIR, or SEEKNAL_EXTENSION_DIRECTORY)"
         )
     ext_dir_clean = normalize_extension_directory(raw_ext_dir)
 
@@ -1065,15 +1154,18 @@ def plan_iceberg_source_setup(
         and all(alias in standin_catalogs for alias in parsed.iceberg_catalogs.keys())
     )
     if standin_extensions is not None:
-        exts_to_load: list[str] = []
+        raw_standin_exts: list[str] = []
         for ext in standin_extensions:
             if not isinstance(ext, str) or not _EXT_NAME_RE.fullmatch(ext):
                 raise BadInputError(f"Invalid extension name '{_safe_label(ext)}'")
-            exts_to_load.append(ext)
+            raw_standin_exts.append(ext)
+        exts_to_load = list(_normalize_iceberg_extensions(raw_standin_exts))
     elif all_standin and tuple(parsed.extensions) == _DEFAULT_ICEBERG_EXTENSIONS:
         exts_to_load = list(_STANDIN_BUILTIN_EXTENSIONS)
     else:
-        exts_to_load = list(parsed.extensions)
+        exts_to_load = list(_normalize_iceberg_extensions(parsed.extensions))
+
+    _check_staged_avro_for_iceberg(ext_dir_clean, exts_to_load)
 
     steps: list[IcebergSetupStep] = [
         IcebergSetupStep(
@@ -1319,6 +1411,27 @@ def plan_iceberg_count_sql(
     return f"SELECT COUNT(*) FROM {from_clause}"
 
 
+def plan_iceberg_snapshot_sql(
+    table_or_spec: Union[str, TableSpec],
+    *,
+    allowed_aliases: Optional[Collection[str]] = None,
+) -> str:
+    """Return deterministic SQL query to resolve an Iceberg table's latest snapshot_id."""
+    source_ref = (
+        table_or_spec.source
+        if isinstance(table_or_spec, TableSpec)
+        else table_or_spec
+    )
+    _, canonical_ref = validate_iceberg_table_ref(
+        source_ref,
+        allowed_aliases=allowed_aliases,
+    )
+    return (
+        f"SELECT snapshot_id FROM iceberg_snapshots({canonical_ref}) "
+        "ORDER BY timestamp_ms DESC LIMIT 1"
+    )
+
+
 def execute_iceberg_source_setup(
     conn: Any,
     cfg: Union[IcebergSourceConfig, Mapping[str, Any]],
@@ -1398,8 +1511,14 @@ def build_iceberg_table_specs(
     live_views: Optional[Iterable[str]] = DEFAULT_LIVE_VIEWS,
     allow_non_hashed_pii: bool = False,
     pii_mode: Optional[str] = None,
+    i_understand_pii_leaves_unmasked: bool = False,
 ) -> list[TableSpec]:
     """Build `TableSpec` list for Iceberg source from either external metadata or inline `tables`."""
+    if allow_non_hashed_pii and not i_understand_pii_leaves_unmasked:
+        raise BadInputError(
+            "--allow-non-hashed-pii requires --i-understand-pii-leaves-unmasked "
+            "(i_understand_pii_leaves_unmasked=True)"
+        )
     cfg = _coerce_config(config)
     effective_mode = validate_pii_mode(
         pii_mode if pii_mode is not None else (cfg.pii_mode or DEFAULT_PII_MODE)
@@ -1466,6 +1585,7 @@ def build_iceberg_table_specs(
             snapshot_pins=snapshot_pins,
             source_overrides=source_overrides,
             target_schema=cfg.target_schema,
+            i_understand_pii_leaves_unmasked=i_understand_pii_leaves_unmasked,
         )
         resolved_specs: list[TableSpec] = []
         for s in base_specs:
@@ -1533,6 +1653,7 @@ def build_iceberg_table_specs(
                     pii_data=pii_data,
                     pii_mode=effective_mode,
                     allow_non_hashed_pii=allow_non_hashed_pii,
+                    i_understand_pii_leaves_unmasked=i_understand_pii_leaves_unmasked,
                 )
             except ValueError as exc:
                 raise BadInputError(str(exc)) from exc
@@ -1590,7 +1711,8 @@ class IcebergSource:
         env: Optional[Mapping[str, str]] = None,
         standin_catalogs: Optional[Mapping[str, str]] = None,
         standin_extensions: Optional[Sequence[str]] = None,
-        standin_snapshots: Optional[Mapping[str, int]] = None,
+        standin_snapshots: Optional[Mapping[str, Optional[int]]] = None,
+        snapshot_resolver: Optional[Callable[[str], Optional[int]]] = None,
     ) -> None:
         if isinstance(config, (str, Path)):
             self.config = load_iceberg_source_config(
@@ -1606,10 +1728,19 @@ class IcebergSource:
         self.memory_limit = memory_limit or self.config.memory_limit
         self.threads = threads if threads is not None else self.config.threads
         self._env = env
+        if self._env is not None:
+            for var_name in self.config.referenced_env_vars():
+                val = self._env.get(var_name)
+                if isinstance(val, str) and val:
+                    register_secret_values(val)
         self.standin_catalogs = standin_catalogs
         self.standin_extensions = standin_extensions
-        self.standin_snapshots = dict(standin_snapshots or {})
+        self.standin_snapshots: dict[str, Optional[int]] = (
+            dict(standin_snapshots) if standin_snapshots is not None else {}
+        )
+        self._snapshot_resolver = snapshot_resolver
         self.executed_setup_steps: list[IcebergSetupStep] = []
+        self.executed_snapshot_sqls: list[str] = []
         self.executed_count_sqls: list[str] = []
 
     @property
@@ -1673,14 +1804,30 @@ class IcebergSource:
             ) from None
         return int(res[0]) if res else 0
 
-    def get_snapshot_id(
+    def _validate_resolved_snapshot(self, raw_val: Any, context_label: str) -> int:
+        if raw_val is None:
+            raise LoadError(
+                f"Iceberg snapshot resolution returned None for '{context_label}'"
+            )
+        try:
+            return validate_snapshot_id(
+                raw_val,
+                context=f"Resolved snapshot for '{context_label}'",
+            )
+        except ValueError as exc:
+            raise LoadError(scrub_text(str(exc))) from exc
+
+    def resolve_snapshot_id(
         self,
         table_or_spec: Union[str, TableSpec],
-    ) -> Optional[int]:
-        """Return pinned snapshot_id, or resolve current Iceberg snapshot_id if available."""
+    ) -> int:
+        """Resolve pinned or current Iceberg snapshot_id; raises LoadError on error/null."""
         if isinstance(table_or_spec, TableSpec):
             if table_or_spec.snapshot_id is not None:
-                return table_or_spec.snapshot_id
+                return self._validate_resolved_snapshot(
+                    table_or_spec.snapshot_id,
+                    table_or_spec.source,
+                )
             source_ref = table_or_spec.source
             view_name = table_or_spec.view
             target_name = table_or_spec.name
@@ -1689,36 +1836,89 @@ class IcebergSource:
             view_name = table_or_spec
             target_name = table_or_spec
 
-        _, canonical_ref = validate_iceberg_table_ref(
+        alias, canonical_ref = validate_iceberg_table_ref(
             source_ref,
             allowed_aliases=self.allowed_aliases,
         )
+        segments = _split_qualified_segments(canonical_ref)
+        rest_ref = ".".join(segments[1:])
+        leaf_table = segments[-1]
 
-        for candidate_key in (canonical_ref, source_ref, target_name, view_name):
+        if self._snapshot_resolver is not None:
+            try:
+                resolved = self._snapshot_resolver(canonical_ref)
+            except LoadError:
+                raise
+            except Exception as exc:
+                raise LoadError(
+                    f"Failed to resolve Iceberg snapshot for '{canonical_ref}': {scrub_text(str(exc))}"
+                ) from None
+            return self._validate_resolved_snapshot(resolved, canonical_ref)
+
+        for candidate_key in (
+            canonical_ref,
+            source_ref,
+            rest_ref,
+            target_name,
+            view_name,
+            leaf_table,
+        ):
             if candidate_key in self.standin_snapshots:
-                return validate_snapshot_id(
+                return self._validate_resolved_snapshot(
                     self.standin_snapshots[candidate_key],
-                    context=f"Stand-in snapshot for '{canonical_ref}'",
+                    canonical_ref,
                 )
 
-        if self.standin_catalogs is not None:
-            return None
+        conn = self._ensure_conn()
 
-        # Best-effort metadata query when running against a live DuckDB iceberg catalog
+        if self.standin_catalogs is not None and alias in self.standin_catalogs:
+            candidates_sql = ", ".join(
+                quote_sql_string(k)
+                for k in dict.fromkeys(
+                    (canonical_ref, rest_ref, target_name, view_name, leaf_table)
+                )
+            )
+            standin_sql = (
+                f"SELECT snapshot_id FROM {alias}._iceberg_snapshots "
+                f"WHERE table_name IN ({candidates_sql}) "
+                "ORDER BY snapshot_id DESC LIMIT 1"
+            )
+            self.executed_snapshot_sqls.append(standin_sql)
+            try:
+                row = conn.execute(standin_sql).fetchone()
+            except Exception as exc:
+                raise LoadError(
+                    f"Failed to resolve stand-in Iceberg snapshot for '{canonical_ref}': {scrub_text(str(exc))}"
+                ) from None
+            if not row or row[0] is None:
+                raise LoadError(
+                    f"No snapshot found in {alias}._iceberg_snapshots for '{canonical_ref}'"
+                )
+            return self._validate_resolved_snapshot(row[0], canonical_ref)
+
+        snap_sql = plan_iceberg_snapshot_sql(
+            canonical_ref,
+            allowed_aliases=self.allowed_aliases,
+        )
+        self.executed_snapshot_sqls.append(snap_sql)
         try:
-            conn = self._ensure_conn()
-            row = conn.execute(
-                f"SELECT snapshot_id FROM iceberg_snapshots({quote_sql_string(canonical_ref)}) "
-                "ORDER BY sequence_number DESC LIMIT 1"
-            ).fetchone()
-            if row and row[0] is not None:
-                return validate_snapshot_id(
-                    int(row[0]),
-                    context=f"Discovered snapshot for '{canonical_ref}'",
-                )
-        except Exception:
-            pass
-        return None
+            row = conn.execute(snap_sql).fetchone()
+        except Exception as exc:
+            raise LoadError(
+                f"Failed to resolve Iceberg snapshot ({snap_sql}): {scrub_text(str(exc))}"
+            ) from None
+        if not row or row[0] is None:
+            raise LoadError(
+                f"Iceberg snapshot query returned no snapshot for '{canonical_ref}'"
+            )
+        return self._validate_resolved_snapshot(row[0], canonical_ref)
+
+    def get_snapshot_id(
+        self,
+        table_or_spec: Union[str, TableSpec],
+    ) -> int:
+        """Resolve and return positive 64-bit snapshot_id; never swallows errors or returns None."""
+        return self.resolve_snapshot_id(table_or_spec)
 
     def close(self) -> None:
         if self._conn is not None:

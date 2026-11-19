@@ -249,6 +249,7 @@ def resolve_column_pii(
     pii_data: Mapping[str, Any],
     pii_mode: str = DEFAULT_PII_MODE,
     allow_non_hashed_pii: bool = False,
+    i_understand_pii_leaves_unmasked: bool = False,
 ) -> tuple[bool, bool, bool]:
     """Resolve PII handling for a column.
 
@@ -316,8 +317,27 @@ def resolve_column_pii(
     if not allow_non_hashed_pii:
         raise ValueError(
             f"Column {col_name!r} in view {view_name!r} has PII source_form {source_form!r} (not sha256). "
-            "Non-hashed PII must not be cached without --allow-non-hashed-pii."
+            "Non-hashed PII must not be cached without --allow-non-hashed-pii and --i-understand-pii-leaves-unmasked."
         )
+    if not i_understand_pii_leaves_unmasked:
+        raise ValueError(
+            f"Column {col_name!r} in view {view_name!r} has PII source_form {source_form!r} (not sha256). "
+            "--allow-non-hashed-pii also requires --i-understand-pii-leaves-unmasked (i_understand_pii_leaves_unmasked=True)."
+        )
+
+    from seeknal.serving.accel.loader import log_event
+
+    log_event(
+        "non_hashed_pii_unmasked_warning",
+        level="WARNING",
+        view=view_name,
+        column=col_name,
+        source_form=source_form,
+        message=(
+            f"Caching non-hashed PII column '{view_name}.{col_name}' "
+            f"(source_form={source_form!r}) UNMASKED in DuckDB cache"
+        ),
+    )
     return True, False, False
 
 
@@ -331,10 +351,16 @@ def build_table_specs(
     snapshot_pins: Optional[Mapping[str, int]] = None,
     source_overrides: Optional[Mapping[str, str]] = None,
     target_schema: str = "rpt",
+    i_understand_pii_leaves_unmasked: bool = False,
 ) -> list[TableSpec]:
     """Build ordered list of table specifications for DuckDB caching."""
     mode = validate_pii_mode(pii_mode)
     validate_identifier(target_schema)
+    if allow_non_hashed_pii and not i_understand_pii_leaves_unmasked:
+        raise ValueError(
+            "--allow-non-hashed-pii requires --i-understand-pii-leaves-unmasked "
+            "(i_understand_pii_leaves_unmasked=True)"
+        )
 
     pii_data = _load_json_data(pii_policy)
     if not isinstance(pii_data, Mapping):
@@ -391,6 +417,7 @@ def build_table_specs(
                 pii_data=pii_data,
                 pii_mode=mode,
                 allow_non_hashed_pii=allow_non_hashed_pii,
+                i_understand_pii_leaves_unmasked=i_understand_pii_leaves_unmasked,
             )
             if is_excluded:
                 continue

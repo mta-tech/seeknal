@@ -291,3 +291,150 @@ def test_placement_and_schemas_generation_respects_pii_exclude(tmp_path):
     )
     assert "customer_email" not in schemas_excl["rpt.daily_orders"]
     assert schemas_excl["rpt.daily_orders"] == ["order_id", "order_date", "net_amount"]
+
+
+def test_b_l1_non_hashed_pii_rejected_without_explicit_acknowledgement(tmp_path, capsys):
+    from seeknal.serving.accel.__main__ import main as accel_main
+    from seeknal.serving.accel.iceberg_source import build_iceberg_table_specs
+
+    columns, _, registry = _synthetic_inputs()
+    plain_pii = {"email_hash": {"source_form": "plain", "mask": "redact"}}
+
+    # 1. Rejected when allow_non_hashed_pii=False (even if acknowledgement flag is True)
+    with pytest.raises(ValueError, match="not sha256"):
+        build_table_specs(
+            columns=columns,
+            pii_policy=plain_pii,
+            registry=registry,
+            pii_mode="null",
+            allow_non_hashed_pii=False,
+            i_understand_pii_leaves_unmasked=True,
+        )
+
+    # 2. Rejected when allow_non_hashed_pii=True WITHOUT i_understand_pii_leaves_unmasked=True
+    with pytest.raises(ValueError, match="i-understand-pii-leaves-unmasked"):
+        build_table_specs(
+            columns=columns,
+            pii_policy=plain_pii,
+            registry=registry,
+            pii_mode="null",
+            allow_non_hashed_pii=True,
+            i_understand_pii_leaves_unmasked=False,
+        )
+
+    # Also rejected in build_iceberg_table_specs without acknowledgement
+    ext_dir = tmp_path / "ext"
+    ext_dir.mkdir()
+    ice_cfg = {
+        "extension_directory": str(ext_dir),
+        "default_catalog": "lake",
+        "default_namespace": "analytics",
+        "iceberg_catalogs": {
+            "lake": {
+                "endpoint": "https://lakekeeper.synthetic.internal/catalog",
+                "warehouse": "wh",
+                "token_uri": "https://idp.synthetic.internal/oauth2/token",
+                "client_id_env": "LK_CID",
+                "client_secret_env": "LK_SEC",
+                "s3": {
+                    "endpoint": "s3.synthetic.internal:9000",
+                    "region": "ap-southeast-1",
+                    "key_id_env": "S3_KID",
+                    "secret_env": "S3_SEC",
+                },
+            }
+        },
+    }
+    with pytest.raises(ValueError, match="i-understand-pii-leaves-unmasked"):
+        build_iceberg_table_specs(
+            ice_cfg,
+            columns=columns,
+            pii_policy=plain_pii,
+            registry=registry,
+            pii_mode="null",
+            allow_non_hashed_pii=True,
+            i_understand_pii_leaves_unmasked=False,
+        )
+
+    # 3. Allowed ONLY when BOTH flags are True, and emits loud WARNING event
+    specs = build_table_specs(
+        columns=columns,
+        pii_policy=plain_pii,
+        registry=registry,
+        live_views=("realtime_alerts",),
+        pii_mode="null",
+        allow_non_hashed_pii=True,
+        i_understand_pii_leaves_unmasked=True,
+    )
+    col_map = {c.name: c for c in specs[0].columns}
+    assert col_map["customer_email"].is_pii is True
+    assert col_map["customer_email"].is_nulled is False
+
+    err_lines = [
+        json.loads(line)
+        for line in capsys.readouterr().err.strip().splitlines()
+        if line.strip()
+    ]
+    warn_events = [
+        e for e in err_lines if e.get("step") == "non_hashed_pii_unmasked_warning"
+    ]
+    assert len(warn_events) == 1
+    assert warn_events[0]["level"] == "WARNING"
+    assert warn_events[0]["column"] == "customer_email"
+
+    # 4. CLI gate: --allow-non-hashed-pii alone exits 2; both flags together succeed and warn
+    cols_f = tmp_path / "columns.json"
+    pii_f = tmp_path / "pii.json"
+    reg_f = tmp_path / "registry.json"
+    cols_f.write_text(json.dumps(columns), encoding="utf-8")
+    pii_f.write_text(json.dumps(plain_pii), encoding="utf-8")
+    reg_f.write_text(json.dumps(registry), encoding="utf-8")
+    cache_dir = tmp_path / "cli_cache"
+
+    rc_rejected = accel_main(
+        [
+            "load",
+            "--columns",
+            str(cols_f),
+            "--pii",
+            str(pii_f),
+            "--registry",
+            str(reg_f),
+            "--cache-dir",
+            str(cache_dir),
+            "--allow-non-hashed-pii",
+            "--dry-run",
+        ]
+    )
+    assert rc_rejected == 2
+    capsys.readouterr()
+
+    rc_allowed = accel_main(
+        [
+            "load",
+            "--columns",
+            str(cols_f),
+            "--pii",
+            str(pii_f),
+            "--registry",
+            str(reg_f),
+            "--cache-dir",
+            str(cache_dir),
+            "--allow-non-hashed-pii",
+            "--i-understand-pii-leaves-unmasked",
+            "--dry-run",
+        ]
+    )
+    assert rc_allowed == 0
+    cli_captured = capsys.readouterr()
+    cli_events = [
+        json.loads(line)
+        for line in cli_captured.err.strip().splitlines()
+        if line.strip()
+    ]
+    assert any(
+        e.get("step") == "non_hashed_pii_unmasked_warning"
+        and e.get("level") == "WARNING"
+        for e in cli_events
+    )
+

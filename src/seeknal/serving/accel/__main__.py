@@ -137,7 +137,12 @@ def build_parser() -> argparse.ArgumentParser:
     load_p.add_argument(
         "--allow-non-hashed-pii",
         action="store_true",
-        help="Allow caching columns with non-sha256 PII in 'null' mode",
+        help="Allow caching columns with non-sha256 PII in 'null' mode (requires --i-understand-pii-leaves-unmasked)",
+    )
+    load_p.add_argument(
+        "--i-understand-pii-leaves-unmasked",
+        action="store_true",
+        help="Explicitly acknowledge that --allow-non-hashed-pii caches non-hashed PII unmasked",
     )
     load_p.add_argument(
         "--extension-dir",
@@ -263,6 +268,7 @@ def _handle_postgres_load(args: argparse.Namespace) -> int:
             registry=args.registry,
             allow_non_hashed_pii=args.allow_non_hashed_pii,
             pii_mode=effective_pii_mode,
+            i_understand_pii_leaves_unmasked=args.i_understand_pii_leaves_unmasked,
         )
     except (ValueError, json.JSONDecodeError, BadInputError) as exc:
         log_event(
@@ -392,6 +398,7 @@ def _handle_iceberg_load(args: argparse.Namespace) -> int:
             registry=args.registry,
             allow_non_hashed_pii=args.allow_non_hashed_pii,
             pii_mode=effective_pii_mode,
+            i_understand_pii_leaves_unmasked=args.i_understand_pii_leaves_unmasked,
         )
         setup_steps = plan_iceberg_source_setup(
             iceberg_cfg,
@@ -486,6 +493,17 @@ def _handle_iceberg_load(args: argparse.Namespace) -> int:
 
 
 def handle_load(args: argparse.Namespace) -> int:
+    if args.allow_non_hashed_pii and not getattr(
+        args, "i_understand_pii_leaves_unmasked", False
+    ):
+        log_event(
+            "bad_input",
+            level="ERROR",
+            error_type="BadInputError",
+            message="--allow-non-hashed-pii requires --i-understand-pii-leaves-unmasked",
+        )
+        return 2
+
     if args.as_of_date is not None:
         try:
             datetime.strptime(args.as_of_date, "%Y-%m-%d")

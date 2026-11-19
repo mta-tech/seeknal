@@ -10,6 +10,7 @@ from seeknal.serving.accel.engines import (
     get_installed_duckdb_version,
 )
 from seeknal.serving.accel.iceberg_source import (
+    AccelIcebergCatalogConfig,
     IcebergCatalogSpec,
     IcebergS3Spec,
     IcebergSetupStep,
@@ -21,6 +22,7 @@ from seeknal.serving.accel.iceberg_source import (
     load_iceberg_source_config,
     plan_iceberg_count_sql,
     plan_iceberg_load_sql,
+    plan_iceberg_snapshot_sql,
     plan_iceberg_source_setup,
 )
 from seeknal.serving.accel.loader import (
@@ -53,6 +55,7 @@ from seeknal.serving.accel.tables import (
 __version__ = "1.0.0"
 
 __all__ = [
+    "AccelIcebergCatalogConfig",
     "AccelerationError",
     "AccelerationSettings",
     "BadInputError",
@@ -84,6 +87,7 @@ __all__ = [
     "map_type",
     "plan_iceberg_count_sql",
     "plan_iceberg_load_sql",
+    "plan_iceberg_snapshot_sql",
     "plan_iceberg_source_setup",
     "plan_sql",
     "run_load",

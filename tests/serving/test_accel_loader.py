@@ -450,12 +450,20 @@ def test_orphan_wal_cleanup_and_buildinfo_single_source_of_truth(tmp_path, monke
     import seeknal.serving.accel.settings as accel_settings
     from seeknal.serving.accel.loader import _prune_older_files
 
-    # 1. Verify settings.py prefers seeknal.serving.buildinfo.EXPECTED_DUCKDB_VERSION when present
+    # 1. Verify settings.py defines DEFAULT_EXPECTED_DUCKDB_VERSION = "2.0.0" independently of buildinfo
     fake_buildinfo = types.ModuleType("seeknal.serving.buildinfo")
-    fake_buildinfo.EXPECTED_DUCKDB_VERSION = "2.0.0-custom-pin"  # type: ignore[attr-defined]
+    fake_buildinfo.EXPECTED_DUCKDB_VERSION = "9.9.9-mutated-buildinfo"  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "seeknal.serving.buildinfo", fake_buildinfo)
     reloaded = importlib.reload(accel_settings)
-    assert reloaded.DEFAULT_EXPECTED_DUCKDB_VERSION == "2.0.0-custom-pin"
+    assert reloaded.DEFAULT_EXPECTED_DUCKDB_VERSION == "2.0.0"
+
+    # Also verify get_extension_dir fallback order: override -> ACCEL_EXTENSION_DIR -> SEEKNAL_EXTENSION_DIRECTORY
+    monkeypatch.delenv("ACCEL_EXTENSION_DIR", raising=False)
+    monkeypatch.setenv("SEEKNAL_EXTENSION_DIRECTORY", "/opt/seeknal/extensions")
+    assert reloaded.get_extension_dir() == "/opt/seeknal/extensions"
+    monkeypatch.setenv("ACCEL_EXTENSION_DIR", "/opt/accel/extensions")
+    assert reloaded.get_extension_dir() == "/opt/accel/extensions"
+    assert reloaded.get_extension_dir("/opt/override/extensions") == "/opt/override/extensions"
 
     # Restore original settings module state
     monkeypatch.delitem(sys.modules, "seeknal.serving.buildinfo", raising=False)
@@ -482,4 +490,37 @@ def test_orphan_wal_cleanup_and_buildinfo_single_source_of_truth(tmp_path, monke
     assert not uncheckpointed.exists()
     assert not uncheckpointed_wal.exists()
     assert not orphan_wal.exists()
+
+
+def test_b_l3_scrub_text_redacts_sql_escaped_doubled_single_quote_secrets(monkeypatch):
+    from seeknal.serving.accel.loader import register_secret_env_vars
+
+    clear_registered_secrets()
+    tag = uuid.uuid4().hex[:10]
+    pg_secret = f"pg'pass'secret'{tag}"
+    env_secret = f"oauth'client'sec'{tag}"
+    extra_secret = f"extra's3'key'{tag}"
+
+    monkeypatch.setenv("PGPASSWORD", pg_secret)
+    monkeypatch.setenv("CUSTOM_SENSITIVE_SECRET_ENV", env_secret)
+    register_secret_env_vars("CUSTOM_SENSITIVE_SECRET_ENV")
+
+    try:
+        sql_escaped_msg = (
+            f"DuckDB Error near '{pg_secret.replace(chr(39), chr(39)*2)}' "
+            f"and '{env_secret.replace(chr(39), chr(39)*2)}' "
+            f"and '{extra_secret.replace(chr(39), chr(39)*2)}' "
+            f"raw={pg_secret},{env_secret},{extra_secret}"
+        )
+        scrubbed = scrub_text(sql_escaped_msg, extra_secrets=[extra_secret])
+
+        for raw_val in (pg_secret, env_secret, extra_secret):
+            escaped_val = raw_val.replace("'", "''")
+            assert raw_val not in scrubbed
+            assert escaped_val not in scrubbed
+            assert tag not in scrubbed
+        assert "[REDACTED]" in scrubbed
+    finally:
+        clear_registered_secrets()
+
 

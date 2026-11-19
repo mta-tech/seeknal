@@ -8,12 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
 
-try:
-    from seeknal.serving.buildinfo import (  # type: ignore[import-not-found]
-        EXPECTED_DUCKDB_VERSION as DEFAULT_EXPECTED_DUCKDB_VERSION,
-    )
-except ImportError:
-    DEFAULT_EXPECTED_DUCKDB_VERSION = "2.0.0"
+DEFAULT_EXPECTED_DUCKDB_VERSION = "2.0.0"
 
 DEFAULT_MEMORY_LIMIT = "2GB"
 DEFAULT_THREADS = 4
@@ -148,10 +143,15 @@ def get_expected_duckdb_version(override: Optional[str] = None) -> str:
 
 
 def get_extension_dir(override: Optional[Union[str, Path]] = None) -> Optional[str]:
-    raw = override or os.environ.get("ACCEL_EXTENSION_DIR") or None
-    if raw is not None:
-        cleaned = str(raw).strip()
-        return cleaned if cleaned else None
+    for candidate in (
+        override,
+        os.environ.get("ACCEL_EXTENSION_DIR"),
+        os.environ.get("SEEKNAL_EXTENSION_DIRECTORY"),
+    ):
+        if candidate is not None:
+            cleaned = str(candidate).strip()
+            if cleaned:
+                return cleaned
     return None
 
 

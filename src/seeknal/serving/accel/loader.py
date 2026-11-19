@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import replace as dc_replace
 from datetime import datetime, timezone
 import fcntl
 import inspect
@@ -51,7 +52,7 @@ class AccelerationError(Exception):
     """Base error for acceleration operations."""
 
 
-class BadInputError(AccelerationError):
+class BadInputError(AccelerationError, ValueError):
     """Raised on invalid inputs or configuration (exit 2)."""
 
 
@@ -105,8 +106,15 @@ def scrub_text(text: str, *, extra_secrets: Optional[Iterable[str]] = None) -> s
             if isinstance(val, str) and len(val) > 1:
                 secret_vals.add(val)
 
+    expanded_secrets: set[str] = set()
+    for val in secret_vals:
+        expanded_secrets.add(val)
+        escaped = val.replace("'", "''")
+        if escaped != val:
+            expanded_secrets.add(escaped)
+
     # Scrub longest values first to avoid partial substring residue
-    for val in sorted(secret_vals, key=len, reverse=True):
+    for val in sorted(expanded_secrets, key=len, reverse=True):
         if val in text:
             text = text.replace(val, "[REDACTED]")
 
@@ -419,8 +427,57 @@ def run_load(
 
         log_event("load_start", file=file_name, target=str(new_file_path))
 
+        is_iceberg_load = (
+            effective_source_type == "iceberg"
+            or hasattr(source, "resolve_snapshot_id")
+            or hasattr(source, "get_snapshot_id")
+        )
+        if is_iceberg_load:
+            resolved_specs: list[TableSpec] = []
+            for spec in specs:
+                if spec.snapshot_id is not None:
+                    resolved_snap = validate_snapshot_id(
+                        int(spec.snapshot_id),
+                        context=f"TableSpec '{spec.name}'",
+                    )
+                elif hasattr(source, "resolve_snapshot_id"):
+                    raw_snap = source.resolve_snapshot_id(spec)
+                    if raw_snap is None:
+                        raise LoadError(
+                            f"Snapshot resolution returned None for table {spec.name!r} ({spec.source!r})"
+                        )
+                    try:
+                        resolved_snap = validate_snapshot_id(
+                            raw_snap,
+                            context=f"Resolved snapshot for '{spec.name}'",
+                        )
+                    except ValueError as exc:
+                        raise LoadError(str(exc)) from exc
+                elif hasattr(source, "get_snapshot_id"):
+                    raw_snap = source.get_snapshot_id(spec)
+                    if raw_snap is None:
+                        raise LoadError(
+                            f"Snapshot resolution returned None for table {spec.name!r} ({spec.source!r})"
+                        )
+                    try:
+                        resolved_snap = validate_snapshot_id(
+                            raw_snap,
+                            context=f"Resolved snapshot for '{spec.name}'",
+                        )
+                    except ValueError as exc:
+                        raise LoadError(str(exc)) from exc
+                else:
+                    raise LoadError(
+                        f"Cannot resolve snapshot_id for unpinned Iceberg table {spec.name!r} ({spec.source!r})"
+                    )
+                resolved_specs.append(dc_replace(spec, snapshot_id=resolved_snap))
+            effective_specs: Sequence[TableSpec] = resolved_specs
+            log_event("snapshots_resolved", table_count=len(effective_specs))
+        else:
+            effective_specs = specs
+
         plan = plan_sql(
-            specs,
+            effective_specs,
             pii_mode=mode,
             source_type=effective_source_type,
         )
@@ -443,15 +500,13 @@ def run_load(
         target.execute("CHECKPOINT")
         log_event("checkpoint_executed")
 
-        include_snapshots = (
-            effective_source_type == "iceberg"
-            or hasattr(source, "get_snapshot_id")
-            or any(s.snapshot_id is not None for s in specs)
+        include_snapshots = is_iceberg_load or any(
+            s.snapshot_id is not None for s in effective_specs
         )
         row_counts: dict[str, int] = {}
-        snapshots: dict[str, Optional[int]] = {}
+        snapshots: dict[str, int] = {}
 
-        for spec in specs:
+        for spec in effective_specs:
             target_count = int(target.get_row_count(spec.name))
             source_count = _query_source_row_count(source, spec)
 
@@ -462,14 +517,16 @@ def run_load(
             row_counts[spec.name] = target_count
 
             if include_snapshots:
-                if spec.snapshot_id is not None:
-                    snapshots[spec.name] = spec.snapshot_id
-                elif hasattr(source, "get_snapshot_id"):
-                    snapshots[spec.name] = source.get_snapshot_id(spec)
-                else:
-                    snapshots[spec.name] = None
+                if spec.snapshot_id is None:
+                    raise LoadError(
+                        f"Missing resolved snapshot_id for {spec.name!r}; refusing to write null snapshot"
+                    )
+                snapshots[spec.name] = validate_snapshot_id(
+                    spec.snapshot_id,
+                    context=f"Freshness snapshot for '{spec.name}'",
+                )
 
-        log_event("row_counts_verified", tables=len(specs))
+        log_event("row_counts_verified", tables=len(effective_specs))
 
         if hasattr(target, "close"):
             try:

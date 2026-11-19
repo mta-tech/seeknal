@@ -126,6 +126,7 @@ def test_plan_iceberg_source_setup_strict_ordering_and_redaction(tmp_path):
             "set_extension_directory",
             "set_custom_extension_repository",
             "load_extension_httpfs",
+            "load_extension_avro",
             "load_extension_iceberg",
             "create_secret_s3_lake",
             "create_secret_iceberg_lake",
@@ -142,15 +143,16 @@ def test_plan_iceberg_source_setup_strict_ordering_and_redaction(tmp_path):
             == "SET custom_extension_repository = '/nonexistent_extension_repository'"
         )
         assert steps[5].sql == "LOAD httpfs"
-        assert steps[6].sql == "LOAD iceberg"
+        assert steps[6].sql == "LOAD avro"
+        assert steps[7].sql == "LOAD iceberg"
 
         # NEVER emits INSTALL statement
         for s in steps:
             assert not s.sql.lstrip().upper().startswith("INSTALL")
 
         # Secrets are TEMPORARY, never PERSISTENT
-        s3_step = steps[7]
-        ice_step = steps[8]
+        s3_step = steps[8]
+        ice_step = steps[9]
         assert s3_step.sql.startswith("CREATE TEMPORARY SECRET s3_lake (TYPE S3, ")
         assert ice_step.sql.startswith(
             "CREATE TEMPORARY SECRET iceberg_lake (TYPE ICEBERG, "
@@ -159,7 +161,7 @@ def test_plan_iceberg_source_setup_strict_ordering_and_redaction(tmp_path):
         assert "PERSISTENT" not in ice_step.sql.upper()
 
         # ATTACH is strictly after LOAD and CREATE TEMPORARY SECRET, and is READ_ONLY
-        attach_step = steps[9]
+        attach_step = steps[10]
         assert attach_step.sql == (
             "ATTACH 'analytics_wh' AS lake ("
             "TYPE ICEBERG, "
@@ -210,7 +212,7 @@ def test_validation_and_quoting_rules_match_iceberg_direct(tmp_path):
     attach_sql = steps[-1].sql
     assert "ATTACH 'wh''with''quotes' AS lake" in attach_sql
     assert "ACCESS_DELEGATION_MODE 'none'" in attach_sql
-    assert "URL_STYLE 'vhost'" in steps[7].safe_sql
+    assert "URL_STYLE 'vhost'" in steps[8].safe_sql
 
     # 4. Invalid access_delegation & url_style rejected
     bad_del = _sample_iceberg_dict(ext_dir, access_delegation="invalid_mode")
@@ -264,10 +266,10 @@ def test_secrets_env_file_mode_0600_enforced(tmp_path):
     try:
         parsed = IcebergSourceConfig.from_dict(cfg_raw)
         steps = plan_iceberg_source_setup(parsed, env={})
-        assert len(steps) == 10
+        assert len(steps) == 11
         for sec_val in secrets.values():
-            assert sec_val not in steps[7].safe_sql
             assert sec_val not in steps[8].safe_sql
+            assert sec_val not in steps[9].safe_sql
     finally:
         clear_registered_secrets()
 
@@ -667,4 +669,459 @@ def test_build_iceberg_table_specs_with_external_columns_and_default_namespace(t
     assert specs[0].source == "lake.curated.daily_orders"
     assert specs[0].snapshot_id == 123456789
     assert [c.name for c in specs[0].columns] == ["order_id"]
+
+
+def test_b_avro_loaded_before_iceberg_in_setup_plan(tmp_path, monkeypatch):
+    clear_registered_secrets()
+    ext_dir = tmp_path / "extensions"
+    ext_dir.mkdir()
+    secrets = _make_fake_secrets()
+
+    try:
+        # 1. Default extensions (when 'extensions' key is omitted) -> ('httpfs', 'avro', 'iceberg')
+        cfg_default = _sample_iceberg_dict(ext_dir)
+        cfg_default.pop("extensions")
+        steps_default = plan_iceberg_source_setup(cfg_default, env=secrets)
+        load_sqls_default = [s.sql for s in steps_default if s.phase == "load"]
+        assert load_sqls_default == ["LOAD httpfs", "LOAD avro", "LOAD iceberg"]
+
+        # 2. Explicit ['httpfs', 'iceberg'], ['iceberg'], or ['iceberg', 'avro'] -> avro ALWAYS before iceberg
+        for configured_exts in (
+            ["httpfs", "iceberg"],
+            ["iceberg"],
+            ["iceberg", "avro"],
+            ["httpfs", "iceberg", "avro"],
+            ["avro", "httpfs", "iceberg"],
+        ):
+            cfg_variant = _sample_iceberg_dict(ext_dir)
+            cfg_variant["extensions"] = configured_exts
+            steps_var = plan_iceberg_source_setup(cfg_variant, env=secrets)
+            load_sqls = [s.sql for s in steps_var if s.phase == "load"]
+            assert "LOAD avro" in load_sqls
+            assert "LOAD iceberg" in load_sqls
+            assert load_sqls.index("LOAD avro") < load_sqls.index("LOAD iceberg")
+            assert all(
+                not s.sql.lstrip().upper().startswith("INSTALL") for s in steps_var
+            )
+
+        # 3. Also verify SEEKNAL_EXTENSION_DIRECTORY fallback when extension_directory omitted
+        cfg_env_ext = _sample_iceberg_dict(ext_dir)
+        cfg_env_ext.pop("extension_directory")
+        monkeypatch.delenv("ACCEL_EXTENSION_DIR", raising=False)
+        monkeypatch.setenv("SEEKNAL_EXTENSION_DIRECTORY", str(ext_dir))
+        steps_env_ext = plan_iceberg_source_setup(cfg_env_ext, env=secrets)
+        assert any(
+            s.sql == f"SET extension_directory = '{ext_dir}'" for s in steps_env_ext
+        )
+
+        # 4. Early check: if iceberg.duckdb_extension is staged without avro.duckdb_extension, fail early
+        missing_avro_dir = tmp_path / "staged_missing_avro"
+        plat_dir = missing_avro_dir / "v2.0.0" / "linux_amd64"
+        plat_dir.mkdir(parents=True)
+        (plat_dir / "iceberg.duckdb_extension").write_bytes(b"stub")
+        (plat_dir / "httpfs.duckdb_extension").write_bytes(b"stub")
+
+        cfg_missing_avro = _sample_iceberg_dict(missing_avro_avro := missing_avro_dir)
+        with pytest.raises(
+            (BadInputError, ValueError), match="avro.duckdb_extension"
+        ):
+            IcebergSourceConfig.from_dict(cfg_missing_avro)
+
+        # Adding avro.duckdb_extension clears the early validation check
+        (missing_avro_avro / "v2.0.0" / "linux_amd64" / "avro.duckdb_extension").write_bytes(
+            b"stub"
+        )
+        parsed_ok = IcebergSourceConfig.from_dict(cfg_missing_avro)
+        assert parsed_ok.extensions == ("httpfs", "avro", "iceberg")
+    finally:
+        clear_registered_secrets()
+
+
+def test_b_avro_real_duckdb_extension_load(tmp_path):
+    ext_dir = os.environ.get("SEEKNAL_TEST_DUCKDB_EXTENSION_DIR", "").strip()
+    if not ext_dir or not Path(ext_dir).is_dir():
+        pytest.skip(
+            "SEEKNAL_TEST_DUCKDB_EXTENSION_DIR is not set to an existing directory"
+        )
+
+    src_root = Path(ext_dir).resolve()
+
+    # 1. Against SEEKNAL_TEST_DUCKDB_EXTENSION_DIR (with avro, iceberg, httpfs present):
+    # LOAD avro, LOAD iceberg, LOAD httpfs succeed and duckdb_extensions() reports loaded = true
+    conn_ok = duckdb.connect(":memory:")
+    try:
+        conn_ok.execute("SET autoinstall_known_extensions = false")
+        conn_ok.execute("SET autoload_known_extensions = false")
+        conn_ok.execute(f"SET extension_directory = '{src_root}'")
+        conn_ok.execute(
+            "SET custom_extension_repository = '/nonexistent_extension_repository'"
+        )
+        conn_ok.execute("LOAD avro")
+        conn_ok.execute("LOAD iceberg")
+        conn_ok.execute("LOAD httpfs")
+
+        loaded_map = dict(
+            conn_ok.execute(
+                "SELECT extension_name, loaded FROM duckdb_extensions() "
+                "WHERE extension_name IN ('avro', 'iceberg', 'httpfs')"
+            ).fetchall()
+        )
+        assert loaded_map == {"avro": True, "iceberg": True, "httpfs": True}
+    finally:
+        conn_ok.close()
+
+    # 2. Against tmp_path / "ext_no_avro" symlinking v2.0.0/<platform>/ files EXCEPT omitting avro.duckdb_extension:
+    # both our early config check AND DuckDB's real LOAD iceberg fail!
+    ext_no_avro = tmp_path / "ext_no_avro"
+    ext_no_avro.mkdir(parents=True, exist_ok=True)
+    for item in src_root.rglob("*"):
+        rel = item.relative_to(src_root)
+        if item.is_dir():
+            (ext_no_avro / rel).mkdir(parents=True, exist_ok=True)
+        elif not item.name.startswith("avro.duckdb_extension"):
+            dest = ext_no_avro / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(item.resolve(), dest)
+
+    with pytest.raises((BadInputError, ValueError), match="avro.duckdb_extension"):
+        IcebergSourceConfig.from_dict(_sample_iceberg_dict(ext_no_avro))
+    clear_registered_secrets()
+
+    conn_fail = duckdb.connect(":memory:")
+    try:
+        conn_fail.execute("SET autoinstall_known_extensions = false")
+        conn_fail.execute("SET autoload_known_extensions = false")
+        conn_fail.execute(f"SET extension_directory = '{ext_no_avro}'")
+        conn_fail.execute(
+            "SET custom_extension_repository = '/nonexistent_extension_repository'"
+        )
+        with pytest.raises(duckdb.Error):
+            conn_fail.execute("LOAD iceberg")
+    finally:
+        conn_fail.close()
+
+
+def test_b_h_unpinned_table_resolves_snapshot_first_and_uses_same_id_for_load_count_and_freshness(
+    tmp_path,
+):
+    clear_registered_secrets()
+    ext_dir = tmp_path / "extensions"
+    ext_dir.mkdir()
+    secrets = _make_fake_secrets()
+    resolved_snap = 700100
+
+    # Stand-in catalog where snapshot 700100 has 3 rows while latest table already advanced to 5 rows,
+    # AND _iceberg_snapshots advertises 700100 at resolution time.
+    standin_file = _create_standin_iceberg_catalog(
+        tmp_path, pii_sentinel="unpinned@synthetic.test", pinned_snap_id=resolved_snap
+    )
+    meta_conn = duckdb.connect(str(standin_file))
+    meta_conn.execute(
+        "CREATE TABLE _iceberg_snapshots (table_name VARCHAR, snapshot_id BIGINT)"
+    )
+    meta_conn.execute(
+        "INSERT INTO _iceberg_snapshots VALUES ('analytics.daily_orders', ?)",
+        [resolved_snap],
+    )
+    meta_conn.close()
+
+    standin_map = {"lake": str(standin_file)}
+    event_order: list[str] = []
+
+    try:
+        # Unpinned table config: snapshot_id=None
+        cfg = IcebergSourceConfig.from_dict(
+            _sample_iceberg_dict(ext_dir, snapshot_id=None)
+        )
+        specs = build_iceberg_table_specs(cfg, pii_mode="exclude")
+        assert specs[0].snapshot_id is None
+
+        class OrderTrackingIcebergSource(IcebergSource):
+            def resolve_snapshot_id(self, table_or_spec):
+                snap = super().resolve_snapshot_id(table_or_spec)
+                event_order.append(f"resolve:{snap}")
+                return snap
+
+            def get_row_count(self, table_or_view: str, snapshot_id: int | None = None) -> int:
+                event_order.append(f"count:{snapshot_id}")
+                return super().get_row_count(table_or_view, snapshot_id=snapshot_id)
+
+        created_targets = []
+        base_factory = create_iceberg_target_factory(
+            cfg, env=secrets, standin_catalogs=standin_map
+        )
+
+        def tracking_factory(target_path):
+            tgt = base_factory(target_path)
+            orig_execute = tgt.execute
+
+            def wrapped_execute(stmt: str):
+                if stmt.startswith("CREATE TABLE "):
+                    event_order.append(f"ctas:{stmt}")
+                return orig_execute(stmt)
+
+            tgt.execute = wrapped_execute  # type: ignore[method-assign]
+            created_targets.append(tgt)
+            return tgt
+
+        source = OrderTrackingIcebergSource(
+            cfg, env=secrets, standin_catalogs=standin_map
+        )
+        cache_dir = tmp_path / "cache_unpinned"
+
+        run_load(
+            specs=specs,
+            source=source,
+            target_factory=tracking_factory,
+            cache_dir=cache_dir,
+            clock=lambda: datetime(2026, 11, 19, 17, 0, 0, tzinfo=timezone.utc),
+            pii_mode="exclude",
+            source_type="iceberg",
+        )
+        source.close()
+
+        # 1. Snapshot resolved FIRST, before CTAS and before row count
+        assert len(event_order) == 3
+        assert event_order[0] == f"resolve:{resolved_snap}"
+        assert event_order[1].startswith("ctas:")
+        assert f"AT (VERSION => {resolved_snap})" in event_order[1]
+        assert event_order[2] == f"count:{resolved_snap}"
+
+        # 2. Target CTAS and Source COUNT both used exact same AT (VERSION => 700100)
+        assert len(created_targets) == 1
+        ctas_stmts = [
+            s
+            for s in created_targets[0].executed_statements
+            if s.startswith("CREATE TABLE ")
+        ]
+        assert ctas_stmts == [
+            f"CREATE TABLE rpt.daily_orders AS SELECT order_id, order_date, net_amount "
+            f"FROM lake.analytics.daily_orders AT (VERSION => {resolved_snap})"
+        ]
+        assert source.executed_count_sqls == [
+            f"SELECT COUNT(*) FROM lake.analytics.daily_orders AT (VERSION => {resolved_snap})"
+        ]
+
+        # 3. freshness.json records exact resolved snapshot_id (3 rows from 700100, NOT 5 from latest)
+        freshness = json.loads(
+            (cache_dir / "freshness.json").read_text(encoding="utf-8")
+        )
+        assert freshness["tables"] == {"rpt.daily_orders": 3}
+        assert freshness["snapshots"] == {"rpt.daily_orders": resolved_snap}
+        assert all(v is not None for v in freshness["snapshots"].values())
+
+        # 4. Also verify live/mocked connection path queries iceberg_snapshots(...)
+        recorded_live_sql: list[str] = []
+
+        class FakeIcebergConn:
+            def execute(self, sql: str):
+                recorded_live_sql.append(sql)
+                return self
+
+            def fetchone(self):
+                return (9876543210,)
+
+            def close(self):
+                pass
+
+        live_src = IcebergSource(cfg, conn=FakeIcebergConn(), env=secrets)
+        assert live_src.resolve_snapshot_id(specs[0]) == 9876543210
+        assert recorded_live_sql == [
+            "SELECT snapshot_id FROM iceberg_snapshots(lake.analytics.daily_orders) "
+            "ORDER BY timestamp_ms DESC LIMIT 1"
+        ]
+    finally:
+        clear_registered_secrets()
+
+
+def test_b_h_snapshot_resolution_error_or_null_aborts_load_without_swap(tmp_path):
+    clear_registered_secrets()
+    ext_dir = tmp_path / "extensions"
+    ext_dir.mkdir()
+    secrets = _make_fake_secrets()
+    standin_file = _create_standin_iceberg_catalog(
+        tmp_path, pii_sentinel="p@synthetic.test", pinned_snap_id=700100
+    )
+    standin_map = {"lake": str(standin_file)}
+    cache_dir = tmp_path / "cache_abort"
+
+    try:
+        # 1. Establish initial valid mart.duckdb symlink and freshness.json
+        pinned_cfg = IcebergSourceConfig.from_dict(
+            _sample_iceberg_dict(ext_dir, snapshot_id=700100)
+        )
+        pinned_specs = build_iceberg_table_specs(pinned_cfg, pii_mode="exclude")
+        src_init = IcebergSource(pinned_cfg, env=secrets, standin_catalogs=standin_map)
+        fac_ok = create_iceberg_target_factory(
+            pinned_cfg, env=secrets, standin_catalogs=standin_map
+        )
+        initial_file = run_load(
+            specs=pinned_specs,
+            source=src_init,
+            target_factory=fac_ok,
+            cache_dir=cache_dir,
+            clock=lambda: datetime(2026, 11, 19, 18, 0, 0, tzinfo=timezone.utc),
+            pii_mode="exclude",
+            source_type="iceberg",
+        )
+        src_init.close()
+        initial_freshness_raw = (cache_dir / "freshness.json").read_text(
+            encoding="utf-8"
+        )
+
+        # Unpinned specs for subsequent failure scenarios
+        unpinned_cfg = IcebergSourceConfig.from_dict(
+            _sample_iceberg_dict(ext_dir, snapshot_id=None)
+        )
+        unpinned_specs = build_iceberg_table_specs(unpinned_cfg, pii_mode="exclude")
+
+        # 2a. Missing _iceberg_snapshots table (query raises error) -> LoadError
+        src_missing_meta = IcebergSource(
+            unpinned_cfg, env=secrets, standin_catalogs=standin_map
+        )
+        with pytest.raises(LoadError):
+            run_load(
+                specs=unpinned_specs,
+                source=src_missing_meta,
+                target_factory=fac_ok,
+                cache_dir=cache_dir,
+                clock=lambda: datetime(2026, 11, 19, 18, 10, 0, tzinfo=timezone.utc),
+                pii_mode="exclude",
+                source_type="iceberg",
+            )
+        src_missing_meta.close()
+
+        # 2b. Snapshot resolution returns None -> LoadError
+        src_null_snap = IcebergSource(
+            unpinned_cfg,
+            env=secrets,
+            standin_catalogs=standin_map,
+            standin_snapshots={"lake.analytics.daily_orders": None},
+        )
+        with pytest.raises(LoadError, match="None"):
+            run_load(
+                specs=unpinned_specs,
+                source=src_null_snap,
+                target_factory=fac_ok,
+                cache_dir=cache_dir,
+                clock=lambda: datetime(2026, 11, 19, 18, 20, 0, tzinfo=timezone.utc),
+                pii_mode="exclude",
+                source_type="iceberg",
+            )
+        src_null_snap.close()
+
+        # 2c. Live connection returning empty/None row -> LoadError
+        class NullRowConn:
+            def execute(self, _sql: str):
+                return self
+
+            def fetchone(self):
+                return (None,)
+
+            def close(self):
+                pass
+
+        src_live_null = IcebergSource(unpinned_cfg, conn=NullRowConn(), env=secrets)
+        with pytest.raises(LoadError):
+            run_load(
+                specs=unpinned_specs,
+                source=src_live_null,
+                target_factory=fac_ok,
+                cache_dir=cache_dir,
+                clock=lambda: datetime(2026, 11, 19, 18, 30, 0, tzinfo=timezone.utc),
+                pii_mode="exclude",
+                source_type="iceberg",
+            )
+
+        # Verify previous symlink, staged files, and freshness.json are completely untouched
+        assert os.readlink(cache_dir / "mart.duckdb") == initial_file.name
+        assert list(cache_dir.glob("mart-*.duckdb")) == [initial_file]
+        after_freshness_raw = (cache_dir / "freshness.json").read_text(encoding="utf-8")
+        assert after_freshness_raw == initial_freshness_raw
+        after_freshness = json.loads(after_freshness_raw)
+        assert after_freshness["snapshots"] == {"rpt.daily_orders": 700100}
+        assert None not in after_freshness["snapshots"].values()
+    finally:
+        clear_registered_secrets()
+
+
+def test_b_l2_http_endpoint_and_token_uri_rejected_unless_allow_insecure_http(tmp_path):
+    from seeknal.serving.accel.iceberg_source import AccelIcebergCatalogConfig
+
+    ext_dir = tmp_path / "extensions"
+    ext_dir.mkdir()
+
+    # 1. http:// endpoint rejected by default
+    cfg_http_ep = _sample_iceberg_dict(ext_dir)
+    cfg_http_ep["iceberg_catalogs"]["lake"]["endpoint"] = (
+        "http://lakekeeper.synthetic.internal/catalog"
+    )
+    with pytest.raises((BadInputError, ValueError), match="allow_insecure_http"):
+        IcebergSourceConfig.from_dict(cfg_http_ep)
+
+    # 2. http:// token_uri rejected by default
+    cfg_http_tok = _sample_iceberg_dict(ext_dir)
+    cfg_http_tok["iceberg_catalogs"]["lake"]["token_uri"] = (
+        "http://idp.synthetic.internal/oauth2/token"
+    )
+    with pytest.raises((BadInputError, ValueError), match="allow_insecure_http"):
+        IcebergSourceConfig.from_dict(cfg_http_tok)
+
+    # 3. Non-boolean allow_insecure_http rejected
+    for non_bool in ("true", 1, 0, None):
+        cfg_bad_bool = _sample_iceberg_dict(ext_dir)
+        cfg_bad_bool["iceberg_catalogs"]["lake"]["allow_insecure_http"] = non_bool
+        with pytest.raises((BadInputError, ValueError), match="allow_insecure_http"):
+            IcebergSourceConfig.from_dict(cfg_bad_bool)
+
+    # 4. allow_insecure_http: true permits http:// endpoint and token_uri
+    cfg_allowed = _sample_iceberg_dict(ext_dir)
+    cfg_allowed["iceberg_catalogs"]["lake"]["endpoint"] = (
+        "http://lakekeeper.synthetic.internal/catalog"
+    )
+    cfg_allowed["iceberg_catalogs"]["lake"]["token_uri"] = (
+        "http://idp.synthetic.internal/oauth2/token"
+    )
+    cfg_allowed["iceberg_catalogs"]["lake"]["allow_insecure_http"] = True
+
+    parsed = IcebergSourceConfig.from_dict(cfg_allowed)
+    cat = parsed.iceberg_catalogs["lake"]
+    assert isinstance(cat, AccelIcebergCatalogConfig)
+    assert cat.allow_insecure_http is True
+    assert cat.endpoint == "http://lakekeeper.synthetic.internal/catalog"
+    assert cat.token_uri == "http://idp.synthetic.internal/oauth2/token"
+    clear_registered_secrets()
+
+
+def test_b_l3_scrub_text_redacts_sql_escaped_doubled_single_quote_secrets(tmp_path):
+    clear_registered_secrets()
+    ext_dir = tmp_path / "extensions"
+    ext_dir.mkdir()
+    tag = uuid.uuid4().hex[:10]
+    secrets = {
+        "TEST_LK_CLIENT_ID": f"id'quote'{tag}",
+        "TEST_LK_CLIENT_SECRET": f"oauth'secret'{tag}",
+        "TEST_S3_KEY_ID": f"s3'kid'{tag}",
+        "TEST_S3_SECRET": f"s3'sec'{tag}",
+    }
+
+    try:
+        cfg = IcebergSourceConfig.from_dict(_sample_iceberg_dict(ext_dir))
+        steps = plan_iceberg_source_setup(cfg, env=secrets)
+
+        # Simulate a DuckDB error echoing the SQL-escaped secret SQL verbatim
+        secret_steps = [s for s in steps if s.phase == "secrets"]
+        assert len(secret_steps) == 2
+        simulated_err = f"Executor failed while running: {secret_steps[0].sql} | {secret_steps[1].sql}"
+        scrubbed = scrub_text(simulated_err)
+
+        for raw_sec in secrets.values():
+            escaped_sec = raw_sec.replace("'", "''")
+            assert raw_sec not in scrubbed
+            assert escaped_sec not in scrubbed
+        assert tag not in scrubbed
+        assert "[REDACTED]" in scrubbed
+    finally:
+        clear_registered_secrets()
+
 
