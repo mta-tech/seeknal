@@ -45,11 +45,13 @@ ops:
 | `public_buildinfo` | `bool` | `false` | Whether to expose `GET /buildinfo` on the public query listener. Disabled by default. |
 | `public_readyz` | `bool` | `true` | Whether to expose `GET /readyz` on the public query listener for ingress/load-balancer readiness checks. |
 
-### Secret Hygiene
+### Secret Hygiene and Startup Guarantees
 
 - Unknown keys in `ops:` are rejected at startup.
 - Literal secret keys (`token`, `auth_token`, `bearer_token`, `secret`, `password`, `api_key`) are strictly rejected; always configure `auth_token_env` with an environment variable name.
 - When `auth_token_env` is configured, every endpoint on the operations listener requires `Authorization: Bearer <token>`, verified in constant time via `hmac.compare_digest`. Missing, malformed, or mismatched tokens return HTTP `401` (`{"error": "unauthorized", ...}`).
+- Binding `ops.host` to a non-loopback address (anything other than `127.0.0.1`, `::1`, or `localhost`) without `ops.auth_token_env` configured emits a startup `WARNING` log.
+- `start_ops_server` pre-binds and verifies the operations listener socket and waits until it is actively serving before main query traffic starts; bind conflicts (e.g. `EADDRINUSE`) or startup failures raise `RuntimeError` immediately rather than silently running without operational endpoints.
 
 ---
 
@@ -65,16 +67,26 @@ Lightweight liveness probe confirming that the ASGI event loop is responsive wit
 
 ### `GET /readyz` — Catalog and Engine Readiness
 
-Verifies both catalog availability and downstream engine reachability:
+Verifies both catalog availability and downstream engine reachability out-of-band without competing with tenant query concurrency limits:
 
 1. **Catalog check:** Ready when static placement is loaded or when live discovery has completed at least one refresh (`refresher.last_success_at is not None`).
-2. **Engine probes:** Probes each configured engine within `readyz_timeout_seconds` and caches each engine's status for `readyz_cache_seconds`:
-   - **DuckDB (`DuckDBAdapter`):** Executes `SELECT 1` non-destructively on a cursor with bounded timeout.
-   - **Lakebase / StarRocks / DB-API (`DBAPIAdapter`):** Acquires a pooled or direct connection, executes `SELECT 1` on a cursor, and cleanly rolls back / releases or closes the connection.
+2. **Out-of-band engine probes with single-flight guard:** Probes each configured engine within `readyz_timeout_seconds` and caches each engine's status for `readyz_cache_seconds`:
+   - **DuckDB (`DuckDBAdapter`):** Opens a short-lived probe cursor directly and executes `SELECT 1` under bounded timeout without acquiring `_slot_semaphore` or touching `in_flight_cursors` / `queue_depth`, so saturated pods remain `Ready` under query load.
+   - **Lakebase / StarRocks / DB-API (`DBAPIAdapter`):** Opens a dedicated short-lived probe connection directly with `connect_timeout` (never acquiring from `LakebasePool`), executes `SELECT 1` on a cursor, and closes both cursor and connection immediately so exhausted query pools do not cause cascading `NotReady` transitions.
    - **Cube (`CubeAdapter`):** Connects with a short-lived probe security context and verifies SQL API reachability.
    - **Workload-routed engines (`WorkloadRoutedAdapter`):** Probes the `"interactive"` workload adapter (or the first configured account adapter).
+   - **Single-flight timeout protection:** At most one probe worker thread may be in flight per engine at any time. If a probe hangs past `readyz_timeout_seconds`, subsequent `/readyz` checks never spawn additional worker threads for that engine while the hung thread is still running; they return a fresh cached status if available or `"unavailable"` immediately until the in-flight probe exits.
 
-**HTTP 200 (all engines healthy and catalog loaded):**
+#### Public Listener vs. Dedicated Operations Listener Payloads
+
+Both listeners execute the full catalog and engine reachability checks (returning HTTP `200` when ready and HTTP `503` when not ready), but **public `/readyz` omits engine names** (`include_engines=False`) so unauthenticated ingress callers cannot enumerate configured backend engines:
+
+- **Public port (`GET /readyz`):**
+  - HTTP `200`: `{"ready": true}`
+  - HTTP `503` (catalog not yet loaded): `{"ready": false, "reason": "catalog_not_loaded"}`
+  - HTTP `503` (engine unavailable): `{"ready": false}`
+- **Operations listener (`GET /readyz`):**
+  - **HTTP 200 (all engines healthy and catalog loaded):**
 
 ```json
 {
@@ -86,7 +98,7 @@ Verifies both catalog availability and downstream engine reachability:
 }
 ```
 
-**HTTP 503 (discovery catalog not yet loaded):**
+  - **HTTP 503 (discovery catalog not yet loaded):**
 
 ```json
 {
@@ -99,7 +111,7 @@ Verifies both catalog availability and downstream engine reachability:
 }
 ```
 
-**HTTP 503 (one or more engines unreachable or timed out):**
+  - **HTTP 503 (one or more engines unreachable or timed out):**
 
 ```json
 {

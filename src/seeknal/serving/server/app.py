@@ -32,7 +32,13 @@ from seeknal.serving.adapters import (
     build_adapter,
     build_workload_adapters,
 )
-from seeknal.serving.audit import AuditSink, AuditWriteError, build_audit_sink
+from seeknal.serving.audit import (
+    AuditSink,
+    AuditWriteError,
+    FileAuditSink,
+    _safe_diag_target,
+    build_audit_sink,
+)
 from seeknal.serving.discovery import PlacementRefresher, discover
 from seeknal.serving.discovery.build import DiscoveryResult
 from seeknal.serving.duckdb_policy import DuckDBHolder, connect_hardened
@@ -167,6 +173,17 @@ def build_server(
 
     # 4. Configure logging
     configure_logging(cfg.logging)
+
+    if isinstance(audit_sink, FileAuditSink) and (
+        audit_sink._max_bytes is None
+        and audit_sink._max_files is None
+        and audit_sink._max_age_seconds is None
+    ):
+        logger.warning(
+            "Audit file sink '%s' has no max_bytes rotation and no retention "
+            "(max_files/max_age_seconds) configured; audit log may grow unbounded",
+            _safe_diag_target(audit_sink.path),
+        )
 
     if cfg.audit is not None and audit_sink is None:
         audit_sink = build_audit_sink(

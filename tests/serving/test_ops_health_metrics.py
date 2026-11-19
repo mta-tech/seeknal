@@ -50,6 +50,8 @@ from seeknal.serving.ops import (
     ReadinessProbe,
     build_public_extra_routes,
     create_ops_app,
+    make_readyz_handler,
+    start_ops_server,
 )
 from seeknal.serving.placement import Placement
 from seeknal.serving.server.app import build_server
@@ -976,7 +978,7 @@ def test_public_port_has_no_metrics_or_buildinfo_by_default(tmp_path):
         assert srv_client.get("/healthz").status_code == 200
         ready_resp = srv_client.get("/readyz")
         assert ready_resp.status_code == 200
-        assert ready_resp.json() == {"ready": True, "engines": {"duck": "ok"}}
+        assert ready_resp.json() == {"ready": True}
         assert srv_client.get("/metrics").status_code == 404
         assert srv_client.get("/buildinfo").status_code == 404
 
@@ -1178,10 +1180,7 @@ def test_build_server_end_to_end_ops_app_public_flags_caching_and_metrics(tmp_pa
         assert pub_client.get("/healthz").status_code == 200
         pub_ready = pub_client.get("/readyz")
         assert pub_ready.status_code == 200
-        assert pub_ready.json() == {
-            "ready": True,
-            "engines": {"duck": "ok", "lakebase": "ok"},
-        }
+        assert pub_ready.json() == {"ready": True}
         assert pub_client.get("/metrics").status_code == 404
         assert pub_client.get("/buildinfo").status_code == 404
 
@@ -1213,12 +1212,16 @@ def test_build_server_end_to_end_ops_app_public_flags_caching_and_metrics(tmp_pa
         fake_clock[0] = 515.0
         pub_ready_503 = pub_client.get("/readyz")
         assert pub_ready_503.status_code == 503
-        assert pub_ready_503.json() == {
+        assert pub_ready_503.json() == {"ready": False}
+        assert "CANARY_PG_PW_888" not in pub_ready_503.text
+        assert "internal-lb.corp.local" not in pub_ready_503.text
+
+        ops_ready_503 = ops_client.get("/readyz", headers=ops_headers)
+        assert ops_ready_503.status_code == 503
+        assert ops_ready_503.json() == {
             "ready": False,
             "engines": {"duck": "ok", "lakebase": "unavailable"},
         }
-        assert "CANARY_PG_PW_888" not in pub_ready_503.text
-        assert "internal-lb.corp.local" not in pub_ready_503.text
 
         # Execute queries, explain, cancel, and error/grant-rejection paths on public port
         planted_subject = "vip-analyst@tenant-secret.org"
@@ -1537,4 +1540,426 @@ def test_cli_main_starts_and_stops_ops_listener_and_keeps_version_and_validate(
     assert rc == 0
     assert len(ops_calls) == 1
     assert ops_calls[0][1] == {"host": "127.0.0.1", "port": 9199}
+
+
+# ---------------------------------------------------------------------------
+# 7. Sub-task D review regression tests (D-M1..M3, D-L1..L2)
+# ---------------------------------------------------------------------------
+
+
+def test_d_m1_readiness_probe_bypasses_duckdb_slot_and_lakebase_pool():
+    duck_query_started = threading.Event()
+    release_duck_query = threading.Event()
+
+    class SlotHoldingCursor:
+        description = [("x", "INTEGER", None, None, None, None, None)]
+
+        def execute(self, sql, params=()):
+            if sql != "SELECT 1":
+                duck_query_started.set()
+                release_duck_query.wait(timeout=5.0)
+
+        def fetchone(self):
+            return (1,)
+
+        def fetchmany(self, size):
+            return [(1,)]
+
+        def close(self):
+            pass
+
+    duck_adapter = DuckDBAdapter(
+        connect=lambda: SlotHoldingCursor(),
+        max_concurrent_cursors=1,
+    )
+
+    class ProbeAwareLBConn:
+        def __init__(self) -> None:
+            self.closed = 0
+            self.executed: list[str] = []
+
+        def cursor(self):
+            conn = self
+
+            class _Cur:
+                def execute(self, sql, params=()):
+                    conn.executed.append(sql)
+
+                def close(self):
+                    pass
+
+            return _Cur()
+
+        def close(self):
+            self.closed = 1
+
+    created_lb_conns: list[ProbeAwareLBConn] = []
+
+    def lb_connect(**kwargs):
+        c = ProbeAwareLBConn()
+        created_lb_conns.append(c)
+        return c
+
+    lb_pool = LakebasePool(
+        lb_connect,
+        pool_max=1,
+        acquire_timeout_seconds=5.0,
+    )
+    lb_adapter = DBAPIAdapter(lb_connect, kind="lakebase", pool=lb_pool)
+
+    # 1) Hold the ONLY DuckDB cursor slot in an active query thread
+    duck_thread = threading.Thread(
+        target=lambda: duck_adapter.execute(
+            _make_prepared_duckdb("SELECT 42", "q-hold-slot"),
+            timeout_seconds=5.0,
+        ),
+        daemon=True,
+    )
+    duck_thread.start()
+    assert duck_query_started.wait(timeout=2.0)
+    assert duck_adapter.stats()["in_flight_cursors"] == 1
+
+    # 2) Acquire and hold the ONLY pooled Lakebase connection
+    held_lb_conn = lb_pool.acquire()
+    assert lb_pool.stats()["in_use"] == 1
+    assert lb_pool.stats()["pool_max"] == 1
+
+    try:
+        probe = ReadinessProbe(
+            {"duck": duck_adapter, "lakebase": lb_adapter},
+            timeout_seconds=2.0,
+            cache_seconds=0.0,
+        )
+        ops_app = create_ops_app(readiness=probe)
+        client = TestClient(ops_app)
+
+        t0 = time.perf_counter()
+        resp = client.get("/readyz")
+        elapsed = time.perf_counter() - t0
+
+        assert resp.status_code == 200
+        assert elapsed < 0.5
+        assert resp.json() == {
+            "ready": True,
+            "engines": {"duck": "ok", "lakebase": "ok"},
+        }
+
+        # Verify neither DuckDB slot gauges nor Lakebase pool counts were disturbed
+        assert duck_adapter.stats()["in_flight_cursors"] == 1
+        assert duck_adapter.stats()["queue_depth"] == 0
+        assert lb_pool.stats()["in_use"] == 1
+        assert held_lb_conn.closed == 0
+        # The separate direct probe connection was opened and closed cleanly
+        assert len(created_lb_conns) == 2
+        assert created_lb_conns[1].closed == 1
+    finally:
+        release_duck_query.set()
+        duck_thread.join(timeout=2.0)
+        lb_pool.release(held_lb_conn, success=True)
+        lb_pool.close()
+
+
+def test_d_m2_single_in_flight_probe_per_engine_prevents_thread_pileup():
+    call_count = 0
+    count_lock = threading.Lock()
+    first_entered = threading.Event()
+    unblock_probe = threading.Event()
+
+    def blocking_connect(**kwargs):
+        nonlocal call_count
+        with count_lock:
+            call_count += 1
+        first_entered.set()
+        unblock_probe.wait(timeout=5.0)
+        return MagicMock()
+
+    adapter = DBAPIAdapter(blocking_connect, kind="lakebase")
+    probe = ReadinessProbe(
+        {"lakebase": adapter},
+        timeout_seconds=0.05,
+        cache_seconds=0.0,
+    )
+    ops_app = create_ops_app(readiness=probe)
+    client = TestClient(ops_app)
+
+    try:
+        t0 = time.perf_counter()
+        responses = [client.get("/readyz") for _ in range(5)]
+        total_elapsed = time.perf_counter() - t0
+
+        assert first_entered.is_set()
+        assert all(r.status_code == 503 for r in responses)
+        assert total_elapsed < 1.0
+        with count_lock:
+            assert call_count == 1
+    finally:
+        unblock_probe.set()
+
+    # Wait briefly for the unblocked worker thread's finally block to clear _in_flight
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        with probe._lock:
+            if "lakebase" not in probe._in_flight:
+                break
+        time.sleep(0.005)
+
+    next_resp = client.get("/readyz")
+    assert next_resp.status_code == 200
+    assert next_resp.json() == {"ready": True, "engines": {"lakebase": "ok"}}
+    with count_lock:
+        assert call_count == 2
+
+
+def test_d_m3_ops_listener_bind_failure_raises_before_serving(
+    tmp_path, monkeypatch, capsys
+):
+    import httpx
+    import socket
+    import yaml
+
+    ops_app = create_ops_app(ops_config=OpsConfig(enabled=True))
+
+    conflict_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    conflict_sock.bind(("127.0.0.1", 0))
+    conflict_sock.listen(1)
+    occupied_port = conflict_sock.getsockname()[1]
+
+    try:
+        # 1) Default uvicorn path fails fast before serving when port is occupied
+        with pytest.raises(RuntimeError, match="Ops listener failed to bind"):
+            start_ops_server(ops_app, host="127.0.0.1", port=occupied_port)
+
+        # 2) Custom ops_run path also fails pre-bind check when port is occupied
+        ops_run_called = False
+
+        def never_called_ops_run(app, **kw):
+            nonlocal ops_run_called
+            ops_run_called = True
+
+        with pytest.raises(RuntimeError, match="Ops listener failed to bind"):
+            start_ops_server(
+                ops_app,
+                host="127.0.0.1",
+                port=occupied_port,
+                ops_run=never_called_ops_run,
+            )
+        assert ops_run_called is False
+
+        # 3) CLI main() exits non-zero (2) within < 2.0s and never calls public run()
+        _, jwks_file, db_file, pf, sf = _setup_test_keys_and_catalog(tmp_path)
+        monkeypatch.setenv("LB_DSN_DM3", "postgresql://u:p@localhost/db")
+        monkeypatch.setenv("OPS_TOK_DM3", "ops-tok-dm3")
+
+        cfg_path = tmp_path / "serving_dm3.yaml"
+        cfg_path.write_text(
+            yaml.safe_dump(
+                {
+                    "listen": {"host": "127.0.0.1", "port": 8765},
+                    "grant_keys": {"jwks_file": jwks_file},
+                    "placement": {
+                        "static": {"placement_file": pf, "schemas_file": sf}
+                    },
+                    "connections": {
+                        "duck": {
+                            "kind": "duckdb",
+                            "path": db_file,
+                            "allowed_directories": [str(tmp_path) + "/"],
+                        },
+                        "lakebase": {"kind": "lakebase", "dsn_env": "LB_DSN_DM3"},
+                    },
+                    "ops": {
+                        "enabled": True,
+                        "host": "127.0.0.1",
+                        "port": occupied_port,
+                        "auth_token_env": "OPS_TOK_DM3",
+                    },
+                }
+            )
+        )
+
+        public_run_called = False
+
+        def fake_public_run(app, **kw):
+            nonlocal public_run_called
+            public_run_called = True
+
+        t0 = time.perf_counter()
+        rc = serving_main(["--config", str(cfg_path)], run=fake_public_run)
+        elapsed = time.perf_counter() - t0
+
+        assert rc == 2
+        assert elapsed < 2.0
+        assert public_run_called is False
+        assert "Error:" in capsys.readouterr().err
+    finally:
+        conflict_sock.close()
+
+    # 4) Custom ops_run raising an exception on startup surfaces RuntimeError in caller
+    def failing_ops_run(app, **kw):
+        raise OSError("simulated startup failure")
+
+    with pytest.raises(RuntimeError, match="Ops listener failed to start"):
+        start_ops_server(
+            ops_app,
+            host="127.0.0.1",
+            port=0,
+            ops_run=failing_ops_run,
+        )
+
+    # 5) Free port succeeds, waits until started, and serves immediately
+    ops_server, ops_thread = start_ops_server(
+        ops_app,
+        host="127.0.0.1",
+        port=0,
+    )
+    try:
+        assert ops_server is not None
+        assert ops_server.started is True
+        bound_port = ops_server.config.port
+        r = httpx.get(f"http://127.0.0.1:{bound_port}/healthz", timeout=2.0)
+        assert r.status_code == 200
+        assert r.json() == {"status": "ok"}
+    finally:
+        ops_server.should_exit = True
+        ops_thread.join(timeout=5.0)
+
+
+def test_d_l1_public_readyz_omits_engines_while_ops_readyz_includes_engines():
+    @dataclass
+    class FakeRefresher:
+        last_success_at: float | None = 1.0
+
+    refresher = FakeRefresher(last_success_at=1.0)
+    lb_healthy = [True]
+
+    def lb_connect(**kwargs):
+        if not lb_healthy[0]:
+            raise ConnectionError("lakebase unreachable")
+        return MagicMock()
+
+    adapters = {
+        "duck": DuckDBAdapter(connect=lambda: duckdb.connect()),
+        "lakebase": DBAPIAdapter(lb_connect, kind="lakebase"),
+    }
+    readiness = ReadinessProbe(
+        adapters,
+        is_static=False,
+        refresher=refresher,
+        cache_seconds=0.0,
+    )
+
+    pipeline = ServingPipeline(
+        placement=Placement(engines={}, tables={}, cubes={}),
+        schemas={},
+        public_keys={},
+    )
+    pub_app = create_app(
+        pipeline=pipeline,
+        adapters=adapters,
+        extra_routes=build_public_extra_routes(
+            OpsConfig(public_readyz=True),
+            readiness=readiness,
+        ),
+    )
+    ops_app = create_ops_app(
+        ops_config=OpsConfig(enabled=True),
+        readiness=readiness,
+    )
+
+    pub_client = TestClient(pub_app)
+    ops_client = TestClient(ops_app)
+
+    # 1) All engines healthy + catalog loaded -> 200
+    r_pub_ok = pub_client.get("/readyz")
+    assert r_pub_ok.status_code == 200
+    assert r_pub_ok.json() == {"ready": True}
+    assert "engines" not in r_pub_ok.json()
+
+    r_ops_ok = ops_client.get("/readyz")
+    assert r_ops_ok.status_code == 200
+    assert r_ops_ok.json() == {
+        "ready": True,
+        "engines": {"duck": "ok", "lakebase": "ok"},
+    }
+
+    # 2) Engine unavailable -> both 503, public omits engines, ops includes engines
+    lb_healthy[0] = False
+    r_pub_unavail = pub_client.get("/readyz")
+    assert r_pub_unavail.status_code == 503
+    assert r_pub_unavail.json() == {"ready": False}
+    assert "engines" not in r_pub_unavail.json()
+
+    r_ops_unavail = ops_client.get("/readyz")
+    assert r_ops_unavail.status_code == 503
+    assert r_ops_unavail.json() == {
+        "ready": False,
+        "engines": {"duck": "ok", "lakebase": "unavailable"},
+    }
+
+    # 3) Discovery catalog not loaded -> both 503 with reason, public omits engines
+    lb_healthy[0] = True
+    refresher.last_success_at = None
+    r_pub_cat = pub_client.get("/readyz")
+    assert r_pub_cat.status_code == 503
+    assert r_pub_cat.json() == {"ready": False, "reason": "catalog_not_loaded"}
+    assert "engines" not in r_pub_cat.json()
+
+    r_ops_cat = ops_client.get("/readyz")
+    assert r_ops_cat.status_code == 503
+    assert r_ops_cat.json() == {
+        "ready": False,
+        "reason": "catalog_not_loaded",
+        "engines": {"duck": "ok", "lakebase": "ok"},
+    }
+
+    # Also verify make_readyz_handler directly
+    assert readiness.check(include_engines=False) == (
+        503,
+        {"ready": False, "reason": "catalog_not_loaded"},
+    )
+    assert callable(make_readyz_handler(readiness, include_engines=False))
+
+
+def test_d_l2_non_loopback_ops_host_without_auth_token_env_logs_warning(caplog):
+    import logging
+
+    # 1) Non-loopback without auth_token_env logs WARNING
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="seeknal.serving.ops"):
+        create_ops_app(
+            ops_config=OpsConfig(enabled=True, host="0.0.0.0", auth_token_env=None)
+        )
+    assert any(
+        rec.levelname == "WARNING"
+        and "Ops listener is bound to non-loopback host '0.0.0.0' without 'ops.auth_token_env' configured"
+        in rec.getMessage()
+        for rec in caplog.records
+    )
+
+    # 2) Loopback hosts without auth_token_env do NOT warn
+    for loopback_host in ("127.0.0.1", "::1", "localhost"):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="seeknal.serving.ops"):
+            create_ops_app(
+                ops_config=OpsConfig(
+                    enabled=True,
+                    host=loopback_host,
+                    auth_token_env=None,
+                )
+            )
+        assert not caplog.records
+
+    # 3) Non-loopback host WITH auth_token_env configured does NOT warn
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="seeknal.serving.ops"):
+        create_ops_app(
+            ops_config=OpsConfig(
+                enabled=True,
+                host="0.0.0.0",
+                auth_token_env="SEEKNAL_OPS_TOKEN",
+            ),
+            env={"SEEKNAL_OPS_TOKEN": "tok-123"},
+        )
+    assert not caplog.records
+
 

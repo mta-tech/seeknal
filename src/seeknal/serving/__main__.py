@@ -13,6 +13,7 @@ from typing import Any
 import uvicorn
 
 from seeknal.serving.buildinfo import format_build_info, get_build_info
+from seeknal.serving.ops import start_ops_server
 from seeknal.serving.server.app import build_server
 from seeknal.serving.server.config import ServerConfig, ServerConfigError
 from seeknal.serving.startup_validation import (
@@ -165,33 +166,30 @@ def main(
             if cfg.tls.require_client_cert:
                 run_kwargs["ssl_cert_reqs"] = ssl.CERT_REQUIRED
 
-    ops_server: uvicorn.Server | None = None
+    ops_server: Any = None
     ops_thread: threading.Thread | None = None
     if cfg.ops is not None and cfg.ops.enabled and handle.ops_app is not None:
-        if ops_run is not None:
-            ops_thread = threading.Thread(
-                target=ops_run,
-                args=(handle.ops_app,),
-                kwargs={"host": cfg.ops.host, "port": cfg.ops.port},
-                name="seeknal-ops-listener",
-                daemon=True,
-            )
-            ops_thread.start()
-        else:
-            ops_uv_cfg = uvicorn.Config(
+        try:
+            ops_server, ops_thread = start_ops_server(
                 handle.ops_app,
                 host=cfg.ops.host,
                 port=cfg.ops.port,
-                log_level="warning",
+                ops_run=ops_run,
             )
-            ops_server = uvicorn.Server(ops_uv_cfg)
-            ops_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
-            ops_thread = threading.Thread(
-                target=ops_server.run,
-                name="seeknal-ops-listener",
-                daemon=True,
-            )
-            ops_thread.start()
+        except Exception as exc:
+            for adapter in handle.adapters.values():
+                if hasattr(adapter, "close"):
+                    try:
+                        adapter.close()
+                    except Exception:
+                        pass
+            if handle.audit_sink is not None and hasattr(handle.audit_sink, "close"):
+                try:
+                    handle.audit_sink.close()
+                except Exception:
+                    pass
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
 
     try:
         run(handle.app, **run_kwargs)

@@ -566,7 +566,7 @@ class DuckDBAdapter:
         }
 
     def check_health(self, timeout_seconds: float = 2.0) -> bool:
-        """Non-destructively probe DuckDB with SELECT 1 under bounded timeout."""
+        """Non-destructively probe DuckDB with SELECT 1 outside the query slot semaphore."""
         try:
             if (
                 isinstance(timeout_seconds, bool)
@@ -582,16 +582,9 @@ class DuckDBAdapter:
             if remaining <= 0:
                 return False
 
-            if not self._slot_semaphore.acquire(timeout=remaining):
-                return False
-
             cur: Any = None
             timer: threading.Timer | None = None
             try:
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0:
-                    return False
-
                 if self._config is not None:
                     if self._holder is not None and getattr(self._holder, "_closed", False):
                         return False
@@ -655,7 +648,6 @@ class DuckDBAdapter:
                         cur.close()
                     except Exception:
                         pass
-                self._slot_semaphore.release()
         except Exception:
             return False
 
@@ -1411,6 +1403,68 @@ class DBAPIAdapter:
     def close(self) -> None:
         if self._pool is not None:
             self._pool.close()
+
+    def check_health(self, timeout_seconds: float = 2.0) -> bool:
+        """Probe engine reachability via a short-lived direct connection outside the query pool."""
+        try:
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or math.isnan(timeout_seconds)
+                or math.isinf(timeout_seconds)
+                or timeout_seconds <= 0
+            ):
+                return False
+
+            if self._before_connect is not None:
+                self._before_connect()
+
+            to_int = max(1, math.ceil(float(timeout_seconds)))
+            accepts_kw = True
+            try:
+                sig = inspect.signature(self._connect)
+                accepts_kw = "connect_timeout" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values()
+                )
+            except (ValueError, TypeError):
+                accepts_kw = True
+
+            if accepts_kw:
+                try:
+                    conn = self._connect(connect_timeout=to_int)
+                except TypeError:
+                    conn = self._connect()
+            else:
+                conn = self._connect()
+
+            if conn is None:
+                return False
+
+            cur: Any = None
+            try:
+                if hasattr(conn, "cursor") and callable(conn.cursor):
+                    cur = conn.cursor()
+                    if (
+                        cur is not None
+                        and hasattr(cur, "execute")
+                        and callable(cur.execute)
+                    ):
+                        cur.execute("SELECT 1")
+                return True
+            finally:
+                if cur is not None and hasattr(cur, "close") and callable(cur.close):
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+                if hasattr(conn, "close") and callable(conn.close):
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        except Exception:
+            return False
 
     def execute(
         self,

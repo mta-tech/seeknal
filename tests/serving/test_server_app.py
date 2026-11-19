@@ -109,7 +109,7 @@ def test_static_duckdb_end_to_end_and_readyz(
         # 2. /readyz 200 for static placement
         resp_r = client.get("/readyz")
         assert resp_r.status_code == 200
-        assert resp_r.json() == {"ready": True, "engines": {"duck": "ok"}}
+        assert resp_r.json() == {"ready": True}
 
         # 3. /v1/query with typ: "grant" succeeds
         sql = "SELECT id, name FROM users ORDER BY id"
@@ -214,7 +214,6 @@ def test_discovery_mode_readyz_and_error_handling(ec_key_pair, jwks_path):
     assert resp_before.json() == {
         "ready": False,
         "reason": "catalog_not_loaded",
-        "engines": {"duck": "ok"},
     }
 
     # 2. After refresh succeeds: /readyz returns 200
@@ -224,7 +223,7 @@ def test_discovery_mode_readyz_and_error_handling(ec_key_pair, jwks_path):
 
     resp_after = client.get("/readyz")
     assert resp_after.status_code == 200
-    assert resp_after.json() == {"ready": True, "engines": {"duck": "ok"}}
+    assert resp_after.json() == {"ready": True}
 
     # 3. Failing refresh keeps it 503 and leaks no error text
     should_fail = True
@@ -238,7 +237,6 @@ def test_discovery_mode_readyz_and_error_handling(ec_key_pair, jwks_path):
     assert resp_fail.json() == {
         "ready": False,
         "reason": "catalog_not_loaded",
-        "engines": {"duck": "ok"},
     }
     assert "SECRET_PASSWORD_999" not in resp_fail.text
 

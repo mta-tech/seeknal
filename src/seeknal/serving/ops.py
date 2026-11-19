@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hmac
+import logging
 import math
 import os
 import re
+import socket
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -13,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import duckdb
+import uvicorn
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
@@ -28,6 +31,8 @@ from seeknal.serving.adapters import (
 )
 from seeknal.serving.metrics import PROMETHEUS_CONTENT_TYPE, MetricsRegistry
 from seeknal.serving.service import PreparedQuery
+
+logger = logging.getLogger(__name__)
 
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _SAFE_KEY_DIAG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -297,15 +302,14 @@ class ReadinessProbe:
             dict(custom_probes) if custom_probes else {}
         )
 
-        self._cache_lock = threading.Lock()
-        self._cache: dict[str, tuple[bool, float]] = {}
-        self._engine_locks: dict[str, threading.Lock] = {
-            name: threading.Lock() for name in self._adapters
-        }
+        self._lock = threading.Lock()
+        self._cache_lock = self._lock
+        self._cache: dict[str, tuple[str, float]] = {}
+        self._in_flight: set[str] = set()
 
     def clear_cache(self) -> None:
         """Invalidate all cached per-engine readiness results."""
-        with self._cache_lock:
+        with self._lock:
             self._cache.clear()
 
     def _is_catalog_loaded(self) -> bool:
@@ -325,7 +329,7 @@ class ReadinessProbe:
             return getattr(self._refresher, "last_success_at", None) is not None
         return True
 
-    def _probe_adapter_impl(self, eng_name: str, adapter: Any) -> bool:
+    def _probe_single_adapter(self, eng_name: str, adapter: Any) -> bool:
         if eng_name in self._custom_probes:
             return bool(self._custom_probes[eng_name]())
 
@@ -335,56 +339,13 @@ class ReadinessProbe:
             sub = adapter.by_workload.get("interactive")
             if sub is None:
                 sub = next(iter(adapter.by_workload.values()))
-            return self._probe_adapter_impl(eng_name, sub)
+            return self._probe_single_adapter(eng_name, sub)
 
         if isinstance(adapter, DuckDBAdapter):
             return adapter.check_health(timeout_seconds=self._timeout_seconds)
 
         if isinstance(adapter, DBAPIAdapter):
-            before = getattr(adapter, "_before_connect", None)
-            if callable(before):
-                before()
-
-            pool = adapter.pool
-            pooled = pool is not None
-            conn = pool.acquire() if pooled else adapter._connect()
-            if conn is None:
-                return False
-
-            ok = False
-            cur = None
-            try:
-                if hasattr(conn, "cursor") and callable(conn.cursor):
-                    cur = conn.cursor()
-                    if (
-                        cur is not None
-                        and hasattr(cur, "execute")
-                        and callable(cur.execute)
-                    ):
-                        cur.execute("SELECT 1")
-                ok = True
-                if pooled and hasattr(conn, "rollback") and callable(conn.rollback):
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                return True
-            finally:
-                if cur is not None and hasattr(cur, "close") and callable(cur.close):
-                    try:
-                        cur.close()
-                    except Exception:
-                        pass
-                if pooled:
-                    try:
-                        pool.release(conn, success=ok)
-                    except Exception:
-                        pass
-                elif hasattr(conn, "close") and callable(conn.close):
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+            return adapter.check_health(timeout_seconds=self._timeout_seconds)
 
         if isinstance(adapter, CubeAdapter):
             probe_prepared = PreparedQuery(
@@ -452,7 +413,11 @@ class ReadinessProbe:
             return bool(adapter.check_health(timeout_seconds=self._timeout_seconds))
 
         if callable(getattr(adapter, "_connect", None)):
-            conn = adapter._connect()
+            to_int = max(1, math.ceil(float(self._timeout_seconds)))
+            try:
+                conn = adapter._connect(connect_timeout=to_int)
+            except TypeError:
+                conn = adapter._connect()
             if conn is None:
                 return False
             cur = None
@@ -483,88 +448,100 @@ class ReadinessProbe:
 
         return False
 
-    def _run_bounded_probe(self, eng_name: str, adapter: Any) -> bool:
-        outcome: list[bool] = [False]
+    _probe_adapter_impl = _probe_single_adapter
+
+    def _get_fresh_cached_locked(self, eng_name: str, now: float) -> str | None:
+        if self._cache_seconds <= 0:
+            return None
+        cached = self._cache.get(eng_name)
+        if cached is None:
+            return None
+        cached_status, cached_ts = cached
+        if 0.0 <= (now - cached_ts) < self._cache_seconds:
+            return cached_status
+        return None
+
+    def _probe_engine_with_timeout(self, eng_name: str, adapter: Any) -> str:
+        with self._lock:
+            now = float(self._clock())
+            fresh = self._get_fresh_cached_locked(eng_name, now)
+            if fresh is not None:
+                return fresh
+            if eng_name in self._in_flight:
+                return "unavailable"
+            self._in_flight.add(eng_name)
+
+        outcome: list[str] = ["unavailable"]
+        done = threading.Event()
+        timed_out = threading.Event()
 
         def _worker() -> None:
             try:
-                outcome[0] = bool(self._probe_adapter_impl(eng_name, adapter))
+                ok = bool(self._probe_single_adapter(eng_name, adapter))
+                outcome[0] = "ok" if ok else "unavailable"
             except Exception:
-                outcome[0] = False
+                outcome[0] = "unavailable"
+            finally:
+                with self._lock:
+                    if not timed_out.is_set() and self._cache_seconds > 0:
+                        self._cache[eng_name] = (outcome[0], float(self._clock()))
+                    self._in_flight.discard(eng_name)
+                    done.set()
 
         thread = threading.Thread(
             target=_worker,
             daemon=True,
             name=f"seeknal-readyz-{eng_name}",
         )
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            with self._lock:
+                self._in_flight.discard(eng_name)
+            return "unavailable"
+
         thread.join(timeout=self._timeout_seconds)
-        if thread.is_alive():
-            return False
+        if not done.is_set():
+            with self._lock:
+                if done.is_set():
+                    return outcome[0]
+                timed_out.set()
+                if self._cache_seconds > 0:
+                    self._cache[eng_name] = ("unavailable", float(self._clock()))
+                return "unavailable"
         return outcome[0]
 
-    def _get_engine_lock(self, eng_name: str) -> threading.Lock:
-        with self._cache_lock:
-            lock = self._engine_locks.get(eng_name)
-            if lock is None:
-                lock = threading.Lock()
-                self._engine_locks[eng_name] = lock
-            return lock
-
-    def _check_engine_cached(self, eng_name: str, adapter: Any) -> bool:
-        if self._cache_seconds > 0:
-            now = float(self._clock())
-            with self._cache_lock:
-                cached = self._cache.get(eng_name)
-                if cached is not None:
-                    is_ok, checked_at = cached
-                    if 0.0 <= (now - checked_at) < self._cache_seconds:
-                        return is_ok
-
-        eng_lock = self._get_engine_lock(eng_name)
-        with eng_lock:
-            if self._cache_seconds > 0:
-                now = float(self._clock())
-                with self._cache_lock:
-                    cached = self._cache.get(eng_name)
-                    if cached is not None:
-                        is_ok, checked_at = cached
-                        if 0.0 <= (now - checked_at) < self._cache_seconds:
-                            return is_ok
-
-            ok = self._run_bounded_probe(eng_name, adapter)
-            if self._cache_seconds > 0:
-                recorded_at = float(self._clock())
-                with self._cache_lock:
-                    self._cache[eng_name] = (ok, recorded_at)
-            return ok
-
-    def check(self) -> tuple[int, dict[str, Any]]:
+    def check(self, *, include_engines: bool = True) -> tuple[int, dict[str, Any]]:
         """Evaluate catalog and engine readiness, returning (http_status, safe_payload)."""
         catalog_loaded = self._is_catalog_loaded()
         engines_status: dict[str, str] = {}
         all_engines_ok = True
 
         for eng_name, adapter in self._adapters.items():
-            ok = self._check_engine_cached(eng_name, adapter)
-            engines_status[eng_name] = "ok" if ok else "unavailable"
-            if not ok:
+            status_str = self._probe_engine_with_timeout(eng_name, adapter)
+            engines_status[eng_name] = status_str
+            if status_str != "ok":
                 all_engines_ok = False
 
         if not catalog_loaded:
-            return (
-                503,
-                {
-                    "ready": False,
-                    "reason": "catalog_not_loaded",
-                    "engines": engines_status,
-                },
-            )
+            payload: dict[str, Any] = {
+                "ready": False,
+                "reason": "catalog_not_loaded",
+            }
+            if include_engines:
+                payload["engines"] = engines_status
+            return 503, payload
 
         if all_engines_ok:
-            return 200, {"ready": True, "engines": engines_status}
+            payload = {"ready": True}
+            if include_engines:
+                payload["engines"] = engines_status
+            return 200, payload
 
-        return 503, {"ready": False, "engines": engines_status}
+        payload = {"ready": False}
+        if include_engines:
+            payload["engines"] = engines_status
+        return 503, payload
 
     async def handle_request(self, request: Request) -> JSONResponse:
         """Async Starlette endpoint handler for GET /readyz."""
@@ -626,6 +603,51 @@ def _verify_ops_bearer_token(
     return None
 
 
+def make_readyz_handler(
+    readiness: ReadinessProbe,
+    *,
+    include_engines: bool = True,
+    metrics: MetricsRegistry | None = None,
+    auth_token_env: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Callable[[Request], Any]:
+    """Create an async Starlette GET /readyz handler with configurable engine visibility."""
+
+    async def readyz_handler(request: Request) -> Response:
+        start = time.perf_counter()
+        auth_err = _verify_ops_bearer_token(request, auth_token_env, env)
+        if auth_err is not None:
+            if metrics is not None:
+                metrics.record_request(
+                    "/readyz",
+                    status=401,
+                    duration_seconds=time.perf_counter() - start,
+                    error_code="unauthorized",
+                )
+            return auth_err
+
+        status_code, payload = await run_in_threadpool(
+            lambda: readiness.check(include_engines=include_engines)
+        )
+        if metrics is not None:
+            err_code = None
+            if status_code != 200:
+                err_code = (
+                    "catalog_not_loaded"
+                    if payload.get("reason") == "catalog_not_loaded"
+                    else "not_ready"
+                )
+            metrics.record_request(
+                "/readyz",
+                status=status_code,
+                duration_seconds=time.perf_counter() - start,
+                error_code=err_code,
+            )
+        return JSONResponse(payload, status_code=status_code)
+
+    return readyz_handler
+
+
 def build_public_extra_routes(
     ops_config: OpsConfig | None = None,
     *,
@@ -639,26 +661,17 @@ def build_public_extra_routes(
     routes: list[Route] = []
 
     if cfg.public_readyz:
-        async def public_readyz(request: Request) -> Response:
-            start = time.perf_counter()
-            status_code, payload = await run_in_threadpool(readiness.check)
-            if metrics is not None:
-                err_code = None
-                if status_code != 200:
-                    err_code = (
-                        "catalog_not_loaded"
-                        if payload.get("reason") == "catalog_not_loaded"
-                        else "not_ready"
-                    )
-                metrics.record_request(
-                    "/readyz",
-                    status=status_code,
-                    duration_seconds=time.perf_counter() - start,
-                    error_code=err_code,
-                )
-            return JSONResponse(payload, status_code=status_code)
-
-        routes.append(Route("/readyz", public_readyz, methods=["GET"]))
+        routes.append(
+            Route(
+                "/readyz",
+                make_readyz_handler(
+                    readiness,
+                    include_engines=False,
+                    metrics=metrics,
+                ),
+                methods=["GET"],
+            )
+        )
 
     if cfg.public_metrics and metrics is not None:
         async def public_metrics_endpoint(request: Request) -> Response:
@@ -704,6 +717,15 @@ def create_ops_app(
 ) -> Starlette:
     """Create the dedicated Starlette operations application (/healthz, /readyz, /metrics, /buildinfo)."""
     cfg = ops_config if ops_config is not None else OpsConfig(enabled=True)
+    if (
+        cfg.host.strip().lower() not in ("127.0.0.1", "::1", "[::1]", "localhost")
+        and not cfg.auth_token_env
+    ):
+        logger.warning(
+            "Ops listener is bound to non-loopback host '%s' without 'ops.auth_token_env' configured",
+            cfg.host,
+        )
+
     probe = (
         readiness
         if readiness is not None
@@ -741,32 +763,13 @@ def create_ops_app(
         )
         return JSONResponse({"status": "ok"})
 
-    async def ops_readyz(request: Request) -> Response:
-        start = time.perf_counter()
-        auth_err = _verify_ops_bearer_token(request, cfg.auth_token_env, env)
-        if auth_err is not None:
-            registry.record_request(
-                "/readyz",
-                status=401,
-                duration_seconds=time.perf_counter() - start,
-                error_code="unauthorized",
-            )
-            return auth_err
-        status_code, payload = await run_in_threadpool(probe.check)
-        err_code = None
-        if status_code != 200:
-            err_code = (
-                "catalog_not_loaded"
-                if payload.get("reason") == "catalog_not_loaded"
-                else "not_ready"
-            )
-        registry.record_request(
-            "/readyz",
-            status=status_code,
-            duration_seconds=time.perf_counter() - start,
-            error_code=err_code,
-        )
-        return JSONResponse(payload, status_code=status_code)
+    ops_readyz = make_readyz_handler(
+        probe,
+        include_engines=True,
+        metrics=registry,
+        auth_token_env=cfg.auth_token_env,
+        env=env,
+    )
 
     async def ops_metrics(request: Request) -> Response:
         start = time.perf_counter()
@@ -817,3 +820,133 @@ def create_ops_app(
     app.state.readiness = probe
     app.state.metrics = registry
     return app
+
+
+def start_ops_server(
+    ops_app: Starlette,
+    *,
+    host: str,
+    port: int,
+    ops_run: Callable[..., Any] | None = None,
+    startup_timeout_seconds: float = 5.0,
+) -> tuple[Any, threading.Thread]:
+    """Start the dedicated operations listener and wait until bound and serving (or raise RuntimeError)."""
+    timeout_s = max(0.01, float(startup_timeout_seconds))
+
+    if ops_run is not None:
+        if port > 0:
+            probe_sock: socket.socket | None = None
+            try:
+                infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+                if not infos:
+                    raise OSError(f"Could not resolve {host}:{port}")
+                family, socktype, proto, _, sockaddr = infos[0]
+                probe_sock = socket.socket(family, socktype, proto)
+                probe_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                probe_sock.bind(sockaddr)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Ops listener failed to bind on {host}:{port}"
+                ) from exc
+            finally:
+                if probe_sock is not None:
+                    try:
+                        probe_sock.close()
+                    except Exception:
+                        pass
+
+        entered = threading.Event()
+        exited = threading.Event()
+        startup_error: list[BaseException] = []
+
+        def _custom_runner() -> None:
+            entered.set()
+            try:
+                ops_run(ops_app, host=host, port=port)
+            except BaseException as exc:
+                startup_error.append(exc)
+            finally:
+                exited.set()
+
+        ops_thread = threading.Thread(
+            target=_custom_runner,
+            name="seeknal-ops-listener",
+            daemon=True,
+        )
+        ops_thread.start()
+        entered.wait(timeout=timeout_s)
+        exited.wait(timeout=min(0.05, timeout_s))
+        if startup_error:
+            raise RuntimeError("Ops listener failed to start") from startup_error[0]
+        return None, ops_thread
+
+    sock: socket.socket | None = None
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        if not infos:
+            raise OSError(f"Could not resolve {host}:{port}")
+        family, socktype, proto, _, sockaddr = infos[0]
+        sock = socket.socket(family, socktype, proto)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(sockaddr)
+        sock.listen(128)
+        bound_port = int(sock.getsockname()[1])
+    except OSError as exc:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        raise RuntimeError(f"Ops listener failed to bind on {host}:{port}") from exc
+
+    ops_uv_cfg = uvicorn.Config(
+        ops_app,
+        host=host,
+        port=bound_port,
+        log_level="warning",
+    )
+    ops_server = uvicorn.Server(ops_uv_cfg)
+    ops_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+    uv_startup_error: list[BaseException] = []
+    bound_sock = sock
+
+    def _uv_runner() -> None:
+        try:
+            ops_server.run(sockets=[bound_sock])
+        except BaseException as exc:
+            uv_startup_error.append(exc)
+        finally:
+            try:
+                bound_sock.close()
+            except Exception:
+                pass
+
+    ops_thread = threading.Thread(
+        target=_uv_runner,
+        name="seeknal-ops-listener",
+        daemon=True,
+    )
+    ops_thread.start()
+
+    deadline = time.monotonic() + timeout_s
+    while (
+        time.monotonic() < deadline
+        and not getattr(ops_server, "started", False)
+        and ops_thread.is_alive()
+    ):
+        time.sleep(0.005)
+
+    if not getattr(ops_server, "started", False):
+        ops_server.should_exit = True
+        ops_thread.join(timeout=1.0)
+        try:
+            bound_sock.close()
+        except Exception:
+            pass
+        if uv_startup_error:
+            raise RuntimeError(
+                f"Ops listener failed to bind on {host}:{port}"
+            ) from uv_startup_error[0]
+        raise RuntimeError(f"Ops listener failed to bind on {host}:{port}")
+
+    return ops_server, ops_thread
