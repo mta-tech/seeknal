@@ -14,6 +14,9 @@ import typer
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from seeknal.ui.output import echo_error as _echo_error
+from seeknal.workflow.executors.exposure_executor import (
+    DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE,
+)
 
 
 # Schema definitions for each node type
@@ -153,6 +156,12 @@ def validate_schema(yaml_data: Dict[str, Any]) -> None:
     if missing_fields:
         _echo_error(f"Missing required fields for {kind}: {', '.join(missing_fields)}")
         raise typer.Exit(1)
+
+    if kind == "exposure":
+        exposure_type = yaml_data.get("type")
+        if isinstance(exposure_type, str) and exposure_type.strip().lower() == "database":
+            _echo_error(DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE)
+            raise typer.Exit(1)
 
 
 def validate_dependencies(yaml_data: Dict[str, Any]) -> None:

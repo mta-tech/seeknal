@@ -53,6 +53,13 @@ class ExposureType(Enum):
     REPORT = "report"
 
 
+DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE = (
+    "Exposure type 'database' is not implemented: it would write 0 rows. "
+    "Use a 'materializations:' target (type: postgresql or iceberg) on the producing node, "
+    "or a 'file' exposure."
+)
+
+
 class FileFormat(Enum):
     """File export formats."""
     CSV = "csv"
@@ -144,14 +151,15 @@ class ExposureExecutor(BaseExecutor):
 
         # Check exposure type
         exposure_type = config.get("type")
-        if not exposure_type:
+        if not exposure_type or not isinstance(exposure_type, str):
             raise ExecutorValidationError(
                 self.node.id,
                 "Missing required field 'type' in exposure configuration"
             )
 
+        normalized_type = exposure_type.strip().lower()
         try:
-            ExposureType(exposure_type.lower())
+            ExposureType(normalized_type)
         except ValueError:
             raise ExecutorValidationError(
                 self.node.id,
@@ -160,17 +168,17 @@ class ExposureExecutor(BaseExecutor):
             )
 
         # Validate type-specific requirements
-        if exposure_type.lower() == ExposureType.FILE.value:
+        if normalized_type == ExposureType.FILE.value:
             self._validate_file_exposure(config)
-        elif exposure_type.lower() == ExposureType.API.value:
+        elif normalized_type == ExposureType.API.value:
             self._validate_api_exposure(config)
-        elif exposure_type.lower() == ExposureType.DATABASE.value:
+        elif normalized_type == ExposureType.DATABASE.value:
             self._validate_database_exposure(config)
-        elif exposure_type.lower() == ExposureType.NOTIFICATION.value:
+        elif normalized_type == ExposureType.NOTIFICATION.value:
             self._validate_notification_exposure(config)
-        elif exposure_type.lower() == ExposureType.STARROCKS_MV.value:
+        elif normalized_type == ExposureType.STARROCKS_MV.value:
             self._validate_starrocks_mv_exposure(config)
-        elif exposure_type.lower() == ExposureType.REPORT.value:
+        elif normalized_type == ExposureType.REPORT.value:
             pass  # Report exposures are rendered externally (seeknal ask)
 
     def _validate_file_exposure(self, config: Dict[str, Any]) -> None:
@@ -209,19 +217,11 @@ class ExposureExecutor(BaseExecutor):
             )
 
     def _validate_database_exposure(self, config: Dict[str, Any]) -> None:
-        """Validate database write configuration."""
-        params = config.get("params", {})
-        if not isinstance(params, dict):
-            raise ExecutorValidationError(
-                self.node.id,
-                "'params' must be a dictionary for database exposures"
-            )
-
-        if "table" not in params:
-            raise ExecutorValidationError(
-                self.node.id,
-                "Database exposures require 'params.table' field"
-            )
+        """Reject database exposure configuration as not implemented."""
+        raise ExecutorValidationError(
+            self.node.id,
+            DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE,
+        )
 
     def _validate_notification_exposure(self, config: Dict[str, Any]) -> None:
         """Validate notification configuration."""
@@ -283,6 +283,26 @@ class ExposureExecutor(BaseExecutor):
         start_time = time.time()
 
         try:
+            # Get exposure configuration
+            config = self.node.config
+            raw_type = config.get("type")
+            exposure_type = raw_type.strip().lower() if isinstance(raw_type, str) else ""
+
+            if exposure_type == ExposureType.DATABASE.value:
+                result = self._execute_database_exposure(None)
+                duration = time.time() - start_time
+                return ExecutorResult(
+                    node_id=self.node.id,
+                    status=ExecutionStatus.FAILED,
+                    duration_seconds=duration,
+                    is_dry_run=bool(self.context.dry_run),
+                    error_message=result.error_message,
+                    metadata={
+                        "exposure_type": exposure_type,
+                        **result.metadata,
+                    },
+                )
+
             # Handle dry-run mode
             if self.context.dry_run:
                 return ExecutorResult(
@@ -295,10 +315,6 @@ class ExposureExecutor(BaseExecutor):
                         "message": "Dry-run - no data delivered"
                     }
                 )
-
-            # Get exposure configuration
-            config = self.node.config
-            exposure_type = config.get("type", "").lower()
 
             # Resolve input data
             data = self._resolve_input_data()
@@ -600,53 +616,21 @@ class ExposureExecutor(BaseExecutor):
         """
         Execute database write exposure.
 
-        Writes data to a database table.
+        Database exposure is not implemented and always returns a failed DeliveryResult.
 
         Args:
             data: Data to write
 
         Returns:
-            DeliveryResult with write status
+            Failed DeliveryResult with guidance to use materializations or file exposure
         """
         start = time.time()
-        config = self.node.config
-        params = config.get("params", {})
-        table = params.get("table")
-
-        if not table:
-            return DeliveryResult(
-                success=False,
-                error_message="Missing table name in database exposure configuration"
-            )
-
-        # Check for DuckDB connection in context
-        con = self.context.duckdb_connection
-
-        if not con:
-            return DeliveryResult(
-                success=False,
-                error_message="No database connection available in execution context"
-            )
-
-        try:
-            # For now, return a placeholder result
-            # Real implementation would execute INSERT or CREATE TABLE AS
-            return DeliveryResult(
-                success=True,
-                records_sent=0,
-                url=f"table://{table}",
-                duration_seconds=time.time() - start,
-                metadata={
-                    "table": table,
-                    "note": "Database write integration pending"
-                }
-            )
-
-        except Exception as e:
-            return DeliveryResult(
-                success=False,
-                error_message=f"Database write failed: {str(e)}"
-            )
+        return DeliveryResult(
+            success=False,
+            records_sent=0,
+            duration_seconds=time.time() - start,
+            error_message=DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE,
+        )
 
     def _execute_notification_exposure(self, data: Any) -> DeliveryResult:
         """

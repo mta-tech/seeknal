@@ -815,6 +815,17 @@ def dry_run_yaml(file_path: Path, file_path_str: str, limit: int, timeout: int, 
     # Step 2: Schema validation
     try:
         validate_schema(yaml_data)
+        if (
+            str(yaml_data.get("kind", "")).strip().lower() == "exposure"
+            and isinstance(yaml_data.get("type"), str)
+            and yaml_data["type"].strip().lower() == "database"
+        ):
+            from seeknal.workflow.executors.exposure_executor import (
+                DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE,
+            )
+
+            _echo_error(DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE)
+            raise typer.Exit(1)
         _echo_success("Schema validation passed")
     except typer.Exit:
         raise

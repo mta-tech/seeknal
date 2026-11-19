@@ -17,7 +17,7 @@ Seeknal uses YAML files to define data pipelines. Each YAML file represents a **
 | `second_order_aggregation` | Aggregations of aggregations | Region-level from user-level metrics |
 | `model` | ML model training and inference | Churn prediction, classification |
 | `rule` | Data quality and validation rules | Non-null checks, value ranges |
-| `exposure` | Data export to external systems | API endpoints, file exports, databases |
+| `exposure` | Data export to external systems | API endpoints, file exports, notifications |
 | `semantic_model` | Semantic layer definitions | Business metrics, dimensions |
 | `metric` | Business metric calculations | Revenue, conversion rates |
 
@@ -727,13 +727,13 @@ tags:
 
 ## Exposure
 
-Exposures define data exports to external systems (files, APIs, databases).
+Exposures define data exports to external systems (files, APIs, notifications, StarRocks materialized views, and reports).
 
 ### Fields
 
 | Field | Type | Required | Description | Default |
 |-------|------|----------|-------------|---------|
-| `type` | string | **Yes** | Exposure type: `file`, `api`, `database` | - |
+| `type` | string | **Yes** | Exposure type: `file`, `api`, `notification`, `starrocks_materialized_view`, `report` (`database` is **not implemented** and fails validation; use [`materializations:`](#multi-target-materialization) instead) | - |
 | `url` | string | Depends | API endpoint URL (for `type: api`) | - |
 | `params` | object | Depends | Type-specific parameters (see [Exposure Params](#exposure-params)) | `{}` |
 | `inputs` | list[object] | **Yes** | Dependencies (data to export) | - |
@@ -766,14 +766,10 @@ params:
   refresh_interval: 3600       # Seconds between refreshes
 ```
 
-**Database export:**
-```yaml
-type: database
-params:
-  connection_string: "postgresql://host/db"
-  table: production.results
-  mode: overwrite              # overwrite, append
-```
+**Database export (not implemented):**
+
+!!! warning "`type: database` is not implemented"
+    `kind: exposure` with `type: database` is not implemented and is rejected at validation and execution time (it previously acted as a no-op stub that wrote 0 rows). To write pipeline outputs to a database or table format, configure [`materializations:`](#multi-target-materialization) (`type: postgresql` or `type: iceberg`) directly on the producing `transform`, `source`, or `feature_group` node, or use a `type: file` exposure.
 
 ### Example (File)
 

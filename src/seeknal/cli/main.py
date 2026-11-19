@@ -777,6 +777,24 @@ def handle_cli_error(error_message: str = "Operation failed"):
     return decorator
 
 
+def _validate_dag_exposures(dag_builder: Any) -> None:
+    """Reject unsupported exposure configurations (e.g. type: database) in DAG nodes."""
+    from seeknal.workflow.executors.exposure_executor import (
+        DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE,
+    )
+
+    for node_id, node in getattr(dag_builder, "nodes", {}).items():
+        kind_val = getattr(node.kind, "value", str(node.kind)) if hasattr(node, "kind") else ""
+        yaml_data = getattr(node, "yaml_data", None) or getattr(node, "config", None) or {}
+        if kind_val == "exposure" or str(yaml_data.get("kind", "")).strip().lower() == "exposure":
+            exposure_type = yaml_data.get("type")
+            if isinstance(exposure_type, str) and exposure_type.strip().lower() == "database":
+                _echo_error(
+                    f"Validation failed for {node_id}: {DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE}"
+                )
+                raise typer.Exit(1)
+
+
 def _build_manifest_from_dag(dag_builder, project_name: str):
     """Build a Manifest from a DAGBuilder result.
 
@@ -2296,6 +2314,7 @@ def _run_yaml_pipeline(
         nodes_to_run = include_upstream_sources(nodes_to_run, dag_upstream)
 
     if show_plan:
+        _validate_dag_exposures(dag_builder)
         # Show execution plan and exit
         _echo_info("")
         _echo_info("Execution Plan:")
@@ -2510,6 +2529,18 @@ def _run_yaml_pipeline(
         )
 
         if dry_run:
+            try:
+                executor = get_executor(node, exec_context)
+                executor.validate()
+            except Exception as e:
+                status_msg = typer.style("FAILED", fg=typer.colors.RED, bold=True)
+                typer.echo(f"  {status_msg}: {e}")
+                failed += 1
+                if not continue_on_error:
+                    typer.echo("")
+                    _echo_error("Stopping execution due to failure")
+                    break
+                continue
             # Dry run - just show what would happen
             typer.echo(f"  Would execute: {node.kind.value}.{node.name}")
             update_node_state(run_state, node_id, NodeStatus.CACHED.value)
@@ -2975,6 +3006,36 @@ def validate(
         _echo_success(f"Config file found: {config_file}")
     else:
         _echo_warning(f"Config file not found: {config_file}")
+
+    if config_path is not None and config_path.is_file() and config_path.suffix.lower() in {".yml", ".yaml"}:
+        from seeknal.workflow.validators import validate_yaml_syntax, validate_schema
+
+        yaml_data = validate_yaml_syntax(config_path)
+        if "kind" in yaml_data:
+            validate_schema(yaml_data)
+
+    project_root = (
+        config_path
+        if (config_path is not None and config_path.is_dir())
+        else Path.cwd()
+    )
+    if (project_root / "seeknal").is_dir():
+        from seeknal.workflow.dag import (
+            DAGBuilder,
+            CycleDetectedError,
+            MissingDependencyError,
+        )
+
+        try:
+            dag_builder = DAGBuilder(project_path=project_root)
+            dag_builder.build()
+        except ValueError:
+            dag_builder = None
+        except (CycleDetectedError, MissingDependencyError) as e:
+            _echo_error(f"DAG validation failed: {e}")
+            raise typer.Exit(1)
+        if dag_builder is not None:
+            _validate_dag_exposures(dag_builder)
 
     # Check database connection
     _echo_info("Validating database connection...")
@@ -3889,6 +3950,8 @@ def parse(
             _echo_error(f"Missing dependency: {e.message}")
             raise typer.Exit(1)
 
+        _validate_dag_exposures(dag_builder)
+
         # Convert DAGBuilder results to Manifest format
         manifest = _build_manifest_from_dag(dag_builder, project)
 
@@ -4002,6 +4065,8 @@ def parse(
                 else:
                     _echo_info("No changes detected since last parse")
 
+    except typer.Exit:
+        raise
     except Exception as e:
         _echo_error(f"Parse failed: {e}")
         raise typer.Exit(1)
@@ -4055,6 +4120,8 @@ def plan(
     except MissingDependencyError as e:
         _echo_error(f"Missing dependency: {e.message}")
         raise typer.Exit(1)
+
+    _validate_dag_exposures(dag_builder)
 
     # Report parse warnings
     errors = dag_builder.get_parse_errors()
@@ -5564,6 +5631,7 @@ def env_plan(
     # Build current manifest from YAML files
     dag_builder = DAGBuilder(project_path=project_path, profile_path=profile_path)
     dag_builder.build()
+    _validate_dag_exposures(dag_builder)
 
     # Convert to Manifest using shared helper
     manifest = _build_manifest_from_dag(dag_builder, project_path.name)
