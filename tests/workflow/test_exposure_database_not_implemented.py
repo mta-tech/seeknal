@@ -192,27 +192,16 @@ class TestExposureDatabaseCLIPaths:
     """CLI validation/plan/dry-run commands must fail with non-zero exit and no traceback."""
 
     def _create_project_with_db_exposure(self, tmp_path: Path, type_value: str = "database") -> Path:
-        sources_dir = tmp_path / "seeknal" / "sources"
         exposures_dir = tmp_path / "seeknal" / "exposures"
-        sources_dir.mkdir(parents=True)
         exposures_dir.mkdir(parents=True)
 
-        data_csv = tmp_path / "orders.csv"
-        data_csv.write_text("order_id,amount\n1,10.0\n", encoding="utf-8")
-
-        (sources_dir / "orders.yml").write_text(
-            f"kind: source\nname: orders\nsource: csv\ntable: {data_csv}\n",
-            encoding="utf-8",
-        )
         exp_file = exposures_dir / "db_out.yml"
         exp_file.write_text(
             f"kind: exposure\n"
             f"name: db_out\n"
             f"type: {type_value}\n"
             f"params:\n"
-            f"  table: public.orders_out\n"
-            f"inputs:\n"
-            f"  - ref: source.orders\n",
+            f"  table: public.orders_out\n",
             encoding="utf-8",
         )
         return exp_file
@@ -262,6 +251,7 @@ class TestExposureDatabaseCLIPaths:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         self._create_project_with_db_exposure(tmp_path, type_value="database")
+        monkeypatch.delenv("ATLAS_API_URL", raising=False)
         monkeypatch.chdir(tmp_path)
         runner = CliRunner()
 
@@ -270,10 +260,69 @@ class TestExposureDatabaseCLIPaths:
         assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in _norm(res_dry.output)
         assert "Traceback" not in res_dry.output
 
+        res_plan = runner.invoke(app, ["run", "--show-plan"])
+        assert res_plan.exit_code != 0
+        assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in _norm(res_plan.output)
+        assert "Traceback" not in res_plan.output
+
         res_run = runner.invoke(app, ["run"])
         assert res_run.exit_code != 0
         assert DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE in _norm(res_run.output)
         assert "Traceback" not in res_run.output
+
+    def test_cli_run_dry_run_preserves_base_behavior_for_source_and_valid_exposure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Regression test: `seeknal run --dry-run` must not call SourceExecutor.validate()
+        (which rejects `/tmp/...` paths) when no database exposure is present."""
+        sources_dir = tmp_path / "seeknal" / "sources"
+        exposures_dir = tmp_path / "seeknal" / "exposures"
+        sources_dir.mkdir(parents=True)
+        exposures_dir.mkdir(parents=True)
+
+        (sources_dir / "orders.yml").write_text(
+            f"kind: source\nname: orders\nsource: csv\ntable: {tmp_path / 'orders.csv'}\n",
+            encoding="utf-8",
+        )
+        (exposures_dir / "file_out.yml").write_text(
+            f"kind: exposure\n"
+            f"name: file_out\n"
+            f"type: file\n"
+            f"params:\n"
+            f"  format: csv\n"
+            f"  path: {tmp_path / 'out.csv'}\n"
+            f"inputs:\n"
+            f"  - ref: source.orders\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.delenv("ATLAS_API_URL", raising=False)
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+        res_dry = runner.invoke(app, ["run", "--dry-run"])
+        assert res_dry.exit_code == 0
+        assert "Would execute: source.orders" in res_dry.output
+        assert "Would execute: exposure.file_out" in res_dry.output
+
+    def test_cli_validate_ignores_dag_build_errors_when_no_database_exposure(
+        self, tmp_path: Path
+    ):
+        """Regression test: `seeknal validate` must not add new hard failures for DAG
+        build errors on projects without database exposures."""
+        transforms_dir = tmp_path / "seeknal" / "transforms"
+        transforms_dir.mkdir(parents=True)
+        # Cyclic transform dependency without database exposure
+        (transforms_dir / "a.yml").write_text(
+            "kind: transform\nname: a\ntransform: SELECT 1\ninputs:\n  - ref: transform.b\n",
+            encoding="utf-8",
+        )
+        (transforms_dir / "b.yml").write_text(
+            "kind: transform\nname: b\ntransform: SELECT 1\ninputs:\n  - ref: transform.a\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        res = runner.invoke(app, ["validate", "--config", str(tmp_path)])
+        assert res.exit_code == 0
 
 
 class TestExposureDatabaseRuntimeFailure:

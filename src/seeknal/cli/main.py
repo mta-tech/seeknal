@@ -2103,6 +2103,8 @@ def _run_yaml_pipeline(
         _echo_error(f"Missing dependency: {e.message}")
         raise typer.Exit(1)
 
+    _validate_dag_exposures(dag_builder)
+
     node_count = dag_builder.get_node_count()
     edge_count = dag_builder.get_edge_count()
 
@@ -2314,7 +2316,6 @@ def _run_yaml_pipeline(
         nodes_to_run = include_upstream_sources(nodes_to_run, dag_upstream)
 
     if show_plan:
-        _validate_dag_exposures(dag_builder)
         # Show execution plan and exit
         _echo_info("")
         _echo_info("Execution Plan:")
@@ -2529,18 +2530,6 @@ def _run_yaml_pipeline(
         )
 
         if dry_run:
-            try:
-                executor = get_executor(node, exec_context)
-                executor.validate()
-            except Exception as e:
-                status_msg = typer.style("FAILED", fg=typer.colors.RED, bold=True)
-                typer.echo(f"  {status_msg}: {e}")
-                failed += 1
-                if not continue_on_error:
-                    typer.echo("")
-                    _echo_error("Stopping execution due to failure")
-                    break
-                continue
             # Dry run - just show what would happen
             typer.echo(f"  Would execute: {node.kind.value}.{node.name}")
             update_node_state(run_state, node_id, NodeStatus.CACHED.value)
@@ -3020,20 +3009,13 @@ def validate(
         else Path.cwd()
     )
     if (project_root / "seeknal").is_dir():
-        from seeknal.workflow.dag import (
-            DAGBuilder,
-            CycleDetectedError,
-            MissingDependencyError,
-        )
+        from seeknal.workflow.dag import DAGBuilder
 
         try:
             dag_builder = DAGBuilder(project_path=project_root)
             dag_builder.build()
-        except ValueError:
+        except Exception:
             dag_builder = None
-        except (CycleDetectedError, MissingDependencyError) as e:
-            _echo_error(f"DAG validation failed: {e}")
-            raise typer.Exit(1)
         if dag_builder is not None:
             _validate_dag_exposures(dag_builder)
 
