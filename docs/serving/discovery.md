@@ -120,7 +120,7 @@ lakebase:
 - `default_catalog`: Required non-empty string. Canonical logical names follow `<default_catalog>.<namespace>.<table>`.
 - `refresh_interval_seconds`: Refresh period in seconds (default: 60.0). Must be positive.
 - `timeout_seconds`: HTTP request timeout in seconds (default: 10.0). Must be positive.
-- Engines: Only one `starrocks` engine and at most one `cube` engine are allowed. `duckdb` engines are copied as-is into placement.
+- Engines: Only one `starrocks` engine and at most one `cube` engine are allowed. `duckdb` engines default to `profile: local_file` (copied into placement `engines` without emitting Lakekeeper table serves); setting `profile: iceberg_direct` (with optional `alias` and `pin_current_snapshot: true`) emits `<alias>.<namespace>.<table>` serves with `max_lag_seconds` derived from the Lakekeeper current-snapshot timestamp age plus `refresh_interval_seconds` (see [`docs/serving/iceberg-direct.md`](iceberg-direct.md)).
 - `lakebase.engine` must reference a defined engine with kind `lakebase`.
 - Tokens come strictly from environment variables named by `token_env` / `*_env` or safe secret files named by `*_file`. Secret files must not be group- or world-readable (`0600` or stricter required).
 - Validation failures raise `DiscoveryConfigError` without leaking credentials.

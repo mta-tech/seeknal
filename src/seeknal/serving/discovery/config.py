@@ -55,6 +55,9 @@ class EngineConfig:
     api_secret_env: str | None = None
     api_secret_file: str | None = None
     api_claims: Mapping[str, Any] | None = None
+    profile: str | None = None
+    alias: str | None = None
+    pin_current_snapshot: bool = False
 
 
 @dataclass(frozen=True)
@@ -253,6 +256,44 @@ class DiscoveryConfig:
                             f"Cube engine '{eng_name_str}' requires 'url'"
                         )
 
+                profile_raw = eng_data.get("profile")
+                profile_str: str | None = None
+                alias_str: str | None = None
+                pin_snap = False
+
+                if profile_raw is not None:
+                    if kind_str != "duckdb":
+                        raise DiscoveryConfigError(
+                            f"Engine '{eng_name_str}' of kind '{kind_str}' cannot specify 'profile'"
+                        )
+                    if not isinstance(profile_raw, str) or profile_raw.strip() not in ("local_file", "iceberg_direct"):
+                        raise DiscoveryConfigError(
+                            f"DuckDB engine '{eng_name_str}' has invalid 'profile', expected 'local_file' or 'iceberg_direct'"
+                        )
+                    profile_str = profile_raw.strip()
+                elif kind_str == "duckdb":
+                    profile_str = "local_file"
+
+                alias_raw = eng_data.get("alias")
+                if alias_raw is not None:
+                    if not isinstance(alias_raw, str) or not alias_raw.strip():
+                        raise DiscoveryConfigError(
+                            f"Engine '{eng_name_str}' has invalid 'alias'"
+                        )
+                    alias_str = alias_raw.strip()
+
+                if kind_str == "duckdb" and profile_str == "iceberg_direct":
+                    if alias_str is None:
+                        alias_str = catalog_str or default_catalog
+                    if catalog_str is None:
+                        catalog_str = alias_str
+                    pin_raw = eng_data.get("pin_current_snapshot", False)
+                    if not isinstance(pin_raw, bool):
+                        raise DiscoveryConfigError(
+                            f"Engine '{eng_name_str}' 'pin_current_snapshot' must be a boolean"
+                        )
+                    pin_snap = pin_raw
+
                 engines_dict[eng_name_str] = EngineConfig(
                     name=eng_name_str,
                     kind=kind_str,
@@ -263,6 +304,9 @@ class DiscoveryConfig:
                     api_secret_env=api_secret_env_str,
                     api_secret_file=api_secret_file_str,
                     api_claims=api_claims,
+                    profile=profile_str,
+                    alias=alias_str,
+                    pin_current_snapshot=pin_snap,
                 )
 
             if starrocks_count > 1:

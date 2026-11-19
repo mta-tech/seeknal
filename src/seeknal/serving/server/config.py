@@ -29,6 +29,10 @@ class ServerConfigError(Exception):
 
 
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,79}$")
+_ICEBERG_ALIAS_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+_S3_PREFIX_RE = re.compile(r"^s3://[A-Za-z0-9._-]+/.+/$")
+_ALLOWED_ICEBERG_EXTENSIONS = frozenset({"iceberg", "httpfs"})
 _SUSPICIOUS_TOKEN_RE = re.compile(
     r"(://|@|secret|password|passwd|token|bearer|private|canary|sentinel|opaque|dsn|credential)",
     re.IGNORECASE,
@@ -373,8 +377,37 @@ class CubeConnectionConfig:
 
 
 @dataclass(frozen=True)
+class IcebergS3Config:
+    """S3 credentials and endpoint configuration for an Iceberg catalog."""
+
+    endpoint: str
+    region: str
+    key_id_env: str
+    secret_env: str
+    url_style: str = "path"
+    use_ssl: bool = True
+
+
+@dataclass(frozen=True)
+class IcebergCatalogConfig:
+    """Lakekeeper REST catalog configuration for DuckDB iceberg_direct profile."""
+
+    alias: str
+    endpoint: str
+    warehouse: str
+    token_uri: str
+    client_id_env: str
+    client_secret_env: str
+    access_delegation: str
+    s3: IcebergS3Config
+    scope: str | None = None
+    token_lifetime_seconds: float | None = None
+
+
+@dataclass(frozen=True)
 class DuckDBConnectionConfig:
     kind: str = "duckdb"
+    profile: str = "local_file"
     path: str = ""
     allowed_directories: tuple[str, ...] = ()
     memory_limit: str | None = None
@@ -382,6 +415,14 @@ class DuckDBConnectionConfig:
     temp_directory: str | None = None
     max_temp_directory_size: str | None = None
     max_concurrent_cursors: int = 32
+    extension_directory: str | None = None
+    extensions: tuple[str, ...] = ()
+    iceberg_catalogs: Mapping[str, IcebergCatalogConfig] = field(default_factory=dict)
+    allowed_s3_prefixes: tuple[str, ...] = ()
+    recycle_seconds: float | None = None
+    token_lifetime_seconds: float | None = None
+    external_access_after_attach: str = "off"
+    secrets_env: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -448,6 +489,17 @@ class ServerConfig:
             elif isinstance(conn, CubeConnectionConfig):
                 if conn.secret_env:
                     referenced.append(conn.secret_env)
+            elif isinstance(conn, DuckDBConnectionConfig):
+                if conn.profile == "iceberg_direct":
+                    for cat in conn.iceberg_catalogs.values():
+                        if cat.client_id_env:
+                            referenced.append(cat.client_id_env)
+                        if cat.client_secret_env:
+                            referenced.append(cat.client_secret_env)
+                        if cat.s3.key_id_env:
+                            referenced.append(cat.s3.key_id_env)
+                        if cat.s3.secret_env:
+                            referenced.append(cat.s3.secret_env)
 
         # Discovery config
         if self.placement.discovery_config is not None:
@@ -1239,42 +1291,29 @@ class ServerConfig:
                 )
 
             elif kind == "duckdb":
-                unknown_duck = set(eng_spec.keys()) - {
-                    "kind",
-                    "path",
-                    "allowed_directories",
-                    "memory_limit",
-                    "threads",
-                    "temp_directory",
-                    "max_temp_directory_size",
-                    "max_concurrent_cursors",
-                }
-                if unknown_duck:
+                profile_raw = eng_spec.get("profile", "local_file")
+                if not isinstance(profile_raw, str) or not profile_raw.strip():
                     raise ServerConfigError(
-                        f"Unknown key(s) in duckdb connection '{eng_name_str}': {sorted(unknown_duck)}"
+                        f"DuckDB connection '{eng_name_str}' 'profile' must be a non-empty string"
                     )
-                path = eng_spec.get("path")
-                if not path or not isinstance(path, str) or not path.strip():
+                profile_str = profile_raw.strip()
+                if profile_str not in ("local_file", "iceberg_direct"):
                     raise ServerConfigError(
-                        f"DuckDB connection '{eng_name_str}' missing required 'path'"
+                        f"DuckDB connection '{eng_name_str}' has unsupported profile "
+                        f"'{_safe_label(profile_str)}', expected 'local_file' or 'iceberg_direct'"
                     )
 
-                raw_allowed = eng_spec.get("allowed_directories", ())
-                if not isinstance(raw_allowed, (list, tuple)):
-                    raise ServerConfigError(
-                        f"DuckDB connection '{eng_name_str}' 'allowed_directories' must be a list of strings"
-                    )
-                validated_allowed: list[str] = []
-                for ad in raw_allowed:
-                    if not isinstance(ad, str):
+                for raw_key in eng_spec.keys():
+                    key_lower = str(raw_key).lower()
+                    if (
+                        "postgres" in key_lower
+                        or "lakebase" in key_lower
+                        or key_lower in ("attach", "pg", "postgresql")
+                    ):
                         raise ServerConfigError(
-                            f"DuckDB connection '{eng_name_str}' 'allowed_directories' entries must be strings"
+                            f"DuckDB connection '{eng_name_str}' forbids Postgres/attach key "
+                            f"'{_safe_label(str(raw_key))}'"
                         )
-                    if not (os.path.isabs(ad) and ad.endswith("/") and (ad == "/" or os.path.normpath(ad) + "/" == ad)):
-                        raise ServerConfigError(
-                            f"DuckDB connection '{eng_name_str}' allowed directory '{ad}' must be an absolute, normalized path ending with '/'"
-                        )
-                    validated_allowed.append(ad)
 
                 mem_limit = eng_spec.get("memory_limit")
                 if mem_limit is not None:
@@ -1291,41 +1330,11 @@ class ServerConfig:
                             f"DuckDB connection '{eng_name_str}' 'threads' must be a positive integer"
                         )
 
-                temp_dir = eng_spec.get("temp_directory")
-                if temp_dir is not None:
-                    if not isinstance(temp_dir, str) or not temp_dir.strip():
-                        raise ServerConfigError(
-                            f"DuckDB connection '{eng_name_str}' 'temp_directory' must be a non-empty string"
-                        )
-                    temp_dir = temp_dir.strip()
-                    if not os.path.isabs(temp_dir):
-                        raise ServerConfigError(
-                            f"DuckDB connection '{eng_name_str}' 'temp_directory' must be an absolute path"
-                        )
-                    if not os.path.exists(temp_dir) or not os.path.isdir(temp_dir) or not os.access(temp_dir, os.W_OK):
-                        raise ServerConfigError(
-                            f"DuckDB connection '{eng_name_str}' 'temp_directory' '{temp_dir}' must be an existing writable directory"
-                        )
-
-                    temp_real = os.path.realpath(temp_dir)
-                    if path != ":memory:" and not path.startswith(":memory:"):
-                        db_real = os.path.realpath(path)
-                        db_dir_real = os.path.dirname(db_real)
-                        if temp_real == db_dir_real or temp_real.startswith(db_dir_real + "/"):
-                            raise ServerConfigError(
-                                f"DuckDB connection '{eng_name_str}' 'temp_directory' must not be inside data directory '{db_dir_real}'"
-                            )
-
-                    for ad in validated_allowed:
-                        ad_real = os.path.realpath(ad)
-                        if temp_real == ad_real or temp_real.startswith(ad_real + "/"):
-                            raise ServerConfigError(
-                                f"DuckDB connection '{eng_name_str}' 'temp_directory' must not be inside allowed_directory '{ad}'"
-                            )
-
                 max_temp_sz = eng_spec.get("max_temp_directory_size")
                 if max_temp_sz is not None:
-                    if not isinstance(max_temp_sz, (str, int)) or (isinstance(max_temp_sz, str) and not max_temp_sz.strip()):
+                    if not isinstance(max_temp_sz, (str, int)) or isinstance(max_temp_sz, bool) or (
+                        isinstance(max_temp_sz, str) and not max_temp_sz.strip()
+                    ):
                         raise ServerConfigError(
                             f"DuckDB connection '{eng_name_str}' 'max_temp_directory_size' must be a non-empty string or integer"
                         )
@@ -1341,15 +1350,475 @@ class ServerConfig:
                         f"DuckDB connection '{eng_name_str}' 'max_concurrent_cursors' must be a positive integer"
                     )
 
-                connections[eng_name_str] = DuckDBConnectionConfig(
-                    path=path.strip(),
-                    allowed_directories=tuple(validated_allowed),
-                    memory_limit=mem_limit,
-                    threads=threads,
-                    temp_directory=temp_dir,
-                    max_temp_directory_size=max_temp_sz,
-                    max_concurrent_cursors=max_concurrent_cursors,
-                )
+                if profile_str == "local_file":
+                    unknown_duck = set(eng_spec.keys()) - {
+                        "kind",
+                        "profile",
+                        "path",
+                        "allowed_directories",
+                        "memory_limit",
+                        "threads",
+                        "temp_directory",
+                        "max_temp_directory_size",
+                        "max_concurrent_cursors",
+                    }
+                    if unknown_duck:
+                        raise ServerConfigError(
+                            f"Unknown key(s) in duckdb connection '{eng_name_str}': {sorted(unknown_duck)}"
+                        )
+                    path = eng_spec.get("path")
+                    if not path or not isinstance(path, str) or not path.strip():
+                        raise ServerConfigError(
+                            f"DuckDB connection '{eng_name_str}' missing required 'path'"
+                        )
+
+                    raw_allowed = eng_spec.get("allowed_directories", ())
+                    if not isinstance(raw_allowed, (list, tuple)):
+                        raise ServerConfigError(
+                            f"DuckDB connection '{eng_name_str}' 'allowed_directories' must be a list of strings"
+                        )
+                    validated_allowed: list[str] = []
+                    for ad in raw_allowed:
+                        if not isinstance(ad, str):
+                            raise ServerConfigError(
+                                f"DuckDB connection '{eng_name_str}' 'allowed_directories' entries must be strings"
+                            )
+                        if not (os.path.isabs(ad) and ad.endswith("/") and (ad == "/" or os.path.normpath(ad) + "/" == ad)):
+                            raise ServerConfigError(
+                                f"DuckDB connection '{eng_name_str}' allowed directory '{ad}' must be an absolute, normalized path ending with '/'"
+                            )
+                        validated_allowed.append(ad)
+
+                    temp_dir = eng_spec.get("temp_directory")
+                    if temp_dir is not None:
+                        if not isinstance(temp_dir, str) or not temp_dir.strip():
+                            raise ServerConfigError(
+                                f"DuckDB connection '{eng_name_str}' 'temp_directory' must be a non-empty string"
+                            )
+                        temp_dir = temp_dir.strip()
+                        if not os.path.isabs(temp_dir):
+                            raise ServerConfigError(
+                                f"DuckDB connection '{eng_name_str}' 'temp_directory' must be an absolute path"
+                            )
+                        if not os.path.exists(temp_dir) or not os.path.isdir(temp_dir) or not os.access(temp_dir, os.W_OK):
+                            raise ServerConfigError(
+                                f"DuckDB connection '{eng_name_str}' 'temp_directory' '{temp_dir}' must be an existing writable directory"
+                            )
+
+                        temp_real = os.path.realpath(temp_dir)
+                        if path != ":memory:" and not path.startswith(":memory:"):
+                            db_real = os.path.realpath(path)
+                            db_dir_real = os.path.dirname(db_real)
+                            if temp_real == db_dir_real or temp_real.startswith(db_dir_real + "/"):
+                                raise ServerConfigError(
+                                    f"DuckDB connection '{eng_name_str}' 'temp_directory' must not be inside data directory '{db_dir_real}'"
+                                )
+
+                        for ad in validated_allowed:
+                            ad_real = os.path.realpath(ad)
+                            if temp_real == ad_real or temp_real.startswith(ad_real + "/"):
+                                raise ServerConfigError(
+                                    f"DuckDB connection '{eng_name_str}' 'temp_directory' must not be inside allowed_directory '{ad}'"
+                                )
+
+                    connections[eng_name_str] = DuckDBConnectionConfig(
+                        profile="local_file",
+                        path=path.strip(),
+                        allowed_directories=tuple(validated_allowed),
+                        memory_limit=mem_limit,
+                        threads=threads,
+                        temp_directory=temp_dir,
+                        max_temp_directory_size=max_temp_sz,
+                        max_concurrent_cursors=max_concurrent_cursors,
+                    )
+                else:
+                    if "path" in eng_spec:
+                        raise ServerConfigError(
+                            f"DuckDB connection '{eng_name_str}' with profile 'iceberg_direct' "
+                            f"uses an in-memory database and forbids 'path'"
+                        )
+                    unknown_iceberg_duck = set(eng_spec.keys()) - {
+                        "kind",
+                        "profile",
+                        "extension_directory",
+                        "extensions",
+                        "iceberg_catalogs",
+                        "allowed_s3_prefixes",
+                        "recycle_seconds",
+                        "token_lifetime_seconds",
+                        "external_access_after_attach",
+                        "temp_directory",
+                        "max_temp_directory_size",
+                        "memory_limit",
+                        "threads",
+                        "max_concurrent_cursors",
+                    }
+                    if unknown_iceberg_duck:
+                        raise ServerConfigError(
+                            f"Unknown key(s) in duckdb iceberg_direct connection '{eng_name_str}': "
+                            f"{sorted(_safe_label(str(k)) for k in unknown_iceberg_duck)}"
+                        )
+
+                    ext_dir = eng_spec.get("extension_directory")
+                    if not ext_dir or not isinstance(ext_dir, str) or not ext_dir.strip():
+                        raise ServerConfigError(
+                            f"DuckDB iceberg_direct connection '{eng_name_str}' missing required 'extension_directory'"
+                        )
+                    ext_dir = ext_dir.strip()
+                    if not os.path.isabs(ext_dir):
+                        raise ServerConfigError(
+                            f"DuckDB iceberg_direct connection '{eng_name_str}' 'extension_directory' must be an absolute path"
+                        )
+                    ext_dir_norm = os.path.normpath(ext_dir)
+                    if ext_dir.rstrip("/") != ext_dir_norm.rstrip("/"):
+                        raise ServerConfigError(
+                            f"DuckDB iceberg_direct connection '{eng_name_str}' 'extension_directory' must be a normalized path"
+                        )
+
+                    raw_exts = eng_spec.get("extensions")
+                    if not isinstance(raw_exts, (list, tuple)) or not raw_exts:
+                        raise ServerConfigError(
+                            f"DuckDB iceberg_direct connection '{eng_name_str}' requires non-empty 'extensions' list"
+                        )
+                    validated_exts: list[str] = []
+                    for ext_item in raw_exts:
+                        if not isinstance(ext_item, str) or not ext_item.strip():
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' 'extensions' entries must be non-empty strings"
+                            )
+                        ext_clean = ext_item.strip().lower()
+                        if ext_clean not in _ALLOWED_ICEBERG_EXTENSIONS:
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' extension "
+                                f"'{_safe_label(ext_clean)}' is not in allowlist {{'httpfs', 'iceberg'}}"
+                            )
+                        if ext_clean not in validated_exts:
+                            validated_exts.append(ext_clean)
+
+                    raw_prefixes = eng_spec.get("allowed_s3_prefixes")
+                    if not isinstance(raw_prefixes, (list, tuple)) or not raw_prefixes:
+                        raise ServerConfigError(
+                            f"DuckDB iceberg_direct connection '{eng_name_str}' requires non-empty 'allowed_s3_prefixes' list"
+                        )
+                    validated_prefixes: list[str] = []
+                    for pfx in raw_prefixes:
+                        if not isinstance(pfx, str) or not pfx.strip():
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' 'allowed_s3_prefixes' entries must be non-empty strings"
+                            )
+                        pfx_str = pfx.strip()
+                        if (
+                            not _S3_PREFIX_RE.match(pfx_str)
+                            or ".." in pfx_str
+                            or "//" in pfx_str[len("s3://"):]
+                        ):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' invalid S3 prefix "
+                                f"'{_safe_label(pfx_str)}', expected 's3://<bucket>/<prefix>/'"
+                            )
+                        validated_prefixes.append(pfx_str)
+
+                    temp_dir = eng_spec.get("temp_directory")
+                    if temp_dir is not None:
+                        if not isinstance(temp_dir, str) or not temp_dir.strip():
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' 'temp_directory' must be a non-empty string"
+                            )
+                        temp_dir = temp_dir.strip()
+                        if not os.path.isabs(temp_dir):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' 'temp_directory' must be an absolute path"
+                            )
+                        temp_dir_norm = os.path.normpath(temp_dir)
+                        if temp_dir.rstrip("/") != temp_dir_norm.rstrip("/"):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' 'temp_directory' must be a normalized path"
+                            )
+                        if os.path.exists(temp_dir) and (
+                            not os.path.isdir(temp_dir) or not os.access(temp_dir, os.W_OK)
+                        ):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' 'temp_directory' '{temp_dir}' must be a writable directory"
+                            )
+                        ext_real = os.path.realpath(ext_dir)
+                        temp_real = os.path.realpath(temp_dir)
+                        if (
+                            temp_real == ext_real
+                            or temp_real.startswith(ext_real.rstrip("/") + "/")
+                            or ext_real.startswith(temp_real.rstrip("/") + "/")
+                        ):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' 'temp_directory' and 'extension_directory' must not overlap"
+                            )
+
+                    raw_recycle = eng_spec.get("recycle_seconds")
+                    if raw_recycle is None or isinstance(raw_recycle, (bool, str)) or not isinstance(raw_recycle, (int, float)):
+                        raise ServerConfigError(
+                            f"DuckDB iceberg_direct connection '{eng_name_str}' 'recycle_seconds' must be a positive number"
+                        )
+                    recycle_f = float(raw_recycle)
+                    if recycle_f <= 0 or math.isnan(recycle_f) or math.isinf(recycle_f):
+                        raise ServerConfigError(
+                            f"DuckDB iceberg_direct connection '{eng_name_str}' 'recycle_seconds' must be > 0"
+                        )
+
+                    conn_tok_life: float | None = None
+                    if "token_lifetime_seconds" in eng_spec and eng_spec["token_lifetime_seconds"] is not None:
+                        raw_tl = eng_spec["token_lifetime_seconds"]
+                        if isinstance(raw_tl, (bool, str)) or not isinstance(raw_tl, (int, float)):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' 'token_lifetime_seconds' must be a positive number"
+                            )
+                        conn_tok_life = float(raw_tl)
+                        if conn_tok_life <= 0 or math.isnan(conn_tok_life) or math.isinf(conn_tok_life):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' 'token_lifetime_seconds' must be > 0"
+                            )
+                        if recycle_f >= conn_tok_life:
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' 'recycle_seconds' ({recycle_f}) "
+                                f"must be strictly below 'token_lifetime_seconds' ({conn_tok_life})"
+                            )
+
+                    raw_ext_access = eng_spec.get("external_access_after_attach", "off")
+                    if raw_ext_access is False:
+                        ext_access_str = "off"
+                    elif raw_ext_access is True:
+                        ext_access_str = "on"
+                    elif isinstance(raw_ext_access, str) and raw_ext_access.strip().lower() in ("off", "on"):
+                        ext_access_str = raw_ext_access.strip().lower()
+                    else:
+                        raise ServerConfigError(
+                            f"DuckDB iceberg_direct connection '{eng_name_str}' 'external_access_after_attach' "
+                            f"must be 'off' or 'on'"
+                        )
+
+                    cats_raw = eng_spec.get("iceberg_catalogs")
+                    if not isinstance(cats_raw, Mapping) or not cats_raw:
+                        raise ServerConfigError(
+                            f"DuckDB iceberg_direct connection '{eng_name_str}' requires non-empty 'iceberg_catalogs' mapping"
+                        )
+
+                    parsed_catalogs: dict[str, IcebergCatalogConfig] = {}
+                    for cat_alias, cat_spec in cats_raw.items():
+                        if not isinstance(cat_alias, str) or not _ICEBERG_ALIAS_RE.fullmatch(cat_alias):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' catalog alias "
+                                f"'{_safe_label(cat_alias)}' must match ^[a-z][a-z0-9_]{{0,31}}$"
+                            )
+                        if cat_alias in ("system", "temp", "memory", "main"):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' catalog alias "
+                                f"'{cat_alias}' is reserved"
+                            )
+                        if not isinstance(cat_spec, Mapping):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct connection '{eng_name_str}' catalog '{cat_alias}' must be a mapping"
+                            )
+                        for raw_ck in cat_spec.keys():
+                            ck_lower = str(raw_ck).lower()
+                            if "postgres" in ck_lower or ck_lower in ("client_id", "client_secret", "token", "secret", "password"):
+                                raise ServerConfigError(
+                                    f"DuckDB iceberg_direct catalog '{cat_alias}' forbids literal secret or Postgres key "
+                                    f"'{_safe_label(str(raw_ck))}'; use *_env environment variable names only"
+                                )
+                        unknown_cat = set(cat_spec.keys()) - {
+                            "endpoint",
+                            "warehouse",
+                            "token_uri",
+                            "client_id_env",
+                            "client_secret_env",
+                            "scope",
+                            "access_delegation",
+                            "token_lifetime_seconds",
+                            "s3",
+                        }
+                        if unknown_cat:
+                            raise ServerConfigError(
+                                f"Unknown key(s) in iceberg_catalogs.{cat_alias}: "
+                                f"{sorted(_safe_label(str(k)) for k in unknown_cat)}"
+                            )
+
+                        endpoint = cat_spec.get("endpoint")
+                        if not endpoint or not isinstance(endpoint, str) or not endpoint.strip():
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}' missing required 'endpoint'"
+                            )
+                        endpoint = endpoint.strip()
+                        if not (endpoint.startswith("http://") or endpoint.startswith("https://")):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}' 'endpoint' must start with http:// or https://"
+                            )
+
+                        warehouse = cat_spec.get("warehouse")
+                        if not warehouse or not isinstance(warehouse, str) or not warehouse.strip():
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}' missing required 'warehouse'"
+                            )
+                        warehouse = warehouse.strip()
+
+                        token_uri = cat_spec.get("token_uri")
+                        if not token_uri or not isinstance(token_uri, str) or not token_uri.strip():
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}' missing required 'token_uri'"
+                            )
+                        token_uri = token_uri.strip()
+                        if not (token_uri.startswith("http://") or token_uri.startswith("https://")):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}' 'token_uri' must start with http:// or https://"
+                            )
+
+                        cid_env = cat_spec.get("client_id_env")
+                        if not cid_env or not isinstance(cid_env, str) or not _ENV_VAR_NAME_RE.fullmatch(cid_env.strip()):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}' 'client_id_env' must be a valid environment variable name"
+                            )
+                        cid_env = cid_env.strip()
+
+                        csec_env = cat_spec.get("client_secret_env")
+                        if not csec_env or not isinstance(csec_env, str) or not _ENV_VAR_NAME_RE.fullmatch(csec_env.strip()):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}' 'client_secret_env' must be a valid environment variable name"
+                            )
+                        csec_env = csec_env.strip()
+
+                        scope_val = cat_spec.get("scope")
+                        if scope_val is not None:
+                            if not isinstance(scope_val, str) or not scope_val.strip():
+                                raise ServerConfigError(
+                                    f"DuckDB iceberg_direct catalog '{cat_alias}' 'scope' must be a non-empty string"
+                                )
+                            scope_val = scope_val.strip()
+
+                        access_del = cat_spec.get("access_delegation")
+                        if not isinstance(access_del, str) or access_del.strip() not in ("vended", "none"):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}' 'access_delegation' must be 'vended' or 'none'"
+                            )
+                        access_del = access_del.strip()
+
+                        cat_tok_life: float | None = None
+                        if "token_lifetime_seconds" in cat_spec and cat_spec["token_lifetime_seconds"] is not None:
+                            raw_ctl = cat_spec["token_lifetime_seconds"]
+                            if isinstance(raw_ctl, (bool, str)) or not isinstance(raw_ctl, (int, float)):
+                                raise ServerConfigError(
+                                    f"DuckDB iceberg_direct catalog '{cat_alias}' 'token_lifetime_seconds' must be a positive number"
+                                )
+                            cat_tok_life = float(raw_ctl)
+                            if cat_tok_life <= 0 or math.isnan(cat_tok_life) or math.isinf(cat_tok_life):
+                                raise ServerConfigError(
+                                    f"DuckDB iceberg_direct catalog '{cat_alias}' 'token_lifetime_seconds' must be > 0"
+                                )
+                            if recycle_f >= cat_tok_life:
+                                raise ServerConfigError(
+                                    f"DuckDB iceberg_direct connection '{eng_name_str}' 'recycle_seconds' ({recycle_f}) "
+                                    f"must be strictly below catalog '{cat_alias}' 'token_lifetime_seconds' ({cat_tok_life})"
+                                )
+
+                        s3_raw = cat_spec.get("s3")
+                        if not isinstance(s3_raw, Mapping):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}' missing required 's3' mapping"
+                            )
+                        for raw_sk in s3_raw.keys():
+                            sk_lower = str(raw_sk).lower()
+                            if sk_lower in ("key_id", "secret", "access_key", "secret_key", "password", "token"):
+                                raise ServerConfigError(
+                                    f"DuckDB iceberg_direct catalog '{cat_alias}.s3' forbids literal secret key "
+                                    f"'{_safe_label(str(raw_sk))}'; use 'key_id_env' and 'secret_env' only"
+                                )
+                        unknown_s3 = set(s3_raw.keys()) - {
+                            "endpoint",
+                            "region",
+                            "url_style",
+                            "key_id_env",
+                            "secret_env",
+                            "use_ssl",
+                        }
+                        if unknown_s3:
+                            raise ServerConfigError(
+                                f"Unknown key(s) in iceberg_catalogs.{cat_alias}.s3: "
+                                f"{sorted(_safe_label(str(k)) for k in unknown_s3)}"
+                            )
+
+                        s3_endpoint = s3_raw.get("endpoint")
+                        if not s3_endpoint or not isinstance(s3_endpoint, str) or not s3_endpoint.strip():
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}.s3' missing required 'endpoint'"
+                            )
+                        s3_endpoint = s3_endpoint.strip()
+
+                        s3_region = s3_raw.get("region")
+                        if not s3_region or not isinstance(s3_region, str) or not s3_region.strip():
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}.s3' missing required 'region'"
+                            )
+                        s3_region = s3_region.strip()
+
+                        s3_url_style = s3_raw.get("url_style", "path")
+                        if not isinstance(s3_url_style, str) or s3_url_style.strip() not in ("path", "vhost"):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}.s3' 'url_style' must be 'path' or 'vhost'"
+                            )
+                        s3_url_style = s3_url_style.strip()
+
+                        s3_key_env = s3_raw.get("key_id_env")
+                        if not s3_key_env or not isinstance(s3_key_env, str) or not _ENV_VAR_NAME_RE.fullmatch(s3_key_env.strip()):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}.s3' 'key_id_env' must be a valid environment variable name"
+                            )
+                        s3_key_env = s3_key_env.strip()
+
+                        s3_sec_env = s3_raw.get("secret_env")
+                        if not s3_sec_env or not isinstance(s3_sec_env, str) or not _ENV_VAR_NAME_RE.fullmatch(s3_sec_env.strip()):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}.s3' 'secret_env' must be a valid environment variable name"
+                            )
+                        s3_sec_env = s3_sec_env.strip()
+
+                        s3_use_ssl = s3_raw.get("use_ssl")
+                        if not isinstance(s3_use_ssl, bool):
+                            raise ServerConfigError(
+                                f"DuckDB iceberg_direct catalog '{cat_alias}.s3' 'use_ssl' is required and must be a boolean"
+                            )
+
+                        parsed_catalogs[cat_alias] = IcebergCatalogConfig(
+                            alias=cat_alias,
+                            endpoint=endpoint,
+                            warehouse=warehouse,
+                            token_uri=token_uri,
+                            client_id_env=cid_env,
+                            client_secret_env=csec_env,
+                            scope=scope_val,
+                            access_delegation=access_del,
+                            token_lifetime_seconds=cat_tok_life,
+                            s3=IcebergS3Config(
+                                endpoint=s3_endpoint,
+                                region=s3_region,
+                                url_style=s3_url_style,
+                                key_id_env=s3_key_env,
+                                secret_env=s3_sec_env,
+                                use_ssl=s3_use_ssl,
+                            ),
+                        )
+
+                    connections[eng_name_str] = DuckDBConnectionConfig(
+                        profile="iceberg_direct",
+                        path=":memory:",
+                        extension_directory=ext_dir,
+                        extensions=tuple(validated_exts),
+                        iceberg_catalogs=parsed_catalogs,
+                        allowed_s3_prefixes=tuple(validated_prefixes),
+                        recycle_seconds=recycle_f,
+                        token_lifetime_seconds=conn_tok_life,
+                        external_access_after_attach=ext_access_str,
+                        memory_limit=mem_limit,
+                        threads=threads,
+                        temp_directory=temp_dir,
+                        max_temp_directory_size=max_temp_sz,
+                        max_concurrent_cursors=max_concurrent_cursors,
+                        secrets_env=dict(secrets_env),
+                    )
 
         # 12. limits
         lim_raw = d.get("limits")

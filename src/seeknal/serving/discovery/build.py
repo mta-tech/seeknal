@@ -113,12 +113,16 @@ def discover(
                 f"Cube metadata was unavailable ({clean_err}); cubes were omitted from placement and schemas"
             )
 
-    # 6. Locate StarRocks engine
+    # 6. Locate StarRocks and DuckDB iceberg_direct engines
     starrocks_engine: EngineConfig | None = None
+    iceberg_direct_engines: list[EngineConfig] = []
     for eng_name, eng in cfg.engines.items():
         if eng.kind == "starrocks":
             starrocks_engine = eng
             break
+    for eng_name, eng in cfg.engines.items():
+        if eng.kind == "duckdb" and eng.profile == "iceberg_direct":
+            iceberg_direct_engines.append(eng)
 
     # 7. Build engines placement dict (kind and dialect only)
     engines_placement: dict[str, dict[str, str]] = {}
@@ -158,6 +162,24 @@ def discover(
             serve[starrocks_engine.name] = {
                 "name": f"{sr_catalog}.{it.namespace}.{it.name}"
             }
+
+        # DuckDB iceberg_direct serve(s)
+        for id_eng in iceberg_direct_engines:
+            id_alias = id_eng.alias or id_eng.catalog or cfg.default_catalog
+            if it.snapshot_ms is not None:
+                snap_dt = datetime.fromtimestamp(it.snapshot_ms / 1000.0, tz=timezone.utc)
+                observed_snap_age = max(0.0, (now_dt - snap_dt).total_seconds())
+                id_max_lag: float | None = observed_snap_age + cfg.refresh_interval_seconds
+            else:
+                id_max_lag = cfg.refresh_interval_seconds
+
+            id_serve: dict[str, Any] = {
+                "name": f"{id_alias}.{it.namespace}.{it.name}",
+                "max_lag_seconds": id_max_lag,
+            }
+            if id_eng.pin_current_snapshot and it.current_snapshot_id is not None:
+                id_serve["snapshot_id"] = it.current_snapshot_id
+            serve[id_eng.name] = id_serve
 
         # Lakebase serve
         if cfg.lakebase is not None and logical in cfg.lakebase.synced_tables:

@@ -9,9 +9,65 @@ from dataclasses import dataclass
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.dialects.duckdb import DuckDB
+from sqlglot.parser import Parser
+from sqlglot.tokens import TokenType
 
 from seeknal.serving.features import QueryFeatures, extract_features
 from seeknal.serving.placement import Engine, Placement, TableEntry
+
+_orig_parse_version = Parser._parse_version
+
+
+def _patched_parse_version(self: Parser) -> exp.Version | None:
+    res = _orig_parse_version(self)
+    if res is not None:
+        return res
+    idx = self._index
+    if self._match_text_seq("AT") and self._match(TokenType.L_PAREN):
+        if self._match_text_seq("VERSION") and self._match(TokenType.FARROW):
+            expr = self._parse_bitwise()
+            if self._match(TokenType.R_PAREN):
+                v = self.expression(
+                    exp.Version, this="VERSION", expression=expr, kind="AS OF"
+                )
+                if v is not None:
+                    v.meta["duckdb_at_version"] = True
+                return v
+    self._retreat(idx)
+    return None
+
+
+Parser._parse_version = _patched_parse_version
+
+
+def _duckdb_version_sql(generator: Any, expression: exp.Version) -> str:
+    if expression.meta.get("duckdb_at_version"):
+        expr = generator.sql(expression, "expression")
+        return f"AT (VERSION => {expr})"
+    return generator.version_sql(expression)
+
+
+DuckDB.Generator.TRANSFORMS[exp.Version] = _duckdb_version_sql
+
+
+def _table_dotted_name(tbl: exp.Table) -> str:
+    if tbl.parts:
+        return ".".join(part.name for part in tbl.parts)
+    parts: list[str] = []
+    if tbl.catalog:
+        parts.append(tbl.catalog)
+    if tbl.db:
+        parts.append(tbl.db)
+    if tbl.name:
+        parts.append(tbl.name)
+    return ".".join(parts)
+
+
+def _table_leaf_name(tbl: exp.Table) -> str:
+    if tbl.parts:
+        return tbl.parts[-1].name
+    return tbl.name
 
 HINT_PATTERN = re.compile(
     r"^\s*seeknal:engine\s*=\s*([a-zA-Z0-9_\-]+)\s*$", re.IGNORECASE
@@ -98,14 +154,7 @@ class Router:
         for tbl in statement.find_all(exp.Table):
             if tbl.name.lower() in cte_names and not tbl.db and not tbl.catalog:
                 continue
-            parts = []
-            if tbl.catalog:
-                parts.append(tbl.catalog)
-            if tbl.db:
-                parts.append(tbl.db)
-            if tbl.name:
-                parts.append(tbl.name)
-            dotted = ".".join(parts).lower()
+            dotted = _table_dotted_name(tbl).lower()
             if self.placement.find_cube(dotted) is not None:
                 continue
             t_entry = self.placement.find_table(dotted)
@@ -117,9 +166,26 @@ class Router:
             if serve is None:
                 continue
 
-            new_tbl = sqlglot.to_table(serve.physical_name)
+            new_tbl = sqlglot.to_table(serve.physical_name, dialect=target_engine.dialect)
+            if serve.snapshot_id is not None and target_engine.dialect == "duckdb":
+                if isinstance(serve.snapshot_id, int) and not isinstance(serve.snapshot_id, bool):
+                    snap_expr: exp.Expression = exp.Literal.number(serve.snapshot_id)
+                else:
+                    snap_str = str(serve.snapshot_id).strip()
+                    if snap_str.lstrip("-").isdigit():
+                        snap_expr = exp.Literal.number(int(snap_str))
+                    else:
+                        snap_expr = exp.Literal.string(snap_str)
+                ver_node = exp.Version(
+                    this="VERSION",
+                    expression=snap_expr,
+                    kind="AS OF",
+                )
+                ver_node.meta["duckdb_at_version"] = True
+                new_tbl.set("version", ver_node)
+
             orig_alias = tbl.alias
-            alias_to_use = orig_alias if orig_alias else tbl.name
+            alias_to_use = orig_alias if orig_alias else _table_leaf_name(tbl)
             new_tbl.set(
                 "alias", exp.TableAlias(this=exp.to_identifier(alias_to_use))
             )

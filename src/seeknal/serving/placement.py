@@ -33,6 +33,7 @@ class TableServe:
     engine: str
     physical_name: str
     max_lag_seconds: float | None = None
+    snapshot_id: int | str | None = None
 
 
 @dataclass(frozen=True)
@@ -241,11 +242,35 @@ class Placement:
                     phys_name = sval.get("name", "")
                     lag_val = sval.get("max_lag_seconds")
                     max_lag = float(lag_val) if lag_val is not None else None
+                    snap_raw = sval.get("snapshot_id")
+                    snap_id: int | str | None = None
+                    if snap_raw is not None:
+                        if isinstance(snap_raw, bool):
+                            raise PlacementError(
+                                f"Table '{tbl_name}' serve for engine '{eng_name}' has invalid boolean snapshot_id"
+                            )
+                        if isinstance(snap_raw, int):
+                            snap_id = snap_raw
+                        elif isinstance(snap_raw, str):
+                            s_clean = snap_raw.strip()
+                            if not s_clean:
+                                raise PlacementError(
+                                    f"Table '{tbl_name}' serve for engine '{eng_name}' has empty snapshot_id"
+                                )
+                            try:
+                                snap_id = int(s_clean)
+                            except ValueError:
+                                snap_id = s_clean
+                        else:
+                            raise PlacementError(
+                                f"Table '{tbl_name}' serve for engine '{eng_name}' has invalid snapshot_id"
+                            )
                     serves.append(
                         TableServe(
                             engine=str(eng_name),
                             physical_name=str(phys_name),
                             max_lag_seconds=max_lag,
+                            snapshot_id=snap_id,
                         )
                     )
                 else:

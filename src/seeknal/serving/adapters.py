@@ -420,10 +420,16 @@ class DuckDBAdapter:
         config: Any = None,
         holder: Any = None,
         max_concurrent_cursors: int | None = None,
+        env: Mapping[str, str] | None = None,
+        standin_catalogs: Mapping[str, str] | None = None,
+        probe_on_reuse: bool = False,
     ) -> None:
         self._connect_fn = connect
         self._config = config
         self._holder = holder
+        self._env = env
+        self._standin_catalogs = standin_catalogs
+        self._probe_on_reuse = probe_on_reuse
         if max_concurrent_cursors is not None:
             if (
                 isinstance(max_concurrent_cursors, bool)
@@ -448,6 +454,15 @@ class DuckDBAdapter:
             from seeknal.serving.duckdb_policy import DuckDBHolder
 
             holder = self._holder or DuckDBHolder.get_holder()
+            profile = getattr(self._config, "profile", "local_file")
+            if profile == "iceberg_direct":
+                return holder.get_iceberg_cursor(
+                    self._config,
+                    config_id=f"iceberg_direct:{id(self._config)}",
+                    env=self._env,
+                    standin_catalogs=self._standin_catalogs,
+                    probe_on_reuse=self._probe_on_reuse,
+                )
             return holder.get_cursor(
                 self._config.path,
                 allowed_directories=self._config.allowed_directories,
@@ -770,7 +785,10 @@ class DuckDBAdapter:
                         from seeknal.serving.duckdb_policy import DuckDBHolder
 
                         holder = self._holder or DuckDBHolder.get_holder()
-                        holder.invalidate_path(self._config.path)
+                        if getattr(self._config, "profile", "local_file") == "iceberg_direct":
+                            holder.invalidate_path(f"iceberg_direct:{id(self._config)}")
+                        else:
+                            holder.invalidate_path(self._config.path)
                 err_outcome = req_state.finalize_outcome("error")
                 if err_outcome == "cancel":
                     logger.error(

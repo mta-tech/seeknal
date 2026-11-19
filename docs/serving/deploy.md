@@ -505,6 +505,9 @@ The probe outputs a JSON report with conformance check results and exits with co
   - When `temp_directory` is unset, DuckDB is configured so that it does not spill into the database file directory, and queries exceeding memory limits fail with a clear `resource_exhausted` error instead of an internal server error.
 - **Graceful Shutdown:** All open DuckDB database instances and cursors are explicitly closed during application lifespan shutdown.
 
+### DuckDB `iceberg_direct` Profile (Experimental / Spike Stage 2)
+A `duckdb` connection may optionally set `profile: iceberg_direct` (default `local_file`) to attach a read-only Lakekeeper Iceberg REST catalog (`<alias>.<namespace>.<table>`) in an in-memory DuckDB generation using pre-installed `httpfs` and `iceberg` extensions, temporary S3/OAuth2 secrets from `secrets_env_file`, periodic generation recycling (`recycle_seconds`), and post-attach configuration lock (`lock_configuration = true`). No Postgres attach is allowed in this profile. See [`docs/serving/iceberg-direct.md`](iceberg-direct.md) for the complete configuration reference, hardening step order, conformance probe checks, and Stage 3 live adoption gates.
+
 ---
 
 ## 9. Lakebase Connection Pool & Sizing Guidance

@@ -280,7 +280,7 @@ def build_server(
                 conn_fn = connect_factories[eng_name]
                 adapters[eng_name] = DuckDBAdapter(conn_fn)
             else:
-                adapters[eng_name] = DuckDBAdapter(config=conn_cfg)
+                adapters[eng_name] = DuckDBAdapter(config=conn_cfg, env=env)
 
     # 7. Add /readyz route and Lifespan
     async def readyz(request: Request) -> Response:
