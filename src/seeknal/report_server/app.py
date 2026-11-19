@@ -25,7 +25,13 @@ def create_app(config: Optional[ServerConfig] = None) -> Starlette:
     config.validate()
     config.data_dir.mkdir(parents=True, exist_ok=True)
 
-    storage = LocalFilesystemStorage(config.data_dir)
+    storage = LocalFilesystemStorage(
+        config.data_dir,
+        max_tar_members=config.max_tar_members,
+        max_unpacked_bytes=config.max_unpacked_bytes,
+        max_path_depth=config.max_path_depth,
+        max_member_name_length=config.max_member_name_length,
+    )
     engine = get_engine(config.data_dir)
 
     @asynccontextmanager

@@ -179,3 +179,126 @@ def test_get_r_path_works_in_api_key_mode_without_bearer(
     assert serve_resp.status_code == 200, (
         "Viewer must be able to access /r/{slug} without Authorization header"
     )
+
+
+def test_bad_content_length_returns_400(test_client: TestClient) -> None:
+    for bad_cl in ("not-a-number", "-1", "12.34", "+10", ""):
+        resp = test_client.post(
+            "/publish",
+            content=b"abc",
+            headers={
+                "Content-Type": "application/gzip",
+                "Authorization": "Bearer test-key-123",
+                "Content-Length": bad_cl,
+            },
+        )
+        assert resp.status_code == 400, f"Content-Length={bad_cl!r} should return 400, got {resp.status_code}"
+        assert "error" in resp.json()
+
+
+def test_chunked_oversized_body_returns_413_without_reading_all_chunks(
+    test_app,
+) -> None:
+    import asyncio
+    from starlette.requests import Request
+    from seeknal.report_server.routes import publish
+
+    test_app.state.config.max_upload_bytes = 100
+    chunk_size = 40
+    total_chunks = 10
+    chunks_yielded = 0
+
+    async def _run():
+        nonlocal chunks_yielded
+        sent_chunks = 0
+
+        async def receive():
+            nonlocal chunks_yielded, sent_chunks
+            sent_chunks += 1
+            chunks_yielded += 1
+            more = sent_chunks < total_chunks
+            return {
+                "type": "http.request",
+                "body": b"x" * chunk_size,
+                "more_body": more,
+            }
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/publish",
+            "raw_path": b"/publish",
+            "query_string": b"",
+            "headers": [
+                (b"content-type", b"application/gzip"),
+                (b"authorization", b"Bearer test-key-123"),
+                (b"transfer-encoding", b"chunked"),
+            ],
+            "app": test_app,
+        }
+        req = Request(scope, receive)
+        return await publish(req)
+
+    resp = asyncio.run(_run())
+    assert resp.status_code == 413
+    # Cap is 100 bytes, chunk size is 40 bytes -> 3rd chunk reaches 120 bytes > 100 and aborts immediately
+    assert chunks_yielded == 3, f"Expected to read at most 3 chunks (120B <= cap + 1 chunk), read {chunks_yielded}"
+
+
+def test_healthz_responsive_while_extraction_runs(
+    test_app,
+    honest_tarball: Path,
+) -> None:
+    import asyncio
+    import threading
+    import time
+    import httpx
+
+    extraction_started = threading.Event()
+    allow_extraction_finish = threading.Event()
+    orig_extract = test_app.state.storage.extract_tarball
+
+    def _slow_extract(slug, fileobj):
+        extraction_started.set()
+        allow_extraction_finish.wait(timeout=5.0)
+        return orig_extract(slug, fileobj)
+
+    tarball_bytes = honest_tarball.read_bytes()
+
+    async def _run():
+        transport = httpx.ASGITransport(app=test_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            pub_task = asyncio.create_task(
+                client.post(
+                    "/publish",
+                    content=tarball_bytes,
+                    headers={
+                        "Content-Type": "application/gzip",
+                        "Authorization": "Bearer test-key-123",
+                    },
+                )
+            )
+            # Wait for extraction thread to start without blocking the event loop
+            for _ in range(100):
+                if extraction_started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert extraction_started.is_set(), "Extraction did not start in worker thread"
+
+            t0 = time.monotonic()
+            health_resp = await client.get("/healthz")
+            elapsed = time.monotonic() - t0
+            assert health_resp.status_code == 200
+            assert health_resp.json()["status"] == "ok"
+            assert elapsed < 0.5, f"/healthz took {elapsed:.3f}s while extraction was blocked"
+
+            allow_extraction_finish.set()
+            pub_resp = await pub_task
+            assert pub_resp.status_code == 201
+
+    with patch.object(test_app.state.storage, "extract_tarball", side_effect=_slow_extract):
+        asyncio.run(_run())
+

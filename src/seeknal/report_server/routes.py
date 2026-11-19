@@ -5,6 +5,7 @@ import mimetypes
 import tarfile
 from datetime import datetime, timezone
 
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 
@@ -50,17 +51,33 @@ async def publish(request: Request) -> JSONResponse:
 
     content_length = request.headers.get("content-length")
     config = request.app.state.config
-    if content_length is not None and int(content_length) > config.max_upload_bytes:
-        return JSONResponse({"error": "Upload exceeds maximum allowed size"}, status_code=413)
+    if content_length is not None:
+        try:
+            parsed_content_length = int(content_length.strip())
+        except ValueError:
+            return JSONResponse({"error": "Invalid Content-Length header"}, status_code=400)
+        if parsed_content_length < 0 or parsed_content_length != int(content_length.strip()):
+            return JSONResponse({"error": "Invalid Content-Length header"}, status_code=400)
+        if not content_length.strip().isdigit():
+            return JSONResponse({"error": "Invalid Content-Length header"}, status_code=400)
+        if parsed_content_length > config.max_upload_bytes:
+            return JSONResponse({"error": "Upload exceeds maximum allowed size"}, status_code=413)
 
     try:
         await require_publish_auth(request, config)
     except AuthError as exc:
         return JSONResponse({"error": str(exc)}, status_code=401)
 
-    body_bytes = await request.body()
-    if len(body_bytes) > config.max_upload_bytes:
-        return JSONResponse({"error": "Upload exceeds maximum allowed size"}, status_code=413)
+    chunks: list[bytes] = []
+    running_bytes = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        running_bytes += len(chunk)
+        if running_bytes > config.max_upload_bytes:
+            return JSONResponse({"error": "Upload exceeds maximum allowed size"}, status_code=413)
+        chunks.append(chunk)
+    body_bytes = b"".join(chunks)
 
     engine = request.app.state.engine
     storage = request.app.state.storage
@@ -73,7 +90,9 @@ async def publish(request: Request) -> JSONResponse:
         report_title = request.headers.get("X-Seeknal-Report-Title") or None
 
         try:
-            asset_relpath = storage.extract_tarball(slug, io.BytesIO(body_bytes))
+            asset_relpath = await run_in_threadpool(
+                storage.extract_tarball, slug, io.BytesIO(body_bytes)
+            )
         except (TarSafetyError, _FILTER_ERROR_TYPE, tarfile.TarError, EOFError) as exc:
             return JSONResponse({"error": _classify_tar_error(exc)}, status_code=400)
 

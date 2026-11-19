@@ -6,13 +6,49 @@ from pathlib import Path
 
 from seeknal.utils.path_security import is_insecure_path
 
+DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+DEFAULT_MAX_TAR_MEMBERS = 10_000
+DEFAULT_MAX_UNPACKED_BYTES = 512 * 1024 * 1024  # 512 MiB
+DEFAULT_MAX_PATH_DEPTH = 32
+DEFAULT_MAX_MEMBER_NAME_LENGTH = 1024
+
+_POSITIVE_INT_FIELDS: tuple[tuple[str, str], ...] = (
+    ("max_upload_bytes", "SEEKNAL_REPORT_SERVER_MAX_UPLOAD_BYTES"),
+    ("max_tar_members", "SEEKNAL_REPORT_SERVER_MAX_TAR_MEMBERS"),
+    ("max_unpacked_bytes", "SEEKNAL_REPORT_SERVER_MAX_UNPACKED_BYTES"),
+    ("max_path_depth", "SEEKNAL_REPORT_SERVER_MAX_PATH_DEPTH"),
+    ("max_member_name_length", "SEEKNAL_REPORT_SERVER_MAX_MEMBER_NAME_LENGTH"),
+)
+
+
+def _parse_int_env(env_var: str, default: int) -> int:
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return default
+    stripped = raw.strip()
+    try:
+        value = int(stripped)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {env_var}='{raw}': must be a positive integer."
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            f"Invalid {env_var}='{raw}': must be a positive integer."
+        )
+    return value
+
 
 @dataclass
 class ServerConfig:
     data_dir: Path = field(default_factory=lambda: Path.home() / ".seeknal" / "report-server")
     auth_mode: str = "open"
     api_keys: list[str] = field(default_factory=list)
-    max_upload_bytes: int = 100 * 1024 * 1024  # 100 MB
+    max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
+    max_tar_members: int = DEFAULT_MAX_TAR_MEMBERS
+    max_unpacked_bytes: int = DEFAULT_MAX_UNPACKED_BYTES
+    max_path_depth: int = DEFAULT_MAX_PATH_DEPTH
+    max_member_name_length: int = DEFAULT_MAX_MEMBER_NAME_LENGTH
     cors_origins: list[str] = field(default_factory=list)
 
     @classmethod
@@ -21,7 +57,13 @@ class ServerConfig:
         auth_mode = os.environ.get("SEEKNAL_REPORT_SERVER_AUTH_MODE", "open")
         raw_keys = os.environ.get("SEEKNAL_REPORT_SERVER_KEYS", "")
         api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()] if raw_keys else []
-        max_upload_bytes = int(os.environ.get("SEEKNAL_REPORT_SERVER_MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
+        max_upload_bytes = _parse_int_env("SEEKNAL_REPORT_SERVER_MAX_UPLOAD_BYTES", DEFAULT_MAX_UPLOAD_BYTES)
+        max_tar_members = _parse_int_env("SEEKNAL_REPORT_SERVER_MAX_TAR_MEMBERS", DEFAULT_MAX_TAR_MEMBERS)
+        max_unpacked_bytes = _parse_int_env("SEEKNAL_REPORT_SERVER_MAX_UNPACKED_BYTES", DEFAULT_MAX_UNPACKED_BYTES)
+        max_path_depth = _parse_int_env("SEEKNAL_REPORT_SERVER_MAX_PATH_DEPTH", DEFAULT_MAX_PATH_DEPTH)
+        max_member_name_length = _parse_int_env(
+            "SEEKNAL_REPORT_SERVER_MAX_MEMBER_NAME_LENGTH", DEFAULT_MAX_MEMBER_NAME_LENGTH
+        )
         raw_origins = os.environ.get("SEEKNAL_REPORT_SERVER_CORS_ORIGINS", "")
         cors_origins = [o.strip() for o in raw_origins.split(",") if o.strip()] if raw_origins else []
         return cls(
@@ -29,6 +71,10 @@ class ServerConfig:
             auth_mode=auth_mode,
             api_keys=api_keys,
             max_upload_bytes=max_upload_bytes,
+            max_tar_members=max_tar_members,
+            max_unpacked_bytes=max_unpacked_bytes,
+            max_path_depth=max_path_depth,
+            max_member_name_length=max_member_name_length,
             cors_origins=cors_origins,
         )
 
@@ -42,3 +88,9 @@ class ServerConfig:
             raise ValueError(
                 f"Invalid auth_mode '{self.auth_mode}'. Must be 'open' or 'api_key'."
             )
+        for attr_name, env_var in _POSITIVE_INT_FIELDS:
+            val = getattr(self, attr_name)
+            if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
+                raise ValueError(
+                    f"Invalid {attr_name} ({env_var}): {val!r} must be a positive integer."
+                )

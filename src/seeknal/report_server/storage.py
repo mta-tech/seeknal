@@ -8,6 +8,12 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import BinaryIO, Optional
 
+from seeknal.report_server.config import (
+    DEFAULT_MAX_MEMBER_NAME_LENGTH,
+    DEFAULT_MAX_PATH_DEPTH,
+    DEFAULT_MAX_TAR_MEMBERS,
+    DEFAULT_MAX_UNPACKED_BYTES,
+)
 from seeknal.utils.path_security import is_insecure_path
 
 
@@ -15,8 +21,17 @@ class TarSafetyError(ValueError):
     pass
 
 
-def _validate_tar_member(member: tarfile.TarInfo, dest_real: str) -> None:
+def _validate_tar_member(
+    member: tarfile.TarInfo,
+    dest_real: str,
+    *,
+    max_path_depth: int = DEFAULT_MAX_PATH_DEPTH,
+    max_member_name_length: int = DEFAULT_MAX_MEMBER_NAME_LENGTH,
+) -> None:
     name = member.name
+    if len(name) > max_member_name_length:
+        raise TarSafetyError("Tarball entry name too long")
+
     # Reject absolute paths (POSIX /..., Windows drive C:..., or UNC \\... / //...)
     if (
         os.path.isabs(name)
@@ -29,6 +44,10 @@ def _validate_tar_member(member: tarfile.TarInfo, dest_real: str) -> None:
     parts = [p for part in name.split("/") for p in part.split("\\")]
     if ".." in parts:
         raise TarSafetyError(f"Tarball entry contains '..': {name!r}")
+
+    depth = sum(1 for p in parts if p and p != ".")
+    if depth > max_path_depth:
+        raise TarSafetyError("Tarball entry path too deep")
 
     # Reject symlinks and hardlinks
     if member.issym() or member.islnk():
@@ -44,6 +63,9 @@ def _validate_tar_member(member: tarfile.TarInfo, dest_real: str) -> None:
         or not (member.isreg() or member.isdir())
     ):
         raise TarSafetyError(f"Tarball entry is a special or device file: {name!r}")
+
+    if member.size < 0:
+        raise TarSafetyError("Tarball uncompressed size exceeds limit")
 
     # Verify resolved path stays inside dest
     normalized_rel = name.replace("\\", os.sep)
@@ -75,13 +97,25 @@ class Storage(ABC):
 
 
 class LocalFilesystemStorage(Storage):
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        max_tar_members: int = DEFAULT_MAX_TAR_MEMBERS,
+        max_unpacked_bytes: int = DEFAULT_MAX_UNPACKED_BYTES,
+        max_path_depth: int = DEFAULT_MAX_PATH_DEPTH,
+        max_member_name_length: int = DEFAULT_MAX_MEMBER_NAME_LENGTH,
+    ) -> None:
         if is_insecure_path(str(root)):
             raise ValueError(
                 f"Insecure storage root detected: '{root}'. "
                 "Use a secure location such as ~/.seeknal/report-server"
             )
         self._root = root
+        self._max_tar_members = max_tar_members
+        self._max_unpacked_bytes = max_unpacked_bytes
+        self._max_path_depth = max_path_depth
+        self._max_member_name_length = max_member_name_length
         (self._root / "assets").mkdir(parents=True, exist_ok=True)
 
     def _slug_dir(self, slug: str) -> Path:
@@ -98,13 +132,35 @@ class LocalFilesystemStorage(Storage):
             raise
         return f"assets/{slug}"
 
+    def _stream_and_validate_members(
+        self,
+        tf: tarfile.TarFile,
+        dest_real: str,
+    ) -> list[tarfile.TarInfo]:
+        members: list[tarfile.TarInfo] = []
+        member_count = 0
+        total_unpacked = 0
+        for member in tf:
+            member_count += 1
+            if member_count > self._max_tar_members:
+                raise TarSafetyError("Tarball has too many members")
+            _validate_tar_member(
+                member,
+                dest_real,
+                max_path_depth=self._max_path_depth,
+                max_member_name_length=self._max_member_name_length,
+            )
+            total_unpacked += member.size
+            if total_unpacked > self._max_unpacked_bytes:
+                raise TarSafetyError("Tarball uncompressed size exceeds limit")
+            members.append(member)
+        return members
+
     def _safe_extract(self, fileobj: BinaryIO, dest: Path) -> None:
         with tarfile.open(fileobj=fileobj, mode="r:gz") as tf:
             # 1. Explicit version-independent check runs first before any member is extracted.
             dest_real = os.path.realpath(dest)
-            members = tf.getmembers()
-            for member in members:
-                _validate_tar_member(member, dest_real)
+            members = self._stream_and_validate_members(tf, dest_real)
 
             # 2. Extract using data_filter when available (3.12+ and backports) as a second layer,
             # otherwise extract the validated members one by one.
@@ -121,9 +177,7 @@ class LocalFilesystemStorage(Storage):
     ) -> None:
         dest_real = os.path.realpath(dest)
         if members is None:
-            members = tf.getmembers()
-            for member in members:
-                _validate_tar_member(member, dest_real)
+            members = self._stream_and_validate_members(tf, dest_real)
         for member in members:
             tf.extract(member, dest)
 
