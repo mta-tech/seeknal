@@ -453,16 +453,24 @@ def scrub_error_detail(
         if stripped_tok and stripped_tok != token:
             detail = detail.replace(stripped_tok, "[REDACTED]")
 
-    for env_secret in _extract_env_secrets(env, extra_secrets=extra_secrets):
-        if env_secret in detail:
-            detail = detail.replace(env_secret, "[REDACTED]")
-
     detail = _JWT_RE.sub("[REDACTED_JWT]", detail)
     detail = _BEARER_RE.sub("Bearer [REDACTED]", detail)
     detail = _URI_USERINFO_RE.sub("://[REDACTED]@", detail)
     detail = _DSN_KV_EQ_RE.sub(r"\1=[REDACTED]", detail)
     detail = _SECRET_COLON_KV_RE.sub(r"\1\2: [REDACTED]", detail)
     detail = _DUCKDB_SECRET_RE.sub("SECRET '[REDACTED]'", detail)
+
+    for env_secret in _extract_env_secrets(env, extra_secrets=extra_secrets):
+        if env_secret not in detail:
+            continue
+        if env_secret.isalpha() and len(env_secret) <= 6:
+            detail = re.sub(
+                rf"(?<![A-Za-z0-9]){re.escape(env_secret)}(?![A-Za-z0-9])",
+                "[REDACTED]",
+                detail,
+            )
+        else:
+            detail = detail.replace(env_secret, "[REDACTED]")
 
     if isinstance(sql, str) and sql:
         sql_literals: list[str] = []
