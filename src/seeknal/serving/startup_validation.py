@@ -1392,8 +1392,33 @@ def run_initial_discovery_refresh_or_raise(
     secret_values: Sequence[str] = (),
 ) -> None:
     """Run the initial catalog discovery refresh before serving and fail closed on error."""
+    refresher_secrets_raw = (
+        getattr(refresher, "secret_values", None) if refresher is not None else None
+    )
+    refresher_secrets: tuple[str, ...] = ()
+    if isinstance(refresher_secrets_raw, (list, tuple, set, frozenset)):
+        refresher_secrets = tuple(
+            s for s in refresher_secrets_raw if isinstance(s, str) and s
+        )
+    elif isinstance(refresher_secrets_raw, Sequence) and not isinstance(
+        refresher_secrets_raw, (str, bytes)
+    ):
+        refresher_secrets = tuple(
+            s for s in refresher_secrets_raw if isinstance(s, str) and s
+        )
+
     merged_secrets = tuple(
-        dict.fromkeys((*_collect_secret_values(env, cfg=cfg), *secret_values))
+        sorted(
+            dict.fromkeys(
+                (
+                    *_collect_secret_values(env, cfg=cfg),
+                    *refresher_secrets,
+                    *secret_values,
+                )
+            ),
+            key=len,
+            reverse=True,
+        )
     )
     if refresher is None:
         if discover_fn is not None:
@@ -1445,13 +1470,6 @@ def run_initial_discovery_refresh_or_raise(
             tracked_err = getattr(refresher, "last_refresh_error", None)
             if isinstance(tracked_err, list) and tracked_err and tracked_err[0] is not None:
                 captured_exc = tracked_err[0]
-        if captured_exc is not None:
-            raise ServerConfigError(
-                _scrub(
-                    f"Initial discovery refresh failed: {captured_exc}",
-                    merged_secrets,
-                )
-            ) from captured_exc
         scrubbed_arr = getattr(refresher, "last_refresh_error_scrubbed", None)
         if isinstance(scrubbed_arr, list) and scrubbed_arr and scrubbed_arr[0]:
             raise ServerConfigError(
@@ -1459,7 +1477,14 @@ def run_initial_discovery_refresh_or_raise(
                     f"Initial discovery refresh failed: {scrubbed_arr[0]}",
                     merged_secrets,
                 )
-            )
+            ) from captured_exc
+        if captured_exc is not None:
+            raise ServerConfigError(
+                _scrub(
+                    f"Initial discovery refresh failed: {captured_exc}",
+                    merged_secrets,
+                )
+            ) from captured_exc
         last_err = getattr(refresher, "last_error", None) or "unknown_error"
         raise ServerConfigError(
             _scrub(

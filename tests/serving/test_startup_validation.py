@@ -1603,4 +1603,99 @@ def test_run_initial_discovery_refresh_or_raise_helper():
     assert refresher_bad.last_success_at is None
 
 
+def test_e_n2_run_initial_discovery_refresh_or_raise_without_cfg_scrubs_harmless_named_password_env(
+    tmp_path: Path, jwks_file: str
+):
+    from seeknal.serving.discovery.config import DiscoveryError
+    from seeknal.serving.discovery.refresh import PlacementRefresher
+    from seeknal.serving.placement import Placement
+    from seeknal.serving.server.app import build_server
+    from seeknal.serving.startup_validation import run_initial_discovery_refresh_or_raise
+
+    # Use both a harmless-looking env var name AND a harmless-looking secret value
+    # (no 'secret'/'password'/'canary'/URI pattern) so regex-only scrubbing would miss it.
+    harmless_env_name = "HARMLESS_CONN_VAL"
+    harmless_secret_val = "plain_db_conn_val_847291"
+    env = {
+        harmless_env_name: harmless_secret_val,
+    }
+
+    cfg_dict = {
+        "listen": {"host": "127.0.0.1", "port": 8765},
+        "grant_keys": {"jwks_file": jwks_file},
+        "placement": {
+            "discovery": {
+                "default_catalog": "lk",
+                "refresh_interval_seconds": 60,
+                "lakekeeper": {
+                    "url": "https://lk.internal:8181",
+                    "warehouse": "main",
+                },
+                "engines": {
+                    "sr": {"kind": "starrocks", "dialect": "starrocks"},
+                },
+            }
+        },
+        "connections": {
+            "sr": {
+                "kind": "starrocks",
+                "accounts": {
+                    "interactive": {
+                        "host": "sr.internal",
+                        "port": 9030,
+                        "user": "svc",
+                        "password_env": harmless_env_name,
+                    }
+                },
+            }
+        },
+    }
+    srv_cfg = ServerConfig.from_dict(cfg_dict, load_keys=True, env=env)
+
+    def _failing_discover():
+        raise DiscoveryError(
+            f"Discovery catalog query failed with auth detail ({harmless_secret_val})"
+        )
+
+    # 1. Server-built refresher: build_server(..., run_initial_refresh=False) then
+    #    run_initial_discovery_refresh_or_raise(refresher) called WITHOUT cfg.
+    handle = build_server(
+        srv_cfg,
+        env=env,
+        discover_fn=_failing_discover,
+        run_initial_refresh=False,
+    )
+    assert handle.refresher is not None
+
+    with pytest.raises(ServerConfigError) as exc_no_cfg:
+        run_initial_discovery_refresh_or_raise(handle.refresher)
+
+    err_msg = str(exc_no_cfg.value)
+    assert "Initial discovery refresh failed" in err_msg
+    assert harmless_secret_val not in err_msg
+    assert "<redacted>" in err_msg
+    assert isinstance(exc_no_cfg.value.__cause__, DiscoveryError)
+
+    # 2. Standalone refresher carrying refresher.secret_values without last_refresh_error_scrubbed
+    class _NoopPipeline:
+        def update_catalog(self, _pl: Placement, _schemas: dict) -> None:
+            pass
+
+    standalone_refresher = PlacementRefresher(
+        discover_fn=_failing_discover,
+        pipeline=_NoopPipeline(),
+        interval_seconds=60.0,
+    )
+    setattr(standalone_refresher, "secret_values", (harmless_secret_val,))
+
+    with pytest.raises(ServerConfigError) as exc_standalone:
+        run_initial_discovery_refresh_or_raise(standalone_refresher)
+
+    standalone_msg = str(exc_standalone.value)
+    assert "Initial discovery refresh failed" in standalone_msg
+    assert harmless_secret_val not in standalone_msg
+    assert "<redacted>" in standalone_msg
+
+
+
 

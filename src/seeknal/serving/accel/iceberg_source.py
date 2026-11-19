@@ -40,6 +40,7 @@ from seeknal.serving.accel.tables import (
     DEFAULT_LIVE_VIEWS,
     ColumnSpec,
     TableSpec,
+    _extract_duplicate_yaml_key,
     _load_json_data,
     build_table_specs,
     map_type,
@@ -1024,10 +1025,27 @@ def load_iceberg_source_config(
     if suffix in (".yaml", ".yml"):
         import yaml
 
+        from seeknal.serving.placement import UniqueKeySafeLoader
+
         try:
-            data = yaml.safe_load(text)
+            data = yaml.load(text, Loader=UniqueKeySafeLoader)
         except yaml.YAMLError as exc:
             mark = getattr(exc, "problem_mark", None)
+            dup_key = _extract_duplicate_yaml_key(exc)
+            if dup_key is not None:
+                safe_dup = (
+                    scrub_text(dup_key)
+                    .replace("\n", " ")
+                    .replace("\r", " ")
+                )
+                if mark is not None:
+                    raise BadInputError(
+                        f"Invalid YAML in Iceberg source config '{p}' at line {mark.line + 1}, "
+                        f"column {mark.column + 1}: duplicate YAML key '{safe_dup}'"
+                    ) from exc
+                raise BadInputError(
+                    f"Invalid YAML in Iceberg source config '{p}': duplicate YAML key '{safe_dup}'"
+                ) from exc
             if mark is not None:
                 raise BadInputError(
                     f"Invalid YAML in Iceberg source config '{p}' at line {mark.line + 1}, column {mark.column + 1}"

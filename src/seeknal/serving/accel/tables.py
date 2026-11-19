@@ -153,6 +153,24 @@ def map_type(col_name: str, raw_type: str) -> str:
     raise ValueError(f"Unknown type {raw_type!r} for column {col_name!r}")
 
 
+def _extract_duplicate_yaml_key(exc: Any) -> Optional[str]:
+    """Return the duplicate key string if `exc` is a duplicate-YAML-key ConstructorError."""
+    from yaml.constructor import ConstructorError
+
+    if not isinstance(exc, ConstructorError):
+        return None
+    if hasattr(exc, "duplicate_key"):
+        return str(getattr(exc, "duplicate_key"))
+    err_text = f"{getattr(exc, 'problem', '')} {exc}"
+    if "duplicate YAML key" not in err_text:
+        return None
+    m = re.search(r"duplicate YAML key '([^']*)'", err_text)
+    if m is not None:
+        return m.group(1)
+    m = re.search(r"duplicate YAML key\s+(\S+)", err_text)
+    return m.group(1) if m is not None else "<unknown>"
+
+
 def _load_json_data(data_or_path: Any) -> Any:
     if isinstance(data_or_path, (str, Path)):
         p = Path(data_or_path)
@@ -161,7 +179,33 @@ def _load_json_data(data_or_path: Any) -> Any:
             if suffix in (".yaml", ".yml"):
                 import yaml
 
-                return yaml.safe_load(f)
+                from seeknal.serving.accel.loader import BadInputError, scrub_text
+                from seeknal.serving.placement import UniqueKeySafeLoader
+
+                try:
+                    return yaml.load(f, Loader=UniqueKeySafeLoader)
+                except yaml.YAMLError as exc:
+                    mark = getattr(exc, "problem_mark", None)
+                    dup_key = _extract_duplicate_yaml_key(exc)
+                    if dup_key is not None:
+                        safe_dup = (
+                            scrub_text(dup_key)
+                            .replace("\n", " ")
+                            .replace("\r", " ")
+                        )
+                        if mark is not None:
+                            raise BadInputError(
+                                f"Invalid YAML in '{p}' at line {mark.line + 1}, "
+                                f"column {mark.column + 1}: duplicate YAML key '{safe_dup}'"
+                            ) from exc
+                        raise BadInputError(
+                            f"Invalid YAML in '{p}': duplicate YAML key '{safe_dup}'"
+                        ) from exc
+                    if mark is not None:
+                        raise BadInputError(
+                            f"Invalid YAML in '{p}' at line {mark.line + 1}, column {mark.column + 1}"
+                        ) from exc
+                    raise BadInputError(f"Invalid YAML in '{p}'") from exc
             return json.load(f)
     return data_or_path
 

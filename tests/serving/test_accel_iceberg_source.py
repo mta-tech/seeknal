@@ -1125,3 +1125,80 @@ def test_b_l3_scrub_text_redacts_sql_escaped_doubled_single_quote_secrets(tmp_pa
         clear_registered_secrets()
 
 
+def test_e_n1_load_iceberg_source_config_rejects_duplicate_yaml_keys(tmp_path):
+    ext_dir = tmp_path / "extensions"
+    ext_dir.mkdir()
+
+    base_yaml_header = (
+        f"extension_directory: {ext_dir}\n"
+        "extensions: [httpfs, avro, iceberg]\n"
+        "iceberg_catalogs:\n"
+        "  lake:\n"
+        "    endpoint: https://lakekeeper.synthetic.internal/catalog\n"
+        "    warehouse: analytics_wh\n"
+        "    token_uri: https://idp.synthetic.internal/oauth2/token\n"
+        "    client_id_env: TEST_LK_CLIENT_ID\n"
+        "    client_secret_env: TEST_LK_CLIENT_SECRET\n"
+        "    s3:\n"
+        "      endpoint: s3.synthetic.internal:9000\n"
+        "      region: ap-southeast-1\n"
+        "      key_id_env: TEST_S3_KEY_ID\n"
+        "      secret_env: TEST_S3_SECRET\n"
+    )
+
+    # 1. Duplicate key under pii_columns
+    dup_pii_cols_cfg = tmp_path / "dup_pii_columns.yaml"
+    dup_pii_cols_cfg.write_text(
+        base_yaml_header
+        + "pii_columns:\n"
+        + "  customer_email:\n"
+        + "    source_form: plain\n"
+        + "    mask: last4\n"
+        + "  customer_email:\n"
+        + "    source_form: sha256\n"
+        + "    mask: redact\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(BadInputError) as exc_pii_col:
+        load_iceberg_source_config(dup_pii_cols_cfg)
+    assert isinstance(exc_pii_col.value, ValueError)
+    msg_pii_col = str(exc_pii_col.value)
+    assert "duplicate YAML key" in msg_pii_col
+    assert "customer_email" in msg_pii_col
+    assert "line 19, column 3" in msg_pii_col
+
+    # 2. Duplicate top-level key (pii_mode)
+    dup_top_cfg = tmp_path / "dup_top_pii_mode.yml"
+    dup_top_cfg.write_text(
+        base_yaml_header
+        + "pii_mode: exclude\n"
+        + "pii_mode: 'null'\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(BadInputError) as exc_top:
+        load_iceberg_source_config(dup_top_cfg)
+    msg_top = str(exc_top.value)
+    assert "duplicate YAML key" in msg_top
+    assert "pii_mode" in msg_top
+    assert "line 16, column 1" in msg_top
+
+    # 3. IcebergSource and CLI fail closed (exit 2) on duplicate YAML key
+    with pytest.raises(BadInputError, match="duplicate YAML key"):
+        IcebergSource(dup_pii_cols_cfg)
+
+    rc = accel_main(
+        [
+            "load",
+            "--source-type",
+            "iceberg",
+            "--source-config",
+            str(dup_pii_cols_cfg),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--dry-run",
+        ]
+    )
+    assert rc == 2
+
+
+

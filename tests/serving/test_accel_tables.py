@@ -438,3 +438,114 @@ def test_b_l1_non_hashed_pii_rejected_without_explicit_acknowledgement(tmp_path,
         for e in cli_events
     )
 
+
+def test_e_n1_duplicate_yaml_keys_rejected_in_pii_policy_and_table_loaders(
+    tmp_path, monkeypatch
+):
+    import yaml
+    from yaml.constructor import ConstructorError
+
+    from seeknal.serving.accel.iceberg_source import build_iceberg_table_specs
+    from seeknal.serving.accel.loader import BadInputError
+    from seeknal.serving.accel.tables import _load_json_data
+
+    columns, _, registry = _synthetic_inputs()
+
+    # 1. PII policy YAML repeating rpt.patients key
+    dup_table_pii_yaml = tmp_path / "dup_patients_pii.yaml"
+    dup_table_pii_yaml.write_text(
+        "rpt.patients:\n"
+        "  ssn:\n"
+        "    source_form: plain\n"
+        "    mask: last4\n"
+        "rpt.patients:\n"
+        "  ssn:\n"
+        "    source_form: sha256\n"
+        "    mask: redact\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(BadInputError) as exc_patients:
+        _load_json_data(dup_table_pii_yaml)
+    assert isinstance(exc_patients.value, ValueError)
+    msg_patients = str(exc_patients.value)
+    assert "duplicate YAML key" in msg_patients
+    assert "rpt.patients" in msg_patients
+    assert "line 5, column 1" in msg_patients
+
+    # 2. PII policy YAML repeating column key email_hash across tables.py, placement.py, iceberg_source.py
+    dup_col_pii_yaml = tmp_path / "dup_col_pii.yml"
+    dup_col_pii_yaml.write_text(
+        "email_hash:\n"
+        "  source_form: plain\n"
+        "  mask: last4\n"
+        "email_hash:\n"
+        "  source_form: sha256\n"
+        "  mask: redact\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(BadInputError) as exc_specs:
+        build_table_specs(
+            columns=columns,
+            pii_policy=dup_col_pii_yaml,
+            registry=registry,
+            pii_mode="null",
+        )
+    msg_specs = str(exc_specs.value)
+    assert "duplicate YAML key" in msg_specs
+    assert "email_hash" in msg_specs
+    assert "line 4, column 1" in msg_specs
+
+    with pytest.raises(BadInputError) as exc_schemas:
+        generate_schemas(
+            columns=columns,
+            registry=registry,
+            pii_policy=dup_col_pii_yaml,
+            pii_mode="exclude",
+        )
+    assert "duplicate YAML key" in str(exc_schemas.value)
+    assert "email_hash" in str(exc_schemas.value)
+
+    ext_dir = tmp_path / "ext"
+    ext_dir.mkdir()
+    ice_cfg = {
+        "extension_directory": str(ext_dir),
+        "default_catalog": "lake",
+        "default_namespace": "analytics",
+        "iceberg_catalogs": {
+            "lake": {
+                "endpoint": "https://lakekeeper.synthetic.internal/catalog",
+                "warehouse": "wh",
+                "token_uri": "https://idp.synthetic.internal/oauth2/token",
+                "client_id_env": "LK_CID",
+                "client_secret_env": "LK_SEC",
+                "s3": {
+                    "endpoint": "s3.synthetic.internal:9000",
+                    "region": "ap-southeast-1",
+                    "key_id_env": "S3_KID",
+                    "secret_env": "S3_SEC",
+                },
+            }
+        },
+    }
+    with pytest.raises(BadInputError) as exc_ice:
+        build_iceberg_table_specs(
+            ice_cfg,
+            columns=columns,
+            pii_policy=dup_col_pii_yaml,
+            registry=registry,
+            pii_mode="null",
+        )
+    assert "duplicate YAML key" in str(exc_ice.value)
+    assert "email_hash" in str(exc_ice.value)
+
+    # 3. ConstructorError with 'duplicate YAML key' in message and problem_mark=None
+    def _fake_yaml_load(*_args, **_kwargs):
+        raise ConstructorError(None, None, "found duplicate YAML key 'rpt.patients'", None)
+
+    monkeypatch.setattr(yaml, "load", _fake_yaml_load)
+    with pytest.raises(BadInputError) as exc_nomark:
+        _load_json_data(dup_table_pii_yaml)
+    assert "duplicate YAML key" in str(exc_nomark.value)
+    assert "rpt.patients" in str(exc_nomark.value)
+
+
