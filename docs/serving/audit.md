@@ -112,7 +112,8 @@ Only the following 21 fields may ever appear in a serialized audit record:
 Audit serialization enforces a **strict schema allowlist** plus value-level secret scrubbing:
 
 - **Never logged:** Raw SQL statements, redacted SQL templates, SQL string/numeric literals, positional query `params`, result `rows` or column values, compact JWS grant/cancel tokens, `Authorization` headers, engine DSNs/connection URIs, passwords, or API secrets.
-- **SQL correlation without leakage:** Only `sql_sha256` (`SHA-256(sql.encode("utf-8"))`) is recorded, enabling exact correlation against Catalog grant issuance logs without exposing query predicates or literals.
+- **SQL correlation without leakage:** Only `sql_sha256` (`SHA-256(sql.encode("utf-8", errors="replace"))`) is recorded, enabling correlation against Catalog grant issuance logs without exposing query predicates or literals and without failing on lone UTF-16 surrogates.
+- **Table & surrogate sanitization:** Blank/whitespace-only table names are dropped, lone UTF-16 surrogates (`U+D800..U+DFFF`) in string fields and table names are replaced with `\ufffd`, table names are truncated to 256 characters, deduplicated in order, and capped at 64 entries. `build_minimal_audit_record()` provides a minimal fallback record if full record construction fails.
 - **Defense in depth:** Any non-allowlisted keys passed to `build_audit_record()` or `serialize_audit_record()` are stripped before serialization, and any accidental Bearer token, compact JWT (`eyJ...`), or database DSN/credential URI in string fields is scrubbed to `[REDACTED]`.
 
 ---
@@ -121,9 +122,10 @@ Audit serialization enforces a **strict schema allowlist** plus value-level secr
 
 ### 3.1 `FileAuditSink` (`sink: file`)
 
-- Opens the active file using `os.open(path, O_WRONLY | O_CREAT | O_APPEND, mode)` and enforces `os.chmod(path, mode)` so file permissions are strictly `0600` (or `0640` when configured), independent of process `umask`.
+- **Symlink, hardlink, UID & `fchmod` hardening:** Never follows symlinks (`O_NOFOLLOW` + `os.lstat`) and never calls path-based `os.chmod`. Rejects paths that are symlinks, non-regular files, hard-linked (`st_nlink != 1`), or not owned by `os.getuid()` both during offline validation (`verify_audit_config_offline`) and before/after `os.open` (`os.fstat`). Sets permissions (`0600` or `0640`) exclusively via `os.fchmod(fd, mode)` on the verified file descriptor, independent of process `umask`.
+- **Unbounded growth warning:** When `max_bytes`, `max_files`, and `max_age_seconds` are all unset (`null`), logs a startup `WARNING` indicating that the audit log may grow unbounded.
 - Flushes writes with `os.fsync` and serializes concurrent writes within a process using a `threading.Lock()`.
-- **Rotation:** Before writing a new record to a non-empty active file, rotates `audit.jsonl` to `audit.jsonl.<UTC_TIMESTAMP>.<SEQ>` if:
+- **Rotation:** Before writing a new record to a non-empty active file, verifies `os.lstat` on both the active path and the target archive path, applies `os.fchmod(fd, mode)` before closing the descriptor, and atomically renames `audit.jsonl` to `audit.jsonl.<UTC_TIMESTAMP>.<SEQ>` via `os.replace` if:
   - `max_bytes` is set and `current_size + record_bytes > max_bytes`, or
   - `rotate_interval_seconds` is set and `now - window_opened_at >= rotate_interval_seconds`.
   Rotated archive files retain the configured `0600` or `0640` permissions.
@@ -147,7 +149,11 @@ Audit serialization enforces a **strict schema allowlist** plus value-level secr
 
 ## 4. Failure Semantics (`refuse` vs `log`)
 
-Audit records are always emitted **before** the HTTP response is returned to the caller.
+Audit records are always emitted off the event loop (via `run_in_threadpool`) **before** the HTTP response is returned or side effects (such as `/v1/cancel` query cancellation) are committed:
+
+- **Non-blocking audit I/O & bounded SQL extraction:** Synchronous sink writes and fallback SQL table extraction run in a worker threadpool so `/healthz` and concurrent requests stay responsive. SQL table extraction runs only after token signature/issuer/audience verification (`claims is not None`), skips statements over 64 KiB, and stops at 64 unique tables.
+- **Pre-action `/v1/cancel` auditing:** `/v1/cancel` emits the `202` audit record before cancelling the in-flight query; if audit emission fails under `on_failure: refuse`, HTTP `503` `audit_unavailable` is returned and the query is not cancelled.
+- **Rejected method & disconnect coverage:** Disallowed HTTP methods (`405 method_not_allowed`, `code: "invalid_sql"`) and client disconnects during request body reads (`499 query_cancelled`) on `/v1/query`, `/v1/explain`, and `/v1/cancel` return typed JSON payloads and emit audit records.
 
 | Phase | `on_failure: refuse` (Default) | `on_failure: log` |
 | --- | --- | --- |

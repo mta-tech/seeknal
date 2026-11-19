@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 import datetime
+import errno
 import hashlib
 import json
 import logging
@@ -128,6 +129,9 @@ _KNOWN_AUDIT_CONFIG_KEYS: frozenset[str] = frozenset(
 _SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _OCTAL_MODE_STR_RE = re.compile(r"^(?:0[oO])?[0-7]{3,4}$")
 _SAFE_KEY_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+_MAX_AUDIT_TABLE_NAME_LEN = 256
+_MAX_AUDIT_TABLES = 64
 
 # Defense-in-depth patterns to prevent tokens, Bearer headers, or DSNs/credentials
 # from ever appearing in serialized string fields or diagnostic error messages.
@@ -176,9 +180,15 @@ class AuditWriteError(AuditUnavailableError):
         return payload
 
 
+def _sanitize_surrogates(text: str) -> str:
+    """Replace any lone UTF-16 surrogates (U+D800..U+DFFF) with U+FFFD."""
+    return _LONE_SURROGATE_RE.sub("\ufffd", text)
+
+
 def _scrub_secret_patterns(text: str) -> str:
-    """Redact compact JWTs, Bearer headers, and DSNs/credential URIs from strings."""
-    cleaned = _BEARER_HEADER_RE.sub("[REDACTED]", text)
+    """Sanitize lone surrogates and redact compact JWTs, Bearer headers, and DSNs/credential URIs."""
+    cleaned = _sanitize_surrogates(text)
+    cleaned = _BEARER_HEADER_RE.sub("[REDACTED]", cleaned)
     cleaned = _JWT_COMPACT_RE.sub("[REDACTED]", cleaned)
     cleaned = _CREDENTIAL_URI_RE.sub("[REDACTED]", cleaned)
     cleaned = _DSN_SCHEME_RE.sub("[REDACTED]", cleaned)
@@ -189,7 +199,7 @@ def _safe_diag_target(value: Any, fallback: str = "<redacted>") -> str:
     """Format a path or host safely for diagnostic/startup messages."""
     if not isinstance(value, (str, os.PathLike)):
         return f"<{type(value).__name__}>"
-    s = str(value).strip()
+    s = _sanitize_surrogates(str(value).strip())
     if not s:
         return "<empty>"
     if _SUSPICIOUS_DIAGNOSTIC_RE.search(s):
@@ -209,7 +219,7 @@ def _safe_config_key_label(key: Any) -> str:
 def compute_sql_sha256(sql: str | None) -> str | None:
     """Compute lowercase hex SHA-256 of SQL text when non-empty, else ``None``."""
     if isinstance(sql, str) and len(sql) > 0:
-        return hashlib.sha256(sql.encode("utf-8")).hexdigest()
+        return hashlib.sha256(sql.encode("utf-8", errors="replace")).hexdigest()
     return None
 
 
@@ -279,12 +289,22 @@ def _normalize_tables(
     else:
         raise ValueError("Audit field 'tables' must be an iterable of strings")
 
-    normalized: list[str] = []
+    out: list[str] = []
+    seen: set[str] = set()
     for item in raw_items:
-        if not isinstance(item, str) or not item.strip():
-            raise ValueError("Each entry in audit 'tables' must be a non-empty string")
-        normalized.append(_scrub_secret_patterns(item.strip()))
-    return normalized
+        if not isinstance(item, str):
+            raise ValueError("Each entry in audit 'tables' must be a string")
+        cleaned = item.strip()
+        if not cleaned:
+            continue
+        cleaned = re.sub(r"[\ud800-\udfff]", "\ufffd", cleaned)
+        cleaned = _scrub_secret_patterns(cleaned)
+        cleaned = cleaned[:_MAX_AUDIT_TABLE_NAME_LEN]
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        out.append(cleaned)
+    return out[:_MAX_AUDIT_TABLES]
 
 
 def _normalize_sql_sha256(
@@ -373,8 +393,9 @@ class AuditRecord:
             else None
         )
 
-        if tables is not None and logical_tables is not None and list(tables) != list(logical_tables):
-            raise ValueError("Conflicting 'tables' and 'logical_tables' supplied to AuditRecord")
+        if tables is not None and logical_tables is not None:
+            if _normalize_tables(tables) != _normalize_tables(logical_tables):
+                raise ValueError("Conflicting 'tables' and 'logical_tables' supplied to AuditRecord")
 
         if isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, (int, float)):
             raise ValueError("Audit field 'elapsed_ms' must be a finite non-negative number")
@@ -431,16 +452,24 @@ class AuditRecord:
         for key in ALLOWED_AUDIT_FIELDS:
             val = getattr(self, key)
             if key == "tables":
-                out[key] = [_scrub_secret_patterns(str(t)) for t in val]
+                out[key] = _normalize_tables(val)
             elif isinstance(val, str) and key not in ("timestamp", "route", "sql_sha256"):
                 out[key] = _scrub_secret_patterns(val)
+            elif isinstance(val, str):
+                out[key] = _sanitize_surrogates(val)
             else:
                 out[key] = val
         return out
 
+    def to_json_line(self) -> str:
+        """Serialize this record to a single compact UTF-8-safe JSON line (without trailing newline)."""
+        allowlisted_payload = _validate_record_dict(self.to_dict())
+        line = json.dumps(allowlisted_payload, separators=(",", ":"), ensure_ascii=False)
+        return _sanitize_surrogates(line)
+
     def to_json(self) -> str:
         """Serialize this record to a single compact JSON line (without trailing newline)."""
-        return serialize_audit_record(self)
+        return self.to_json_line()
 
     @classmethod
     def from_dict(
@@ -616,6 +645,75 @@ def build_audit_record(
     )
 
 
+def _validate_record_dict(raw_dict: Mapping[str, Any]) -> dict[str, Any]:
+    """Enforce strict allowlist, forbidden-key exclusion, and surrogate/secret sanitization."""
+    allowlisted_payload: dict[str, Any] = {}
+    for key in ALLOWED_AUDIT_FIELDS:
+        if key not in raw_dict or key in FORBIDDEN_AUDIT_KEYS:
+            continue
+        val = raw_dict[key]
+        if key == "tables":
+            val = _normalize_tables(val)
+        elif isinstance(val, str):
+            if key in ("timestamp", "route", "sql_sha256"):
+                val = _sanitize_surrogates(val)
+            else:
+                val = _scrub_secret_patterns(val)
+        allowlisted_payload[key] = val
+
+    if set(allowlisted_payload.keys()) != ALLOWED_AUDIT_FIELD_SET:
+        raise ValueError("Serialized audit record is missing required allowlisted keys")
+    return allowlisted_payload
+
+
+def build_minimal_audit_record(
+    *,
+    route: str,
+    status: int,
+    code: str | None = None,
+    elapsed_ms: float = 0.0,
+    audit_id: str | None = None,
+    timestamp: Any = None,
+) -> AuditRecord:
+    """Build a minimal fallback ``AuditRecord`` when full record construction/emission fails."""
+    safe_status = (
+        status
+        if not isinstance(status, bool) and isinstance(status, int) and 100 <= status <= 599
+        else 500
+    )
+
+    safe_elapsed = 0.0
+    if not isinstance(elapsed_ms, bool) and isinstance(elapsed_ms, (int, float)):
+        ef = float(elapsed_ms)
+        if math.isfinite(ef) and ef >= 0.0:
+            safe_elapsed = ef
+
+    try:
+        safe_ts = format_utc_timestamp(timestamp)
+    except Exception:
+        safe_ts = format_utc_timestamp(None)
+
+    safe_code = (
+        _scrub_secret_patterns(code)
+        if safe_status >= 400 and isinstance(code, str)
+        else None
+    )
+    safe_audit_id = (
+        _scrub_secret_patterns(audit_id)
+        if isinstance(audit_id, str)
+        else None
+    )
+
+    return AuditRecord(
+        route=route,
+        status=safe_status,
+        code=safe_code,
+        elapsed_ms=safe_elapsed,
+        audit_id=safe_audit_id,
+        timestamp=safe_ts,
+    )
+
+
 def serialize_audit_record(record: AuditRecord | Mapping[str, Any]) -> str:
     """Serialize an ``AuditRecord`` or mapping into a single allowlisted JSON line."""
     if isinstance(record, AuditRecord):
@@ -625,17 +723,7 @@ def serialize_audit_record(record: AuditRecord | Mapping[str, Any]) -> str:
     else:
         raise ValueError(f"Expected AuditRecord or Mapping, got {type(record).__name__}")
 
-    raw_dict = validated.to_dict()
-    # Enforce strict allowlist and explicit forbidden-key exclusion at serialization boundary.
-    allowlisted_payload = {
-        key: raw_dict[key]
-        for key in ALLOWED_AUDIT_FIELDS
-        if key in raw_dict and key not in FORBIDDEN_AUDIT_KEYS
-    }
-    if set(allowlisted_payload.keys()) != ALLOWED_AUDIT_FIELD_SET:
-        raise ValueError("Serialized audit record is missing required allowlisted keys")
-
-    return json.dumps(allowlisted_payload, separators=(",", ":"), ensure_ascii=False)
+    return validated.to_json_line()
 
 
 # ---------------------------------------------------------------------------
@@ -995,6 +1083,28 @@ class AuditSink(ABC):
         """Release any open file descriptors or sockets."""
 
 
+def _validate_audit_lstat(
+    path: Path,
+    lst: os.stat_result,
+    *,
+    error_cls: type[Exception] = AuditWriteError,
+) -> None:
+    """Validate via ``lstat`` result that an audit path is a single-linked regular file owned by current UID."""
+    safe_label = _safe_diag_target(path)
+    if stat.S_ISLNK(lst.st_mode):
+        raise error_cls(f"Audit file path '{safe_label}' must not be a symlink")
+    if not stat.S_ISREG(lst.st_mode):
+        raise error_cls(f"Audit file path '{safe_label}' is not a regular file")
+    if lst.st_nlink != 1:
+        raise error_cls(
+            f"Audit file path '{safe_label}' must not have hard links (st_nlink={lst.st_nlink})"
+        )
+    if lst.st_uid != os.getuid():
+        raise error_cls(
+            f"Audit file path '{safe_label}' is not owned by current process uid"
+        )
+
+
 def _write_all_fd(fd: int, data: bytes) -> None:
     """Write all bytes to a file descriptor, handling short writes."""
     view = memoryview(data)
@@ -1057,6 +1167,17 @@ class FileAuditSink(AuditSink):
             eff_max_age, "max_age_seconds", ValueError
         )
 
+        if (
+            self._max_bytes is None
+            and self._max_files is None
+            and self._max_age_seconds is None
+        ):
+            logger.warning(
+                "Audit file sink '%s' has no max_bytes rotation and no retention "
+                "(max_files/max_age_seconds) configured; audit log may grow unbounded",
+                _safe_diag_target(self._path),
+            )
+
         self._clock = clock
         self._fsync = bool(fsync)
         self._lock = threading.Lock()
@@ -1109,29 +1230,54 @@ class FileAuditSink(AuditSink):
                     f"Audit file parent directory is not writable: {safe_parent_label}"
                 )
 
-            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-            if hasattr(os, "O_CLOEXEC"):
-                flags |= os.O_CLOEXEC
+            if os.path.lexists(self._path):
+                lst = os.lstat(self._path)
+                _validate_audit_lstat(self._path, lst, error_cls=AuditWriteError)
+
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_APPEND
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
 
             fd = os.open(str(self._path), flags, self._mode)
             try:
-                st = os.fstat(fd)
-                if stat.S_ISDIR(st.st_mode):
+                fst = os.fstat(fd)
+                if not stat.S_ISREG(fst.st_mode):
                     raise AuditWriteError(
-                        f"Audit file path points to a directory: {safe_path_label}"
+                        f"Audit file path '{safe_path_label}' is not a regular file"
                     )
-                if stat.S_ISREG(st.st_mode):
-                    try:
-                        os.fchmod(fd, self._mode)
-                    except OSError:
-                        pass
-                    os.chmod(self._path, self._mode)
+                if fst.st_nlink != 1:
+                    raise AuditWriteError(
+                        f"Audit file path '{safe_path_label}' must not have hard links (st_nlink={fst.st_nlink})"
+                    )
+                if fst.st_uid != os.getuid():
+                    raise AuditWriteError(
+                        f"Audit file path '{safe_path_label}' is not owned by current process uid"
+                    )
+                if os.path.lexists(self._path):
+                    post_lst = os.lstat(self._path)
+                    if stat.S_ISLNK(post_lst.st_mode):
+                        raise AuditWriteError(
+                            f"Audit file path '{safe_path_label}' must not be a symlink"
+                        )
+                    if (post_lst.st_dev, post_lst.st_ino) != (fst.st_dev, fst.st_ino):
+                        raise AuditWriteError(
+                            f"Audit file path '{safe_path_label}' inode changed during open"
+                        )
+                os.fchmod(fd, self._mode)
             except Exception:
                 os.close(fd)
                 raise
         except AuditWriteError:
             raise
         except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise AuditWriteError(
+                    f"Audit file path '{safe_path_label}' must not be a symlink"
+                ) from exc
             reason = exc.strerror or type(exc).__name__
             raise AuditWriteError(
                 f"Cannot open audit file {safe_path_label}: {reason}"
@@ -1169,39 +1315,62 @@ class FileAuditSink(AuditSink):
 
         return False
 
-    def _rotate_locked(self, now: float) -> Path:
+    def _rotate_unlocked(self, now: float) -> Path:
         safe_path_label = _safe_diag_target(self._path)
         try:
-            if self._fd is not None and self._fsync:
-                os.fsync(self._fd)
-            self._close_locked()
+            lst_src = os.lstat(self._path)
+            _validate_audit_lstat(self._path, lst_src, error_cls=AuditWriteError)
 
-            self._rotation_seq += 1
+            next_seq = self._rotation_seq + 1
             clamped_epoch = max(0.0, now)
             ts_tag = datetime.datetime.fromtimestamp(
                 clamped_epoch, tz=datetime.timezone.utc
             ).strftime("%Y%m%dT%H%M%S%fZ")
-            rotated_name = f"{self._path.name}.{ts_tag}.{self._rotation_seq:06d}"
+            rotated_name = f"{self._path.name}.{ts_tag}.{next_seq:06d}"
             rotated_path = self._path.with_name(rotated_name)
 
+            if os.path.lexists(rotated_path):
+                lst_dst = os.lstat(rotated_path)
+                _validate_audit_lstat(rotated_path, lst_dst, error_cls=AuditWriteError)
+
+            if self._fd is not None:
+                fst = os.fstat(self._fd)
+                if (
+                    not stat.S_ISREG(fst.st_mode)
+                    or fst.st_nlink != 1
+                    or fst.st_uid != os.getuid()
+                    or (lst_src.st_dev, lst_src.st_ino) != (fst.st_dev, fst.st_ino)
+                ):
+                    raise AuditWriteError(
+                        f"Audit file path '{safe_path_label}' failed descriptor verification before rotation"
+                    )
+                os.fchmod(self._fd, self._mode)
+                if now >= 0.0 and os.utime in os.supports_fd:
+                    try:
+                        os.utime(self._fd, (now, now))
+                    except OSError:
+                        pass
+                if self._fsync:
+                    os.fsync(self._fd)
+
+            self._close_locked()
+            self._rotation_seq = next_seq
             os.replace(self._path, rotated_path)
-            os.chmod(rotated_path, self._mode)
-            if now >= 0.0:
-                try:
-                    os.utime(rotated_path, (now, now))
-                except OSError:
-                    pass
 
             self._opened_at = now
             self._open_locked(now)
             return rotated_path
         except AuditWriteError:
+            self._close_locked()
             raise
         except OSError as exc:
+            self._close_locked()
             reason = exc.strerror or type(exc).__name__
             raise AuditWriteError(
                 f"Failed to rotate audit file {safe_path_label}: {reason}"
             ) from exc
+
+    _rotate_locked = _rotate_unlocked
 
     def _list_rotated_entries_locked(self) -> list[tuple[str, int, float, Path]]:
         """Return ``(ts_tag, seq, mtime, path)`` sorted oldest-first."""
@@ -1217,6 +1386,8 @@ class FileAuditSink(AuditSink):
                 try:
                     st = dentry.stat(follow_symlinks=False)
                 except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
                     continue
                 entries.append((m.group(1), int(m.group(2)), st.st_mtime, Path(dentry.path)))
         except OSError:
@@ -1279,7 +1450,7 @@ class FileAuditSink(AuditSink):
             fd = self._open_locked(now)
             try:
                 if self._should_rotate_locked(fd, len(payload), now):
-                    self._rotate_locked(now)
+                    self._rotate_unlocked(now)
                     assert self._fd is not None
                     fd = self._fd
 
@@ -1854,11 +2025,15 @@ def verify_audit_config_offline(
         raise error_cls(
             f"Audit file parent directory is not writable: {_safe_diag_target(parent)}"
         )
-    if target.exists():
-        if target.is_dir():
+    if os.path.lexists(target):
+        try:
+            lst = os.lstat(target)
+        except OSError as exc:
+            reason = exc.strerror or type(exc).__name__
             raise error_cls(
-                f"Audit file path points to a directory: {_safe_diag_target(target)}"
-            )
+                f"Cannot stat audit file {_safe_diag_target(target)}: {reason}"
+            ) from exc
+        _validate_audit_lstat(target, lst, error_cls=error_cls)
         if not os.access(target, os.W_OK):
             raise error_cls(
                 f"Audit file is not writable: {_safe_diag_target(target)}"
@@ -1881,6 +2056,7 @@ __all__ = [
     "SyslogAuditSink",
     "build_audit_record",
     "build_audit_sink",
+    "build_minimal_audit_record",
     "compute_sql_sha256",
     "emit_audit_record",
     "format_utc_timestamp",

@@ -21,7 +21,7 @@ import sqlglot
 from sqlglot import exp
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
@@ -34,10 +34,12 @@ from seeknal.serving.adapters import (
     EngineTimeout,
 )
 from seeknal.serving.audit import (
+    ALLOWED_AUDIT_ROUTES,
     AuditManager,
     AuditSink,
     AuditWriteError,
     build_audit_record,
+    build_minimal_audit_record,
     emit_audit_record,
 )
 from seeknal.serving.enforce import EnforcementError
@@ -47,7 +49,6 @@ from seeknal.serving.errors import (
     get_error_spec,
     scrub_error_detail,
 )
-from seeknal.serving.features import _extract_tables
 from seeknal.serving.grant_token import (
     GrantTokenError,
     verify_cancel_token,
@@ -73,6 +74,10 @@ SAFE_ENGINE_ERROR_MESSAGES = frozenset(
         "Engine resource limit exceeded",
     }
 )
+_MAX_AUDIT_SQL_EXTRACT_BYTES = 64 * 1024
+_MAX_AUDIT_TABLES = 64
+_MAX_AUDIT_TABLE_NAME_LEN = 256
+_LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 
 
 class DuplicateQueryIdError(ValueError):
@@ -160,6 +165,12 @@ class RunningQueries:
                 cancel_func()
             except Exception:
                 pass
+
+    def is_running(self, jti: str, subject: str) -> bool:
+        """Check whether a query with matching jti and subject is currently running."""
+        with self._lock:
+            entry = self._queries.get(jti)
+            return entry is not None and entry.subject == subject
 
     def cancel(self, jti: str, subject: str) -> bool:
         """Cancel query if found and subject matches. Returns True on match, False otherwise."""
@@ -329,6 +340,7 @@ def _extract_verified_identity(
 def _extract_logical_tables(
     sql: str | None,
     *,
+    claims: Mapping[str, Any] | None = None,
     sql_dialect: str = "postgres",
     default_catalog: str | None = None,
     prepared: Any = None,
@@ -336,26 +348,107 @@ def _extract_logical_tables(
     if prepared is not None:
         prep_tables = getattr(prepared, "tables", None)
         if prep_tables is not None:
-            return [str(t) for t in prep_tables]
-    if not sql or not isinstance(sql, str) or not sql.strip():
+            out_prep: list[str] = []
+            seen_prep: set[str] = set()
+            for raw_t in prep_tables:
+                cleaned = _LONE_SURROGATE_RE.sub("\ufffd", str(raw_t)).strip()
+                if not cleaned:
+                    continue
+                cleaned = cleaned[:_MAX_AUDIT_TABLE_NAME_LEN]
+                if cleaned not in seen_prep:
+                    seen_prep.add(cleaned)
+                    out_prep.append(cleaned)
+                    if len(out_prep) >= _MAX_AUDIT_TABLES:
+                        break
+            return out_prep
+
+    if claims is None and prepared is None:
         return []
+    if not sql or not isinstance(sql, str):
+        return []
+    if len(sql) > _MAX_AUDIT_SQL_EXTRACT_BYTES:
+        return []
+    if len(sql.encode("utf-8", errors="replace")) > _MAX_AUDIT_SQL_EXTRACT_BYTES:
+        return []
+    if not sql.strip():
+        return []
+
     try:
         stmts = sqlglot.parse(sql, read=sql_dialect)
         if len(stmts) != 1 or stmts[0] is None:
             return []
         stmt = stmts[0]
-        if default_catalog is not None:
-            cte_names = {cte.alias_or_name.lower() for cte in stmt.find_all(exp.CTE)}
-            for tbl in stmt.find_all(exp.Table):
-                if (tbl.name.lower() in cte_names and not tbl.db and not tbl.catalog) or (
-                    tbl.parts and ".".join(p.name for p in tbl.parts).lower() in cte_names
-                ):
-                    continue
-                if tbl.db and tbl.name and not tbl.catalog:
-                    tbl.set("catalog", exp.to_identifier(default_catalog))
-        return list(_extract_tables(stmt))
+        cte_names = {cte.alias_or_name.lower() for cte in stmt.find_all(exp.CTE)}
+        tables: list[str] = []
+        seen: set[str] = set()
+        for tbl in stmt.find_all(exp.Table):
+            raw_name = (tbl.name or "").strip()
+            raw_db = (tbl.db or "").strip()
+            raw_cat = (tbl.catalog or "").strip()
+            if not raw_name and not raw_db and not raw_cat:
+                continue
+            if (raw_name.lower() in cte_names and not raw_db and not raw_cat) or (
+                tbl.parts
+                and ".".join(p.name for p in tbl.parts).strip().lower() in cte_names
+            ):
+                continue
+            parts: list[str] = []
+            if raw_cat:
+                parts.append(raw_cat)
+            elif default_catalog is not None and raw_db and raw_name:
+                parts.append(default_catalog)
+            if raw_db:
+                parts.append(raw_db)
+            if raw_name:
+                parts.append(raw_name)
+            dotted = ".".join(p for p in parts if p).strip().lower()
+            if not dotted:
+                continue
+            dotted = _LONE_SURROGATE_RE.sub("\ufffd", dotted)[:_MAX_AUDIT_TABLE_NAME_LEN]
+            if dotted and dotted not in seen:
+                seen.add(dotted)
+                tables.append(dotted)
+                if len(tables) >= _MAX_AUDIT_TABLES:
+                    break
+        return tables
     except Exception:
         return []
+
+
+async def _extract_logical_tables_async(
+    sql: str | None,
+    *,
+    claims: Mapping[str, Any] | None = None,
+    sql_dialect: str = "postgres",
+    default_catalog: str | None = None,
+    prepared: Any = None,
+) -> list[str]:
+    if prepared is not None and getattr(prepared, "tables", None) is not None:
+        return _extract_logical_tables(
+            sql,
+            claims=claims,
+            sql_dialect=sql_dialect,
+            default_catalog=default_catalog,
+            prepared=prepared,
+        )
+    if claims is None and prepared is None:
+        return []
+    if not sql or not isinstance(sql, str):
+        return []
+    if len(sql) > _MAX_AUDIT_SQL_EXTRACT_BYTES:
+        return []
+    if len(sql.encode("utf-8", errors="replace")) > _MAX_AUDIT_SQL_EXTRACT_BYTES:
+        return []
+    if not sql.strip():
+        return []
+    return await run_in_threadpool(
+        _extract_logical_tables,
+        sql,
+        claims=claims,
+        sql_dialect=sql_dialect,
+        default_catalog=default_catalog,
+        prepared=prepared,
+    )
 
 
 def _error_response(
@@ -378,32 +471,41 @@ def _error_response(
         )
     else:
         resolved_msg = spec.message
+    resolved_msg = _LONE_SURROGATE_RE.sub("\ufffd", resolved_msg)
+    safe_audit_id = (
+        _LONE_SURROGATE_RE.sub("\ufffd", audit_id)
+        if isinstance(audit_id, str) and audit_id
+        else None
+    )
     _, body = build_error_payload(
         spec.code,
         category=resolved_category,
         message=resolved_msg,
-        audit_id=audit_id,
+        audit_id=safe_audit_id,
     )
     return JSONResponse(body, status_code=resolved_status)
 
 
-def _extract_token_claims(token: str | None) -> dict[str, Any]:
-    if not token or not isinstance(token, str):
-        return {}
-    parts = token.split(".")
-    if len(parts) != 3:
-        return {}
-    try:
-        payload_b64 = parts[1]
-        pad = len(payload_b64) % 4
-        if pad:
-            payload_b64 += "=" * (4 - pad)
-        data = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8"))
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return {}
+def _sanitize_log_value(value: Any, *, default: str = "-") -> str:
+    if value is None:
+        return default
+    raw = _LONE_SURROGATE_RE.sub("\ufffd", str(value))
+    if not raw:
+        return default
+    out_chars: list[str] = []
+    for ch in raw:
+        code = ord(ch)
+        if ch == "\n":
+            out_chars.append("\\n")
+        elif ch == "\r":
+            out_chars.append("\\r")
+        elif ch == "\t":
+            out_chars.append("\\t")
+        elif code < 0x20 or code == 0x7F or (0x80 <= code <= 0x9F):
+            out_chars.append(f"\\x{code:02x}")
+        else:
+            out_chars.append(ch)
+    return "".join(out_chars)
 
 
 def _log_request(
@@ -419,14 +521,14 @@ def _log_request(
     revision: int | str | None = None,
     digest: str | None = None,
     binding: Mapping[str, Any] | None = None,
+    claims: Mapping[str, Any] | None = None,
     workload: str | None = None,
     azp: str | None = None,
     origin: str | None = None,
     act_sub: str | None = None,
     act_typ: str | None = None,
-    token: str | None = None,
 ) -> None:
-    if binding:
+    if binding and isinstance(binding, Mapping):
         if publication_id is None and "publication_id" in binding:
             publication_id = binding["publication_id"]
         if revision is None and "revision" in binding:
@@ -444,52 +546,56 @@ def _log_request(
         if act_typ is None and "act_typ" in binding:
             act_typ = binding["act_typ"]
 
-    if token and isinstance(token, str):
-        claims = _extract_token_claims(token)
-        if workload is None and "workload" in claims and isinstance(claims["workload"], str):
+    if claims and isinstance(claims, Mapping):
+        if publication_id is None and isinstance(claims.get("publication_id"), str):
+            publication_id = claims["publication_id"]
+        if revision is None and "revision" in claims:
+            c_rev = claims["revision"]
+            if (isinstance(c_rev, int) and not isinstance(c_rev, bool)) or isinstance(c_rev, str):
+                revision = c_rev
+        if digest is None and isinstance(claims.get("digest"), str):
+            digest = claims["digest"]
+        if workload is None and isinstance(claims.get("workload"), str):
             workload = claims["workload"]
-        if azp is None and "azp" in claims and isinstance(claims["azp"], str):
+        if azp is None and isinstance(claims.get("azp"), str):
             azp = claims["azp"]
-        if origin is None and "origin" in claims and isinstance(claims["origin"], str):
+        if origin is None and isinstance(claims.get("origin"), str):
             origin = claims["origin"]
         act = claims.get("act")
         if isinstance(act, Mapping):
-            if act_sub is None and "sub" in act and isinstance(act["sub"], str):
+            if act_sub is None and isinstance(act.get("sub"), str):
                 act_sub = act["sub"]
-            if act_typ is None and "typ" in act and isinstance(act["typ"], str):
+            if act_typ is None and isinstance(act.get("typ"), str):
                 act_typ = act["typ"]
 
-    extra_parts = []
-    if publication_id is not None:
-        extra_parts.append(f"publication_id={publication_id}")
-    if revision is not None:
-        extra_parts.append(f"revision={revision}")
-    if digest is not None:
-        extra_parts.append(f"digest={digest}")
-    if workload is not None:
-        extra_parts.append(f"workload={workload}")
-    if azp is not None:
-        extra_parts.append(f"azp={azp}")
-    if origin is not None:
-        extra_parts.append(f"origin={origin}")
-    if act_sub is not None:
-        extra_parts.append(f"act_sub={act_sub}")
-    if act_typ is not None:
-        extra_parts.append(f"act_typ={act_typ}")
-
-    extra_str = (" " + " ".join(extra_parts)) if extra_parts else ""
-
-    logger.info(
+    fmt_parts = [
         "request audit_id=%s subject=%s engine=%s rule=%s status=%d elapsed_ms=%.2f row_count=%s"
-        + extra_str,
-        audit_id or "-",
-        subject or "-",
-        engine or "-",
-        rule or "-",
-        status,
-        elapsed_ms,
-        str(row_count),
-    )
+    ]
+    log_args: list[Any] = [
+        _sanitize_log_value(audit_id),
+        _sanitize_log_value(subject),
+        _sanitize_log_value(engine),
+        _sanitize_log_value(rule),
+        int(status),
+        float(elapsed_ms),
+        _sanitize_log_value(row_count),
+    ]
+
+    for key_name, val in (
+        ("publication_id", publication_id),
+        ("revision", revision),
+        ("digest", digest),
+        ("workload", workload),
+        ("azp", azp),
+        ("origin", origin),
+        ("act_sub", act_sub),
+        ("act_typ", act_typ),
+    ):
+        if val is not None:
+            fmt_parts.append(f"{key_name}=%s")
+            log_args.append(_sanitize_log_value(val))
+
+    logger.info(" ".join(fmt_parts), *log_args)
 
 
 def create_app(
@@ -554,7 +660,10 @@ def create_app(
             )
         return resp
 
-    def _finish(
+    def _noop_failure_cb() -> None:
+        return None
+
+    async def _finish(
         response: Response,
         *,
         route: str,
@@ -573,78 +682,49 @@ def create_app(
         sql: str | None = None,
         params: Any = None,
         token: str | None = None,
-        log_token: str | None = None,
         claims: Mapping[str, Any] | None = None,
         binding: Mapping[str, Any] | None = None,
         skip_callable_audit: bool = False,
         log_request_line: bool = True,
     ) -> Response:
-        if audit_sink is not None:
-            record = build_audit_record(
-                route=route,
-                status=status,
-                code=code if status >= 400 else None,
-                elapsed_ms=elapsed_ms,
-                sql=sql,
-                audit_id=audit_id,
-                subject=subject,
-                workload=workload,
-                engine=engine,
-                rule=rule,
-                tables=tables,
-                row_count=row_count,
-                truncated=truncated,
-                claims=claims,
-                binding=binding,
-            )
+        if audit_sink is not None and route in ALLOWED_AUDIT_ROUTES:
             if is_structured_sink:
+                primary_cb_called = False
+
+                def _primary_failure_cb() -> None:
+                    nonlocal primary_cb_called
+                    primary_cb_called = True
+                    _on_audit_write_failure()
+
                 try:
-                    emit_audit_record(
+                    record = build_audit_record(
+                        route=route,
+                        status=status,
+                        code=code if status >= 400 else None,
+                        elapsed_ms=elapsed_ms,
+                        sql=sql,
+                        audit_id=audit_id,
+                        subject=subject,
+                        workload=workload,
+                        engine=engine,
+                        rule=rule,
+                        tables=tables,
+                        row_count=row_count,
+                        truncated=truncated,
+                        claims=claims,
+                        binding=binding,
+                    )
+                    await run_in_threadpool(
+                        emit_audit_record,
                         audit_sink,
                         record,
                         on_failure=effective_audit_on_failure,
-                        on_write_failure=_on_audit_write_failure,
+                        on_write_failure=_primary_failure_cb,
                     )
-                except (AuditWriteError, AuditUnavailableError) as exc:
-                    logger.error(
-                        "engine=%s code=%s error=%s detail=%s audit_id=%s",
-                        engine_kind or "-",
-                        "audit_unavailable",
-                        type(exc).__name__,
-                        scrub_error_detail(exc, token=token, sql=sql, params=params),
-                        audit_id or "-",
-                    )
-                    _log_request(
-                        audit_id=audit_id,
-                        subject=subject,
-                        engine=engine,
-                        rule=rule,
-                        status=503,
-                        elapsed_ms=elapsed_ms,
-                        binding=binding,
-                        token=log_token,
-                    )
-                    if metrics is not None:
-                        metrics.record_request(
-                            route,
-                            status=503,
-                            duration_seconds=elapsed_ms / 1000.0,
-                            engine=engine,
-                            error_code="audit_unavailable",
-                        )
-                    return _error_response(
-                        "audit_unavailable",
-                        audit_id=audit_id,
-                        token=token,
-                        sql=sql,
-                        params=params,
-                    )
-            elif is_callable_sink and not skip_callable_audit:
-                try:
-                    audit_sink(record.to_dict())
                 except Exception as exc:
-                    _on_audit_write_failure()
                     if effective_audit_on_failure == "log":
+                        if not primary_cb_called:
+                            _on_audit_write_failure()
                         logger.error(
                             "Audit write failed (on_failure=log, route=%s, audit_id=%s, status=%d): %s detail=%s",
                             route,
@@ -654,39 +734,153 @@ def create_app(
                             scrub_error_detail(exc, token=token, sql=sql, params=params),
                         )
                     else:
+                        try:
+                            minimal_record = build_minimal_audit_record(
+                                route=route,
+                                status=status,
+                                code=code if status >= 400 else None,
+                                elapsed_ms=elapsed_ms,
+                                audit_id=audit_id,
+                            )
+                            retry_cb = (
+                                _noop_failure_cb
+                                if primary_cb_called
+                                else _on_audit_write_failure
+                            )
+                            await run_in_threadpool(
+                                emit_audit_record,
+                                audit_sink,
+                                minimal_record,
+                                on_failure="refuse",
+                                on_write_failure=retry_cb,
+                            )
+                        except Exception as retry_exc:
+                            if not primary_cb_called and not isinstance(
+                                retry_exc, (AuditWriteError, AuditUnavailableError)
+                            ):
+                                _on_audit_write_failure()
+                            final_exc = (
+                                retry_exc
+                                if isinstance(
+                                    retry_exc, (AuditWriteError, AuditUnavailableError)
+                                )
+                                else exc
+                            )
+                            logger.error(
+                                "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                                engine_kind or "-",
+                                "audit_unavailable",
+                                type(final_exc).__name__,
+                                scrub_error_detail(
+                                    final_exc, token=token, sql=sql, params=params
+                                ),
+                                audit_id or "-",
+                            )
+                            _log_request(
+                                audit_id=audit_id,
+                                subject=subject,
+                                engine=engine,
+                                rule=rule,
+                                status=503,
+                                elapsed_ms=elapsed_ms,
+                                binding=binding,
+                                claims=claims,
+                            )
+                            if metrics is not None:
+                                metrics.record_request(
+                                    route,
+                                    status=503,
+                                    duration_seconds=elapsed_ms / 1000.0,
+                                    engine=engine,
+                                    error_code="audit_unavailable",
+                                )
+                            return _error_response(
+                                "audit_unavailable",
+                                audit_id=audit_id,
+                                token=token,
+                                sql=sql,
+                                params=params,
+                            )
+            elif is_callable_sink and not skip_callable_audit:
+                try:
+                    record = build_audit_record(
+                        route=route,
+                        status=status,
+                        code=code if status >= 400 else None,
+                        elapsed_ms=elapsed_ms,
+                        sql=sql,
+                        audit_id=audit_id,
+                        subject=subject,
+                        workload=workload,
+                        engine=engine,
+                        rule=rule,
+                        tables=tables,
+                        row_count=row_count,
+                        truncated=truncated,
+                        claims=claims,
+                        binding=binding,
+                    )
+                    await run_in_threadpool(audit_sink, record.to_dict())
+                except Exception as exc:
+                    if effective_audit_on_failure == "log":
+                        _on_audit_write_failure()
                         logger.error(
-                            "engine=%s code=%s error=%s detail=%s audit_id=%s",
-                            engine_kind or "-",
-                            "audit_unavailable",
+                            "Audit write failed (on_failure=log, route=%s, audit_id=%s, status=%d): %s detail=%s",
+                            route,
+                            audit_id or "-",
+                            status,
                             type(exc).__name__,
                             scrub_error_detail(exc, token=token, sql=sql, params=params),
-                            audit_id or "-",
                         )
-                        _log_request(
-                            audit_id=audit_id,
-                            subject=subject,
-                            engine=engine,
-                            rule=rule,
-                            status=503,
-                            elapsed_ms=elapsed_ms,
-                            binding=binding,
-                            token=log_token,
-                        )
-                        if metrics is not None:
-                            metrics.record_request(
-                                route,
-                                status=503,
-                                duration_seconds=elapsed_ms / 1000.0,
-                                engine=engine,
-                                error_code="audit_unavailable",
+                    else:
+                        try:
+                            minimal_record = build_minimal_audit_record(
+                                route=route,
+                                status=status,
+                                code=code if status >= 400 else None,
+                                elapsed_ms=elapsed_ms,
+                                audit_id=audit_id,
                             )
-                        return _error_response(
-                            "audit_unavailable",
-                            audit_id=audit_id,
-                            token=token,
-                            sql=sql,
-                            params=params,
-                        )
+                            await run_in_threadpool(
+                                audit_sink, minimal_record.to_dict()
+                            )
+                        except Exception as retry_exc:
+                            _on_audit_write_failure()
+                            logger.error(
+                                "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                                engine_kind or "-",
+                                "audit_unavailable",
+                                type(retry_exc).__name__,
+                                scrub_error_detail(
+                                    retry_exc, token=token, sql=sql, params=params
+                                ),
+                                audit_id or "-",
+                            )
+                            _log_request(
+                                audit_id=audit_id,
+                                subject=subject,
+                                engine=engine,
+                                rule=rule,
+                                status=503,
+                                elapsed_ms=elapsed_ms,
+                                binding=binding,
+                                claims=claims,
+                            )
+                            if metrics is not None:
+                                metrics.record_request(
+                                    route,
+                                    status=503,
+                                    duration_seconds=elapsed_ms / 1000.0,
+                                    engine=engine,
+                                    error_code="audit_unavailable",
+                                )
+                            return _error_response(
+                                "audit_unavailable",
+                                audit_id=audit_id,
+                                token=token,
+                                sql=sql,
+                                params=params,
+                            )
 
         if log_request_line:
             _log_request(
@@ -698,7 +892,7 @@ def create_app(
                 elapsed_ms=elapsed_ms,
                 row_count=row_count if row_count is not None else "-",
                 binding=binding,
-                token=log_token,
+                claims=claims,
             )
         if metrics is not None:
             err_code = (code or "internal_error") if status >= 400 else None
@@ -711,7 +905,7 @@ def create_app(
             )
         return response
 
-    def _bad_request_with_token(
+    async def _bad_request_with_token(
         token: str,
         req_start: float,
         *,
@@ -726,8 +920,9 @@ def create_app(
             if claims is not None and isinstance(claims.get("sql_dialect"), str)
             else "postgres"
         )
-        tables = _extract_logical_tables(
+        tables = await _extract_logical_tables_async(
             sql,
+            claims=claims,
             sql_dialect=sql_dialect,
             default_catalog=pipeline.default_catalog,
         )
@@ -740,7 +935,7 @@ def create_app(
             sql=sql,
             params=params,
         )
-        return _finish(
+        return await _finish(
             err_resp,
             route=route,
             status=400,
@@ -752,7 +947,6 @@ def create_app(
             sql=sql,
             params=params,
             token=token,
-            log_token=token,
             claims=claims,
         )
 
@@ -778,7 +972,7 @@ def create_app(
         if content_length_hdr is not None:
             try:
                 if int(content_length_hdr) > max_body_bytes:
-                    return _finish(
+                    return await _finish(
                         _error_response("payload_too_large"),
                         route=route,
                         status=413,
@@ -788,9 +982,20 @@ def create_app(
             except ValueError:
                 pass
 
-        raw_body = await request.body()
+        try:
+            raw_body = await request.body()
+        except ClientDisconnect:
+            return await _finish(
+                _error_response("query_cancelled"),
+                route=route,
+                status=499,
+                code="query_cancelled",
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                log_request_line=False,
+            )
+
         if len(raw_body) > max_body_bytes:
-            return _finish(
+            return await _finish(
                 _error_response("payload_too_large"),
                 route=route,
                 status=413,
@@ -803,7 +1008,7 @@ def create_app(
         if not auth_header:
             if metrics is not None:
                 metrics.record_grant_rejected("malformed")
-            return _finish(
+            return await _finish(
                 _error_response("grant_invalid"),
                 route=route,
                 status=401,
@@ -815,7 +1020,7 @@ def create_app(
         if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
             if metrics is not None:
                 metrics.record_grant_rejected("malformed")
-            return _finish(
+            return await _finish(
                 _error_response("grant_invalid"),
                 route=route,
                 status=401,
@@ -829,10 +1034,10 @@ def create_app(
         try:
             payload = json.loads(raw_body.decode("utf-8"))
         except Exception:
-            return _bad_request_with_token(token, req_start, route=route)
+            return await _bad_request_with_token(token, req_start, route=route)
 
         if not isinstance(payload, dict):
-            return _bad_request_with_token(token, req_start, route=route)
+            return await _bad_request_with_token(token, req_start, route=route)
 
         unknown_fields = set(payload.keys()) - {
             "sql",
@@ -857,7 +1062,7 @@ def create_app(
                 if isinstance(payload.get("sql"), str) and payload["sql"]
                 else None
             )
-            return _bad_request_with_token(
+            return await _bad_request_with_token(
                 token,
                 req_start,
                 route=route,
@@ -870,7 +1075,7 @@ def create_app(
             or not isinstance(payload["sql"], str)
             or not payload["sql"].strip()
         ):
-            return _bad_request_with_token(token, req_start, route=route)
+            return await _bad_request_with_token(token, req_start, route=route)
 
         sql = payload["sql"]
 
@@ -879,14 +1084,14 @@ def create_app(
             raw_params = payload["params"]
             if raw_params is not None:
                 if not isinstance(raw_params, list):
-                    return _bad_request_with_token(
+                    return await _bad_request_with_token(
                         token, req_start, route=route, sql=sql
                     )
                 params = tuple(raw_params)
 
         hint = payload.get("hint")
         if hint is not None and not isinstance(hint, str):
-            return _bad_request_with_token(
+            return await _bad_request_with_token(
                 token, req_start, route=route, sql=sql, params=params
             )
 
@@ -895,11 +1100,11 @@ def create_app(
             if isinstance(max_staleness, bool) or not isinstance(
                 max_staleness, (int, float)
             ):
-                return _bad_request_with_token(
+                return await _bad_request_with_token(
                     token, req_start, route=route, sql=sql, params=params
                 )
             if math.isnan(max_staleness) or math.isinf(max_staleness):
-                return _bad_request_with_token(
+                return await _bad_request_with_token(
                     token, req_start, route=route, sql=sql, params=params
                 )
             max_staleness = float(max_staleness)
@@ -907,11 +1112,11 @@ def create_app(
         timeout_s = payload.get("timeout_s")
         if timeout_s is not None:
             if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
-                return _bad_request_with_token(
+                return await _bad_request_with_token(
                     token, req_start, route=route, sql=sql, params=params
                 )
             if math.isnan(timeout_s) or math.isinf(timeout_s) or timeout_s <= 0:
-                return _bad_request_with_token(
+                return await _bad_request_with_token(
                     token, req_start, route=route, sql=sql, params=params
                 )
             timeout_s = float(timeout_s)
@@ -923,7 +1128,7 @@ def create_app(
                 or not isinstance(max_rows, int)
                 or max_rows <= 0
             ):
-                return _bad_request_with_token(
+                return await _bad_request_with_token(
                     token, req_start, route=route, sql=sql, params=params
                 )
 
@@ -934,7 +1139,7 @@ def create_app(
                 or not isinstance(req_max_result_bytes, int)
                 or req_max_result_bytes <= 0
             ):
-                return _bad_request_with_token(
+                return await _bad_request_with_token(
                     token, req_start, route=route, sql=sql, params=params
                 )
 
@@ -949,7 +1154,7 @@ def create_app(
             req_max_result_bytes,
         )
 
-    def _handle_prepare_exception(
+    async def _handle_prepare_exception(
         exc: Exception,
         *,
         route: str,
@@ -965,8 +1170,9 @@ def create_app(
             if claims is not None and isinstance(claims.get("sql_dialect"), str)
             else "postgres"
         )
-        tables = _extract_logical_tables(
+        tables = await _extract_logical_tables_async(
             sql,
+            claims=claims,
             sql_dialect=sql_dialect,
             default_catalog=pipeline.default_catalog,
         )
@@ -991,7 +1197,7 @@ def create_app(
                 scrub_error_detail(exc, token=token, sql=sql, params=params),
                 audit_id or "-",
             )
-            return _finish(
+            return await _finish(
                 _error_response(
                     spec.code,
                     message=custom_msg,
@@ -1010,7 +1216,6 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
             )
 
@@ -1027,7 +1232,7 @@ def create_app(
                 scrub_error_detail(exc, token=token, sql=sql, params=params),
                 audit_id or "-",
             )
-            return _finish(
+            return await _finish(
                 _error_response(
                     spec.code,
                     audit_id=audit_id,
@@ -1045,7 +1250,6 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
             )
 
@@ -1062,7 +1266,7 @@ def create_app(
                 scrub_error_detail(exc, token=token, sql=sql, params=params),
                 audit_id or "-",
             )
-            return _finish(
+            return await _finish(
                 _error_response(
                     spec.code,
                     audit_id=audit_id,
@@ -1080,12 +1284,41 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
             )
 
         audit_id = getattr(exc, "audit_id", None) or v_jti
         subject = getattr(exc, "subject", None) or v_sub
+        if isinstance(exc, UnicodeError):
+            logger.error(
+                "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                "-",
+                "invalid_sql",
+                type(exc).__name__,
+                scrub_error_detail(exc, token=token, sql=sql, params=params),
+                audit_id or "-",
+            )
+            return await _finish(
+                _error_response(
+                    "invalid_sql",
+                    audit_id=audit_id,
+                    token=token,
+                    sql=sql,
+                    params=params,
+                ),
+                route=route,
+                status=400,
+                code="invalid_sql",
+                elapsed_ms=elapsed,
+                audit_id=audit_id,
+                subject=subject,
+                tables=tables,
+                sql=sql,
+                params=params,
+                token=token,
+                claims=claims,
+            )
+
         if _is_audit_unavailable(exc):
             logger.error(
                 "engine=%s code=%s error=%s detail=%s audit_id=%s",
@@ -1095,7 +1328,7 @@ def create_app(
                 scrub_error_detail(exc, token=token, sql=sql, params=params),
                 audit_id or "-",
             )
-            return _finish(
+            return await _finish(
                 _error_response(
                     "audit_unavailable",
                     audit_id=audit_id,
@@ -1113,7 +1346,6 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
             )
 
@@ -1125,7 +1357,7 @@ def create_app(
             scrub_error_detail(exc, token=token, sql=sql, params=params),
             audit_id or "-",
         )
-        return _finish(
+        return await _finish(
             _error_response(
                 "internal_error",
                 audit_id=audit_id,
@@ -1143,7 +1375,6 @@ def create_app(
             sql=sql,
             params=params,
             token=token,
-            log_token=token,
             claims=claims,
         )
 
@@ -1165,7 +1396,8 @@ def create_app(
         ) = parsed
 
         try:
-            prepared = pipeline.prepare(
+            prepared = await run_in_threadpool(
+                pipeline.prepare,
                 sql,
                 token,
                 params=params,
@@ -1174,7 +1406,7 @@ def create_app(
                 max_rows=max_rows,
             )
         except Exception as exc:
-            return _handle_prepare_exception(
+            return await _handle_prepare_exception(
                 exc,
                 route="/v1/explain",
                 token=token,
@@ -1183,14 +1415,15 @@ def create_app(
                 req_start=req_start,
             )
 
-        claims = _extract_token_claims(token)
+        claims, _, _ = _extract_verified_grant_claims(token, pipeline)
         sql_dialect = (
             claims["sql_dialect"]
-            if isinstance(claims.get("sql_dialect"), str)
+            if claims is not None and isinstance(claims.get("sql_dialect"), str)
             else "postgres"
         )
-        tables = _extract_logical_tables(
+        tables = await _extract_logical_tables_async(
             sql,
+            claims=claims,
             sql_dialect=sql_dialect,
             default_catalog=pipeline.default_catalog,
             prepared=prepared,
@@ -1209,7 +1442,7 @@ def create_app(
                 "redacted_sql": prepared.redacted_sql,
             }
         )
-        return _finish(
+        return await _finish(
             resp,
             route="/v1/explain",
             status=200,
@@ -1224,7 +1457,6 @@ def create_app(
             sql=sql,
             params=params,
             token=token,
-            log_token=token,
             claims=claims,
             binding=prepared.binding,
         )
@@ -1247,7 +1479,8 @@ def create_app(
         ) = parsed
 
         try:
-            prepared = pipeline.prepare(
+            prepared = await run_in_threadpool(
+                pipeline.prepare,
                 sql,
                 token,
                 params=params,
@@ -1256,7 +1489,7 @@ def create_app(
                 max_rows=max_rows,
             )
         except Exception as exc:
-            return _handle_prepare_exception(
+            return await _handle_prepare_exception(
                 exc,
                 route="/v1/query",
                 token=token,
@@ -1265,14 +1498,15 @@ def create_app(
                 req_start=req_start,
             )
 
-        claims = _extract_token_claims(token)
+        claims, _, _ = _extract_verified_grant_claims(token, pipeline)
         sql_dialect = (
             claims["sql_dialect"]
-            if isinstance(claims.get("sql_dialect"), str)
+            if claims is not None and isinstance(claims.get("sql_dialect"), str)
             else "postgres"
         )
-        tables = _extract_logical_tables(
+        tables = await _extract_logical_tables_async(
             sql,
+            claims=claims,
             sql_dialect=sql_dialect,
             default_catalog=pipeline.default_catalog,
             prepared=prepared,
@@ -1281,7 +1515,7 @@ def create_app(
         if prepared.expires_at is None:
             if metrics is not None:
                 metrics.record_grant_rejected("invalid_claims")
-            return _finish(
+            return await _finish(
                 _error_response(
                     "grant_invalid",
                     audit_id=prepared.audit_id,
@@ -1303,7 +1537,6 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
                 binding=prepared.binding,
             )
@@ -1313,7 +1546,7 @@ def create_app(
         except GrantReplayedError:
             if metrics is not None:
                 metrics.record_grant_rejected("replayed")
-            return _finish(
+            return await _finish(
                 _error_response(
                     "grant_replayed",
                     audit_id=prepared.audit_id,
@@ -1335,12 +1568,11 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
                 binding=prepared.binding,
             )
         except GrantReplayCacheFull:
-            return _finish(
+            return await _finish(
                 _error_response(
                     "engine_unavailable",
                     status_code=503,
@@ -1364,14 +1596,13 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
                 binding=prepared.binding,
             )
 
         adapter = adapters.get(prepared.engine)
         if adapter is None:
-            return _finish(
+            return await _finish(
                 _error_response(
                     "engine_unavailable",
                     audit_id=prepared.audit_id,
@@ -1393,33 +1624,32 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
                 binding=prepared.binding,
             )
 
         callable_audit_done = False
         if is_callable_sink:
-            pre_record = build_audit_record(
-                route="/v1/query",
-                status=200,
-                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                sql=sql,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                workload=prepared.workload,
-                engine=prepared.engine,
-                rule=prepared.rule,
-                tables=tables,
-                claims=claims,
-                binding=prepared.binding,
-            )
             try:
-                audit_sink(pre_record.to_dict())
+                pre_record = build_audit_record(
+                    route="/v1/query",
+                    status=200,
+                    elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                    sql=sql,
+                    audit_id=prepared.audit_id,
+                    subject=prepared.subject,
+                    workload=prepared.workload,
+                    engine=prepared.engine,
+                    rule=prepared.rule,
+                    tables=tables,
+                    claims=claims,
+                    binding=prepared.binding,
+                )
+                await run_in_threadpool(audit_sink, pre_record.to_dict())
                 callable_audit_done = True
             except Exception as exc:
-                _on_audit_write_failure()
                 if effective_audit_on_failure == "log":
+                    _on_audit_write_failure()
                     logger.error(
                         "Audit write failed (on_failure=log, route=/v1/query, audit_id=%s, status=200): %s detail=%s",
                         prepared.audit_id or "-",
@@ -1428,40 +1658,53 @@ def create_app(
                     )
                     callable_audit_done = True
                 else:
-                    elapsed_audit_err = (time.perf_counter() - req_start) * 1000.0
-                    logger.error(
-                        "engine=%s code=%s error=%s detail=%s audit_id=%s",
-                        prepared.engine_kind or "-",
-                        "audit_unavailable",
-                        type(exc).__name__,
-                        scrub_error_detail(exc, token=token, sql=sql, params=params),
-                        prepared.audit_id or "-",
-                    )
-                    _log_request(
-                        audit_id=prepared.audit_id,
-                        subject=prepared.subject,
-                        engine=prepared.engine,
-                        rule=prepared.rule,
-                        status=503,
-                        elapsed_ms=elapsed_audit_err,
-                        binding=prepared.binding,
-                        token=token,
-                    )
-                    if metrics is not None:
-                        metrics.record_request(
-                            "/v1/query",
-                            status=503,
-                            duration_seconds=elapsed_audit_err / 1000.0,
-                            engine=prepared.engine,
-                            error_code="audit_unavailable",
+                    try:
+                        min_pre = build_minimal_audit_record(
+                            route="/v1/query",
+                            status=200,
+                            elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                            audit_id=prepared.audit_id,
                         )
-                    return _error_response(
-                        "audit_unavailable",
-                        audit_id=prepared.audit_id,
-                        token=token,
-                        sql=sql,
-                        params=params,
-                    )
+                        await run_in_threadpool(audit_sink, min_pre.to_dict())
+                        callable_audit_done = True
+                    except Exception as retry_exc:
+                        _on_audit_write_failure()
+                        elapsed_audit_err = (time.perf_counter() - req_start) * 1000.0
+                        logger.error(
+                            "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                            prepared.engine_kind or "-",
+                            "audit_unavailable",
+                            type(retry_exc).__name__,
+                            scrub_error_detail(
+                                retry_exc, token=token, sql=sql, params=params
+                            ),
+                            prepared.audit_id or "-",
+                        )
+                        _log_request(
+                            audit_id=prepared.audit_id,
+                            subject=prepared.subject,
+                            engine=prepared.engine,
+                            rule=prepared.rule,
+                            status=503,
+                            elapsed_ms=elapsed_audit_err,
+                            binding=prepared.binding,
+                            claims=claims,
+                        )
+                        if metrics is not None:
+                            metrics.record_request(
+                                "/v1/query",
+                                status=503,
+                                duration_seconds=elapsed_audit_err / 1000.0,
+                                engine=prepared.engine,
+                                error_code="audit_unavailable",
+                            )
+                        return _error_response(
+                            "audit_unavailable",
+                            audit_id=prepared.audit_id,
+                            token=token,
+                            sql=sql,
+                            params=params,
+                        )
 
         effective_timeout = (
             min(timeout_seconds, timeout_s)
@@ -1477,7 +1720,7 @@ def create_app(
         try:
             running_queries.register(prepared.audit_id, prepared.subject)
         except DuplicateQueryIdError:
-            return _finish(
+            return await _finish(
                 _error_response(
                     "duplicate_query_id",
                     audit_id=prepared.audit_id,
@@ -1499,7 +1742,6 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
                 binding=prepared.binding,
                 skip_callable_audit=callable_audit_done,
@@ -1545,7 +1787,7 @@ def create_app(
                             await query_task
                         except Exception:
                             pass
-                        return _finish(
+                        return await _finish(
                             Response(status_code=499),
                             route="/v1/query",
                             status=499,
@@ -1561,7 +1803,6 @@ def create_app(
                             sql=sql,
                             params=params,
                             token=token,
-                            log_token=token,
                             claims=claims,
                             binding=prepared.binding,
                             skip_callable_audit=callable_audit_done,
@@ -1579,7 +1820,7 @@ def create_app(
                 scrub_error_detail(exc, token=token, sql=sql, params=params),
                 prepared.audit_id or "-",
             )
-            return _finish(
+            return await _finish(
                 _error_response(
                     "engine_timeout",
                     audit_id=prepared.audit_id,
@@ -1601,7 +1842,6 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
                 binding=prepared.binding,
                 skip_callable_audit=callable_audit_done,
@@ -1615,7 +1855,7 @@ def create_app(
                 scrub_error_detail(exc, token=token, sql=sql, params=params),
                 prepared.audit_id or "-",
             )
-            return _finish(
+            return await _finish(
                 _error_response(
                     "engine_unavailable",
                     audit_id=prepared.audit_id,
@@ -1637,7 +1877,6 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
                 binding=prepared.binding,
                 skip_callable_audit=callable_audit_done,
@@ -1657,7 +1896,7 @@ def create_app(
                 scrub_error_detail(exc, token=token, sql=sql, params=params),
                 prepared.audit_id or "-",
             )
-            return _finish(
+            return await _finish(
                 _error_response(
                     "engine_unavailable",
                     status_code=503,
@@ -1682,7 +1921,6 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
                 binding=prepared.binding,
                 skip_callable_audit=callable_audit_done,
@@ -1696,7 +1934,7 @@ def create_app(
                 scrub_error_detail(exc, token=token, sql=sql, params=params),
                 prepared.audit_id or "-",
             )
-            return _finish(
+            return await _finish(
                 _error_response(
                     "query_cancelled",
                     audit_id=prepared.audit_id,
@@ -1718,7 +1956,6 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
                 binding=prepared.binding,
                 skip_callable_audit=callable_audit_done,
@@ -1738,7 +1975,7 @@ def create_app(
                 scrub_error_detail(exc, token=token, sql=sql, params=params),
                 prepared.audit_id or "-",
             )
-            return _finish(
+            return await _finish(
                 _error_response(
                     "engine_unavailable",
                     status_code=502,
@@ -1763,7 +2000,6 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
                 binding=prepared.binding,
                 skip_callable_audit=callable_audit_done,
@@ -1778,7 +2014,7 @@ def create_app(
                     scrub_error_detail(exc, token=token, sql=sql, params=params),
                     prepared.audit_id or "-",
                 )
-                return _finish(
+                return await _finish(
                     _error_response(
                         "audit_unavailable",
                         audit_id=prepared.audit_id,
@@ -1800,7 +2036,6 @@ def create_app(
                     sql=sql,
                     params=params,
                     token=token,
-                    log_token=token,
                     claims=claims,
                     binding=prepared.binding,
                     skip_callable_audit=callable_audit_done,
@@ -1814,7 +2049,7 @@ def create_app(
                 scrub_error_detail(exc, token=token, sql=sql, params=params),
                 prepared.audit_id or "-",
             )
-            return _finish(
+            return await _finish(
                 _error_response(
                     "internal_error",
                     audit_id=prepared.audit_id,
@@ -1836,7 +2071,6 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
                 binding=prepared.binding,
                 skip_callable_audit=callable_audit_done,
@@ -1850,7 +2084,7 @@ def create_app(
             else getattr(pipeline, "on_row_cap", "truncate")
         )
         if effective_row_cap_mode == "error" and result.truncated:
-            return _finish(
+            return await _finish(
                 _error_response(
                     "row_cap_hit",
                     audit_id=prepared.audit_id,
@@ -1873,7 +2107,6 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
                 binding=prepared.binding,
                 skip_callable_audit=callable_audit_done,
@@ -1883,7 +2116,7 @@ def create_app(
 
         encoded_rows = json.dumps(safe_rows).encode("utf-8")
         if len(encoded_rows) > effective_max_result_bytes:
-            return _finish(
+            return await _finish(
                 _error_response(
                     "result_too_large",
                     audit_id=prepared.audit_id,
@@ -1905,7 +2138,6 @@ def create_app(
                 sql=sql,
                 params=params,
                 token=token,
-                log_token=token,
                 claims=claims,
                 binding=prepared.binding,
                 skip_callable_audit=callable_audit_done,
@@ -1933,7 +2165,7 @@ def create_app(
                 "elapsed_ms": result.elapsed_ms,
             }
         )
-        return _finish(
+        return await _finish(
             resp,
             route="/v1/query",
             status=200,
@@ -1950,7 +2182,6 @@ def create_app(
             sql=sql,
             params=params,
             token=token,
-            log_token=token,
             claims=claims,
             binding=prepared.binding,
             skip_callable_audit=callable_audit_done,
@@ -1962,7 +2193,7 @@ def create_app(
         if not auth_header:
             if metrics is not None:
                 metrics.record_grant_rejected("malformed")
-            return _finish(
+            return await _finish(
                 _error_response("grant_invalid"),
                 route="/v1/cancel",
                 status=401,
@@ -1974,7 +2205,7 @@ def create_app(
         if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
             if metrics is not None:
                 metrics.record_grant_rejected("malformed")
-            return _finish(
+            return await _finish(
                 _error_response("grant_invalid"),
                 route="/v1/cancel",
                 status=401,
@@ -1984,13 +2215,24 @@ def create_app(
 
         token = parts[1].strip()
 
-        raw_body = await request.body()
+        try:
+            raw_body = await request.body()
+        except ClientDisconnect:
+            return await _finish(
+                _error_response("query_cancelled"),
+                route="/v1/cancel",
+                status=499,
+                code="query_cancelled",
+                elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                log_request_line=False,
+            )
+
         if raw_body.strip():
             c_claims, c_jti, c_sub = _extract_verified_cancel_claims(token, pipeline)
             try:
                 body_json = json.loads(raw_body.decode("utf-8"))
             except Exception:
-                return _finish(
+                return await _finish(
                     _error_response("invalid_sql", token=token),
                     route="/v1/cancel",
                     status=400,
@@ -2002,7 +2244,7 @@ def create_app(
                     claims=c_claims,
                 )
             if not isinstance(body_json, dict) or body_json != {}:
-                return _finish(
+                return await _finish(
                     _error_response("invalid_sql", token=token),
                     route="/v1/cancel",
                     status=400,
@@ -2036,7 +2278,7 @@ def create_app(
                 scrub_error_detail(exc, token=token),
                 audit_id or "-",
             )
-            return _finish(
+            return await _finish(
                 _error_response(spec.code, audit_id=audit_id, token=token),
                 route="/v1/cancel",
                 status=401,
@@ -2049,9 +2291,8 @@ def create_app(
 
         jti = claims["jti"]
         sub = claims["sub"]
-        matched = running_queries.cancel(jti, sub)
-        if not matched:
-            return _finish(
+        if not running_queries.is_running(jti, sub):
+            return await _finish(
                 _error_response("not_found", audit_id=jti, token=token),
                 route="/v1/cancel",
                 status=404,
@@ -2063,7 +2304,7 @@ def create_app(
                 claims=claims,
             )
 
-        return _finish(
+        resp = await _finish(
             JSONResponse({"cancelled": True, "query_id": jti}, status_code=202),
             route="/v1/cancel",
             status=202,
@@ -2072,6 +2313,28 @@ def create_app(
             subject=sub,
             token=token,
             claims=claims,
+        )
+        if resp.status_code == 202:
+            running_queries.cancel(jti, sub)
+        return resp
+
+    async def handle_405(request: Request, exc: Exception) -> Response:
+        resp_405 = JSONResponse(
+            {
+                "error": "method_not_allowed",
+                "code": "invalid_sql",
+                "message": "HTTP method not allowed for this endpoint.",
+                "next_step": "Check the HTTP method (use POST for /v1/query, /v1/explain, /v1/cancel) and try again.",
+            },
+            status_code=405,
+        )
+        return await _finish(
+            resp_405,
+            route=request.url.path,
+            status=405,
+            code="invalid_sql",
+            elapsed_ms=0.0,
+            log_request_line=request.url.path in ALLOWED_AUDIT_ROUTES,
         )
 
     routes = [
@@ -2083,4 +2346,8 @@ def create_app(
     if extra_routes:
         routes.extend(extra_routes)
 
-    return Starlette(routes=routes, lifespan=lifespan)
+    return Starlette(
+        routes=routes,
+        lifespan=lifespan,
+        exception_handlers={405: handle_405},
+    )

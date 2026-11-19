@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import datetime
 import errno
@@ -18,6 +20,7 @@ import time
 from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric import ec
+import httpx
 import pytest
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -41,11 +44,14 @@ from seeknal.serving.audit import (
     SyslogAuditSink,
     build_audit_record,
     build_audit_sink,
+    build_minimal_audit_record,
+    compute_sql_sha256,
     emit_audit_record,
     serialize_audit_record,
+    verify_audit_config_offline,
 )
 from seeknal.serving.grant_token import sign_cancel_token, sign_grant_token
-from seeknal.serving.http import create_app
+from seeknal.serving.http import _log_request, create_app
 from seeknal.serving.placement import Placement
 from seeknal.serving.server.app import build_server
 from seeknal.serving.server.config import ServerConfig, ServerConfigError
@@ -1530,4 +1536,878 @@ def test_create_app_runtime_refuse_vs_log_with_real_pipeline(
         rec.levelno == logging.ERROR and "on_failure=log" in rec.getMessage()
         for rec in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. C-H1, C-M2, C-M3 Regression & Hardening Tests
+# ---------------------------------------------------------------------------
+
+
+def test_c_h1_blank_tables_dropped_deduped_truncated_and_capped():
+    # Blank/whitespace-only table names (e.g. SELECT * FROM " ") are dropped instead of raising.
+    rec_blank = build_audit_record(
+        route="/v1/query",
+        status=400,
+        code="invalid_sql",
+        sql='SELECT * FROM " "',
+        tables=["", " ", "   \t\n  "],
+    )
+    assert rec_blank.tables == []
+
+    # Preserves first-seen order, drops blanks, truncates >256 chars, caps at 64 entries.
+    long_name = "t_" + ("x" * 300)
+    many_tables = [
+        " ",
+        "orders",
+        "",
+        "customers",
+        "orders",
+        long_name,
+        long_name + "_extra_beyond_256",  # truncates to same 256-char prefix -> deduped
+        *[f"tbl_{idx:03d}" for idx in range(80)],
+    ]
+    rec_many = build_audit_record(
+        route="/v1/explain",
+        status=200,
+        tables=many_tables,
+    )
+    assert len(rec_many.tables) == 64
+    assert rec_many.tables[0] == "orders"
+    assert rec_many.tables[1] == "customers"
+    assert rec_many.tables[2] == long_name[:256]
+    assert len(rec_many.tables[2]) == 256
+    assert rec_many.tables[3] == "tbl_000"
+
+
+def test_c_h1_lone_surrogates_in_tables_sql_and_fields_never_raise(tmp_path: Path):
+    surrogate_sql = "SELECT * FROM t WHERE note = 'bad-\ud800-\udfff'"
+    expected_sha = hashlib.sha256(
+        surrogate_sql.encode("utf-8", errors="replace")
+    ).hexdigest()
+    assert compute_sql_sha256(surrogate_sql) == expected_sha
+
+    rec = build_audit_record(
+        route="/v1/query",
+        status=400,
+        code="invalid_sql_\ud800",
+        sql=surrogate_sql,
+        audit_id="jti-\ud800-01",
+        subject="user:\udfffalice",
+        tables=[" ", "tbl_\ud800_one", "tbl_\udfff_one"],
+    )
+    # Both surrogate variants map to \ufffd and deduplicate cleanly.
+    assert rec.tables == ["tbl_\ufffd_one"]
+    assert rec.sql_sha256 == expected_sha
+
+    json_line = rec.to_json_line()
+    encoded = json_line.encode("utf-8")
+    decoded = json.loads(encoded.decode("utf-8"))
+    assert decoded["tables"] == ["tbl_\ufffd_one"]
+    assert decoded["subject"] == "user:\ufffdalice"
+    assert decoded["audit_id"] == "jti-\ufffd-01"
+    assert decoded["code"] == "invalid_sql_\ufffd"
+
+    # Even if an attribute is mutated after init with a lone surrogate, to_json_line stays UTF-8 safe.
+    rec.origin = "ask-\ud83d"
+    mutated_bytes = rec.to_json_line().encode("utf-8")
+    assert json.loads(mutated_bytes.decode("utf-8"))["origin"] == "ask-\ufffd"
+
+    # Writing to FileAuditSink succeeds without UnicodeEncodeError.
+    sink_path = tmp_path / "surrogate_audit.jsonl"
+    sink = FileAuditSink(sink_path, max_bytes=4096, fsync=False)
+    sink.write_record(rec)
+    sink.close()
+    on_disk = json.loads(sink_path.read_text(encoding="utf-8").strip())
+    assert on_disk["sql_sha256"] == expected_sha
+
+
+def test_c_h1_build_minimal_audit_record_fallback():
+    min_rec = build_minimal_audit_record(
+        route="/v1/query",
+        status=500,
+        code="internal_error",
+        elapsed_ms=float("nan"),
+        audit_id="jti-\ud800-fallback",
+        timestamp="not-a-valid-iso-timestamp",
+    )
+    assert min_rec.route == "/v1/query"
+    assert min_rec.status == 500
+    assert min_rec.code == "internal_error"
+    assert min_rec.elapsed_ms == 0.0
+    assert min_rec.audit_id == "jti-\ufffd-fallback"
+    assert min_rec.tables == []
+    parsed = json.loads(min_rec.to_json_line().encode("utf-8").decode("utf-8"))
+    assert set(parsed.keys()) == ALLOWED_AUDIT_FIELD_SET
+
+
+def test_c_m2_startup_warning_when_unbounded_file_sink(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    unbounded_path = tmp_path / "unbounded.jsonl"
+    with caplog.at_level(logging.WARNING, logger="seeknal.serving.audit"):
+        caplog.clear()
+        cfg = AuditConfig.from_dict({"sink": "file", "path": str(unbounded_path)})
+        sink = build_audit_sink(cfg, fsync=False)
+        sink.close()
+
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert str(unbounded_path) in warnings[0]
+    assert (
+        "has no max_bytes rotation and no retention (max_files/max_age_seconds) configured; "
+        "audit log may grow unbounded"
+    ) in warnings[0]
+
+    # Configuring max_bytes or retention suppresses the unbounded warning.
+    for bounded_opts in (
+        {"max_bytes": 10240},
+        {"max_files": 7},
+        {"max_age_seconds": 3600},
+    ):
+        with caplog.at_level(logging.WARNING, logger="seeknal.serving.audit"):
+            caplog.clear()
+            b_cfg = AuditConfig.from_dict(
+                {
+                    "sink": "file",
+                    "path": str(tmp_path / "bounded.jsonl"),
+                    **bounded_opts,
+                }
+            )
+            b_sink = build_audit_sink(b_cfg, fsync=False)
+            b_sink.close()
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_c_m3_symlink_victim_keeps_0644_and_receives_no_records(tmp_path: Path):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("original-victim-content\n", encoding="utf-8")
+    os.chmod(victim, 0o644)
+
+    symlink_audit = tmp_path / "audit_symlink.jsonl"
+    symlink_audit.symlink_to(victim)
+
+    cfg = AuditConfig.from_dict(
+        {"sink": "file", "path": str(symlink_audit), "mode": "0600", "max_bytes": 4096}
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        verify_audit_config_offline(cfg)
+
+    with pytest.raises(AuditWriteError, match="symlink"):
+        build_audit_sink(cfg, fsync=False)
+
+    sink = FileAuditSink(symlink_audit, mode=0o600, max_bytes=4096, fsync=False)
+    with pytest.raises(AuditWriteError, match="symlink"):
+        sink.write_record(_sample_record(audit_id="sym-attempt"))
+    sink.close()
+
+    assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o644
+    assert victim.read_text(encoding="utf-8") == "original-victim-content\n"
+
+    # Dangling symlink must also be rejected without creating target.
+    dangling_target = tmp_path / "should_never_exist.txt"
+    dangling_link = tmp_path / "dangling_audit.jsonl"
+    dangling_link.symlink_to(dangling_target)
+    dangling_cfg = AuditConfig.from_dict(
+        {"sink": "file", "path": str(dangling_link), "max_bytes": 4096}
+    )
+    with pytest.raises(ValueError, match="symlink"):
+        verify_audit_config_offline(dangling_cfg)
+    with pytest.raises(AuditWriteError, match="symlink"):
+        build_audit_sink(dangling_cfg, fsync=False)
+    assert not dangling_target.exists()
+
+
+def test_c_m3_hardlink_victim_keeps_0644_and_receives_no_records(tmp_path: Path):
+    victim = tmp_path / "hardlink_victim.txt"
+    victim.write_text("do-not-clobber\n", encoding="utf-8")
+    os.chmod(victim, 0o644)
+
+    hardlinked_audit = tmp_path / "audit_hardlink.jsonl"
+    os.link(victim, hardlinked_audit)
+    assert os.lstat(hardlinked_audit).st_nlink == 2
+
+    cfg = AuditConfig.from_dict(
+        {"sink": "file", "path": str(hardlinked_audit), "mode": "0600", "max_bytes": 4096}
+    )
+
+    with pytest.raises(ValueError, match="hard links"):
+        verify_audit_config_offline(cfg)
+
+    with pytest.raises(AuditWriteError, match=r"hard links.*st_nlink=2"):
+        build_audit_sink(cfg, fsync=False)
+
+    sink = FileAuditSink(hardlinked_audit, mode=0o600, max_bytes=4096, fsync=False)
+    with pytest.raises(AuditWriteError, match=r"hard links.*st_nlink=2"):
+        sink.write_record(_sample_record(audit_id="hl-attempt"))
+    sink.close()
+
+    assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o644
+    assert victim.read_text(encoding="utf-8") == "do-not-clobber\n"
+
+
+def test_c_m3_wrong_uid_rejected_and_never_calls_path_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    audit_file = tmp_path / "foreign_uid.jsonl"
+    audit_file.write_text("foreign-owner-data\n", encoding="utf-8")
+    os.chmod(audit_file, 0o644)
+    real_uid = os.getuid()
+
+    cfg = AuditConfig.from_dict(
+        {"sink": "file", "path": str(audit_file), "mode": "0600", "max_bytes": 4096}
+    )
+
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 1000)
+    with pytest.raises(ValueError, match="uid"):
+        verify_audit_config_offline(cfg)
+
+    with pytest.raises(AuditWriteError, match="uid"):
+        build_audit_sink(cfg, fsync=False)
+
+    sink = FileAuditSink(audit_file, mode=0o600, max_bytes=4096, fsync=False)
+    with pytest.raises(AuditWriteError, match="uid"):
+        sink.write_record(_sample_record(audit_id="uid-attempt"))
+    sink.close()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid)
+
+    # Mode and contents of foreign-owned file remain untouched.
+    assert stat.S_IMODE(os.lstat(audit_file).st_mode) == 0o644
+    assert audit_file.read_text(encoding="utf-8") == "foreign-owner-data\n"
+
+    # Verify FileAuditSink open + write + rotation NEVER calls path-based os.chmod.
+    def _forbid_path_chmod(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("path-based os.chmod must never be called by FileAuditSink")
+
+    monkeypatch.setattr(os, "chmod", _forbid_path_chmod)
+    clean_path = tmp_path / "fchmod_only.jsonl"
+    rot_sink = FileAuditSink(clean_path, mode=0o640, max_bytes=300, fsync=False)
+    rot_sink.verify_writable()
+    for idx in range(4):
+        rot_sink.write_record(_sample_record(audit_id=f"fchmod-{idx}"))
+    rot_sink.close()
+
+    assert stat.S_IMODE(os.lstat(clean_path).st_mode) == 0o640
+    assert len(rot_sink.rotated_files()) >= 1
+    for rf in rot_sink.rotated_files():
+        assert stat.S_IMODE(os.lstat(rf).st_mode) == 0o640
+
+
+def test_c_m3_post_open_fstat_race_and_rotated_symlink_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # 1) Simulate a TOCTOU race where a second hard link is added right as os.open runs:
+    # fd must be closed WITHOUT calling fchmod and without writing any record.
+    race_victim = tmp_path / "race_victim.txt"
+    race_audit = tmp_path / "race_audit.jsonl"
+    real_open = os.open
+
+    def _racing_open(path: Any, flags: int, mode: int = 0o777, **kwargs: Any) -> int:
+        # Open with 0o644 initially so we can prove fchmod(fd, 0o600) is NOT called!
+        fd = real_open(path, flags, 0o644, **kwargs)
+        if str(path) == str(race_audit) and not race_victim.exists():
+            os.link(race_audit, race_victim)
+            os.chmod(race_victim, 0o644)
+        return fd
+
+    old_umask = os.umask(0o000)
+    try:
+        monkeypatch.setattr(os, "open", _racing_open)
+        race_sink = FileAuditSink(race_audit, mode=0o600, max_bytes=4096, fsync=False)
+        with pytest.raises(AuditWriteError, match=r"hard links.*st_nlink=2"):
+            race_sink.write_record(_sample_record(audit_id="race-hl"))
+        race_sink.close()
+    finally:
+        os.umask(old_umask)
+        monkeypatch.setattr(os, "open", real_open)
+
+    assert stat.S_IMODE(os.lstat(race_victim).st_mode) == 0o644
+    assert race_victim.read_text(encoding="utf-8") == ""
+
+    # 2) Pre-planted symlink at rotated destination path during _rotate_unlocked is refused.
+    clock = FakeClock(1_763_542_800.0)
+    rot_audit = tmp_path / "rot_audit.jsonl"
+    rot_victim = tmp_path / "rot_victim.txt"
+    rot_victim.write_text("keep-rot-victim\n", encoding="utf-8")
+    os.chmod(rot_victim, 0o644)
+
+    rot_sink = FileAuditSink(
+        rot_audit,
+        mode=0o600,
+        rotate_interval_seconds=10.0,
+        max_files=5,
+        clock=clock,
+        fsync=False,
+    )
+    rot_sink.write_record(_sample_record(audit_id="before-rot"))
+
+    next_epoch = clock.advance(15.0)
+    ts_tag = datetime.datetime.fromtimestamp(
+        next_epoch, tz=datetime.timezone.utc
+    ).strftime("%Y%m%dT%H%M%S%fZ")
+    predicted_rot = tmp_path / f"{rot_audit.name}.{ts_tag}.000001"
+    predicted_rot.symlink_to(rot_victim)
+
+    with pytest.raises(AuditWriteError, match="symlink"):
+        rot_sink.write_record(_sample_record(audit_id="blocked-by-rot-symlink"))
+    rot_sink.close()
+
+    assert stat.S_IMODE(os.lstat(rot_victim).st_mode) == 0o644
+    assert rot_victim.read_text(encoding="utf-8") == "keep-rot-victim\n"
+
+
+# ---------------------------------------------------------------------------
+# 9. Step 2 HTTP Audit Hardening Regression Tests (C-B1, C-H1, C-M1, C-M4, C-L1, C-L3)
+# ---------------------------------------------------------------------------
+
+
+def _build_minimal_pipeline_and_keys(
+    tmp_path: Path,
+) -> tuple[ec.EllipticCurvePrivateKey, ServingPipeline]:
+    priv, jwks_file, _, _ = _write_static_server_artifacts(tmp_path)
+    pub_keys = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_file},
+            "placement": {"static": {"placement_file": "p", "schemas_file": "s"}},
+            "connections": {"duck": {"kind": "duckdb", "path": ":memory:"}},
+        },
+        load_keys=False,
+    ).load_grant_keys()
+
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "users": {
+                    "keys": ["id"],
+                    "row_count": 5,
+                    "serve": {"duck": "users"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas={"users": ["id", "name", "region"]},
+        public_keys=pub_keys,
+        require_grant_typ=True,
+        max_grant_lifetime_seconds=60.0,
+    )
+    return priv, pipeline
+
+
+async def test_c_b1_large_unauthenticated_sql_returns_fast_and_healthz_stays_responsive(
+    tmp_path: Path,
+):
+    import duckdb
+
+    _, pipeline = _build_minimal_pipeline_and_keys(tmp_path)
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR, region VARCHAR)")
+
+    audit_path = tmp_path / "c_b1_audit.jsonl"
+    sink = FileAuditSink(audit_path, max_bytes=1024 * 1024, fsync=False)
+    app = create_app(pipeline, {"duck": DuckDBAdapter(lambda: con.cursor())}, audit_sink=sink)
+
+    huge_sql = "SELECT * FROM " + ",".join(f"t{i}" for i in range(55000))
+    body_bytes = json.dumps({"sql": huge_sql, "bogus": 1}).encode("utf-8")
+    assert len(body_bytes) > 350_000
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        t0 = time.perf_counter()
+        q_resp, h_resp = await asyncio.gather(
+            ac.post(
+                "/v1/query",
+                headers={
+                    "Authorization": "Bearer fake.token.sig",
+                    "Content-Type": "application/json",
+                },
+                content=body_bytes,
+            ),
+            ac.get("/healthz"),
+        )
+        elapsed = time.perf_counter() - t0
+
+    sink.close()
+
+    assert elapsed < 1.5
+    assert h_resp.status_code == 200
+    assert h_resp.json() == {"status": "ok"}
+    assert q_resp.status_code == 400
+    q_body = q_resp.json()
+    assert q_body["code"] == "invalid_sql"
+
+    lines = audit_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["route"] == "/v1/query"
+    assert rec["status"] == 400
+    assert rec["code"] == "invalid_sql"
+    assert rec["tables"] == []
+
+
+def test_c_h1_whitespace_table_name_and_lone_surrogate_return_typed_response_and_one_audit_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import duckdb
+
+    priv, pipeline = _build_minimal_pipeline_and_keys(tmp_path)
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR, region VARCHAR)")
+
+    audit_path = tmp_path / "c_h1_http_audit.jsonl"
+    sink = FileAuditSink(audit_path, max_bytes=1024 * 1024, fsync=False)
+    app = create_app(pipeline, {"duck": DuckDBAdapter(lambda: con.cursor())}, audit_sink=sink)
+    client = TestClient(app)
+
+    ws_sql = 'SELECT * FROM " "'
+    tok_ws = _mint_grant(priv, ws_sql, jti="jti-ws-1")
+
+    surrogate_sql = 'SELECT * FROM "a\ud800"'
+    surrogate_sha = hashlib.sha256(
+        surrogate_sql.encode("utf-8", errors="replace")
+    ).hexdigest()
+    now = time.time()
+    tok_surr = sign_grant_token(
+        {
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "typ": "grant",
+            "sub": "user:analyst",
+            "ws": "ws-prod",
+            "jti": "jti-surr-1",
+            "iat": now,
+            "exp": now + 30.0,
+            "sql_sha256": surrogate_sha,
+            "max_rows": 50,
+            "tables": {
+                "users": {
+                    "columns": ["id"],
+                    "masks": {},
+                    "row_filters": [],
+                    "actions": ["select"],
+                }
+            },
+        },
+        priv,
+        kid="k-audit-int",
+    )
+
+    probes: list[tuple[dict[str, str], bytes]] = [
+        # Probe 1a: whitespace table name with fake token + unknown field
+        (
+            {"Authorization": "Bearer fake.token.sig", "Content-Type": "application/json"},
+            json.dumps({"sql": ws_sql, "bogus": 1}).encode("utf-8"),
+        ),
+        # Probe 1b: whitespace table name with valid signed token + unknown field
+        (
+            {"Authorization": f"Bearer {tok_ws}", "Content-Type": "application/json"},
+            json.dumps({"sql": ws_sql, "bogus": 1}).encode("utf-8"),
+        ),
+        # Probe 2a: raw JSON bytes with lone surrogate (fake token)
+        (
+            {"Authorization": "Bearer fake.token.sig", "Content-Type": "application/json"},
+            b'{"sql": "SELECT * FROM \\"a\\ud800\\""}',
+        ),
+        # Probe 2b: raw JSON bytes with lone surrogate (valid signed token)
+        (
+            {"Authorization": f"Bearer {tok_surr}", "Content-Type": "application/json"},
+            b'{"sql": "SELECT * FROM \\"a\\ud800\\""}',
+        ),
+        # Probe 2c: raw JSON bytes with lone surrogate + bogus field (fake token)
+        (
+            {"Authorization": "Bearer fake.token.sig", "Content-Type": "application/json"},
+            b'{"sql": "SELECT * FROM \\"a\\ud800\\"", "bogus": 1}',
+        ),
+        # Probe 2d: raw JSON bytes with lone surrogate + bogus field (valid signed token)
+        (
+            {"Authorization": f"Bearer {tok_surr}", "Content-Type": "application/json"},
+            b'{"sql": "SELECT * FROM \\"a\\ud800\\"", "bogus": 1}',
+        ),
+    ]
+
+    expected_count = 0
+    for headers, raw_payload in probes:
+        resp = client.post("/v1/query", headers=headers, content=raw_payload)
+        assert resp.status_code >= 400
+        body = resp.json()
+        for required_key in ("error", "code", "message", "next_step"):
+            assert required_key in body and isinstance(body[required_key], str)
+        expected_count += 1
+        current_lines = audit_path.read_text(encoding="utf-8").splitlines()
+        assert len(current_lines) == expected_count
+
+    # Also verify _finish fallback retry via build_minimal_audit_record if build_audit_record fails.
+    import seeknal.serving.http as http_mod
+
+    def _exploding_build_audit_record(**_kwargs: Any) -> AuditRecord:
+        raise ValueError("simulated full record build failure")
+
+    monkeypatch.setattr(http_mod, "build_audit_record", _exploding_build_audit_record)
+    resp_fallback = client.post(
+        "/v1/query",
+        headers={"Authorization": "Bearer fake.token.sig"},
+        json={"sql": "SELECT 1", "bogus": 1},
+    )
+    assert resp_fallback.status_code == 400
+    fb_body = resp_fallback.json()
+    for required_key in ("error", "code", "message", "next_step"):
+        assert required_key in fb_body
+
+    sink.close()
+    final_lines = audit_path.read_text(encoding="utf-8").splitlines()
+    assert len(final_lines) == expected_count + 1
+    last_rec = json.loads(final_lines[-1])
+    assert last_rec["route"] == "/v1/query"
+    assert last_rec["status"] == 400
+    assert last_rec["code"] == "invalid_sql"
+    assert last_rec["tables"] == []
+
+
+async def test_c_m1_slow_or_blackholed_audit_sink_does_not_block_event_loop_or_healthz(
+    tmp_path: Path,
+):
+    import duckdb
+
+    priv, pipeline = _build_minimal_pipeline_and_keys(tmp_path)
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR, region VARCHAR)")
+    con.execute("INSERT INTO users VALUES (1, 'SECRET_ROW_99', 'EU')")
+
+    entered = threading.Event()
+    calls_lock = threading.Lock()
+    call_count = 0
+
+    class _SlowFailingAuditSink(AuditSink):
+        def verify_writable(self) -> None:
+            return None
+
+        def write_record(self, record: AuditRecord | dict[str, Any]) -> None:
+            nonlocal call_count
+            with calls_lock:
+                call_count += 1
+                idx = call_count
+            if idx == 1:
+                entered.set()
+                time.sleep(0.6)
+            raise AuditWriteError("audit destination timed out")
+
+    app = create_app(
+        pipeline,
+        {"duck": DuckDBAdapter(lambda: con.cursor())},
+        audit_sink=_SlowFailingAuditSink(),
+        audit_on_failure="refuse",
+    )
+
+    sql = "SELECT id, name FROM users"
+    tok = _mint_grant(priv, sql, jti="jti-slow-audit-01")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        q_start = time.perf_counter()
+        q_task = asyncio.create_task(
+            ac.post(
+                "/v1/query",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"sql": sql},
+            )
+        )
+
+        # Wait until the threadpool worker enters the 0.6s blocking write_record call.
+        while not entered.is_set():
+            await asyncio.sleep(0.005)
+
+        h_start = time.perf_counter()
+        h_resp = await ac.get("/healthz")
+        h_elapsed = time.perf_counter() - h_start
+
+        q_resp = await q_task
+        q_elapsed = time.perf_counter() - q_start
+
+    assert h_resp.status_code == 200
+    assert h_elapsed < 0.25
+    assert q_resp.status_code == 503
+    q_body = q_resp.json()
+    assert q_body["code"] == "audit_unavailable"
+    assert "rows" not in q_body
+    assert "SECRET_ROW_99" not in q_resp.text
+    assert q_elapsed < 1.5
+
+
+def test_c_m4_log_request_prevents_log_forging_from_unverified_token_claims(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    import duckdb
+
+    _, pipeline = _build_minimal_pipeline_and_keys(tmp_path)
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR, region VARCHAR)")
+
+    app = create_app(pipeline, {"duck": DuckDBAdapter(lambda: con.cursor())})
+    client = TestClient(app)
+
+    hdr_b64 = (
+        base64.urlsafe_b64encode(json.dumps({"alg": "ES256", "kid": "forged"}).encode("utf-8"))
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    forged_payload = {
+        "azp": "x\nrequest audit_id=FORGED subject=admin status=200",
+        "origin": "%s%s%d",
+        "workload": "ask\r\nFORGED",
+        "act": {"sub": "sess\nFORGED", "typ": "ask_session\t%s"},
+    }
+    pay_b64 = (
+        base64.urlsafe_b64encode(json.dumps(forged_payload).encode("utf-8"))
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    unverified_jwt = f"{hdr_b64}.{pay_b64}.fakesignature"
+
+    with caplog.at_level(logging.INFO, logger="seeknal.serving.http"):
+        caplog.clear()
+        resp = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {unverified_jwt}"},
+            json={"sql": "SELECT id FROM users"},
+        )
+        assert resp.status_code == 401
+        assert "FORGED" not in caplog.text
+        for rec in caplog.records:
+            msg = rec.getMessage()
+            assert "\n" not in msg
+            assert "\r" not in msg
+
+        # Direct _log_request call with control chars and %-format tokens in verified claims/binding:
+        # must never raise TypeError and must escape control characters on a single line.
+        caplog.clear()
+        _log_request(
+            audit_id="jti-1\ninjected",
+            subject="user%s%d\r\tname",
+            status=200,
+            elapsed_ms=1.23,
+            claims={
+                "azp": "azp-%s%s%d\nline2",
+                "origin": "ask\rline3",
+                "workload": "ask\x00\x7f",
+            },
+        )
+        req_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert len(req_msgs) == 1
+        assert "\n" not in req_msgs[0]
+        assert "\r" not in req_msgs[0]
+        assert "\t" not in req_msgs[0]
+        assert "%s%s%d" in req_msgs[0]
+        assert "\\n" in req_msgs[0]
+
+
+def test_c_l1_cancel_does_not_cancel_query_when_audit_refused(tmp_path: Path):
+    priv, pipeline = _build_minimal_pipeline_and_keys(tmp_path)
+
+    started = threading.Event()
+    allow_finish = threading.Event()
+    cancelled = threading.Event()
+
+    class _ControllableAdapter:
+        def execute(
+            self,
+            prepared: PreparedQuery,
+            *,
+            timeout_seconds: float,
+            on_cancel_handle: Any = None,
+        ) -> QueryResult:
+            if on_cancel_handle is not None:
+                on_cancel_handle(cancelled.set)
+            started.set()
+            allow_finish.wait(timeout=5.0)
+            if cancelled.is_set():
+                raise EngineCancelled("cancelled")
+            return QueryResult(
+                columns=("id",),
+                rows=[(42,)],
+                truncated=False,
+                engine="duck",
+                elapsed_ms=2.0,
+            )
+
+    class _CancelRefusingAuditSink(AuditSink):
+        def __init__(self) -> None:
+            self.records: list[AuditRecord] = []
+            self._lock = threading.Lock()
+
+        def verify_writable(self) -> None:
+            return None
+
+        def write_record(self, record: AuditRecord | dict[str, Any]) -> None:
+            rec_obj = (
+                record
+                if isinstance(record, AuditRecord)
+                else AuditRecord.from_dict(record)
+            )
+            if rec_obj.route == "/v1/cancel":
+                raise AuditWriteError("cancel audit log unavailable")
+            with self._lock:
+                self.records.append(rec_obj)
+
+    sink = _CancelRefusingAuditSink()
+    app = create_app(
+        pipeline,
+        {"duck": _ControllableAdapter()},
+        audit_sink=sink,
+        audit_on_failure="refuse",
+    )
+    client = TestClient(app)
+
+    sql = "SELECT id FROM users"
+    q_tok = _mint_grant(priv, sql, jti="jti-c-l1-hold")
+    c_tok = _mint_cancel(priv, jti="jti-c-l1-hold")
+
+    q_responses: list[Response] = []
+
+    def _run_query() -> None:
+        q_responses.append(
+            client.post(
+                "/v1/query",
+                headers={"Authorization": f"Bearer {q_tok}"},
+                json={"sql": sql},
+            )
+        )
+
+    t = threading.Thread(target=_run_query)
+    t.start()
+    assert started.wait(timeout=3.0)
+
+    c_resp = client.post(
+        "/v1/cancel",
+        headers={"Authorization": f"Bearer {c_tok}"},
+    )
+    assert c_resp.status_code == 503
+    assert c_resp.json()["code"] == "audit_unavailable"
+    # Query must NOT have been cancelled because the cancel audit write was refused!
+    assert not cancelled.is_set()
+
+    allow_finish.set()
+    t.join(timeout=3.0)
+    assert len(q_responses) == 1
+    assert q_responses[0].status_code == 200
+    assert q_responses[0].json()["rows"] == [[42]]
+
+
+async def test_c_l3_method_not_allowed_and_client_disconnect_are_typed_and_audited(
+    tmp_path: Path,
+):
+    import duckdb
+
+    _, pipeline = _build_minimal_pipeline_and_keys(tmp_path)
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR, region VARCHAR)")
+
+    audit_path = tmp_path / "c_l3_audit.jsonl"
+    sink = FileAuditSink(audit_path, max_bytes=1024 * 1024, fsync=False)
+    app = create_app(pipeline, {"duck": DuckDBAdapter(lambda: con.cursor())}, audit_sink=sink)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        for method, path in (
+            ("GET", "/v1/query"),
+            ("DELETE", "/v1/explain"),
+            ("PUT", "/v1/cancel"),
+            ("POST", "/healthz"),
+        ):
+            r405 = await ac.request(method, path)
+            assert r405.status_code == 405
+            b405 = r405.json()
+            assert b405["error"] == "method_not_allowed"
+            assert b405["code"] == "invalid_sql"
+            assert "HTTP method not allowed" in b405["message"]
+            assert "next_step" in b405
+
+    records_after_405 = [
+        json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    # Only the 3 /v1/* endpoints are audited; /healthz is never audited.
+    assert len(records_after_405) == 3
+    assert [(r["route"], r["status"], r["code"]) for r in records_after_405] == [
+        ("/v1/query", 405, "invalid_sql"),
+        ("/v1/explain", 405, "invalid_sql"),
+        ("/v1/cancel", 405, "invalid_sql"),
+    ]
+
+    # Simulate ClientDisconnect during body read on /v1/query and /v1/cancel via raw ASGI call.
+    async def _send_disconnected_post(path: str, headers: list[tuple[bytes, bytes]]) -> tuple[int, bytes]:
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": b"",
+            "headers": headers,
+            "client": ("127.0.0.1", 50000),
+            "server": ("test", 80),
+        }
+        status_holder: list[int] = []
+        body_chunks: list[bytes] = []
+
+        async def _receive() -> dict[str, Any]:
+            return {"type": "http.disconnect"}
+
+        async def _send(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                status_holder.append(message["status"])
+            elif message["type"] == "http.response.body":
+                body_chunks.append(message.get("body", b""))
+
+        await app(scope, _receive, _send)
+        return status_holder[0], b"".join(body_chunks)
+
+    st_q, body_q = await _send_disconnected_post(
+        "/v1/query",
+        [(b"authorization", b"Bearer fake.token.sig")],
+    )
+    st_c, body_c = await _send_disconnected_post(
+        "/v1/cancel",
+        [(b"authorization", b"Bearer fake.token.sig")],
+    )
+
+    sink.close()
+
+    for st_code, raw_b in ((st_q, body_q), (st_c, body_c)):
+        assert st_code == 499
+        parsed_b = json.loads(raw_b.decode("utf-8"))
+        assert parsed_b["error"] == "query_cancelled"
+        assert parsed_b["code"] == "query_cancelled"
+        assert "message" in parsed_b
+        assert "next_step" in parsed_b
+
+    all_records = [
+        json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(all_records) == 5
+    assert (all_records[3]["route"], all_records[3]["status"], all_records[3]["code"]) == (
+        "/v1/query",
+        499,
+        "query_cancelled",
+    )
+    assert (all_records[4]["route"], all_records[4]["status"], all_records[4]["code"]) == (
+        "/v1/cancel",
+        499,
+        "query_cancelled",
+    )
+
+
+
 
