@@ -2666,6 +2666,164 @@ def test_c_n1_f_l2_log_mode_and_build_fallback_log_detail_and_audit_id(
         con.close()
 
 
+def test_c_m3_cached_fd_rechecked_on_unlink_and_replace(tmp_path: Path):
+    import duckdb
+
+    priv, pipeline = _build_minimal_pipeline_and_keys(tmp_path)
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR, region VARCHAR)")
+    con.execute("INSERT INTO users VALUES (1, 'ROW_SECRET_M3', 'US')")
+
+    try:
+        audit_dir = tmp_path / "m3_dir"
+        audit_dir.mkdir()
+        audit_path = audit_dir / "audit.jsonl"
+
+        sink = FileAuditSink(audit_path, mode=0o600, max_bytes=1024 * 1024, fsync=False)
+        app = create_app(
+            pipeline,
+            {"duck": DuckDBAdapter(lambda: con.cursor())},
+            audit_sink=sink,
+            audit_on_failure="refuse",
+        )
+        client = TestClient(app)
+        sql = "SELECT id, name FROM users"
+
+        # 1) Initial write opens and caches self._fd
+        tok1 = _mint_grant(priv, sql, jti="jti-m3-init")
+        r1 = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok1}"},
+            json={"sql": sql},
+        )
+        assert r1.status_code == 200
+        assert sink._fd is not None
+        first_ino = os.lstat(audit_path).st_ino
+
+        # 2) Unlink case (writable parent): next write detects missing path, closes orphan fd,
+        #    recreates self._path with 0600, and writes the record there (not to unlinked inode).
+        os.unlink(audit_path)
+        assert not audit_path.exists()
+
+        tok2 = _mint_grant(priv, sql, jti="jti-m3-after-unlink")
+        r2 = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok2}"},
+            json={"sql": sql},
+        )
+        assert r2.status_code == 200
+        assert audit_path.exists()
+        assert stat.S_IMODE(os.lstat(audit_path).st_mode) == 0o600
+        lines_after_unlink = [
+            json.loads(l) for l in audit_path.read_text(encoding="utf-8").splitlines()
+        ]
+        assert [r["audit_id"] for r in lines_after_unlink] == ["jti-m3-after-unlink"]
+
+        # 3) Replace with new regular file (e.g. external logrotate mv + create):
+        #    next write detects st_ino mismatch, closes old fd, and appends to new file.
+        archived_path = audit_dir / "archived_external.jsonl"
+        os.replace(audit_path, archived_path)
+        replacement_tmp = audit_dir / "new_audit.tmp"
+        replacement_tmp.write_text("", encoding="utf-8")
+        os.chmod(replacement_tmp, 0o644)
+        os.replace(replacement_tmp, audit_path)
+        replaced_ino = os.lstat(audit_path).st_ino
+        assert replaced_ino != first_ino
+
+        tok3 = _mint_grant(priv, sql, jti="jti-m3-after-replace")
+        r3 = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok3}"},
+            json={"sql": sql},
+        )
+        assert r3.status_code == 200
+        assert stat.S_IMODE(os.lstat(audit_path).st_mode) == 0o600
+        assert [
+            json.loads(l)["audit_id"]
+            for l in audit_path.read_text(encoding="utf-8").splitlines()
+        ] == ["jti-m3-after-replace"]
+        # Old archived file did NOT receive the post-replace record!
+        assert [
+            json.loads(l)["audit_id"]
+            for l in archived_path.read_text(encoding="utf-8").splitlines()
+        ] == ["jti-m3-after-unlink"]
+
+        # 4) Replace active audit file with a symlink while fd is cached -> refuses with 503 and NO rows!
+        victim = tmp_path / "m3_symlink_victim.txt"
+        victim.write_text("untouched\n", encoding="utf-8")
+        os.chmod(victim, 0o644)
+        sym_tmp = audit_dir / "sym.tmp"
+        sym_tmp.symlink_to(victim)
+        os.replace(sym_tmp, audit_path)
+
+        tok4 = _mint_grant(priv, sql, jti="jti-m3-replace-sym")
+        r4 = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok4}"},
+            json={"sql": sql},
+        )
+        assert r4.status_code == 503
+        assert r4.json()["code"] == "audit_unavailable"
+        assert "ROW_SECRET_M3" not in r4.text
+        assert victim.read_text(encoding="utf-8") == "untouched\n"
+        assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o644
+
+        # Restore clean file, cache fd again, then add hardlink while fd is open -> refuses 503!
+        os.unlink(audit_path)
+        tok5 = _mint_grant(priv, sql, jti="jti-m3-clean-again")
+        assert (
+            client.post(
+                "/v1/query",
+                headers={"Authorization": f"Bearer {tok5}"},
+                json={"sql": sql},
+            ).status_code
+            == 200
+        )
+        hl_path = audit_dir / "hardlink_after_open.jsonl"
+        os.link(audit_path, hl_path)
+        tok6 = _mint_grant(priv, sql, jti="jti-m3-hardlink-open")
+        r6 = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok6}"},
+            json={"sql": sql},
+        )
+        assert r6.status_code == 503
+        assert r6.json()["code"] == "audit_unavailable"
+        assert "ROW_SECRET_M3" not in r6.text
+        os.unlink(hl_path)
+
+        # 5) Unlink + unwritable directory -> reopening fails -> refuses 503 with NO rows!
+        if os.geteuid() != 0:
+            tok7 = _mint_grant(priv, sql, jti="jti-m3-pre-ro")
+            assert (
+                client.post(
+                    "/v1/query",
+                    headers={"Authorization": f"Bearer {tok7}"},
+                    json={"sql": sql},
+                ).status_code
+                == 200
+            )
+            os.unlink(audit_path)
+            os.chmod(audit_dir, 0o500)
+            try:
+                tok8 = _mint_grant(priv, sql, jti="jti-m3-unwritable-reopen")
+                r8 = client.post(
+                    "/v1/query",
+                    headers={"Authorization": f"Bearer {tok8}"},
+                    json={"sql": sql},
+                )
+                assert r8.status_code == 503
+                assert r8.json()["code"] == "audit_unavailable"
+                assert "ROW_SECRET_M3" not in r8.text
+            finally:
+                os.chmod(audit_dir, 0o700)
+
+        sink.close()
+    finally:
+        con.close()
+
+
+
 
 
 

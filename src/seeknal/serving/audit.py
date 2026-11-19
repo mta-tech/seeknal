@@ -1304,6 +1304,44 @@ class FileAuditSink(AuditSink):
             except OSError:
                 pass
 
+    def _ensure_valid_fd_locked(self, now: float) -> int:
+        if self._fd is not None:
+            reopen_needed = False
+            try:
+                lst = os.stat(self._path, follow_symlinks=False)
+                fst = os.fstat(self._fd)
+            except FileNotFoundError:
+                reopen_needed = True
+            except OSError as exc:
+                self._close_locked()
+                self._opened_at = None
+                reason = exc.strerror or type(exc).__name__
+                raise AuditWriteError(
+                    f"Cannot stat audit file {_safe_diag_target(self._path)}: {reason}"
+                ) from exc
+
+            if not reopen_needed:
+                try:
+                    _validate_audit_lstat(self._path, lst, error_cls=AuditWriteError)
+                except AuditWriteError:
+                    self._close_locked()
+                    self._opened_at = None
+                    return self._open_locked(now)
+
+                if (
+                    (lst.st_dev, lst.st_ino) != (fst.st_dev, fst.st_ino)
+                    or not stat.S_ISREG(fst.st_mode)
+                    or fst.st_nlink != 1
+                    or fst.st_uid != os.getuid()
+                ):
+                    reopen_needed = True
+
+            if reopen_needed:
+                self._close_locked()
+                self._opened_at = None
+
+        return self._open_locked(now)
+
     def _should_rotate_locked(self, fd: int, incoming_bytes: int, now: float) -> bool:
         if self._max_bytes is None and self._rotate_interval_seconds is None:
             return False
@@ -1438,7 +1476,7 @@ class FileAuditSink(AuditSink):
     def verify_writable(self) -> None:
         with self._lock:
             now = self._now()
-            fd = self._open_locked(now)
+            fd = self._ensure_valid_fd_locked(now)
             try:
                 os.write(fd, b"")
             except OSError as exc:
@@ -1454,7 +1492,7 @@ class FileAuditSink(AuditSink):
 
         with self._lock:
             now = self._now()
-            fd = self._open_locked(now)
+            fd = self._ensure_valid_fd_locked(now)
             try:
                 if self._should_rotate_locked(fd, len(payload), now):
                     self._rotate_unlocked(now)
