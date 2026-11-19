@@ -2823,6 +2823,140 @@ def test_c_m3_cached_fd_rechecked_on_unlink_and_replace(tmp_path: Path):
         con.close()
 
 
+def test_c_n4_fsync_eio_single_record_and_partial_write_reopen_trailing_newline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import duckdb
+
+    priv, pipeline = _build_minimal_pipeline_and_keys(tmp_path)
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR, region VARCHAR)")
+    con.execute("INSERT INTO users VALUES (1, 'CONFIDENTIAL_N4_ROW', 'APAC')")
+
+    try:
+        # 1) fsync EIO in refuse mode: bytes were written before fsync failed, so ONLY 1 record
+        #    line is in the file (no minimal duplicate appended!), fd is closed, and HTTP returns 503.
+        fsync_audit_path = tmp_path / "fsync_eio.jsonl"
+        fsync_sink = FileAuditSink(fsync_audit_path, max_bytes=1024 * 1024, fsync=True)
+        app_fsync = create_app(
+            pipeline,
+            {"duck": DuckDBAdapter(lambda: con.cursor())},
+            audit_sink=fsync_sink,
+            audit_on_failure="refuse",
+        )
+        client_fsync = TestClient(app_fsync)
+        sql = "SELECT id, name FROM users"
+
+        real_fsync = os.fsync
+        fail_fsync = True
+
+        def _flaky_fsync(fd: int) -> None:
+            if fail_fsync:
+                raise OSError(errno.EIO, "Input/output error")
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", _flaky_fsync)
+        tok_eio = _mint_grant(priv, sql, jti="jti-n4-fsync-eio")
+        r_eio = client_fsync.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_eio}"},
+            json={"sql": sql},
+        )
+        assert r_eio.status_code == 503
+        assert r_eio.json()["code"] == "audit_unavailable"
+        assert "rows" not in r_eio.json()
+        assert "CONFIDENTIAL_N4_ROW" not in r_eio.text
+        assert fsync_sink._fd is None
+
+        lines_after_eio = fsync_audit_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines_after_eio) == 1
+        assert json.loads(lines_after_eio[0])["audit_id"] == "jti-n4-fsync-eio"
+
+        # Once fsync recovers, the next write reopens cleanly without inserting a blank line.
+        fail_fsync = False
+        tok_after_eio = _mint_grant(priv, sql, jti="jti-n4-after-eio")
+        r_ok = client_fsync.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_after_eio}"},
+            json={"sql": sql},
+        )
+        assert r_ok.status_code == 200
+        fsync_sink.close()
+        monkeypatch.setattr(os, "fsync", real_fsync)
+
+        lines_recovered = fsync_audit_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines_recovered) == 2
+        assert [json.loads(l)["audit_id"] for l in lines_recovered] == [
+            "jti-n4-fsync-eio",
+            "jti-n4-after-eio",
+        ]
+
+        # 2) Partial write without trailing '\n': first write writes partial bytes then fails;
+        #    fd is closed, 503 is returned, and next reopen writes b'\n' first so the next record
+        #    starts cleanly on a new line!
+        partial_path = tmp_path / "partial_write.jsonl"
+        partial_sink = FileAuditSink(partial_path, max_bytes=1024 * 1024, fsync=True)
+        app_partial = create_app(
+            pipeline,
+            {"duck": DuckDBAdapter(lambda: con.cursor())},
+            audit_sink=partial_sink,
+            audit_on_failure="refuse",
+        )
+        client_partial = TestClient(app_partial)
+
+        real_write = os.write
+        inject_partial = True
+        partial_step = 0
+
+        def _partial_os_write(fd: int, data: Any) -> int:
+            nonlocal partial_step
+            raw_bytes = bytes(data)
+            if inject_partial and len(raw_bytes) > 10:
+                partial_step += 1
+                if partial_step == 1:
+                    # Write only first 32 bytes (no trailing '\n')
+                    return real_write(fd, raw_bytes[:32])
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_write(fd, raw_bytes)
+
+        monkeypatch.setattr(os, "write", _partial_os_write)
+        tok_part = _mint_grant(priv, sql, jti="jti-n4-partial-1")
+        r_part = client_partial.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_part}"},
+            json={"sql": sql},
+        )
+        assert r_part.status_code == 503
+        assert r_part.json()["code"] == "audit_unavailable"
+        assert "CONFIDENTIAL_N4_ROW" not in r_part.text
+        assert partial_sink._fd is None
+        assert not partial_path.read_bytes().endswith(b"\n")
+
+        # Now restore os.write: next request reopens, heals missing '\n', and writes on line 2!
+        inject_partial = False
+        monkeypatch.setattr(os, "write", real_write)
+
+        tok_healed = _mint_grant(priv, sql, jti="jti-n4-healed-2")
+        r_healed = client_partial.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_healed}"},
+            json={"sql": sql},
+        )
+        assert r_healed.status_code == 200
+        partial_sink.close()
+
+        raw_lines = partial_path.read_text(encoding="utf-8").splitlines()
+        assert len(raw_lines) == 2
+        # Line 0 is the partial fragment; Line 1 is a complete valid JSON audit record!
+        healed_rec = json.loads(raw_lines[1])
+        assert healed_rec["audit_id"] == "jti-n4-healed-2"
+        assert healed_rec["status"] == 200
+    finally:
+        con.close()
+
+
+
 
 
 

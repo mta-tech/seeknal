@@ -1241,15 +1241,41 @@ class FileAuditSink(AuditSink):
                 lst = os.lstat(self._path)
                 _validate_audit_lstat(self._path, lst, error_cls=AuditWriteError)
 
-            flags = (
-                os.O_WRONLY
+            rdwr_flags = (
+                os.O_RDWR
                 | os.O_CREAT
                 | os.O_APPEND
                 | getattr(os, "O_NOFOLLOW", 0)
                 | getattr(os, "O_CLOEXEC", 0)
             )
 
-            fd = os.open(str(self._path), flags, self._mode)
+            try:
+                fd = os.open(str(self._path), rdwr_flags, self._mode)
+            except PermissionError:
+                # If pre-existing file owned by current UID had write-only permissions (e.g. 0200),
+                # verify safely on O_WRONLY, tighten to self._mode (0600/0640), then reopen O_RDWR.
+                wronly_flags = (
+                    os.O_WRONLY
+                    | os.O_APPEND
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0)
+                )
+                fd_wo = os.open(str(self._path), wronly_flags)
+                try:
+                    fst_wo = os.fstat(fd_wo)
+                    if (
+                        not stat.S_ISREG(fst_wo.st_mode)
+                        or fst_wo.st_nlink != 1
+                        or fst_wo.st_uid != os.getuid()
+                    ):
+                        raise AuditWriteError(
+                            f"Audit file path '{safe_path_label}' failed descriptor verification"
+                        )
+                    os.fchmod(fd_wo, self._mode)
+                finally:
+                    os.close(fd_wo)
+                fd = os.open(str(self._path), rdwr_flags, self._mode)
+
             try:
                 fst = os.fstat(fd)
                 if not stat.S_ISREG(fst.st_mode):
@@ -1275,6 +1301,17 @@ class FileAuditSink(AuditSink):
                             f"Audit file path '{safe_path_label}' inode changed during open"
                         )
                 os.fchmod(fd, self._mode)
+
+                if fst.st_size > 0:
+                    if hasattr(os, "pread"):
+                        last_byte = os.pread(fd, 1, fst.st_size - 1)
+                    else:
+                        os.lseek(fd, fst.st_size - 1, os.SEEK_SET)
+                        last_byte = os.read(fd, 1)
+                    if last_byte != b"\n":
+                        _write_all_fd(fd, b"\n")
+                        if self._fsync:
+                            os.fsync(fd)
             except Exception:
                 os.close(fd)
                 raise
@@ -1503,12 +1540,18 @@ class FileAuditSink(AuditSink):
                 if self._fsync:
                     os.fsync(fd)
             except AuditWriteError:
+                self._close_locked()
                 raise
             except OSError as exc:
                 self._close_locked()
                 reason = exc.strerror or type(exc).__name__
                 raise AuditWriteError(
                     f"Failed writing to audit file {_safe_diag_target(self._path)}: {reason}"
+                ) from exc
+            except Exception as exc:
+                self._close_locked()
+                raise AuditWriteError(
+                    f"Failed writing to audit file {_safe_diag_target(self._path)}: {type(exc).__name__}"
                 ) from exc
 
             self._prune_rotated_locked(now)
