@@ -27,12 +27,13 @@ from seeknal.serving.adapters import (
     DBAPIAdapter,
     DuckDBAdapter,
     EngineAdapter,
+    LakebasePool,
     build_adapter,
     build_workload_adapters,
 )
 from seeknal.serving.discovery import PlacementRefresher, discover
 from seeknal.serving.discovery.build import DiscoveryResult
-from seeknal.serving.duckdb_policy import connect_hardened
+from seeknal.serving.duckdb_policy import DuckDBHolder, connect_hardened
 from seeknal.serving.http import GrantReplayCache, create_app
 from seeknal.serving.placement import Placement
 from seeknal.serving.server.config import (
@@ -231,8 +232,22 @@ def build_server(
             if connect_factories and eng_name in connect_factories:
                 conn_fn = connect_factories[eng_name]
             else:
-                conn_fn = _make_lakebase_connect(conn_cfg.dsn_env, cfg, env)
-            adapters[eng_name] = build_adapter("lakebase", conn_fn)
+                conn_fn = _make_lakebase_connect(
+                    conn_cfg.dsn_env,
+                    cfg,
+                    env,
+                    connect_timeout=conn_cfg.connect_timeout_seconds,
+                )
+            pool = LakebasePool(
+                conn_fn,
+                pool_max=conn_cfg.pool_max,
+                pool_min=conn_cfg.pool_min,
+                connect_timeout_seconds=conn_cfg.connect_timeout_seconds,
+                max_idle_seconds=conn_cfg.max_idle_seconds,
+                max_lifetime_seconds=conn_cfg.max_lifetime_seconds,
+                acquire_timeout_seconds=conn_cfg.acquire_timeout_seconds,
+            )
+            adapters[eng_name] = build_adapter("lakebase", conn_fn, pool=pool)
 
         elif isinstance(conn_cfg, CubeConnectionConfig):
             if connect_factories and eng_name in connect_factories:
@@ -263,15 +278,9 @@ def build_server(
         elif isinstance(conn_cfg, DuckDBConnectionConfig):
             if connect_factories and eng_name in connect_factories:
                 conn_fn = connect_factories[eng_name]
+                adapters[eng_name] = DuckDBAdapter(conn_fn)
             else:
-                conn_fn = lambda c=conn_cfg: connect_hardened(
-                    c.path,
-                    read_only=True,
-                    allowed_directories=c.allowed_directories,
-                    memory_limit=c.memory_limit,
-                    threads=c.threads,
-                )
-            adapters[eng_name] = DuckDBAdapter(conn_fn)
+                adapters[eng_name] = DuckDBAdapter(config=conn_cfg)
 
     # 7. Add /readyz route and Lifespan
     async def readyz(request: Request) -> Response:
@@ -297,6 +306,13 @@ def build_server(
         finally:
             if refresher is not None:
                 refresher.stop()
+            for adapter in adapters.values():
+                if hasattr(adapter, "close"):
+                    try:
+                        adapter.close()
+                    except Exception:
+                        pass
+            DuckDBHolder.get_holder().close_all()
 
     extra_routes = [
         Route("/readyz", readyz, methods=["GET"]),
@@ -371,13 +387,18 @@ def _make_starrocks_fields_connect(
 
 
 def _make_lakebase_connect(
-    dsn_env: str, cfg: ServerConfig, env: Mapping[str, str]
-) -> Callable[[], Any]:
-    def connect() -> Any:
+    dsn_env: str,
+    cfg: ServerConfig,
+    env: Mapping[str, str],
+    connect_timeout: float = 10.0,
+) -> Callable[..., Any]:
+    def connect(**kwargs: Any) -> Any:
         dsn = cfg.get_env(dsn_env, env)
         import psycopg2
 
-        return psycopg2.connect(dsn)
+        to = kwargs.get("connect_timeout", connect_timeout)
+        to_int = max(1, math.ceil(float(to)))
+        return psycopg2.connect(dsn, connect_timeout=to_int)
 
     return connect
 

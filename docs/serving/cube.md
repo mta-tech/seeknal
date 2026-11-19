@@ -179,7 +179,7 @@ module.exports = {
 
 ### Twin Dimension Convention
 Cube cannot mask per request inside `queryRewrite`: substituting a member there is mapped back by the original member key, so values come out NULL.
-What works on a real Cube: the model defines *twin* dimensions `<member>__<method>` (supported methods: `redact`, `null`, `year`, `last4`), and the SQL sent to Cube projects `member__method AS member`. The result column keeps the name `member` and the masked value.
+What works on a real Cube: the model defines *twin* dimensions `<member>__<method>` (supported methods: `redact`, `null`, `year`, `last4`), and the SQL sent to Cube projects `member__method AS member`. The result column keeps the name `member` and the masked value. It is recommended to declare `__year` twins with Cube `type: time`, so the SQL API reports a timestamp column type.
 
 Example cube model definition:
 ```javascript
@@ -197,6 +197,14 @@ cube(`claims_cube`, {
       sql: `NULL`,
       type: `string`,
     },
+    created_date: {
+      sql: `created_date`,
+      type: `time`,
+    },
+    created_date__year: {
+      sql: `date_trunc('year', created_date)`,
+      type: `time`,
+    },
   },
 });
 ```
@@ -204,7 +212,7 @@ cube(`claims_cube`, {
 **Hash is Unsupported on Cube:** Keyed HMAC cannot live in Cube model SQL. The `hash` mask method is not supported on cube targets and is rejected with `EnforcementError`.
 
 ### Backend Engine Execution Bounds
-Note that cancelling a Cube SQL connection may not stop the backend engine query. Cube targets need an engine-side bound (such as a StarRocks resource group or `query_timeout`).
+Note that cancelling a Cube SQL connection may not stop the backend engine query. As verified on a real Cube v1.0.0, Cube acknowledges the Postgres-protocol cancel but does not cancel the warehouse statement, so the engine-side bound (StarRocks resource group / `query_timeout`) is mandatory for cube targets.
 
 ---
 

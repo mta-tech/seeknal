@@ -28,8 +28,15 @@ from seeknal.serving import (
     sign_cancel_token,
     sign_grant_token,
 )
-from seeknal.serving.duckdb_policy import connect_hardened, probe
+from seeknal.serving.duckdb_policy import DuckDBHolder, connect_hardened, probe
 from seeknal.serving.service import PreparedQuery
+
+
+@pytest.fixture(autouse=True)
+def _reset_duckdb_holder():
+    DuckDBHolder.reset()
+    yield
+    DuckDBHolder.reset()
 
 
 def _make_prepared(
@@ -170,7 +177,7 @@ def hardened_duckdb_setup(tmp_path):
 def test_retained_connection_reference_sequential_hardened_file_reproducer(
     hardened_duckdb_setup,
 ):
-    """Sequential queries on a real hardened DuckDB file succeed and close connections even when Python references remain."""
+    """Sequential queries on a real hardened DuckDB file succeed: custom factory connections close per query, and default build_server shares a hardened DuckDBHolder instance with per-query cursors."""
     db_file = hardened_duckdb_setup["db_file"]
     allowed_dir = hardened_duckdb_setup["allowed_dir"]
     cfg_dict = hardened_duckdb_setup["cfg_dict"]
@@ -215,7 +222,7 @@ def test_retained_connection_reference_sequential_hardened_file_reproducer(
         with pytest.raises(duckdb.ConnectionException):
             retained_conns[-1].execute("SELECT 1")
 
-    # Also verify default build_server (without custom connect_factories) across sequential queries
+    # Also verify default build_server (holder path) across sequential queries: reuses 1 hardened instance and leaves 0 in-flight cursors
     default_handle = build_server(ServerConfig.from_dict(cfg_dict))
     default_client = TestClient(default_handle.app)
     for i in range(3):
@@ -232,83 +239,88 @@ def test_retained_connection_reference_sequential_hardened_file_reproducer(
         assert resp.status_code == 200
         assert resp.json()["rows"] == [[1, "Alice"], [2, "Bob"]]
 
-    # Security hardening remains intact
+    # Security hardening remains intact and all per-query cursors were closed
     duck_adapter = default_handle.adapters["duck"]
     assert isinstance(duck_adapter, DuckDBAdapter)
+    holder = DuckDBHolder.get_holder()
+    assert len(holder._instances_by_dev_ino) == 1
+    inst = next(iter(holder._instances_by_dev_ino.values()))
+    assert inst.in_flight == 0
     probe_conn = duck_adapter._connect()
     try:
+        assert inst.in_flight == 1
         probe_res = probe(probe_conn)
         assert all(probe_res.values())
     finally:
         probe_conn.close()
+    assert inst.in_flight == 0
 
 
 def test_two_concurrent_callers_barrier_real_hardened_readonly_file(
     hardened_duckdb_setup,
 ):
-    """Two concurrent callers synchronize via barrier and both succeed against a real hardened file with max 1 active connection."""
-    db_file = hardened_duckdb_setup["db_file"]
-    allowed_dir = hardened_duckdb_setup["allowed_dir"]
+    """Two concurrent callers synchronize via barrier and both succeed in parallel against a real hardened file on the shared DuckDBHolder."""
     cfg_dict = hardened_duckdb_setup["cfg_dict"]
     priv = hardened_duckdb_setup["priv"]
+
+    handle = build_server(ServerConfig.from_dict(cfg_dict))
+    client = TestClient(handle.app)
+    duck_adapter = handle.adapters["duck"]
+    assert isinstance(duck_adapter, DuckDBAdapter)
+    holder = DuckDBHolder.get_holder()
 
     state_lock = threading.Lock()
     active_count = 0
     max_active_count = 0
-    opened_conns: list[duckdb.DuckDBPyConnection] = []
+    opened_cursors = 0
     closed_count = 0
+    in_exec_barrier = threading.Barrier(2)
 
-    class TrackedHardenedConnection:
-        def __init__(self, raw: duckdb.DuckDBPyConnection) -> None:
-            self._raw = raw
-            self.closed = False
+    orig_get_cursor = holder.get_cursor
 
-        def execute(self, *args: Any, **kwargs: Any) -> Any:
-            return self._raw.execute(*args, **kwargs)
-
-        @property
-        def description(self) -> Any:
-            return self._raw.description
-
-        def fetchmany(self, size: int) -> Any:
-            return self._raw.fetchmany(size)
-
-        def commit(self) -> None:
-            self._raw.commit()
-
-        def interrupt(self) -> None:
-            self._raw.interrupt()
-
-        def close(self) -> None:
-            nonlocal active_count, closed_count
-            with state_lock:
-                if not self.closed:
-                    self.closed = True
-                    active_count -= 1
-                    closed_count += 1
-            self._raw.close()
-
-    def factory() -> Any:
-        nonlocal active_count, max_active_count
-        raw = connect_hardened(
-            db_file,
-            read_only=True,
-            allowed_directories=[allowed_dir],
-            memory_limit="256MB",
-            threads=2,
-        )
+    def tracking_get_cursor(*args: Any, **kwargs: Any) -> Any:
+        nonlocal active_count, max_active_count, opened_cursors
+        raw_cur = orig_get_cursor(*args, **kwargs)
         with state_lock:
+            opened_cursors += 1
             active_count += 1
             if active_count > max_active_count:
                 max_active_count = active_count
-            opened_conns.append(raw)
-        return TrackedHardenedConnection(raw)
 
-    handle = build_server(
-        ServerConfig.from_dict(cfg_dict),
-        connect_factories={"duck": factory},
-    )
-    client = TestClient(handle.app)
+        class TrackedCursor:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def execute(self, *e_args: Any, **e_kwargs: Any) -> Any:
+                in_exec_barrier.wait(timeout=5.0)
+                return raw_cur.execute(*e_args, **e_kwargs)
+
+            @property
+            def description(self) -> Any:
+                return raw_cur.description
+
+            def fetchmany(self, size: int) -> Any:
+                return raw_cur.fetchmany(size)
+
+            def commit(self) -> None:
+                if hasattr(raw_cur, "commit"):
+                    raw_cur.commit()
+
+            def interrupt(self) -> None:
+                raw_cur.interrupt()
+
+            def close(self) -> None:
+                nonlocal active_count, closed_count
+                with state_lock:
+                    if not self.closed:
+                        self.closed = True
+                        active_count -= 1
+                        closed_count += 1
+                raw_cur.close()
+
+        return TrackedCursor()
+
+    holder.get_cursor = tracking_get_cursor  # type: ignore[method-assign]
 
     barrier = threading.Barrier(2)
     sql = "SELECT id, name FROM users ORDER BY id"
@@ -347,13 +359,15 @@ def test_two_concurrent_callers_barrier_real_hardened_readonly_file(
         assert status == 200
         assert body["rows"] == [[1, "Alice"], [2, "Bob"]]
 
-    assert max_active_count == 1
+    # Both concurrent queries executed simultaneously on the single shared hardened holder instance
+    assert max_active_count == 2
     assert active_count == 0
-    assert len(opened_conns) == 2
+    assert opened_cursors == 2
     assert closed_count == 2
-    for raw_conn in opened_conns:
-        with pytest.raises(duckdb.ConnectionException):
-            raw_conn.execute("SELECT 1")
+    assert duck_adapter._active_slots == 0
+    assert len(holder._instances_by_dev_ino) == 1
+    inst = next(iter(holder._instances_by_dev_ino.values()))
+    assert inst.in_flight == 0
 
 
 def test_factory_error_maps_to_secret_safe_engine_error_and_http_502(
@@ -580,7 +594,7 @@ def test_resource_cleanup_across_all_execution_paths(monkeypatch, caplog):
         finally:
             next_delay_connect_s = 0.0
 
-        # 7a. Truly unstarted Timer.start failure preserves setup RuntimeError, closes connection, and releases lock
+        # 7a. Truly unstarted Timer.start failure preserves setup RuntimeError, closes connection, and releases slot
         events.clear()
         real_timer_start = threading.Timer.start
 
@@ -593,7 +607,7 @@ def test_resource_cleanup_across_all_execution_paths(monkeypatch, caplog):
                 adapter.execute(_make_prepared(), timeout_seconds=5.0)
             assert created_wrappers[-1].closed is True
             assert events == ["connect", "close"]
-            assert not adapter._lock.locked()
+            assert adapter._active_slots == 0
         finally:
             monkeypatch.setattr(threading.Timer, "start", real_timer_start)
 
@@ -634,12 +648,12 @@ def test_resource_cleanup_across_all_execution_paths(monkeypatch, caplog):
             ]
             assert created_wrappers[-1].closed is True
             assert events == ["connect", "close"]
-            assert not adapter._lock.locked()
+            assert adapter._active_slots == 0
         finally:
             monkeypatch.undo()
 
         # 8. Close failure (raising BEFORE actually closing):
-        # 8a. Sole close failure raises secret-safe EngineError('Engine connection cleanup failed') after releasing lock
+        # 8a. Sole close failure raises secret-safe EngineError('Engine connection cleanup failed') after releasing slot
         events.clear()
         next_fail_close = RuntimeError("CLOSE_SECRET_SENTINEL_888")
         try:
@@ -653,7 +667,7 @@ def test_resource_cleanup_across_all_execution_paths(monkeypatch, caplog):
             assert "CLOSE_SECRET_SENTINEL_888" not in caplog.text
             assert created_wrappers[-1].close_attempted is True
             assert created_wrappers[-1].closed is False
-            assert not adapter._lock.locked()
+            assert adapter._active_slots == 0
 
             # 8b. Primary execute failure + close failure preserves primary EngineError('Engine query execution failed')
             next_fail_execute = RuntimeError("PRIMARY_EXEC_FAIL_111")
@@ -667,7 +681,7 @@ def test_resource_cleanup_across_all_execution_paths(monkeypatch, caplog):
             assert "PRIMARY_EXEC_FAIL_111" not in str(exc_info.value)
             assert "CLOSE_SECRET_SENTINEL_888" not in caplog.text
             assert "PRIMARY_EXEC_FAIL_111" not in caplog.text
-            assert not adapter._lock.locked()
+            assert adapter._active_slots == 0
         finally:
             next_fail_close = None
             next_fail_execute = None

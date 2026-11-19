@@ -353,6 +353,12 @@ class StarRocksConnectionConfig:
 class LakebaseConnectionConfig:
     kind: str = "lakebase"
     dsn_env: str = ""
+    pool_max: int = 8
+    pool_min: int = 0
+    connect_timeout_seconds: float = 10.0
+    max_idle_seconds: float = 300.0
+    max_lifetime_seconds: float = 1800.0
+    acquire_timeout_seconds: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -373,6 +379,9 @@ class DuckDBConnectionConfig:
     allowed_directories: tuple[str, ...] = ()
     memory_limit: str | None = None
     threads: int | None = None
+    temp_directory: str | None = None
+    max_temp_directory_size: str | None = None
+    max_concurrent_cursors: int = 32
 
 
 @dataclass(frozen=True)
@@ -1032,7 +1041,16 @@ class ServerConfig:
                 connections[eng_name_str] = StarRocksConnectionConfig(accounts=accounts)
 
             elif kind == "lakebase":
-                unknown_lb = set(eng_spec.keys()) - {"kind", "dsn_env"}
+                unknown_lb = set(eng_spec.keys()) - {
+                    "kind",
+                    "dsn_env",
+                    "pool_max",
+                    "pool_min",
+                    "connect_timeout_seconds",
+                    "max_idle_seconds",
+                    "max_lifetime_seconds",
+                    "acquire_timeout_seconds",
+                }
                 if unknown_lb:
                     raise ServerConfigError(
                         f"Unknown key(s) in lakebase connection '{eng_name_str}': {sorted(unknown_lb)}"
@@ -1042,8 +1060,93 @@ class ServerConfig:
                     raise ServerConfigError(
                         f"Lakebase connection '{eng_name_str}' missing required 'dsn_env'"
                     )
+
+                pool_max = eng_spec.get("pool_max", 8)
+                if (
+                    isinstance(pool_max, bool)
+                    or not isinstance(pool_max, int)
+                    or pool_max < 1
+                    or pool_max > 64
+                ):
+                    raise ServerConfigError(
+                        f"Lakebase connection '{eng_name_str}' 'pool_max' must be an integer between 1 and 64, got {pool_max}"
+                    )
+
+                pool_min = eng_spec.get("pool_min", 0)
+                if (
+                    isinstance(pool_min, bool)
+                    or not isinstance(pool_min, int)
+                    or pool_min < 0
+                    or pool_min > pool_max
+                ):
+                    raise ServerConfigError(
+                        f"Lakebase connection '{eng_name_str}' 'pool_min' must be an integer between 0 and pool_max ({pool_max}), got {pool_min}"
+                    )
+
+                ct_val = eng_spec.get("connect_timeout_seconds", 10.0)
+                if isinstance(ct_val, (bool, str)) or not isinstance(ct_val, (int, float)):
+                    raise ServerConfigError(
+                        f"Lakebase connection '{eng_name_str}' 'connect_timeout_seconds' must be a positive number"
+                    )
+                try:
+                    ct_f = float(ct_val)
+                    if ct_f <= 0 or math.isnan(ct_f) or math.isinf(ct_f):
+                        raise ValueError()
+                except (TypeError, ValueError) as exc:
+                    raise ServerConfigError(
+                        f"Lakebase connection '{eng_name_str}' 'connect_timeout_seconds' must be a positive number"
+                    ) from exc
+
+                mi_val = eng_spec.get("max_idle_seconds", 300.0)
+                if isinstance(mi_val, (bool, str)) or not isinstance(mi_val, (int, float)):
+                    raise ServerConfigError(
+                        f"Lakebase connection '{eng_name_str}' 'max_idle_seconds' must be a positive number"
+                    )
+                try:
+                    mi_f = float(mi_val)
+                    if mi_f <= 0 or math.isnan(mi_f) or math.isinf(mi_f):
+                        raise ValueError()
+                except (TypeError, ValueError) as exc:
+                    raise ServerConfigError(
+                        f"Lakebase connection '{eng_name_str}' 'max_idle_seconds' must be a positive number"
+                    ) from exc
+
+                ml_val = eng_spec.get("max_lifetime_seconds", 1800.0)
+                if isinstance(ml_val, (bool, str)) or not isinstance(ml_val, (int, float)):
+                    raise ServerConfigError(
+                        f"Lakebase connection '{eng_name_str}' 'max_lifetime_seconds' must be a positive number"
+                    )
+                try:
+                    ml_f = float(ml_val)
+                    if ml_f <= 0 or math.isnan(ml_f) or math.isinf(ml_f):
+                        raise ValueError()
+                except (TypeError, ValueError) as exc:
+                    raise ServerConfigError(
+                        f"Lakebase connection '{eng_name_str}' 'max_lifetime_seconds' must be a positive number"
+                    ) from exc
+
+                at_val = eng_spec.get("acquire_timeout_seconds", 5.0)
+                if isinstance(at_val, (bool, str)) or not isinstance(at_val, (int, float)):
+                    raise ServerConfigError(
+                        f"Lakebase connection '{eng_name_str}' 'acquire_timeout_seconds' must be a positive number"
+                    )
+                try:
+                    at_f = float(at_val)
+                    if at_f <= 0 or math.isnan(at_f) or math.isinf(at_f):
+                        raise ValueError()
+                except (TypeError, ValueError) as exc:
+                    raise ServerConfigError(
+                        f"Lakebase connection '{eng_name_str}' 'acquire_timeout_seconds' must be a positive number"
+                    ) from exc
+
                 connections[eng_name_str] = LakebaseConnectionConfig(
-                    dsn_env=dsn_env.strip()
+                    dsn_env=dsn_env.strip(),
+                    pool_max=pool_max,
+                    pool_min=pool_min,
+                    connect_timeout_seconds=ct_f,
+                    max_idle_seconds=mi_f,
+                    max_lifetime_seconds=ml_f,
+                    acquire_timeout_seconds=at_f,
                 )
 
             elif kind == "cube":
@@ -1091,6 +1194,10 @@ class ServerConfig:
                     )
 
                 timeout = eng_spec.get("connect_timeout_seconds", 10.0)
+                if isinstance(timeout, (bool, str)) or not isinstance(timeout, (int, float)):
+                    raise ServerConfigError(
+                        f"Cube connection '{eng_name_str}' 'connect_timeout_seconds' must be a positive number"
+                    )
                 try:
                     timeout_float = float(timeout)
                     if (
@@ -1138,6 +1245,9 @@ class ServerConfig:
                     "allowed_directories",
                     "memory_limit",
                     "threads",
+                    "temp_directory",
+                    "max_temp_directory_size",
+                    "max_concurrent_cursors",
                 }
                 if unknown_duck:
                     raise ServerConfigError(
@@ -1181,11 +1291,64 @@ class ServerConfig:
                             f"DuckDB connection '{eng_name_str}' 'threads' must be a positive integer"
                         )
 
+                temp_dir = eng_spec.get("temp_directory")
+                if temp_dir is not None:
+                    if not isinstance(temp_dir, str) or not temp_dir.strip():
+                        raise ServerConfigError(
+                            f"DuckDB connection '{eng_name_str}' 'temp_directory' must be a non-empty string"
+                        )
+                    temp_dir = temp_dir.strip()
+                    if not os.path.isabs(temp_dir):
+                        raise ServerConfigError(
+                            f"DuckDB connection '{eng_name_str}' 'temp_directory' must be an absolute path"
+                        )
+                    if not os.path.exists(temp_dir) or not os.path.isdir(temp_dir) or not os.access(temp_dir, os.W_OK):
+                        raise ServerConfigError(
+                            f"DuckDB connection '{eng_name_str}' 'temp_directory' '{temp_dir}' must be an existing writable directory"
+                        )
+
+                    temp_real = os.path.realpath(temp_dir)
+                    if path != ":memory:" and not path.startswith(":memory:"):
+                        db_real = os.path.realpath(path)
+                        db_dir_real = os.path.dirname(db_real)
+                        if temp_real == db_dir_real or temp_real.startswith(db_dir_real + "/"):
+                            raise ServerConfigError(
+                                f"DuckDB connection '{eng_name_str}' 'temp_directory' must not be inside data directory '{db_dir_real}'"
+                            )
+
+                    for ad in validated_allowed:
+                        ad_real = os.path.realpath(ad)
+                        if temp_real == ad_real or temp_real.startswith(ad_real + "/"):
+                            raise ServerConfigError(
+                                f"DuckDB connection '{eng_name_str}' 'temp_directory' must not be inside allowed_directory '{ad}'"
+                            )
+
+                max_temp_sz = eng_spec.get("max_temp_directory_size")
+                if max_temp_sz is not None:
+                    if not isinstance(max_temp_sz, (str, int)) or (isinstance(max_temp_sz, str) and not max_temp_sz.strip()):
+                        raise ServerConfigError(
+                            f"DuckDB connection '{eng_name_str}' 'max_temp_directory_size' must be a non-empty string or integer"
+                        )
+                    max_temp_sz = str(max_temp_sz).strip()
+
+                max_concurrent_cursors = eng_spec.get("max_concurrent_cursors", 32)
+                if (
+                    isinstance(max_concurrent_cursors, bool)
+                    or not isinstance(max_concurrent_cursors, int)
+                    or max_concurrent_cursors <= 0
+                ):
+                    raise ServerConfigError(
+                        f"DuckDB connection '{eng_name_str}' 'max_concurrent_cursors' must be a positive integer"
+                    )
+
                 connections[eng_name_str] = DuckDBConnectionConfig(
                     path=path.strip(),
                     allowed_directories=tuple(validated_allowed),
                     memory_limit=mem_limit,
                     threads=threads,
+                    temp_directory=temp_dir,
+                    max_temp_directory_size=max_temp_sz,
+                    max_concurrent_cursors=max_concurrent_cursors,
                 )
 
         # 12. limits
@@ -1205,6 +1368,10 @@ class ServerConfig:
                     f"Unknown key(s) in 'limits': {sorted(unknown_lim)}"
                 )
             to_val = lim_raw.get("timeout_seconds", 30.0)
+            if isinstance(to_val, (bool, str)) or not isinstance(to_val, (int, float)):
+                raise ServerConfigError(
+                    "'limits.timeout_seconds' must be a positive number"
+                )
             try:
                 to_f = float(to_val)
                 if to_f <= 0 or math.isnan(to_f) or math.isinf(to_f):

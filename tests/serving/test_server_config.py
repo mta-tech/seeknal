@@ -1119,3 +1119,120 @@ def test_compilation_cache_max_entries_config_and_constructor_agreement(
                 connections=cfg_default.connections,
                 compilation_cache_max_entries=bad_val,  # type: ignore[arg-type]
             )
+
+
+def test_lakebase_pool_config_validation(
+    valid_jwks_file,
+    valid_placement_files,
+    valid_secrets_file,
+    valid_password_file,
+):
+    pf, sf = valid_placement_files
+    d = _build_full_valid_dict(
+        valid_jwks_file, pf, sf, valid_secrets_file, valid_password_file
+    )
+    # Valid pool config
+    d["connections"]["lb"] = {
+        "kind": "lakebase",
+        "dsn_env": "LAKEBASE_DSN",
+        "pool_max": 16,
+        "pool_min": 2,
+        "connect_timeout_seconds": 5.0,
+        "max_idle_seconds": 120.0,
+        "max_lifetime_seconds": 600.0,
+        "acquire_timeout_seconds": 3.0,
+    }
+    cfg = ServerConfig.from_dict(d)
+    lb_cfg = cfg.connections["lb"]
+    assert lb_cfg.pool_max == 16
+    assert lb_cfg.pool_min == 2
+    assert lb_cfg.connect_timeout_seconds == 5.0
+    assert lb_cfg.max_idle_seconds == 120.0
+    assert lb_cfg.max_lifetime_seconds == 600.0
+    assert lb_cfg.acquire_timeout_seconds == 3.0
+
+    # pool_max out of range (>64)
+    d["connections"]["lb"]["pool_max"] = 65
+    with pytest.raises(ServerConfigError, match="'pool_max' must be an integer between 1 and 64"):
+        ServerConfig.from_dict(d)
+
+    # pool_min > pool_max
+    d["connections"]["lb"]["pool_max"] = 4
+    d["connections"]["lb"]["pool_min"] = 5
+    with pytest.raises(ServerConfigError, match="'pool_min' must be an integer between 0 and pool_max"):
+        ServerConfig.from_dict(d)
+
+    # Unknown key refused
+    d["connections"]["lb"]["pool_min"] = 1
+    d["connections"]["lb"]["invalid_key"] = "bad"
+    with pytest.raises(ServerConfigError, match="Unknown key"):
+        ServerConfig.from_dict(d)
+    del d["connections"]["lb"]["invalid_key"]
+
+    # Float config keys reject booleans and strings
+    d["connections"]["lb"]["connect_timeout_seconds"] = "10"
+    with pytest.raises(ServerConfigError, match="must be a positive number"):
+        ServerConfig.from_dict(d)
+
+    d["connections"]["lb"]["connect_timeout_seconds"] = True
+    with pytest.raises(ServerConfigError, match="must be a positive number"):
+        ServerConfig.from_dict(d)
+
+    d["connections"]["lb"]["connect_timeout_seconds"] = 10.0
+    d["connections"]["lb"]["max_idle_seconds"] = False
+    with pytest.raises(ServerConfigError, match="must be a positive number"):
+        ServerConfig.from_dict(d)
+
+
+def test_duckdb_temp_directory_config_validation(
+    tmp_path,
+    valid_jwks_file,
+    valid_placement_files,
+    valid_secrets_file,
+    valid_password_file,
+):
+    pf, sf = valid_placement_files
+    d = _build_full_valid_dict(
+        valid_jwks_file, pf, sf, valid_secrets_file, valid_password_file
+    )
+    temp_dir = tmp_path / "duck_temp"
+    temp_dir.mkdir()
+    allowed_data_dir = tmp_path / "data"
+    allowed_data_dir.mkdir()
+
+    # Valid temp_directory and max_temp_directory_size
+    d["connections"]["duck"] = {
+        "kind": "duckdb",
+        "path": str(allowed_data_dir / "app.duckdb"),
+        "allowed_directories": [str(allowed_data_dir) + "/"],
+        "temp_directory": str(temp_dir),
+        "max_temp_directory_size": "500MB",
+    }
+    cfg = ServerConfig.from_dict(d)
+    duck_cfg = cfg.connections["duck"]
+    assert duck_cfg.temp_directory == str(temp_dir)
+    assert duck_cfg.max_temp_directory_size == "500MB"
+
+    # temp_directory inside allowed_directories is rejected
+    inside_dir = allowed_data_dir / "spill"
+    inside_dir.mkdir()
+    d["connections"]["duck"]["temp_directory"] = str(inside_dir)
+    with pytest.raises(ServerConfigError, match="must not be inside"):
+        ServerConfig.from_dict(d)
+
+    # temp_directory inside data directory is rejected even when allowed_directories is empty
+    d["connections"]["duck"]["allowed_directories"] = []
+    d["connections"]["duck"]["temp_directory"] = str(inside_dir)
+    with pytest.raises(ServerConfigError, match="must not be inside data directory"):
+        ServerConfig.from_dict(d)
+
+    # Relative temp_directory rejected
+    d["connections"]["duck"]["temp_directory"] = "relative/temp"
+    with pytest.raises(ServerConfigError, match="must be an absolute path"):
+        ServerConfig.from_dict(d)
+
+    # Unknown key refused
+    d["connections"]["duck"]["temp_directory"] = str(temp_dir)
+    d["connections"]["duck"]["unknown_duck_key"] = "bad"
+    with pytest.raises(ServerConfigError, match="Unknown key"):
+        ServerConfig.from_dict(d)

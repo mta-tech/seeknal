@@ -51,6 +51,10 @@ class EngineCancelled(EngineError):
     """Raised when engine query execution is cancelled."""
 
 
+class EnginePoolExhausted(EngineConfigError):
+    """Raised when Lakebase connection pool is exhausted."""
+
+
 @dataclass(frozen=True)
 class CubeSecurityConfig:
     """Security configuration for Cube context token generation."""
@@ -176,6 +180,11 @@ def normalize_column_type(kind: str, description_entry: Any) -> str:
         display_size = description_entry[2] if len(description_entry) > 2 else None
         precision = description_entry[4] if len(description_entry) > 4 else None
         scale = description_entry[5] if len(description_entry) > 5 else None
+    elif hasattr(description_entry, "type_code"):
+        type_code = getattr(description_entry, "type_code", None)
+        display_size = getattr(description_entry, "display_size", None)
+        precision = getattr(description_entry, "precision", None)
+        scale = getattr(description_entry, "scale", None)
     else:
         type_code = description_entry
         display_size = None
@@ -280,6 +289,8 @@ def normalize_column_type(kind: str, description_entry: Any) -> str:
             return "double"
         if oid == 1700:
             if precision is not None and scale is not None:
+                if (precision, scale) == (65535, 65535) or precision == 65535:
+                    return "decimal"
                 return f"decimal({precision},{scale})"
             return "decimal"
         if oid in (25, 1043):
@@ -400,11 +411,83 @@ class _DuckDBRequestState:
 
 
 class DuckDBAdapter:
-    """Adapter for in-process DuckDB execution with serialized owned-connection lifecycle."""
+    """Adapter for in-process DuckDB execution with bounded concurrent cursor slots and owned lifecycle."""
 
-    def __init__(self, connect: Callable[[], duckdb.DuckDBPyConnection]) -> None:
-        self._connect = connect
-        self._lock = threading.Lock()
+    def __init__(
+        self,
+        connect: Callable[[], duckdb.DuckDBPyConnection] | None = None,
+        *,
+        config: Any = None,
+        holder: Any = None,
+        max_concurrent_cursors: int | None = None,
+    ) -> None:
+        self._connect_fn = connect
+        self._config = config
+        self._holder = holder
+        if max_concurrent_cursors is not None:
+            if (
+                isinstance(max_concurrent_cursors, bool)
+                or not isinstance(max_concurrent_cursors, int)
+                or max_concurrent_cursors <= 0
+            ):
+                raise ValueError("max_concurrent_cursors must be a positive integer")
+            bound = max_concurrent_cursors
+        elif config is not None and getattr(config, "max_concurrent_cursors", None) is not None:
+            bound = int(config.max_concurrent_cursors)
+        elif config is not None or holder is not None:
+            bound = 32
+        else:
+            bound = 1
+        self._max_concurrent_cursors = bound
+        self._slot_semaphore = threading.BoundedSemaphore(bound)
+        self._active_slots = 0
+        self._slots_lock = threading.Lock()
+
+    def _get_cursor(self) -> Any:
+        if self._config is not None:
+            from seeknal.serving.duckdb_policy import DuckDBHolder
+
+            holder = self._holder or DuckDBHolder.get_holder()
+            return holder.get_cursor(
+                self._config.path,
+                allowed_directories=self._config.allowed_directories,
+                memory_limit=self._config.memory_limit,
+                threads=self._config.threads,
+                temp_directory=getattr(self._config, "temp_directory", None),
+                max_temp_directory_size=getattr(
+                    self._config, "max_temp_directory_size", None
+                ),
+            )
+        if self._connect_fn is not None:
+            return self._connect_fn()
+        raise EngineError("DuckDBAdapter has neither config nor connect function")
+
+    def _connect(self) -> Any:
+        return self._get_cursor()
+
+    def close(self) -> None:
+        if self._holder is not None:
+            self._holder.close_all()
+
+    @staticmethod
+    def _connection_error_message(exc: Exception) -> str:
+        msg = str(exc)
+        if msg in (
+            "DuckDBHolder is closed",
+            "DuckDB instance is closed",
+            "DuckDB database file not found",
+            "DuckDB database file is already open with different hardening parameters",
+            "In-place rewrite of active DuckDB file is not supported; use atomic symlink swaps",
+            "DuckDB probe conformance check failed",
+            "DuckDBAdapter has neither config nor connect function",
+        ):
+            return f"Engine connection failed: {msg}"
+        return "Engine connection failed"
+
+    def _resource_exhausted_message(self) -> str:
+        if self._config is not None and getattr(self._config, "temp_directory", None):
+            return "resource_exhausted: query exceeded memory limit or temp_directory spill space; increase memory_limit or max_temp_directory_size"
+        return "resource_exhausted: query exceeded memory limit and temp_directory is not configured; configure temp_directory to allow spilling"
 
     def execute(
         self,
@@ -454,9 +537,12 @@ class DuckDBAdapter:
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
                 continue
-            acquired = self._lock.acquire(
+            acquired = self._slot_semaphore.acquire(
                 timeout=min(remaining, _DUCKDB_QUEUE_POLL_SECONDS)
             )
+            if acquired:
+                with self._slots_lock:
+                    self._active_slots += 1
 
         timer: threading.Timer | None = None
         timer_start_attempted = False
@@ -481,7 +567,7 @@ class DuckDBAdapter:
                 raise EngineTimeout("Engine query timed out")
 
             try:
-                con = self._connect()
+                con = self._get_cursor()
             except Exception as exc:
                 conn_err_outcome = req_state.finalize_outcome("error")
                 if conn_err_outcome == "cancel":
@@ -498,7 +584,7 @@ class DuckDBAdapter:
                     type(exc).__name__,
                     prepared.audit_id,
                 )
-                raise EngineError("Engine connection failed") from None
+                raise EngineError(self._connection_error_message(exc)) from None
 
             if (
                 con is None
@@ -615,7 +701,8 @@ class DuckDBAdapter:
                     raise EngineTimeout("Engine query timed out")
 
                 if prepared.row_limit is None:
-                    con.commit()
+                    if hasattr(con, "commit"):
+                        con.commit()
                     columns: tuple[str, ...] = ()
                     column_types: tuple[str, ...] = ()
                     rows: list[tuple] = []
@@ -677,6 +764,37 @@ class DuckDBAdapter:
                     prepared.audit_id,
                 )
                 raise EngineTimeout("Engine query timed out") from None
+            except (duckdb.OutOfMemoryException, duckdb.FatalException) as exc:
+                if isinstance(exc, duckdb.FatalException):
+                    if self._config is not None:
+                        from seeknal.serving.duckdb_policy import DuckDBHolder
+
+                        holder = self._holder or DuckDBHolder.get_holder()
+                        holder.invalidate_path(self._config.path)
+                err_outcome = req_state.finalize_outcome("error")
+                if err_outcome == "cancel":
+                    logger.error(
+                        "engine=%s error=%s audit_id=%s",
+                        "duckdb",
+                        type(exc).__name__,
+                        prepared.audit_id,
+                    )
+                    raise EngineCancelled("Engine query execution cancelled") from None
+                if err_outcome == "timeout":
+                    logger.warning(
+                        "engine=%s error=%s audit_id=%s",
+                        "duckdb",
+                        type(exc).__name__,
+                        prepared.audit_id,
+                    )
+                    raise EngineTimeout("Engine query timed out") from None
+                logger.error(
+                    "engine=%s error=%s audit_id=%s",
+                    "duckdb",
+                    type(exc).__name__,
+                    prepared.audit_id,
+                )
+                raise EngineError(self._resource_exhausted_message()) from None
             except (EngineTimeout, EngineCancelled, EngineError):
                 req_state.disarm("error")
                 raise
@@ -704,6 +822,13 @@ class DuckDBAdapter:
                     type(exc).__name__,
                     prepared.audit_id,
                 )
+                err_msg = str(exc)
+                if (
+                    "Out of Memory" in err_msg
+                    or "temporary directory" in err_msg
+                    or "cannot be offloaded" in err_msg
+                ):
+                    raise EngineError(self._resource_exhausted_message()) from None
                 raise EngineError("Engine query execution failed") from None
         finally:
             req_state.disarm("error")
@@ -725,7 +850,9 @@ class DuckDBAdapter:
                     except Exception:
                         pass
             close_exc = req_state.close_connection(prepared.audit_id)
-            self._lock.release()
+            with self._slots_lock:
+                self._active_slots -= 1
+            self._slot_semaphore.release()
             if close_exc is not None and completed_ok:
                 raise EngineError("Engine connection cleanup failed") from None
 
@@ -740,6 +867,278 @@ class DuckDBAdapter:
         )
 
 
+class PooledConnection:
+    """Wrapper holding connection creation and last used timestamps."""
+
+    def __init__(self, conn: Any, created_at: float) -> None:
+        self.conn = conn
+        self.created_at = created_at
+        self.last_used_at = created_at
+
+
+class LakebasePool:
+    """Thread-safe connection pool for Lakebase connections."""
+
+    def __init__(
+        self,
+        connect_fn: Callable[..., Any],
+        *,
+        pool_max: int = 8,
+        pool_min: int = 0,
+        connect_timeout_seconds: float = 10.0,
+        max_idle_seconds: float = 300.0,
+        max_lifetime_seconds: float = 1800.0,
+        acquire_timeout_seconds: float = 5.0,
+    ) -> None:
+        self._connect_fn = connect_fn
+        self._pool_max = pool_max
+        self._pool_min = pool_min
+        self._connect_timeout_seconds = connect_timeout_seconds
+        self._max_idle_seconds = max_idle_seconds
+        self._max_lifetime_seconds = max_lifetime_seconds
+        self._acquire_timeout_seconds = acquire_timeout_seconds
+
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._idle: list[PooledConnection] = []
+        self._in_use: dict[Any, PooledConnection] = {}
+        self._total_count = 0
+        self._closed = False
+
+        self._reaper_lock = threading.Lock()
+        self._reaper_thread: threading.Thread | None = None
+        self._stop_reaper = threading.Event()
+
+        if self._pool_min > 0:
+            with self._lock:
+                for _ in range(self._pool_min):
+                    try:
+                        conn = self._create_connection()
+                        now = time.monotonic()
+                        self._idle.append(PooledConnection(conn, now))
+                        self._total_count += 1
+                    except Exception:
+                        break
+
+    def _ensure_reaper_started(self) -> None:
+        with self._reaper_lock:
+            if self._reaper_thread is None and not self._closed:
+                self._stop_reaper.clear()
+                self._reaper_thread = threading.Thread(
+                    target=self._reaper_loop,
+                    daemon=True,
+                    name="lakebase-reaper",
+                )
+                self._reaper_thread.start()
+
+    def _reaper_loop(self) -> None:
+        interval = max(0.05, min(self._max_idle_seconds / 2.0, 10.0))
+        while not self._stop_reaper.wait(timeout=interval):
+            if self._closed:
+                break
+            to_close = []
+            now = time.monotonic()
+            with self._cond:
+                remaining = []
+                for pooled in self._idle:
+                    if (
+                        (now - pooled.last_used_at) > self._max_idle_seconds
+                        or (now - pooled.created_at) > self._max_lifetime_seconds
+                    ):
+                        self._total_count -= 1
+                        to_close.append(pooled.conn)
+                    else:
+                        remaining.append(pooled)
+                self._idle = remaining
+                if to_close:
+                    self._cond.notify_all()
+            for c in to_close:
+                self._close_conn(c)
+
+    def _create_connection(self) -> Any:
+        sig = inspect.signature(self._connect_fn)
+        if "connect_timeout" in sig.parameters:
+            return self._connect_fn(connect_timeout=self._connect_timeout_seconds)
+        try:
+            return self._connect_fn(connect_timeout=self._connect_timeout_seconds)
+        except TypeError:
+            return self._connect_fn()
+
+    def _close_conn(self, conn: Any) -> None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def _is_dead(self, pooled: PooledConnection, now: float) -> bool:
+        conn = pooled.conn
+        # Check closed safely across standard DB-API and psycopg2
+        closed = getattr(conn, "closed", None)
+        if closed is not None:
+            if callable(closed):
+                try:
+                    if closed():
+                        return True
+                except Exception:
+                    return True
+            elif isinstance(closed, bool):
+                if closed:
+                    return True
+            elif isinstance(closed, (int, float)):
+                if closed != 0:
+                    return True
+
+        if (
+            getattr(conn, "is_dead", False)
+            or getattr(conn, "broken", False)
+            or getattr(conn, "dead", False)
+        ):
+            return True
+
+        open_attr = getattr(conn, "open", None)
+        if open_attr is not None and isinstance(open_attr, bool) and not open_attr:
+            return True
+
+        # In psycopg2, TRANSACTION_STATUS_UNKNOWN (4) means broken connection
+        if hasattr(conn, "get_transaction_status"):
+            try:
+                if conn.get_transaction_status() == 4:
+                    return True
+            except Exception:
+                return True
+
+        # Cheap poll validation only when connection has been idle longer than threshold
+        idle_time = now - pooled.last_used_at
+        if idle_time > 10.0:
+            if hasattr(conn, "poll"):
+                try:
+                    conn.poll()
+                except Exception:
+                    return True
+        return False
+
+    def acquire(self) -> Any:
+        self._ensure_reaper_started()
+        deadline = time.monotonic() + self._acquire_timeout_seconds
+        to_close_expired = []
+        with self._cond:
+            while True:
+                if self._closed:
+                    raise EngineError("Connection pool is closed")
+
+                now = time.monotonic()
+                while self._idle:
+                    pooled = self._idle.pop()
+                    if (
+                        (now - pooled.created_at) > self._max_lifetime_seconds
+                        or (now - pooled.last_used_at) > self._max_idle_seconds
+                    ):
+                        self._total_count -= 1
+                        to_close_expired.append(pooled.conn)
+                        continue
+                    if self._is_dead(pooled, now):
+                        self._total_count -= 1
+                        to_close_expired.append(pooled.conn)
+                        continue
+
+                    self._in_use[pooled.conn] = pooled
+                    for c in to_close_expired:
+                        self._close_conn(c)
+                    return pooled.conn
+
+                if self._total_count < self._pool_max:
+                    self._total_count += 1
+                    break
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    for c in to_close_expired:
+                        self._close_conn(c)
+                    raise EnginePoolExhausted(
+                        f"engine_busy: Timed out after {self._acquire_timeout_seconds}s waiting for a Lakebase pooled connection"
+                    )
+                self._cond.wait(timeout=remaining)
+                if (
+                    time.monotonic() >= deadline
+                    and not self._idle
+                    and self._total_count >= self._pool_max
+                ):
+                    for c in to_close_expired:
+                        self._close_conn(c)
+                    raise EnginePoolExhausted(
+                        f"engine_busy: Timed out after {self._acquire_timeout_seconds}s waiting for a Lakebase pooled connection"
+                    )
+
+        for c in to_close_expired:
+            self._close_conn(c)
+
+        try:
+            conn = self._create_connection()
+        except Exception:
+            with self._cond:
+                self._total_count -= 1
+                self._cond.notify()
+            raise
+
+        now = time.monotonic()
+        with self._cond:
+            if self._closed:
+                self._total_count -= 1
+                self._close_conn(conn)
+                raise EngineError("Connection pool is closed")
+            self._in_use[conn] = PooledConnection(conn, now)
+            return conn
+
+    def release(self, conn: Any, *, success: bool) -> None:
+        pooled = None
+        with self._cond:
+            pooled = self._in_use.pop(conn, None)
+            if self._closed:
+                self._total_count -= 1
+                self._cond.notify()
+                self._close_conn(conn)
+                return
+
+        if not success:
+            with self._cond:
+                self._total_count -= 1
+                self._cond.notify()
+            self._close_conn(conn)
+            return
+
+        now = time.monotonic()
+        with self._cond:
+            if self._closed:
+                self._total_count -= 1
+                self._cond.notify()
+                self._close_conn(conn)
+                return
+
+            if pooled is None:
+                pooled = PooledConnection(conn, now)
+            else:
+                pooled.last_used_at = now
+
+            self._idle.append(pooled)
+            self._cond.notify()
+
+    def close(self) -> None:
+        self._stop_reaper.set()
+        to_close = []
+        with self._cond:
+            self._closed = True
+            while self._idle:
+                p = self._idle.pop()
+                to_close.append(p.conn)
+            for c in list(self._in_use.keys()):
+                to_close.append(c)
+            self._in_use.clear()
+            self._total_count = 0
+            self._cond.notify_all()
+        for c in to_close:
+            self._close_conn(c)
+
+
 class DBAPIAdapter:
     """Adapter for DB-API 2.0 drivers (pymysql, psycopg2) for StarRocks, Lakebase, and Cube."""
 
@@ -749,10 +1148,16 @@ class DBAPIAdapter:
         *,
         kind: str,
         before_connect: Callable[[], None] | None = None,
+        pool: LakebasePool | None = None,
     ) -> None:
         self._connect = connect
         self._kind = kind
         self._before_connect = before_connect
+        self._pool = pool
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.close()
 
     def execute(
         self,
@@ -780,69 +1185,28 @@ class DBAPIAdapter:
                 raise EngineError("Engine connection preparation failed") from exc
 
         start = time.perf_counter()
-        try:
-            conn = self._connect()
-        except Exception as exc:
-            logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
-            raise EngineError("Engine connection failed") from exc
-
+        conn = None
+        conn_is_pooled = (self._kind == "lakebase" and self._pool is not None)
+        query_success = False
+        cursor = None
         cancel_event = threading.Event()
         timed_out = threading.Event()
         cancel_called = False
         cancel_lock = threading.Lock()
+        finished = False
         cube_timer: threading.Timer | None = None
 
-        try:
-            cursor = conn.cursor()
-            try:
-                if self._kind == "starrocks":
-                    if on_cancel_handle is not None:
-                        cursor.execute("SELECT CONNECTION_ID()")
-                        if hasattr(cursor, "fetchone"):
-                            row = cursor.fetchone()
-                        else:
-                            fetched_rows = cursor.fetchmany(1)
-                            row = fetched_rows[0] if fetched_rows else None
-                        if row is None or not isinstance(row[0], int):
-                            raise EngineError("Failed to retrieve connection id for StarRocks")
-                        conn_id = row[0]
+        if conn_is_pooled:
+            max_attempts = 2
+            for attempt in range(max_attempts):
+                try:
+                    conn = self._pool.acquire()
+                    cursor = conn.cursor()
 
-                        def cancel_sr() -> None:
-                            nonlocal cancel_called
-                            with cancel_lock:
-                                if cancel_called:
-                                    return
-                                cancel_called = True
-                            cancel_event.set()
-                            try:
-                                cancel_conn = self._connect()
-                                try:
-                                    cancel_cur = cancel_conn.cursor()
-                                    try:
-                                        cancel_cur.execute(f"KILL QUERY {conn_id}")
-                                    finally:
-                                        try:
-                                            cancel_cur.close()
-                                        except Exception:
-                                            pass
-                                finally:
-                                    try:
-                                        cancel_conn.close()
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
-
-                        on_cancel_handle(cancel_sr)
-
-                    timeout_s = max(1, int(round(timeout_seconds)))
-                    cursor.execute(f"SET query_timeout = {timeout_s}")
-
-                elif self._kind == "lakebase":
                     def cancel_lb() -> None:
                         nonlocal cancel_called
                         with cancel_lock:
-                            if cancel_called:
+                            if finished or cancel_called:
                                 return
                             cancel_called = True
                         cancel_event.set()
@@ -859,32 +1223,124 @@ class DBAPIAdapter:
                     if prepared.row_limit is not None:
                         cursor.execute("SET TRANSACTION READ ONLY")
                     cursor.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
-
-                elif self._kind == "cube":
-                    def cancel_cube() -> None:
-                        nonlocal cancel_called
-                        with cancel_lock:
-                            if cancel_called:
-                                return
-                            cancel_called = True
-                        cancel_event.set()
+                    break
+                except EnginePoolExhausted:
+                    raise
+                except Exception as exc:
+                    if cursor is not None:
                         try:
-                            conn.cancel()
+                            cursor.close()
                         except Exception:
                             pass
+                        cursor = None
+                    if conn is not None:
+                        self._pool.release(conn, success=False)
+                        conn = None
+                    if attempt < max_attempts - 1:
+                        continue
+                    logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
+                    raise EngineError("Engine connection failed") from exc
+        else:
+            try:
+                conn = self._connect()
+            except Exception as exc:
+                logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
+                raise EngineError("Engine connection failed") from exc
 
-                    if on_cancel_handle is not None:
-                        on_cancel_handle(cancel_cube)
+        try:
+            try:
+                if cursor is None:
+                    cursor = conn.cursor()
+                    if self._kind == "starrocks":
+                        if on_cancel_handle is not None:
+                            cursor.execute("SELECT CONNECTION_ID()")
+                            if hasattr(cursor, "fetchone"):
+                                row = cursor.fetchone()
+                            else:
+                                fetched_rows = cursor.fetchmany(1)
+                                row = fetched_rows[0] if fetched_rows else None
+                            if row is None or not isinstance(row[0], int):
+                                raise EngineError("Failed to retrieve connection id for StarRocks")
+                            conn_id = row[0]
 
-                    def timeout_cube() -> None:
-                        timed_out.set()
-                        try:
-                            conn.cancel()
-                        except Exception:
-                            pass
+                            def cancel_sr() -> None:
+                                nonlocal cancel_called
+                                with cancel_lock:
+                                    if cancel_called:
+                                        return
+                                    cancel_called = True
+                                cancel_event.set()
+                                try:
+                                    cancel_conn = self._connect()
+                                    try:
+                                        cancel_cur = cancel_conn.cursor()
+                                        try:
+                                            cancel_cur.execute(f"KILL QUERY {conn_id}")
+                                        finally:
+                                            try:
+                                                cancel_cur.close()
+                                            except Exception:
+                                                pass
+                                    finally:
+                                        try:
+                                            cancel_conn.close()
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
 
-                    cube_timer = threading.Timer(timeout_seconds, timeout_cube)
-                    cube_timer.start()
+                            on_cancel_handle(cancel_sr)
+
+                        timeout_s = max(1, int(round(timeout_seconds)))
+                        cursor.execute(f"SET query_timeout = {timeout_s}")
+
+                    elif self._kind == "lakebase":
+                        def cancel_lb_unpooled() -> None:
+                            nonlocal cancel_called
+                            with cancel_lock:
+                                if cancel_called:
+                                    return
+                                cancel_called = True
+                            cancel_event.set()
+                            try:
+                                conn.cancel()
+                            except Exception:
+                                pass
+
+                        if on_cancel_handle is not None:
+                            on_cancel_handle(cancel_lb_unpooled)
+
+                        timeout_ms = max(1, int(round(timeout_seconds * 1000)))
+                        cursor.execute("BEGIN")
+                        if prepared.row_limit is not None:
+                            cursor.execute("SET TRANSACTION READ ONLY")
+                        cursor.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
+
+                    elif self._kind == "cube":
+                        def cancel_cube() -> None:
+                            nonlocal cancel_called
+                            with cancel_lock:
+                                if cancel_called:
+                                    return
+                                cancel_called = True
+                            cancel_event.set()
+                            try:
+                                conn.cancel()
+                            except Exception:
+                                pass
+
+                        if on_cancel_handle is not None:
+                            on_cancel_handle(cancel_cube)
+
+                        def timeout_cube() -> None:
+                            timed_out.set()
+                            try:
+                                conn.cancel()
+                            except Exception:
+                                pass
+
+                        cube_timer = threading.Timer(timeout_seconds, timeout_cube)
+                        cube_timer.start()
 
                 cursor.execute(prepared.sql, prepared.params)
                 if cancel_event.is_set():
@@ -918,13 +1374,19 @@ class DBAPIAdapter:
                     else:
                         rows = [tuple(r) for r in fetched]
                         truncated = False
+                    if conn_is_pooled:
+                        if hasattr(conn, "rollback"):
+                            conn.rollback()
+
+                query_success = True
             finally:
                 if cube_timer is not None:
                     cube_timer.cancel()
-                try:
-                    cursor.close()
-                except Exception:
-                    pass
+                if cursor is not None:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
         except Exception as exc:
             if cancel_event.is_set():
                 logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
@@ -939,10 +1401,17 @@ class DBAPIAdapter:
                 raise
             raise EngineError("Engine query execution failed") from exc
         finally:
-            try:
-                conn.close()
-            except Exception as exc:
-                logger.warning("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
+            with cancel_lock:
+                finished = True
+            if conn_is_pooled:
+                if conn is not None:
+                    self._pool.release(conn, success=query_success)
+            else:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception as exc:
+                        logger.warning("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return QueryResult(
@@ -1137,17 +1606,22 @@ def build_workload_adapters(
 
 def build_adapter(
     kind: str,
-    connect: Callable[..., Any],
+    connect: Callable[..., Any] | None = None,
+    *,
+    config: Any = None,
+    pool: LakebasePool | None = None,
     **kw: Any,
 ) -> EngineAdapter:
     """Small factory to build an engine adapter for a given engine kind."""
     if kind == "duckdb":
-        return DuckDBAdapter(connect, **kw)
+        return DuckDBAdapter(connect, config=config, **kw)
     if kind == "cube":
         if "security" in kw and kw["security"] is not None:
             security = kw.pop("security")
             return CubeAdapter(connect, security=security, **kw)
         return DBAPIAdapter(connect, kind=kind, **kw)
-    if kind in ("starrocks", "lakebase"):
+    if kind == "lakebase":
+        return DBAPIAdapter(connect, kind=kind, pool=pool, **kw)
+    if kind == "starrocks":
         return DBAPIAdapter(connect, kind=kind, **kw)
     raise ValueError(f"Unsupported engine kind: '{kind}'")

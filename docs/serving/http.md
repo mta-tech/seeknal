@@ -177,7 +177,7 @@ Returns a JSON object with:
 
 ### 1.4 `POST /v1/cancel`
 
-Cancels an in-flight query (actively executing or queued waiting for the per-adapter embedded DuckDB execution lock) identified by `jti` in the cancel token. For embedded DuckDB (`DuckDBAdapter`), the cancellation handle is registered before waiting for the adapter lock and the request's monotonic timeout deadline (`timeout_s` / server `timeout_seconds`) includes both queue wait and SQL execution; cancelling a queued request aborts it (`499 query_cancelled`) without calling the connection factory or executing SQL.
+Cancels an in-flight query (actively executing or queued waiting for an embedded DuckDB cursor slot) identified by `jti` in the cancel token. For embedded DuckDB (`DuckDBAdapter`), the cancellation handle is registered before waiting for a cursor slot and the request's monotonic timeout deadline (`timeout_s` / server `timeout_seconds`) includes both queue wait and SQL execution; cancelling a queued request aborts it (`499 query_cancelled`) without touching DuckDB or executing SQL.
 
 #### Request Headers
 - `Authorization: Bearer <cancel token>` (required): Compact ES256 JWS cancel token issued by the Catalog.
@@ -346,16 +346,16 @@ app = create_app(
 )
 ```
 
-### 3.1 Embedded DuckDB Lifecycle, Serialization, Queueing & Limitations
+### 3.1 Embedded DuckDB Lifecycle, Bounded Concurrency, Queueing & Symlink Swaps
 
-- **Owned Per-Query Connection Factory:** `DuckDBAdapter(connect)` treats `connect` as an owned per-query factory. Once a request acquires the adapter's execution lock, it calls `connect()` exactly once, executes the query, stops and joins any started watchdog timer, and calls `conn.close()` before releasing the lock. Connection-factory exceptions are wrapped into secret-safe `EngineError("Engine connection failed")` (`502 engine_error`) and sole connection-close failures raise secret-safe `EngineError("Engine connection cleanup failed")` (`502 engine_error`) after releasing the lock, without exposing file paths, DSNs, SQL, parameters, or driver internals.
-  - *In-memory test fixtures:* Do not pass `lambda: parent` when retaining an in-memory parent connection across queries, as the adapter closes each returned connection. Instead, pass `lambda: parent.cursor()` so each query owns and closes a child cursor while the caller-owned `parent` fixture stays inspectable until the caller explicitly calls `parent.close()`. Production deployments must not retain a persistent root connection.
-- **Per-Adapter Execution Serialization:** Because DuckDB hardening (`SET lock_configuration = true`, `allowed_directories`, `enable_external_access = false`) locks database-level configuration while any connection to that database instance remains open, each `DuckDBAdapter` serializes execution under a single per-adapter lock spanning `connect -> harden -> execute/fetch -> watchdog cleanup -> close`.
-- **Pre-Lock Cancellation & Shared Monotonic Deadline:**
-  - `DuckDBAdapter.execute()` registers its per-request cancellation handle via `on_cancel_handle` *before* waiting for the execution lock.
-  - A single monotonic deadline (`timeout_seconds`) covers both queue wait and SQL execution; the timeout budget is **not** reset after acquiring the lock, and the execution watchdog timer receives only the remaining budget after `connect()` completes.
-  - If a queued request is cancelled or its deadline expires while waiting for the lock, it raises `EngineCancelled` (`499 query_cancelled`) or `EngineTimeout` (`504 engine_timeout`) without calling `connect()` or executing SQL. If `connect()` finishes after the deadline, the acquired connection is closed immediately without executing SQL.
-- **Single Adapter per DuckDB File & Non-Coordination Limitation:** Execution serialization is scoped strictly to a single `DuckDBAdapter` instance within a single OS process. Separate `DuckDBAdapter` instances, separate server processes (e.g., multi-worker or multi-process deployments), and external connections opening the same locked DuckDB file are **not** coordinated and can conflict with `lock_configuration`. Keep at most **one configured `DuckDBAdapter` per DuckDB database file per process**, and note that one adapter per process is **not** a cross-process or external-connection coordination guarantee.
+- **Shared Hardened Instance & Owned Per-Query Cursor:** In production (`DuckDBAdapter(config=conn_cfg)`), a process-wide thread-safe `DuckDBHolder` maintains a single hardened database instance per resolved database file (`connect_hardened` + conformance `probe`). Each query acquires a bounded concurrency slot (`max_concurrent_cursors`, default `32`) and its own isolated `cursor()`, executes the query, stops and joins any started watchdog timer, and deterministically closes the cursor and releases the slot. When constructed with a custom factory (`DuckDBAdapter(connect)`), each acquired slot calls `connect()` once and closes the returned connection/cursor before releasing the slot.
+  - Connection-factory / holder errors map to secret-safe `EngineError` (`502 engine_error`), and sole connection/cursor-close failures raise secret-safe `EngineError("Engine connection cleanup failed")` (`502 engine_error`) after releasing the slot, without exposing file paths, DSNs, SQL, parameters, or driver internals.
+  - *In-memory test fixtures:* Do not pass `lambda: parent` when retaining an in-memory parent connection across queries, as the adapter closes each returned object. Instead, pass `lambda: parent.cursor()` so each query owns and closes a child cursor while the caller-owned `parent` fixture stays inspectable until the caller explicitly calls `parent.close()`.
+- **Pre-Wait Cancellation & Shared Monotonic Deadline:**
+  - `DuckDBAdapter.execute()` registers its per-request cancellation handle via `on_cancel_handle` *before* waiting for a cursor slot.
+  - A single monotonic deadline (`timeout_seconds`) covers both queue wait and SQL execution; the timeout budget is **not** reset after acquiring a slot, and the execution watchdog timer receives only the remaining budget after the cursor is acquired.
+  - If a queued request is cancelled or its deadline expires while waiting for a slot, it raises `EngineCancelled` (`499 query_cancelled`) or `EngineTimeout` (`504 engine_timeout`) without touching DuckDB or executing SQL. If cursor acquisition finishes after the deadline, the acquired cursor is closed immediately without executing SQL.
+- **Zero-Downtime Symlink Swaps:** `DuckDBHolder` checks the configured path's resolved target and `(st_dev, st_ino)` on each query. When an atomic symlink swap points to a new database file, incoming queries open, harden, and probe the new generation while in-flight queries finish on the old generation; the superseded generation closes once drained (or via the idle reaper after `max_idle_seconds` 300s).
 
 ---
 
