@@ -29,6 +29,8 @@ def _validate_tar_member(
     max_member_name_length: int = DEFAULT_MAX_MEMBER_NAME_LENGTH,
 ) -> None:
     name = member.name
+    if "\x00" in name:
+        raise TarSafetyError("Tarball entry name contains a NUL byte")
     if len(name) > max_member_name_length:
         raise TarSafetyError("Tarball entry name too long")
 

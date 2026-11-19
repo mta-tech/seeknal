@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import mimetypes
 import tarfile
 from datetime import datetime, timezone
@@ -13,6 +14,8 @@ from seeknal.report_server import owner, slugs
 from seeknal.report_server.auth import AuthError, require_publish_auth
 from seeknal.report_server.models import Publish, get_session
 from seeknal.report_server.storage import TarSafetyError
+
+_log = logging.getLogger("seeknal.report_server")
 
 
 _FILTER_ERROR_TYPE = getattr(tarfile, "FilterError", TarSafetyError)
@@ -93,7 +96,19 @@ async def publish(request: Request) -> JSONResponse:
             asset_relpath = await run_in_threadpool(
                 storage.extract_tarball, slug, io.BytesIO(body_bytes)
             )
-        except (TarSafetyError, _FILTER_ERROR_TYPE, tarfile.TarError, EOFError) as exc:
+        except (
+            TarSafetyError,
+            _FILTER_ERROR_TYPE,
+            tarfile.TarError,
+            EOFError,
+            OSError,
+            ValueError,
+        ) as exc:
+            _log.warning(
+                "publish tarball rejected: slug=%s exc_class=%s",
+                slug,
+                type(exc).__name__,
+            )
             return JSONResponse({"error": _classify_tar_error(exc)}, status_code=400)
 
         created_at = datetime.now(timezone.utc)

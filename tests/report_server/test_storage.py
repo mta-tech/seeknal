@@ -408,3 +408,23 @@ def test_server_config_validates_positive_int_caps(
         ServerConfig.from_env()
 
 
+def test_rejects_nul_byte_in_member_name(
+    test_storage: LocalFilesystemStorage,
+    tmp_path: Path,
+) -> None:
+    nul_tar = tmp_path / "pax_nul.tar.gz"
+    with tarfile.open(nul_tar, "w:gz", format=tarfile.PAX_FORMAT) as tf:
+        info = tarfile.TarInfo(name="placeholder.txt")
+        info.pax_headers["path"] = "bad\x00name.txt"
+        data = b"payload"
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+
+    with open(nul_tar, "rb") as f:
+        with pytest.raises(TarSafetyError, match="Tarball entry name contains a NUL byte"):
+            test_storage.extract_tarball("nul_slug", f)
+
+    assert not (test_storage._root / "assets" / "nul_slug").exists()
+
+
+

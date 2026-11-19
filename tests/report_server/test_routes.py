@@ -302,3 +302,99 @@ def test_healthz_responsive_while_extraction_runs(
     with patch.object(test_app.state.storage, "extract_tarball", side_effect=_slow_extract):
         asyncio.run(_run())
 
+
+def test_nul_in_pax_path_returns_typed_400_without_paths_in_response_or_logs(
+    test_client: TestClient,
+    tmp_path: Path,
+    caplog,
+) -> None:
+    import io
+    import logging
+
+    nul_tar = tmp_path / "route_pax_nul.tar.gz"
+    with tarfile.open(nul_tar, "w:gz", format=tarfile.PAX_FORMAT) as tf:
+        info = tarfile.TarInfo(name="placeholder.txt")
+        info.pax_headers["path"] = "evil\x00path.txt"
+        data = b"payload"
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    resp = _publish(test_client, nul_tar)
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "Tarball entry name contains a NUL byte"}
+
+    data_dir_str = str(test_client.app.state.config.data_dir)
+    assert data_dir_str not in resp.text
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        assert data_dir_str not in msg
+        assert "evil" not in msg
+        assert "embedded null" not in msg
+
+
+def test_overlong_name_and_file_dir_conflict_return_typed_400_without_paths_in_logs(
+    test_client: TestClient,
+    tmp_path: Path,
+    caplog,
+) -> None:
+    import logging
+    from tests.report_server.conftest import _make_tarball
+
+    data_dir_str = str(test_client.app.state.config.data_dir)
+
+    # 1. Overlong name (> 1024 chars)
+    overlong_name = ("segment_" * 15) + "/" + ("x" * 950)
+    assert len(overlong_name) > 1024
+    overlong_tar = _make_tarball(
+        tmp_path,
+        [(overlong_name, b"data", "file")],
+        filename="overlong_route.tar.gz",
+    )
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    resp_long = _publish(test_client, overlong_tar)
+    assert resp_long.status_code == 400
+    assert resp_long.json() == {"error": "Tarball entry name too long"}
+    assert data_dir_str not in resp_long.text
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        assert data_dir_str not in msg
+        assert "segment_" not in msg
+
+    # 2. File "a" followed by "a/b" (raises OSError during extraction with absolute dest path in exc text)
+    conflict_tar = _make_tarball(
+        tmp_path,
+        [("a", b"file_content", "file"), ("a/b", b"nested_under_file", "file")],
+        filename="file_then_dir_conflict.tar.gz",
+    )
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    resp_conflict = _publish(test_client, conflict_tar)
+    assert resp_conflict.status_code == 400
+    assert resp_conflict.json() == {"error": "Invalid or corrupt tarball archive"}
+    assert data_dir_str not in resp_conflict.text
+    assert any("exc_class=" in rec.getMessage() for rec in caplog.records)
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        assert data_dir_str not in msg
+        assert "/assets/" not in msg
+
+    # 3. Single component over OS NAME_MAX (e.g. 300 chars <= 1024, raises ENAMETOOLONG OSError on extraction)
+    enametoolong_tar = _make_tarball(
+        tmp_path,
+        [("z" * 300, b"too_long_for_fs", "file")],
+        filename="enametoolong.tar.gz",
+    )
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    resp_nametoolong = _publish(test_client, enametoolong_tar)
+    assert resp_nametoolong.status_code == 400
+    assert resp_nametoolong.json() == {"error": "Invalid or corrupt tarball archive"}
+    assert data_dir_str not in resp_nametoolong.text
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        assert data_dir_str not in msg
+        assert "zzzzzzzz" not in msg
+
+
