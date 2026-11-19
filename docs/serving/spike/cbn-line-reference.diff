@@ -1,0 +1,3538 @@
+diff --git a/docs/serving/cube.md b/docs/serving/cube.md
+index 0bea5f7..c1ee757 100644
+--- a/docs/serving/cube.md
++++ b/docs/serving/cube.md
+@@ -179,7 +179,7 @@ module.exports = {
+ 
+ ### Twin Dimension Convention
+ Cube cannot mask per request inside `queryRewrite`: substituting a member there is mapped back by the original member key, so values come out NULL.
+-What works on a real Cube: the model defines *twin* dimensions `<member>__<method>` (supported methods: `redact`, `null`, `year`, `last4`), and the SQL sent to Cube projects `member__method AS member`. The result column keeps the name `member` and the masked value.
++What works on a real Cube: the model defines *twin* dimensions `<member>__<method>` (supported methods: `redact`, `null`, `year`, `last4`), and the SQL sent to Cube projects `member__method AS member`. The result column keeps the name `member` and the masked value. It is recommended to declare `__year` twins with Cube `type: time`, so the SQL API reports a timestamp column type.
+ 
+ Example cube model definition:
+ ```javascript
+@@ -197,6 +197,14 @@ cube(`claims_cube`, {
+       sql: `NULL`,
+       type: `string`,
+     },
++    created_date: {
++      sql: `created_date`,
++      type: `time`,
++    },
++    created_date__year: {
++      sql: `date_trunc('year', created_date)`,
++      type: `time`,
++    },
+   },
+ });
+ ```
+@@ -204,7 +212,7 @@ cube(`claims_cube`, {
+ **Hash is Unsupported on Cube:** Keyed HMAC cannot live in Cube model SQL. The `hash` mask method is not supported on cube targets and is rejected with `EnforcementError`.
+ 
+ ### Backend Engine Execution Bounds
+-Note that cancelling a Cube SQL connection may not stop the backend engine query. Cube targets need an engine-side bound (such as a StarRocks resource group or `query_timeout`).
++Note that cancelling a Cube SQL connection may not stop the backend engine query. As verified on a real Cube v1.0.0, Cube acknowledges the Postgres-protocol cancel but does not cancel the warehouse statement, so the engine-side bound (StarRocks resource group / `query_timeout`) is mandatory for cube targets.
+ 
+ ---
+ 
+diff --git a/docs/serving/deploy.md b/docs/serving/deploy.md
+index 32bdfb9..235d3e4 100644
+--- a/docs/serving/deploy.md
++++ b/docs/serving/deploy.md
+@@ -115,6 +115,12 @@ connections:
+   lb:
+     kind: lakebase
+     dsn_env: LAKEBASE_DSN
++    pool_max: 8  # Optional: max pooled connections (default 8, 1..64)
++    pool_min: 0  # Optional: min idle connections (default 0)
++    connect_timeout_seconds: 10  # Optional: connection timeout in seconds (default 10)
++    max_idle_seconds: 300  # Optional: max idle seconds before close (default 300)
++    max_lifetime_seconds: 1800  # Optional: max connection lifetime in seconds (default 1800)
++    acquire_timeout_seconds: 5  # Optional: acquire wait timeout before 503 error (default 5)
+   cube:
+     kind: cube
+     host: cube-sql.internal.net
+@@ -131,6 +137,8 @@ connections:
+       - /data/serving/
+     memory_limit: 4GB
+     threads: 4
++    temp_directory: /tmpfs/duckdb-temp  # Optional: writable directory outside allowed_directories
++    max_temp_directory_size: 10GB  # Optional: max disk space for spills
+ 
+ limits:
+   timeout_seconds: 30.0
+@@ -368,3 +376,47 @@ The probe outputs a JSON report with conformance check results and exits with co
+   "select_ok": true
+ }
+ ```
++
++### DuckDB Connection Reuse, Symlink File Swap, and Temp Directory
++- **Connection Reuse:** A process-wide, thread-safe holder maintains a single hardened database instance per resolved database file. Hardening policy enforcement and conformance probing execute once when the database is loaded. Each incoming query operates on its own isolated `cursor()` taken from that connection, allowing per-query interruption and timeout isolation without interference across concurrent queries.
++- **Zero-Downtime Symlink File Swap:** The configured database `path` may point to a symlink that is atomically updated to point to a new database file after an offline data reload. Only atomic symlink swaps are supported (in-place rewrites of active database files are not supported and will be refused). On every query, the holder cheaply checks the path's resolved target and inode. When a swap is detected:
++  - If the path points back to an already open instance, that instance is reused without re-hardening.
++  - Otherwise, the new file is opened, hardened, and probed immediately for incoming queries.
++  - In-flight queries on superseded instances complete normally.
++  - A superseded database connection is automatically closed once all in-flight queries finish and it is no longer current. No queries fail during swaps and no server restart is needed.
++- **`temp_directory` and `max_temp_directory_size`:**
++  - `temp_directory`: An optional absolute path where DuckDB may spill data for memory-intensive operations (such as large sorts or group-by aggregations). It **has to be a dedicated per-instance writable tmpfs or volume outside the data directory** (DuckDB allows arbitrary reads and writes inside its temp directory) and **must NOT be inside any `allowed_directories` entry or the data directory**.
++  - `max_temp_directory_size`: An optional disk limit string (e.g., `10GB`).
++  - When `temp_directory` is unset, DuckDB is configured so that it does not spill into the database file directory, and queries exceeding memory limits fail with a clear `resource_exhausted` error instead of an internal server error.
++- **Graceful Shutdown:** All open DuckDB database instances and cursors are explicitly closed during application lifespan shutdown.
++
++---
++
++## 6. Lakebase Connection Pool & Sizing Guidance
++
++When querying Lakebase (PostgreSQL), Seeknal Serving manages a thread-safe connection pool per Lakebase endpoint to eliminate connection establishment overhead.
++
++### Connection Configuration Keys
++| Key | Type | Default | Description |
++|:---|:---|:---|:---|
++| `pool_max` | integer | `8` | Maximum concurrent connections in the pool (allowed range: `1` to `64`). |
++| `pool_min` | integer | `0` | Minimum idle connections pre-warmed in the pool. |
++| `connect_timeout_seconds` | number | `10.0` | Connection timeout in seconds, applied to all driver connection attempts even if not in DSN. |
++| `max_idle_seconds` | number | `300.0` | Maximum time in seconds an idle connection remains in the pool before being closed and replaced. |
++| `max_lifetime_seconds` | number | `1800.0` | Maximum lifetime in seconds of any pooled connection before being closed and replaced. |
++| `acquire_timeout_seconds` | number | `5.0` | Maximum wait time in seconds to check out a pooled connection. If exhausted, fails with a `503` error. |
++
++### Sizing Guidance Against Database `max_connections`
++When planning pool sizes, calculate the total potential connections across all running Seeknal Serving instances against PostgreSQL's `max_connections` setting:
++$$\text{Total Connections} = (\text{Number of Serving Replicas}) \times \text{pool\_max}$$
++Ensure that this total connection count leaves sufficient margin for:
++1. `superuser_reserved_connections` (typically 3–5 connections reserved for Postgres superusers).
++2. Direct admin tools, catalog discovery workers, and operational migration tasks.
++For example, if PostgreSQL has `max_connections = 100` and you run 4 Serving replicas, setting `pool_max: 16` requires at most $4 \times 16 = 64$ connections, leaving 36 connections for administrative operations and catalog sync.
++
++### Session Isolation & Endpoint Resilience
++- **Strict Session Isolation:** No connection is ever shared between concurrent queries. Each query executes within its own transaction (`BEGIN`, `SET TRANSACTION READ ONLY`, `SET LOCAL statement_timeout`).
++- **Safe Return:** A connection is returned to the pool only after a successful `ROLLBACK` or `COMMIT` leaving no modified session state. Network I/O (rollback and close) is performed outside the pool lock to prevent contention.
++- **Fail-Closed on Errors:** Any query error, cancellation, or statement timeout causes the connection to be immediately closed and discarded—never reused. Late cancellations cannot affect subsequent queries on reused connections.
++- **Idle Expiry via Background Reaper:** A lightweight daemon thread periodically reaps connections idle longer than `max_idle_seconds` (default 300s). Expired connections are also closed on checkout.
++- **Dead Connection & Restart Recovery:** Connections found dead on checkout are transparently replaced. If the database endpoint restarts and an existing pooled connection is severed, the connection attempt is transparently retried once before starting query execution, preventing spurious errors to callers.
+diff --git a/docs/serving/discovery.md b/docs/serving/discovery.md
+index f6c0a15..522deb8 100644
+--- a/docs/serving/discovery.md
++++ b/docs/serving/discovery.md
+@@ -54,10 +54,11 @@ Authorization: <token>
+ - The engine `url` is configured as the bare base (e.g. `http://cube:4000`), because `/cubejs-api/v1/meta` is appended automatically.
+ - All cubes and views are parsed.
+ - Member names have the leading cube name prefix stripped (e.g., `orders.revenue` becomes `revenue`).
+-- **Twins and Mask Variants:** Dimensions are inspected for twin masking dimensions `<base>__<method>` where `<method>` is one of `redact`, `null`, `year`, `last4` and `<base>` is another dimension of the same cube. Dimensions are split into ordinary dimensions (no twins) and `mask_variants` mapping `{base: [method, ...]}`.
++- **Twins and Mask Variants:** Dimensions are inspected for twin masking dimensions `<base>__<method>` where `<method>` is one of `redact`, `null`, `year`, `last4` and `<base>` is another (non-twin) dimension of the same cube. Valid twins are recorded in `mask_variants` and excluded from `dimensions` and `schemas`.
++- **Reserved Suffixes & Member Omission:** Suffixes `__redact`, `__null`, `__last4`, `__year`, and `__hash` are reserved for masking. Any member (dimension or measure) whose name ends in a reserved suffix and is not a valid twin dimension is omitted everywhere: from `dimensions`, `measures`, `schemas`, and `mask_variants`. A warning names each omitted member as `<cube>.<member>` (e.g. `x__hash`, `product__hash`, `orphan__last4`, or a measure `total__null`). Names with `__` but a non-reserved suffix (e.g. `nik__weird`) stay ordinary members.
+ - **Placement and Schemas:** `placement["cubes"][name]` receives `measures`, ordinary `dimensions`, and `mask_variants`. `schemas[name]` is populated with ordinary dimensions + measures (no twins) so cube queries resolve without table-not-found errors.
++- **Cube Failure Isolation:** While `CubeSource.discover()` raises `DiscoveryError` upon HTTP or parsing failures, `discover()` isolates Cube failures so that discovery continues: `placement["cubes"]` is empty, no cube appears in `schemas`, and a warning is appended to `DiscoveryResult.warnings` mentioning that Cube metadata was unavailable and that cubes were omitted. The warehouse catalog (Iceberg/Lakekeeper tables and Lakebase synced tables) still loads successfully.
+ - Produces `CubeMeta(name, measures, dimensions, mask_variants)`.
+-- Endpoint or JSON parsing failures raise `DiscoveryError`.
+ 
+ #### Cube Authentication (Minted Token & Static Token)
+ - **Minted Meta Token (`api_secret_env` | `api_secret_file`)**: Cube `/cubejs-api/v1/meta` can be authenticated by minting an HS256 JWT using Cube's `CUBEJS_API_SECRET` (configured via `api_secret_env`, e.g., `CUBEJS_API_SECRET`, or `api_secret_file`).
+diff --git a/src/seeknal/serving/adapters.py b/src/seeknal/serving/adapters.py
+index 6192033..3121f13 100644
+--- a/src/seeknal/serving/adapters.py
++++ b/src/seeknal/serving/adapters.py
+@@ -51,6 +51,10 @@ class EngineCancelled(EngineError):
+     """Raised when engine query execution is cancelled."""
+ 
+ 
++class EnginePoolExhausted(EngineConfigError):
++    """Raised when Lakebase connection pool is exhausted."""
++
++
+ @dataclass(frozen=True)
+ class CubeSecurityConfig:
+     """Security configuration for Cube context token generation."""
+@@ -176,6 +180,11 @@ def normalize_column_type(kind: str, description_entry: Any) -> str:
+         display_size = description_entry[2] if len(description_entry) > 2 else None
+         precision = description_entry[4] if len(description_entry) > 4 else None
+         scale = description_entry[5] if len(description_entry) > 5 else None
++    elif hasattr(description_entry, "type_code"):
++        type_code = getattr(description_entry, "type_code", None)
++        display_size = getattr(description_entry, "display_size", None)
++        precision = getattr(description_entry, "precision", None)
++        scale = getattr(description_entry, "scale", None)
+     else:
+         type_code = description_entry
+         display_size = None
+@@ -280,6 +289,8 @@ def normalize_column_type(kind: str, description_entry: Any) -> str:
+             return "double"
+         if oid == 1700:
+             if precision is not None and scale is not None:
++                if (precision, scale) == (65535, 65535) or precision == 65535:
++                    return "decimal"
+                 return f"decimal({precision},{scale})"
+             return "decimal"
+         if oid in (25, 1043):
+@@ -304,8 +315,45 @@ def normalize_column_type(kind: str, description_entry: Any) -> str:
+ class DuckDBAdapter:
+     """Adapter for in-process DuckDB execution."""
+ 
+-    def __init__(self, connect: Callable[[], duckdb.DuckDBPyConnection]) -> None:
+-        self._connect = connect
++    def __init__(
++        self,
++        connect: Callable[[], duckdb.DuckDBPyConnection] | None = None,
++        *,
++        config: Any = None,
++        holder: Any = None,
++    ) -> None:
++        self._connect_fn = connect
++        self._config = config
++        self._holder = holder
++
++    def _get_cursor(self) -> tuple[Any, bool]:
++        if self._config is not None:
++            from seeknal.serving.duckdb_policy import DuckDBHolder
++
++            holder = self._holder or DuckDBHolder.get_holder()
++            cur = holder.get_cursor(
++                self._config.path,
++                allowed_directories=self._config.allowed_directories,
++                memory_limit=self._config.memory_limit,
++                threads=self._config.threads,
++                temp_directory=self._config.temp_directory,
++                max_temp_directory_size=self._config.max_temp_directory_size,
++            )
++            return cur, True
++        elif self._connect_fn is not None:
++            raw = self._connect_fn()
++            if hasattr(raw, "cursor"):
++                return raw.cursor(), True
++            return raw, False
++        raise EngineError("DuckDBAdapter has neither config nor connect function")
++
++    def _connect(self) -> Any:
++        cur, _ = self._get_cursor()
++        return cur
++
++    def close(self) -> None:
++        if self._holder is not None:
++            self._holder.close_all()
+ 
+     def execute(
+         self,
+@@ -320,25 +368,36 @@ class DuckDBAdapter:
+             )
+ 
+         start = time.perf_counter()
+-        con = self._connect()
++        con = None
++        is_owned_cursor = False
++        timer = None
+         cancel_event = threading.Event()
+ 
+-        def cancel_func() -> None:
+-            cancel_event.set()
++        try:
+             try:
+-                con.interrupt()
+-            except Exception:
+-                pass
++                con, is_owned_cursor = self._get_cursor()
++            except Exception as exc:
++                logger.error("engine=%s error=%s audit_id=%s", "duckdb", type(exc).__name__, prepared.audit_id)
++                raise EngineError(f"Engine connection failed: {exc}") from exc
+ 
+-        if on_cancel_handle is not None:
+-            on_cancel_handle(cancel_func)
++            def cancel_func() -> None:
++                cancel_event.set()
++                if con is not None:
++                    try:
++                        con.interrupt()
++                    except Exception:
++                        pass
++
++            if on_cancel_handle is not None:
++                on_cancel_handle(cancel_func)
++
++            timer = threading.Timer(timeout_seconds, con.interrupt)
++            timer.start()
+ 
+-        timer = threading.Timer(timeout_seconds, con.interrupt)
+-        timer.start()
+-        try:
+             con.execute(prepared.sql, prepared.params)
+             if prepared.row_limit is None:
+-                con.commit()
++                if hasattr(con, "commit"):
++                    con.commit()
+                 columns: tuple[str, ...] = ()
+                 column_types: tuple[str, ...] = ()
+                 rows: list[tuple] = []
+@@ -367,18 +426,52 @@ class DuckDBAdapter:
+                 raise EngineCancelled("Engine query execution cancelled") from exc
+             logger.warning("engine=%s error=%s audit_id=%s", "duckdb", type(exc).__name__, prepared.audit_id)
+             raise EngineTimeout("Engine query timed out") from exc
++        except (duckdb.OutOfMemoryException, duckdb.FatalException) as exc:
++            if isinstance(exc, duckdb.FatalException):
++                if self._config is not None:
++                    from seeknal.serving.duckdb_policy import DuckDBHolder
++
++                    holder = self._holder or DuckDBHolder.get_holder()
++                    holder.invalidate_path(self._config.path)
++            logger.error("engine=%s error=%s audit_id=%s", "duckdb", type(exc).__name__, prepared.audit_id)
++            if self._config is not None and getattr(self._config, "temp_directory", None):
++                raise EngineError(
++                    "resource_exhausted: query exceeded memory limit or temp_directory spill space; increase memory_limit or max_temp_directory_size"
++                ) from exc
++            else:
++                raise EngineError(
++                    "resource_exhausted: query exceeded memory limit and temp_directory is not configured; configure temp_directory to allow spilling"
++                ) from exc
+         except EngineTimeout:
+             raise
+         except EngineCancelled:
+             raise
++        except EngineError:
++            raise
+         except Exception as exc:
+             if cancel_event.is_set():
+                 logger.error("engine=%s error=%s audit_id=%s", "duckdb", type(exc).__name__, prepared.audit_id)
+                 raise EngineCancelled("Engine query execution cancelled") from exc
+             logger.error("engine=%s error=%s audit_id=%s", "duckdb", type(exc).__name__, prepared.audit_id)
++            err_msg = str(exc)
++            if "Out of Memory" in err_msg or "temporary directory" in err_msg or "cannot be offloaded" in err_msg:
++                if self._config is not None and getattr(self._config, "temp_directory", None):
++                    raise EngineError(
++                        "resource_exhausted: query exceeded memory limit or temp_directory spill space; increase memory_limit or max_temp_directory_size"
++                    ) from exc
++                else:
++                    raise EngineError(
++                        "resource_exhausted: query exceeded memory limit and temp_directory is not configured; configure temp_directory to allow spilling"
++                    ) from exc
+             raise EngineError("Engine query execution failed") from exc
+         finally:
+-            timer.cancel()
++            if timer is not None:
++                timer.cancel()
++            if is_owned_cursor and con is not None:
++                try:
++                    con.close()
++                except Exception:
++                    pass
+ 
+         elapsed_ms = (time.perf_counter() - start) * 1000.0
+         return QueryResult(
+@@ -391,6 +484,278 @@ class DuckDBAdapter:
+         )
+ 
+ 
++class PooledConnection:
++    """Wrapper holding connection creation and last used timestamps."""
++
++    def __init__(self, conn: Any, created_at: float) -> None:
++        self.conn = conn
++        self.created_at = created_at
++        self.last_used_at = created_at
++
++
++class LakebasePool:
++    """Thread-safe connection pool for Lakebase connections."""
++
++    def __init__(
++        self,
++        connect_fn: Callable[..., Any],
++        *,
++        pool_max: int = 8,
++        pool_min: int = 0,
++        connect_timeout_seconds: float = 10.0,
++        max_idle_seconds: float = 300.0,
++        max_lifetime_seconds: float = 1800.0,
++        acquire_timeout_seconds: float = 5.0,
++    ) -> None:
++        self._connect_fn = connect_fn
++        self._pool_max = pool_max
++        self._pool_min = pool_min
++        self._connect_timeout_seconds = connect_timeout_seconds
++        self._max_idle_seconds = max_idle_seconds
++        self._max_lifetime_seconds = max_lifetime_seconds
++        self._acquire_timeout_seconds = acquire_timeout_seconds
++
++        self._lock = threading.Lock()
++        self._cond = threading.Condition(self._lock)
++        self._idle: list[PooledConnection] = []
++        self._in_use: dict[Any, PooledConnection] = {}
++        self._total_count = 0
++        self._closed = False
++
++        self._reaper_lock = threading.Lock()
++        self._reaper_thread: threading.Thread | None = None
++        self._stop_reaper = threading.Event()
++
++        if self._pool_min > 0:
++            with self._lock:
++                for _ in range(self._pool_min):
++                    try:
++                        conn = self._create_connection()
++                        now = time.monotonic()
++                        self._idle.append(PooledConnection(conn, now))
++                        self._total_count += 1
++                    except Exception:
++                        break
++
++    def _ensure_reaper_started(self) -> None:
++        with self._reaper_lock:
++            if self._reaper_thread is None and not self._closed:
++                self._stop_reaper.clear()
++                self._reaper_thread = threading.Thread(
++                    target=self._reaper_loop,
++                    daemon=True,
++                    name="lakebase-reaper",
++                )
++                self._reaper_thread.start()
++
++    def _reaper_loop(self) -> None:
++        interval = max(0.05, min(self._max_idle_seconds / 2.0, 10.0))
++        while not self._stop_reaper.wait(timeout=interval):
++            if self._closed:
++                break
++            to_close = []
++            now = time.monotonic()
++            with self._cond:
++                remaining = []
++                for pooled in self._idle:
++                    if (
++                        (now - pooled.last_used_at) > self._max_idle_seconds
++                        or (now - pooled.created_at) > self._max_lifetime_seconds
++                    ):
++                        self._total_count -= 1
++                        to_close.append(pooled.conn)
++                    else:
++                        remaining.append(pooled)
++                self._idle = remaining
++                if to_close:
++                    self._cond.notify_all()
++            for c in to_close:
++                self._close_conn(c)
++
++    def _create_connection(self) -> Any:
++        sig = inspect.signature(self._connect_fn)
++        if "connect_timeout" in sig.parameters:
++            return self._connect_fn(connect_timeout=self._connect_timeout_seconds)
++        try:
++            return self._connect_fn(connect_timeout=self._connect_timeout_seconds)
++        except TypeError:
++            return self._connect_fn()
++
++    def _close_conn(self, conn: Any) -> None:
++        try:
++            conn.close()
++        except Exception:
++            pass
++
++    def _is_dead(self, pooled: PooledConnection, now: float) -> bool:
++        conn = pooled.conn
++        # Check closed safely across standard DB-API and psycopg2
++        closed = getattr(conn, "closed", None)
++        if closed is not None:
++            if callable(closed):
++                try:
++                    if closed():
++                        return True
++                except Exception:
++                    return True
++            elif isinstance(closed, bool):
++                if closed:
++                    return True
++            elif isinstance(closed, (int, float)):
++                if closed != 0:
++                    return True
++
++        if (
++            getattr(conn, "is_dead", False)
++            or getattr(conn, "broken", False)
++            or getattr(conn, "dead", False)
++        ):
++            return True
++
++        open_attr = getattr(conn, "open", None)
++        if open_attr is not None and isinstance(open_attr, bool) and not open_attr:
++            return True
++
++        # In psycopg2, TRANSACTION_STATUS_UNKNOWN (4) means broken connection
++        if hasattr(conn, "get_transaction_status"):
++            try:
++                if conn.get_transaction_status() == 4:
++                    return True
++            except Exception:
++                return True
++
++        # Cheap poll validation only when connection has been idle longer than threshold
++        idle_time = now - pooled.last_used_at
++        if idle_time > 10.0:
++            if hasattr(conn, "poll"):
++                try:
++                    conn.poll()
++                except Exception:
++                    return True
++        return False
++
++    def acquire(self) -> Any:
++        self._ensure_reaper_started()
++        deadline = time.monotonic() + self._acquire_timeout_seconds
++        to_close_expired = []
++        with self._cond:
++            while True:
++                if self._closed:
++                    raise EngineError("Connection pool is closed")
++
++                now = time.monotonic()
++                while self._idle:
++                    pooled = self._idle.pop()
++                    if (
++                        (now - pooled.created_at) > self._max_lifetime_seconds
++                        or (now - pooled.last_used_at) > self._max_idle_seconds
++                    ):
++                        self._total_count -= 1
++                        to_close_expired.append(pooled.conn)
++                        continue
++                    if self._is_dead(pooled, now):
++                        self._total_count -= 1
++                        to_close_expired.append(pooled.conn)
++                        continue
++
++                    self._in_use[pooled.conn] = pooled
++                    for c in to_close_expired:
++                        self._close_conn(c)
++                    return pooled.conn
++
++                if self._total_count < self._pool_max:
++                    self._total_count += 1
++                    break
++
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    for c in to_close_expired:
++                        self._close_conn(c)
++                    raise EnginePoolExhausted(
++                        f"engine_busy: Timed out after {self._acquire_timeout_seconds}s waiting for a Lakebase pooled connection"
++                    )
++                self._cond.wait(timeout=remaining)
++                if (
++                    time.monotonic() >= deadline
++                    and not self._idle
++                    and self._total_count >= self._pool_max
++                ):
++                    for c in to_close_expired:
++                        self._close_conn(c)
++                    raise EnginePoolExhausted(
++                        f"engine_busy: Timed out after {self._acquire_timeout_seconds}s waiting for a Lakebase pooled connection"
++                    )
++
++        for c in to_close_expired:
++            self._close_conn(c)
++
++        try:
++            conn = self._create_connection()
++        except Exception:
++            with self._cond:
++                self._total_count -= 1
++                self._cond.notify()
++            raise
++
++        now = time.monotonic()
++        with self._cond:
++            if self._closed:
++                self._total_count -= 1
++                self._close_conn(conn)
++                raise EngineError("Connection pool is closed")
++            self._in_use[conn] = PooledConnection(conn, now)
++            return conn
++
++    def release(self, conn: Any, *, success: bool) -> None:
++        pooled = None
++        with self._cond:
++            pooled = self._in_use.pop(conn, None)
++            if self._closed:
++                self._total_count -= 1
++                self._cond.notify()
++                self._close_conn(conn)
++                return
++
++        if not success:
++            with self._cond:
++                self._total_count -= 1
++                self._cond.notify()
++            self._close_conn(conn)
++            return
++
++        now = time.monotonic()
++        with self._cond:
++            if self._closed:
++                self._total_count -= 1
++                self._cond.notify()
++                self._close_conn(conn)
++                return
++
++            if pooled is None:
++                pooled = PooledConnection(conn, now)
++            else:
++                pooled.last_used_at = now
++
++            self._idle.append(pooled)
++            self._cond.notify()
++
++    def close(self) -> None:
++        self._stop_reaper.set()
++        to_close = []
++        with self._cond:
++            self._closed = True
++            while self._idle:
++                p = self._idle.pop()
++                to_close.append(p.conn)
++            for c in list(self._in_use.keys()):
++                to_close.append(c)
++            self._in_use.clear()
++            self._total_count = 0
++            self._cond.notify_all()
++        for c in to_close:
++            self._close_conn(c)
++
++
+ class DBAPIAdapter:
+     """Adapter for DB-API 2.0 drivers (pymysql, psycopg2) for StarRocks, Lakebase, and Cube."""
+ 
+@@ -400,10 +765,16 @@ class DBAPIAdapter:
+         *,
+         kind: str,
+         before_connect: Callable[[], None] | None = None,
++        pool: LakebasePool | None = None,
+     ) -> None:
+         self._connect = connect
+         self._kind = kind
+         self._before_connect = before_connect
++        self._pool = pool
++
++    def close(self) -> None:
++        if self._pool is not None:
++            self._pool.close()
+ 
+     def execute(
+         self,
+@@ -431,69 +802,28 @@ class DBAPIAdapter:
+                 raise EngineError("Engine connection preparation failed") from exc
+ 
+         start = time.perf_counter()
+-        try:
+-            conn = self._connect()
+-        except Exception as exc:
+-            logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
+-            raise EngineError("Engine connection failed") from exc
+-
++        conn = None
++        conn_is_pooled = (self._kind == "lakebase" and self._pool is not None)
++        query_success = False
++        cursor = None
+         cancel_event = threading.Event()
+         timed_out = threading.Event()
+         cancel_called = False
+         cancel_lock = threading.Lock()
++        finished = False
+         cube_timer: threading.Timer | None = None
+ 
+-        try:
+-            cursor = conn.cursor()
+-            try:
+-                if self._kind == "starrocks":
+-                    if on_cancel_handle is not None:
+-                        cursor.execute("SELECT CONNECTION_ID()")
+-                        if hasattr(cursor, "fetchone"):
+-                            row = cursor.fetchone()
+-                        else:
+-                            fetched_rows = cursor.fetchmany(1)
+-                            row = fetched_rows[0] if fetched_rows else None
+-                        if row is None or not isinstance(row[0], int):
+-                            raise EngineError("Failed to retrieve connection id for StarRocks")
+-                        conn_id = row[0]
+-
+-                        def cancel_sr() -> None:
+-                            nonlocal cancel_called
+-                            with cancel_lock:
+-                                if cancel_called:
+-                                    return
+-                                cancel_called = True
+-                            cancel_event.set()
+-                            try:
+-                                cancel_conn = self._connect()
+-                                try:
+-                                    cancel_cur = cancel_conn.cursor()
+-                                    try:
+-                                        cancel_cur.execute(f"KILL QUERY {conn_id}")
+-                                    finally:
+-                                        try:
+-                                            cancel_cur.close()
+-                                        except Exception:
+-                                            pass
+-                                finally:
+-                                    try:
+-                                        cancel_conn.close()
+-                                    except Exception:
+-                                        pass
+-                            except Exception:
+-                                pass
+-
+-                        on_cancel_handle(cancel_sr)
+-
+-                    timeout_s = max(1, int(round(timeout_seconds)))
+-                    cursor.execute(f"SET query_timeout = {timeout_s}")
++        if conn_is_pooled:
++            max_attempts = 2
++            for attempt in range(max_attempts):
++                try:
++                    conn = self._pool.acquire()
++                    cursor = conn.cursor()
+ 
+-                elif self._kind == "lakebase":
+                     def cancel_lb() -> None:
+                         nonlocal cancel_called
+                         with cancel_lock:
+-                            if cancel_called:
++                            if finished or cancel_called:
+                                 return
+                             cancel_called = True
+                         cancel_event.set()
+@@ -510,32 +840,124 @@ class DBAPIAdapter:
+                     if prepared.row_limit is not None:
+                         cursor.execute("SET TRANSACTION READ ONLY")
+                     cursor.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
+-
+-                elif self._kind == "cube":
+-                    def cancel_cube() -> None:
+-                        nonlocal cancel_called
+-                        with cancel_lock:
+-                            if cancel_called:
+-                                return
+-                            cancel_called = True
+-                        cancel_event.set()
++                    break
++                except EnginePoolExhausted:
++                    raise
++                except Exception as exc:
++                    if cursor is not None:
+                         try:
+-                            conn.cancel()
++                            cursor.close()
+                         except Exception:
+                             pass
++                        cursor = None
++                    if conn is not None:
++                        self._pool.release(conn, success=False)
++                        conn = None
++                    if attempt < max_attempts - 1:
++                        continue
++                    logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
++                    raise EngineError("Engine connection failed") from exc
++        else:
++            try:
++                conn = self._connect()
++            except Exception as exc:
++                logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
++                raise EngineError("Engine connection failed") from exc
+ 
+-                    if on_cancel_handle is not None:
+-                        on_cancel_handle(cancel_cube)
++        try:
++            try:
++                if cursor is None:
++                    cursor = conn.cursor()
++                    if self._kind == "starrocks":
++                        if on_cancel_handle is not None:
++                            cursor.execute("SELECT CONNECTION_ID()")
++                            if hasattr(cursor, "fetchone"):
++                                row = cursor.fetchone()
++                            else:
++                                fetched_rows = cursor.fetchmany(1)
++                                row = fetched_rows[0] if fetched_rows else None
++                            if row is None or not isinstance(row[0], int):
++                                raise EngineError("Failed to retrieve connection id for StarRocks")
++                            conn_id = row[0]
++
++                            def cancel_sr() -> None:
++                                nonlocal cancel_called
++                                with cancel_lock:
++                                    if cancel_called:
++                                        return
++                                    cancel_called = True
++                                cancel_event.set()
++                                try:
++                                    cancel_conn = self._connect()
++                                    try:
++                                        cancel_cur = cancel_conn.cursor()
++                                        try:
++                                            cancel_cur.execute(f"KILL QUERY {conn_id}")
++                                        finally:
++                                            try:
++                                                cancel_cur.close()
++                                            except Exception:
++                                                pass
++                                    finally:
++                                        try:
++                                            cancel_conn.close()
++                                        except Exception:
++                                            pass
++                                except Exception:
++                                    pass
+ 
+-                    def timeout_cube() -> None:
+-                        timed_out.set()
+-                        try:
+-                            conn.cancel()
+-                        except Exception:
+-                            pass
++                            on_cancel_handle(cancel_sr)
+ 
+-                    cube_timer = threading.Timer(timeout_seconds, timeout_cube)
+-                    cube_timer.start()
++                        timeout_s = max(1, int(round(timeout_seconds)))
++                        cursor.execute(f"SET query_timeout = {timeout_s}")
++
++                    elif self._kind == "lakebase":
++                        def cancel_lb_unpooled() -> None:
++                            nonlocal cancel_called
++                            with cancel_lock:
++                                if cancel_called:
++                                    return
++                                cancel_called = True
++                            cancel_event.set()
++                            try:
++                                conn.cancel()
++                            except Exception:
++                                pass
++
++                        if on_cancel_handle is not None:
++                            on_cancel_handle(cancel_lb_unpooled)
++
++                        timeout_ms = max(1, int(round(timeout_seconds * 1000)))
++                        cursor.execute("BEGIN")
++                        if prepared.row_limit is not None:
++                            cursor.execute("SET TRANSACTION READ ONLY")
++                        cursor.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
++
++                    elif self._kind == "cube":
++                        def cancel_cube() -> None:
++                            nonlocal cancel_called
++                            with cancel_lock:
++                                if cancel_called:
++                                    return
++                                cancel_called = True
++                            cancel_event.set()
++                            try:
++                                conn.cancel()
++                            except Exception:
++                                pass
++
++                        if on_cancel_handle is not None:
++                            on_cancel_handle(cancel_cube)
++
++                        def timeout_cube() -> None:
++                            timed_out.set()
++                            try:
++                                conn.cancel()
++                            except Exception:
++                                pass
++
++                        cube_timer = threading.Timer(timeout_seconds, timeout_cube)
++                        cube_timer.start()
+ 
+                 cursor.execute(prepared.sql, prepared.params)
+                 if cancel_event.is_set():
+@@ -569,13 +991,19 @@ class DBAPIAdapter:
+                     else:
+                         rows = [tuple(r) for r in fetched]
+                         truncated = False
++                    if conn_is_pooled:
++                        if hasattr(conn, "rollback"):
++                            conn.rollback()
++
++                query_success = True
+             finally:
+                 if cube_timer is not None:
+                     cube_timer.cancel()
+-                try:
+-                    cursor.close()
+-                except Exception:
+-                    pass
++                if cursor is not None:
++                    try:
++                        cursor.close()
++                    except Exception:
++                        pass
+         except Exception as exc:
+             if cancel_event.is_set():
+                 logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
+@@ -590,10 +1018,17 @@ class DBAPIAdapter:
+                 raise
+             raise EngineError("Engine query execution failed") from exc
+         finally:
+-            try:
+-                conn.close()
+-            except Exception as exc:
+-                logger.warning("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
++            with cancel_lock:
++                finished = True
++            if conn_is_pooled:
++                if conn is not None:
++                    self._pool.release(conn, success=query_success)
++            else:
++                if conn is not None:
++                    try:
++                        conn.close()
++                    except Exception as exc:
++                        logger.warning("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
+ 
+         elapsed_ms = (time.perf_counter() - start) * 1000.0
+         return QueryResult(
+@@ -788,17 +1223,22 @@ def build_workload_adapters(
+ 
+ def build_adapter(
+     kind: str,
+-    connect: Callable[..., Any],
++    connect: Callable[..., Any] | None = None,
++    *,
++    config: Any = None,
++    pool: LakebasePool | None = None,
+     **kw: Any,
+ ) -> EngineAdapter:
+     """Small factory to build an engine adapter for a given engine kind."""
+     if kind == "duckdb":
+-        return DuckDBAdapter(connect, **kw)
++        return DuckDBAdapter(connect, config=config, **kw)
+     if kind == "cube":
+         if "security" in kw and kw["security"] is not None:
+             security = kw.pop("security")
+             return CubeAdapter(connect, security=security, **kw)
+         return DBAPIAdapter(connect, kind=kind, **kw)
+-    if kind in ("starrocks", "lakebase"):
++    if kind == "lakebase":
++        return DBAPIAdapter(connect, kind=kind, pool=pool, **kw)
++    if kind == "starrocks":
+         return DBAPIAdapter(connect, kind=kind, **kw)
+     raise ValueError(f"Unsupported engine kind: '{kind}'")
+diff --git a/src/seeknal/serving/discovery/build.py b/src/seeknal/serving/discovery/build.py
+index 96c74c4..7fa1561 100644
+--- a/src/seeknal/serving/discovery/build.py
++++ b/src/seeknal/serving/discovery/build.py
+@@ -14,7 +14,7 @@ from seeknal.serving.discovery.config import (
+     DiscoveryConfig,
+     EngineConfig,
+ )
+-from seeknal.serving.discovery.cube import CubeMeta, CubeSource
++from seeknal.serving.discovery.cube import CubeMeta, CubeSource, _sanitize
+ from seeknal.serving.discovery.lakebase import LakebaseSyncSource, SyncState
+ from seeknal.serving.discovery.lakekeeper import IcebergTable, LakekeeperSource
+ from seeknal.serving.placement import Placement
+@@ -86,13 +86,32 @@ def discover(
+             break
+ 
+     if cube_engine_name is not None:
+-        cube_source = CubeSource(
+-            cfg.engines[cube_engine_name],
+-            http_client,
+-            env=env,
+-            timeout=cfg.timeout_seconds,
+-        )
+-        cube_metas = cube_source.discover()
++        try:
++            cube_source = CubeSource(
++                cfg.engines[cube_engine_name],
++                http_client,
++                env=env,
++                timeout=cfg.timeout_seconds,
++            )
++            cube_metas = cube_source.discover()
++            warnings.extend(cube_source.warnings)
++        except Exception as exc:
++            cube_metas = []
++            eng = cfg.engines[cube_engine_name]
++            tok = env.get(eng.token_env) if eng.token_env else None
++            sec = None
++            if eng.api_secret_env:
++                sec = env.get(eng.api_secret_env)
++            elif eng.api_secret_file and os.path.exists(eng.api_secret_file):
++                try:
++                    with open(eng.api_secret_file, "r", encoding="utf-8") as f:
++                        sec = f.read().strip()
++                except Exception:
++                    pass
++            clean_err = _sanitize(str(exc), tok, sec)
++            warnings.append(
++                f"Cube metadata was unavailable ({clean_err}); cubes were omitted from placement and schemas"
++            )
+ 
+     # 6. Locate StarRocks engine
+     starrocks_engine: EngineConfig | None = None
+diff --git a/src/seeknal/serving/discovery/cube.py b/src/seeknal/serving/discovery/cube.py
+index 9ff9129..3524b34 100644
+--- a/src/seeknal/serving/discovery/cube.py
++++ b/src/seeknal/serving/discovery/cube.py
+@@ -22,6 +22,7 @@ from seeknal.serving.discovery.config import (
+ 
+ 
+ VALID_TWIN_METHODS = frozenset({"redact", "null", "year", "last4"})
++RESERVED_SUFFIXES = frozenset({"__redact", "__null", "__last4", "__year", "__hash"})
+ 
+ 
+ @dataclass(frozen=True)
+@@ -88,6 +89,7 @@ class CubeSource:
+         self.env = env
+         self.timeout = timeout
+         self.clock = clock
++        self.warnings: list[str] = []
+ 
+         self._token: str | None = None
+         if self.engine_config.token_env:
+@@ -123,6 +125,7 @@ class CubeSource:
+ 
+     def discover(self) -> list[CubeMeta]:
+         """Fetch /cubejs-api/v1/meta and return list of CubeMeta."""
++        self.warnings = []
+         if not self.engine_config.url:
+             raise DiscoveryError(
+                 f"Cube engine '{self.engine_config.name}' has no URL configured"
+@@ -178,6 +181,11 @@ class CubeSource:
+                 m_name = str(m_name).strip()
+                 if m_name.startswith(prefix):
+                     m_name = m_name[len(prefix) :]
++                if any(m_name.endswith(sfx) for sfx in RESERVED_SUFFIXES):
++                    self.warnings.append(
++                        f"Cube member '{cube_name}.{m_name}' has reserved suffix and was omitted"
++                    )
++                    continue
+                 measures.append(m_name)
+ 
+             raw_dims: list[str] = []
+@@ -190,20 +198,34 @@ class CubeSource:
+                     d_name = d_name[len(prefix) :]
+                 raw_dims.append(d_name)
+ 
+-            raw_dims_set = set(raw_dims)
++            non_twin_dim_set = {
++                d for d in raw_dims if not any(d.endswith(sfx) for sfx in RESERVED_SUFFIXES)
++            }
+             twin_map: dict[str, list[str]] = {}
+             twin_dims: set[str] = set()
++            omitted_dims: set[str] = set()
++
+             for d in raw_dims:
+-                if "__" in d:
+-                    base, method = d.rsplit("__", 1)
+-                    if method in VALID_TWIN_METHODS and base in raw_dims_set and base != d:
+-                        twin_dims.add(d)
+-                        if base not in twin_map:
+-                            twin_map[base] = []
+-                        if method not in twin_map[base]:
+-                            twin_map[base].append(method)
+-
+-            ordinary_dims = [d for d in raw_dims if d not in twin_dims]
++                if any(d.endswith(sfx) for sfx in RESERVED_SUFFIXES):
++                    is_valid_twin = False
++                    if "__" in d:
++                        base, method = d.rsplit("__", 1)
++                        if method in VALID_TWIN_METHODS and base in non_twin_dim_set and base != d:
++                            is_valid_twin = True
++                            twin_dims.add(d)
++                            if base not in twin_map:
++                                twin_map[base] = []
++                            if method not in twin_map[base]:
++                                twin_map[base].append(method)
++                    if not is_valid_twin:
++                        omitted_dims.add(d)
++                        self.warnings.append(
++                            f"Cube member '{cube_name}.{d}' has reserved suffix and was omitted"
++                        )
++
++            ordinary_dims = [
++                d for d in raw_dims if d not in twin_dims and d not in omitted_dims
++            ]
+             mask_variants = {b: tuple(methods) for b, methods in twin_map.items()}
+ 
+             result.append(
+diff --git a/src/seeknal/serving/duckdb_policy.py b/src/seeknal/serving/duckdb_policy.py
+index a61caf9..ea73af6 100644
+--- a/src/seeknal/serving/duckdb_policy.py
++++ b/src/seeknal/serving/duckdb_policy.py
+@@ -6,6 +6,8 @@ import argparse
+ import json
+ import os
+ import sys
++import threading
++import time
+ import uuid
+ from collections.abc import Sequence
+ from typing import Any
+@@ -31,13 +33,43 @@ def harden_connection(
+     allowed_directories: Sequence[str] = (),
+     memory_limit: str | None = None,
+     threads: int | None = None,
++    temp_directory: str | None = None,
++    max_temp_directory_size: str | None = None,
+ ) -> None:
+     """Harden a DuckDB connection in strict order."""
++    validated_dirs: list[str] = []
+     # 1. sets allowed_directories (when non-empty; absolute, normalized paths, each must end with /, otherwise ValueError)
+     if allowed_directories:
+         validated_dirs = [_validate_allowed_directory(d) for d in allowed_directories]
+         conn.execute("SET allowed_directories = ?", [validated_dirs])
+ 
++    # 1b. temp_directory and max_temp_directory_size
++    if temp_directory is not None:
++        if not isinstance(temp_directory, str) or not temp_directory.strip():
++            raise ValueError(f"temp_directory must be a non-empty string, got {temp_directory!r}")
++        if not os.path.isabs(temp_directory):
++            raise ValueError(f"temp_directory must be an absolute path, got {temp_directory!r}")
++        if not os.path.exists(temp_directory):
++            raise ValueError(f"temp_directory '{temp_directory}' does not exist")
++        if not os.path.isdir(temp_directory):
++            raise ValueError(f"temp_directory '{temp_directory}' is not a directory")
++        if not os.access(temp_directory, os.W_OK):
++            raise ValueError(f"temp_directory '{temp_directory}' is not writable")
++
++        temp_real = os.path.realpath(temp_directory)
++        for d in validated_dirs:
++            d_real = os.path.realpath(d)
++            if temp_real == d_real or temp_real.startswith(d_real + "/"):
++                raise ValueError(
++                    f"temp_directory '{temp_directory}' must not be inside allowed directory '{d}'"
++                )
++        conn.execute("SET temp_directory = ?", [temp_directory])
++        if max_temp_directory_size is not None:
++            conn.execute("SET max_temp_directory_size = ?", [str(max_temp_directory_size)])
++    else:
++        conn.execute("SET max_temp_directory_size = '0B'")
++        conn.execute("SET temp_directory = ''")
++
+     # 2. sets enable_external_access = false
+     conn.execute("SET enable_external_access = false")
+ 
+@@ -62,8 +94,19 @@ def connect_hardened(
+     allowed_directories: Sequence[str] = (),
+     memory_limit: str | None = None,
+     threads: int | None = None,
++    temp_directory: str | None = None,
++    max_temp_directory_size: str | None = None,
+ ) -> Any:
+     """Open and harden a DuckDB connection, never falling back to unhardened."""
++    if temp_directory is not None and path != ":memory:" and not path.startswith(":memory:"):
++        temp_real = os.path.realpath(temp_directory)
++        db_real = os.path.realpath(path)
++        db_dir_real = os.path.dirname(db_real)
++        if temp_real == db_dir_real or temp_real.startswith(db_dir_real + "/"):
++            raise ValueError(
++                f"temp_directory '{temp_directory}' must not be inside data directory '{db_dir_real}'"
++            )
++
+     conn = duckdb.connect(path, read_only=read_only)
+     try:
+         harden_connection(
+@@ -71,7 +114,19 @@ def connect_hardened(
+             allowed_directories=allowed_directories,
+             memory_limit=memory_limit,
+             threads=threads,
++            temp_directory=temp_directory,
++            max_temp_directory_size=max_temp_directory_size,
+         )
++    except duckdb.Error as exc:
++        if "the configuration has been locked" in str(exc) or "locked" in str(exc):
++            p = probe(conn)
++            if all(p.values()):
++                return conn
++        try:
++            conn.close()
++        except Exception:
++            pass
++        raise
+     except Exception:
+         try:
+             conn.close()
+@@ -81,6 +136,267 @@ def connect_hardened(
+     return conn
+ 
+ 
++class DuckDBInstance:
++    """A hardened DuckDB database instance for a resolved database file."""
++
++    def __init__(
++        self,
++        holder: DuckDBHolder,
++        key: tuple[int, int],
++        configured_path: str,
++        resolved_path: str,
++        stat_identity: tuple[int, int, int] | None,
++        connection: Any,
++        params: tuple,
++    ) -> None:
++        self.holder = holder
++        self.key = key
++        self.configured_path = configured_path
++        self.resolved_path = resolved_path
++        self.stat_identity = stat_identity
++        self.connection = connection
++        self.params = params
++        self.in_flight = 0
++        self.is_retired = False
++        self.is_closed = False
++        self.lock = threading.Lock()
++
++    def acquire_cursor(self) -> Any:
++        with self.lock:
++            if self.is_closed:
++                raise RuntimeError("DuckDB instance is closed")
++            self.in_flight += 1
++            raw_cursor = self.connection.cursor()
++            return DuckDBCursorWrapper(raw_cursor, self)
++
++    def release_cursor(self, cursor: Any) -> None:
++        try:
++            cursor.close()
++        except Exception:
++            pass
++        with self.lock:
++            self.in_flight -= 1
++        self.holder._on_cursor_released(self)
++
++    def close_instance(self) -> None:
++        with self.lock:
++            if not self.is_closed:
++                self.is_closed = True
++                try:
++                    self.connection.close()
++                except Exception:
++                    pass
++
++
++class DuckDBCursorWrapper:
++    """Wrapper around a DuckDB cursor that tracks in-flight queries on its DuckDBInstance."""
++
++    def __init__(self, cursor: Any, instance: DuckDBInstance) -> None:
++        self._cursor = cursor
++        self._instance = instance
++        self._closed = False
++        self._lock = threading.Lock()
++
++    def close(self) -> None:
++        with self._lock:
++            if not self._closed:
++                self._closed = True
++                cur = self._cursor
++                self._cursor = None
++                self._instance.release_cursor(cur)
++
++    def __getattr__(self, name: str) -> Any:
++        if self._cursor is None:
++            raise RuntimeError("Cursor is closed")
++        return getattr(self._cursor, name)
++
++
++class DuckDBHolder:
++    """Process-wide, thread-safe holder keeping one hardened connection per resolved database file."""
++
++    _instance: DuckDBHolder | None = None
++    _global_lock = threading.Lock()
++
++    def __init__(self) -> None:
++        # Key: (st_dev, st_ino) -> DuckDBInstance (including retired-but-still-open instances)
++        self._instances_by_dev_ino: dict[tuple[int, int], DuckDBInstance] = {}
++        # Key: configured_path -> (st_dev, st_ino)
++        self._configured_to_dev_ino: dict[str, tuple[int, int]] = {}
++        self._closed = False
++        self._lock = threading.Lock()
++
++    @classmethod
++    def get_holder(cls) -> DuckDBHolder:
++        with cls._global_lock:
++            if cls._instance is None:
++                cls._instance = cls()
++            return cls._instance
++
++    @classmethod
++    def reset(cls) -> None:
++        with cls._global_lock:
++            if cls._instance is not None:
++                cls._instance.close_all()
++                cls._instance = None
++
++    def _is_current(self, key: tuple[int, int]) -> bool:
++        return any(k == key for k in self._configured_to_dev_ino.values())
++
++    def _on_cursor_released(self, inst: DuckDBInstance) -> None:
++        with self._lock:
++            with inst.lock:
++                should_close = (
++                    inst.is_retired
++                    and inst.in_flight <= 0
++                    and not self._is_current(inst.key)
++                )
++            if should_close:
++                inst.close_instance()
++                self._instances_by_dev_ino.pop(inst.key, None)
++
++    def invalidate_path(self, path: str) -> None:
++        """Drop invalidated instance (e.g. after FatalException) so next query reopens."""
++        with self._lock:
++            key = self._configured_to_dev_ino.pop(path, None)
++            if key is not None:
++                inst = self._instances_by_dev_ino.pop(key, None)
++                if inst is not None:
++                    inst.close_instance()
++
++    def get_cursor(
++        self,
++        path: str,
++        *,
++        allowed_directories: Sequence[str] = (),
++        memory_limit: str | None = None,
++        threads: int | None = None,
++        temp_directory: str | None = None,
++        max_temp_directory_size: str | None = None,
++    ) -> Any:
++        with self._lock:
++            if self._closed:
++                raise RuntimeError("DuckDBHolder is closed")
++
++            is_memory = path == ":memory:" or path.startswith(":memory:")
++
++            if is_memory:
++                key = (0, id(path))
++                resolved = path
++                stat_id = None
++            else:
++                st = None
++                resolved = None
++                # Handle transient filesystem race during atomic symlink replace (macOS/POSIX)
++                for _ in range(25):
++                    try:
++                        st = os.stat(path)
++                        resolved = os.path.realpath(path)
++                        if os.path.exists(resolved):
++                            break
++                    except (FileNotFoundError, OSError):
++                        pass
++                    time.sleep(0.002)
++
++                if st is None or resolved is None:
++                    # Fallback to current instance if currently open and not closed
++                    curr_key = self._configured_to_dev_ino.get(path)
++                    if curr_key is not None:
++                        curr_inst = self._instances_by_dev_ino.get(curr_key)
++                        if curr_inst is not None and not curr_inst.is_closed:
++                            return curr_inst.acquire_cursor()
++                    raise FileNotFoundError("DuckDB database file not found")
++
++                stat_id = (st.st_dev, st.st_ino, st.st_mtime_ns)
++                key = (st.st_dev, st.st_ino)
++
++            params = (
++                tuple(sorted(allowed_directories)),
++                memory_limit,
++                threads,
++                temp_directory,
++                max_temp_directory_size,
++            )
++
++            # Check if this configured_path was pointing to a different file
++            old_key = self._configured_to_dev_ino.get(path)
++            if old_key is not None and old_key != key:
++                # Update configured mapping to new key first
++                self._configured_to_dev_ino[path] = key
++                old_inst = self._instances_by_dev_ino.get(old_key)
++                if old_inst is not None:
++                    with old_inst.lock:
++                        old_inst.is_retired = True
++                        should_close = (
++                            old_inst.in_flight <= 0 and not self._is_current(old_key)
++                        )
++                    if should_close:
++                        old_inst.close_instance()
++                        self._instances_by_dev_ino.pop(old_key, None)
++            else:
++                self._configured_to_dev_ino[path] = key
++
++            # Check if an instance already exists for this (device, inode)
++            existing = self._instances_by_dev_ino.get(key)
++            if existing is not None and not existing.is_closed:
++                # Refuse if parameters differ
++                if existing.params != params:
++                    raise ValueError(
++                        f"DuckDB database file is already open with different hardening parameters"
++                    )
++                # Check for unsupported in-place rewrite of active file
++                if (
++                    stat_id is not None
++                    and existing.stat_identity is not None
++                    and stat_id[2] != existing.stat_identity[2]
++                ):
++                    raise RuntimeError(
++                        "In-place rewrite of active DuckDB file is not supported; use atomic symlink swaps"
++                    )
++
++                # REUSE existing instance! Unretire it since it is now current for `path`
++                with existing.lock:
++                    existing.is_retired = False
++                return existing.acquire_cursor()
++
++            # Open and harden a new instance
++            conn = connect_hardened(
++                resolved if not is_memory else path,
++                read_only=True,
++                allowed_directories=allowed_directories,
++                memory_limit=memory_limit,
++                threads=threads,
++                temp_directory=temp_directory,
++                max_temp_directory_size=max_temp_directory_size,
++            )
++            probe_results = probe(conn)
++            if not all(probe_results.values()):
++                try:
++                    conn.close()
++                except Exception:
++                    pass
++                raise RuntimeError("DuckDB probe conformance check failed")
++
++            inst = DuckDBInstance(
++                holder=self,
++                key=key,
++                configured_path=path,
++                resolved_path=resolved,
++                stat_identity=stat_id,
++                connection=conn,
++                params=params,
++            )
++            self._instances_by_dev_ino[key] = inst
++            return inst.acquire_cursor()
++
++    def close_all(self) -> None:
++        with self._lock:
++            self._closed = True
++            for inst in list(self._instances_by_dev_ino.values()):
++                inst.close_instance()
++            self._instances_by_dev_ino.clear()
++            self._configured_to_dev_ino.clear()
++
++
+ def probe(conn: Any) -> dict[str, bool]:
+     """Run conformance checks against a connection and return {check_name: passed}."""
+     checks: dict[str, bool] = {}
+diff --git a/src/seeknal/serving/server/app.py b/src/seeknal/serving/server/app.py
+index fc23180..e00b1e6 100644
+--- a/src/seeknal/serving/server/app.py
++++ b/src/seeknal/serving/server/app.py
+@@ -27,12 +27,13 @@ from seeknal.serving.adapters import (
+     DBAPIAdapter,
+     DuckDBAdapter,
+     EngineAdapter,
++    LakebasePool,
+     build_adapter,
+     build_workload_adapters,
+ )
+ from seeknal.serving.discovery import PlacementRefresher, discover
+ from seeknal.serving.discovery.build import DiscoveryResult
+-from seeknal.serving.duckdb_policy import connect_hardened
++from seeknal.serving.duckdb_policy import DuckDBHolder, connect_hardened
+ from seeknal.serving.http import GrantReplayCache, create_app
+ from seeknal.serving.placement import Placement
+ from seeknal.serving.server.config import (
+@@ -237,8 +238,22 @@ def build_server(
+             if connect_factories and eng_name in connect_factories:
+                 conn_fn = connect_factories[eng_name]
+             else:
+-                conn_fn = _make_lakebase_connect(conn_cfg.dsn_env, cfg, env)
+-            adapters[eng_name] = build_adapter("lakebase", conn_fn)
++                conn_fn = _make_lakebase_connect(
++                    conn_cfg.dsn_env,
++                    cfg,
++                    env,
++                    connect_timeout=conn_cfg.connect_timeout_seconds,
++                )
++            pool = LakebasePool(
++                conn_fn,
++                pool_max=conn_cfg.pool_max,
++                pool_min=conn_cfg.pool_min,
++                connect_timeout_seconds=conn_cfg.connect_timeout_seconds,
++                max_idle_seconds=conn_cfg.max_idle_seconds,
++                max_lifetime_seconds=conn_cfg.max_lifetime_seconds,
++                acquire_timeout_seconds=conn_cfg.acquire_timeout_seconds,
++            )
++            adapters[eng_name] = build_adapter("lakebase", conn_fn, pool=pool)
+ 
+         elif isinstance(conn_cfg, CubeConnectionConfig):
+             if connect_factories and eng_name in connect_factories:
+@@ -269,15 +284,9 @@ def build_server(
+         elif isinstance(conn_cfg, DuckDBConnectionConfig):
+             if connect_factories and eng_name in connect_factories:
+                 conn_fn = connect_factories[eng_name]
++                adapters[eng_name] = DuckDBAdapter(conn_fn)
+             else:
+-                conn_fn = lambda c=conn_cfg: connect_hardened(
+-                    c.path,
+-                    read_only=True,
+-                    allowed_directories=c.allowed_directories,
+-                    memory_limit=c.memory_limit,
+-                    threads=c.threads,
+-                )
+-            adapters[eng_name] = DuckDBAdapter(conn_fn)
++                adapters[eng_name] = DuckDBAdapter(config=conn_cfg)
+ 
+     # 7. Add /readyz route and Lifespan
+     async def readyz(request: Request) -> Response:
+@@ -303,6 +312,13 @@ def build_server(
+         finally:
+             if refresher is not None:
+                 refresher.stop()
++            for adapter in adapters.values():
++                if hasattr(adapter, "close"):
++                    try:
++                        adapter.close()
++                    except Exception:
++                        pass
++            DuckDBHolder.get_holder().close_all()
+ 
+     extra_routes = [
+         Route("/readyz", readyz, methods=["GET"]),
+@@ -377,13 +393,18 @@ def _make_starrocks_fields_connect(
+ 
+ 
+ def _make_lakebase_connect(
+-    dsn_env: str, cfg: ServerConfig, env: Mapping[str, str]
+-) -> Callable[[], Any]:
+-    def connect() -> Any:
++    dsn_env: str,
++    cfg: ServerConfig,
++    env: Mapping[str, str],
++    connect_timeout: float = 10.0,
++) -> Callable[..., Any]:
++    def connect(**kwargs: Any) -> Any:
+         dsn = cfg.get_env(dsn_env, env)
+         import psycopg2
+ 
+-        return psycopg2.connect(dsn)
++        to = kwargs.get("connect_timeout", connect_timeout)
++        to_int = max(1, math.ceil(float(to)))
++        return psycopg2.connect(dsn, connect_timeout=to_int)
+ 
+     return connect
+ 
+diff --git a/src/seeknal/serving/server/config.py b/src/seeknal/serving/server/config.py
+index 63c81a5..1793cf9 100644
+--- a/src/seeknal/serving/server/config.py
++++ b/src/seeknal/serving/server/config.py
+@@ -292,6 +292,12 @@ class StarRocksConnectionConfig:
+ class LakebaseConnectionConfig:
+     kind: str = "lakebase"
+     dsn_env: str = ""
++    pool_max: int = 8
++    pool_min: int = 0
++    connect_timeout_seconds: float = 10.0
++    max_idle_seconds: float = 300.0
++    max_lifetime_seconds: float = 1800.0
++    acquire_timeout_seconds: float = 5.0
+ 
+ 
+ @dataclass(frozen=True)
+@@ -312,6 +318,8 @@ class DuckDBConnectionConfig:
+     allowed_directories: tuple[str, ...] = ()
+     memory_limit: str | None = None
+     threads: int | None = None
++    temp_directory: str | None = None
++    max_temp_directory_size: str | None = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -876,7 +884,16 @@ class ServerConfig:
+                 connections[eng_name_str] = StarRocksConnectionConfig(accounts=accounts)
+ 
+             elif kind == "lakebase":
+-                unknown_lb = set(eng_spec.keys()) - {"kind", "dsn_env"}
++                unknown_lb = set(eng_spec.keys()) - {
++                    "kind",
++                    "dsn_env",
++                    "pool_max",
++                    "pool_min",
++                    "connect_timeout_seconds",
++                    "max_idle_seconds",
++                    "max_lifetime_seconds",
++                    "acquire_timeout_seconds",
++                }
+                 if unknown_lb:
+                     raise ServerConfigError(
+                         f"Unknown key(s) in lakebase connection '{eng_name_str}': {sorted(unknown_lb)}"
+@@ -886,8 +903,93 @@ class ServerConfig:
+                     raise ServerConfigError(
+                         f"Lakebase connection '{eng_name_str}' missing required 'dsn_env'"
+                     )
++
++                pool_max = eng_spec.get("pool_max", 8)
++                if (
++                    isinstance(pool_max, bool)
++                    or not isinstance(pool_max, int)
++                    or pool_max < 1
++                    or pool_max > 64
++                ):
++                    raise ServerConfigError(
++                        f"Lakebase connection '{eng_name_str}' 'pool_max' must be an integer between 1 and 64, got {pool_max}"
++                    )
++
++                pool_min = eng_spec.get("pool_min", 0)
++                if (
++                    isinstance(pool_min, bool)
++                    or not isinstance(pool_min, int)
++                    or pool_min < 0
++                    or pool_min > pool_max
++                ):
++                    raise ServerConfigError(
++                        f"Lakebase connection '{eng_name_str}' 'pool_min' must be an integer between 0 and pool_max ({pool_max}), got {pool_min}"
++                    )
++
++                ct_val = eng_spec.get("connect_timeout_seconds", 10.0)
++                if isinstance(ct_val, (bool, str)) or not isinstance(ct_val, (int, float)):
++                    raise ServerConfigError(
++                        f"Lakebase connection '{eng_name_str}' 'connect_timeout_seconds' must be a positive number"
++                    )
++                try:
++                    ct_f = float(ct_val)
++                    if ct_f <= 0 or math.isnan(ct_f) or math.isinf(ct_f):
++                        raise ValueError()
++                except (TypeError, ValueError) as exc:
++                    raise ServerConfigError(
++                        f"Lakebase connection '{eng_name_str}' 'connect_timeout_seconds' must be a positive number"
++                    ) from exc
++
++                mi_val = eng_spec.get("max_idle_seconds", 300.0)
++                if isinstance(mi_val, (bool, str)) or not isinstance(mi_val, (int, float)):
++                    raise ServerConfigError(
++                        f"Lakebase connection '{eng_name_str}' 'max_idle_seconds' must be a positive number"
++                    )
++                try:
++                    mi_f = float(mi_val)
++                    if mi_f <= 0 or math.isnan(mi_f) or math.isinf(mi_f):
++                        raise ValueError()
++                except (TypeError, ValueError) as exc:
++                    raise ServerConfigError(
++                        f"Lakebase connection '{eng_name_str}' 'max_idle_seconds' must be a positive number"
++                    ) from exc
++
++                ml_val = eng_spec.get("max_lifetime_seconds", 1800.0)
++                if isinstance(ml_val, (bool, str)) or not isinstance(ml_val, (int, float)):
++                    raise ServerConfigError(
++                        f"Lakebase connection '{eng_name_str}' 'max_lifetime_seconds' must be a positive number"
++                    )
++                try:
++                    ml_f = float(ml_val)
++                    if ml_f <= 0 or math.isnan(ml_f) or math.isinf(ml_f):
++                        raise ValueError()
++                except (TypeError, ValueError) as exc:
++                    raise ServerConfigError(
++                        f"Lakebase connection '{eng_name_str}' 'max_lifetime_seconds' must be a positive number"
++                    ) from exc
++
++                at_val = eng_spec.get("acquire_timeout_seconds", 5.0)
++                if isinstance(at_val, (bool, str)) or not isinstance(at_val, (int, float)):
++                    raise ServerConfigError(
++                        f"Lakebase connection '{eng_name_str}' 'acquire_timeout_seconds' must be a positive number"
++                    )
++                try:
++                    at_f = float(at_val)
++                    if at_f <= 0 or math.isnan(at_f) or math.isinf(at_f):
++                        raise ValueError()
++                except (TypeError, ValueError) as exc:
++                    raise ServerConfigError(
++                        f"Lakebase connection '{eng_name_str}' 'acquire_timeout_seconds' must be a positive number"
++                    ) from exc
++
+                 connections[eng_name_str] = LakebaseConnectionConfig(
+-                    dsn_env=dsn_env.strip()
++                    dsn_env=dsn_env.strip(),
++                    pool_max=pool_max,
++                    pool_min=pool_min,
++                    connect_timeout_seconds=ct_f,
++                    max_idle_seconds=mi_f,
++                    max_lifetime_seconds=ml_f,
++                    acquire_timeout_seconds=at_f,
+                 )
+ 
+             elif kind == "cube":
+@@ -935,6 +1037,10 @@ class ServerConfig:
+                     )
+ 
+                 timeout = eng_spec.get("connect_timeout_seconds", 10.0)
++                if isinstance(timeout, (bool, str)) or not isinstance(timeout, (int, float)):
++                    raise ServerConfigError(
++                        f"Cube connection '{eng_name_str}' 'connect_timeout_seconds' must be a positive number"
++                    )
+                 try:
+                     timeout_float = float(timeout)
+                     if (
+@@ -982,6 +1088,8 @@ class ServerConfig:
+                     "allowed_directories",
+                     "memory_limit",
+                     "threads",
++                    "temp_directory",
++                    "max_temp_directory_size",
+                 }
+                 if unknown_duck:
+                     raise ServerConfigError(
+@@ -1025,11 +1133,53 @@ class ServerConfig:
+                             f"DuckDB connection '{eng_name_str}' 'threads' must be a positive integer"
+                         )
+ 
++                temp_dir = eng_spec.get("temp_directory")
++                if temp_dir is not None:
++                    if not isinstance(temp_dir, str) or not temp_dir.strip():
++                        raise ServerConfigError(
++                            f"DuckDB connection '{eng_name_str}' 'temp_directory' must be a non-empty string"
++                        )
++                    temp_dir = temp_dir.strip()
++                    if not os.path.isabs(temp_dir):
++                        raise ServerConfigError(
++                            f"DuckDB connection '{eng_name_str}' 'temp_directory' must be an absolute path"
++                        )
++                    if not os.path.exists(temp_dir) or not os.path.isdir(temp_dir) or not os.access(temp_dir, os.W_OK):
++                        raise ServerConfigError(
++                            f"DuckDB connection '{eng_name_str}' 'temp_directory' '{temp_dir}' must be an existing writable directory"
++                        )
++
++                    temp_real = os.path.realpath(temp_dir)
++                    if path != ":memory:" and not path.startswith(":memory:"):
++                        db_real = os.path.realpath(path)
++                        db_dir_real = os.path.dirname(db_real)
++                        if temp_real == db_dir_real or temp_real.startswith(db_dir_real + "/"):
++                            raise ServerConfigError(
++                                f"DuckDB connection '{eng_name_str}' 'temp_directory' must not be inside data directory '{db_dir_real}'"
++                            )
++
++                    for ad in validated_allowed:
++                        ad_real = os.path.realpath(ad)
++                        if temp_real == ad_real or temp_real.startswith(ad_real + "/"):
++                            raise ServerConfigError(
++                                f"DuckDB connection '{eng_name_str}' 'temp_directory' must not be inside allowed_directory '{ad}'"
++                            )
++
++                max_temp_sz = eng_spec.get("max_temp_directory_size")
++                if max_temp_sz is not None:
++                    if not isinstance(max_temp_sz, (str, int)) or (isinstance(max_temp_sz, str) and not max_temp_sz.strip()):
++                        raise ServerConfigError(
++                            f"DuckDB connection '{eng_name_str}' 'max_temp_directory_size' must be a non-empty string or integer"
++                        )
++                    max_temp_sz = str(max_temp_sz).strip()
++
+                 connections[eng_name_str] = DuckDBConnectionConfig(
+                     path=path.strip(),
+                     allowed_directories=tuple(validated_allowed),
+                     memory_limit=mem_limit,
+                     threads=threads,
++                    temp_directory=temp_dir,
++                    max_temp_directory_size=max_temp_sz,
+                 )
+ 
+         # 12. limits
+@@ -1049,6 +1199,10 @@ class ServerConfig:
+                     f"Unknown key(s) in 'limits': {sorted(unknown_lim)}"
+                 )
+             to_val = lim_raw.get("timeout_seconds", 30.0)
++            if isinstance(to_val, (bool, str)) or not isinstance(to_val, (int, float)):
++                raise ServerConfigError(
++                    "'limits.timeout_seconds' must be a positive number"
++                )
+             try:
+                 to_f = float(to_val)
+                 if to_f <= 0 or math.isnan(to_f) or math.isinf(to_f):
+diff --git a/tests/serving/test_column_types_psycopg2.py b/tests/serving/test_column_types_psycopg2.py
+new file mode 100644
+index 0000000..8b29625
+--- /dev/null
++++ b/tests/serving/test_column_types_psycopg2.py
+@@ -0,0 +1,98 @@
++"""Tests for psycopg2 Column description entries normalization (Section D)."""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++import pytest
++from psycopg2.extensions import Column
++
++from seeknal.serving.adapters import normalize_column_type
++
++
++@pytest.mark.parametrize(
++    "type_code,precision,scale,expected",
++    [
++        (16, None, None, "boolean"),
++        (21, None, None, "smallint"),
++        (23, None, None, "integer"),
++        (20, None, None, "bigint"),
++        (700, None, None, "float"),
++        (701, None, None, "double"),
++        (1700, 10, 2, "decimal(10,2)"),
++        (1700, None, None, "decimal"),
++        (1700, 65535, 65535, "decimal"),
++        (1700, 65535, 0, "decimal"),
++        (25, None, None, "varchar"),
++        (1043, None, None, "varchar"),
++        (1082, None, None, "date"),
++        (1114, None, None, "timestamp"),
++        (1184, None, None, "timestamptz"),
++        (1083, None, None, "time"),
++        (17, None, None, "binary"),
++        (114, None, None, "json"),
++        (3802, None, None, "json"),
++        (99999, None, None, "unknown"),
++    ],
++)
++@pytest.mark.parametrize("kind", ["cube", "lakebase", "psycopg2", "postgres"])
++def test_real_psycopg2_column_and_required_property(kind, type_code, precision, scale, expected):
++    """normalize_column_type(kind, col) == normalize_column_type(kind, equivalent_tuple)."""
++    col = Column("col_name", type_code, 10, 4, precision, scale, True)
++    equiv_tuple = (col.name, col.type_code, col.display_size, col.internal_size, col.precision, col.scale, col.null_ok)
++
++    res_col = normalize_column_type(kind, col)
++    res_tuple = normalize_column_type(kind, equiv_tuple)
++
++    assert res_col == expected
++    assert res_col == res_tuple
++
++
++@pytest.mark.parametrize("kind", ["cube", "lakebase"])
++def test_attribute_stub_full_and_partial(kind):
++    # Full attribute stub
++    stub_full = SimpleNamespace(
++        name="price",
++        type_code=1700,
++        display_size=12,
++        internal_size=None,
++        precision=12,
++        scale=4,
++        null_ok=True,
++    )
++    equiv_full = (
++        stub_full.name,
++        stub_full.type_code,
++        stub_full.display_size,
++        stub_full.internal_size,
++        stub_full.precision,
++        stub_full.scale,
++        stub_full.null_ok,
++    )
++    assert normalize_column_type(kind, stub_full) == "decimal(12,4)"
++    assert normalize_column_type(kind, stub_full) == normalize_column_type(kind, equiv_full)
++
++    # Partial stub with only type_code (missing display_size, precision, scale)
++    stub_minimal = SimpleNamespace(name="created_at", type_code=1114)
++    assert normalize_column_type(kind, stub_minimal) == "timestamp"
++
++    # Stub with invalid type_code
++    stub_invalid = SimpleNamespace(name="bad", type_code="not_an_int")
++    assert normalize_column_type(kind, stub_invalid) == "unknown"
++
++
++def test_tuple_entries_and_other_kinds_unchanged():
++    # Tuples for DuckDB
++    assert normalize_column_type("duckdb", ("a", "INTEGER", None, None, None, None, None)) == "integer"
++    assert normalize_column_type("duckdb", ("b", "DECIMAL(10,2)", None, None, None, None, None)) == "decimal(10,2)"
++
++    # Tuples for StarRocks
++    assert normalize_column_type("starrocks", ("c", 3, None, None, None, None, None)) == "integer"
++    assert normalize_column_type("starrocks", ("d", 246, None, None, 10, 2, None)) == "decimal(10,2)"
++
++    # Tuples for Cube and Lakebase
++    assert normalize_column_type("cube", ("e", 20, None, None, None, None, None)) == "bigint"
++    assert normalize_column_type("lakebase", ("f", 1114, None, None, None, None, None)) == "timestamp"
++
++    # Direct raw values
++    assert normalize_column_type("cube", 20) == "bigint"
++    assert normalize_column_type("duckdb", "varchar") == "varchar"
+diff --git a/tests/serving/test_cube_twins.py b/tests/serving/test_cube_twins.py
+index 0fe25ce..c0864c6 100644
+--- a/tests/serving/test_cube_twins.py
++++ b/tests/serving/test_cube_twins.py
+@@ -184,6 +184,7 @@ def test_cube_source_discovery_splits_twins_and_preserves_non_twins():
+                     {"name": "products_cube.x__hash"},
+                     {"name": "products_cube.created_date"},
+                     {"name": "products_cube.created_date__year"},
++                    {"name": "products_cube.nik__weird"},
+                 ],
+             }
+         ]
+@@ -208,13 +209,15 @@ def test_cube_source_discovery_splits_twins_and_preserves_non_twins():
+     cm = cubes[0]
+     assert cm.name == "products_cube"
+     assert cm.measures == ("total_sales",)
+-    # Ordinary dimensions only (no twins). orphan__redact and x__hash are ordinary because
+-    # orphan has no base dimension and hash is not a twin method.
+-    assert cm.dimensions == ("product", "orphan__redact", "x__hash", "created_date")
++    # Ordinary dimensions only (no twins, and members ending in reserved suffixes omitted).
++    # orphan__redact and x__hash are omitted with warnings. nik__weird has non-reserved suffix and is kept.
++    assert cm.dimensions == ("product", "created_date", "nik__weird")
+     assert cm.mask_variants == {
+         "product": ("redact", "null"),
+         "created_date": ("year",),
+     }
++    assert any("products_cube.orphan__redact" in w for w in source.warnings)
++    assert any("products_cube.x__hash" in w for w in source.warnings)
+ 
+ 
+ def test_discovery_build_populates_cubes_and_schemas_without_twins():
+diff --git a/tests/serving/test_discovery_cube_resilience.py b/tests/serving/test_discovery_cube_resilience.py
+new file mode 100644
+index 0000000..37a9bce
+--- /dev/null
++++ b/tests/serving/test_discovery_cube_resilience.py
+@@ -0,0 +1,378 @@
++"""Tests for Cube discovery resilience (Section A) and reserved suffixes (Section B)."""
++
++from __future__ import annotations
++
++import io
++import json
++import sqlite3
++import sys
++import time
++from datetime import datetime, timezone
++
++import httpx
++import pytest
++import yaml
++
++from seeknal.serving import Placement, ServingPipeline
++from seeknal.serving.discovery import main
++from seeknal.serving.discovery.build import discover
++from seeknal.serving.discovery.config import DiscoveryError
++from seeknal.serving.discovery.cube import CubeSource
++from seeknal.serving.discovery.refresh import PlacementRefresher
++
++
++# ==============================================================================
++# Helpers
++# ==============================================================================
++
++def _make_base_config():
++    return {
++        "default_catalog": "lakekeeper",
++        "refresh_interval_seconds": 60,
++        "lakekeeper": {
++            "url": "https://lk.test",
++            "warehouse": "atlas",
++        },
++        "engines": {
++            "sr": {"kind": "starrocks", "dialect": "starrocks", "catalog": "starrocks_cat"},
++            "lb": {"kind": "lakebase", "dialect": "postgres"},
++            "cube": {
++                "kind": "cube",
++                "dialect": "postgres",
++                "url": "http://cube.test",
++                "token_env": "CUBE_TOKEN",
++            },
++        },
++        "lakebase": {
++            "engine": "lb",
++            "synced_tables": {
++                "lakekeeper.claims.claim": {
++                    "target": "public.claim",
++                    "primary_key": ["claim_id"],
++                }
++            },
++        },
++    }
++
++
++def _lakekeeper_and_lakebase_mock(request: httpx.Request) -> httpx.Response:
++    path = request.url.path
++    if path == "/v1/config":
++        return httpx.Response(200, json={})
++    if path == "/v1/namespaces":
++        return httpx.Response(200, json={"namespaces": [["claims"]]})
++    if path == "/v1/namespaces/claims/tables":
++        return httpx.Response(200, json={"identifiers": [{"name": "claim"}]})
++    if path == "/v1/namespaces/claims/tables/claim":
++        return httpx.Response(
++            200,
++            json={
++                "metadata": {
++                    "current-schema-id": 0,
++                    "schemas": [
++                        {
++                            "schema-id": 0,
++                            "fields": [
++                                {"id": 1, "name": "claim_id"},
++                                {"id": 2, "name": "amount"},
++                            ],
++                            "identifier-field-ids": [1],
++                        }
++                    ],
++                    "current-snapshot-id": 100,
++                }
++            },
++        )
++    return httpx.Response(404)
++
++
++def _make_sqlite_lakebase():
++    conn = sqlite3.connect(":memory:")
++    cur = conn.cursor()
++    cur.execute(
++        """
++        CREATE TABLE _lakebase_sync_state (
++            target_table TEXT PRIMARY KEY,
++            snapshot_id INTEGER,
++            synced_at TEXT
++        )
++        """
++    )
++    cur.execute(
++        "INSERT INTO _lakebase_sync_state VALUES (?, ?, ?)",
++        ("public.claim", 100, "2026-05-01T10:00:00+00:00"),
++    )
++    conn.commit()
++    return conn
++
++
++# ==============================================================================
++# Section A: Cube Failure Isolation
++# ==============================================================================
++
++@pytest.mark.parametrize(
++    "cube_status_or_error",
++    [
++        500,
++        502,
++        503,
++        "connect_error",
++        "invalid_json",
++    ],
++)
++def test_cube_failure_isolation_continues_discovery(cube_status_or_error):
++    secret_token = "secret-token-xyz-12345"
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.path == "/cubejs-api/v1/meta":
++            if cube_status_or_error == "connect_error":
++                raise httpx.ConnectError(f"Connection refused with token {secret_token}", request=request)
++            elif cube_status_or_error == "invalid_json":
++                return httpx.Response(200, text="not valid json")
++            else:
++                return httpx.Response(cube_status_or_error, text=f"Cube error with {secret_token}")
++        return _lakekeeper_and_lakebase_mock(request)
++
++    client = httpx.Client(transport=httpx.MockTransport(handler))
++    sqlite_conn = _make_sqlite_lakebase()
++    cfg = _make_base_config()
++
++    result = discover(
++        cfg,
++        http_client=client,
++        lakebase_connect=lambda: sqlite_conn,
++        env={"CUBE_TOKEN": secret_token},
++    )
++
++    # 1. Placement cubes is empty
++    assert result.placement["cubes"] == {}
++
++    # 2. No cube appears in schemas
++    assert "claims_cube" not in result.schemas
++    for name in result.schemas:
++        assert not name.endswith("_cube")
++
++    # 3. Warning mentions cube metadata was unavailable and cubes were omitted
++    cube_warnings = [
++        w for w in result.warnings
++        if "Cube metadata was unavailable" in w and "cubes were omitted" in w
++    ]
++    assert len(cube_warnings) == 1
++
++    # 4. Secret token was never leaked in warnings
++    assert secret_token not in cube_warnings[0]
++    if cube_status_or_error == "connect_error":
++        assert "***" in cube_warnings[0]
++
++    # 5. Lakekeeper / StarRocks / Lakebase tables still present
++    assert "lakekeeper.claims.claim" in result.placement["tables"]
++    assert "lakekeeper.claims.claim" in result.schemas
++    assert result.schemas["lakekeeper.claims.claim"] == ["claim_id", "amount"]
++
++    # 6. Placement validates with Placement.from_dict
++    placement = Placement.from_dict(result.placement)
++    assert "sr" in placement.engines
++    assert "lb" in placement.engines
++    assert "cube" in placement.engines
++    assert "lakekeeper.claims.claim" in placement.tables
++    assert len(placement.cubes) == 0
++
++
++def test_cube_failure_isolation_placement_refresher():
++    """PlacementRefresher succeeds with Cube down, swapping catalog without cubes."""
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.path == "/cubejs-api/v1/meta":
++            return httpx.Response(500, text="Cube unavailable")
++        return _lakekeeper_and_lakebase_mock(request)
++
++    client = httpx.Client(transport=httpx.MockTransport(handler))
++    sqlite_conn = _make_sqlite_lakebase()
++    cfg = _make_base_config()
++
++    def discover_fn():
++        return discover(
++            cfg,
++            http_client=client,
++            lakebase_connect=lambda: sqlite_conn,
++            env={"CUBE_TOKEN": "tok"},
++        )
++
++    pipeline = ServingPipeline(
++        placement=Placement.from_dict(
++            {"engines": {"sr": {"kind": "starrocks", "dialect": "starrocks"}}, "tables": {}, "cubes": {}}
++        ),
++        schemas={},
++        public_keys={},
++    )
++
++    refresher = PlacementRefresher(discover_fn, pipeline, interval_seconds=60)
++    success = refresher.refresh_once()
++
++    assert success is True
++    assert refresher.last_error is None
++    assert refresher.consecutive_failures == 0
++    # Cube catalog has no cubes, but has table
++    assert "lakekeeper.claims.claim" in pipeline.schemas
++    assert len(pipeline.placement.cubes) == 0
++
++
++def test_cube_failure_isolation_one_shot_cli(tmp_path):
++    """CLI exits 0 when Cube is down, writing valid placement and schemas, with warning on stderr."""
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.path == "/cubejs-api/v1/meta":
++            return httpx.Response(503, text="Service Unavailable")
++        return _lakekeeper_and_lakebase_mock(request)
++
++    client = httpx.Client(transport=httpx.MockTransport(handler))
++    sqlite_conn = _make_sqlite_lakebase()
++    cfg_path = tmp_path / "discovery.yaml"
++    placement_out = tmp_path / "placement.yaml"
++    schemas_out = tmp_path / "schemas.json"
++
++    with open(cfg_path, "w", encoding="utf-8") as f:
++        yaml.safe_dump(_make_base_config(), f)
++
++    stderr_buf = io.StringIO()
++    old_stderr = sys.stderr
++    try:
++        sys.stderr = stderr_buf
++        exit_code = main(
++            [
++                "--config", str(cfg_path),
++                "--placement-out", str(placement_out),
++                "--schemas-out", str(schemas_out),
++            ],
++            http_client=client,
++            lakebase_connect=lambda: sqlite_conn,
++            env={"CUBE_TOKEN": "cube-tok-123"},
++        )
++    finally:
++        sys.stderr = old_stderr
++
++    assert exit_code == 0
++    stderr_output = stderr_buf.getvalue()
++    assert "Warning: Cube metadata was unavailable" in stderr_output
++    assert "cubes were omitted" in stderr_output
++
++    with open(placement_out, "r", encoding="utf-8") as f:
++        placement_dict = yaml.safe_load(f)
++    assert placement_dict["cubes"] == {}
++    assert "lakekeeper.claims.claim" in placement_dict["tables"]
++
++    with open(schemas_out, "r", encoding="utf-8") as f:
++        schemas_dict = json.load(f)
++    assert "lakekeeper.claims.claim" in schemas_dict
++    assert len([k for k in schemas_dict if k.endswith("_cube")]) == 0
++
++
++def test_lakekeeper_failure_still_raises_discovery_error():
++    """Lakekeeper failure is NOT swallowed; it still raises DiscoveryError."""
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.path.startswith("/v1/namespaces"):
++            return httpx.Response(500, text="Lakekeeper down")
++        if request.url.path == "/v1/config":
++            return httpx.Response(200, json={})
++        return httpx.Response(404)
++
++    client = httpx.Client(transport=httpx.MockTransport(handler))
++    cfg = _make_base_config()
++
++    with pytest.raises(DiscoveryError, match="Failed to list namespaces"):
++        discover(cfg, http_client=client)
++
++
++# ==============================================================================
++# Section B: Reserved Suffixes
++# ==============================================================================
++
++def test_reserved_suffixes_omission_and_warnings():
++    raw_meta = {
++        "cubes": [
++            {
++                "name": "sales_cube",
++                "measures": [
++                    {"name": "sales_cube.total_amount"},
++                    {"name": "sales_cube.total__null"},
++                    {"name": "sales_cube.count__hash"},
++                    {"name": "sales_cube.metric__weird"},
++                ],
++                "dimensions": [
++                    {"name": "sales_cube.product"},
++                    {"name": "sales_cube.product__redact"},
++                    {"name": "sales_cube.product__null"},
++                    {"name": "sales_cube.product__last4"},
++                    {"name": "sales_cube.order_date"},
++                    {"name": "sales_cube.order_date__year"},
++                    {"name": "sales_cube.product__hash"},
++                    {"name": "sales_cube.x__hash"},
++                    {"name": "sales_cube.orphan__last4"},
++                    {"name": "sales_cube.orphan__redact"},
++                    {"name": "sales_cube.nik__weird"},
++                ],
++            }
++        ]
++    }
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.path == "/cubejs-api/v1/meta":
++            return httpx.Response(200, json=raw_meta)
++        return _lakekeeper_and_lakebase_mock(request)
++
++    client = httpx.Client(transport=httpx.MockTransport(handler))
++    cfg = _make_base_config()
++    sqlite_conn = _make_sqlite_lakebase()
++
++    result = discover(
++        cfg,
++        http_client=client,
++        lakebase_connect=lambda: sqlite_conn,
++        env={"CUBE_TOKEN": "token"},
++    )
++
++    placement = Placement.from_dict(result.placement)
++    cube_entry = placement.cubes["sales_cube"]
++
++    # 1. Valid twins: recorded in mask_variants, excluded from dimensions and schemas
++    assert cube_entry.mask_variants == {
++        "product": ("redact", "null", "last4"),
++        "order_date": ("year",),
++    }
++
++    # 2. Ordinary dimensions: only product, order_date, and nik__weird (non-reserved suffix)
++    assert cube_entry.dimensions == ("product", "order_date", "nik__weird")
++
++    # 3. Measures: total_amount and metric__weird (non-reserved suffix). total__null and count__hash omitted!
++    assert cube_entry.measures == ("total_amount", "metric__weird")
++
++    # 4. Schemas: ordinary dimensions + ordinary measures
++    assert result.schemas["sales_cube"] == [
++        "product",
++        "order_date",
++        "nik__weird",
++        "total_amount",
++        "metric__weird",
++    ]
++
++    # 5. Omitted members warning: each omitted member is named as <cube>.<member>
++    expected_omitted = [
++        "sales_cube.total__null",
++        "sales_cube.count__hash",
++        "sales_cube.product__hash",
++        "sales_cube.x__hash",
++        "sales_cube.orphan__last4",
++        "sales_cube.orphan__redact",
++    ]
++    for omitted in expected_omitted:
++        assert any(omitted in w for w in result.warnings), f"Expected warning for {omitted}"
++
++    # 6. Valid twins and non-reserved suffix members should NOT have omission warnings
++    not_omitted = [
++        "sales_cube.product__redact",
++        "sales_cube.product__null",
++        "sales_cube.product__last4",
++        "sales_cube.order_date__year",
++        "sales_cube.nik__weird",
++        "sales_cube.metric__weird",
++    ]
++    for member in not_omitted:
++        assert not any(f"'{member}' has reserved suffix" in w for w in result.warnings)
+diff --git a/tests/serving/test_duckdb_concurrency.py b/tests/serving/test_duckdb_concurrency.py
+new file mode 100644
+index 0000000..bab0caf
+--- /dev/null
++++ b/tests/serving/test_duckdb_concurrency.py
+@@ -0,0 +1,526 @@
++"""Tests for DuckDB concurrency, connection reuse, symlink swap, and temp directory."""
++
++from __future__ import annotations
++
++import concurrent.futures
++import os
++import threading
++import time
++from pathlib import Path
++
++import duckdb
++import pytest
++
++from seeknal.serving.adapters import (
++    DuckDBAdapter,
++    EngineError,
++    EngineTimeout,
++    QueryResult,
++)
++from seeknal.serving.duckdb_policy import (
++    DuckDBHolder,
++    connect_hardened,
++    harden_connection,
++    probe,
++)
++from seeknal.serving.server.config import DuckDBConnectionConfig
++from seeknal.serving.service import PreparedQuery
++
++
++def _make_prepared(
++    *,
++    engine: str = "duck",
++    sql: str = "SELECT 1",
++    params: tuple = (),
++    row_limit: int | None = 10,
++    audit_id: str = "audit-1",
++) -> PreparedQuery:
++    return PreparedQuery(
++        engine=engine,
++        engine_kind="duckdb",
++        sql=sql,
++        params=params,
++        paramstyle="qmark",
++        rule="test",
++        reason="test",
++        row_limit=row_limit,
++        masked_columns=(),
++        redacted_sql="SELECT ?",
++        subject="test@example.com",
++        workspace="ws-test",
++        audit_id=audit_id,
++        cube_security_context=None,
++    )
++
++
++@pytest.fixture(autouse=True)
++def reset_holder():
++    DuckDBHolder.reset()
++    yield
++    DuckDBHolder.reset()
++
++
++def test_duckdb_32_concurrent_queries_succeed(tmp_path):
++    """32 queries across 8 threads all succeed on a real in-process DuckDB file."""
++    db_file = tmp_path / "concurrent.duckdb"
++    con = duckdb.connect(str(db_file))
++    con.execute("CREATE TABLE metrics (id INT, value DOUBLE)")
++    for i in range(100):
++        con.execute("INSERT INTO metrics VALUES (?, ?)", [i, float(i * 1.5)])
++    con.close()
++
++    cfg = DuckDBConnectionConfig(
++        path=str(db_file),
++        allowed_directories=(str(tmp_path) + "/",),
++        threads=2,
++    )
++    adapter = DuckDBAdapter(config=cfg)
++
++    def run_query(idx: int) -> QueryResult:
++        prep = _make_prepared(
++            sql="SELECT id, value FROM metrics WHERE id = ? ORDER BY id",
++            params=(idx,),
++            audit_id=f"audit-concurrent-{idx}",
++        )
++        return adapter.execute(prep, timeout_seconds=10.0)
++
++    # 32 queries across 8 threads
++    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
++        futures = [executor.submit(run_query, i % 100) for i in range(32)]
++        results = [f.result() for f in concurrent.futures.as_completed(futures)]
++
++    assert len(results) == 32
++    for r in results:
++        assert isinstance(r, QueryResult)
++        assert len(r.rows) == 1
++        assert r.columns == ("id", "value")
++
++
++def test_duckdb_hardening_holds_on_cursor_during_concurrent_query(tmp_path):
++    """Assert hardening properties hold on a cursor taken while another query is running."""
++    db_file = tmp_path / "hardening.duckdb"
++    con = duckdb.connect(str(db_file))
++    con.execute("CREATE TABLE data (id INT)")
++    con.execute("INSERT INTO data VALUES (1), (2), (3)")
++    con.close()
++
++    allowed_dir = str(tmp_path) + "/"
++    cfg = DuckDBConnectionConfig(
++        path=str(db_file),
++        allowed_directories=(allowed_dir,),
++    )
++    adapter = DuckDBAdapter(config=cfg)
++
++    slow_started = threading.Event()
++    slow_can_finish = threading.Event()
++    slow_error = []
++
++    def slow_worker():
++        try:
++            # Query with python sleep UDF or large computation
++            holder = DuckDBHolder.get_holder()
++            cur = holder.get_cursor(str(db_file), allowed_directories=(allowed_dir,))
++            slow_started.set()
++            # Wait for main thread check
++            slow_can_finish.wait(timeout=10.0)
++            cur.execute("SELECT count(*) FROM data")
++            cur.fetchall()
++            cur.close()
++        except Exception as e:
++            slow_error.append(e)
++
++    t = threading.Thread(target=slow_worker)
++    t.start()
++    assert slow_started.wait(timeout=5.0)
++
++    try:
++        # Take a new cursor while slow query is running
++        holder = DuckDBHolder.get_holder()
++        test_cur = holder.get_cursor(str(db_file), allowed_directories=(allowed_dir,))
++        try:
++            results = probe(test_cur)
++            assert results["external_access_disabled"] is True
++            assert results["config_locked"] is True
++            assert results["read_text_outside_refused"] is True
++            assert results["copy_to_refused"] is True
++            assert results["attach_refused"] is True
++            assert results["install_refused"] is True
++            assert results["load_refused"] is True
++            assert results["select_ok"] is True
++            assert all(results.values())
++
++            # Read-only check: cannot INSERT or CREATE
++            with pytest.raises(duckdb.Error):
++                test_cur.execute("INSERT INTO data VALUES (999)")
++        finally:
++            test_cur.close()
++    finally:
++        slow_can_finish.set()
++        t.join()
++
++    assert not slow_error, f"Slow worker failed: {slow_error}"
++
++
++def test_duckdb_symlink_swap_during_load(tmp_path):
++    """A symlink swap during load is picked up by later queries and in-flight ones finish."""
++    v1_file = tmp_path / "v1.duckdb"
++    con1 = duckdb.connect(str(v1_file))
++    con1.execute("CREATE TABLE version (val VARCHAR)")
++    con1.execute("INSERT INTO version VALUES ('version_1')")
++    con1.close()
++
++    v2_file = tmp_path / "v2.duckdb"
++    con2 = duckdb.connect(str(v2_file))
++    con2.execute("CREATE TABLE version (val VARCHAR)")
++    con2.execute("INSERT INTO version VALUES ('version_2')")
++    con2.close()
++
++    symlink_path = tmp_path / "current.duckdb"
++    os.symlink(str(v1_file), str(symlink_path))
++
++    cfg = DuckDBConnectionConfig(
++        path=str(symlink_path),
++        allowed_directories=(str(tmp_path) + "/",),
++    )
++    adapter = DuckDBAdapter(config=cfg)
++
++    # First query picks up version_1
++    res1 = adapter.execute(_make_prepared(sql="SELECT val FROM version"), timeout_seconds=5.0)
++    assert res1.rows == [("version_1",)]
++
++    # Start a slow query on v1
++    v1_inflight_started = threading.Event()
++    v1_inflight_finish = threading.Event()
++    v1_result = []
++
++    def inflight_worker():
++        try:
++            holder = DuckDBHolder.get_holder()
++            cur = holder.get_cursor(str(symlink_path), allowed_directories=(str(tmp_path) + "/",))
++            v1_inflight_started.set()
++            v1_inflight_finish.wait(timeout=10.0)
++            cur.execute("SELECT val FROM version")
++            rows = cur.fetchall()
++            v1_result.append(rows)
++            cur.close()
++        except Exception as e:
++            v1_result.append(e)
++
++    t = threading.Thread(target=inflight_worker)
++    t.start()
++    assert v1_inflight_started.wait(timeout=5.0)
++
++    # Repoint symlink atomically to v2
++    tmp_link = tmp_path / "tmp_symlink"
++    os.symlink(str(v2_file), str(tmp_link))
++    os.replace(str(tmp_link), str(symlink_path))
++
++    # New query picks up version_2 immediately without restart
++    res2 = adapter.execute(_make_prepared(sql="SELECT val FROM version"), timeout_seconds=5.0)
++    assert res2.rows == [("version_2",)]
++
++    # Allow in-flight query on v1 to finish
++    v1_inflight_finish.set()
++    t.join()
++
++    assert v1_result == [[("version_1",)]]
++
++
++def test_duckdb_timeout_isolation(tmp_path):
++    """Timeout of one query does not kill another concurrent query."""
++    db_file = tmp_path / "timeout.duckdb"
++    con = duckdb.connect(str(db_file))
++    con.execute("CREATE TABLE t (n INT)")
++    con.execute("INSERT INTO t VALUES (42)")
++    con.close()
++
++    cfg = DuckDBConnectionConfig(
++        path=str(db_file),
++        allowed_directories=(str(tmp_path) + "/",),
++    )
++    adapter = DuckDBAdapter(config=cfg)
++
++    slow_prep = _make_prepared(
++        sql="WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n < 50000000) SELECT count(*) FROM t CROSS JOIN (SELECT 1 UNION ALL SELECT 2)",
++        audit_id="audit-slow",
++    )
++    fast_prep = _make_prepared(
++        sql="SELECT n FROM t",
++        audit_id="audit-fast",
++    )
++
++    slow_error = []
++    fast_result = []
++
++    def run_slow():
++        try:
++            adapter.execute(slow_prep, timeout_seconds=0.2)
++        except Exception as e:
++            slow_error.append(e)
++
++    def run_fast():
++        time.sleep(0.05)
++        try:
++            res = adapter.execute(fast_prep, timeout_seconds=5.0)
++            fast_result.append(res)
++        except Exception as e:
++            fast_result.append(e)
++
++    t_slow = threading.Thread(target=run_slow)
++    t_fast = threading.Thread(target=run_fast)
++
++    t_slow.start()
++    t_fast.start()
++
++    t_slow.join()
++    t_fast.join()
++
++    assert len(slow_error) == 1
++    assert isinstance(slow_error[0], EngineTimeout)
++
++    assert len(fast_result) == 1
++    assert isinstance(fast_result[0], QueryResult)
++    assert fast_result[0].rows == [(42,)]
++
++
++def test_duckdb_temp_directory_validation_and_spill_error(tmp_path):
++    """temp_directory validation and unset spill failure behavior."""
++    allowed_dir = tmp_path / "data"
++    allowed_dir.mkdir()
++    allowed_str = str(allowed_dir) + "/"
++
++    db_file = allowed_dir / "spill_test.duckdb"
++    con = duckdb.connect(str(db_file))
++    con.execute("CREATE TABLE t AS SELECT range AS x FROM range(100)")
++    con.close()
++
++    inside_dir = allowed_dir / "spill_inside"
++    inside_dir.mkdir()
++
++    outside_dir = tmp_path / "spill_outside"
++    outside_dir.mkdir()
++
++    # 1. Validation in harden_connection: inside allowed_directories raises
++    con_test = duckdb.connect(str(db_file), read_only=True)
++    with pytest.raises(ValueError, match="must not be inside allowed directory"):
++        harden_connection(con_test, allowed_directories=[allowed_str], temp_directory=str(inside_dir))
++    con_test.close()
++
++    # 2. Validation in harden_connection: relative path raises
++    con_test = duckdb.connect(str(db_file), read_only=True)
++    with pytest.raises(ValueError, match="must be an absolute path"):
++        harden_connection(con_test, allowed_directories=[allowed_str], temp_directory="relative/path")
++    con_test.close()
++
++    # 3. Validation in harden_connection: non-existent path raises
++    con_test = duckdb.connect(str(db_file), read_only=True)
++    with pytest.raises(ValueError, match="does not exist"):
++        harden_connection(con_test, allowed_directories=[allowed_str], temp_directory=str(tmp_path / "non_existent"))
++    con_test.close()
++
++    # 4. When temp_directory is unset, a query needing spill fails with resource_exhausted style error
++    cfg_unset = DuckDBConnectionConfig(
++        path=str(db_file),
++        allowed_directories=(allowed_str,),
++        memory_limit="10MB",
++        temp_directory=None,
++    )
++    adapter = DuckDBAdapter(config=cfg_unset)
++    spill_prep = _make_prepared(
++        sql="SELECT count(*) FROM (SELECT range, repeat(range::varchar, 1000) FROM range(100000) ORDER BY 2)",
++        audit_id="audit-spill",
++    )
++    with pytest.raises(EngineError) as exc_info:
++        adapter.execute(spill_prep, timeout_seconds=10.0)
++
++    # Must be a clear resource_exhausted style error rather than internal error
++    assert "resource_exhausted" in str(exc_info.value).lower()
++    # Must NOT pass DuckDB's raw text suggesting SET temp_directory
++    assert "SET temp_directory" not in str(exc_info.value)
++
++
++def test_duckdb_50_swaps_under_concurrency(tmp_path):
++    """50 swaps back and forth between two files under 8 threads with zero failed queries."""
++    file_a = tmp_path / "a.duckdb"
++    con_a = duckdb.connect(str(file_a))
++    con_a.execute("CREATE TABLE ver (val VARCHAR)")
++    con_a.execute("INSERT INTO ver VALUES ('A')")
++    con_a.close()
++
++    file_b = tmp_path / "b.duckdb"
++    con_b = duckdb.connect(str(file_b))
++    con_b.execute("CREATE TABLE ver (val VARCHAR)")
++    con_b.execute("INSERT INTO ver VALUES ('B')")
++    con_b.close()
++
++    link_path = tmp_path / "active.duckdb"
++    os.symlink(str(file_a), str(link_path))
++
++    cfg = DuckDBConnectionConfig(
++        path=str(link_path),
++        allowed_directories=(str(tmp_path) + "/",),
++    )
++    adapter = DuckDBAdapter(config=cfg)
++
++    stop_workers = threading.Event()
++    worker_errors = []
++    queries_run = [0]
++    queries_lock = threading.Lock()
++
++    def query_worker(w_id: int):
++        prep = _make_prepared(sql="SELECT val FROM ver", audit_id=f"audit-swap-{w_id}")
++        while not stop_workers.is_set():
++            try:
++                res = adapter.execute(prep, timeout_seconds=5.0)
++                assert res.rows in ([("A",)], [("B",)])
++                with queries_lock:
++                    queries_run[0] += 1
++            except Exception as e:
++                worker_errors.append(e)
++                break
++            time.sleep(0.001)
++
++    threads = [threading.Thread(target=query_worker, args=(i,)) for i in range(8)]
++    for t in threads:
++        t.start()
++
++    # Perform 50 swaps back and forth
++    current_target = file_a
++    for i in range(50):
++        next_target = file_b if current_target == file_a else file_a
++        tmp_link = tmp_path / f"tmp_swap_{i}"
++        os.symlink(str(next_target), str(tmp_link))
++        os.replace(str(tmp_link), str(link_path))
++        current_target = next_target
++        time.sleep(0.01)
++
++    stop_workers.set()
++    for t in threads:
++        t.join()
++
++    assert not worker_errors, f"Failed queries during 50 swaps: {worker_errors}"
++    assert queries_run[0] > 50, f"Expected >50 queries, ran {queries_run[0]}"
++
++
++def test_duckdb_holder_closed_state(tmp_path):
++    """After close_all() the holder is closed and subsequent query fails cleanly with EngineError."""
++    db_file = tmp_path / "closed.duckdb"
++    con = duckdb.connect(str(db_file))
++    con.execute("CREATE TABLE t (id INT)")
++    con.close()
++
++    cfg = DuckDBConnectionConfig(path=str(db_file), allowed_directories=(str(tmp_path) + "/",))
++    adapter = DuckDBAdapter(config=cfg)
++
++    # First query succeeds
++    res = adapter.execute(_make_prepared(sql="SELECT 1"), timeout_seconds=5.0)
++    assert res.rows == [(1,)]
++
++    # Close holder
++    DuckDBHolder.get_holder().close_all()
++
++    # Query after close fails cleanly with EngineError (502 class)
++    with pytest.raises(EngineError) as exc_info:
++        adapter.execute(_make_prepared(sql="SELECT 1"), timeout_seconds=5.0)
++    assert "DuckDBHolder is closed" in str(exc_info.value)
++
++
++def test_duckdb_refuse_different_parameters_on_same_file(tmp_path):
++    """Holder refuses opening the same file with different hardening parameters."""
++    db_file = tmp_path / "params.duckdb"
++    con = duckdb.connect(str(db_file))
++    con.execute("CREATE TABLE t (id INT)")
++    con.close()
++
++    holder = DuckDBHolder.get_holder()
++    cur1 = holder.get_cursor(str(db_file), memory_limit="256MB", threads=2)
++    cur1.close()
++
++    # Attempt to open same file with different threads parameter
++    with pytest.raises(ValueError, match="already open with different hardening parameters"):
++        holder.get_cursor(str(db_file), memory_limit="256MB", threads=4)
++
++
++def test_duckdb_1000_swaps_fd_lifecycle(tmp_path):
++    """After 1000 swaps only the current instance remains open in the holder."""
++    file_a = tmp_path / "swap_a.duckdb"
++    con_a = duckdb.connect(str(file_a))
++    con_a.execute("CREATE TABLE t (id INT)")
++    con_a.close()
++
++    file_b = tmp_path / "swap_b.duckdb"
++    con_b = duckdb.connect(str(file_b))
++    con_b.execute("CREATE TABLE t (id INT)")
++    con_b.close()
++
++    link_path = tmp_path / "swap_active.duckdb"
++    os.symlink(str(file_a), str(link_path))
++
++    cfg = DuckDBConnectionConfig(
++        path=str(link_path),
++        allowed_directories=(str(tmp_path) + "/",),
++    )
++    adapter = DuckDBAdapter(config=cfg)
++
++    current_target = file_a
++    for i in range(1000):
++        next_target = file_b if current_target == file_a else file_a
++        tmp_link = tmp_path / f"tmp_swap1000_{i}"
++        os.symlink(str(next_target), str(tmp_link))
++        os.replace(str(tmp_link), str(link_path))
++        current_target = next_target
++        res = adapter.execute(_make_prepared(sql="SELECT 1"), timeout_seconds=5.0)
++        assert res.rows == [(1,)]
++
++    holder = DuckDBHolder.get_holder()
++    open_instances = [inst for inst in holder._instances_by_dev_ino.values() if not inst.is_closed]
++    # Exactly ONE instance is open (the current one)
++    assert len(open_instances) == 1
++    assert not open_instances[0].is_retired
++
++
++def test_duckdb_configured_temp_dir_oom_error_message(tmp_path):
++    """When temp_directory is configured and OOM occurs, message remediation is accurate."""
++    temp_dir = tmp_path / "spill_tmp"
++    temp_dir.mkdir()
++    allowed_dir = tmp_path / "data"
++    allowed_dir.mkdir()
++
++    db_file = allowed_dir / "oom.duckdb"
++    con = duckdb.connect(str(db_file))
++    con.execute("CREATE TABLE t AS SELECT range AS x FROM range(100)")
++    con.close()
++
++    cfg = DuckDBConnectionConfig(
++        path=str(db_file),
++        allowed_directories=(str(allowed_dir) + "/",),
++        memory_limit="10MB",
++        temp_directory=str(temp_dir),
++        max_temp_directory_size="1KB",
++    )
++    adapter = DuckDBAdapter(config=cfg)
++    spill_prep = _make_prepared(
++        sql="SELECT count(*) FROM (SELECT range, repeat(range::varchar, 1000) FROM range(100000) ORDER BY 2)",
++        audit_id="audit-spill-cfg",
++    )
++    with pytest.raises(EngineError) as exc_info:
++        adapter.execute(spill_prep, timeout_seconds=10.0)
++
++    err = str(exc_info.value)
++    assert "increase memory_limit or max_temp_directory_size" in err
++    assert "temp_directory is not configured" not in err
++
++
++def test_duckdb_missing_target_redacts_path(tmp_path):
++    """Missing target errors do not expose the full filesystem path."""
++    cfg = DuckDBConnectionConfig(
++        path=str(tmp_path / "missing" / "secret_folder" / "secret.duckdb"),
++    )
++    adapter = DuckDBAdapter(config=cfg)
++    with pytest.raises(EngineError) as exc_info:
++        adapter.execute(_make_prepared(sql="SELECT 1"), timeout_seconds=5.0)
++
++    err = str(exc_info.value)
++    assert "secret_folder" not in err
++    assert "secret.duckdb" not in err
++    assert "DuckDB database file not found" in err
+diff --git a/tests/serving/test_duckdb_policy.py b/tests/serving/test_duckdb_policy.py
+index 7e849a0..f8810be 100644
+--- a/tests/serving/test_duckdb_policy.py
++++ b/tests/serving/test_duckdb_policy.py
+@@ -108,6 +108,38 @@ def test_harden_connection_validates_allowed_directories(bad_dir):
+     conn.close()
+ 
+ 
++def test_harden_connection_validates_temp_directory(tmp_path):
++    allowed_dir = tmp_path / "allowed"
++    allowed_dir.mkdir()
++    allowed_str = str(allowed_dir) + "/"
++
++    inside_dir = allowed_dir / "temp"
++    inside_dir.mkdir()
++
++    outside_dir = tmp_path / "outside_temp"
++    outside_dir.mkdir()
++
++    conn = duckdb.connect(":memory:")
++    # temp_directory inside allowed_directories raises ValueError
++    with pytest.raises(ValueError, match="must not be inside allowed directory"):
++        harden_connection(conn, allowed_directories=[allowed_str], temp_directory=str(inside_dir))
++
++    # relative path raises ValueError
++    with pytest.raises(ValueError, match="must be an absolute path"):
++        harden_connection(conn, allowed_directories=[allowed_str], temp_directory="rel/temp")
++
++    # non-existent path raises ValueError
++    with pytest.raises(ValueError, match="does not exist"):
++        harden_connection(conn, allowed_directories=[allowed_str], temp_directory=str(tmp_path / "non_existent"))
++
++    # valid outside path succeeds
++    conn2 = duckdb.connect(":memory:")
++    harden_connection(conn2, allowed_directories=[allowed_str], temp_directory=str(outside_dir), max_temp_directory_size="256MB")
++    res = probe(conn2)
++    assert all(res.values())
++    conn2.close()
++
++
+ def test_build_server_yields_hardened_duckdb_connection(temp_duckdb_file, tmp_path):
+     pl_file = tmp_path / "placement.yaml"
+     pl_file.write_text(
+diff --git a/tests/serving/test_lakebase_pool.py b/tests/serving/test_lakebase_pool.py
+new file mode 100644
+index 0000000..9778391
+--- /dev/null
++++ b/tests/serving/test_lakebase_pool.py
+@@ -0,0 +1,575 @@
++"""Tests for Lakebase connection pool: reuse, bounding, acquire timeout, expiration, error discard, and restart."""
++
++from __future__ import annotations
++
++import concurrent.futures
++import threading
++import time
++from typing import Any
++
++import pytest
++
++from seeknal.serving.adapters import (
++    DBAPIAdapter,
++    EngineCancelled,
++    EngineError,
++    EnginePoolExhausted,
++    EngineTimeout,
++    LakebasePool,
++    QueryResult,
++)
++from seeknal.serving.service import PreparedQuery
++
++
++def _make_prepared(
++    *,
++    sql: str = "SELECT 1",
++    params: tuple = (),
++    row_limit: int | None = 10,
++    audit_id: str = "audit-lb-1",
++) -> PreparedQuery:
++    return PreparedQuery(
++        engine="lb",
++        engine_kind="lakebase",
++        sql=sql,
++        params=params,
++        paramstyle="format",
++        rule="test",
++        reason="test",
++        row_limit=row_limit,
++        masked_columns=(),
++        redacted_sql="SELECT %s",
++        subject="test@example.com",
++        workspace="ws-test",
++        audit_id=audit_id,
++        cube_security_context=None,
++    )
++
++
++STATUS_READY = 1
++STATUS_BEGIN = 2
++STATUS_IN_TRANSACTION = 2
++
++TRANSACTION_STATUS_IDLE = 0
++TRANSACTION_STATUS_ACTIVE = 1
++TRANSACTION_STATUS_INTRANS = 2
++TRANSACTION_STATUS_INERROR = 3
++TRANSACTION_STATUS_UNKNOWN = 4
++
++
++class FakeCursor:
++    def __init__(self, conn: FakeConnection) -> None:
++        self.conn = conn
++        self.closed = False
++        self.description = (("val", 23, None, None, None, None, None),)
++
++    def execute(self, sql: str, params: tuple = ()) -> None:
++        if self.conn.closed != 0 or self.conn.is_dead:
++            raise Exception("Connection is closed or dead")
++        if self.conn.fail_on_begin and "BEGIN" in sql:
++            self.conn.is_dead = True
++            self.conn.closed = 2
++            raise Exception("server closed the connection unexpectedly (simulated restart)")
++        if "BEGIN" in sql:
++            self.conn.status = STATUS_IN_TRANSACTION
++        if self.conn.fail_on_query and "SELECT" in sql:
++            raise Exception("syntax error in SQL query")
++        if self.conn.timeout_on_query and "SELECT" in sql:
++            raise Exception("canceling statement due to statement timeout")
++        if self.conn.slow_query_seconds > 0 and "SELECT" in sql:
++            time.sleep(self.conn.slow_query_seconds)
++            if self.conn.cancelled:
++                raise Exception("canceling statement due to user request")
++
++    def fetchmany(self, size: int) -> list[tuple]:
++        return [(self.conn.conn_id,)]
++
++    def close(self) -> None:
++        self.closed = True
++
++
++class FakeConnection:
++    _id_counter = 0
++    _id_lock = threading.Lock()
++
++    def __init__(
++        self,
++        *,
++        fail_on_begin: bool = False,
++        fail_on_query: bool = False,
++        timeout_on_query: bool = False,
++        slow_query_seconds: float = 0.0,
++    ) -> None:
++        with self._id_lock:
++            FakeConnection._id_counter += 1
++            self.conn_id = FakeConnection._id_counter
++
++        # Real psycopg2 attributes:
++        # closed: 0 if open, 1 or 2 if closed
++        self.closed = 0
++        # status: STATUS_READY is 1
++        self.status = STATUS_READY
++        self.is_dead = False
++        self.cancelled = False
++        self.in_use = False
++        self.lock = threading.Lock()
++        self.fail_on_begin = fail_on_begin
++        self.fail_on_query = fail_on_query
++        self.timeout_on_query = timeout_on_query
++        self.slow_query_seconds = slow_query_seconds
++        self.rolled_back = False
++        self.committed = False
++
++    def cursor(self) -> FakeCursor:
++        if self.closed != 0 or self.is_dead:
++            raise Exception("Cannot create cursor on closed or dead connection")
++        with self.lock:
++            if self.in_use:
++                raise AssertionError(f"Connection {self.conn_id} concurrently used by two queries!")
++            self.in_use = True
++        return FakeCursor(self)
++
++    def cancel(self) -> None:
++        self.cancelled = True
++
++    def rollback(self) -> None:
++        with self.lock:
++            self.in_use = False
++            self.status = STATUS_READY
++            self.rolled_back = True
++
++    def commit(self) -> None:
++        with self.lock:
++            self.in_use = False
++            self.status = STATUS_READY
++            self.committed = True
++
++    def close(self) -> None:
++        with self.lock:
++            self.closed = 1
++            self.in_use = False
++
++    def get_transaction_status(self) -> int:
++        if self.closed != 0 or self.is_dead:
++            return TRANSACTION_STATUS_UNKNOWN
++        if self.in_use:
++            return TRANSACTION_STATUS_INTRANS
++        return TRANSACTION_STATUS_IDLE
++
++    def poll(self) -> int:
++        if self.closed != 0 or self.is_dead:
++            raise Exception("Connection dead in poll()")
++        return 0
++
++
++class FakeDriver:
++    def __init__(self) -> None:
++        self.connections: list[FakeConnection] = []
++        self.lock = threading.Lock()
++        self.next_fail_on_begin = False
++        self.next_slow_seconds = 0.0
++
++    def connect(self, **kwargs: Any) -> FakeConnection:
++        with self.lock:
++            conn = FakeConnection(
++                fail_on_begin=self.next_fail_on_begin,
++                slow_query_seconds=self.next_slow_seconds,
++            )
++            self.next_fail_on_begin = False
++            self.next_slow_seconds = 0.0
++            self.connections.append(conn)
++            return conn
++
++
++def test_connection_reuse():
++    """Sequential queries reuse the same connection instance."""
++    driver = FakeDriver()
++    pool = LakebasePool(driver.connect, pool_max=4, pool_min=0)
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    res1 = adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    res2 = adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    res3 = adapter.execute(_make_prepared(), timeout_seconds=5.0)
++
++    assert res1.rows == res2.rows == res3.rows
++    # Only 1 connection was created by driver
++    assert len(driver.connections) == 1
++    assert not driver.connections[0].closed
++
++
++def test_pool_bounding():
++    """Concurrent queries are bounded by pool_max."""
++    driver = FakeDriver()
++    pool = LakebasePool(driver.connect, pool_max=3, pool_min=0)
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    def run_q(i: int):
++        return adapter.execute(_make_prepared(audit_id=f"audit-{i}"), timeout_seconds=5.0)
++
++    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
++        futures = [executor.submit(run_q, i) for i in range(12)]
++        results = [f.result() for f in concurrent.futures.as_completed(futures)]
++
++    assert len(results) == 12
++    # At most pool_max (3) connections created
++    assert len(driver.connections) <= 3
++
++
++def test_acquire_timeout_exhaustion():
++    """When pool is exhausted, waiting times out with EnginePoolExhausted (503-class error)."""
++    driver = FakeDriver()
++    # pool_max=1, acquire_timeout=0.2s
++    pool = LakebasePool(
++        driver.connect,
++        pool_max=1,
++        pool_min=0,
++        acquire_timeout_seconds=0.2,
++    )
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    # Hold the single connection
++    conn1 = pool.acquire()
++    try:
++        # A query now attempts to acquire and must time out
++        with pytest.raises(EnginePoolExhausted) as exc_info:
++            adapter.execute(_make_prepared(), timeout_seconds=5.0)
++        assert "Lakebase pooled connection" in str(exc_info.value)
++    finally:
++        pool.release(conn1, success=True)
++
++
++def test_discard_after_error():
++    """A connection with an error is closed and never reused."""
++    driver = FakeDriver()
++    pool = LakebasePool(driver.connect, pool_max=2, pool_min=0)
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    # First query succeeds
++    res1 = adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    c1 = driver.connections[0]
++
++    # Second query fails
++    c1.fail_on_query = True
++    with pytest.raises(EngineError):
++        adapter.execute(_make_prepared(), timeout_seconds=5.0)
++
++    # c1 was closed and discarded
++    assert c1.closed
++
++    # Third query succeeds on a new connection
++    res3 = adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    assert len(driver.connections) == 2
++    c2 = driver.connections[1]
++    assert not c2.closed
++    assert res1.rows != res3.rows
++
++
++def test_discard_after_cancel():
++    """A connection cancelled by the client is closed and never reused."""
++    driver = FakeDriver()
++    driver.next_slow_seconds = 0.5
++    pool = LakebasePool(driver.connect, pool_max=2, pool_min=0)
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    def cancel_after_start(on_cancel):
++        time.sleep(0.05)
++        on_cancel()
++
++    cancel_fn_holder = [None]
++    def on_cancel_handle(fn):
++        cancel_fn_holder[0] = fn
++        threading.Thread(target=cancel_after_start, args=(fn,)).start()
++
++    with pytest.raises(EngineCancelled):
++        adapter.execute(_make_prepared(), timeout_seconds=5.0, on_cancel_handle=on_cancel_handle)
++
++    c1 = driver.connections[0]
++    assert c1.closed
++
++
++def test_discard_after_timeout():
++    """A connection timed out by statement timeout is closed and never reused."""
++    driver = FakeDriver()
++    pool = LakebasePool(driver.connect, pool_max=2, pool_min=0)
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    # First query succeeds
++    adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    c1 = driver.connections[0]
++
++    # Statement timeout happens on query
++    c1.timeout_on_query = True
++    with pytest.raises(EngineTimeout):
++        adapter.execute(_make_prepared(), timeout_seconds=0.1)
++
++    assert c1.closed
++
++
++def test_idle_and_lifetime_expiry():
++    """Idle connections older than max_idle_seconds, or beyond max_lifetime_seconds, are closed and replaced."""
++    driver = FakeDriver()
++    pool = LakebasePool(
++        driver.connect,
++        pool_max=2,
++        pool_min=0,
++        max_idle_seconds=0.1,
++        max_lifetime_seconds=0.2,
++    )
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    # 1. Query 1
++    adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    c1 = driver.connections[0]
++
++    # Sleep longer than max_idle_seconds
++    time.sleep(0.15)
++
++    # Query 2 triggers idle expiration of c1
++    adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    assert c1.closed
++    assert len(driver.connections) == 2
++    c2 = driver.connections[1]
++    assert not c2.closed
++
++    # Sleep longer than max_lifetime_seconds
++    time.sleep(0.25)
++    adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    assert c2.closed
++    assert len(driver.connections) == 3
++
++
++def test_dead_connection_replacement():
++    """A connection found dead on checkout is replaced transparently once."""
++    driver = FakeDriver()
++    pool = LakebasePool(driver.connect, pool_max=2, pool_min=0)
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    c1 = driver.connections[0]
++
++    # Mark c1 as dead while idle in the pool
++    c1.is_dead = True
++
++    # Next query checks out c1, detects it is dead, replaces it transparently, and succeeds
++    res = adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    assert c1.closed
++    assert len(driver.connections) == 2
++    c2 = driver.connections[1]
++    assert res.rows == [(c2.conn_id,)]
++
++
++def test_endpoint_restart_transparent_retry():
++    """After an endpoint restart, dead pooled connection is detected on setup and transparently retried."""
++    driver = FakeDriver()
++    pool = LakebasePool(driver.connect, pool_max=2, pool_min=0)
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    # Query 1 opens connection 1
++    res1 = adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    c1 = driver.connections[0]
++
++    # Endpoint restarts: c1 is severed and fails on BEGIN
++    c1.fail_on_begin = True
++
++    # Next query should transparently replace c1 and succeed without surfacing error to caller
++    res2 = adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    assert c1.closed
++    assert len(driver.connections) == 2
++    c2 = driver.connections[1]
++    assert res2.rows == [(c2.conn_id,)]
++
++
++def test_no_concurrent_sharing():
++    """No connection is ever used by two queries at the same time."""
++    driver = FakeDriver()
++    pool = LakebasePool(driver.connect, pool_max=4, pool_min=0)
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    def run_worker(idx: int):
++        return adapter.execute(_make_prepared(audit_id=f"concur-{idx}"), timeout_seconds=5.0)
++
++    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
++        futures = [executor.submit(run_worker, i) for i in range(16)]
++        for f in concurrent.futures.as_completed(futures):
++            # If any concurrent sharing happened, FakeConnection.cursor() would have raised AssertionError
++            f.result()
++
++
++def test_shutdown_closes_all():
++    """Pool shutdown / adapter close closes all open connections."""
++    driver = FakeDriver()
++    pool = LakebasePool(driver.connect, pool_max=4, pool_min=2)
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    # Pre-warmed connections
++    assert len(driver.connections) == 2
++    assert not driver.connections[0].closed
++    assert not driver.connections[1].closed
++
++    adapter.close()
++    assert driver.connections[0].closed
++    assert driver.connections[1].closed
++
++
++def test_pool_max_one_and_pool_min_zero():
++    """pool_max: 1 plus pool_min: 0 works properly."""
++    driver = FakeDriver()
++    pool = LakebasePool(driver.connect, pool_max=1, pool_min=0)
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    res1 = adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    res2 = adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    assert res1.rows == res2.rows
++    assert len(driver.connections) == 1
++
++
++def test_64_sequential_queries_use_one_connection():
++    """64 sequential queries with real psycopg2 attributes use ONE connection."""
++    driver = FakeDriver()
++    pool = LakebasePool(driver.connect, pool_max=8, pool_min=0)
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    first_res = adapter.execute(_make_prepared(audit_id="seq-0"), timeout_seconds=5.0)
++    expected_id = driver.connections[0].conn_id
++    assert first_res.rows == [(expected_id,)]
++
++    for i in range(1, 64):
++        res = adapter.execute(_make_prepared(audit_id=f"seq-{i}"), timeout_seconds=5.0)
++        assert res.rows == [(expected_id,)]
++
++    # Exactly 1 connection was created across all 64 queries
++    assert len(driver.connections) == 1
++    assert driver.connections[0].status == STATUS_READY
++    assert driver.connections[0].closed == 0
++    pool.close()
++
++
++def test_late_cancel_does_not_cancel_subsequent_query():
++    """A cancel callback called after a query completes does not cancel a subsequent query."""
++    driver = FakeDriver()
++    pool = LakebasePool(driver.connect, pool_max=1, pool_min=0)
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    captured_cancel = [None]
++    def on_cancel(fn):
++        captured_cancel[0] = fn
++
++    # Query 1 finishes cleanly
++    res1 = adapter.execute(_make_prepared(audit_id="q1"), timeout_seconds=5.0, on_cancel_handle=on_cancel)
++    expected_id = driver.connections[0].conn_id
++    assert res1.rows == [(expected_id,)]
++    assert captured_cancel[0] is not None
++
++    # Late cancel arriving for Query 1
++    captured_cancel[0]()
++
++    # The connection returned to the pool was NOT cancelled
++    assert not driver.connections[0].cancelled
++
++    # Query 2 executes on the same connection successfully
++    res2 = adapter.execute(_make_prepared(audit_id="q2"), timeout_seconds=5.0)
++    assert res2.rows == [(expected_id,)]
++    assert not driver.connections[0].cancelled
++    pool.close()
++
++
++def test_background_reaper_cleans_idle_connections():
++    """Background reaper daemon thread cleans connections idle longer than max_idle_seconds."""
++    driver = FakeDriver()
++    pool = LakebasePool(
++        driver.connect,
++        pool_max=4,
++        pool_min=0,
++        max_idle_seconds=0.1,
++    )
++    adapter = DBAPIAdapter(driver.connect, kind="lakebase", pool=pool)
++
++    adapter.execute(_make_prepared(), timeout_seconds=5.0)
++    c1 = driver.connections[0]
++    assert c1.closed == 0
++
++    # Wait for reaper to run (max_idle_seconds is 0.1s, interval is 0.05s)
++    time.sleep(0.3)
++
++    assert c1.closed != 0
++    pool.close()
++
++
++def test_minimal_dbapi_driver_sequential_queries_reuse():
++    """5 sequential queries through a minimal PEP 249 DB-API driver reuse 1 connection."""
++    class MinimalPEP249Connection:
++        def __init__(self, idx: int) -> None:
++            self.conn_id = idx
++            self.in_transaction = False
++            self.closed_flag = False
++
++        def cursor(self):
++            if self.closed_flag:
++                raise Exception("Cannot open cursor on closed connection")
++            self.in_transaction = True
++            return MinimalPEP249Cursor(self)
++
++        def commit(self):
++            if not self.in_transaction:
++                raise Exception("Cannot commit without an active transaction")
++            self.in_transaction = False
++
++        def rollback(self):
++            if not self.in_transaction:
++                raise Exception("Cannot rollback without an active transaction")
++            self.in_transaction = False
++
++        def close(self):
++            self.closed_flag = True
++
++        @property
++        def closed(self) -> bool:
++            return self.closed_flag
++
++    class MinimalPEP249Cursor:
++        def __init__(self, conn: MinimalPEP249Connection) -> None:
++            self.conn = conn
++            self.description = [("id", 23, None, None, None, None, None)]
++
++        def execute(self, sql: str, params: tuple = ()):
++            if self.conn.closed_flag:
++                raise Exception("Cursor execute on closed connection")
++            if "FAIL" in sql:
++                raise Exception("Query failed")
++
++        def fetchmany(self, size: int):
++            return [(self.conn.conn_id,)]
++
++        def close(self):
++            pass
++
++    created_conns: list[MinimalPEP249Connection] = []
++
++    def minimal_connect():
++        c = MinimalPEP249Connection(len(created_conns) + 1)
++        created_conns.append(c)
++        return c
++
++    pool = LakebasePool(minimal_connect, pool_max=5, pool_min=0)
++    adapter = DBAPIAdapter(minimal_connect, kind="lakebase", pool=pool)
++
++    # 5 sequential queries must use exactly ONE connection
++    for i in range(5):
++        res = adapter.execute(_make_prepared(audit_id=f"min-{i}"), timeout_seconds=5.0)
++        assert res.rows == [(1,)]
++
++    assert len(created_conns) == 1
++    assert not created_conns[0].closed_flag
++
++    # An error query discards the connection
++    fail_prep = _make_prepared(sql="SELECT FAIL", audit_id="fail-query")
++    with pytest.raises(EngineError):
++        adapter.execute(fail_prep, timeout_seconds=5.0)
++
++    assert created_conns[0].closed_flag
++
++    # Next query opens a fresh connection and succeeds
++    res_next = adapter.execute(_make_prepared(audit_id="min-next"), timeout_seconds=5.0)
++    assert res_next.rows == [(2,)]
++    assert len(created_conns) == 2
++    pool.close()
+diff --git a/tests/serving/test_server_config.py b/tests/serving/test_server_config.py
+index 7e92930..c12cfc8 100644
+--- a/tests/serving/test_server_config.py
++++ b/tests/serving/test_server_config.py
+@@ -472,3 +472,120 @@ def test_static_vs_discovery_exclusivity(
+     }
+     with pytest.raises(ServerConfigError, match="got both"):
+         ServerConfig.from_dict(d)
++
++
++def test_lakebase_pool_config_validation(
++    valid_jwks_file,
++    valid_placement_files,
++    valid_secrets_file,
++    valid_password_file,
++):
++    pf, sf = valid_placement_files
++    d = _build_full_valid_dict(
++        valid_jwks_file, pf, sf, valid_secrets_file, valid_password_file
++    )
++    # Valid pool config
++    d["connections"]["lb"] = {
++        "kind": "lakebase",
++        "dsn_env": "LAKEBASE_DSN",
++        "pool_max": 16,
++        "pool_min": 2,
++        "connect_timeout_seconds": 5.0,
++        "max_idle_seconds": 120.0,
++        "max_lifetime_seconds": 600.0,
++        "acquire_timeout_seconds": 3.0,
++    }
++    cfg = ServerConfig.from_dict(d)
++    lb_cfg = cfg.connections["lb"]
++    assert lb_cfg.pool_max == 16
++    assert lb_cfg.pool_min == 2
++    assert lb_cfg.connect_timeout_seconds == 5.0
++    assert lb_cfg.max_idle_seconds == 120.0
++    assert lb_cfg.max_lifetime_seconds == 600.0
++    assert lb_cfg.acquire_timeout_seconds == 3.0
++
++    # pool_max out of range (>64)
++    d["connections"]["lb"]["pool_max"] = 65
++    with pytest.raises(ServerConfigError, match="'pool_max' must be an integer between 1 and 64"):
++        ServerConfig.from_dict(d)
++
++    # pool_min > pool_max
++    d["connections"]["lb"]["pool_max"] = 4
++    d["connections"]["lb"]["pool_min"] = 5
++    with pytest.raises(ServerConfigError, match="'pool_min' must be an integer between 0 and pool_max"):
++        ServerConfig.from_dict(d)
++
++    # Unknown key refused
++    d["connections"]["lb"]["pool_min"] = 1
++    d["connections"]["lb"]["invalid_key"] = "bad"
++    with pytest.raises(ServerConfigError, match="Unknown key"):
++        ServerConfig.from_dict(d)
++    del d["connections"]["lb"]["invalid_key"]
++
++    # Float config keys reject booleans and strings
++    d["connections"]["lb"]["connect_timeout_seconds"] = "10"
++    with pytest.raises(ServerConfigError, match="must be a positive number"):
++        ServerConfig.from_dict(d)
++
++    d["connections"]["lb"]["connect_timeout_seconds"] = True
++    with pytest.raises(ServerConfigError, match="must be a positive number"):
++        ServerConfig.from_dict(d)
++
++    d["connections"]["lb"]["connect_timeout_seconds"] = 10.0
++    d["connections"]["lb"]["max_idle_seconds"] = False
++    with pytest.raises(ServerConfigError, match="must be a positive number"):
++        ServerConfig.from_dict(d)
++
++
++def test_duckdb_temp_directory_config_validation(
++    tmp_path,
++    valid_jwks_file,
++    valid_placement_files,
++    valid_secrets_file,
++    valid_password_file,
++):
++    pf, sf = valid_placement_files
++    d = _build_full_valid_dict(
++        valid_jwks_file, pf, sf, valid_secrets_file, valid_password_file
++    )
++    temp_dir = tmp_path / "duck_temp"
++    temp_dir.mkdir()
++    allowed_data_dir = tmp_path / "data"
++    allowed_data_dir.mkdir()
++
++    # Valid temp_directory and max_temp_directory_size
++    d["connections"]["duck"] = {
++        "kind": "duckdb",
++        "path": str(allowed_data_dir / "app.duckdb"),
++        "allowed_directories": [str(allowed_data_dir) + "/"],
++        "temp_directory": str(temp_dir),
++        "max_temp_directory_size": "500MB",
++    }
++    cfg = ServerConfig.from_dict(d)
++    duck_cfg = cfg.connections["duck"]
++    assert duck_cfg.temp_directory == str(temp_dir)
++    assert duck_cfg.max_temp_directory_size == "500MB"
++
++    # temp_directory inside allowed_directories is rejected
++    inside_dir = allowed_data_dir / "spill"
++    inside_dir.mkdir()
++    d["connections"]["duck"]["temp_directory"] = str(inside_dir)
++    with pytest.raises(ServerConfigError, match="must not be inside"):
++        ServerConfig.from_dict(d)
++
++    # temp_directory inside data directory is rejected even when allowed_directories is empty
++    d["connections"]["duck"]["allowed_directories"] = []
++    d["connections"]["duck"]["temp_directory"] = str(inside_dir)
++    with pytest.raises(ServerConfigError, match="must not be inside data directory"):
++        ServerConfig.from_dict(d)
++
++    # Relative temp_directory rejected
++    d["connections"]["duck"]["temp_directory"] = "relative/temp"
++    with pytest.raises(ServerConfigError, match="must be an absolute path"):
++        ServerConfig.from_dict(d)
++
++    # Unknown key refused
++    d["connections"]["duck"]["temp_directory"] = str(temp_dir)
++    d["connections"]["duck"]["unknown_duck_key"] = "bad"
++    with pytest.raises(ServerConfigError, match="Unknown key"):
++        ServerConfig.from_dict(d)
