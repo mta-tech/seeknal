@@ -10,6 +10,7 @@ from typing import Any
 
 import uvicorn
 
+from seeknal.serving.buildinfo import format_build_info, get_build_info
 from seeknal.serving.server.app import build_server
 from seeknal.serving.server.config import ServerConfig, ServerConfigError
 
@@ -25,7 +26,7 @@ def main(
     parser.add_argument(
         "--config",
         "-c",
-        required=True,
+        default=None,
         help="Path to server YAML configuration file",
     )
     parser.add_argument(
@@ -33,14 +34,30 @@ def main(
         action="store_true",
         help="Validate configuration, grant keys, environment variables, and runtime wiring without starting the server",
     )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Print build and runtime version metadata and exit",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Format --version output as single-line JSON",
+    )
 
     if argv is None:
         argv = sys.argv[1:]
 
     try:
         args = parser.parse_args(argv)
+        if not args.version and not args.config:
+            parser.error("the following arguments are required: --config/-c")
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 2
+
+    if args.version:
+        print(format_build_info(get_build_info(), as_json=args.json))
+        return 0
 
     if args.check:
         try:

@@ -2,6 +2,11 @@
 .github
 .claude
 .worktrees
+.seeknal
+.env
+.env.*
+*.pem
+*.key
 tests
 docs/*
 !docs/cli
@@ -11,5 +16,11 @@ dist
 *.egg-info
 __pycache__
 .pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
 .venv
 target
+!docker/serving-image
+!docker/serving-image/**

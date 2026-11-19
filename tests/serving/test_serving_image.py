@@ -99,9 +99,6 @@ def test_import_closure():
     reqs_path = repo_root / "docker" / "serving-requirements.txt"
     assert reqs_path.is_file(), f"Missing {reqs_path}"
 
-    # Ensure docs/cli exists so hatchling build doesn't fail if triggered
-    (repo_root / "docs" / "cli").mkdir(parents=True, exist_ok=True)
-
     proc = subprocess.run(
         [sys.executable, "-c", SUBPROCESS_CLOSURE_SCRIPT],
         capture_output=True,
@@ -247,6 +244,20 @@ def test_serving_requirements_file():
             norm_name not in forbidden_normalized
         ), f"Forbidden package listed in serving-requirements.txt: {name}"
 
+    # Verify [dependency-groups].serving in pyproject.toml matches serving-requirements.txt
+    pyproject_path = repo_root / "pyproject.toml"
+    with open(pyproject_path, "rb") as f:
+        pyproject_data = tomllib.load(f)
+    serving_group = pyproject_data.get("dependency-groups", {}).get("serving", [])
+    assert serving_group, "Missing [dependency-groups].serving in pyproject.toml"
+    group_names = {
+        normalize_pep503(packaging.requirements.Requirement(req).name)
+        for req in serving_group
+    }
+    assert group_names == {normalize_pep503(n) for n in listed_names}, (
+        "[dependency-groups].serving in pyproject.toml must match docker/serving-requirements.txt"
+    )
+
 
 def test_dockerfile_static_checks():
     """Verify static properties of docker/Dockerfile.serving."""
@@ -302,6 +313,8 @@ def test_dockerfile_static_checks():
         "README.md",
         "LICENSE",
         "docker/serving-requirements.txt",
+        "docker/serving-image/",
+        "docker/serving-image",
         "src/",
         "src",
     }
@@ -316,10 +329,17 @@ def test_dockerfile_static_checks():
                 src in allowed_sources
             ), f"COPY source '{src}' is not in allowed sources {allowed_sources}"
 
-    # 5. Install uses -c /tmp/constraints.txt
-    assert "-c /tmp/constraints.txt" in content, (
-        "Install instruction must use '-c /tmp/constraints.txt'"
-    )
+    # 5. Lock-only hash-verified install sequence (no floating constraints)
+    assert (
+        "uv export --locked --only-group serving --no-emit-project --format requirements-txt -o /tmp/requirements.txt"
+        in content
+    ), "Dockerfile must export locked serving requirements with hashes"
+    assert (
+        "uv pip install --system --require-hashes -r /tmp/requirements.txt" in content
+    ), "Dockerfile must install serving requirements with --require-hashes"
+    assert (
+        "uv pip install --system --no-deps ." in content
+    ), "Dockerfile must install seeknal with --no-deps"
 
     # 6. No ENV key matches (?i)(secret|token|password|passwd|key)
     env_key_pattern = re.compile(

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "duckdb_version": "2.0.0",
+  "extension_directory": "/opt/seeknal/duckdb_extensions",
+  "extensions": [
+    {
+      "platform": "linux_amd64",
+      "name": "httpfs",
+      "source_url": "https://extensions.duckdb.org/v2.0.0/linux_amd64/httpfs.duckdb_extension.gz",
+      "sha256": "ee6c7d7e60a5da1b6f6bf6156b4298b55ddce0496a5bfe628bd6ab6d47eb8e3e",
+      "gz_sha256": "ee6c7d7e60a5da1b6f6bf6156b4298b55ddce0496a5bfe628bd6ab6d47eb8e3e",
+      "raw_sha256": "77e6c429aa04f25da7962572f12b19113e0ce46080fa1365ad66017aadcdb68d",
+      "decompressed_sha256": "77e6c429aa04f25da7962572f12b19113e0ce46080fa1365ad66017aadcdb68d",
+      "gz_bytes": 8657469,
+      "install_relpath": "v2.0.0/linux_amd64/httpfs.duckdb_extension"
+    },
+    {
+      "platform": "linux_amd64",
+      "name": "iceberg",
+      "source_url": "https://extensions.duckdb.org/v2.0.0/linux_amd64/iceberg.duckdb_extension.gz",
+      "sha256": "ddc8e8f4af60e6e3accffa1b38043c328c810db91215d6299f29cc933655bf1a",
+      "gz_sha256": "ddc8e8f4af60e6e3accffa1b38043c328c810db91215d6299f29cc933655bf1a",
+      "raw_sha256": "b93676e544e5c6843915fb3392e3b3c35859c065fa6ace7a26cb46ca4394e56d",
+      "decompressed_sha256": "b93676e544e5c6843915fb3392e3b3c35859c065fa6ace7a26cb46ca4394e56d",
+      "gz_bytes": 17879202,
+      "install_relpath": "v2.0.0/linux_amd64/iceberg.duckdb_extension"
+    },
+    {
+      "platform": "linux_arm64",
+      "name": "httpfs",
+      "source_url": "https://extensions.duckdb.org/v2.0.0/linux_arm64/httpfs.duckdb_extension.gz",
+      "sha256": "f524888fc7d74cc0c6c4a8f7ed5beedac5b12e71cb426503f882c72ce6afbd43",
+      "gz_sha256": "f524888fc7d74cc0c6c4a8f7ed5beedac5b12e71cb426503f882c72ce6afbd43",
+      "raw_sha256": "53f7aea1a0448ea62ef9b63f95da37c5766070084f14f14110e275e76382e7b2",
+      "decompressed_sha256": "53f7aea1a0448ea62ef9b63f95da37c5766070084f14f14110e275e76382e7b2",
+      "gz_bytes": 8620240,
+      "install_relpath": "v2.0.0/linux_arm64/httpfs.duckdb_extension"
+    },
+    {
+      "platform": "linux_arm64",
+      "name": "iceberg",
+      "source_url": "https://extensions.duckdb.org/v2.0.0/linux_arm64/iceberg.duckdb_extension.gz",
+      "sha256": "dc5fc010b24a044ec2dc34294d8d251f481560cfbd5819c22f1fb1b6cc0032ae",
+      "gz_sha256": "dc5fc010b24a044ec2dc34294d8d251f481560cfbd5819c22f1fb1b6cc0032ae",
+      "raw_sha256": "5616c30201099564326826d223aeea19b59f15744a981b074a906fb2b9dd4f44",
+      "decompressed_sha256": "5616c30201099564326826d223aeea19b59f15744a981b074a906fb2b9dd4f44",
+      "gz_bytes": 16161197,
+      "install_relpath": "v2.0.0/linux_arm64/iceberg.duckdb_extension"
+    }
+  ]
+}
