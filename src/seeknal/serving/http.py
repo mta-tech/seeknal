@@ -52,6 +52,7 @@ from seeknal.serving.grant_token import (
     verify_cancel_token,
     verify_grant_token,
 )
+from seeknal.serving.metrics import MetricsRegistry
 from seeknal.serving.router import RoutingError
 from seeknal.serving.service import ServingPipeline
 
@@ -504,22 +505,36 @@ def create_app(
     audit_on_failure: str | None = None,
     audit_failure_callback: Callable[[], Any] | None = None,
     on_row_cap: str = "truncate",
+    metrics: MetricsRegistry | None = None,
 ) -> Starlette:
     """Create a Starlette serving application."""
     if replay_cache is None:
         replay_cache = GrantReplayCache()
     running_queries = RunningQueries()
 
+    if metrics is not None and adapters:
+        metrics.register_adapters(adapters)
+
     effective_audit_on_failure = (
         audit_on_failure
         if audit_on_failure is not None
         else getattr(audit_sink, "on_failure", "refuse")
     )
-    effective_failure_cb = (
+    base_failure_cb = (
         audit_failure_callback
         if audit_failure_callback is not None
         else getattr(audit_sink, "on_write_failure", None)
     )
+
+    def _on_audit_write_failure() -> None:
+        if metrics is not None:
+            metrics.record_audit_write_failure()
+        if base_failure_cb is not None:
+            try:
+                base_failure_cb()
+            except Exception:
+                pass
+
     is_structured_sink = isinstance(audit_sink, (AuditSink, AuditManager)) or (
         audit_sink is not None and hasattr(audit_sink, "write_record")
     )
@@ -528,7 +543,15 @@ def create_app(
     )
 
     async def healthz(request: Request) -> Response:
-        return JSONResponse({"status": "ok"})
+        start = time.perf_counter()
+        resp = JSONResponse({"status": "ok"})
+        if metrics is not None:
+            metrics.record_request(
+                "/healthz",
+                status=200,
+                duration_seconds=time.perf_counter() - start,
+            )
+        return resp
 
     def _finish(
         response: Response,
@@ -579,7 +602,7 @@ def create_app(
                         audit_sink,
                         record,
                         on_failure=effective_audit_on_failure,
-                        on_write_failure=effective_failure_cb,
+                        on_write_failure=_on_audit_write_failure,
                     )
                 except (AuditWriteError, AuditUnavailableError) as exc:
                     logger.error(
@@ -599,6 +622,14 @@ def create_app(
                         binding=binding,
                         token=log_token,
                     )
+                    if metrics is not None:
+                        metrics.record_request(
+                            route,
+                            status=503,
+                            duration_seconds=elapsed_ms / 1000.0,
+                            engine=engine,
+                            error_code="audit_unavailable",
+                        )
                     return _error_response(
                         "audit_unavailable",
                         audit_id=audit_id,
@@ -610,11 +641,7 @@ def create_app(
                 try:
                     audit_sink(record.to_dict())
                 except Exception as exc:
-                    if effective_failure_cb is not None:
-                        try:
-                            effective_failure_cb()
-                        except Exception:
-                            pass
+                    _on_audit_write_failure()
                     if effective_audit_on_failure == "log":
                         logger.error(
                             "Audit write failed (on_failure=log, route=%s, audit_id=%s, status=%d): %s",
@@ -641,6 +668,14 @@ def create_app(
                             binding=binding,
                             token=log_token,
                         )
+                        if metrics is not None:
+                            metrics.record_request(
+                                route,
+                                status=503,
+                                duration_seconds=elapsed_ms / 1000.0,
+                                engine=engine,
+                                error_code="audit_unavailable",
+                            )
                         return _error_response(
                             "audit_unavailable",
                             audit_id=audit_id,
@@ -660,6 +695,15 @@ def create_app(
                 row_count=row_count if row_count is not None else "-",
                 binding=binding,
                 token=log_token,
+            )
+        if metrics is not None:
+            err_code = (code or "internal_error") if status >= 400 else None
+            metrics.record_request(
+                route,
+                status=status,
+                duration_seconds=elapsed_ms / 1000.0,
+                engine=engine,
+                error_code=err_code,
             )
         return response
 
@@ -753,6 +797,8 @@ def create_app(
         # 2. Check Authorization header
         auth_header = request.headers.get("authorization")
         if not auth_header:
+            if metrics is not None:
+                metrics.record_grant_rejected("malformed")
             return _finish(
                 _error_response("grant_invalid"),
                 route=route,
@@ -763,6 +809,8 @@ def create_app(
 
         parts = auth_header.split()
         if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+            if metrics is not None:
+                metrics.record_grant_rejected("malformed")
             return _finish(
                 _error_response("grant_invalid"),
                 route=route,
@@ -920,6 +968,8 @@ def create_app(
         )
 
         if isinstance(exc, GrantTokenError):
+            if metrics is not None:
+                metrics.record_grant_rejected(exc)
             code = getattr(exc, "code", None) or "grant_invalid"
             audit_id = getattr(exc, "audit_id", None) or v_jti
             subject = getattr(exc, "subject", None) or v_sub
@@ -1198,6 +1248,8 @@ def create_app(
         )
 
         if prepared.expires_at is None:
+            if metrics is not None:
+                metrics.record_grant_rejected("invalid_claims")
             return _finish(
                 _error_response(
                     "grant_invalid",
@@ -1228,6 +1280,8 @@ def create_app(
         try:
             replay_cache.check_and_record(prepared.audit_id, prepared.expires_at)
         except GrantReplayedError:
+            if metrics is not None:
+                metrics.record_grant_rejected("replayed")
             return _finish(
                 _error_response(
                     "grant_replayed",
@@ -1333,11 +1387,7 @@ def create_app(
                 audit_sink(pre_record.to_dict())
                 callable_audit_done = True
             except Exception as exc:
-                if effective_failure_cb is not None:
-                    try:
-                        effective_failure_cb()
-                    except Exception:
-                        pass
+                _on_audit_write_failure()
                 if effective_audit_on_failure == "log":
                     logger.error(
                         "Audit write failed (on_failure=log, route=/v1/query, audit_id=%s, status=200): %s",
@@ -1346,6 +1396,7 @@ def create_app(
                     )
                     callable_audit_done = True
                 else:
+                    elapsed_audit_err = (time.perf_counter() - req_start) * 1000.0
                     logger.error(
                         "engine=%s code=%s error=%s audit_id=%s",
                         prepared.engine_kind,
@@ -1359,10 +1410,18 @@ def create_app(
                         engine=prepared.engine,
                         rule=prepared.rule,
                         status=503,
-                        elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                        elapsed_ms=elapsed_audit_err,
                         binding=prepared.binding,
                         token=token,
                     )
+                    if metrics is not None:
+                        metrics.record_request(
+                            "/v1/query",
+                            status=503,
+                            duration_seconds=elapsed_audit_err / 1000.0,
+                            engine=prepared.engine,
+                            error_code="audit_unavailable",
+                        )
                     return _error_response(
                         "audit_unavailable",
                         audit_id=prepared.audit_id,
@@ -1854,6 +1913,8 @@ def create_app(
         req_start = time.perf_counter()
         auth_header = request.headers.get("authorization")
         if not auth_header:
+            if metrics is not None:
+                metrics.record_grant_rejected("malformed")
             return _finish(
                 _error_response("grant_invalid"),
                 route="/v1/cancel",
@@ -1864,6 +1925,8 @@ def create_app(
 
         parts = auth_header.split()
         if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+            if metrics is not None:
+                metrics.record_grant_rejected("malformed")
             return _finish(
                 _error_response("grant_invalid"),
                 route="/v1/cancel",
@@ -1912,6 +1975,8 @@ def create_app(
                 issuer=pipeline.issuer,
             )
         except GrantTokenError as exc:
+            if metrics is not None:
+                metrics.record_grant_rejected(exc)
             code = getattr(exc, "code", None) or "grant_invalid"
             audit_id = getattr(exc, "audit_id", None)
             subject = getattr(exc, "subject", None)

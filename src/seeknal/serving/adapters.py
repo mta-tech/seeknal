@@ -447,7 +447,22 @@ class DuckDBAdapter:
         self._max_concurrent_cursors = bound
         self._slot_semaphore = threading.BoundedSemaphore(bound)
         self._active_slots = 0
+        self._waiting_requests = 0
+        self._seen_file_inst_id: int | None = None
+        self._file_generation = 0
         self._slots_lock = threading.Lock()
+
+    def _note_cursor_instance(self, cur: Any) -> None:
+        inst = getattr(cur, "_instance", None)
+        if inst is None or getattr(inst, "is_closed", False):
+            return
+        inst_id = id(inst)
+        if self._seen_file_inst_id == inst_id:
+            return
+        with self._slots_lock:
+            if self._seen_file_inst_id != inst_id:
+                self._seen_file_inst_id = inst_id
+                self._file_generation += 1
 
     def _get_cursor(self) -> Any:
         if self._config is not None:
@@ -463,7 +478,7 @@ class DuckDBAdapter:
                     standin_catalogs=self._standin_catalogs,
                     probe_on_reuse=self._probe_on_reuse,
                 )
-            return holder.get_cursor(
+            cur = holder.get_cursor(
                 self._config.path,
                 allowed_directories=self._config.allowed_directories,
                 memory_limit=self._config.memory_limit,
@@ -473,9 +488,176 @@ class DuckDBAdapter:
                     self._config, "max_temp_directory_size", None
                 ),
             )
+            self._note_cursor_instance(cur)
+            return cur
         if self._connect_fn is not None:
             return self._connect_fn()
         raise EngineError("DuckDBAdapter has neither config nor connect function")
+
+    def _extract_holder_generation(self, holder: Any) -> int:
+        if getattr(holder, "_closed", False):
+            return 0
+        configured_map = getattr(holder, "_configured_to_dev_ino", {})
+        instances_map = getattr(holder, "_instances_by_dev_ino", {})
+
+        if self._config is not None:
+            profile = getattr(self._config, "profile", "local_file")
+            if profile == "iceberg_direct":
+                cfg_key = f"iceberg_direct:{id(self._config)}"
+                curr_key = configured_map.get(cfg_key)
+                if curr_key is not None:
+                    curr_inst = instances_map.get(curr_key)
+                    if curr_inst is not None and not getattr(curr_inst, "is_closed", False):
+                        if (
+                            isinstance(curr_key, tuple)
+                            and len(curr_key) >= 2
+                            and curr_key[0] == -1
+                        ):
+                            return int(curr_key[1])
+                        return max(1, int(getattr(holder, "_generation_seq", 1)))
+                return 0
+
+            path = getattr(self._config, "path", None)
+            curr_key = configured_map.get(path) if path is not None else None
+            curr_inst = instances_map.get(curr_key) if curr_key is not None else None
+            if curr_inst is not None and not getattr(curr_inst, "is_closed", False):
+                inst_id = id(curr_inst)
+                with self._slots_lock:
+                    if self._seen_file_inst_id != inst_id:
+                        self._seen_file_inst_id = inst_id
+                        self._file_generation += 1
+                    return self._file_generation
+            return 0
+
+        gen_seq = int(getattr(holder, "_generation_seq", 0))
+        if gen_seq > 0:
+            return gen_seq
+        return sum(
+            1
+            for inst in instances_map.values()
+            if not getattr(inst, "is_closed", False)
+        )
+
+    def _read_current_generation(self) -> int:
+        from seeknal.serving.duckdb_policy import DuckDBHolder
+
+        holder = self._holder
+        if holder is None and self._config is not None:
+            holder = DuckDBHolder.get_holder()
+        if holder is None:
+            return 0
+        lock = getattr(holder, "_lock", None)
+        if lock is not None:
+            with lock:
+                return self._extract_holder_generation(holder)
+        return self._extract_holder_generation(holder)
+
+    def stats(self) -> dict[str, int]:
+        """Return read-only concurrency and generation statistics without opening a connection."""
+        with self._slots_lock:
+            waiting = self._waiting_requests
+            active_slots = self._active_slots
+        current_generation = self._read_current_generation()
+        return {
+            "queue_depth": waiting,
+            "in_flight_cursors": active_slots,
+            "generation": current_generation,
+            "max_concurrent_cursors": self._max_concurrent_cursors,
+        }
+
+    def check_health(self, timeout_seconds: float = 2.0) -> bool:
+        """Non-destructively probe DuckDB with SELECT 1 under bounded timeout."""
+        try:
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or math.isnan(timeout_seconds)
+                or math.isinf(timeout_seconds)
+                or timeout_seconds <= 0
+            ):
+                return False
+
+            deadline = time.perf_counter() + float(timeout_seconds)
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return False
+
+            if not self._slot_semaphore.acquire(timeout=remaining):
+                return False
+
+            cur: Any = None
+            timer: threading.Timer | None = None
+            try:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    return False
+
+                if self._config is not None:
+                    if self._holder is not None and getattr(self._holder, "_closed", False):
+                        return False
+                    profile = getattr(self._config, "profile", "local_file")
+                    cfg_path = getattr(self._config, "path", None)
+                    if (
+                        profile != "iceberg_direct"
+                        and isinstance(cfg_path, str)
+                        and (cfg_path == ":memory:" or cfg_path.startswith(":memory:"))
+                    ):
+                        cur = duckdb.connect(":memory:")
+                    else:
+                        cur = self._get_cursor()
+                elif self._connect_fn is not None:
+                    raw = self._connect_fn()
+                    if raw is None:
+                        return False
+                    if isinstance(raw, duckdb.DuckDBPyConnection):
+                        cur = raw.cursor()
+                    else:
+                        cur = raw
+                else:
+                    return False
+
+                if cur is None or not callable(getattr(cur, "execute", None)):
+                    return False
+
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    return False
+
+                timed_out = threading.Event()
+
+                def _interrupt() -> None:
+                    timed_out.set()
+                    try:
+                        cur.interrupt()
+                    except Exception:
+                        pass
+
+                timer = threading.Timer(remaining, _interrupt)
+                timer.daemon = True
+                timer.start()
+
+                cur.execute("SELECT 1")
+                if timed_out.is_set():
+                    return False
+                try:
+                    cur.fetchone()
+                except Exception:
+                    pass
+                return not timed_out.is_set()
+            finally:
+                if timer is not None:
+                    try:
+                        timer.cancel()
+                    except Exception:
+                        pass
+                if cur is not None and callable(getattr(cur, "close", None)):
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+                self._slot_semaphore.release()
+        except Exception:
+            return False
 
     def _connect(self) -> Any:
         return self._get_cursor()
@@ -530,34 +712,66 @@ class DuckDBAdapter:
         if on_cancel_handle is not None:
             on_cancel_handle(req_state.cancel)
 
-        acquired = False
-        while not acquired:
-            pre_outcome = req_state.check_or_expire(deadline)
-            if pre_outcome == "cancel":
-                logger.error(
-                    "engine=%s error=%s audit_id=%s",
-                    "duckdb",
-                    "EngineCancelled",
-                    prepared.audit_id,
-                )
-                raise EngineCancelled("Engine query execution cancelled")
-            if pre_outcome == "timeout":
-                logger.warning(
-                    "engine=%s error=%s audit_id=%s",
-                    "duckdb",
-                    "EngineTimeout",
-                    prepared.audit_id,
-                )
-                raise EngineTimeout("Engine query timed out")
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
-                continue
-            acquired = self._slot_semaphore.acquire(
-                timeout=min(remaining, _DUCKDB_QUEUE_POLL_SECONDS)
+        pre_fast = req_state.check_or_expire(deadline)
+        if pre_fast == "cancel":
+            logger.error(
+                "engine=%s error=%s audit_id=%s",
+                "duckdb",
+                "EngineCancelled",
+                prepared.audit_id,
             )
-            if acquired:
-                with self._slots_lock:
-                    self._active_slots += 1
+            raise EngineCancelled("Engine query execution cancelled")
+        if pre_fast == "timeout":
+            logger.warning(
+                "engine=%s error=%s audit_id=%s",
+                "duckdb",
+                "EngineTimeout",
+                prepared.audit_id,
+            )
+            raise EngineTimeout("Engine query timed out")
+
+        acquired = self._slot_semaphore.acquire(blocking=False)
+        if acquired:
+            with self._slots_lock:
+                self._active_slots += 1
+        else:
+            decremented_waiting = False
+            with self._slots_lock:
+                self._waiting_requests += 1
+            try:
+                while not acquired:
+                    pre_outcome = req_state.check_or_expire(deadline)
+                    if pre_outcome == "cancel":
+                        logger.error(
+                            "engine=%s error=%s audit_id=%s",
+                            "duckdb",
+                            "EngineCancelled",
+                            prepared.audit_id,
+                        )
+                        raise EngineCancelled("Engine query execution cancelled")
+                    if pre_outcome == "timeout":
+                        logger.warning(
+                            "engine=%s error=%s audit_id=%s",
+                            "duckdb",
+                            "EngineTimeout",
+                            prepared.audit_id,
+                        )
+                        raise EngineTimeout("Engine query timed out")
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        continue
+                    acquired = self._slot_semaphore.acquire(
+                        timeout=min(remaining, _DUCKDB_QUEUE_POLL_SECONDS)
+                    )
+                    if acquired:
+                        with self._slots_lock:
+                            self._active_slots += 1
+                            self._waiting_requests -= 1
+                            decremented_waiting = True
+            finally:
+                if not decremented_waiting:
+                    with self._slots_lock:
+                        self._waiting_requests -= 1
 
         timer: threading.Timer | None = None
         timer_start_attempted = False
@@ -1156,6 +1370,16 @@ class LakebasePool:
         for c in to_close:
             self._close_conn(c)
 
+    def stats(self) -> dict[str, int]:
+        """Return read-only connection pool counts."""
+        with self._lock:
+            return {
+                "in_use": len(self._in_use),
+                "idle": len(self._idle),
+                "total": self._total_count,
+                "pool_max": self._pool_max,
+            }
+
 
 class DBAPIAdapter:
     """Adapter for DB-API 2.0 drivers (pymysql, psycopg2) for StarRocks, Lakebase, and Cube."""
@@ -1172,6 +1396,17 @@ class DBAPIAdapter:
         self._kind = kind
         self._before_connect = before_connect
         self._pool = pool
+
+    @property
+    def pool(self) -> LakebasePool | None:
+        """Return the underlying Lakebase connection pool, if configured."""
+        return self._pool
+
+    def pool_stats(self) -> dict[str, int] | None:
+        """Return read-only Lakebase connection pool counts, or None when unpooled."""
+        if self._pool is None:
+            return None
+        return self._pool.stats()
 
     def close(self) -> None:
         if self._pool is not None:

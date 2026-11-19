@@ -26,6 +26,7 @@ from seeknal.serving.compilation_cache import (
 )
 from seeknal.serving.discovery.config import DiscoveryConfig
 from seeknal.serving.grant_token import _load_public_key
+from seeknal.serving.ops import OpsConfig
 from seeknal.serving.placement import Placement, PlacementError
 
 
@@ -461,6 +462,7 @@ class ServerConfig:
     replay_cache_max_entries: int = 100_000
     compilation_cache_max_entries: int = DEFAULT_COMPILATION_CACHE_MAX_ENTRIES
     audit: AuditConfig | None = None
+    ops: OpsConfig | None = None
 
     def __post_init__(self) -> None:
         validate_compilation_cache_max_entries(
@@ -469,6 +471,8 @@ class ServerConfig:
         )
         if self.audit is not None and not isinstance(self.audit, AuditConfig):
             raise ServerConfigError("'audit' must be an AuditConfig instance or None")
+        if self.ops is not None and not isinstance(self.ops, OpsConfig):
+            raise ServerConfigError("'ops' must be an OpsConfig instance or None")
 
     def load_grant_keys(self) -> dict[str, str]:
         """Load and return parsed PEM public keys."""
@@ -526,6 +530,10 @@ class ServerConfig:
                     referenced.append(eng.token_env)
                 if eng.api_secret_env:
                     referenced.append(eng.api_secret_env)
+
+        # Ops config
+        if self.ops is not None and self.ops.auth_token_env:
+            referenced.append(self.ops.auth_token_env)
 
         return referenced
 
@@ -637,6 +645,7 @@ class ServerConfig:
             "replay_cache_max_entries",
             "compilation_cache_max_entries",
             "audit",
+            "ops",
         }
         unknown_top = set(d.keys()) - allowed_top
         if unknown_top:
@@ -1880,6 +1889,13 @@ class ServerConfig:
         else:
             audit_cfg = AuditConfig.from_dict(audit_raw, error_cls=ServerConfigError)
 
+        # 17. ops
+        ops_raw = d.get("ops")
+        if ops_raw is None:
+            ops_cfg = None
+        else:
+            ops_cfg = OpsConfig.from_dict(ops_raw, error_cls=ServerConfigError)
+
         server_config = cls(
             listen=listen_cfg,
             tls=tls_cfg,
@@ -1897,6 +1913,7 @@ class ServerConfig:
             replay_cache_max_entries=replay_cache_max_entries,
             compilation_cache_max_entries=compilation_cache_max_entries,
             audit=audit_cfg,
+            ops=ops_cfg,
         )
 
         if load_keys:

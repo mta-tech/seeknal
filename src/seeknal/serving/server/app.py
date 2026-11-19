@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import sys
+import time
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -36,6 +37,12 @@ from seeknal.serving.discovery import PlacementRefresher, discover
 from seeknal.serving.discovery.build import DiscoveryResult
 from seeknal.serving.duckdb_policy import DuckDBHolder, connect_hardened
 from seeknal.serving.http import GrantReplayCache, create_app
+from seeknal.serving.metrics import MetricsRegistry
+from seeknal.serving.ops import (
+    ReadinessProbe,
+    build_public_extra_routes,
+    create_ops_app,
+)
 from seeknal.serving.placement import Placement
 from seeknal.serving.server.config import (
     AuditStartupError,
@@ -105,6 +112,8 @@ class ServerHandle:
     refresher: PlacementRefresher | None
     adapters: dict[str, EngineAdapter] = field(default_factory=dict)
     audit_sink: AuditSink | None = None
+    ops_app: Starlette | None = None
+    metrics: MetricsRegistry | None = None
 
     def __iter__(self):
         yield self.app
@@ -119,6 +128,7 @@ def build_server(
     connect_factories: Mapping[str, Any] | None = None,
     discover_fn: Callable[[], DiscoveryResult] | None = None,
     audit_failure_callback: Callable[[], Any] | None = None,
+    readiness_clock: Callable[[], float] | None = None,
 ) -> ServerHandle:
     """Build a complete Seeknal Serving server handle from configuration."""
     # 1. Resolve configuration
@@ -313,19 +323,23 @@ def build_server(
             else:
                 adapters[eng_name] = DuckDBAdapter(config=conn_cfg, env=env)
 
-    # 7. Add /readyz route and Lifespan
-    async def readyz(request: Request) -> Response:
-        is_ready = False
-        if cfg.placement.is_static:
-            is_ready = True
-        elif refresher is not None and refresher.last_success_at is not None:
-            is_ready = True
-
-        if is_ready:
-            return JSONResponse({"ready": True}, status_code=200)
-        return JSONResponse(
-            {"ready": False, "reason": "catalog_not_loaded"}, status_code=503
-        )
+    # 7. Build MetricsRegistry, shared ReadinessProbe, public extra routes, and Lifespan
+    metrics = MetricsRegistry(
+        allowed_engines=tuple(cfg.connections.keys()),
+        adapters=adapters,
+    )
+    readiness = ReadinessProbe(
+        adapters,
+        is_static=cfg.placement.is_static,
+        refresher=refresher,
+        timeout_seconds=(
+            cfg.ops.readyz_timeout_seconds if cfg.ops is not None else 2.0
+        ),
+        cache_seconds=(
+            cfg.ops.readyz_cache_seconds if cfg.ops is not None else 5.0
+        ),
+        clock=readiness_clock if readiness_clock is not None else time.monotonic,
+    )
 
     @asynccontextmanager
     async def lifespan(app: Starlette):
@@ -350,9 +364,11 @@ def build_server(
                 except Exception:
                     pass
 
-    extra_routes = [
-        Route("/readyz", readyz, methods=["GET"]),
-    ]
+    extra_routes = build_public_extra_routes(
+        cfg.ops,
+        readiness=readiness,
+        metrics=metrics,
+    )
 
     app = create_app(
         pipeline=pipeline,
@@ -366,7 +382,27 @@ def build_server(
         audit_sink=audit_sink,
         audit_on_failure=cfg.audit.on_failure if cfg.audit is not None else "refuse",
         audit_failure_callback=audit_failure_callback,
+        metrics=metrics,
     )
+
+    ops_app: Starlette | None = None
+    if cfg.ops is not None and cfg.ops.enabled:
+        ops_env = dict(env)
+        if cfg.secrets_env:
+            ops_env.update(cfg.secrets_env)
+        if cfg.ops.auth_token_env:
+            ops_env[cfg.ops.auth_token_env] = cfg.get_env(
+                cfg.ops.auth_token_env, env
+            )
+        ops_app = create_ops_app(
+            ops_config=cfg.ops,
+            readiness=readiness,
+            metrics=metrics,
+            adapters=adapters,
+            is_static=cfg.placement.is_static,
+            refresher=refresher,
+            env=ops_env,
+        )
 
     return ServerHandle(
         app=app,
@@ -374,6 +410,8 @@ def build_server(
         refresher=refresher,
         adapters=adapters,
         audit_sink=audit_sink,
+        ops_app=ops_app,
+        metrics=metrics,
     )
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ssl
 import sys
+import threading
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -20,7 +21,10 @@ from seeknal.serving.startup_validation import (
 
 
 def main(
-    argv: Sequence[str] | None = None, *, run: Callable[..., Any] = uvicorn.run
+    argv: Sequence[str] | None = None,
+    *,
+    run: Callable[..., Any] = uvicorn.run,
+    ops_run: Callable[..., Any] | None = None,
 ) -> int:
     """CLI entry point for seeknal.serving."""
     parser = argparse.ArgumentParser(
@@ -140,7 +144,41 @@ def main(
             if cfg.tls.require_client_cert:
                 run_kwargs["ssl_cert_reqs"] = ssl.CERT_REQUIRED
 
-    run(handle.app, **run_kwargs)
+    ops_server: uvicorn.Server | None = None
+    ops_thread: threading.Thread | None = None
+    if cfg.ops is not None and cfg.ops.enabled and handle.ops_app is not None:
+        if ops_run is not None:
+            ops_thread = threading.Thread(
+                target=ops_run,
+                args=(handle.ops_app,),
+                kwargs={"host": cfg.ops.host, "port": cfg.ops.port},
+                name="seeknal-ops-listener",
+                daemon=True,
+            )
+            ops_thread.start()
+        else:
+            ops_uv_cfg = uvicorn.Config(
+                handle.ops_app,
+                host=cfg.ops.host,
+                port=cfg.ops.port,
+                log_level="warning",
+            )
+            ops_server = uvicorn.Server(ops_uv_cfg)
+            ops_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+            ops_thread = threading.Thread(
+                target=ops_server.run,
+                name="seeknal-ops-listener",
+                daemon=True,
+            )
+            ops_thread.start()
+
+    try:
+        run(handle.app, **run_kwargs)
+    finally:
+        if ops_server is not None:
+            ops_server.should_exit = True
+        if ops_thread is not None and ops_thread.is_alive():
+            ops_thread.join(timeout=5.0)
     return 0
 
 
