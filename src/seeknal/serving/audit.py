@@ -26,7 +26,11 @@ import threading
 import time
 from typing import Any, TextIO
 
-from seeknal.serving.errors import AuditUnavailableError, build_error_payload
+from seeknal.serving.errors import (
+    AuditUnavailableError,
+    build_error_payload,
+    scrub_error_detail,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +170,10 @@ class AuditWriteError(AuditUnavailableError):
         *,
         audit_id: str | None = None,
     ) -> None:
-        super().__init__(_scrub_secret_patterns(str(message)), audit_id=audit_id)
+        super().__init__(
+            scrub_error_detail(_scrub_secret_patterns(str(message))),
+            audit_id=audit_id,
+        )
         self.error_code = "audit_unavailable"
         self.code = "audit_unavailable"
 
@@ -1812,9 +1819,11 @@ def build_audit_sink(
                 sink.close()
                 raise
             logger.error(
-                "Audit sink startup check failed (sink=%s, on_failure=log): %s",
+                "Audit sink startup check failed (sink=%s, on_failure=log) error=%s detail=%s audit_id=%s",
                 cfg.sink,
-                exc,
+                type(exc).__name__,
+                scrub_error_detail(exc.__cause__ or exc),
+                exc.audit_id or "-",
             )
             _invoke_failure_callback(on_write_failure)
 
@@ -1869,8 +1878,10 @@ class AuditManager:
             if self.on_failure == "refuse":
                 raise
             logger.error(
-                "Audit sink verification failed (on_failure=log): %s",
-                exc,
+                "Audit sink verification failed (on_failure=log) error=%s detail=%s audit_id=%s",
+                type(exc).__name__,
+                scrub_error_detail(exc.__cause__ or exc),
+                exc.audit_id or "-",
             )
             _invoke_failure_callback(self.on_write_failure)
 
@@ -1901,25 +1912,31 @@ class AuditManager:
         try:
             self.sink.write_record(validated)
             return True
-        except (AuditWriteError, AuditUnavailableError, OSError) as raw_exc:
+        except Exception as raw_exc:
             if isinstance(raw_exc, AuditWriteError):
                 exc = raw_exc
             elif isinstance(raw_exc, AuditUnavailableError):
                 exc = AuditWriteError("Audit sink unavailable", audit_id=validated.audit_id)
-            else:
+            elif isinstance(raw_exc, OSError):
                 exc = AuditWriteError(
                     f"Audit sink write failed: {raw_exc.strerror or type(raw_exc).__name__}",
+                    audit_id=validated.audit_id,
+                )
+            else:
+                exc = AuditWriteError(
+                    f"Audit sink write failed: {type(raw_exc).__name__}",
                     audit_id=validated.audit_id,
                 )
             _invoke_failure_callback(callback)
             if effective_mode == "refuse":
                 raise exc from raw_exc
             logger.error(
-                "Audit write failed (on_failure=log, route=%s, audit_id=%s, status=%d): %s",
+                "Audit write failed (on_failure=log, route=%s, status=%d) error=%s detail=%s audit_id=%s",
                 validated.route,
-                validated.audit_id or "-",
                 validated.status,
-                exc,
+                type(raw_exc).__name__,
+                scrub_error_detail(raw_exc),
+                validated.audit_id or "-",
             )
             return False
 
@@ -1961,7 +1978,9 @@ def emit_audit_record(
             on_write_failure=on_write_failure,
         )
 
-    if not isinstance(sink_or_manager, AuditSink):
+    if not isinstance(sink_or_manager, AuditSink) and not callable(
+        getattr(sink_or_manager, "write_record", None)
+    ):
         raise ValueError(
             f"Expected AuditSink, AuditManager, or None, got {type(sink_or_manager).__name__}"
         )
@@ -1983,25 +2002,31 @@ def emit_audit_record(
     try:
         sink_or_manager.write_record(validated)
         return True
-    except (AuditWriteError, AuditUnavailableError, OSError) as raw_exc:
+    except Exception as raw_exc:
         if isinstance(raw_exc, AuditWriteError):
             exc = raw_exc
         elif isinstance(raw_exc, AuditUnavailableError):
             exc = AuditWriteError("Audit sink unavailable", audit_id=validated.audit_id)
-        else:
+        elif isinstance(raw_exc, OSError):
             exc = AuditWriteError(
                 f"Audit sink write failed: {raw_exc.strerror or type(raw_exc).__name__}",
+                audit_id=validated.audit_id,
+            )
+        else:
+            exc = AuditWriteError(
+                f"Audit sink write failed: {type(raw_exc).__name__}",
                 audit_id=validated.audit_id,
             )
         _invoke_failure_callback(on_write_failure)
         if effective_mode == "refuse":
             raise exc from raw_exc
         logger.error(
-            "Audit write failed (on_failure=log, route=%s, audit_id=%s, status=%d): %s",
+            "Audit write failed (on_failure=log, route=%s, status=%d) error=%s detail=%s audit_id=%s",
             validated.route,
-            validated.audit_id or "-",
             validated.status,
-            exc,
+            type(raw_exc).__name__,
+            scrub_error_detail(raw_exc),
+            validated.audit_id or "-",
         )
         return False
 

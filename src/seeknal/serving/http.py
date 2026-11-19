@@ -704,93 +704,86 @@ def create_app(
                         claims=claims,
                         binding=binding,
                     )
+                    record.to_json_line()
+                except (ValueError, UnicodeError, TypeError) as build_exc:
+                    logger.error(
+                        "Audit record build/serialize failed, falling back to minimal record "
+                        "(route=%s, status=%d) error=%s detail=%s audit_id=%s",
+                        route,
+                        status,
+                        type(build_exc).__name__,
+                        scrub_error_detail(
+                            build_exc, token=token, sql=sql, params=params
+                        ),
+                        audit_id or "-",
+                    )
+                    record = build_minimal_audit_record(
+                        route=route,
+                        status=status,
+                        code=code if status >= 400 else None,
+                        elapsed_ms=elapsed_ms,
+                        audit_id=audit_id,
+                    )
+
+                try:
                     await run_in_threadpool(
                         emit_audit_record,
                         audit_sink,
                         record,
-                        on_failure=effective_audit_on_failure,
+                        on_failure="refuse",
                         on_write_failure=_primary_failure_cb,
                     )
                 except Exception as exc:
+                    if not primary_cb_called:
+                        _on_audit_write_failure()
                     if effective_audit_on_failure == "log":
-                        if not primary_cb_called:
-                            _on_audit_write_failure()
                         logger.error(
-                            "Audit write failed (on_failure=log, route=%s, audit_id=%s, status=%d): %s detail=%s",
+                            "Audit write failed (on_failure=log, route=%s, status=%d) "
+                            "error=%s detail=%s audit_id=%s",
                             route,
-                            audit_id or "-",
                             status,
                             type(exc).__name__,
-                            scrub_error_detail(exc, token=token, sql=sql, params=params),
+                            scrub_error_detail(
+                                exc, token=token, sql=sql, params=params
+                            ),
+                            audit_id or "-",
                         )
                     else:
-                        try:
-                            minimal_record = build_minimal_audit_record(
-                                route=route,
-                                status=status,
-                                code=code if status >= 400 else None,
-                                elapsed_ms=elapsed_ms,
-                                audit_id=audit_id,
-                            )
-                            retry_cb = (
-                                _noop_failure_cb
-                                if primary_cb_called
-                                else _on_audit_write_failure
-                            )
-                            await run_in_threadpool(
-                                emit_audit_record,
-                                audit_sink,
-                                minimal_record,
-                                on_failure="refuse",
-                                on_write_failure=retry_cb,
-                            )
-                        except Exception as retry_exc:
-                            if not primary_cb_called and not isinstance(
-                                retry_exc, (AuditWriteError, AuditUnavailableError)
-                            ):
-                                _on_audit_write_failure()
-                            final_exc = (
-                                retry_exc
-                                if isinstance(
-                                    retry_exc, (AuditWriteError, AuditUnavailableError)
-                                )
-                                else exc
-                            )
-                            logger.error(
-                                "engine=%s code=%s error=%s detail=%s audit_id=%s",
-                                engine_kind or "-",
-                                "audit_unavailable",
-                                type(final_exc).__name__,
-                                scrub_error_detail(
-                                    final_exc, token=token, sql=sql, params=params
-                                ),
-                                audit_id or "-",
-                            )
-                            _log_request(
-                                audit_id=audit_id,
-                                subject=subject,
-                                engine=engine,
-                                rule=rule,
+                        logger.error(
+                            "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                            engine_kind or "-",
+                            "audit_unavailable",
+                            type(exc).__name__,
+                            scrub_error_detail(
+                                exc, token=token, sql=sql, params=params
+                            ),
+                            audit_id or "-",
+                        )
+                        _log_request(
+                            audit_id=audit_id,
+                            subject=subject,
+                            engine=engine,
+                            rule=rule,
+                            status=503,
+                            elapsed_ms=elapsed_ms,
+                            binding=binding,
+                            claims=claims,
+                        )
+                        if metrics is not None:
+                            metrics.record_request(
+                                route,
                                 status=503,
-                                elapsed_ms=elapsed_ms,
-                                binding=binding,
-                                claims=claims,
+                                duration_seconds=elapsed_ms / 1000.0,
+                                engine=engine,
+                                error_code="audit_unavailable",
                             )
-                            if metrics is not None:
-                                metrics.record_request(
-                                    route,
-                                    status=503,
-                                    duration_seconds=elapsed_ms / 1000.0,
-                                    engine=engine,
-                                    error_code="audit_unavailable",
-                                )
-                            return _error_response(
-                                "audit_unavailable",
-                                audit_id=audit_id,
-                                token=token,
-                                sql=sql,
-                                params=params,
-                            )
+                        return _error_response(
+                            "audit_unavailable",
+                            audit_id=audit_id,
+                            token=token,
+                            sql=sql,
+                            params=params,
+                        )
             elif is_callable_sink and not skip_callable_audit:
                 try:
                     record = build_audit_record(
@@ -810,67 +803,80 @@ def create_app(
                         claims=claims,
                         binding=binding,
                     )
-                    await run_in_threadpool(audit_sink, record.to_dict())
+                    record_dict = record.to_dict()
+                except (ValueError, UnicodeError, TypeError) as build_exc:
+                    logger.error(
+                        "Audit record build/serialize failed, falling back to minimal record "
+                        "(route=%s, status=%d) error=%s detail=%s audit_id=%s",
+                        route,
+                        status,
+                        type(build_exc).__name__,
+                        scrub_error_detail(
+                            build_exc, token=token, sql=sql, params=params
+                        ),
+                        audit_id or "-",
+                    )
+                    minimal_record = build_minimal_audit_record(
+                        route=route,
+                        status=status,
+                        code=code if status >= 400 else None,
+                        elapsed_ms=elapsed_ms,
+                        audit_id=audit_id,
+                    )
+                    record_dict = minimal_record.to_dict()
+
+                try:
+                    await run_in_threadpool(audit_sink, record_dict)
                 except Exception as exc:
+                    _on_audit_write_failure()
                     if effective_audit_on_failure == "log":
-                        _on_audit_write_failure()
                         logger.error(
-                            "Audit write failed (on_failure=log, route=%s, audit_id=%s, status=%d): %s detail=%s",
+                            "Audit write failed (on_failure=log, route=%s, status=%d) "
+                            "error=%s detail=%s audit_id=%s",
                             route,
-                            audit_id or "-",
                             status,
                             type(exc).__name__,
-                            scrub_error_detail(exc, token=token, sql=sql, params=params),
+                            scrub_error_detail(
+                                exc, token=token, sql=sql, params=params
+                            ),
+                            audit_id or "-",
                         )
                     else:
-                        try:
-                            minimal_record = build_minimal_audit_record(
-                                route=route,
-                                status=status,
-                                code=code if status >= 400 else None,
-                                elapsed_ms=elapsed_ms,
-                                audit_id=audit_id,
-                            )
-                            await run_in_threadpool(
-                                audit_sink, minimal_record.to_dict()
-                            )
-                        except Exception as retry_exc:
-                            _on_audit_write_failure()
-                            logger.error(
-                                "engine=%s code=%s error=%s detail=%s audit_id=%s",
-                                engine_kind or "-",
-                                "audit_unavailable",
-                                type(retry_exc).__name__,
-                                scrub_error_detail(
-                                    retry_exc, token=token, sql=sql, params=params
-                                ),
-                                audit_id or "-",
-                            )
-                            _log_request(
-                                audit_id=audit_id,
-                                subject=subject,
-                                engine=engine,
-                                rule=rule,
+                        logger.error(
+                            "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                            engine_kind or "-",
+                            "audit_unavailable",
+                            type(exc).__name__,
+                            scrub_error_detail(
+                                exc, token=token, sql=sql, params=params
+                            ),
+                            audit_id or "-",
+                        )
+                        _log_request(
+                            audit_id=audit_id,
+                            subject=subject,
+                            engine=engine,
+                            rule=rule,
+                            status=503,
+                            elapsed_ms=elapsed_ms,
+                            binding=binding,
+                            claims=claims,
+                        )
+                        if metrics is not None:
+                            metrics.record_request(
+                                route,
                                 status=503,
-                                elapsed_ms=elapsed_ms,
-                                binding=binding,
-                                claims=claims,
+                                duration_seconds=elapsed_ms / 1000.0,
+                                engine=engine,
+                                error_code="audit_unavailable",
                             )
-                            if metrics is not None:
-                                metrics.record_request(
-                                    route,
-                                    status=503,
-                                    duration_seconds=elapsed_ms / 1000.0,
-                                    engine=engine,
-                                    error_code="audit_unavailable",
-                                )
-                            return _error_response(
-                                "audit_unavailable",
-                                audit_id=audit_id,
-                                token=token,
-                                sql=sql,
-                                params=params,
-                            )
+                        return _error_response(
+                            "audit_unavailable",
+                            audit_id=audit_id,
+                            token=token,
+                            sql=sql,
+                            params=params,
+                        )
 
         if log_request_line:
             _log_request(
@@ -1635,66 +1641,74 @@ def create_app(
                     claims=claims,
                     binding=prepared.binding,
                 )
-                await run_in_threadpool(audit_sink, pre_record.to_dict())
+                pre_record_dict = pre_record.to_dict()
+            except (ValueError, UnicodeError, TypeError) as build_exc:
+                logger.error(
+                    "Audit record build/serialize failed, falling back to minimal record "
+                    "(route=/v1/query, status=200) error=%s detail=%s audit_id=%s",
+                    type(build_exc).__name__,
+                    scrub_error_detail(
+                        build_exc, token=token, sql=sql, params=params
+                    ),
+                    prepared.audit_id or "-",
+                )
+                min_pre = build_minimal_audit_record(
+                    route="/v1/query",
+                    status=200,
+                    elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                    audit_id=prepared.audit_id,
+                )
+                pre_record_dict = min_pre.to_dict()
+
+            try:
+                await run_in_threadpool(audit_sink, pre_record_dict)
                 callable_audit_done = True
             except Exception as exc:
+                _on_audit_write_failure()
                 if effective_audit_on_failure == "log":
-                    _on_audit_write_failure()
                     logger.error(
-                        "Audit write failed (on_failure=log, route=/v1/query, audit_id=%s, status=200): %s detail=%s",
-                        prepared.audit_id or "-",
+                        "Audit write failed (on_failure=log, route=/v1/query, status=200) "
+                        "error=%s detail=%s audit_id=%s",
                         type(exc).__name__,
                         scrub_error_detail(exc, token=token, sql=sql, params=params),
+                        prepared.audit_id or "-",
                     )
                     callable_audit_done = True
                 else:
-                    try:
-                        min_pre = build_minimal_audit_record(
-                            route="/v1/query",
-                            status=200,
-                            elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                            audit_id=prepared.audit_id,
-                        )
-                        await run_in_threadpool(audit_sink, min_pre.to_dict())
-                        callable_audit_done = True
-                    except Exception as retry_exc:
-                        _on_audit_write_failure()
-                        elapsed_audit_err = (time.perf_counter() - req_start) * 1000.0
-                        logger.error(
-                            "engine=%s code=%s error=%s detail=%s audit_id=%s",
-                            prepared.engine_kind or "-",
-                            "audit_unavailable",
-                            type(retry_exc).__name__,
-                            scrub_error_detail(
-                                retry_exc, token=token, sql=sql, params=params
-                            ),
-                            prepared.audit_id or "-",
-                        )
-                        _log_request(
-                            audit_id=prepared.audit_id,
-                            subject=prepared.subject,
-                            engine=prepared.engine,
-                            rule=prepared.rule,
+                    elapsed_audit_err = (time.perf_counter() - req_start) * 1000.0
+                    logger.error(
+                        "engine=%s code=%s error=%s detail=%s audit_id=%s",
+                        prepared.engine_kind or "-",
+                        "audit_unavailable",
+                        type(exc).__name__,
+                        scrub_error_detail(exc, token=token, sql=sql, params=params),
+                        prepared.audit_id or "-",
+                    )
+                    _log_request(
+                        audit_id=prepared.audit_id,
+                        subject=prepared.subject,
+                        engine=prepared.engine,
+                        rule=prepared.rule,
+                        status=503,
+                        elapsed_ms=elapsed_audit_err,
+                        binding=prepared.binding,
+                        claims=claims,
+                    )
+                    if metrics is not None:
+                        metrics.record_request(
+                            "/v1/query",
                             status=503,
-                            elapsed_ms=elapsed_audit_err,
-                            binding=prepared.binding,
-                            claims=claims,
+                            duration_seconds=elapsed_audit_err / 1000.0,
+                            engine=prepared.engine,
+                            error_code="audit_unavailable",
                         )
-                        if metrics is not None:
-                            metrics.record_request(
-                                "/v1/query",
-                                status=503,
-                                duration_seconds=elapsed_audit_err / 1000.0,
-                                engine=prepared.engine,
-                                error_code="audit_unavailable",
-                            )
-                        return _error_response(
-                            "audit_unavailable",
-                            audit_id=prepared.audit_id,
-                            token=token,
-                            sql=sql,
-                            params=params,
-                        )
+                    return _error_response(
+                        "audit_unavailable",
+                        audit_id=prepared.audit_id,
+                        token=token,
+                        sql=sql,
+                        params=params,
+                    )
 
         effective_timeout = (
             min(timeout_seconds, timeout_s)

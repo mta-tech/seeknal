@@ -2409,5 +2409,263 @@ async def test_c_l3_method_not_allowed_and_client_disconnect_are_typed_and_audit
     )
 
 
+def test_c_n1_oversized_udp_64x256_tables_emits_no_minimal_record_and_returns_503(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import duckdb
+
+    priv, jwks_file, _, _ = _write_static_server_artifacts(tmp_path)
+    pub_keys = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_file},
+            "placement": {"static": {"placement_file": "p", "schemas_file": "s"}},
+            "connections": {"duck": {"kind": "duckdb", "path": ":memory:"}},
+        },
+        load_keys=False,
+    ).load_grant_keys()
+
+    # Build 64 tables each with a 256-character name
+    table_names = [f"t{idx:02d}_" + ("x" * 252) for idx in range(64)]
+    assert len(table_names) == 64
+    assert all(len(t) == 256 for t in table_names)
+
+    con = duckdb.connect()
+    for idx, tname in enumerate(table_names):
+        con.execute(f'CREATE TABLE "{tname}" (id INT, val VARCHAR)')
+        if idx == 0:
+            con.execute(f"INSERT INTO \"{tname}\" VALUES (1, 'CONFIDENTIAL_UDP_ROW')")
+
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                tname: {"keys": ["id"], "row_count": 1, "serve": {"duck": tname}}
+                for tname in table_names
+            },
+            "cubes": {},
+        }
+    )
+    schemas = {tname: ["id", "val"] for tname in table_names}
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas=schemas,
+        public_keys=pub_keys,
+        require_grant_typ=True,
+        max_grant_lifetime_seconds=60.0,
+    )
+
+    udp_collector = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_collector.bind(("127.0.0.1", 0))
+    udp_collector.settimeout(0.2)
+    udp_port = udp_collector.getsockname()[1]
+
+    try:
+        syslog_sink = SyslogAuditSink(
+            host="127.0.0.1",
+            port=udp_port,
+            transport="udp",
+            timeout_seconds=1.0,
+        )
+        syslog_sink.verify_writable()
+        assert syslog_sink._sock is not None
+
+        # Simulate OS UDP datagram MTU limit where oversized datagram raises EMSGSIZE
+        # while a small minimal record (< 1024 bytes) WOULD have succeeded if retried!
+        real_sock = syslog_sink._sock
+
+        class _MaxDatagramSocketProxy:
+            def __init__(self, inner: socket.socket) -> None:
+                self._inner = inner
+
+            def settimeout(self, val: float | None) -> None:
+                self._inner.settimeout(val)
+
+            def sendto(self, data: bytes, addr: Any) -> int:
+                if len(data) > 9216:
+                    raise OSError(errno.EMSGSIZE, "Message too long")
+                return self._inner.sendto(data, addr)
+
+            def close(self) -> None:
+                self._inner.close()
+
+        syslog_sink._sock = _MaxDatagramSocketProxy(real_sock)  # type: ignore[assignment]
+
+        app = create_app(
+            pipeline,
+            {"duck": DuckDBAdapter(lambda: con.cursor())},
+            audit_sink=syslog_sink,
+            audit_on_failure="refuse",
+        )
+        client = TestClient(app)
+
+        union_branches = [f'SELECT id, val FROM "{tname}"' for tname in table_names]
+        big_sql = " UNION ALL ".join(union_branches)
+        now = time.time()
+        tok = sign_grant_token(
+            {
+                "iss": "atlas-catalog",
+                "aud": "seeknal-serving",
+                "typ": "grant",
+                "sub": "user:analyst",
+                "ws": "ws-prod",
+                "jti": "jti-udp-emsgsize-01",
+                "iat": now,
+                "exp": now + 30.0,
+                "sql_sha256": hashlib.sha256(big_sql.encode("utf-8")).hexdigest(),
+                "max_rows": 50,
+                "tables": {
+                    tname: {
+                        "columns": ["id", "val"],
+                        "masks": {},
+                        "row_filters": [],
+                        "actions": ["select"],
+                    }
+                    for tname in table_names
+                },
+            },
+            priv,
+            kid="k-audit-int",
+        )
+
+        with caplog.at_level(logging.ERROR):
+            caplog.clear()
+            resp = client.post(
+                "/v1/query",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"sql": big_sql},
+            )
+
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["code"] == "audit_unavailable"
+        assert body["audit_id"] == "jti-udp-emsgsize-01"
+        assert "rows" not in body
+        assert "CONFIDENTIAL_UDP_ROW" not in resp.text
+
+        # Confirm NO fallback minimal UDP datagram was sent!
+        with pytest.raises(socket.timeout):
+            udp_collector.recvfrom(65535)
+
+        assert any(
+            rec.levelno == logging.ERROR
+            and "code=audit_unavailable" in rec.getMessage()
+            and "Message too long" in rec.getMessage()
+            and "detail=" in rec.getMessage()
+            and "audit_id=jti-udp-emsgsize-01" in rec.getMessage()
+            for rec in caplog.records
+        )
+        syslog_sink.close()
+    finally:
+        udp_collector.close()
+        con.close()
+
+
+def test_c_n1_f_l2_log_mode_and_build_fallback_log_detail_and_audit_id(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import duckdb
+    import seeknal.serving.http as http_mod
+
+    priv, pipeline = _build_minimal_pipeline_and_keys(tmp_path)
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR, region VARCHAR)")
+    con.execute("INSERT INTO users VALUES (1, 'Alice', 'US')")
+
+    try:
+        # 1) Direct audit.py log mode includes detail= (scrubbed) and audit_id=
+        class _LeakyFailSink(AuditSink):
+            def verify_writable(self) -> None:
+                raise AuditWriteError(
+                    "disk error password='secret_startup_pw_1234'",
+                    audit_id="aud-init-1",
+                )
+
+            def write_record(self, record: AuditRecord | dict[str, Any]) -> None:
+                raise OSError(
+                    errno.EIO,
+                    "io error password='secret_runtime_pw_5678'",
+                )
+
+        mgr = AuditManager(_LeakyFailSink(), on_failure="log")
+        with caplog.at_level(logging.ERROR, logger="seeknal.serving.audit"):
+            caplog.clear()
+            mgr.verify_writable()
+            ok = mgr.emit(_sample_record(audit_id="aud-log-direct-1"))
+            assert ok is False
+
+        audit_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(audit_msgs) == 2
+        assert "detail=" in audit_msgs[0] and "audit_id=aud-init-1" in audit_msgs[0]
+        assert "secret_startup_pw_1234" not in audit_msgs[0]
+        assert "detail=" in audit_msgs[1] and "audit_id=aud-log-direct-1" in audit_msgs[1]
+        assert "secret_runtime_pw_5678" not in audit_msgs[1]
+
+        # 2) HTTP log mode (structured & callable) logs detail= (scrubbed) and audit_id=
+        sql = "SELECT id, name FROM users"
+        tok1 = _mint_grant(priv, sql, jti="jti-http-log-struct")
+        app_log_struct = create_app(
+            pipeline,
+            {"duck": DuckDBAdapter(lambda: con.cursor())},
+            audit_sink=_LeakyFailSink(),
+            audit_on_failure="log",
+        )
+        with caplog.at_level(logging.ERROR):
+            caplog.clear()
+            r1 = TestClient(app_log_struct).post(
+                "/v1/query",
+                headers={"Authorization": f"Bearer {tok1}"},
+                json={"sql": sql},
+            )
+        assert r1.status_code == 200
+        assert any(
+            rec.levelno == logging.ERROR
+            and "on_failure=log" in rec.getMessage()
+            and "detail=" in rec.getMessage()
+            and "audit_id=jti-http-log-struct" in rec.getMessage()
+            and "secret_runtime_pw_5678" not in rec.getMessage()
+            for rec in caplog.records
+        )
+
+        # 3) Build/serialize error fallback logs ERROR with detail= and audit_id=
+        audit_file = tmp_path / "build_fallback.jsonl"
+        file_sink = FileAuditSink(audit_file, max_bytes=4096, fsync=False)
+        app_fb = create_app(
+            pipeline,
+            {"duck": DuckDBAdapter(lambda: con.cursor())},
+            audit_sink=file_sink,
+            audit_on_failure="refuse",
+        )
+
+        def _bad_build(**_kw: Any) -> AuditRecord:
+            raise ValueError("bad record field password='build_secret_pw_9999'")
+
+        monkeypatch.setattr(http_mod, "build_audit_record", _bad_build)
+        tok2 = _mint_grant(priv, sql, jti="jti-build-fb-01")
+        with caplog.at_level(logging.ERROR):
+            caplog.clear()
+            r_fb = TestClient(app_fb).post(
+                "/v1/query",
+                headers={"Authorization": f"Bearer {tok2}"},
+                json={"sql": sql},
+            )
+        file_sink.close()
+        assert r_fb.status_code == 200
+        assert any(
+            rec.levelno == logging.ERROR
+            and "falling back to minimal record" in rec.getMessage()
+            and "detail=ValueError:" in rec.getMessage()
+            and "audit_id=jti-build-fb-01" in rec.getMessage()
+            and "build_secret_pw_9999" not in rec.getMessage()
+            for rec in caplog.records
+        )
+    finally:
+        con.close()
+
+
+
 
 

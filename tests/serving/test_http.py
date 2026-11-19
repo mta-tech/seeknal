@@ -634,3 +634,140 @@ def test_safe_message_redaction_precision_preserves_61_0s_and_redacts_secret_par
     finally:
         con.close()
 
+
+def test_c_n1_refuse_mode_never_weakens_record_when_sink_fails_only_full_records(
+    ec_key_pair,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Structured and callable sinks failing only full records return 503 with no rows and no minimal fallback."""
+    import errno
+    import logging
+    from seeknal.serving.audit import AuditRecord, AuditSink
+
+    priv, pub = ec_key_pair
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR, salary INT, role VARCHAR)")
+    con.execute("INSERT INTO users VALUES (1, 'SENSITIVE_ROW_CELL', 90000, 'analyst')")
+
+    try:
+        placement = Placement.from_dict(
+            {
+                "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+                "tables": {
+                    "users": {
+                        "keys": ["id"],
+                        "row_count": 1,
+                        "serve": {"duck": "users"},
+                    }
+                },
+                "cubes": {},
+            }
+        )
+        pipeline = ServingPipeline(
+            placement=placement,
+            schemas={"users": ["id", "name", "salary", "role"]},
+            public_keys={"key-1": pub},
+        )
+        adapter = DuckDBAdapter(lambda: con.cursor())
+        sql = "SELECT id, salary FROM users"
+
+        # 1) Structured sink that accepts minimal records (tables == [] and subject is None)
+        #    but fails full records!
+        persisted_structured: list[AuditRecord] = []
+
+        class FullRecordRejectingStructuredSink(AuditSink):
+            def verify_writable(self) -> None:
+                return None
+
+            def write_record(self, record: AuditRecord | dict) -> None:
+                rec = (
+                    record
+                    if isinstance(record, AuditRecord)
+                    else AuditRecord.from_dict(record)
+                )
+                if rec.tables or rec.subject is not None or rec.sql_sha256 is not None:
+                    raise OSError(errno.EMSGSIZE, "Message too long for full record")
+                persisted_structured.append(rec)
+
+        app_struct = create_app(
+            pipeline,
+            {"duck": adapter},
+            audit_sink=FullRecordRejectingStructuredSink(),
+            audit_on_failure="refuse",
+        )
+        client_struct = TestClient(app_struct)
+        tok1 = _make_token(priv, sql)
+        with caplog.at_level(logging.ERROR):
+            caplog.clear()
+            r_struct = client_struct.post(
+                "/v1/query",
+                headers={"Authorization": f"Bearer {tok1}"},
+                json={"sql": sql},
+            )
+
+        assert r_struct.status_code == 503
+        body_struct = r_struct.json()
+        assert body_struct["code"] == "audit_unavailable"
+        assert "rows" not in body_struct
+        assert "90000" not in r_struct.text
+        assert persisted_structured == []
+        assert any(
+            rec.levelno == logging.ERROR
+            and "code=audit_unavailable" in rec.getMessage()
+            and "detail=" in rec.getMessage()
+            and "Message too long" in rec.getMessage()
+            and "audit_id=jti-http-001" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+        # 2) Callable sink that fails full records on both /v1/query (pre-exec) and /v1/explain (_finish)
+        persisted_callable: list[dict] = []
+
+        def full_record_rejecting_callable(rec_dict: dict) -> None:
+            if (
+                rec_dict.get("tables")
+                or rec_dict.get("subject") is not None
+                or rec_dict.get("sql_sha256") is not None
+            ):
+                raise RuntimeError("callable broker rejected full audit payload")
+            persisted_callable.append(rec_dict)
+
+        app_call = create_app(
+            pipeline,
+            {"duck": adapter},
+            audit_sink=full_record_rejecting_callable,
+            audit_on_failure="refuse",
+        )
+        client_call = TestClient(app_call)
+        tok2 = _make_token(priv, sql)
+        with caplog.at_level(logging.ERROR):
+            caplog.clear()
+            r_call_q = client_call.post(
+                "/v1/query",
+                headers={"Authorization": f"Bearer {tok2}"},
+                json={"sql": sql},
+            )
+            r_call_exp = client_call.post(
+                "/v1/explain",
+                headers={"Authorization": f"Bearer {tok2}"},
+                json={"sql": sql},
+            )
+
+        for resp in (r_call_q, r_call_exp):
+            assert resp.status_code == 503
+            assert resp.json()["code"] == "audit_unavailable"
+            assert "rows" not in resp.json()
+        assert persisted_callable == []
+        err_msgs = [
+            rec.getMessage()
+            for rec in caplog.records
+            if rec.levelno == logging.ERROR and "code=audit_unavailable" in rec.getMessage()
+        ]
+        assert len(err_msgs) == 2
+        for m in err_msgs:
+            assert "detail=RuntimeError: callable broker rejected full audit payload" in m
+            assert "audit_id=jti-http-001" in m
+    finally:
+        con.close()
+
+
