@@ -39,11 +39,11 @@ The full Seeknal repository includes libraries for analysis, orchestration, and 
 
 ## Build Modes
 
-The build context must be the root of the repository. `docker/Dockerfile.serving` omits `# syntax=` directives so air-gapped hosts never attempt a remote BuildKit frontend pull. The base image defaults to `ghcr.io/astral-sh/uv:0.9.18-python3.11-bookworm-slim`.
+The build context must be the root of the repository. `docker/Dockerfile.serving` uses a two-stage multi-stage build (`FROM ${BASE_IMAGE} AS builder` followed by `FROM ${BASE_IMAGE} AS runtime`) and omits `# syntax=` directives so air-gapped hosts never attempt a remote BuildKit frontend pull. The base image defaults to `ghcr.io/astral-sh/uv:0.9.18-python3.11-bookworm-slim`.
 
 ### 1. Online Lock-Only Build
 
-Exports hash-pinned requirements from `uv.lock`, installs with `--require-hashes`, installs `seeknal` from `src/` with `--no-deps`, downloads and verifies DuckDB `2.0.0` extensions (`httpfs`, `avro`, `iceberg`) against `docker/serving-image/extensions.lock.json`, writes `/opt/seeknal/buildinfo.json`, and runs `docker/serving-image/check_serving_env.py`:
+In the `builder` stage, `Dockerfile.serving` exports hash-pinned requirements from `uv.lock`, installs with `--require-hashes`, installs `seeknal` from `src/` with `--no-deps`, downloads and verifies DuckDB `2.0.0` extensions (`httpfs`, `avro`, `iceberg`) against `docker/serving-image/extensions.lock.json`, and writes `/opt/seeknal/buildinfo.json`. The final `runtime` stage copies only `/usr/local/lib/python3.11/site-packages`, `/opt/seeknal/duckdb_extensions`, and `/opt/seeknal/buildinfo.json` via `COPY --from=builder`, copies `uv.lock`, `docker/serving-image/extensions.lock.json`, and `docker/serving-image/check_serving_env.py`, runs `check_serving_env.py` in the final stage, and removes those lock/check files via `rm -rf`:
 
 ```bash
 docker build -f docker/Dockerfile.serving \
@@ -70,9 +70,9 @@ For disconnected or regulated build environments where container builds run with
      --build-arg SEEKNAL_COMMIT="$(git rev-parse HEAD)" \
      -t atlas-rt-serving:airgapped .
    ```
-   The offline stage re-verifies vendor wheel and extension SHA-256 hashes (`prefetch.py verify-vendor`), installs serving and locked build-backend wheels via `uv pip install --system --offline --no-index --require-hashes --find-links docker/serving-image/vendor/wheels -r docker/serving-image/vendor/requirements.txt`, builds and installs `seeknal` from the copied `src/` via `uv pip install --system --offline --no-index --no-deps --no-build-isolation .`, unpacks verified extensions into `/opt/seeknal/duckdb_extensions`, verifies `LOAD httpfs`, `LOAD avro`, and `LOAD iceberg` offline in `check_serving_env.py`, and removes `docker/serving-image/vendor` from the final filesystem view.
+   In the `builder` stage, the offline path re-verifies vendor wheel and extension SHA-256 hashes (`prefetch.py verify-vendor`), installs serving and locked build-backend wheels via `uv pip install --system --offline --no-index --require-hashes --find-links docker/serving-image/vendor/wheels -r docker/serving-image/vendor/requirements.txt`, builds and installs `seeknal` from the copied `src/` via `uv pip install --system --offline --no-index --no-deps --no-build-isolation .`, unpacks verified extensions into `/opt/seeknal/duckdb_extensions`, writes `/opt/seeknal/buildinfo.json`, and cleans up `docker/serving-image/vendor`. The final `runtime` stage uses `COPY --from=builder` for only installed `site-packages`, `/opt/seeknal/duckdb_extensions`, and `/opt/seeknal/buildinfo.json` (never copying `docker/serving-image/` or `docker/serving-image/vendor`), verifies `LOAD httpfs`, `LOAD avro`, and `LOAD iceberg` offline in `check_serving_env.py`, and cleans up temporary lock/check files via `rm -rf`.
 
-> **Layer size note:** `COPY`ing `docker/serving-image/` when `vendor/` is populated for an air-gapped build retains the vendored files in the `COPY` layer even after `rm -rf`, whereas online builds keep `vendor/` empty/absent (or operators with BuildKit locally can bind-mount the vendor dir).
+> **Multi-stage layer isolation:** Because `docker/serving-image/` (including `vendor/`) is copied only into the `builder` stage and never copied into the final `runtime` stage, vendored wheels and compressed extension archives never remain in any image layer of the final image.
 
 ### Build Arguments
 
@@ -187,6 +187,11 @@ The automated release CI/CD pipeline:
 
 ## Release notes
 
+- seeknal works with DuckDB 1.4.x and 2.0.x; the Serving release pins 2.0.0.
 - `atlas-rt-serving` pins DuckDB `2.0.0` across `uv.lock`, `seeknal.serving.buildinfo.EXPECTED_DUCKDB_VERSION`, `seeknal.serving.accel.settings.DEFAULT_EXPECTED_DUCKDB_VERSION`, and `docker/serving-image/extensions.lock.json` (`httpfs`, `avro`, `iceberg`).
 - DuckDB advises waiting for `2.0.1` before mission-critical use; the pin will move to `2.0.1` when it ships.
 - `.duckdb` cache files written by DuckDB `2.0` cannot be read by pre-2.0 DuckDB tools.
+- Known limitations (backlog):
+  - a discovery refresh fails as a whole (the previous catalog is kept) when one PII table loses its only safe serve, or when two Lakekeeper tables differ only by case; planned fix: omit just that table and add a metric for consecutive failures;
+  - in discovery mode, cubes cannot be marked PII; PII cubes are static-only;
+  - validate cannot detect a typo in discovery pii_tables offline; start refuses it, because the first refresh fails.

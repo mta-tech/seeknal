@@ -852,7 +852,8 @@ def test_docs_and_readme_avro_layer_size_duckdb_2_0_and_release_notes():
     ]:
         assert "avro" in content, doc_name
         assert "extensions: [httpfs, avro, iceberg]" in content, doc_name
-        assert "COPY" in content and "rm -rf" in content, doc_name
+        assert "COPY --from=builder" in content and "rm -rf" in content, doc_name
+        assert "builder" in content and "runtime" in content, doc_name
         assert "cannot be read by pre-2.0 DuckDB tools" in content, doc_name
         assert "## Release notes" in content, doc_name
         assert "2.0.1" in content, doc_name
@@ -860,48 +861,115 @@ def test_docs_and_readme_avro_layer_size_duckdb_2_0_and_release_notes():
         assert "validate --config" in content, doc_name
         assert "--version" in content, doc_name
 
+        # Verify the 3 backlog known limitations in the ## Release notes section
+        release_notes_sec = content.split("## Release notes", 1)[1]
+        assert (
+            "a discovery refresh fails as a whole (the previous catalog is kept) "
+            "when one PII table loses its only safe serve, or when two Lakekeeper "
+            "tables differ only by case; planned fix: omit just that table and add "
+            "a metric for consecutive failures"
+        ) in release_notes_sec, doc_name
+        assert (
+            "in discovery mode, cubes cannot be marked PII; PII cubes are static-only"
+        ) in release_notes_sec, doc_name
+        assert (
+            "validate cannot detect a typo in discovery pii_tables offline; "
+            "start refuses it, because the first refresh fails"
+        ) in release_notes_sec, doc_name
+
 
 def test_dockerfile_serving_lock_only_offline_and_verification_contract():
     dockerfile = (REPO_ROOT / "docker" / "Dockerfile.serving").read_text(
         encoding="utf-8"
     )
 
-    # 1. Pinned uv 0.9.18 base image
+    # 1. Pinned uv 0.9.18 base image and two-stage builder -> runtime build (no # syntax=)
+    assert not re.search(
+        r"^\s*#\s*syntax\s*=", dockerfile, re.MULTILINE | re.IGNORECASE
+    )
     assert (
         "ARG BASE_IMAGE=ghcr.io/astral-sh/uv:0.9.18-python3.11-bookworm-slim"
         in dockerfile
     )
+    stage_matches = list(
+        re.finditer(r"^FROM\s+\$\{BASE_IMAGE\}\s+AS\s+(\S+)\s*$", dockerfile, re.MULTILINE)
+    )
+    assert [m.group(1) for m in stage_matches] == ["builder", "runtime"]
+    builder_stage = dockerfile[stage_matches[0].end() : stage_matches[1].start()]
+    runtime_stage = dockerfile[stage_matches[1].end() :]
 
-    # 2. Online lock-only sequence in strict order
-    idx_export = dockerfile.index(
+    # 2. Builder stage: online lock-only sequence in strict order
+    idx_export = builder_stage.index(
         "uv export --locked --only-group serving --no-emit-project --format requirements-txt -o /tmp/requirements.txt"
     )
-    idx_install_deps = dockerfile.index(
+    idx_install_deps = builder_stage.index(
         "uv pip install --system --require-hashes -r /tmp/requirements.txt"
     )
-    idx_install_pkg = dockerfile.index("uv pip install --system --no-deps .")
+    idx_install_pkg = builder_stage.index("uv pip install --system --no-deps .")
     assert idx_export < idx_install_deps < idx_install_pkg
 
-    # 3. Offline (--network=none) vendor verification & install sequence
-    assert 'if [ "${OFFLINE}" = "1" ]; then' in dockerfile
-    assert "prefetch.py verify-vendor" in dockerfile
-    assert "--offline --no-index --require-hashes" in dockerfile
-    assert "--find-links docker/serving-image/vendor/wheels" in dockerfile
-    assert "--no-build-isolation ." in dockerfile
-    assert "prefetch.py install-extensions" in dockerfile
-    assert "/opt/seeknal/duckdb_extensions" in dockerfile
+    # 3. Builder stage: offline (--network=none) vendor verification & install sequence
+    assert 'if [ "${OFFLINE}" = "1" ]; then' in builder_stage
+    assert "prefetch.py verify-vendor" in builder_stage
+    assert "--offline --no-index --require-hashes" in builder_stage
+    assert "--find-links docker/serving-image/vendor/wheels" in builder_stage
+    assert "--no-build-isolation ." in builder_stage
+    assert "prefetch.py install-extensions" in builder_stage
+    assert "/opt/seeknal/duckdb_extensions" in builder_stage
 
-    # 4. Build metadata JSON and fail-closed check_serving_env.py before cleanup
-    idx_buildinfo = dockerfile.index('write_build_info("/opt/seeknal/buildinfo.json"')
-    idx_check_env = dockerfile.index("python3 docker/serving-image/check_serving_env.py")
-    idx_cleanup = dockerfile.index("rm -rf /root/.cache")
-    assert idx_install_pkg < idx_buildinfo < idx_check_env < idx_cleanup
+    # 4. Builder stage writes buildinfo.json and cleans up caches, docs/cli, and vendor
+    idx_buildinfo = builder_stage.index('write_build_info("/opt/seeknal/buildinfo.json"')
+    idx_builder_cleanup = builder_stage.index(
+        "rm -rf /root/.cache /tmp/* docs/cli docker/serving-image/vendor"
+    )
+    assert idx_install_pkg < idx_buildinfo < idx_builder_cleanup
+    assert "check_serving_env.py" not in builder_stage
 
-    # 5. Runtime contract preserved
-    assert "USER 10001:10001" in dockerfile
-    assert "EXPOSE 8765" in dockerfile
-    assert 'ENTRYPOINT ["python", "-m", "seeknal.serving"]' in dockerfile
-    assert 'CMD ["--config", "/etc/seeknal/serving.yaml"]' in dockerfile
+    # 5. Final runtime stage: copies ONLY site-packages, extensions, buildinfo from builder
+    #    and uv.lock + extensions.lock.json + check_serving_env.py (NEVER vendor)
+    assert (
+        "COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages"
+        in runtime_stage
+    )
+    assert (
+        "COPY --from=builder /opt/seeknal/duckdb_extensions /opt/seeknal/duckdb_extensions"
+        in runtime_stage
+    )
+    assert (
+        "COPY --from=builder /opt/seeknal/buildinfo.json /opt/seeknal/buildinfo.json"
+        in runtime_stage
+    )
+    assert "vendor" not in runtime_stage
+    for copy_line in re.findall(r"^COPY\s+(.+)$", runtime_stage, re.MULTILINE):
+        tokens = [t for t in copy_line.split() if not t.startswith("--")]
+        for src in tokens[:-1]:
+            assert src not in {"docker/serving-image", "docker/serving-image/", "src", "src/"}
+            assert "vendor" not in src
+
+    idx_check_env = runtime_stage.index(
+        "python3 docker/serving-image/check_serving_env.py"
+    )
+    idx_etc = runtime_stage.index("mkdir -p /etc/seeknal")
+    idx_chmod_etc = runtime_stage.index("chmod 755 /etc/seeknal")
+    idx_chmod_ext = runtime_stage.index(
+        "chmod -R a+rX /opt/seeknal/duckdb_extensions /opt/seeknal/buildinfo.json"
+    )
+    idx_runtime_cleanup = runtime_stage.index(
+        "rm -rf /root/.cache /tmp/* uv.lock docker/serving-image"
+    )
+    assert (
+        idx_check_env
+        < idx_etc
+        < idx_chmod_etc
+        < idx_chmod_ext
+        < idx_runtime_cleanup
+    )
+
+    # 6. Runtime contract preserved in final stage
+    assert "USER 10001:10001" in runtime_stage
+    assert "EXPOSE 8765" in runtime_stage
+    assert 'ENTRYPOINT ["python", "-m", "seeknal.serving"]' in runtime_stage
+    assert 'CMD ["--config", "/etc/seeknal/serving.yaml"]' in runtime_stage
 
 
 def test_prefetch_extension_hash_verification_and_offline_install(tmp_path):

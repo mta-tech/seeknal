@@ -49,9 +49,9 @@ docker build -f docker/Dockerfile.serving \
      -t atlas-rt-serving:airgapped .
    ```
 
-   During the offline build (`OFFLINE=1`), `Dockerfile.serving` re-verifies all vendor wheel and extension SHA-256 digests against `uv.lock` and `extensions.lock.json`, installs serving and build-backend wheels via `uv pip install --system --offline --no-index --require-hashes --find-links docker/serving-image/vendor/wheels -r docker/serving-image/vendor/requirements.txt`, installs `seeknal` from the copied `src/` via `uv pip install --system --offline --no-index --no-deps --no-build-isolation .`, unpacks verified extensions into `/opt/seeknal/duckdb_extensions`, verifies installed source hashes before writing `/opt/seeknal/buildinfo.json`, runs `check_serving_env.py`, and removes `docker/serving-image/vendor` from the final filesystem view.
+   During the offline build (`OFFLINE=1`), the `builder` stage of `Dockerfile.serving` re-verifies all vendor wheel and extension SHA-256 digests against `uv.lock` and `extensions.lock.json`, installs serving and build-backend wheels via `uv pip install --system --offline --no-index --require-hashes --find-links docker/serving-image/vendor/wheels -r docker/serving-image/vendor/requirements.txt`, installs `seeknal` from the copied `src/` via `uv pip install --system --offline --no-index --no-deps --no-build-isolation .`, unpacks verified extensions into `/opt/seeknal/duckdb_extensions`, verifies installed source hashes before writing `/opt/seeknal/buildinfo.json`, and removes `docker/serving-image/vendor`. The final `runtime` stage copies only `/usr/local/lib/python3.11/site-packages`, `/opt/seeknal/duckdb_extensions`, and `/opt/seeknal/buildinfo.json` via `COPY --from=builder` (plus `uv.lock`, `extensions.lock.json`, and `check_serving_env.py`), runs `check_serving_env.py`, and cleans up temporary lock/check files via `rm -rf`.
 
-   > **Layer size note:** `COPY`ing `docker/serving-image/` when `vendor/` is populated for an air-gapped build retains the vendored files in the `COPY` layer even after `rm -rf docker/serving-image/vendor`, whereas online builds keep `vendor/` empty/absent (or operators with BuildKit locally can bind-mount the vendor dir).
+   > **Multi-stage layer isolation:** Because `docker/Dockerfile.serving` separates the `builder` and `runtime` stages and never copies `docker/serving-image/` or `docker/serving-image/vendor` into the `runtime` stage, vendored wheels and extension archives never sit in any final image layer even during air-gapped builds.
 
 ## DuckDB Storage & Extension Notes
 
@@ -87,3 +87,7 @@ Because `ENTRYPOINT` is `["python", "-m", "seeknal.serving"]`, passing arguments
 - This image pins DuckDB `2.0.0` across `uv.lock`, `seeknal.serving.buildinfo.EXPECTED_DUCKDB_VERSION`, `seeknal.serving.accel.settings.DEFAULT_EXPECTED_DUCKDB_VERSION`, and `docker/serving-image/extensions.lock.json`.
 - DuckDB advises waiting for `2.0.1` before mission-critical use; the DuckDB pin in `atlas-rt-serving` will move to `2.0.1` when it ships.
 - `.duckdb` cache files written by DuckDB `2.0` use the 2.0 storage format and cannot be read by pre-2.0 DuckDB tools.
+- Known limitations (backlog):
+  - a discovery refresh fails as a whole (the previous catalog is kept) when one PII table loses its only safe serve, or when two Lakekeeper tables differ only by case; planned fix: omit just that table and add a metric for consecutive failures;
+  - in discovery mode, cubes cannot be marked PII; PII cubes are static-only;
+  - validate cannot detect a typo in discovery pii_tables offline; start refuses it, because the first refresh fails.

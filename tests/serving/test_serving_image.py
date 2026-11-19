@@ -306,8 +306,23 @@ def test_dockerfile_static_checks():
         "seeknal.serving",
     ], f"ENTRYPOINT must be exactly ['python', '-m', 'seeknal.serving'], got: {ep_json}"
 
-    # 4. COPY sources are a subset of the allowed list
-    allowed_sources = {
+    # 4. Multi-stage structure (builder + runtime) and strict per-stage COPY allowlists
+    stage_headers = list(
+        re.finditer(r"^FROM\s+(\S+)\s+AS\s+(\S+)\s*$", content, re.MULTILINE)
+    )
+    assert [m.group(2) for m in stage_headers] == [
+        "builder",
+        "runtime",
+    ], f"Expected stages ['builder', 'runtime'], got {[m.group(2) for m in stage_headers]}"
+    for m in stage_headers:
+        assert m.group(1) == "${BASE_IMAGE}", (
+            f"Stage {m.group(2)} must derive from ${{BASE_IMAGE}}, got {m.group(1)}"
+        )
+
+    builder_stage = content[stage_headers[0].end() : stage_headers[1].start()]
+    runtime_stage = content[stage_headers[1].end() :]
+
+    allowed_builder_sources = {
         "pyproject.toml",
         "uv.lock",
         "README.md",
@@ -318,16 +333,80 @@ def test_dockerfile_static_checks():
         "src/",
         "src",
     }
-    copy_matches = re.findall(r"^COPY\s+(.+)$", content, re.MULTILINE)
-    assert copy_matches, "No COPY instructions found in Dockerfile"
-    for copy_line in copy_matches:
+    builder_copies = re.findall(r"^COPY\s+(.+)$", builder_stage, re.MULTILINE)
+    assert builder_copies, "No COPY instructions found in builder stage"
+    for copy_line in builder_copies:
         tokens = [t for t in copy_line.split() if not t.startswith("--")]
-        assert len(tokens) >= 2, f"Invalid COPY line: {copy_line}"
+        assert len(tokens) >= 2, f"Invalid COPY line in builder stage: {copy_line}"
+        for src in tokens[:-1]:
+            assert src in allowed_builder_sources, (
+                f"Builder COPY source '{src}' is not in allowed sources {allowed_builder_sources}"
+            )
+
+    expected_from_builder_pairs = {
+        (
+            "/usr/local/lib/python3.11/site-packages",
+            "/usr/local/lib/python3.11/site-packages",
+        ),
+        (
+            "/opt/seeknal/duckdb_extensions",
+            "/opt/seeknal/duckdb_extensions",
+        ),
+        (
+            "/opt/seeknal/buildinfo.json",
+            "/opt/seeknal/buildinfo.json",
+        ),
+    }
+    allowed_runtime_context_sources = {
+        "uv.lock",
+        "docker/serving-image/extensions.lock.json",
+        "docker/serving-image/check_serving_env.py",
+    }
+    runtime_copies = re.findall(r"^COPY\s+(.+)$", runtime_stage, re.MULTILINE)
+    assert runtime_copies, "No COPY instructions found in runtime stage"
+    actual_from_builder_pairs: set[tuple[str, str]] = set()
+    actual_runtime_context_sources: set[str] = set()
+    for copy_line in runtime_copies:
+        raw_tokens = copy_line.split()
+        flags = [t for t in raw_tokens if t.startswith("--")]
+        tokens = [t for t in raw_tokens if not t.startswith("--")]
+        assert len(tokens) >= 2, f"Invalid COPY line in runtime stage: {copy_line}"
+        dest = tokens[-1]
         sources = tokens[:-1]
-        for src in sources:
-            assert (
-                src in allowed_sources
-            ), f"COPY source '{src}' is not in allowed sources {allowed_sources}"
+        for s in sources:
+            assert "vendor" not in s, (
+                f"Vendor path forbidden in runtime stage COPY: {copy_line}"
+            )
+            assert s not in {"docker/serving-image", "docker/serving-image/"}, (
+                f"Whole docker/serving-image directory forbidden in runtime stage COPY: {copy_line}"
+            )
+        if "--from=builder" in flags:
+            assert len(sources) == 1, f"Expected single source on COPY --from=builder: {copy_line}"
+            actual_from_builder_pairs.add((sources[0], dest))
+        else:
+            assert not flags, f"Unexpected COPY flags in runtime stage: {copy_line}"
+            for src in sources:
+                assert src in allowed_runtime_context_sources, (
+                    f"Runtime COPY source '{src}' is not in {allowed_runtime_context_sources}"
+                )
+                actual_runtime_context_sources.add(src)
+
+    assert actual_from_builder_pairs == expected_from_builder_pairs, (
+        f"Runtime COPY --from=builder pairs mismatch: {actual_from_builder_pairs}"
+    )
+    assert actual_runtime_context_sources == allowed_runtime_context_sources, (
+        f"Runtime context COPY sources mismatch: {actual_runtime_context_sources}"
+    )
+    assert "vendor" not in runtime_stage, (
+        "Final runtime stage must never reference vendor artifacts in any layer"
+    )
+    assert "python3 docker/serving-image/check_serving_env.py" in runtime_stage, (
+        "check_serving_env.py must run in the final runtime stage"
+    )
+    assert "USER 10001:10001" in runtime_stage
+    assert "EXPOSE 8765" in runtime_stage
+    assert 'ENTRYPOINT ["python", "-m", "seeknal.serving"]' in runtime_stage
+    assert 'CMD ["--config", "/etc/seeknal/serving.yaml"]' in runtime_stage
 
     # 5. Lock-only hash-verified install sequence (no floating constraints)
     assert (
