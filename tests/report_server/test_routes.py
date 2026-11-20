@@ -753,6 +753,61 @@ def test_publish_concurrency_cap_returns_503_with_retry_after_and_cleans_spool(
     assert list(spool_dir.iterdir()) == []
 
 
+def test_publish_catches_memory_error_and_cleans_up_on_commit_failure(
+    test_client: TestClient,
+    honest_tarball: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    import logging
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import Session
+
+    data_dir_str = str(test_client.app.state.config.data_dir)
+    assets_dir = test_client.app.state.config.data_dir / "assets"
+
+    # 1. MemoryError during extraction returns typed 400 with generic message
+    def _raise_mem_err(*args, **kwargs):
+        raise MemoryError("secret /internal/path allocation failure")
+
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=_raise_mem_err):
+        mem_resp = _publish(test_client, honest_tarball)
+    assert mem_resp.status_code == 400
+    assert mem_resp.json() == {"error": "Tarball uncompressed size exceeds limit"}
+    assert "allocation failure" not in mem_resp.text
+    assert data_dir_str not in mem_resp.text
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        assert "exc_class=MemoryError" in msg
+        assert "allocation failure" not in msg
+
+    # 2. Database commit failure deletes extracted folder and returns typed 500 {"error": "Publish failed"}
+    def _failing_commit(self):
+        raise IntegrityError("INSERT INTO publish", {"slug": "dup"}, Exception("UNIQUE constraint failed"))
+
+    monkeypatch.setattr(Session, "commit", _failing_commit)
+    caplog.clear()
+    caplog.set_level(logging.ERROR, logger="seeknal.report_server")
+    commit_resp = _publish(test_client, honest_tarball)
+    assert commit_resp.status_code == 500
+    assert commit_resp.json() == {"error": "Publish failed"}
+    assert list(assets_dir.iterdir()) == [], "Extracted folder must be deleted when DB commit fails"
+
+    err_records = [
+        rec for rec in caplog.records
+        if rec.name == "seeknal.report_server" and rec.levelno == logging.ERROR
+    ]
+    assert len(err_records) == 1
+    log_msg = err_records[0].getMessage()
+    assert "slug=" in log_msg
+    assert "exc_class=IntegrityError" in log_msg
+    assert "UNIQUE constraint failed" not in log_msg
+    assert data_dir_str not in log_msg
+
+
+
 
 
 

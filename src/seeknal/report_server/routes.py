@@ -41,6 +41,8 @@ _SPECIAL_FILE_ERROR_TYPE = getattr(tarfile, "SpecialFileError", ())
 
 
 def _classify_tar_error(exc: Exception) -> str:
+    if isinstance(exc, MemoryError):
+        return "Tarball uncompressed size exceeds limit"
     if isinstance(exc, TarSafetyError):
         msg = str(exc)
         if ":" in msg:
@@ -133,6 +135,7 @@ async def publish(request: Request) -> JSONResponse:
                 EOFError,
                 OSError,
                 ValueError,
+                MemoryError,
             ) as exc:
                 _log.warning(
                     "publish tarball rejected: slug=%s exc_class=%s",
@@ -152,8 +155,21 @@ async def publish(request: Request) -> JSONResponse:
                 asset_relpath=asset_relpath,
                 byte_size=running_bytes,
             )
-            session.add(pub)
-            session.commit()
+            try:
+                session.add(pub)
+                session.commit()
+            except Exception as exc:
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                storage.delete(slug)
+                _log.error(
+                    "publish database commit failed: slug=%s exc_class=%s",
+                    slug,
+                    type(exc).__name__,
+                )
+                return JSONResponse({"error": "Publish failed"}, status_code=500)
     finally:
         spool.close()
         semaphore.release()
