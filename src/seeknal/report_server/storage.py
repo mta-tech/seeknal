@@ -19,7 +19,8 @@ from seeknal.utils.path_security import is_insecure_path
 
 MAX_TAR_HEADER_BYTES = 64 * 1024  # 64 KiB cap for any single pax or GNU longname/longlink header
 MAX_CONSECUTIVE_EXTENDED_HEADERS = 8
-TAR_MEMBER_HEADER_OVERHEAD_BYTES = 1536
+TAR_MEMBER_HEADER_OVERHEAD_BYTES = 4096
+TAR_FIXED_HEADER_SLACK_BYTES = 1024 * 1024  # 1 MiB fixed header slack
 
 _ALLOWED_TAR_HEADER_TYPES: frozenset[bytes] = frozenset(
     {
@@ -356,6 +357,7 @@ class LocalFilesystemStorage(Storage):
         max_position = (
             self._max_unpacked_bytes
             + self._max_tar_members * TAR_MEMBER_HEADER_OVERHEAD_BYTES
+            + TAR_FIXED_HEADER_SLACK_BYTES
         )
         with gzip.GzipFile(fileobj=fileobj, mode="rb") as gz_stream:
             reader = _PositionBoundedReader(gz_stream, max_position)

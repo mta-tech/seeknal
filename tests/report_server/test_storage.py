@@ -1094,6 +1094,45 @@ def test_bsdtar_and_gnu_posix_ignored_pax_keys_accepted_and_dropped(
     assert not hasattr(observed_members_posix[0], "ctime")
 
 
+def test_200_long_named_members_summing_exactly_to_max_unpacked_bytes_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("seeknal.report_server.storage.is_insecure_path", lambda _p: False)
+    member_count = 200
+    per_member_bytes = 64
+    exact_max_unpacked = member_count * per_member_bytes
+
+    storage = LocalFilesystemStorage(
+        tmp_path / "near-cap-storage",
+        max_tar_members=member_count,
+        max_unpacked_bytes=exact_max_unpacked,
+    )
+
+    tar_path = tmp_path / "200_long_names.tar.gz"
+    expected_names: list[str] = []
+    with tarfile.open(tar_path, "w:gz", format=tarfile.PAX_FORMAT) as tf:
+        for i in range(member_count):
+            long_name = f"_app/immutable/chunks/report_module_{'a' * 90}_{i:04d}.js"
+            assert len(long_name) > 100
+            expected_names.append(long_name)
+            payload = f"{i:04d}".encode("ascii").ljust(per_member_bytes, b"x")
+            assert len(payload) == per_member_bytes
+            info = tarfile.TarInfo(name=long_name)
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+
+    with open(tar_path, "rb") as f:
+        storage.extract_tarball("near_cap_200", f)
+
+    mount = storage.local_mount_path("near_cap_200")
+    assert mount is not None
+    for i, name in enumerate(expected_names):
+        p = mount / name
+        assert p.is_file()
+        assert len(p.read_bytes()) == per_member_bytes
+
+
 
 
 
