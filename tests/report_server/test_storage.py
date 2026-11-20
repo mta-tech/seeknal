@@ -1133,6 +1133,35 @@ def test_200_long_named_members_summing_exactly_to_max_unpacked_bytes_accepted(
         assert len(p.read_bytes()) == per_member_bytes
 
 
+def test_global_pax_header_refused_small_and_over_64k(
+    test_storage: LocalFilesystemStorage,
+    tmp_path: Path,
+) -> None:
+    import gzip
+
+    # Small 'g' global pax header is refused by the header-type allowlist (S1b)
+    small_g = _build_pax_global_header_tar_gz(tmp_path / "small_global_g.tar.gz")
+    with open(small_g, "rb") as f:
+        with pytest.raises(TarSafetyError, match="Tarball entry type not allowed"):
+            test_storage.extract_tarball("small_g_slug", f)
+    assert not (test_storage._root / "assets" / "small_g_slug").exists()
+
+    # Over-64 KiB 'g' global pax header is also refused before reading its body
+    huge_g_path = tmp_path / "huge_global_g.tar.gz"
+    g_info = tarfile.TarInfo(name="PaxHeader/GlobalHuge")
+    g_info.type = tarfile.XGLTYPE
+    g_info.size = 128 * 1024
+    with gzip.open(huge_g_path, "wb", compresslevel=1) as gz:
+        gz.write(g_info.tobuf(tarfile.PAX_FORMAT))
+        gz.write(b"\x00" * (128 * 1024))
+        gz.write(b"\x00" * 1024)
+
+    with open(huge_g_path, "rb") as f:
+        with pytest.raises(TarSafetyError):
+            test_storage.extract_tarball("huge_g_slug", f)
+    assert not (test_storage._root / "assets" / "huge_g_slug").exists()
+
+
 
 
 

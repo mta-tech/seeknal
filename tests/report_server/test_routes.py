@@ -905,6 +905,72 @@ def test_semaphore_released_when_spool_dir_mkdir_fails(
     assert second_resp.status_code == 201
 
 
+def test_semaphore_released_after_mid_upload_413_and_unhandled_error(
+    test_app,
+    honest_tarball: Path,
+) -> None:
+    import asyncio
+    from starlette.requests import Request
+    from seeknal.report_server.routes import publish
+
+    test_app.state.config.max_concurrent_publishes = 1
+    orig_max_upload = test_app.state.config.max_upload_bytes
+
+    # 1. Mid-upload 413 (chunked stream exceeding max_upload_bytes after semaphore.acquire())
+    test_app.state.config.max_upload_bytes = 50
+
+    async def _run_mid_upload_413():
+        sent = 0
+
+        async def receive():
+            nonlocal sent
+            sent += 1
+            return {
+                "type": "http.request",
+                "body": b"x" * 30,
+                "more_body": sent < 3,
+            }
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/publish",
+            "raw_path": b"/publish",
+            "query_string": b"",
+            "headers": [
+                (b"content-type", b"application/gzip"),
+                (b"authorization", b"Bearer test-key-123"),
+                (b"transfer-encoding", b"chunked"),
+            ],
+            "app": test_app,
+        }
+        req = Request(scope, receive)
+        return await publish(req)
+
+    resp_413 = asyncio.run(_run_mid_upload_413())
+    assert resp_413.status_code == 413
+    test_app.state.config.max_upload_bytes = orig_max_upload
+
+    client = TestClient(test_app, raise_server_exceptions=False)
+    after_413_resp = _publish(client, honest_tarball)
+    assert after_413_resp.status_code == 201
+
+    # 2. Unhandled error during extraction (e.g. RuntimeError not in caught tar exception tuple)
+    def _raise_unhandled(*args, **kwargs):
+        raise RuntimeError("simulated unhandled extraction error")
+
+    with patch.object(test_app.state.storage, "extract_tarball", side_effect=_raise_unhandled):
+        unhandled_resp = _publish(client, honest_tarball)
+    assert unhandled_resp.status_code == 500
+
+    # Semaphore must still be released so the next publish succeeds with 201
+    after_unhandled_resp = _publish(client, honest_tarball)
+    assert after_unhandled_resp.status_code == 201
+
+
 
 
 
