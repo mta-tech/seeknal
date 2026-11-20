@@ -732,6 +732,7 @@ def _make_postgres_wire_connect(
     metrics: MetricsRegistry | None = None,
     get_http_client: Callable[[], httpx.Client] | None = None,
     connectors_by_endpoint: dict[str, Any] | None = None,
+    account_name: str | None = None,
 ) -> Callable[..., Any]:
     kind = conn_cfg.kind
     read_only = conn_cfg.read_only
@@ -826,6 +827,9 @@ def _make_postgres_wire_connect(
             and ep_key in connectors_by_endpoint
         ):
             connector = connectors_by_endpoint[ep_key]
+            reg_fn = getattr(connector, "register_connect_fn", None)
+            if callable(reg_fn):
+                reg_fn(base_connect, preferred=(account_name == "interactive"))
         else:
             connector = ColdStartConnector(base_connect, lb_block, **cs_init_kw)
             if connectors_by_endpoint is not None:
@@ -855,15 +859,16 @@ def _make_postgres_wire_connect(
                     p.kind == inspect.Parameter.VAR_KEYWORD
                     for p in c_params.values()
                 )
-                if "connect_fn" in c_params:
+                if "connect_fn" in c_params or c_varkw:
                     call_kw["connect_fn"] = base_connect
                 if ("connect_timeout" in c_params or c_varkw) and connect_timeout is not None:
                     call_kw["connect_timeout"] = connect_timeout
             except (ValueError, TypeError):
-                pass
+                call_kw["connect_fn"] = base_connect
             return connector.connect(eff_deadline, **call_kw)
 
         setattr(cold_start_connect, "cold_start_connector", connector)
+        setattr(cold_start_connect, "base_connect", base_connect)
         return cold_start_connect
 
     return base_connect
@@ -932,6 +937,7 @@ def _build_postgres_wire_adapter(
                     metrics=metrics,
                     get_http_client=get_http_client,
                     connectors_by_endpoint=connectors_by_endpoint,
+                    account_name=acc_name,
                 )
                 pool = PostgresPool(
                     conn_fn,
@@ -1034,6 +1040,7 @@ def _make_discovery_source_connect(
             metrics=metrics,
             get_http_client=get_http_client,
             connectors_by_endpoint=connectors_by_endpoint,
+            account_name=account_name,
         )
         return lambda: conn_fn()
 

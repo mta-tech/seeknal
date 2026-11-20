@@ -998,6 +998,7 @@ class _WakeOperation:
         "active_waiters",
         "connect_kwargs",
         "done",
+        "endpoint_woke",
         "finished_at",
         "first_conn",
         "opener_connect_fn",
@@ -1021,6 +1022,7 @@ class _WakeOperation:
         self.opener_connect_fn = opener_connect_fn
         self.active_waiters: int = 0
         self.done: bool = False
+        self.endpoint_woke: bool = False
         self.finished_at: float = float("inf")
         self.outcome: str = "starting"  # 'ok' | 'error' | 'timeout'
         self.first_conn: Any = None
@@ -1052,6 +1054,7 @@ class ColdStartConnector:
             )
 
         self._connect_fn = connect_fn
+        self._account_connect_fns: list[Callable[..., Any]] = [connect_fn]
         self._project_id = project_id
         self._endpoint_id = endpoint_id
         self._cold_start = cold_start
@@ -1094,6 +1097,25 @@ class ColdStartConnector:
     @property
     def cold_start_config(self) -> LakebaseColdStartConfig:
         return self._cold_start
+
+    def register_connect_fn(
+        self,
+        connect_fn: Callable[..., Any],
+        *,
+        preferred: bool = False,
+    ) -> None:
+        """Register an additional account connect callable sharing this endpoint connector."""
+        if not callable(connect_fn):
+            return
+        with self._lock:
+            existing = [
+                fn for fn in self._account_connect_fns if fn is not connect_fn
+            ]
+            if preferred:
+                self._connect_fn = connect_fn
+                self._account_connect_fns = [connect_fn, *existing]
+            else:
+                self._account_connect_fns = [*existing, connect_fn]
 
     def reset_thread_cold_start(self) -> None:
         self._tls.cold_start = None
@@ -1303,6 +1325,9 @@ class ColdStartConnector:
                 if api_status != "running":
                     outcome = api_status  # 'error' or 'timeout'
                     return
+                op.endpoint_woke = True
+            else:
+                op.endpoint_woke = True
 
             retry_idx = 0
             while True:
@@ -1362,13 +1387,17 @@ class ColdStartConnector:
                         op.first_conn = opened_conn
                     else:
                         orphan_conn = opened_conn
+                elif op.terminal_error is not None:
+                    self._state = "ok"
+                    self._failed_until = None
+                    self._last_no_wake_probe_at = None
+                    orphan_conn = opened_conn
                 else:
                     self._state = "unavailable"
                     self._last_no_wake_probe_at = None
-                    if op.terminal_error is None:
-                        self._failed_until = (
-                            finish_now + self._cold_start.max_wake_seconds
-                        )
+                    self._failed_until = (
+                        finish_now + self._cold_start.max_wake_seconds
+                    )
                     orphan_conn = opened_conn
 
                 op.done = True
@@ -1421,49 +1450,64 @@ class ColdStartConnector:
             self._no_wake_probe_in_flight = True
 
         to_int = max(1, math.ceil(float(timeout_seconds)))
-        conn: Any = None
-        cur: Any = None
+        with self._lock:
+            candidate_fns = list(self._account_connect_fns) or [self._connect_fn]
         try:
-            try:
-                accepts_kw = True
+            probe_succeeded = False
+            for target_fn in candidate_fns:
+                conn: Any = None
+                cur: Any = None
                 try:
-                    sig = inspect.signature(self._connect_fn)
-                    accepts_kw = "connect_timeout" in sig.parameters or any(
-                        p.kind == inspect.Parameter.VAR_KEYWORD
-                        for p in sig.parameters.values()
-                    )
-                except (ValueError, TypeError):
                     accepts_kw = True
-
-                if accepts_kw:
                     try:
-                        conn = self._connect_fn(connect_timeout=to_int)
-                    except TypeError:
-                        conn = self._connect_fn()
-                else:
-                    conn = self._connect_fn()
+                        sig = inspect.signature(target_fn)
+                        accepts_kw = "connect_timeout" in sig.parameters or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD
+                            for p in sig.parameters.values()
+                        )
+                    except (ValueError, TypeError):
+                        accepts_kw = True
 
-                if conn is None:
+                    if accepts_kw:
+                        try:
+                            conn = target_fn(connect_timeout=to_int)
+                        except TypeError:
+                            conn = target_fn()
+                    else:
+                        conn = target_fn()
+
+                    if conn is None:
+                        continue
+
+                    if hasattr(conn, "cursor") and callable(conn.cursor):
+                        cur = conn.cursor()
+                        if (
+                            cur is not None
+                            and hasattr(cur, "execute")
+                            and callable(cur.execute)
+                        ):
+                            cur.execute("SELECT 1")
+                    probe_succeeded = True
+                    break
+                except Exception as exc:
+                    if _classify_non_wakeable_connect_error(exc) is not None:
+                        continue
                     return "unavailable"
-
-                if hasattr(conn, "cursor") and callable(conn.cursor):
-                    cur = conn.cursor()
+                finally:
                     if (
                         cur is not None
-                        and hasattr(cur, "execute")
-                        and callable(cur.execute)
+                        and hasattr(cur, "close")
+                        and callable(cur.close)
                     ):
-                        cur.execute("SELECT 1")
-            except Exception:
+                        try:
+                            cur.close()
+                        except Exception:
+                            pass
+                    if conn is not None:
+                        _safe_close_conn(conn)
+
+            if not probe_succeeded:
                 return "unavailable"
-            finally:
-                if cur is not None and hasattr(cur, "close") and callable(cur.close):
-                    try:
-                        cur.close()
-                    except Exception:
-                        pass
-                if conn is not None:
-                    _safe_close_conn(conn)
 
             recovered = False
             with self._lock:
@@ -1588,9 +1632,14 @@ class ColdStartConnector:
                     )
 
                 if op.outcome != "ok":
-                    if op.terminal_error is not None:
-                        raise op.terminal_error
-                    raise EngineError("Engine connection failed")
+                    if eff_connect_fn is not op.opener_connect_fn and (
+                        op.terminal_error is not None or op.endpoint_woke
+                    ):
+                        pass
+                    else:
+                        if op.terminal_error is not None:
+                            raise op.terminal_error
+                        raise EngineError("Engine connection failed")
 
                 if (
                     op.first_conn is not None
@@ -1622,4 +1671,10 @@ class ColdStartConnector:
             self._emit_state("unavailable")
             raise EngineError("Engine connection failed") from None
 
+        with self._lock:
+            self._state = "ok"
+            self._last_cold_start = True
+            self._failed_until = None
+            self._last_no_wake_probe_at = None
+        self._emit_state("ok")
         return conn

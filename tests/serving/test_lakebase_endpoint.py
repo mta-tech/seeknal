@@ -1380,3 +1380,86 @@ class TestColdStartConnector:
         assert connector.consume_thread_cold_start() is False
         assert metrics.states[-1] == ("lb_ops", "ok")
 
+    def test_b_l3_bad_password_on_bi_account_does_not_fail_interactive_waiter_or_poison_state(
+        self,
+    ) -> None:
+        import time
+
+        clock = FakeClock(initial=800.0)
+        metrics = FakeMetrics()
+        post_calls = 0
+        running = False
+        post_entered = threading.Event()
+        wake_gate = threading.Event()
+        planted_bi_pw = "SECRET_BAD_BI_PW_28P01_8899"
+
+        class BadPasswordError(Exception):
+            pgcode = "28P01"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal post_calls, running
+            if request.method == "POST":
+                post_calls += 1
+                post_entered.set()
+                wake_gate.wait(timeout=2.0)
+                return httpx.Response(202, json={"state": "starting"})
+            running = True
+            return httpx.Response(200, json={"state": "running"})
+
+        def connect_bi(**kw: Any) -> FakeDBConnection:
+            if not running:
+                raise ConnectionRefusedError("endpoint suspended")
+            raise BadPasswordError(
+                f'FATAL: password authentication failed for user "bi_role" ({planted_bi_pw})'
+            )
+
+        def connect_interactive(**kw: Any) -> FakeDBConnection:
+            if not running:
+                raise ConnectionRefusedError("endpoint suspended")
+            c = FakeDBConnection(conn_id=909)
+            c.role_tag = "interactive"  # type: ignore[attr-defined]
+            return c
+
+        connector = ColdStartConnector(
+            connect_bi,
+            _make_wake_cfg(),
+            metrics=metrics,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            engine_name="lb_ops",
+            env={"LB_OPS_PROJECT_TOKEN": "tok-bl3"},
+            clock=clock,
+            sleep_fn=clock.sleep,
+        )
+        connector.register_connect_fn(connect_interactive, preferred=True)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            # bi starts the wake as opener
+            f_bi = ex.submit(lambda: connector.connect(connect_fn=connect_bi))
+            assert post_entered.wait(timeout=2.0)
+            # interactive joins the in-flight wake as a waiter
+            f_int = ex.submit(
+                lambda: connector.connect(connect_fn=connect_interactive)
+            )
+            time.sleep(0.02)
+            wake_gate.set()
+
+            with pytest.raises(EngineError, match="Engine authentication failed") as bi_exc:
+                f_bi.result(timeout=5.0)
+            assert planted_bi_pw not in str(bi_exc.value)
+
+            int_conn = f_int.result(timeout=5.0)
+            assert int_conn.conn_id == 909
+            assert int_conn.role_tag == "interactive"
+
+        assert post_calls == 1
+        assert connector.state == "ok"
+
+        # Warm bad-password failure on bi still keeps connector.state == "ok" for interactive
+        with pytest.raises(EngineError, match="Engine authentication failed"):
+            connector.connect(connect_fn=connect_bi)
+        assert connector.state == "ok"
+        warm_int_conn = connector.connect(connect_fn=connect_interactive)
+        assert warm_int_conn.conn_id == 909
+        assert post_calls == 1
+
+

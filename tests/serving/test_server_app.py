@@ -1639,4 +1639,153 @@ def test_b_fix_build_server_refuses_startup_when_cursor_key_missing(
     assert planted_other_secret not in str(exc_val.value)
 
 
+def test_b_l3_build_server_isolates_bad_account_password_on_shared_lakebase_endpoint(
+    jwks_path, static_catalog_files, monkeypatch
+):
+    import concurrent.futures
+    import threading
+    import httpx
+    from tests.serving.fake_postgres_catalog import FakePostgresCatalog
+
+    pf, sf = static_catalog_files
+    endpoint_awake = False
+    post_entered = threading.Event()
+    wake_gate = threading.Event()
+
+    class BadPasswordError(Exception):
+        pgcode = "28P01"
+
+    def cp_transport(request: httpx.Request) -> httpx.Response:
+        nonlocal endpoint_awake
+        if request.method == "POST" and request.url.path.endswith("/start"):
+            post_entered.set()
+            wake_gate.wait(timeout=2.0)
+            return httpx.Response(202, json={"state": "starting"})
+        endpoint_awake = True
+        return httpx.Response(200, json={"state": "running"})
+
+    real_httpx_client = httpx.Client
+    monkeypatch.setattr(
+        app_mod.httpx,
+        "Client",
+        lambda *_a, **_kw: real_httpx_client(
+            transport=httpx.MockTransport(cp_transport)
+        ),
+    )
+
+    int_cat = FakePostgresCatalog()
+
+    def connect_bi(**kw: Any) -> Any:
+        if not endpoint_awake:
+            raise ConnectionRefusedError("endpoint suspended")
+        raise BadPasswordError('FATAL: password authentication failed for user "bi"')
+
+    def connect_int(**kw: Any) -> Any:
+        if not endpoint_awake:
+            raise ConnectionRefusedError("endpoint suspended")
+        return int_cat.connect(**kw)
+
+    env = {
+        "LB_BI_DSN": "postgresql://bi:badpw@127.0.0.1:40100/ops",
+        "LB_INT_DSN": "postgresql://interactive:goodpw@127.0.0.1:40100/ops",
+        "LB_API_TOK": "cp-token-bl3",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
+    }
+    cfg = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "placement": {"static": {"placement_file": pf, "schemas_file": sf}},
+            "connections": {
+                "duck": {"kind": "duckdb", "path": ":memory:"},
+                "lb_ops": {
+                    "kind": "lakebase",
+                    "accounts": {
+                        "bi": {"dsn_env": "LB_BI_DSN"},
+                        "interactive": {"dsn_env": "LB_INT_DSN"},
+                    },
+                    "tls": {
+                        "sslmode": "verify-full",
+                        "sslrootcert_file": "/etc/seeknal/tls/lb-ca.pem",
+                    },
+                    "lakebase": {
+                        "project_id": "prj_0123456789abcdefghij",
+                        "branch_id": "br_0123456789abcdefghij",
+                        "endpoint_id": "ep_0123456789abcdefghij",
+                        "endpoint_type": "read_write",
+                        "cold_start": {
+                            "wake": "api",
+                            "api_url": "https://lakebase-cp.internal.example",
+                            "api_token_env": "LB_API_TOK",
+                            "connect_timeout_seconds": 2,
+                            "max_query_wait_seconds": 5,
+                            "max_wake_seconds": 30,
+                            "retry_backoff_ms": [10, 20],
+                        },
+                    },
+                },
+            },
+        },
+        env=env,
+    )
+
+    handle = build_server(
+        cfg,
+        env=env,
+        connect_factories={
+            "duck": lambda: duckdb.connect(),
+            "lb_ops": {"bi": connect_bi, "interactive": connect_int},
+        },
+    )
+    lb_routed = handle.adapters["lb_ops"]
+
+    prep_bi = PreparedQuery(
+        engine="lb_ops",
+        engine_kind="lakebase",
+        sql="SELECT 1",
+        params=(),
+        paramstyle="format",
+        rule="point_lookup",
+        reason="test",
+        row_limit=5,
+        masked_columns=(),
+        redacted_sql="SELECT 1",
+        subject="u@test.org",
+        workspace="ws",
+        audit_id="aud-bl3-bi",
+        cube_security_context=None,
+        workload="bi",
+    )
+    prep_int = PreparedQuery(
+        engine="lb_ops",
+        engine_kind="lakebase",
+        sql="SELECT 1",
+        params=(),
+        paramstyle="format",
+        rule="point_lookup",
+        reason="test",
+        row_limit=5,
+        masked_columns=(),
+        redacted_sql="SELECT 1",
+        subject="u@test.org",
+        workspace="ws",
+        audit_id="aud-bl3-int",
+        cube_security_context=None,
+        workload="interactive",
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f_bi = ex.submit(lambda: lb_routed.execute(prep_bi, timeout_seconds=5.0))
+        assert post_entered.wait(timeout=2.0)
+        f_int = ex.submit(lambda: lb_routed.execute(prep_int, timeout_seconds=5.0))
+        time.sleep(0.02)
+        wake_gate.set()
+
+        with pytest.raises(EngineError):
+            f_bi.result(timeout=5.0)
+        res_int = f_int.result(timeout=5.0)
+        assert res_int.rows == [(1,)]
+        assert res_int.cold_start is True
+
+
+
 
