@@ -2418,7 +2418,7 @@ seeknal report-server start --host 0.0.0.0 --port 9000
 
 **Prerequisites:** `pip install seeknal[report-server]`
 
-**Auth modes:** Set `SEEKNAL_REPORT_SERVER_AUTH_MODE` to `token` (default, requires `SEEKNAL_REPORT_SERVER_KEYS`) or `open` (development only).
+**Auth modes:** Set `SEEKNAL_REPORT_SERVER_AUTH_MODE` to `api_key` (default; requires `SEEKNAL_REPORT_SERVER_KEYS` and refuses to start without it) or `open` (explicit opt-in for local development only; logs a warning at startup and must not be exposed beyond localhost).
 
 **Publishing:** After building a report with `seeknal ask report`, publish via the chat TUI menu or the `publish_to_seeknal_report` agent tool. Set `SEEKNAL_PUBLISH_SERVER` and `SEEKNAL_PUBLISH_TOKEN` in your project `.env`.
 
