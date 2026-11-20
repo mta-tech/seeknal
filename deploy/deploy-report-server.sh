@@ -50,7 +50,7 @@ ssh $SSH_OPTS "$REMOTE_HOST" "mkdir -p $REMOTE_DIR"
 # 2. Package and copy seeknal source
 echo "[2/4] Packaging and copying seeknal source..."
 cd "$REPO_ROOT"
-TMP_BUNDLE="$(mktemp "${TMPDIR:-/tmp}/seeknal-report-src.XXXXXX.tar.gz")"
+TMP_BUNDLE="$(mktemp "${TMPDIR:-/tmp}/seeknal-report-src.XXXXXX")"
 trap 'rm -f "$TMP_BUNDLE"' EXIT
 tar czf "$TMP_BUNDLE" \
     --exclude='.git' \

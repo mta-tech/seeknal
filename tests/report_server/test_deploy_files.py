@@ -31,6 +31,24 @@ def _extract_default(expr: str) -> str:
     return match.group(1)
 
 
+def _assert_every_mktemp_template_ends_with_six_xs(script: str) -> None:
+    non_comment_lines = [
+        line.strip()
+        for line in script.splitlines()
+        if "mktemp" in line and not line.strip().startswith("#")
+    ]
+    assert len(non_comment_lines) > 0, "Expected at least one mktemp call in deploy script"
+    mktemp_templates = re.findall(
+        r"\bmktemp\b(?:\s+--?[a-zA-Z0-9_-]+)*\s+[\"']?([^\"'\s;`\)]+)[\"']?",
+        "\n".join(non_comment_lines),
+    )
+    assert len(mktemp_templates) > 0, "Expected at least one mktemp template in deploy script"
+    for tmpl in mktemp_templates:
+        assert re.search(r"X{6,}$", tmpl), (
+            f"mktemp template {tmpl!r} must end with at least six X's (no suffix after them)"
+        )
+
+
 def test_compose_file_auth_default_loopback_bind_and_env_vars_match_server_config(
     monkeypatch,
 ) -> None:
@@ -102,6 +120,7 @@ def test_deploy_script_and_readme_security_guards() -> None:
     # 3. Tar bundle uses mktemp + EXIT trap, excludes .env*, extracts into a fresh seeknal-src
     #    (removing any stale deploy/.env.report-server), and streams remote .env with umask 077
     assert "mktemp" in script
+    _assert_every_mktemp_template_ends_with_six_xs(script)
     assert "trap " in script and "EXIT" in script
     assert "/tmp/seeknal-report-src.tar.gz" not in script
     assert "--exclude='.env'" in script
@@ -127,3 +146,9 @@ def test_deploy_script_and_readme_security_guards() -> None:
     assert "TLS" in readme
     assert ".env.report-server" in readme
     assert "/healthz" in readme
+
+
+def test_deploy_script_mktemp_templates_end_with_at_least_six_xs() -> None:
+    script = DEPLOY_SCRIPT_PATH.read_text(encoding="utf-8")
+    _assert_every_mktemp_template_ends_with_six_xs(script)
+
