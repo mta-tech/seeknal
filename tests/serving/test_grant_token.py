@@ -332,3 +332,55 @@ def test_c_n2_unverified_header_values_never_echoed_in_grant_or_cancel_errors(
     assert "FORGED" not in str(exc_cancel_typ.value)
 
 
+def test_refuses_non_canonical_signature_and_padded_segments(valid_claims):
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    for _ in range(20):
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key = private_key.public_key()
+        token = sign_grant_token(valid_claims, private_key, kid="key-1")
+
+        # Valid token still verifies
+        verified = verify_grant_token(token, {"key-1": public_key})
+        assert verified["sub"] == valid_claims["sub"]
+
+        header_b64, payload_b64, sig_b64 = token.split(".")
+
+        # Padded segments (=) are refused
+        with pytest.raises(GrantTokenError):
+            verify_grant_token(f"{header_b64}=.{payload_b64}.{sig_b64}", {"key-1": public_key})
+        with pytest.raises(GrantTokenError):
+            verify_grant_token(f"{header_b64}.{payload_b64}=.{sig_b64}", {"key-1": public_key})
+        with pytest.raises(GrantTokenError):
+            verify_grant_token(f"{header_b64}.{payload_b64}.{sig_b64}=", {"key-1": public_key})
+
+        # Non-canonical last-character signature variant (same bytes) is refused
+        rem_sig = len(sig_b64) % 4
+        padded_sig = sig_b64 + ("=" * ((4 - rem_sig) % 4))
+        orig_sig_bytes = base64.urlsafe_b64decode(padded_sig.encode("ascii"))
+
+        non_canonical_sig = None
+        for c in alphabet:
+            if c == sig_b64[-1]:
+                continue
+            cand = sig_b64[:-1] + c
+            cand_padded = cand + ("=" * ((4 - len(cand) % 4) % 4))
+            try:
+                cand_bytes = base64.urlsafe_b64decode(cand_padded.encode("ascii"))
+                if cand_bytes == orig_sig_bytes:
+                    non_canonical_sig = cand
+                    break
+            except Exception:
+                pass
+
+        assert non_canonical_sig is not None, "Failed to find non-canonical signature variant"
+        non_canonical_padded = non_canonical_sig + (
+            "=" * ((4 - len(non_canonical_sig) % 4) % 4)
+        )
+        assert base64.urlsafe_b64decode(non_canonical_padded.encode("ascii")) == orig_sig_bytes
+
+        non_canonical_token = f"{header_b64}.{payload_b64}.{non_canonical_sig}"
+        with pytest.raises(GrantTokenError):
+            verify_grant_token(non_canonical_token, {"key-1": public_key})
+
+
+
