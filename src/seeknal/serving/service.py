@@ -27,7 +27,7 @@ from seeknal.serving.enforce import (
     enforce,
 )
 from seeknal.serving.grant_token import verify_grant_token
-from seeknal.serving.guardrails import check_guardrails
+from seeknal.serving.guardrails import GuardrailError, check_guardrails
 from seeknal.serving.parameter_binding import verify_parameter_digest
 from seeknal.serving.placement import Placement
 from seeknal.serving.router import Router, RoutingError
@@ -374,14 +374,23 @@ class ServingPipeline:
 
             # 2. Access pattern guardrails (after routing, before enforce)
             active_metrics = self.metrics if metrics is None else metrics
-            guard_res = check_guardrails(
-                statement,
-                decision=decision,
-                placement=placement,
-                grant=grant,
-                request_max_rows=max_rows,
-                metrics=active_metrics,
-            )
+            try:
+                guard_res = check_guardrails(
+                    statement,
+                    decision=decision,
+                    placement=placement,
+                    grant=grant,
+                    request_max_rows=max_rows,
+                    metrics=active_metrics,
+                )
+            except GuardrailError as g_exc:
+                g_exc.guard = getattr(g_exc, "guard", None) or "reject"
+                g_exc.engine = getattr(g_exc, "engine", None) or decision.engine
+                g_exc.engine_kind = (
+                    getattr(g_exc, "engine_kind", None) or target_kind
+                )
+                g_exc.rule = getattr(g_exc, "rule", None) or decision.rule
+                raise
 
             cube_mask_variants = {
                 c.name.lower(): c.mask_variants for c in placement.cubes.values()
@@ -506,7 +515,11 @@ class ServingPipeline:
                 expires_at=expires_at,
                 tables=enforced.tables,
                 access_pattern=guard_res.access_pattern,
-                guard=guard_res.outcome,
+                guard=(
+                    guard_res.outcome
+                    if guard_res.outcome != "not_applicable"
+                    else None
+                ),
                 filter_columns=guard_res.filter_columns,
                 effective_max_rows=guard_res.effective_max_rows,
                 api=resolved_api,

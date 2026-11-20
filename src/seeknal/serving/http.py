@@ -644,6 +644,57 @@ def _log_request(
     logger.info(" ".join(fmt_parts), *log_args)
 
 
+def _resolve_adapter_audit_metadata(
+    adapter: Any,
+    *,
+    engine_kind: str | None = None,
+    workload: str | None = None,
+    result: Any = None,
+    include_cold_start: bool = True,
+) -> tuple[str | None, str | None, Any, Any]:
+    """Resolve (storage_class, account, lakebase_endpoint, cold_start) for audit logging."""
+    target = adapter
+    has_by_workload = False
+    if adapter is not None and hasattr(adapter, "by_workload"):
+        by_wl = getattr(adapter, "by_workload", None)
+        if isinstance(by_wl, Mapping):
+            has_by_workload = True
+            target = by_wl.get(workload, adapter)
+
+    storage_class = (
+        getattr(result, "storage_class", None)
+        or getattr(target, "storage_class", None)
+        or getattr(adapter, "storage_class", None)
+    )
+    if storage_class is None:
+        if engine_kind in ("postgres", "duckdb"):
+            storage_class = "local"
+        elif engine_kind in ("lakebase", "starrocks", "cube"):
+            storage_class = "object_storage"
+
+    account = (
+        getattr(result, "account", None)
+        or getattr(target, "account", None)
+        or (workload if has_by_workload else getattr(adapter, "account", None))
+    )
+
+    lakebase_endpoint = (
+        getattr(result, "lakebase_endpoint", None)
+        or getattr(target, "lakebase_endpoint", None)
+        or getattr(adapter, "lakebase_endpoint", None)
+    )
+
+    cold_start: Any = None
+    if include_cold_start:
+        cold_start = getattr(result, "cold_start", None)
+        if cold_start is None and target is not None:
+            cold_start = getattr(target, "last_cold_start", None)
+        if cold_start is None and adapter is not None:
+            cold_start = getattr(adapter, "last_cold_start", None)
+
+    return storage_class, account, lakebase_endpoint, cold_start
+
+
 def create_app(
     pipeline: ServingPipeline,
     adapters: Mapping[str, EngineAdapter],
@@ -760,7 +811,15 @@ def create_app(
         subject: str | None = None,
         engine: str | None = None,
         engine_kind: str | None = None,
+        storage_class: str | None = None,
+        account: str | None = None,
+        lakebase_endpoint: Any = None,
+        cold_start: Any = None,
         rule: str | None = None,
+        access_pattern: str | None = None,
+        guard: str | None = None,
+        filter_columns: Sequence[str] | None = None,
+        effective_max_rows: int | None = None,
         workload: str | None = None,
         tables: Sequence[str] | None = None,
         row_count: int | None = None,
@@ -773,9 +832,59 @@ def create_app(
         token: str | None = None,
         claims: Mapping[str, Any] | None = None,
         binding: Mapping[str, Any] | None = None,
+        prepared: PreparedQuery | None = None,
+        adapter: Any = None,
+        result: Any = None,
+        include_cold_start: bool = True,
         skip_callable_audit: bool = False,
         log_request_line: bool = True,
     ) -> Response:
+        if prepared is not None:
+            if audit_id is None:
+                audit_id = prepared.audit_id
+            if subject is None:
+                subject = prepared.subject
+            if engine is None:
+                engine = prepared.engine
+            if engine_kind is None:
+                engine_kind = prepared.engine_kind
+            if rule is None:
+                rule = prepared.rule
+            if workload is None:
+                workload = prepared.workload
+            if api is None:
+                api = prepared.api
+            if access_pattern is None:
+                access_pattern = prepared.access_pattern
+            if guard is None:
+                guard = prepared.guard
+            if filter_columns is None:
+                filter_columns = prepared.filter_columns
+            if effective_max_rows is None:
+                effective_max_rows = prepared.effective_max_rows
+            if not binding and prepared.binding:
+                binding = prepared.binding
+
+        if adapter is None and engine is not None:
+            adapter = adapters.get(engine)
+
+        if engine_kind is not None or adapter is not None or result is not None:
+            res_sc, res_acc, res_lb, res_cs = _resolve_adapter_audit_metadata(
+                adapter,
+                engine_kind=engine_kind,
+                workload=workload,
+                result=result,
+                include_cold_start=include_cold_start,
+            )
+            if storage_class is None:
+                storage_class = res_sc
+            if account is None:
+                account = res_acc
+            if lakebase_endpoint is None:
+                lakebase_endpoint = res_lb
+            if cold_start is None:
+                cold_start = res_cs
+
         if audit_sink is not None and route in ALLOWED_AUDIT_ROUTES:
             if is_structured_sink:
                 primary_cb_called = False
@@ -795,6 +904,14 @@ def create_app(
                         sql_sha256=sql_sha256,
                         api=api,
                         engine_kind=engine_kind,
+                        storage_class=storage_class,
+                        account=account,
+                        lakebase_endpoint=lakebase_endpoint,
+                        cold_start=cold_start,
+                        access_pattern=access_pattern,
+                        guard=guard,
+                        filter_columns=filter_columns,
+                        effective_max_rows=effective_max_rows,
                         paged=paged,
                         audit_id=audit_id,
                         subject=subject,
@@ -898,6 +1015,14 @@ def create_app(
                         sql_sha256=sql_sha256,
                         api=api,
                         engine_kind=engine_kind,
+                        storage_class=storage_class,
+                        account=account,
+                        lakebase_endpoint=lakebase_endpoint,
+                        cold_start=cold_start,
+                        access_pattern=access_pattern,
+                        guard=guard,
+                        filter_columns=filter_columns,
+                        effective_max_rows=effective_max_rows,
                         paged=paged,
                         audit_id=audit_id,
                         subject=subject,
@@ -1345,9 +1470,11 @@ def create_app(
                 metrics.record_grant_rejected("invalid_claims")
             audit_id = getattr(exc, "audit_id", None) or v_jti
             subject = getattr(exc, "subject", None) or v_sub
+            exc_engine = getattr(exc, "engine", None)
+            exc_engine_kind = getattr(exc, "engine_kind", None)
             logger.error(
                 "engine=%s code=%s error=%s detail=%s audit_id=%s",
-                "-",
+                exc_engine_kind or "-",
                 spec.code,
                 type(exc).__name__,
                 scrub_error_detail(exc, token=token, sql=sql, params=params),
@@ -1367,11 +1494,19 @@ def create_app(
                 elapsed_ms=elapsed,
                 audit_id=audit_id,
                 subject=subject,
+                engine=exc_engine,
+                engine_kind=exc_engine_kind,
+                rule=getattr(exc, "rule", None),
+                access_pattern=getattr(exc, "access_pattern", None),
+                guard=getattr(exc, "guard", None),
+                filter_columns=getattr(exc, "filter_columns", None),
+                effective_max_rows=getattr(exc, "effective_max_rows", None),
                 tables=tables,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
+                include_cold_start=False,
             )
 
         if isinstance(exc, RoutingError):
@@ -1563,6 +1698,7 @@ def create_app(
                 hint=hint,
                 max_staleness_seconds=max_staleness,
                 max_rows=max_rows,
+                metrics=metrics,
             )
         except Exception as exc:
             return await _handle_prepare_exception(
@@ -1618,6 +1754,8 @@ def create_app(
             token=token,
             claims=claims,
             binding=prepared.binding,
+            prepared=prepared,
+            include_cold_start=False,
         )
 
     async def query(request: Request) -> Response:
@@ -1646,6 +1784,7 @@ def create_app(
                 hint=hint,
                 max_staleness_seconds=max_staleness,
                 max_rows=max_rows,
+                metrics=metrics,
             )
         except Exception as exc:
             return await _handle_prepare_exception(
@@ -1686,18 +1825,13 @@ def create_app(
                 status=401,
                 code="grant_invalid",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                include_cold_start=False,
             )
 
         try:
@@ -1717,18 +1851,13 @@ def create_app(
                 status=401,
                 code="grant_replayed",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                include_cold_start=False,
             )
         except GrantReplayCacheFull:
             return await _finish(
@@ -1745,18 +1874,13 @@ def create_app(
                 status=503,
                 code="engine_unavailable",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                include_cold_start=False,
             )
 
         adapter = adapters.get(prepared.engine)
@@ -1773,28 +1897,41 @@ def create_app(
                 status=503,
                 code="engine_unavailable",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                include_cold_start=False,
             )
 
         callable_audit_done = False
         if is_callable_sink:
+            pre_sc, pre_acc, pre_lb, pre_cs = _resolve_adapter_audit_metadata(
+                adapter,
+                engine_kind=prepared.engine_kind,
+                workload=prepared.workload,
+                result=None,
+                include_cold_start=True,
+            )
             try:
                 pre_record = build_audit_record(
                     route="/v1/query",
                     status=200,
                     elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
                     sql=sql,
+                    api=prepared.api,
+                    engine_kind=prepared.engine_kind,
+                    storage_class=pre_sc,
+                    account=pre_acc,
+                    lakebase_endpoint=pre_lb,
+                    cold_start=pre_cs,
+                    access_pattern=prepared.access_pattern,
+                    guard=prepared.guard,
+                    filter_columns=prepared.filter_columns,
+                    effective_max_rows=prepared.effective_max_rows,
+                    paged=None,
                     audit_id=prepared.audit_id,
                     subject=prepared.subject,
                     workload=prepared.workload,
@@ -1899,18 +2036,14 @@ def create_app(
                 status=409,
                 code="duplicate_query_id",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
+                include_cold_start=False,
                 skip_callable_audit=callable_audit_done,
             )
 
@@ -1960,18 +2093,13 @@ def create_app(
                             status=499,
                             code="query_cancelled",
                             elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                            audit_id=prepared.audit_id,
-                            subject=prepared.subject,
-                            engine=prepared.engine,
-                            engine_kind=prepared.engine_kind,
-                            rule=prepared.rule,
-                            workload=prepared.workload,
                             tables=tables,
                             sql=sql,
                             params=params,
                             token=token,
                             claims=claims,
-                            binding=prepared.binding,
+                            prepared=prepared,
+                            adapter=adapter,
                             skip_callable_audit=callable_audit_done,
                             log_request_line=False,
                         )
@@ -1999,18 +2127,13 @@ def create_app(
                 status=504,
                 code="engine_timeout",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
                 skip_callable_audit=callable_audit_done,
             )
         except EnginePoolExhausted as exc:
@@ -2034,18 +2157,13 @@ def create_app(
                 status=503,
                 code="engine_unavailable",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
                 skip_callable_audit=callable_audit_done,
             )
         except EngineConfigError as exc:
@@ -2078,18 +2196,13 @@ def create_app(
                 status=503,
                 code="engine_unavailable",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
                 skip_callable_audit=callable_audit_done,
             )
         except EngineCancelled as exc:
@@ -2113,18 +2226,13 @@ def create_app(
                 status=499,
                 code="query_cancelled",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
                 skip_callable_audit=callable_audit_done,
             )
         except EngineError as exc:
@@ -2151,18 +2259,13 @@ def create_app(
                     status=503,
                     code="engine_starting",
                     elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                    audit_id=prepared.audit_id,
-                    subject=prepared.subject,
-                    engine=prepared.engine,
-                    engine_kind=prepared.engine_kind,
-                    rule=prepared.rule,
-                    workload=prepared.workload,
                     tables=tables,
                     sql=sql,
                     params=params,
                     token=token,
                     claims=claims,
-                    binding=prepared.binding,
+                    prepared=prepared,
+                    adapter=adapter,
                     skip_callable_audit=callable_audit_done,
                 )
             raw_eng_msg = str(exc)
@@ -2194,18 +2297,13 @@ def create_app(
                 status=502,
                 code="engine_unavailable",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
                 skip_callable_audit=callable_audit_done,
             )
         except Exception as exc:
@@ -2232,18 +2330,13 @@ def create_app(
                     status=503,
                     code="engine_starting",
                     elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                    audit_id=prepared.audit_id,
-                    subject=prepared.subject,
-                    engine=prepared.engine,
-                    engine_kind=prepared.engine_kind,
-                    rule=prepared.rule,
-                    workload=prepared.workload,
                     tables=tables,
                     sql=sql,
                     params=params,
                     token=token,
                     claims=claims,
-                    binding=prepared.binding,
+                    prepared=prepared,
+                    adapter=adapter,
                     skip_callable_audit=callable_audit_done,
                 )
             if _is_audit_unavailable(exc):
@@ -2267,18 +2360,13 @@ def create_app(
                     status=503,
                     code="audit_unavailable",
                     elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                    audit_id=prepared.audit_id,
-                    subject=prepared.subject,
-                    engine=prepared.engine,
-                    engine_kind=prepared.engine_kind,
-                    rule=prepared.rule,
-                    workload=prepared.workload,
                     tables=tables,
                     sql=sql,
                     params=params,
                     token=token,
                     claims=claims,
-                    binding=prepared.binding,
+                    prepared=prepared,
+                    adapter=adapter,
                     skip_callable_audit=callable_audit_done,
                 )
 
@@ -2302,18 +2390,13 @@ def create_app(
                 status=500,
                 code="internal_error",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
                 skip_callable_audit=callable_audit_done,
             )
         finally:
@@ -2337,19 +2420,15 @@ def create_app(
                 status=422,
                 code="row_cap_hit",
                 elapsed_ms=result.elapsed_ms,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 truncated=True,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
+                result=result,
                 skip_callable_audit=callable_audit_done,
             )
 
@@ -2369,18 +2448,14 @@ def create_app(
                 status=413,
                 code="result_too_large",
                 elapsed_ms=result.elapsed_ms,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql=sql,
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
+                result=result,
                 skip_callable_audit=callable_audit_done,
             )
 
@@ -2411,12 +2486,7 @@ def create_app(
             route="/v1/query",
             status=200,
             elapsed_ms=result.elapsed_ms,
-            audit_id=prepared.audit_id,
-            subject=prepared.subject,
             engine=result.engine,
-            engine_kind=prepared.engine_kind,
-            rule=prepared.rule,
-            workload=prepared.workload,
             tables=tables,
             row_count=len(safe_rows),
             truncated=bool(result.truncated),
@@ -2424,7 +2494,9 @@ def create_app(
             params=params,
             token=token,
             claims=claims,
-            binding=prepared.binding,
+            prepared=prepared,
+            adapter=adapter,
+            result=result,
             skip_callable_audit=callable_audit_done,
         )
 
@@ -2819,6 +2891,7 @@ def create_app(
             )
 
         effective_cursor_key = _resolve_cursor_key()
+        compiled_holder: list[CompiledSelect | None] = [None]
 
         def _compile_and_prepare() -> tuple[CompiledSelect, PreparedQuery]:
             with pipeline._lock:
@@ -2834,6 +2907,7 @@ def create_app(
                 cursor_key=effective_cursor_key,
                 include_cursor_columns=bool(effective_cursor_key),
             )
+            compiled_holder[0] = comp
             prep = pipeline.prepare_statement(
                 statement=comp.statement.copy(),
                 grant=grant,
@@ -2852,14 +2926,19 @@ def create_app(
             compiled, prepared = await run_in_threadpool(_compile_and_prepare)
         except Exception as exc:
             elapsed = (time.perf_counter() - req_start) * 1000.0
+            comp_err = compiled_holder[0]
+            err_tables = [comp_err.table.lower()] if comp_err is not None else None
+            err_paged = comp_err.paged if comp_err is not None else None
             if isinstance(exc, (SelectInvalidError, CursorError, EnforcementError)):
                 code = getattr(exc, "code", None) or "access_denied"
                 spec = get_error_spec(code)
                 if metrics is not None and spec.code == "grant_invalid":
                     metrics.record_grant_rejected("invalid_claims")
+                exc_engine = getattr(exc, "engine", None)
+                exc_engine_kind = getattr(exc, "engine_kind", None)
                 logger.error(
                     "engine=%s code=%s error=%s detail=%s audit_id=%s",
-                    "-",
+                    exc_engine_kind or "-",
                     spec.code,
                     type(exc).__name__,
                     scrub_error_detail(exc, token=token),
@@ -2873,12 +2952,22 @@ def create_app(
                     elapsed_ms=elapsed,
                     audit_id=grant.audit_id,
                     subject=grant.subject,
+                    engine=exc_engine,
+                    engine_kind=exc_engine_kind,
+                    rule=getattr(exc, "rule", None),
+                    access_pattern=getattr(exc, "access_pattern", None),
+                    guard=getattr(exc, "guard", None),
+                    filter_columns=getattr(exc, "filter_columns", None),
+                    effective_max_rows=getattr(exc, "effective_max_rows", None),
                     workload=grant.workload,
+                    tables=err_tables,
                     sql_sha256=body_sha256,
                     api="select.v1",
+                    paged=err_paged,
                     token=token,
                     claims=claims,
                     binding=grant.binding,
+                    include_cold_start=False,
                 )
             if isinstance(exc, RoutingError):
                 code = getattr(exc, "code", None) or "query_spans_engines"
@@ -2900,8 +2989,10 @@ def create_app(
                     audit_id=grant.audit_id,
                     subject=grant.subject,
                     workload=grant.workload,
+                    tables=err_tables,
                     sql_sha256=body_sha256,
                     api="select.v1",
+                    paged=err_paged,
                     token=token,
                     claims=claims,
                     binding=grant.binding,
@@ -2930,8 +3021,10 @@ def create_app(
                     audit_id=grant.audit_id,
                     subject=grant.subject,
                     workload=grant.workload,
+                    tables=err_tables,
                     sql_sha256=body_sha256,
                     api="select.v1",
+                    paged=err_paged,
                     token=token,
                     claims=claims,
                     binding=grant.binding,
@@ -2946,8 +3039,10 @@ def create_app(
                     audit_id=grant.audit_id,
                     subject=grant.subject,
                     workload=grant.workload,
+                    tables=err_tables,
                     sql_sha256=body_sha256,
                     api="select.v1",
+                    paged=err_paged,
                     token=token,
                     claims=claims,
                     binding=grant.binding,
@@ -2969,8 +3064,10 @@ def create_app(
                 audit_id=grant.audit_id,
                 subject=grant.subject,
                 workload=grant.workload,
+                tables=err_tables,
                 sql_sha256=body_sha256,
                 api="select.v1",
+                paged=err_paged,
                 token=token,
                 claims=claims,
                 binding=grant.binding,
@@ -2996,12 +3093,6 @@ def create_app(
                 status=401,
                 code="grant_replayed",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql_sha256=body_sha256,
                 api="select.v1",
@@ -3009,7 +3100,8 @@ def create_app(
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                include_cold_start=False,
             )
         except GrantReplayCacheFull:
             return await _finish(
@@ -3025,12 +3117,6 @@ def create_app(
                 status=503,
                 code="engine_unavailable",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql_sha256=body_sha256,
                 api="select.v1",
@@ -3038,7 +3124,8 @@ def create_app(
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                include_cold_start=False,
             )
 
         adapter = adapters.get(prepared.engine)
@@ -3054,12 +3141,6 @@ def create_app(
                 status=503,
                 code="engine_unavailable",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql_sha256=body_sha256,
                 api="select.v1",
@@ -3067,11 +3148,19 @@ def create_app(
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                include_cold_start=False,
             )
 
         callable_audit_done = False
         if is_callable_sink and route in ALLOWED_AUDIT_ROUTES:
+            pre_sc, pre_acc, pre_lb, pre_cs = _resolve_adapter_audit_metadata(
+                adapter,
+                engine_kind=prepared.engine_kind,
+                workload=prepared.workload,
+                result=None,
+                include_cold_start=True,
+            )
             try:
                 pre_record = build_audit_record(
                     route=route,
@@ -3080,6 +3169,14 @@ def create_app(
                     sql_sha256=body_sha256,
                     api="select.v1",
                     engine_kind=prepared.engine_kind,
+                    storage_class=pre_sc,
+                    account=pre_acc,
+                    lakebase_endpoint=pre_lb,
+                    cold_start=pre_cs,
+                    access_pattern=prepared.access_pattern,
+                    guard=prepared.guard,
+                    filter_columns=prepared.filter_columns,
+                    effective_max_rows=prepared.effective_max_rows,
                     paged=compiled.paged,
                     audit_id=prepared.audit_id,
                     subject=prepared.subject,
@@ -3167,12 +3264,6 @@ def create_app(
                 status=409,
                 code="duplicate_query_id",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql_sha256=body_sha256,
                 api="select.v1",
@@ -3180,7 +3271,9 @@ def create_app(
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
+                include_cold_start=False,
                 skip_callable_audit=callable_audit_done,
             )
 
@@ -3230,12 +3323,6 @@ def create_app(
                             status=499,
                             code="query_cancelled",
                             elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                            audit_id=prepared.audit_id,
-                            subject=prepared.subject,
-                            engine=prepared.engine,
-                            engine_kind=prepared.engine_kind,
-                            rule=prepared.rule,
-                            workload=prepared.workload,
                             tables=tables,
                             sql_sha256=body_sha256,
                             api="select.v1",
@@ -3243,7 +3330,8 @@ def create_app(
                             params=params,
                             token=token,
                             claims=claims,
-                            binding=prepared.binding,
+                            prepared=prepared,
+                            adapter=adapter,
                             skip_callable_audit=callable_audit_done,
                             log_request_line=False,
                         )
@@ -3270,12 +3358,6 @@ def create_app(
                 status=504,
                 code="engine_timeout",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql_sha256=body_sha256,
                 api="select.v1",
@@ -3283,7 +3365,8 @@ def create_app(
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
                 skip_callable_audit=callable_audit_done,
             )
         except EnginePoolExhausted as exc:
@@ -3306,12 +3389,6 @@ def create_app(
                 status=503,
                 code="engine_unavailable",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql_sha256=body_sha256,
                 api="select.v1",
@@ -3319,7 +3396,8 @@ def create_app(
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
                 skip_callable_audit=callable_audit_done,
             )
         except EngineConfigError as exc:
@@ -3351,12 +3429,6 @@ def create_app(
                 status=503,
                 code="engine_unavailable",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql_sha256=body_sha256,
                 api="select.v1",
@@ -3364,7 +3436,8 @@ def create_app(
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
                 skip_callable_audit=callable_audit_done,
             )
         except EngineCancelled as exc:
@@ -3387,12 +3460,6 @@ def create_app(
                 status=499,
                 code="query_cancelled",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql_sha256=body_sha256,
                 api="select.v1",
@@ -3400,7 +3467,8 @@ def create_app(
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
                 skip_callable_audit=callable_audit_done,
             )
         except EngineError as exc:
@@ -3426,12 +3494,6 @@ def create_app(
                     status=503,
                     code="engine_starting",
                     elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                    audit_id=prepared.audit_id,
-                    subject=prepared.subject,
-                    engine=prepared.engine,
-                    engine_kind=prepared.engine_kind,
-                    rule=prepared.rule,
-                    workload=prepared.workload,
                     tables=tables,
                     sql_sha256=body_sha256,
                     api="select.v1",
@@ -3439,7 +3501,8 @@ def create_app(
                     params=params,
                     token=token,
                     claims=claims,
-                    binding=prepared.binding,
+                    prepared=prepared,
+                    adapter=adapter,
                     skip_callable_audit=callable_audit_done,
                 )
             raw_eng_msg = str(exc)
@@ -3470,12 +3533,6 @@ def create_app(
                 status=502,
                 code="engine_unavailable",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql_sha256=body_sha256,
                 api="select.v1",
@@ -3483,7 +3540,8 @@ def create_app(
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
                 skip_callable_audit=callable_audit_done,
             )
         except Exception as exc:
@@ -3509,12 +3567,6 @@ def create_app(
                     status=503,
                     code="engine_starting",
                     elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                    audit_id=prepared.audit_id,
-                    subject=prepared.subject,
-                    engine=prepared.engine,
-                    engine_kind=prepared.engine_kind,
-                    rule=prepared.rule,
-                    workload=prepared.workload,
                     tables=tables,
                     sql_sha256=body_sha256,
                     api="select.v1",
@@ -3522,7 +3574,8 @@ def create_app(
                     params=params,
                     token=token,
                     claims=claims,
-                    binding=prepared.binding,
+                    prepared=prepared,
+                    adapter=adapter,
                     skip_callable_audit=callable_audit_done,
                 )
             if _is_audit_unavailable(exc):
@@ -3545,12 +3598,6 @@ def create_app(
                     status=503,
                     code="audit_unavailable",
                     elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                    audit_id=prepared.audit_id,
-                    subject=prepared.subject,
-                    engine=prepared.engine,
-                    engine_kind=prepared.engine_kind,
-                    rule=prepared.rule,
-                    workload=prepared.workload,
                     tables=tables,
                     sql_sha256=body_sha256,
                     api="select.v1",
@@ -3558,7 +3605,8 @@ def create_app(
                     params=params,
                     token=token,
                     claims=claims,
-                    binding=prepared.binding,
+                    prepared=prepared,
+                    adapter=adapter,
                     skip_callable_audit=callable_audit_done,
                 )
 
@@ -3581,12 +3629,6 @@ def create_app(
                 status=500,
                 code="internal_error",
                 elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql_sha256=body_sha256,
                 api="select.v1",
@@ -3594,7 +3636,8 @@ def create_app(
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
                 skip_callable_audit=callable_audit_done,
             )
         finally:
@@ -3621,12 +3664,6 @@ def create_app(
                 status=422,
                 code="row_cap_hit",
                 elapsed_ms=result.elapsed_ms,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 truncated=True,
                 sql_sha256=body_sha256,
@@ -3635,7 +3672,9 @@ def create_app(
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
+                result=result,
                 skip_callable_audit=callable_audit_done,
             )
 
@@ -3690,12 +3729,6 @@ def create_app(
                 status=413,
                 code="result_too_large",
                 elapsed_ms=result.elapsed_ms,
-                audit_id=prepared.audit_id,
-                subject=prepared.subject,
-                engine=prepared.engine,
-                engine_kind=prepared.engine_kind,
-                rule=prepared.rule,
-                workload=prepared.workload,
                 tables=tables,
                 sql_sha256=body_sha256,
                 api="select.v1",
@@ -3703,7 +3736,9 @@ def create_app(
                 params=params,
                 token=token,
                 claims=claims,
-                binding=prepared.binding,
+                prepared=prepared,
+                adapter=adapter,
+                result=result,
                 skip_callable_audit=callable_audit_done,
             )
 
@@ -3729,12 +3764,7 @@ def create_app(
             route=route,
             status=200,
             elapsed_ms=result.elapsed_ms,
-            audit_id=prepared.audit_id,
-            subject=prepared.subject,
             engine=result.engine,
-            engine_kind=prepared.engine_kind,
-            rule=prepared.rule,
-            workload=prepared.workload,
             tables=tables,
             row_count=len(safe_rows),
             truncated=bool(result.truncated),
@@ -3744,7 +3774,9 @@ def create_app(
             params=params,
             token=token,
             claims=claims,
-            binding=prepared.binding,
+            prepared=prepared,
+            adapter=adapter,
+            result=result,
             skip_callable_audit=callable_audit_done,
         )
 

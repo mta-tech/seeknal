@@ -324,6 +324,7 @@ class MetricsRegistry:
         self._grants_rejected_total: dict[str, int] = {}
         self._audit_write_failures_total: int = 0
         self._guard_rejections_total: dict[str, int] = {}
+        self._guard_warnings_total: dict[str, int] = {}
         self._sync_lag_seconds: dict[str, float] = {}
         self._discovery_refresh_total: dict[tuple[str, str], int] = {}
         self._lakebase_wake_total: dict[tuple[str, str], int] = {}
@@ -486,6 +487,18 @@ class MetricsRegistry:
         """Alias for record_guard_rejection."""
         self.record_guard_rejection(code)
 
+    def record_guard_warning(self, code: Any) -> None:
+        """Increment seeknal_serving_guard_warnings_total by bounded guardrail code."""
+        safe_code = normalize_guard_code(code)
+        with self._lock:
+            self._guard_warnings_total[safe_code] = (
+                self._guard_warnings_total.get(safe_code, 0) + 1
+            )
+
+    def inc_guard_warning(self, code: Any) -> None:
+        """Alias for record_guard_warning."""
+        self.record_guard_warning(code)
+
     def set_sync_lag(self, engine: Any, lag_seconds: float | int | None) -> None:
         """Set or clear seeknal_serving_sync_lag_seconds{engine}."""
         with self._lock:
@@ -582,6 +595,7 @@ class MetricsRegistry:
             self._grants_rejected_total.clear()
             self._audit_write_failures_total = 0
             self._guard_rejections_total.clear()
+            self._guard_warnings_total.clear()
             self._sync_lag_seconds.clear()
             self._discovery_refresh_total.clear()
             self._lakebase_wake_total.clear()
@@ -688,6 +702,7 @@ class MetricsRegistry:
             grants_snap = sorted(self._grants_rejected_total.items())
             audit_failures = self._audit_write_failures_total
             guard_snap = sorted(self._guard_rejections_total.items())
+            guard_warn_snap = sorted(self._guard_warnings_total.items())
             sync_lag_snap = sorted(self._sync_lag_seconds.items())
             disc_refresh_snap = sorted(self._discovery_refresh_total.items())
             lb_wake_snap = sorted(self._lakebase_wake_total.items())
@@ -849,7 +864,7 @@ class MetricsRegistry:
         lines.append("# TYPE seeknal_serving_audit_write_failures_total counter")
         lines.append(f"seeknal_serving_audit_write_failures_total {audit_failures}")
 
-        # 8. Guardrail rejections counter
+        # 8. Guardrail rejections & warnings counters
         lines.append(
             "# HELP seeknal_serving_guard_rejections_total Total guardrail rejections by bounded code."
         )
@@ -858,6 +873,16 @@ class MetricsRegistry:
             gc_esc = _escape_label_value(g_code)
             lines.append(
                 f'seeknal_serving_guard_rejections_total{{code="{gc_esc}"}} {val}'
+            )
+
+        lines.append(
+            "# HELP seeknal_serving_guard_warnings_total Total guardrail warnings by bounded code."
+        )
+        lines.append("# TYPE seeknal_serving_guard_warnings_total counter")
+        for g_code, val in guard_warn_snap:
+            gc_esc = _escape_label_value(g_code)
+            lines.append(
+                f'seeknal_serving_guard_warnings_total{{code="{gc_esc}"}} {val}'
             )
 
         # 9. Sync lag gauge

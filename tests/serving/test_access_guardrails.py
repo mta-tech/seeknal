@@ -18,6 +18,7 @@ from seeknal.serving.guardrails import (
     check_guardrails,
 )
 from seeknal.serving.http import create_app
+from seeknal.serving.metrics import MetricsRegistry
 from seeknal.serving.placement import Placement
 from seeknal.serving.router import Router
 from seeknal.serving.service import ServingPipeline
@@ -28,9 +29,13 @@ class FakeGuardMetrics:
 
     def __init__(self) -> None:
         self.counts: dict[str, int] = {}
+        self.warnings: dict[str, int] = {}
 
     def record_guard_rejection(self, code: str) -> None:
         self.counts[code] = self.counts.get(code, 0) + 1
+
+    def record_guard_warning(self, code: str) -> None:
+        self.warnings[code] = self.warnings.get(code, 0) + 1
 
 
 def _make_placement(*, guard_mode: str = "enforce", max_in_list: int = 1000, max_offset: int = 10000) -> Placement:
@@ -625,7 +630,14 @@ def test_guard_mode_warn_records_metric_without_rejecting():
     assert res.outcome == "warn"
     assert len(res.warnings) >= 1
     assert "filter_required" in res.warnings[0]
-    assert metrics.counts == {"filter_required": 1}
+    assert metrics.counts == {}
+    assert metrics.warnings == {"filter_required": 1}
+
+    reg = MetricsRegistry(engines=["pg_report", "lake"])
+    _run_guard("SELECT * FROM cbn.rpt.txn_detail", pl_warn, metrics=reg)
+    rendered = reg.render()
+    assert 'seeknal_serving_guard_warnings_total{code="filter_required"} 1' in rendered
+    assert 'seeknal_serving_guard_rejections_total{code="filter_required"}' not in rendered
 
 
 # ==============================================================================

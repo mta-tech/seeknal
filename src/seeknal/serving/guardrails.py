@@ -41,8 +41,27 @@ class GuardrailError(EnforcementError):
 
     code: str = "filter_required"
 
-    def __init__(self, message: str = "", *, code: str = "filter_required") -> None:
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        code: str = "filter_required",
+        guard: str = "reject",
+        access_pattern: str | None = None,
+        filter_columns: tuple[str, ...] = (),
+        effective_max_rows: int | None = None,
+        engine: str | None = None,
+        engine_kind: str | None = None,
+        rule: str | None = None,
+    ) -> None:
         super().__init__(message, code=code)
+        self.guard = guard
+        self.access_pattern = access_pattern
+        self.filter_columns = filter_columns
+        self.effective_max_rows = effective_max_rows
+        self.engine = engine
+        self.engine_kind = engine_kind
+        self.rule = rule
 
 
 @dataclass(frozen=True)
@@ -113,11 +132,21 @@ def effective_table_access(table: TableEntry) -> TableAccess | None:
     return None
 
 
-def _record_guard_metric(metrics: Any, code: str) -> None:
+def _record_guard_rejection(metrics: Any, code: str) -> None:
     if metrics is None:
         return
     fn = getattr(metrics, "record_guard_rejection", None) or getattr(
         metrics, "inc_guard_rejection", None
+    )
+    if callable(fn):
+        fn(code)
+
+
+def _record_guard_warning(metrics: Any, code: str) -> None:
+    if metrics is None:
+        return
+    fn = getattr(metrics, "record_guard_warning", None) or getattr(
+        metrics, "inc_guard_warning", None
     )
     if callable(fn):
         fn(code)
@@ -1151,8 +1180,8 @@ def check_guardrails(
 
     if violations:
         first_code, first_msg = violations[0]
-        _record_guard_metric(metrics, first_code)
         if placement.policy.guard_mode == "warn":
+            _record_guard_warning(metrics, first_code)
             warn_msgs = tuple(f"{c}: {m}" for c, m in violations)
             return GuardrailResult(
                 outcome="warn",
@@ -1161,7 +1190,18 @@ def check_guardrails(
                 effective_max_rows=effective_max_rows,
                 warnings=warn_msgs,
             )
-        raise GuardrailError(first_msg, code=first_code)
+        _record_guard_rejection(metrics, first_code)
+        raise GuardrailError(
+            first_msg,
+            code=first_code,
+            guard="reject",
+            access_pattern=access_pattern,
+            filter_columns=tuple(filter_cols),
+            effective_max_rows=effective_max_rows,
+            engine=decision.engine,
+            engine_kind=target_engine.kind if target_engine is not None else None,
+            rule=decision.rule,
+        )
 
     return GuardrailResult(
         outcome="pass",
