@@ -903,7 +903,10 @@ def _check_select_scope(
                 inner_order = _extract_order_by(inner_sel)
                 if inner_order:
                     inner_ord_err = _check_order_by_for_select(
-                        inner_order, inner_sel, [inst], False
+                        inner_order,
+                        inner_sel,
+                        [inst],
+                        bool(inner_sel.args.get("group")),
                     )
                     if inner_ord_err is not None:
                         violations.append(inner_ord_err)
@@ -1004,7 +1007,7 @@ def _check_select_scope(
         return (violations, filter_cols, transparent_inner_ids)
 
     # Check ORDER BY on this Select (and any outer SetOperation ORDER BY passed in)
-    sel_has_group_by = bool(sel.args.get("group")) or has_outer_group_by
+    sel_has_group_by = bool(sel.args.get("group"))
     sel_order = _extract_order_by(sel)
     if sel_order:
         ord_err = _check_order_by_for_select(
@@ -1015,7 +1018,10 @@ def _check_select_scope(
 
     if not violations and outer_order_items:
         ord_err = _check_order_by_for_select(
-            outer_order_items, sel, instances, sel_has_group_by
+            outer_order_items,
+            sel,
+            instances,
+            sel_has_group_by or has_outer_group_by,
         )
         if ord_err is not None:
             violations.append(ord_err)
@@ -1149,7 +1155,6 @@ def check_guardrails(
         if isinstance(statement, _SET_OP_CLASSES)
         else None
     )
-    has_any_group_by = decision.features.has_group_by
 
     for sel in top_selects:
         checked_select_ids.add(id(sel))
@@ -1158,7 +1163,6 @@ def check_guardrails(
             placement,
             cte_map,
             outer_order_items=outer_setop_order,
-            has_outer_group_by=has_any_group_by,
             params=params,
         )
         violations.extend(v_list)

@@ -552,12 +552,21 @@ def test_order_by_sortable_accept_reject_and_group_by_exemption():
     )
     assert r_grp.outcome == "pass"
 
-    # Reject: unindexed column, expression, ordinal, or computed alias shadowing sortable name
+    # Reject: unindexed column, expression, ordinal, computed alias, or GROUP BY only inside CTE/subquery
     for bad_order_sql in (
         "SELECT * FROM cbn.rpt.txn_detail WHERE customer_id = 'C-1001' ORDER BY amount DESC",
         "SELECT * FROM cbn.rpt.txn_detail WHERE customer_id = 'C-1001' ORDER BY lower(as_of_date)",
         "SELECT txn_id FROM cbn.rpt.txn_detail WHERE customer_id = 'C-1001' ORDER BY 1",
         "SELECT lower(branch_code) AS as_of_date FROM cbn.rpt.txn_detail WHERE customer_id = 'C-1001' ORDER BY as_of_date",
+        "WITH g AS (SELECT branch_code, count(*) AS cnt FROM cbn.rpt.branch_dim GROUP BY branch_code) "
+        "SELECT t.txn_id, t.amount FROM cbn.rpt.txn_detail t WHERE t.customer_id = 'C-1001' ORDER BY t.amount DESC",
+        "WITH g AS (SELECT branch_code, count(*) AS cnt FROM cbn.rpt.branch_dim GROUP BY branch_code) "
+        "SELECT t.txn_id, t.amount FROM cbn.rpt.txn_detail t JOIN g ON t.branch_code = g.branch_code "
+        "WHERE t.customer_id = 'C-1001' ORDER BY t.amount DESC",
+        "SELECT t.txn_id, t.amount FROM cbn.rpt.txn_detail t "
+        "WHERE t.customer_id = 'C-1001' "
+        "AND t.branch_code IN (SELECT branch_code FROM cbn.rpt.branch_dim GROUP BY branch_code) "
+        "ORDER BY t.amount DESC",
     ):
         with pytest.raises(GuardrailError) as exc_info:
             _run_guard(bad_order_sql, pl)
