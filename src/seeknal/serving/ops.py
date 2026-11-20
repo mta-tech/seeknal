@@ -257,45 +257,54 @@ def resolve_build_info() -> dict[str, str]:
     return {key: str(info.get(key, "unknown")) for key in BUILD_INFO_KEYS}
 
 
-def _is_connector_starting(obj: Any) -> bool:
+def _extract_connector_state_from_obj(obj: Any) -> str | None:
     if obj is None:
-        return False
-    try:
-        if getattr(obj, "state", None) == "starting":
-            return True
-    except Exception:
-        pass
-    try:
-        csc = getattr(obj, "cold_start_connector", None)
-        if csc is not None and getattr(csc, "state", None) == "starting":
-            return True
-    except Exception:
-        pass
-    try:
-        bound_self = getattr(obj, "__self__", None)
-        if bound_self is not None and getattr(bound_self, "state", None) == "starting":
-            return True
-    except Exception:
-        pass
-    return False
+        return None
+    for candidate in (
+        getattr(obj, "_cold_start_connector", None),
+        getattr(obj, "cold_start_connector", None),
+        getattr(obj, "__self__", None),
+        obj,
+    ):
+        if candidate is None:
+            continue
+        try:
+            st = getattr(candidate, "state", None)
+            if isinstance(st, str) and st in ("ok", "starting", "unavailable"):
+                return st
+        except Exception:
+            pass
+    return None
+
+
+def _get_adapter_cold_start_state(adapter: Any) -> str | None:
+    if adapter is None:
+        return None
+    if isinstance(adapter, WorkloadRoutedAdapter):
+        if not adapter.by_workload:
+            return None
+        sub = adapter.by_workload.get("interactive")
+        if sub is None:
+            sub = next(iter(adapter.by_workload.values()))
+        return _get_adapter_cold_start_state(sub)
+
+    pool = getattr(adapter, "pool", None) or getattr(adapter, "_pool", None)
+    for target in (
+        adapter,
+        getattr(adapter, "_connect", None),
+        pool,
+        getattr(pool, "_connect_fn", None) if pool is not None else None,
+    ):
+        st = _extract_connector_state_from_obj(target)
+        if st is not None:
+            if pool is not None and getattr(pool, "_closed", False):
+                return "unavailable"
+            return st
+    return None
 
 
 def _is_adapter_starting(adapter: Any) -> bool:
-    if adapter is None:
-        return False
-    if isinstance(adapter, WorkloadRoutedAdapter):
-        return any(_is_adapter_starting(sub) for sub in adapter.by_workload.values())
-    if _is_connector_starting(adapter):
-        return True
-    if _is_connector_starting(getattr(adapter, "_connect", None)):
-        return True
-    pool = getattr(adapter, "pool", None) or getattr(adapter, "_pool", None)
-    if pool is not None:
-        if _is_connector_starting(pool):
-            return True
-        if _is_connector_starting(getattr(pool, "_connect_fn", None)):
-            return True
-    return False
+    return _get_adapter_cold_start_state(adapter) == "starting"
 
 
 class ReadinessProbe:
@@ -395,8 +404,9 @@ class ReadinessProbe:
                 return raw_custom
             return bool(raw_custom)
 
-        if _is_adapter_starting(adapter):
-            return "starting"
+        cs_state = _get_adapter_cold_start_state(adapter)
+        if cs_state is not None:
+            return cs_state
 
         if isinstance(adapter, WorkloadRoutedAdapter):
             if not adapter.by_workload:
@@ -535,11 +545,13 @@ class ReadinessProbe:
         return None
 
     def _probe_engine_with_timeout(self, eng_name: str, adapter: Any) -> str:
-        if eng_name not in self._custom_probes and _is_adapter_starting(adapter):
-            with self._lock:
-                if self._cache_seconds > 0:
-                    self._cache[eng_name] = ("starting", float(self._clock()))
-            return "starting"
+        if eng_name not in self._custom_probes:
+            cs_state = _get_adapter_cold_start_state(adapter)
+            if cs_state is not None:
+                with self._lock:
+                    if self._cache_seconds > 0:
+                        self._cache[eng_name] = (cs_state, float(self._clock()))
+                return cs_state
 
         with self._lock:
             now = float(self._clock())

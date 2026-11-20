@@ -1085,3 +1085,170 @@ class TestColdStartConnector:
         assert canary_token not in repr(metrics.states)
         # Also verify global error scrubber registered the token
         assert canary_token not in scrub_error_detail(RuntimeError(canary_token))
+
+    def test_auth_role_guard_show_and_tls_errors_never_trigger_wake(self) -> None:
+        from seeknal.serving.adapters import PostgresSessionHardeningError
+
+        class BadPasswordError(Exception):
+            pgcode = "28P01"
+
+        planted_pw = "SECRET_BAD_PW_28P01_777"
+        non_wakeable_errors = [
+            BadPasswordError(f'FATAL: password authentication failed for user "svc" ({planted_pw})'),
+            PostgresSessionHardeningError("Role guard refused connection"),
+            PostgresSessionHardeningError("Session hardening SHOW verification failed"),
+            RuntimeError("SSL error: certificate verify failed"),
+        ]
+
+        for err in non_wakeable_errors:
+            clock = FakeClock()
+            metrics = FakeMetrics()
+            http_calls: list[str] = []
+            client = httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda req: (
+                        http_calls.append(f"{req.method} {req.url}")
+                        or httpx.Response(202, json={"state": "starting"})
+                    )
+                )
+            )
+            connector = ColdStartConnector(
+                lambda **kw: (_ for _ in ()).throw(err),
+                _make_wake_cfg(),
+                metrics=metrics,
+                http_client=client,
+                engine_name="lb_ops",
+                env={"LB_OPS_PROJECT_TOKEN": "tok-no-wake"},
+                clock=clock,
+                sleep_fn=clock.sleep,
+            )
+
+            with pytest.raises(EngineError) as exc_info:
+                connector.connect()
+
+            assert not isinstance(exc_info.value, EngineStartingError)
+            assert http_calls == []
+            assert metrics.wakes == []
+            assert connector.state == "ok"
+            assert planted_pw not in str(exc_info.value)
+
+    def test_failed_wake_negative_cache_suppresses_new_wakes_until_cooldown_expires(
+        self,
+    ) -> None:
+        clock = FakeClock(initial=1000.0)
+        metrics = FakeMetrics()
+        post_calls = 0
+        cp_healthy = False
+        db_running = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal post_calls, db_running
+            if request.method == "POST":
+                post_calls += 1
+                if not cp_healthy:
+                    return httpx.Response(503, json={"error": "outage"})
+                return httpx.Response(202, json={"state": "starting"})
+            db_running = True
+            return httpx.Response(200, json={"state": "running"})
+
+        def connect_fn(**kwargs: Any) -> FakeDBConnection:
+            if not db_running:
+                raise ConnectionRefusedError("endpoint suspended")
+            return FakeDBConnection(conn_id=77)
+
+        connector = ColdStartConnector(
+            connect_fn,
+            _make_wake_cfg(max_query_wait_seconds=10.0, max_wake_seconds=30.0),
+            metrics=metrics,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            engine_name="lb_ops",
+            env={"LB_OPS_PROJECT_TOKEN": "tok-cooldown"},
+            clock=clock,
+            sleep_fn=clock.sleep,
+        )
+
+        # 1st request fails wake -> enters 30s negative cache cooldown
+        with pytest.raises(EngineError, match="Engine connection failed"):
+            connector.connect()
+        assert post_calls == 1
+        assert connector.state == "unavailable"
+
+        # Requests during the 30s cooldown fail immediately with ZERO new POST /start calls!
+        clock.advance(10.0)
+        with pytest.raises(EngineError, match="Engine connection failed"):
+            connector.connect()
+        clock.advance(19.9)
+        with pytest.raises(EngineError, match="Engine connection failed"):
+            connector.connect()
+        assert post_calls == 1
+        assert metrics.wakes == [("lb_ops", "error")]
+
+        # Once cooldown (30s) expires and control plane recovers, a single new wake succeeds
+        cp_healthy = True
+        clock.advance(0.2)
+        conn = connector.connect()
+        assert conn.conn_id == 77
+        assert post_calls == 2
+        assert connector.state == "ok"
+
+    def test_shared_connector_across_distinct_account_connect_fns_isolates_connections(
+        self,
+    ) -> None:
+        clock = FakeClock(initial=200.0)
+        post_calls = 0
+        running = False
+        barrier = threading.Barrier(2)
+        wake_gate = threading.Event()
+        post_entered = threading.Event()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal post_calls, running
+            if request.method == "POST":
+                post_calls += 1
+                post_entered.set()
+                wake_gate.wait(timeout=2.0)
+                return httpx.Response(202, json={"state": "starting"})
+            running = True
+            return httpx.Response(200, json={"state": "running"})
+
+        def connect_interactive(**kw: Any) -> FakeDBConnection:
+            if not running:
+                raise ConnectionRefusedError("suspended")
+            c = FakeDBConnection(conn_id=101)
+            c.role_tag = "interactive"  # type: ignore[attr-defined]
+            return c
+
+        def connect_bi(**kw: Any) -> FakeDBConnection:
+            if not running:
+                raise ConnectionRefusedError("suspended")
+            c = FakeDBConnection(conn_id=202)
+            c.role_tag = "bi"  # type: ignore[attr-defined]
+            return c
+
+        connector = ColdStartConnector(
+            connect_interactive,
+            _make_wake_cfg(),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            engine_name="lb_ops",
+            env={"LB_OPS_PROJECT_TOKEN": "tok-shared-ep"},
+            clock=clock,
+            sleep_fn=clock.sleep,
+        )
+
+        out: dict[str, Any] = {}
+
+        def call_acc(name: str, fn: Any) -> None:
+            barrier.wait(timeout=2.0)
+            out[name] = connector.connect(connect_fn=fn)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            f1 = ex.submit(call_acc, "interactive", connect_interactive)
+            f2 = ex.submit(call_acc, "bi", connect_bi)
+            assert post_entered.wait(timeout=2.0)
+            wake_gate.set()
+            f1.result(timeout=5.0)
+            f2.result(timeout=5.0)
+
+        assert post_calls == 1
+        assert out["interactive"].role_tag == "interactive"
+        assert out["bi"].role_tag == "bi"

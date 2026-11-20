@@ -16,7 +16,11 @@ from typing import Any
 
 import httpx
 
-from seeknal.serving.adapters import EngineError
+from seeknal.serving.adapters import (
+    EngineConfigError,
+    EngineError,
+    PostgresSessionHardeningError,
+)
 from seeknal.serving.errors import register_config_secrets
 
 logger = logging.getLogger(__name__)
@@ -719,7 +723,9 @@ def check_role_guard(conn: Any, kind: str) -> None:
 
     if row is None or len(row) < 2:
         _safe_close_conn(conn)
-        raise EngineError("Role guard check returned no role metadata for current_user")
+        raise PostgresSessionHardeningError(
+            "Role guard check returned no role metadata for current_user"
+        )
 
     has_rolsuper = bool(row[0])
     has_bypassrls = bool(row[1])
@@ -727,7 +733,7 @@ def check_role_guard(conn: Any, kind: str) -> None:
 
     if has_rolsuper or has_bypassrls or has_neon_superuser:
         _safe_close_conn(conn)
-        raise EngineError(_ROLE_GUARD_REFUSED_MSG)
+        raise PostgresSessionHardeningError(_ROLE_GUARD_REFUSED_MSG)
 
 
 def _resolve_endpoint_type(cfg: Any) -> str | None:
@@ -868,6 +874,98 @@ def _extract_endpoint_state(payload: Any) -> str | None:
     return None
 
 
+def _extract_pgcode(exc: BaseException) -> str | None:
+    for candidate in (exc, getattr(exc, "__cause__", None)):
+        if candidate is None:
+            continue
+        code = getattr(candidate, "pgcode", None)
+        if isinstance(code, str) and code.strip():
+            return code.strip().upper()
+    return None
+
+
+def _classify_non_wakeable_connect_error(exc: BaseException) -> EngineError | None:
+    """Return a typed EngineError if ``exc`` must NOT trigger a Lakebase wake, else None."""
+    if isinstance(exc, (PostgresSessionHardeningError, EngineConfigError)):
+        return exc
+    if isinstance(exc, EngineError) and not isinstance(exc, EngineStartingError):
+        return exc
+    if isinstance(exc, (ValueError, TypeError)):
+        return EngineError("Engine connection failed")
+
+    pgcode = _extract_pgcode(exc)
+    if pgcode is not None:
+        if pgcode.startswith("28"):
+            return EngineError("Engine authentication failed")
+        if pgcode.startswith(("22", "3D", "3F", "42")):
+            return EngineError("Engine connection failed")
+
+    msg_low = str(exc).lower()
+    if any(
+        m in msg_low
+        for m in (
+            "password authentication failed",
+            "authentication failed",
+            "no pg_hba.conf entry",
+            "fe_sendauth",
+            "not permitted to log in",
+        )
+    ):
+        return EngineError("Engine authentication failed")
+
+    if "role guard" in msg_low:
+        return PostgresSessionHardeningError("Role guard refused connection")
+    if "session hardening" in msg_low or "show verification" in msg_low:
+        return PostgresSessionHardeningError(
+            "Session hardening SHOW verification failed"
+        )
+
+    if any(
+        m in msg_low
+        for m in (
+            "certificate verify failed",
+            "ssl error",
+            "sslmode",
+            "root certificate file",
+            "server common name",
+            "hostname mismatch",
+        )
+    ):
+        return EngineError("Engine TLS verification failed")
+
+    mro_names = {cls.__name__ for cls in type(exc).__mro__}
+    is_operational_cls = "OperationalError" in mro_names
+    is_wakeable_pgcode = pgcode is None or pgcode.startswith("08") or pgcode in (
+        "57P01",
+        "57P02",
+        "57P03",
+    )
+    if isinstance(exc, (OSError, ConnectionError, TimeoutError)):
+        return None
+    if is_operational_cls and is_wakeable_pgcode:
+        return None
+    if is_wakeable_pgcode and any(
+        m in msg_low
+        for m in (
+            "connection refused",
+            "connection to server",
+            "could not connect",
+            "timed out",
+            "timeout expired",
+            "network is unreachable",
+            "no route to host",
+            "suspended",
+            "starting up",
+            "warming up",
+            "restarting",
+            "server closed the connection",
+        )
+    ):
+        return None
+
+    return EngineError("Engine connection failed")
+
+
 class _WakeOperation:
     """Single-flight state shared by concurrent callers waiting on one endpoint wake."""
 
@@ -877,8 +975,10 @@ class _WakeOperation:
         "done",
         "finished_at",
         "first_conn",
+        "opener_connect_fn",
         "outcome",
         "started_at",
+        "terminal_error",
         "wake_deadline",
     )
 
@@ -888,15 +988,18 @@ class _WakeOperation:
         started_at: float,
         wake_deadline: float,
         connect_kwargs: dict[str, Any],
+        opener_connect_fn: Callable[..., Any],
     ) -> None:
         self.started_at = started_at
         self.wake_deadline = wake_deadline
         self.connect_kwargs = dict(connect_kwargs)
+        self.opener_connect_fn = opener_connect_fn
         self.active_waiters: int = 0
         self.done: bool = False
         self.finished_at: float = float("inf")
         self.outcome: str = "starting"  # 'ok' | 'error' | 'timeout'
         self.first_conn: Any = None
+        self.terminal_error: EngineError | None = None
 
 
 class ColdStartConnector:
@@ -944,6 +1047,12 @@ class ColdStartConnector:
         self._state: str = "ok"
         self._last_cold_start: bool = False
         self._active_wake: _WakeOperation | None = None
+        self._failed_until: float = float("-inf")
+        self._tls = threading.local()
+
+    @property
+    def endpoint_id(self) -> str | None:
+        return self._endpoint_id
 
     @property
     def state(self) -> str:
@@ -958,6 +1067,14 @@ class ColdStartConnector:
     @property
     def cold_start_config(self) -> LakebaseColdStartConfig:
         return self._cold_start
+
+    def reset_thread_cold_start(self) -> None:
+        self._tls.cold_start = None
+
+    def consume_thread_cold_start(self) -> bool | None:
+        val = getattr(self._tls, "cold_start", None)
+        self._tls.cold_start = None
+        return val
 
     def _emit_state(self, state: str) -> None:
         if self._metrics is None:
@@ -1177,11 +1294,16 @@ class ColdStartConnector:
                         self._emit_connect_retry()
 
                 try:
-                    opened_conn = self._connect_fn(**op.connect_kwargs)
+                    opened_conn = op.opener_connect_fn(**op.connect_kwargs)
                     outcome = "ok"
                     return
-                except Exception:
+                except Exception as conn_exc:
                     opened_conn = None
+                    non_wakeable = _classify_non_wakeable_connect_error(conn_exc)
+                    if non_wakeable is not None:
+                        op.terminal_error = non_wakeable
+                        outcome = "error"
+                        return
 
                 backoff_idx = retry_idx + 1 if self._cold_start.wake == "none" else retry_idx
                 if not self._wake_sleep(
@@ -1207,12 +1329,17 @@ class ColdStartConnector:
                 if outcome == "ok":
                     self._state = "ok"
                     self._last_cold_start = True
+                    self._failed_until = float("-inf")
                     if op.active_waiters > 0:
                         op.first_conn = opened_conn
                     else:
                         orphan_conn = opened_conn
                 else:
                     self._state = "unavailable"
+                    if op.terminal_error is None:
+                        self._failed_until = (
+                            finish_now + self._cold_start.max_wake_seconds
+                        )
                     orphan_conn = opened_conn
 
                 op.done = True
@@ -1237,16 +1364,23 @@ class ColdStartConnector:
                 )
             self._emit_state(new_state)
 
-    def _get_or_start_wake(self, connect_kwargs: dict[str, Any]) -> _WakeOperation:
+    def _get_or_start_wake(
+        self,
+        connect_kwargs: dict[str, Any],
+        opener_connect_fn: Callable[..., Any],
+    ) -> _WakeOperation:
         started_new = False
         with self._cond:
             if self._active_wake is not None and not self._active_wake.done:
                 return self._active_wake
             now = self._clock()
+            if now < self._failed_until:
+                raise EngineError("Engine connection failed")
             op = _WakeOperation(
                 started_at=now,
                 wake_deadline=now + self._cold_start.max_wake_seconds,
                 connect_kwargs=connect_kwargs,
+                opener_connect_fn=opener_connect_fn,
             )
             self._active_wake = op
             self._state = "starting"
@@ -1263,9 +1397,17 @@ class ColdStartConnector:
             worker.start()
         return op
 
-    def connect(self, deadline: float | None = None, **connect_kwargs: Any) -> Any:
+    def connect(
+        self,
+        deadline: float | None = None,
+        *,
+        connect_fn: Callable[..., Any] | None = None,
+        **connect_kwargs: Any,
+    ) -> Any:
         """Open a Lakebase connection, coordinating single-flight cold-start wake on failure."""
+        eff_connect_fn = connect_fn if connect_fn is not None else self._connect_fn
         call_start = self._clock()
+        self._tls.cold_start = False
         query_budget_deadline = call_start + self._cold_start.max_query_wait_seconds
         if deadline is not None:
             wait_deadline = min(query_budget_deadline, float(deadline))
@@ -1278,19 +1420,29 @@ class ColdStartConnector:
                 if (self._active_wake is not None and not self._active_wake.done)
                 else None
             )
+            in_cooldown = existing_op is None and call_start < self._failed_until
+
+        if in_cooldown:
+            raise EngineError("Engine connection failed")
 
         if existing_op is None:
             try:
-                conn = self._connect_fn(**connect_kwargs)
-            except Exception:
-                op = self._get_or_start_wake(connect_kwargs)
+                conn = eff_connect_fn(**connect_kwargs)
+            except Exception as exc:
+                non_wakeable = _classify_non_wakeable_connect_error(exc)
+                if non_wakeable is not None:
+                    raise non_wakeable from None
+                self._tls.cold_start = True
+                op = self._get_or_start_wake(connect_kwargs, eff_connect_fn)
             else:
                 with self._lock:
                     self._state = "ok"
                     self._last_cold_start = False
+                    self._failed_until = float("-inf")
                 self._emit_state("ok")
                 return conn
         else:
+            self._tls.cold_start = True
             op = existing_op
 
         claimed_conn: Any = None
@@ -1315,9 +1467,15 @@ class ColdStartConnector:
                     )
 
                 if op.outcome != "ok":
+                    if op.terminal_error is not None:
+                        raise op.terminal_error
                     raise EngineError("Engine connection failed")
 
-                if op.first_conn is not None and op.connect_kwargs == connect_kwargs:
+                if (
+                    op.first_conn is not None
+                    and op.opener_connect_fn is eff_connect_fn
+                    and op.connect_kwargs == connect_kwargs
+                ):
                     claimed_conn = op.first_conn
                     op.first_conn = None
             finally:
@@ -1333,8 +1491,11 @@ class ColdStartConnector:
             return claimed_conn
 
         try:
-            conn = self._connect_fn(**connect_kwargs)
-        except Exception:
+            conn = eff_connect_fn(**connect_kwargs)
+        except Exception as exc:
+            non_wakeable = _classify_non_wakeable_connect_error(exc)
+            if non_wakeable is not None:
+                raise non_wakeable from None
             with self._lock:
                 self._state = "unavailable"
             self._emit_state("unavailable")

@@ -218,9 +218,11 @@ def build_server(
         )
 
     # Pre-create MetricsRegistry and optional cold-start HTTP client so Lakebase
-    # ColdStartConnectors and discovery connect callables share the same registry.
+    # ColdStartConnectors and discovery connect callables share the same registry
+    # and single-flight ColdStartConnector keyed by endpoint_id.
     metrics = MetricsRegistry(allowed_engines=tuple(cfg.connections.keys()))
     cold_start_http_clients: list[httpx.Client] = []
+    connectors_by_endpoint: dict[str, Any] = {}
 
     def _get_cold_start_http_client() -> httpx.Client:
         if not cold_start_http_clients:
@@ -284,6 +286,7 @@ def build_server(
                         connect_factories=connect_factories,
                         metrics=metrics,
                         get_http_client=_get_cold_start_http_client,
+                        connectors_by_endpoint=connectors_by_endpoint,
                     )
                 elif lb_custom is not None:
                     lb_connect = lb_custom
@@ -295,6 +298,7 @@ def build_server(
                 connect_factories=connect_factories,
                 metrics=metrics,
                 get_http_client=_get_cold_start_http_client,
+                connectors_by_endpoint=connectors_by_endpoint,
             )
 
             effective_env = dict(env)
@@ -409,6 +413,7 @@ def build_server(
                 metrics=metrics,
                 get_http_client=_get_cold_start_http_client,
                 storage_class=eff_sc,
+                connectors_by_endpoint=connectors_by_endpoint,
             )
             adapters[eng_name] = pg_adapter
 
@@ -714,6 +719,7 @@ def _make_postgres_wire_connect(
     custom_factory: Callable[..., Any] | None = None,
     metrics: MetricsRegistry | None = None,
     get_http_client: Callable[[], httpx.Client] | None = None,
+    connectors_by_endpoint: dict[str, Any] | None = None,
 ) -> Callable[..., Any]:
     kind = conn_cfg.kind
     read_only = conn_cfg.read_only
@@ -802,7 +808,16 @@ def _make_postgres_wire_connect(
         except (ValueError, TypeError):
             cs_init_kw = {"metrics": metrics, "http_client": http_client}
 
-        connector = ColdStartConnector(base_connect, lb_block, **cs_init_kw)
+        ep_key = str(getattr(lb_block, "endpoint_id", "") or eng_name)
+        if (
+            connectors_by_endpoint is not None
+            and ep_key in connectors_by_endpoint
+        ):
+            connector = connectors_by_endpoint[ep_key]
+        else:
+            connector = ColdStartConnector(base_connect, lb_block, **cs_init_kw)
+            if connectors_by_endpoint is not None:
+                connectors_by_endpoint[ep_key] = connector
 
         def cold_start_connect(
             *,
@@ -820,15 +835,21 @@ def _make_postgres_wire_connect(
                 )
                 eff_deadline = time.monotonic() + float(wait_s)
 
+            call_kw: dict[str, Any] = {}
             try:
                 c_sig = inspect.signature(connector.connect)
-                if "connect_timeout" in c_sig.parameters and connect_timeout is not None:
-                    return connector.connect(
-                        eff_deadline, connect_timeout=connect_timeout
-                    )
+                c_params = c_sig.parameters
+                c_varkw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in c_params.values()
+                )
+                if "connect_fn" in c_params:
+                    call_kw["connect_fn"] = base_connect
+                if ("connect_timeout" in c_params or c_varkw) and connect_timeout is not None:
+                    call_kw["connect_timeout"] = connect_timeout
             except (ValueError, TypeError):
                 pass
-            return connector.connect(eff_deadline)
+            return connector.connect(eff_deadline, **call_kw)
 
         setattr(cold_start_connect, "cold_start_connector", connector)
         return cold_start_connect
@@ -846,6 +867,7 @@ def _build_postgres_wire_adapter(
     metrics: MetricsRegistry | None,
     get_http_client: Callable[[], httpx.Client] | None,
     storage_class: str | None = None,
+    connectors_by_endpoint: dict[str, Any] | None = None,
 ) -> EngineAdapter:
     lb_block = getattr(conn_cfg, "lakebase", None)
     eff_sc = (
@@ -897,6 +919,7 @@ def _build_postgres_wire_adapter(
                     custom_factory=custom_fn,
                     metrics=metrics,
                     get_http_client=get_http_client,
+                    connectors_by_endpoint=connectors_by_endpoint,
                 )
                 pool = PostgresPool(
                     conn_fn,
@@ -939,6 +962,7 @@ def _build_postgres_wire_adapter(
         custom_factory=custom_fn,
         metrics=metrics,
         get_http_client=get_http_client,
+        connectors_by_endpoint=connectors_by_endpoint,
     )
     pool = PostgresPool(
         conn_fn,
@@ -972,6 +996,7 @@ def _make_discovery_source_connect(
     connect_factories: Mapping[str, Any] | None,
     metrics: MetricsRegistry | None,
     get_http_client: Callable[[], httpx.Client] | None,
+    connectors_by_endpoint: dict[str, Any] | None = None,
 ) -> Callable[[], Any]:
     if conn_cfg.accounts:
         if account_name not in conn_cfg.accounts:
@@ -996,6 +1021,7 @@ def _make_discovery_source_connect(
             custom_factory=custom_fn,
             metrics=metrics,
             get_http_client=get_http_client,
+            connectors_by_endpoint=connectors_by_endpoint,
         )
         return lambda: conn_fn()
 
@@ -1010,6 +1036,7 @@ def _make_discovery_source_connect(
         custom_factory=custom_fn,
         metrics=metrics,
         get_http_client=get_http_client,
+        connectors_by_endpoint=connectors_by_endpoint,
     )
     return lambda: conn_fn()
 
@@ -1022,6 +1049,7 @@ def _build_discovery_postgres_connects(
     connect_factories: Mapping[str, Any] | None,
     metrics: MetricsRegistry | None,
     get_http_client: Callable[[], httpx.Client] | None,
+    connectors_by_endpoint: dict[str, Any] | None = None,
 ) -> dict[str, Callable[[], Any]]:
     introspect_accounts: dict[str, str] = {}
     parsed_pgs = getattr(disc_cfg, "postgres_sources", None)
@@ -1061,6 +1089,7 @@ def _build_discovery_postgres_connects(
                 connect_factories=connect_factories,
                 metrics=metrics,
                 get_http_client=get_http_client,
+                connectors_by_endpoint=connectors_by_endpoint,
             )
 
     for src_name, acc_name in introspect_accounts.items():

@@ -307,10 +307,10 @@ def verify_and_harden_session(
     Fails closed: on any error, privileged role, or ``SHOW`` mismatch, closes ``conn``
     and raises ``EngineError`` without leaking DSNs or driver secrets.
     """
-    from seeknal.serving.adapters import EngineError
+    from seeknal.serving.adapters import EngineError, PostgresSessionHardeningError
 
     if conn is None:
-        raise EngineError("Database connection is None")
+        raise PostgresSessionHardeningError("Database connection is None")
 
     should_check_role = bool(role_guard or kind == "lakebase")
     if not should_check_role and session is None:
@@ -326,16 +326,18 @@ def verify_and_harden_session(
             row = _fetch_one_row(cur)
             if isinstance(row, (tuple, list)):
                 if len(row) < 2:
-                    raise EngineError("Role guard refused connection")
+                    raise PostgresSessionHardeningError("Role guard refused connection")
                 for col_val in row:
                     if _pg_bool_is_true(col_val):
-                        raise EngineError("Role guard refused connection")
+                        raise PostgresSessionHardeningError("Role guard refused connection")
             else:
                 if not (is_legacy_lakebase and session is None):
-                    raise EngineError("Role guard refused connection")
+                    raise PostgresSessionHardeningError("Role guard refused connection")
 
         if session is not None:
-            sp_parts = _parse_search_path_parts(session.search_path, error_cls=EngineError)
+            sp_parts = _parse_search_path_parts(
+                session.search_path, error_cls=PostgresSessionHardeningError
+            )
             if not session.startup_options:
                 if read_only:
                     cur.execute("SET default_transaction_read_only = on")
@@ -357,7 +359,9 @@ def verify_and_harden_session(
                     or not isinstance(ro_row[0], str)
                     or ro_row[0].strip().lower() != "on"
                 ):
-                    raise EngineError("Session hardening SHOW verification failed")
+                    raise PostgresSessionHardeningError(
+                        "Session hardening SHOW verification failed"
+                    )
 
             for guc_name, expected_ms in (
                 ("statement_timeout", int(session.statement_timeout_ms)),
@@ -370,10 +374,14 @@ def verify_and_harden_session(
                 cur.execute(f"SHOW {guc_name}")
                 guc_row = _fetch_one_row(cur)
                 if not isinstance(guc_row, (tuple, list)) or not guc_row:
-                    raise EngineError("Session hardening SHOW verification failed")
+                    raise PostgresSessionHardeningError(
+                        "Session hardening SHOW verification failed"
+                    )
                 actual_ms = _parse_pg_duration_ms(guc_row[0])
                 if actual_ms != expected_ms:
-                    raise EngineError("Session hardening SHOW verification failed")
+                    raise PostgresSessionHardeningError(
+                        "Session hardening SHOW verification failed"
+                    )
 
             cur.execute("SHOW search_path")
             sp_row = _fetch_one_row(cur)
@@ -382,7 +390,9 @@ def verify_and_harden_session(
                 or not sp_row
                 or not _search_path_matches(sp_row[0], session.search_path)
             ):
-                raise EngineError("Session hardening SHOW verification failed")
+                raise PostgresSessionHardeningError(
+                    "Session hardening SHOW verification failed"
+                )
 
         _close_quietly(cur)
         cur = None
@@ -406,7 +416,9 @@ def verify_and_harden_session(
     except Exception:
         _close_quietly(cur)
         _close_quietly(conn)
-        raise EngineError("Session hardening verification failed") from None
+        raise PostgresSessionHardeningError(
+            "Session hardening verification failed"
+        ) from None
 
 
 def begin_query_transaction(

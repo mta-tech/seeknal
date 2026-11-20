@@ -2283,5 +2283,85 @@ def test_readyz_reports_starting_for_lakebase_cold_start_connector():
         pool.close()
 
 
+def test_b_m2_readyz_and_check_health_never_wake_suspended_lakebase_endpoint():
+    import httpx
+    from seeknal.serving.adapters import PostgresPool
+    from seeknal.serving.lakebase_endpoint import ColdStartConnector, parse_lakebase_block
+
+    http_wake_calls: list[str] = []
+    db_connect_calls = 0
+
+    def cp_handler(request: httpx.Request) -> httpx.Response:
+        http_wake_calls.append(f"{request.method} {request.url}")
+        return httpx.Response(202, json={"state": "starting"})
+
+    def suspended_db_connect(**kwargs):
+        nonlocal db_connect_calls
+        db_connect_calls += 1
+        raise ConnectionRefusedError("endpoint is suspended")
+
+    lb_cfg = parse_lakebase_block(
+        {
+            "project_id": "prj_0123456789abcdefghij",
+            "branch_id": "br_0123456789abcdefghij",
+            "endpoint_id": "ep_0123456789abcdefghij",
+            "endpoint_type": "read_write",
+            "cold_start": {
+                "wake": "api",
+                "api_url": "https://lakebase-cp.internal.example",
+                "api_token_env": "LB_CP_TOK",
+            },
+        }
+    )
+    connector = ColdStartConnector(
+        suspended_db_connect,
+        lb_cfg,
+        http_client=httpx.Client(transport=httpx.MockTransport(cp_handler)),
+        engine_name="lb_ops",
+        env={"LB_CP_TOK": "tok-secret"},
+    )
+
+    def wrapped_connect(**kw):
+        return connector.connect(**kw)
+
+    setattr(wrapped_connect, "cold_start_connector", connector)
+    pool = PostgresPool(wrapped_connect, pool_max=2)
+
+    try:
+        lb_adapter = DBAPIAdapter(
+            wrapped_connect,
+            kind="lakebase",
+            pool=pool,
+            lakebase_config=lb_cfg,
+            cold_start_connector=connector,
+        )
+        probe = ReadinessProbe(
+            {"lb_ops": lb_adapter},
+            timeout_seconds=1.0,
+            cache_seconds=0.0,
+        )
+        ops_app = create_ops_app(readiness=probe)
+        client = TestClient(ops_app)
+
+        # /readyz and check_health read connector.state only: ZERO DB connects and ZERO POST /start!
+        assert lb_adapter.check_health(timeout_seconds=1.0) is True
+        r1 = client.get("/readyz")
+        assert r1.status_code == 200
+        assert r1.json() == {"ready": True, "engines": {"lb_ops": "ok"}}
+        assert http_wake_calls == []
+        assert db_connect_calls == 0
+
+        # When connector is unavailable, /readyz returns 503 unavailable without waking!
+        connector._state = "unavailable"
+        assert lb_adapter.check_health(timeout_seconds=1.0) is False
+        r2 = client.get("/readyz")
+        assert r2.status_code == 503
+        assert r2.json() == {"ready": False, "engines": {"lb_ops": "unavailable"}}
+        assert http_wake_calls == []
+        assert db_connect_calls == 0
+    finally:
+        pool.close()
+
+
 
 

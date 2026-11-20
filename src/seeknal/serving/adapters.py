@@ -56,6 +56,10 @@ class EnginePoolExhausted(EngineConfigError):
     """Raised when Postgres/Lakebase connection pool is exhausted."""
 
 
+class PostgresSessionHardeningError(EngineError):
+    """Raised when role guard or session hardening verification refuses a connection."""
+
+
 from seeknal.serving.postgres_session import (  # noqa: E402
     POSTGRES_WIRE_KINDS,
     PostgresAccountConfig,
@@ -1539,7 +1543,7 @@ class DBAPIAdapter:
             self._pool.close()
 
     def check_health(self, timeout_seconds: float = 2.0) -> bool:
-        """Probe engine reachability via a short-lived direct connection outside the query pool."""
+        """Probe engine reachability without waking suspended Lakebase cold-start endpoints."""
         try:
             if (
                 isinstance(timeout_seconds, bool)
@@ -1549,6 +1553,11 @@ class DBAPIAdapter:
                 or timeout_seconds <= 0
             ):
                 return False
+
+            if self._cold_start_connector is not None:
+                if self._pool is not None and getattr(self._pool, "_closed", False):
+                    return False
+                return getattr(self._cold_start_connector, "state", "unavailable") == "ok"
 
             if self._before_connect is not None:
                 self._before_connect()
@@ -1750,9 +1759,14 @@ class DBAPIAdapter:
                         )
                         if callable(consume_fn) and consume_fn() is True:
                             self.last_cold_start = True
-                    if isinstance(exc, EngineError) and (
-                        "Role guard refused connection" in str(exc)
-                        or "Session hardening" in str(exc)
+                    if isinstance(exc, PostgresSessionHardeningError) or (
+                        isinstance(exc, EngineError)
+                        and (
+                            "Role guard refused connection" in str(exc)
+                            or "Session hardening" in str(exc)
+                            or "authentication" in str(exc).lower()
+                            or "TLS verification" in str(exc)
+                        )
                     ):
                         raise
                     if attempt < max_attempts - 1:
@@ -1795,9 +1809,14 @@ class DBAPIAdapter:
                     )
                     if callable(consume_fn) and consume_fn() is True:
                         self.last_cold_start = True
-                if isinstance(exc, EngineError) and (
-                    "Role guard refused connection" in str(exc)
-                    or "Session hardening" in str(exc)
+                if isinstance(exc, PostgresSessionHardeningError) or (
+                    isinstance(exc, EngineError)
+                    and (
+                        "Role guard refused connection" in str(exc)
+                        or "Session hardening" in str(exc)
+                        or "authentication" in str(exc).lower()
+                        or "TLS verification" in str(exc)
+                    )
                 ):
                     raise
                 logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)

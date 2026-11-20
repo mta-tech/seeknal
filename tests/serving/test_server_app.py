@@ -1260,3 +1260,164 @@ def test_runtime_discovery_passes_connections_storage_class_through_build_server
     )
 
 
+def test_b_m2_multi_account_lakebase_shares_single_connector_by_endpoint_id_and_populates_cold_start(
+    jwks_path, static_catalog_files, monkeypatch
+):
+    import httpx
+    from tests.serving.fake_postgres_catalog import FakePostgresCatalog
+
+    pf, sf = static_catalog_files
+    post_start_calls = 0
+    endpoint_awake = False
+
+    def cp_transport(request: httpx.Request) -> httpx.Response:
+        nonlocal post_start_calls, endpoint_awake
+        if request.method == "POST" and request.url.path.endswith("/start"):
+            post_start_calls += 1
+            return httpx.Response(202, json={"state": "starting"})
+        endpoint_awake = True
+        return httpx.Response(200, json={"state": "running"})
+
+    real_httpx_client = httpx.Client
+
+    def _make_cp_client(*_a: Any, **_kw: Any) -> Any:
+        return real_httpx_client(transport=httpx.MockTransport(cp_transport))
+
+    monkeypatch.setattr(app_mod.httpx, "Client", _make_cp_client)
+
+    int_cat = FakePostgresCatalog()
+    bi_cat = FakePostgresCatalog()
+
+    def connect_int(**kw: Any) -> Any:
+        if not endpoint_awake:
+            raise ConnectionRefusedError("endpoint suspended")
+        return int_cat.connect(**kw)
+
+    def connect_bi(**kw: Any) -> Any:
+        if not endpoint_awake:
+            raise ConnectionRefusedError("endpoint suspended")
+        return bi_cat.connect(**kw)
+
+    env = {
+        "LB_INT_DSN": "postgresql://int_role:pw1@127.0.0.1:40100/ops",
+        "LB_BI_DSN": "postgresql://bi_role:pw2@127.0.0.1:40100/ops",
+        "LB_API_TOK": "cp-token-shared-ep",
+    }
+    cfg = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "ops": {"enabled": True, "public_readyz": True, "readyz_cache_seconds": 0},
+            "placement": {"static": {"placement_file": pf, "schemas_file": sf}},
+            "connections": {
+                "duck": {"kind": "duckdb", "path": ":memory:"},
+                "lb_ops": {
+                    "kind": "lakebase",
+                    "accounts": {
+                        "interactive": {"dsn_env": "LB_INT_DSN"},
+                        "bi": {"dsn_env": "LB_BI_DSN"},
+                    },
+                    "tls": {
+                        "sslmode": "verify-full",
+                        "sslrootcert_file": "/etc/seeknal/tls/lb-ca.pem",
+                    },
+                    "lakebase": {
+                        "project_id": "prj_0123456789abcdefghij",
+                        "branch_id": "br_0123456789abcdefghij",
+                        "endpoint_id": "ep_0123456789abcdefghij",
+                        "endpoint_type": "read_write",
+                        "cold_start": {
+                            "wake": "api",
+                            "api_url": "https://lakebase-cp.internal.example",
+                            "api_token_env": "LB_API_TOK",
+                            "connect_timeout_seconds": 2,
+                            "max_query_wait_seconds": 5,
+                            "max_wake_seconds": 30,
+                            "retry_backoff_ms": [10, 20],
+                        },
+                    },
+                },
+            },
+        },
+        env=env,
+    )
+
+    handle = build_server(
+        cfg,
+        env=env,
+        connect_factories={
+            "duck": lambda: duckdb.connect(),
+            "lb_ops": {"interactive": connect_int, "bi": connect_bi},
+        },
+    )
+
+    lb_routed = handle.adapters["lb_ops"]
+    assert isinstance(lb_routed, WorkloadRoutedAdapter)
+    ad_int = lb_routed.by_workload["interactive"]
+    ad_bi = lb_routed.by_workload["bi"]
+    assert isinstance(ad_int, DBAPIAdapter)
+    assert isinstance(ad_bi, DBAPIAdapter)
+
+    # Distinct accounts on same endpoint_id have separate DB pools, but ONE shared ColdStartConnector!
+    assert ad_int.pool is not ad_bi.pool
+    assert ad_int._cold_start_connector is not None
+    assert ad_int._cold_start_connector is ad_bi._cold_start_connector
+
+    # /readyz on public and ops apps NEVER triggers POST /start while endpoint is suspended!
+    with TestClient(handle.app) as pub_c, TestClient(handle.ops_app) as ops_c:
+        assert pub_c.get("/readyz").status_code == 200
+        assert ops_c.get("/readyz").status_code == 200
+        assert post_start_calls == 0
+
+        # 1st query wakes the endpoint -> cold_start is True
+        prep_bi = PreparedQuery(
+            engine="lb_ops",
+            engine_kind="lakebase",
+            sql="SELECT 1",
+            params=(),
+            paramstyle="format",
+            rule="point_lookup",
+            reason="test",
+            row_limit=5,
+            masked_columns=(),
+            redacted_sql="SELECT 1",
+            subject="u@test.org",
+            workspace="ws",
+            audit_id="aud-bi-cold",
+            cube_security_context=None,
+            workload="bi",
+        )
+        res_cold = lb_routed.execute(prep_bi, timeout_seconds=5.0)
+        assert res_cold.cold_start is True
+        assert lb_routed.last_cold_start is True
+        assert ad_bi.last_cold_start is True
+        assert post_start_calls == 1
+
+        # 2nd query on warm pooled connection -> cold_start is False
+        res_warm = lb_routed.execute(prep_bi, timeout_seconds=5.0)
+        assert res_warm.cold_start is False
+        assert lb_routed.last_cold_start is False
+        assert ad_bi.last_cold_start is False
+        assert post_start_calls == 1
+
+        # Non-Lakebase DuckDB query -> cold_start is None
+        duck_ad = handle.adapters["duck"]
+        prep_duck = PreparedQuery(
+            engine="duck",
+            engine_kind="duckdb",
+            sql="SELECT 1",
+            params=(),
+            paramstyle="qmark",
+            rule="point_lookup",
+            reason="test",
+            row_limit=5,
+            masked_columns=(),
+            redacted_sql="SELECT 1",
+            subject="u@test.org",
+            workspace="ws",
+            audit_id="aud-duck-1",
+            cube_security_context=None,
+        )
+        res_duck = duck_ad.execute(prep_duck, timeout_seconds=5.0)
+        assert res_duck.cold_start is None
+
+
