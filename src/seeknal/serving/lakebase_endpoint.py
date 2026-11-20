@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import os
@@ -1071,7 +1072,9 @@ class ColdStartConnector:
         self._state: str = "ok"
         self._last_cold_start: bool = False
         self._active_wake: _WakeOperation | None = None
-        self._failed_until: float = float("-inf")
+        self._failed_until: float | None = None
+        self._last_no_wake_probe_at: float | None = None
+        self._no_wake_probe_in_flight: bool = False
         self._tls = threading.local()
 
     @property
@@ -1353,13 +1356,15 @@ class ColdStartConnector:
                 if outcome == "ok":
                     self._state = "ok"
                     self._last_cold_start = True
-                    self._failed_until = float("-inf")
+                    self._failed_until = None
+                    self._last_no_wake_probe_at = None
                     if op.active_waiters > 0:
                         op.first_conn = opened_conn
                     else:
                         orphan_conn = opened_conn
                 else:
                     self._state = "unavailable"
+                    self._last_no_wake_probe_at = None
                     if op.terminal_error is None:
                         self._failed_until = (
                             finish_now + self._cold_start.max_wake_seconds
@@ -1388,6 +1393,93 @@ class ColdStartConnector:
                 )
             self._emit_state(new_state)
 
+    def probe_no_wake(
+        self,
+        *,
+        timeout_seconds: float = 2.0,
+        min_interval_seconds: float = 5.0,
+        now: float | None = None,
+    ) -> str:
+        """Perform at most one bounded no-wake plain connect per interval when unavailable."""
+        with self._lock:
+            if self._state == "ok":
+                return "ok"
+            if self._state == "starting" or (
+                self._active_wake is not None and not self._active_wake.done
+            ):
+                return "starting"
+            probe_now = float(now) if now is not None else float(self._clock())
+            if self._no_wake_probe_in_flight:
+                return "unavailable"
+            if (
+                min_interval_seconds > 0.0
+                and self._last_no_wake_probe_at is not None
+                and 0.0 <= (probe_now - self._last_no_wake_probe_at) < min_interval_seconds
+            ):
+                return self._state
+            self._last_no_wake_probe_at = probe_now
+            self._no_wake_probe_in_flight = True
+
+        to_int = max(1, math.ceil(float(timeout_seconds)))
+        conn: Any = None
+        cur: Any = None
+        try:
+            try:
+                accepts_kw = True
+                try:
+                    sig = inspect.signature(self._connect_fn)
+                    accepts_kw = "connect_timeout" in sig.parameters or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in sig.parameters.values()
+                    )
+                except (ValueError, TypeError):
+                    accepts_kw = True
+
+                if accepts_kw:
+                    try:
+                        conn = self._connect_fn(connect_timeout=to_int)
+                    except TypeError:
+                        conn = self._connect_fn()
+                else:
+                    conn = self._connect_fn()
+
+                if conn is None:
+                    return "unavailable"
+
+                if hasattr(conn, "cursor") and callable(conn.cursor):
+                    cur = conn.cursor()
+                    if (
+                        cur is not None
+                        and hasattr(cur, "execute")
+                        and callable(cur.execute)
+                    ):
+                        cur.execute("SELECT 1")
+            except Exception:
+                return "unavailable"
+            finally:
+                if cur is not None and hasattr(cur, "close") and callable(cur.close):
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+                if conn is not None:
+                    _safe_close_conn(conn)
+
+            recovered = False
+            with self._lock:
+                if self._active_wake is None or self._active_wake.done:
+                    self._state = "ok"
+                    self._failed_until = None
+                    self._last_no_wake_probe_at = None
+                    recovered = True
+                cur_state = self._state
+            if recovered:
+                self._emit_state("ok")
+            return cur_state
+        finally:
+            with self._lock:
+                self._no_wake_probe_in_flight = False
+
     def _get_or_start_wake(
         self,
         connect_kwargs: dict[str, Any],
@@ -1398,7 +1490,7 @@ class ColdStartConnector:
             if self._active_wake is not None and not self._active_wake.done:
                 return self._active_wake
             now = self._clock()
-            if now < self._failed_until:
+            if self._failed_until is not None and now < self._failed_until:
                 raise EngineError("Engine connection failed")
             op = _WakeOperation(
                 started_at=now,
@@ -1444,10 +1536,11 @@ class ColdStartConnector:
                 if (self._active_wake is not None and not self._active_wake.done)
                 else None
             )
-            in_cooldown = existing_op is None and call_start < self._failed_until
-
-        if in_cooldown:
-            raise EngineError("Engine connection failed")
+            in_cooldown = (
+                existing_op is None
+                and self._failed_until is not None
+                and call_start < self._failed_until
+            )
 
         if existing_op is None:
             try:
@@ -1456,13 +1549,17 @@ class ColdStartConnector:
                 non_wakeable = _classify_non_wakeable_connect_error(exc)
                 if non_wakeable is not None:
                     raise non_wakeable from None
+                if in_cooldown:
+                    raise EngineError("Engine connection failed") from None
                 self._tls.cold_start = True
                 op = self._get_or_start_wake(connect_kwargs, eff_connect_fn)
             else:
                 with self._lock:
                     self._state = "ok"
                     self._last_cold_start = False
-                    self._failed_until = float("-inf")
+                    self._failed_until = None
+                    self._last_no_wake_probe_at = None
+                self._tls.cold_start = False
                 self._emit_state("ok")
                 return conn
         else:

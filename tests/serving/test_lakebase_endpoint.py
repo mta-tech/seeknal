@@ -1322,3 +1322,61 @@ class TestColdStartConnector:
         assert post_calls == 1
         assert out["interactive"].role_tag == "interactive"
         assert out["bi"].role_tag == "bi"
+
+    def test_b_m5_plain_connect_during_cooldown_recovers_state_without_new_wake(
+        self,
+    ) -> None:
+        clock = FakeClock(initial=500.0)
+        metrics = FakeMetrics()
+        post_calls = 0
+        db_running = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal post_calls
+            if request.method == "POST":
+                post_calls += 1
+                return httpx.Response(503, json={"error": "control plane outage"})
+            return httpx.Response(503, json={"error": "control plane outage"})
+
+        def connect_fn(**kwargs: Any) -> FakeDBConnection:
+            if not db_running:
+                raise ConnectionRefusedError("endpoint down")
+            return FakeDBConnection(conn_id=505)
+
+        connector = ColdStartConnector(
+            connect_fn,
+            _make_wake_cfg(max_query_wait_seconds=10.0, max_wake_seconds=60.0),
+            metrics=metrics,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            engine_name="lb_ops",
+            env={"LB_OPS_PROJECT_TOKEN": "tok-bm5"},
+            clock=clock,
+            sleep_fn=clock.sleep,
+        )
+
+        # 1. Failed wake puts connector into "unavailable" with 60s cooldown
+        with pytest.raises(EngineError, match="Engine connection failed"):
+            connector.connect()
+        assert post_calls == 1
+        assert connector.state == "unavailable"
+        assert metrics.states[-1] == ("lb_ops", "unavailable")
+
+        # 2. Still down during cooldown (t + 5s): plain connect fails, wake suppressed
+        clock.advance(5.0)
+        with pytest.raises(EngineError, match="Engine connection failed"):
+            connector.connect()
+        assert post_calls == 1
+        assert connector.state == "unavailable"
+
+        # 3. DB comes up during cooldown (t + 10s, well before 60s cooldown expires):
+        # plain connect succeeds immediately without calling POST .../start!
+        db_running = True
+        clock.advance(5.0)
+        conn = connector.connect()
+        assert conn.conn_id == 505
+        assert post_calls == 1
+        assert connector.state == "ok"
+        assert connector.last_cold_start is False
+        assert connector.consume_thread_cold_start() is False
+        assert metrics.states[-1] == ("lb_ops", "ok")
+

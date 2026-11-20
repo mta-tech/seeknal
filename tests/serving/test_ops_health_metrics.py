@@ -2359,16 +2359,142 @@ def test_b_m2_readyz_and_check_health_never_wake_suspended_lakebase_endpoint():
         assert http_wake_calls == []
         assert db_connect_calls == 0
 
-        # When connector is unavailable, /readyz returns 503 unavailable without waking!
+        # When connector is unavailable, /readyz returns 503 unavailable via at most one
+        # bounded plain connect per 5s without ever calling the wake API!
         connector._state = "unavailable"
         assert lb_adapter.check_health(timeout_seconds=1.0) is False
         r2 = client.get("/readyz")
         assert r2.status_code == 503
         assert r2.json() == {"ready": False, "engines": {"lb_ops": "unavailable"}}
         assert http_wake_calls == []
-        assert db_connect_calls == 0
+        assert db_connect_calls == 1
     finally:
         pool.close()
+
+
+def test_b_m5_readyz_recovers_unavailable_lakebase_without_traffic_or_wake_api():
+    import httpx
+    from seeknal.serving.adapters import EngineError, PostgresPool
+    from seeknal.serving.lakebase_endpoint import ColdStartConnector, parse_lakebase_block
+
+    now_val = [1000.0]
+    post_start_calls = 0
+    plain_connect_calls = 0
+    db_up = False
+
+    def fake_clock() -> float:
+        return now_val[0]
+
+    def fake_sleep(sec: float) -> None:
+        now_val[0] += max(0.0, float(sec))
+
+    def cp_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_start_calls
+        if request.method == "POST" and request.url.path.endswith("/start"):
+            post_start_calls += 1
+        return httpx.Response(503, json={"error": "cp_down"})
+
+    def plain_db_connect(**kwargs):
+        nonlocal plain_connect_calls
+        plain_connect_calls += 1
+        if not db_up:
+            raise ConnectionRefusedError("db unreachable")
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value = cur
+        return conn
+
+    lb_cfg = parse_lakebase_block(
+        {
+            "project_id": "prj_0123456789abcdefghij",
+            "branch_id": "br_0123456789abcdefghij",
+            "endpoint_id": "ep_0123456789abcdefghij",
+            "endpoint_type": "read_write",
+            "cold_start": {
+                "wake": "api",
+                "api_url": "https://lakebase-cp.internal.example",
+                "api_token_env": "LB_CP_TOK",
+                "max_query_wait_seconds": 5.0,
+                "max_wake_seconds": 60.0,
+            },
+        }
+    )
+    metrics_reg = MetricsRegistry(allowed_engines=("lb_ops",))
+    connector = ColdStartConnector(
+        plain_db_connect,
+        lb_cfg,
+        metrics=metrics_reg,
+        http_client=httpx.Client(transport=httpx.MockTransport(cp_handler)),
+        engine_name="lb_ops",
+        env={"LB_CP_TOK": "tok-secret"},
+        clock=fake_clock,
+        sleep_fn=fake_sleep,
+    )
+
+    def wrapped_connect(**kw):
+        return connector.connect(**kw)
+
+    setattr(wrapped_connect, "cold_start_connector", connector)
+    pool = PostgresPool(wrapped_connect, pool_max=2)
+
+    try:
+        lb_adapter = DBAPIAdapter(
+            wrapped_connect,
+            kind="lakebase",
+            pool=pool,
+            lakebase_config=lb_cfg,
+            cold_start_connector=connector,
+        )
+        metrics_reg.register_adapters({"lb_ops": lb_adapter})
+        probe = ReadinessProbe(
+            {"lb_ops": lb_adapter},
+            timeout_seconds=1.0,
+            cache_seconds=0.0,
+            clock=fake_clock,
+        )
+        ops_app = create_ops_app(readiness=probe, metrics=metrics_reg)
+        client = TestClient(ops_app)
+
+        # 1. Initial failed wake transitions connector to "unavailable"
+        with pytest.raises(EngineError):
+            connector.connect()
+        assert connector.state == "unavailable"
+        assert post_start_calls == 1
+        connects_after_wake_fail = plain_connect_calls
+
+        # 2. No traffic; DB still down -> /readyz does 1 plain connect, rate-limited for 5s, ZERO wake calls
+        r_down_1 = client.get("/readyz")
+        assert r_down_1.status_code == 503
+        assert r_down_1.json() == {"ready": False, "engines": {"lb_ops": "unavailable"}}
+        assert plain_connect_calls == connects_after_wake_fail + 1
+        assert post_start_calls == 1
+
+        now_val[0] += 2.0
+        r_down_2 = client.get("/readyz")
+        assert r_down_2.status_code == 503
+        assert plain_connect_calls == connects_after_wake_fail + 1
+        assert post_start_calls == 1
+
+        # 3. DB comes back up; after 5s interval, /readyz alone recovers state to "ok" with ZERO wake API calls!
+        db_up = True
+        now_val[0] += 3.1
+        r_up = client.get("/readyz")
+        assert r_up.status_code == 200
+        assert r_up.json() == {"ready": True, "engines": {"lb_ops": "ok"}}
+        assert connector.state == "ok"
+        assert post_start_calls == 1
+        assert plain_connect_calls == connects_after_wake_fail + 2
+        assert 'seeknal_serving_lakebase_state{engine="lb_ops",state="ok"} 1' in metrics_reg.render()
+
+        # 4. Once state == "ok", /readyz no longer connects to DB
+        now_val[0] += 10.0
+        r_steady = client.get("/readyz")
+        assert r_steady.status_code == 200
+        assert plain_connect_calls == connects_after_wake_fail + 2
+        assert post_start_calls == 1
+    finally:
+        pool.close()
+
 
 
 

@@ -257,7 +257,7 @@ def resolve_build_info() -> dict[str, str]:
     return {key: str(info.get(key, "unknown")) for key in BUILD_INFO_KEYS}
 
 
-def _extract_connector_state_from_obj(obj: Any) -> str | None:
+def _extract_connector_from_obj(obj: Any) -> Any:
     if obj is None:
         return None
     for candidate in (
@@ -271,35 +271,46 @@ def _extract_connector_state_from_obj(obj: Any) -> str | None:
         try:
             st = getattr(candidate, "state", None)
             if isinstance(st, str) and st in ("ok", "starting", "unavailable"):
-                return st
+                return candidate
         except Exception:
             pass
     return None
 
 
-def _get_adapter_cold_start_state(adapter: Any) -> str | None:
+def _get_adapter_cold_start_connector(adapter: Any) -> tuple[Any, bool]:
     if adapter is None:
-        return None
+        return None, False
     if isinstance(adapter, WorkloadRoutedAdapter):
         if not adapter.by_workload:
-            return None
+            return None, False
         sub = adapter.by_workload.get("interactive")
         if sub is None:
             sub = next(iter(adapter.by_workload.values()))
-        return _get_adapter_cold_start_state(sub)
+        return _get_adapter_cold_start_connector(sub)
 
     pool = getattr(adapter, "pool", None) or getattr(adapter, "_pool", None)
+    pool_closed = bool(pool is not None and getattr(pool, "_closed", False))
     for target in (
         adapter,
         getattr(adapter, "_connect", None),
         pool,
         getattr(pool, "_connect_fn", None) if pool is not None else None,
     ):
-        st = _extract_connector_state_from_obj(target)
-        if st is not None:
-            if pool is not None and getattr(pool, "_closed", False):
-                return "unavailable"
-            return st
+        connector = _extract_connector_from_obj(target)
+        if connector is not None:
+            return connector, pool_closed
+    return None, False
+
+
+def _get_adapter_cold_start_state(adapter: Any) -> str | None:
+    connector, pool_closed = _get_adapter_cold_start_connector(adapter)
+    if connector is None:
+        return None
+    if pool_closed:
+        return "unavailable"
+    st = getattr(connector, "state", None)
+    if isinstance(st, str) and st in ("ok", "starting", "unavailable"):
+        return st
     return None
 
 
@@ -359,6 +370,7 @@ class ReadinessProbe:
         self._timeout_seconds = float(timeout_seconds)
         self._cache_seconds = float(cache_seconds)
         self._clock = clock
+        self._has_custom_clock = clock is not time.monotonic
         self._custom_probes: dict[str, Callable[[], bool]] = (
             dict(custom_probes) if custom_probes else {}
         )
@@ -404,9 +416,23 @@ class ReadinessProbe:
                 return raw_custom
             return bool(raw_custom)
 
-        cs_state = _get_adapter_cold_start_state(adapter)
-        if cs_state is not None:
-            return cs_state
+        connector, pool_closed = _get_adapter_cold_start_connector(adapter)
+        if connector is not None:
+            if pool_closed:
+                return "unavailable"
+            cs_state = getattr(connector, "state", "unavailable")
+            if cs_state in ("ok", "starting"):
+                return cs_state
+            probe_fn = getattr(connector, "probe_no_wake", None)
+            if callable(probe_fn):
+                probe_now = (
+                    float(self._clock()) if self._has_custom_clock else None
+                )
+                return probe_fn(
+                    timeout_seconds=self._timeout_seconds,
+                    now=probe_now,
+                )
+            return "unavailable"
 
         if isinstance(adapter, WorkloadRoutedAdapter):
             if not adapter.by_workload:
@@ -536,22 +562,47 @@ class ReadinessProbe:
         cached_status, cached_ts = cached
         if 0.0 <= (now - cached_ts) < self._cache_seconds:
             if adapter is not None and eng_name not in self._custom_probes:
-                currently_starting = _is_adapter_starting(adapter)
-                if currently_starting and cached_status != "starting":
+                cs_state = _get_adapter_cold_start_state(adapter)
+                if cs_state == "starting" and cached_status != "starting":
                     return "starting"
-                if cached_status == "starting" and not currently_starting:
+                if cached_status == "starting" and cs_state != "starting":
+                    return None
+                if cached_status == "unavailable" and cs_state == "ok":
+                    return "ok"
+                if cached_status == "ok" and cs_state == "unavailable":
                     return None
             return cached_status
         return None
 
     def _probe_engine_with_timeout(self, eng_name: str, adapter: Any) -> str:
         if eng_name not in self._custom_probes:
-            cs_state = _get_adapter_cold_start_state(adapter)
-            if cs_state is not None:
-                with self._lock:
-                    if self._cache_seconds > 0:
-                        self._cache[eng_name] = (cs_state, float(self._clock()))
-                return cs_state
+            connector, pool_closed = _get_adapter_cold_start_connector(adapter)
+            if connector is not None:
+                if pool_closed:
+                    with self._lock:
+                        if self._cache_seconds > 0:
+                            self._cache[eng_name] = (
+                                "unavailable",
+                                float(self._clock()),
+                            )
+                    return "unavailable"
+                cs_state = getattr(connector, "state", "unavailable")
+                if cs_state in ("ok", "starting"):
+                    with self._lock:
+                        if self._cache_seconds > 0:
+                            self._cache[eng_name] = (
+                                cs_state,
+                                float(self._clock()),
+                            )
+                    return cs_state
+                if not callable(getattr(connector, "probe_no_wake", None)):
+                    with self._lock:
+                        if self._cache_seconds > 0:
+                            self._cache[eng_name] = (
+                                "unavailable",
+                                float(self._clock()),
+                            )
+                    return "unavailable"
 
         with self._lock:
             now = float(self._clock())

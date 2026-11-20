@@ -1557,7 +1557,15 @@ class DBAPIAdapter:
             if self._cold_start_connector is not None:
                 if self._pool is not None and getattr(self._pool, "_closed", False):
                     return False
-                return getattr(self._cold_start_connector, "state", "unavailable") == "ok"
+                st = getattr(self._cold_start_connector, "state", "unavailable")
+                if st == "ok":
+                    return True
+                if st == "starting":
+                    return False
+                probe_fn = getattr(self._cold_start_connector, "probe_no_wake", None)
+                if callable(probe_fn):
+                    return probe_fn(timeout_seconds=timeout_seconds) == "ok"
+                return False
 
             if self._before_connect is not None:
                 self._before_connect()
