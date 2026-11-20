@@ -33,6 +33,7 @@ class QueryResult:
     engine: str
     elapsed_ms: float
     column_types: tuple[str, ...] = ()
+    cold_start: bool | None = None
 
 
 class EngineError(Exception):
@@ -480,6 +481,10 @@ class DuckDBAdapter:
         self._seen_file_inst_id: int | None = None
         self._file_generation = 0
         self._slots_lock = threading.Lock()
+        self.storage_class: str | None = None
+        self.account: str | None = None
+        self.lakebase_endpoint: dict[str, str] | None = None
+        self.last_cold_start: bool | None = None
 
     def _note_cursor_instance(self, cur: Any) -> None:
         inst = getattr(cur, "_instance", None)
@@ -1430,6 +1435,9 @@ class DBAPIAdapter:
         session_config: PostgresSessionConfig | None = None,
         account: str | None = None,
         lakebase_config: Any = None,
+        storage_class: str | None = None,
+        lakebase_endpoint: Mapping[str, str] | None = None,
+        cold_start_connector: Any = None,
     ) -> None:
         if kind not in ("postgres", "lakebase", "starrocks", "cube"):
             raise ValueError(f"Unsupported DBAPIAdapter kind: '{kind}'")
@@ -1441,6 +1449,34 @@ class DBAPIAdapter:
         self._session_config = session_config
         self._account = account
         self._lakebase_config = lakebase_config
+        self._cold_start_connector = (
+            cold_start_connector
+            if cold_start_connector is not None
+            else getattr(connect, "cold_start_connector", None)
+        )
+        self.storage_class: str | None = storage_class
+        self.lakebase_endpoint: dict[str, str] | None = (
+            dict(lakebase_endpoint)
+            if lakebase_endpoint is not None
+            else (
+                {
+                    "project_id": str(lakebase_config.project_id),
+                    "branch_id": str(lakebase_config.branch_id),
+                    "endpoint_id": str(lakebase_config.endpoint_id),
+                    "endpoint_type": str(lakebase_config.endpoint_type),
+                }
+                if (
+                    kind == "lakebase"
+                    and lakebase_config is not None
+                    and hasattr(lakebase_config, "project_id")
+                    and hasattr(lakebase_config, "branch_id")
+                    and hasattr(lakebase_config, "endpoint_id")
+                    and hasattr(lakebase_config, "endpoint_type")
+                )
+                else None
+            )
+        )
+        self.last_cold_start: bool | None = None
 
     @property
     def kind(self) -> str:
@@ -1462,6 +1498,10 @@ class DBAPIAdapter:
     @property
     def account(self) -> str | None:
         return self._account
+
+    @account.setter
+    def account(self, value: str | None) -> None:
+        self._account = value
 
     def pool_stats(self) -> dict[str, int] | None:
         """Return read-only PostgreSQL-wire connection pool counts, or None when unpooled."""
@@ -1589,6 +1629,20 @@ class DBAPIAdapter:
 
         start = time.perf_counter()
         conn = None
+        has_cs_connector = (
+            self._kind == "lakebase" and self._cold_start_connector is not None
+        )
+        if has_cs_connector:
+            reset_fn = getattr(
+                self._cold_start_connector, "reset_thread_cold_start", None
+            )
+            if callable(reset_fn):
+                reset_fn()
+            query_cold_start: bool | None = False
+            self.last_cold_start = False
+        else:
+            query_cold_start = None
+            self.last_cold_start = None
         is_pg_wire = is_postgres_wire(self._kind)
         conn_is_pooled = is_pg_wire and self._pool is not None
         hardened_pg = (
@@ -1623,6 +1677,25 @@ class DBAPIAdapter:
             for attempt in range(max_attempts):
                 try:
                     conn = self._pool.acquire(deadline=query_deadline)
+                    if has_cs_connector:
+                        consume_fn = getattr(
+                            self._cold_start_connector,
+                            "consume_thread_cold_start",
+                            None,
+                        )
+                        if callable(consume_fn):
+                            woke = consume_fn()
+                            if woke is True:
+                                query_cold_start = True
+                        elif bool(
+                            getattr(
+                                self._cold_start_connector,
+                                "last_cold_start",
+                                False,
+                            )
+                        ):
+                            query_cold_start = True
+                        self.last_cold_start = query_cold_start
                     cursor = conn.cursor()
 
                     def cancel_lb() -> None:
@@ -1666,7 +1739,17 @@ class DBAPIAdapter:
                         isinstance(exc, EngineStartingError)
                         or getattr(exc, "code", None) == "engine_starting"
                     ):
+                        if has_cs_connector:
+                            self.last_cold_start = True
                         raise
+                    if has_cs_connector:
+                        consume_fn = getattr(
+                            self._cold_start_connector,
+                            "consume_thread_cold_start",
+                            None,
+                        )
+                        if callable(consume_fn) and consume_fn() is True:
+                            self.last_cold_start = True
                     if isinstance(exc, EngineError) and (
                         "Role guard refused connection" in str(exc)
                         or "Session hardening" in str(exc)
@@ -1679,12 +1762,39 @@ class DBAPIAdapter:
         else:
             try:
                 conn = self._connect()
+                if has_cs_connector:
+                    consume_fn = getattr(
+                        self._cold_start_connector,
+                        "consume_thread_cold_start",
+                        None,
+                    )
+                    if callable(consume_fn):
+                        query_cold_start = bool(consume_fn())
+                    else:
+                        query_cold_start = bool(
+                            getattr(
+                                self._cold_start_connector,
+                                "last_cold_start",
+                                False,
+                            )
+                        )
+                    self.last_cold_start = query_cold_start
             except Exception as exc:
                 if (
                     isinstance(exc, EngineStartingError)
                     or getattr(exc, "code", None) == "engine_starting"
                 ):
+                    if has_cs_connector:
+                        self.last_cold_start = True
                     raise
+                if has_cs_connector:
+                    consume_fn = getattr(
+                        self._cold_start_connector,
+                        "consume_thread_cold_start",
+                        None,
+                    )
+                    if callable(consume_fn) and consume_fn() is True:
+                        self.last_cold_start = True
                 if isinstance(exc, EngineError) and (
                     "Role guard refused connection" in str(exc)
                     or "Session hardening" in str(exc)
@@ -1871,6 +1981,7 @@ class DBAPIAdapter:
             engine=prepared.engine,
             elapsed_ms=elapsed_ms,
             column_types=column_types,
+            cold_start=query_cold_start,
         )
 
 
@@ -1887,6 +1998,10 @@ class CubeAdapter:
         self._connect = connect
         self._security = security
         self._connect_timeout_seconds = connect_timeout_seconds
+        self.storage_class: str | None = None
+        self.account: str | None = None
+        self.lakebase_endpoint: dict[str, str] | None = None
+        self.last_cold_start: bool | None = None
 
     def execute(
         self,
@@ -2016,8 +2131,54 @@ class CubeAdapter:
 class WorkloadRoutedAdapter:
     """Adapter that delegates to another adapter based on prepared.workload."""
 
-    def __init__(self, by_workload: Mapping[str, EngineAdapter]) -> None:
+    def __init__(
+        self,
+        by_workload: Mapping[str, EngineAdapter],
+        *,
+        storage_class: str | None = None,
+        lakebase_endpoint: Mapping[str, str] | None = None,
+    ) -> None:
         self.by_workload = dict(by_workload)
+        self._storage_class: str | None = storage_class
+        self._lakebase_endpoint: dict[str, str] | None = (
+            dict(lakebase_endpoint) if lakebase_endpoint is not None else None
+        )
+        self.account: str | None = (
+            "interactive"
+            if "interactive" in self.by_workload
+            else (next(iter(self.by_workload)) if self.by_workload else None)
+        )
+        self.last_cold_start: bool | None = None
+        if self._storage_class is not None:
+            for sub in self.by_workload.values():
+                setattr(sub, "storage_class", self._storage_class)
+        if self._lakebase_endpoint is not None:
+            for sub in self.by_workload.values():
+                setattr(sub, "lakebase_endpoint", dict(self._lakebase_endpoint))
+
+    @property
+    def storage_class(self) -> str | None:
+        return self._storage_class
+
+    @storage_class.setter
+    def storage_class(self, value: str | None) -> None:
+        self._storage_class = value
+        for sub in self.by_workload.values():
+            setattr(sub, "storage_class", value)
+
+    @property
+    def lakebase_endpoint(self) -> dict[str, str] | None:
+        return self._lakebase_endpoint
+
+    @lakebase_endpoint.setter
+    def lakebase_endpoint(self, value: dict[str, str] | None) -> None:
+        self._lakebase_endpoint = dict(value) if value is not None else None
+        for sub in self.by_workload.values():
+            setattr(
+                sub,
+                "lakebase_endpoint",
+                dict(value) if value is not None else None,
+            )
 
     def close(self) -> None:
         seen_ids: set[int] = set()
@@ -2040,14 +2201,18 @@ class WorkloadRoutedAdapter:
             raise EngineConfigError(
                 f"no engine account configured for workload '{prepared.workload}'"
             )
+        self.account = prepared.workload
         sig = inspect.signature(adapter.execute)
-        if "on_cancel_handle" in sig.parameters:
-            return adapter.execute(
-                prepared,
-                timeout_seconds=timeout_seconds,
-                on_cancel_handle=on_cancel_handle,
-            )
-        return adapter.execute(prepared, timeout_seconds=timeout_seconds)
+        try:
+            if "on_cancel_handle" in sig.parameters:
+                return adapter.execute(
+                    prepared,
+                    timeout_seconds=timeout_seconds,
+                    on_cancel_handle=on_cancel_handle,
+                )
+            return adapter.execute(prepared, timeout_seconds=timeout_seconds)
+        finally:
+            self.last_cold_start = getattr(adapter, "last_cold_start", None)
 
 
 def build_workload_adapters(

@@ -864,6 +864,7 @@ def test_discovery_wires_postgres_connects_for_configured_account(
     jwks_path, monkeypatch
 ):
     captured_postgres_connects: dict[str, Any] = {}
+    captured_connections: list[Any] = []
 
     def fake_discover(
         disc_data,
@@ -871,10 +872,12 @@ def test_discovery_wires_postgres_connects_for_configured_account(
         http_client,
         lakebase_connect=None,
         postgres_connects=None,
+        connections=None,
         env=None,
     ):
         if postgres_connects is not None:
             captured_postgres_connects.update(postgres_connects)
+        captured_connections.append(connections)
         return DiscoveryResult(
             placement={"engines": {}, "tables": {}, "cubes": {}},
             schemas={},
@@ -945,6 +948,7 @@ def test_discovery_wires_postgres_connects_for_configured_account(
     assert "pg_default" in captured_postgres_connects
     assert captured_postgres_connects["pg_report"]() is bi_conn_sentinel
     assert captured_postgres_connects["pg_default"]() is int_conn_sentinel
+    assert captured_connections == [cfg.connections]
 
 
 def test_lakebase_cold_start_connector_wiring_and_engine_starting_propagation(
@@ -1034,5 +1038,225 @@ def test_lakebase_cold_start_connector_wiring_and_engine_starting_propagation(
     assert exc_start.value.code == "engine_starting"
     assert "lb_proj_token_secret_3344" not in str(exc_start.value)
     assert "lb_pw_1122" not in str(exc_start.value)
+    assert lb_adapter.storage_class == "object_storage"
+    assert lb_adapter.account == "default"
+    assert lb_adapter.lakebase_endpoint == {
+        "project_id": "prj_xxxxxxxxxxxxxxxxxxxx",
+        "branch_id": "br_xxxxxxxxxxxxxxxxxxxx",
+        "endpoint_id": "ep_xxxxxxxxxxxxxxxxxxxx",
+        "endpoint_type": "read_write",
+    }
+    assert lb_adapter.last_cold_start is True
+
+
+def test_runtime_discovery_passes_connections_storage_class_through_build_server_and_refresh(
+    jwks_path, monkeypatch
+):
+    from dataclasses import dataclass
+    import seeknal.serving.discovery.build as build_mod
+    from tests.serving.fake_postgres_catalog import FakePostgresCatalog
+
+    @dataclass(frozen=True)
+    class FlaggedIcebergTable:
+        namespace: str
+        name: str
+        columns: tuple[str, ...]
+        keys: tuple[str, ...]
+        row_count: int | None
+        current_snapshot_id: int | None
+        snapshot_ms: int | None
+        pii: bool = False
+
+    class FakeLakekeeperSource:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.warnings: list[str] = []
+
+        def discover(self) -> list[FlaggedIcebergTable]:
+            return [
+                FlaggedIcebergTable(
+                    namespace="src_pii",
+                    name="customer",
+                    columns=("customer_id", "full_name"),
+                    keys=("customer_id",),
+                    row_count=100,
+                    current_snapshot_id=11,
+                    snapshot_ms=1777636800000,
+                    pii=True,
+                )
+            ]
+
+    monkeypatch.setattr(build_mod, "LakekeeperSource", FakeLakekeeperSource)
+
+    pg_cat = FakePostgresCatalog()
+    pg_cat.add_table(
+        "src_pii",
+        "customer",
+        reltuples=100,
+        columns=[("customer_id", "text", True), ("full_name", "text", True)],
+        indexes=[
+            {
+                "index_name": "customer_pkey",
+                "amname": "btree",
+                "columns": ["customer_id"],
+                "is_primary": True,
+            }
+        ],
+    )
+
+    env = {
+        "PG_S3_DSN": "postgresql://svc:pw@localhost:5432/cbn",
+        "SR_PW": "sr-secret-pw",
+    }
+
+    # 1. Lakekeeper-flagged PII table on kind: postgres declared storage_class: object_storage
+    # must fail closed through build_server + initial/periodic refresh!
+    cfg_pg_obj = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "default_catalog": "cbn",
+            "placement": {
+                "discovery": {
+                    "default_catalog": "cbn",
+                    "refresh_interval_seconds": 60,
+                    "lakekeeper": {
+                        "url": "https://lk.internal/catalog",
+                        "warehouse": "cbn",
+                    },
+                    "engines": {
+                        "pg_s3": {"kind": "postgres", "dialect": "postgres"},
+                    },
+                    "postgres_sources": {
+                        "pg_s3": {
+                            "logical_catalog": "cbn",
+                            "schemas": {"src_pii": {"include": ["customer"]}},
+                        }
+                    },
+                }
+            },
+            "connections": {
+                "pg_s3": {
+                    "kind": "postgres",
+                    "dsn_env": "PG_S3_DSN",
+                    "role_guard": False,
+                    "storage_class": "object_storage",
+                }
+            },
+        },
+        env=env,
+    )
+
+    with pytest.raises(ServerConfigError, match="has storage_class object_storage"):
+        build_server(
+            cfg_pg_obj,
+            env=env,
+            connect_factories={"pg_s3": pg_cat.connect},
+            run_initial_refresh=True,
+        )
+
+    handle_pg_obj = build_server(
+        cfg_pg_obj,
+        env=env,
+        connect_factories={"pg_s3": pg_cat.connect},
+    )
+    assert handle_pg_obj.adapters["pg_s3"].storage_class == "object_storage"
+    assert handle_pg_obj.refresher is not None
+    assert handle_pg_obj.refresher.refresh_once() is False
+    assert handle_pg_obj.refresher.last_success_at is None
+    assert "has storage_class object_storage" in str(
+        handle_pg_obj.refresher.last_refresh_error[0]
+    )
+
+    # 2. StarRocks declared storage_class: local is honoured at build_server + refresh_once()
+    cfg_sr_local = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "default_catalog": "cbn",
+            "placement": {
+                "discovery": {
+                    "default_catalog": "cbn",
+                    "refresh_interval_seconds": 60,
+                    "lakekeeper": {
+                        "url": "https://lk.internal/catalog",
+                        "warehouse": "cbn",
+                    },
+                    "engines": {
+                        "sr": {"kind": "starrocks", "dialect": "starrocks"},
+                    },
+                }
+            },
+            "connections": {
+                "sr": {
+                    "kind": "starrocks",
+                    "storage_class": "local",
+                    "accounts": {
+                        "interactive": {
+                            "host": "sr.internal",
+                            "port": 9030,
+                            "user": "svc",
+                            "password_env": "SR_PW",
+                        }
+                    },
+                }
+            },
+        },
+        env=env,
+    )
+    handle_sr_local = build_server(
+        cfg_sr_local,
+        env=env,
+        connect_factories={"sr": {"interactive": MagicMock()}},
+        run_initial_refresh=True,
+    )
+    assert handle_sr_local.adapters["sr"].storage_class == "local"
+    assert handle_sr_local.refresher is not None
+    assert handle_sr_local.refresher.last_success_at is not None
+    assert "cbn.src_pii.customer" in handle_sr_local.pipeline.placement.tables
+    assert handle_sr_local.pipeline.placement.tables["cbn.src_pii.customer"].pii is True
+    assert handle_sr_local.refresher.refresh_once() is True
+
+    # Without storage_class: local, StarRocks defaults to object_storage and refuses Lakekeeper PII at refresh!
+    cfg_sr_obj = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "default_catalog": "cbn",
+            "placement": {
+                "discovery": {
+                    "default_catalog": "cbn",
+                    "refresh_interval_seconds": 60,
+                    "lakekeeper": {
+                        "url": "https://lk.internal/catalog",
+                        "warehouse": "cbn",
+                    },
+                    "engines": {
+                        "sr": {"kind": "starrocks", "dialect": "starrocks"},
+                    },
+                }
+            },
+            "connections": {
+                "sr": {
+                    "kind": "starrocks",
+                    "accounts": {
+                        "interactive": {
+                            "host": "sr.internal",
+                            "port": 9030,
+                            "user": "svc",
+                            "password_env": "SR_PW",
+                        }
+                    },
+                }
+            },
+        },
+        env=env,
+    )
+    handle_sr_obj = build_server(
+        cfg_sr_obj,
+        env=env,
+        connect_factories={"sr": {"interactive": MagicMock()}},
+    )
+    assert handle_sr_obj.refresher is not None
+    assert handle_sr_obj.refresher.refresh_once() is False
+    assert "has storage_class object_storage" in str(
+        handle_sr_obj.refresher.last_refresh_error[0]
+    )
 
 

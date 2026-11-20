@@ -259,6 +259,19 @@ def test_merge_identical_columns_mismatch_drop_and_pii_never_merges():
             "pg_report": pg_cat.connect,
             "lb_ops": lb_ops_cat.connect,
         },
+        connections={
+            "pg_report": {"kind": "postgres", "dsn_env": "PG_DSN"},
+            "lb_ops": {
+                "kind": "lakebase",
+                "dsn_env": "LB_DSN",
+                "lakebase": {
+                    "project_id": "prj_0123456789abcdefghij",
+                    "branch_id": "br_0123456789abcdefghij",
+                    "endpoint_id": "ep_0123456789abcdefghij",
+                },
+            },
+            "lake": {"kind": "duckdb", "profile": "iceberg_direct"},
+        },
         now=now_dt,
     )
 
@@ -354,6 +367,10 @@ def test_lake_marked_pii_also_drops_lake_serve_and_keeps_postgres_only():
         cfg,
         http_client=lk_client,
         postgres_connects={"pg_report": pg_cat.connect},
+        connections={
+            "pg_report": {"kind": "postgres", "dsn_env": "PG_DSN"},
+            "sr": {"kind": "starrocks"},
+        },
     )
     cust = res.placement["tables"]["cbn.src_pii.customer"]
     assert cust["pii"] is True
@@ -392,13 +409,31 @@ def test_storage_class_pii_rule_rejects_object_storage_and_allows_exceptions():
         },
     }
     with pytest.raises(DiscoveryError) as exc_info:
-        discover(cfg_lb_pii, postgres_connects={"lb_ops": lb_cat.connect})
+        discover(
+            cfg_lb_pii,
+            postgres_connects={"lb_ops": lb_cat.connect},
+            connections={
+                "lb_ops": {
+                    "kind": "lakebase",
+                    "dsn_env": "LB_DSN",
+                    "lakebase": {
+                        "project_id": "prj_0123456789abcdefghij",
+                        "branch_id": "br_0123456789abcdefghij",
+                        "endpoint_id": "ep_0123456789abcdefghij",
+                    },
+                }
+            },
+        )
     assert str(exc_info.value) == (
         "table 'cbn.src_pii.customer' is pii: true but its serve engine 'lb_ops' "
         "(kind lakebase) has storage_class object_storage; "
         "CBN policy forbids PII in object storage — serve it from a postgres source "
         "or list the engine in policy.pii_object_storage_engines"
     )
+
+    # 1b. Missing connections / storage_classes fails closed with storage_class unknown
+    with pytest.raises(DiscoveryError, match="has storage_class unknown"):
+        discover(cfg_lb_pii, postgres_connects={"lb_ops": lb_cat.connect})
 
     # 2. Legacy lakebase connection without lakebase: block -> storage_class unknown -> rejected
     with pytest.raises(DiscoveryError, match="has storage_class unknown"):

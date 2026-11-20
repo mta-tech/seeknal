@@ -116,51 +116,44 @@ def _resolve_effective_storage_class(
     storage_classes: Mapping[str, str] | None,
     connections: Mapping[str, Any] | None,
 ) -> str:
-    """Resolve effective storage_class ('local' | 'object_storage' | 'unknown') per §2.3."""
+    """Resolve effective storage_class ('local' | 'object_storage' | 'unknown') per §2.3.
+
+    Fails closed: if neither ``storage_classes`` nor ``connections`` provides an
+    entry for ``eng_name``, returns ``'unknown'``.
+    """
     if storage_classes is not None and eng_name in storage_classes:
-        return str(storage_classes[eng_name])
+        raw_sc = storage_classes[eng_name]
+        if isinstance(raw_sc, str) and raw_sc.strip() in (
+            "local",
+            "object_storage",
+            "unknown",
+        ):
+            return raw_sc.strip()
+        return "unknown"
 
     if connections is not None and eng_name in connections:
         conn_obj = connections[eng_name]
+        from seeknal.serving.lakebase_endpoint import effective_storage_class
+
         try:
-            from seeknal.serving.lakebase_endpoint import effective_storage_class
+            if isinstance(conn_obj, Mapping):
+                conn_map = (
+                    dict(conn_obj)
+                    if "kind" in conn_obj
+                    else {**conn_obj, "kind": eng_cfg.kind}
+                )
+                if (
+                    eng_cfg.kind == "duckdb"
+                    and "profile" not in conn_map
+                    and eng_cfg.profile is not None
+                ):
+                    conn_map["profile"] = eng_cfg.profile
+                return str(effective_storage_class(conn_map))
+            return str(effective_storage_class(conn_obj))
+        except ValueError as exc:
+            raise DiscoveryError(str(exc)) from exc
 
-            if not isinstance(conn_obj, Mapping):
-                return str(effective_storage_class(conn_obj))
-        except Exception:
-            pass
-
-        explicit_sc = (
-            conn_obj.get("storage_class")
-            if isinstance(conn_obj, Mapping)
-            else getattr(conn_obj, "storage_class", None)
-        )
-        if isinstance(explicit_sc, str) and explicit_sc.strip():
-            return explicit_sc.strip()
-
-        if eng_cfg.kind == "postgres":
-            return "local"
-        if eng_cfg.kind == "lakebase":
-            lb_block = (
-                conn_obj.get("lakebase")
-                if isinstance(conn_obj, Mapping)
-                else getattr(conn_obj, "lakebase", None)
-            )
-            return "object_storage" if lb_block is not None else "unknown"
-        if eng_cfg.kind == "duckdb":
-            prof = (
-                conn_obj.get("profile")
-                if isinstance(conn_obj, Mapping)
-                else getattr(conn_obj, "profile", None)
-            ) or eng_cfg.profile or "local_file"
-            return "local" if prof == "local_file" else "object_storage"
-        return "object_storage"
-
-    if eng_cfg.kind == "postgres":
-        return "local"
-    if eng_cfg.kind == "duckdb" and eng_cfg.profile == "local_file":
-        return "local"
-    return "object_storage"
+    return "unknown"
 
 
 def discover(

@@ -659,3 +659,163 @@ def test_storage_class_forbidden_in_placement_engines_static_and_discovery(
         "Engine 'pg_report' cannot declare 'storage_class' in placement; "
         "declare 'storage_class' on connections.pg_report instead"
     ) in exc_disc.value.problems
+
+
+def test_b_m3_runtime_refresh_enforces_postgres_object_storage_starrocks_local_and_missing_unknown(
+    cbn_files: dict[str, str], monkeypatch
+):
+    from dataclasses import dataclass
+    from unittest.mock import MagicMock
+
+    import seeknal.serving.discovery.build as build_mod
+    from seeknal.serving.discovery.build import discover
+    from seeknal.serving.discovery.config import DiscoveryError
+    from tests.serving.fake_postgres_catalog import FakePostgresCatalog
+
+    @dataclass(frozen=True)
+    class TaggedIcebergTable:
+        namespace: str
+        name: str
+        columns: tuple[str, ...]
+        keys: tuple[str, ...]
+        row_count: int | None
+        current_snapshot_id: int | None
+        snapshot_ms: int | None
+        pii: bool = False
+
+    class FakeLakekeeperSource:
+        def __init__(self, *args, **kwargs):
+            self.warnings: list[str] = []
+
+        def discover(self):
+            return [
+                TaggedIcebergTable(
+                    namespace="src_pii",
+                    name="customer",
+                    columns=("customer_id", "full_name"),
+                    keys=("customer_id",),
+                    row_count=200,
+                    current_snapshot_id=42,
+                    snapshot_ms=1777636800000,
+                    pii=True,
+                )
+            ]
+
+    monkeypatch.setattr(build_mod, "LakekeeperSource", FakeLakekeeperSource)
+
+    pg_cat = FakePostgresCatalog()
+    pg_cat.add_table(
+        "src_pii",
+        "customer",
+        reltuples=200,
+        columns=[("customer_id", "text", True), ("full_name", "text", True)],
+        indexes=[
+            {
+                "index_name": "customer_pkey",
+                "amname": "btree",
+                "columns": ["customer_id"],
+                "is_primary": True,
+            }
+        ],
+    )
+
+    # 1. Missing connections/storage_classes in discover() fails closed with storage_class unknown
+    with pytest.raises(DiscoveryError, match="has storage_class unknown"):
+        discover(
+            {
+                "default_catalog": "cbn",
+                "engines": {"pg_report": {"kind": "postgres", "dialect": "postgres"}},
+                "postgres_sources": {
+                    "pg_report": {
+                        "logical_catalog": "cbn",
+                        "schemas": {"src_pii": {"include": ["customer"], "pii": True}},
+                    }
+                },
+            },
+            postgres_connects={"pg_report": pg_cat.connect},
+        )
+
+    # 2. build_server + refresher.refresh_once() refuses kind: postgres declared storage_class: object_storage
+    env = {
+        "CBN_PG_S3_DSN": "postgresql://svc:pw@127.0.0.1:5432/cbn",
+        "CBN_SR_LOCAL_PW": "sr-pw",
+    }
+    handle_pg_obj = build_server(
+        {
+            "grant_keys": {"jwks_file": cbn_files["jwks"]},
+            "default_catalog": "cbn",
+            "connections": {
+                "pg_s3": {
+                    "kind": "postgres",
+                    "dsn_env": "CBN_PG_S3_DSN",
+                    "role_guard": False,
+                    "storage_class": "object_storage",
+                }
+            },
+            "placement": {
+                "discovery": {
+                    "default_catalog": "cbn",
+                    "lakekeeper": {
+                        "url": "https://lk.cbn.internal/catalog",
+                        "warehouse": "cbn",
+                    },
+                    "engines": {
+                        "pg_s3": {"kind": "postgres", "dialect": "postgres"}
+                    },
+                    "postgres_sources": {
+                        "pg_s3": {
+                            "logical_catalog": "cbn",
+                            "schemas": {"src_pii": {"include": ["customer"]}},
+                        }
+                    },
+                }
+            },
+        },
+        env=env,
+        connect_factories={"pg_s3": pg_cat.connect},
+    )
+    assert handle_pg_obj.refresher is not None
+    assert handle_pg_obj.refresher.refresh_once() is False
+    assert (
+        "table 'cbn.src_pii.customer' is pii: true but its serve engine 'pg_s3' "
+        "(kind postgres) has storage_class object_storage"
+    ) in str(handle_pg_obj.refresher.last_refresh_error[0])
+
+    # 3. build_server + refresher.refresh_once() honours StarRocks declared storage_class: local
+    handle_sr_local = build_server(
+        {
+            "grant_keys": {"jwks_file": cbn_files["jwks"]},
+            "default_catalog": "cbn",
+            "connections": {
+                "sr_local": {
+                    "kind": "starrocks",
+                    "storage_class": "local",
+                    "accounts": {
+                        "interactive": {
+                            "host": "sr.cbn.internal",
+                            "port": 9030,
+                            "user": "svc",
+                            "password_env": "CBN_SR_LOCAL_PW",
+                        }
+                    },
+                }
+            },
+            "placement": {
+                "discovery": {
+                    "default_catalog": "cbn",
+                    "lakekeeper": {
+                        "url": "https://lk.cbn.internal/catalog",
+                        "warehouse": "cbn",
+                    },
+                    "engines": {
+                        "sr_local": {"kind": "starrocks", "dialect": "starrocks"}
+                    },
+                }
+            },
+        },
+        env=env,
+        connect_factories={"sr_local": {"interactive": MagicMock()}},
+    )
+    assert handle_sr_local.refresher is not None
+    assert handle_sr_local.refresher.refresh_once() is True
+    assert handle_sr_local.pipeline.placement.tables["cbn.src_pii.customer"].pii is True

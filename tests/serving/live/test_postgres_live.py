@@ -445,6 +445,10 @@ def test_live_introspection_ignores_partial_expression_invalid_indexes_and_repor
             "pg_report": lambda: psycopg2.connect(seeded_cbn_cluster["bi_dsn"]),
             "pg_ops": lambda: psycopg2.connect(seeded_cbn_cluster["ops_dsn"]),
         },
+        connections={
+            "pg_report": {"kind": "postgres"},
+            "pg_ops": {"kind": "postgres"},
+        },
     )
 
     tables = res.placement["tables"]

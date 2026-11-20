@@ -82,11 +82,13 @@ try:
     from seeknal.serving.lakebase_endpoint import (
         ColdStartConnector,
         EngineStartingError,
+        effective_storage_class,
     )
 except ImportError:
     from seeknal.serving.postgres_session import (
         ColdStartConnector,
         EngineStartingError,
+        effective_storage_class,
     )
 
 logger = logging.getLogger(__name__)
@@ -300,21 +302,37 @@ def build_server(
                 effective_env.update(cfg.secrets_env)
 
             def _call_run_discovery() -> DiscoveryResult:
-                rd_kw: dict[str, Any] = {
-                    "client": None,
-                    "lb_connect": lb_connect,
-                    "env": effective_env,
-                }
+                if _run_discovery is _ORIG_RUN_DISCOVERY:
+                    return _run_discovery(
+                        cfg.placement.discovery,
+                        client=None,
+                        lb_connect=lb_connect,
+                        postgres_connects=postgres_connects,
+                        connections=cfg.connections,
+                        env=effective_env,
+                    )
                 try:
-                    rd_sig = inspect.signature(_run_discovery)
-                    if "postgres_connects" in rd_sig.parameters or any(
-                        p.kind == inspect.Parameter.VAR_KEYWORD
-                        for p in rd_sig.parameters.values()
+                    return _run_discovery(
+                        cfg.placement.discovery,
+                        client=None,
+                        lb_connect=lb_connect,
+                        postgres_connects=postgres_connects,
+                        connections=cfg.connections,
+                        env=effective_env,
+                    )
+                except TypeError as exc:
+                    if (
+                        exc.__traceback__ is not None
+                        and exc.__traceback__.tb_next is None
+                        and "unexpected keyword argument" in str(exc)
                     ):
-                        rd_kw["postgres_connects"] = postgres_connects
-                except (ValueError, TypeError):
-                    rd_kw["postgres_connects"] = postgres_connects
-                return _run_discovery(cfg.placement.discovery, **rd_kw)
+                        return _run_discovery(
+                            cfg.placement.discovery,
+                            client=None,
+                            lb_connect=lb_connect,
+                            env=effective_env,
+                        )
+                    raise
 
             raw_disc_call = _call_run_discovery
 
@@ -355,6 +373,7 @@ def build_server(
     # 6. Build adapters from connections
     adapters: dict[str, EngineAdapter] = {}
     for eng_name, conn_cfg in cfg.connections.items():
+        eff_sc = effective_storage_class(conn_cfg)
         if isinstance(conn_cfg, StarRocksConnectionConfig):
             connects: dict[str, Callable[[], Any]] = {}
             for acc_name, acc in conn_cfg.accounts.items():
@@ -370,12 +389,18 @@ def build_server(
                 else:
                     connects[acc_name] = _make_starrocks_fields_connect(acc, cfg, env)
 
-            adapters[eng_name] = build_workload_adapters("starrocks", connects)
+            sr_adapter = build_workload_adapters(
+                "starrocks",
+                connects,
+                storage_class=eff_sc,
+            )
+            sr_adapter.storage_class = eff_sc
+            adapters[eng_name] = sr_adapter
 
         elif isinstance(
             conn_cfg, (PostgresConnectionConfig, LakebaseConnectionConfig)
         ):
-            adapters[eng_name] = _build_postgres_wire_adapter(
+            pg_adapter = _build_postgres_wire_adapter(
                 eng_name=eng_name,
                 conn_cfg=conn_cfg,
                 cfg=cfg,
@@ -383,7 +408,9 @@ def build_server(
                 connect_factories=connect_factories,
                 metrics=metrics,
                 get_http_client=_get_cold_start_http_client,
+                storage_class=eff_sc,
             )
+            adapters[eng_name] = pg_adapter
 
         elif isinstance(conn_cfg, CubeConnectionConfig):
             if connect_factories and eng_name in connect_factories:
@@ -403,20 +430,31 @@ def build_server(
                     secret=secret_str.encode("utf-8"),
                     sql_user=conn_cfg.sql_user,
                 )
-                adapters[eng_name] = CubeAdapter(
+                cube_ad: EngineAdapter = CubeAdapter(
                     conn_fn,
                     security=security,
                     connect_timeout_seconds=conn_cfg.connect_timeout_seconds,
                 )
             else:
-                adapters[eng_name] = DBAPIAdapter(conn_fn, kind="cube")
+                cube_ad = DBAPIAdapter(
+                    conn_fn,
+                    kind="cube",
+                    account="default",
+                    storage_class=eff_sc,
+                )
+            setattr(cube_ad, "storage_class", eff_sc)
+            setattr(cube_ad, "account", "default")
+            adapters[eng_name] = cube_ad
 
         elif isinstance(conn_cfg, DuckDBConnectionConfig):
             if connect_factories and eng_name in connect_factories:
                 conn_fn = connect_factories[eng_name]
-                adapters[eng_name] = DuckDBAdapter(conn_fn)
+                duck_ad = DuckDBAdapter(conn_fn)
             else:
-                adapters[eng_name] = DuckDBAdapter(config=conn_cfg, env=env)
+                duck_ad = DuckDBAdapter(config=conn_cfg, env=env)
+            duck_ad.storage_class = eff_sc
+            duck_ad.account = "default"
+            adapters[eng_name] = duck_ad
 
     # 7. Register built adapters on MetricsRegistry, build shared ReadinessProbe, public extra routes, and Lifespan
     metrics.register_adapters(adapters)
@@ -539,27 +577,30 @@ def _run_discovery(
     client: httpx.Client | None = None,
     lb_connect: Callable[[], Any] | None = None,
     postgres_connects: Mapping[str, Callable[[], Any]] | None = None,
+    connections: Mapping[str, Any] | None = None,
     env: Mapping[str, str] = os.environ,
 ) -> DiscoveryResult:
-    disc_kwargs: dict[str, Any] = {
-        "lakebase_connect": lb_connect,
-        "env": env,
-    }
-    if postgres_connects is not None:
-        try:
-            sig = inspect.signature(discover)
-            if "postgres_connects" in sig.parameters or any(
-                p.kind == inspect.Parameter.VAR_KEYWORD
-                for p in sig.parameters.values()
-            ):
-                disc_kwargs["postgres_connects"] = postgres_connects
-        except (ValueError, TypeError):
-            disc_kwargs["postgres_connects"] = postgres_connects
-
     if client is not None:
-        return discover(disc_data, http_client=client, **disc_kwargs)
+        return discover(
+            disc_data,
+            http_client=client,
+            lakebase_connect=lb_connect,
+            postgres_connects=postgres_connects,
+            connections=connections,
+            env=env,
+        )
     with httpx.Client() as c:
-        return discover(disc_data, http_client=c, **disc_kwargs)
+        return discover(
+            disc_data,
+            http_client=c,
+            lakebase_connect=lb_connect,
+            postgres_connects=postgres_connects,
+            connections=connections,
+            env=env,
+        )
+
+
+_ORIG_RUN_DISCOVERY = _run_discovery
 
 
 def _resolve_custom_factory(
@@ -804,8 +845,29 @@ def _build_postgres_wire_adapter(
     connect_factories: Mapping[str, Any] | None,
     metrics: MetricsRegistry | None,
     get_http_client: Callable[[], httpx.Client] | None,
+    storage_class: str | None = None,
 ) -> EngineAdapter:
     lb_block = getattr(conn_cfg, "lakebase", None)
+    eff_sc = (
+        storage_class
+        if storage_class is not None
+        else effective_storage_class(conn_cfg)
+    )
+    lb_ep_meta: dict[str, str] | None = None
+    if (
+        isinstance(conn_cfg, LakebaseConnectionConfig)
+        and lb_block is not None
+        and hasattr(lb_block, "project_id")
+        and hasattr(lb_block, "branch_id")
+        and hasattr(lb_block, "endpoint_id")
+        and hasattr(lb_block, "endpoint_type")
+    ):
+        lb_ep_meta = {
+            "project_id": str(lb_block.project_id),
+            "branch_id": str(lb_block.branch_id),
+            "endpoint_id": str(lb_block.endpoint_id),
+            "endpoint_type": str(lb_block.endpoint_type),
+        }
 
     if conn_cfg.accounts:
         pools_by_cred: dict[tuple[str, Any], tuple[PostgresPool, Callable[..., Any]]] = {}
@@ -852,14 +914,19 @@ def _build_postgres_wire_adapter(
             connects_by_workload[acc_name] = conn_fn
             pools_by_workload[acc_name] = pool
 
-        return build_workload_adapters(
+        wl_adapter = build_workload_adapters(
             conn_cfg.kind,
             connects_by_workload,
             pools=pools_by_workload,
             read_only=conn_cfg.read_only,
             session_config=conn_cfg.session,
             lakebase_config=lb_block,
+            storage_class=eff_sc,
+            lakebase_endpoint=lb_ep_meta,
         )
+        wl_adapter.storage_class = eff_sc
+        wl_adapter.lakebase_endpoint = lb_ep_meta
+        return wl_adapter
 
     custom_fn = _resolve_custom_factory(connect_factories, eng_name, None)
     conn_fn = _make_postgres_wire_connect(
@@ -888,7 +955,10 @@ def _build_postgres_wire_adapter(
         pool=pool,
         read_only=conn_cfg.read_only,
         session_config=conn_cfg.session,
+        account="default",
         lakebase_config=lb_block,
+        storage_class=eff_sc,
+        lakebase_endpoint=lb_ep_meta,
     )
 
 

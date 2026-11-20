@@ -622,7 +622,23 @@ def test_cli_emit_with_standalone_and_full_serving_yaml(tmp_path, capsys):
     )
     pg_emit = tmp_path / "pg_placement.yaml"
     pg_schemas = tmp_path / "pg_schemas.json"
-    # Also test lakebase_connect fallback for single postgres_sources engine
+    # Without storage_classes or connections, standalone PII discovery fails closed as 'unknown'
+    capsys.readouterr()
+    rc_missing_sc = discovery_main(
+        [
+            "--config",
+            str(standalone_yaml),
+            "--emit",
+            str(pg_emit),
+            "--schemas-out",
+            str(pg_schemas),
+        ],
+        lakebase_connect=pg_cat.connect,
+    )
+    assert rc_missing_sc == 2
+    assert "has storage_class unknown" in capsys.readouterr().err
+
+    # Also test lakebase_connect fallback for single postgres_sources engine when storage_class is known
     rc2 = discovery_main(
         [
             "--config",
@@ -633,6 +649,7 @@ def test_cli_emit_with_standalone_and_full_serving_yaml(tmp_path, capsys):
             str(pg_schemas),
         ],
         lakebase_connect=pg_cat.connect,
+        storage_classes={"pg_report": "local"},
     )
     assert rc2 == 0
     raw_pg = yaml.safe_load(pg_emit.read_text(encoding="utf-8"))
