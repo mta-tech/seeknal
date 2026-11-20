@@ -12,11 +12,33 @@ echo "=== Seeknal Report Server Deployment ==="
 echo "  Target: $REMOTE_HOST:$REMOTE_DIR"
 echo ""
 
-AUTH_MODE="${SEEKNAL_REPORT_SERVER_AUTH_MODE:-api_key}"
+ENV_FILE="$SCRIPT_DIR/.env.report-server"
+if [ ! -f "$ENV_FILE" ]; then
+    echo "ERROR: $ENV_FILE not found. Configure SEEKNAL_REPORT_SERVER_KEYS (or SEEKNAL_REPORT_SERVER_AUTH_MODE=open) in deploy/.env.report-server before deploying." >&2
+    exit 1
+fi
+
+read_env_var() {
+    local var_name="$1"
+    local val
+    val="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${var_name}=" "$ENV_FILE" | tail -n 1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?${var_name}=//" || true)"
+    val="${val%\"}"
+    val="${val#\"}"
+    val="${val%\'}"
+    val="${val#\'}"
+    printf '%s' "$val"
+}
+
+AUTH_MODE="$(read_env_var SEEKNAL_REPORT_SERVER_AUTH_MODE)"
+AUTH_MODE="${AUTH_MODE:-api_key}"
+RAW_KEYS="$(read_env_var SEEKNAL_REPORT_SERVER_KEYS)"
+BIND_ADDRESS="$(read_env_var SEEKNAL_REPORT_SERVER_BIND_ADDRESS)"
+BIND_ADDRESS="${BIND_ADDRESS:-127.0.0.1}"
+
 if [ "$AUTH_MODE" = "open" ]; then
-    echo "WARNING: SEEKNAL_REPORT_SERVER_AUTH_MODE=open is set explicitly; deploying without API-key authentication." >&2
-elif [ -z "${SEEKNAL_REPORT_SERVER_KEYS:-}" ] || [ -z "$(printf '%s' "${SEEKNAL_REPORT_SERVER_KEYS}" | tr -d '[:space:],')" ]; then
-    echo "ERROR: SEEKNAL_REPORT_SERVER_KEYS must be set before deploying (or set SEEKNAL_REPORT_SERVER_AUTH_MODE=open explicitly for unauthenticated mode)." >&2
+    echo "WARNING: SEEKNAL_REPORT_SERVER_AUTH_MODE=open is set in deploy/.env.report-server; deploying without API-key authentication." >&2
+elif [ -z "$RAW_KEYS" ] || [ -z "$(printf '%s' "$RAW_KEYS" | tr -d '[:space:],')" ]; then
+    echo "ERROR: SEEKNAL_REPORT_SERVER_KEYS must be set in deploy/.env.report-server before deploying (or set SEEKNAL_REPORT_SERVER_AUTH_MODE=open explicitly for unauthenticated mode)." >&2
     exit 1
 fi
 
@@ -58,19 +80,38 @@ fi
 echo "[4/4] Building and starting services..."
 ssh $SSH_OPTS "$REMOTE_HOST" "cd $REMOTE_DIR && docker compose down --remove-orphans 2>/dev/null; docker compose up -d --build"
 
-# Wait for health check
+# Poll /healthz with a bounded timeout (30 x 2s = 60s)
 echo ""
 echo "Waiting for health check..."
-sleep 5
-HEALTH=$(ssh $SSH_OPTS "$REMOTE_HOST" "curl -sf http://localhost:8787/healthz 2>/dev/null || echo 'UNREACHABLE'")
+HEALTH="UNREACHABLE"
+for _attempt in $(seq 1 30); do
+    HEALTH=$(ssh $SSH_OPTS "$REMOTE_HOST" "curl -sf http://localhost:8787/healthz 2>/dev/null || true")
+    if [ -n "$HEALTH" ]; then
+        break
+    fi
+    sleep 2
+done
+
+if [ -z "$HEALTH" ] || [ "$HEALTH" = "UNREACHABLE" ]; then
+    echo "ERROR: Report server failed health check at http://localhost:8787/healthz after 60 seconds." >&2
+    exit 1
+fi
 echo "  Health: $HEALTH"
 
 echo ""
 echo "=== Deployment Complete ==="
-echo "  Report Server: http://reportkami.exe.xyz:8787"
-echo "  Health Check:  http://reportkami.exe.xyz:8787/healthz"
-echo "  Reports at:    http://reportkami.exe.xyz:8787/r/{slug}"
-echo ""
-echo "To publish reports, set:"
-echo "  export SEEKNAL_PUBLISH_SERVER=http://reportkami.exe.xyz:8787"
+if [ "$BIND_ADDRESS" = "127.0.0.1" ] || [ "$BIND_ADDRESS" = "localhost" ]; then
+    echo "  Bind Address:  $BIND_ADDRESS:8787 (loopback-only; set SEEKNAL_REPORT_SERVER_BIND_ADDRESS in deploy/.env.report-server to expose externally)"
+    echo "  Report Server: http://127.0.0.1:8787 (on $REMOTE_HOST)"
+    echo "  Health Check:  http://127.0.0.1:8787/healthz"
+    echo "  Reports at:    http://127.0.0.1:8787/r/{slug}"
+else
+    echo "  Bind Address:  $BIND_ADDRESS:8787"
+    echo "  Report Server: http://reportkami.exe.xyz:8787"
+    echo "  Health Check:  http://reportkami.exe.xyz:8787/healthz"
+    echo "  Reports at:    http://reportkami.exe.xyz:8787/r/{slug}"
+    echo ""
+    echo "To publish reports, set:"
+    echo "  export SEEKNAL_PUBLISH_SERVER=http://reportkami.exe.xyz:8787"
+fi
 echo ""
