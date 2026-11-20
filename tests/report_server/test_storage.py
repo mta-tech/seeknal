@@ -1358,6 +1358,58 @@ def test_pax_chain_size_record_and_corrupt_next_header_do_not_raise_attribute_er
     assert not (test_storage._root / "assets" / "pax_corrupt_next_slug").exists()
 
 
+def _build_mid_archive_malformed_pax_tar_gz(out_path: Path, malformed_payload: bytes = b"not_a_pax_len_prefix\n") -> Path:
+    import gzip
+
+    first = tarfile.TarInfo(name="a.txt")
+    first_data = b"first_member"
+    first.size = len(first_data)
+    first_blocks = first.tobuf(tarfile.PAX_FORMAT) + first_data.ljust(512, b"\x00")
+
+    bad_x = tarfile.TarInfo(name="PaxHeader/b.txt")
+    bad_x.type = tarfile.XHDTYPE
+    bad_x.size = len(malformed_payload)
+    bad_x_blocks = bad_x.tobuf(tarfile.PAX_FORMAT) + malformed_payload.ljust(512, b"\x00")
+
+    second = tarfile.TarInfo(name="b.txt")
+    second_data = b"second_member"
+    second.size = len(second_data)
+    second_blocks = second.tobuf(tarfile.PAX_FORMAT) + second_data.ljust(512, b"\x00")
+
+    with gzip.open(out_path, "wb", compresslevel=1) as gz:
+        gz.write(first_blocks)
+        gz.write(bad_x_blocks)
+        gz.write(second_blocks)
+        gz.write(b"\x00" * 1024)
+    return out_path
+
+
+@pytest.mark.parametrize(
+    "bad_payload",
+    [
+        b"not_a_length_prefix\n",
+        b"3 x\n",
+        b"9999 path=too_long\n",
+        b"8 noeq!!\n",
+        b"8 path=a!",
+    ],
+)
+def test_mid_archive_malformed_pax_header_raises_tar_safety_error_without_truncating(
+    test_storage: LocalFilesystemStorage,
+    tmp_path: Path,
+    bad_payload: bytes,
+) -> None:
+    archive = _build_mid_archive_malformed_pax_tar_gz(
+        tmp_path / f"mid_bad_pax_{len(bad_payload)}_{bad_payload[0]}.tar.gz",
+        bad_payload,
+    )
+    slug = f"mid_bad_pax_{len(bad_payload)}_{bad_payload[0]}"
+    with open(archive, "rb") as f:
+        with pytest.raises(TarSafetyError, match="Tarball pax header malformed"):
+            test_storage.extract_tarball(slug, f)
+    assert not (test_storage._root / "assets" / slug).exists()
+
+
 
 
 

@@ -131,6 +131,13 @@ async def publish(request: Request) -> JSONResponse:
                 asset_relpath = await run_in_threadpool(
                     storage.extract_tarball, slug, spool
                 )
+            except AttributeError as exc:
+                _log.error(
+                    "publish failed with unexpected AttributeError: slug=%s exc_class=%s",
+                    slug,
+                    type(exc).__name__,
+                )
+                raise
             except (
                 TarSafetyError,
                 _FILTER_ERROR_TYPE,

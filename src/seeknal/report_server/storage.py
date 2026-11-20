@@ -234,18 +234,18 @@ class _BoundedTarInfo(_tarfile.TarInfo):
         while len(buf) > pos and buf[pos] != 0x00:
             match = _PAX_LEN_RE.match(buf, pos)
             if not match:
-                raise _tarfile.InvalidHeaderError("invalid header")
+                raise TarSafetyError("Tarball pax header malformed")
             try:
                 length = int(match.group(1))
             except ValueError:
-                raise _tarfile.InvalidHeaderError("invalid header") from None
+                raise TarSafetyError("Tarball pax header malformed") from None
             if length < 5 or pos + length > len(buf):
-                raise _tarfile.InvalidHeaderError("invalid header")
+                raise TarSafetyError("Tarball pax header malformed")
             header_value_end_offset = match.start(1) + length - 1
             keyword_and_value = buf[match.end(1) + 1 : header_value_end_offset]
             raw_keyword, equals, raw_value = keyword_and_value.partition(b"=")
             if not raw_keyword or equals != b"=" or buf[header_value_end_offset] != 0x0A:
-                raise _tarfile.InvalidHeaderError("invalid header")
+                raise TarSafetyError("Tarball pax header malformed")
             if raw_keyword == b"hdrcharset":
                 raise TarSafetyError("Tarball entry has a non-UTF-8 member name")
             if (

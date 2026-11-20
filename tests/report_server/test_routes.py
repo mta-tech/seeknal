@@ -975,7 +975,9 @@ def test_overflow_error_mapped_to_typed_400_and_attribute_error_surfaces(
     test_app,
     test_client: TestClient,
     honest_tarball: Path,
+    caplog,
 ) -> None:
+    import logging
     import pytest
 
     with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=OverflowError("mtime out of range")):
@@ -983,10 +985,39 @@ def test_overflow_error_mapped_to_typed_400_and_attribute_error_surfaces(
     assert resp.status_code == 400
     assert resp.json() == {"error": "Invalid or corrupt tarball archive"}
 
-    # AttributeError is a programming error and must surface as an unhandled exception in tests
+    # AttributeError is a programming error: it logs at ERROR, surfaces in raising TestClient,
+    # and returns 500 (not 400) when server exceptions are converted to responses.
+    caplog.clear()
+    caplog.set_level(logging.ERROR, logger="seeknal.report_server")
     with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=AttributeError("programming bug")):
         with pytest.raises(AttributeError, match="programming bug"):
             _publish(test_client, honest_tarball)
+
+        non_raising_client = TestClient(test_app, raise_server_exceptions=False)
+        resp_500 = _publish(non_raising_client, honest_tarball)
+        assert resp_500.status_code == 500
+
+    attr_err_logs = [
+        rec for rec in caplog.records
+        if rec.name == "seeknal.report_server"
+        and rec.levelno == logging.ERROR
+        and "exc_class=AttributeError" in rec.getMessage()
+    ]
+    assert len(attr_err_logs) == 2
+
+
+def test_publish_rejects_mid_archive_malformed_pax_header_with_400_and_writes_nothing(
+    test_client: TestClient,
+    tmp_path: Path,
+) -> None:
+    from tests.report_server.test_storage import _build_mid_archive_malformed_pax_tar_gz
+
+    assets_dir = test_client.app.state.config.data_dir / "assets"
+    archive = _build_mid_archive_malformed_pax_tar_gz(tmp_path / "route_mid_bad_pax.tar.gz")
+    resp = _publish(test_client, archive)
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "Tarball pax header malformed"}
+    assert list(assets_dir.iterdir()) == []
 
 
 def test_publish_rejects_invalid_pax_mtimes_with_400_and_accepts_normal_float_mtime(
