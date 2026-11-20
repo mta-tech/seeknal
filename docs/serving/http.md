@@ -265,6 +265,7 @@ All error responses have an HTTP status code $\ge 400$ and return a consistent t
 | `select_invalid` | **400** | `bad_request` | The structured select request payload is invalid. | Check table, columns, where operators, order_by, and parameter types and try again. |
 | `cursor_invalid` | **400** | `bad_request` | The pagination cursor is malformed, tampered, or does not match this query. | Restart pagination from the first page or supply the unmodified next cursor. |
 | `engine_starting` | **503** | `engine_starting` | The target database endpoint is starting up. | The database is waking up; retry in a few seconds. |
+| `cursor_key_missing` | **500** | `cursor_key_missing` | Pagination cursor signing key is not configured. | Configure cursor_key_env and set the cursor signing key environment variable. |
 | `not_found` | **404** | `not_found` | Query not found | Verify the query_id (jti) and that the query is still running. |
 | `duplicate_query_id` | **409** | `duplicate_query_id` | A query with this audit_id is already running. | Wait for the in-flight query to complete or issue a new grant. |
 

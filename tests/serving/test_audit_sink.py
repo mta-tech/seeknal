@@ -1120,7 +1120,11 @@ def test_build_server_http_end_to_end_query_explain_cancel_and_rejected(tmp_path
         },
     }
 
-    handle = build_server(cfg_dict, connect_factories={"duck": lambda: con.cursor()})
+    handle = build_server(
+        cfg_dict,
+        connect_factories={"duck": lambda: con.cursor()},
+        cursor_key="test-audit-cursor-key",
+    )
     assert isinstance(handle.audit_sink, FileAuditSink)
 
     query_sql = (
@@ -1382,8 +1386,10 @@ def test_cancel_202_emits_audit_record(tmp_path: Path):
 
 def test_build_server_and_cli_refuse_startup_on_unwritable_audit(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ):
+    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "test-audit-cursor-key")
     _, jwks_file, placement_file, schemas_file = _write_static_server_artifacts(tmp_path)
     unwritable_audit = tmp_path / "does_not_exist_dir" / "audit.jsonl"
 

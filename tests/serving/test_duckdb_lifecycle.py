@@ -199,6 +199,7 @@ def test_retained_connection_reference_sequential_hardened_file_reproducer(
     handle = build_server(
         ServerConfig.from_dict(cfg_dict),
         connect_factories={"duck": tracking_connect},
+        cursor_key="test-duckdb-lifecycle-cursor-key",
     )
     client = TestClient(handle.app)
 
@@ -223,7 +224,10 @@ def test_retained_connection_reference_sequential_hardened_file_reproducer(
             retained_conns[-1].execute("SELECT 1")
 
     # Also verify default build_server (holder path) across sequential queries: reuses 1 hardened instance and leaves 0 in-flight cursors
-    default_handle = build_server(ServerConfig.from_dict(cfg_dict))
+    default_handle = build_server(
+        ServerConfig.from_dict(cfg_dict),
+        cursor_key="test-duckdb-lifecycle-cursor-key",
+    )
     default_client = TestClient(default_handle.app)
     for i in range(3):
         tok = sign_grant_token(
@@ -263,7 +267,10 @@ def test_two_concurrent_callers_barrier_real_hardened_readonly_file(
     cfg_dict = hardened_duckdb_setup["cfg_dict"]
     priv = hardened_duckdb_setup["priv"]
 
-    handle = build_server(ServerConfig.from_dict(cfg_dict))
+    handle = build_server(
+        ServerConfig.from_dict(cfg_dict),
+        cursor_key="test-duckdb-lifecycle-cursor-key",
+    )
     client = TestClient(handle.app)
     duck_adapter = handle.adapters["duck"]
     assert isinstance(duck_adapter, DuckDBAdapter)
@@ -398,6 +405,7 @@ def test_factory_error_maps_to_secret_safe_engine_error_and_http_502(
     handle = build_server(
         ServerConfig.from_dict(cfg_dict),
         connect_factories={"duck": failing_factory},
+        cursor_key="test-duckdb-lifecycle-cursor-key",
     )
     client = TestClient(handle.app)
     sql = "SELECT id, name FROM users ORDER BY id"

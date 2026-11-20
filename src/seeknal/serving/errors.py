@@ -221,6 +221,13 @@ _CATALOGUE_ENTRIES: tuple[ErrorSpec, ...] = (
         next_step="The database is waking up; retry in a few seconds.",
     ),
     ErrorSpec(
+        code="cursor_key_missing",
+        status=500,
+        category="cursor_key_missing",
+        message="Pagination cursor signing key is not configured.",
+        next_step="Configure cursor_key_env and set the cursor signing key environment variable.",
+    ),
+    ErrorSpec(
         code="not_found",
         status=404,
         category="not_found",

@@ -75,6 +75,7 @@ from seeknal.serving.service import ServingPipeline
 from seeknal.serving.startup_validation import (
     _collect_secret_values,
     _scrub,
+    resolve_startup_cursor_key,
     run_initial_discovery_refresh_or_raise,
 )
 
@@ -162,6 +163,7 @@ def build_server(
     audit_failure_callback: Callable[[], Any] | None = None,
     readiness_clock: Callable[[], float] | None = None,
     run_initial_refresh: bool = False,
+    cursor_key: bytes | str | None = None,
 ) -> ServerHandle:
     """Build a complete Seeknal Serving server handle from configuration."""
     # 1. Resolve configuration
@@ -179,7 +181,16 @@ def build_server(
     # before configuring a file logger or constructing adapters/refresher
     secret_values = _collect_secret_values(env, cfg=cfg)
     register_config_secrets(*secret_values)
-    preflight = cfg.validate_runtime_wiring(env=env)
+    preflight = cfg.validate_runtime_wiring(
+        env=env,
+        check_cursor_key=True,
+        cursor_key=cursor_key,
+    )
+    resolved_cursor_key = resolve_startup_cursor_key(
+        cfg,
+        cursor_key=cursor_key,
+        env=env,
+    )
     secret_values = _collect_secret_values(env, cfg=cfg)
     register_config_secrets(*secret_values)
 
@@ -542,6 +553,7 @@ def build_server(
         ),
         audit_failure_callback=audit_failure_callback,
         metrics=metrics,
+        cursor_key=resolved_cursor_key,
     )
 
     ops_app: Starlette | None = None

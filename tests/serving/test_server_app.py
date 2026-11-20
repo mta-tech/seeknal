@@ -108,7 +108,11 @@ def test_static_duckdb_end_to_end_and_readyz(
     }
     config = ServerConfig.from_dict(cfg_dict)
 
-    handle = build_server(config, connect_factories={"duck": lambda: con})
+    handle = build_server(
+        config,
+        connect_factories={"duck": lambda: con},
+        cursor_key="test-app-cursor-key",
+    )
     assert isinstance(handle, ServerHandle)
     assert handle.refresher is None
 
@@ -216,7 +220,11 @@ def test_discovery_mode_readyz_and_error_handling(ec_key_pair, jwks_path):
     config = ServerConfig.from_dict(cfg_dict)
 
     # 1. Before first refresh: /readyz returns 503
-    handle = build_server(config, discover_fn=fake_discover)
+    handle = build_server(
+        config,
+        discover_fn=fake_discover,
+        cursor_key="test-app-cursor-key",
+    )
     assert handle.refresher is not None
     assert handle.refresher.last_success_at is None
 
@@ -239,7 +247,11 @@ def test_discovery_mode_readyz_and_error_handling(ec_key_pair, jwks_path):
 
     # 3. Failing refresh keeps it 503 and leaks no error text
     should_fail = True
-    handle_fail = build_server(config, discover_fn=fake_discover)
+    handle_fail = build_server(
+        config,
+        discover_fn=fake_discover,
+        cursor_key="test-app-cursor-key",
+    )
     handle_fail.refresher.refresh_once()
     assert handle_fail.refresher.last_success_at is None
 
@@ -314,7 +326,11 @@ cubes: {}
         }
     }
 
-    env = {"SR_PW1": "p1", "SR_PW2": "p2"}
+    env = {
+        "SR_PW1": "p1",
+        "SR_PW2": "p2",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
+    }
     handle = build_server(config, env=env, connect_factories=factories)
 
     sr_adapter = handle.adapters["sr"]
@@ -371,7 +387,10 @@ cubes:
             },
         },
     }
-    env = {"CUBE_SQL_SECRET": "cube-super-secret-key"}
+    env = {
+        "CUBE_SQL_SECRET": "cube-super-secret-key",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
+    }
     config_jwt = ServerConfig.from_dict(cfg_jwt)
     handle_jwt = build_server(
         config_jwt, env=env, connect_factories={"cube": fake_factory}
@@ -461,12 +480,16 @@ def test_build_server_discovery_with_secrets_env_file(
         },
     }
     config = ServerConfig.from_dict(cfg_dict)
-    handle = build_server(config, discover_fn=lambda: DiscoveryResult(
-        placement={"engines": {}, "tables": {}, "cubes": {}},
-        schemas={},
-        warnings=(),
-        discovered_at=datetime.datetime.now(datetime.timezone.utc),
-    ))
+    handle = build_server(
+        config,
+        discover_fn=lambda: DiscoveryResult(
+            placement={"engines": {}, "tables": {}, "cubes": {}},
+            schemas={},
+            warnings=(),
+            discovered_at=datetime.datetime.now(datetime.timezone.utc),
+        ),
+        cursor_key="test-app-cursor-key",
+    )
     assert handle.refresher is not None
     assert handle.refresher.refresh_once() is True
 
@@ -550,7 +573,11 @@ def test_build_server_loads_static_artifacts_once(
     assert open_counts[sf] == 0
 
     monkeypatch.setattr(builtins, "open", _counting_open)
-    handle = build_server(cfg, connect_factories={"duck": lambda: duckdb.connect()})
+    handle = build_server(
+        cfg,
+        connect_factories={"duck": lambda: duckdb.connect()},
+        cursor_key="test-app-cursor-key",
+    )
     assert isinstance(handle, ServerHandle)
     assert open_counts[pf] == 1
     assert open_counts[sf] == 1
@@ -611,7 +638,11 @@ def test_build_server_propagates_compilation_cache_max_entries(
             "connections": {"duck": {"kind": "duckdb", "path": ":memory:"}},
         }
     )
-    h_default = build_server(cfg_default, connect_factories={"duck": lambda: duckdb.connect()})
+    h_default = build_server(
+        cfg_default,
+        connect_factories={"duck": lambda: duckdb.connect()},
+        cursor_key="test-app-cursor-key",
+    )
     assert h_default.pipeline.compilation_cache_info() == {
         "hits": 0,
         "misses": 0,
@@ -630,7 +661,11 @@ def test_build_server_propagates_compilation_cache_max_entries(
                 "connections": {"duck": {"kind": "duckdb", "path": ":memory:"}},
             }
         )
-        h_cap = build_server(cfg_cap, connect_factories={"duck": lambda: duckdb.connect()})
+        h_cap = build_server(
+            cfg_cap,
+            connect_factories={"duck": lambda: duckdb.connect()},
+            cursor_key="test-app-cursor-key",
+        )
         assert h_cap.pipeline.compilation_cache_info()["max_entries"] == cap
 
 
@@ -648,6 +683,7 @@ def test_postgres_accounts_share_one_pool_per_credential_and_harden_session(
 
     env = {
         "CBN_PG_REPORT_DSN_BI": f"postgresql://seeknal_bi:{planted_bi_pw}@127.0.0.1:5432/cbn",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
     }
 
     cfg = ServerConfig.from_dict(
@@ -928,6 +964,7 @@ def test_discovery_wires_postgres_connects_for_configured_account(
         "PG_INT_DSN": "postgresql://u1:pw1@localhost/db",
         "PG_BI_DSN": "postgresql://u2:pw2@localhost/db",
         "PG_DEF_DSN": "postgresql://u3:pw3@localhost/db",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
     }
     cfg = ServerConfig.from_dict(cfg_dict, env=env)
     handle = build_server(
@@ -972,6 +1009,7 @@ def test_lakebase_cold_start_connector_wiring_and_engine_starting_propagation(
     env = {
         "CBN_LB_OPS_DSN": "postgresql://lb_role:lb_pw_1122@127.0.0.1:40001/ops",
         "LB_OPS_PROJECT_TOKEN": "lb_proj_token_secret_3344",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
     }
     cfg = ServerConfig.from_dict(
         {
@@ -1106,6 +1144,7 @@ def test_runtime_discovery_passes_connections_storage_class_through_build_server
     env = {
         "PG_S3_DSN": "postgresql://svc:pw@localhost:5432/cbn",
         "SR_PW": "sr-secret-pw",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
     }
 
     # 1. Lakekeeper-flagged PII table on kind: postgres declared storage_class: object_storage
@@ -1302,6 +1341,7 @@ def test_b_m2_multi_account_lakebase_shares_single_connector_by_endpoint_id_and_
         "LB_INT_DSN": "postgresql://int_role:pw1@127.0.0.1:40100/ops",
         "LB_BI_DSN": "postgresql://bi_role:pw2@127.0.0.1:40100/ops",
         "LB_API_TOK": "cp-token-shared-ep",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
     }
     cfg = ServerConfig.from_dict(
         {
@@ -1419,5 +1459,184 @@ def test_b_m2_multi_account_lakebase_shares_single_connector_by_endpoint_id_and_
         )
         res_duck = duck_ad.execute(prep_duck, timeout_seconds=5.0)
         assert res_duck.cold_start is None
+
+
+def test_b_fix_build_server_wires_cursor_key_env_from_env_mapping_and_pages_select(
+    tmp_path, ec_key_pair, jwks_path, monkeypatch
+):
+    priv, _, _ = ec_key_pair
+    monkeypatch.delenv("SEEKNAL_CURSOR_KEY", raising=False)
+    monkeypatch.delenv("CUSTOM_SELECT_CURSOR_KEY", raising=False)
+
+    pf = tmp_path / "select_placement.yaml"
+    pf.write_text(
+        """
+engines:
+  duck: {kind: duckdb, dialect: duckdb}
+tables:
+  users:
+    keys: [id]
+    row_count: 10
+    access:
+      sortable: [id, name]
+    serve:
+      duck: users
+cubes: {}
+""",
+        encoding="utf-8",
+    )
+    sf = tmp_path / "select_schemas.json"
+    sf.write_text(json.dumps({"users": ["id", "name"]}), encoding="utf-8")
+
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE users (id INTEGER, name VARCHAR)")
+    expected_rows = [[i, f"user-{i:02d}"] for i in range(1, 11)]
+    con.executemany("INSERT INTO users VALUES (?, ?)", expected_rows)
+
+    cursor_secret = "custom-env-mapping-only-cursor-key-9911"
+    env = {"CUSTOM_SELECT_CURSOR_KEY": cursor_secret}
+    cfg = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "cursor_key_env": "CUSTOM_SELECT_CURSOR_KEY",
+            "placement": {
+                "static": {
+                    "placement_file": str(pf),
+                    "schemas_file": str(sf),
+                }
+            },
+            "connections": {
+                "duck": {"kind": "duckdb", "path": ":memory:"},
+            },
+        },
+        env=env,
+    )
+
+    handle = build_server(
+        cfg,
+        env=env,
+        connect_factories={"duck": lambda: con.cursor()},
+    )
+
+    collected: list[list[Any]] = []
+    after_cursor: str | None = None
+    page_num = 0
+    with TestClient(handle.app) as client:
+        while True:
+            page_num += 1
+            body_obj: dict[str, Any] = {
+                "table": "users",
+                "columns": ["id", "name"],
+                "order_by": [{"id": "asc"}],
+                "limit": 3,
+            }
+            if after_cursor is not None:
+                body_obj["after"] = after_cursor
+            raw_body = json.dumps(body_obj, separators=(",", ":")).encode("utf-8")
+            now = time.time()
+            tok = sign_grant_token(
+                {
+                    "sub": "user@test.org",
+                    "ws": "analytics",
+                    "jti": f"jti-bfix-page-{page_num}",
+                    "iss": "atlas-catalog",
+                    "aud": "seeknal-serving",
+                    "iat": now,
+                    "exp": now + 60.0,
+                    "typ": "grant",
+                    "api": "select.v1",
+                    "sql_dialect": "postgres",
+                    "sql_sha256": hashlib.sha256(raw_body).hexdigest(),
+                    "max_rows": 50,
+                    "tables": {
+                        "users": {
+                            "columns": ["id", "name"],
+                            "masks": {},
+                            "row_filters": [],
+                            "actions": ["select"],
+                        }
+                    },
+                },
+                priv,
+                kid="app-test-key",
+            )
+            resp = client.post(
+                "/v1/select",
+                headers={
+                    "Authorization": f"Bearer {tok}",
+                    "Content-Type": "application/json",
+                },
+                content=raw_body,
+            )
+            assert resp.status_code == 200, resp.text
+            pdata = resp.json()
+            if page_num == 1:
+                assert pdata["truncated"] is True
+                assert isinstance(pdata["next"], str) and pdata["next"]
+            collected.extend(pdata["rows"])
+            after_cursor = pdata.get("next")
+            if not after_cursor:
+                break
+
+    assert page_num == 4
+    assert collected == expected_rows
+
+
+def test_b_fix_build_server_refuses_startup_when_cursor_key_missing(
+    jwks_path, static_catalog_files, monkeypatch
+):
+    from seeknal.serving.startup_validation import (
+        CursorKeyMissingError,
+        validate_startup,
+    )
+
+    pf, sf = static_catalog_files
+    monkeypatch.delenv("SEEKNAL_CURSOR_KEY", raising=False)
+    monkeypatch.delenv("MY_CUSTOM_CURSOR_KEY", raising=False)
+    planted_other_secret = "PLANTED_UNRELATED_SECRET_8822"
+
+    # 1. Default env var (SEEKNAL_CURSOR_KEY) missing everywhere -> refuses with code == "cursor_key_missing"
+    cfg_default = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "placement": {"static": {"placement_file": pf, "schemas_file": sf}},
+            "connections": {"duck": {"kind": "duckdb", "path": ":memory:"}},
+        }
+    )
+    with pytest.raises(ServerConfigError) as exc_def:
+        build_server(
+            cfg_default,
+            env={"OTHER_SECRET": planted_other_secret},
+        )
+    assert isinstance(exc_def.value, CursorKeyMissingError)
+    assert exc_def.value.code == "cursor_key_missing"
+    assert "cursor_key_missing" in str(exc_def.value)
+    assert "SEEKNAL_CURSOR_KEY" in str(exc_def.value)
+    assert planted_other_secret not in str(exc_def.value)
+
+    # 2. Custom cursor_key_env missing everywhere -> refuses in both build_server and validate_startup
+    cfg_custom = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "cursor_key_env": "MY_CUSTOM_CURSOR_KEY",
+            "placement": {"static": {"placement_file": pf, "schemas_file": sf}},
+            "connections": {"duck": {"kind": "duckdb", "path": ":memory:"}},
+        }
+    )
+    with pytest.raises(ServerConfigError) as exc_cust:
+        build_server(cfg_custom, env={"OTHER_SECRET": planted_other_secret})
+    assert isinstance(exc_cust.value, CursorKeyMissingError)
+    assert exc_cust.value.code == "cursor_key_missing"
+    assert "cursor_key_missing" in str(exc_cust.value)
+    assert "MY_CUSTOM_CURSOR_KEY" in str(exc_cust.value)
+    assert planted_other_secret not in str(exc_cust.value)
+
+    with pytest.raises(ServerConfigError) as exc_val:
+        validate_startup(cfg_custom, env={"OTHER_SECRET": planted_other_secret})
+    assert isinstance(exc_val.value, CursorKeyMissingError)
+    assert exc_val.value.code == "cursor_key_missing"
+    assert "MY_CUSTOM_CURSOR_KEY" in str(exc_val.value)
+    assert planted_other_secret not in str(exc_val.value)
+
 
 

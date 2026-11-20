@@ -146,8 +146,9 @@ connections:
 
 
 def test_cli_run_without_check_passes_uvicorn_kwargs(
-    tmp_path, jwks_file, placement_files, cert_files
+    tmp_path, jwks_file, placement_files, cert_files, monkeypatch
 ):
+    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "cli-test-cursor-key")
     pf, sf = placement_files
     cert, key, ca = cert_files
     cfg_file = tmp_path / "serving.yaml"

@@ -681,3 +681,95 @@ def test_select_never_falls_open_on_prepare_statement_error(ec_keys, exc_cls):
     assert resp.json()["code"] == "internal_error"
     assert adapter_called is False
 
+
+def test_b_fix_create_app_without_cursor_key_returns_500_cursor_key_missing_on_truncated_select(
+    ec_keys, monkeypatch
+):
+    from seeknal.serving.adapters import DuckDBAdapter
+
+    priv, pub = ec_keys
+    # Even if SEEKNAL_CURSOR_KEY exists in os.environ, create_app called directly
+    # with no cursor_key / cursor_key_env must NOT fall back to os.environ.
+    planted_env_key = "PLANTED_ENV_CURSOR_KEY_MUST_NOT_BE_READ_7711"
+    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", planted_env_key)
+
+    con = duckdb.connect()
+    con.execute(
+        "CREATE TABLE rpt_txn_detail ("
+        "txn_id INT, customer_id VARCHAR, as_of_date VARCHAR, amount INT)"
+    )
+    con.execute(
+        "INSERT INTO rpt_txn_detail VALUES "
+        "(1, 'C-1', '2026-10-01', 100), "
+        "(2, 'C-1', '2026-10-02', 200), "
+        "(3, 'C-1', '2026-10-03', 300)"
+    )
+
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "cbn.rpt.rpt_txn_detail": {
+                    "keys": ["txn_id"],
+                    "row_count": 3,
+                    "access": {"sortable": ["txn_id", "as_of_date"]},
+                    "serve": {"duck": "rpt_txn_detail"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    schemas = {
+        "cbn.rpt.rpt_txn_detail": [
+            "txn_id",
+            "customer_id",
+            "as_of_date",
+            "amount",
+        ]
+    }
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas=schemas,
+        public_keys={"k1": pub},
+        default_catalog="cbn",
+    )
+
+    app = create_app(pipeline, {"duck": DuckDBAdapter(lambda: con.cursor())})
+    client = TestClient(app)
+
+    grant_tables = {
+        "cbn.rpt.rpt_txn_detail": {
+            "columns": ["txn_id", "customer_id", "as_of_date", "amount"],
+            "masks": {},
+            "row_filters": [],
+            "actions": ["select"],
+        }
+    }
+
+    raw_paged = json.dumps(
+        {
+            "table": "cbn.rpt.rpt_txn_detail",
+            "columns": ["txn_id", "amount"],
+            "order_by": [{"txn_id": "asc"}],
+            "limit": 2,
+        }
+    ).encode("utf-8")
+    tok_paged = _mint_select_grant(
+        priv,
+        raw_paged,
+        jti="jti-bfix-no-cursor-key-1",
+        tables=grant_tables,
+    )
+    resp = client.post(
+        "/v1/select",
+        headers={"Authorization": f"Bearer {tok_paged}"},
+        content=raw_paged,
+    )
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["code"] == "cursor_key_missing"
+    assert body["error"] == "cursor_key_missing"
+    assert body["audit_id"] == "jti-bfix-no-cursor-key-1"
+    assert planted_env_key not in resp.text
+
+

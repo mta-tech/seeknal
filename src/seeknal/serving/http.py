@@ -714,7 +714,7 @@ def create_app(
     on_row_cap: str = "truncate",
     metrics: MetricsRegistry | None = None,
     cursor_key: bytes | str | None = None,
-    cursor_key_env: str | None = "SEEKNAL_CURSOR_KEY",
+    cursor_key_env: str | None = None,
 ) -> Starlette:
     """Create a Starlette serving application."""
     if replay_cache is None:
@@ -3683,6 +3683,38 @@ def create_app(
         full_safe_rows = [
             [_make_json_safe(cell) for cell in row] for row in result.rows
         ]
+
+        if result.truncated and effective_cursor_key is None:
+            logger.error(
+                "engine=%s code=cursor_key_missing error=CursorKeyMissing detail=Pagination cursor signing key is not configured audit_id=%s",
+                getattr(adapter, "kind", None) or "-",
+                prepared.audit_id or "-",
+            )
+            return await _finish(
+                _error_response(
+                    "cursor_key_missing",
+                    status_code=500,
+                    audit_id=prepared.audit_id,
+                    token=token,
+                    params=params,
+                ),
+                route=route,
+                status=500,
+                code="cursor_key_missing",
+                elapsed_ms=result.elapsed_ms,
+                tables=tables,
+                truncated=True,
+                sql_sha256=body_sha256,
+                api="select.v1",
+                paged=compiled.paged,
+                params=params,
+                token=token,
+                claims=claims,
+                prepared=prepared,
+                adapter=adapter,
+                result=result,
+                skip_callable_audit=callable_audit_done,
+            )
 
         next_cursor: str | None = None
         if (

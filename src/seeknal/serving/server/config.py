@@ -1501,29 +1501,53 @@ class ServerConfig:
                 )
             read_secret_file(path)
 
-    def check_env(self, env: Mapping[str, str] | None = None) -> None:
+    def check_env(
+        self,
+        env: Mapping[str, str] | None = None,
+        *,
+        cursor_key: bytes | str | None = None,
+    ) -> None:
         """Verify that every referenced environment variable exists and secret files are safe."""
         for var in self.get_referenced_env_vars():
-            self.get_env(var, env)
+            if self.cursor_key_env is not None and var == self.cursor_key_env:
+                from seeknal.serving.startup_validation import (
+                    resolve_startup_cursor_key,
+                )
+
+                resolve_startup_cursor_key(
+                    self,
+                    cursor_key=cursor_key,
+                    env=env,
+                )
+            else:
+                self.get_env(var, env)
         self.check_secret_files()
 
     def validate_runtime_wiring(
         self,
         *,
         env: Mapping[str, str] | None = None,
+        check_cursor_key: bool = False,
+        cursor_key: bytes | str | None = None,
     ) -> PreflightResult:
         """Offline preflight validation of env, static placement/schemas, and engine-connection wiring.
 
         Returns a PreflightResult so callers (such as build_server) can reuse parsed
         static Placement and schemas without re-reading files.
         """
-        self.check_env(env=env)
+        self.check_env(env=env, cursor_key=cursor_key)
         if self.audit is not None:
             verify_audit_config_offline(self.audit, error_cls=AuditStartupError)
 
         from seeknal.serving.startup_validation import validate_startup
 
-        report = validate_startup(self, env=env, check_grant_keys=False)
+        report = validate_startup(
+            self,
+            env=env,
+            check_grant_keys=False,
+            check_cursor_key=check_cursor_key,
+            cursor_key=cursor_key,
+        )
         return PreflightResult(
             mode=report.mode,
             placement=report.placement,

@@ -16,6 +16,7 @@ import yaml
 
 from seeknal.serving.audit import verify_audit_config_offline
 from seeknal.serving.enforce import VALID_MASKS, VALID_OPS
+from seeknal.serving.errors import register_config_secrets
 from seeknal.serving.lakebase_endpoint import effective_storage_class
 from seeknal.serving.placement import (
     VALID_ACCESS_PATTERNS,
@@ -92,6 +93,7 @@ _SENSITIVE_ENV_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 _ROLE_TOP_KEYS = frozenset({"roles", "role_policies", "default_role", "role_bindings", "role_grants"})
+DEFAULT_CURSOR_KEY_ENV = "SEEKNAL_CURSOR_KEY"
 
 
 class StartupValidationError(ServerConfigError):
@@ -107,6 +109,65 @@ class StartupValidationError(ServerConfigError):
         deduped = tuple(dict.fromkeys(raw_list))
         self.problems: tuple[str, ...] = deduped
         super().__init__("\n".join(deduped))
+
+
+class CursorKeyMissingError(StartupValidationError):
+    """Raised when the pagination cursor signing key is missing at server startup."""
+
+    code: str = "cursor_key_missing"
+
+    def __init__(self, problems: Sequence[str] | str) -> None:
+        super().__init__(problems)
+        self.code = "cursor_key_missing"
+
+
+def resolve_startup_cursor_key(
+    cfg: ServerConfig,
+    *,
+    cursor_key: bytes | str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> bytes | str:
+    """Resolve the pagination cursor signing key or raise CursorKeyMissingError."""
+    if cursor_key is not None and not isinstance(cursor_key, bool):
+        if isinstance(cursor_key, (bytes, bytearray)):
+            if len(cursor_key) > 0:
+                key_bytes = bytes(cursor_key)
+                try:
+                    register_config_secrets(key_bytes.decode("utf-8"))
+                except UnicodeDecodeError:
+                    pass
+                return key_bytes
+        elif isinstance(cursor_key, str):
+            if cursor_key:
+                register_config_secrets(cursor_key)
+                return cursor_key
+        else:
+            raise ServerConfigError("'cursor_key' must be str, bytes, or None")
+    elif isinstance(cursor_key, bool):
+        raise ServerConfigError("'cursor_key' must be str, bytes, or None")
+
+    env_var = cfg.cursor_key_env or DEFAULT_CURSOR_KEY_ENV
+    sec_val = cfg.secrets_env.get(env_var)
+    if isinstance(sec_val, str) and sec_val:
+        register_config_secrets(sec_val)
+        return sec_val
+
+    if env is not None:
+        env_val = env.get(env_var)
+        if isinstance(env_val, str) and env_val:
+            register_config_secrets(env_val)
+            return env_val
+
+    os_val = os.environ.get(env_var)
+    if isinstance(os_val, str) and os_val:
+        register_config_secrets(os_val)
+        return os_val
+
+    safe_var = _safe_ident(env_var)
+    raise CursorKeyMissingError(
+        f"cursor_key_missing: pagination cursor signing key is not configured; "
+        f"set environment variable '{safe_var}'"
+    )
 
 
 @dataclass(frozen=True)
@@ -2140,6 +2201,8 @@ def validate_startup(
     raw_placement: Mapping[str, Any] | None = None,
     raw_schemas: Mapping[str, Sequence[str]] | None = None,
     check_grant_keys: bool = True,
+    check_cursor_key: bool = False,
+    cursor_key: bytes | str | None = None,
 ) -> ValidationReport:
     """Perform comprehensive fail-closed startup validation.
 
@@ -2270,8 +2333,20 @@ def validate_startup(
         if var_name in seen_vars:
             continue
         seen_vars.add(var_name)
+        if cfg.cursor_key_env is not None and var_name == cfg.cursor_key_env:
+            continue
         try:
             cfg.get_env(var_name, env)
+        except ServerConfigError as exc:
+            problems.append(_scrub(str(exc), secret_values))
+
+    cursor_key_missing_error = False
+    if check_cursor_key or cfg.cursor_key_env is not None:
+        try:
+            resolve_startup_cursor_key(cfg, cursor_key=cursor_key, env=env)
+        except CursorKeyMissingError as exc:
+            cursor_key_missing_error = True
+            problems.extend(_scrub(p, secret_values) for p in exc.problems)
         except ServerConfigError as exc:
             problems.append(_scrub(str(exc), secret_values))
 
@@ -2331,7 +2406,12 @@ def validate_startup(
             )
 
         if problems:
-            raise StartupValidationError([_scrub(p, secret_values) for p in problems])
+            err_cls = (
+                CursorKeyMissingError
+                if cursor_key_missing_error
+                else StartupValidationError
+            )
+            raise err_cls([_scrub(p, secret_values) for p in problems])
 
         clean_warnings = tuple(
             dict.fromkeys(_scrub(w, secret_values) for w in warnings_out)
@@ -2371,7 +2451,12 @@ def validate_startup(
     )
 
     if problems:
-        raise StartupValidationError([_scrub(p, secret_values) for p in problems])
+        err_cls_disc = (
+            CursorKeyMissingError
+            if cursor_key_missing_error
+            else StartupValidationError
+        )
+        raise err_cls_disc([_scrub(p, secret_values) for p in problems])
 
     clean_disc_warnings = tuple(
         dict.fromkeys(_scrub(w, secret_values) for w in warnings_out)
