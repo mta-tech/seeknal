@@ -578,12 +578,14 @@ def test_freshness_cascade_all_four_levels_and_validation():
     assert res1.tables["cbn.rpt.t_synced"].max_lag_seconds == 180.0
     assert res1.tables["cbn.rpt.t_sql"].max_lag_seconds == 43500.0 + 60.0
 
-    # Verify freshness_sql ran inside BEGIN READ ONLY ... ROLLBACK
+    # Verify freshness_sql ran inside BEGIN + SET TRANSACTION READ ONLY + conn.rollback()
     sql_seq = [s.strip().upper() for s, _ in cat.executed]
-    begin_idx = sql_seq.index("BEGIN READ ONLY")
-    fresh_idx = sql_seq.index(fresh_query.upper())
-    rollback_idx = sql_seq.index("ROLLBACK", fresh_idx)
-    assert begin_idx < fresh_idx < rollback_idx
+    begin_idx = sql_seq.index("BEGIN")
+    set_ro_idx = sql_seq.index("SET TRANSACTION READ ONLY", begin_idx)
+    fresh_idx = sql_seq.index(fresh_query.upper(), set_ro_idx)
+    assert begin_idx + 1 == set_ro_idx
+    assert set_ro_idx < fresh_idx
+    assert cat.connections[0].rollback_count >= 2
 
     # With matching Iceberg snapshot_id=42 -> sync lag = 0 + 60 = 60s
     res_match = introspect_postgres_source(
@@ -653,3 +655,35 @@ def test_freshness_cascade_all_four_levels_and_validation():
             introspect_postgres_source(
                 cat_bad.connect, bad_cfg, engine_kind="postgres", read_only=True
             )
+
+    # Non-single-SELECT freshness_sql statements must be rejected before execution
+    for bad_sql in (
+        "SELECT max(ts) FROM stg.load_control; SELECT 1",
+        "INSERT INTO stg.load_control VALUES (now())",
+        "UPDATE stg.load_control SET ts = now()",
+        "DELETE FROM stg.load_control",
+        "WITH d AS (DELETE FROM stg.load_control RETURNING ts) SELECT max(ts) FROM d",
+        "SELECT max(ts) INTO stg.copy_tbl FROM stg.load_control",
+        "SELECT max(ts) FROM stg.load_control FOR UPDATE",
+        "DROP TABLE stg.load_control",
+    ):
+        cat_sql_guard = FakePostgresCatalog()
+        cat_sql_guard.set_show("default_transaction_read_only", "off")
+        cat_sql_guard.add_table("rpt", "t1", columns=[("id", "int8", True)])
+        bad_sql_cfg = PostgresSourceConfig(
+            engine="pg",
+            freshness=PostgresFreshnessConfig(freshness_sql=bad_sql),
+            schemas={"rpt": PostgresSchemaConfig()},
+        )
+        with pytest.raises(
+            DiscoveryError, match="freshness_sql must be a single SELECT statement"
+        ):
+            introspect_postgres_source(
+                cat_sql_guard.connect,
+                bad_sql_cfg,
+                engine_kind="postgres",
+                read_only=False,
+            )
+        assert not any(
+            bad_sql.upper() in s.upper() for s, _ in cat_sql_guard.executed
+        )

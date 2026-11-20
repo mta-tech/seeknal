@@ -370,7 +370,7 @@ def test_verify_and_harden_session_never_leaks_driver_dsn_on_error():
 
 
 def test_begin_query_transaction_hardened_and_legacy():
-    # 1. Hardened read-only transaction uses BEGIN READ ONLY and parameterised set_config
+    # 1. Hardened read-only transaction uses BEGIN + SET TRANSACTION READ ONLY and parameterised set_config
     conn_ro = ScriptedConnection()
     cur_ro = conn_ro.cursor()
     begin_query_transaction(
@@ -382,7 +382,8 @@ def test_begin_query_transaction_hardened_and_legacy():
         hardened=True,
     )
     assert conn_ro.executed == [
-        ("BEGIN READ ONLY", None),
+        ("BEGIN", None),
+        ("SET TRANSACTION READ ONLY", None),
         ("SET LOCAL statement_timeout = 12500", None),
         (
             "SELECT set_config('application_name', %s, true)",
@@ -390,7 +391,28 @@ def test_begin_query_transaction_hardened_and_legacy():
         ),
     ]
 
-    # 2. Hardened read-write transaction uses BEGIN and parameterised set_config
+    # 2a. Hardened read-write SELECT (has_row_limit=True) also issues SET TRANSACTION READ ONLY
+    conn_rw_sel = ScriptedConnection()
+    begin_query_transaction(
+        conn_rw_sel.cursor(),
+        read_only=False,
+        timeout_ms=5000,
+        workload="interactive",
+        audit_id="jti-rw-sel",
+        hardened=True,
+        has_row_limit=True,
+    )
+    assert conn_rw_sel.executed == [
+        ("BEGIN", None),
+        ("SET TRANSACTION READ ONLY", None),
+        ("SET LOCAL statement_timeout = 5000", None),
+        (
+            "SELECT set_config('application_name', %s, true)",
+            ("seeknal:interactive:jti-rw-sel",),
+        ),
+    ]
+
+    # 2b. Hardened read-write explicit write (has_row_limit=False) omits SET TRANSACTION READ ONLY
     conn_rw = ScriptedConnection()
     cur_rw = conn_rw.cursor()
     begin_query_transaction(
@@ -400,6 +422,7 @@ def test_begin_query_transaction_hardened_and_legacy():
         workload="interactive",
         audit_id="jti-rw-999",
         hardened=True,
+        has_row_limit=False,
     )
     assert conn_rw.executed == [
         ("BEGIN", None),
@@ -441,6 +464,37 @@ def test_begin_query_transaction_hardened_and_legacy():
         "BEGIN",
         "SET LOCAL statement_timeout = 3000",
     ]
+
+    # 4. Under psycopg2 implicit-BEGIN semantics (default_transaction_read_only = off),
+    # BEGIN READ ONLY is a no-op, whereas begin_query_transaction makes SHOW transaction_read_only = on
+    # and rejects INSERT with SQLSTATE 25006.
+    from tests.serving.fake_postgres_catalog import FakePostgresCatalog, ProgrammingError
+
+    cat = FakePostgresCatalog()
+    cat.set_show("default_transaction_read_only", "off")
+
+    conn_noop = cat.connect()
+    cur_noop = conn_noop.cursor()
+    cur_noop.execute("BEGIN READ ONLY")
+    cur_noop.execute("SHOW transaction_read_only")
+    assert cur_noop.fetchone() == ("off",)
+    conn_noop.rollback()
+
+    conn_tx = cat.connect()
+    cur_tx = conn_tx.cursor()
+    begin_query_transaction(
+        cur_tx,
+        read_only=True,
+        timeout_ms=5000,
+        workload="bi",
+        audit_id="jti-ro-check",
+        hardened=True,
+    )
+    cur_tx.execute("SHOW transaction_read_only")
+    assert cur_tx.fetchone() == ("on",)
+    with pytest.raises(ProgrammingError, match="25006"):
+        cur_tx.execute("INSERT INTO rpt.t VALUES (1)")
+    conn_tx.rollback()
 
 
 def test_engine_starting_error_and_effective_storage_class_exports():

@@ -530,7 +530,7 @@ def test_postgres_read_only_preamble_and_write_refusal_before_connect():
         adapter.execute(write_prep, timeout_seconds=30.0)
     assert connect_calls == 0
 
-    # Read statement runs BEGIN READ ONLY, caps timeout at 15000ms (< 30s request), and binds application_name
+    # Read statement runs BEGIN + SET TRANSACTION READ ONLY, caps timeout at 15000ms (< 30s request), and binds application_name
     fake_conn = FakeConnection(rows=[(7,)], description=(("id", 23),))
     adapter_sel = DBAPIAdapter(
         lambda: fake_conn,
@@ -550,7 +550,8 @@ def test_postgres_read_only_preamble_and_write_refusal_before_connect():
     res = adapter_sel.execute(sel_prep, timeout_seconds=30.0)
     assert res.rows == [(7,)]
     assert fake_conn.recorded_statements == [
-        ("BEGIN READ ONLY", ()),
+        ("BEGIN", ()),
+        ("SET TRANSACTION READ ONLY", ()),
         ("SET LOCAL statement_timeout = 15000", ()),
         (
             "SELECT set_config('application_name', %s, true)",

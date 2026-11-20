@@ -419,20 +419,17 @@ def begin_query_transaction(
     hardened: bool,
     has_row_limit: bool = True,
 ) -> None:
-    """Open a per-query transaction with statement timeout and parameterised application_name."""
+    """Open a per-query transaction with SET TRANSACTION READ ONLY, statement timeout, and parameterised application_name."""
     ms = max(1, int(timeout_ms))
+    cursor.execute("BEGIN")
+    if read_only or has_row_limit:
+        cursor.execute("SET TRANSACTION READ ONLY")
+    cursor.execute(f"SET LOCAL statement_timeout = {ms}")
     if hardened or read_only:
-        cursor.execute("BEGIN READ ONLY" if read_only else "BEGIN")
-        cursor.execute(f"SET LOCAL statement_timeout = {ms}")
         cursor.execute(
             "SELECT set_config('application_name', %s, true)",
             (f"seeknal:{workload}:{audit_id}",),
         )
-    else:
-        cursor.execute("BEGIN")
-        if has_row_limit:
-            cursor.execute("SET TRANSACTION READ ONLY")
-        cursor.execute(f"SET LOCAL statement_timeout = {ms}")
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,7 @@ from seeknal.serving.ops import ReadinessProbe
 from seeknal.serving.parameter_binding import parameter_digest
 from seeknal.serving.postgres_session import (
     PostgresSessionConfig,
+    begin_query_transaction,
     build_connect_kwargs,
     verify_and_harden_session,
 )
@@ -537,6 +538,41 @@ def test_live_readonly_rejects_insert_25006_show_hardening_and_role_guard(
     bypass_conn = psycopg2.connect(seeded_cbn_cluster["bypass_dsn"], connect_timeout=5)
     with pytest.raises(EngineError, match="Role guard refused connection"):
         check_role_guard(bypass_conn, "postgres")
+
+    # 4. B-M1: With session default_transaction_read_only = off on a non-autocommit
+    # psycopg2 connection, begin_query_transaction sets transaction_read_only = on
+    # and rejects INSERT with SQLSTATE 25006.
+    rw_conn = psycopg2.connect(seeded_cbn_cluster["ops_dsn"], connect_timeout=5)
+    try:
+        rw_cur = rw_conn.cursor()
+        try:
+            rw_cur.execute("SET default_transaction_read_only = off")
+            rw_conn.commit()
+            rw_cur.execute("SHOW default_transaction_read_only")
+            assert rw_cur.fetchone()[0] == "off"
+            rw_conn.rollback()
+
+            begin_query_transaction(
+                rw_cur,
+                read_only=True,
+                timeout_ms=10000,
+                workload="interactive",
+                audit_id="live-bm1-ro",
+                hardened=True,
+                has_row_limit=True,
+            )
+            rw_cur.execute("SHOW transaction_read_only")
+            assert rw_cur.fetchone()[0] == "on"
+            with pytest.raises(psycopg2.Error) as exc_tx_ro:
+                rw_cur.execute(
+                    "INSERT INTO ops.case_status (case_id, customer_id, status) VALUES ('C999', 'C-000042', 'OPEN')"
+                )
+            assert exc_tx_ro.value.pgcode == "25006"
+            rw_conn.rollback()
+        finally:
+            rw_cur.close()
+    finally:
+        rw_conn.close()
 
 
 def test_live_http_queries_guardrails_keyset_masks_explain_index_scan_timeout_and_pii_cross_engine(

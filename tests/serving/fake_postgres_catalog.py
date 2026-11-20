@@ -493,6 +493,9 @@ class FakePostgresConnection:
         self.autocommit: bool = False
         self.in_transaction: bool = False
         self.in_readonly_transaction: bool = False
+        self._tx_has_query: bool = False
+        self.rollback_count: int = 0
+        self.commit_count: int = 0
         self.executed: list[tuple[str, Any]] = []
         self.session_values: dict[str, str] = dict(catalog.show_values)
         self._local_values: dict[str, str] = {}
@@ -515,20 +518,25 @@ class FakePostgresConnection:
 
     def commit(self) -> None:
         self._check_open()
+        self.commit_count += 1
         self.in_transaction = False
         self.in_readonly_transaction = False
+        self._tx_has_query = False
         self._local_values.clear()
 
     def rollback(self) -> None:
         self._check_open()
+        self.rollback_count += 1
         self.in_transaction = False
         self.in_readonly_transaction = False
+        self._tx_has_query = False
         self._local_values.clear()
 
     def close(self) -> None:
         self.closed = True
         self.in_transaction = False
         self.in_readonly_transaction = False
+        self._tx_has_query = False
         self._local_values.clear()
 
     def __enter__(self) -> FakePostgresConnection:
@@ -571,9 +579,23 @@ class FakePostgresCursor:
         upper = stripped.rstrip(";").strip().upper()
         cat = self.connection.catalog
 
+        # Model psycopg2's implicit BEGIN before any statement when autocommit is False:
+        # an implicit transaction (inheriting only session default_transaction_read_only)
+        # is already active before explicit BEGIN / BEGIN READ ONLY is evaluated.
+        if not self.connection.autocommit and not self.connection.in_transaction:
+            self.connection.in_transaction = True
+            self.connection._tx_has_query = False
+            self.connection.in_readonly_transaction = (
+                self.connection.session_values.get(
+                    "default_transaction_read_only", "off"
+                ).lower()
+                == "on"
+            )
+
         # 0. Custom handlers
         for matcher, handler in cat._custom_handlers:
             if matcher(sql, params):
+                self.connection._tx_has_query = True
                 col_names, rows = handler(sql, params)
                 self.description = _make_description(col_names)
                 self._rows = list(rows)
@@ -582,22 +604,33 @@ class FakePostgresCursor:
 
         # 1. Transaction control
         if upper in ("BEGIN", "START TRANSACTION"):
-            self.connection.in_transaction = True
-            ro_default = (
-                self.connection.session_values.get("default_transaction_read_only", "off").lower()
-                == "on"
-            )
-            self.connection.in_readonly_transaction = ro_default
+            if self.connection.autocommit and not self.connection.in_transaction:
+                self.connection.in_transaction = True
+                self.connection._tx_has_query = False
+                self.connection.in_readonly_transaction = (
+                    self.connection.session_values.get(
+                        "default_transaction_read_only", "off"
+                    ).lower()
+                    == "on"
+                )
             self.rowcount = 0
             return
 
         if upper in ("BEGIN READ ONLY", "START TRANSACTION READ ONLY"):
-            self.connection.in_transaction = True
-            self.connection.in_readonly_transaction = True
+            # Under psycopg2 (autocommit=False), an implicit BEGIN was already sent,
+            # so BEGIN READ ONLY is ignored (WARNING 25001) and does NOT make the tx read-only!
+            if self.connection.autocommit and not self.connection.in_transaction:
+                self.connection.in_transaction = True
+                self.connection._tx_has_query = False
+                self.connection.in_readonly_transaction = True
             self.rowcount = 0
             return
 
         if upper == "SET TRANSACTION READ ONLY":
+            if self.connection._tx_has_query:
+                raise ProgrammingError(
+                    "SET TRANSACTION ISOLATION LEVEL / READ ONLY must be called before any query (SQLSTATE 25P01)"
+                )
             self.connection.in_readonly_transaction = True
             self.rowcount = 0
             return
@@ -615,11 +648,24 @@ class FakePostgresCursor:
         # 2. SHOW commands
         m_show = _SHOW_RE.match(stripped)
         if m_show:
+            self.connection._tx_has_query = True
             guc = m_show.group(1).lower()
-            val = self.connection._local_values.get(
-                guc,
-                self.connection.session_values.get(guc, cat.show_values.get(guc, "")),
-            )
+            if guc == "transaction_read_only":
+                is_tx_ro = (
+                    self.connection.in_readonly_transaction
+                    or self.connection.session_values.get(
+                        "default_transaction_read_only", "off"
+                    ).lower()
+                    == "on"
+                )
+                val = "on" if is_tx_ro else "off"
+            else:
+                val = self.connection._local_values.get(
+                    guc,
+                    self.connection.session_values.get(
+                        guc, cat.show_values.get(guc, "")
+                    ),
+                )
             self.description = _make_description([guc])
             self._rows = [(val,)]
             self.rowcount = 1
@@ -627,6 +673,7 @@ class FakePostgresCursor:
 
         # 3. SET commands & set_config(...)
         if "set_config(" in stripped.lower():
+            self.connection._tx_has_query = True
             # e.g. SELECT pg_catalog.set_config('application_name', %s, true)
             if isinstance(params, (list, tuple)) and params:
                 self.connection._local_values["application_name"] = str(params[0])
@@ -649,6 +696,8 @@ class FakePostgresCursor:
                 self.connection.session_values[guc] = raw_val
             self.rowcount = 0
             return
+
+        self.connection._tx_has_query = True
 
         # Enforce read-only rejection on mutating statements
         is_ro = (

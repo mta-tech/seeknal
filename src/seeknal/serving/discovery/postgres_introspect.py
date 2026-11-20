@@ -12,6 +12,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any
 
+import sqlglot
+from sqlglot import exp
+
 from seeknal.serving.discovery.config import (
     DiscoveryConfigError,
     DiscoveryError,
@@ -24,6 +27,91 @@ _PG_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}\Z")
 _PATTERN_OPS = frozenset(
     {"text_pattern_ops", "varchar_pattern_ops", "bpchar_pattern_ops"}
 )
+_FORBIDDEN_FRESHNESS_NODES: tuple[type[exp.Expression], ...] = tuple(
+    cls
+    for _name in (
+        "Insert",
+        "Update",
+        "Delete",
+        "Merge",
+        "Create",
+        "Drop",
+        "Alter",
+        "TruncateTable",
+        "Command",
+        "Set",
+        "Transaction",
+        "Commit",
+        "Rollback",
+        "Copy",
+        "Into",
+        "Lock",
+    )
+    if (cls := getattr(exp, _name, None)) is not None
+)
+
+
+def _validate_freshness_sql(freshness_sql: str) -> None:
+    """Validate that freshness_sql parses as a single read-only SELECT statement."""
+    if not isinstance(freshness_sql, str) or not freshness_sql.strip():
+        raise DiscoveryError("freshness_sql must be a single SELECT statement")
+    try:
+        statements = sqlglot.parse(freshness_sql, read="postgres")
+    except Exception as exc:
+        raise DiscoveryError(
+            "freshness_sql must be a single SELECT statement"
+        ) from exc
+    if (
+        len(statements) != 1
+        or statements[0] is None
+        or not isinstance(statements[0], exp.Select)
+    ):
+        raise DiscoveryError("freshness_sql must be a single SELECT statement")
+    stmt = statements[0]
+    if _FORBIDDEN_FRESHNESS_NODES and any(
+        isinstance(node, _FORBIDDEN_FRESHNESS_NODES) for node in stmt.walk()
+    ):
+        raise DiscoveryError("freshness_sql must be a single SELECT statement")
+
+
+def _run_freshness_sql(
+    conn: Any,
+    cursor: Any,
+    freshness_sql: str,
+    *,
+    engine_label: str,
+) -> list[tuple[Any, ...]]:
+    """Validate and execute freshness_sql inside BEGIN + SET TRANSACTION READ ONLY + rollback."""
+    _validate_freshness_sql(freshness_sql)
+    try:
+        if hasattr(conn, "rollback") and callable(conn.rollback):
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        cursor.execute("BEGIN")
+        try:
+            cursor.execute("SET TRANSACTION READ ONLY")
+            cursor.execute(freshness_sql)
+            return list(cursor.fetchall())
+        finally:
+            if hasattr(conn, "rollback") and callable(conn.rollback):
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            else:
+                try:
+                    cursor.execute("ROLLBACK")
+                except Exception:
+                    pass
+    except DiscoveryError:
+        raise
+    except Exception as exc:
+        raise DiscoveryError(
+            f"freshness_sql failed on source '{engine_label}': "
+            f"{type(exc).__name__}"
+        ) from exc
 
 RELATIONS_SQL = """
 SELECT
@@ -442,26 +530,12 @@ def introspect_postgres_source(
 
             freshness_sql_lag: float | None = None
             if freshness_sql is not None:
-                try:
-                    cursor.execute("BEGIN READ ONLY")
-                    try:
-                        cursor.execute(freshness_sql)
-                        fr_rows = cursor.fetchall()
-                    finally:
-                        try:
-                            cursor.execute("ROLLBACK")
-                        except Exception:
-                            try:
-                                conn.rollback()
-                            except Exception:
-                                pass
-                except DiscoveryError:
-                    raise
-                except Exception as exc:
-                    raise DiscoveryError(
-                        f"freshness_sql failed on source '{_safe_disc_label(source_cfg.engine)}': "
-                        f"{type(exc).__name__}"
-                    ) from exc
+                fr_rows = _run_freshness_sql(
+                    conn,
+                    cursor,
+                    freshness_sql,
+                    engine_label=_safe_disc_label(source_cfg.engine),
+                )
 
                 if not fr_rows or len(fr_rows) != 1 or len(fr_rows[0]) != 1:
                     raise DiscoveryError(
