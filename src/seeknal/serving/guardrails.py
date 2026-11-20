@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -577,6 +578,8 @@ def _extract_equi_join_edges_and_join_preds(
     sel: exp.Select,
     instances: list[_RelationInstance],
     source_to_inst: dict[int, _RelationInstance],
+    *,
+    params: Sequence[Any] | None = None,
 ) -> list[_EquiJoinEdge]:
     """Extract directed equi-join edges from JOIN ON / USING and top-level WHERE."""
     edges: list[_EquiJoinEdge] = []
@@ -617,7 +620,7 @@ def _extract_equi_join_edges_and_join_preds(
                 elif side == "INNER":
                     # Inner join ON literal predicates are equivalent to top-level WHERE conjuncts
                     dummy_sel = exp.Select().where(conj, copy=False)
-                    for p in _extract_predicates(dummy_sel):
+                    for p in _extract_predicates(dummy_sel, params=params):
                         _attach_predicate(p, instances)
 
         using_idents = j.args.get("using") or ()
@@ -794,6 +797,7 @@ def _check_select_scope(
     *,
     outer_order_items: tuple[OrderByItem, ...] | None = None,
     has_outer_group_by: bool = False,
+    params: Sequence[Any] | None = None,
 ) -> tuple[list[tuple[str, str]], list[str], set[int]]:
     """Check one Select scope for derived depth, require_filter, and ORDER BY.
 
@@ -889,7 +893,7 @@ def _check_select_scope(
                             value_count=p.value_count,
                             table_qualifier=None,
                         )
-                        for p in _extract_predicates(inner_sel)
+                        for p in _extract_predicates(inner_sel, params=params)
                     ],
                 )
                 instances.append(inst)
@@ -924,7 +928,7 @@ def _check_select_scope(
         for n_sel in _collect_query_selects(nq):
             transparent_inner_ids.add(id(n_sel))
             sub_v, sub_fc, sub_trans = _check_select_scope(
-                n_sel, placement, local_ctes
+                n_sel, placement, local_ctes, params=params
             )
             violations.extend(sub_v)
             for c in sub_fc:
@@ -936,12 +940,12 @@ def _check_select_scope(
         return (violations, filter_cols, transparent_inner_ids)
 
     # Attach outer sargable predicates
-    for pred in _extract_predicates(sel):
+    for pred in _extract_predicates(sel, params=params):
         _attach_predicate(pred, instances)
 
     # Extract equi-join edges (and INNER JOIN ON sargable predicates)
     edges = _extract_equi_join_edges_and_join_preds(
-        sel, instances, source_to_inst
+        sel, instances, source_to_inst, params=params
     )
 
     # Evaluate direct filter satisfaction on each transparent instance
@@ -1076,6 +1080,7 @@ def check_guardrails(
     grant: Any = None,
     request_max_rows: int | None = None,
     metrics: Any = None,
+    params: Sequence[Any] | None = None,
 ) -> GuardrailResult:
     """Run table access guardrails after routing and before policy enforcement."""
     referenced_tables: list[TableEntry] = []
@@ -1112,9 +1117,14 @@ def check_guardrails(
         or not is_postgres_wire(target_engine.kind)
     ):
         non_pg_filter_cols: tuple[str, ...] = ()
-        if is_select_query and decision.features.predicates:
+        if is_select_query:
+            cand_preds = (
+                _extract_predicates(statement, params=params)
+                if params is not None
+                else decision.features.predicates
+            )
             seen_cols: list[str] = []
-            for p in decision.features.predicates:
+            for p in cand_preds:
                 if (
                     p.value_count <= placement.policy.max_in_list
                     and p.column not in seen_cols
@@ -1149,6 +1159,7 @@ def check_guardrails(
             cte_map,
             outer_order_items=outer_setop_order,
             has_outer_group_by=has_any_group_by,
+            params=params,
         )
         violations.extend(v_list)
         for c in fc_list:
@@ -1164,7 +1175,7 @@ def check_guardrails(
                 continue
             checked_select_ids.add(id(sub_sel))
             v_list, fc_list, trans_ids = _check_select_scope(
-                sub_sel, placement, cte_map
+                sub_sel, placement, cte_map, params=params
             )
             violations.extend(v_list)
             for c in fc_list:

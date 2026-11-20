@@ -135,11 +135,15 @@ def _run_guard(
     grant_max_rows: int = 1000,
     request_max_rows: int | None = None,
     metrics: FakeGuardMetrics | None = None,
+    params: tuple | list | None = None,
 ) -> GuardrailResult:
+    from seeknal.serving.features import _bind_feature_params
+
     pl = placement or _make_placement()
     router = Router(pl)
     stmt = sqlglot.parse_one(sql, read="postgres")
-    decision = router.decide_statement(stmt, hint=hint)
+    with _bind_feature_params(params or ()):
+        decision = router.decide_statement(stmt, hint=hint)
 
     class _StubGrant:
         max_rows = grant_max_rows
@@ -151,6 +155,7 @@ def _run_guard(
         grant=_StubGrant(),
         request_max_rows=request_max_rows,
         metrics=metrics,
+        params=params,
     )
 
 
@@ -205,6 +210,25 @@ def test_filter_table_accepts_valid_sargable_conjuncts(sql: str, expected_cols: 
     assert res.outcome == "pass"
     assert res.access_pattern == "filter"
     assert res.filter_columns == expected_cols
+
+
+def test_parameterised_prefix_like_satisfies_guardrails_and_routes_via_filter():
+    res = _run_guard(
+        "SELECT * FROM cbn.rpt.txn_detail WHERE merchant_code LIKE $1",
+        hint=None,
+        params=["MRC01%"],
+    )
+    assert res.outcome == "pass"
+    assert res.filter_columns == ("merchant_code",)
+
+    for bad_params in (["%MRC"], ["M_C%"], ["%"], []):
+        with pytest.raises(GuardrailError) as exc_info:
+            _run_guard(
+                "SELECT * FROM cbn.rpt.txn_detail WHERE merchant_code LIKE $1",
+                hint="pg_report",
+                params=bad_params,
+            )
+        assert exc_info.value.code == "filter_required"
 
 
 @pytest.mark.parametrize(

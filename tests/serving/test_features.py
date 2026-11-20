@@ -270,3 +270,40 @@ def test_offset_and_order_by_extraction():
     f_neg = _parse_and_extract("SELECT * FROM t OFFSET -5")
     assert f_neg.offset == -5
 
+
+def test_parameterised_prefix_like_extraction():
+    stmt = sqlglot.parse_one(
+        "SELECT * FROM rpt.txn WHERE merchant_code LIKE $2 AND customer_id = $1",
+        read="postgres",
+    )
+    # Without params -> LIKE $2 is not resolved, only eq is counted
+    f_no_params = extract_features(stmt)
+    assert f_no_params.predicates == (
+        PredicateFeature(column="customer_id", op="eq", value_count=1),
+    )
+
+    # Valid prefix pattern in params[1] -> counted as prefix_like
+    f_ok = extract_features(stmt, params=["C-1", "MRC01%"])
+    assert f_ok.predicates == (
+        PredicateFeature(column="merchant_code", op="prefix_like", value_count=1),
+        PredicateFeature(column="customer_id", op="eq", value_count=1),
+    )
+
+    # Escaped underscore / percent before trailing % -> valid prefix_like
+    f_esc = extract_features(stmt, params=["C-1", r"MRC\_01\%A%"])
+    assert f_esc.predicates[0] == PredicateFeature(
+        column="merchant_code", op="prefix_like", value_count=1
+    )
+
+    # Leading wildcard, interior wildcard, bare %, non-string, NOT LIKE -> rejected
+    for bad_pat in ("%MRC", "M_C%", "%", "MRC%01%", 123, True):
+        f_bad = extract_features(stmt, params=["C-1", bad_pat])
+        assert all(p.op != "prefix_like" for p in f_bad.predicates)
+
+    stmt_not = sqlglot.parse_one(
+        "SELECT * FROM rpt.txn WHERE NOT (merchant_code LIKE $1)",
+        read="postgres",
+    )
+    assert extract_features(stmt_not, params=["MRC01%"]).predicates == ()
+
+

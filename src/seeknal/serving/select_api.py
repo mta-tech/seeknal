@@ -655,6 +655,8 @@ def compile_select_request(
         ]
         select_stmt = select_stmt.order_by(*order_nodes)
 
+    params_tuple = tuple(params_list)
+    select_stmt.meta["bound_params"] = params_tuple
     rendered_postgres_sql = select_stmt.sql(dialect="postgres")
 
     return CompiledSelect(
@@ -664,7 +666,7 @@ def compile_select_request(
         extra_cursor_columns=tuple(extra_cursor_cols),
         statement=select_stmt,
         sql=rendered_postgres_sql,
-        params=tuple(params_list),
+        params=params_tuple,
         order_spec=effective_order_spec,
         limit=limit_val,
         paged=after_token is not None,

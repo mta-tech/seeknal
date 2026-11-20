@@ -26,6 +26,7 @@ from seeknal.serving.enforce import (
     apply_null_ordering,
     enforce,
 )
+from seeknal.serving.features import _bind_feature_params
 from seeknal.serving.grant_token import verify_grant_token
 from seeknal.serving.guardrails import GuardrailError, check_guardrails
 from seeknal.serving.parameter_binding import verify_parameter_digest
@@ -363,11 +364,12 @@ class ServingPipeline:
                         tbl.set("catalog", exp.to_identifier(self.default_catalog))
 
             # 1. Routing decision on canonical statement
-            decision = router.decide_statement(
-                statement,
-                hint=hint,
-                max_staleness_seconds=max_staleness_seconds,
-            )
+            with _bind_feature_params(raw_params):
+                decision = router.decide_statement(
+                    statement,
+                    hint=hint,
+                    max_staleness_seconds=max_staleness_seconds,
+                )
             target_engine = placement.engines[decision.engine]
             target_dialect = target_engine.dialect
             target_kind = target_engine.kind
@@ -382,6 +384,7 @@ class ServingPipeline:
                     grant=grant,
                     request_max_rows=max_rows,
                     metrics=active_metrics,
+                    params=raw_params,
                 )
             except GuardrailError as g_exc:
                 g_exc.guard = getattr(g_exc, "guard", None) or "reject"

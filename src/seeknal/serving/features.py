@@ -2,13 +2,65 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+import contextvars
 from dataclasses import dataclass
 import re
+from typing import Any
 
 from sqlglot import exp
 
 PREFIX_LIKE_RE = re.compile(r"^([^%_\\]|\\[%_\\])+%$")
+
+_ACTIVE_FEATURE_PARAMS: contextvars.ContextVar[tuple[Any, ...] | None] = (
+    contextvars.ContextVar("seeknal_active_feature_params", default=None)
+)
+
+
+@contextmanager
+def _bind_feature_params(params: Sequence[Any]) -> Iterator[None]:
+    """Temporarily bind query parameters for AST feature/predicate extraction."""
+    token = _ACTIVE_FEATURE_PARAMS.set(tuple(params))
+    try:
+        yield
+    finally:
+        _ACTIVE_FEATURE_PARAMS.reset(token)
+
+
+def _resolve_active_params(
+    statement: exp.Expression,
+    params: Sequence[Any] | None = None,
+) -> tuple[Any, ...]:
+    if params is not None:
+        return tuple(params)
+    meta_params = statement.meta.get("bound_params") if hasattr(statement, "meta") else None
+    if isinstance(meta_params, Sequence) and not isinstance(meta_params, (str, bytes)):
+        return tuple(meta_params)
+    ctx_params = _ACTIVE_FEATURE_PARAMS.get()
+    if ctx_params is not None:
+        return ctx_params
+    return ()
+
+
+def _is_valid_prefix_like_pattern(pattern: Any) -> bool:
+    """Return True if *pattern* is a valid prefix LIKE string (no leading/interior wildcard)."""
+    return type(pattern) is str and bool(PREFIX_LIKE_RE.fullmatch(pattern))
+
+
+def _resolve_param_index(node: exp.Expression) -> int | None:
+    """Return 1-based parameter index for an exp.Parameter or exp.Placeholder, or None."""
+    if not isinstance(node, (exp.Parameter, exp.Placeholder)):
+        return None
+    raw = getattr(node, "name", None) or getattr(node, "this", None)
+    if raw is None:
+        return None
+    raw_str = str(raw).lstrip("$")
+    try:
+        idx = int(raw_str)
+    except (ValueError, TypeError):
+        return None
+    return idx if idx >= 1 else None
 
 DDL_CLASSES = (
     exp.Create,
@@ -267,12 +319,17 @@ def _extract_single_eq_or_in(
     return None
 
 
-def _extract_predicates(statement: exp.Expression) -> tuple[PredicateFeature, ...]:
+def _extract_predicates(
+    statement: exp.Expression,
+    *,
+    params: Sequence[Any] | None = None,
+) -> tuple[PredicateFeature, ...]:
     """Extract sargable top-level AND conjuncts from outermost WHERE per §4.2."""
     where = statement.args.get("where")
     if where is None or where.this is None:
         return ()
 
+    resolved_params = _resolve_active_params(statement, params)
     preds: list[PredicateFeature] = []
     for raw_conjunct in _flatten_and(where.this):
         conjunct = _unwrap_paren(raw_conjunct)
@@ -340,21 +397,28 @@ def _extract_predicates(statement: exp.Expression) -> tuple[PredicateFeature, ..
         if type(conjunct) is exp.Like:
             left = _unwrap_paren(conjunct.this)
             right = _unwrap_paren(conjunct.expression)
-            if (
-                _is_bare_column(left)
-                and isinstance(right, exp.Literal)
-                and right.is_string
-                and PREFIX_LIKE_RE.fullmatch(right.this)
-            ):
-                assert isinstance(left, exp.Column)
-                preds.append(
-                    PredicateFeature(
-                        column=left.name.lower(),
-                        op="prefix_like",
-                        value_count=1,
-                        table_qualifier=_column_qualifier(left),
+            if _is_bare_column(left):
+                pat_str: str | None = None
+                if isinstance(right, exp.Literal) and right.is_string:
+                    pat_str = right.this
+                elif isinstance(right, (exp.Parameter, exp.Placeholder)):
+                    idx = _resolve_param_index(right)
+                    if (
+                        idx is not None
+                        and 1 <= idx <= len(resolved_params)
+                        and type(resolved_params[idx - 1]) is str
+                    ):
+                        pat_str = resolved_params[idx - 1]
+                if pat_str is not None and _is_valid_prefix_like_pattern(pat_str):
+                    assert isinstance(left, exp.Column)
+                    preds.append(
+                        PredicateFeature(
+                            column=left.name.lower(),
+                            op="prefix_like",
+                            value_count=1,
+                            table_qualifier=_column_qualifier(left),
+                        )
                     )
-                )
             continue
 
         if isinstance(conjunct, exp.Or):
@@ -403,7 +467,11 @@ def _extract_key_equalities(statement: exp.Expression) -> dict[str, int]:
     return key_equalities
 
 
-def extract_features(statement: exp.Expression) -> QueryFeatures:
+def extract_features(
+    statement: exp.Expression,
+    *,
+    params: Sequence[Any] | None = None,
+) -> QueryFeatures:
     """Extract structural analysis features from a parsed SQL statement AST."""
     kind = _extract_kind(statement)
     tables = _extract_tables(statement)
@@ -415,7 +483,7 @@ def extract_features(statement: exp.Expression) -> QueryFeatures:
     has_subquery = _has_subquery(statement)
     limit = _extract_limit(statement)
     key_equalities = _extract_key_equalities(statement)
-    predicates = _extract_predicates(statement)
+    predicates = _extract_predicates(statement, params=params)
     offset = _extract_offset(statement)
     order_by = _extract_order_by(statement)
 

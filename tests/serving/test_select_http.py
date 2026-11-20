@@ -346,67 +346,135 @@ def test_select_invalid_cursor_invalid_and_masked_column_errors(select_env):
         assert resp.json()["code"] == "access_denied"
 
 
-def test_select_propagates_filter_required_and_engine_starting(ec_keys, monkeypatch):
+def test_select_real_pipeline_guardrails_prefix_like_and_engine_starting(
+    ec_keys, monkeypatch
+):
+    from seeknal.serving.adapters import QueryResult
+
     priv, pub = ec_keys
     placement = Placement.from_dict(
         {
-            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "engines": {
+                "pg_report": {"kind": "postgres", "dialect": "postgres"},
+                "lb_waking": {"kind": "lakebase", "dialect": "postgres"},
+                "lake": {"kind": "duckdb", "dialect": "duckdb"},
+            },
             "tables": {
                 "cbn.rpt.rpt_txn_detail": {
                     "keys": ["txn_id"],
-                    "row_count": 500_000,
-                    "serve": {"duck": "rpt_txn_detail"},
-                }
+                    "row_count": 5_000_000,
+                    "serve": {
+                        "pg_report": "rpt.rpt_txn_detail",
+                        "lake": "lake.rpt_txn_detail",
+                    },
+                    "access": {
+                        "pattern": "filter",
+                        "keys": ["txn_id"],
+                        "filterable": ["customer_id", "as_of_date"],
+                        "prefix_filterable": ["merchant_code"],
+                        "sortable": ["as_of_date", "txn_id"],
+                        "max_rows": 500,
+                    },
+                },
+                "cbn.ops.ticket": {
+                    "keys": ["ticket_id"],
+                    "row_count": 10_000,
+                    "serve": {"lb_waking": "ops.ticket"},
+                    "access": {
+                        "pattern": "filter",
+                        "keys": ["ticket_id"],
+                        "filterable": ["customer_id"],
+                        "sortable": ["ticket_id"],
+                    },
+                },
             },
+            "policy": {"max_offset": 100},
             "cubes": {},
         }
     )
-    schemas = {"cbn.rpt.rpt_txn_detail": ["txn_id", "customer_id", "amount"]}
+    schemas = {
+        "cbn.rpt.rpt_txn_detail": [
+            "txn_id",
+            "customer_id",
+            "as_of_date",
+            "merchant_code",
+            "amount",
+        ],
+        "cbn.ops.ticket": ["ticket_id", "customer_id"],
+    }
 
-    class GuardedPipeline(ServingPipeline):
-        def prepare_statement(self, statement, grant, *, sql=b"", params=(), **kwargs):
-            if statement.args.get("where") is None:
-                raise EnforcementError(
-                    "Selective filter required on filter table",
-                    code="filter_required",
-                )
-            return super().prepare_statement(
-                statement=statement,
-                grant=grant,
-                sql=sql,
-                params=params,
-                **kwargs,
+    executed_prepared: list[Any] = []
+
+    class RecordingPgAdapter:
+        def execute(self, prepared, *, timeout_seconds: float):
+            executed_prepared.append(prepared)
+            return QueryResult(
+                columns=("txn_id", "merchant_code"),
+                column_types=("INT", "TEXT"),
+                rows=[(101, "MRC0199")],
+                truncated=False,
+                elapsed_ms=1.5,
+                engine=prepared.engine,
+            )
+
+    class NeverLakeAdapter:
+        def execute(self, prepared, *, timeout_seconds: float):
+            raise AssertionError(
+                f"Expected pg_report via filter rule, got lake ({prepared.rule})"
             )
 
     class WakingAdapter:
         def execute(self, prepared, *, timeout_seconds: float):
             raise EngineStartingError("Lakebase waking", retry_after=7)
 
-    pipeline = GuardedPipeline(
+    pipeline = ServingPipeline(
         placement=placement,
         schemas=schemas,
         public_keys={"k1": pub},
+        default_catalog="cbn",
     )
     monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "env-cursor-secret")
-    app = create_app(pipeline, {"duck": WakingAdapter()})
+    app = create_app(
+        pipeline,
+        {
+            "pg_report": RecordingPgAdapter(),
+            "lb_waking": WakingAdapter(),
+            "lake": NeverLakeAdapter(),
+        },
+    )
     client = TestClient(app)
 
-    # 1. Unfiltered select hits filter_required (422)
+    grant_tables = {
+        "cbn.rpt.rpt_txn_detail": {
+            "columns": [
+                "txn_id",
+                "customer_id",
+                "as_of_date",
+                "merchant_code",
+                "amount",
+            ],
+            "masks": {},
+            "row_filters": [],
+            "actions": ["select"],
+        },
+        "cbn.ops.ticket": {
+            "columns": ["ticket_id", "customer_id"],
+            "masks": {},
+            "row_filters": [],
+            "actions": ["select"],
+        },
+    }
+
+    # 1. Unfiltered /v1/select on pg_report hits real filter_required (422)
     unfiltered_raw = json.dumps(
-        {"table": "cbn.rpt.rpt_txn_detail", "columns": ["txn_id"]}
+        {
+            "table": "cbn.rpt.rpt_txn_detail",
+            "columns": ["txn_id"],
+            "hint": "pg_report",
+        }
     ).encode("utf-8")
     tok1 = _mint_select_grant(
-        priv,
-        unfiltered_raw,
-        jti="jti-guard-1",
-        tables={
-            "cbn.rpt.rpt_txn_detail": {
-                "columns": ["txn_id", "customer_id", "amount"],
-                "masks": {},
-                "row_filters": [],
-                "actions": ["select"],
-            }
-        },
+        priv, unfiltered_raw, jti="jti-guard-1", tables=grant_tables
     )
     r_guard = client.post(
         "/v1/select",
@@ -416,26 +484,118 @@ def test_select_propagates_filter_required_and_engine_starting(ec_keys, monkeypa
     assert r_guard.status_code == 422
     assert r_guard.json()["code"] == "filter_required"
 
-    # 2. Filtered select passes guardrails and surfaces 503 engine_starting + Retry-After
-    filtered_raw = json.dumps(
+    # 2. Unindexed order_by on /v1/select hits real sort_not_indexed (422)
+    bad_sort_raw = json.dumps(
+        {
+            "table": "cbn.rpt.rpt_txn_detail",
+            "columns": ["txn_id", "amount"],
+            "where": {"customer_id": {"_eq": "C-1"}},
+            "order_by": [{"amount": "desc"}],
+        }
+    ).encode("utf-8")
+    tok_sort = _mint_select_grant(
+        priv, bad_sort_raw, jti="jti-guard-sort-1", tables=grant_tables
+    )
+    r_sort = client.post(
+        "/v1/select",
+        headers={"Authorization": f"Bearer {tok_sort}"},
+        content=bad_sort_raw,
+    )
+    assert r_sort.status_code == 422
+    assert r_sort.json()["code"] == "sort_not_indexed"
+
+    # 3. _like on non-prefix_filterable column hits filter_required (422)
+    bad_like_raw = json.dumps(
+        {
+            "table": "cbn.rpt.rpt_txn_detail",
+            "columns": ["txn_id"],
+            "where": {"customer_id": {"_like": "C-1%"}},
+            "hint": "pg_report",
+        }
+    ).encode("utf-8")
+    tok_bad_like = _mint_select_grant(
+        priv, bad_like_raw, jti="jti-guard-badlike-1", tables=grant_tables
+    )
+    r_bad_like = client.post(
+        "/v1/select",
+        headers={"Authorization": f"Bearer {tok_bad_like}"},
+        content=bad_like_raw,
+    )
+    assert r_bad_like.status_code == 422
+    assert r_bad_like.json()["code"] == "filter_required"
+
+    # 4. _like on prefix_filterable column routes via 'filter' to pg_report and passes require_filter
+    good_like_raw = json.dumps(
+        {
+            "table": "rpt.rpt_txn_detail",
+            "columns": ["txn_id", "merchant_code"],
+            "where": {"merchant_code": {"_like": "MRC01%"}},
+            "order_by": [{"as_of_date": "desc"}],
+            "limit": 10,
+        }
+    ).encode("utf-8")
+    tok_good_like = _mint_select_grant(
+        priv, good_like_raw, jti="jti-guard-goodlike-1", tables=grant_tables
+    )
+    r_good_like = client.post(
+        "/v1/select",
+        headers={"Authorization": f"Bearer {tok_good_like}"},
+        content=good_like_raw,
+    )
+    assert r_good_like.status_code == 200, r_good_like.text
+    good_body = r_good_like.json()
+    assert good_body["engine"] == "pg_report"
+    assert good_body["rule"] == "filter"
+    assert good_body["rows"] == [[101, "MRC0199"]]
+    assert len(executed_prepared) == 1
+    assert executed_prepared[0].filter_columns == ("merchant_code",)
+
+    # 5. Real offset_too_large guardrail (422) on the same pipeline, and offset rejected on /v1/select (400)
+    offset_sel_raw = json.dumps(
         {
             "table": "cbn.rpt.rpt_txn_detail",
             "columns": ["txn_id"],
             "where": {"customer_id": {"_eq": "C-1"}},
+            "offset": 500,
+        }
+    ).encode("utf-8")
+    tok_off_sel = _mint_select_grant(
+        priv, offset_sel_raw, jti="jti-off-sel-1", tables=grant_tables
+    )
+    r_off_sel = client.post(
+        "/v1/select",
+        headers={"Authorization": f"Bearer {tok_off_sel}"},
+        content=offset_sel_raw,
+    )
+    assert r_off_sel.status_code == 400
+    assert r_off_sel.json()["code"] == "select_invalid"
+
+    off_sql = "SELECT txn_id FROM cbn.rpt.rpt_txn_detail WHERE customer_id = 'C-1' OFFSET 500"
+    tok_off_q = _mint_select_grant(
+        priv,
+        off_sql.encode("utf-8"),
+        jti="jti-off-q-1",
+        include_api=False,
+        tables=grant_tables,
+    )
+    r_off_q = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok_off_q}"},
+        json={"sql": off_sql},
+    )
+    assert r_off_q.status_code == 422
+    assert r_off_q.json()["code"] == "offset_too_large"
+
+    # 6. Filtered select on lb_waking passes guardrails and surfaces 503 engine_starting + Retry-After
+    filtered_raw = json.dumps(
+        {
+            "table": "cbn.ops.ticket",
+            "columns": ["ticket_id"],
+            "where": {"customer_id": {"_eq": "C-1"}},
         }
     ).encode("utf-8")
     tok2 = _mint_select_grant(
-        priv,
-        filtered_raw,
-        jti="jti-wake-1",
-        tables={
-            "cbn.rpt.rpt_txn_detail": {
-                "columns": ["txn_id", "customer_id", "amount"],
-                "masks": {},
-                "row_filters": [],
-                "actions": ["select"],
-            }
-        },
+        priv, filtered_raw, jti="jti-wake-1", tables=grant_tables
     )
     r_wake = client.post(
         "/v1/select",
