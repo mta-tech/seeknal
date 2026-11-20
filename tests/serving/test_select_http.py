@@ -356,6 +356,49 @@ def test_select_invalid_cursor_invalid_and_masked_column_errors(select_env):
         assert resp.json()["code"] == "access_denied"
 
 
+def test_grant_column_both_visible_and_masked_refused_with_403_access_denied(
+    select_env,
+):
+    """A grant listing a column in both columns and masks is refused with 403 access_denied."""
+    client, priv, _, _, _ = select_env
+    raw = json.dumps(
+        {"table": "cbn.rpt.rpt_txn_detail", "columns": ["txn_id"]}
+    ).encode("utf-8")
+    tables = {
+        "cbn.rpt.rpt_txn_detail": {
+            "columns": ["txn_id", "msisdn"],
+            "masks": {"msisdn": "redact"},
+            "row_filters": [],
+            "actions": ["select"],
+        }
+    }
+    tok = _mint_select_grant(priv, raw, jti="jti-overlap-col-mask", tables=tables)
+    resp = client.post(
+        "/v1/select",
+        headers={"Authorization": f"Bearer {tok}"},
+        content=raw,
+    )
+    assert resp.status_code == 403
+    assert resp.json()["code"] == "access_denied"
+
+    # Also verify /v1/query with a grant having overlapping column and mask
+    query_body = json.dumps({"sql": "SELECT txn_id FROM cbn.rpt.rpt_txn_detail"}).encode("utf-8")
+    tok_query = _mint_select_grant(
+        priv,
+        query_body,
+        jti="jti-overlap-query",
+        tables=tables,
+        include_api=False,
+    )
+    resp_query = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok_query}"},
+        content=query_body,
+    )
+    assert resp_query.status_code == 403
+    assert resp_query.json()["code"] == "access_denied"
+
+
 def test_select_real_pipeline_guardrails_prefix_like_and_engine_starting(
     ec_keys, monkeypatch
 ):

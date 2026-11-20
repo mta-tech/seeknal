@@ -470,8 +470,9 @@ def test_claims_validation_column_both_visible_and_masked():
         "sub": "u", "ws": "w", "jti": "j", "sql_sha256": "x", "max_rows": 10, "exp": 1000,
         "tables": {"t": {"columns": ["patient_nik"], "masks": {"PATIENT_NIK": "hash"}, "actions": ["select"]}},
     }
-    with pytest.raises(EnforcementError, match="column 'patient_nik' is both visible and masked"):
+    with pytest.raises(EnforcementError, match="column 'patient_nik' is both visible and masked") as exc_info:
         Grant.from_claims(claims)
+    assert exc_info.value.code == "access_denied"
 
 
 def test_claims_validation_non_positive_max_rows():

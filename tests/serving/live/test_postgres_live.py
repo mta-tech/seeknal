@@ -686,7 +686,7 @@ def test_live_http_queries_guardrails_keyset_masks_explain_index_scan_timeout_an
     }
     pii_masked_grant = {
         "cbn.src_pii.customer": {
-            "columns": ["customer_id", "full_name", "segment"],
+            "columns": ["customer_id", "segment"],
             "masks": {"full_name": "redact"},
             "row_filters": [],
             "actions": ["select"],
