@@ -143,11 +143,18 @@ async def publish(request: Request) -> JSONResponse:
                 AttributeError,
                 OverflowError,
             ) as exc:
-                _log.warning(
-                    "publish tarball rejected: slug=%s exc_class=%s",
-                    slug,
-                    type(exc).__name__,
-                )
+                if isinstance(exc, AttributeError):
+                    _log.error(
+                        "publish tarball rejected with unexpected AttributeError: slug=%s exc_class=%s",
+                        slug,
+                        type(exc).__name__,
+                    )
+                else:
+                    _log.warning(
+                        "publish tarball rejected: slug=%s exc_class=%s",
+                        slug,
+                        type(exc).__name__,
+                    )
                 return JSONResponse({"error": _classify_tar_error(exc)}, status_code=400)
 
             created_at = datetime.now(timezone.utc)

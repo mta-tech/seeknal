@@ -1282,6 +1282,82 @@ def test_ustar_out_of_range_mtimes_refused_and_normal_float_mtime_accepted(
     assert (mount / "index.html").read_bytes() == b"<html>ok</html>"
 
 
+def _build_chained_pax_extended_headers_tar_gz(out_path: Path, *, count: int = 9) -> Path:
+    import gzip
+
+    pax_payload = _pax_record("path", "chained_pax_name.html")
+    x_info = tarfile.TarInfo(name="PaxHeader/chained")
+    x_info.type = tarfile.XHDTYPE
+    x_info.size = len(pax_payload)
+    x_block = x_info.tobuf(tarfile.PAX_FORMAT) + pax_payload.ljust(512, b"\x00")
+
+    reg = tarfile.TarInfo(name="placeholder.html")
+    reg_data = b"<html>pax_chain</html>"
+    reg.size = len(reg_data)
+    reg_blocks = reg.tobuf(tarfile.PAX_FORMAT) + reg_data.ljust(512, b"\x00")
+
+    with gzip.open(out_path, "wb", compresslevel=1) as gz:
+        for _ in range(count):
+            gz.write(x_block)
+        gz.write(reg_blocks)
+        gz.write(b"\x00" * 1024)
+    return out_path
+
+
+def test_pax_chain_size_record_and_corrupt_next_header_do_not_raise_attribute_error(
+    test_storage: LocalFilesystemStorage,
+    tmp_path: Path,
+) -> None:
+    import gzip
+
+    # 1. A chain of 9 extended pax headers raises TarSafetyError (never AttributeError) at storage level
+    pax_chain_9 = _build_chained_pax_extended_headers_tar_gz(tmp_path / "pax_chain_9.tar.gz", count=9)
+    with open(pax_chain_9, "rb") as f:
+        with pytest.raises(TarSafetyError, match="Tarball entry header too large"):
+            test_storage.extract_tarball("pax_chain_9_slug", f)
+    assert not (test_storage._root / "assets" / "pax_chain_9_slug").exists()
+
+    # 2. A chain of 8 pax headers followed by a member is accepted
+    pax_chain_8 = _build_chained_pax_extended_headers_tar_gz(tmp_path / "pax_chain_8.tar.gz", count=8)
+    with open(pax_chain_8, "rb") as f:
+        test_storage.extract_tarball("pax_chain_8_ok", f)
+    mount_chain_8 = test_storage.local_mount_path("pax_chain_8_ok")
+    assert mount_chain_8 is not None
+    assert (mount_chain_8 / "chained_pax_name.html").read_bytes() == b"<html>pax_chain</html>"
+
+    # 3. Default-format PAX archive whose member carries an explicit pax size record (pax_headers={"size": "2"})
+    pax_size_tar = tmp_path / "pax_size_record.tar.gz"
+    with tarfile.open(pax_size_tar, "w:gz") as tf:
+        info = tarfile.TarInfo(name="two_bytes.txt")
+        info.size = 2
+        info.pax_headers = {"size": "2"}
+        tf.addfile(info, io.BytesIO(b"ok"))
+
+    with open(pax_size_tar, "rb") as f:
+        test_storage.extract_tarball("pax_size_ok", f)
+    mount_size = test_storage.local_mount_path("pax_size_ok")
+    assert mount_size is not None
+    assert (mount_size / "two_bytes.txt").read_bytes() == b"ok"
+
+    # 4. A pax header followed by a corrupt next header raises a tarfile.TarError or TarSafetyError, never AttributeError
+    corrupt_next_tar = tmp_path / "pax_corrupt_next.tar.gz"
+    pax_payload = _pax_record("path", "after_pax.txt")
+    x_info = tarfile.TarInfo(name="PaxHeader/after_pax")
+    x_info.type = tarfile.XHDTYPE
+    x_info.size = len(pax_payload)
+    x_block = x_info.tobuf(tarfile.PAX_FORMAT) + pax_payload.ljust(512, b"\x00")
+    with gzip.open(corrupt_next_tar, "wb", compresslevel=1) as gz:
+        gz.write(x_block)
+        gz.write(b"not_a_valid_512_byte_tar_header!" * 16)
+        gz.write(b"\x00" * 1024)
+
+    with open(corrupt_next_tar, "rb") as f:
+        with pytest.raises((tarfile.TarError, TarSafetyError)) as exc_info:
+            test_storage.extract_tarball("pax_corrupt_next_slug", f)
+    assert not isinstance(exc_info.value, AttributeError)
+    assert not (test_storage._root / "assets" / "pax_corrupt_next_slug").exists()
+
+
 
 
 

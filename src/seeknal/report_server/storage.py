@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import sys
-import tarfile
+import tarfile as _tarfile
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import BinaryIO, Optional
@@ -27,17 +27,17 @@ TAR_FIXED_HEADER_SLACK_BYTES = 1024 * 1024  # 1 MiB fixed header slack
 
 _ALLOWED_TAR_HEADER_TYPES: frozenset[bytes] = frozenset(
     {
-        tarfile.REGTYPE,
-        tarfile.AREGTYPE,
-        tarfile.DIRTYPE,
-        tarfile.XHDTYPE,
-        tarfile.GNUTYPE_LONGNAME,
+        _tarfile.REGTYPE,
+        _tarfile.AREGTYPE,
+        _tarfile.DIRTYPE,
+        _tarfile.XHDTYPE,
+        _tarfile.GNUTYPE_LONGNAME,
     }
 )
 _EXTENDED_TAR_HEADER_TYPES: frozenset[bytes] = frozenset(
     {
-        tarfile.XHDTYPE,
-        tarfile.GNUTYPE_LONGNAME,
+        _tarfile.XHDTYPE,
+        _tarfile.GNUTYPE_LONGNAME,
     }
 )
 _ALLOWED_PAX_HEADER_KEYS: frozenset[str] = frozenset(
@@ -141,78 +141,80 @@ class _PositionBoundedReader:
         self._raw.close()
 
 
-class _BoundedTarInfo(tarfile.TarInfo):
+class _BoundedTarInfo(_tarfile.TarInfo):
     """TarInfo subclass enforcing a header-type allowlist, pax key allowlist, 64 KiB header cap, and chain depth cap."""
 
-    def _proc_member(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
+    def _proc_member(self, tar: _tarfile.TarFile) -> _tarfile.TarInfo:  # type: ignore[override]
         if self.type not in _ALLOWED_TAR_HEADER_TYPES:
             raise TarSafetyError("Tarball entry type not allowed")
         _validate_mtime_value(self.mtime)
         if self.type in _EXTENDED_TAR_HEADER_TYPES:
-            chain_depth = getattr(tarfile, "_extended_header_chain_depth", 0) + 1
+            chain_depth = getattr(tar, "_extended_header_chain_depth", 0) + 1
             if chain_depth > MAX_CONSECUTIVE_EXTENDED_HEADERS:
                 raise TarSafetyError("Tarball entry header too large")
-            setattr(tarfile, "_extended_header_chain_depth", chain_depth)
+            setattr(tar, "_extended_header_chain_depth", chain_depth)
         else:
-            setattr(tarfile, "_extended_header_chain_depth", 0)
+            setattr(tar, "_extended_header_chain_depth", 0)
         parent_proc_member = getattr(super(), "_proc_member", None)
         if parent_proc_member is None:
             raise TarSafetyError("Tarball entry type not allowed")
-        return parent_proc_member(tarfile)  # type: ignore[misc]
+        return parent_proc_member(tar)  # type: ignore[misc]
 
-    def _proc_sparse(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
+    def _proc_sparse(self, tar: _tarfile.TarFile) -> _tarfile.TarInfo:  # type: ignore[override]
         raise TarSafetyError("Tarball entry type not allowed")
 
-    def _proc_gnusparse_00(self, next: tarfile.TarInfo, raw_headers: object) -> None:  # type: ignore[override]
+    def _proc_gnusparse_00(self, next_info: _tarfile.TarInfo, raw_headers: object) -> None:  # type: ignore[override]
         raise TarSafetyError("Tarball entry type not allowed")
 
-    def _proc_gnusparse_01(self, next: tarfile.TarInfo, pax_headers: object) -> None:  # type: ignore[override]
+    def _proc_gnusparse_01(self, next_info: _tarfile.TarInfo, pax_headers: object) -> None:  # type: ignore[override]
         raise TarSafetyError("Tarball entry type not allowed")
 
-    def _proc_gnusparse_10(self, next: tarfile.TarInfo, pax_headers: object, tarfile: tarfile.TarFile) -> None:  # type: ignore[override]
+    def _proc_gnusparse_10(self, next_info: _tarfile.TarInfo, pax_headers: object, tar: _tarfile.TarFile) -> None:  # type: ignore[override]
         raise TarSafetyError("Tarball entry type not allowed")
 
-    def _proc_gnulong(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
+    def _proc_gnulong(self, tar: _tarfile.TarFile) -> _tarfile.TarInfo:  # type: ignore[override]
         if self.size < 0 or self.size > MAX_TAR_HEADER_BYTES:
             raise TarSafetyError("Tarball entry header too large")
         parent_proc_gnulong = getattr(super(), "_proc_gnulong", None)
         if parent_proc_gnulong is None:
             raise TarSafetyError("Tarball entry type not allowed")
-        return parent_proc_gnulong(tarfile)  # type: ignore[misc]
+        return parent_proc_gnulong(tar)  # type: ignore[misc]
 
-    def _proc_pax(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
+    def _proc_pax(self, tar: _tarfile.TarFile) -> _tarfile.TarInfo:  # type: ignore[override]
         if self.size < 0 or self.size > MAX_TAR_HEADER_BYTES:
             raise TarSafetyError("Tarball entry header too large")
-        header_buf = tarfile.fileobj.read(self._block(self.size))
+        header_buf = tar.fileobj.read(self._block(self.size))
         raw_headers = self._validate_and_parse_pax_records(header_buf)
-        pax_headers = tarfile.pax_headers.copy()
+        pax_headers = tar.pax_headers.copy()
         for raw_keyword, raw_value in raw_headers:
             keyword = raw_keyword.decode("ascii")
             try:
                 value = raw_value.decode("utf-8", "strict")
             except UnicodeDecodeError:
-                value = raw_value.decode(tarfile.encoding, tarfile.errors)
+                value = raw_value.decode(tar.encoding, tar.errors)
             if keyword in _ALLOWED_PAX_HEADER_KEYS:
                 pax_headers[keyword] = value
         try:
             fromtarfile_fn = getattr(self, "_fromtarfile", None)
             if fromtarfile_fn is not None:
-                next_info = fromtarfile_fn(tarfile, dircheck=False)
+                next_info = fromtarfile_fn(tar, dircheck=False)
             else:
-                next_info = self.fromtarfile(tarfile)
-        except tarfile.HeaderError as exc:
-            raise tarfile.SubsequentHeaderError(str(exc)) from None
+                next_info = self.fromtarfile(tar)
+        except _tarfile.HeaderError as exc:
+            raise _tarfile.SubsequentHeaderError(str(exc)) from None
         apply_pax_fn = getattr(next_info, "_apply_pax_info", None)
         if apply_pax_fn is not None:
-            apply_pax_fn(pax_headers, tarfile.encoding, tarfile.errors)
+            apply_pax_fn(pax_headers, tar.encoding, tar.errors)
         else:
             next_info.pax_headers = pax_headers.copy()
         next_info.offset = self.offset
         if "size" in pax_headers:
+            if next_info.size < 0:
+                raise TarSafetyError("Tarball uncompressed size exceeds limit")
             offset = next_info.offset_data
-            if next_info.isreg() or next_info.type not in tarfile.SUPPORTED_TYPES:
+            if next_info.isreg() or next_info.type not in _tarfile.SUPPORTED_TYPES:
                 offset += next_info._block(next_info.size)
-            tarfile.offset = offset
+            tar.offset = offset
         return next_info
 
     @staticmethod
@@ -232,18 +234,18 @@ class _BoundedTarInfo(tarfile.TarInfo):
         while len(buf) > pos and buf[pos] != 0x00:
             match = _PAX_LEN_RE.match(buf, pos)
             if not match:
-                raise tarfile.InvalidHeaderError("invalid header")
+                raise _tarfile.InvalidHeaderError("invalid header")
             try:
                 length = int(match.group(1))
             except ValueError:
-                raise tarfile.InvalidHeaderError("invalid header") from None
+                raise _tarfile.InvalidHeaderError("invalid header") from None
             if length < 5 or pos + length > len(buf):
-                raise tarfile.InvalidHeaderError("invalid header")
+                raise _tarfile.InvalidHeaderError("invalid header")
             header_value_end_offset = match.start(1) + length - 1
             keyword_and_value = buf[match.end(1) + 1 : header_value_end_offset]
             raw_keyword, equals, raw_value = keyword_and_value.partition(b"=")
             if not raw_keyword or equals != b"=" or buf[header_value_end_offset] != 0x0A:
-                raise tarfile.InvalidHeaderError("invalid header")
+                raise _tarfile.InvalidHeaderError("invalid header")
             if raw_keyword == b"hdrcharset":
                 raise TarSafetyError("Tarball entry has a non-UTF-8 member name")
             if (
@@ -259,7 +261,7 @@ class _BoundedTarInfo(tarfile.TarInfo):
 
 
 def _validate_tar_member(
-    member: tarfile.TarInfo,
+    member: _tarfile.TarInfo,
     dest_real: str,
     *,
     max_path_depth: int = DEFAULT_MAX_PATH_DEPTH,
@@ -394,10 +396,10 @@ class LocalFilesystemStorage(Storage):
 
     def _stream_and_validate_members(
         self,
-        tf: tarfile.TarFile,
+        tf: _tarfile.TarFile,
         dest_real: str,
-    ) -> list[tarfile.TarInfo]:
-        members: list[tarfile.TarInfo] = []
+    ) -> list[_tarfile.TarInfo]:
+        members: list[_tarfile.TarInfo] = []
         member_count = 0
         total_unpacked = 0
         for member in tf:
@@ -424,23 +426,23 @@ class LocalFilesystemStorage(Storage):
         )
         with gzip.GzipFile(fileobj=fileobj, mode="rb") as gz_stream:
             reader = _PositionBoundedReader(gz_stream, max_position)
-            with tarfile.open(fileobj=reader, mode="r:", tarinfo=_BoundedTarInfo) as tf:  # type: ignore[arg-type]
+            with _tarfile.open(fileobj=reader, mode="r:", tarinfo=_BoundedTarInfo) as tf:  # type: ignore[arg-type]
                 # 1. Explicit version-independent check runs first before any member is extracted.
                 dest_real = os.path.realpath(dest)
                 members = self._stream_and_validate_members(tf, dest_real)
 
                 # 2. Extract using data_filter when available (3.12+ and backports) as a second layer,
                 # otherwise extract the validated members one by one.
-                if hasattr(tarfile, "data_filter"):
+                if hasattr(_tarfile, "data_filter"):
                     tf.extractall(dest, members=members, filter="data")  # type: ignore[call-arg]
                 else:
                     self._manual_safe_extract(tf, dest, members=members)
 
     def _manual_safe_extract(
         self,
-        tf: tarfile.TarFile,
+        tf: _tarfile.TarFile,
         dest: Path,
-        members: Optional[list[tarfile.TarInfo]] = None,
+        members: Optional[list[_tarfile.TarInfo]] = None,
     ) -> None:
         dest_real = os.path.realpath(dest)
         if members is None:
