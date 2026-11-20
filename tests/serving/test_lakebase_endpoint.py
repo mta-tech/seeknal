@@ -288,6 +288,8 @@ class TestParseLakebaseBlock:
             "ftp://cp.internal.example",
             "cp.internal.example",
             "https://",
+            "http://cp.internal.example",
+            "http://10.0.0.5:8080/api",
             "https://admin:SUPER_SECRET_PASS@cp.internal.example",
             "http://user@cp.internal.example",
             "https://cp.internal.example?token=secret",
@@ -307,6 +309,29 @@ class TestParseLakebaseBlock:
         with pytest.raises(ValueError) as exc_info:
             parse_lakebase_block(raw)
         assert "SUPER_SECRET_PASS" not in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "loopback_or_https_url,expected",
+        [
+            ("https://cp.internal.example/", "https://cp.internal.example"),
+            ("http://127.0.0.1:8080/", "http://127.0.0.1:8080"),
+            ("http://localhost:8080/v0/", "http://localhost:8080/v0"),
+            ("http://[::1]:8080/", "http://[::1]:8080"),
+        ],
+    )
+    def test_cold_start_accepts_https_and_loopback_http_api_url(
+        self, loopback_or_https_url: str, expected: str
+    ) -> None:
+        cfg = parse_lakebase_block(
+            _minimal_raw_block(
+                cold_start={
+                    "wake": "api",
+                    "api_url": loopback_or_https_url,
+                    "api_token_env": "LB_TOKEN",
+                }
+            )
+        )
+        assert cfg.cold_start.api_url == expected
 
     @pytest.mark.parametrize(
         "bad_env",

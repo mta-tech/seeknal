@@ -149,16 +149,24 @@ def _validate_api_url(
     error_cls: type[Exception] = ValueError,
 ) -> str:
     if not isinstance(raw_url, str) or not raw_url.strip():
-        raise error_cls("'cold_start.api_url' must be a non-empty http:// or https:// URL")
+        raise error_cls("'cold_start.api_url' must be a non-empty https:// URL")
     clean = raw_url.strip()
     if any(ch.isspace() or ord(ch) < 0x20 for ch in clean):
         raise error_cls("'cold_start.api_url' must not contain whitespace or control characters")
 
     parsed = urllib.parse.urlsplit(clean)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise error_cls("'cold_start.api_url' must start with http:// or https:// and include a host")
+        raise error_cls("'cold_start.api_url' must start with https:// and include a host")
     if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         raise error_cls("'cold_start.api_url' must not contain credentials or userinfo")
+    if parsed.scheme == "http" and parsed.hostname.lower() not in (
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    ):
+        raise error_cls(
+            "'cold_start.api_url' must use https:// (http:// is allowed only for loopback hosts)"
+        )
     if parsed.query or parsed.fragment:
         raise error_cls("'cold_start.api_url' must not contain query parameters or fragments")
 

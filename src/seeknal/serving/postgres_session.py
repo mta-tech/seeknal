@@ -629,6 +629,8 @@ def _fallback_parse_lakebase_block(
         api_url_raw = cs_raw.get("api_url")
         api_url_clean: str | None = None
         if api_url_raw is not None:
+            import urllib.parse
+
             if (
                 not isinstance(api_url_raw, str)
                 or not api_url_raw.strip()
@@ -639,7 +641,16 @@ def _fallback_parse_lakebase_block(
                 or "@" in api_url_raw
             ):
                 raise error_cls(
-                    f"Lakebase connection '{eng_name}' 'cold_start.api_url' must be a valid HTTP(S) URL without credentials"
+                    f"Lakebase connection '{eng_name}' 'cold_start.api_url' must be a valid HTTPS URL without credentials"
+                )
+            parsed_fb = urllib.parse.urlsplit(api_url_raw.strip())
+            if not parsed_fb.hostname or (
+                parsed_fb.scheme == "http"
+                and parsed_fb.hostname.lower()
+                not in ("localhost", "127.0.0.1", "::1")
+            ):
+                raise error_cls(
+                    f"Lakebase connection '{eng_name}' 'cold_start.api_url' must use https:// (http:// is allowed only for loopback hosts)"
                 )
             api_url_clean = api_url_raw.strip()
 
