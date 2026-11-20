@@ -182,10 +182,24 @@ class PreflightResult:
     schemas: dict[str, list[str]] | None = None
 
 
+_B64URL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 def _b64url_decode(s: str) -> bytes:
+    if not isinstance(s, str) or not s or not _B64URL_PATTERN.match(s):
+        raise ServerConfigError("Invalid base64url segment")
     rem = len(s) % 4
+    if rem == 1:
+        raise ServerConfigError("Invalid base64url segment")
     padded = s + ("=" * ((4 - rem) % 4))
-    return base64.urlsafe_b64decode(padded.encode("ascii"))
+    try:
+        data = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except Exception as exc:
+        raise ServerConfigError("Failed to decode base64url segment") from exc
+    canonical = base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+    if canonical != s:
+        raise ServerConfigError("Invalid base64url segment")
+    return data
 
 
 def parse_jwks(data_or_str: dict | list | str) -> dict[str, str]:
