@@ -1383,3 +1383,44 @@ def test_postgres_target_kind_and_select_v1_grant_claims():
     assert exc_mismatch.value.code == "grant_invalid"
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "WITH i AS (INSERT INTO claims.claim (claim_id, amount) VALUES (999, 1) RETURNING 1 AS x) SELECT 1 AS one",
+        "WITH i AS (INSERT INTO claims.claim (claim_id) SELECT 5 RETURNING 1 AS x) SELECT count(*) AS n FROM i",
+        "WITH u AS (UPDATE claims.claim SET amount = 2 WHERE claim_id = 1 RETURNING claim_id) SELECT * FROM u",
+        "WITH d AS (DELETE FROM claims.claim WHERE claim_id = 1 RETURNING claim_id) SELECT * FROM d",
+    ],
+)
+def test_dml_inside_cte_is_rejected(sql: str):
+    schemas = {"claims.claim": ["claim_id", "amount"]}
+    for granted_actions in (["select"], ["select", "insert", "update", "delete"]):
+        grant = Grant.from_claims(
+            {
+                "sub": "user:analyst",
+                "ws": "claims",
+                "jti": "jti-cte-dml",
+                "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+                "max_rows": 100,
+                "exp": time.time() + 3600.0,
+                "tables": {
+                    "claims.claim": {
+                        "columns": ["claim_id", "amount"],
+                        "masks": {},
+                        "row_filters": [],
+                        "actions": granted_actions,
+                    }
+                },
+            }
+        )
+        with pytest.raises(EnforcementError, match="DML statements inside CTEs"):
+            enforce(
+                sql,
+                grant,
+                schemas=schemas,
+                target_dialect="postgres",
+                target_kind="postgres",
+            )
+
+
+

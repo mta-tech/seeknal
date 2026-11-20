@@ -1021,6 +1021,18 @@ def enforce(
                 )
 
     # Step 3: Action
+    for cte in statement.find_all(exp.CTE):
+        if cte.find((exp.Insert, exp.Update, exp.Delete, exp.Merge)) is not None:
+            raise EnforcementError(
+                "DML statements inside CTEs or subqueries are not permitted"
+            )
+    if isinstance(statement, exp.Query) and statement.find(
+        (exp.Insert, exp.Update, exp.Delete, exp.Merge)
+    ) is not None:
+        raise EnforcementError(
+            "DML statements inside CTEs or subqueries are not permitted"
+        )
+
     target_table_ref: exp.Table | None = None
     if isinstance(statement, exp.Query):
         for tbl_key in referenced_table_keys:

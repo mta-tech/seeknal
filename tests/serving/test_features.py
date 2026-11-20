@@ -49,6 +49,13 @@ def test_statement_kinds():
     assert (
         _parse_and_extract("SET search_path TO public").kind == "other"
     )
+    for dml_cte_sql in (
+        "WITH i AS (INSERT INTO claims.claim (claim_id, amount) VALUES (999, 1) RETURNING 1 AS x) SELECT 1 AS one",
+        "WITH i AS (INSERT INTO claims.claim (claim_id) SELECT 5 RETURNING 1 AS x) SELECT count(*) AS n FROM i",
+        "WITH u AS (UPDATE claims.claim SET amount = 0 WHERE claim_id = 1 RETURNING claim_id) SELECT * FROM u",
+        "WITH d AS (DELETE FROM claims.claim WHERE claim_id = 1 RETURNING claim_id) SELECT * FROM d",
+    ):
+        assert _parse_and_extract(dml_cte_sql).kind == "other"
 
 
 def test_extract_tables_and_cte_exclusion():

@@ -174,9 +174,23 @@ def _has_subquery(statement: exp.Expression) -> bool:
     return False
 
 
+_NESTED_DML_DDL_CLASSES = (
+    exp.Insert,
+    exp.Update,
+    exp.Delete,
+    exp.Merge,
+    *DDL_CLASSES,
+)
+
+
 def _extract_kind(statement: exp.Expression) -> str:
     """Determine statement kind."""
+    for cte in statement.find_all(exp.CTE):
+        if cte.find(_NESTED_DML_DDL_CLASSES) is not None:
+            return "other"
     if isinstance(statement, (exp.Select, exp.Union)):
+        if statement.find(_NESTED_DML_DDL_CLASSES) is not None:
+            return "other"
         return "select"
     if isinstance(statement, exp.Insert):
         return "insert"
