@@ -917,7 +917,7 @@ def test_live_http_queries_guardrails_keyset_masks_explain_index_scan_timeout_an
         r_slow = client.post(
             "/v1/query",
             headers={"Authorization": f"Bearer {tok_slow}"},
-            json={"sql": slow_sql, "timeout_seconds": 0.08},
+            json={"sql": slow_sql, "timeout_s": 0.08},
         )
         assert r_slow.status_code == 504
         assert r_slow.json()["code"] == "engine_timeout"
