@@ -75,7 +75,7 @@ async def publish(request: Request) -> JSONResponse:
             parsed_content_length = int(content_length.strip())
         except ValueError:
             return JSONResponse({"error": "Invalid Content-Length header"}, status_code=400)
-        if parsed_content_length < 0 or parsed_content_length != int(content_length.strip()):
+        if parsed_content_length < 0:
             return JSONResponse({"error": "Invalid Content-Length header"}, status_code=400)
         if not content_length.strip().isdigit():
             return JSONResponse({"error": "Invalid Content-Length header"}, status_code=400)
