@@ -1162,6 +1162,44 @@ def test_global_pax_header_refused_small_and_over_64k(
     assert not (test_storage._root / "assets" / "huge_g_slug").exists()
 
 
+def test_pax_extraction_and_sparse_refusal_without_private_tarfile_regex(
+    test_storage: LocalFilesystemStorage,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(tarfile, "_header_length_prefix_re", raising=False)
+    assert not hasattr(tarfile, "_header_length_prefix_re")
+
+    long_name = "reports/" + ("a" * 129) + "_summary.html"
+    assert len(long_name) == 150
+    non_ascii_name = "reports/données_financière_日本語.html"
+
+    pax_tar = tmp_path / "no_private_regex_pax.tar.gz"
+    with tarfile.open(pax_tar, "w:gz") as tf:
+        for arcname, content in (
+            (long_name, b"<html>long</html>"),
+            (non_ascii_name, "<html>non-ascii</html>".encode("utf-8")),
+        ):
+            info = tarfile.TarInfo(name=arcname)
+            info.size = len(content)
+            tf.addfile(info, io.BytesIO(content))
+
+    with open(pax_tar, "rb") as f:
+        test_storage.extract_tarball("no_priv_regex_ok", f)
+
+    mount = test_storage.local_mount_path("no_priv_regex_ok")
+    assert mount is not None
+    assert (mount / long_name).read_bytes() == b"<html>long</html>"
+    assert (mount / non_ascii_name).read_bytes() == b"<html>non-ascii</html>"
+
+    # A GNU.sparse key is still refused when tarfile._header_length_prefix_re is absent
+    sparse_tar = _build_pax_gnu_sparse_01_tar_gz(tmp_path / "no_priv_regex_sparse.tar.gz")
+    with open(sparse_tar, "rb") as f:
+        with pytest.raises(TarSafetyError, match="Tarball pax header key not allowed"):
+            test_storage.extract_tarball("no_priv_regex_sparse", f)
+    assert not (test_storage._root / "assets" / "no_priv_regex_sparse").exists()
+
+
 
 
 

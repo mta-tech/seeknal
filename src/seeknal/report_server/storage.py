@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import os
+import re
 import shutil
 import sys
 import tarfile
@@ -63,6 +64,7 @@ _IGNORED_PAX_HEADER_RAW_KEYS: frozenset[bytes] = frozenset(
 )
 _IGNORED_PAX_HEADER_PREFIXES: tuple[str, ...] = ("SCHILY.", "LIBARCHIVE.")
 _IGNORED_PAX_HEADER_RAW_PREFIXES: tuple[bytes, ...] = (b"SCHILY.", b"LIBARCHIVE.")
+_PAX_LEN_RE = re.compile(rb"([0-9]{1,20}) ")
 
 
 class TarSafetyError(ValueError):
@@ -116,7 +118,10 @@ class _BoundedTarInfo(tarfile.TarInfo):
             setattr(tarfile, "_extended_header_chain_depth", chain_depth)
         else:
             setattr(tarfile, "_extended_header_chain_depth", 0)
-        return super()._proc_member(tarfile)  # type: ignore[misc]
+        parent_proc_member = getattr(super(), "_proc_member", None)
+        if parent_proc_member is None:
+            raise TarSafetyError("Tarball entry type not allowed")
+        return parent_proc_member(tarfile)  # type: ignore[misc]
 
     def _proc_sparse(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
         raise TarSafetyError("Tarball entry type not allowed")
@@ -133,29 +138,44 @@ class _BoundedTarInfo(tarfile.TarInfo):
     def _proc_gnulong(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
         if self.size < 0 or self.size > MAX_TAR_HEADER_BYTES:
             raise TarSafetyError("Tarball entry header too large")
-        return super()._proc_gnulong(tarfile)  # type: ignore[misc]
+        parent_proc_gnulong = getattr(super(), "_proc_gnulong", None)
+        if parent_proc_gnulong is None:
+            raise TarSafetyError("Tarball entry type not allowed")
+        return parent_proc_gnulong(tarfile)  # type: ignore[misc]
 
     def _proc_pax(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
         if self.size < 0 or self.size > MAX_TAR_HEADER_BYTES:
             raise TarSafetyError("Tarball entry header too large")
-        pos = tarfile.fileobj.tell()
         header_buf = tarfile.fileobj.read(self._block(self.size))
-        self._validate_pax_records(header_buf)
-        tarfile.fileobj.seek(pos)
-        next_info = super()._proc_pax(tarfile)  # type: ignore[misc]
-        raw_pax = getattr(next_info, "pax_headers", None)
-        if isinstance(raw_pax, dict):
-            cleaned_pax: dict[str, str] = {}
-            for key, value in raw_pax.items():
-                if key in _ALLOWED_PAX_HEADER_KEYS:
-                    cleaned_pax[key] = value
-                elif self._is_ignored_pax_key(key):
-                    continue
-                elif key == "hdrcharset":
-                    raise TarSafetyError("Tarball entry has a non-UTF-8 member name")
-                else:
-                    raise TarSafetyError("Tarball pax header key not allowed")
-            next_info.pax_headers = cleaned_pax
+        raw_headers = self._validate_and_parse_pax_records(header_buf)
+        pax_headers = tarfile.pax_headers.copy()
+        for raw_keyword, raw_value in raw_headers:
+            keyword = raw_keyword.decode("ascii")
+            try:
+                value = raw_value.decode("utf-8", "strict")
+            except UnicodeDecodeError:
+                value = raw_value.decode(tarfile.encoding, tarfile.errors)
+            if keyword in _ALLOWED_PAX_HEADER_KEYS:
+                pax_headers[keyword] = value
+        try:
+            fromtarfile_fn = getattr(self, "_fromtarfile", None)
+            if fromtarfile_fn is not None:
+                next_info = fromtarfile_fn(tarfile, dircheck=False)
+            else:
+                next_info = self.fromtarfile(tarfile)
+        except tarfile.HeaderError as exc:
+            raise tarfile.SubsequentHeaderError(str(exc)) from None
+        apply_pax_fn = getattr(next_info, "_apply_pax_info", None)
+        if apply_pax_fn is not None:
+            apply_pax_fn(pax_headers, tarfile.encoding, tarfile.errors)
+        else:
+            next_info.pax_headers = pax_headers.copy()
+        next_info.offset = self.offset
+        if "size" in pax_headers:
+            offset = next_info.offset_data
+            if next_info.isreg() or next_info.type not in tarfile.SUPPORTED_TYPES:
+                offset += next_info._block(next_info.size)
+            tarfile.offset = offset
         return next_info
 
     @staticmethod
@@ -169,23 +189,24 @@ class _BoundedTarInfo(tarfile.TarInfo):
         )
 
     @classmethod
-    def _validate_pax_records(cls, buf: bytes) -> None:
+    def _validate_and_parse_pax_records(cls, buf: bytes) -> list[tuple[bytes, bytes]]:
         pos = 0
+        records: list[tuple[bytes, bytes]] = []
         while len(buf) > pos and buf[pos] != 0x00:
-            match = tarfile._header_length_prefix_re.match(buf, pos)  # type: ignore[attr-defined]
+            match = _PAX_LEN_RE.match(buf, pos)
             if not match:
-                break
+                raise tarfile.InvalidHeaderError("invalid header")
             try:
                 length = int(match.group(1))
             except ValueError:
-                break
+                raise tarfile.InvalidHeaderError("invalid header") from None
             if length < 5 or pos + length > len(buf):
-                break
+                raise tarfile.InvalidHeaderError("invalid header")
             header_value_end_offset = match.start(1) + length - 1
             keyword_and_value = buf[match.end(1) + 1 : header_value_end_offset]
-            raw_keyword, equals, _ = keyword_and_value.partition(b"=")
+            raw_keyword, equals, raw_value = keyword_and_value.partition(b"=")
             if not raw_keyword or equals != b"=" or buf[header_value_end_offset] != 0x0A:
-                break
+                raise tarfile.InvalidHeaderError("invalid header")
             if raw_keyword == b"hdrcharset":
                 raise TarSafetyError("Tarball entry has a non-UTF-8 member name")
             if (
@@ -193,7 +214,9 @@ class _BoundedTarInfo(tarfile.TarInfo):
                 and not cls._is_ignored_pax_raw_key(raw_keyword)
             ):
                 raise TarSafetyError("Tarball pax header key not allowed")
+            records.append((raw_keyword, raw_value))
             pos += length
+        return records
 
 
 def _validate_tar_member(

@@ -140,6 +140,8 @@ async def publish(request: Request) -> JSONResponse:
                 ValueError,
                 MemoryError,
                 RecursionError,
+                AttributeError,
+                OverflowError,
             ) as exc:
                 _log.warning(
                     "publish tarball rejected: slug=%s exc_class=%s",

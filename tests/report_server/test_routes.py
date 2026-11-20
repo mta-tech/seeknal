@@ -971,6 +971,17 @@ def test_semaphore_released_after_mid_upload_413_and_unhandled_error(
     assert after_unhandled_resp.status_code == 201
 
 
+def test_attribute_and_overflow_errors_mapped_to_typed_400(
+    test_client: TestClient,
+    honest_tarball: Path,
+) -> None:
+    for exc in (AttributeError("missing private attr"), OverflowError("mtime out of range")):
+        with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=exc):
+            resp = _publish(test_client, honest_tarball)
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "Invalid or corrupt tarball archive"}
+
+
 
 
 
