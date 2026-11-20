@@ -971,27 +971,22 @@ def test_semaphore_released_after_mid_upload_413_and_unhandled_error(
     assert after_unhandled_resp.status_code == 201
 
 
-def test_attribute_and_overflow_errors_mapped_to_typed_400(
+def test_overflow_error_mapped_to_typed_400_and_attribute_error_surfaces(
+    test_app,
     test_client: TestClient,
     honest_tarball: Path,
-    caplog,
 ) -> None:
-    import logging
+    import pytest
 
-    caplog.set_level(logging.ERROR, logger="seeknal.report_server")
-    for exc in (AttributeError("missing private attr"), OverflowError("mtime out of range")):
-        with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=exc):
-            resp = _publish(test_client, honest_tarball)
-        assert resp.status_code == 400
-        assert resp.json() == {"error": "Invalid or corrupt tarball archive"}
+    with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=OverflowError("mtime out of range")):
+        resp = _publish(test_client, honest_tarball)
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "Invalid or corrupt tarball archive"}
 
-    attr_err_logs = [
-        rec for rec in caplog.records
-        if rec.name == "seeknal.report_server"
-        and rec.levelno == logging.ERROR
-        and "exc_class=AttributeError" in rec.getMessage()
-    ]
-    assert len(attr_err_logs) == 1
+    # AttributeError is a programming error and must surface as an unhandled exception in tests
+    with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=AttributeError("programming bug")):
+        with pytest.raises(AttributeError, match="programming bug"):
+            _publish(test_client, honest_tarball)
 
 
 def test_publish_rejects_invalid_pax_mtimes_with_400_and_accepts_normal_float_mtime(
