@@ -421,6 +421,37 @@ def test_same_source_equi_join_propagation():
         )
     assert exc_info.value.code == "filter_required"
 
+    # Accept legitimate equality join propagation from scan table to filter table
+    r_legit_eq = _run_guard(
+        "SELECT t.* FROM cbn.rpt.branch_dim b "
+        "JOIN cbn.rpt.txn_detail t ON b.branch_code = t.branch_code "
+        "WHERE b.branch_code = 'X'",
+        pl,
+        hint="pg_report",
+    )
+    assert r_legit_eq.outcome == "pass"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT c.* FROM cbn.rpt.branch_dim b JOIN cbn.src_pii.customer c ON c.customer_id = b.branch_code WHERE b.region >= ''",
+        "SELECT c.* FROM cbn.rpt.branch_dim b JOIN cbn.src_pii.customer c ON c.customer_id = b.branch_code WHERE b.region LIKE 'a%'",
+        "SELECT c.* FROM cbn.rpt.branch_dim b JOIN cbn.rpt.txn_detail t ON b.branch_code = t.branch_code JOIN cbn.src_pii.customer c ON c.customer_id = t.customer_id WHERE b.branch_code >= ''",
+        "SELECT p.* FROM cbn.rpt.branch_dim b JOIN cbn.src_pii.implicit_pii p ON p.person_id = b.branch_code WHERE b.branch_code > ''",
+        "SELECT c.* FROM cbn.rpt.tokenized_customer tc JOIN cbn.src_pii.customer c ON c.customer_id = tc.customer_tok WHERE tc.customer_tok >= ''",
+        "SELECT c.* FROM cbn.rpt.tokenized_customer tc JOIN cbn.src_pii.customer c ON c.customer_id = tc.customer_tok WHERE tc.customer_tok LIKE 'a%'",
+    ],
+)
+def test_join_propagation_rejects_unsargable_range_or_like_from_unguarded_tables(
+    sql: str,
+):
+    pl = _make_placement()
+    for hint_val in (None, "pg_report"):
+        with pytest.raises(GuardrailError) as exc_info:
+            _run_guard(sql, pl, hint=hint_val)
+        assert exc_info.value.code == "filter_required"
+
 
 # ==============================================================================
 # §4.2.3: Derived tables (1-level transparent vs 2+ levels rejected)

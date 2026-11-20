@@ -405,22 +405,41 @@ def _evaluate_direct_filter(
     Returns ``(satisfied_require_filter, has_any_sargable_filter, matched_columns)``.
     """
     matched_cols: list[str] = []
-    any_bounded_pred = any(
-        p.value_count <= policy.max_in_list for p in inst.predicates
-    )
-
     acc = inst.eff_access
-    if acc is None or not acc.require_filter:
+
+    if acc is None:
+        has_sargable = False
         for p in inst.predicates:
-            if p.value_count <= policy.max_in_list and p.column not in matched_cols:
-                matched_cols.append(p.column)
-        return (True, any_bounded_pred, matched_cols)
+            if p.op in ("eq", "in", "or_eq") and p.value_count <= policy.max_in_list:
+                has_sargable = True
+                if p.column not in matched_cols:
+                    matched_cols.append(p.column)
+        return (True, has_sargable, matched_cols)
 
     keys_tuple = tuple(k.lower() for k in acc.keys)
     keys_set = set(keys_tuple)
     filterable_set = {c.lower() for c in acc.filterable}
     range_set = {c.lower() for c in acc.range_filterable}
     prefix_set = {c.lower() for c in acc.prefix_filterable}
+
+    if not acc.require_filter:
+        has_sargable = False
+        eq_cols = keys_set | filterable_set
+        for p in inst.predicates:
+            if p.op in ("eq", "in", "or_eq") and p.value_count <= policy.max_in_list:
+                if not eq_cols or p.column in (eq_cols | range_set | prefix_set):
+                    has_sargable = True
+                    if p.column not in matched_cols:
+                        matched_cols.append(p.column)
+            elif p.op in ("range", "between") and p.column in range_set:
+                has_sargable = True
+                if p.column not in matched_cols:
+                    matched_cols.append(p.column)
+            elif p.op == "prefix_like" and p.column in prefix_set:
+                has_sargable = True
+                if p.column not in matched_cols:
+                    matched_cols.append(p.column)
+        return (True, has_sargable, matched_cols)
 
     # Check primary/unique key equality/IN/OR constraint
     keys_satisfied = False
