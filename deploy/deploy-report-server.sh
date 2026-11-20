@@ -12,6 +12,14 @@ echo "=== Seeknal Report Server Deployment ==="
 echo "  Target: $REMOTE_HOST:$REMOTE_DIR"
 echo ""
 
+AUTH_MODE="${SEEKNAL_REPORT_SERVER_AUTH_MODE:-api_key}"
+if [ "$AUTH_MODE" = "open" ]; then
+    echo "WARNING: SEEKNAL_REPORT_SERVER_AUTH_MODE=open is set explicitly; deploying without API-key authentication." >&2
+elif [ -z "${SEEKNAL_REPORT_SERVER_KEYS:-}" ] || [ -z "$(printf '%s' "${SEEKNAL_REPORT_SERVER_KEYS}" | tr -d '[:space:],')" ]; then
+    echo "ERROR: SEEKNAL_REPORT_SERVER_KEYS must be set before deploying (or set SEEKNAL_REPORT_SERVER_AUTH_MODE=open explicitly for unauthenticated mode)." >&2
+    exit 1
+fi
+
 # 1. Create remote directory structure
 echo "[1/4] Creating remote directories..."
 ssh $SSH_OPTS "$REMOTE_HOST" "mkdir -p $REMOTE_DIR"
