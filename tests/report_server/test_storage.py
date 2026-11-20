@@ -844,10 +844,10 @@ def _build_gnu_longlink_tar_gz(out_path: Path) -> Path:
     return out_path
 
 
-def _build_pax_unknown_key_tar_gz(out_path: Path) -> Path:
+def _build_pax_unknown_key_tar_gz(out_path: Path, *, key: str = "foo.bar", value: str = "x") -> Path:
     import gzip
 
-    pax_payload = _pax_record("comment", "x")
+    pax_payload = _pax_record(key, value)
     x_info = tarfile.TarInfo(name="PaxHeader/index.html")
     x_info.type = tarfile.XHDTYPE
     x_info.size = len(pax_payload)
@@ -863,6 +863,14 @@ def _build_pax_unknown_key_tar_gz(out_path: Path) -> Path:
         gz.write(reg_blocks)
         gz.write(b"\x00" * 1024)
     return out_path
+
+
+def _build_pax_hdrcharset_tar_gz(out_path: Path) -> Path:
+    return _build_pax_unknown_key_tar_gz(out_path, key="hdrcharset", value="BINARY")
+
+
+def _build_pax_linkpath_tar_gz(out_path: Path) -> Path:
+    return _build_pax_unknown_key_tar_gz(out_path, key="linkpath", value="target.html")
 
 
 def _build_conttype_tar_gz(out_path: Path) -> Path:
@@ -914,6 +922,8 @@ def _build_chained_extended_headers_tar_gz(out_path: Path, *, count: int = 9) ->
         ("global_pax_g", _build_pax_global_header_tar_gz, "Tarball entry type not allowed"),
         ("gnu_longlink_K", _build_gnu_longlink_tar_gz, "Tarball entry type not allowed"),
         ("pax_unknown_key", _build_pax_unknown_key_tar_gz, "Tarball pax header key not allowed"),
+        ("pax_linkpath", _build_pax_linkpath_tar_gz, "Tarball pax header key not allowed"),
+        ("pax_hdrcharset", _build_pax_hdrcharset_tar_gz, "Tarball entry has a non-UTF-8 member name"),
         ("pax_gnu_sparse_map", _build_pax_gnu_sparse_01_tar_gz, "Tarball pax header key not allowed"),
         ("old_gnu_sparse_S", _build_old_gnu_sparse_tar_gz, "Tarball entry type not allowed"),
         ("pax_gnu_sparse_10", _build_pax_gnu_sparse_10_tar_gz, "Tarball pax header key not allowed"),
@@ -1009,6 +1019,79 @@ def test_seeknal_packager_and_gnu_tar_longname_archives_accepted(
     mount_gnu = test_storage.local_mount_path("gnu_long_ok")
     assert mount_gnu is not None
     assert (mount_gnu / gnu_long_name).read_bytes() == b"console.log('gnu150');"
+
+
+def test_bsdtar_and_gnu_posix_ignored_pax_keys_accepted_and_dropped(
+    test_storage: LocalFilesystemStorage,
+    tmp_path: Path,
+) -> None:
+    # (a) bsdtar-style archive with SCHILY.xattr.*, LIBARCHIVE.creationtime, and SCHILY.dev/ino keys
+    bsdtar_path = tmp_path / "bsdtar_style.tar.gz"
+    with tarfile.open(bsdtar_path, "w:gz", format=tarfile.PAX_FORMAT) as tf:
+        info = tarfile.TarInfo(name="index.html")
+        payload = b"<html><body>bsdtar</body></html>"
+        info.size = len(payload)
+        info.pax_headers = {
+            "SCHILY.xattr.com.apple.provenance": "01020304",
+            "SCHILY.acl.access": "user::rw-",
+            "LIBARCHIVE.xattr.user.test": "val",
+            "LIBARCHIVE.creationtime": "1700000000",
+            "SCHILY.dev": "16777220",
+            "SCHILY.ino": "1234567",
+            "comment": "harmless pax comment",
+        }
+        tf.addfile(info, io.BytesIO(payload))
+
+    observed_members_bsd: list[tarfile.TarInfo] = []
+    orig_stream = test_storage._stream_and_validate_members
+
+    def _recording_stream_bsd(tf, dest_real):
+        members = orig_stream(tf, dest_real)
+        observed_members_bsd.extend(members)
+        return members
+
+    with patch.object(test_storage, "_stream_and_validate_members", side_effect=_recording_stream_bsd):
+        with open(bsdtar_path, "rb") as f:
+            test_storage.extract_tarball("bsdtar_ok", f)
+
+    mount_bsd = test_storage.local_mount_path("bsdtar_ok")
+    assert mount_bsd is not None
+    assert (mount_bsd / "index.html").read_bytes() == b"<html><body>bsdtar</body></html>"
+    assert len(observed_members_bsd) == 1
+    assert observed_members_bsd[0].pax_headers == {}
+
+    # (b) GNU tar --format=posix style archive with atime and ctime
+    gnu_posix_path = tmp_path / "gnu_posix_style.tar.gz"
+    with tarfile.open(gnu_posix_path, "w:gz", format=tarfile.PAX_FORMAT) as tf:
+        info = tarfile.TarInfo(name="report.html")
+        payload = b"<html><body>gnu-posix</body></html>"
+        info.size = len(payload)
+        info.pax_headers = {
+            "atime": "1700000000.123",
+            "ctime": "1700000000.456",
+            "mtime": "1700000000",
+        }
+        tf.addfile(info, io.BytesIO(payload))
+
+    observed_members_posix: list[tarfile.TarInfo] = []
+
+    def _recording_stream_posix(tf, dest_real):
+        members = orig_stream(tf, dest_real)
+        observed_members_posix.extend(members)
+        return members
+
+    with patch.object(test_storage, "_stream_and_validate_members", side_effect=_recording_stream_posix):
+        with open(gnu_posix_path, "rb") as f:
+            test_storage.extract_tarball("gnu_posix_ok", f)
+
+    mount_posix = test_storage.local_mount_path("gnu_posix_ok")
+    assert mount_posix is not None
+    assert (mount_posix / "report.html").read_bytes() == b"<html><body>gnu-posix</body></html>"
+    assert len(observed_members_posix) == 1
+    assert "atime" not in observed_members_posix[0].pax_headers
+    assert "ctime" not in observed_members_posix[0].pax_headers
+    assert not hasattr(observed_members_posix[0], "atime")
+    assert not hasattr(observed_members_posix[0], "ctime")
 
 
 

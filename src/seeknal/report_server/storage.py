@@ -50,6 +50,18 @@ _ALLOWED_PAX_HEADER_KEYS: frozenset[str] = frozenset(
 _ALLOWED_PAX_HEADER_RAW_KEYS: frozenset[bytes] = frozenset(
     k.encode("ascii") for k in _ALLOWED_PAX_HEADER_KEYS
 )
+_IGNORED_PAX_HEADER_KEYS: frozenset[str] = frozenset(
+    {
+        "atime",
+        "ctime",
+        "comment",
+    }
+)
+_IGNORED_PAX_HEADER_RAW_KEYS: frozenset[bytes] = frozenset(
+    k.encode("ascii") for k in _IGNORED_PAX_HEADER_KEYS
+)
+_IGNORED_PAX_HEADER_PREFIXES: tuple[str, ...] = ("SCHILY.", "LIBARCHIVE.")
+_IGNORED_PAX_HEADER_RAW_PREFIXES: tuple[bytes, ...] = (b"SCHILY.", b"LIBARCHIVE.")
 
 
 class TarSafetyError(ValueError):
@@ -130,13 +142,33 @@ class _BoundedTarInfo(tarfile.TarInfo):
         self._validate_pax_records(header_buf)
         tarfile.fileobj.seek(pos)
         next_info = super()._proc_pax(tarfile)  # type: ignore[misc]
-        for key in getattr(next_info, "pax_headers", ()):
-            if key not in _ALLOWED_PAX_HEADER_KEYS:
-                raise TarSafetyError("Tarball pax header key not allowed")
+        raw_pax = getattr(next_info, "pax_headers", None)
+        if isinstance(raw_pax, dict):
+            cleaned_pax: dict[str, str] = {}
+            for key, value in raw_pax.items():
+                if key in _ALLOWED_PAX_HEADER_KEYS:
+                    cleaned_pax[key] = value
+                elif self._is_ignored_pax_key(key):
+                    continue
+                elif key == "hdrcharset":
+                    raise TarSafetyError("Tarball entry has a non-UTF-8 member name")
+                else:
+                    raise TarSafetyError("Tarball pax header key not allowed")
+            next_info.pax_headers = cleaned_pax
         return next_info
 
     @staticmethod
-    def _validate_pax_records(buf: bytes) -> None:
+    def _is_ignored_pax_key(key: str) -> bool:
+        return key in _IGNORED_PAX_HEADER_KEYS or key.startswith(_IGNORED_PAX_HEADER_PREFIXES)
+
+    @staticmethod
+    def _is_ignored_pax_raw_key(raw_key: bytes) -> bool:
+        return raw_key in _IGNORED_PAX_HEADER_RAW_KEYS or raw_key.startswith(
+            _IGNORED_PAX_HEADER_RAW_PREFIXES
+        )
+
+    @classmethod
+    def _validate_pax_records(cls, buf: bytes) -> None:
         pos = 0
         while len(buf) > pos and buf[pos] != 0x00:
             match = tarfile._header_length_prefix_re.match(buf, pos)  # type: ignore[attr-defined]
@@ -153,7 +185,12 @@ class _BoundedTarInfo(tarfile.TarInfo):
             raw_keyword, equals, _ = keyword_and_value.partition(b"=")
             if not raw_keyword or equals != b"=" or buf[header_value_end_offset] != 0x0A:
                 break
-            if raw_keyword not in _ALLOWED_PAX_HEADER_RAW_KEYS:
+            if raw_keyword == b"hdrcharset":
+                raise TarSafetyError("Tarball entry has a non-UTF-8 member name")
+            if (
+                raw_keyword not in _ALLOWED_PAX_HEADER_RAW_KEYS
+                and not cls._is_ignored_pax_raw_key(raw_keyword)
+            ):
                 raise TarSafetyError("Tarball pax header key not allowed")
             pos += length
 

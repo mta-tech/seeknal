@@ -820,13 +820,18 @@ def test_publish_rejects_disallowed_headers_and_chains_with_typed_400_and_bounde
         _build_pax_global_header_tar_gz,
         _build_pax_gnu_sparse_01_tar_gz,
         _build_pax_gnu_sparse_10_tar_gz,
+        _build_pax_hdrcharset_tar_gz,
+        _build_pax_linkpath_tar_gz,
         _build_pax_unknown_key_tar_gz,
     )
 
+    hdrcharset_tar = _build_pax_hdrcharset_tar_gz(tmp_path / "route_pax_hdrcharset.tar.gz")
     cases = [
         (_build_pax_global_header_tar_gz(tmp_path / "route_global_g.tar.gz"), "Tarball entry type not allowed"),
         (_build_gnu_longlink_tar_gz(tmp_path / "route_longlink_K.tar.gz"), "Tarball entry type not allowed"),
         (_build_pax_unknown_key_tar_gz(tmp_path / "route_pax_unknown.tar.gz"), "Tarball pax header key not allowed"),
+        (_build_pax_linkpath_tar_gz(tmp_path / "route_pax_linkpath.tar.gz"), "Tarball pax header key not allowed"),
+        (hdrcharset_tar, "Tarball entry has a non-UTF-8 member name"),
         (_build_pax_gnu_sparse_01_tar_gz(tmp_path / "route_sparse_01.tar.gz"), "Tarball pax header key not allowed"),
         (_build_old_gnu_sparse_tar_gz(tmp_path / "route_sparse_old.tar.gz"), "Tarball entry type not allowed"),
         (_build_pax_gnu_sparse_10_tar_gz(tmp_path / "route_sparse_10.tar.gz"), "Tarball pax header key not allowed"),
