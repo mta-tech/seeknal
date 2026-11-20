@@ -59,11 +59,17 @@ def _b64url_decode(s: str) -> bytes:
     if not isinstance(s, str) or not s or not B64URL_PATTERN.match(s):
         raise GrantTokenError("Invalid base64url segment")
     rem = len(s) % 4
+    if rem == 1:
+        raise GrantTokenError("Invalid base64url segment")
     padded = s + ("=" * ((4 - rem) % 4))
     try:
-        return base64.urlsafe_b64decode(padded.encode("ascii"))
+        data = base64.urlsafe_b64decode(padded.encode("ascii"))
     except Exception as exc:
         raise GrantTokenError("Failed to decode base64url segment") from exc
+    canonical = base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+    if canonical != s:
+        raise GrantTokenError("Invalid base64url segment")
+    return data
 
 
 def _parse_numeric_claim(val: Any, name: str) -> float:
