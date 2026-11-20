@@ -60,6 +60,13 @@ class PostgresSessionHardeningError(EngineError):
     """Raised when role guard or session hardening verification refuses a connection."""
 
 
+from seeknal.serving.lakebase_endpoint import (  # noqa: E402
+    ColdStartConnector,
+    EngineStartingError,
+    effective_storage_class,
+    role_guard_sql,
+    snapshot_freshness,
+)
 from seeknal.serving.postgres_session import (  # noqa: E402
     POSTGRES_WIRE_KINDS,
     PostgresAccountConfig,
@@ -70,23 +77,6 @@ from seeknal.serving.postgres_session import (  # noqa: E402
     is_postgres_wire,
     verify_and_harden_session,
 )
-
-try:
-    from seeknal.serving.lakebase_endpoint import (  # noqa: E402
-        ColdStartConnector,
-        EngineStartingError,
-        effective_storage_class,
-        role_guard_sql,
-        snapshot_freshness,
-    )
-except ImportError:
-    from seeknal.serving.postgres_session import (  # noqa: E402
-        ColdStartConnector,
-        EngineStartingError,
-        effective_storage_class,
-        role_guard_sql,
-        snapshot_freshness,
-    )
 
 
 @dataclass(frozen=True)

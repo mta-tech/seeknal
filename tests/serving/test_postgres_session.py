@@ -546,3 +546,28 @@ def test_engine_starting_error_and_effective_storage_class_exports():
     assert effective_storage_class(DummyConn("postgres", "object_storage")) == "object_storage"
     assert effective_storage_class(DummyConn("lakebase", lakebase=object())) == "object_storage"
     assert effective_storage_class(DummyConn("lakebase", lakebase=None)) == "unknown"
+
+
+def test_b_l4_postgres_session_raises_import_error_when_lakebase_endpoint_unimportable():
+    import importlib
+    import sys
+    import seeknal.serving as serving_pkg
+
+    orig_lb_ep = sys.modules.get("seeknal.serving.lakebase_endpoint")
+    orig_pg_sess = sys.modules.get("seeknal.serving.postgres_session")
+    try:
+        sys.modules["seeknal.serving.lakebase_endpoint"] = None  # type: ignore[assignment]
+        sys.modules.pop("seeknal.serving.postgres_session", None)
+        with pytest.raises(ImportError):
+            importlib.import_module("seeknal.serving.postgres_session")
+    finally:
+        if orig_lb_ep is not None:
+            sys.modules["seeknal.serving.lakebase_endpoint"] = orig_lb_ep
+        else:
+            sys.modules.pop("seeknal.serving.lakebase_endpoint", None)
+        if orig_pg_sess is not None:
+            sys.modules["seeknal.serving.postgres_session"] = orig_pg_sess
+            setattr(serving_pkg, "postgres_session", orig_pg_sess)
+        else:
+            sys.modules.pop("seeknal.serving.postgres_session", None)
+

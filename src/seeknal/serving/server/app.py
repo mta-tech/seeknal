@@ -79,18 +79,11 @@ from seeknal.serving.startup_validation import (
     run_initial_discovery_refresh_or_raise,
 )
 
-try:
-    from seeknal.serving.lakebase_endpoint import (
-        ColdStartConnector,
-        EngineStartingError,
-        effective_storage_class,
-    )
-except ImportError:
-    from seeknal.serving.postgres_session import (
-        ColdStartConnector,
-        EngineStartingError,
-        effective_storage_class,
-    )
+from seeknal.serving.lakebase_endpoint import (
+    ColdStartConnector,
+    EngineStartingError,
+    effective_storage_class,
+)
 
 logger = logging.getLogger(__name__)
 

@@ -32,6 +32,10 @@ from seeknal.serving.errors import register_config_secrets
 from seeknal.serving.grant_token import _load_public_key
 from seeknal.serving.ops import OpsConfig
 from seeknal.serving.placement import Placement, PlacementError, UniqueKeySafeLoader
+from seeknal.serving.lakebase_endpoint import (
+    effective_storage_class,
+    parse_lakebase_block,
+)
 from seeknal.serving.postgres_session import (
     PostgresAccountConfig,
     PostgresFreshnessConfig,
@@ -40,17 +44,6 @@ from seeknal.serving.postgres_session import (
     VALID_POSTGRES_MODES,
     VALID_SSLMODES,
 )
-
-try:
-    from seeknal.serving.lakebase_endpoint import (
-        effective_storage_class,
-        parse_lakebase_block,
-    )
-except ImportError:
-    from seeknal.serving.postgres_session import (
-        effective_storage_class,
-        parse_lakebase_block,
-    )
 
 logger = logging.getLogger(__name__)
 
