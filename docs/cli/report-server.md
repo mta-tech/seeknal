@@ -68,19 +68,34 @@ The server supports two auth modes controlled by the `SEEKNAL_REPORT_SERVER_AUTH
 
 | Mode | Description |
 |------|-------------|
-| `token` (default) | Requires `SEEKNAL_REPORT_SERVER_KEYS` — comma-separated list of valid tokens |
-| `open` | No authentication (development only) |
+| `api_key` (default) | Requires `SEEKNAL_REPORT_SERVER_KEYS` (comma-separated list of non-empty API keys). The server refuses to start without at least one configured key. |
+| `open` | Explicit opt-in with no authentication for local development only. Logs a warning at startup and must not be exposed beyond localhost. |
+
+> **Breaking change:** Earlier versions defaulted to `open`. Deployments that relied on unauthenticated publishing must now either configure `SEEKNAL_REPORT_SERVER_KEYS` (recommended) or explicitly opt in to `open` mode with `export SEEKNAL_REPORT_SERVER_AUTH_MODE=open`.
 
 ### Server-side configuration
 
 ```bash
-# Token-based auth (production)
-export SEEKNAL_REPORT_SERVER_AUTH_MODE=token
+# API-key auth (default; production)
+export SEEKNAL_REPORT_SERVER_AUTH_MODE=api_key
 export SEEKNAL_REPORT_SERVER_KEYS=my-secret-key-1,my-secret-key-2
 
-# Open mode (development only)
+# Open mode (explicit opt-in for local development only; do not expose beyond localhost)
 export SEEKNAL_REPORT_SERVER_AUTH_MODE=open
 ```
+
+### Upload limits
+
+| Environment variable | Default | Description |
+|----------------------|---------|-------------|
+| `SEEKNAL_REPORT_SERVER_MAX_UPLOAD_BYTES` | `104857600` (100 MiB) | Maximum compressed upload body size in bytes |
+| `SEEKNAL_REPORT_SERVER_MAX_TAR_MEMBERS` | `10000` | Maximum number of entries allowed in a report tarball |
+| `SEEKNAL_REPORT_SERVER_MAX_UNPACKED_BYTES` | `536870912` (512 MiB) | Maximum total uncompressed payload size in bytes (individual pax/GNU long headers are also capped at 64 KiB) |
+| `SEEKNAL_REPORT_SERVER_MAX_PATH_DEPTH` | `32` | Maximum path component depth for any tarball entry |
+| `SEEKNAL_REPORT_SERVER_MAX_MEMBER_NAME_LENGTH` | `1024` | Maximum character length for any tarball entry path |
+| `SEEKNAL_REPORT_SERVER_MAX_CONCURRENT_PUBLISHES` | `4` | Maximum concurrent `/publish` uploads and extractions |
+
+Oversized request bodies get `413`; archives that break a tarball cap get `400`; publish requests that exceed the concurrency limit get `503` with `Retry-After: 1`.
 
 ## Published Report URLs
 
