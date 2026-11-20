@@ -49,8 +49,6 @@ from seeknal.serving.audit import (
 from seeknal.serving.enforce import (
     EnforcementError,
     Grant,
-    apply_null_ordering,
-    enforce,
 )
 from seeknal.serving.errors import (
     ERROR_CATALOGUE,
@@ -78,11 +76,8 @@ from seeknal.serving.select_api import (
     compile_select_request,
 )
 from seeknal.serving.service import (
-    PARAM_MARKER_PATTERN,
     PreparedQuery,
     ServingPipeline,
-    _check_round_trip,
-    _extract_placeholder_index,
 )
 
 logger = logging.getLogger(__name__)
@@ -312,244 +307,6 @@ def _retry_after_header_value(exc: BaseException) -> str:
 
 def _reject_json_constant(_val: str) -> Any:
     raise ValueError("Invalid JSON constant")
-
-
-def _prepare_compiled_select_fallback(
-    pipeline: ServingPipeline,
-    raw_body: bytes,
-    grant: Grant,
-    compiled: CompiledSelect,
-) -> PreparedQuery:
-    """Execute routing, enforcement, rewrite, and parameter binding for CompiledSelect."""
-    with pipeline._lock:
-        placement = pipeline.placement
-        schemas = pipeline.schemas
-        router = pipeline.router
-
-    statement = compiled.statement.copy()
-    decision = router.decide_statement(
-        statement,
-        hint=compiled.hint,
-        max_staleness_seconds=compiled.max_staleness_seconds,
-    )
-    target_engine = placement.engines[decision.engine]
-    target_dialect = target_engine.dialect
-    target_kind = target_engine.kind
-
-    effective_max_rows = compiled.limit
-    tbl_entry = placement.find_table(compiled.table)
-    tbl_access = getattr(tbl_entry, "access", None) if tbl_entry is not None else None
-    acc_max_rows = (
-        getattr(tbl_access, "max_rows", None) if tbl_access is not None else None
-    )
-    if (
-        isinstance(acc_max_rows, int)
-        and not isinstance(acc_max_rows, bool)
-        and acc_max_rows > 0
-    ):
-        effective_max_rows = (
-            min(effective_max_rows, acc_max_rows)
-            if effective_max_rows is not None
-            else acc_max_rows
-        )
-
-    cube_mask_variants = {
-        c.name.lower(): c.mask_variants for c in placement.cubes.values()
-    }
-    cube_measures = {
-        c.name.lower(): set(c.measures) for c in placement.cubes.values()
-    }
-
-    raw_params = tuple(compiled.params)
-    enforced = enforce(
-        raw_body,
-        grant,
-        schemas=schemas,
-        target_dialect=target_dialect,
-        target_kind=target_kind,
-        dialect=grant.sql_dialect,
-        statement=statement,
-        max_rows=effective_max_rows,
-        cube_mode=pipeline.cube_mode,
-        cube_mask_variants=cube_mask_variants,
-        cube_measures=cube_measures,
-        params=raw_params,
-        on_row_cap=pipeline.on_row_cap,
-    )
-
-    router.rewrite(enforced.statement, decision.engine)
-    apply_null_ordering(enforced.statement, grant.sql_dialect, target_dialect)
-
-    if target_kind == "duckdb":
-        paramstyle = "qmark"
-    elif target_kind in ("starrocks", "lakebase", "postgres", "cube"):
-        paramstyle = "format"
-    else:
-        paramstyle = "format"
-
-    num_params = len(raw_params)
-    placeholder_nodes = list(
-        enforced.statement.find_all((exp.Parameter, exp.Placeholder))
-    )
-
-    if not placeholder_nodes:
-        if num_params > 0:
-            raise EnforcementError(
-                f"Provided {num_params} parameters, but SQL query contains no placeholders"
-            )
-        final_params: tuple[Any, ...] = ()
-        rendered_sql = enforced.statement.sql(dialect=target_dialect)
-        _check_round_trip(enforced.statement, rendered_sql, target_dialect)
-        if paramstyle == "format":
-            rendered_sql = rendered_sql.replace("%", "%%")
-        final_sql = rendered_sql
-    else:
-        marker_to_idx: dict[str, int] = {}
-        for i, node in enumerate(placeholder_nodes):
-            idx = _extract_placeholder_index(node)
-            if idx > num_params:
-                raise EnforcementError(
-                    f"Placeholder ${idx} has no matching parameter ({num_params} provided)"
-                )
-            marker = f"__SEEKNAL_PARAM_{i}__"
-            marker_to_idx[marker] = idx
-            node.replace(exp.var(marker))
-
-        used_indices = set(marker_to_idx.values())
-        for p_idx in range(1, num_params + 1):
-            if p_idx not in used_indices:
-                raise EnforcementError(
-                    f"Parameter ${p_idx} is never used in the query"
-                )
-
-        rendered_sql = enforced.statement.sql(dialect=target_dialect)
-        _check_round_trip(enforced.statement, rendered_sql, target_dialect)
-        matches = PARAM_MARKER_PATTERN.findall(rendered_sql)
-        ordered_indices = [marker_to_idx[m] for m in matches]
-        final_params = tuple(raw_params[idx - 1] for idx in ordered_indices)
-
-        if paramstyle == "format":
-            rendered_sql = rendered_sql.replace("%", "%%")
-            final_sql = PARAM_MARKER_PATTERN.sub("%s", rendered_sql)
-        else:
-            final_sql = PARAM_MARKER_PATTERN.sub("?", rendered_sql)
-
-    return PreparedQuery(
-        engine=decision.engine,
-        engine_kind=target_kind,
-        sql=final_sql,
-        params=final_params,
-        paramstyle=paramstyle,
-        rule=decision.rule,
-        reason=decision.reason,
-        row_limit=enforced.row_limit,
-        masked_columns=enforced.masked_columns,
-        redacted_sql=enforced.redacted_sql,
-        subject=grant.subject,
-        workspace=grant.workspace,
-        audit_id=grant.audit_id,
-        cube_security_context=enforced.cube_security_context,
-        workload=grant.workload,
-        binding=grant.binding,
-        expires_at=grant.expires_at,
-    )
-
-
-def _prepare_compiled_select_in_pipeline(
-    pipeline: ServingPipeline,
-    raw_body: bytes,
-    grant: Grant,
-    claims: Mapping[str, Any],
-    token: str,
-    compiled: CompiledSelect,
-) -> PreparedQuery:
-    """Delegate CompiledSelect to pipeline.prepare_statement when available, else fallback."""
-    prep_stmt_fn = getattr(pipeline, "prepare_statement", None)
-    if callable(prep_stmt_fn):
-        sig = inspect.signature(prep_stmt_fn)
-        pos_args: list[Any] = []
-        kw_args: dict[str, Any] = {}
-        can_bind = True
-        has_integrity_arg = False
-
-        for pname, param in sig.parameters.items():
-            if param.kind in (
-                inspect.Parameter.VAR_POSITIONAL,
-                inspect.Parameter.VAR_KEYWORD,
-            ):
-                continue
-
-            matched = True
-            val: Any = None
-            if pname in ("statement", "stmt", "ast", "parsed_statement"):
-                val = compiled.statement.copy()
-            elif pname in (
-                "sql",
-                "raw_sql",
-                "body",
-                "raw_body",
-                "integrity_input",
-                "payload_bytes",
-            ):
-                val = raw_body
-                has_integrity_arg = True
-            elif pname == "grant":
-                val = grant
-            elif pname == "claims":
-                val = claims
-            elif pname == "token":
-                val = token
-            elif pname == "params":
-                val = compiled.params
-            elif pname == "hint":
-                val = compiled.hint
-            elif pname == "max_staleness_seconds":
-                val = compiled.max_staleness_seconds
-            elif pname in ("max_rows", "limit", "request_max_rows"):
-                val = compiled.limit
-            elif pname == "expires_at":
-                val = grant.expires_at
-            elif pname == "audit_id":
-                val = grant.audit_id
-            elif pname == "subject":
-                val = grant.subject
-            elif pname in ("verified", "verified_grant") and hasattr(
-                pipeline, "verify_grant"
-            ):
-                val = pipeline.verify_grant(token)
-            else:
-                matched = False
-
-            if matched:
-                if param.kind == inspect.Parameter.POSITIONAL_ONLY:
-                    pos_args.append(val)
-                elif param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD:
-                    if not kw_args:
-                        pos_args.append(val)
-                    else:
-                        kw_args[pname] = val
-                elif param.kind == inspect.Parameter.KEYWORD_ONLY:
-                    kw_args[pname] = val
-            else:
-                if param.default is inspect.Parameter.empty:
-                    can_bind = False
-                    break
-
-        if can_bind:
-            try:
-                return prep_stmt_fn(*pos_args, **kw_args)
-            except EnforcementError as exc:
-                msg = str(exc)
-                if msg == "SQL query must be a string" or (
-                    not has_integrity_arg and "SQL SHA256 mismatch" in msg
-                ):
-                    pass
-                else:
-                    raise
-            except (AttributeError, TypeError):
-                pass
-
-    return _prepare_compiled_select_fallback(pipeline, raw_body, grant, compiled)
 
 
 def _safe_grant_invalid_message(exc: GrantTokenError) -> str | None:
@@ -3067,6 +2824,7 @@ def create_app(
             with pipeline._lock:
                 placement_snap = pipeline.placement
                 schemas_snap = pipeline.schemas
+                router_snap = pipeline.router
             comp = compile_select_request(
                 payload,
                 placement=placement_snap,
@@ -3076,13 +2834,17 @@ def create_app(
                 cursor_key=effective_cursor_key,
                 include_cursor_columns=bool(effective_cursor_key),
             )
-            prep = _prepare_compiled_select_in_pipeline(
-                pipeline,
-                raw_body,
-                grant,
-                claims,
-                token,
-                comp,
+            prep = pipeline.prepare_statement(
+                statement=comp.statement.copy(),
+                grant=grant,
+                sql=raw_body,
+                params=comp.params,
+                hint=comp.hint,
+                max_staleness_seconds=comp.max_staleness_seconds,
+                max_rows=comp.limit,
+                api="select.v1",
+                metrics=metrics,
+                _snapshot=(placement_snap, schemas_snap, router_snap),
             )
             return comp, prep
 

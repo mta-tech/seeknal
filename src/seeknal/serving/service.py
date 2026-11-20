@@ -327,16 +327,20 @@ class ServingPipeline:
                 )
 
             if sql is None:
-                enforce_sql_input = statement.sql(dialect=grant.sql_dialect)
+                enforce_sql_input: str | bytes = statement.sql(
+                    dialect=grant.sql_dialect
+                )
             elif isinstance(sql, str):
                 enforce_sql_input = sql
             elif isinstance(sql, (bytes, bytearray, memoryview)):
+                raw_sql_bytes = bytes(sql)
                 try:
-                    enforce_sql_input = bytes(sql).decode("utf-8")
+                    raw_sql_bytes.decode("utf-8")
                 except UnicodeDecodeError as exc:
                     raise EnforcementError(
                         "Request payload must be valid UTF-8", code="invalid_sql"
                     ) from exc
+                enforce_sql_input = raw_sql_bytes
             else:
                 raise EnforcementError("SQL query must be a string", code="invalid_sql")
 

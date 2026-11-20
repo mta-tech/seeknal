@@ -370,22 +370,13 @@ def test_select_propagates_filter_required_and_engine_starting(ec_keys, monkeypa
                     "Selective filter required on filter table",
                     code="filter_required",
                 )
-            from seeknal.serving.http import _prepare_compiled_select_fallback
-            from seeknal.serving.select_api import CompiledSelect
-
-            comp = CompiledSelect(
-                table="cbn.rpt.rpt_txn_detail",
-                columns=("txn_id",),
-                projected_columns=("txn_id",),
-                extra_cursor_columns=(),
+            return super().prepare_statement(
                 statement=statement,
-                sql=statement.sql(dialect="postgres"),
-                params=tuple(params),
-                order_spec=(("txn_id", "asc"),),
-                limit=kwargs.get("max_rows"),
-                paged=False,
+                grant=grant,
+                sql=sql,
+                params=params,
+                **kwargs,
             )
-            return _prepare_compiled_select_fallback(self, sql, grant, comp)
 
     class WakingAdapter:
         def execute(self, prepared, *, timeout_seconds: float):
@@ -456,3 +447,67 @@ def test_select_propagates_filter_required_and_engine_starting(ec_keys, monkeypa
     body = r_wake.json()
     assert body["code"] == "engine_starting"
     assert body["audit_id"] == "jti-wake-1"
+
+
+@pytest.mark.parametrize("exc_cls", [TypeError, AttributeError])
+def test_select_never_falls_open_on_prepare_statement_error(ec_keys, exc_cls):
+    priv, pub = ec_keys
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "cbn.rpt.rpt_txn_detail": {
+                    "keys": ["txn_id"],
+                    "row_count": 10,
+                    "serve": {"duck": "rpt_txn_detail"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    schemas = {"cbn.rpt.rpt_txn_detail": ["txn_id", "customer_id", "amount"]}
+    adapter_called = False
+
+    class BrokenPipeline(ServingPipeline):
+        def prepare_statement(self, *args, **kwargs):
+            raise exc_cls("boom inside prepare_statement")
+
+    class SpyAdapter:
+        def execute(self, prepared, *, timeout_seconds: float):
+            nonlocal adapter_called
+            adapter_called = True
+            raise AssertionError("Adapter must never run when prepare_statement fails")
+
+    pipeline = BrokenPipeline(
+        placement=placement,
+        schemas=schemas,
+        public_keys={"k1": pub},
+    )
+    client = TestClient(
+        create_app(pipeline, {"duck": SpyAdapter()}, cursor_key=CURSOR_KEY)
+    )
+    raw = json.dumps(
+        {"table": "cbn.rpt.rpt_txn_detail", "columns": ["txn_id"]}
+    ).encode("utf-8")
+    tok = _mint_select_grant(
+        priv,
+        raw,
+        jti=f"jti-failclosed-{exc_cls.__name__}",
+        tables={
+            "cbn.rpt.rpt_txn_detail": {
+                "columns": ["txn_id", "customer_id", "amount"],
+                "masks": {},
+                "row_filters": [],
+                "actions": ["select"],
+            }
+        },
+    )
+    resp = client.post(
+        "/v1/select",
+        headers={"Authorization": f"Bearer {tok}"},
+        content=raw,
+    )
+    assert resp.status_code == 500
+    assert resp.json()["code"] == "internal_error"
+    assert adapter_called is False
+
