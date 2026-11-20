@@ -185,6 +185,7 @@ class FakePostgresCatalog:
         self.role: FakeRoleInfo = FakeRoleInfo()
         self.session_role: FakeRoleInfo | None = None
         self.member_roles: list[FakeRoleInfo] = []
+        self.unforced_rls_owned_tables: list[tuple[str, str]] = []
         self.sync_tables: dict[str, list[FakeSyncStateRow]] = {
             "public._lakebase_sync_state": [],
         }
@@ -225,6 +226,9 @@ class FakePostgresCatalog:
         )
         self.relations.append(rel)
         return rel
+
+    def add_unforced_rls_owned_table(self, schema: str, table: str) -> None:
+        self.unforced_rls_owned_tables.append((schema, table))
 
     def add_column(
         self,
@@ -720,8 +724,14 @@ class FakePostgresCursor:
                 "cannot execute write statement in a read-only transaction (SQLSTATE 25006)"
             )
 
-        # 4. Role guard queries (pg_roles / pg_has_role)
+        # 4. Role guard & unforced-RLS ownership queries
         lower_sql = stripped.lower()
+        if "relrowsecurity" in lower_sql:
+            self.description = _make_description(["nspname", "relname"])
+            self._rows = list(sorted(cat.unforced_rls_owned_tables))
+            self.rowcount = len(self._rows)
+            return
+
         if "pg_roles" in lower_sql or "rolsuper" in lower_sql or "pg_has_role" in lower_sql:
             candidate_roles: list[FakeRoleInfo] = [cat.role]
             if "session_user" in lower_sql and cat.session_role is not None:
@@ -734,7 +744,7 @@ class FakePostgresCursor:
             eff_neon = any(r.neon_superuser for r in candidate_roles)
             has_super = "rolsuper" in lower_sql
             has_bypass = "rolbypassrls" in lower_sql
-            has_neon = "neon_superuser" in lower_sql
+            in_match = re.search(r"r\.rolname\s+in\s*\(([^)]*)\)", stripped, re.IGNORECASE)
             cols: list[str] = []
             vals: list[Any] = []
             if has_super:
@@ -743,7 +753,17 @@ class FakePostgresCursor:
             if has_bypass:
                 cols.append("rolbypassrls")
                 vals.append(eff_bypass)
-            if has_neon:
+            if in_match is not None:
+                denied_set = {
+                    m.group(1)
+                    for m in re.finditer(r"'([^']+)'", in_match.group(1))
+                }
+                eff_denied = any(r.rolname in denied_set for r in candidate_roles) or (
+                    "neon_superuser" in denied_set and eff_neon
+                )
+                cols.append("is_denied_role")
+                vals.append(eff_denied)
+            elif "neon_superuser" in lower_sql:
                 cols.append("neon_superuser")
                 vals.append(eff_neon)
             if not cols:

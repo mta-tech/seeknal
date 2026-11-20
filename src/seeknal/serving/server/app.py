@@ -81,6 +81,7 @@ from seeknal.serving.startup_validation import (
 
 from seeknal.serving.lakebase_endpoint import (
     ColdStartConnector,
+    DEFAULT_DENY_ROLES,
     EngineStartingError,
     effective_storage_class,
 )
@@ -777,6 +778,9 @@ def _make_postgres_wire_connect(
                 read_only=read_only,
                 session=conn_cfg.session,
                 role_guard=conn_cfg.role_guard,
+                deny_roles=getattr(
+                    conn_cfg, "role_guard_deny_roles", DEFAULT_DENY_ROLES
+                ),
                 is_legacy_lakebase=is_legacy,
             )
         return conn

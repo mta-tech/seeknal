@@ -1006,3 +1006,81 @@ def test_live_cold_start_simulation_with_pg_ctl_stop_and_start(
         assert payload == {"ready": False, "engines": {"lb_sim": "starting"}}
     finally:
         cluster.start()
+
+
+def test_live_unforced_rls_table_ownership_emits_warning_until_forced(
+    seeded_cbn_cluster: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    bi_probe = psycopg2.connect(seeded_cbn_cluster["bi_dsn"], connect_timeout=5)
+    try:
+        with bi_probe.cursor() as bcur:
+            bcur.execute("SELECT current_user")
+            bi_role = bcur.fetchone()[0]
+    finally:
+        bi_probe.close()
+
+    admin_conn = psycopg2.connect(seeded_cbn_cluster["super_dsn"], connect_timeout=5)
+    admin_conn.autocommit = True
+    try:
+        with admin_conn.cursor() as acur:
+            acur.execute("DROP TABLE IF EXISTS rpt.b_l5_unforced_rls_test")
+            acur.execute("CREATE TABLE rpt.b_l5_unforced_rls_test (id INT PRIMARY KEY)")
+            acur.execute(
+                pgsql.SQL("ALTER TABLE rpt.b_l5_unforced_rls_test OWNER TO {}").format(
+                    pgsql.Identifier(bi_role)
+                )
+            )
+            acur.execute(
+                "ALTER TABLE rpt.b_l5_unforced_rls_test ENABLE ROW LEVEL SECURITY"
+            )
+
+        # 1. RLS enabled without FORCE ROW LEVEL SECURITY -> warns without failing
+        caplog.clear()
+        bi_conn_warn = psycopg2.connect(seeded_cbn_cluster["bi_dsn"], connect_timeout=5)
+        try:
+            with caplog.at_level(
+                logging.WARNING, logger="seeknal.serving.postgres_session"
+            ):
+                verify_and_harden_session(
+                    bi_conn_warn, kind="postgres", role_guard=True
+                )
+            assert bi_conn_warn.closed == 0
+            assert any(
+                "rpt.b_l5_unforced_rls_test" in r.getMessage()
+                and "FORCE ROW LEVEL SECURITY" in r.getMessage()
+                for r in caplog.records
+            )
+        finally:
+            bi_conn_warn.close()
+
+        # 2. Enabling FORCE ROW LEVEL SECURITY clears the warning
+        with admin_conn.cursor() as acur:
+            acur.execute(
+                "ALTER TABLE rpt.b_l5_unforced_rls_test FORCE ROW LEVEL SECURITY"
+            )
+
+        caplog.clear()
+        bi_conn_ok = psycopg2.connect(seeded_cbn_cluster["bi_dsn"], connect_timeout=5)
+        try:
+            with caplog.at_level(
+                logging.WARNING, logger="seeknal.serving.postgres_session"
+            ):
+                verify_and_harden_session(
+                    bi_conn_ok, kind="postgres", role_guard=True
+                )
+            assert bi_conn_ok.closed == 0
+            assert not any(
+                "rpt.b_l5_unforced_rls_test" in r.getMessage()
+                for r in caplog.records
+            )
+        finally:
+            bi_conn_ok.close()
+    finally:
+        try:
+            with admin_conn.cursor() as acur:
+                acur.execute("DROP TABLE IF EXISTS rpt.b_l5_unforced_rls_test")
+        finally:
+            admin_conn.close()
+

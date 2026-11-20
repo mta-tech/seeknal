@@ -453,6 +453,75 @@ def test_role_guard_config_rules(base_cfg, caplog):
     with pytest.raises(ServerConfigError, match="role_guard"):
         ServerConfig.from_dict(d_lb_blk)
 
+    # 3. role_guard mapping with configurable deny_roles (B-L5)
+    from seeknal.serving.lakebase_endpoint import DEFAULT_DENY_ROLES
+
+    d_map = copy.deepcopy(base_cfg)
+    d_map["connections"] = {
+        "pg_custom": {
+            "kind": "postgres",
+            "dsn_env": "PG_DSN",
+            "role_guard": {
+                "enabled": True,
+                "deny_roles": ["rds_superuser", "tenant-dba", "rds_superuser"],
+            },
+        },
+        "lb_custom": {
+            "kind": "lakebase",
+            "dsn_env": "LB_DSN",
+            "role_guard": {"deny_roles": ["neon_superuser", "custom_lb_admin"]},
+            "tls": {"sslmode": "verify-full", "sslrootcert_file": "/etc/ca.pem"},
+            "lakebase": _valid_lakebase_block(),
+        },
+        "pg_default_rg": {
+            "kind": "postgres",
+            "dsn_env": "PG_DSN",
+        },
+    }
+    cfg_map = ServerConfig.from_dict(d_map)
+    assert cfg_map.connections["pg_custom"].role_guard is True
+    assert cfg_map.connections["pg_custom"].role_guard_deny_roles == (
+        "rds_superuser",
+        "tenant-dba",
+    )
+    assert cfg_map.connections["lb_custom"].role_guard is True
+    assert cfg_map.connections["lb_custom"].role_guard_deny_roles == (
+        "neon_superuser",
+        "custom_lb_admin",
+    )
+    assert (
+        cfg_map.connections["pg_default_rg"].role_guard_deny_roles
+        == DEFAULT_DENY_ROLES
+    )
+
+    # Disabling via mapping on lakebase is still refused
+    d_lb_map_off = copy.deepcopy(base_cfg)
+    d_lb_map_off["connections"] = {
+        "lb": {
+            "kind": "lakebase",
+            "dsn_env": "LB_DSN",
+            "role_guard": {"enabled": False},
+        }
+    }
+    with pytest.raises(ServerConfigError, match="role_guard"):
+        ServerConfig.from_dict(d_lb_map_off)
+
+    # Unsafe / secret-like deny_roles rejected without echoing secret
+    d_bad_dr = copy.deepcopy(base_cfg)
+    planted_dr_sec = "CANARY_DENY_ROLE_SECRET_9911"
+    d_bad_dr["connections"] = {
+        "pg_bad": {
+            "kind": "postgres",
+            "dsn_env": "PG_DSN",
+            "role_guard": {
+                "deny_roles": [f"bad'; DROP ROLE x;--{planted_dr_sec}"]
+            },
+        }
+    }
+    with pytest.raises(ServerConfigError, match="deny_roles") as exc_dr:
+        ServerConfig.from_dict(d_bad_dr)
+    assert planted_dr_sec not in str(exc_dr.value)
+
 
 def test_storage_class_on_other_engines_and_cursor_key_env(base_cfg, tmp_path):
     ext_dir = tmp_path / "empty_exts"

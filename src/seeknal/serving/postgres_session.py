@@ -2,10 +2,30 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+import logging
 import math
 import re
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+UNFORCED_RLS_OWNER_SQL = (
+    "SELECT n.nspname, c.relname "
+    "FROM pg_catalog.pg_class AS c "
+    "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+    "WHERE c.relkind IN ('r', 'p') "
+    "AND c.relrowsecurity = TRUE "
+    "AND c.relforcerowsecurity = FALSE "
+    "AND n.nspname NOT LIKE 'pg_%' "
+    "AND n.nspname <> 'information_schema' "
+    "AND ("
+    "pg_catalog.pg_has_role(current_user, c.relowner, 'USAGE') "
+    "OR pg_catalog.pg_has_role(session_user, c.relowner, 'USAGE')"
+    ") "
+    "ORDER BY n.nspname, c.relname"
+)
 
 POSTGRES_WIRE_KINDS: frozenset[str] = frozenset({"postgres", "lakebase"})
 VALID_POSTGRES_MODES: frozenset[str] = frozenset({"read_only", "read_write"})
@@ -273,6 +293,31 @@ def _close_quietly(obj: Any) -> None:
             pass
 
 
+def _warn_unforced_rls_owned_tables(cur: Any) -> None:
+    fetchall_fn = getattr(cur, "fetchall", None)
+    if not callable(fetchall_fn):
+        return
+    try:
+        cur.execute(UNFORCED_RLS_OWNER_SQL)
+        rows = fetchall_fn()
+    except Exception:
+        return
+    if not rows or not isinstance(rows, (list, tuple)):
+        return
+    safe_tables: list[str] = []
+    for r in rows:
+        if isinstance(r, (tuple, list)) and len(r) >= 2:
+            nsp, rel = r[0], r[1]
+            if isinstance(nsp, str) and isinstance(rel, str) and nsp and rel:
+                safe_tables.append(f"{nsp}.{rel}")
+    if safe_tables:
+        logger.warning(
+            "Serving role owns table(s) with ROW LEVEL SECURITY enabled without "
+            "FORCE ROW LEVEL SECURITY (table owner bypasses unforced RLS): %s",
+            ", ".join(safe_tables),
+        )
+
+
 def verify_and_harden_session(
     conn: Any,
     *,
@@ -280,6 +325,7 @@ def verify_and_harden_session(
     read_only: bool = False,
     session: PostgresSessionConfig | None = None,
     role_guard: bool = True,
+    deny_roles: Sequence[str] | None = None,
     is_legacy_lakebase: bool = False,
 ) -> None:
     """Verify role guard and session hardening on a newly opened connection.
@@ -296,13 +342,15 @@ def verify_and_harden_session(
     if not should_check_role and session is None:
         return
 
+    eff_deny_roles = DEFAULT_DENY_ROLES if deny_roles is None else deny_roles
+
     cur: Any = None
     ran_sets = False
     try:
         cur = conn.cursor()
 
         if should_check_role:
-            cur.execute(role_guard_sql(kind))
+            cur.execute(role_guard_sql(kind, deny_roles=eff_deny_roles))
             row = _fetch_one_row(cur)
             if isinstance(row, (tuple, list)):
                 if len(row) < 2:
@@ -310,6 +358,7 @@ def verify_and_harden_session(
                 for col_val in row:
                     if _pg_bool_is_true(col_val):
                         raise PostgresSessionHardeningError("Role guard refused connection")
+                _warn_unforced_rls_owned_tables(cur)
             else:
                 if not (is_legacy_lakebase and session is None):
                     raise PostgresSessionHardeningError("Role guard refused connection")
@@ -426,16 +475,19 @@ def begin_query_transaction(
 
 from seeknal.serving.lakebase_endpoint import (  # noqa: E402
     ColdStartConnector,
+    DEFAULT_DENY_ROLES,
     EngineStartingError,
     LakebaseEndpointConfig,
     effective_storage_class,
     parse_lakebase_block,
     role_guard_sql,
     snapshot_freshness,
+    validate_deny_roles,
 )
 
 __all__ = [
     "ColdStartConnector",
+    "DEFAULT_DENY_ROLES",
     "EngineStartingError",
     "LakebaseEndpointConfig",
     "POSTGRES_WIRE_KINDS",
@@ -443,6 +495,7 @@ __all__ = [
     "PostgresFreshnessConfig",
     "PostgresSessionConfig",
     "PostgresTLSConfig",
+    "UNFORCED_RLS_OWNER_SQL",
     "VALID_POSTGRES_MODES",
     "VALID_SSLMODES",
     "begin_query_transaction",
@@ -452,5 +505,6 @@ __all__ = [
     "parse_lakebase_block",
     "role_guard_sql",
     "snapshot_freshness",
+    "validate_deny_roles",
     "verify_and_harden_session",
 ]

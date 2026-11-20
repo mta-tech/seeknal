@@ -33,8 +33,10 @@ from seeknal.serving.grant_token import _load_public_key
 from seeknal.serving.ops import OpsConfig
 from seeknal.serving.placement import Placement, PlacementError, UniqueKeySafeLoader
 from seeknal.serving.lakebase_endpoint import (
+    DEFAULT_DENY_ROLES,
     effective_storage_class,
     parse_lakebase_block,
+    validate_deny_roles,
 )
 from seeknal.serving.postgres_session import (
     PostgresAccountConfig,
@@ -844,9 +846,46 @@ def _parse_postgres_wire_connection(
     at_f = _pos_timeout("acquire_timeout_seconds", 5.0)
 
     # role_guard
-    role_guard = eng_spec.get("role_guard", True)
-    if not isinstance(role_guard, bool):
-        raise ServerConfigError(f"{ctx} 'role_guard' must be a boolean")
+    raw_role_guard = eng_spec.get("role_guard", True)
+    if isinstance(raw_role_guard, bool):
+        role_guard = raw_role_guard
+        role_guard_deny_roles = DEFAULT_DENY_ROLES
+    elif isinstance(raw_role_guard, Mapping):
+        unknown_rg = set(raw_role_guard.keys()) - {"enabled", "deny_roles"}
+        if unknown_rg:
+            safe_rg_keys = ", ".join(
+                _safe_label(str(k)) for k in sorted(unknown_rg, key=str)
+            )
+            raise ServerConfigError(
+                f"Unknown key(s) in {ctx} 'role_guard': {safe_rg_keys}"
+            )
+        enabled_raw = raw_role_guard.get("enabled", True)
+        if not isinstance(enabled_raw, bool):
+            raise ServerConfigError(
+                f"{ctx} 'role_guard.enabled' must be a boolean"
+            )
+        role_guard = enabled_raw
+        if "deny_roles" in raw_role_guard and raw_role_guard["deny_roles"] is not None:
+            dr_val = raw_role_guard["deny_roles"]
+            if isinstance(dr_val, Sequence) and not isinstance(
+                dr_val, (str, bytes, bytearray, Mapping)
+            ):
+                for item in dr_val:
+                    if isinstance(item, str) and _SUSPICIOUS_TOKEN_RE.search(item):
+                        raise ServerConfigError(
+                            f"{ctx} 'role_guard.deny_roles' entries must match "
+                            "^[A-Za-z_][A-Za-z0-9_-]{0,62}$"
+                        )
+            role_guard_deny_roles = validate_deny_roles(
+                dr_val,
+                error_cls=ServerConfigError,
+            )
+        else:
+            role_guard_deny_roles = DEFAULT_DENY_ROLES
+    else:
+        raise ServerConfigError(
+            f"{ctx} 'role_guard' must be a boolean or a mapping"
+        )
     if kind == "lakebase" and role_guard is False:
         raise ServerConfigError(
             f"Lakebase connection '{safe_eng}' cannot disable 'role_guard'"
@@ -984,6 +1023,7 @@ def _parse_postgres_wire_connection(
             session=session_cfg,
             tls=tls_cfg,
             role_guard=role_guard,
+            role_guard_deny_roles=role_guard_deny_roles,
             storage_class=storage_class_clean,
             freshness=freshness_cfg,
         )
@@ -1003,6 +1043,7 @@ def _parse_postgres_wire_connection(
         session=session_cfg,
         tls=tls_cfg,
         role_guard=role_guard,
+        role_guard_deny_roles=role_guard_deny_roles,
         storage_class=storage_class_clean,
         lakebase=lakebase_cfg,
         freshness=freshness_cfg,
@@ -1128,6 +1169,7 @@ class PostgresConnectionConfig:
     session: PostgresSessionConfig | None = None
     tls: PostgresTLSConfig | None = None
     role_guard: bool = True
+    role_guard_deny_roles: tuple[str, ...] = DEFAULT_DENY_ROLES
     storage_class: str | None = None
     freshness: PostgresFreshnessConfig | None = None
 
@@ -1152,6 +1194,7 @@ class LakebaseConnectionConfig:
     session: PostgresSessionConfig | None = None
     tls: PostgresTLSConfig | None = None
     role_guard: bool = True
+    role_guard_deny_roles: tuple[str, ...] = DEFAULT_DENY_ROLES
     storage_class: str | None = None
     lakebase: Any = None
     freshness: Any = None

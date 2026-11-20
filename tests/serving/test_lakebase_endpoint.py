@@ -584,15 +584,23 @@ class TestEffectiveStorageClass:
 
 class TestRoleGuard:
     def test_role_guard_sql_variants(self) -> None:
+        from seeknal.serving.lakebase_endpoint import DEFAULT_DENY_ROLES
+
+        assert DEFAULT_DENY_ROLES == (
+            "neon_superuser",
+            "rds_superuser",
+            "cloudsqlsuperuser",
+            "azure_pg_admin",
+        )
+
         lb_sql = role_guard_sql("lakebase")
         assert "rolsuper" in lb_sql
         assert "rolbypassrls" in lb_sql
         assert "session_user" in lb_sql
         assert "pg_has_role(current_user, r.oid, 'MEMBER')" in lb_sql
         assert "pg_has_role(session_user, r.oid, 'MEMBER')" in lb_sql
-        assert "CASE WHEN EXISTS" in lb_sql
-        assert "pg_has_role(current_user, 'neon_superuser', 'MEMBER')" in lb_sql
-        assert "pg_has_role(session_user, 'neon_superuser', 'MEMBER')" in lb_sql
+        for denied in DEFAULT_DENY_ROLES:
+            assert f"'{denied}'" in lb_sql
 
         pg_sql = role_guard_sql("postgres")
         assert "rolsuper" in pg_sql
@@ -600,10 +608,62 @@ class TestRoleGuard:
         assert "session_user" in pg_sql
         assert "pg_has_role(current_user, r.oid, 'MEMBER')" in pg_sql
         assert "pg_has_role(session_user, r.oid, 'MEMBER')" in pg_sql
-        assert "neon_superuser" not in pg_sql
+        for denied in DEFAULT_DENY_ROLES:
+            assert f"'{denied}'" in pg_sql
+
+        empty_deny_sql = role_guard_sql("postgres", deny_roles=())
+        assert "neon_superuser" not in empty_deny_sql
+        assert "rds_superuser" not in empty_deny_sql
+
+        custom_sql = role_guard_sql(
+            "postgres", deny_roles=("custom_dba_role", "tenant-admin")
+        )
+        assert "'custom_dba_role'" in custom_sql
+        assert "'tenant-admin'" in custom_sql
+        assert "neon_superuser" not in custom_sql
 
         with pytest.raises(ValueError):
             role_guard_sql("duckdb")
+        with pytest.raises(ValueError):
+            role_guard_sql("postgres", deny_roles=("bad'; DROP TABLE x; --",))
+
+    def test_check_role_guard_refuses_default_and_custom_deny_roles(self) -> None:
+        from tests.serving.fake_postgres_catalog import FakePostgresCatalog, FakeRoleInfo
+
+        for cloud_admin in (
+            "neon_superuser",
+            "rds_superuser",
+            "cloudsqlsuperuser",
+            "azure_pg_admin",
+        ):
+            cat = FakePostgresCatalog()
+            cat.set_role(
+                rolname="app_login",
+                member_roles=[FakeRoleInfo(rolname=cloud_admin)],
+            )
+            conn = cat.connect()
+            with pytest.raises(EngineError, match="Role guard refused connection"):
+                check_role_guard(conn, "postgres")
+            assert conn.closed is True
+
+        # Custom deny_roles refuses custom role and allows when not in deny_roles
+        cat_custom = FakePostgresCatalog()
+        cat_custom.set_role(
+            rolname="app_login",
+            member_roles=[FakeRoleInfo(rolname="platform_dba")],
+        )
+        conn_allowed = cat_custom.connect()
+        check_role_guard(conn_allowed, "postgres")
+        assert conn_allowed.closed is False
+
+        conn_denied = cat_custom.connect()
+        with pytest.raises(EngineError, match="Role guard refused connection"):
+            check_role_guard(
+                conn_denied,
+                "postgres",
+                deny_roles=("platform_dba", "rds_superuser"),
+            )
+        assert conn_denied.closed is True
 
     def test_check_role_guard_refuses_session_user_and_inherited_role_memberships(
         self,

@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ColdStartConnector",
+    "DEFAULT_DENY_ROLES",
     "EngineStartingError",
     "LakebaseColdStartConfig",
     "LakebaseEndpointConfig",
@@ -37,6 +38,7 @@ __all__ = [
     "parse_lakebase_block",
     "role_guard_sql",
     "snapshot_freshness",
+    "validate_deny_roles",
     "validate_lakebase_tls",
 ]
 
@@ -48,6 +50,14 @@ _QUALIFIED_TABLE_RE = re.compile(
     r"\A[a-z_][a-z0-9_]{0,62}(?:\.[a-z_][a-z0-9_]{0,62})?\Z"
 )
 _SAFE_LABEL_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,80}\Z")
+_DENY_ROLE_IDENT_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_-]{0,62}\Z")
+
+DEFAULT_DENY_ROLES: tuple[str, ...] = (
+    "neon_superuser",
+    "rds_superuser",
+    "cloudsqlsuperuser",
+    "azure_pg_admin",
+)
 
 _DEFAULT_SYNC_STATE_TABLE = "public._lakebase_sync_state"
 _DEFAULT_RETRY_BACKOFF_MS: tuple[int, ...] = (500, 1000, 2000, 4000)
@@ -682,38 +692,67 @@ def effective_storage_class(conn_cfg: Any) -> str:
     raise ValueError(f"Unsupported connection kind '{_safe_label(kind_norm)}'")
 
 
-def role_guard_sql(kind: str) -> str:
+def validate_deny_roles(
+    deny_roles: Sequence[str],
+    *,
+    error_cls: type[Exception] = ValueError,
+) -> tuple[str, ...]:
+    """Validate and normalize ``deny_roles`` to a deduplicated tuple of safe role identifiers."""
+    if isinstance(deny_roles, (str, bytes, bytearray, Mapping)) or not isinstance(
+        deny_roles, Sequence
+    ):
+        raise error_cls("'deny_roles' must be a sequence of role name strings")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in deny_roles:
+        if not isinstance(item, str):
+            raise error_cls(
+                "'deny_roles' entries must be non-empty safe role identifiers"
+            )
+        role = item.strip()
+        if not role or not _DENY_ROLE_IDENT_RE.fullmatch(role):
+            raise error_cls(
+                "'deny_roles' entries must match ^[A-Za-z_][A-Za-z0-9_-]{0,62}$"
+            )
+        if role not in seen:
+            seen.add(role)
+            cleaned.append(role)
+    return tuple(cleaned)
+
+
+def role_guard_sql(
+    kind: str,
+    *,
+    deny_roles: Sequence[str] = DEFAULT_DENY_ROLES,
+) -> str:
     """Return the startup/pool role-guard verification SQL for ``kind``."""
     if not isinstance(kind, str):
         raise ValueError("kind must be 'lakebase' or 'postgres'")
     kind_norm = kind.strip()
-    if kind_norm == "lakebase":
+    if kind_norm not in ("lakebase", "postgres"):
+        raise ValueError(
+            f"Unsupported connection kind '{_safe_label(kind_norm)}' for role_guard_sql; "
+            "expected 'lakebase' or 'postgres'"
+        )
+    cleaned_deny = validate_deny_roles(deny_roles, error_cls=ValueError)
+    if cleaned_deny:
+        roles_list_sql = ", ".join(f"'{r}'" for r in cleaned_deny)
         return (
             "SELECT COALESCE(BOOL_OR(r.rolsuper), FALSE) AS rolsuper, "
             "COALESCE(BOOL_OR(r.rolbypassrls), FALSE) AS rolbypassrls, "
-            "CASE WHEN EXISTS ("
-            "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'neon_superuser'"
-            ") THEN ("
-            "pg_has_role(current_user, 'neon_superuser', 'MEMBER') "
-            "OR pg_has_role(session_user, 'neon_superuser', 'MEMBER')"
-            ") ELSE FALSE END AS is_neon_superuser "
+            f"COALESCE(BOOL_OR(r.rolname IN ({roles_list_sql})), FALSE) AS is_denied_role "
             "FROM pg_catalog.pg_roles AS r "
             "WHERE r.rolname IN (current_user, session_user) "
             "OR pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER') "
             "OR pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER')"
         )
-    if kind_norm == "postgres":
-        return (
-            "SELECT COALESCE(BOOL_OR(r.rolsuper), FALSE) AS rolsuper, "
-            "COALESCE(BOOL_OR(r.rolbypassrls), FALSE) AS rolbypassrls "
-            "FROM pg_catalog.pg_roles AS r "
-            "WHERE r.rolname IN (current_user, session_user) "
-            "OR pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER') "
-            "OR pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER')"
-        )
-    raise ValueError(
-        f"Unsupported connection kind '{_safe_label(kind_norm)}' for role_guard_sql; "
-        "expected 'lakebase' or 'postgres'"
+    return (
+        "SELECT COALESCE(BOOL_OR(r.rolsuper), FALSE) AS rolsuper, "
+        "COALESCE(BOOL_OR(r.rolbypassrls), FALSE) AS rolbypassrls "
+        "FROM pg_catalog.pg_roles AS r "
+        "WHERE r.rolname IN (current_user, session_user) "
+        "OR pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER') "
+        "OR pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER')"
     )
 
 
@@ -726,10 +765,14 @@ def _safe_close_conn(conn: Any) -> None:
         pass
 
 
-def check_role_guard(conn: Any, kind: str) -> None:
+def check_role_guard(
+    conn: Any,
+    kind: str,
+    *,
+    deny_roles: Sequence[str] = DEFAULT_DENY_ROLES,
+) -> None:
     """Execute role guard query on ``conn`` and fail closed if privileged flags are set."""
-    sql = role_guard_sql(kind)
-    kind_norm = kind.strip()
+    sql = role_guard_sql(kind, deny_roles=deny_roles)
     row: Any = None
     cursor: Any = None
     try:
@@ -754,9 +797,9 @@ def check_role_guard(conn: Any, kind: str) -> None:
 
     has_rolsuper = bool(row[0])
     has_bypassrls = bool(row[1])
-    has_neon_superuser = bool(row[2]) if (kind_norm == "lakebase" and len(row) > 2) else False
+    has_denied_role = any(bool(v) for v in row[2:])
 
-    if has_rolsuper or has_bypassrls or has_neon_superuser:
+    if has_rolsuper or has_bypassrls or has_denied_role:
         _safe_close_conn(conn)
         raise PostgresSessionHardeningError(_ROLE_GUARD_REFUSED_MSG)
 

@@ -29,6 +29,7 @@ class ScriptedCursor:
         self.conn = conn
         self.closed = False
         self._pending_row: Any = None
+        self._pending_rows: list[Any] = []
 
     def execute(self, sql: str, params: Any = None) -> None:
         if self.conn.closed:
@@ -37,7 +38,13 @@ class ScriptedCursor:
             raise self.conn.fail_on_execute
         self.conn.executed.append((sql, params))
         sql_norm = " ".join(sql.strip().split())
-        if "pg_roles" in sql_norm:
+        self._pending_rows = []
+        if "relrowsecurity" in sql_norm:
+            self._pending_rows = list(self.conn.unforced_rls_rows)
+            self._pending_row = (
+                self._pending_rows[0] if self._pending_rows else None
+            )
+        elif "pg_roles" in sql_norm:
             self._pending_row = self.conn.role_row
         elif sql_norm.upper().startswith("SHOW "):
             guc = sql_norm.split()[1].lower()
@@ -47,6 +54,9 @@ class ScriptedCursor:
 
     def fetchone(self) -> Any:
         return self._pending_row
+
+    def fetchall(self) -> list[Any]:
+        return list(self._pending_rows)
 
     def close(self) -> None:
         self.closed = True
@@ -61,8 +71,12 @@ class ScriptedConnection:
         role_row: Any = (False, False),
         show_rows: dict[str, Any] | None = None,
         fail_on_execute: Exception | None = None,
+        unforced_rls_rows: list[tuple[str, str]] | None = None,
     ) -> None:
         self.role_row = role_row
+        self.unforced_rls_rows: list[tuple[str, str]] = (
+            list(unforced_rls_rows) if unforced_rls_rows else []
+        )
         self.show_rows: dict[str, Any] = {
             "default_transaction_read_only": ("on",),
             "statement_timeout": ("30s",),
@@ -570,4 +584,53 @@ def test_b_l4_postgres_session_raises_import_error_when_lakebase_endpoint_unimpo
             setattr(serving_pkg, "postgres_session", orig_pg_sess)
         else:
             sys.modules.pop("seeknal.serving.postgres_session", None)
+
+
+def test_b_l5_verify_and_harden_session_deny_roles_and_unforced_rls_owner_warning(
+    caplog,
+):
+    import logging
+    from tests.serving.fake_postgres_catalog import FakePostgresCatalog, FakeRoleInfo
+
+    # 1. Custom deny_roles forwarded to role_guard_sql and enforced
+    cat = FakePostgresCatalog()
+    cat.set_role(
+        rolname="app_svc",
+        member_roles=[FakeRoleInfo(rolname="custom_org_superuser")],
+    )
+    conn_denied = cat.connect()
+    with pytest.raises(EngineError, match="Role guard refused connection"):
+        verify_and_harden_session(
+            conn_denied,
+            kind="postgres",
+            role_guard=True,
+            deny_roles=("custom_org_superuser",),
+        )
+    assert conn_denied.closed is True
+
+    # 2. Owned table with RLS enabled and relforcerowsecurity = false logs warning without failing!
+    cat_rls = FakePostgresCatalog()
+    cat_rls.add_unforced_rls_owned_table("rpt", "customer_orders")
+    cat_rls.add_unforced_rls_owned_table("src_pii", "customer")
+    conn_rls = cat_rls.connect()
+
+    with caplog.at_level(logging.WARNING, logger="seeknal.serving.postgres_session"):
+        verify_and_harden_session(conn_rls, kind="postgres", role_guard=True)
+
+    assert conn_rls.closed is False
+    warn_msgs = [r.getMessage() for r in caplog.records]
+    assert any(
+        "FORCE ROW LEVEL SECURITY" in m
+        and "rpt.customer_orders" in m
+        and "src_pii.customer" in m
+        for m in warn_msgs
+    )
+
+    # 3. Clean connection with no unforced RLS owned tables emits zero warnings
+    caplog.clear()
+    conn_clean = ScriptedConnection(role_row=(False, False, False), unforced_rls_rows=[])
+    with caplog.at_level(logging.WARNING, logger="seeknal.serving.postgres_session"):
+        verify_and_harden_session(conn_clean, kind="postgres", role_guard=True)
+    assert caplog.records == []
+
 
