@@ -650,6 +650,25 @@ def test_effective_max_rows_minimum_across_grant_request_and_all_tables():
     )
     assert r_req.effective_max_rows == 20
 
+    # Implicit PII table (pii=True, tokenized=False, access=None) gets max_rows=50 cap
+    r_imp = _run_guard(
+        "SELECT * FROM cbn.src_pii.implicit_pii WHERE person_id = 'P-1'",
+        pl,
+        hint=None,
+        grant_max_rows=1000,
+        request_max_rows=500,
+    )
+    assert r_imp.effective_max_rows == 50
+
+    r_imp_smaller = _run_guard(
+        "SELECT * FROM cbn.src_pii.implicit_pii WHERE person_id = 'P-1'",
+        pl,
+        hint=None,
+        grant_max_rows=1000,
+        request_max_rows=10,
+    )
+    assert r_imp_smaller.effective_max_rows == 10
+
 
 def test_guard_mode_warn_records_metric_without_rejecting():
     pl_warn = _make_placement(guard_mode="warn")

@@ -125,10 +125,12 @@ def effective_table_access(table: TableEntry) -> TableAccess | None:
                 filterable=table.keys,
                 sortable=table.keys,
                 require_filter=True,
+                max_rows=50,
             )
         return TableAccess(
             pattern="filter",
             require_filter=True,
+            max_rows=50,
         )
     return None
 
@@ -1107,8 +1109,9 @@ def check_guardrails(
         if request_max_rows is not None:
             caps.append(int(request_max_rows))
         for tbl in referenced_tables:
-            if tbl.access is not None and tbl.access.max_rows is not None:
-                caps.append(tbl.access.max_rows)
+            eff_acc = effective_table_access(tbl)
+            if eff_acc is not None and eff_acc.max_rows is not None:
+                caps.append(eff_acc.max_rows)
         if caps:
             effective_max_rows = min(caps)
 
