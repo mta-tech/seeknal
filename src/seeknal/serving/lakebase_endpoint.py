@@ -1495,7 +1495,10 @@ class ColdStartConnector:
             self._last_no_wake_probe_at = probe_now
             self._no_wake_probe_in_flight = True
 
-        to_int = max(1, math.ceil(float(timeout_seconds)))
+        eff_timeout = float(timeout_seconds)
+        to_param: int | float = (
+            int(eff_timeout) if eff_timeout >= 1.0 else eff_timeout
+        )
         with self._lock:
             candidate_fns = list(self._account_connect_fns) or [self._connect_fn]
         try:
@@ -1516,15 +1519,19 @@ class ColdStartConnector:
 
                     if accepts_kw:
                         try:
-                            conn = target_fn(connect_timeout=to_int)
+                            conn = target_fn(connect_timeout=to_param)
                         except TypeError:
-                            conn = target_fn()
+                            try:
+                                conn = target_fn(connect_timeout=max(1, int(eff_timeout)))
+                            except TypeError:
+                                conn = target_fn()
                     else:
                         conn = target_fn()
 
                     if conn is None:
                         continue
 
+                    timeout_ms = max(1, int(round(eff_timeout * 1000)))
                     if hasattr(conn, "cursor") and callable(conn.cursor):
                         cur = conn.cursor()
                         if (
@@ -1532,6 +1539,7 @@ class ColdStartConnector:
                             and hasattr(cur, "execute")
                             and callable(cur.execute)
                         ):
+                            cur.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
                             cur.execute("SELECT 1")
                     probe_succeeded = True
                     break

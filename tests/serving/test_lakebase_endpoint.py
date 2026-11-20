@@ -1430,6 +1430,95 @@ class TestColdStartConnector:
         if connector._last_wake_worker is not None and connector._last_wake_worker.is_alive():
             connector._last_wake_worker.join(timeout=2.0)
 
+    def test_f4_readyz_probe_no_wake_sets_local_statement_timeout_and_no_wake(
+        self,
+    ) -> None:
+        """Prove probe_no_wake sets SET LOCAL statement_timeout in ms and makes zero wake calls."""
+        clock = FakeClock(initial=100.0)
+        post_calls = 0
+        recorded_connect_timeouts: list[Any] = []
+        recording_conn = FakeDBConnection(conn_id=909)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal post_calls
+            if request.method == "POST":
+                post_calls += 1
+            return httpx.Response(200, json={"state": "running"})
+
+        def connect_fn(*, connect_timeout: Any = None, **kwargs: Any) -> FakeDBConnection:
+            recorded_connect_timeouts.append(connect_timeout)
+            return recording_conn
+
+        connector = ColdStartConnector(
+            connect_fn,
+            _make_wake_cfg(max_query_wait_seconds=10.0, max_wake_seconds=60.0),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            engine_name="lb_ops",
+            env={"LB_OPS_PROJECT_TOKEN": "tok-f4"},
+            clock=clock,
+            sleep_fn=clock.sleep,
+        )
+
+        with connector._lock:
+            connector._state = "unavailable"
+
+        probe_state = connector.probe_no_wake(timeout_seconds=2.5)
+        assert probe_state == "ok"
+        assert post_calls == 0  # Zero wake calls!
+
+        # Connect timeout must be no longer than probe timeout (2.5)
+        assert len(recorded_connect_timeouts) == 1
+        assert recorded_connect_timeouts[0] <= 2.5
+
+        # Check executed statements on fake connection:
+        # SET LOCAL statement_timeout = 2500 issued before SELECT 1
+        stmts = [item[0] for item in recording_conn.executed]
+        assert "SET LOCAL statement_timeout = 2500" in stmts
+        assert stmts == ["SET LOCAL statement_timeout = 2500", "SELECT 1"]
+
+        # Also test via ReadinessProbe /readyz flow
+        from seeknal.serving.adapters import DBAPIAdapter
+        from seeknal.serving.ops import ReadinessProbe, create_ops_app
+        from starlette.testclient import TestClient
+
+        recording_conn2 = FakeDBConnection(conn_id=910)
+
+        def connect_fn2(*, connect_timeout: Any = None, **kwargs: Any) -> FakeDBConnection:
+            return recording_conn2
+
+        connector2 = ColdStartConnector(
+            connect_fn2,
+            _make_wake_cfg(max_query_wait_seconds=10.0, max_wake_seconds=60.0),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            engine_name="lb_ops",
+            env={"LB_OPS_PROJECT_TOKEN": "tok-f4-2"},
+            clock=clock,
+            sleep_fn=clock.sleep,
+        )
+        with connector2._lock:
+            connector2._state = "unavailable"
+
+        adapter = DBAPIAdapter(
+            lambda **kw: connector2.connect(**kw),
+            kind="lakebase",
+            cold_start_connector=connector2,
+        )
+        readiness = ReadinessProbe(
+            {"lb_ops": adapter},
+            timeout_seconds=1.5,
+            cache_seconds=0.0,
+            clock=clock,
+        )
+        ops_app = create_ops_app(readiness=readiness)
+        with TestClient(ops_app) as client:
+            resp = client.get("/readyz")
+            assert resp.status_code == 200
+            assert resp.json()["ready"] is True
+            assert post_calls == 0
+            stmts2 = [item[0] for item in recording_conn2.executed]
+            assert "SET LOCAL statement_timeout = 1500" in stmts2
+            assert stmts2 == ["SET LOCAL statement_timeout = 1500", "SELECT 1"]
+
     @pytest.mark.parametrize("run_idx", range(200))
     def test_b_m5_plain_connect_during_cooldown_recovers_state_without_new_wake(
         self,
