@@ -875,6 +875,36 @@ def test_publish_rejects_disallowed_headers_and_chains_with_typed_400_and_bounde
     assert rec_resp.json() == {"error": "Tarball entry header too large"}
 
 
+def test_semaphore_released_when_spool_dir_mkdir_fails(
+    test_app,
+    honest_tarball: Path,
+    monkeypatch,
+) -> None:
+    import pytest
+
+    test_app.state.config.max_concurrent_publishes = 1
+    orig_mkdir = Path.mkdir
+    failed_once = False
+
+    def _fail_mkdir_once(self, *args, **kwargs):
+        nonlocal failed_once
+        if not failed_once and self == test_app.state.config.data_dir / "tmp":
+            failed_once = True
+            raise OSError("simulated spool_dir mkdir failure")
+        return orig_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", _fail_mkdir_once)
+    client = TestClient(test_app, raise_server_exceptions=False)
+
+    first_resp = _publish(client, honest_tarball)
+    assert failed_once
+    assert first_resp.status_code == 500
+
+    # Semaphore slot must have been released so a following honest publish gets 201 (not 503)
+    second_resp = _publish(client, honest_tarball)
+    assert second_resp.status_code == 201
+
+
 
 
 

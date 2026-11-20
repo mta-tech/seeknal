@@ -98,14 +98,15 @@ async def publish(request: Request) -> JSONResponse:
         )
     await semaphore.acquire()
 
-    spool_dir = config.data_dir / "tmp"
-    spool_dir.mkdir(parents=True, exist_ok=True)
-    spool = tempfile.SpooledTemporaryFile(
-        max_size=SPOOL_MAX_SIZE,
-        mode="w+b",
-        dir=str(spool_dir),
-    )
+    spool = None
     try:
+        spool_dir = config.data_dir / "tmp"
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        spool = tempfile.SpooledTemporaryFile(
+            max_size=SPOOL_MAX_SIZE,
+            mode="w+b",
+            dir=str(spool_dir),
+        )
         running_bytes = 0
         async for chunk in request.stream():
             if not chunk:
@@ -174,7 +175,8 @@ async def publish(request: Request) -> JSONResponse:
                 )
                 return JSONResponse({"error": "Publish failed"}, status_code=500)
     finally:
-        spool.close()
+        if spool is not None:
+            spool.close()
         semaphore.release()
 
     return JSONResponse(
