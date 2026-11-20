@@ -50,7 +50,9 @@ ssh $SSH_OPTS "$REMOTE_HOST" "mkdir -p $REMOTE_DIR"
 # 2. Package and copy seeknal source
 echo "[2/4] Packaging and copying seeknal source..."
 cd "$REPO_ROOT"
-tar czf /tmp/seeknal-report-src.tar.gz \
+TMP_BUNDLE="$(mktemp "${TMPDIR:-/tmp}/seeknal-report-src.XXXXXX.tar.gz")"
+trap 'rm -f "$TMP_BUNDLE"' EXIT
+tar czf "$TMP_BUNDLE" \
     --exclude='.git' \
     --exclude='.env' \
     --exclude='.env.*' \
@@ -65,8 +67,8 @@ tar czf /tmp/seeknal-report-src.tar.gz \
     --exclude='.omc' \
     --exclude='state' \
     -C "$REPO_ROOT" .
-scp $SSH_OPTS /tmp/seeknal-report-src.tar.gz "$REMOTE_HOST:$REMOTE_DIR/seeknal-report-src.tar.gz"
-ssh $SSH_OPTS "$REMOTE_HOST" "mkdir -p $REMOTE_DIR/seeknal-src && tar xzf $REMOTE_DIR/seeknal-report-src.tar.gz -C $REMOTE_DIR/seeknal-src"
+scp $SSH_OPTS "$TMP_BUNDLE" "$REMOTE_HOST:$REMOTE_DIR/seeknal-report-src.tar.gz"
+ssh $SSH_OPTS "$REMOTE_HOST" "rm -rf $REMOTE_DIR/seeknal-src && mkdir -p $REMOTE_DIR/seeknal-src && tar xzf $REMOTE_DIR/seeknal-report-src.tar.gz -C $REMOTE_DIR/seeknal-src && rm -f $REMOTE_DIR/seeknal-src/deploy/.env.report-server"
 
 # 3. Copy deployment files
 echo "[3/4] Copying deployment configs..."
@@ -75,8 +77,7 @@ scp $SSH_OPTS \
     "$REMOTE_HOST:$REMOTE_DIR/docker-compose.yml"
 
 echo "  Copying .env.report-server..."
-scp $SSH_OPTS "$ENV_FILE" "$REMOTE_HOST:$REMOTE_DIR/.env"
-ssh $SSH_OPTS "$REMOTE_HOST" "chmod 0600 $REMOTE_DIR/.env"
+ssh $SSH_OPTS "$REMOTE_HOST" "umask 077; cat > $REMOTE_DIR/.env" < "$ENV_FILE"
 
 # 4. Build and start services
 echo "[4/4] Building and starting services..."

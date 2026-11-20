@@ -55,3 +55,12 @@ Mount a host directory to `/data` so reports survive container restarts:
 
 The server stores extracted report assets under `/data/assets/` and its
 report registry under `/data/registry.db`.
+
+## Deploying with `deploy/deploy-report-server.sh`
+
+The deploy script's pre-flight key check reads `deploy/.env.report-server`
+with a simple `KEY=VALUE` parser. It does not interpret Docker Compose `.env`
+features such as inline `# comments` or `${...}` variable interpolation, so
+keep `SEEKNAL_REPORT_SERVER_KEYS` on a plain `SEEKNAL_REPORT_SERVER_KEYS=...`
+line. The post-deploy `/healthz` poll is the authoritative startup check and
+fails closed with a non-zero exit if the server does not become healthy.

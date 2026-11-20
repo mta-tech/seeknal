@@ -99,11 +99,17 @@ def test_deploy_script_and_readme_security_guards() -> None:
     assert "StrictHostKeyChecking=accept-new" in script
     assert "StrictHostKeyChecking=no" not in script
 
-    # 3. Tar bundle excludes .env, .env.*, and deploy/.env.report-server, and remote .env gets chmod 0600
+    # 3. Tar bundle uses mktemp + EXIT trap, excludes .env*, extracts into a fresh seeknal-src
+    #    (removing any stale deploy/.env.report-server), and streams remote .env with umask 077
+    assert "mktemp" in script
+    assert "trap " in script and "EXIT" in script
+    assert "/tmp/seeknal-report-src.tar.gz" not in script
     assert "--exclude='.env'" in script
     assert "--exclude='.env.*'" in script
     assert "--exclude='deploy/.env.report-server'" in script
-    assert "chmod 0600" in script
+    assert "rm -rf $REMOTE_DIR/seeknal-src" in script
+    assert "rm -f $REMOTE_DIR/seeknal-src/deploy/.env.report-server" in script
+    assert 'umask 077; cat > $REMOTE_DIR/.env" < "$ENV_FILE"' in script
 
     # 4. Bounded health-check polling loop exits non-zero on failure before "Deployment Complete"
     health_loop_pos = script.find("seq 1 30")
@@ -114,8 +120,10 @@ def test_deploy_script_and_readme_security_guards() -> None:
     assert deploy_complete_pos != -1
     assert health_loop_pos < health_fail_exit_pos < deploy_complete_pos
 
-    # 5. Plain-HTTP / TLS proxy note present in both script and README
+    # 5. Plain-HTTP / TLS proxy note and .env.report-server parser / /healthz notes present
     assert "plain HTTP" in script
     assert "TLS" in script
     assert "plain HTTP" in readme
     assert "TLS" in readme
+    assert ".env.report-server" in readme
+    assert "/healthz" in readme
