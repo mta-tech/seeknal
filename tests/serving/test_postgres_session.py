@@ -111,6 +111,7 @@ def test_dataclasses_defaults_and_immutability():
     assert tls.sslrootcert_file is None
     assert tls.sslcert_file is None
     assert tls.sslkey_file is None
+    assert tls.allow_insecure_tls is False
 
     acc_env = PostgresAccountConfig(dsn_env="PG_DSN")
     assert acc_env.dsn_env == "PG_DSN"
@@ -211,9 +212,17 @@ def test_build_connect_kwargs_hardened_read_only_and_tls():
     assert kw_pooler["application_name"] == "seeknal-serving"
     assert kw_pooler["sslmode"] == "verify-full"
 
-    # 4. Legacy unhardened writable: only connect_timeout
-    kw_legacy = build_connect_kwargs(planted_dsn, connect_timeout=10.0, read_only=False)
-    assert kw_legacy == {"connect_timeout": 10}
+    # 4. Unhardened writable postgres still defaults sslmode to verify-full;
+    # legacy unhardened lakebase (without tls/session) preserves connect_timeout only.
+    kw_pg_min = build_connect_kwargs(
+        planted_dsn, connect_timeout=10.0, read_only=False, kind="postgres"
+    )
+    assert kw_pg_min == {"connect_timeout": 10, "sslmode": "verify-full"}
+
+    kw_legacy_lb = build_connect_kwargs(
+        planted_dsn, connect_timeout=10.0, read_only=False, kind="lakebase"
+    )
+    assert kw_legacy_lb == {"connect_timeout": 10}
 
 
 def test_verify_and_harden_session_role_guard():

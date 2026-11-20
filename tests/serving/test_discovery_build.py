@@ -545,6 +545,10 @@ def test_cli_emit_with_standalone_and_full_serving_yaml(tmp_path, capsys):
             "lb_ops": {
                 "kind": "lakebase",
                 "dsn_env": "LB_OPS_DSN",
+                "tls": {
+                    "sslmode": "verify-full",
+                    "sslrootcert_file": "/etc/seeknal/tls/lb-ca.pem",
+                },
                 "lakebase": {
                     "project_id": "prj_aaaaaaaaaaaaaaaaaaaa",
                     "branch_id": "br_aaaaaaaaaaaaaaaaaaaa",
@@ -675,4 +679,159 @@ def test_cli_emit_with_standalone_and_full_serving_yaml(tmp_path, capsys):
     )
     assert rc_conflict == 2
     assert "Cannot specify both --emit and --placement-out" in capsys.readouterr().err
+
+
+def test_b_m4_discovery_cli_reuses_validated_server_config_and_enforces_tls_role_guard_and_show(
+    tmp_path, monkeypatch, capsys
+):
+    import yaml
+    from seeknal.serving.discovery.__main__ import main as discovery_main
+    from tests.serving.fake_postgres_catalog import FakePostgresCatalog
+
+    # 1. Weak sslmode without allow_insecure_tls, missing Lakebase TLS, and injected search_path refused
+    for bad_name, bad_conn in (
+        (
+            "weak_pg_tls",
+            {
+                "kind": "postgres",
+                "dsn_env": "PG_DSN",
+                "tls": {"sslmode": "require"},
+            },
+        ),
+        (
+            "bad_search_path",
+            {
+                "kind": "postgres",
+                "dsn_env": "PG_DSN",
+                "session": {"search_path": "pg_catalog; DROP TABLE users"},
+            },
+        ),
+        (
+            "lb_missing_tls",
+            {
+                "kind": "lakebase",
+                "dsn_env": "PG_DSN",
+                "lakebase": {
+                    "project_id": "prj_aaaaaaaaaaaaaaaaaaaa",
+                    "branch_id": "br_aaaaaaaaaaaaaaaaaaaa",
+                    "endpoint_id": "ep_aaaaaaaaaaaaaaaaaaaa",
+                },
+            },
+        ),
+    ):
+        bad_yaml = tmp_path / f"{bad_name}.yaml"
+        bad_yaml.write_text(
+            yaml.safe_dump(
+                {
+                    "default_catalog": "cbn",
+                    "connections": {"src": bad_conn},
+                    "placement": {
+                        "discovery": {
+                            "engines": {
+                                "src": {
+                                    "kind": bad_conn["kind"],
+                                    "dialect": "postgres",
+                                }
+                            },
+                            "postgres_sources": {
+                                "src": {"schemas": {"rpt": {"include": ["*"]}}}
+                            },
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        capsys.readouterr()
+        rc = discovery_main(
+            ["--config", str(bad_yaml), "--emit", str(tmp_path / f"{bad_name}_out.yaml")],
+            env={"PG_DSN": "postgresql://svc:pw@db.internal:5432/cbn"},
+        )
+        assert rc == 2
+        assert "Error:" in capsys.readouterr().err
+
+    # 2. Real CLI path (without injected postgres_connects) uses _make_postgres_wire_connect:
+    # passes sslmode='verify-full' by default on kind: postgres and runs role_guard + SHOW checks!
+    import psycopg2
+
+    pg_cat = FakePostgresCatalog()
+    pg_cat.add_table(
+        "rpt",
+        "sales",
+        reltuples=100,
+        columns=[("id", "int8", True)],
+        indexes=[
+            {
+                "index_name": "sales_pkey",
+                "amname": "btree",
+                "columns": ["id"],
+                "is_primary": True,
+            }
+        ],
+    )
+    recorded_connects: list[tuple[str, dict]] = []
+
+    def fake_psycopg2_connect(dsn: str, **kwargs):
+        recorded_connects.append((dsn, dict(kwargs)))
+        return pg_cat.connect(**kwargs)
+
+    monkeypatch.setattr(psycopg2, "connect", fake_psycopg2_connect)
+
+    valid_srv_yaml = tmp_path / "valid_cli_srv.yaml"
+    valid_srv_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "default_catalog": "cbn",
+                "connections": {
+                    "pg_report": {
+                        "kind": "postgres",
+                        "dsn_env": "PG_CLI_DSN",
+                        "session": {
+                            "statement_timeout_ms": 30000,
+                            "lock_timeout_ms": 2000,
+                            "idle_in_transaction_session_timeout_ms": 10000,
+                            "search_path": "pg_catalog",
+                        },
+                    }
+                },
+                "placement": {
+                    "discovery": {
+                        "engines": {
+                            "pg_report": {"kind": "postgres", "dialect": "postgres"}
+                        },
+                        "postgres_sources": {
+                            "pg_report": {
+                                "logical_catalog": "cbn",
+                                "schemas": {"rpt": {"include": ["sales"]}},
+                            }
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    out_yaml = tmp_path / "valid_cli_out.yaml"
+    rc_ok = discovery_main(
+        ["--config", str(valid_srv_yaml), "--emit", str(out_yaml)],
+        env={"PG_CLI_DSN": "postgresql://svc:PLANTED_CLI_PW_44@db.internal:5432/cbn"},
+    )
+    assert rc_ok == 0
+    assert len(recorded_connects) == 1
+    _, passed_kw = recorded_connects[0]
+    assert passed_kw["sslmode"] == "verify-full"
+    assert "dsn" not in passed_kw
+    assert any("pg_roles" in sql for sql, _ in pg_cat.executed)
+    assert any("SHOW search_path" in sql for sql, _ in pg_cat.executed)
+
+    # Superuser on CLI discovery connect is refused by role_guard without leaking DSN password!
+    pg_cat.set_role(rolsuper=True)
+    capsys.readouterr()
+    rc_sup = discovery_main(
+        ["--config", str(valid_srv_yaml), "--emit", str(tmp_path / "sup_out.yaml")],
+        env={"PG_CLI_DSN": "postgresql://svc:PLANTED_CLI_PW_44@db.internal:5432/cbn"},
+    )
+    assert rc_sup == 2
+    err_sup = capsys.readouterr().err
+    assert "PLANTED_CLI_PW_44" not in err_sup
 

@@ -8,7 +8,7 @@ import os
 import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import yaml
@@ -22,6 +22,9 @@ from seeknal.serving.discovery.config import (
     _safe_disc_label,
 )
 from seeknal.serving.placement import UniqueKeySafeLoader
+
+if TYPE_CHECKING:
+    from seeknal.serving.server.config import ServerConfig
 
 _URI_PASSWORD_RE = re.compile(r"(://[^:@/\s]+:)([^@/\s]+)(@)")
 
@@ -43,10 +46,12 @@ def _sanitize_tokens(text: str, env: Mapping[str, str]) -> str:
     return sanitized
 
 
-def _load_yaml_config_and_connections(
+def _load_yaml_config_and_server_config(
     path: str | os.PathLike,
-) -> tuple[DiscoveryConfig, Mapping[str, Any] | None, str | None]:
-    """Load either a standalone discovery YAML or a full serving.yaml."""
+    *,
+    env: Mapping[str, str],
+) -> tuple[DiscoveryConfig, ServerConfig | None]:
+    """Load either a standalone discovery YAML or a full validated ServerConfig YAML."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw_data = yaml.load(f, Loader=UniqueKeySafeLoader)
@@ -90,176 +95,94 @@ def _load_yaml_config_and_connections(
             f"Config file must contain a mapping, got {type(raw_data).__name__}"
         )
 
-    if "placement" in raw_data and isinstance(raw_data["placement"], Mapping):
-        pl_map = raw_data["placement"]
-        if "discovery" not in pl_map or not isinstance(pl_map["discovery"], Mapping):
+    if "placement" in raw_data or "connections" in raw_data:
+        pl_raw = raw_data.get("placement")
+        if not isinstance(pl_raw, Mapping):
+            raise DiscoveryConfigError(
+                f"Config file '{path}' contains 'connections' without a valid 'placement' mapping"
+            )
+        if "discovery" not in pl_raw or not isinstance(pl_raw["discovery"], Mapping):
             raise DiscoveryConfigError(
                 f"Config file '{path}' contains 'placement' without a 'discovery' mapping"
             )
-        disc_map = dict(pl_map["discovery"])
+        disc_map = dict(pl_raw["discovery"])
         if "default_catalog" not in disc_map and "default_catalog" in raw_data:
             disc_map["default_catalog"] = raw_data["default_catalog"]
-        connections_map = (
-            raw_data["connections"]
-            if isinstance(raw_data.get("connections"), Mapping)
-            else None
-        )
-        secrets_env_file = (
-            str(raw_data["secrets_env_file"]).strip()
-            if isinstance(raw_data.get("secrets_env_file"), str)
-            and raw_data["secrets_env_file"].strip()
-            else None
-        )
-        return DiscoveryConfig.from_dict(disc_map), connections_map, secrets_env_file
 
-    return DiscoveryConfig.from_dict(raw_data), None, None
+        srv_dict: dict[str, Any] = dict(raw_data)
+        srv_dict["placement"] = {**dict(pl_raw), "discovery": disc_map}
+        if "grant_keys" not in srv_dict:
+            srv_dict["grant_keys"] = {
+                "jwks_file": "__discovery_cli_unused__.jwks.json"
+            }
 
+        from seeknal.serving.server.config import ServerConfig, ServerConfigError
 
-def _read_dsn_from_spec(
-    spec: Mapping[str, Any],
-    env: Mapping[str, str],
-    *,
-    label: str,
-) -> str | None:
-    dsn_env = spec.get("dsn_env")
-    dsn_file = spec.get("dsn_file")
-    if isinstance(dsn_env, str) and dsn_env.strip():
-        val = env.get(dsn_env.strip())
-        if not val:
-            raise DiscoveryConfigError(
-                f"Missing required environment variable '{dsn_env.strip()}' for {label}"
+        try:
+            server_cfg = ServerConfig.from_dict(
+                srv_dict,
+                load_keys=False,
+                env=env,
             )
-        return val
-    if isinstance(dsn_file, str) and dsn_file.strip():
-        fpath = dsn_file.strip()
-        if not os.path.exists(fpath):
-            raise DiscoveryConfigError(f"Secret file not found for {label}: '{fpath}'")
-        st = os.stat(fpath)
-        if (st.st_mode & 0o044) != 0:
-            raise DiscoveryConfigError(
-                f"Secret file '{fpath}' for {label} is group- or world-readable"
-            )
-        with open(fpath, "r", encoding="utf-8") as fh:
-            return fh.read().strip()
-    return None
+        except ServerConfigError as exc:
+            raise DiscoveryConfigError(str(exc)) from exc
+
+        assert server_cfg.placement.discovery_config is not None
+        return server_cfg.placement.discovery_config, server_cfg
+
+    return DiscoveryConfig.from_dict(raw_data), None
 
 
-def _build_default_postgres_connects(
+def _build_validated_discovery_connects(
     cfg: DiscoveryConfig,
-    connections_map: Mapping[str, Any] | None,
+    server_cfg: ServerConfig,
     env: Mapping[str, str],
-) -> dict[str, Callable[[], Any]]:
-    """Build psycopg2 connect factories from serving.yaml connections when not injected."""
-    if not connections_map:
-        return {}
-    needed_engines: dict[str, str] = {}
-    for eng_name, src_cfg in cfg.postgres_sources.items():
-        needed_engines[eng_name] = src_cfg.account
-    if cfg.lakebase is not None and cfg.lakebase.engine not in needed_engines:
-        needed_engines[cfg.lakebase.engine] = "interactive"
+) -> tuple[Callable[[], Any] | None, dict[str, Callable[[], Any]], list[httpx.Client]]:
+    """Build hardened Postgres/Lakebase discovery connect factories via ServerConfig & app builders."""
+    from seeknal.serving.server.app import (
+        _build_discovery_postgres_connects,
+        _make_discovery_source_connect,
+    )
+    from seeknal.serving.server.config import (
+        LakebaseConnectionConfig,
+        PostgresConnectionConfig,
+    )
 
-    built: dict[str, Callable[[], Any]] = {}
-    for eng_name, account in needed_engines.items():
-        conn_spec = connections_map.get(eng_name)
-        if not isinstance(conn_spec, Mapping):
-            continue
-        dsn: str | None = None
-        accounts_map = conn_spec.get("accounts")
-        if isinstance(accounts_map, Mapping) and isinstance(
-            accounts_map.get(account), Mapping
-        ):
-            dsn = _read_dsn_from_spec(
-                accounts_map[account],
-                env,
-                label=f"connections.{_safe_disc_label(eng_name)}.accounts.{account}",
+    http_clients: list[httpx.Client] = []
+    connectors_by_endpoint: dict[str, Any] = {}
+
+    def _get_http_client() -> httpx.Client:
+        if not http_clients:
+            http_clients.append(httpx.Client())
+        return http_clients[0]
+
+    lb_connect: Callable[[], Any] | None = None
+    if cfg.lakebase is not None:
+        lb_eng = cfg.lakebase.engine
+        conn_obj = server_cfg.connections.get(lb_eng)
+        if isinstance(conn_obj, (PostgresConnectionConfig, LakebaseConnectionConfig)):
+            lb_connect = _make_discovery_source_connect(
+                eng_name=lb_eng,
+                conn_cfg=conn_obj,
+                account_name="interactive",
+                cfg=server_cfg,
+                env=env,
+                connect_factories=None,
+                metrics=None,
+                get_http_client=_get_http_client,
+                connectors_by_endpoint=connectors_by_endpoint,
             )
-        if dsn is None:
-            dsn = _read_dsn_from_spec(
-                conn_spec,
-                env,
-                label=f"connections.{_safe_disc_label(eng_name)}",
-            )
-        if dsn is None:
-            continue
 
-        timeout_s = int(float(conn_spec.get("connect_timeout_seconds", 5)))
-        tls_spec = (
-            conn_spec.get("tls") if isinstance(conn_spec.get("tls"), Mapping) else None
-        )
-        session_spec = (
-            conn_spec.get("session")
-            if isinstance(conn_spec.get("session"), Mapping)
-            else None
-        )
-
-        def _make_factory(
-            dsn_val: str,
-            conn_timeout: int,
-            tls_cfg: Mapping[str, Any] | None,
-            sess_cfg: Mapping[str, Any] | None,
-            ro_flag: bool,
-        ) -> Callable[[], Any]:
-            def _connect() -> Any:
-                import psycopg2  # type: ignore[import-untyped]
-
-                kwargs: dict[str, Any] = {"connect_timeout": conn_timeout}
-                if tls_cfg is not None:
-                    if isinstance(tls_cfg.get("sslmode"), str):
-                        kwargs["sslmode"] = tls_cfg["sslmode"]
-                    if isinstance(tls_cfg.get("sslrootcert_file"), str):
-                        kwargs["sslrootcert"] = tls_cfg["sslrootcert_file"]
-                opts: list[str] = []
-                if ro_flag:
-                    opts.append("-c default_transaction_read_only=on")
-                if sess_cfg is not None and sess_cfg.get("startup_options", True):
-                    if isinstance(sess_cfg.get("search_path"), str):
-                        opts.append(f"-c search_path={sess_cfg['search_path']}")
-                    if isinstance(sess_cfg.get("application_name"), str):
-                        kwargs["application_name"] = sess_cfg["application_name"]
-                if opts:
-                    kwargs["options"] = " ".join(opts)
-                return psycopg2.connect(dsn_val, **kwargs)
-
-            return _connect
-
-        kind = str(conn_spec.get("kind", "postgres"))
-        mode = str(conn_spec.get("mode", "read_only"))
-        lb_sub = (
-            conn_spec.get("lakebase")
-            if isinstance(conn_spec.get("lakebase"), Mapping)
-            else None
-        )
-        ep_type = (
-            str(lb_sub.get("endpoint_type", "read_write"))
-            if lb_sub is not None
-            else "read_write"
-        )
-        ro = (mode != "read_write") if kind == "postgres" else (ep_type == "read_only")
-        built[eng_name] = _make_factory(dsn, timeout_s, tls_spec, session_spec, ro)
-
-    return built
-
-
-def _load_secrets_env_file(path: str) -> dict[str, str]:
-    loaded: dict[str, str] = {}
-    if not os.path.exists(path):
-        return loaded
-    st = os.stat(path)
-    if (st.st_mode & 0o044) != 0:
-        raise DiscoveryConfigError(
-            f"secrets_env_file '{path}' is group- or world-readable"
-        )
-    with open(path, "r", encoding="utf-8") as fh:
-        for raw_line in fh:
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k = k.strip()
-            v = v.strip().strip('"').strip("'")
-            if k:
-                loaded[k] = v
-    return loaded
+    pg_connects = _build_discovery_postgres_connects(
+        cfg=server_cfg,
+        disc_cfg=cfg,
+        env=env,
+        connect_factories=None,
+        metrics=None,
+        get_http_client=_get_http_client,
+        connectors_by_endpoint=connectors_by_endpoint,
+    )
+    return lb_connect, pg_connects, http_clients
 
 
 def main(
@@ -320,34 +243,38 @@ def main(
 
     placement_target = args.emit if args.emit is not None else args.placement_out
 
+    owned_cs_clients: list[httpx.Client] = []
     try:
-        cfg, connections_map, secrets_env_file = _load_yaml_config_and_connections(
-            args.config
+        cfg, server_cfg = _load_yaml_config_and_server_config(
+            args.config,
+            env=resolved_env,
         )
-        if secrets_env_file:
-            file_secrets = _load_secrets_env_file(secrets_env_file)
-            for sk, sv in file_secrets.items():
+        if server_cfg is not None and server_cfg.secrets_env:
+            for sk, sv in server_cfg.secrets_env.items():
                 resolved_env.setdefault(sk, sv)
 
+        effective_lb_connect = lakebase_connect
         effective_pg_connects = postgres_connects
         if (
             effective_pg_connects is None
-            and lakebase_connect is None
-            and connections_map is not None
+            and effective_lb_connect is None
+            and server_cfg is not None
         ):
-            auto_connects = _build_default_postgres_connects(
-                cfg, connections_map, resolved_env
+            auto_lb, auto_pg, owned_cs_clients = _build_validated_discovery_connects(
+                cfg, server_cfg, resolved_env
             )
-            if auto_connects:
-                effective_pg_connects = auto_connects
+            if auto_lb is not None:
+                effective_lb_connect = auto_lb
+            if auto_pg:
+                effective_pg_connects = auto_pg
 
         result = discover(
             cfg,
             http_client=http_client,
-            lakebase_connect=lakebase_connect,
+            lakebase_connect=effective_lb_connect,
             postgres_connects=effective_pg_connects,
             storage_classes=storage_classes,
-            connections=connections_map,
+            connections=server_cfg.connections if server_cfg is not None else None,
             env=resolved_env,
         )
 
@@ -372,6 +299,12 @@ def main(
         msg = _sanitize_tokens(str(exc), resolved_env)
         sys.stderr.write(f"Error: {msg}\n")
         return 2
+    finally:
+        for hc in owned_cs_clients:
+            try:
+                hc.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

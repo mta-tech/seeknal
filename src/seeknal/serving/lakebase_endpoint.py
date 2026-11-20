@@ -570,12 +570,20 @@ def validate_lakebase_tls(
                 )
         sslmode = tls_cfg.get("sslmode")
         sslrootcert_file = tls_cfg.get("sslrootcert_file")
+        allow_insecure_tls = tls_cfg.get("allow_insecure_tls", False)
     elif hasattr(tls_cfg, "sslmode") or hasattr(tls_cfg, "sslrootcert_file"):
         sslmode = getattr(tls_cfg, "sslmode", None)
         sslrootcert_file = getattr(tls_cfg, "sslrootcert_file", None)
+        allow_insecure_tls = getattr(tls_cfg, "allow_insecure_tls", False)
     else:
         raise error_cls(
             f"Lakebase connection '{safe_eng}' 'tls' configuration must be a mapping or TLS config object"
+        )
+
+    if allow_insecure_tls is True:
+        raise error_cls(
+            f"Lakebase connection '{safe_eng}' forbids tls.allow_insecure_tls; "
+            "sslmode='verify-full' is mandatory"
         )
 
     if not isinstance(sslmode, str) or sslmode != "verify-full":

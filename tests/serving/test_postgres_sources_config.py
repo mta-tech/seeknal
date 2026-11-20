@@ -528,3 +528,53 @@ def test_storage_class_on_other_engines_and_cursor_key_env(base_cfg, tmp_path):
     with pytest.raises(ServerConfigError) as exc_cur:
         ServerConfig.from_dict(d_bad_cur)
     assert "PLANTED_CURSOR_SECRET_5511" not in str(exc_cur.value)
+
+
+def test_b_m4_postgres_weak_sslmode_requires_allow_insecure_tls_and_lakebase_forbids_it(
+    base_cfg, caplog
+):
+    for weak_mode in ("disable", "allow", "prefer", "require", "verify-ca"):
+        d_refused = copy.deepcopy(base_cfg)
+        d_refused["connections"] = {
+            "pg": {
+                "kind": "postgres",
+                "dsn_env": "PG_DSN",
+                "tls": {"sslmode": weak_mode},
+            }
+        }
+        with pytest.raises(ServerConfigError, match="allow_insecure_tls"):
+            ServerConfig.from_dict(d_refused)
+
+        d_allowed = copy.deepcopy(base_cfg)
+        d_allowed["connections"] = {
+            "pg": {
+                "kind": "postgres",
+                "dsn_env": "PG_DSN",
+                "tls": {"sslmode": weak_mode, "allow_insecure_tls": True},
+            }
+        }
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="seeknal.serving.server.config"):
+            cfg_ok = ServerConfig.from_dict(d_allowed)
+        assert cfg_ok.connections["pg"].tls.sslmode == weak_mode
+        assert cfg_ok.connections["pg"].tls.allow_insecure_tls is True
+        assert any(
+            "allow_insecure_tls: true" in r.getMessage() for r in caplog.records
+        )
+
+    # Lakebase with endpoint block ALWAYS forbids allow_insecure_tls: true
+    d_lb = copy.deepcopy(base_cfg)
+    d_lb["connections"] = {
+        "lb_ops": {
+            "kind": "lakebase",
+            "dsn_env": "LB_DSN",
+            "tls": {
+                "sslmode": "verify-full",
+                "sslrootcert_file": "/etc/ca.pem",
+                "allow_insecure_tls": True,
+            },
+            "lakebase": _valid_lakebase_block(),
+        }
+    }
+    with pytest.raises(ServerConfigError, match="allow_insecure_tls"):
+        ServerConfig.from_dict(d_lb)

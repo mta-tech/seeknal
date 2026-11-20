@@ -44,7 +44,7 @@ connections:
       startup_options: true                          # set false behind transaction-mode poolers
       connection_limit: 30
     tls:
-      sslmode: verify-full                           # defaults to verify-full when session: is set
+      sslmode: verify-full                           # defaults to verify-full on kind: postgres; weaker modes require allow_insecure_tls: true
       sslrootcert_file: /etc/seeknal/tls/pg-ca.pem
     freshness:
       sync_state_table: public._lakebase_sync_state
@@ -112,7 +112,7 @@ connections:
 ### Per-Query Preamble (`begin_query_transaction`)
 - Write statements targeting a `read_only` source are rejected before any connection is acquired.
 - Every hardened or read-only query executes:
-  1. `BEGIN READ ONLY` (when `read_only`) or `BEGIN`
+  1. `BEGIN` followed immediately by `SET TRANSACTION READ ONLY` (whenever `read_only` or executing a row-limited `SELECT`)
   2. `SET LOCAL statement_timeout = <min(request_ms, session_cap_ms)>`
   3. `SELECT set_config('application_name', %s, true)` bound to `seeknal:<workload>:<audit_id>` as a driver parameter.
 

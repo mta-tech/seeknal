@@ -106,12 +106,15 @@ class PostgresTLSConfig:
     sslrootcert_file: str | None = None
     sslcert_file: str | None = None
     sslkey_file: str | None = None
+    allow_insecure_tls: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.sslmode, str) or self.sslmode not in VALID_SSLMODES:
             raise ValueError(
                 f"'sslmode' must be one of {sorted(VALID_SSLMODES)}"
             )
+        if not isinstance(self.allow_insecure_tls, bool):
+            raise ValueError("'allow_insecure_tls' must be a boolean")
         for attr in ("sslrootcert_file", "sslcert_file", "sslkey_file"):
             val = getattr(self, attr)
             if val is not None and (not isinstance(val, str) or not val.strip()):
@@ -198,7 +201,7 @@ def build_connect_kwargs(
             kwargs["sslcert"] = tls.sslcert_file
         if tls.sslkey_file:
             kwargs["sslkey"] = tls.sslkey_file
-    elif session is not None and kind == "postgres":
+    elif kind == "postgres":
         kwargs["sslmode"] = "verify-full"
 
     return kwargs

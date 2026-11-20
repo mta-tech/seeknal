@@ -556,6 +556,7 @@ def _parse_postgres_tls_block(raw_tls: Any, context: str) -> PostgresTLSConfig:
         "sslrootcert_file",
         "sslcert_file",
         "sslkey_file",
+        "allow_insecure_tls",
     }
     unknown_tls = set(raw_tls.keys()) - allowed_tls
     if unknown_tls:
@@ -570,6 +571,12 @@ def _parse_postgres_tls_block(raw_tls: Any, context: str) -> PostgresTLSConfig:
             f"{context} 'tls.sslmode' must be one of {sorted(VALID_SSLMODES)}"
         )
     sslmode_clean = sslmode_raw.strip()
+
+    allow_insecure_tls = raw_tls.get("allow_insecure_tls", False)
+    if not isinstance(allow_insecure_tls, bool):
+        raise ServerConfigError(
+            f"{context} 'tls.allow_insecure_tls' must be a boolean"
+        )
 
     file_vals: dict[str, str | None] = {}
     for fk in ("sslrootcert_file", "sslcert_file", "sslkey_file"):
@@ -598,6 +605,7 @@ def _parse_postgres_tls_block(raw_tls: Any, context: str) -> PostgresTLSConfig:
         sslrootcert_file=file_vals["sslrootcert_file"],
         sslcert_file=file_vals["sslcert_file"],
         sslkey_file=file_vals["sslkey_file"],
+        allow_insecure_tls=allow_insecure_tls,
     )
 
 
@@ -862,6 +870,11 @@ def _parse_postgres_wire_connection(
         tls_cfg = _parse_postgres_tls_block(eng_spec["tls"], ctx)
 
     if kind == "lakebase" and lakebase_cfg is not None:
+        if tls_cfg is not None and tls_cfg.allow_insecure_tls:
+            raise ServerConfigError(
+                f"Lakebase connection '{safe_eng}' forbids 'tls.allow_insecure_tls'; "
+                f"sslmode='verify-full' is mandatory"
+            )
         if (
             tls_cfg is None
             or tls_cfg.sslmode != "verify-full"
@@ -870,6 +883,13 @@ def _parse_postgres_wire_connection(
             raise ServerConfigError(
                 f"Lakebase connection '{safe_eng}' requires 'tls' with "
                 f"sslmode='verify-full' and a non-empty 'sslrootcert_file'"
+            )
+    elif tls_cfg is not None and tls_cfg.sslmode != "verify-full":
+        if not tls_cfg.allow_insecure_tls:
+            raise ServerConfigError(
+                f"{ctx} 'tls.sslmode' ('{tls_cfg.sslmode}') is weaker than "
+                f"'verify-full'; use 'verify-full' or explicitly set "
+                f"'tls.allow_insecure_tls: true'"
             )
 
     # mode
@@ -931,6 +951,12 @@ def _parse_postgres_wire_connection(
         freshness_cfg = getattr(lakebase_cfg, "freshness", None)
 
     # Emit warnings after validation succeeds
+    if tls_cfg is not None and tls_cfg.sslmode != "verify-full" and tls_cfg.allow_insecure_tls:
+        logger.warning(
+            "connection '%s' uses insecure TLS sslmode='%s' via tls.allow_insecure_tls: true",
+            safe_eng,
+            tls_cfg.sslmode,
+        )
     if kind == "postgres" and role_guard is False:
         logger.warning(
             "connection '%s' has role_guard: false; superuser and BYPASSRLS checks are disabled",
