@@ -513,6 +513,11 @@ def _collect_connection_warnings(
                     "if this is a plain PostgreSQL database relabel it kind: postgres "
                     "(mode: read_write keeps today's write behaviour), otherwise add the lakebase: block"
                 )
+                if conn.tls is None:
+                    warnings_out.append(
+                        f"legacy lakebase connection '{safe_eng}' has no explicit tls.sslmode "
+                        "configured; libpq default 'prefer' applies — configure 'tls.sslmode: verify-full'"
+                    )
             else:
                 ep_type = getattr(conn.lakebase, "endpoint_type", conn.mode)
                 if ep_type == "read_only" or conn.mode == "read_only":

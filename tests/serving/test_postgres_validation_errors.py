@@ -584,3 +584,83 @@ def test_startup_validation_warnings_collected_and_logged_without_failing_valid_
     assert len(caplog.records) >= 6
     for secret in base_env.values():
         assert secret not in joined_warnings
+
+
+def test_b_l6_legacy_lakebase_without_tls_emits_sslmode_prefer_warning(
+    tmp_path: Path, jwks_path: str, base_env: dict[str, str], caplog
+):
+    import logging
+
+    ca_file = tmp_path / "ca_bl6.pem"
+    ca_file.write_text("FAKECA\n", encoding="utf-8")
+
+    # 1. Legacy lakebase without tls -> warns about missing tls.sslmode and libpq default 'prefer'
+    cf_no_tls = _write_static(
+        tmp_path,
+        jwks_path,
+        "legacy_lb_no_tls",
+        placement={
+            "engines": {"lb_leg": {"kind": "lakebase", "dialect": "postgres"}},
+            "tables": {
+                "ops.tickets": {
+                    "keys": ["id"],
+                    "serve": {"lb_leg": "public.tickets"},
+                }
+            },
+        },
+        schemas={"ops.tickets": ["id", "status"]},
+        connections={
+            "lb_leg": {
+                "kind": "lakebase",
+                "dsn_env": "LB_OPS_DSN",
+            }
+        },
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="seeknal.serving.startup_validation"):
+        report = validate_startup(cf_no_tls, env=base_env)
+
+    assert report.ok is True
+    assert any(
+        "lb_leg" in w and "tls.sslmode" in w and "prefer" in w
+        for w in report.warnings
+    )
+    assert any(
+        "lb_leg" in r.getMessage()
+        and "tls.sslmode" in r.getMessage()
+        and "prefer" in r.getMessage()
+        for r in caplog.records
+    )
+
+    # 2. Legacy lakebase with explicit tls.sslmode -> does NOT emit the missing-sslmode warning
+    cf_with_tls = _write_static(
+        tmp_path,
+        jwks_path,
+        "legacy_lb_with_tls",
+        placement={
+            "engines": {"lb_leg": {"kind": "lakebase", "dialect": "postgres"}},
+            "tables": {
+                "ops.tickets": {
+                    "keys": ["id"],
+                    "serve": {"lb_leg": "public.tickets"},
+                }
+            },
+        },
+        schemas={"ops.tickets": ["id", "status"]},
+        connections={
+            "lb_leg": {
+                "kind": "lakebase",
+                "dsn_env": "LB_OPS_DSN",
+                "tls": {
+                    "sslmode": "verify-full",
+                    "sslrootcert_file": str(ca_file),
+                },
+            }
+        },
+    )
+    rep_with_tls = validate_startup(cf_with_tls, env=base_env)
+    assert not any(
+        "tls.sslmode" in w and "prefer" in w for w in rep_with_tls.warnings
+    )
+
