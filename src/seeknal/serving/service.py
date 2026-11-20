@@ -27,7 +27,7 @@ from seeknal.serving.enforce import (
     enforce,
 )
 from seeknal.serving.features import _bind_feature_params
-from seeknal.serving.grant_token import verify_grant_token
+from seeknal.serving.grant_token import GrantTokenError, verify_grant_token
 from seeknal.serving.guardrails import GuardrailError, check_guardrails
 from seeknal.serving.parameter_binding import verify_parameter_digest
 from seeknal.serving.placement import Placement
@@ -242,6 +242,8 @@ class ServingPipeline:
         sql: str | bytes | None = None,
         params: Sequence | None = None,
         now: float | None = None,
+        expected_api: str | None = None,
+        allow_api_claim: bool = False,
     ) -> Grant:
         """Verify signed grant token and optional SQL/body and parameter digests."""
         claims = verify_grant_token(
@@ -253,13 +255,38 @@ class ServingPipeline:
             require_grant_typ=self.require_grant_typ,
             max_lifetime_seconds=self.max_grant_lifetime_seconds,
         )
-        audit_id = claims.get("jti")
-        subject = claims.get("sub")
+        raw_jti = claims.get("jti")
+        raw_sub = claims.get("sub")
+        audit_id = raw_jti if isinstance(raw_jti, str) and raw_jti else None
+        subject = raw_sub if isinstance(raw_sub, str) and raw_sub else None
 
         try:
+            claim_api = claims.get("api")
+            if expected_api is not None:
+                if claim_api != expected_api:
+                    raise GrantTokenError(
+                        f"Grant 'api' claim must be '{expected_api}'",
+                        code="grant_invalid",
+                    )
+            elif not allow_api_claim and claim_api is not None:
+                raise GrantTokenError(
+                    "Grant with 'api' claim is not permitted for SQL queries",
+                    code="grant_invalid",
+                )
+
             grant = Grant.from_claims(claims)
             if "api" in claims and not hasattr(grant, "api"):
                 object.__setattr__(grant, "_claims_api", claims.get("api"))
+
+            if (
+                expected_api is None
+                and not allow_api_claim
+                and getattr(grant, "api", None) is not None
+            ):
+                raise GrantTokenError(
+                    "Grant with 'api' claim is not permitted for SQL queries",
+                    code="grant_invalid",
+                )
 
             if sql is not None:
                 if isinstance(sql, str):
@@ -553,13 +580,33 @@ class ServingPipeline:
 
         if not isinstance(sql, str):
             # Verify token first so audit_id / subject are attached to the error
-            grant = self.verify_grant(token, now=now)
+            grant = self.verify_grant(
+                token, now=now, expected_api=None, allow_api_claim=False
+            )
             exc = EnforcementError("SQL query must be a string", code="invalid_sql")
             exc.audit_id = grant.audit_id
             exc.subject = grant.subject
             raise exc
 
-        grant = self.verify_grant(token, sql=sql, params=params, now=now)
+        grant = self.verify_grant(
+            token,
+            sql=sql,
+            params=params,
+            now=now,
+            expected_api=None,
+            allow_api_claim=False,
+        )
+        if (
+            getattr(grant, "api", None) is not None
+            or getattr(grant, "_claims_api", None) is not None
+        ):
+            api_exc = GrantTokenError(
+                "Grant with 'api' claim is not permitted for SQL queries",
+                code="grant_invalid",
+            )
+            api_exc.audit_id = grant.audit_id
+            api_exc.subject = grant.subject
+            raise api_exc
 
         try:
             raw_params = tuple(params)

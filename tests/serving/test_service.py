@@ -980,3 +980,82 @@ def test_split_verify_grant_prepare_statement_and_postgres_guardrails(ec_key):
     assert exc_info.value.code == "filter_required"
     assert exc_info.value.audit_id == "jti-service-001"
 
+
+def test_prepare_and_verify_grant_reject_non_null_api_claim(standard_pipeline):
+    """ServingPipeline.prepare and default verify_grant must reject non-null 'api' claims directly."""
+    from seeknal.serving.grant_token import GrantTokenError
+
+    pipeline, priv = standard_pipeline
+    sql = "SELECT user_id, username FROM users WHERE user_id = 1"
+    tables_grant = {
+        "users": {
+            "columns": ["user_id", "username"],
+            "masks": {},
+            "row_filters": [],
+            "actions": ["select"],
+        }
+    }
+
+    def _mint(api_val, *, include_api: bool = True, jti: str = "jti-api-check") -> str:
+        now = time.time()
+        claims = {
+            "sub": "analyst@atlas.org",
+            "ws": "ws-claims",
+            "jti": jti,
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": now,
+            "exp": now + 120,
+            "sql_dialect": "postgres",
+            "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            "max_rows": 100,
+            "tables": tables_grant,
+        }
+        if include_api:
+            claims["api"] = api_val
+        return sign_grant_token(claims, priv, kid="key-atlas")
+
+    # 1. Direct pipeline.prepare rejects 'api': 'select.v1' and arbitrary non-null 'api'
+    for idx, bad_api in enumerate(("select.v1", "custom.v1", 123)):
+        jti = f"jti-api-prep-{idx}"
+        tok = _mint(bad_api, jti=jti)
+        with pytest.raises(GrantTokenError) as exc_info:
+            pipeline.prepare(sql, tok)
+        assert exc_info.value.code == "grant_invalid"
+        assert exc_info.value.audit_id == jti
+        assert exc_info.value.subject == "analyst@atlas.org"
+
+        # Default verify_grant (SQL mode) also rejects non-null 'api'
+        with pytest.raises(GrantTokenError) as vg_exc:
+            pipeline.verify_grant(tok, sql=sql)
+        assert vg_exc.value.code == "grant_invalid"
+        assert vg_exc.value.audit_id == jti
+        assert vg_exc.value.subject == "analyst@atlas.org"
+
+    # 2. Explicit null 'api': None is permitted for SQL queries
+    tok_null_api = _mint(None, jti="jti-api-null")
+    prep_ok = pipeline.prepare(sql, tok_null_api)
+    assert prep_ok.audit_id == "jti-api-null"
+    assert prep_ok.api is None
+
+    # 3. verify_grant with expected_api='select.v1' or allow_api_claim=True accepts select.v1 grant
+    tok_select = _mint("select.v1", jti="jti-api-select-ok")
+    g_expected = pipeline.verify_grant(
+        tok_select, sql=sql, expected_api="select.v1"
+    )
+    assert g_expected.api == "select.v1"
+    assert g_expected.audit_id == "jti-api-select-ok"
+
+    g_allowed = pipeline.verify_grant(
+        tok_select, sql=sql, allow_api_claim=True
+    )
+    assert g_allowed.api == "select.v1"
+
+    # 4. verify_grant with expected_api='select.v1' rejects SQL grant lacking 'api'
+    tok_no_api = _mint(None, include_api=False, jti="jti-no-api")
+    with pytest.raises(GrantTokenError) as missing_api_exc:
+        pipeline.verify_grant(tok_no_api, sql=sql, expected_api="select.v1")
+    assert missing_api_exc.value.code == "grant_invalid"
+    assert missing_api_exc.value.audit_id == "jti-no-api"
+
+
