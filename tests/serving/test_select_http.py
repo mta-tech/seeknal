@@ -290,8 +290,18 @@ def test_select_body_digest_and_cross_endpoint_api_claim_isolation(select_env):
 def test_select_invalid_cursor_invalid_and_masked_column_errors(select_env):
     client, priv, _, _, _ = select_env
 
-    # 1. Invalid JSON and non-object JSON -> 400 select_invalid
-    for idx, bad_raw in enumerate((b"{not-json", b"[1,2,3]")):
+    # 1. Invalid JSON, non-object JSON, and duplicate JSON keys at any nesting level -> 400 select_invalid
+    for idx, bad_raw in enumerate(
+        (
+            b"{not-json",
+            b"[1,2,3]",
+            b'{"table":"cbn.rpt.rpt_txn_detail","table":"cbn.rpt.rpt_txn_detail","columns":["txn_id"]}',
+            b'{"table":"cbn.rpt.rpt_txn_detail","columns":["txn_id"],"where":{"customer_id":{"_eq":"C-1"}},"where":{"customer_id":{"_eq":"C-2"}}}',
+            b'{"table":"cbn.rpt.rpt_txn_detail","columns":["txn_id"],"where":{"customer_id":{"_eq":"C-1"},"customer_id":{"_eq":"C-2"}}}',
+            b'{"table":"cbn.rpt.rpt_txn_detail","columns":["txn_id"],"where":{"customer_id":{"_eq":"C-1","_eq":"C-2"}}}',
+            b'{"table":"cbn.rpt.rpt_txn_detail","columns":["txn_id"],"order_by":[{"txn_id":"asc","txn_id":"desc"}]}',
+        )
+    ):
         tok = _mint_select_grant(priv, bad_raw, jti=f"jti-badjson-{idx}")
         resp = client.post(
             "/v1/select",

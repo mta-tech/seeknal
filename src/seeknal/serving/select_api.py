@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -71,6 +72,48 @@ class SelectInvalidError(EnforcementError):
         code: str | None = None,
     ) -> None:
         super().__init__(message, code=code or "select_invalid")
+
+
+def reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """json.loads object_pairs_hook that raises SelectInvalidError on duplicate keys."""
+    out: dict[str, Any] = {}
+    for key, val in pairs:
+        if key in out:
+            raise SelectInvalidError("duplicate key in select JSON object")
+        out[key] = val
+    return out
+
+
+def _reject_select_json_constant(_val: str) -> Any:
+    raise SelectInvalidError("invalid JSON constant in select request")
+
+
+def parse_select_json(raw: bytes | str) -> dict[str, Any]:
+    """Parse a raw /v1/select JSON body rejecting non-UTF-8, constants, and duplicate keys."""
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        try:
+            text = bytes(raw).decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise SelectInvalidError("select body must be valid UTF-8") from exc
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        raise SelectInvalidError("select body must be bytes or string")
+
+    try:
+        parsed = json.loads(
+            text,
+            parse_constant=_reject_select_json_constant,
+            object_pairs_hook=reject_duplicate_json_keys,
+        )
+    except SelectInvalidError:
+        raise
+    except Exception as exc:
+        raise SelectInvalidError("invalid JSON in select request") from exc
+
+    if not isinstance(parsed, dict):
+        raise SelectInvalidError("select payload must be a JSON object")
+    return parsed
 
 
 @dataclass(frozen=True)

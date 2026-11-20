@@ -74,6 +74,7 @@ from seeknal.serving.select_api import (
     CompiledSelect,
     SelectInvalidError,
     compile_select_request,
+    reject_duplicate_json_keys,
 )
 from seeknal.serving.service import (
     PreparedQuery,
@@ -2855,6 +2856,7 @@ def create_app(
             payload = json.loads(
                 raw_body.decode("utf-8", errors="strict"),
                 parse_constant=_reject_json_constant,
+                object_pairs_hook=reject_duplicate_json_keys,
             )
         except Exception:
             return await _finish(
