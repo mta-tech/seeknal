@@ -1200,6 +1200,88 @@ def test_pax_extraction_and_sparse_refusal_without_private_tarfile_regex(
     assert not (test_storage._root / "assets" / "no_priv_regex_sparse").exists()
 
 
+def _build_pax_mtime_tar_gz(out_path: Path, mtime_str: str) -> Path:
+    return _build_pax_unknown_key_tar_gz(out_path, key="mtime", value=mtime_str)
+
+
+def _build_ustar_mtime_tar_gz(out_path: Path, raw_mtime_field: bytes) -> Path:
+    import gzip
+
+    info = tarfile.TarInfo(name="index.html")
+    data = b"<html>mtime</html>"
+    info.size = len(data)
+    raw = bytearray(info.tobuf(tarfile.GNU_FORMAT))
+    assert len(raw_mtime_field) == 12
+    raw[136:148] = raw_mtime_field
+    raw[148:156] = b"        "
+    chksum = tarfile.calc_chksums(bytes(raw))[0]
+    raw[148:156] = f"{chksum:06o}\x00 ".encode("ascii")
+
+    with gzip.open(out_path, "wb", compresslevel=1) as gz:
+        gz.write(bytes(raw))
+        gz.write(data.ljust(512, b"\x00"))
+        gz.write(b"\x00" * 1024)
+    return out_path
+
+
+@pytest.mark.parametrize(
+    "bad_mtime",
+    [
+        "1e400",
+        "1234567890123456789012345678901",
+        "-1",
+        "nan",
+        "inf",
+        "-inf",
+        str((1 << 33) + 1),
+    ],
+)
+def test_pax_out_of_range_and_non_finite_mtimes_refused(
+    test_storage: LocalFilesystemStorage,
+    tmp_path: Path,
+    bad_mtime: str,
+) -> None:
+    safe_label = bad_mtime.replace("-", "neg_")
+    archive = _build_pax_mtime_tar_gz(tmp_path / f"pax_mtime_{safe_label}.tar.gz", bad_mtime)
+    slug = f"mtime_{safe_label}"
+    with open(archive, "rb") as f:
+        with pytest.raises(TarSafetyError, match="Tarball entry has an invalid mtime"):
+            test_storage.extract_tarball(slug, f)
+    assert not (test_storage._root / "assets" / slug).exists()
+
+
+def test_ustar_out_of_range_mtimes_refused_and_normal_float_mtime_accepted(
+    test_storage: LocalFilesystemStorage,
+    tmp_path: Path,
+) -> None:
+    # Negative base-256 GNU mtime (-1) and > 2**33 base-256 GNU mtime in the 12-byte header field
+    neg_ustar = _build_ustar_mtime_tar_gz(
+        tmp_path / "ustar_neg_mtime.tar.gz",
+        tarfile.itn(-1, 12, tarfile.GNU_FORMAT),
+    )
+    over_ustar = _build_ustar_mtime_tar_gz(
+        tmp_path / "ustar_over_mtime.tar.gz",
+        tarfile.itn((1 << 33) + 100, 12, tarfile.GNU_FORMAT),
+    )
+    for idx, archive in enumerate((neg_ustar, over_ustar)):
+        slug = f"ustar_bad_mtime_{idx}"
+        with open(archive, "rb") as f:
+            with pytest.raises(TarSafetyError, match="Tarball entry has an invalid mtime"):
+                test_storage.extract_tarball(slug, f)
+        assert not (test_storage._root / "assets" / slug).exists()
+
+    # Normal float mtime in pax header is accepted
+    ok_float_tar = _build_pax_mtime_tar_gz(
+        tmp_path / "pax_float_mtime_ok.tar.gz",
+        "1700000000.125",
+    )
+    with open(ok_float_tar, "rb") as f:
+        test_storage.extract_tarball("pax_float_mtime_ok", f)
+    mount = test_storage.local_mount_path("pax_float_mtime_ok")
+    assert mount is not None
+    assert (mount / "index.html").read_bytes() == b"<html>ok</html>"
+
+
 
 
 

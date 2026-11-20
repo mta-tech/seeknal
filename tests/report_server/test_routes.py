@@ -982,6 +982,26 @@ def test_attribute_and_overflow_errors_mapped_to_typed_400(
         assert resp.json() == {"error": "Invalid or corrupt tarball archive"}
 
 
+def test_publish_rejects_invalid_pax_mtimes_with_400_and_accepts_normal_float_mtime(
+    test_client: TestClient,
+    tmp_path: Path,
+) -> None:
+    from tests.report_server.test_storage import _build_pax_mtime_tar_gz
+
+    assets_dir = test_client.app.state.config.data_dir / "assets"
+    for bad_mtime in ("1e400", "1234567890123456789012345678901", "-1", "nan", "inf"):
+        safe_label = bad_mtime.replace("-", "neg_")
+        archive = _build_pax_mtime_tar_gz(tmp_path / f"route_mtime_{safe_label}.tar.gz", bad_mtime)
+        resp = _publish(test_client, archive)
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "Tarball entry has an invalid mtime"}
+    assert list(assets_dir.iterdir()) == []
+
+    ok_archive = _build_pax_mtime_tar_gz(tmp_path / "route_mtime_float_ok.tar.gz", "1700000000.5")
+    ok_resp = _publish(test_client, ok_archive)
+    assert ok_resp.status_code == 201
+
+
 
 
 

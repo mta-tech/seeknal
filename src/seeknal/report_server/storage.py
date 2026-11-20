@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import math
 import os
 import re
 import shutil
@@ -20,6 +21,7 @@ from seeknal.utils.path_security import is_insecure_path
 
 MAX_TAR_HEADER_BYTES = 64 * 1024  # 64 KiB cap for any single pax or GNU longname/longlink header
 MAX_CONSECUTIVE_EXTENDED_HEADERS = 8
+MAX_TAR_MTIME = 1 << 33  # 2**33 seconds
 TAR_MEMBER_HEADER_OVERHEAD_BYTES = 4096
 TAR_FIXED_HEADER_SLACK_BYTES = 1024 * 1024  # 1 MiB fixed header slack
 
@@ -71,6 +73,40 @@ class TarSafetyError(ValueError):
     pass
 
 
+def _validate_mtime_value(value: object) -> None:
+    if isinstance(value, bool):
+        raise TarSafetyError("Tarball entry has an invalid mtime")
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            text = bytes(value).decode("ascii")
+        except UnicodeDecodeError:
+            raise TarSafetyError("Tarball entry has an invalid mtime") from None
+        stripped = text.strip()
+        if not stripped:
+            raise TarSafetyError("Tarball entry has an invalid mtime")
+        try:
+            parsed: int | float = int(stripped) if "." not in stripped and "e" not in stripped.lower() else float(stripped)
+        except (ValueError, OverflowError):
+            raise TarSafetyError("Tarball entry has an invalid mtime") from None
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise TarSafetyError("Tarball entry has an invalid mtime")
+        try:
+            parsed = int(stripped) if "." not in stripped and "e" not in stripped.lower() else float(stripped)
+        except (ValueError, OverflowError):
+            raise TarSafetyError("Tarball entry has an invalid mtime") from None
+    elif isinstance(value, (int, float)):
+        parsed = value
+    else:
+        raise TarSafetyError("Tarball entry has an invalid mtime")
+
+    if isinstance(parsed, float) and not math.isfinite(parsed):
+        raise TarSafetyError("Tarball entry has an invalid mtime")
+    if parsed < 0 or parsed > MAX_TAR_MTIME:
+        raise TarSafetyError("Tarball entry has an invalid mtime")
+
+
 class _PositionBoundedReader:
     """File-like wrapper around a decompressed stream that enforces a position ceiling."""
 
@@ -111,6 +147,7 @@ class _BoundedTarInfo(tarfile.TarInfo):
     def _proc_member(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
         if self.type not in _ALLOWED_TAR_HEADER_TYPES:
             raise TarSafetyError("Tarball entry type not allowed")
+        _validate_mtime_value(self.mtime)
         if self.type in _EXTENDED_TAR_HEADER_TYPES:
             chain_depth = getattr(tarfile, "_extended_header_chain_depth", 0) + 1
             if chain_depth > MAX_CONSECUTIVE_EXTENDED_HEADERS:
@@ -214,6 +251,8 @@ class _BoundedTarInfo(tarfile.TarInfo):
                 and not cls._is_ignored_pax_raw_key(raw_keyword)
             ):
                 raise TarSafetyError("Tarball pax header key not allowed")
+            if raw_keyword == b"mtime":
+                _validate_mtime_value(raw_value)
             records.append((raw_keyword, raw_value))
             pos += length
         return records
@@ -266,6 +305,7 @@ def _validate_tar_member(
 
     if member.size < 0:
         raise TarSafetyError("Tarball uncompressed size exceeds limit")
+    _validate_mtime_value(member.mtime)
 
     # Verify resolved path stays inside dest
     normalized_rel = name.replace("\\", os.sep)
