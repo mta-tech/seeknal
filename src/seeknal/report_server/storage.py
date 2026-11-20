@@ -18,7 +18,38 @@ from seeknal.report_server.config import (
 from seeknal.utils.path_security import is_insecure_path
 
 MAX_TAR_HEADER_BYTES = 64 * 1024  # 64 KiB cap for any single pax or GNU longname/longlink header
+MAX_CONSECUTIVE_EXTENDED_HEADERS = 8
 TAR_MEMBER_HEADER_OVERHEAD_BYTES = 1536
+
+_ALLOWED_TAR_HEADER_TYPES: frozenset[bytes] = frozenset(
+    {
+        tarfile.REGTYPE,
+        tarfile.AREGTYPE,
+        tarfile.DIRTYPE,
+        tarfile.XHDTYPE,
+        tarfile.GNUTYPE_LONGNAME,
+    }
+)
+_EXTENDED_TAR_HEADER_TYPES: frozenset[bytes] = frozenset(
+    {
+        tarfile.XHDTYPE,
+        tarfile.GNUTYPE_LONGNAME,
+    }
+)
+_ALLOWED_PAX_HEADER_KEYS: frozenset[str] = frozenset(
+    {
+        "path",
+        "size",
+        "mtime",
+        "uid",
+        "gid",
+        "uname",
+        "gname",
+    }
+)
+_ALLOWED_PAX_HEADER_RAW_KEYS: frozenset[bytes] = frozenset(
+    k.encode("ascii") for k in _ALLOWED_PAX_HEADER_KEYS
+)
 
 
 class TarSafetyError(ValueError):
@@ -60,7 +91,31 @@ class _PositionBoundedReader:
 
 
 class _BoundedTarInfo(tarfile.TarInfo):
-    """TarInfo subclass that caps pax ('x'/'g') and GNU longname/longlink ('L'/'K') headers before reading."""
+    """TarInfo subclass enforcing a header-type allowlist, pax key allowlist, 64 KiB header cap, and chain depth cap."""
+
+    def _proc_member(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
+        if self.type not in _ALLOWED_TAR_HEADER_TYPES:
+            raise TarSafetyError("Tarball entry type not allowed")
+        if self.type in _EXTENDED_TAR_HEADER_TYPES:
+            chain_depth = getattr(tarfile, "_extended_header_chain_depth", 0) + 1
+            if chain_depth > MAX_CONSECUTIVE_EXTENDED_HEADERS:
+                raise TarSafetyError("Tarball entry header too large")
+            setattr(tarfile, "_extended_header_chain_depth", chain_depth)
+        else:
+            setattr(tarfile, "_extended_header_chain_depth", 0)
+        return super()._proc_member(tarfile)  # type: ignore[misc]
+
+    def _proc_sparse(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
+        raise TarSafetyError("Tarball entry type not allowed")
+
+    def _proc_gnusparse_00(self, next: tarfile.TarInfo, raw_headers: object) -> None:  # type: ignore[override]
+        raise TarSafetyError("Tarball entry type not allowed")
+
+    def _proc_gnusparse_01(self, next: tarfile.TarInfo, pax_headers: object) -> None:  # type: ignore[override]
+        raise TarSafetyError("Tarball entry type not allowed")
+
+    def _proc_gnusparse_10(self, next: tarfile.TarInfo, pax_headers: object, tarfile: tarfile.TarFile) -> None:  # type: ignore[override]
+        raise TarSafetyError("Tarball entry type not allowed")
 
     def _proc_gnulong(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
         if self.size < 0 or self.size > MAX_TAR_HEADER_BYTES:
@@ -70,7 +125,37 @@ class _BoundedTarInfo(tarfile.TarInfo):
     def _proc_pax(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
         if self.size < 0 or self.size > MAX_TAR_HEADER_BYTES:
             raise TarSafetyError("Tarball entry header too large")
-        return super()._proc_pax(tarfile)  # type: ignore[misc]
+        pos = tarfile.fileobj.tell()
+        header_buf = tarfile.fileobj.read(self._block(self.size))
+        self._validate_pax_records(header_buf)
+        tarfile.fileobj.seek(pos)
+        next_info = super()._proc_pax(tarfile)  # type: ignore[misc]
+        for key in getattr(next_info, "pax_headers", ()):
+            if key not in _ALLOWED_PAX_HEADER_KEYS:
+                raise TarSafetyError("Tarball pax header key not allowed")
+        return next_info
+
+    @staticmethod
+    def _validate_pax_records(buf: bytes) -> None:
+        pos = 0
+        while len(buf) > pos and buf[pos] != 0x00:
+            match = tarfile._header_length_prefix_re.match(buf, pos)  # type: ignore[attr-defined]
+            if not match:
+                break
+            try:
+                length = int(match.group(1))
+            except ValueError:
+                break
+            if length < 5 or pos + length > len(buf):
+                break
+            header_value_end_offset = match.start(1) + length - 1
+            keyword_and_value = buf[match.end(1) + 1 : header_value_end_offset]
+            raw_keyword, equals, _ = keyword_and_value.partition(b"=")
+            if not raw_keyword or equals != b"=" or buf[header_value_end_offset] != 0x0A:
+                break
+            if raw_keyword not in _ALLOWED_PAX_HEADER_RAW_KEYS:
+                raise TarSafetyError("Tarball pax header key not allowed")
+            pos += length
 
 
 def _validate_tar_member(

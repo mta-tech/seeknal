@@ -807,6 +807,69 @@ def test_publish_catches_memory_error_and_cleans_up_on_commit_failure(
     assert data_dir_str not in log_msg
 
 
+def test_publish_rejects_disallowed_headers_and_chains_with_typed_400_and_bounded_memory(
+    test_client: TestClient,
+    tmp_path: Path,
+) -> None:
+    import tracemalloc
+    from tests.report_server.test_storage import (
+        _build_chained_extended_headers_tar_gz,
+        _build_conttype_tar_gz,
+        _build_gnu_longlink_tar_gz,
+        _build_old_gnu_sparse_tar_gz,
+        _build_pax_global_header_tar_gz,
+        _build_pax_gnu_sparse_01_tar_gz,
+        _build_pax_gnu_sparse_10_tar_gz,
+        _build_pax_unknown_key_tar_gz,
+    )
+
+    cases = [
+        (_build_pax_global_header_tar_gz(tmp_path / "route_global_g.tar.gz"), "Tarball entry type not allowed"),
+        (_build_gnu_longlink_tar_gz(tmp_path / "route_longlink_K.tar.gz"), "Tarball entry type not allowed"),
+        (_build_pax_unknown_key_tar_gz(tmp_path / "route_pax_unknown.tar.gz"), "Tarball pax header key not allowed"),
+        (_build_pax_gnu_sparse_01_tar_gz(tmp_path / "route_sparse_01.tar.gz"), "Tarball pax header key not allowed"),
+        (_build_old_gnu_sparse_tar_gz(tmp_path / "route_sparse_old.tar.gz"), "Tarball entry type not allowed"),
+        (_build_pax_gnu_sparse_10_tar_gz(tmp_path / "route_sparse_10.tar.gz"), "Tarball pax header key not allowed"),
+        (
+            _build_chained_extended_headers_tar_gz(tmp_path / "route_chain_9.tar.gz", count=9),
+            "Tarball entry header too large",
+        ),
+        (
+            _build_chained_extended_headers_tar_gz(tmp_path / "route_chain_300.tar.gz", count=300),
+            "Tarball entry header too large",
+        ),
+        (_build_conttype_tar_gz(tmp_path / "route_conttype_7.tar.gz"), "Tarball entry type not allowed"),
+    ]
+    assets_dir = test_client.app.state.config.data_dir / "assets"
+
+    for archive, expected_error in cases:
+        tracemalloc.start()
+        try:
+            resp = _publish(test_client, archive)
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert resp.status_code == 400
+        assert resp.json() == {"error": expected_error}
+        assert peak_bytes < 16 * 1024 * 1024, f"{archive.name} peak memory {peak_bytes} exceeded 16 MiB"
+        assert list(assets_dir.iterdir()) == []
+
+    # Chain of 8 extended headers is accepted via /publish
+    ok_chain_8 = _build_chained_extended_headers_tar_gz(tmp_path / "route_chain_8.tar.gz", count=8)
+    ok_resp = _publish(test_client, ok_chain_8)
+    assert ok_resp.status_code == 201
+
+    # Direct RecursionError during extraction is also caught and mapped to typed 400
+    def _raise_recursion(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded in tar header chain")
+
+    with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=_raise_recursion):
+        rec_resp = _publish(test_client, ok_chain_8)
+    assert rec_resp.status_code == 400
+    assert rec_resp.json() == {"error": "Tarball entry header too large"}
+
+
 
 
 

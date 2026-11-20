@@ -681,6 +681,336 @@ def test_position_bounded_reader_enforces_position_and_allows_two_pass_rewind(
     assert (mount / "index.html").read_bytes() == payload
 
 
+def _pax_record(key: str, value: str) -> bytes:
+    body = f" {key}={value}\n".encode("utf-8")
+    length = len(str(len(body))) + len(body)
+    if len(str(length)) + len(body) != length:
+        length += 1
+    return f"{length}".encode("ascii") + body
+
+
+def _build_old_gnu_sparse_tar_gz(out_path: Path, *, num_extended_blocks: int = 8) -> Path:
+    import gzip
+
+    first = tarfile.TarInfo(name="innocent.txt")
+    first_data = b"ok"
+    first.size = len(first_data)
+    first_block = first.tobuf(tarfile.GNU_FORMAT) + first_data.ljust(512, b"\x00")
+
+    sparse_info = tarfile.TarInfo(name="sparse_old.bin")
+    sparse_info.type = tarfile.GNUTYPE_SPARSE
+    sparse_info.size = 512
+    raw = bytearray(sparse_info.tobuf(tarfile.GNU_FORMAT))
+    # Populate 4 inline sparse descriptors at offset 386, set isextended=1 at 482, origsize at 483
+    for i in range(4):
+        pos = 386 + i * 24
+        raw[pos : pos + 12] = tarfile.itn(i * 4096 + 1, 12, tarfile.GNU_FORMAT)
+        raw[pos + 12 : pos + 24] = tarfile.itn(512, 12, tarfile.GNU_FORMAT)
+    raw[482] = 1
+    raw[483:495] = tarfile.itn(1024 * 1024, 12, tarfile.GNU_FORMAT)
+    raw[148:156] = b"        "
+    chksum = tarfile.calc_chksums(bytes(raw))[0]
+    raw[148:156] = f"{chksum:06o}\x00 ".encode("ascii")
+
+    ext_blocks = bytearray()
+    for blk_idx in range(num_extended_blocks):
+        ext = bytearray(512)
+        for j in range(21):
+            pos = j * 24
+            ext[pos : pos + 12] = tarfile.itn((blk_idx * 21 + j + 5) * 4096, 12, tarfile.GNU_FORMAT)
+            ext[pos + 12 : pos + 24] = tarfile.itn(512, 12, tarfile.GNU_FORMAT)
+        ext[504] = 1 if blk_idx < num_extended_blocks - 1 else 0
+        ext_blocks.extend(ext)
+
+    with gzip.open(out_path, "wb", compresslevel=1) as gz:
+        gz.write(first_block)
+        gz.write(bytes(raw))
+        gz.write(bytes(ext_blocks))
+        gz.write(b"x" * 512)
+        gz.write(b"\x00" * 1024)
+    return out_path
+
+
+def _build_pax_gnu_sparse_01_tar_gz(out_path: Path) -> Path:
+    import gzip
+
+    first = tarfile.TarInfo(name="innocent.txt")
+    first_data = b"ok"
+    first.size = len(first_data)
+    first_block = first.tobuf(tarfile.PAX_FORMAT) + first_data.ljust(512, b"\x00")
+
+    sparse_map = ",".join(f"{i * 1024},512" for i in range(64))
+    pax_payload = (
+        _pax_record("GNU.sparse.size", "65536")
+        + _pax_record("GNU.sparse.numblocks", "64")
+        + _pax_record("GNU.sparse.name", "sparse01.bin")
+        + _pax_record("GNU.sparse.map", sparse_map)
+    )
+    pax_info = tarfile.TarInfo(name="PaxHeader/sparse01.bin")
+    pax_info.type = tarfile.XHDTYPE
+    pax_info.size = len(pax_payload)
+    pax_blocks = pax_info.tobuf(tarfile.PAX_FORMAT) + pax_payload.ljust(
+        ((len(pax_payload) + 511) // 512) * 512, b"\x00"
+    )
+
+    reg_info = tarfile.TarInfo(name="sparse01.bin")
+    reg_info.type = tarfile.REGTYPE
+    reg_info.size = 512
+    reg_blocks = reg_info.tobuf(tarfile.PAX_FORMAT) + (b"y" * 512)
+
+    with gzip.open(out_path, "wb", compresslevel=1) as gz:
+        gz.write(first_block)
+        gz.write(pax_blocks)
+        gz.write(reg_blocks)
+        gz.write(b"\x00" * 1024)
+    return out_path
+
+
+def _build_pax_gnu_sparse_10_tar_gz(out_path: Path) -> Path:
+    import gzip
+
+    first = tarfile.TarInfo(name="innocent.txt")
+    first_data = b"ok"
+    first.size = len(first_data)
+    first_block = first.tobuf(tarfile.PAX_FORMAT) + first_data.ljust(512, b"\x00")
+
+    pax_payload = (
+        _pax_record("GNU.sparse.major", "1")
+        + _pax_record("GNU.sparse.minor", "0")
+        + _pax_record("GNU.sparse.name", "sparse10.bin")
+        + _pax_record("GNU.sparse.realsize", "1048576")
+    )
+    pax_info = tarfile.TarInfo(name="PaxHeader/sparse10.bin")
+    pax_info.type = tarfile.XHDTYPE
+    pax_info.size = len(pax_payload)
+    pax_blocks = pax_info.tobuf(tarfile.PAX_FORMAT) + pax_payload.ljust(
+        ((len(pax_payload) + 511) // 512) * 512, b"\x00"
+    )
+
+    # GNU sparse 1.0 data block starts with number of entries followed by offset/numbytes lines
+    sparse_map_block = (b"256\n" + (b"1\n1\n" * 256)).ljust(2048, b"\x00")
+    reg_info = tarfile.TarInfo(name="sparse10.bin")
+    reg_info.type = tarfile.REGTYPE
+    reg_info.size = len(sparse_map_block)
+    reg_blocks = reg_info.tobuf(tarfile.PAX_FORMAT) + sparse_map_block
+
+    with gzip.open(out_path, "wb", compresslevel=1) as gz:
+        gz.write(first_block)
+        gz.write(pax_blocks)
+        gz.write(reg_blocks)
+        gz.write(b"\x00" * 1024)
+    return out_path
+
+
+def _build_pax_global_header_tar_gz(out_path: Path) -> Path:
+    import gzip
+
+    pax_payload = _pax_record("path", "global_override.txt")
+    g_info = tarfile.TarInfo(name="PaxHeader/GlobalHead")
+    g_info.type = tarfile.XGLTYPE
+    g_info.size = len(pax_payload)
+    g_blocks = g_info.tobuf(tarfile.PAX_FORMAT) + pax_payload.ljust(512, b"\x00")
+
+    reg = tarfile.TarInfo(name="index.html")
+    reg_data = b"<html>ok</html>"
+    reg.size = len(reg_data)
+    reg_blocks = reg.tobuf(tarfile.PAX_FORMAT) + reg_data.ljust(512, b"\x00")
+
+    with gzip.open(out_path, "wb", compresslevel=1) as gz:
+        gz.write(g_blocks)
+        gz.write(reg_blocks)
+        gz.write(b"\x00" * 1024)
+    return out_path
+
+
+def _build_gnu_longlink_tar_gz(out_path: Path) -> Path:
+    import gzip
+
+    longlink_payload = b"target_" + (b"a" * 120) + b"\x00"
+    k_info = tarfile.TarInfo(name="././@LongLink")
+    k_info.type = tarfile.GNUTYPE_LONGLINK
+    k_info.size = len(longlink_payload)
+    k_blocks = k_info.tobuf(tarfile.GNU_FORMAT) + longlink_payload.ljust(512, b"\x00")
+
+    reg = tarfile.TarInfo(name="index.html")
+    reg_data = b"<html>ok</html>"
+    reg.size = len(reg_data)
+    reg_blocks = reg.tobuf(tarfile.GNU_FORMAT) + reg_data.ljust(512, b"\x00")
+
+    with gzip.open(out_path, "wb", compresslevel=1) as gz:
+        gz.write(k_blocks)
+        gz.write(reg_blocks)
+        gz.write(b"\x00" * 1024)
+    return out_path
+
+
+def _build_pax_unknown_key_tar_gz(out_path: Path) -> Path:
+    import gzip
+
+    pax_payload = _pax_record("comment", "x")
+    x_info = tarfile.TarInfo(name="PaxHeader/index.html")
+    x_info.type = tarfile.XHDTYPE
+    x_info.size = len(pax_payload)
+    x_blocks = x_info.tobuf(tarfile.PAX_FORMAT) + pax_payload.ljust(512, b"\x00")
+
+    reg = tarfile.TarInfo(name="index.html")
+    reg_data = b"<html>ok</html>"
+    reg.size = len(reg_data)
+    reg_blocks = reg.tobuf(tarfile.PAX_FORMAT) + reg_data.ljust(512, b"\x00")
+
+    with gzip.open(out_path, "wb", compresslevel=1) as gz:
+        gz.write(x_blocks)
+        gz.write(reg_blocks)
+        gz.write(b"\x00" * 1024)
+    return out_path
+
+
+def _build_conttype_tar_gz(out_path: Path) -> Path:
+    import gzip
+
+    first = tarfile.TarInfo(name="innocent.txt")
+    first_data = b"ok"
+    first.size = len(first_data)
+    first_block = first.tobuf(tarfile.GNU_FORMAT) + first_data.ljust(512, b"\x00")
+
+    c_info = tarfile.TarInfo(name="contiguous.bin")
+    c_info.type = tarfile.CONTTYPE
+    c_data = b"1234"
+    c_info.size = len(c_data)
+    c_blocks = c_info.tobuf(tarfile.GNU_FORMAT) + c_data.ljust(512, b"\x00")
+
+    with gzip.open(out_path, "wb", compresslevel=1) as gz:
+        gz.write(first_block)
+        gz.write(c_blocks)
+        gz.write(b"\x00" * 1024)
+    return out_path
+
+
+def _build_chained_extended_headers_tar_gz(out_path: Path, *, count: int = 9) -> Path:
+    import gzip
+
+    long_payload = b"chained_long_name.html\x00"
+    l_info = tarfile.TarInfo(name="././@LongLink")
+    l_info.type = tarfile.GNUTYPE_LONGNAME
+    l_info.size = len(long_payload)
+    l_block = l_info.tobuf(tarfile.GNU_FORMAT) + long_payload.ljust(512, b"\x00")
+
+    reg = tarfile.TarInfo(name="placeholder.html")
+    reg_data = b"<html>chained</html>"
+    reg.size = len(reg_data)
+    reg_blocks = reg.tobuf(tarfile.GNU_FORMAT) + reg_data.ljust(512, b"\x00")
+
+    with gzip.open(out_path, "wb", compresslevel=1) as gz:
+        for _ in range(count):
+            gz.write(l_block)
+        gz.write(reg_blocks)
+        gz.write(b"\x00" * 1024)
+    return out_path
+
+
+@pytest.mark.parametrize(
+    "case_name,builder,expected_error",
+    [
+        ("global_pax_g", _build_pax_global_header_tar_gz, "Tarball entry type not allowed"),
+        ("gnu_longlink_K", _build_gnu_longlink_tar_gz, "Tarball entry type not allowed"),
+        ("pax_unknown_key", _build_pax_unknown_key_tar_gz, "Tarball pax header key not allowed"),
+        ("pax_gnu_sparse_map", _build_pax_gnu_sparse_01_tar_gz, "Tarball pax header key not allowed"),
+        ("old_gnu_sparse_S", _build_old_gnu_sparse_tar_gz, "Tarball entry type not allowed"),
+        ("pax_gnu_sparse_10", _build_pax_gnu_sparse_10_tar_gz, "Tarball pax header key not allowed"),
+        (
+            "chain_of_9_extended_headers",
+            lambda p: _build_chained_extended_headers_tar_gz(p, count=9),
+            "Tarball entry header too large",
+        ),
+        (
+            "chain_of_300_L_headers",
+            lambda p: _build_chained_extended_headers_tar_gz(p, count=300),
+            "Tarball entry header too large",
+        ),
+        ("conttype_7", _build_conttype_tar_gz, "Tarball entry type not allowed"),
+    ],
+)
+def test_header_allowlist_and_chain_caps_rejected_before_parsing_with_bounded_memory(
+    test_storage: LocalFilesystemStorage,
+    tmp_path: Path,
+    case_name: str,
+    builder,
+    expected_error: str,
+) -> None:
+    import tracemalloc
+
+    archive = builder(tmp_path / f"{case_name}.tar.gz")
+    slug = f"allowlist_{case_name}"
+
+    tracemalloc.start()
+    try:
+        with open(archive, "rb") as f:
+            with pytest.raises(TarSafetyError, match=expected_error):
+                test_storage.extract_tarball(slug, f)
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak_bytes < 16 * 1024 * 1024, f"{case_name} peak memory {peak_bytes} exceeded 16 MiB"
+    assert not (test_storage._root / "assets" / slug).exists()
+
+
+def test_chain_of_8_extended_headers_accepted(
+    test_storage: LocalFilesystemStorage,
+    tmp_path: Path,
+) -> None:
+    archive = _build_chained_extended_headers_tar_gz(tmp_path / "chain_8.tar.gz", count=8)
+    with open(archive, "rb") as f:
+        test_storage.extract_tarball("chain_8_ok", f)
+
+    mount = test_storage.local_mount_path("chain_8_ok")
+    assert mount is not None
+    assert (mount / "chained_long_name.html").read_bytes() == b"<html>chained</html>"
+
+
+def test_seeknal_packager_and_gnu_tar_longname_archives_accepted(
+    test_storage: LocalFilesystemStorage,
+    tmp_path: Path,
+) -> None:
+    from seeknal.publish.packager import package_build
+
+    # 1. Archive built by seeknal's own packager (package_build)
+    build_dir = tmp_path / "packager_build"
+    (build_dir / "_app" / "immutable").mkdir(parents=True)
+    (build_dir / "index.html").write_text("<html><body>Packaged</body></html>", encoding="utf-8")
+    long_asset_rel = "_app/immutable/" + ("chunk_" * 20) + "entry.js"  # > 100 chars
+    (build_dir / long_asset_rel).write_text("console.log('packaged');", encoding="utf-8")
+
+    packaged_tar = package_build(build_dir)
+    try:
+        with open(packaged_tar, "rb") as f:
+            test_storage.extract_tarball("packaged_ok", f)
+    finally:
+        packaged_tar.unlink(missing_ok=True)
+
+    mount_pkg = test_storage.local_mount_path("packaged_ok")
+    assert mount_pkg is not None
+    assert (mount_pkg / "index.html").exists()
+    assert (mount_pkg / long_asset_rel).read_text(encoding="utf-8") == "console.log('packaged');"
+
+    # 2. GNU tar format archive with a 150-character member name (uses GNUTYPE_LONGNAME 'L')
+    gnu_long_name = "assets/" + ("a" * 140) + ".js"
+    assert len(gnu_long_name) == 150
+    gnu_tar_path = tmp_path / "gnu_150_char.tar.gz"
+    with tarfile.open(gnu_tar_path, "w:gz", format=tarfile.GNU_FORMAT) as tf:
+        info = tarfile.TarInfo(name=gnu_long_name)
+        payload = b"console.log('gnu150');"
+        info.size = len(payload)
+        tf.addfile(info, io.BytesIO(payload))
+
+    with open(gnu_tar_path, "rb") as f:
+        test_storage.extract_tarball("gnu_long_ok", f)
+
+    mount_gnu = test_storage.local_mount_path("gnu_long_ok")
+    assert mount_gnu is not None
+    assert (mount_gnu / gnu_long_name).read_bytes() == b"console.log('gnu150');"
+
+
 
 
 

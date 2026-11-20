@@ -43,6 +43,8 @@ _SPECIAL_FILE_ERROR_TYPE = getattr(tarfile, "SpecialFileError", ())
 def _classify_tar_error(exc: Exception) -> str:
     if isinstance(exc, MemoryError):
         return "Tarball uncompressed size exceeds limit"
+    if isinstance(exc, RecursionError):
+        return "Tarball entry header too large"
     if isinstance(exc, TarSafetyError):
         msg = str(exc)
         if ":" in msg:
@@ -136,6 +138,7 @@ async def publish(request: Request) -> JSONResponse:
                 OSError,
                 ValueError,
                 MemoryError,
+                RecursionError,
             ) as exc:
                 _log.warning(
                     "publish tarball rejected: slug=%s exc_class=%s",
