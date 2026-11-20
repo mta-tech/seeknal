@@ -238,8 +238,27 @@ class LocalFilesystemStorage(Storage):
                     pass
 
     def open_asset(self, slug: str, relpath: str) -> BinaryIO:
-        full = self._slug_dir(slug) / relpath.lstrip("/")
-        return open(full, "rb")  # noqa: WPS515
+        if (
+            not relpath
+            or "\x00" in relpath
+            or "\\" in relpath
+            or os.path.isabs(relpath)
+            or relpath.startswith("/")
+            or (len(relpath) >= 2 and relpath[0].isalpha() and relpath[1] == ":")
+            or ".." in relpath.split("/")
+        ):
+            raise FileNotFoundError("Not found")
+        slug_dir = self._slug_dir(slug)
+        try:
+            slug_dir_resolved = slug_dir.resolve()
+            candidate = (slug_dir_resolved / relpath).resolve()
+        except (OSError, ValueError) as exc:
+            raise FileNotFoundError("Not found") from exc
+        if not candidate.is_relative_to(slug_dir_resolved) or candidate == slug_dir_resolved:
+            raise FileNotFoundError("Not found")
+        if not candidate.exists() or candidate.is_dir() or not candidate.is_file():
+            raise FileNotFoundError("Not found")
+        return open(candidate, "rb")  # noqa: WPS515
 
     def local_mount_path(self, slug: str) -> Optional[Path]:
         p = self._slug_dir(slug)

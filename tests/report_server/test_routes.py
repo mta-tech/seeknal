@@ -502,4 +502,120 @@ def test_explicit_open_mode_allows_unauthenticated_publish_and_logs_warning(
         assert "secret-key-not-logged" not in rec.getMessage()
 
 
+def test_serve_asset_blocks_path_traversal_and_unsafe_paths(
+    test_app,
+    test_client: TestClient,
+    honest_tarball: Path,
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    marker = "OUTSIDE_SECRET_MARKER_99182"
+    outside_secret = tmp_path / "secret.txt"
+    outside_secret.write_text(marker, encoding="utf-8")
+    data_dir_secret = test_app.state.config.data_dir / "secret.txt"
+    data_dir_secret.write_text(marker, encoding="utf-8")
+
+    pub_resp = _publish(test_client, honest_tarball)
+    assert pub_resp.status_code == 201
+    slug = pub_resp.json()["slug"]
+
+    # Place a symlink inside the slug directory pointing outside to verify resolved-path containment
+    mount = test_app.state.storage.local_mount_path(slug)
+    assert mount is not None
+    (mount / "escaped_symlink.txt").symlink_to(outside_secret)
+
+    # Honest nested asset and index still return 200
+    honest_nested = test_client.get(f"/r/{slug}/_app/asset.js")
+    assert honest_nested.status_code == 200
+    assert b"console.log('hello');" in honest_nested.content
+
+    # Pre-encoded URLs via TestClient (so the HTTP client does not normalise dot segments)
+    encoded_cases = [
+        f"/r/{slug}/..%2Fsecret.txt",
+        f"/r/{slug}/..%2F..%2Fsecret.txt",
+        f"/r/{slug}/..%2F..%2F..%2Fsecret.txt",
+        f"/r/{slug}/..%2F..%2Fmetadata.db",
+        f"/r/{slug}/%2e%2e/secret.txt",
+        f"/r/{slug}/%2e%2e/%2e%2e/secret.txt",
+        f"/r/{slug}/%2e%2e%2f%2e%2e%2fsecret.txt",
+        f"/r/{slug}/%2F{outside_secret.as_posix().lstrip('/')}",
+        f"/r/{slug}/%2Fetc%2Fpasswd",
+        f"/r/{slug}/index.html%00.txt",
+        f"/r/{slug}/_app%5Casset.js",
+        f"/r/{slug}/..%5C..%5Csecret.txt",
+        f"/r/{slug}/escaped_symlink.txt",
+    ]
+    for url in encoded_cases:
+        resp = test_client.get(url)
+        assert resp.status_code == 404, f"Expected 404 for {url!r}, got {resp.status_code}"
+        assert marker.encode() not in resp.content
+        assert b"SQLite format" not in resp.content
+        assert "secret.txt" not in resp.text
+        assert str(outside_secret) not in resp.text
+
+    # Raw ASGI scope requests (matching uvicorn behaviour without dot-segment normalisation)
+    raw_asgi_paths = [
+        f"/r/{slug}/../../../secret.txt",
+        f"/r/{slug}/../../secret.txt",
+        f"/r/{slug}/../../metadata.db",
+        f"/r/{slug}/_app/../../../secret.txt",
+        f"/r/{slug}//{outside_secret.as_posix().lstrip('/')}",
+        f"/r/{slug}//etc/passwd",
+        f"/r/{slug}/a\x00b.txt",
+        f"/r/{slug}/_app\\asset.js",
+        f"/r/{slug}/..\\..\\secret.txt",
+        f"/r/{slug}/escaped_symlink.txt",
+    ]
+
+    async def _call_raw_asgi(req_path: str) -> tuple[int, bytes]:
+        status_code = 0
+        body_parts: list[bytes] = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            elif message["type"] == "http.response.body":
+                body_parts.append(message.get("body", b""))
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": req_path,
+            "raw_path": req_path.encode("utf-8", errors="surrogateescape"),
+            "query_string": b"",
+            "headers": [],
+            "app": test_app,
+        }
+        await test_app(scope, receive, send)
+        return status_code, b"".join(body_parts)
+
+    for raw_path in raw_asgi_paths:
+        status, body = asyncio.run(_call_raw_asgi(raw_path))
+        assert status == 404, f"Expected 404 for raw ASGI {raw_path!r}, got {status}"
+        assert marker.encode() not in body
+        assert b"SQLite format" not in body
+        assert b"secret.txt" not in body
+
+    # Also verify fallback to storage.open_asset when local_mount_path returns None
+    with patch.object(test_app.state.storage, "local_mount_path", return_value=None):
+        honest_fallback = test_client.get(f"/r/{slug}/_app/asset.js")
+        assert honest_fallback.status_code == 200
+        assert b"console.log('hello');" in honest_fallback.content
+
+        for raw_path in raw_asgi_paths:
+            status, body = asyncio.run(_call_raw_asgi(raw_path))
+            assert status == 404, f"Expected 404 on open_asset branch for {raw_path!r}, got {status}"
+            assert marker.encode() not in body
+            assert b"secret.txt" not in body
+
+
+
 

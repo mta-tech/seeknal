@@ -502,5 +502,46 @@ def test_fallback_path_normalises_modes_and_cleans_up_on_failure(
     )
 
 
+def test_open_asset_rejects_traversal_nul_backslash_absolute_and_resolved_escape(
+    test_storage: LocalFilesystemStorage,
+    honest_tarball: Path,
+    tmp_path: Path,
+) -> None:
+    slug = "open_asset_guard"
+    with open(honest_tarball, "rb") as f:
+        test_storage.extract_tarball(slug, f)
+
+    secret_file = tmp_path / "secret.txt"
+    secret_file.write_text("TOP_SECRET_MARKER_H1", encoding="utf-8")
+
+    # Honest nested asset succeeds
+    with test_storage.open_asset(slug, "_app/asset.js") as fh:
+        assert b"console.log" in fh.read()
+
+    # Create a post-extraction symlink inside slug dir pointing to outside secret_file
+    mount = test_storage.local_mount_path(slug)
+    assert mount is not None
+    (mount / "leak_link.txt").symlink_to(secret_file)
+
+    bad_paths = [
+        "../secret.txt",
+        "../../secret.txt",
+        "../../../secret.txt",
+        "_app/../../secret.txt",
+        str(secret_file),
+        "/etc/passwd",
+        "C:\\Windows\\win.ini",
+        "_app\\asset.js",
+        "index.html\x00.txt",
+        "leak_link.txt",
+        "",
+    ]
+    for bad in bad_paths:
+        with pytest.raises(FileNotFoundError) as exc_info:
+            test_storage.open_asset(slug, bad)
+        assert bad.strip() == "" or bad not in str(exc_info.value)
+
+
+
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import logging
 import mimetypes
+import os
 import tarfile
 from datetime import datetime, timezone
 
@@ -162,7 +163,7 @@ async def revoke(request: Request) -> JSONResponse:
 async def serve_asset(request: Request) -> Response:
     slug = request.path_params["slug"]
     has_path_param = "path" in request.path_params
-    path = request.path_params.get("path", "").lstrip("/")
+    raw_path = request.path_params.get("path", "")
 
     # Redirect /r/{slug} (no trailing slash) to /r/{slug}/ so relative URLs
     # in served HTML resolve correctly. Without this, ./data/report.duckdb
@@ -182,15 +183,27 @@ async def serve_asset(request: Request) -> Response:
     if pub.revoked_at is not None:
         return JSONResponse({"error": "Report has been revoked"}, status_code=410)
 
-    if not path:
-        path = "index.html"
+    path = raw_path if raw_path != "" else "index.html"
+    if (
+        "\x00" in path
+        or "\\" in path
+        or os.path.isabs(path)
+        or path.startswith("/")
+        or (len(path) >= 2 and path[0].isalpha() and path[1] == ":")
+        or ".." in path.split("/")
+    ):
+        return JSONResponse({"error": "Not found"}, status_code=404)
 
     mount = storage.local_mount_path(slug)
     if mount is not None:
-        full_path = mount / path
-        if not full_path.exists():
+        try:
+            mount_resolved = mount.resolve()
+            full_path = (mount_resolved / path).resolve()
+        except (OSError, ValueError):
             return JSONResponse({"error": "Not found"}, status_code=404)
-        if full_path.is_dir():
+        if not full_path.is_relative_to(mount_resolved) or full_path == mount_resolved:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        if not full_path.exists() or full_path.is_dir() or not full_path.is_file():
             return JSONResponse({"error": "Not found"}, status_code=404)
         mime, _ = mimetypes.guess_type(str(full_path))
         return FileResponse(str(full_path), media_type=mime or "application/octet-stream")
