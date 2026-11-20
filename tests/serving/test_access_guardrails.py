@@ -482,6 +482,149 @@ def test_join_propagation_rejects_unsargable_range_or_like_from_unguarded_tables
         assert exc_info.value.code == "filter_required"
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Negative test 1: non-key / non-join column on scan or unguarded table
+        "SELECT c.* FROM cbn.rpt.branch_dim b JOIN cbn.src_pii.customer c ON c.customer_id = b.branch_code WHERE b.region = 'WEST'",
+        "SELECT c.* FROM cbn.rpt.branch_dim b JOIN cbn.src_pii.customer c ON c.customer_id = b.branch_code WHERE b.unindexed_col = 'WEST'",
+        "SELECT c.* FROM cbn.rpt.tokenized_customer tc JOIN cbn.src_pii.customer c ON c.customer_id = tc.customer_tok WHERE tc.region = 'WEST'",
+        # Negative test 2: IN / OR-of-eq exceeding policy.point_lookup_max_keys (5)
+        "SELECT c.* FROM cbn.rpt.branch_dim b JOIN cbn.src_pii.customer c ON c.customer_id = b.branch_code WHERE b.branch_code IN ('a','b','c','d','e','f')",
+        "SELECT c.* FROM cbn.rpt.branch_dim b JOIN cbn.src_pii.customer c ON c.customer_id = b.branch_code WHERE (b.branch_code = 'a' OR b.branch_code IN ('b','c','d','e','f'))",
+        "SELECT p.* FROM cbn.rpt.branch_dim b JOIN cbn.src_pii.implicit_pii p ON p.person_id = b.branch_code WHERE b.branch_code IN ('a','b','c','d','e','f')",
+        # Multi-hop negative tests: b -> t -> c exceeding point_lookup_max_keys
+        "SELECT c.* FROM cbn.rpt.branch_dim b JOIN cbn.rpt.txn_detail t ON b.branch_code = t.branch_code JOIN cbn.src_pii.customer c ON c.customer_id = t.customer_id WHERE b.branch_code IN ('a','b','c','d','e','f')",
+        "SELECT c.* FROM cbn.rpt.branch_dim b JOIN cbn.rpt.txn_detail t ON b.branch_code = t.txn_id JOIN cbn.src_pii.customer c ON c.customer_id = t.customer_id WHERE b.branch_code IN ('a','b','c','d','e','f')",
+        # OFFSET never widens key budget (6 > 5 still fails even with valid OFFSET 100)
+        "SELECT c.* FROM cbn.rpt.branch_dim b JOIN cbn.src_pii.customer c ON c.customer_id = b.branch_code WHERE b.branch_code IN ('a','b','c','d','e','f') OFFSET 100",
+    ],
+)
+def test_join_propagation_to_pii_and_point_enforces_key_budget_and_selective_cols(
+    sql: str,
+):
+    pl = _make_placement()
+    for hint_val in (None, "pg_report"):
+        with pytest.raises(GuardrailError) as exc_info:
+            _run_guard(sql, pl, hint=hint_val)
+        assert exc_info.value.code == "filter_required"
+
+    # Also verify scan table with filterable=() rejects non-key column on both point and filter joins
+    pl_no_branch_filterable = Placement.from_dict(
+        {
+            "engines": {"pg_report": {"kind": "postgres", "dialect": "postgres"}},
+            "tables": {
+                "cbn.rpt.branch_dim": {
+                    "keys": ["branch_code"],
+                    "serve": {"pg_report": "rpt.branch_dim"},
+                    "access": {
+                        "pattern": "scan",
+                        "keys": ["branch_code"],
+                        "filterable": [],
+                        "require_filter": False,
+                    },
+                },
+                "cbn.src_pii.customer": {
+                    "pii": True,
+                    "serve": {"pg_report": "src_pii.customer"},
+                    "access": {
+                        "pattern": "point",
+                        "keys": ["customer_id"],
+                        "filterable": ["customer_id"],
+                        "max_rows": 50,
+                    },
+                },
+            },
+            "policy": {"point_lookup_max_keys": 5},
+        }
+    )
+    with pytest.raises(GuardrailError) as exc_info:
+        _run_guard(
+            "SELECT c.* FROM cbn.rpt.branch_dim b "
+            "JOIN cbn.src_pii.customer c ON c.customer_id = b.branch_code "
+            "WHERE b.region = 'WEST'",
+            pl_no_branch_filterable,
+            hint="pg_report",
+        )
+    assert exc_info.value.code == "filter_required"
+
+
+def test_join_propagation_to_pii_and_point_accepts_bounded_keys_and_preserves_caps():
+    pl = _make_placement()  # point_lookup_max_keys=5, max_offset=10000, customer.max_rows=50
+
+    for hint_val in (None, "pg_report"):
+        r_in = _run_guard(
+            "SELECT c.* FROM cbn.rpt.branch_dim b "
+            "JOIN cbn.src_pii.customer c ON c.customer_id = b.branch_code "
+            "WHERE b.branch_code IN ('a','b','c')",
+            pl,
+            hint=hint_val,
+        )
+        assert r_in.outcome == "pass"
+        assert r_in.access_pattern == "point"
+        assert "customer_id" in r_in.filter_columns
+        assert r_in.effective_max_rows == 50
+
+        r_eq = _run_guard(
+            "SELECT c.* FROM cbn.rpt.branch_dim b "
+            "JOIN cbn.src_pii.customer c ON c.customer_id = b.branch_code "
+            "WHERE b.branch_code = 'X'",
+            pl,
+            hint=hint_val,
+        )
+        assert r_eq.outcome == "pass"
+        assert r_eq.access_pattern == "point"
+        assert "customer_id" in r_eq.filter_columns
+        assert r_eq.effective_max_rows == 50
+
+        r_offset = _run_guard(
+            "SELECT c.* FROM cbn.rpt.branch_dim b "
+            "JOIN cbn.src_pii.customer c ON c.customer_id = b.branch_code "
+            "WHERE b.branch_code IN ('a','b','c') OFFSET 100",
+            pl,
+            hint=hint_val,
+            grant_max_rows=1000,
+            request_max_rows=500,
+        )
+        assert r_offset.outcome == "pass"
+        assert r_offset.effective_max_rows == 50
+
+        # Multi-hop composite key product: 2 * 2 = 4 <= 5 passes, 3 * 2 = 6 > 5 rejects
+        r_multihop_ok = _run_guard(
+            "SELECT c.* FROM cbn.rpt.branch_dim b "
+            "JOIN cbn.src_pii.composite_acct a ON a.bank_code = b.branch_code "
+            "JOIN cbn.src_pii.customer c ON c.customer_id = a.tax_id_hash "
+            "WHERE b.branch_code IN ('001','002') AND a.acct_no IN ('A1','A2')",
+            pl,
+            hint=hint_val,
+        )
+        assert r_multihop_ok.outcome == "pass"
+
+        with pytest.raises(GuardrailError) as exc_info:
+            _run_guard(
+                "SELECT c.* FROM cbn.rpt.branch_dim b "
+                "JOIN cbn.src_pii.composite_acct a ON a.bank_code = b.branch_code "
+                "JOIN cbn.src_pii.customer c ON c.customer_id = a.tax_id_hash "
+                "WHERE b.branch_code IN ('001','002','003') AND a.acct_no IN ('A1','A2')",
+                pl,
+                hint=hint_val,
+            )
+        assert exc_info.value.code == "filter_required"
+
+    # guard_mode='warn' records warning instead of raising on over-budget join propagation
+    pl_warn = _make_placement(guard_mode="warn")
+    warn_metrics = FakeGuardMetrics()
+    r_warn = _run_guard(
+        "SELECT c.* FROM cbn.rpt.branch_dim b "
+        "JOIN cbn.src_pii.customer c ON c.customer_id = b.branch_code "
+        "WHERE b.branch_code IN ('a','b','c','d','e','f')",
+        pl_warn,
+        metrics=warn_metrics,
+    )
+    assert r_warn.outcome == "warn"
+    assert warn_metrics.warnings == {"filter_required": 1}
+
+
 # ==============================================================================
 # §4.2.3: Derived tables (1-level transparent vs 2+ levels rejected)
 # ==============================================================================

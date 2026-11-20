@@ -428,6 +428,31 @@ def _attach_predicate(
         )
 
 
+def _is_pii_or_point_instance(inst: _RelationInstance) -> bool:
+    """Return True when *inst* is an untokenized PII table or has pattern == 'point'."""
+    if inst.table.pii and not inst.table.tokenized:
+        return True
+    if inst.eff_access is not None and inst.eff_access.pattern == "point":
+        return True
+    return False
+
+
+def _instance_keys_tuple(inst: _RelationInstance) -> tuple[str, ...]:
+    """Return lower-cased primary/unique keys tuple for *inst*."""
+    if inst.eff_access is not None and inst.eff_access.keys:
+        return tuple(k.lower() for k in inst.eff_access.keys)
+    return tuple(k.lower() for k in inst.table.keys)
+
+
+def _instance_selective_eq_cols(inst: _RelationInstance) -> set[str]:
+    """Return lower-cased keys and filterable columns declared on *inst*."""
+    cols = {k.lower() for k in inst.table.keys}
+    if inst.eff_access is not None:
+        cols.update(k.lower() for k in inst.eff_access.keys)
+        cols.update(c.lower() for c in inst.eff_access.filterable)
+    return cols
+
+
 def _evaluate_direct_filter(
     inst: _RelationInstance,
     policy: Policy,
@@ -441,15 +466,20 @@ def _evaluate_direct_filter(
 
     if acc is None:
         has_sargable = False
+        known_eq_cols = {k.lower() for k in inst.table.keys}
         for p in inst.predicates:
-            if p.op in ("eq", "in", "or_eq") and p.value_count <= policy.max_in_list:
+            if (
+                p.op in ("eq", "in", "or_eq")
+                and p.value_count <= policy.max_in_list
+                and p.column in known_eq_cols
+            ):
                 has_sargable = True
                 if p.column not in matched_cols:
                     matched_cols.append(p.column)
         return (True, has_sargable, matched_cols)
 
-    keys_tuple = tuple(k.lower() for k in acc.keys)
-    keys_set = set(keys_tuple)
+    keys_tuple = _instance_keys_tuple(inst)
+    keys_set = set(keys_tuple) | {k.lower() for k in inst.table.keys}
     filterable_set = {c.lower() for c in acc.filterable}
     range_set = {c.lower() for c in acc.range_filterable}
     prefix_set = {c.lower() for c in acc.prefix_filterable}
@@ -459,7 +489,7 @@ def _evaluate_direct_filter(
         eq_cols = keys_set | filterable_set
         for p in inst.predicates:
             if p.op in ("eq", "in", "or_eq") and p.value_count <= policy.max_in_list:
-                if not eq_cols or p.column in (eq_cols | range_set | prefix_set):
+                if p.column in (eq_cols | range_set | prefix_set):
                     has_sargable = True
                     if p.column not in matched_cols:
                         matched_cols.append(p.column)
@@ -964,7 +994,99 @@ def _check_select_scope(
             if c not in filter_cols:
                 filter_cols.append(c)
 
-    # Propagate equi-joins from filtered instances to joined instances
+    # Propagate bounded eq/IN/OR-of-eq value counts across equi-join edges
+    # for PII and point-lookup destinations (capped at policy.point_lookup_max_keys).
+    point_col_bounds: dict[int, dict[str, int]] = {
+        inst.idx: {} for inst in instances
+    }
+    for inst in instances:
+        if not inst.transparent:
+            continue
+        sel_eq_cols = _instance_selective_eq_cols(inst)
+        for p in inst.predicates:
+            if (
+                p.op in ("eq", "in", "or_eq")
+                and p.value_count <= placement.policy.max_in_list
+                and p.column in sel_eq_cols
+            ):
+                prev_vc = point_col_bounds[inst.idx].get(p.column)
+                if prev_vc is None or p.value_count < prev_vc:
+                    point_col_bounds[inst.idx][p.column] = p.value_count
+
+    def _point_row_bound(inst: _RelationInstance) -> int | None:
+        k_tuple = _instance_keys_tuple(inst)
+        if not k_tuple:
+            return None
+        b_map = point_col_bounds[inst.idx]
+        if all(k in b_map for k in k_tuple):
+            return math.prod(b_map[k] for k in k_tuple)
+        return None
+
+    bound_progress = True
+    while bound_progress:
+        bound_progress = False
+        for edge in edges:
+            src_inst = instances[edge.src_idx]
+            dst_inst = instances[edge.dst_idx]
+            if not src_inst.transparent or not dst_inst.transparent:
+                continue
+            src_col_b = point_col_bounds[src_inst.idx].get(edge.src_col)
+            src_row_b = _point_row_bound(src_inst)
+            candidates = [b for b in (src_col_b, src_row_b) if b is not None]
+            if not candidates:
+                continue
+            edge_bound = min(candidates)
+            if edge.dst_col not in _instance_selective_eq_cols(dst_inst):
+                continue
+            prev_dst = point_col_bounds[dst_inst.idx].get(edge.dst_col)
+            if prev_dst is None or edge_bound < prev_dst:
+                point_col_bounds[dst_inst.idx][edge.dst_col] = edge_bound
+                bound_progress = True
+
+    for dst_inst in instances:
+        if (
+            not dst_inst.transparent
+            or dst_inst.satisfied
+            or not _is_pii_or_point_instance(dst_inst)
+        ):
+            continue
+        dst_keys_tuple = _instance_keys_tuple(dst_inst)
+        dst_keys_set = set(dst_keys_tuple)
+        acc_dst = dst_inst.eff_access
+        dst_filterable_set = (
+            {c.lower() for c in acc_dst.filterable}
+            if acc_dst is not None
+            else set()
+        )
+        bounds = point_col_bounds[dst_inst.idx]
+        pii_point_ok = False
+        matched_prop_cols: list[str] = []
+
+        if dst_keys_tuple and all(k in bounds for k in dst_keys_tuple):
+            if (
+                math.prod(bounds[k] for k in dst_keys_tuple)
+                <= placement.policy.point_lookup_max_keys
+            ):
+                pii_point_ok = True
+                matched_prop_cols.extend(dst_keys_tuple)
+
+        for col in sorted(dst_filterable_set - dst_keys_set):
+            if (
+                col in bounds
+                and bounds[col] <= placement.policy.point_lookup_max_keys
+            ):
+                pii_point_ok = True
+                if col not in matched_prop_cols:
+                    matched_prop_cols.append(col)
+
+        if pii_point_ok:
+            dst_inst.satisfied = True
+            dst_inst.has_filter = True
+            for c in matched_prop_cols:
+                if c not in filter_cols:
+                    filter_cols.append(c)
+
+    # Propagate equi-joins from filtered instances to non-PII, non-point joined instances
     progress = True
     while progress:
         progress = False
@@ -973,6 +1095,8 @@ def _check_select_scope(
             dst_inst = instances[edge.dst_idx]
             if not src_inst.has_filter or not dst_inst.transparent:
                 continue
+            if _is_pii_or_point_instance(dst_inst):
+                continue
             if dst_inst.satisfied and dst_inst.has_filter:
                 continue
 
@@ -980,9 +1104,11 @@ def _check_select_scope(
             if acc_dst is None:
                 allowed_join_cols = {k.lower() for k in dst_inst.table.keys}
             else:
-                allowed_join_cols = {c.lower() for c in acc_dst.filterable} | {
-                    c.lower() for c in acc_dst.keys
-                }
+                allowed_join_cols = (
+                    {c.lower() for c in acc_dst.filterable}
+                    | {c.lower() for c in acc_dst.keys}
+                    | {k.lower() for k in dst_inst.table.keys}
+                )
 
             if edge.dst_col in allowed_join_cols:
                 dst_inst.satisfied = True
