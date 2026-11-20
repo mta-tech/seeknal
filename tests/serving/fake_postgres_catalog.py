@@ -183,6 +183,8 @@ class FakePostgresCatalog:
         }
         self.apply_connect_options: bool = False
         self.role: FakeRoleInfo = FakeRoleInfo()
+        self.session_role: FakeRoleInfo | None = None
+        self.member_roles: list[FakeRoleInfo] = []
         self.sync_tables: dict[str, list[FakeSyncStateRow]] = {
             "public._lakebase_sync_state": [],
         }
@@ -373,6 +375,8 @@ class FakePostgresCatalog:
         rolsuper: bool = False,
         rolbypassrls: bool = False,
         neon_superuser: bool = False,
+        session_role: FakeRoleInfo | None = None,
+        member_roles: Sequence[FakeRoleInfo] = (),
     ) -> None:
         self.role = FakeRoleInfo(
             rolname=rolname,
@@ -380,6 +384,8 @@ class FakePostgresCatalog:
             rolbypassrls=rolbypassrls,
             neon_superuser=neon_superuser,
         )
+        self.session_role = session_role
+        self.member_roles = list(member_roles)
 
     def add_sync_state(
         self,
@@ -717,7 +723,15 @@ class FakePostgresCursor:
         # 4. Role guard queries (pg_roles / pg_has_role)
         lower_sql = stripped.lower()
         if "pg_roles" in lower_sql or "rolsuper" in lower_sql or "pg_has_role" in lower_sql:
-            role = cat.role
+            candidate_roles: list[FakeRoleInfo] = [cat.role]
+            if "session_user" in lower_sql and cat.session_role is not None:
+                candidate_roles.append(cat.session_role)
+            if "r.oid" in lower_sql and "member" in lower_sql:
+                candidate_roles.extend(cat.member_roles)
+
+            eff_super = any(r.rolsuper for r in candidate_roles)
+            eff_bypass = any(r.rolbypassrls for r in candidate_roles)
+            eff_neon = any(r.neon_superuser for r in candidate_roles)
             has_super = "rolsuper" in lower_sql
             has_bypass = "rolbypassrls" in lower_sql
             has_neon = "neon_superuser" in lower_sql
@@ -725,16 +739,16 @@ class FakePostgresCursor:
             vals: list[Any] = []
             if has_super:
                 cols.append("rolsuper")
-                vals.append(role.rolsuper)
+                vals.append(eff_super)
             if has_bypass:
                 cols.append("rolbypassrls")
-                vals.append(role.rolbypassrls)
+                vals.append(eff_bypass)
             if has_neon:
                 cols.append("neon_superuser")
-                vals.append(role.neon_superuser)
+                vals.append(eff_neon)
             if not cols:
                 cols = ["rolname", "rolsuper", "rolbypassrls"]
-                vals = [role.rolname, role.rolsuper, role.rolbypassrls]
+                vals = [cat.role.rolname, eff_super, eff_bypass]
             self.description = _make_description(cols)
             self._rows = [tuple(vals)]
             self.rowcount = 1

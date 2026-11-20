@@ -587,16 +587,61 @@ class TestRoleGuard:
         lb_sql = role_guard_sql("lakebase")
         assert "rolsuper" in lb_sql
         assert "rolbypassrls" in lb_sql
+        assert "session_user" in lb_sql
+        assert "pg_has_role(current_user, r.oid, 'MEMBER')" in lb_sql
+        assert "pg_has_role(session_user, r.oid, 'MEMBER')" in lb_sql
         assert "CASE WHEN EXISTS" in lb_sql
         assert "pg_has_role(current_user, 'neon_superuser', 'MEMBER')" in lb_sql
+        assert "pg_has_role(session_user, 'neon_superuser', 'MEMBER')" in lb_sql
 
         pg_sql = role_guard_sql("postgres")
         assert "rolsuper" in pg_sql
         assert "rolbypassrls" in pg_sql
+        assert "session_user" in pg_sql
+        assert "pg_has_role(current_user, r.oid, 'MEMBER')" in pg_sql
+        assert "pg_has_role(session_user, r.oid, 'MEMBER')" in pg_sql
         assert "neon_superuser" not in pg_sql
 
         with pytest.raises(ValueError):
             role_guard_sql("duckdb")
+
+    def test_check_role_guard_refuses_session_user_and_inherited_role_memberships(
+        self,
+    ) -> None:
+        from tests.serving.fake_postgres_catalog import FakePostgresCatalog, FakeRoleInfo
+
+        # 1. Privileged session_user after SET ROLE unpriv -> refused
+        cat_sess = FakePostgresCatalog()
+        cat_sess.set_role(
+            rolname="unpriv_current",
+            session_role=FakeRoleInfo(rolname="orig_admin", rolsuper=True),
+        )
+        conn_sess = cat_sess.connect()
+        with pytest.raises(EngineError, match="Role guard refused connection"):
+            check_role_guard(conn_sess, "postgres")
+        assert conn_sess.closed is True
+
+        # 2. Granted BYPASSRLS group role via pg_has_role(..., r.oid, 'MEMBER') -> refused
+        cat_mem = FakePostgresCatalog()
+        cat_mem.set_role(
+            rolname="login_role",
+            member_roles=[FakeRoleInfo(rolname="bypass_grp", rolbypassrls=True)],
+        )
+        conn_mem = cat_mem.connect()
+        with pytest.raises(EngineError, match="Role guard refused connection"):
+            check_role_guard(conn_mem, "postgres")
+        assert conn_mem.closed is True
+
+        # 3. session_user with neon_superuser on lakebase -> refused
+        cat_lb = FakePostgresCatalog()
+        cat_lb.set_role(
+            rolname="unpriv_current",
+            session_role=FakeRoleInfo(rolname="api_owner", neon_superuser=True),
+        )
+        conn_lb = cat_lb.connect()
+        with pytest.raises(EngineError, match="Role guard refused connection"):
+            check_role_guard(conn_lb, "lakebase")
+        assert conn_lb.closed is True
 
     def test_check_role_guard_allows_least_privilege_sql_role(self) -> None:
         lb_conn = FakeDBConnection(next_row=(False, False, False))

@@ -256,6 +256,29 @@ def test_verify_and_harden_session_role_guard():
     assert conn_neon.closed is True
     assert "neon_superuser" in role_guard_sql("lakebase")
 
+    # 5b. Inherited/member BYPASSRLS or privileged session_user refused by verify_and_harden_session
+    from tests.serving.fake_postgres_catalog import FakePostgresCatalog, FakeRoleInfo
+
+    cat_inh = FakePostgresCatalog()
+    cat_inh.set_role(
+        rolname="app_login",
+        member_roles=[FakeRoleInfo(rolname="inherited_bypass", rolbypassrls=True)],
+    )
+    conn_inh = cat_inh.connect()
+    with pytest.raises(EngineError, match="Role guard refused connection"):
+        verify_and_harden_session(conn_inh, kind="postgres", role_guard=True)
+    assert conn_inh.closed is True
+
+    cat_sess = FakePostgresCatalog()
+    cat_sess.set_role(
+        rolname="dropped_role",
+        session_role=FakeRoleInfo(rolname="postgres", rolsuper=True),
+    )
+    conn_sess = cat_sess.connect()
+    with pytest.raises(EngineError, match="Role guard refused connection"):
+        verify_and_harden_session(conn_sess, kind="postgres", role_guard=True)
+    assert conn_sess.closed is True
+
     # 6. role_guard=False on postgres skips role guard
     conn_skip = ScriptedConnection(role_row=(True, True))
     verify_and_harden_session(conn_skip, kind="postgres", role_guard=False, session=None)

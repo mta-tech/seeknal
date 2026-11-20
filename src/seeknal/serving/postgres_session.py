@@ -488,18 +488,26 @@ class _FallbackLakebaseEndpointConfig:
 def _fallback_role_guard_sql(kind: str) -> str:
     if kind == "lakebase":
         return (
-            "SELECT r.rolsuper, r.rolbypassrls, "
+            "SELECT COALESCE(BOOL_OR(r.rolsuper), FALSE) AS rolsuper, "
+            "COALESCE(BOOL_OR(r.rolbypassrls), FALSE) AS rolbypassrls, "
             "CASE WHEN EXISTS ("
             "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'neon_superuser'"
-            ") THEN pg_catalog.pg_has_role(current_user, 'neon_superuser', 'MEMBER') "
-            "ELSE FALSE END AS is_neon_superuser "
+            ") THEN ("
+            "pg_catalog.pg_has_role(current_user, 'neon_superuser', 'MEMBER') "
+            "OR pg_catalog.pg_has_role(session_user, 'neon_superuser', 'MEMBER')"
+            ") ELSE FALSE END AS is_neon_superuser "
             "FROM pg_catalog.pg_roles AS r "
-            "WHERE r.rolname = current_user"
+            "WHERE r.rolname IN (current_user, session_user) "
+            "OR pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER') "
+            "OR pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER')"
         )
     return (
-        "SELECT r.rolsuper, r.rolbypassrls "
+        "SELECT COALESCE(BOOL_OR(r.rolsuper), FALSE) AS rolsuper, "
+        "COALESCE(BOOL_OR(r.rolbypassrls), FALSE) AS rolbypassrls "
         "FROM pg_catalog.pg_roles AS r "
-        "WHERE r.rolname = current_user"
+        "WHERE r.rolname IN (current_user, session_user) "
+        "OR pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER') "
+        "OR pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER')"
     )
 
 
