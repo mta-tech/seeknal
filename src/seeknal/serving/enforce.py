@@ -678,10 +678,14 @@ class EnforcedQuery:
     cube_security_context: Mapping[str, Any] | None
 
 
-def _build_row_filter_node(rf: RowFilter) -> exp.Expression:
+def _build_row_filter_node(rf: RowFilter, *, quoted: bool = False) -> exp.Expression:
     """Construct an AST predicate node for a RowFilter using sqlglot literals."""
     op = rf.op.lower()
-    col = exp.to_column(rf.column)
+    col = (
+        exp.Column(this=exp.Identifier(this=rf.column, quoted=True))
+        if quoted
+        else exp.to_column(rf.column)
+    )
     if op == "eq":
         val = rf.values[0]
         if val is None:
@@ -696,7 +700,9 @@ def _build_row_filter_node(rf: RowFilter) -> exp.Expression:
     raise EnforcementError(f"unsupported row filter op: {rf.op}")
 
 
-def _build_mask_expression(method: str, col_name: str, target_dialect: str) -> exp.Expression:
+def _build_mask_expression(
+    method: str, col_name: str, target_dialect: str, *, quoted: bool = False
+) -> exp.Expression:
     """Build a mask expression for a column and method in the target dialect."""
     method_lower = method.lower()
     if method_lower not in MASK_TEMPLATES:
@@ -707,9 +713,14 @@ def _build_mask_expression(method: str, col_name: str, target_dialect: str) -> e
 
     template = dialect_templates[target_dialect]
     parsed = sqlglot.parse_one(template, read=target_dialect)
+    replacement_col = (
+        exp.Column(this=exp.Identifier(this=col_name, quoted=True))
+        if quoted
+        else exp.to_column(col_name)
+    )
     for col_node in parsed.find_all(exp.Column):
         if col_node.name.lower() == "c":
-            col_node.replace(exp.to_column(col_name))
+            col_node.replace(replacement_col.copy())
     return parsed
 
 
@@ -1422,23 +1433,39 @@ def enforce(
             visible_cols_map = {c.lower(): c for c in table_grant.columns}
             masks_cols_map = {c.lower(): (c, m) for c, m in table_grant.masks.items()}
 
+            quote_idents = grant.api == "select.v1"
             inner_projections: list[exp.Expression] = []
             for col_name in schema_cols:
                 col_lower = col_name.lower()
                 if col_lower in visible_cols_map:
-                    inner_projections.append(exp.to_column(col_name))
+                    inner_projections.append(
+                        exp.Column(this=exp.Identifier(this=col_name, quoted=True))
+                        if quote_idents
+                        else exp.to_column(col_name)
+                    )
                 elif col_lower in masks_cols_map:
                     orig_name, mask_method = masks_cols_map[col_lower]
-                    mask_expr = _build_mask_expression(mask_method, orig_name, target_dialect_lower)
-                    inner_projections.append(exp.alias_(mask_expr, orig_name))
+                    mask_expr = _build_mask_expression(
+                        mask_method, orig_name, target_dialect_lower, quoted=quote_idents
+                    )
+                    inner_projections.append(
+                        exp.alias_(mask_expr, orig_name, quoted=quote_idents)
+                    )
 
             sub = exp.select(*inner_projections).from_(exp.to_table(canonical_tbl))
             if table_grant.row_filters:
-                filter_nodes = [_build_row_filter_node(rf) for rf in table_grant.row_filters]
+                filter_nodes = [
+                    _build_row_filter_node(rf, quoted=quote_idents)
+                    for rf in table_grant.row_filters
+                ]
                 sub = sub.where(exp.and_(*filter_nodes))
 
             derived_alias = tbl.alias or tbl.name
-            derived_table = sub.subquery(alias=derived_alias)
+            derived_table = sub.subquery(
+                alias=exp.Identifier(this=derived_alias, quoted=True)
+                if quote_idents
+                else derived_alias
+            )
             tbl.replace(derived_table)
 
         # Clear catalog/db qualifications on outer columns matching unaliased tables

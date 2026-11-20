@@ -119,11 +119,11 @@ def test_section5_design_example_golden_sql(cbn_catalog):
 
     assert (
         compiled.sql
-        == "SELECT txn_id, as_of_date, branch_code, amount "
-        "FROM cbn.rpt.rpt_txn_detail "
-        "WHERE customer_id = $1 AND as_of_date >= $2 AND as_of_date < $3 "
-        "AND NOT branch_code IN ($4, $5) "
-        "ORDER BY as_of_date DESC, txn_id DESC"
+        == 'SELECT "txn_id", "as_of_date", "branch_code", "amount" '
+        'FROM "cbn"."rpt"."rpt_txn_detail" '
+        'WHERE "customer_id" = $1 AND "as_of_date" >= $2 AND "as_of_date" < $3 '
+        'AND NOT "branch_code" IN ($4, $5) '
+        'ORDER BY "as_of_date" DESC, "txn_id" DESC'
     )
     assert compiled.params == ("C-1001", "2026-10-01", "2026-11-01", "X01", "X02")
     assert compiled.order_spec == (("as_of_date", "desc"), ("txn_id", "desc"))
@@ -134,37 +134,37 @@ def test_section5_design_example_golden_sql(cbn_catalog):
 @pytest.mark.parametrize(
     ("where_clause", "expected_where_sql", "expected_params"),
     [
-        ({"customer_id": {"_eq": "C-1"}}, "customer_id = $1", ("C-1",)),
-        ({"customer_id": {"_neq": "C-1"}}, "customer_id <> $1", ("C-1",)),
-        ({"amount": {"_gt": 100}}, "amount > $1", (100,)),
-        ({"amount": {"_gte": 100}}, "amount >= $1", (100,)),
-        ({"amount": {"_lt": 500}}, "amount < $1", (500,)),
-        ({"amount": {"_lte": 500}}, "amount <= $1", (500,)),
+        ({"customer_id": {"_eq": "C-1"}}, '"customer_id" = $1', ("C-1",)),
+        ({"customer_id": {"_neq": "C-1"}}, '"customer_id" <> $1', ("C-1",)),
+        ({"amount": {"_gt": 100}}, '"amount" > $1', (100,)),
+        ({"amount": {"_gte": 100}}, '"amount" >= $1', (100,)),
+        ({"amount": {"_lt": 500}}, '"amount" < $1', (500,)),
+        ({"amount": {"_lte": 500}}, '"amount" <= $1', (500,)),
         (
             {"branch_code": {"_in": ["B1", "B2", "B3"]}},
-            "branch_code IN ($1, $2, $3)",
+            '"branch_code" IN ($1, $2, $3)',
             ("B1", "B2", "B3"),
         ),
         (
             {"branch_code": {"_nin": ["B1", "B2"]}},
-            "NOT branch_code IN ($1, $2)",
+            'NOT "branch_code" IN ($1, $2)',
             ("B1", "B2"),
         ),
         (
             {"branch_code": {"_like": "JKT%"}},
-            "branch_code LIKE $1",
+            '"branch_code" LIKE $1',
             ("JKT%",),
         ),
         (
             {"memo": {"_like": r"A\%B\_C\\D%"}},
-            "memo LIKE $1",
+            '"memo" LIKE $1',
             (r"A\%B\_C\\D%",),
         ),
-        ({"memo": {"_is_null": True}}, "memo IS NULL", ()),
-        ({"memo": {"_is_null": False}}, "NOT memo IS NULL", ()),
+        ({"memo": {"_is_null": True}}, '"memo" IS NULL', ()),
+        ({"memo": {"_is_null": False}}, 'NOT "memo" IS NULL', ()),
         (
             {"is_reversed": {"_eq": False}},
-            "is_reversed = $1",
+            '"is_reversed" = $1',
             (False,),
         ),
         (
@@ -179,7 +179,7 @@ def test_section5_design_example_golden_sql(cbn_catalog):
                     {"amount": {"_gt": 0}},
                 ]
             },
-            "(branch_code = $1 OR branch_code = $2) AND amount > $3",
+            '("branch_code" = $1 OR "branch_code" = $2) AND "amount" > $3',
             ("B1", "B2", 0),
         ),
         (
@@ -191,7 +191,7 @@ def test_section5_design_example_golden_sql(cbn_catalog):
                     ]
                 }
             },
-            "NOT (branch_code = $1 AND is_reversed = $2)",
+            'NOT ("branch_code" = $1 AND "is_reversed" = $2)',
             ("B1", True),
         ),
     ],
@@ -210,8 +210,8 @@ def test_golden_sql_all_operators(
         schemas=schemas,
     )
     expected_sql = (
-        "SELECT txn_id, amount FROM cbn.rpt.rpt_txn_detail "
-        f"WHERE {expected_where_sql} ORDER BY txn_id ASC"
+        'SELECT "txn_id", "amount" FROM "cbn"."rpt"."rpt_txn_detail" '
+        f'WHERE {expected_where_sql} ORDER BY "txn_id" ASC'
     )
     assert compiled.sql == expected_sql
     assert compiled.params == expected_params
@@ -308,7 +308,7 @@ def test_default_catalog_resolves_two_part_table(cbn_catalog):
         default_catalog="cbn",
     )
     assert compiled.table == "cbn.rpt.rpt_txn_detail"
-    assert "FROM cbn.rpt.rpt_txn_detail" in compiled.sql
+    assert 'FROM "cbn"."rpt"."rpt_txn_detail"' in compiled.sql
 
 
 @pytest.mark.parametrize(
@@ -476,9 +476,9 @@ def test_order_by_direction_pk_append_and_keyset_compilation(cbn_catalog):
     assert comp_desc.projected_columns == ("amount", "as_of_date", "txn_id")
     assert (
         comp_desc.sql
-        == "SELECT amount, as_of_date, txn_id FROM cbn.rpt.rpt_txn_detail "
-        "WHERE customer_id = $1 AND (as_of_date, txn_id) < ($2, $3) "
-        "ORDER BY as_of_date DESC, txn_id DESC"
+        == 'SELECT "amount", "as_of_date", "txn_id" FROM "cbn"."rpt"."rpt_txn_detail" '
+        'WHERE "customer_id" = $1 AND ("as_of_date", "txn_id") < ($2, $3) '
+        'ORDER BY "as_of_date" DESC, "txn_id" DESC'
     )
     assert comp_desc.params == ("C-9", "2026-10-15", 777)
 
@@ -501,8 +501,8 @@ def test_order_by_direction_pk_append_and_keyset_compilation(cbn_catalog):
     )
     assert (
         comp_asc.sql
-        == "SELECT txn_id, amount FROM cbn.rpt.rpt_txn_detail "
-        "WHERE txn_id > $1 ORDER BY txn_id ASC"
+        == 'SELECT "txn_id", "amount" FROM "cbn"."rpt"."rpt_txn_detail" '
+        'WHERE "txn_id" > $1 ORDER BY "txn_id" ASC'
     )
     assert comp_asc.params == (50,)
 
@@ -580,3 +580,39 @@ def test_masked_and_ungranted_columns_in_where_or_order_by_raise_access_denied(
             grant=grant,
         )
     assert exc_ug.value.code == "access_denied"
+
+
+def test_reserved_word_and_mixed_case_identifiers_render_quoted():
+    placement = Placement.from_dict(
+        {
+            "engines": {"lb": {"kind": "lakebase", "dialect": "postgres"}},
+            "tables": {
+                "cbn.rpt.UserEvents": {
+                    "keys": ["EventId"],
+                    "row_count": 100,
+                    "serve": {"lb": "rpt.user_events"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    schemas = {"cbn.rpt.UserEvents": ["EventId", "user", "CreatedAt"]}
+    compiled = compile_select_request(
+        {
+            "table": "cbn.rpt.UserEvents",
+            "columns": ["EventId", "user", "CreatedAt"],
+            "where": {"user": {"_eq": "alice"}},
+            "order_by": [{"CreatedAt": "desc"}],
+        },
+        placement=placement,
+        schemas=schemas,
+    )
+    assert (
+        compiled.sql
+        == 'SELECT "EventId", "user", "CreatedAt" '
+        'FROM "cbn"."rpt"."UserEvents" '
+        'WHERE "user" = $1 '
+        'ORDER BY "CreatedAt" DESC, "EventId" DESC'
+    )
+    assert all(ident.quoted for ident in compiled.statement.find_all(exp.Identifier))
+

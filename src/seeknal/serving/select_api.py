@@ -245,23 +245,23 @@ class _WhereValidator:
 
 
 def _build_col_node(canonical_col: str) -> exp.Column:
-    return exp.Column(this=exp.Identifier(this=canonical_col, quoted=False))
+    return exp.Column(this=exp.Identifier(this=canonical_col, quoted=True))
 
 
 def _build_table_node(canonical_table: str) -> exp.Table:
     parts = canonical_table.split(".")
     if len(parts) == 3:
         return exp.Table(
-            this=exp.Identifier(this=parts[2], quoted=False),
-            db=exp.Identifier(this=parts[1], quoted=False),
-            catalog=exp.Identifier(this=parts[0], quoted=False),
+            this=exp.Identifier(this=parts[2], quoted=True),
+            db=exp.Identifier(this=parts[1], quoted=True),
+            catalog=exp.Identifier(this=parts[0], quoted=True),
         )
     if len(parts) == 2:
         return exp.Table(
-            this=exp.Identifier(this=parts[1], quoted=False),
-            db=exp.Identifier(this=parts[0], quoted=False),
+            this=exp.Identifier(this=parts[1], quoted=True),
+            db=exp.Identifier(this=parts[0], quoted=True),
         )
-    return exp.Table(this=exp.Identifier(this=parts[0], quoted=False))
+    return exp.Table(this=exp.Identifier(this=parts[0], quoted=True))
 
 
 def _flatten_and_nodes(expr: exp.Expression) -> list[exp.Expression]:
