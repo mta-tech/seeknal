@@ -103,7 +103,11 @@ class ServerConfig:
             raise ValueError(
                 f"Invalid auth_mode '{self.auth_mode}'. Must be 'open' or 'api_key'."
             )
-        if self.auth_mode == "api_key" and not [k for k in self.api_keys if k and k.strip()]:
+        if any(not isinstance(k, str) or not k.strip() for k in self.api_keys):
+            raise ValueError(
+                "Invalid SEEKNAL_REPORT_SERVER_KEYS: API keys must not contain blank or whitespace-only entries."
+            )
+        if self.auth_mode == "api_key" and not self.api_keys:
             raise ValueError(
                 "report_server auth_mode='api_key' requires at least one API key: "
                 "set SEEKNAL_REPORT_SERVER_KEYS, or explicitly opt in to unauthenticated "

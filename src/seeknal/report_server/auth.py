@@ -20,8 +20,11 @@ async def require_publish_auth(request: Request, config: ServerConfig) -> None:
         raise AuthError("Missing or malformed Authorization header")
 
     provided = auth_header[len("Bearer "):]
+    if not provided.strip():
+        raise AuthError("Invalid API key")
+
     for key in config.api_keys:
-        if hmac.compare_digest(key.encode(), provided.encode()):
+        if key and key.strip() and hmac.compare_digest(key.encode(), provided.encode()):
             return
 
     raise AuthError("Invalid API key")
