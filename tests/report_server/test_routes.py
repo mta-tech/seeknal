@@ -617,5 +617,34 @@ def test_serve_asset_blocks_path_traversal_and_unsafe_paths(
             assert b"secret.txt" not in body
 
 
+def test_publish_rejects_huge_gnu_longname_and_pax_headers_with_typed_400_and_bounded_memory(
+    test_client: TestClient,
+    tmp_path: Path,
+) -> None:
+    import tracemalloc
+    from tests.report_server.test_storage import (
+        _build_streamed_huge_gnu_longname_tar_gz,
+        _build_streamed_huge_pax_comment_tar_gz,
+    )
+
+    gnu_tar = _build_streamed_huge_gnu_longname_tar_gz(tmp_path / "route_huge_gnu.tar.gz")
+    pax_tar = _build_streamed_huge_pax_comment_tar_gz(tmp_path / "route_huge_pax.tar.gz")
+    assets_dir = test_client.app.state.config.data_dir / "assets"
+
+    for archive in (gnu_tar, pax_tar):
+        tracemalloc.start()
+        try:
+            resp = _publish(test_client, archive)
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "Tarball entry header too large"}
+        assert peak_bytes < 64 * 1024 * 1024, f"Peak memory {peak_bytes} exceeded 64 MiB"
+        assert list(assets_dir.iterdir()) == []
+
+
+
 
 

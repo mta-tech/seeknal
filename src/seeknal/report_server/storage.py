@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import os
 import shutil
 import sys
@@ -16,9 +17,60 @@ from seeknal.report_server.config import (
 )
 from seeknal.utils.path_security import is_insecure_path
 
+MAX_TAR_HEADER_BYTES = 64 * 1024  # 64 KiB cap for any single pax or GNU longname/longlink header
+TAR_MEMBER_HEADER_OVERHEAD_BYTES = 1536
+
 
 class TarSafetyError(ValueError):
     pass
+
+
+class _PositionBoundedReader:
+    """File-like wrapper around a decompressed stream that enforces a position ceiling."""
+
+    def __init__(self, raw: BinaryIO, max_position: int) -> None:
+        self._raw = raw
+        self._max_position = max_position
+
+    def tell(self) -> int:
+        return self._raw.tell()
+
+    def seekable(self) -> bool:
+        return True
+
+    def read(self, n: int = -1) -> bytes:
+        pos = self._raw.tell()
+        if n is None or n < 0 or pos + n > self._max_position:
+            raise TarSafetyError("Tarball uncompressed size exceeds limit")
+        return self._raw.read(n)
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            target = offset
+        elif whence == os.SEEK_CUR:
+            target = self._raw.tell() + offset
+        else:
+            raise TarSafetyError("Tarball uncompressed size exceeds limit")
+        if target < 0 or target > self._max_position:
+            raise TarSafetyError("Tarball uncompressed size exceeds limit")
+        return self._raw.seek(offset, whence)
+
+    def close(self) -> None:
+        self._raw.close()
+
+
+class _BoundedTarInfo(tarfile.TarInfo):
+    """TarInfo subclass that caps pax ('x'/'g') and GNU longname/longlink ('L'/'K') headers before reading."""
+
+    def _proc_gnulong(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
+        if self.size < 0 or self.size > MAX_TAR_HEADER_BYTES:
+            raise TarSafetyError("Tarball entry header too large")
+        return super()._proc_gnulong(tarfile)  # type: ignore[misc]
+
+    def _proc_pax(self, tarfile: tarfile.TarFile) -> tarfile.TarInfo:  # type: ignore[override]
+        if self.size < 0 or self.size > MAX_TAR_HEADER_BYTES:
+            raise TarSafetyError("Tarball entry header too large")
+        return super()._proc_pax(tarfile)  # type: ignore[misc]
 
 
 def _validate_tar_member(
@@ -179,17 +231,23 @@ class LocalFilesystemStorage(Storage):
         return members
 
     def _safe_extract(self, fileobj: BinaryIO, dest: Path) -> None:
-        with tarfile.open(fileobj=fileobj, mode="r:gz") as tf:
-            # 1. Explicit version-independent check runs first before any member is extracted.
-            dest_real = os.path.realpath(dest)
-            members = self._stream_and_validate_members(tf, dest_real)
+        max_position = (
+            self._max_unpacked_bytes
+            + self._max_tar_members * TAR_MEMBER_HEADER_OVERHEAD_BYTES
+        )
+        with gzip.GzipFile(fileobj=fileobj, mode="rb") as gz_stream:
+            reader = _PositionBoundedReader(gz_stream, max_position)
+            with tarfile.open(fileobj=reader, mode="r:", tarinfo=_BoundedTarInfo) as tf:  # type: ignore[arg-type]
+                # 1. Explicit version-independent check runs first before any member is extracted.
+                dest_real = os.path.realpath(dest)
+                members = self._stream_and_validate_members(tf, dest_real)
 
-            # 2. Extract using data_filter when available (3.12+ and backports) as a second layer,
-            # otherwise extract the validated members one by one.
-            if hasattr(tarfile, "data_filter"):
-                tf.extractall(dest, members=members, filter="data")  # type: ignore[call-arg]
-            else:
-                self._manual_safe_extract(tf, dest, members=members)
+                # 2. Extract using data_filter when available (3.12+ and backports) as a second layer,
+                # otherwise extract the validated members one by one.
+                if hasattr(tarfile, "data_filter"):
+                    tf.extractall(dest, members=members, filter="data")  # type: ignore[call-arg]
+                else:
+                    self._manual_safe_extract(tf, dest, members=members)
 
     def _manual_safe_extract(
         self,

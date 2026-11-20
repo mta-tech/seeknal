@@ -542,6 +542,143 @@ def test_open_asset_rejects_traversal_nul_backslash_absolute_and_resolved_escape
         assert bad.strip() == "" or bad not in str(exc_info.value)
 
 
+def _build_streamed_huge_gnu_longname_tar_gz(
+    out_path: Path,
+    *,
+    claimed_bytes: int = 3 * 1024 * 1024 * 1024,
+    streamed_bytes: int = 64 * 1024 * 1024,
+) -> Path:
+    import gzip
+
+    first = tarfile.TarInfo(name="innocent.txt")
+    first_data = b"ok"
+    first.size = len(first_data)
+    first_block = first.tobuf(tarfile.GNU_FORMAT) + first_data.ljust(512, b"\x00")
+
+    long_info = tarfile.TarInfo(name="././@LongLink")
+    long_info.type = tarfile.GNUTYPE_LONGNAME
+    long_info.size = claimed_bytes
+    long_header = long_info.tobuf(tarfile.GNU_FORMAT)
+
+    zero_chunk = b"\x00" * (1024 * 1024)
+    with gzip.open(out_path, "wb", compresslevel=1) as gz:
+        gz.write(first_block)
+        gz.write(long_header)
+        remaining = streamed_bytes
+        while remaining > 0:
+            step = min(len(zero_chunk), remaining)
+            gz.write(zero_chunk[:step])
+            remaining -= step
+    return out_path
+
+
+def _build_streamed_huge_pax_comment_tar_gz(
+    out_path: Path,
+    *,
+    claimed_bytes: int = 3 * 1024 * 1024 * 1024,
+    streamed_bytes: int = 64 * 1024 * 1024,
+) -> Path:
+    import gzip
+
+    first = tarfile.TarInfo(name="innocent.txt")
+    first_data = b"ok"
+    first.size = len(first_data)
+    first_block = first.tobuf(tarfile.PAX_FORMAT) + first_data.ljust(512, b"\x00")
+
+    pax_info = tarfile.TarInfo(name="PaxHeader/huge")
+    pax_info.type = tarfile.XHDTYPE
+    pax_info.size = claimed_bytes
+    pax_header = pax_info.tobuf(tarfile.PAX_FORMAT)
+
+    record_prefix = f"{claimed_bytes} comment=".encode("ascii")
+    zero_chunk = b"\x00" * (1024 * 1024)
+    with gzip.open(out_path, "wb", compresslevel=1) as gz:
+        gz.write(first_block)
+        gz.write(pax_header)
+        gz.write(record_prefix)
+        remaining = streamed_bytes - len(record_prefix)
+        while remaining > 0:
+            step = min(len(zero_chunk), remaining)
+            gz.write(zero_chunk[:step])
+            remaining -= step
+    return out_path
+
+
+def test_huge_gnu_longname_and_pax_headers_rejected_with_bounded_memory(
+    test_storage: LocalFilesystemStorage,
+    tmp_path: Path,
+) -> None:
+    import tracemalloc
+
+    gnu_tar = _build_streamed_huge_gnu_longname_tar_gz(tmp_path / "huge_gnulong.tar.gz")
+    pax_tar = _build_streamed_huge_pax_comment_tar_gz(tmp_path / "huge_pax.tar.gz")
+
+    for slug, archive in (("huge_gnu_slug", gnu_tar), ("huge_pax_slug", pax_tar)):
+        tracemalloc.start()
+        try:
+            with open(archive, "rb") as f:
+                with pytest.raises(TarSafetyError, match="Tarball entry header too large"):
+                    test_storage.extract_tarball(slug, f)
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert peak_bytes < 64 * 1024 * 1024, f"{slug} peak memory {peak_bytes} exceeded 64 MiB"
+        assert not (test_storage._root / "assets" / slug).exists()
+
+
+def test_position_bounded_reader_enforces_position_and_allows_two_pass_rewind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from seeknal.report_server.storage import _PositionBoundedReader
+
+    raw = io.BytesIO(b"0123456789abcdef")
+    reader = _PositionBoundedReader(raw, max_position=10)
+
+    assert reader.read(6) == b"012345"
+    assert reader.tell() == 6
+
+    # Reading past limit raises BEFORE advancing position
+    with pytest.raises(TarSafetyError, match="Tarball uncompressed size exceeds limit"):
+        reader.read(5)
+    assert reader.tell() == 6
+
+    # Unbounded read (n < 0) raises BEFORE reading
+    with pytest.raises(TarSafetyError, match="Tarball uncompressed size exceeds limit"):
+        reader.read(-1)
+    assert reader.tell() == 6
+
+    # Seeking past limit raises BEFORE seeking
+    with pytest.raises(TarSafetyError, match="Tarball uncompressed size exceeds limit"):
+        reader.seek(11)
+    assert reader.tell() == 6
+
+    # Rewinding to 0 and reading again does not double-count against the position ceiling
+    assert reader.seek(0) == 0
+    assert reader.read(10) == b"0123456789"
+
+    # End-to-end two-pass extraction near max_unpacked_bytes succeeds without double-counting
+    monkeypatch.setattr("seeknal.report_server.storage.is_insecure_path", lambda _p: False)
+    payload = b"x" * 4000
+    tight_storage = LocalFilesystemStorage(
+        tmp_path / "tight-pos-storage",
+        max_unpacked_bytes=4096,
+        max_tar_members=2,
+    )
+    near_limit_tar = _make_tarball(
+        tmp_path,
+        [("index.html", payload, "file")],
+        filename="near_limit.tar.gz",
+    )
+    with open(near_limit_tar, "rb") as f:
+        tight_storage.extract_tarball("tight_ok", f)
+    mount = tight_storage.local_mount_path("tight_ok")
+    assert mount is not None
+    assert (mount / "index.html").read_bytes() == payload
+
+
+
 
 
 
