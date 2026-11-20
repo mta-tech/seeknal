@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Deploy seeknal report server to remote host
+# NOTE: Report server listens on plain HTTP; API keys travel over plain HTTP unless TLS is terminated in front of the server (e.g. by a TLS reverse proxy or gateway).
 set -euo pipefail
 
 REMOTE_HOST="exedev@reportkami.exe.xyz"
 REMOTE_DIR="/home/exedev/seeknal-report-server"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SSH_OPTS="-o ConnectTimeout=30 -o StrictHostKeyChecking=no -o GSSAPIAuthentication=no -o ServerAliveInterval=10"
+SSH_OPTS="-o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new -o GSSAPIAuthentication=no -o ServerAliveInterval=10"
 
 echo "=== Seeknal Report Server Deployment ==="
 echo "  Target: $REMOTE_HOST:$REMOTE_DIR"
@@ -51,6 +52,9 @@ echo "[2/4] Packaging and copying seeknal source..."
 cd "$REPO_ROOT"
 tar czf /tmp/seeknal-report-src.tar.gz \
     --exclude='.git' \
+    --exclude='.env' \
+    --exclude='.env.*' \
+    --exclude='deploy/.env.report-server' \
     --exclude='__pycache__' \
     --exclude='.claude' \
     --exclude='node_modules' \
@@ -70,11 +74,9 @@ scp $SSH_OPTS \
     "$SCRIPT_DIR/docker-compose.report-server.yml" \
     "$REMOTE_HOST:$REMOTE_DIR/docker-compose.yml"
 
-# Copy .env if it exists locally
-if [ -f "$SCRIPT_DIR/.env.report-server" ]; then
-    echo "  Copying .env.report-server..."
-    scp $SSH_OPTS "$SCRIPT_DIR/.env.report-server" "$REMOTE_HOST:$REMOTE_DIR/.env"
-fi
+echo "  Copying .env.report-server..."
+scp $SSH_OPTS "$ENV_FILE" "$REMOTE_HOST:$REMOTE_DIR/.env"
+ssh $SSH_OPTS "$REMOTE_HOST" "chmod 0600 $REMOTE_DIR/.env"
 
 # 4. Build and start services
 echo "[4/4] Building and starting services..."

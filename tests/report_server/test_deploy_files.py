@@ -11,6 +11,8 @@ from seeknal.report_server.config import ServerConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_PATH = REPO_ROOT / "deploy" / "docker-compose.report-server.yml"
+DEPLOY_SCRIPT_PATH = REPO_ROOT / "deploy" / "deploy-report-server.sh"
+DOCKER_README_PATH = REPO_ROOT / "docker" / "report-server" / "README.md"
 
 
 def _parse_compose_env(entries: list[str] | dict[str, str]) -> dict[str, str]:
@@ -81,3 +83,39 @@ def test_compose_file_auth_default_loopback_bind_and_env_vars_match_server_confi
     assert cfg.max_path_depth == config_mod.DEFAULT_MAX_PATH_DEPTH
     assert cfg.max_member_name_length == config_mod.DEFAULT_MAX_MEMBER_NAME_LENGTH
     assert cfg.max_concurrent_publishes == config_mod.DEFAULT_MAX_CONCURRENT_PUBLISHES
+
+
+def test_deploy_script_and_readme_security_guards() -> None:
+    script = DEPLOY_SCRIPT_PATH.read_text(encoding="utf-8")
+    readme = DOCKER_README_PATH.read_text(encoding="utf-8")
+
+    # 1. Script reads deploy/.env.report-server for the pre-deploy auth guard
+    assert ".env.report-server" in script
+    assert "SEEKNAL_REPORT_SERVER_KEYS" in script
+    assert "SEEKNAL_REPORT_SERVER_AUTH_MODE" in script
+    assert "SEEKNAL_REPORT_SERVER_BIND_ADDRESS" in script
+
+    # 2. SSH options use StrictHostKeyChecking=accept-new and never StrictHostKeyChecking=no
+    assert "StrictHostKeyChecking=accept-new" in script
+    assert "StrictHostKeyChecking=no" not in script
+
+    # 3. Tar bundle excludes .env, .env.*, and deploy/.env.report-server, and remote .env gets chmod 0600
+    assert "--exclude='.env'" in script
+    assert "--exclude='.env.*'" in script
+    assert "--exclude='deploy/.env.report-server'" in script
+    assert "chmod 0600" in script
+
+    # 4. Bounded health-check polling loop exits non-zero on failure before "Deployment Complete"
+    health_loop_pos = script.find("seq 1 30")
+    health_fail_exit_pos = script.find("exit 1", health_loop_pos)
+    deploy_complete_pos = script.find("=== Deployment Complete ===")
+    assert health_loop_pos != -1, "Expected bounded health-check loop (seq 1 30)"
+    assert health_fail_exit_pos != -1, "Expected non-zero exit when health check fails"
+    assert deploy_complete_pos != -1
+    assert health_loop_pos < health_fail_exit_pos < deploy_complete_pos
+
+    # 5. Plain-HTTP / TLS proxy note present in both script and README
+    assert "plain HTTP" in script
+    assert "TLS" in script
+    assert "plain HTTP" in readme
+    assert "TLS" in readme

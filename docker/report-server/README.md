@@ -18,6 +18,11 @@ docker run \
 
 Multiple keys are comma-separated: `SEEKNAL_REPORT_SERVER_KEYS=<key-1>,<key-2>`.
 
+> **Note:** The report server listens on plain HTTP inside the container.
+> The `Bearer` API key and owner secret travel over plain HTTP unless TLS is
+> terminated in front of the server (for example, by a TLS reverse proxy or
+> the gateway).
+
 ## Local development (open mode opt-in)
 
 ```bash
