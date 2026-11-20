@@ -1087,6 +1087,7 @@ class ColdStartConnector:
         env: Mapping[str, str] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep_fn: Callable[[float], None] = time.sleep,
+        executor: Any = None,
     ) -> None:
         if not callable(connect_fn):
             raise ValueError("connect_fn must be callable")
@@ -1108,6 +1109,8 @@ class ColdStartConnector:
         self._env = env
         self._clock = clock
         self._sleep_fn = sleep_fn
+        self._executor = executor
+        self._last_wake_worker: threading.Thread | None = None
         self._uses_real_clock = (clock is time.monotonic) and (sleep_fn is time.sleep)
 
         if isinstance(api_token, str) and api_token:
@@ -1447,15 +1450,16 @@ class ColdStartConnector:
                 if self._active_wake is op:
                     self._active_wake = None
                 new_state = self._state
+                self._emit_wake(outcome)
+                if outcome == "ok":
+                    self._emit_cold_start_duration(elapsed)
+                self._emit_state(new_state)
                 self._cond.notify_all()
 
             if orphan_conn is not None:
                 _safe_close_conn(orphan_conn)
 
-            self._emit_wake(outcome)
-            if outcome == "ok":
-                self._emit_cold_start_duration(elapsed)
-            else:
+            if outcome != "ok":
                 logger.warning(
                     "Lakebase outage engine=%s endpoint=%s outcome=%s elapsed_s=%.3f",
                     self._engine_name,
@@ -1463,7 +1467,6 @@ class ColdStartConnector:
                     outcome,
                     elapsed,
                 )
-            self._emit_state(new_state)
 
     def probe_no_wake(
         self,
@@ -1552,16 +1555,13 @@ class ColdStartConnector:
             if not probe_succeeded:
                 return "unavailable"
 
-            recovered = False
             with self._lock:
                 if self._active_wake is None or self._active_wake.done:
                     self._state = "ok"
                     self._failed_until = None
                     self._last_no_wake_probe_at = None
-                    recovered = True
+                    self._emit_state("ok")
                 cur_state = self._state
-            if recovered:
-                self._emit_state("ok")
             return cur_state
         finally:
             with self._lock:
@@ -1587,17 +1587,24 @@ class ColdStartConnector:
             )
             self._active_wake = op
             self._state = "starting"
+            self._emit_state("starting")
             started_new = True
 
         if started_new:
-            self._emit_state("starting")
-            worker = threading.Thread(
-                target=self._run_wake,
-                args=(op,),
-                daemon=True,
-                name=f"lakebase-wake-{self._engine_name}",
-            )
-            worker.start()
+            if self._executor is not None:
+                if callable(getattr(self._executor, "submit", None)):
+                    self._executor.submit(self._run_wake, op)
+                elif callable(self._executor):
+                    self._executor(self._run_wake, op)
+            else:
+                worker = threading.Thread(
+                    target=self._run_wake,
+                    args=(op,),
+                    daemon=True,
+                    name=f"lakebase-wake-{self._engine_name}",
+                )
+                self._last_wake_worker = worker
+                worker.start()
         return op
 
     def connect(
@@ -1646,8 +1653,8 @@ class ColdStartConnector:
                     self._last_cold_start = False
                     self._failed_until = None
                     self._last_no_wake_probe_at = None
+                    self._emit_state("ok")
                 self._tls.cold_start = False
-                self._emit_state("ok")
                 return conn
         else:
             self._tls.cold_start = True
@@ -1711,7 +1718,7 @@ class ColdStartConnector:
                 raise non_wakeable from None
             with self._lock:
                 self._state = "unavailable"
-            self._emit_state("unavailable")
+                self._emit_state("unavailable")
             raise EngineError("Engine connection failed") from None
 
         with self._lock:
@@ -1719,5 +1726,5 @@ class ColdStartConnector:
             self._last_cold_start = True
             self._failed_until = None
             self._last_no_wake_probe_at = None
-        self._emit_state("ok")
+            self._emit_state("ok")
         return conn

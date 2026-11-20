@@ -1383,8 +1383,57 @@ class TestColdStartConnector:
         assert out["interactive"].role_tag == "interactive"
         assert out["bi"].role_tag == "bi"
 
+    def test_wake_failure_published_state_transition_is_deterministic_and_cannot_remain_starting(
+        self,
+    ) -> None:
+        """Prove that after a wake failure, published metrics state cannot stick or regress to 'starting'."""
+        clock = FakeClock(initial=100.0)
+        metrics = FakeMetrics()
+        post_calls = 0
+        wake_started = threading.Event()
+        wake_finished = threading.Event()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal post_calls
+            if request.method == "POST":
+                post_calls += 1
+                wake_started.set()
+                return httpx.Response(503, json={"error": "control plane outage"})
+            return httpx.Response(503, json={"error": "control plane outage"})
+
+        def connect_fn(**kwargs: Any) -> FakeDBConnection:
+            raise ConnectionRefusedError("endpoint down")
+
+        connector = ColdStartConnector(
+            connect_fn,
+            _make_wake_cfg(max_query_wait_seconds=10.0, max_wake_seconds=60.0),
+            metrics=metrics,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            engine_name="lb_ops",
+            env={"LB_OPS_PROJECT_TOKEN": "tok-bm5"},
+            clock=clock,
+            sleep_fn=clock.sleep,
+        )
+
+        with pytest.raises(EngineError, match="Engine connection failed"):
+            connector.connect()
+
+        # The waiter unblocks only AFTER state is published under connector lock.
+        # It must be unavailable, never sticking in 'starting'.
+        assert post_calls == 1
+        assert connector.state == "unavailable"
+        assert metrics.states[-1] == ("lb_ops", "unavailable")
+        assert ("lb_ops", "starting") in metrics.states
+        # Verify sequence: starting followed by unavailable, nothing after
+        assert metrics.states == [("lb_ops", "starting"), ("lb_ops", "unavailable")]
+
+        if connector._last_wake_worker is not None and connector._last_wake_worker.is_alive():
+            connector._last_wake_worker.join(timeout=2.0)
+
+    @pytest.mark.parametrize("run_idx", range(200))
     def test_b_m5_plain_connect_during_cooldown_recovers_state_without_new_wake(
         self,
+        run_idx: int,
     ) -> None:
         clock = FakeClock(initial=500.0)
         metrics = FakeMetrics()
@@ -1420,6 +1469,9 @@ class TestColdStartConnector:
         assert post_calls == 1
         assert connector.state == "unavailable"
         assert metrics.states[-1] == ("lb_ops", "unavailable")
+
+        if connector._last_wake_worker is not None and connector._last_wake_worker.is_alive():
+            connector._last_wake_worker.join(timeout=2.0)
 
         # 2. Still down during cooldown (t + 5s): plain connect fails, wake suppressed
         clock.advance(5.0)
