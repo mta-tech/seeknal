@@ -11,6 +11,7 @@ DEFAULT_MAX_TAR_MEMBERS = 10_000
 DEFAULT_MAX_UNPACKED_BYTES = 512 * 1024 * 1024  # 512 MiB
 DEFAULT_MAX_PATH_DEPTH = 32
 DEFAULT_MAX_MEMBER_NAME_LENGTH = 1024
+DEFAULT_MAX_CONCURRENT_PUBLISHES = 4
 
 _POSITIVE_INT_FIELDS: tuple[tuple[str, str], ...] = (
     ("max_upload_bytes", "SEEKNAL_REPORT_SERVER_MAX_UPLOAD_BYTES"),
@@ -18,6 +19,7 @@ _POSITIVE_INT_FIELDS: tuple[tuple[str, str], ...] = (
     ("max_unpacked_bytes", "SEEKNAL_REPORT_SERVER_MAX_UNPACKED_BYTES"),
     ("max_path_depth", "SEEKNAL_REPORT_SERVER_MAX_PATH_DEPTH"),
     ("max_member_name_length", "SEEKNAL_REPORT_SERVER_MAX_MEMBER_NAME_LENGTH"),
+    ("max_concurrent_publishes", "SEEKNAL_REPORT_SERVER_MAX_CONCURRENT_PUBLISHES"),
 )
 
 
@@ -57,6 +59,7 @@ class ServerConfig:
     max_unpacked_bytes: int = DEFAULT_MAX_UNPACKED_BYTES
     max_path_depth: int = DEFAULT_MAX_PATH_DEPTH
     max_member_name_length: int = DEFAULT_MAX_MEMBER_NAME_LENGTH
+    max_concurrent_publishes: int = DEFAULT_MAX_CONCURRENT_PUBLISHES
     cors_origins: list[str] = field(default_factory=list)
 
     @classmethod
@@ -72,6 +75,9 @@ class ServerConfig:
         max_member_name_length = _parse_int_env(
             "SEEKNAL_REPORT_SERVER_MAX_MEMBER_NAME_LENGTH", DEFAULT_MAX_MEMBER_NAME_LENGTH
         )
+        max_concurrent_publishes = _parse_int_env(
+            "SEEKNAL_REPORT_SERVER_MAX_CONCURRENT_PUBLISHES", DEFAULT_MAX_CONCURRENT_PUBLISHES
+        )
         raw_origins = os.environ.get("SEEKNAL_REPORT_SERVER_CORS_ORIGINS", "")
         cors_origins = [o.strip() for o in raw_origins.split(",") if o.strip()] if raw_origins else []
         return cls(
@@ -83,6 +89,7 @@ class ServerConfig:
             max_unpacked_bytes=max_unpacked_bytes,
             max_path_depth=max_path_depth,
             max_member_name_length=max_member_name_length,
+            max_concurrent_publishes=max_concurrent_publishes,
             cors_origins=cors_origins,
         )
 

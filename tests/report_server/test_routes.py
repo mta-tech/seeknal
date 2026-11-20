@@ -645,6 +645,115 @@ def test_publish_rejects_huge_gnu_longname_and_pax_headers_with_typed_400_and_bo
         assert list(assets_dir.iterdir()) == []
 
 
+def test_publish_concurrency_cap_returns_503_with_retry_after_and_cleans_spool(
+    test_app,
+    honest_tarball: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import asyncio
+    import tempfile
+    import threading
+    import httpx
+    import seeknal.report_server.routes as routes_mod
+    from tests.report_server.conftest import _make_tarball
+
+    test_app.state.config.max_concurrent_publishes = 1
+    # Force SpooledTemporaryFile to roll over to disk inside data_dir so disk cleanup is verified
+    monkeypatch.setattr(routes_mod, "SPOOL_MAX_SIZE", 1)
+
+    created_spools: list[tempfile.SpooledTemporaryFile] = []
+    orig_spooled = tempfile.SpooledTemporaryFile
+
+    def _tracking_spooled(*args, **kwargs):
+        s = orig_spooled(*args, **kwargs)
+        created_spools.append(s)
+        return s
+
+    monkeypatch.setattr(routes_mod.tempfile, "SpooledTemporaryFile", _tracking_spooled)
+
+    extraction_started = threading.Event()
+    allow_extraction_finish = threading.Event()
+    orig_extract = test_app.state.storage.extract_tarball
+    rolled_during_extract: list[bool] = []
+    open_fds_during_extract: list[int] = []
+
+    def _blocked_extract(slug, fileobj):
+        rolled_during_extract.append(getattr(fileobj, "_rolled", False))
+        open_fds_during_extract.append(fileobj.fileno())
+        extraction_started.set()
+        allow_extraction_finish.wait(timeout=5.0)
+        return orig_extract(slug, fileobj)
+
+    tarball_bytes = honest_tarball.read_bytes()
+
+    async def _run_concurrent():
+        transport = httpx.ASGITransport(app=test_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            first_task = asyncio.create_task(
+                client.post(
+                    "/publish",
+                    content=tarball_bytes,
+                    headers={
+                        "Content-Type": "application/gzip",
+                        "Authorization": "Bearer test-key-123",
+                    },
+                )
+            )
+            for _ in range(100):
+                if extraction_started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert extraction_started.is_set()
+
+            # Second concurrent publish must immediately get 503 with Retry-After: 1
+            second_resp = await client.post(
+                "/publish",
+                content=tarball_bytes,
+                headers={
+                    "Content-Type": "application/gzip",
+                    "Authorization": "Bearer test-key-123",
+                },
+            )
+            assert second_resp.status_code == 503
+            assert second_resp.headers.get("Retry-After") == "1"
+
+            allow_extraction_finish.set()
+            first_resp = await first_task
+            assert first_resp.status_code == 201
+
+    with patch.object(test_app.state.storage, "extract_tarball", side_effect=_blocked_extract):
+        asyncio.run(_run_concurrent())
+
+    assert rolled_during_extract == [True]
+    assert len(created_spools) == 1
+    assert created_spools[0].closed
+    spool_dir = test_app.state.config.data_dir / "tmp"
+    assert list(spool_dir.iterdir()) == []
+
+    # Verify spool file is also closed and removed after a failed publish (400)
+    bad_tar = _make_tarball(
+        tmp_path,
+        [("../../etc/passwd", b"root", "file")],
+        filename="bad_for_spool_test.tar.gz",
+    )
+    bad_bytes = bad_tar.read_bytes()
+    client = TestClient(test_app, raise_server_exceptions=True)
+    fail_resp = client.post(
+        "/publish",
+        content=bad_bytes,
+        headers={
+            "Content-Type": "application/gzip",
+            "Authorization": "Bearer test-key-123",
+        },
+    )
+    assert fail_resp.status_code == 400
+    assert len(created_spools) == 2
+    assert created_spools[1].closed
+    assert list(spool_dir.iterdir()) == []
+
+
+
 
 
 

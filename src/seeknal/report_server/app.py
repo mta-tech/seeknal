@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -62,6 +63,8 @@ def create_app(config: Optional[ServerConfig] = None) -> Starlette:
     app.state.config = config
     app.state.storage = storage
     app.state.engine = engine
+    app.state.publish_semaphore = asyncio.Semaphore(config.max_concurrent_publishes)
+    app.state.publish_semaphore_capacity = config.max_concurrent_publishes
 
     if config.cors_origins:
         app.add_middleware(

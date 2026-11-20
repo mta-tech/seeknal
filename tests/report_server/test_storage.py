@@ -370,6 +370,7 @@ def test_server_config_validates_positive_int_caps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from seeknal.report_server.config import (
+        DEFAULT_MAX_CONCURRENT_PUBLISHES,
         DEFAULT_MAX_MEMBER_NAME_LENGTH,
         DEFAULT_MAX_PATH_DEPTH,
         DEFAULT_MAX_TAR_MEMBERS,
@@ -385,6 +386,7 @@ def test_server_config_validates_positive_int_caps(
     assert cfg.max_unpacked_bytes == DEFAULT_MAX_UNPACKED_BYTES == 512 * 1024 * 1024
     assert cfg.max_path_depth == DEFAULT_MAX_PATH_DEPTH == 32
     assert cfg.max_member_name_length == DEFAULT_MAX_MEMBER_NAME_LENGTH == 1024
+    assert cfg.max_concurrent_publishes == DEFAULT_MAX_CONCURRENT_PUBLISHES == 4
     cfg.validate()
 
     for field_name in (
@@ -393,6 +395,7 @@ def test_server_config_validates_positive_int_caps(
         "max_unpacked_bytes",
         "max_path_depth",
         "max_member_name_length",
+        "max_concurrent_publishes",
     ):
         for bad_val in (0, -5, True, "100"):
             bad_cfg = ServerConfig(

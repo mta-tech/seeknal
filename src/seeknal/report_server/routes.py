@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import io
+import asyncio
 import logging
 import mimetypes
 import os
 import tarfile
+import tempfile
 from datetime import datetime, timezone
 
 from starlette.concurrency import run_in_threadpool
@@ -17,6 +18,18 @@ from seeknal.report_server.models import Publish, get_session
 from seeknal.report_server.storage import TarSafetyError
 
 _log = logging.getLogger("seeknal.report_server")
+
+SPOOL_MAX_SIZE = 8 * 1024 * 1024  # 8 MiB in-memory threshold before rolling to disk inside data_dir
+
+
+def _get_publish_semaphore(app, config) -> asyncio.Semaphore:
+    sem = getattr(app.state, "publish_semaphore", None)
+    cap = getattr(app.state, "publish_semaphore_capacity", None)
+    if sem is None or cap != config.max_concurrent_publishes:
+        sem = asyncio.Semaphore(config.max_concurrent_publishes)
+        app.state.publish_semaphore = sem
+        app.state.publish_semaphore_capacity = config.max_concurrent_publishes
+    return sem
 
 
 _FILTER_ERROR_TYPE = getattr(tarfile, "FilterError", TarSafetyError)
@@ -72,59 +85,78 @@ async def publish(request: Request) -> JSONResponse:
     except AuthError as exc:
         return JSONResponse({"error": str(exc)}, status_code=401)
 
-    chunks: list[bytes] = []
-    running_bytes = 0
-    async for chunk in request.stream():
-        if not chunk:
-            continue
-        running_bytes += len(chunk)
-        if running_bytes > config.max_upload_bytes:
-            return JSONResponse({"error": "Upload exceeds maximum allowed size"}, status_code=413)
-        chunks.append(chunk)
-    body_bytes = b"".join(chunks)
-
-    engine = request.app.state.engine
-    storage = request.app.state.storage
-
-    with get_session(engine) as session:
-        slug = slugs.generate_unique(session)
-        plain_secret, hash_hex, salt_hex = owner.mint()
-
-        report_name = request.headers.get("X-Seeknal-Report-Name", slug)
-        report_title = request.headers.get("X-Seeknal-Report-Title") or None
-
-        try:
-            asset_relpath = await run_in_threadpool(
-                storage.extract_tarball, slug, io.BytesIO(body_bytes)
-            )
-        except (
-            TarSafetyError,
-            _FILTER_ERROR_TYPE,
-            tarfile.TarError,
-            EOFError,
-            OSError,
-            ValueError,
-        ) as exc:
-            _log.warning(
-                "publish tarball rejected: slug=%s exc_class=%s",
-                slug,
-                type(exc).__name__,
-            )
-            return JSONResponse({"error": _classify_tar_error(exc)}, status_code=400)
-
-        created_at = datetime.now(timezone.utc)
-        pub = Publish(
-            slug=slug,
-            report_name=report_name,
-            report_title=report_title,
-            owner_secret_hash=hash_hex,
-            owner_secret_salt=salt_hex,
-            created_at=created_at,
-            asset_relpath=asset_relpath,
-            byte_size=len(body_bytes),
+    semaphore = _get_publish_semaphore(request.app, config)
+    if semaphore.locked():
+        return JSONResponse(
+            {"error": "Too many concurrent publish requests"},
+            status_code=503,
+            headers={"Retry-After": "1"},
         )
-        session.add(pub)
-        session.commit()
+    await semaphore.acquire()
+
+    spool_dir = config.data_dir / "tmp"
+    spool_dir.mkdir(parents=True, exist_ok=True)
+    spool = tempfile.SpooledTemporaryFile(
+        max_size=SPOOL_MAX_SIZE,
+        mode="w+b",
+        dir=str(spool_dir),
+    )
+    try:
+        running_bytes = 0
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            running_bytes += len(chunk)
+            if running_bytes > config.max_upload_bytes:
+                return JSONResponse({"error": "Upload exceeds maximum allowed size"}, status_code=413)
+            spool.write(chunk)
+        spool.seek(0)
+
+        engine = request.app.state.engine
+        storage = request.app.state.storage
+
+        with get_session(engine) as session:
+            slug = slugs.generate_unique(session)
+            plain_secret, hash_hex, salt_hex = owner.mint()
+
+            report_name = request.headers.get("X-Seeknal-Report-Name", slug)
+            report_title = request.headers.get("X-Seeknal-Report-Title") or None
+
+            try:
+                asset_relpath = await run_in_threadpool(
+                    storage.extract_tarball, slug, spool
+                )
+            except (
+                TarSafetyError,
+                _FILTER_ERROR_TYPE,
+                tarfile.TarError,
+                EOFError,
+                OSError,
+                ValueError,
+            ) as exc:
+                _log.warning(
+                    "publish tarball rejected: slug=%s exc_class=%s",
+                    slug,
+                    type(exc).__name__,
+                )
+                return JSONResponse({"error": _classify_tar_error(exc)}, status_code=400)
+
+            created_at = datetime.now(timezone.utc)
+            pub = Publish(
+                slug=slug,
+                report_name=report_name,
+                report_title=report_title,
+                owner_secret_hash=hash_hex,
+                owner_secret_salt=salt_hex,
+                created_at=created_at,
+                asset_relpath=asset_relpath,
+                byte_size=running_bytes,
+            )
+            session.add(pub)
+            session.commit()
+    finally:
+        spool.close()
+        semaphore.release()
 
     return JSONResponse(
         {
