@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import inspect
+import json
 import re
-from pathlib import Path
+import shlex
+import tomllib
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -13,6 +16,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_PATH = REPO_ROOT / "deploy" / "docker-compose.report-server.yml"
 DEPLOY_SCRIPT_PATH = REPO_ROOT / "deploy" / "deploy-report-server.sh"
 DOCKER_README_PATH = REPO_ROOT / "docker" / "report-server" / "README.md"
+PYPROJECT_PATH = REPO_ROOT / "pyproject.toml"
+DOCKERFILE_PATH = REPO_ROOT / "docker" / "report-server" / "Dockerfile"
 
 
 def _parse_compose_env(entries: list[str] | dict[str, str]) -> dict[str, str]:
@@ -151,4 +156,86 @@ def test_deploy_script_and_readme_security_guards() -> None:
 def test_deploy_script_mktemp_templates_end_with_at_least_six_xs() -> None:
     script = DEPLOY_SCRIPT_PATH.read_text(encoding="utf-8")
     _assert_every_mktemp_template_ends_with_six_xs(script)
+
+
+def _extract_builder_copy_sources(dockerfile_path: Path) -> list[str]:
+    lines = dockerfile_path.read_text(encoding="utf-8").splitlines()
+    merged_lines: list[str] = []
+    current = ""
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if stripped.endswith("\\"):
+            current += stripped[:-1] + " "
+        else:
+            current += stripped
+            if current:
+                merged_lines.append(current)
+            current = ""
+
+    builder_lines: list[str] = []
+    in_builder = False
+    for line in merged_lines:
+        if re.match(r"^FROM\s+.*\s+AS\s+builder\b", line, re.IGNORECASE):
+            in_builder = True
+            continue
+        elif in_builder and re.match(r"^FROM\b", line, re.IGNORECASE):
+            in_builder = False
+            break
+        if in_builder:
+            builder_lines.append(line)
+
+    copy_sources: list[str] = []
+    for line in builder_lines:
+        if not re.match(r"^COPY\b", line, re.IGNORECASE):
+            continue
+        rest = re.sub(r"^COPY\s+", "", line, flags=re.IGNORECASE).strip()
+        if rest.startswith("["):
+            try:
+                tokens = json.loads(rest)
+            except Exception:
+                tokens = shlex.split(rest)
+        else:
+            tokens = shlex.split(rest)
+        args = [t for t in tokens if not t.startswith("--")]
+        if len(args) >= 2:
+            copy_sources.extend(args[:-1])
+
+    return copy_sources
+
+
+def test_dockerfile_builder_copies_wheel_packages_and_force_includes() -> None:
+    with open(PYPROJECT_PATH, "rb") as f:
+        pyproject_data = tomllib.load(f)
+
+    wheel_target = (
+        pyproject_data.get("tool", {})
+        .get("hatch", {})
+        .get("build", {})
+        .get("targets", {})
+        .get("wheel", {})
+    )
+    force_includes = list(wheel_target.get("force-include", {}).keys())
+    packages = list(wheel_target.get("packages", []))
+    required_paths = force_includes + packages
+
+    assert force_includes, "Expected at least one force-include key in pyproject.toml"
+    assert packages, "Expected at least one package path in pyproject.toml"
+
+    copy_sources = _extract_builder_copy_sources(DOCKERFILE_PATH)
+    assert copy_sources, "Expected at least one COPY source in Dockerfile builder stage"
+
+    for req_path_str in required_paths:
+        req_path = PurePosixPath(req_path_str)
+        is_copied = any(
+            req_path.is_relative_to(PurePosixPath(src)) for src in copy_sources
+        )
+        assert is_copied, (
+            f"Path {req_path_str!r} required by pyproject.toml wheel build "
+            f"(force-include or packages) is not copied into the builder stage "
+            f"of {DOCKERFILE_PATH.relative_to(REPO_ROOT)}. "
+            f"Builder copy sources: {copy_sources}"
+        )
+
 
