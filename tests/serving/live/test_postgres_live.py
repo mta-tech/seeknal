@@ -36,7 +36,7 @@ from seeknal.serving.lakebase_endpoint import (
     check_role_guard,
     parse_lakebase_block,
 )
-from seeknal.serving.ops import ReadinessProbe
+from seeknal.serving.ops import ReadinessProbe, create_ops_app
 from seeknal.serving.parameter_binding import parameter_digest
 from seeknal.serving.postgres_session import (
     PostgresSessionConfig,
@@ -1149,35 +1149,72 @@ def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
         env={"PROBE_LB_TOKEN": "token-probe-secret"},
     )
 
+    class _ProbeAdapterStub:
+        cold_start_connector = connector
+
+    readiness = ReadinessProbe(
+        {"lb_probe": _ProbeAdapterStub()},
+        timeout_seconds=0.5,
+        cache_seconds=0.0,
+    )
+    ops_app = create_ops_app(readiness=readiness)
+    ops_client = TestClient(ops_app)
+
     try:
         # 1. Positive control: a fast probe returns ok, and last_probe_pgcode is None.
+        #    Also verify /readyz returns 200 through ReadinessProbe.
         with connector._lock:
             connector._state = "unavailable"
-        state_pos = connector.probe_no_wake(timeout_seconds=2.0, min_interval_seconds=0.0)
-        assert state_pos == "ok"
+            connector._last_no_wake_probe_at = None
+
+        r_pos = ops_client.get("/readyz")
+        assert r_pos.status_code == 200
+        assert r_pos.json() == {"ready": True, "engines": {"lb_probe": "ok"}}
         assert connector.state == "ok"
         assert connector.last_probe_pgcode is None
         assert len(wake_calls) == 0
         assert len(tracked_conns) == 1
         assert tracked_conns[0].closed != 0
 
+        # Also test direct probe_no_wake call
+        with connector._lock:
+            connector._state = "unavailable"
+            connector._last_no_wake_probe_at = None
+        state_pos = connector.probe_no_wake(timeout_seconds=2.0, min_interval_seconds=0.0)
+        assert state_pos == "ok"
+        assert connector.state == "ok"
+        assert connector.last_probe_pgcode is None
+        assert len(wake_calls) == 0
+
         # 2. With the probe SQL set to SELECT pg_sleep(5) through the private _PROBE_SQL hook
         #    (monkeypatch) and a 500 ms probe timeout, the probe connect has its own 500 ms budget,
         #    the slow probe query is cancelled by PostgreSQL with last_probe_pgcode == "57014",
-        #    and no wake call happened.
+        #    /readyz returns 503 through ReadinessProbe, and no wake call happened.
         monkeypatch.setattr(lb_mod, "_PROBE_SQL", "SELECT pg_sleep(5)")
         with connector._lock:
             connector._state = "unavailable"
             connector._last_no_wake_probe_at = None
 
+        r_slow = ops_client.get("/readyz")
+        assert r_slow.status_code == 503
+        assert r_slow.json() == {
+            "ready": False,
+            "engines": {"lb_probe": "unavailable"},
+        }
+        assert connector.state == "unavailable"
+        assert connector.last_probe_pgcode == "57014"
+        assert len(wake_calls) == 0
+
+        # Direct probe_no_wake also returns "unavailable" with 57014
+        with connector._lock:
+            connector._state = "unavailable"
+            connector._last_no_wake_probe_at = None
         state_slow = connector.probe_no_wake(timeout_seconds=0.5, min_interval_seconds=0.0)
         assert state_slow == "unavailable"
         assert state_slow != "ok"
         assert connector.state == "unavailable"
         assert connector.last_probe_pgcode == "57014"
         assert len(wake_calls) == 0
-        assert len(tracked_conns) == 2
-        assert tracked_conns[1].closed != 0
 
         # 3. The same as 2 on an autocommit connection: the base_connect sets conn.autocommit = True
         #    before returning. This proves set_config inside BEGIN/ROLLBACK applies under autocommit.
@@ -1194,12 +1231,11 @@ def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
         assert connector.state == "unavailable"
         assert connector.last_probe_pgcode == "57014"
         assert len(wake_calls) == 0
-        assert len(tracked_conns) == 3
-        assert tracked_conns[2].closed != 0
 
         # 4. After each probe, the connection used by the probe is closed. Track it in the connect wrapper.
         assert all(c.closed != 0 for c in tracked_conns)
     finally:
+        ops_client.close()
         connector.close()
         stub_http_client.close()
 
