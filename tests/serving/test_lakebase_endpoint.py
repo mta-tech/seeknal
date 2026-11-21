@@ -1976,6 +1976,44 @@ def test_p1_probe_queue_never_grows_beyond_n():
         assert connect_started <= n_workers
 
 
+def test_p2_connect_finishing_at_deadline_is_closed():
+    """P2: A connect that finishes at/after deadline (Event-driven) gets closed without race."""
+    late_conn = FakeDBConnection(conn_id=888)
+    at_deadline_event = threading.Event()
+    can_finish_event = threading.Event()
+
+    def event_driven_connect(**kw: Any) -> Any:
+        at_deadline_event.set()
+        can_finish_event.wait(timeout=5.0)
+        return late_conn
+
+    cfg = _make_wake_cfg(max_query_wait_seconds=5.0, max_wake_seconds=10.0)
+    connector = ColdStartConnector(
+        event_driven_connect,
+        cfg,
+        engine_name="lb_p2",
+        env={"LB_OPS_PROJECT_TOKEN": "tok-p2"},
+    )
+    with connector._lock:
+        connector._state = "unavailable"
+
+    def release_after_blocked():
+        at_deadline_event.wait(timeout=2.0)
+        time.sleep(0.04)
+        can_finish_event.set()
+
+    t = threading.Thread(target=release_after_blocked)
+    t.start()
+
+    state = connector.probe_no_wake(timeout_seconds=0.02, min_interval_seconds=0.0)
+    assert state == "unavailable"
+    t.join(timeout=2.0)
+
+    time.sleep(0.05)
+    assert late_conn.closed is True
+
+
+
 
 
 

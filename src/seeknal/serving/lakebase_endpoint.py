@@ -1559,28 +1559,28 @@ class ColdStartConnector:
                                     return target_fn()
                         return target_fn()
 
-                    timed_out_tracker = {"timed_out": False}
-
-                    def _on_done(f: concurrent.futures.Future) -> None:
+                    def _release_slot(_f: concurrent.futures.Future) -> None:
                         try:
-                            res = f.result()
-                            if timed_out_tracker["timed_out"] and res is not None:
-                                _safe_close_conn(res)
-                        except Exception:
+                            self._probe_semaphore.release()
+                        except ValueError:
                             pass
-                        finally:
-                            try:
-                                self._probe_semaphore.release()
-                            except ValueError:
-                                pass
 
                     fut = self._probe_executor.submit(_attempt_target_connect)
-                    fut.add_done_callback(_on_done)
+                    fut.add_done_callback(_release_slot)
                     try:
                         conn = fut.result(timeout=max(0.001, remaining))
                     except concurrent.futures.TimeoutError:
                         fut.cancel()
-                        timed_out_tracker["timed_out"] = True
+
+                        def _close_late_conn(f: concurrent.futures.Future) -> None:
+                            try:
+                                res = f.result()
+                                if res is not None:
+                                    _safe_close_conn(res)
+                            except Exception:
+                                pass
+
+                        fut.add_done_callback(_close_late_conn)
                         conn = None
                         continue
 
