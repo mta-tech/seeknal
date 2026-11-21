@@ -1,0 +1,15 @@
+{
+  "lb": {
+    "kind": "lakebase",
+    "dsn_env": "LAKEBASE_DSN"
+  },
+  "duck": {
+    "kind": "duckdb",
+    "path": "/data/serving/mart.duckdb",
+    "allowed_directories": [
+      "/data/serving/"
+    ],
+    "memory_limit": "2GB",
+    "threads": 4
+  }
+}

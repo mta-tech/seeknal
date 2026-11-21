@@ -211,7 +211,10 @@ def test_discovery_mode_readyz_and_error_handling(ec_key_pair, jwks_path):
     client = TestClient(handle.app)
     resp_before = client.get("/readyz")
     assert resp_before.status_code == 503
-    assert resp_before.json() == {"ready": False, "reason": "catalog_not_loaded"}
+    assert resp_before.json() == {
+        "ready": False,
+        "reason": "catalog_not_loaded",
+    }
 
     # 2. After refresh succeeds: /readyz returns 200
     ok = handle.refresher.refresh_once()
@@ -231,7 +234,10 @@ def test_discovery_mode_readyz_and_error_handling(ec_key_pair, jwks_path):
     client_fail = TestClient(handle_fail.app)
     resp_fail = client_fail.get("/readyz")
     assert resp_fail.status_code == 503
-    assert resp_fail.json() == {"ready": False, "reason": "catalog_not_loaded"}
+    assert resp_fail.json() == {
+        "ready": False,
+        "reason": "catalog_not_loaded",
+    }
     assert "SECRET_PASSWORD_999" not in resp_fail.text
 
 

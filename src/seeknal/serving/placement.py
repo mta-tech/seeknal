@@ -4,17 +4,68 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 
 import yaml
+from yaml.constructor import ConstructorError
 
 VALID_ENGINE_KINDS = frozenset({"starrocks", "cube", "lakebase", "duckdb"})
 VALID_TWIN_METHODS = frozenset({"redact", "null", "year", "last4"})
+MAX_SIGNED_INT64 = 9_223_372_036_854_775_807
+
+
+def _validate_snapshot_id(value: object, *, context: str = "TableServe") -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PlacementError(
+            f"{context} has invalid snapshot_id: must be a positive integer within signed 64-bit range"
+        )
+    if value <= 0 or value > MAX_SIGNED_INT64:
+        raise PlacementError(
+            f"{context} has invalid snapshot_id: must be a positive integer within signed 64-bit range (1..{MAX_SIGNED_INT64})"
+        )
+    return value
 
 
 class PlacementError(ValueError):
     """Raised when a placement configuration is invalid."""
+
+
+class DuplicateYamlKeyError(ConstructorError, PlacementError):
+    """Raised when a YAML mapping contains duplicate keys."""
+
+    def __init__(self, key: object, mark: yaml.Mark | None) -> None:
+        self.duplicate_key = key
+        super().__init__(
+            None,
+            None,
+            f"found duplicate YAML key '{key}'",
+            mark,
+        )
+
+
+class UniqueKeySafeLoader(yaml.SafeLoader):
+    """SafeLoader subclass that rejects duplicate keys at every YAML mapping node."""
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict:
+        if isinstance(node, yaml.MappingNode):
+            self.flatten_mapping(node)
+        seen_keys: set[object] = set()
+        for key_node, _value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                is_dup = key in seen_keys
+            except TypeError as exc:
+                raise ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found unhashable key",
+                    key_node.start_mark,
+                ) from exc
+            if is_dup:
+                raise DuplicateYamlKeyError(key, key_node.start_mark)
+            seen_keys.add(key)
+        return super().construct_mapping(node, deep=deep)
 
 
 @dataclass(frozen=True)
@@ -33,6 +84,14 @@ class TableServe:
     engine: str
     physical_name: str
     max_lag_seconds: float | None = None
+    snapshot_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.snapshot_id is not None:
+            _validate_snapshot_id(
+                self.snapshot_id,
+                context=f"TableServe for engine '{self.engine}'",
+            )
 
 
 @dataclass(frozen=True)
@@ -43,6 +102,13 @@ class TableEntry:
     keys: tuple[str, ...]
     row_count: int | None
     serves: tuple[TableServe, ...]
+    pii: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pii, bool):
+            raise PlacementError(
+                f"Table '{self.name}' field 'pii' must be a boolean, got {type(self.pii).__name__}"
+            )
 
 
 @dataclass(frozen=True)
@@ -54,8 +120,13 @@ class CubeEntry:
     measures: tuple[str, ...]
     dimensions: tuple[str, ...]
     mask_variants: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    pii: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.pii, bool):
+            raise PlacementError(
+                f"Cube '{self.name}' field 'pii' must be a boolean, got {type(self.pii).__name__}"
+            )
         if not isinstance(self.measures, tuple):
             object.__setattr__(self, "measures", tuple(self.measures))
         if not isinstance(self.dimensions, tuple):
@@ -89,6 +160,21 @@ class Policy:
     analytics_min_rows: int = 1_000_000
     small_scan_order: tuple[str, ...] = ("lakebase", "starrocks", "duckdb")
     analytics_order: tuple[str, ...] = ("starrocks", "duckdb")
+    pii_engines: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pii_engines, (list, tuple)):
+            raise PlacementError(
+                "Policy 'pii_engines' must be a list or tuple of non-empty engine name strings"
+            )
+        cleaned: list[str] = []
+        for item in self.pii_engines:
+            if not isinstance(item, str) or not item.strip():
+                raise PlacementError(
+                    "Policy 'pii_engines' must contain only non-empty engine name strings"
+                )
+            cleaned.append(item.strip())
+        object.__setattr__(self, "pii_engines", tuple(cleaned))
 
 
 @dataclass(frozen=True)
@@ -112,6 +198,13 @@ class Placement:
                     f"Unknown engine kind '{engine.kind}' for engine '{engine.name}'"
                 )
 
+        # Validate policy.pii_engines
+        for pii_eng in self.policy.pii_engines:
+            if pii_eng not in self.engines:
+                raise PlacementError(
+                    f"Policy 'pii_engines' references undefined engine '{pii_eng}'"
+                )
+
         # Validate tables and collision
         seen_tables: dict[str, str] = {}
         for tbl_name, table in self.tables.items():
@@ -126,6 +219,11 @@ class Placement:
                 )
             seen_tables[lower] = table.name
 
+            if not isinstance(table.pii, bool):
+                raise PlacementError(
+                    f"Table '{table.name}' field 'pii' must be a boolean, got {type(table.pii).__name__}"
+                )
+
             if not table.serves:
                 raise PlacementError(f"Table '{table.name}' has no serve")
             for serve in table.serves:
@@ -136,6 +234,20 @@ class Placement:
                 if not serve.physical_name or not serve.physical_name.strip():
                     raise PlacementError(
                         f"Table '{table.name}' has empty physical name for engine '{serve.engine}'"
+                    )
+
+            if table.pii:
+                if len(table.serves) != 1:
+                    raise PlacementError(
+                        f"PII table '{table.name}' must have exactly one serve, got {len(table.serves)}"
+                    )
+                serve_eng = self.engines[table.serves[0].engine]
+                if (
+                    serve_eng.kind == "duckdb"
+                    and serve_eng.name not in self.policy.pii_engines
+                ):
+                    raise PlacementError(
+                        f"PII table '{table.name}' cannot be served on duckdb engine '{serve_eng.name}' unless listed in policy.pii_engines"
                     )
 
         # Validate cubes and collision
@@ -163,6 +275,14 @@ class Placement:
             if self.engines[cube.engine].kind != "cube":
                 raise PlacementError(
                     f"Cube '{cube.name}' engine '{cube.engine}' is not of kind 'cube'"
+                )
+            if not isinstance(cube.pii, bool):
+                raise PlacementError(
+                    f"Cube '{cube.name}' field 'pii' must be a boolean, got {type(cube.pii).__name__}"
+                )
+            if cube.pii and cube.engine not in self.policy.pii_engines:
+                raise PlacementError(
+                    f"PII cube '{cube.name}' engine '{cube.engine}' must be listed in policy.pii_engines"
                 )
 
             # Validate mask_variants on cube
@@ -241,11 +361,19 @@ class Placement:
                     phys_name = sval.get("name", "")
                     lag_val = sval.get("max_lag_seconds")
                     max_lag = float(lag_val) if lag_val is not None else None
+                    snap_raw = sval.get("snapshot_id")
+                    snap_id: int | None = None
+                    if snap_raw is not None:
+                        snap_id = _validate_snapshot_id(
+                            snap_raw,
+                            context=f"Table '{tbl_name}' serve for engine '{eng_name}'",
+                        )
                     serves.append(
                         TableServe(
                             engine=str(eng_name),
                             physical_name=str(phys_name),
                             max_lag_seconds=max_lag,
+                            snapshot_id=snap_id,
                         )
                     )
                 else:
@@ -253,11 +381,18 @@ class Placement:
                         f"Table '{tbl_name}' serve has invalid format for engine '{eng_name}'"
                     )
 
+            pii_raw = tbl_spec.get("pii", False)
+            if not isinstance(pii_raw, bool):
+                raise PlacementError(
+                    f"Table '{tbl_name}' field 'pii' must be a boolean, got {type(pii_raw).__name__}"
+                )
+
             tables[str(tbl_name)] = TableEntry(
                 name=str(tbl_name),
                 keys=keys,
                 row_count=row_count,
                 serves=tuple(serves),
+                pii=pii_raw,
             )
 
         # 3. Cubes
@@ -279,12 +414,18 @@ class Placement:
                 }
             else:
                 mask_variants = {}
+            cube_pii_raw = cube_spec.get("pii", False)
+            if not isinstance(cube_pii_raw, bool):
+                raise PlacementError(
+                    f"Cube '{cube_name}' field 'pii' must be a boolean, got {type(cube_pii_raw).__name__}"
+                )
             cubes[str(cube_name)] = CubeEntry(
                 name=str(cube_name),
                 engine=cube_eng,
                 measures=measures,
                 dimensions=dimensions,
                 mask_variants=mask_variants,
+                pii=cube_pii_raw,
             )
 
         # 4. Policy
@@ -292,6 +433,8 @@ class Placement:
         if policy_raw is None:
             policy = Policy()
         else:
+            if not isinstance(policy_raw, Mapping):
+                raise PlacementError("'policy' must be a mapping")
             kwargs = {}
             if "point_lookup_max_keys" in policy_raw:
                 kwargs["point_lookup_max_keys"] = int(
@@ -307,7 +450,54 @@ class Placement:
                 kwargs["analytics_order"] = tuple(
                     str(x) for x in policy_raw["analytics_order"]
                 )
+            if "pii_engines" in policy_raw:
+                raw_pii_engines = policy_raw["pii_engines"]
+                if not isinstance(raw_pii_engines, (list, tuple)):
+                    raise PlacementError(
+                        "Policy 'pii_engines' must be a list or tuple of non-empty engine name strings"
+                    )
+                parsed_pii_engines: list[str] = []
+                for item in raw_pii_engines:
+                    if not isinstance(item, str) or not item.strip():
+                        raise PlacementError(
+                            "Policy 'pii_engines' must contain only non-empty engine name strings"
+                        )
+                    parsed_pii_engines.append(item.strip())
+                kwargs["pii_engines"] = tuple(parsed_pii_engines)
             policy = Policy(**kwargs)
+
+        # 5. Fold top-level pii_tables and policy.pii_tables into TableEntry.pii / CubeEntry.pii
+        top_pii_tables = data.get("pii_tables")
+        policy_pii_tables = (
+            policy_raw.get("pii_tables") if isinstance(policy_raw, Mapping) else None
+        )
+        if top_pii_tables is not None or policy_pii_tables is not None:
+            tables_by_lower = {k.lower(): k for k in tables}
+            cubes_by_lower = {k.lower(): k for k in cubes}
+            for src_label, raw_pii_list in (
+                ("pii_tables", top_pii_tables),
+                ("policy.pii_tables", policy_pii_tables),
+            ):
+                if raw_pii_list is None:
+                    continue
+                if not isinstance(raw_pii_list, (list, tuple)):
+                    raise PlacementError(
+                        f"'{src_label}' must be a list or tuple of non-empty table name strings"
+                    )
+                for t_ref in raw_pii_list:
+                    if not isinstance(t_ref, str) or not t_ref.strip():
+                        raise PlacementError(
+                            f"'{src_label}' must contain only non-empty table name strings"
+                        )
+                    ref_lower = t_ref.strip().lower()
+                    if ref_lower in tables_by_lower:
+                        canon_key = tables_by_lower[ref_lower]
+                        tables[canon_key] = replace(tables[canon_key], pii=True)
+                    elif ref_lower in cubes_by_lower:
+                        canon_key = cubes_by_lower[ref_lower]
+                        cubes[canon_key] = replace(cubes[canon_key], pii=True)
+                    else:
+                        raise PlacementError(f"Unknown table '{t_ref}' in pii_tables")
 
         return cls(engines=engines, tables=tables, cubes=cubes, policy=policy)
 
@@ -315,5 +505,5 @@ class Placement:
     def from_yaml(cls, path: str | os.PathLike) -> Placement:
         """Construct Placement from a YAML file."""
         with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            data = yaml.load(f, Loader=UniqueKeySafeLoader) or {}
         return cls.from_dict(data)

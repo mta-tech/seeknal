@@ -1,4 +1,4 @@
-# Minimal runtime dependencies for seeknal.serving
+# Minimal runtime dependencies for seeknal.serving (kept in sync with [dependency-groups].serving in pyproject.toml)
 attrs
 cryptography
 duckdb

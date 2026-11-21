@@ -40,18 +40,28 @@ tables:
       sr: lakekeeper.ref.province
       lb: public.province
       duck: province
+  claims.patient_identity:
+    keys: [patient_id]
+    row_count: 500000
+    pii: true
+    serve:
+      lb: public.patient_identity
 
 cubes:
   claims_cube:
     engine: cube
     measures: [total_amount, claim_count]
     dimensions: [province, idrg_code, admit_month]
+    pii: false  # Optional boolean; if true, 'cube' must be listed in policy.pii_engines
 
 policy:
   point_lookup_max_keys: 100
   analytics_min_rows: 1000000
   small_scan_order: ["lakebase", "starrocks", "duckdb"]
   analytics_order: ["starrocks", "duckdb"]
+  pii_engines: []
+  # Optional policy-level PII table list (folded into TableEntry.pii=True / CubeEntry.pii=True):
+  # pii_tables: [claims.patient_identity]
 ```
 
 ### Key Principles
@@ -187,6 +197,29 @@ router.route("SELECT * FROM claims.claim WHERE claim_id = 42", max_staleness_sec
 - The router checks each engine's `max_lag_seconds` for all referenced tables.
 - Because Lakebase has 300s lag ($> 10\text{s}$), it is rejected with a reason detailing staleness.
 - The router falls through to the next feasible engine (StarRocks, where lag is fresh/`None`), choosing `sr` under the `analytics` rule.
+
+---
+
+## PII Placement and Cross-Engine Query Isolation
+
+Tables and semantic cubes containing personally identifiable information can be marked with `pii: true` directly (`tables.<table>.pii: true`, `cubes.<cube>.pii: true`), via static `placement.pii_tables` / `placement.policy.pii_tables` (which fold into `TableEntry.pii = True` and `CubeEntry.pii = True`), or carried through catalog discovery (`lakebase.synced_tables.<table>.pii: true` or `discovery.pii_tables`).
+
+### Placement Invariants (`PlacementError` / Startup Refusal)
+
+1. **Single Dedicated Serve**: Every table with `pii: true` must declare **exactly one** `serve` (`len(serves) == 1`). Declaring two or more serves for a PII table is rejected at placement load and startup validation.
+2. **Static `pii_tables` & `policy.pii_tables` Folding**: Listing a table or cube in top-level `pii_tables` or `policy.pii_tables` sets `pii=True` on that `TableEntry` / `CubeEntry` so all PII placement and routing invariants apply. Referencing an unknown table raises `PlacementError`.
+3. **DuckDB Prohibition Unless Explicitly Approved**: A `pii: true` table cannot be served on any engine of `kind: duckdb` (including both `local_file` and `iceberg_direct` profiles) unless that specific engine name is listed in `policy.pii_engines` (or `discovery.pii_engines`).
+4. **PII Cubes Require Explicit `policy.pii_engines` Approval**: A cube with `pii: true` is refused unless its `engine` is explicitly listed in `policy.pii_engines`.
+5. **Validated `policy.pii_engines`**: `policy.pii_engines` defaults to `()` and must be a list/tuple of non-empty engine names declared in `engines`. Referencing an unknown engine raises `PlacementError`.
+
+### Cross-Engine Mixing Guard (`pii_cross_engine`, HTTP 422)
+
+Before any backend engine is called, `check_pii_query_mixing` and `Router` enforce strict engine isolation on every query referencing a `pii: true` table or cube:
+
+- Let `pii_engine` be the sole engine serving the `pii: true` table (or `pii: true` cube).
+- Every other table referenced in the statement **must also be served on `pii_engine`** (including when multiple `pii: true` tables appear in the same query).
+- Mixing a `pii: true` cube with any table, referencing cubes across different Cube engines when any cube has `pii: true`, or supplying an engine hint (`hint` argument or `/* seeknal:engine=... */` comment) other than `pii_engine` is rejected.
+- Violations raise a typed `RoutingError` (`PiiCrossEngineError`) with `.code = "pii_cross_engine"`, mapped to **HTTP 422** before any engine adapter is invoked—even when an engine hint is supplied.
 
 ---
 

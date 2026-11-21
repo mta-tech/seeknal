@@ -1,0 +1,551 @@
+"""Unit tests for seeknal.serving.accel.tables and placement helpers."""
+
+from __future__ import annotations
+
+import json
+import pytest
+
+from seeknal.serving.accel.loader import plan_sql
+from seeknal.serving.accel.placement import (
+    generate_placement,
+    generate_schemas,
+    write_placement_files,
+)
+from seeknal.serving.accel.tables import (
+    MAX_SIGNED_INT64,
+    ColumnSpec,
+    TableSpec,
+    build_table_specs,
+    map_type,
+    validate_duckdb_type,
+    validate_identifier,
+    validate_snapshot_id,
+)
+
+
+def _synthetic_inputs():
+    columns = {
+        "views": {
+            "daily_orders": {
+                "keys": ["order_id"],
+                "columns": [
+                    {"name": "order_id", "type": "bigint"},
+                    {"name": "order_date", "type": "date"},
+                    {"name": "net_amount", "type": "decimal(18, 2)"},
+                    {"name": "customer_email", "type": "varchar(128)", "pii": "email_hash"},
+                ],
+            },
+            "inventory_snapshot": {
+                "keys": ["sku_id"],
+                "columns": [
+                    {"name": "sku_id", "type": "varchar"},
+                    {"name": "on_hand_qty", "type": "integer"},
+                    {"name": "is_active", "type": "boolean"},
+                ],
+            },
+            "realtime_alerts": {
+                "keys": ["alert_id"],
+                "columns": [
+                    {"name": "alert_id", "type": "bigint"},
+                    {"name": "created_at", "type": "timestamptz"},
+                ],
+            },
+        }
+    }
+    pii_policy = {
+        "email_hash": {
+            "source_form": "sha256",
+            "mask": "redact",
+        }
+    }
+    registry = {
+        "reports": [
+            {"view": "daily_orders", "status": "ready"},
+            {"view": "inventory_snapshot", "status": "contract"},
+            {"view": "realtime_alerts", "status": "ready"},
+        ]
+    }
+    return columns, pii_policy, registry
+
+
+def test_map_type_and_identifier_validation():
+    assert map_type("c", "varchar(50)") == "VARCHAR"
+    assert map_type("c", "string") == "VARCHAR"
+    assert map_type("c", "int4") == "INTEGER"
+    assert map_type("c", "bigint") == "BIGINT"
+    assert map_type("c", "long") == "BIGINT"
+    assert map_type("c", "bool") == "BOOLEAN"
+    assert map_type("c", "date") == "DATE"
+    assert map_type("c", "timestamp with time zone") == "TIMESTAMP"
+    assert map_type("c", "double precision") == "DOUBLE"
+    assert map_type("c", "numeric(12, 4)") == "DECIMAL(12,4)"
+
+    with pytest.raises(ValueError, match="Unknown type"):
+        map_type("c", "jsonb")
+
+    validate_identifier("valid_col_1")
+    for bad_ident in ("", "UpperCase", "1leading_digit", "bad-dash", "a; DROP TABLE x", "x" * 64):
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            validate_identifier(bad_ident)
+
+    validate_duckdb_type("DECIMAL(10,2)", "amt")
+    with pytest.raises(ValueError, match="Invalid DuckDB type"):
+        validate_duckdb_type("BLOB", "payload")
+
+
+def test_build_table_specs_pii_null_mode_and_live_view_filtering():
+    columns, pii_policy, registry = _synthetic_inputs()
+    specs = build_table_specs(
+        columns=columns,
+        pii_policy=pii_policy,
+        registry=registry,
+        live_views=("realtime_alerts",),
+        pii_mode="null",
+    )
+
+    assert [s.view for s in specs] == ["daily_orders", "inventory_snapshot"]
+    orders_spec = specs[0]
+    assert orders_spec.name == "rpt.daily_orders"
+    assert orders_spec.source == "rpt_base.daily_orders"
+    assert orders_spec.keys == ("order_id",)
+
+    col_map = {c.name: c for c in orders_spec.columns}
+    assert col_map["customer_email"].is_nulled is True
+    assert col_map["customer_email"].is_pii is True
+    assert col_map["customer_email"].duckdb_type == "VARCHAR"
+    assert col_map["order_id"].is_nulled is False
+
+    stmts = plan_sql(specs, pii_mode="null")
+    assert stmts == [
+        "CREATE SCHEMA rpt",
+        "CREATE TABLE rpt.daily_orders AS SELECT order_id, order_date, net_amount, CAST(NULL AS VARCHAR) AS customer_email FROM pg.rpt_base.daily_orders",
+        "CREATE TABLE rpt.inventory_snapshot AS SELECT sku_id, on_hand_qty, is_active FROM pg.rpt_base.inventory_snapshot",
+    ]
+
+
+def test_build_table_specs_pii_exclude_mode_omits_pii_columns():
+    columns, _, registry = _synthetic_inputs()
+    # Include both sha256 and plaintext PII policies; exclude mode omits all PII columns cleanly
+    pii_policy = {
+        "email_hash": {"source_form": "plain", "mask": "last4"},
+    }
+    specs = build_table_specs(
+        columns=columns,
+        pii_policy=pii_policy,
+        registry=registry,
+        live_views=("realtime_alerts",),
+        pii_mode="exclude",
+    )
+
+    orders_spec = specs[0]
+    col_names = [c.name for c in orders_spec.columns]
+    assert "customer_email" not in col_names
+    assert col_names == ["order_id", "order_date", "net_amount"]
+
+    stmts = plan_sql(specs, pii_mode="exclude")
+    assert "customer_email" not in stmts[1]
+    assert (
+        stmts[1]
+        == "CREATE TABLE rpt.daily_orders AS SELECT order_id, order_date, net_amount FROM pg.rpt_base.daily_orders"
+    )
+
+
+def test_plan_sql_exclude_mode_also_filters_nulled_column_specs_and_rejects_empty():
+    spec = TableSpec(
+        name="rpt.accounts",
+        source="rpt_base.accounts",
+        view="accounts",
+        columns=(
+            ColumnSpec("account_id", "BIGINT", is_nulled=False),
+            ColumnSpec("phone_hash", "VARCHAR", is_nulled=True),
+        ),
+    )
+    stmts = plan_sql([spec], pii_mode="exclude")
+    assert stmts == [
+        "CREATE SCHEMA rpt",
+        "CREATE TABLE rpt.accounts AS SELECT account_id FROM pg.rpt_base.accounts",
+    ]
+
+    all_pii_spec = TableSpec(
+        name="rpt.only_pii",
+        source="rpt_base.only_pii",
+        view="only_pii",
+        columns=(ColumnSpec("secret_email", "VARCHAR", is_nulled=True),),
+    )
+    with pytest.raises(ValueError, match="no remaining columns"):
+        plan_sql([all_pii_spec], pii_mode="exclude")
+
+
+def test_pii_policy_validation_rejects_non_hashed_and_non_neutral_masks_in_null_mode():
+    columns, _, registry = _synthetic_inputs()
+
+    # Non-hashed PII rejected in null mode unless allow_non_hashed_pii=True
+    with pytest.raises(ValueError, match="not sha256"):
+        build_table_specs(
+            columns=columns,
+            pii_policy={"email_hash": {"source_form": "plain", "mask": "redact"}},
+            registry=registry,
+            pii_mode="null",
+        )
+
+    # Non-neutral mask (e.g. last4) on sha256 PII rejected in null mode
+    with pytest.raises(ValueError, match="not engine-neutral"):
+        build_table_specs(
+            columns=columns,
+            pii_policy={"email_hash": {"source_form": "sha256", "mask": "last4"}},
+            registry=registry,
+            pii_mode="null",
+        )
+
+    # Missing PII key in policy rejected
+    with pytest.raises(ValueError, match="missing from pii_columns policy"):
+        build_table_specs(
+            columns=columns,
+            pii_policy={},
+            registry=registry,
+            pii_mode="null",
+        )
+
+
+def test_registry_status_enforcement():
+    columns, pii_policy, _ = _synthetic_inputs()
+    blocked_registry = {
+        "reports": [
+            {"view": "daily_orders", "status": "blocked", "blocked_reason": "pending audit"},
+            {"view": "inventory_snapshot", "status": "contract"},
+            {"view": "realtime_alerts", "status": "ready"},
+        ]
+    }
+    with pytest.raises(ValueError, match="pending audit"):
+        build_table_specs(columns=columns, pii_policy=pii_policy, registry=blocked_registry)
+
+
+def test_snapshot_id_validation_and_precedence():
+    assert validate_snapshot_id(1) == 1
+    assert validate_snapshot_id(MAX_SIGNED_INT64) == MAX_SIGNED_INT64
+
+    for invalid_snap in (0, -42, MAX_SIGNED_INT64 + 1, True, False, "12345", 12.5):
+        with pytest.raises(ValueError, match="snapshot_id"):
+            TableSpec(
+                name="rpt.daily_orders",
+                source="lake.analytics.daily_orders",
+                view="daily_orders",
+                columns=(ColumnSpec("order_id", "BIGINT", False),),
+                snapshot_id=invalid_snap,  # type: ignore[arg-type]
+            )
+
+    columns, pii_policy, _ = _synthetic_inputs()
+    registry = {
+        "reports": [
+            {"view": "daily_orders", "status": "ready", "snapshot_id": 1001},
+            {"view": "inventory_snapshot", "status": "contract", "snapshot_id": 2002},
+            {"view": "realtime_alerts", "status": "ready"},
+        ]
+    }
+    specs = build_table_specs(
+        columns=columns,
+        pii_policy=pii_policy,
+        registry=registry,
+        live_views=("realtime_alerts",),
+        snapshot_pins={"daily_orders": 999001},
+    )
+    assert specs[0].snapshot_id == 999001
+    assert specs[1].snapshot_id == 2002
+
+
+def test_placement_and_schemas_generation_respects_pii_exclude(tmp_path):
+    columns, pii_policy, registry = _synthetic_inputs()
+    cols_file = tmp_path / "columns.json"
+    pii_file = tmp_path / "pii.json"
+    reg_file = tmp_path / "registry.json"
+    fresh_file = tmp_path / "freshness.json"
+    out_dir = tmp_path / "out"
+
+    cols_file.write_text(json.dumps(columns), encoding="utf-8")
+    pii_file.write_text(json.dumps(pii_policy), encoding="utf-8")
+    reg_file.write_text(json.dumps(registry), encoding="utf-8")
+    fresh_file.write_text(
+        json.dumps({"tables": {"rpt.daily_orders": 450, "rpt.inventory_snapshot": 80}}),
+        encoding="utf-8",
+    )
+
+    placement, schemas_null = write_placement_files(
+        columns_path=cols_file,
+        registry_path=reg_file,
+        freshness_path=fresh_file,
+        live_views=("realtime_alerts",),
+        out_dir=out_dir,
+        pii_policy_path=pii_file,
+        pii_mode="null",
+    )
+    assert placement["tables"]["rpt.daily_orders"]["row_count"] == 450
+    assert "duck" in placement["tables"]["rpt.daily_orders"]["serve"]
+    assert "duck" not in placement["tables"]["rpt.realtime_alerts"]["serve"]
+    assert "customer_email" in schemas_null["rpt.daily_orders"]
+
+    schemas_excl = generate_schemas(
+        columns=cols_file,
+        registry=reg_file,
+        pii_policy=pii_file,
+        pii_mode="exclude",
+    )
+    assert "customer_email" not in schemas_excl["rpt.daily_orders"]
+    assert schemas_excl["rpt.daily_orders"] == ["order_id", "order_date", "net_amount"]
+
+
+def test_b_l1_non_hashed_pii_rejected_without_explicit_acknowledgement(tmp_path, capsys):
+    from seeknal.serving.accel.__main__ import main as accel_main
+    from seeknal.serving.accel.iceberg_source import build_iceberg_table_specs
+
+    columns, _, registry = _synthetic_inputs()
+    plain_pii = {"email_hash": {"source_form": "plain", "mask": "redact"}}
+
+    # 1. Rejected when allow_non_hashed_pii=False (even if acknowledgement flag is True)
+    with pytest.raises(ValueError, match="not sha256"):
+        build_table_specs(
+            columns=columns,
+            pii_policy=plain_pii,
+            registry=registry,
+            pii_mode="null",
+            allow_non_hashed_pii=False,
+            i_understand_pii_leaves_unmasked=True,
+        )
+
+    # 2. Rejected when allow_non_hashed_pii=True WITHOUT i_understand_pii_leaves_unmasked=True
+    with pytest.raises(ValueError, match="i-understand-pii-leaves-unmasked"):
+        build_table_specs(
+            columns=columns,
+            pii_policy=plain_pii,
+            registry=registry,
+            pii_mode="null",
+            allow_non_hashed_pii=True,
+            i_understand_pii_leaves_unmasked=False,
+        )
+
+    # Also rejected in build_iceberg_table_specs without acknowledgement
+    ext_dir = tmp_path / "ext"
+    ext_dir.mkdir()
+    ice_cfg = {
+        "extension_directory": str(ext_dir),
+        "default_catalog": "lake",
+        "default_namespace": "analytics",
+        "iceberg_catalogs": {
+            "lake": {
+                "endpoint": "https://lakekeeper.synthetic.internal/catalog",
+                "warehouse": "wh",
+                "token_uri": "https://idp.synthetic.internal/oauth2/token",
+                "client_id_env": "LK_CID",
+                "client_secret_env": "LK_SEC",
+                "s3": {
+                    "endpoint": "s3.synthetic.internal:9000",
+                    "region": "ap-southeast-1",
+                    "key_id_env": "S3_KID",
+                    "secret_env": "S3_SEC",
+                },
+            }
+        },
+    }
+    with pytest.raises(ValueError, match="i-understand-pii-leaves-unmasked"):
+        build_iceberg_table_specs(
+            ice_cfg,
+            columns=columns,
+            pii_policy=plain_pii,
+            registry=registry,
+            pii_mode="null",
+            allow_non_hashed_pii=True,
+            i_understand_pii_leaves_unmasked=False,
+        )
+
+    # 3. Allowed ONLY when BOTH flags are True, and emits loud WARNING event
+    specs = build_table_specs(
+        columns=columns,
+        pii_policy=plain_pii,
+        registry=registry,
+        live_views=("realtime_alerts",),
+        pii_mode="null",
+        allow_non_hashed_pii=True,
+        i_understand_pii_leaves_unmasked=True,
+    )
+    col_map = {c.name: c for c in specs[0].columns}
+    assert col_map["customer_email"].is_pii is True
+    assert col_map["customer_email"].is_nulled is False
+
+    err_lines = [
+        json.loads(line)
+        for line in capsys.readouterr().err.strip().splitlines()
+        if line.strip()
+    ]
+    warn_events = [
+        e for e in err_lines if e.get("step") == "non_hashed_pii_unmasked_warning"
+    ]
+    assert len(warn_events) == 1
+    assert warn_events[0]["level"] == "WARNING"
+    assert warn_events[0]["column"] == "customer_email"
+
+    # 4. CLI gate: --allow-non-hashed-pii alone exits 2; both flags together succeed and warn
+    cols_f = tmp_path / "columns.json"
+    pii_f = tmp_path / "pii.json"
+    reg_f = tmp_path / "registry.json"
+    cols_f.write_text(json.dumps(columns), encoding="utf-8")
+    pii_f.write_text(json.dumps(plain_pii), encoding="utf-8")
+    reg_f.write_text(json.dumps(registry), encoding="utf-8")
+    cache_dir = tmp_path / "cli_cache"
+
+    rc_rejected = accel_main(
+        [
+            "load",
+            "--columns",
+            str(cols_f),
+            "--pii",
+            str(pii_f),
+            "--registry",
+            str(reg_f),
+            "--cache-dir",
+            str(cache_dir),
+            "--allow-non-hashed-pii",
+            "--dry-run",
+        ]
+    )
+    assert rc_rejected == 2
+    capsys.readouterr()
+
+    rc_allowed = accel_main(
+        [
+            "load",
+            "--columns",
+            str(cols_f),
+            "--pii",
+            str(pii_f),
+            "--registry",
+            str(reg_f),
+            "--cache-dir",
+            str(cache_dir),
+            "--allow-non-hashed-pii",
+            "--i-understand-pii-leaves-unmasked",
+            "--dry-run",
+        ]
+    )
+    assert rc_allowed == 0
+    cli_captured = capsys.readouterr()
+    cli_events = [
+        json.loads(line)
+        for line in cli_captured.err.strip().splitlines()
+        if line.strip()
+    ]
+    assert any(
+        e.get("step") == "non_hashed_pii_unmasked_warning"
+        and e.get("level") == "WARNING"
+        for e in cli_events
+    )
+
+
+def test_e_n1_duplicate_yaml_keys_rejected_in_pii_policy_and_table_loaders(
+    tmp_path, monkeypatch
+):
+    import yaml
+    from yaml.constructor import ConstructorError
+
+    from seeknal.serving.accel.iceberg_source import build_iceberg_table_specs
+    from seeknal.serving.accel.loader import BadInputError
+    from seeknal.serving.accel.tables import _load_json_data
+
+    columns, _, registry = _synthetic_inputs()
+
+    # 1. PII policy YAML repeating rpt.patients key
+    dup_table_pii_yaml = tmp_path / "dup_patients_pii.yaml"
+    dup_table_pii_yaml.write_text(
+        "rpt.patients:\n"
+        "  ssn:\n"
+        "    source_form: plain\n"
+        "    mask: last4\n"
+        "rpt.patients:\n"
+        "  ssn:\n"
+        "    source_form: sha256\n"
+        "    mask: redact\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(BadInputError) as exc_patients:
+        _load_json_data(dup_table_pii_yaml)
+    assert isinstance(exc_patients.value, ValueError)
+    msg_patients = str(exc_patients.value)
+    assert "duplicate YAML key" in msg_patients
+    assert "rpt.patients" in msg_patients
+    assert "line 5, column 1" in msg_patients
+
+    # 2. PII policy YAML repeating column key email_hash across tables.py, placement.py, iceberg_source.py
+    dup_col_pii_yaml = tmp_path / "dup_col_pii.yml"
+    dup_col_pii_yaml.write_text(
+        "email_hash:\n"
+        "  source_form: plain\n"
+        "  mask: last4\n"
+        "email_hash:\n"
+        "  source_form: sha256\n"
+        "  mask: redact\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(BadInputError) as exc_specs:
+        build_table_specs(
+            columns=columns,
+            pii_policy=dup_col_pii_yaml,
+            registry=registry,
+            pii_mode="null",
+        )
+    msg_specs = str(exc_specs.value)
+    assert "duplicate YAML key" in msg_specs
+    assert "email_hash" in msg_specs
+    assert "line 4, column 1" in msg_specs
+
+    with pytest.raises(BadInputError) as exc_schemas:
+        generate_schemas(
+            columns=columns,
+            registry=registry,
+            pii_policy=dup_col_pii_yaml,
+            pii_mode="exclude",
+        )
+    assert "duplicate YAML key" in str(exc_schemas.value)
+    assert "email_hash" in str(exc_schemas.value)
+
+    ext_dir = tmp_path / "ext"
+    ext_dir.mkdir()
+    ice_cfg = {
+        "extension_directory": str(ext_dir),
+        "default_catalog": "lake",
+        "default_namespace": "analytics",
+        "iceberg_catalogs": {
+            "lake": {
+                "endpoint": "https://lakekeeper.synthetic.internal/catalog",
+                "warehouse": "wh",
+                "token_uri": "https://idp.synthetic.internal/oauth2/token",
+                "client_id_env": "LK_CID",
+                "client_secret_env": "LK_SEC",
+                "s3": {
+                    "endpoint": "s3.synthetic.internal:9000",
+                    "region": "ap-southeast-1",
+                    "key_id_env": "S3_KID",
+                    "secret_env": "S3_SEC",
+                },
+            }
+        },
+    }
+    with pytest.raises(BadInputError) as exc_ice:
+        build_iceberg_table_specs(
+            ice_cfg,
+            columns=columns,
+            pii_policy=dup_col_pii_yaml,
+            registry=registry,
+            pii_mode="null",
+        )
+    assert "duplicate YAML key" in str(exc_ice.value)
+    assert "email_hash" in str(exc_ice.value)
+
+    # 3. ConstructorError with 'duplicate YAML key' in message and problem_mark=None
+    def _fake_yaml_load(*_args, **_kwargs):
+        raise ConstructorError(None, None, "found duplicate YAML key 'rpt.patients'", None)
+
+    monkeypatch.setattr(yaml, "load", _fake_yaml_load)
+    with pytest.raises(BadInputError) as exc_nomark:
+        _load_json_data(dup_table_pii_yaml)
+    assert "duplicate YAML key" in str(exc_nomark.value)
+    assert "rpt.patients" in str(exc_nomark.value)
+
+

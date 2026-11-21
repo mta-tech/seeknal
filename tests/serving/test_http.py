@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import hashlib
+import json
 import time
 from decimal import Decimal
 
 import duckdb
+import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 from starlette.testclient import TestClient
 
-from seeknal.serving import Placement, ServingPipeline, sign_grant_token
+from seeknal.serving import Placement, ServingPipeline, sign_cancel_token, sign_grant_token
 from seeknal.serving.adapters import (
     DuckDBAdapter,
     EngineError,
@@ -567,3 +570,667 @@ def test_http_named_operation_parameter_digest_and_compilation_cache(serving_set
     )
     assert r5.status_code == 403
     assert r5.json()["error"] == "enforcement_error"
+
+
+def test_safe_message_redaction_precision_preserves_61_0s_and_redacts_secret_param(
+    ec_key_pair,
+):
+    """Ensure params=[0] does not corrupt '61.0s' while 'PARAM_SECRET_VALUE' is still redacted."""
+    from seeknal.serving.http import _safe_message
+
+    priv, pub = ec_key_pair
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "users": {
+                    "keys": ["id"],
+                    "row_count": 1,
+                    "serve": {"duck": "users"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas={"users": ["id", "name"]},
+        public_keys={"key-1": pub},
+        max_grant_lifetime_seconds=60.0,
+    )
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR)")
+    try:
+        app = create_app(pipeline, {"duck": DuckDBAdapter(lambda: con.cursor())})
+        client = TestClient(app)
+
+        sql = "SELECT id FROM users WHERE id >= $1 AND name != $2"
+        token_61s = _make_token(
+            priv,
+            sql,
+            exp_offset=61.0,
+            iat_offset=0.0,
+            tables={"users": {"columns": ["id"], "masks": {}, "actions": ["select"]}},
+        )
+
+        resp = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {token_61s}"},
+            json={"sql": sql, "params": [0, "PARAM_SECRET_VALUE"]},
+        )
+        assert resp.status_code == 401
+        msg = resp.json()["message"]
+        assert "61.0s" in msg
+        assert "60.0s" in msg
+        assert "PARAM_SECRET_VALUE" not in resp.text
+
+        direct_msg = _safe_message(
+            "Token lifetime of 61.0s exceeds maximum 60.0s; quoted='0'; secret=PARAM_SECRET_VALUE; lit='LIT_SECRET_VAL'",
+            sql="SELECT id FROM users WHERE name = 'LIT_SECRET_VAL'",
+            params=[0, "PARAM_SECRET_VALUE"],
+        )
+        assert "61.0s" in direct_msg
+        assert "60.0s" in direct_msg
+        assert "'0'" not in direct_msg
+        assert "PARAM_SECRET_VALUE" not in direct_msg
+        assert "LIT_SECRET_VAL" not in direct_msg
+    finally:
+        con.close()
+
+
+def test_c_n1_refuse_mode_never_weakens_record_when_sink_fails_only_full_records(
+    ec_key_pair,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Structured and callable sinks failing only full records return 503 with no rows and no minimal fallback."""
+    import errno
+    import logging
+    from seeknal.serving.audit import AuditRecord, AuditSink
+
+    priv, pub = ec_key_pair
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR, salary INT, role VARCHAR)")
+    con.execute("INSERT INTO users VALUES (1, 'SENSITIVE_ROW_CELL', 90000, 'analyst')")
+
+    try:
+        placement = Placement.from_dict(
+            {
+                "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+                "tables": {
+                    "users": {
+                        "keys": ["id"],
+                        "row_count": 1,
+                        "serve": {"duck": "users"},
+                    }
+                },
+                "cubes": {},
+            }
+        )
+        pipeline = ServingPipeline(
+            placement=placement,
+            schemas={"users": ["id", "name", "salary", "role"]},
+            public_keys={"key-1": pub},
+        )
+        adapter = DuckDBAdapter(lambda: con.cursor())
+        sql = "SELECT id, salary FROM users"
+
+        # 1) Structured sink that accepts minimal records (tables == [] and subject is None)
+        #    but fails full records!
+        persisted_structured: list[AuditRecord] = []
+
+        class FullRecordRejectingStructuredSink(AuditSink):
+            def verify_writable(self) -> None:
+                return None
+
+            def write_record(self, record: AuditRecord | dict) -> None:
+                rec = (
+                    record
+                    if isinstance(record, AuditRecord)
+                    else AuditRecord.from_dict(record)
+                )
+                if rec.tables or rec.subject is not None or rec.sql_sha256 is not None:
+                    raise OSError(errno.EMSGSIZE, "Message too long for full record")
+                persisted_structured.append(rec)
+
+        app_struct = create_app(
+            pipeline,
+            {"duck": adapter},
+            audit_sink=FullRecordRejectingStructuredSink(),
+            audit_on_failure="refuse",
+        )
+        client_struct = TestClient(app_struct)
+        tok1 = _make_token(priv, sql)
+        with caplog.at_level(logging.ERROR):
+            caplog.clear()
+            r_struct = client_struct.post(
+                "/v1/query",
+                headers={"Authorization": f"Bearer {tok1}"},
+                json={"sql": sql},
+            )
+
+        assert r_struct.status_code == 503
+        body_struct = r_struct.json()
+        assert body_struct["code"] == "audit_unavailable"
+        assert "rows" not in body_struct
+        assert "90000" not in r_struct.text
+        assert persisted_structured == []
+        assert any(
+            rec.levelno == logging.ERROR
+            and "code=audit_unavailable" in rec.getMessage()
+            and "detail=" in rec.getMessage()
+            and "Message too long" in rec.getMessage()
+            and "audit_id=jti-http-001" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+        # 2) Callable sink that fails full records on both /v1/query (pre-exec) and /v1/explain (_finish)
+        persisted_callable: list[dict] = []
+
+        def full_record_rejecting_callable(rec_dict: dict) -> None:
+            if (
+                rec_dict.get("tables")
+                or rec_dict.get("subject") is not None
+                or rec_dict.get("sql_sha256") is not None
+            ):
+                raise RuntimeError("callable broker rejected full audit payload")
+            persisted_callable.append(rec_dict)
+
+        app_call = create_app(
+            pipeline,
+            {"duck": adapter},
+            audit_sink=full_record_rejecting_callable,
+            audit_on_failure="refuse",
+        )
+        client_call = TestClient(app_call)
+        tok2 = _make_token(priv, sql)
+        with caplog.at_level(logging.ERROR):
+            caplog.clear()
+            r_call_q = client_call.post(
+                "/v1/query",
+                headers={"Authorization": f"Bearer {tok2}"},
+                json={"sql": sql},
+            )
+            r_call_exp = client_call.post(
+                "/v1/explain",
+                headers={"Authorization": f"Bearer {tok2}"},
+                json={"sql": sql},
+            )
+
+        for resp in (r_call_q, r_call_exp):
+            assert resp.status_code == 503
+            assert resp.json()["code"] == "audit_unavailable"
+            assert "rows" not in resp.json()
+        assert persisted_callable == []
+        err_msgs = [
+            rec.getMessage()
+            for rec in caplog.records
+            if rec.levelno == logging.ERROR and "code=audit_unavailable" in rec.getMessage()
+        ]
+        assert len(err_msgs) == 2
+        for m in err_msgs:
+            assert "detail=RuntimeError: callable broker rejected full audit payload" in m
+            assert "audit_id=jti-http-001" in m
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("route", ["/v1/query", "/v1/explain", "/v1/cancel"])
+@pytest.mark.parametrize("chunk_size", [1024, 4096])
+def test_chunked_20mb_body_rejected_streaming_on_all_post_routes(
+    ec_key_pair, route: str, chunk_size: int
+):
+    """N2: Chunked 20 MB stream without Content-Length stops reading at max_body_bytes."""
+    _, pub = ec_key_pair
+    max_cap = 1024
+    total_stream_bytes = 20 * 1024 * 1024  # 20 MB
+
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "users": {"keys": ["id"], "row_count": 1, "serve": {"duck": "users"}}
+            },
+            "cubes": {},
+        }
+    )
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas={"users": ["id"]},
+        public_keys={"key-1": pub},
+    )
+    audited: list[dict] = []
+    con = duckdb.connect()
+    try:
+        app = create_app(
+            pipeline,
+            {"duck": DuckDBAdapter(lambda: con.cursor())},
+            max_body_bytes=max_cap,
+            audit_sink=audited.append,
+        )
+
+        bytes_yielded = 0
+        chunk_payload = b"x" * chunk_size
+        num_chunks = total_stream_bytes // chunk_size
+
+        async def _counting_20mb_stream():
+            nonlocal bytes_yielded
+            for _ in range(num_chunks):
+                bytes_yielded += len(chunk_payload)
+                yield chunk_payload
+
+        async def _run() -> httpx.Response:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as async_client:
+                return await async_client.post(
+                    route,
+                    content=_counting_20mb_stream(),
+                )
+
+        resp = asyncio.run(_run())
+
+        assert "content-length" not in resp.request.headers
+        assert resp.status_code == 413
+        payload = resp.json()
+        assert payload["code"] == "payload_too_large"
+        assert payload["error"] == "payload_too_large"
+        assert 0 < bytes_yielded <= max_cap + chunk_size
+        assert bytes_yielded < total_stream_bytes
+        assert len(audited) == 1
+        assert audited[0]["route"] == route
+        assert audited[0]["status"] == 413
+        assert audited[0]["code"] == "payload_too_large"
+    finally:
+        con.close()
+
+
+def test_chunked_body_within_cap_and_midstream_disconnect(ec_key_pair):
+    """N2: Chunked bodies <= max_body_bytes succeed and mid-stream ClientDisconnect returns 499."""
+    priv, pub = ec_key_pair
+    max_cap = 1024
+    con = duckdb.connect()
+    try:
+        con.execute("CREATE TABLE users (id INT, role VARCHAR)")
+        con.execute("INSERT INTO users VALUES (1, 'analyst')")
+        placement = Placement.from_dict(
+            {
+                "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+                "tables": {
+                    "users": {
+                        "keys": ["id"],
+                        "row_count": 1,
+                        "serve": {"duck": "users"},
+                    }
+                },
+                "cubes": {},
+            }
+        )
+        pipeline = ServingPipeline(
+            placement=placement,
+            schemas={"users": ["id", "role"]},
+            public_keys={"key-1": pub},
+        )
+        app = create_app(
+            pipeline,
+            {"duck": DuckDBAdapter(lambda: con.cursor())},
+            max_body_bytes=max_cap,
+        )
+
+        sql = "SELECT id FROM users"
+        tables_claim = {
+            "users": {"columns": ["id"], "masks": {}, "actions": ["select"]}
+        }
+
+        async def _chunked_bytes(raw: bytes, step: int = 17):
+            for idx in range(0, len(raw), step):
+                yield raw[idx : idx + step]
+
+        async def _run_valid_chunked() -> None:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as async_client:
+                # Exact-boundary 1024-byte chunked body on /v1/query
+                base_body = json.dumps({"sql": sql}).encode("utf-8")
+                padded_body = base_body + (b" " * (max_cap - len(base_body)))
+                assert len(padded_body) == max_cap
+                tok_q = sign_grant_token(
+                    {
+                        "jti": "jti-chunk-q",
+                        "sub": "analyst@example.com",
+                        "ws": "ws-test",
+                        "iat": time.time(),
+                        "exp": time.time() + 60,
+                        "aud": "seeknal-serving",
+                        "iss": "atlas-catalog",
+                        "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+                        "tables": tables_claim,
+                        "max_rows": 100,
+                    },
+                    priv,
+                    kid="key-1",
+                )
+                rq = await async_client.post(
+                    "/v1/query",
+                    headers={"Authorization": f"Bearer {tok_q}"},
+                    content=_chunked_bytes(padded_body, step=64),
+                )
+                assert "content-length" not in rq.request.headers
+                assert rq.status_code == 200
+                assert rq.json()["rows"] == [[1]]
+
+                tok_e = sign_grant_token(
+                    {
+                        "jti": "jti-chunk-e",
+                        "sub": "analyst@example.com",
+                        "ws": "ws-test",
+                        "iat": time.time(),
+                        "exp": time.time() + 60,
+                        "aud": "seeknal-serving",
+                        "iss": "atlas-catalog",
+                        "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+                        "tables": tables_claim,
+                        "max_rows": 100,
+                    },
+                    priv,
+                    kid="key-1",
+                )
+                rexp = await async_client.post(
+                    "/v1/explain",
+                    headers={"Authorization": f"Bearer {tok_e}"},
+                    content=_chunked_bytes(base_body, step=7),
+                )
+                assert "content-length" not in rexp.request.headers
+                assert rexp.status_code == 200
+
+                now_ts = time.time()
+                tok_c = sign_cancel_token(
+                    {
+                        "typ": "cancel",
+                        "jti": "jti-chunk-c",
+                        "sub": "analyst@example.com",
+                        "iat": now_ts,
+                        "exp": now_ts + 60,
+                        "aud": "seeknal-serving",
+                        "iss": "atlas-catalog",
+                    },
+                    priv,
+                    kid="key-1",
+                )
+                rc = await async_client.post(
+                    "/v1/cancel",
+                    headers={"Authorization": f"Bearer {tok_c}"},
+                    content=_chunked_bytes(b" { } ", step=2),
+                )
+                assert "content-length" not in rc.request.headers
+                assert rc.status_code == 404
+                assert rc.json()["code"] == "not_found"
+
+        asyncio.run(_run_valid_chunked())
+
+        async def _send_midstream_disconnect(route: str) -> tuple[int, dict]:
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": route,
+                "raw_path": route.encode("ascii"),
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 50000),
+                "server": ("test", 80),
+            }
+            sent_first = False
+            status_holder: list[int] = []
+            body_parts: list[bytes] = []
+
+            async def _receive():
+                nonlocal sent_first
+                if not sent_first:
+                    sent_first = True
+                    return {"type": "http.request", "body": b'{"sql":', "more_body": True}
+                return {"type": "http.disconnect"}
+
+            async def _send(msg):
+                if msg["type"] == "http.response.start":
+                    status_holder.append(msg["status"])
+                elif msg["type"] == "http.response.body":
+                    body_parts.append(msg.get("body", b""))
+
+            await app(scope, _receive, _send)
+            return status_holder[0], json.loads(b"".join(body_parts).decode("utf-8"))
+
+        for post_route in ("/v1/query", "/v1/explain", "/v1/cancel"):
+            st, body = asyncio.run(_send_midstream_disconnect(post_route))
+            assert st == 499
+            assert body["code"] == "query_cancelled"
+    finally:
+        con.close()
+
+
+def test_n5_numeric_string_params_redacted_in_safe_message_and_http_errors(
+    ec_key_pair, caplog: pytest.LogCaptureFixture
+):
+    """N5: Numeric-string params >= 4 chars redact at word boundaries while preserving 61.0s."""
+    import logging
+    from seeknal.serving.http import _safe_message
+
+    # 1. _safe_message unit checks: unquoted PIN redacted, word boundaries respected, 61.0s intact
+    assert (
+        _safe_message("invalid pin 482913", params=["482913"])
+        == "invalid pin [REDACTED]"
+    )
+    bounded = _safe_message(
+        "invalid pin 482913; pin=482913; (482913); ref=order_482913_v1; big=94829130",
+        params=["482913"],
+    )
+    assert (
+        bounded
+        == "invalid pin [REDACTED]; pin=[REDACTED]; ([REDACTED]); ref=order_482913_v1; big=94829130"
+    )
+
+    lifetime_msg = "Token lifetime of 61.0s exceeds maximum 60.0s"
+    for p_list in ([0], ["0"], ["61"], ["999"], ["482913"]):
+        assert _safe_message(lifetime_msg, params=p_list) == lifetime_msg
+
+    # 2. End-to-end HTTP checks:
+    #    (a) Engine error containing 'invalid pin 482913' with params=['482913'] never leaks PIN in HTTP or logs.
+    #    (b) Oversized grant lifetime 61.0s with params=[0], ['0'], ['61'], ['482913'] preserves '61.0s'.
+    priv, pub = ec_key_pair
+
+    class PinFailingAdapter:
+        def execute(
+            self, prepared: PreparedQuery, *, timeout_seconds: float
+        ) -> QueryResult:
+            raise EngineError(
+                "invalid pin 482913 for order_482913_v1 seq 94829130"
+            )
+
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "users": {
+                    "keys": ["id"],
+                    "row_count": 1,
+                    "serve": {"duck": "users"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas={"users": ["id", "pin"]},
+        public_keys={"key-1": pub},
+        max_grant_lifetime_seconds=60.0,
+    )
+    client = TestClient(create_app(pipeline, {"duck": PinFailingAdapter()}))
+
+    sql = "SELECT id FROM users WHERE pin = $1"
+    tables_claim = {
+        "users": {"columns": ["id", "pin"], "masks": {}, "actions": ["select"]}
+    }
+    tok_valid = _make_token(priv, sql, tables=tables_claim)
+
+    with caplog.at_level(logging.ERROR):
+        caplog.clear()
+        resp_eng = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_valid}"},
+            json={"sql": sql, "params": ["482913"]},
+        )
+
+    assert resp_eng.status_code == 502
+    assert "482913" not in resp_eng.text
+    assert "invalid pin [REDACTED]" in caplog.text
+    assert "order_482913_v1" in caplog.text
+    assert "94829130" in caplog.text
+    assert "invalid pin 482913" not in caplog.text
+
+    for idx, p_list in enumerate(([0], ["0"], ["61"], ["482913"])):
+        tok_61s = sign_grant_token(
+            {
+                "sub": "analyst@example.com",
+                "ws": "ws-test",
+                "jti": f"jti-n5-61s-{idx}",
+                "iss": "atlas-catalog",
+                "aud": "seeknal-serving",
+                "iat": time.time(),
+                "exp": time.time() + 61.0,
+                "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+                "max_rows": 100,
+                "tables": tables_claim,
+            },
+            priv,
+            kid="key-1",
+        )
+        resp_61s = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_61s}"},
+            json={"sql": sql, "params": p_list},
+        )
+        assert resp_61s.status_code == 401
+        assert (
+            resp_61s.json()["message"]
+            == "Token lifetime of 61.0s exceeds maximum 60.0s"
+        )
+
+
+def test_integer_params_redacted_in_safe_message_and_http_errors(
+    ec_key_pair, caplog: pytest.LogCaptureFixture
+):
+    """Integer bound params of length >= 4 redact at word boundaries while params=[0] preserves 61.0s."""
+    import logging
+    from seeknal.serving.http import _safe_message
+
+    assert (
+        _safe_message("invalid pin 482913", params=[482913])
+        == "invalid pin [REDACTED]"
+    )
+    assert (
+        _safe_message(
+            "invalid pin 482913; ref=order_482913_v1; big=94829130",
+            params=[482913],
+        )
+        == "invalid pin [REDACTED]; ref=order_482913_v1; big=94829130"
+    )
+    assert (
+        _safe_message("Token lifetime of 61.0s", params=[0])
+        == "Token lifetime of 61.0s"
+    )
+
+    priv, pub = ec_key_pair
+
+    class IntPinFailingAdapter:
+        def execute(
+            self, prepared: PreparedQuery, *, timeout_seconds: float
+        ) -> QueryResult:
+            raise EngineError("invalid pin 482913 for order_482913_v1 seq 94829130")
+
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "users": {
+                    "keys": ["id"],
+                    "row_count": 1,
+                    "serve": {"duck": "users"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas={"users": ["id", "pin"]},
+        public_keys={"key-1": pub},
+        max_grant_lifetime_seconds=60.0,
+    )
+    client = TestClient(create_app(pipeline, {"duck": IntPinFailingAdapter()}))
+
+    sql = "SELECT id FROM users WHERE pin = $1"
+    tables_claim = {
+        "users": {"columns": ["id", "pin"], "masks": {}, "actions": ["select"]}
+    }
+    tok_valid = sign_grant_token(
+        {
+            "sub": "analyst@example.com",
+            "ws": "ws-test",
+            "jti": "jti-int-pin-001",
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": time.time(),
+            "exp": time.time() + 30.0,
+            "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            "max_rows": 100,
+            "tables": tables_claim,
+        },
+        priv,
+        kid="key-1",
+    )
+
+    with caplog.at_level(logging.ERROR):
+        caplog.clear()
+        resp_eng = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {tok_valid}"},
+            json={"sql": sql, "params": [482913]},
+        )
+
+    assert resp_eng.status_code == 502
+    assert "482913" not in resp_eng.text
+    assert "invalid pin [REDACTED]" in caplog.text
+    assert "order_482913_v1" in caplog.text
+    assert "94829130" in caplog.text
+    assert "invalid pin 482913" not in caplog.text
+
+    tok_61s = sign_grant_token(
+        {
+            "sub": "analyst@example.com",
+            "ws": "ws-test",
+            "jti": "jti-int-61s-0",
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": time.time(),
+            "exp": time.time() + 61.0,
+            "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            "max_rows": 100,
+            "tables": tables_claim,
+        },
+        priv,
+        kid="key-1",
+    )
+    resp_61s = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok_61s}"},
+        json={"sql": sql, "params": [0]},
+    )
+    assert resp_61s.status_code == 401
+    assert (
+        resp_61s.json()["message"]
+        == "Token lifetime of 61.0s exceeds maximum 60.0s"
+    )

@@ -13,7 +13,9 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from seeknal.serving.grant_token import (
     GrantTokenError,
     _b64url_encode,
+    sign_cancel_token,
     sign_grant_token,
+    verify_cancel_token,
     verify_grant_token,
 )
 
@@ -160,7 +162,8 @@ def test_unknown_kid(ec_key_pair, valid_claims):
 
     with pytest.raises(GrantTokenError) as exc_info:
         verify_grant_token(token, {"known-kid": public_key})
-    assert "unknown-kid" in str(exc_info.value)
+    assert str(exc_info.value) == "Unknown key ID"
+    assert "unknown-kid" not in str(exc_info.value)
     assert token not in str(exc_info.value)
 
 
@@ -260,4 +263,72 @@ def test_non_finite_and_boolean_claims(ec_key_pair, valid_claims, claim_name, ba
     with pytest.raises(GrantTokenError) as exc_info:
         verify_grant_token(token, {"key-1": public_key})
     assert claim_name in str(exc_info.value).lower()
+
+
+def test_c_n2_unverified_header_values_never_echoed_in_grant_or_cancel_errors(
+    ec_key_pair,
+    valid_claims,
+):
+    private_key, public_key = ec_key_pair
+    forged_kid = "k\x1b[2J FAKE audit_id=root\x85x\x0bY"
+    forged_alg = "HS256\x1b[2J FAKE audit_id=root\x85"
+    forged_typ = "FORGED\x1b[2J audit_id=root\x0c"
+
+    # 1. Unverified kid in grant and cancel tokens
+    grant_tok = sign_grant_token(valid_claims, private_key, kid=forged_kid)
+    with pytest.raises(GrantTokenError) as exc_grant_kid:
+        verify_grant_token(grant_tok, {"key-1": public_key})
+    assert str(exc_grant_kid.value) == "Unknown key ID"
+    assert "FAKE" not in str(exc_grant_kid.value)
+    assert "\x1b" not in str(exc_grant_kid.value)
+
+    cancel_claims = {
+        "typ": "cancel",
+        "sub": "analyst@example.com",
+        "jti": "grant-abc-123",
+        "iss": "atlas-catalog",
+        "aud": "seeknal-serving",
+        "iat": valid_claims["iat"],
+        "exp": valid_claims["iat"] + 30,
+    }
+    cancel_tok = sign_cancel_token(cancel_claims, private_key, kid=forged_kid)
+    with pytest.raises(GrantTokenError) as exc_cancel_kid:
+        verify_cancel_token(cancel_tok, {"key-1": public_key})
+    assert str(exc_cancel_kid.value) == "Unknown key ID"
+    assert "FAKE" not in str(exc_cancel_kid.value)
+
+    # 2. Unverified alg in grant and cancel tokens
+    alg_hdr = _b64url_encode(
+        json.dumps({"alg": forged_alg, "typ": "JWT", "kid": "key-1"}).encode("utf-8")
+    )
+    pay_b64 = _b64url_encode(json.dumps(valid_claims).encode("utf-8"))
+    sig_b64 = _b64url_encode(b"0" * 64)
+    bad_alg_tok = f"{alg_hdr}.{pay_b64}.{sig_b64}"
+
+    with pytest.raises(GrantTokenError) as exc_grant_alg:
+        verify_grant_token(bad_alg_tok, {"key-1": public_key})
+    assert str(exc_grant_alg.value) == "Unsupported algorithm, only ES256 permitted"
+    assert "FAKE" not in str(exc_grant_alg.value)
+
+    with pytest.raises(GrantTokenError) as exc_cancel_alg:
+        verify_cancel_token(bad_alg_tok, {"key-1": public_key})
+    assert str(exc_cancel_alg.value) == "Unsupported algorithm, only ES256 permitted"
+    assert "FAKE" not in str(exc_cancel_alg.value)
+
+    # 3. Unverified typ in grant and cancel tokens
+    typ_hdr = _b64url_encode(
+        json.dumps({"alg": "ES256", "typ": forged_typ, "kid": "key-1"}).encode("utf-8")
+    )
+    bad_typ_tok = f"{typ_hdr}.{pay_b64}.{sig_b64}"
+
+    with pytest.raises(GrantTokenError) as exc_grant_typ:
+        verify_grant_token(bad_typ_tok, {"key-1": public_key})
+    assert str(exc_grant_typ.value) == "Unsupported token type, expected JWT"
+    assert "FORGED" not in str(exc_grant_typ.value)
+
+    with pytest.raises(GrantTokenError) as exc_cancel_typ:
+        verify_cancel_token(bad_typ_tok, {"key-1": public_key})
+    assert str(exc_cancel_typ.value) == "Unsupported token type, expected JWT or cancel"
+    assert "FORGED" not in str(exc_cancel_typ.value)
+
 

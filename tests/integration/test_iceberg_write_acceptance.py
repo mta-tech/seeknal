@@ -30,6 +30,7 @@ from seeknal.workflow.executors.base import (
 )
 from seeknal.workflow.materialization.config import CatalogConfig
 from seeknal.workflow.materialization.operations import WriteError, write_to_iceberg
+from seeknal.utils.duckdb_arrow import result_to_arrow_table
 from seeknal.workflow.runner import DAGRunner
 from tests.integration.iceberg_rest_fixture import RunningRestFixture, run_rest_fixture
 
@@ -198,7 +199,7 @@ def test_batch_budget_accepts_exact_boundary_and_rejects_one_byte_over_preflight
         con,
         "SELECT 1 AS id, 'one' AS value, DATE '2026-09-14' AS business_date",
     )
-    frozen = con.execute("SELECT * FROM incoming").fetch_arrow_table()
+    frozen = result_to_arrow_table(con.execute("SELECT * FROM incoming"))
 
     accepted = write_to_iceberg(
         con,

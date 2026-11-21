@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from seeknal.serving import ServerConfig, build_server
 from seeknal.serving.duckdb_policy import (
+    DuckDBHolder,
     connect_hardened,
     harden_connection,
     main,
@@ -108,58 +109,94 @@ def test_harden_connection_validates_allowed_directories(bad_dir):
     conn.close()
 
 
+def test_harden_connection_validates_temp_directory(tmp_path):
+    allowed_dir = tmp_path / "allowed"
+    allowed_dir.mkdir()
+    allowed_str = str(allowed_dir) + "/"
+
+    inside_dir = allowed_dir / "temp"
+    inside_dir.mkdir()
+
+    outside_dir = tmp_path / "outside_temp"
+    outside_dir.mkdir()
+
+    conn = duckdb.connect(":memory:")
+    # temp_directory inside allowed_directories raises ValueError
+    with pytest.raises(ValueError, match="must not be inside allowed directory"):
+        harden_connection(conn, allowed_directories=[allowed_str], temp_directory=str(inside_dir))
+
+    # relative path raises ValueError
+    with pytest.raises(ValueError, match="must be an absolute path"):
+        harden_connection(conn, allowed_directories=[allowed_str], temp_directory="rel/temp")
+
+    # non-existent path raises ValueError
+    with pytest.raises(ValueError, match="does not exist"):
+        harden_connection(conn, allowed_directories=[allowed_str], temp_directory=str(tmp_path / "non_existent"))
+
+    # valid outside path succeeds
+    conn2 = duckdb.connect(":memory:")
+    harden_connection(conn2, allowed_directories=[allowed_str], temp_directory=str(outside_dir), max_temp_directory_size="256MB")
+    res = probe(conn2)
+    assert all(res.values())
+    conn2.close()
+
+
 def test_build_server_yields_hardened_duckdb_connection(temp_duckdb_file, tmp_path):
-    pl_file = tmp_path / "placement.yaml"
-    pl_file.write_text(
-        "engines:\n  duck:\n    kind: duckdb\n    dialect: duckdb\n"
-        "tables:\n  users:\n    keys: [id]\n    row_count: 2\n    serve:\n      duck: users\n"
-        "cubes: {}\n",
-        encoding="utf-8",
-    )
-    sc_file = tmp_path / "schemas.json"
-    sc_file.write_text('{"users": ["id", "name"]}', encoding="utf-8")
-
-    priv = ec.generate_private_key(ec.SECP256R1())
-    pub_pem = priv.public_key().public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    ).decode("ascii")
-    pub_file = tmp_path / "pub.pem"
-    pub_file.write_text(pub_pem, encoding="utf-8")
-
-    config = {
-        "grant_keys": {
-            "pem_files": {
-                "key-1": str(pub_file),
-            }
-        },
-        "placement": {
-            "static": {
-                "placement_file": str(pl_file),
-                "schemas_file": str(sc_file),
-            }
-        },
-        "connections": {
-            "duck": {
-                "kind": "duckdb",
-                "path": temp_duckdb_file,
-                "memory_limit": "256MB",
-                "threads": 2,
-            }
-        },
-    }
-
-    server = build_server(config)
-    adapter = server.adapters["duck"]
-    # Adapter._connect should return a hardened connection
-    conn = adapter._connect()
+    DuckDBHolder.reset()
     try:
-        results = probe(conn)
-        assert all(results.values())
-        assert results["external_access_disabled"] is True
-        assert results["config_locked"] is True
+        pl_file = tmp_path / "placement.yaml"
+        pl_file.write_text(
+            "engines:\n  duck:\n    kind: duckdb\n    dialect: duckdb\n"
+            "tables:\n  users:\n    keys: [id]\n    row_count: 2\n    serve:\n      duck: users\n"
+            "cubes: {}\n",
+            encoding="utf-8",
+        )
+        sc_file = tmp_path / "schemas.json"
+        sc_file.write_text('{"users": ["id", "name"]}', encoding="utf-8")
+
+        priv = ec.generate_private_key(ec.SECP256R1())
+        pub_pem = priv.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode("ascii")
+        pub_file = tmp_path / "pub.pem"
+        pub_file.write_text(pub_pem, encoding="utf-8")
+
+        config = {
+            "grant_keys": {
+                "pem_files": {
+                    "key-1": str(pub_file),
+                }
+            },
+            "placement": {
+                "static": {
+                    "placement_file": str(pl_file),
+                    "schemas_file": str(sc_file),
+                }
+            },
+            "connections": {
+                "duck": {
+                    "kind": "duckdb",
+                    "path": temp_duckdb_file,
+                    "memory_limit": "256MB",
+                    "threads": 2,
+                }
+            },
+        }
+
+        server = build_server(config)
+        adapter = server.adapters["duck"]
+        # Adapter._connect should return a hardened cursor from DuckDBHolder
+        conn = adapter._connect()
+        try:
+            results = probe(conn)
+            assert all(results.values())
+            assert results["external_access_disabled"] is True
+            assert results["config_locked"] is True
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        DuckDBHolder.reset()
 
 
 def test_cli_probe_exit_codes_and_output(temp_duckdb_file, capsys):

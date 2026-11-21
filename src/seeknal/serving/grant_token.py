@@ -26,6 +26,28 @@ B64URL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 class GrantTokenError(EnforcementError):
     """Raised when grant token verification or decoding fails."""
 
+    code: str = "grant_invalid"
+
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message, code=code)
+
+
+class GrantExpiredError(GrantTokenError):
+    """Raised when a grant or cancel token has expired."""
+
+    code: str = "grant_expired"
+
+
+def _attach_verified_identity(exc: GrantTokenError, claims: Mapping[str, Any]) -> GrantTokenError:
+    """Attach verified jti/sub from signature+issuer+audience verified claims."""
+    jti_val = claims.get("jti")
+    sub_val = claims.get("sub")
+    if isinstance(jti_val, str) and jti_val:
+        exc.audit_id = jti_val
+    if isinstance(sub_val, str) and sub_val:
+        exc.subject = sub_val
+    return exc
+
 
 def _b64url_encode(data: bytes) -> str:
     """Encode bytes to unpadded base64url string."""
@@ -149,18 +171,18 @@ def verify_grant_token(
     if "alg" not in header:
         raise GrantTokenError("Missing 'alg' in token header")
     if header["alg"] != "ES256":
-        raise GrantTokenError(f"Unsupported algorithm '{header['alg']}', only ES256 permitted")
+        raise GrantTokenError("Unsupported algorithm, only ES256 permitted")
 
     typ = header.get("typ")
     if typ is not None and typ != "JWT":
-        raise GrantTokenError(f"Unsupported token type '{typ}', expected JWT")
+        raise GrantTokenError("Unsupported token type, expected JWT")
 
     kid = header.get("kid")
     if not kid or not isinstance(kid, str):
         raise GrantTokenError("Missing or invalid 'kid' in token header")
 
     if kid not in public_keys:
-        raise GrantTokenError(f"Unknown key ID '{kid}'")
+        raise GrantTokenError("Unknown key ID")
 
     pub_key = _load_public_key(public_keys[kid], kid)
 
@@ -195,59 +217,67 @@ def verify_grant_token(
         raise GrantTokenError("Token claims must be a JSON object")
 
     # 4. Validate claims
-    if claims.get("typ") == "cancel" or header.get("typ") == "cancel":
-        raise GrantTokenError("Cancel token cannot be used to run a query")
-
-    if require_grant_typ and claims.get("typ") != "grant":
-        raise GrantTokenError("Missing or invalid 'typ' claim, expected 'grant'")
-
-    current_time = time.time() if now is None else float(now)
-
-    # iss
+    # iss / aud check helper for attaching verified identity on post-signature errors
     iss = claims.get("iss")
-    if iss != issuer:
-        raise GrantTokenError(f"Invalid issuer '{iss}', expected '{issuer}'")
-
-    # aud
     aud = claims.get("aud")
     aud_match = False
     if isinstance(aud, str):
         aud_match = (aud == audience)
     elif isinstance(aud, (list, tuple)):
         aud_match = (audience in aud)
+    trusted_origin = (iss == issuer and aud_match)
+
+    if claims.get("typ") == "cancel" or header.get("typ") == "cancel":
+        err = GrantTokenError("Cancel token cannot be used to run a query")
+        raise _attach_verified_identity(err, claims) if trusted_origin else err
+
+    if require_grant_typ and claims.get("typ") != "grant":
+        err = GrantTokenError("Missing or invalid 'typ' claim, expected 'grant'")
+        raise _attach_verified_identity(err, claims) if trusted_origin else err
+
+    current_time = time.time() if now is None else float(now)
+
+    # iss
+    if iss != issuer:
+        raise GrantTokenError(f"Invalid issuer '{iss}', expected '{issuer}'")
+
+    # aud
     if not aud_match:
         raise GrantTokenError(f"Invalid audience '{aud}', expected '{audience}'")
 
-    # iat
-    if "iat" not in claims:
-        raise GrantTokenError("Missing required 'iat' claim")
-    iat = _parse_numeric_claim(claims["iat"], "iat")
-    if iat > current_time + leeway_seconds:
-        raise GrantTokenError("Token 'iat' is in the future beyond leeway")
+    try:
+        # iat
+        if "iat" not in claims:
+            raise GrantTokenError("Missing required 'iat' claim")
+        iat = _parse_numeric_claim(claims["iat"], "iat")
+        if iat > current_time + leeway_seconds:
+            raise GrantTokenError("Token 'iat' is in the future beyond leeway")
 
-    # exp
-    if "exp" not in claims:
-        raise GrantTokenError("Missing required 'exp' claim")
-    exp = _parse_numeric_claim(claims["exp"], "exp")
-    if exp < current_time - leeway_seconds:
-        raise GrantTokenError("Token has expired")
+        # exp
+        if "exp" not in claims:
+            raise GrantTokenError("Missing required 'exp' claim")
+        exp = _parse_numeric_claim(claims["exp"], "exp")
+        if exp < current_time - leeway_seconds:
+            raise GrantExpiredError("Token has expired")
 
-    if exp - iat > max_lifetime_seconds:
-        raise GrantTokenError(
-            f"Token lifetime of {exp - iat:.1f}s exceeds maximum {max_lifetime_seconds}s"
-        )
-    if exp < iat:
-        raise GrantTokenError("Token 'exp' must not be before 'iat'")
+        if exp - iat > max_lifetime_seconds:
+            raise GrantTokenError(
+                f"Token lifetime of {exp - iat:.1f}s exceeds maximum {max_lifetime_seconds}s"
+            )
+        if exp < iat:
+            raise GrantTokenError("Token 'exp' must not be before 'iat'")
 
-    # nbf
-    if "nbf" in claims:
-        nbf = _parse_numeric_claim(claims["nbf"], "nbf")
-        if nbf > current_time + leeway_seconds:
-            raise GrantTokenError("Token is not yet valid ('nbf' is in the future)")
+        # nbf
+        if "nbf" in claims:
+            nbf = _parse_numeric_claim(claims["nbf"], "nbf")
+            if nbf > current_time + leeway_seconds:
+                raise GrantTokenError("Token is not yet valid ('nbf' is in the future)")
 
-    # max_rows
-    if "max_rows" in claims:
-        _parse_numeric_claim(claims["max_rows"], "max_rows")
+        # max_rows
+        if "max_rows" in claims:
+            _parse_numeric_claim(claims["max_rows"], "max_rows")
+    except GrantTokenError as exc:
+        raise _attach_verified_identity(exc, claims)
 
     return claims
 
@@ -298,18 +328,18 @@ def verify_cancel_token(
     if "alg" not in header:
         raise GrantTokenError("Missing 'alg' in token header")
     if header["alg"] != "ES256":
-        raise GrantTokenError(f"Unsupported algorithm '{header['alg']}', only ES256 permitted")
+        raise GrantTokenError("Unsupported algorithm, only ES256 permitted")
 
     typ = header.get("typ")
     if typ is not None and typ not in ("JWT", "cancel"):
-        raise GrantTokenError(f"Unsupported token type '{typ}', expected JWT or cancel")
+        raise GrantTokenError("Unsupported token type, expected JWT or cancel")
 
     kid = header.get("kid")
     if not kid or not isinstance(kid, str):
         raise GrantTokenError("Missing or invalid 'kid' in token header")
 
     if kid not in key_dict:
-        raise GrantTokenError(f"Unknown key ID '{kid}'")
+        raise GrantTokenError("Unknown key ID")
 
     pub_key = _load_public_key(key_dict[kid], kid)
 
@@ -364,41 +394,44 @@ def verify_cancel_token(
     if not aud_match:
         raise GrantTokenError(f"Invalid audience '{aud}', expected '{audience}'")
 
-    # iat
-    if "iat" not in claims:
-        raise GrantTokenError("Missing required 'iat' claim")
-    iat = _parse_numeric_claim(claims["iat"], "iat")
-    if iat > current_time + leeway_seconds:
-        raise GrantTokenError("Token 'iat' is in the future beyond leeway")
+    try:
+        # iat
+        if "iat" not in claims:
+            raise GrantTokenError("Missing required 'iat' claim")
+        iat = _parse_numeric_claim(claims["iat"], "iat")
+        if iat > current_time + leeway_seconds:
+            raise GrantTokenError("Token 'iat' is in the future beyond leeway")
 
-    # exp
-    if "exp" not in claims:
-        raise GrantTokenError("Missing required 'exp' claim")
-    exp = _parse_numeric_claim(claims["exp"], "exp")
-    if exp < current_time - leeway_seconds:
-        raise GrantTokenError("Token has expired")
+        # exp
+        if "exp" not in claims:
+            raise GrantTokenError("Missing required 'exp' claim")
+        exp = _parse_numeric_claim(claims["exp"], "exp")
+        if exp < current_time - leeway_seconds:
+            raise GrantExpiredError("Token has expired")
 
-    if exp - iat > max_lifetime_seconds:
-        raise GrantTokenError(
-            f"Token lifetime of {exp - iat:.1f}s exceeds maximum {max_lifetime_seconds}s"
-        )
-    if exp < iat:
-        raise GrantTokenError("Token 'exp' must not be before 'iat'")
+        if exp - iat > max_lifetime_seconds:
+            raise GrantTokenError(
+                f"Token lifetime of {exp - iat:.1f}s exceeds maximum {max_lifetime_seconds}s"
+            )
+        if exp < iat:
+            raise GrantTokenError("Token 'exp' must not be before 'iat'")
 
-    # nbf
-    if "nbf" in claims:
-        nbf = _parse_numeric_claim(claims["nbf"], "nbf")
-        if nbf > current_time + leeway_seconds:
-            raise GrantTokenError("Token is not yet valid ('nbf' is in the future)")
+        # nbf
+        if "nbf" in claims:
+            nbf = _parse_numeric_claim(claims["nbf"], "nbf")
+            if nbf > current_time + leeway_seconds:
+                raise GrantTokenError("Token is not yet valid ('nbf' is in the future)")
 
-    # jti
-    jti = claims.get("jti")
-    if not jti or not isinstance(jti, str):
-        raise GrantTokenError("Missing or invalid 'jti' claim")
+        # jti
+        jti = claims.get("jti")
+        if not jti or not isinstance(jti, str):
+            raise GrantTokenError("Missing or invalid 'jti' claim")
 
-    # sub
-    sub = claims.get("sub")
-    if not sub or not isinstance(sub, str):
-        raise GrantTokenError("Missing or invalid 'sub' claim")
+        # sub
+        sub = claims.get("sub")
+        if not sub or not isinstance(sub, str):
+            raise GrantTokenError("Missing or invalid 'sub' claim")
+    except GrantTokenError as exc:
+        raise _attach_verified_identity(exc, claims)
 
     return claims

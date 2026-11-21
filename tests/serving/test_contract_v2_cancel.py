@@ -516,6 +516,9 @@ def test_disconnect_cancel_calls_cancel_callable_and_finishes():
             self.headers = {"authorization": f"Bearer {token}"}
             self.checks = 0
 
+        async def stream(self):
+            yield f'{{"sql": "{sql}"}}'.encode("utf-8")
+
         async def body(self) -> bytes:
             return f'{{"sql": "{sql}"}}'.encode("utf-8")
 
@@ -573,3 +576,87 @@ def test_log_redaction_secret_literal_never_in_logs(caplog):
 
     assert resp.status_code == 502
     assert secret not in caplog.text
+
+
+def test_cancel_oversized_body_returns_413_payload_too_large_and_audits():
+    priv = ec.generate_private_key(ec.SECP256R1())
+    pub = priv.public_key()
+    pipeline = ServingPipeline(
+        placement=Placement.from_dict(
+            {
+                "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+                "tables": {
+                    "users": {"keys": ["id"], "row_count": 1, "serve": {"duck": "users"}}
+                },
+                "cubes": {},
+            }
+        ),
+        schemas={"users": ["id"]},
+        public_keys={"key-1": pub},
+    )
+    audited_records: list[dict[str, Any]] = []
+    app = create_app(
+        pipeline,
+        {"duck": DuckDBAdapter(duckdb.connect)},
+        max_body_bytes=64,
+        audit_sink=audited_records.append,
+    )
+    client = TestClient(app)
+
+    cancel_token = sign_cancel_token(_base_cancel_claims(), priv, kid="key-1")
+
+    # 1. Oversized Content-Length / raw body > max_body_bytes -> 413 payload_too_large
+    oversized_body = b"{" + (b" " * 128) + b"}"
+    resp_big = client.post(
+        "/v1/cancel",
+        headers={"Authorization": f"Bearer {cancel_token}"},
+        content=oversized_body,
+    )
+    assert resp_big.status_code == 413
+    body_big = resp_big.json()
+    assert body_big["code"] == "payload_too_large"
+    assert body_big["error"] == "payload_too_large"
+    assert len(audited_records) == 1
+    assert audited_records[0]["route"] == "/v1/cancel"
+    assert audited_records[0]["status"] == 413
+    assert audited_records[0]["code"] == "payload_too_large"
+
+    # 2. Oversized raw body even when Content-Length header lies (< max_body_bytes) -> 413
+    body_read_called = False
+
+    class FakeLyingCancelRequest:
+        headers = {
+            "authorization": f"Bearer {cancel_token}",
+            "content-length": "10",
+        }
+
+        async def stream(self):
+            nonlocal body_read_called
+            body_read_called = True
+            for _ in range(10):
+                yield b"x" * 20
+
+    cancel_route = [
+        r for r in app.routes if getattr(r, "path", None) == "/v1/cancel"
+    ][0]
+    resp_lying = asyncio.run(cancel_route.endpoint(FakeLyingCancelRequest()))
+    assert body_read_called is True
+    assert resp_lying.status_code == 413
+
+    # 3. Cheap bounded JSON check: '{}' with whitespace succeeds (404 since query not running),
+    #    while deeply nested '[[[[' under max_body_bytes is rejected cheaply as 400 invalid_sql.
+    resp_empty_obj = client.post(
+        "/v1/cancel",
+        headers={"Authorization": f"Bearer {cancel_token}"},
+        content=b" { \n\t } ",
+    )
+    assert resp_empty_obj.status_code == 404
+
+    resp_nested = client.post(
+        "/v1/cancel",
+        headers={"Authorization": f"Bearer {cancel_token}"},
+        content=b"[" * 30 + b"]" * 30,
+    )
+    assert resp_nested.status_code == 400
+    assert resp_nested.json()["code"] == "invalid_sql"
+

@@ -1,0 +1,215 @@
+"""CLI entrypoint for accel (python -m accel)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Sequence
+
+from accel.loader import BadInputError, LoadError, log_event, plan_sql, run_load, scrub_text
+from accel.placement import generate_placement, generate_schemas, write_placement_files
+from accel.settings import (
+    DEFAULT_EXPECTED_DUCKDB_VERSION,
+    DEFAULT_KEEP,
+    get_expected_duckdb_version,
+    get_extension_dir,
+)
+from accel.tables import build_table_specs
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="accel", description="Lakebase DuckDB acceleration tools.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Subcommand: load
+    load_p = subparsers.add_parser("load", help="Cache Lakebase mart into DuckDB.")
+    load_p.add_argument("--columns", required=True, type=Path, help="Path to columns.json")
+    load_p.add_argument("--pii", required=True, type=Path, help="Path to pii_columns.json")
+    load_p.add_argument("--registry", required=True, type=Path, help="Path to registry.json")
+    load_p.add_argument("--cache-dir", required=True, type=Path, help="Directory to store duckdb cache")
+    load_p.add_argument("--keep", type=int, default=DEFAULT_KEEP, help="Number of cached files to keep")
+    load_p.add_argument("--as-of-date", type=str, default=None, help="As-of date in YYYY-MM-DD")
+    load_p.add_argument("--dry-run", action="store_true", help="Print plan SQL and touch nothing")
+    load_p.add_argument(
+        "--expect-duckdb-version",
+        type=str,
+        default=get_expected_duckdb_version(),
+        help="Expected DuckDB version matching Seeknal Serving",
+    )
+    load_p.add_argument(
+        "--allow-version-mismatch",
+        action="store_true",
+        help="Allow running when duckdb version differs from expected version",
+    )
+    load_p.add_argument(
+        "--allow-non-hashed-pii",
+        action="store_true",
+        help="Allow caching columns with non-sha256 PII",
+    )
+    load_p.add_argument(
+        "--extension-dir",
+        type=str,
+        default=get_extension_dir(),
+        help="Directory with pre-staged DuckDB extensions for air-gapped run",
+    )
+
+    # Subcommand: placement
+    place_p = subparsers.add_parser("placement", help="Generate Serving placement and schemas files.")
+    place_p.add_argument("--columns", required=True, type=Path, help="Path to columns.json")
+    place_p.add_argument("--registry", type=Path, default=None, help="Path to registry.json")
+    place_p.add_argument("--freshness", type=Path, default=None, help="Path to freshness.json")
+    place_p.add_argument("--no-duck", action="store_true", help="Generate Lakebase-only placement")
+    place_p.add_argument("--out-dir", type=Path, default=None, help="Directory to write placement and schemas")
+    place_p.add_argument("--placement-out", type=Path, default=None, help="File to write placement.json")
+    place_p.add_argument("--schemas-out", type=Path, default=None, help="File to write schemas.json")
+
+    return parser
+
+
+def handle_load(args: argparse.Namespace) -> int:
+    # Validate inputs exist
+    for p_name in ("columns", "pii", "registry"):
+        p: Path = getattr(args, p_name)
+        if not p.exists():
+            log_event("input_missing", level="ERROR", field=p_name, path=str(p))
+            return 2
+
+    if args.as_of_date is not None:
+        try:
+            datetime.strptime(args.as_of_date, "%Y-%m-%d")
+        except ValueError:
+            log_event("invalid_as_of_date", level="ERROR", date=args.as_of_date)
+            return 2
+
+    try:
+        specs = build_table_specs(
+            columns=args.columns,
+            pii_policy=args.pii,
+            registry=args.registry,
+            allow_non_hashed_pii=args.allow_non_hashed_pii,
+        )
+    except (ValueError, json.JSONDecodeError, BadInputError) as exc:
+        log_event("bad_input", level="ERROR", error_type=type(exc).__name__, message=scrub_text(str(exc)))
+        return 2
+    except Exception as exc:
+        log_event("bad_input", level="ERROR", error_type=type(exc).__name__, message=scrub_text(str(exc)))
+        return 2
+
+    if args.dry_run:
+        plan = plan_sql(specs)
+        for stmt in plan:
+            print(stmt)
+        return 0
+
+    # Validate extension_dir before creating or changing directories
+    if args.extension_dir:
+        try:
+            from accel.settings import validate_extension_dir
+            args.extension_dir = validate_extension_dir(args.extension_dir)
+        except ValueError as exc:
+            log_event("bad_input", level="ERROR", error_type="BadInputError", message=scrub_text(str(exc)))
+            return 2
+
+    # Version check BEFORE any directory is created or modified (exit 2 on mismatch)
+    try:
+        from accel.engines import check_duckdb_version
+
+        check_duckdb_version(
+            allow_mismatch=args.allow_version_mismatch,
+            expected_version=args.expect_duckdb_version,
+        )
+    except RuntimeError as exc:
+        log_event(
+            "version_mismatch_refusal",
+            level="ERROR",
+            error_type="BadInputError",
+            message=scrub_text(str(exc)),
+        )
+        return 2
+    except Exception as exc:
+        log_event("version_check_failed", level="ERROR", error_type=type(exc).__name__, message=scrub_text(str(exc)))
+        return 2
+
+    # Real load requires engines (which imports duckdb)
+    try:
+        from accel.engines import (
+            LakebaseSource,
+            create_target_factory,
+            get_installed_duckdb_version,
+        )
+
+        actual_version = get_installed_duckdb_version()
+
+        source = LakebaseSource(
+            allow_version_mismatch=args.allow_version_mismatch,
+            expected_version=args.expect_duckdb_version,
+            extension_dir=args.extension_dir,
+        )
+        target_factory = create_target_factory(
+            allow_version_mismatch=args.allow_version_mismatch,
+            expected_version=args.expect_duckdb_version,
+            extension_dir=args.extension_dir,
+        )
+
+        run_load(
+            specs=specs,
+            source=source,
+            target_factory=target_factory,
+            cache_dir=args.cache_dir,
+            clock=lambda: datetime.now(timezone.utc),
+            keep=args.keep,
+            as_of_date=args.as_of_date,
+            duckdb_version=actual_version,
+        )
+        return 0
+    except (LoadError, RuntimeError, Exception) as exc:
+        log_event(
+            "load_execution_failed",
+            level="ERROR",
+            error_type=type(exc).__name__,
+            message=scrub_text(str(exc)),
+        )
+        return 3
+
+
+def handle_placement(args: argparse.Namespace) -> int:
+    if not args.columns.exists():
+        log_event("input_missing", level="ERROR", field="columns", path=str(args.columns))
+        return 2
+
+    try:
+        write_placement_files(
+            columns_path=args.columns,
+            registry_path=args.registry,
+            freshness_path=args.freshness,
+            duck=not args.no_duck,
+            out_dir=args.out_dir,
+            placement_out=args.placement_out,
+            schemas_out=args.schemas_out,
+        )
+        return 0
+    except Exception as exc:
+        log_event("placement_failed", level="ERROR", error_type=type(exc).__name__, message=scrub_text(str(exc)))
+        return 2
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return 2 if exc.code != 0 else 0
+
+    if args.command == "load":
+        return handle_load(args)
+    elif args.command == "placement":
+        return handle_placement(args)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

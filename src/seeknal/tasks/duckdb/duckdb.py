@@ -6,6 +6,7 @@ from pyarrow import Table
 import os
 import pandas as pd
 
+from seeknal.utils.duckdb_arrow import result_to_arrow_reader, result_to_arrow_table
 from seeknal.validation import validate_file_path
 
 
@@ -393,13 +394,13 @@ class DuckDBTask(Task):
             # Load from path and register as table
             table_name = "_input_table"
             rel = self.conn.sql(f"SELECT * FROM '{self.input['path']}'")
-            self.conn.register(table_name, rel.arrow().read_all())
+            self.conn.register(table_name, result_to_arrow_table(rel))
             return self.conn.table(table_name)
         elif "sql" in self.input:
             # Execute SQL and register as table
             table_name = "_input_table"
             rel = self.conn.sql(self.input["sql"])
-            self.conn.register(table_name, rel.arrow().read_all())
+            self.conn.register(table_name, result_to_arrow_table(rel))
             return self.conn.table(table_name)
         else:
             raise ValueError("Invalid input configuration")
@@ -533,10 +534,10 @@ class DuckDBTask(Task):
                 # Get current column names
                 if i == 0:
                     # First stage - get columns from input
-                    all_cols = list(self.conn.table("_input_table").arrow().read_all().column_names)
+                    all_cols = list(result_to_arrow_table(self.conn.table("_input_table")).column_names)
                 else:
                     # Subsequent stages - get columns from previous result
-                    all_cols = list(self.conn.table(f"_result_{i}").arrow().read_all().column_names)
+                    all_cols = list(result_to_arrow_table(self.conn.table(f"_result_{i}")).column_names)
                 
                 sql = transformer.to_sql(all_cols)
             else:
@@ -558,7 +559,7 @@ class DuckDBTask(Task):
             # Register result for next stage
             result_name = f"_result_{i+1}"
             # Force execution and get Arrow table (use read_all())
-            arrow_reader = current_rel.arrow()
+            arrow_reader = result_to_arrow_reader(current_rel)
             arrow_result = arrow_reader.read_all()
             self.conn.register(result_name, arrow_result)
 
@@ -568,7 +569,7 @@ class DuckDBTask(Task):
             return self
         else:
             # Get final result as Arrow table
-            arrow_reader = current_rel.arrow()
+            arrow_reader = result_to_arrow_reader(current_rel)
             final_result = arrow_reader.read_all()
 
             # Check if user wants pandas DataFrame

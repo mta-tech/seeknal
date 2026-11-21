@@ -149,6 +149,22 @@ dev = [
     "pytest>=8.3.4",
     "pytest-asyncio>=0.24.0",
 ]
+serving = [
+    "attrs",
+    "cryptography",
+    "duckdb",
+    "httpx",
+    "psycopg2-binary",
+    "pygments",
+    "pymysql",
+    "python-multipart",
+    "pyyaml",
+    "rich",
+    "sniffio",
+    "sqlglot",
+    "starlette",
+    "uvicorn",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/seeknal"]

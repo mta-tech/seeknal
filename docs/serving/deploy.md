@@ -88,6 +88,10 @@ placement:
         lakekeeper.analytics.users:
           target: users_sync
           primary_key: [id]
+          pii: false  # Optional boolean; when true, enforces single-serve PII placement rules
+    # Optional discovery-level PII lists:
+    # pii_tables: [lakekeeper.analytics.patient_identity]
+    # pii_engines: []  # Engine names of kind 'duckdb' explicitly permitted to serve pii tables
 
   # Alternatively, static placement:
   # static:
@@ -116,6 +120,12 @@ connections:
   lb:
     kind: lakebase
     dsn_env: LAKEBASE_DSN
+    pool_max: 8  # Optional: max pooled connections (default 8, 1..64)
+    pool_min: 0  # Optional: min idle connections (default 0)
+    connect_timeout_seconds: 10  # Optional: connection timeout in seconds (default 10)
+    max_idle_seconds: 300  # Optional: max idle seconds before close (default 300)
+    max_lifetime_seconds: 1800  # Optional: max connection lifetime in seconds (default 1800)
+    acquire_timeout_seconds: 5  # Optional: acquire wait timeout before 503 error (default 5)
   cube:
     kind: cube
     host: cube-sql.internal.net
@@ -132,6 +142,9 @@ connections:
       - /data/serving/
     memory_limit: 4GB
     threads: 4
+    temp_directory: /tmpfs/duckdb-temp  # Optional: writable directory outside allowed_directories
+    max_temp_directory_size: 10GB  # Optional: max disk space for spills
+    max_concurrent_cursors: 32  # Optional: max concurrent query cursors (default 32)
 
 limits:
   timeout_seconds: 30.0
@@ -284,6 +297,30 @@ Seeknal Serving exposes two distinct probe endpoints:
 ---
 
 ## 7. Operational Deployment
+
+### Fail-Closed Startup Validation (`validate` CLI Subcommand)
+In addition to `--check`, Seeknal Serving provides comprehensive fail-closed startup validation via `validate_startup()` (`src/seeknal/serving/startup_validation.py`) and the `validate` subcommand:
+
+```bash
+python -m seeknal.serving validate --config /etc/seeknal/serving.yaml
+```
+
+- **Exit codes & output:**
+  - Exits with code `0` and prints `ok` to `stdout` when all checks pass (in `discovery` mode, also prints a note recording `skipped: live_catalog_discovery` for checks that require live catalog polling).
+  - Exits with code `2` and prints one clear, secret-safe `Error: ...` line per validation problem to `stderr` when any check fails—never leaking DSNs, passwords, tokens, or secret file contents.
+- **Comprehensive fail-closed checks collected in a single pass:**
+  1. **Unknown engine & kind mismatches:** Verifies every engine in `placement.engines` (or `placement.discovery.engines` and `placement.discovery.lakebase.engine`) has a same-name, same-kind entry in `connections`; verifies every table `serve` engine, cube `engine`, and `policy.pii_engines` entry exists in both `placement` and `connections`; and verifies engine kinds in `policy.small_scan_order` / `policy.analytics_order`.
+  2. **Unknown table:** Verifies exact case-insensitive and lowercase alignment between static `schemas.json` and `placement.tables` / `placement.cubes` (rejecting missing or extra/stale schema keys) as well as any table references in `pii_tables` or policy table mappings.
+  3. **Unknown column:** Verifies that every column in `table.keys`, `cube.measures`, `cube.dimensions`, `cube.mask_variants`, and any static table/policy `masks` or `row_filters` exists in `schemas.json`.
+  4. **Unknown role:** Seeknal Serving authorizes requests via per-request signed ES256 grant tokens from Atlas Data Catalog rather than static server roles (`ValidationReport` records `no_static_role_references` when none exist, and rejects any unbacked static role references if present in config or placement policy).
+  5. **PII placement & query isolation rules:**
+     - Any table marked `pii: true` (via `tables.<table>.pii: true`, static `placement.pii_tables` / `placement.policy.pii_tables`, or carried through discovery via `lakebase.synced_tables.<table_name>.pii: true` or `discovery.pii_tables`) must have **exactly one** `serve` (`len(serves) == 1`).
+     - Static `placement.pii_tables` and `placement.policy.pii_tables` entries fold directly into `TableEntry.pii = True` (or `CubeEntry.pii = True`), and referencing an unknown table raises `PlacementError`.
+     - Semantic cubes may optionally declare `pii: true` (`cubes.<cube>.pii: true` or via `pii_tables`), which requires that Cube engine to be explicitly listed in `policy.pii_engines`.
+     - A `pii: true` table cannot be served on a `duckdb` engine (whether `local_file` or `iceberg_direct`) unless that engine name is explicitly listed in `policy.pii_engines`.
+     - In discovery mode, every `pii_tables` and `synced_tables` entry must be an unquoted 3-part `<default_catalog>.<namespace>.<table>` identifier, and any PII entry matching no discovered Iceberg table raises `DiscoveryError`. When multiple engines could serve a discovered PII table, `discover()` selects a single serve in priority order: synced Lakebase (`lakebase.engine`), first non-DuckDB engine (e.g. StarRocks), first approved engine in `pii_engines`.
+     - Duplicate YAML keys at any nesting level in `serving.yaml`, static `placement.yaml`, or discovery YAML configs are rejected fail-closed (`UniqueKeySafeLoader`).
+     - At query time, `check_pii_query_mixing()` and the router reject any statement that joins or combines a `pii: true` table or cube across engines—or supplies an engine hint targeting another engine—with typed error code `pii_cross_engine` (**HTTP 422**) before any engine is called.
 
 ### Pre-flight Configuration & Runtime-Wiring Check (`--check`)
 Before launching the service (in CI pipelines, container entrypoints, or `systemd` `ExecStartPre`), run the offline preflight check:
@@ -451,17 +488,16 @@ docker run -d \
 
 ---
 
-## 5. DuckDB Engine Hardening & Conformance Probe
+## 8. DuckDB Engine Hardening & Conformance Probe
 
 When using the embedded DuckDB engine (`kind: duckdb`), Seeknal Serving locks down database connections to prevent external access, unauthorized file reads, extension downloads, and configuration tampering.
 
-### Owned Per-Query Lifecycle, Serialization & Operational Limits
-- **Fresh Owned Connection per Acquired Query:** `DuckDBAdapter` opens and hardens a fresh read-only connection via `connect_hardened` for each acquired query, cancels and joins any started watchdog timer, and deterministically closes the connection (`conn.close()`) before releasing its execution lock. It does not retain a persistent root connection or connection pool, preserving per-query file-reopen and replacement freshness semantics.
-- **Per-Adapter Execution Lock & Shared Deadline:** Because DuckDB's `SET lock_configuration = true` and `allowed_directories` apply to the underlying database instance while any connection is open, `DuckDBAdapter` serializes execution per adapter instance (`connect -> harden -> query/fetch -> timer cleanup -> close`).
-  - Request cancellation handles are registered before waiting for the adapter lock.
-  - A single monotonic deadline (`timeout_seconds`) spans both queue wait and query execution (not reset after acquiring the lock); queued requests that are cancelled or expire before acquiring the lock fail fast (`499 query_cancelled` or `504 engine_timeout`) without calling the connection factory or executing SQL.
-  - Connection-factory failures map to secret-safe `EngineError("Engine connection failed")` (`502 engine_error`), and sole connection-close failures raise secret-safe `EngineError("Engine connection cleanup failed")` (`502 engine_error`) after releasing the lock.
-- **One Configured Adapter per DuckDB File per Process (No Cross-Process Coordination):** Serialization is local to a single `DuckDBAdapter` instance in a single process. Separate `DuckDBAdapter` instances, separate server processes (such as multi-worker/multi-process deployments), and external connections targeting the same locked DuckDB file are **not** coordinated and are unsupported. Configure at most one `DuckDBAdapter` per DuckDB database file per process; one adapter per process is **not** a cross-process or external-connection coordination guarantee.
+### Owned Per-Query Cursor Lifecycle, Bounded Concurrency & Operational Limits
+- **Shared Hardened Instance & Owned Per-Query Cursor:** A process-wide, thread-safe `DuckDBHolder` maintains a single hardened database instance per resolved database file. Hardening policy enforcement and conformance probing execute once when each database file generation is loaded. Each query acquires a bounded concurrency slot (`max_concurrent_cursors`, default `32`) and its own isolated `cursor()`, cancels and joins its started watchdog timer, and deterministically closes the cursor and releases the slot on every path.
+- **Deadline-Aware Slot Acquisition & Pre-Wait Cancellation:**
+  - Request cancellation handles are registered before waiting for a cursor slot.
+  - A single monotonic deadline (`timeout_seconds`) spans both queue wait and query execution (not reset after acquiring a slot); queued requests that are cancelled or expire before acquiring a slot fail fast (`499 query_cancelled` or `504 engine_timeout`) without touching DuckDB or executing SQL.
+  - Terminal outcomes (`success`, `cancel`, `timeout`, `error`) are latched first-wins per request, and connection/cursor cleanup failures never mask primary errors (sole close failures raise secret-safe `EngineError("Engine connection cleanup failed")`).
 
 The probe command verifies that a DuckDB database connection complies with the locked-down runtime policy:
 
@@ -483,3 +519,50 @@ The probe outputs a JSON report with conformance check results and exits with co
   "select_ok": true
 }
 ```
+
+### DuckDB Connection Reuse, Symlink File Swap, and Temp Directory
+- **Connection Reuse:** A process-wide, thread-safe holder maintains a single hardened database instance per resolved database file. Hardening policy enforcement and conformance probing execute once when the database is loaded. Each incoming query operates on its own isolated `cursor()` taken from that connection, allowing per-query interruption and timeout isolation without interference across concurrent queries.
+- **Zero-Downtime Symlink File Swap:** The configured database `path` may point to a symlink that is atomically updated to point to a new database file after an offline data reload. Only atomic symlink swaps are supported (in-place rewrites of active database files are not supported and will be refused). On every query, the holder cheaply checks the path's resolved target and inode. When a swap is detected:
+  - If the path points back to an already open instance, that instance is reused without re-hardening.
+  - Otherwise, the new file is opened, hardened, and probed immediately for incoming queries.
+  - In-flight queries on superseded instances complete normally.
+  - A superseded database connection is automatically closed once all in-flight queries finish and it is no longer current (or reaped after `max_idle_seconds` 300s). No queries fail during swaps and no server restart is needed.
+- **`temp_directory` and `max_temp_directory_size`:**
+  - `temp_directory`: An optional absolute path where DuckDB may spill data for memory-intensive operations (such as large sorts or group-by aggregations). It **has to be a dedicated per-instance writable tmpfs or volume outside the data directory** (DuckDB allows arbitrary reads and writes inside its temp directory) and **must NOT be inside any `allowed_directories` entry or the data directory**.
+  - `max_temp_directory_size`: An optional disk limit string (e.g., `10GB`).
+  - When `temp_directory` is unset, DuckDB is configured so that it does not spill into the database file directory, and queries exceeding memory limits fail with a clear `resource_exhausted` error instead of an internal server error.
+- **Graceful Shutdown:** All open DuckDB database instances and cursors are explicitly closed during application lifespan shutdown.
+
+### DuckDB `iceberg_direct` Profile (Experimental / Spike Stage 2)
+A `duckdb` connection may optionally set `profile: iceberg_direct` (default `local_file`) to attach a read-only Lakekeeper Iceberg REST catalog (`<alias>.<namespace>.<table>`) in an in-memory DuckDB generation using pre-installed `httpfs`, `avro`, and `iceberg` extensions (`extensions: [httpfs, avro, iceberg]`), temporary S3/OAuth2 secrets from `secrets_env_file`, periodic generation recycling (`recycle_seconds`), and post-attach configuration lock (`lock_configuration = true`). Because DuckDB's `iceberg` extension depends on `avro`, `"avro"` is required whenever `"iceberg"` is configured in `extensions`, is automatically ordered before `"iceberg"` during `LOAD`, and `avro.duckdb_extension` is verified early when `extension_directory` is populated on disk. No Postgres attach is allowed in this profile. See [`docs/serving/iceberg-direct.md`](iceberg-direct.md) for the complete configuration reference, hardening step order, conformance probe checks, and Stage 3 live adoption gates.
+
+---
+
+## 9. Lakebase Connection Pool & Sizing Guidance
+
+When querying Lakebase (PostgreSQL), Seeknal Serving manages a thread-safe connection pool per Lakebase endpoint to eliminate connection establishment overhead.
+
+### Connection Configuration Keys
+| Key | Type | Default | Description |
+|:---|:---|:---|:---|
+| `pool_max` | integer | `8` | Maximum concurrent connections in the pool (allowed range: `1` to `64`). |
+| `pool_min` | integer | `0` | Minimum idle connections pre-warmed in the pool. |
+| `connect_timeout_seconds` | number | `10.0` | Connection timeout in seconds, applied to all driver connection attempts even if not in DSN. |
+| `max_idle_seconds` | number | `300.0` | Maximum time in seconds an idle connection remains in the pool before being closed and replaced. |
+| `max_lifetime_seconds` | number | `1800.0` | Maximum lifetime in seconds of any pooled connection before being closed and replaced. |
+| `acquire_timeout_seconds` | number | `5.0` | Maximum wait time in seconds to check out a pooled connection. If exhausted, fails with a `503` error. |
+
+### Sizing Guidance Against Database `max_connections`
+When planning pool sizes, calculate the total potential connections across all running Seeknal Serving instances against PostgreSQL's `max_connections` setting:
+$$\text{Total Connections} = (\text{Number of Serving Replicas}) \times \text{pool\_max}$$
+Ensure that this total connection count leaves sufficient margin for:
+1. `superuser_reserved_connections` (typically 3–5 connections reserved for Postgres superusers).
+2. Direct admin tools, catalog discovery workers, and operational migration tasks.
+For example, if PostgreSQL has `max_connections = 100` and you run 4 Serving replicas, setting `pool_max: 16` requires at most $4 \times 16 = 64$ connections, leaving 36 connections for administrative operations and catalog sync.
+
+### Session Isolation & Endpoint Resilience
+- **Strict Session Isolation:** No connection is ever shared between concurrent queries. Each query executes within its own transaction (`BEGIN`, `SET TRANSACTION READ ONLY`, `SET LOCAL statement_timeout`).
+- **Safe Return:** A connection is returned to the pool only after a successful `ROLLBACK` or `COMMIT` leaving no modified session state. Network I/O (rollback and close) is performed outside the pool lock to prevent contention.
+- **Fail-Closed on Errors:** Any query error, cancellation, or statement timeout causes the connection to be immediately closed and discarded—never reused. Late cancellations cannot affect subsequent queries on reused connections.
+- **Idle Expiry via Background Reaper:** A lightweight daemon thread periodically reaps connections idle longer than `max_idle_seconds` (default 300s). Expired connections are also closed on checkout.
+- **Dead Connection & Restart Recovery:** Connections found dead on checkout are transparently replaced. If the database endpoint restarts and an existing pooled connection is severed, the connection attempt is transparently retried once before starting query execution, preventing spurious errors to callers.

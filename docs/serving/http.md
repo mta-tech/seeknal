@@ -112,6 +112,7 @@ Returns a JSON object with:
   - `bytes`: Base64 encoded string.
   - `float` `NaN`, `+Infinity`, `-Infinity`: Encoded as `null`.
 - `truncated` (`bool`): `true` if results exceeded the effective row cap.
+- `notices` (`list[str]`): Machine-readable execution notices; contains `"row_cap_hit"` when `truncated` is `true`, otherwise `[]`.
 - `engine` (`str`): Identifier of the engine where the query executed.
 - `rule` (`str`): Placement routing rule selected (e.g., `analytics`, `point_lookup`, `small_scan`).
 - `reason` (`str`): Diagnostic rationale for engine selection.
@@ -129,6 +130,7 @@ Returns a JSON object with:
     [2, "****", 80000]
   ],
   "truncated": false,
+  "notices": [],
   "engine": "duck",
   "rule": "small_scan",
   "reason": "small table scan without key filter",
@@ -177,7 +179,7 @@ Returns a JSON object with:
 
 ### 1.4 `POST /v1/cancel`
 
-Cancels an in-flight query (actively executing or queued waiting for the per-adapter embedded DuckDB execution lock) identified by `jti` in the cancel token. For embedded DuckDB (`DuckDBAdapter`), the cancellation handle is registered before waiting for the adapter lock and the request's monotonic timeout deadline (`timeout_s` / server `timeout_seconds`) includes both queue wait and SQL execution; cancelling a queued request aborts it (`499 query_cancelled`) without calling the connection factory or executing SQL.
+Cancels an in-flight query (actively executing or queued waiting for an embedded DuckDB cursor slot) identified by `jti` in the cancel token. For embedded DuckDB (`DuckDBAdapter`), the cancellation handle is registered before waiting for a cursor slot and the request's monotonic timeout deadline (`timeout_s` / server `timeout_seconds`) includes both queue wait and SQL execution; cancelling a queued request aborts it (`499 query_cancelled`) without touching DuckDB or executing SQL.
 
 #### Request Headers
 - `Authorization: Bearer <cancel token>` (required): Compact ES256 JWS cancel token issued by the Catalog.
@@ -208,45 +210,62 @@ Empty body or `{}`.
 - **401 Unauthorized:** Invalid or expired cancel token, missing `typ: "cancel"`, or bad signature.
 - **404 Not Found:** Query ID not currently running, or running query's subject differs from `sub` (never reveals which).
 - **400 Bad Request:** Malformed request body (non-empty and not `{}`).
+- **413 Payload Too Large:** Request body exceeds `max_body_bytes` (`code: "payload_too_large"`).
 
 ---
 
-## 2. Error Handling & Privacy Guarantees
+## 2. Error Handling, Typed Error Catalogue & Privacy Guarantees
 
-All error responses have an HTTP status code $\ge 400$ and return a consistent JSON payload:
+All error responses have an HTTP status code $\ge 400$ and return a consistent typed JSON payload:
 
 ```json
 {
   "error": "<category>",
-  "message": "<short safe diagnostic text>"
+  "code": "<catalogue_code>",
+  "message": "<short safe diagnostic text>",
+  "next_step": "<user-facing actionable guidance>",
+  "audit_id": "<verified jti when known>"
 }
 ```
 
+- `error` (`str`, always present): Backwards-compatible error category string.
+- `code` (`str`, always present): Stable typed error code from `seeknal.serving.errors.ERROR_CATALOGUE`.
+- `message` (`str`, always present): Short, secret-safe user-facing summary.
+- `next_step` (`str`, always present): Actionable user-facing guidance sentence from `ERROR_CATALOGUE`.
+- `audit_id` (`str`, optional): Included whenever the request's `jti` has been cryptographically verified (omitted when missing or before token verification).
+
 ### Privacy & Leakage Invariants
-- **No Grant Tokens:** Raw grant tokens and signature data are never included in error messages.
-- **No SQL Literals or Parameters:** Client SQL expressions, literals, and supplied parameter values are scrubbed and redacted from error text.
-- **No Driver Internals:** Database driver connection strings, internal stack traces, and data fragments are logged server-side and never returned to the HTTP client.
+- **No Grant Tokens or Unverified Headers:** Raw grant/cancel tokens, signature data, and unverified JWS header fields (`kid`, `alg`, `typ`) are never echoed in error messages.
+- **No SQL Literals or Sensitive Parameters:** Client SQL expressions, string literals, exact quoted bound-parameter tokens (`'<p>'`), and non-numeric parameter values (`len >= 3`) are never included in error messages or logs, while ordinary numeric diagnostics (such as `"61.0s"`) remain readable.
+- **No Driver Internals, Config Secrets, or Log Forging:** Database driver connection strings, DSNs (including `/` in userinfo), quoted/escaped credentials (`''`, `""`, `\'`, `\"`), DuckDB `SECRET '...'` clauses, secrets loaded from `ServerConfig` / secret files / environment variables, raw driver error text, and Python tracebacks are never returned to the HTTP client; operational failure details (`engine`, `code`, `error` class, secret-scrubbed single-line `detail` with all control/non-printable characters escaped and capped at 2048 characters, and `audit_id`) are logged server-side at `ERROR` and never included in HTTP responses.
 
-### Error Status Mapping
+### Typed Error Code Catalogue (`ERROR_CATALOGUE`)
 
-| Condition | Status | Error Category | Description |
-|:---|:---:|:---|:---|
-| `GrantTokenError` | **401** | `grant_token_error` | Missing/malformed Authorization header, invalid signature, expired token, or invalid claims. |
-| `GrantReplayedError` | **401** | `grant_replayed` | Grant token with this `jti` has already been used (replay detected). |
-| `EnforcementError` | **403** | `enforcement_error` | Query policy violation: ungranted table, ungranted column, disallowed SQL function, or write violation. |
-| Query not found / subject mismatch | **404** | `not_found` | In `/v1/cancel`: query `jti` not found in running queries, or subject does not match running query. |
-| Duplicate query execution | **409** | `duplicate_query_id` | A query with the same `jti` is already actively running. |
-| Result rows exceed byte cap | **413** | `result_too_large` | JSON-encoded result rows exceed `max_result_bytes` (no partial rows returned). |
-| `RoutingError` | **422** | `routing_error` | No feasible engine available to satisfy query constraints (e.g. invalid hint, unserved table). |
-| Malformed JSON or invalid types | **400** | `bad_request` | Non-JSON body, missing `sql`, invalid field types, or unrecognized extra fields. |
-| Request body exceeds size limit | **413** | `payload_too_large` | Body exceeds `max_body_bytes` (checked prior to JSON parsing). |
-| Query cancelled | **499** | `query_cancelled` | Query execution cancelled via `/v1/cancel` or client disconnect. |
-| `GrantReplayCacheFull` | **503** | `replay_cache_full` | Grant replay cache has reached capacity; query refused to fail closed. |
-| Missing workload account | **503** | `workload_account_missing` | Routed engine has no configured account matching the grant's `workload` claim. |
-| No adapter for chosen engine | **503** | `engine_unavailable` | Placement routed to an engine that is not registered in the application's adapters mapping. |
-| `EngineTimeout` | **504** | `engine_timeout` | Query execution exceeded the allotted timeout threshold. |
-| `EngineError` | **502** | `engine_error` | Database engine driver failed during connection or query execution. |
-| Unhandled server exception | **500** | `internal_error` | Generic server-side fault. |
+| `code` | Status | `error` Category | `message` | `next_step` |
+|:---|:---:|:---|:---|:---|
+| `grant_expired` | **401** | `grant_token_error` | Grant token has expired. | Sign in again or refresh the dashboard to get a new grant. |
+| `grant_invalid` | **401** | `grant_token_error` | Grant token is missing, malformed, or invalid. | Sign in again or request a valid grant token from the catalog. |
+| `grant_replayed` | **401** | `grant_replayed` | Grant token has already been used. | Request a fresh grant token for each query execution. |
+| `access_denied` | **403** | `enforcement_error` | Query violates data access policy or grant permissions. | Request access to the required tables and columns in the catalog. |
+| `data_stale` | **422** | `routing_error` | No engine meets the requested data freshness constraint. | Relax max_staleness_seconds or wait for replication to catch up. |
+| `engine_unavailable` | **503** | `engine_unavailable` | The target execution engine is currently unavailable. | Retry shortly or contact the platform operator if the outage persists. |
+| `engine_timeout` | **504** | `engine_timeout` | Query execution timed out. | Simplify the query, add selective filters, or increase timeout_s. |
+| `query_spans_engines` | **422** | `routing_error` | Query references tables or cubes across incompatible engines. | Query tables served by a single engine or split the query. |
+| `pii_cross_engine` | **422** | `routing_error` | PII table cannot be queried together with tables not served on its engine. | Query the PII table separately on its designated engine. |
+| `row_cap_hit` | **422** | `enforcement_error` | Query exceeded the maximum permitted row cap. | Add a stricter LIMIT or narrow your query filters. |
+| `result_too_large` | **413** | `result_too_large` | Query result size exceeds the maximum byte limit. | Reduce the number of projected columns or rows returned. |
+| `invalid_sql` | **400** | `bad_request` | The SQL statement or request payload is invalid. | Check the SQL syntax and request fields and try again. |
+| `payload_too_large` | **413** | `payload_too_large` | Request body exceeds the maximum size limit. | Shorten the SQL statement or reduce the request payload size. |
+| `query_cancelled` | **499** | `query_cancelled` | Engine query execution cancelled | Re-run the query if the cancellation was unintentional. |
+| `audit_unavailable` | **503** | `audit_unavailable` | Audit logging destination is unavailable; query refused. | Retry later or contact the platform operator to restore the audit sink. |
+| `internal_error` | **500** | `internal_error` | Internal server error | Retry the request or contact support with the audit_id. |
+| `not_found` | **404** | `not_found` | Query not found | Verify the query_id (jti) and that the query is still running. |
+| `duplicate_query_id` | **409** | `duplicate_query_id` | A query with this audit_id is already running. | Wait for the in-flight query to complete or issue a new grant. |
+
+### Category Compatibility Notes
+- **Row Cap Truncation vs Refusal:** In default truncation mode (`on_row_cap="truncate"`), queries exceeding the effective row cap succeed with `200 OK`, `"truncated": true`, and `"notices": ["row_cap_hit"]`. When configured to refuse (`on_row_cap="error"`) or when a query supplies an invalid `LIMIT`/`FETCH` clause, Serving returns `422` with `error="enforcement_error"` and `code="row_cap_hit"`.
+- **Engine Driver Errors (`502 engine_error`):** When an adapter raises `EngineError` during connection or query execution, Serving preserves HTTP `502` and `error="engine_error"` with `code="engine_unavailable"`, a whitelisted safe message (`"Engine connection failed"` or `"Engine query execution failed"`), and `next_step` from `engine_unavailable`.
+- **Workload Account & Replay Cache (`503`):** Missing workload accounts (`workload_account_missing`) and full grant replay caches (`replay_cache_full`) preserve their existing `error` category and `503` status while setting `code="engine_unavailable"`.
 
 ---
 
@@ -346,16 +365,16 @@ app = create_app(
 )
 ```
 
-### 3.1 Embedded DuckDB Lifecycle, Serialization, Queueing & Limitations
+### 3.1 Embedded DuckDB Lifecycle, Bounded Concurrency, Queueing & Symlink Swaps
 
-- **Owned Per-Query Connection Factory:** `DuckDBAdapter(connect)` treats `connect` as an owned per-query factory. Once a request acquires the adapter's execution lock, it calls `connect()` exactly once, executes the query, stops and joins any started watchdog timer, and calls `conn.close()` before releasing the lock. Connection-factory exceptions are wrapped into secret-safe `EngineError("Engine connection failed")` (`502 engine_error`) and sole connection-close failures raise secret-safe `EngineError("Engine connection cleanup failed")` (`502 engine_error`) after releasing the lock, without exposing file paths, DSNs, SQL, parameters, or driver internals.
-  - *In-memory test fixtures:* Do not pass `lambda: parent` when retaining an in-memory parent connection across queries, as the adapter closes each returned connection. Instead, pass `lambda: parent.cursor()` so each query owns and closes a child cursor while the caller-owned `parent` fixture stays inspectable until the caller explicitly calls `parent.close()`. Production deployments must not retain a persistent root connection.
-- **Per-Adapter Execution Serialization:** Because DuckDB hardening (`SET lock_configuration = true`, `allowed_directories`, `enable_external_access = false`) locks database-level configuration while any connection to that database instance remains open, each `DuckDBAdapter` serializes execution under a single per-adapter lock spanning `connect -> harden -> execute/fetch -> watchdog cleanup -> close`.
-- **Pre-Lock Cancellation & Shared Monotonic Deadline:**
-  - `DuckDBAdapter.execute()` registers its per-request cancellation handle via `on_cancel_handle` *before* waiting for the execution lock.
-  - A single monotonic deadline (`timeout_seconds`) covers both queue wait and SQL execution; the timeout budget is **not** reset after acquiring the lock, and the execution watchdog timer receives only the remaining budget after `connect()` completes.
-  - If a queued request is cancelled or its deadline expires while waiting for the lock, it raises `EngineCancelled` (`499 query_cancelled`) or `EngineTimeout` (`504 engine_timeout`) without calling `connect()` or executing SQL. If `connect()` finishes after the deadline, the acquired connection is closed immediately without executing SQL.
-- **Single Adapter per DuckDB File & Non-Coordination Limitation:** Execution serialization is scoped strictly to a single `DuckDBAdapter` instance within a single OS process. Separate `DuckDBAdapter` instances, separate server processes (e.g., multi-worker or multi-process deployments), and external connections opening the same locked DuckDB file are **not** coordinated and can conflict with `lock_configuration`. Keep at most **one configured `DuckDBAdapter` per DuckDB database file per process**, and note that one adapter per process is **not** a cross-process or external-connection coordination guarantee.
+- **Shared Hardened Instance & Owned Per-Query Cursor:** In production (`DuckDBAdapter(config=conn_cfg)`), a process-wide thread-safe `DuckDBHolder` maintains a single hardened database instance per resolved database file (`connect_hardened` + conformance `probe`). Each query acquires a bounded concurrency slot (`max_concurrent_cursors`, default `32`) and its own isolated `cursor()`, executes the query, stops and joins any started watchdog timer, and deterministically closes the cursor and releases the slot. When constructed with a custom factory (`DuckDBAdapter(connect)`), each acquired slot calls `connect()` once and closes the returned connection/cursor before releasing the slot.
+  - Connection-factory / holder errors map to secret-safe `EngineError` (`502 engine_error`), and sole connection/cursor-close failures raise secret-safe `EngineError("Engine connection cleanup failed")` (`502 engine_error`) after releasing the slot, without exposing file paths, DSNs, SQL, parameters, or driver internals.
+  - *In-memory test fixtures:* Do not pass `lambda: parent` when retaining an in-memory parent connection across queries, as the adapter closes each returned object. Instead, pass `lambda: parent.cursor()` so each query owns and closes a child cursor while the caller-owned `parent` fixture stays inspectable until the caller explicitly calls `parent.close()`.
+- **Pre-Wait Cancellation & Shared Monotonic Deadline:**
+  - `DuckDBAdapter.execute()` registers its per-request cancellation handle via `on_cancel_handle` *before* waiting for a cursor slot.
+  - A single monotonic deadline (`timeout_seconds`) covers both queue wait and SQL execution; the timeout budget is **not** reset after acquiring a slot, and the execution watchdog timer receives only the remaining budget after the cursor is acquired.
+  - If a queued request is cancelled or its deadline expires while waiting for a slot, it raises `EngineCancelled` (`499 query_cancelled`) or `EngineTimeout` (`504 engine_timeout`) without touching DuckDB or executing SQL. If cursor acquisition finishes after the deadline, the acquired cursor is closed immediately without executing SQL.
+- **Zero-Downtime Symlink Swaps:** `DuckDBHolder` checks the configured path's resolved target and `(st_dev, st_ino)` on each query. When an atomic symlink swap points to a new database file, incoming queries open, harden, and probe the new generation while in-flight queries finish on the old generation; the superseded generation closes once drained (or via the idle reaper after `max_idle_seconds` 300s).
 
 ---
 

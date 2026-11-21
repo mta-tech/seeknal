@@ -171,6 +171,9 @@ ANONYMOUS_FUNCTION_ALLOWLIST: dict[str, set[str]] = {
 DISALLOWED_FUNCTION_PREFIXES: tuple[str, ...] = (
     "pg_",
     "read_",
+    "iceberg_",
+    "parquet_",
+    "delta_",
     "lo_",
     "dblink",
     "glob",
@@ -215,6 +218,13 @@ MASK_TEMPLATES: dict[str, dict[str, str]] = {
 
 class EnforcementError(ValueError):
     """Raised when query enforcement rejects a statement."""
+
+    code: str = "access_denied"
+
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message)
+        if code is not None:
+            self.code = code
 
 
 @dataclass(frozen=True)
@@ -661,6 +671,8 @@ def _build_mask_expression(method: str, col_name: str, target_dialect: str) -> e
 
 def _table_full_name(table: exp.Table) -> str:
     """Return the dotted name of an exp.Table node."""
+    if isinstance(table.this, exp.Func):
+        return ""
     if table.parts:
         return ".".join(part.name for part in table.parts)
     return table.name
@@ -846,10 +858,13 @@ def enforce(
     cube_mask_variants: Mapping[str, Mapping[str, Collection[str]]] | None = None,
     cube_measures: Mapping[str, Collection[str]] | None = None,
     params: Sequence[Any] | None = None,
+    on_row_cap: str = "truncate",
 ) -> EnforcedQuery:
     """Enforce a data catalog grant on a SQL query."""
     if cube_mode not in ("refuse", "jwt"):
         raise EnforcementError(f"invalid cube_mode '{cube_mode}', must be 'refuse' or 'jwt'")
+    if on_row_cap not in ("truncate", "error"):
+        raise EnforcementError(f"invalid on_row_cap '{on_row_cap}', must be 'truncate' or 'error'")
     # Step 1: Integrity
     computed_sha256 = hashlib.sha256(sql.encode("utf-8")).hexdigest()
     if computed_sha256.lower() != grant.sql_sha256.lower():
@@ -869,7 +884,8 @@ def enforce(
     check_now = time.time() if now is None else float(now)
     if check_now >= grant.expires_at:
         raise EnforcementError(
-            f"grant expired at {grant.expires_at}, current time is {check_now}"
+            f"grant expired at {grant.expires_at}, current time is {check_now}",
+            code="grant_expired",
         )
 
     if statement is not None:
@@ -878,11 +894,14 @@ def enforce(
         try:
             parsed_statements = sqlglot.parse(sql, read=dialect)
         except Exception as exc:
-            raise EnforcementError(f"SQL parse error: {exc}") from exc
+            raise EnforcementError(
+                f"SQL parse error: {exc}", code="invalid_sql"
+            ) from exc
 
         if len(parsed_statements) != 1 or parsed_statements[0] is None:
             raise EnforcementError(
-                f"expected exactly one statement, got {len(parsed_statements)}"
+                f"expected exactly one statement, got {len(parsed_statements)}",
+                code="invalid_sql",
             )
 
         statement = parsed_statements[0]
@@ -1469,12 +1488,18 @@ def enforce(
             limit_node: exp.Expression | None
             if isinstance(existing_limit, exp.Fetch):
                 if existing_limit.args.get("percent") or existing_limit.args.get("with_ties"):
-                    raise EnforcementError("FETCH ... PERCENT or WITH TIES is not supported")
+                    raise EnforcementError(
+                        "FETCH ... PERCENT or WITH TIES is not supported",
+                        code="row_cap_hit",
+                    )
                 limit_node = existing_limit.args.get("count")
             elif isinstance(existing_limit, exp.Limit):
                 limit_node = existing_limit.expression
             else:
-                raise EnforcementError("LIMIT must be a non-negative integer literal")
+                raise EnforcementError(
+                    "LIMIT must be a non-negative integer literal",
+                    code="row_cap_hit",
+                )
 
             if (
                 isinstance(limit_node, exp.Literal)
@@ -1486,11 +1511,26 @@ def enforce(
                     if parsed_val >= 0:
                         existing_val = parsed_val
                     else:
-                        raise EnforcementError("LIMIT must be a non-negative integer literal")
+                        raise EnforcementError(
+                            "LIMIT must be a non-negative integer literal",
+                            code="row_cap_hit",
+                        )
                 except (ValueError, TypeError) as exc:
-                    raise EnforcementError("LIMIT must be a non-negative integer literal") from exc
+                    raise EnforcementError(
+                        "LIMIT must be a non-negative integer literal",
+                        code="row_cap_hit",
+                    ) from exc
             else:
-                raise EnforcementError("LIMIT must be a non-negative integer literal")
+                raise EnforcementError(
+                    "LIMIT must be a non-negative integer literal",
+                    code="row_cap_hit",
+                )
+
+            if on_row_cap == "error" and existing_val > effective_max_rows:
+                raise EnforcementError(
+                    f"LIMIT {existing_val} exceeds maximum permitted row cap {effective_max_rows}",
+                    code="row_cap_hit",
+                )
 
         new_limit = min(existing_val, cap) if existing_val is not None else cap
         statement.set("limit", exp.Limit(expression=exp.Literal.number(new_limit)))
