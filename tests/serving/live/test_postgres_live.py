@@ -1219,6 +1219,8 @@ cubes: {}
 
     connector._connect_fn = autocommit_connect
     connector._account_connect_fns = [autocommit_connect]
+    connector.last_probe_pgcode = None
+    connector.last_probe_error = None
     with connector._lock:
         connector._state = "unavailable"
 

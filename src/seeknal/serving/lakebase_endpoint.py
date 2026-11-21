@@ -1489,6 +1489,8 @@ class ColdStartConnector:
         now: float | None = None,
     ) -> str:
         """Perform at most one bounded no-wake plain connect per interval when unavailable."""
+        self.last_probe_pgcode = None
+        self.last_probe_error = None
         with self._lock:
             if self._state == "ok":
                 return "ok"
