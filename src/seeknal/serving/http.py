@@ -2933,6 +2933,41 @@ def create_app(
             )
 
         effective_cursor_key = _resolve_cursor_key()
+        if effective_cursor_key is not None:
+            try:
+                effective_key_bytes = (
+                    effective_cursor_key.encode("utf-8")
+                    if isinstance(effective_cursor_key, str)
+                    else bytes(effective_cursor_key)
+                )
+            except UnicodeEncodeError:
+                effective_key_bytes = b""
+            if len(effective_key_bytes) < 32:
+                logger.error(
+                    "engine=- code=cursor_key_weak error=CursorKeyWeak detail=Pagination cursor signing key is too weak audit_id=%s",
+                    grant.audit_id,
+                )
+                return await _finish(
+                    _error_response(
+                        "cursor_key_weak",
+                        status_code=500,
+                        audit_id=grant.audit_id,
+                        token=token,
+                    ),
+                    route=route,
+                    status=500,
+                    code="cursor_key_weak",
+                    elapsed_ms=(time.perf_counter() - req_start) * 1000.0,
+                    audit_id=grant.audit_id,
+                    subject=grant.subject,
+                    workload=grant.workload,
+                    sql_sha256=body_sha256,
+                    api="select.v1",
+                    token=token,
+                    claims=claims,
+                    binding=grant.binding,
+                )
+
         compiled_holder: list[CompiledSelect | None] = [None]
 
         def _compile_and_prepare() -> tuple[CompiledSelect, PreparedQuery]:

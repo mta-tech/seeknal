@@ -816,3 +816,107 @@ def test_b_fix_create_app_without_cursor_key_returns_500_cursor_key_missing_on_t
     assert planted_env_key not in resp.text
 
 
+def test_s2_weak_key_in_env_returns_500_cursor_key_weak_before_verifying_after_cursor(
+    ec_keys, monkeypatch
+):
+    from seeknal.serving.adapters import DuckDBAdapter
+    from seeknal.serving import keyset
+
+    priv, pub = ec_keys
+    monkeypatch.delenv("CUSTOM_CURSOR_KEY_ENV", raising=False)
+
+    con = duckdb.connect()
+    con.execute(
+        "CREATE TABLE rpt_txn_detail ("
+        "txn_id INT, customer_id VARCHAR, as_of_date VARCHAR, amount INT)"
+    )
+    con.execute(
+        "INSERT INTO rpt_txn_detail VALUES (1, 'C-1', '2026-10-01', 100)"
+    )
+
+    placement = Placement.from_dict(
+        {
+            "engines": {"duck": {"kind": "duckdb", "dialect": "duckdb"}},
+            "tables": {
+                "cbn.rpt.rpt_txn_detail": {
+                    "keys": ["txn_id"],
+                    "row_count": 1,
+                    "access": {"sortable": ["txn_id", "as_of_date"]},
+                    "serve": {"duck": "rpt_txn_detail"},
+                }
+            },
+            "cubes": {},
+        }
+    )
+    schemas = {
+        "cbn.rpt.rpt_txn_detail": ["txn_id", "customer_id", "as_of_date", "amount"]
+    }
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas=schemas,
+        public_keys={"k1": pub},
+        default_catalog="cbn",
+    )
+
+    # env var initially unset at create_app
+    app = create_app(
+        pipeline,
+        {"duck": DuckDBAdapter(lambda: con.cursor())},
+        cursor_key_env="CUSTOM_CURSOR_KEY_ENV",
+    )
+    client = TestClient(app)
+
+    # Then set to a 31-byte value
+    weak_31 = "weak-secret-key-31-bytes-long!!"
+    assert len(weak_31.encode("utf-8")) == 31
+    monkeypatch.setenv("CUSTOM_CURSOR_KEY_ENV", weak_31)
+
+    grant_tables = {
+        "cbn.rpt.rpt_txn_detail": {
+            "columns": ["txn_id", "customer_id", "as_of_date", "amount"],
+            "masks": {},
+            "row_filters": [],
+            "actions": ["select"],
+        }
+    }
+
+    # Tracking spy to prove decode_cursor was NEVER called
+    decode_called = False
+    orig_decode = keyset.decode_cursor
+
+    def spy_decode(*args, **kwargs):
+        nonlocal decode_called
+        decode_called = True
+        return orig_decode(*args, **kwargs)
+
+    monkeypatch.setattr(keyset, "decode_cursor", spy_decode)
+
+    raw_req = json.dumps(
+        {
+            "table": "cbn.rpt.rpt_txn_detail",
+            "columns": ["txn_id", "amount"],
+            "order_by": [{"txn_id": "asc"}],
+            "limit": 1,
+            "after": "dummy.cursor.token",
+        }
+    ).encode("utf-8")
+
+    tok = _mint_select_grant(
+        priv,
+        raw_req,
+        jti="jti-s2-weak-key-1",
+        tables=grant_tables,
+    )
+    resp = client.post(
+        "/v1/select",
+        headers={"Authorization": f"Bearer {tok}"},
+        content=raw_req,
+    )
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["code"] == "cursor_key_weak"
+    assert body["error"] == "cursor_key_weak"
+    assert body["audit_id"] == "jti-s2-weak-key-1"
+    assert decode_called is False
+
+
