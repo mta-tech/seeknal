@@ -266,6 +266,7 @@ All error responses have an HTTP status code $\ge 400$ and return a consistent t
 | `cursor_invalid` | **400** | `bad_request` | The pagination cursor is malformed, tampered, or does not match this query. | Restart pagination from the first page or supply the unmodified next cursor. |
 | `engine_starting` | **503** | `engine_starting` | The target database endpoint is starting up. | The database is waking up; retry in a few seconds. |
 | `cursor_key_missing` | **500** | `cursor_key_missing` | Pagination cursor signing key is not configured. | Configure cursor_key_env and set the cursor signing key environment variable. |
+| `cursor_key_weak` | **500** | `cursor_key_weak` | Pagination cursor signing key is too weak (minimum 32 bytes). | Configure a cursor signing key of at least 32 bytes in cursor_key_env. |
 | `not_found` | **404** | `not_found` | Query not found | Verify the query_id (jti) and that the query is still running. |
 | `duplicate_query_id` | **409** | `duplicate_query_id` | A query with this audit_id is already running. | Wait for the in-flight query to complete or issue a new grant. |
 

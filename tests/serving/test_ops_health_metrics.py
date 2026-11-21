@@ -969,7 +969,7 @@ def test_public_port_has_no_metrics_or_buildinfo_by_default(tmp_path):
     handle = build_server(
         srv_cfg,
         connect_factories={"duck": lambda: duckdb.connect()},
-        cursor_key="test-ops-cursor-key",
+        cursor_key="test-ops-cursor-key-32-bytes-ok-xx",
     )
     assert handle.ops_app is None
     assert handle.metrics is not None
@@ -1174,7 +1174,7 @@ def test_build_server_end_to_end_ops_app_public_flags_caching_and_metrics(tmp_pa
         env=env,
         connect_factories={"lakebase": lb_connect},
         readiness_clock=lambda: fake_clock[0],
-        cursor_key="test-ops-cursor-key",
+        cursor_key="test-ops-cursor-key-32-bytes-ok-xx",
     )
     assert handle.ops_app is not None
     assert handle.metrics is not None
@@ -1425,7 +1425,7 @@ def test_public_opt_in_flags_and_audit_failure_metrics(tmp_path):
         cfg_public_opt_in,
         env={"LB_DSN": "postgresql://u:p@localhost/db"},
         connect_factories={"lakebase": lambda: MagicMock()},
-        cursor_key="test-ops-cursor-key",
+        cursor_key="test-ops-cursor-key-32-bytes-ok-xx",
     )
     assert handle_opt.ops_app is None
     with TestClient(handle_opt.app) as pub_c:
@@ -1497,7 +1497,7 @@ def test_cli_main_starts_and_stops_ops_listener_and_keeps_version_and_validate(
     _, jwks_file, db_file, pf, sf = _setup_test_keys_and_catalog(tmp_path)
     monkeypatch.setenv("LB_DSN_CLI", "postgresql://u:p@localhost/db")
     monkeypatch.setenv("OPS_TOK_CLI", "cli-ops-secret")
-    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "cli-ops-cursor-secret")
+    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "cli-ops-cursor-secret-32-bytes-ok")
 
     import yaml
 
@@ -2009,7 +2009,7 @@ def test_c_n5_ops_readyz_reports_audit_sink_not_ready_in_refuse_mode_only(tmp_pa
         cfg_refuse,
         env={"LB_DSN_N5": "postgresql://u:p@localhost:5432/db"},
         connect_factories={"lakebase": lambda **kw: MagicMock()},
-        cursor_key="test-ops-cursor-key",
+        cursor_key="test-ops-cursor-key-32-bytes-ok-xx",
     )
     assert handle.ops_app is not None
 

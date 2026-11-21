@@ -228,6 +228,13 @@ _CATALOGUE_ENTRIES: tuple[ErrorSpec, ...] = (
         next_step="Configure cursor_key_env and set the cursor signing key environment variable.",
     ),
     ErrorSpec(
+        code="cursor_key_weak",
+        status=500,
+        category="cursor_key_weak",
+        message="Pagination cursor signing key is too weak (minimum 32 bytes).",
+        next_step="Configure a cursor signing key of at least 32 bytes in cursor_key_env.",
+    ),
+    ErrorSpec(
         code="not_found",
         status=404,
         category="not_found",

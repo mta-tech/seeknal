@@ -721,13 +721,39 @@ def create_app(
         replay_cache = GrantReplayCache()
     running_queries = RunningQueries()
 
-    if isinstance(cursor_key, str) and cursor_key:
-        register_config_secrets(cursor_key)
-    elif isinstance(cursor_key, (bytes, bytearray)) and len(cursor_key) > 0:
-        try:
-            register_config_secrets(bytes(cursor_key).decode("utf-8"))
-        except UnicodeDecodeError:
-            pass
+    env_var = cursor_key_env or "SEEKNAL_CURSOR_KEY"
+    if cursor_key is not None:
+        if isinstance(cursor_key, bool) or not isinstance(cursor_key, (bytes, bytearray, str)):
+            from seeknal.serving.server.config import ServerConfigError
+            raise ServerConfigError("'cursor_key' must be str, bytes, or None")
+        raw_bytes = (
+            cursor_key.encode("utf-8")
+            if isinstance(cursor_key, str)
+            else bytes(cursor_key)
+        )
+        if len(raw_bytes) < 32:
+            from seeknal.serving.startup_validation import CursorKeyWeakError
+            raise CursorKeyWeakError(
+                f"cursor_key_weak: pagination cursor signing key in environment variable '{env_var}' "
+                f"must be at least 32 bytes (minimum 32 bytes)"
+            )
+        if isinstance(cursor_key, str):
+            register_config_secrets(cursor_key)
+        else:
+            try:
+                register_config_secrets(raw_bytes.decode("utf-8"))
+            except UnicodeDecodeError:
+                pass
+    elif cursor_key_env:
+        env_val = os.environ.get(cursor_key_env)
+        if env_val is not None:
+            raw_bytes = env_val.encode("utf-8")
+            if len(raw_bytes) < 32:
+                from seeknal.serving.startup_validation import CursorKeyWeakError
+                raise CursorKeyWeakError(
+                    f"cursor_key_weak: pagination cursor signing key in environment variable '{cursor_key_env}' "
+                    f"must be at least 32 bytes (minimum 32 bytes)"
+                )
 
     def _resolve_cursor_key() -> bytes | str | None:
         if cursor_key is not None:
@@ -3701,6 +3727,45 @@ def create_app(
                 route=route,
                 status=500,
                 code="cursor_key_missing",
+                elapsed_ms=result.elapsed_ms,
+                tables=tables,
+                truncated=True,
+                sql_sha256=body_sha256,
+                api="select.v1",
+                paged=compiled.paged,
+                params=params,
+                token=token,
+                claims=claims,
+                prepared=prepared,
+                adapter=adapter,
+                result=result,
+                skip_callable_audit=callable_audit_done,
+            )
+
+        effective_key_bytes = (
+            effective_cursor_key.encode("utf-8")
+            if isinstance(effective_cursor_key, str)
+            else bytes(effective_cursor_key)
+            if effective_cursor_key is not None
+            else b""
+        )
+        if result.truncated and len(effective_key_bytes) < 32:
+            logger.error(
+                "engine=%s code=cursor_key_weak error=CursorKeyWeak detail=Pagination cursor signing key is too weak audit_id=%s",
+                getattr(adapter, "kind", None) or "-",
+                prepared.audit_id or "-",
+            )
+            return await _finish(
+                _error_response(
+                    "cursor_key_weak",
+                    status_code=500,
+                    audit_id=prepared.audit_id,
+                    token=token,
+                    params=params,
+                ),
+                route=route,
+                status=500,
+                code="cursor_key_weak",
                 elapsed_ms=result.elapsed_ms,
                 tables=tables,
                 truncated=True,

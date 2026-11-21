@@ -137,6 +137,7 @@ def test_error_catalogue_contains_all_required_codes_and_is_immutable():
     assert "not_found" in ERROR_CATALOGUE
     assert "duplicate_query_id" in ERROR_CATALOGUE
     assert "cursor_key_missing" in ERROR_CATALOGUE
+    assert "cursor_key_weak" in ERROR_CATALOGUE
 
     with pytest.raises(TypeError):
         ERROR_CATALOGUE["tamper"] = ERROR_CATALOGUE["internal_error"]  # type: ignore[index]
@@ -1623,7 +1624,7 @@ def test_c_n3_scrubber_escaped_quotes_all_keys_duckdb_secret_slash_userinfo_and_
             cfg_dict,
             env=harmless_env,
             connect_factories={"sr": lambda: None, "lb": lambda: None},
-            cursor_key="test-typed-errors-cursor-key",
+            cursor_key="test-typed-errors-cursor-key-32-bytes",
         )
 
         # Also verify direct read_secret_file & ServerConfig.get_env registration

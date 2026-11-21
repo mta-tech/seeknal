@@ -111,7 +111,7 @@ def test_static_duckdb_end_to_end_and_readyz(
     handle = build_server(
         config,
         connect_factories={"duck": lambda: con},
-        cursor_key="test-app-cursor-key",
+        cursor_key="test-app-cursor-key-32-bytes-valid",
     )
     assert isinstance(handle, ServerHandle)
     assert handle.refresher is None
@@ -223,7 +223,7 @@ def test_discovery_mode_readyz_and_error_handling(ec_key_pair, jwks_path):
     handle = build_server(
         config,
         discover_fn=fake_discover,
-        cursor_key="test-app-cursor-key",
+        cursor_key="test-app-cursor-key-32-bytes-valid",
     )
     assert handle.refresher is not None
     assert handle.refresher.last_success_at is None
@@ -250,7 +250,7 @@ def test_discovery_mode_readyz_and_error_handling(ec_key_pair, jwks_path):
     handle_fail = build_server(
         config,
         discover_fn=fake_discover,
-        cursor_key="test-app-cursor-key",
+        cursor_key="test-app-cursor-key-32-bytes-valid",
     )
     handle_fail.refresher.refresh_once()
     assert handle_fail.refresher.last_success_at is None
@@ -329,7 +329,7 @@ cubes: {}
     env = {
         "SR_PW1": "p1",
         "SR_PW2": "p2",
-        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key-32-bytes-valid",
     }
     handle = build_server(config, env=env, connect_factories=factories)
 
@@ -389,7 +389,7 @@ cubes:
     }
     env = {
         "CUBE_SQL_SECRET": "cube-super-secret-key",
-        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key-32-bytes-valid",
     }
     config_jwt = ServerConfig.from_dict(cfg_jwt)
     handle_jwt = build_server(
@@ -488,7 +488,7 @@ def test_build_server_discovery_with_secrets_env_file(
             warnings=(),
             discovered_at=datetime.datetime.now(datetime.timezone.utc),
         ),
-        cursor_key="test-app-cursor-key",
+        cursor_key="test-app-cursor-key-32-bytes-valid",
     )
     assert handle.refresher is not None
     assert handle.refresher.refresh_once() is True
@@ -576,7 +576,7 @@ def test_build_server_loads_static_artifacts_once(
     handle = build_server(
         cfg,
         connect_factories={"duck": lambda: duckdb.connect()},
-        cursor_key="test-app-cursor-key",
+        cursor_key="test-app-cursor-key-32-bytes-valid",
     )
     assert isinstance(handle, ServerHandle)
     assert open_counts[pf] == 1
@@ -641,7 +641,7 @@ def test_build_server_propagates_compilation_cache_max_entries(
     h_default = build_server(
         cfg_default,
         connect_factories={"duck": lambda: duckdb.connect()},
-        cursor_key="test-app-cursor-key",
+        cursor_key="test-app-cursor-key-32-bytes-valid",
     )
     assert h_default.pipeline.compilation_cache_info() == {
         "hits": 0,
@@ -664,7 +664,7 @@ def test_build_server_propagates_compilation_cache_max_entries(
         h_cap = build_server(
             cfg_cap,
             connect_factories={"duck": lambda: duckdb.connect()},
-            cursor_key="test-app-cursor-key",
+            cursor_key="test-app-cursor-key-32-bytes-valid",
         )
         assert h_cap.pipeline.compilation_cache_info()["max_entries"] == cap
 
@@ -683,7 +683,7 @@ def test_postgres_accounts_share_one_pool_per_credential_and_harden_session(
 
     env = {
         "CBN_PG_REPORT_DSN_BI": f"postgresql://seeknal_bi:{planted_bi_pw}@127.0.0.1:5432/cbn",
-        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key-32-bytes-valid",
     }
 
     cfg = ServerConfig.from_dict(
@@ -964,7 +964,7 @@ def test_discovery_wires_postgres_connects_for_configured_account(
         "PG_INT_DSN": "postgresql://u1:pw1@localhost/db",
         "PG_BI_DSN": "postgresql://u2:pw2@localhost/db",
         "PG_DEF_DSN": "postgresql://u3:pw3@localhost/db",
-        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key-32-bytes-valid",
     }
     cfg = ServerConfig.from_dict(cfg_dict, env=env)
     handle = build_server(
@@ -1009,7 +1009,7 @@ def test_lakebase_cold_start_connector_wiring_and_engine_starting_propagation(
     env = {
         "CBN_LB_OPS_DSN": "postgresql://lb_role:lb_pw_1122@127.0.0.1:40001/ops",
         "LB_OPS_PROJECT_TOKEN": "lb_proj_token_secret_3344",
-        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key-32-bytes-valid",
     }
     cfg = ServerConfig.from_dict(
         {
@@ -1144,7 +1144,7 @@ def test_runtime_discovery_passes_connections_storage_class_through_build_server
     env = {
         "PG_S3_DSN": "postgresql://svc:pw@localhost:5432/cbn",
         "SR_PW": "sr-secret-pw",
-        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key-32-bytes-valid",
     }
 
     # 1. Lakekeeper-flagged PII table on kind: postgres declared storage_class: object_storage
@@ -1341,7 +1341,7 @@ def test_b_m2_multi_account_lakebase_shares_single_connector_by_endpoint_id_and_
         "LB_INT_DSN": "postgresql://int_role:pw1@127.0.0.1:40100/ops",
         "LB_BI_DSN": "postgresql://bi_role:pw2@127.0.0.1:40100/ops",
         "LB_API_TOK": "cp-token-shared-ep",
-        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key-32-bytes-valid",
     }
     cfg = ServerConfig.from_dict(
         {
@@ -1639,6 +1639,120 @@ def test_b_fix_build_server_refuses_startup_when_cursor_key_missing(
     assert planted_other_secret not in str(exc_val.value)
 
 
+def test_f3_cursor_key_weak_refused_at_startup_and_create_app(
+    jwks_path, static_catalog_files, ec_key_pair, monkeypatch
+):
+    from seeknal.serving.http import create_app
+    from seeknal.serving.placement import Placement
+    from seeknal.serving.service import ServingPipeline
+    from seeknal.serving.startup_validation import (
+        CursorKeyWeakError,
+        validate_startup,
+    )
+
+    pf, sf = static_catalog_files
+    monkeypatch.delenv("SEEKNAL_CURSOR_KEY", raising=False)
+    monkeypatch.delenv("MY_CUSTOM_CURSOR_KEY", raising=False)
+
+    planted_key_31 = "weak-secret-key-prefix-31bytes!"
+    assert len(planted_key_31.encode("utf-8")) == 31
+    prefix_8 = planted_key_31[:8]
+
+    valid_key_32 = "valid-secret-key-length-32bytes!"
+    assert len(valid_key_32.encode("utf-8")) == 32
+
+    cfg_default = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "placement": {"static": {"placement_file": pf, "schemas_file": sf}},
+            "connections": {"duck": {"kind": "duckdb", "path": ":memory:"}},
+        }
+    )
+
+    # 1. 31-byte key passed directly to build_server -> refused with cursor_key_weak
+    with pytest.raises(ServerConfigError) as exc_direct:
+        build_server(cfg_default, cursor_key=planted_key_31)
+    assert isinstance(exc_direct.value, CursorKeyWeakError)
+    assert exc_direct.value.code == "cursor_key_weak"
+    assert "cursor_key_weak" in str(exc_direct.value)
+    assert "SEEKNAL_CURSOR_KEY" in str(exc_direct.value)
+    assert "32" in str(exc_direct.value)
+    assert planted_key_31 not in str(exc_direct.value)
+    assert prefix_8 not in str(exc_direct.value)
+
+    # 2. 31-byte key in default env var (SEEKNAL_CURSOR_KEY) -> refused at startup and in validate_startup
+    with pytest.raises(ServerConfigError) as exc_env:
+        build_server(cfg_default, env={"SEEKNAL_CURSOR_KEY": planted_key_31})
+    assert isinstance(exc_env.value, CursorKeyWeakError)
+    assert exc_env.value.code == "cursor_key_weak"
+    assert "SEEKNAL_CURSOR_KEY" in str(exc_env.value)
+    assert "32" in str(exc_env.value)
+    assert planted_key_31 not in str(exc_env.value)
+    assert prefix_8 not in str(exc_env.value)
+
+    with pytest.raises(ServerConfigError) as exc_val:
+        validate_startup(cfg_default, env={"SEEKNAL_CURSOR_KEY": planted_key_31}, check_cursor_key=True)
+    assert isinstance(exc_val.value, CursorKeyWeakError)
+    assert exc_val.value.code == "cursor_key_weak"
+    assert "SEEKNAL_CURSOR_KEY" in str(exc_val.value)
+    assert "32" in str(exc_val.value)
+    assert planted_key_31 not in str(exc_val.value)
+    assert prefix_8 not in str(exc_val.value)
+
+    # 3. 31-byte key with custom cursor_key_env -> message names custom env var
+    cfg_custom = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "cursor_key_env": "MY_CUSTOM_CURSOR_KEY",
+            "placement": {"static": {"placement_file": pf, "schemas_file": sf}},
+            "connections": {"duck": {"kind": "duckdb", "path": ":memory:"}},
+        }
+    )
+    with pytest.raises(ServerConfigError) as exc_cust:
+        build_server(cfg_custom, env={"MY_CUSTOM_CURSOR_KEY": planted_key_31})
+    assert isinstance(exc_cust.value, CursorKeyWeakError)
+    assert exc_cust.value.code == "cursor_key_weak"
+    assert "MY_CUSTOM_CURSOR_KEY" in str(exc_cust.value)
+    assert "32" in str(exc_cust.value)
+    assert planted_key_31 not in str(exc_cust.value)
+    assert prefix_8 not in str(exc_cust.value)
+
+    # 4. create_app called directly with 31-byte key also refuses
+    priv, pub, _ = ec_key_pair
+    pipeline = ServingPipeline(
+        placement=Placement.from_dict({"engines": {"duck": {"kind": "duckdb"}}, "tables": {}, "cubes": {}}),
+        schemas={},
+        public_keys={"k1": pub},
+    )
+    dummy_adapters = {"duck": MagicMock()}
+
+    with pytest.raises(ServerConfigError) as exc_app_str:
+        create_app(pipeline, dummy_adapters, cursor_key=planted_key_31)
+    assert exc_app_str.value.code == "cursor_key_weak"
+    assert "SEEKNAL_CURSOR_KEY" in str(exc_app_str.value)
+    assert "32" in str(exc_app_str.value)
+    assert planted_key_31 not in str(exc_app_str.value)
+    assert prefix_8 not in str(exc_app_str.value)
+
+    with pytest.raises(ServerConfigError) as exc_app_bytes:
+        create_app(pipeline, dummy_adapters, cursor_key=planted_key_31.encode("utf-8"))
+    assert exc_app_bytes.value.code == "cursor_key_weak"
+    assert "SEEKNAL_CURSOR_KEY" in str(exc_app_bytes.value)
+    assert "32" in str(exc_app_bytes.value)
+    assert planted_key_31 not in str(exc_app_bytes.value)
+    assert prefix_8 not in str(exc_app_bytes.value)
+
+    # 5. 32-byte key is accepted at startup and in create_app
+    handle_ok = build_server(cfg_default, cursor_key=valid_key_32)
+    assert isinstance(handle_ok, ServerHandle)
+
+    handle_env_ok = build_server(cfg_default, env={"SEEKNAL_CURSOR_KEY": valid_key_32})
+    assert isinstance(handle_env_ok, ServerHandle)
+
+    app_ok = create_app(pipeline, dummy_adapters, cursor_key=valid_key_32)
+    assert app_ok is not None
+
+
 def test_b_l3_build_server_isolates_bad_account_password_on_shared_lakebase_endpoint(
     jwks_path, static_catalog_files, monkeypatch
 ):
@@ -1689,7 +1803,7 @@ def test_b_l3_build_server_isolates_bad_account_password_on_shared_lakebase_endp
         "LB_BI_DSN": "postgresql://bi:badpw@127.0.0.1:40100/ops",
         "LB_INT_DSN": "postgresql://interactive:goodpw@127.0.0.1:40100/ops",
         "LB_API_TOK": "cp-token-bl3",
-        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key",
+        "SEEKNAL_CURSOR_KEY": "test-app-cursor-key-32-bytes-valid",
     }
     cfg = ServerConfig.from_dict(
         {

@@ -1123,7 +1123,7 @@ def test_build_server_http_end_to_end_query_explain_cancel_and_rejected(tmp_path
     handle = build_server(
         cfg_dict,
         connect_factories={"duck": lambda: con.cursor()},
-        cursor_key="test-audit-cursor-key",
+        cursor_key="test-audit-cursor-key-32-bytes-ok",
     )
     assert isinstance(handle.audit_sink, FileAuditSink)
 
@@ -1389,7 +1389,7 @@ def test_build_server_and_cli_refuse_startup_on_unwritable_audit(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ):
-    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "test-audit-cursor-key")
+    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "test-audit-cursor-key-32-bytes-ok")
     _, jwks_file, placement_file, schemas_file = _write_static_server_artifacts(tmp_path)
     unwritable_audit = tmp_path / "does_not_exist_dir" / "audit.jsonl"
 
@@ -3376,7 +3376,7 @@ def test_http_run3_audit_fields_across_query_explain_select_and_guardrail_reject
                 pipeline,
                 {"lb_ops": routed_adapter},
                 audit_sink=mgr,
-                cursor_key="run3-audit-cursor-secret",
+                cursor_key="run3-audit-cursor-secret-32-bytes-ok",
             )
         )
 
@@ -3495,7 +3495,7 @@ def test_http_run3_audit_fields_across_query_explain_select_and_guardrail_reject
             pipeline,
             {"lb_ops": routed_adapter},
             audit_sink=callable_records.append,
-            cursor_key="run3-audit-cursor-secret",
+            cursor_key="run3-audit-cursor-secret-32-bytes-ok",
         )
     )
     r_cb_q = client_cb.post(

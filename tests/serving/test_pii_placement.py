@@ -1263,7 +1263,7 @@ def test_e_m2_discovery_initial_refresh_failure_exits_2_before_serving(
     monkeypatch.setenv("EM2_LK_SECRET", lk_secret)
     monkeypatch.setenv("EM2_S3_KEY", "AKIAEXAMPLE")
     monkeypatch.setenv("EM2_S3_SECRET", s3_secret)
-    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "em2-cursor-signing-key")
+    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "em2-cursor-signing-key-32-bytes-ok")
 
     ext_dir = tmp_path / "duck_exts"
     ext_dir.mkdir()

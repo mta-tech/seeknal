@@ -48,7 +48,7 @@ def base_env() -> dict[str, str]:
         "TEST_LK_SECRET": "CANARY_LK_OAUTH_SECRET_445566",
         "TEST_S3_KEY": "AKIAIOSFODNN7EXAMPLE",
         "TEST_S3_SECRET": "CANARY_S3_SECRET_KEY_778899",
-        "SEEKNAL_CURSOR_KEY": "test-startup-cursor-key",
+        "SEEKNAL_CURSOR_KEY": "test-startup-cursor-key-32-bytes-ok",
     }
 
 
@@ -1695,7 +1695,7 @@ def test_e_n2_run_initial_discovery_refresh_or_raise_without_cfg_scrubs_harmless
         env=env,
         discover_fn=_failing_discover,
         run_initial_refresh=False,
-        cursor_key="test-startup-cursor-key",
+        cursor_key="test-startup-cursor-key-32-bytes-ok",
     )
     assert handle.refresher is not None
 

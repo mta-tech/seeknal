@@ -486,7 +486,7 @@ def test_select_real_pipeline_guardrails_prefix_like_and_engine_starting(
         public_keys={"k1": pub},
         default_catalog="cbn",
     )
-    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "env-cursor-secret")
+    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "env-cursor-secret-32-bytes-ok-key")
     app = create_app(
         pipeline,
         {

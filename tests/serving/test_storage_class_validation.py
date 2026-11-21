@@ -426,7 +426,7 @@ def test_cbn_static_placement_pg_report_passes_lb_ops_refuses_and_lake_fails_twi
     assert exc_lb.value.problems == (expected_lb_msg,)
 
     with pytest.raises(ServerConfigError, match="storage_class object_storage"):
-        build_server(cfg_lb, env={}, cursor_key="test-storage-class-cursor-key")
+        build_server(cfg_lb, env={}, cursor_key="test-storage-class-cursor-key-32-bytes")
 
     capsys.readouterr()
     assert serving_cli_main(["validate", "--config", str(cfg_lb)]) == 2
@@ -739,7 +739,7 @@ def test_b_m3_runtime_refresh_enforces_postgres_object_storage_starrocks_local_a
     env = {
         "CBN_PG_S3_DSN": "postgresql://svc:pw@127.0.0.1:5432/cbn",
         "CBN_SR_LOCAL_PW": "sr-pw",
-        "SEEKNAL_CURSOR_KEY": "test-storage-class-cursor-key",
+        "SEEKNAL_CURSOR_KEY": "test-storage-class-cursor-key-32-bytes",
     }
     handle_pg_obj = build_server(
         {

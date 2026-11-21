@@ -121,53 +121,70 @@ class CursorKeyMissingError(StartupValidationError):
         self.code = "cursor_key_missing"
 
 
+class CursorKeyWeakError(StartupValidationError):
+    """Raised when the pagination cursor signing key is shorter than 32 bytes."""
+
+    code: str = "cursor_key_weak"
+
+    def __init__(self, problems: Sequence[str] | str) -> None:
+        super().__init__(problems)
+        self.code = "cursor_key_weak"
+
+
 def resolve_startup_cursor_key(
     cfg: ServerConfig,
     *,
     cursor_key: bytes | str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> bytes | str:
-    """Resolve the pagination cursor signing key or raise CursorKeyMissingError."""
+    """Resolve the pagination cursor signing key or raise CursorKeyMissingError / CursorKeyWeakError."""
+    env_var = cfg.cursor_key_env or DEFAULT_CURSOR_KEY_ENV
+    resolved: bytes | str | None = None
     if cursor_key is not None and not isinstance(cursor_key, bool):
         if isinstance(cursor_key, (bytes, bytearray)):
-            if len(cursor_key) > 0:
-                key_bytes = bytes(cursor_key)
-                try:
-                    register_config_secrets(key_bytes.decode("utf-8"))
-                except UnicodeDecodeError:
-                    pass
-                return key_bytes
+            resolved = bytes(cursor_key)
         elif isinstance(cursor_key, str):
-            if cursor_key:
-                register_config_secrets(cursor_key)
-                return cursor_key
+            resolved = cursor_key
         else:
             raise ServerConfigError("'cursor_key' must be str, bytes, or None")
     elif isinstance(cursor_key, bool):
         raise ServerConfigError("'cursor_key' must be str, bytes, or None")
 
-    env_var = cfg.cursor_key_env or DEFAULT_CURSOR_KEY_ENV
-    sec_val = cfg.secrets_env.get(env_var)
-    if isinstance(sec_val, str) and sec_val:
-        register_config_secrets(sec_val)
-        return sec_val
+    if resolved is None:
+        sec_val = cfg.secrets_env.get(env_var)
+        if isinstance(sec_val, str) and sec_val:
+            resolved = sec_val
+        elif env is not None and isinstance(env.get(env_var), str) and env.get(env_var):
+            resolved = env.get(env_var)
+        else:
+            os_val = os.environ.get(env_var)
+            if isinstance(os_val, str) and os_val:
+                resolved = os_val
 
-    if env is not None:
-        env_val = env.get(env_var)
-        if isinstance(env_val, str) and env_val:
-            register_config_secrets(env_val)
-            return env_val
+    if resolved is None:
+        safe_var = _safe_ident(env_var)
+        raise CursorKeyMissingError(
+            f"cursor_key_missing: pagination cursor signing key is not configured; "
+            f"set environment variable '{safe_var}'"
+        )
 
-    os_val = os.environ.get(env_var)
-    if isinstance(os_val, str) and os_val:
-        register_config_secrets(os_val)
-        return os_val
+    raw_bytes = resolved.encode("utf-8") if isinstance(resolved, str) else bytes(resolved)
+    if len(raw_bytes) < 32:
+        safe_var = _safe_ident(env_var)
+        raise CursorKeyWeakError(
+            f"cursor_key_weak: pagination cursor signing key in environment variable '{safe_var}' "
+            f"must be at least 32 bytes (minimum 32 bytes)"
+        )
 
-    safe_var = _safe_ident(env_var)
-    raise CursorKeyMissingError(
-        f"cursor_key_missing: pagination cursor signing key is not configured; "
-        f"set environment variable '{safe_var}'"
-    )
+    if isinstance(resolved, str):
+        register_config_secrets(resolved)
+    else:
+        try:
+            register_config_secrets(resolved.decode("utf-8"))
+        except UnicodeDecodeError:
+            pass
+
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -2346,11 +2363,15 @@ def validate_startup(
             problems.append(_scrub(str(exc), secret_values))
 
     cursor_key_missing_error = False
+    cursor_key_weak_error = False
     if check_cursor_key or cfg.cursor_key_env is not None:
         try:
             resolve_startup_cursor_key(cfg, cursor_key=cursor_key, env=env)
         except CursorKeyMissingError as exc:
             cursor_key_missing_error = True
+            problems.extend(_scrub(p, secret_values) for p in exc.problems)
+        except CursorKeyWeakError as exc:
+            cursor_key_weak_error = True
             problems.extend(_scrub(p, secret_values) for p in exc.problems)
         except ServerConfigError as exc:
             problems.append(_scrub(str(exc), secret_values))
@@ -2411,11 +2432,12 @@ def validate_startup(
             )
 
         if problems:
-            err_cls = (
-                CursorKeyMissingError
-                if cursor_key_missing_error
-                else StartupValidationError
-            )
+            if cursor_key_missing_error:
+                err_cls = CursorKeyMissingError
+            elif cursor_key_weak_error:
+                err_cls = CursorKeyWeakError
+            else:
+                err_cls = StartupValidationError
             raise err_cls([_scrub(p, secret_values) for p in problems])
 
         clean_warnings = tuple(
@@ -2456,11 +2478,12 @@ def validate_startup(
     )
 
     if problems:
-        err_cls_disc = (
-            CursorKeyMissingError
-            if cursor_key_missing_error
-            else StartupValidationError
-        )
+        if cursor_key_missing_error:
+            err_cls_disc = CursorKeyMissingError
+        elif cursor_key_weak_error:
+            err_cls_disc = CursorKeyWeakError
+        else:
+            err_cls_disc = StartupValidationError
         raise err_cls_disc([_scrub(p, secret_values) for p in problems])
 
     clean_disc_warnings = tuple(

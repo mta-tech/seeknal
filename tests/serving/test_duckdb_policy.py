@@ -184,7 +184,7 @@ def test_build_server_yields_hardened_duckdb_connection(temp_duckdb_file, tmp_pa
             },
         }
 
-        server = build_server(config, cursor_key="test-duckdb-policy-cursor-key")
+        server = build_server(config, cursor_key="test-duckdb-policy-cursor-key-32b")
         adapter = server.adapters["duck"]
         # Adapter._connect should return a hardened cursor from DuckDBHolder
         conn = adapter._connect()
