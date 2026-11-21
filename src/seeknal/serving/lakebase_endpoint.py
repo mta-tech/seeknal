@@ -1474,8 +1474,19 @@ class ColdStartConnector:
         timeout_seconds: float = 2.0,
         min_interval_seconds: float = 5.0,
         now: float | None = None,
+        query: str | None = None,
+        probe_query: str | None = None,
     ) -> str:
         """Perform at most one bounded no-wake plain connect per interval when unavailable."""
+        effective_query = (
+            probe_query
+            if probe_query is not None
+            else (
+                query
+                if query is not None
+                else getattr(self, "_probe_query", "SELECT 1")
+            )
+        )
         with self._lock:
             if self._state == "ok":
                 return "ok"
@@ -1539,8 +1550,18 @@ class ColdStartConnector:
                             and hasattr(cur, "execute")
                             and callable(cur.execute)
                         ):
-                            cur.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
-                            cur.execute("SELECT 1")
+                            cur.execute("BEGIN")
+                            try:
+                                cur.execute(
+                                    "SELECT set_config('statement_timeout', %s, true)",
+                                    (str(timeout_ms),),
+                                )
+                                cur.execute(effective_query)
+                            finally:
+                                try:
+                                    cur.execute("ROLLBACK")
+                                except Exception:
+                                    pass
                     probe_succeeded = True
                     break
                 except Exception as exc:

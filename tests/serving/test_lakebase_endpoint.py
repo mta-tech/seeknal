@@ -1471,10 +1471,15 @@ class TestColdStartConnector:
         assert recorded_connect_timeouts[0] <= 2.5
 
         # Check executed statements on fake connection:
-        # SET LOCAL statement_timeout = 2500 issued before SELECT 1
+        # BEGIN, SELECT set_config('statement_timeout', %s, true), SELECT 1, ROLLBACK
         stmts = [item[0] for item in recording_conn.executed]
-        assert "SET LOCAL statement_timeout = 2500" in stmts
-        assert stmts == ["SET LOCAL statement_timeout = 2500", "SELECT 1"]
+        assert stmts == [
+            "BEGIN",
+            "SELECT set_config('statement_timeout', %s, true)",
+            "SELECT 1",
+            "ROLLBACK",
+        ]
+        assert recording_conn.executed[1][1] == ("2500",)
 
         # Also test via ReadinessProbe /readyz flow
         from seeknal.serving.adapters import DBAPIAdapter
@@ -1516,8 +1521,13 @@ class TestColdStartConnector:
             assert resp.json()["ready"] is True
             assert post_calls == 0
             stmts2 = [item[0] for item in recording_conn2.executed]
-            assert "SET LOCAL statement_timeout = 1500" in stmts2
-            assert stmts2 == ["SET LOCAL statement_timeout = 1500", "SELECT 1"]
+            assert stmts2 == [
+                "BEGIN",
+                "SELECT set_config('statement_timeout', %s, true)",
+                "SELECT 1",
+                "ROLLBACK",
+            ]
+            assert recording_conn2.executed[1][1] == ("1500",)
 
     @pytest.mark.parametrize("run_idx", range(200))
     def test_b_m5_plain_connect_during_cooldown_recovers_state_without_new_wake(

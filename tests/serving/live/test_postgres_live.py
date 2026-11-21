@@ -1084,3 +1084,115 @@ def test_live_unforced_rls_table_ownership_emits_warning_until_forced(
         finally:
             admin_conn.close()
 
+
+def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
+    seeded_cbn_cluster: dict[str, Any],
+    tmp_path: Path,
+):
+    """L5: Prove probe timeout applies via set_config inside explicit transaction on the real connect path.
+
+    With probe timeout set to 50 ms (0.050 s), a probe query of 'SELECT pg_sleep(1)' is cancelled
+    by PostgreSQL with SQLSTATE 57014, and the probe reports not-ready without any wake call.
+    """
+    bi_dsn = seeded_cbn_cluster["bi_dsn"]
+    jwks_file = tmp_path / "live_probe.jwks.json"
+    priv = ec.generate_private_key(ec.SECP256R1())
+    pub = priv.public_key()
+    pn = pub.public_numbers()
+    jwk = {
+        "kty": "EC",
+        "crv": "P-256",
+        "x": base64.urlsafe_b64encode(pn.x.to_bytes(32, "big")).rstrip(b"=").decode("ascii"),
+        "y": base64.urlsafe_b64encode(pn.y.to_bytes(32, "big")).rstrip(b"=").decode("ascii"),
+        "kid": "k-live-probe",
+    }
+    jwks_file.write_text(json.dumps({"keys": [jwk]}), encoding="utf-8")
+
+    pf = tmp_path / "placement_probe.yaml"
+    pf.write_text("""
+engines:
+  lb_probe: {kind: lakebase, dialect: postgres}
+tables: {}
+cubes: {}
+""")
+    sf = tmp_path / "schemas_probe.json"
+    sf.write_text("{}")
+
+    wake_calls: list[httpx.Request] = []
+
+    def fake_cp_handler(request: httpx.Request) -> httpx.Response:
+        wake_calls.append(request)
+        return httpx.Response(200, json={"state": "running"})
+
+    cfg_dict = {
+        "grant_keys": {"jwks_file": str(jwks_file)},
+        "cursor_key_env": "PROBE_CURSOR_KEY",
+        "ops": {
+            "enabled": True,
+            "public_readyz": True,
+            "readyz_timeout_seconds": 0.05,
+            "readyz_cache_seconds": 0.0,
+        },
+        "placement": {
+            "static": {
+                "placement_file": str(pf),
+                "schemas_file": str(sf),
+            }
+        },
+        "connections": {
+            "lb_probe": {
+                "kind": "lakebase",
+                "dsn_env": "PROBE_LB_DSN",
+                "lakebase": {
+                    "project_id": "prj_0123456789abcdefghij",
+                    "branch_id": "br_0123456789abcdefghij",
+                    "endpoint_id": "ep_0123456789abcdefghij",
+                    "endpoint_type": "read_write",
+                    "cold_start": {
+                        "wake": "api",
+                        "api_url": "https://lakebase-cp.internal.example",
+                        "api_token_env": "PROBE_LB_TOKEN",
+                        "connect_timeout_seconds": 2.0,
+                        "max_query_wait_seconds": 5.0,
+                        "max_wake_seconds": 10.0,
+                    },
+                },
+            },
+        },
+    }
+    env = {
+        "PROBE_LB_DSN": bi_dsn,
+        "PROBE_LB_TOKEN": "token-probe-secret",
+        "PROBE_CURSOR_KEY": "a" * 32,
+    }
+
+    handle = build_server(cfg_dict, env=env)
+    adapter = handle.adapters["lb_probe"]
+    connector = adapter.cold_start_connector
+    assert connector is not None
+    connector._http_client = httpx.Client(transport=httpx.MockTransport(fake_cp_handler))
+
+    # Mark connector as unavailable to trigger probe_no_wake
+    with connector._lock:
+        connector._state = "unavailable"
+
+    # Execute probe_no_wake with 50 ms timeout and probe query of 'SELECT pg_sleep(1)'
+    state = connector.probe_no_wake(
+        timeout_seconds=0.05,
+        probe_query="SELECT pg_sleep(1)",
+    )
+    assert state == "unavailable"
+    assert len(wake_calls) == 0
+
+    # Also test via ReadinessProbe /readyz
+    probe = handle.readiness
+    probe._probe_query = "SELECT pg_sleep(1)"
+    with connector._lock:
+        connector._state = "unavailable"
+
+    status_code, payload = probe.check()
+    assert status_code == 503
+    assert payload["ready"] is False
+    assert len(wake_calls) == 0
+
+
