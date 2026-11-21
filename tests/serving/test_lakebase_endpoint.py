@@ -1780,6 +1780,32 @@ def test_l2_plain_connect_failure_does_not_overwrite_newer_wake_state():
     assert connector.state == "starting"
 
 
+def test_l3_probe_connect_timeout_never_above_probe_timeout():
+    """L3: Connect timeout never above the probe timeout (sub-second probe timeout enforced via hard deadline)."""
+    cfg = _make_wake_cfg(max_query_wait_seconds=5.0, max_wake_seconds=10.0)
+
+    def slow_connect(**kw: Any) -> Any:
+        time.sleep(1.0)
+        return "connected"
+
+    connector = ColdStartConnector(
+        slow_connect,
+        cfg,
+        engine_name="lb_l3",
+        env={"LB_OPS_PROJECT_TOKEN": "tok-l3"},
+    )
+    with connector._lock:
+        connector._state = "unavailable"
+
+    t0 = time.monotonic()
+    state = connector.probe_no_wake(timeout_seconds=0.2)
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 0.5
+    assert state == "unavailable"
+
+
+
 
 
 

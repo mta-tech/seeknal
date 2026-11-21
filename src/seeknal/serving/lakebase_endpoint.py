@@ -1521,26 +1521,39 @@ class ColdStartConnector:
                 conn: Any = None
                 cur: Any = None
                 try:
-                    accepts_kw = True
-                    try:
-                        sig = inspect.signature(target_fn)
-                        accepts_kw = "connect_timeout" in sig.parameters or any(
-                            p.kind == inspect.Parameter.VAR_KEYWORD
-                            for p in sig.parameters.values()
-                        )
-                    except (ValueError, TypeError):
+                    def _attempt_target_connect() -> Any:
                         accepts_kw = True
-
-                    if accepts_kw:
                         try:
-                            conn = target_fn(connect_timeout=to_param)
-                        except TypeError:
+                            sig = inspect.signature(target_fn)
+                            accepts_kw = "connect_timeout" in sig.parameters or any(
+                                p.kind == inspect.Parameter.VAR_KEYWORD
+                                for p in sig.parameters.values()
+                            )
+                        except (ValueError, TypeError):
+                            accepts_kw = True
+
+                        if accepts_kw:
                             try:
-                                conn = target_fn(connect_timeout=max(1, int(eff_timeout)))
+                                return target_fn(connect_timeout=to_param)
                             except TypeError:
-                                conn = target_fn()
+                                try:
+                                    return target_fn(connect_timeout=max(1, int(eff_timeout)))
+                                except TypeError:
+                                    return target_fn()
+                        return target_fn()
+
+                    if eff_timeout < 1.0:
+                        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                        try:
+                            fut = pool.submit(_attempt_target_connect)
+                            conn = fut.result(timeout=eff_timeout)
+                        except concurrent.futures.TimeoutError:
+                            conn = None
+                            continue
+                        finally:
+                            pool.shutdown(wait=False)
                     else:
-                        conn = target_fn()
+                        conn = _attempt_target_connect()
 
                     if conn is None:
                         continue
