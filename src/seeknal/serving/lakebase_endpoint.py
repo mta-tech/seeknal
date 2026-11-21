@@ -1115,8 +1115,10 @@ class ColdStartConnector:
             if not callable(executor) and not callable(getattr(executor, "submit", None)):
                 raise TypeError("executor must be callable or have a submit method")
         self._executor = executor
+        self._probe_max_workers = 2
+        self._probe_semaphore = threading.BoundedSemaphore(self._probe_max_workers)
         self._probe_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=2,
+            max_workers=self._probe_max_workers,
             thread_name_prefix=f"lakebase-probe-{self._engine_name}",
         )
         self._last_wake_worker: threading.Thread | None = None
@@ -1531,6 +1533,8 @@ class ColdStartConnector:
                 remaining = overall_deadline - time.monotonic()
                 if remaining <= 0.0:
                     break
+                if not self._probe_semaphore.acquire(blocking=False):
+                    return "unavailable"
                 conn: Any = None
                 cur: Any = None
                 try:
@@ -1564,12 +1568,18 @@ class ColdStartConnector:
                                 _safe_close_conn(res)
                         except Exception:
                             pass
+                        finally:
+                            try:
+                                self._probe_semaphore.release()
+                            except ValueError:
+                                pass
 
                     fut = self._probe_executor.submit(_attempt_target_connect)
                     fut.add_done_callback(_on_done)
                     try:
                         conn = fut.result(timeout=max(0.001, remaining))
                     except concurrent.futures.TimeoutError:
+                        fut.cancel()
                         timed_out_tracker["timed_out"] = True
                         conn = None
                         continue

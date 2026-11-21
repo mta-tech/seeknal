@@ -1933,6 +1933,50 @@ def test_l4_bad_timeout_inf_and_nan_do_not_disable_probe_forever(caplog):
     assert state_after_nan == "ok"
 
 
+def test_p1_probe_queue_never_grows_beyond_n():
+    """P1: With a blocked connect and N = max_workers, run 50 probes; queue never exceeds N, and after release total connects <= N."""
+    block_event = threading.Event()
+    connect_started = 0
+    lock = threading.Lock()
+
+    def blocking_connect(**kw: Any) -> Any:
+        nonlocal connect_started
+        with lock:
+            connect_started += 1
+        block_event.wait()
+        return FakeDBConnection()
+
+    cfg = _make_wake_cfg(max_query_wait_seconds=5.0, max_wake_seconds=10.0)
+    connector = ColdStartConnector(
+        blocking_connect,
+        cfg,
+        engine_name="lb_p1",
+        env={"LB_OPS_PROJECT_TOKEN": "tok-p1"},
+    )
+    with connector._lock:
+        connector._state = "unavailable"
+
+    n_workers = connector._probe_max_workers
+
+    # Run 50 probes
+    for _ in range(50):
+        st = connector.probe_no_wake(timeout_seconds=0.02, min_interval_seconds=0.0)
+        assert st == "unavailable"
+
+    # Number of started connect calls never exceeds N
+    with lock:
+        assert connect_started <= n_workers
+
+    # Release the block
+    block_event.set()
+    time.sleep(0.1)
+
+    # After release, verify no further connects were queued or ran
+    with lock:
+        assert connect_started <= n_workers
+
+
+
 
 
 
