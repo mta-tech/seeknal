@@ -1185,9 +1185,11 @@ def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
         assert connector.state == "ok"
         assert connector.last_probe_pgcode is None
         assert len(wake_calls) == 0
+        assert len(tracked_conns) == 2
+        assert tracked_conns[1].closed != 0
 
         # 2. With the probe SQL set to SELECT pg_sleep(5) through the private _PROBE_SQL hook
-        #    (monkeypatch) and a 500 ms probe timeout, the probe connect has its own 500 ms budget,
+        #    (monkeypatch) and a 500 ms probe timeout providing ample connect headroom,
         #    the slow probe query is cancelled by PostgreSQL with last_probe_pgcode == "57014",
         #    /readyz returns 503 through ReadinessProbe, and no wake call happened.
         monkeypatch.setattr(lb_mod, "_PROBE_SQL", "SELECT pg_sleep(5)")
@@ -1214,6 +1216,8 @@ def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
         assert connector.state == "unavailable"
         assert connector.last_probe_pgcode == "57014"
         assert len(wake_calls) == 0
+        assert len(tracked_conns) == 3
+        assert tracked_conns[2].closed != 0
 
         # Direct probe_no_wake also returns "unavailable" with 57014
         with connector._lock:
@@ -1225,6 +1229,8 @@ def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
         assert connector.state == "unavailable"
         assert connector.last_probe_pgcode == "57014"
         assert len(wake_calls) == 0
+        assert len(tracked_conns) == 4
+        assert tracked_conns[3].closed != 0
 
         # 3. The same as 2 on an autocommit connection: the base_connect sets conn.autocommit = True
         #    before returning. This proves set_config inside BEGIN/ROLLBACK applies under autocommit.
@@ -1241,8 +1247,11 @@ def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
         assert connector.state == "unavailable"
         assert connector.last_probe_pgcode == "57014"
         assert len(wake_calls) == 0
+        assert len(tracked_conns) == 5
+        assert tracked_conns[4].closed != 0
 
         # 4. After each probe, the connection used by the probe is closed. Track it in the connect wrapper.
+        assert len(tracked_conns) == 5
         assert all(c.closed != 0 for c in tracked_conns)
     finally:
         ops_client.close()
