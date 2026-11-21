@@ -168,7 +168,19 @@ def resolve_startup_cursor_key(
             f"set environment variable '{safe_var}'"
         )
 
-    raw_bytes = resolved.encode("utf-8") if isinstance(resolved, str) else bytes(resolved)
+    try:
+        raw_bytes = (
+            resolved.encode("utf-8")
+            if isinstance(resolved, str)
+            else bytes(resolved)
+        )
+    except UnicodeEncodeError:
+        safe_var = _safe_ident(env_var)
+        raise CursorKeyWeakError(
+            f"cursor_key_weak: pagination cursor signing key in environment variable '{safe_var}' "
+            f"must be valid UTF-8 and at least 32 bytes"
+        ) from None
+
     if len(raw_bytes) < 32:
         safe_var = _safe_ident(env_var)
         raise CursorKeyWeakError(

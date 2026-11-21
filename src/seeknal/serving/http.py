@@ -726,11 +726,18 @@ def create_app(
         if isinstance(cursor_key, bool) or not isinstance(cursor_key, (bytes, bytearray, str)):
             from seeknal.serving.server.config import ServerConfigError
             raise ServerConfigError("'cursor_key' must be str, bytes, or None")
-        raw_bytes = (
-            cursor_key.encode("utf-8")
-            if isinstance(cursor_key, str)
-            else bytes(cursor_key)
-        )
+        try:
+            raw_bytes = (
+                cursor_key.encode("utf-8")
+                if isinstance(cursor_key, str)
+                else bytes(cursor_key)
+            )
+        except UnicodeEncodeError:
+            from seeknal.serving.startup_validation import CursorKeyWeakError
+            raise CursorKeyWeakError(
+                f"cursor_key_weak: pagination cursor signing key in environment variable '{env_var}' "
+                f"must be valid UTF-8 and at least 32 bytes"
+            ) from None
         if len(raw_bytes) < 32:
             from seeknal.serving.startup_validation import CursorKeyWeakError
             raise CursorKeyWeakError(
@@ -747,7 +754,14 @@ def create_app(
     elif cursor_key_env:
         env_val = os.environ.get(cursor_key_env)
         if env_val is not None:
-            raw_bytes = env_val.encode("utf-8")
+            try:
+                raw_bytes = env_val.encode("utf-8")
+            except UnicodeEncodeError:
+                from seeknal.serving.startup_validation import CursorKeyWeakError
+                raise CursorKeyWeakError(
+                    f"cursor_key_weak: pagination cursor signing key in environment variable '{cursor_key_env}' "
+                    f"must be valid UTF-8 and at least 32 bytes"
+                ) from None
             if len(raw_bytes) < 32:
                 from seeknal.serving.startup_validation import CursorKeyWeakError
                 raise CursorKeyWeakError(
@@ -3742,13 +3756,16 @@ def create_app(
                 skip_callable_audit=callable_audit_done,
             )
 
-        effective_key_bytes = (
-            effective_cursor_key.encode("utf-8")
-            if isinstance(effective_cursor_key, str)
-            else bytes(effective_cursor_key)
-            if effective_cursor_key is not None
-            else b""
-        )
+        try:
+            effective_key_bytes = (
+                effective_cursor_key.encode("utf-8")
+                if isinstance(effective_cursor_key, str)
+                else bytes(effective_cursor_key)
+                if effective_cursor_key is not None
+                else b""
+            )
+        except UnicodeEncodeError:
+            effective_key_bytes = b""
         if result.truncated and len(effective_key_bytes) < 32:
             logger.error(
                 "engine=%s code=cursor_key_weak error=CursorKeyWeak detail=Pagination cursor signing key is too weak audit_id=%s",

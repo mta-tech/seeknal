@@ -1753,6 +1753,92 @@ def test_f3_cursor_key_weak_refused_at_startup_and_create_app(
     assert app_ok is not None
 
 
+def test_s1_lone_surrogate_cursor_key_refused_without_leak(
+    jwks_path, static_catalog_files, ec_key_pair, monkeypatch
+):
+    from seeknal.serving.http import create_app
+    from seeknal.serving.placement import Placement
+    from seeknal.serving.service import ServingPipeline
+    from seeknal.serving.startup_validation import (
+        CursorKeyWeakError,
+        validate_startup,
+    )
+
+    pf, sf = static_catalog_files
+    monkeypatch.delenv("SEEKNAL_CURSOR_KEY", raising=False)
+
+    surrogate_key = "surr_prefix_1234\ud800surr_suffix_5678_32b"
+    slices_8 = [surrogate_key[i:i+8] for i in range(len(surrogate_key) - 7)]
+
+    def _assert_no_surrogate_leak(exc_val: Exception, expected_env_var: str) -> None:
+        assert isinstance(exc_val, ServerConfigError)
+        assert getattr(exc_val, "code", None) == "cursor_key_weak"
+        msg = str(exc_val)
+        rep = repr(exc_val)
+        args_str = str(exc_val.args)
+        assert expected_env_var in msg
+        assert "must be valid UTF-8 and at least 32 bytes" in msg
+        for sl in slices_8:
+            assert sl not in msg
+            assert sl not in rep
+            assert sl not in args_str
+        assert surrogate_key not in msg
+        assert surrogate_key not in rep
+        assert surrogate_key not in args_str
+        assert exc_val.__cause__ is None
+
+    cfg = ServerConfig.from_dict(
+        {
+            "grant_keys": {"jwks_file": jwks_path},
+            "placement": {"static": {"placement_file": pf, "schemas_file": sf}},
+            "connections": {"duck": {"kind": "duckdb", "path": ":memory:"}},
+        }
+    )
+
+    # 1. Explicit argument in build_server
+    with pytest.raises(ServerConfigError) as exc_arg:
+        build_server(cfg, cursor_key=surrogate_key)
+    _assert_no_surrogate_leak(exc_arg.value, "SEEKNAL_CURSOR_KEY")
+
+    # 2. Env mapping in build_server and validate_startup
+    with pytest.raises(ServerConfigError) as exc_env:
+        build_server(cfg, env={"SEEKNAL_CURSOR_KEY": surrogate_key})
+    _assert_no_surrogate_leak(exc_env.value, "SEEKNAL_CURSOR_KEY")
+
+    with pytest.raises(ServerConfigError) as exc_val:
+        validate_startup(cfg, env={"SEEKNAL_CURSOR_KEY": surrogate_key}, check_cursor_key=True)
+    _assert_no_surrogate_leak(exc_val.value, "SEEKNAL_CURSOR_KEY")
+
+    # 3. os.environ (via non-UTF-8 bytes in os.environb producing surrogateescape)
+    surrogate_bytes = b"surr_prefix_1234\x80surr_suffix_5678_32b"
+    monkeypatch.setitem(os.environb, b"SEEKNAL_CURSOR_KEY", surrogate_bytes)
+    surrogate_os_key = os.environ["SEEKNAL_CURSOR_KEY"]
+    slices_8_os = [surrogate_os_key[i:i+8] for i in range(len(surrogate_os_key) - 7)]
+    with pytest.raises(ServerConfigError) as exc_os:
+        build_server(cfg)
+    assert isinstance(exc_os.value, ServerConfigError)
+    assert getattr(exc_os.value, "code", None) == "cursor_key_weak"
+    for sl in slices_8_os:
+        assert sl not in str(exc_os.value)
+        assert sl not in repr(exc_os.value)
+        assert sl not in str(exc_os.value.args)
+    assert surrogate_os_key not in str(exc_os.value)
+    assert surrogate_os_key not in repr(exc_os.value)
+    assert surrogate_os_key not in str(exc_os.value.args)
+    assert exc_os.value.__cause__ is None
+
+    # 4. Explicit argument in create_app
+    priv, pub, _ = ec_key_pair
+    pipeline = ServingPipeline(
+        placement=Placement.from_dict({"engines": {"duck": {"kind": "duckdb"}}, "tables": {}, "cubes": {}}),
+        schemas={},
+        public_keys={"k1": pub},
+    )
+    with pytest.raises(ServerConfigError) as exc_app:
+        create_app(pipeline, {"duck": MagicMock()}, cursor_key=surrogate_key)
+    _assert_no_surrogate_leak(exc_app.value, "SEEKNAL_CURSOR_KEY")
+
+
 def test_b_l3_build_server_isolates_bad_account_password_on_shared_lakebase_endpoint(
     jwks_path, static_catalog_files, monkeypatch
 ):
