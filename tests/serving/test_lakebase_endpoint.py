@@ -1805,6 +1805,43 @@ def test_l3_probe_connect_timeout_never_above_probe_timeout():
     assert state == "unavailable"
 
 
+def test_l4_bad_timeout_inf_and_nan_do_not_disable_probe_forever():
+    """L4: Bad timeout (inf, nan) raises but does not leave _no_wake_probe_in_flight stuck."""
+    def conn_fn(**kw: Any) -> Any:
+        return FakeDBConnection()
+
+    cfg = _make_wake_cfg(max_query_wait_seconds=5.0, max_wake_seconds=10.0)
+    connector = ColdStartConnector(
+        conn_fn,
+        cfg,
+        engine_name="lb_l4",
+        env={"LB_OPS_PROJECT_TOKEN": "tok-l4"},
+    )
+    with connector._lock:
+        connector._state = "unavailable"
+
+    # Test inf: raises OverflowError and does NOT leave flag stuck
+    with pytest.raises(OverflowError):
+        connector.probe_no_wake(timeout_seconds=float("inf"))
+    assert connector._no_wake_probe_in_flight is False
+
+    # Probe still works after inf
+    state_after_inf = connector.probe_no_wake(timeout_seconds=2.0, min_interval_seconds=0.0)
+    assert state_after_inf == "ok"
+
+    # Test nan: raises ValueError and does NOT leave flag stuck
+    with connector._lock:
+        connector._state = "unavailable"
+    with pytest.raises(ValueError):
+        connector.probe_no_wake(timeout_seconds=float("nan"))
+    assert connector._no_wake_probe_in_flight is False
+
+    # Probe still works after nan
+    state_after_nan = connector.probe_no_wake(timeout_seconds=2.0, min_interval_seconds=0.0)
+    assert state_after_nan == "ok"
+
+
+
 
 
 

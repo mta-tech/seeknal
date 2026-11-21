@@ -1509,13 +1509,17 @@ class ColdStartConnector:
             self._last_no_wake_probe_at = probe_now
             self._no_wake_probe_in_flight = True
 
-        eff_timeout = float(timeout_seconds)
-        to_param: int | float = (
-            int(eff_timeout) if eff_timeout >= 1.0 else eff_timeout
-        )
-        with self._lock:
-            candidate_fns = list(self._account_connect_fns) or [self._connect_fn]
         try:
+            eff_timeout = float(timeout_seconds)
+            if math.isinf(eff_timeout):
+                raise OverflowError("cannot convert float infinity to integer")
+            if math.isnan(eff_timeout):
+                raise ValueError("cannot convert float NaN to integer")
+            to_param: int | float = (
+                int(eff_timeout) if eff_timeout >= 1.0 else eff_timeout
+            )
+            with self._lock:
+                candidate_fns = list(self._account_connect_fns) or [self._connect_fn]
             probe_succeeded = False
             for target_fn in candidate_fns:
                 conn: Any = None
