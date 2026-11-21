@@ -1134,6 +1134,8 @@ class ColdStartConnector:
         self._last_no_wake_probe_at: float | None = None
         self._no_wake_probe_in_flight: bool = False
         self._tls = threading.local()
+        self.last_probe_error: Exception | None = None
+        self.last_probe_pgcode: str | None = None
 
     @property
     def endpoint_id(self) -> str | None:
@@ -1601,6 +1603,8 @@ class ColdStartConnector:
                     logger.error("Programming error during probe_no_wake: %s", exc, exc_info=True)
                     raise
                 except Exception as exc:
+                    self.last_probe_error = exc
+                    self.last_probe_pgcode = _extract_pgcode(exc)
                     if _classify_non_wakeable_connect_error(exc) is not None:
                         continue
                     return "unavailable"

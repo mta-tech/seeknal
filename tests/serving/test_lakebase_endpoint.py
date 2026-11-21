@@ -1805,6 +1805,93 @@ def test_l3_probe_connect_timeout_never_above_probe_timeout():
     assert state == "unavailable"
 
 
+def test_l3_positive_control_subsecond_probe_returns_ok():
+    """M2 positive control: sub-second timeout, fast connect, SELECT 1 returns 'ok'."""
+    recording_conn = FakeDBConnection(conn_id=42)
+
+    connector = ColdStartConnector(
+        lambda **kw: recording_conn,
+        _make_wake_cfg(max_query_wait_seconds=5.0, max_wake_seconds=10.0),
+        engine_name="lb_l3_pos",
+        env={"LB_OPS_PROJECT_TOKEN": "tok-l3"},
+    )
+    with connector._lock:
+        connector._state = "unavailable"
+
+    state = connector.probe_no_wake(timeout_seconds=0.5)
+    assert state == "ok"
+    assert connector.state == "ok"
+    stmts = [item[0] for item in recording_conn.executed]
+    assert stmts == [
+        "BEGIN",
+        "SELECT set_config('statement_timeout', %s, true)",
+        "SELECT 1",
+        "ROLLBACK",
+    ]
+
+
+def test_l3_slow_connect_times_out_and_closes_late_connection():
+    """M2: Slow connect beyond deadline gives 'unavailable' within timeout + 0.2s and late conn is closed."""
+    late_conn = FakeDBConnection(conn_id=999)
+
+    def slow_connect(**kw: Any) -> Any:
+        time.sleep(0.3)
+        return late_conn
+
+    connector = ColdStartConnector(
+        slow_connect,
+        _make_wake_cfg(max_query_wait_seconds=5.0, max_wake_seconds=10.0),
+        engine_name="lb_l3_slow",
+        env={"LB_OPS_PROJECT_TOKEN": "tok-l3"},
+    )
+    with connector._lock:
+        connector._state = "unavailable"
+
+    t0 = time.monotonic()
+    state = connector.probe_no_wake(timeout_seconds=0.1)
+    elapsed = time.monotonic() - t0
+
+    assert state == "unavailable"
+    assert elapsed < 0.3  # within timeout + 0.2s
+
+    # Wait for the background worker to finish and verify late_conn was closed
+    time.sleep(0.35)
+    assert late_conn.closed is True
+
+
+def test_l3_multiple_candidates_bounded_by_single_overall_deadline():
+    """M2: Several candidate functions are bounded by one overall deadline."""
+    call_counts = [0, 0, 0]
+
+    def make_candidate(idx: int):
+        def _connect(**kw: Any) -> Any:
+            call_counts[idx] += 1
+            time.sleep(0.25)
+            return FakeDBConnection(conn_id=idx)
+        return _connect
+
+    connector = ColdStartConnector(
+        make_candidate(0),
+        _make_wake_cfg(max_query_wait_seconds=5.0, max_wake_seconds=10.0),
+        engine_name="lb_l3_multi",
+        env={"LB_OPS_PROJECT_TOKEN": "tok-l3"},
+    )
+    connector.register_connect_fn(make_candidate(1))
+    connector.register_connect_fn(make_candidate(2))
+
+    with connector._lock:
+        connector._state = "unavailable"
+
+    t0 = time.monotonic()
+    state = connector.probe_no_wake(timeout_seconds=0.15)
+    elapsed = time.monotonic() - t0
+
+    assert state == "unavailable"
+    assert elapsed < 0.35  # bounded by single 0.15s deadline, not 3 * 0.15s
+    assert call_counts[2] == 0
+
+
+
 def test_l4_bad_timeout_inf_and_nan_do_not_disable_probe_forever(caplog):
     """L4: Bad timeout (inf, nan) returns 'unavailable', logs warning, and does not leave flag stuck."""
     def conn_fn(**kw: Any) -> Any:

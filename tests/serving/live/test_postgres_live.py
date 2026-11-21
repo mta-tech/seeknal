@@ -1088,12 +1088,16 @@ def test_live_unforced_rls_table_ownership_emits_warning_until_forced(
 def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
     seeded_cbn_cluster: dict[str, Any],
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    """L5: Prove probe timeout applies via set_config inside explicit transaction on the real connect path.
+    """L5/M2: Prove probe timeout applies via set_config inside explicit transaction on the real connect path.
 
     With probe timeout set to 50 ms (0.050 s), a probe query of 'SELECT pg_sleep(1)' is cancelled
     by PostgreSQL with SQLSTATE 57014, and the probe reports not-ready without any wake call.
+    Also tests positive control (fast query -> ok) and autocommit connection proving BEGIN/ROLLBACK applies.
     """
+    import seeknal.serving.lakebase_endpoint as lb_mod
+
     bi_dsn = seeded_cbn_cluster["bi_dsn"]
     jwks_file = tmp_path / "live_probe.jwks.json"
     priv = ec.generate_private_key(ec.SECP256R1())
@@ -1172,27 +1176,55 @@ cubes: {}
     assert connector is not None
     connector._http_client = httpx.Client(transport=httpx.MockTransport(fake_cp_handler))
 
-    # Mark connector as unavailable to trigger probe_no_wake
+    # 1. Positive control: default fast query ("SELECT 1") on real connect path -> "ok"
+    with connector._lock:
+        connector._state = "unavailable"
+    state_pos = connector.probe_no_wake(timeout_seconds=2.0)
+    assert state_pos == "ok"
+    assert connector.state == "ok"
+    assert len(wake_calls) == 0
+
+    # Readyz returns 200 OK
+    status_pos, payload_pos = handle.readiness.check()
+    assert status_pos == 200
+    assert payload_pos["ready"] is True
+
+    # 2. Patch _PROBE_SQL to slow query "SELECT pg_sleep(1)" with 50 ms timeout
+    monkeypatch.setattr(lb_mod, "_PROBE_SQL", "SELECT pg_sleep(1)")
     with connector._lock:
         connector._state = "unavailable"
 
-    # Execute probe_no_wake with 50 ms timeout and probe query of 'SELECT pg_sleep(1)'
-    state = connector.probe_no_wake(
-        timeout_seconds=0.05,
-        probe_query="SELECT pg_sleep(1)",
-    )
-    assert state == "unavailable"
+    # Execute probe_no_wake with 50 ms timeout
+    state_slow = connector.probe_no_wake(timeout_seconds=0.05)
+    assert state_slow == "unavailable"
+    assert connector.last_probe_pgcode == "57014"
     assert len(wake_calls) == 0
 
     # Also test via ReadinessProbe /readyz
-    probe = handle.readiness
-    probe._probe_query = "SELECT pg_sleep(1)"
+    with connector._lock:
+        connector._state = "unavailable"
+    status_code, payload = handle.readiness.check()
+    assert status_code == 503
+    assert payload["ready"] is False
+    assert len(wake_calls) == 0
+
+    # 3. Autocommit connection: prove set_config inside BEGIN/ROLLBACK applies and cancels pg_sleep(1)
+    orig_connect_fn = connector._connect_fn
+
+    def autocommit_connect(**kw: Any) -> Any:
+        c = orig_connect_fn(**kw)
+        if c is not None:
+            c.autocommit = True
+        return c
+
+    connector._connect_fn = autocommit_connect
+    connector._account_connect_fns = [autocommit_connect]
     with connector._lock:
         connector._state = "unavailable"
 
-    status_code, payload = probe.check()
-    assert status_code == 503
-    assert payload["ready"] is False
+    state_auto = connector.probe_no_wake(timeout_seconds=0.05)
+    assert state_auto == "unavailable"
+    assert connector.last_probe_pgcode == "57014"
     assert len(wake_calls) == 0
 
 
