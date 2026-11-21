@@ -1173,7 +1173,7 @@ def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
         state_slow = connector.probe_no_wake(timeout_seconds=0.5, min_interval_seconds=0.0)
         assert state_slow == "unavailable"
         assert state_slow != "ok"
-        assert connector.state != "ok"
+        assert connector.state == "unavailable"
         assert connector.last_probe_pgcode == "57014"
         assert len(wake_calls) == 0
         assert len(tracked_conns) == 2
@@ -1191,7 +1191,7 @@ def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
         state_auto = connector.probe_no_wake(timeout_seconds=0.5, min_interval_seconds=0.0)
         assert state_auto == "unavailable"
         assert state_auto != "ok"
-        assert connector.state != "ok"
+        assert connector.state == "unavailable"
         assert connector.last_probe_pgcode == "57014"
         assert len(wake_calls) == 0
         assert len(tracked_conns) == 3
