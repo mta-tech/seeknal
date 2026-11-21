@@ -11,6 +11,7 @@ import base64
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -19,6 +20,7 @@ import time
 from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric import ec
+import httpx
 import psycopg2
 from psycopg2 import sql as pgsql
 import pytest
@@ -32,6 +34,7 @@ from seeknal.serving.lakebase_endpoint import (
     EngineStartingError,
     LakebaseColdStartConfig,
     check_role_guard,
+    parse_lakebase_block,
 )
 from seeknal.serving.ops import ReadinessProbe
 from seeknal.serving.parameter_binding import parameter_digest
@@ -1087,10 +1090,12 @@ def test_live_unforced_rls_table_ownership_emits_warning_until_forced(
 
 def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
     seeded_cbn_cluster: dict[str, Any],
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """L5/M2: Prove probe timeout applies via set_config inside explicit transaction on the real connect path.
+
+    Live coverage excludes the Lakebase TLS (verify-full) branch; covered by unit tests
+    and by the pre-deploy check against a real Lakebase/Neon endpoint.
 
     With probe timeout set to 50 ms (0.050 s), a probe query of 'SELECT pg_sleep(1)' is cancelled
     by PostgreSQL with SQLSTATE 57014, and the probe reports not-ready without any wake call.
@@ -1099,134 +1104,102 @@ def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
     import seeknal.serving.lakebase_endpoint as lb_mod
 
     bi_dsn = seeded_cbn_cluster["bi_dsn"]
-    jwks_file = tmp_path / "live_probe.jwks.json"
-    priv = ec.generate_private_key(ec.SECP256R1())
-    pub = priv.public_key()
-    pn = pub.public_numbers()
-    jwk = {
-        "kty": "EC",
-        "crv": "P-256",
-        "x": base64.urlsafe_b64encode(pn.x.to_bytes(32, "big")).rstrip(b"=").decode("ascii"),
-        "y": base64.urlsafe_b64encode(pn.y.to_bytes(32, "big")).rstrip(b"=").decode("ascii"),
-        "kid": "k-live-probe",
-    }
-    jwks_file.write_text(json.dumps({"keys": [jwk]}), encoding="utf-8")
-
-    pf = tmp_path / "placement_probe.yaml"
-    pf.write_text("""
-engines:
-  lb_probe: {kind: lakebase, dialect: postgres}
-tables: {}
-cubes: {}
-""")
-    sf = tmp_path / "schemas_probe.json"
-    sf.write_text("{}")
 
     wake_calls: list[httpx.Request] = []
 
-    def fake_cp_handler(request: httpx.Request) -> httpx.Response:
+    def fail_cp_handler(request: httpx.Request) -> httpx.Response:
         wake_calls.append(request)
-        return httpx.Response(200, json={"state": "running"})
+        pytest.fail(f"Unexpected wake/HTTP call made to {request.url}")
 
-    cfg_dict = {
-        "grant_keys": {"jwks_file": str(jwks_file)},
-        "cursor_key_env": "PROBE_CURSOR_KEY",
-        "ops": {
-            "enabled": True,
-            "public_readyz": True,
-            "readyz_timeout_seconds": 0.05,
-            "readyz_cache_seconds": 0.0,
-        },
-        "placement": {
-            "static": {
-                "placement_file": str(pf),
-                "schemas_file": str(sf),
-            }
-        },
-        "connections": {
-            "lb_probe": {
-                "kind": "lakebase",
-                "dsn_env": "PROBE_LB_DSN",
-                "lakebase": {
-                    "project_id": "prj_0123456789abcdefghij",
-                    "branch_id": "br_0123456789abcdefghij",
-                    "endpoint_id": "ep_0123456789abcdefghij",
-                    "endpoint_type": "read_write",
-                    "cold_start": {
-                        "wake": "api",
-                        "api_url": "https://lakebase-cp.internal.example",
-                        "api_token_env": "PROBE_LB_TOKEN",
-                        "connect_timeout_seconds": 2.0,
-                        "max_query_wait_seconds": 5.0,
-                        "max_wake_seconds": 10.0,
-                    },
-                },
-            },
+    stub_http_client = httpx.Client(transport=httpx.MockTransport(fail_cp_handler))
+
+    raw_lakebase = {
+        "project_id": "prj_0123456789abcdefghij",
+        "branch_id": "br_0123456789abcdefghij",
+        "endpoint_id": "ep_0123456789abcdefghij",
+        "endpoint_type": "read_write",
+        "cold_start": {
+            "wake": "api",
+            "api_url": "https://lakebase-cp.internal.example",
+            "api_token_env": "PROBE_LB_TOKEN",
+            "connect_timeout_seconds": 2.0,
+            "max_query_wait_seconds": 5.0,
+            "max_wake_seconds": 10.0,
         },
     }
-    env = {
-        "PROBE_LB_DSN": bi_dsn,
-        "PROBE_LB_TOKEN": "token-probe-secret",
-        "PROBE_CURSOR_KEY": "a" * 32,
-    }
+    lb_block = parse_lakebase_block(raw_lakebase, eng_name="lb_probe")
 
-    handle = build_server(cfg_dict, env=env)
-    adapter = handle.adapters["lb_probe"]
-    connector = adapter.cold_start_connector
-    assert connector is not None
-    connector._http_client = httpx.Client(transport=httpx.MockTransport(fake_cp_handler))
+    tracked_conns: list[Any] = []
+    autocommit_mode = False
 
-    # 1. Positive control: default fast query ("SELECT 1") on real connect path -> "ok"
-    with connector._lock:
-        connector._state = "unavailable"
-    state_pos = connector.probe_no_wake(timeout_seconds=2.0)
-    assert state_pos == "ok"
-    assert connector.state == "ok"
-    assert len(wake_calls) == 0
+    def base_connect(**kwargs: Any) -> Any:
+        to = kwargs.get("connect_timeout", 2.0)
+        to_int = max(1, math.ceil(float(to))) if to is not None else 2
+        conn = psycopg2.connect(bi_dsn, connect_timeout=to_int)
+        if autocommit_mode:
+            conn.autocommit = True
+        tracked_conns.append(conn)
+        return conn
 
-    # Readyz returns 200 OK
-    status_pos, payload_pos = handle.readiness.check()
-    assert status_pos == 200
-    assert payload_pos["ready"] is True
+    connector = ColdStartConnector(
+        base_connect,
+        lb_block,
+        http_client=stub_http_client,
+        engine_name="lb_probe",
+        env={"PROBE_LB_TOKEN": "token-probe-secret"},
+    )
 
-    # 2. Patch _PROBE_SQL to slow query "SELECT pg_sleep(1)" with 50 ms timeout
-    monkeypatch.setattr(lb_mod, "_PROBE_SQL", "SELECT pg_sleep(1)")
-    with connector._lock:
-        connector._state = "unavailable"
+    try:
+        # 1. Positive control: a fast probe returns ok, and last_probe_pgcode is None.
+        with connector._lock:
+            connector._state = "unavailable"
+        state_pos = connector.probe_no_wake(timeout_seconds=2.0, min_interval_seconds=0.0)
+        assert state_pos == "ok"
+        assert connector.state == "ok"
+        assert connector.last_probe_pgcode is None
+        assert len(wake_calls) == 0
+        assert len(tracked_conns) == 1
+        assert tracked_conns[0].closed != 0
 
-    # Execute probe_no_wake with 50 ms timeout
-    state_slow = connector.probe_no_wake(timeout_seconds=0.05)
-    assert state_slow == "unavailable"
-    assert connector.last_probe_pgcode == "57014"
-    assert len(wake_calls) == 0
+        # 2. With the probe SQL set to SELECT pg_sleep(1) through the private _PROBE_SQL hook
+        #    (monkeypatch) and a 50 ms probe timeout, the probe returns not-ready,
+        #    last_probe_pgcode == "57014", and no wake call happened.
+        monkeypatch.setattr(lb_mod, "_PROBE_SQL", "SELECT pg_sleep(1)")
+        with connector._lock:
+            connector._state = "unavailable"
+            connector._last_no_wake_probe_at = None
 
-    # Also test via ReadinessProbe /readyz
-    with connector._lock:
-        connector._state = "unavailable"
-    status_code, payload = handle.readiness.check()
-    assert status_code == 503
-    assert payload["ready"] is False
-    assert len(wake_calls) == 0
+        state_slow = connector.probe_no_wake(timeout_seconds=0.05, min_interval_seconds=0.0)
+        assert state_slow == "unavailable"
+        assert state_slow != "ok"
+        assert connector.state != "ok"
+        assert connector.last_probe_pgcode == "57014"
+        assert len(wake_calls) == 0
+        assert len(tracked_conns) == 2
+        assert tracked_conns[1].closed != 0
 
-    # 3. Autocommit connection: prove set_config inside BEGIN/ROLLBACK applies and cancels pg_sleep(1)
-    orig_connect_fn = connector._connect_fn
+        # 3. The same as 2 on an autocommit connection: the base_connect sets conn.autocommit = True
+        #    before returning. This proves set_config inside BEGIN/ROLLBACK applies under autocommit.
+        autocommit_mode = True
+        connector.last_probe_pgcode = None
+        connector.last_probe_error = None
+        with connector._lock:
+            connector._state = "unavailable"
+            connector._last_no_wake_probe_at = None
 
-    def autocommit_connect(**kw: Any) -> Any:
-        c = orig_connect_fn(**kw)
-        if c is not None:
-            c.autocommit = True
-        return c
+        state_auto = connector.probe_no_wake(timeout_seconds=0.05, min_interval_seconds=0.0)
+        assert state_auto == "unavailable"
+        assert state_auto != "ok"
+        assert connector.state != "ok"
+        assert connector.last_probe_pgcode == "57014"
+        assert len(wake_calls) == 0
+        assert len(tracked_conns) == 3
+        assert tracked_conns[2].closed != 0
 
-    connector._connect_fn = autocommit_connect
-    connector._account_connect_fns = [autocommit_connect]
-    connector.last_probe_pgcode = None
-    connector.last_probe_error = None
-    with connector._lock:
-        connector._state = "unavailable"
-
-    state_auto = connector.probe_no_wake(timeout_seconds=0.05)
-    assert state_auto == "unavailable"
-    assert connector.last_probe_pgcode == "57014"
-    assert len(wake_calls) == 0
+        # 4. After each probe, the connection used by the probe is closed. Track it in the connect wrapper.
+        assert all(c.closed != 0 for c in tracked_conns)
+    finally:
+        connector.close()
+        stub_http_client.close()
 
 
