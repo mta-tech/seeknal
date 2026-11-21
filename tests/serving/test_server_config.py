@@ -1261,3 +1261,52 @@ def test_postgres_and_lakebase_connections_coexist(
     assert cfg.connections["lb"].is_legacy is True
     assert "CBN_PG_DSN" in cfg.get_referenced_env_vars()
 
+
+def test_parse_jwks_refuses_non_canonical_coordinate():
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    for _ in range(20):
+        priv = ec.generate_private_key(ec.SECP256R1())
+        pub = priv.public_key()
+        pn = pub.public_numbers()
+        x_bytes = pn.x.to_bytes(32, "big")
+        y_bytes = pn.y.to_bytes(32, "big")
+        x_b64 = base64.urlsafe_b64encode(x_bytes).rstrip(b"=").decode("ascii")
+        y_b64 = base64.urlsafe_b64encode(y_bytes).rstrip(b"=").decode("ascii")
+        valid_jwk = {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": x_b64,
+            "y": y_b64,
+            "kid": "atlas-2026-test",
+        }
+
+        # Valid JWKS parses
+        res = parse_jwks({"keys": [valid_jwk]})
+        assert "atlas-2026-test" in res
+
+        # Find non-canonical last character for x coordinate that decodes to the exact same bytes
+        non_canonical_x = None
+        for c in alphabet:
+            if c == x_b64[-1]:
+                continue
+            cand = x_b64[:-1] + c
+            cand_padded = cand + ("=" * ((4 - len(cand) % 4) % 4))
+            try:
+                cand_bytes = base64.urlsafe_b64decode(cand_padded.encode("ascii"))
+                if cand_bytes == x_bytes:
+                    non_canonical_x = cand
+                    break
+            except Exception:
+                pass
+
+        assert non_canonical_x is not None, "Failed to find non-canonical x coordinate"
+        non_canonical_padded = non_canonical_x + (
+            "=" * ((4 - len(non_canonical_x) % 4) % 4)
+        )
+        assert base64.urlsafe_b64decode(non_canonical_padded.encode("ascii")) == x_bytes
+
+        bad_jwk = dict(valid_jwk, x=non_canonical_x)
+        with pytest.raises(ServerConfigError, match="invalid base64url coordinate"):
+            parse_jwks({"keys": [bad_jwk]})
+
+
