@@ -1157,6 +1157,14 @@ class ColdStartConnector:
     def cold_start_config(self) -> LakebaseColdStartConfig:
         return self._cold_start
 
+    def close(self) -> None:
+        """Shut down background probe executor and release resources."""
+        if hasattr(self, "_probe_executor"):
+            try:
+                self._probe_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+
     def register_connect_fn(
         self,
         connect_fn: Callable[..., Any],

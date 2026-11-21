@@ -1531,6 +1531,12 @@ class DBAPIAdapter:
     def close(self) -> None:
         if self._pool is not None:
             self._pool.close()
+        if (
+            self._cold_start_connector is not None
+            and hasattr(self._cold_start_connector, "close")
+            and callable(self._cold_start_connector.close)
+        ):
+            self._cold_start_connector.close()
 
     def check_health(self, timeout_seconds: float = 2.0) -> bool:
         """Probe engine reachability without waking suspended Lakebase cold-start endpoints."""

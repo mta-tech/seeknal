@@ -2013,6 +2013,20 @@ def test_p2_connect_finishing_at_deadline_is_closed():
     assert late_conn.closed is True
 
 
+def test_p4_connector_close_shuts_down_probe_executor():
+    """P4: connector.close() cleanly shuts down _probe_executor with cancel_futures=True."""
+    connector = ColdStartConnector(
+        lambda **kw: FakeDBConnection(),
+        _make_wake_cfg(max_query_wait_seconds=5.0, max_wake_seconds=10.0),
+        engine_name="lb_p4",
+        env={"LB_OPS_PROJECT_TOKEN": "tok-p4"},
+    )
+    assert connector._probe_executor._shutdown is False
+    connector.close()
+    assert connector._probe_executor._shutdown is True
+
+
+
 
 
 
