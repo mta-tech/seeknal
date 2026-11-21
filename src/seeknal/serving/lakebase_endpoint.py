@@ -61,6 +61,7 @@ DEFAULT_DENY_ROLES: tuple[str, ...] = (
 )
 
 _DEFAULT_SYNC_STATE_TABLE = "public._lakebase_sync_state"
+_PROBE_SQL = "SELECT 1"
 _DEFAULT_RETRY_BACKOFF_MS: tuple[int, ...] = (500, 1000, 2000, 4000)
 
 _LITERAL_SECRET_KEYS = frozenset(
@@ -1482,19 +1483,8 @@ class ColdStartConnector:
         timeout_seconds: float = 2.0,
         min_interval_seconds: float = 5.0,
         now: float | None = None,
-        query: str | None = None,
-        probe_query: str | None = None,
     ) -> str:
         """Perform at most one bounded no-wake plain connect per interval when unavailable."""
-        effective_query = (
-            probe_query
-            if probe_query is not None
-            else (
-                query
-                if query is not None
-                else getattr(self, "_probe_query", "SELECT 1")
-            )
-        )
         with self._lock:
             if self._state == "ok":
                 return "ok"
@@ -1591,7 +1581,7 @@ class ColdStartConnector:
                                     "SELECT set_config('statement_timeout', %s, true)",
                                     (str(timeout_ms),),
                                 )
-                                cur.execute(effective_query)
+                                cur.execute(_PROBE_SQL)
                             finally:
                                 try:
                                     cur.execute("ROLLBACK")

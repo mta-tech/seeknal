@@ -335,7 +335,6 @@ class ReadinessProbe:
         cache_seconds: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
         custom_probes: Mapping[str, Callable[[], bool]] | None = None,
-        probe_query: str | None = None,
     ) -> None:
         if (
             isinstance(timeout_seconds, bool)
@@ -372,7 +371,6 @@ class ReadinessProbe:
         self._cache_seconds = float(cache_seconds)
         self._clock = clock
         self._has_custom_clock = clock is not time.monotonic
-        self._probe_query = probe_query
         self._custom_probes: dict[str, Callable[[], bool]] = (
             dict(custom_probes) if custom_probes else {}
         )
@@ -430,13 +428,10 @@ class ReadinessProbe:
                 probe_now = (
                     float(self._clock()) if self._has_custom_clock else None
                 )
-                kw: dict[str, Any] = {
-                    "timeout_seconds": self._timeout_seconds,
-                    "now": probe_now,
-                }
-                if getattr(self, "_probe_query", None) is not None:
-                    kw["probe_query"] = self._probe_query
-                return probe_fn(**kw)
+                return probe_fn(
+                    timeout_seconds=self._timeout_seconds,
+                    now=probe_now,
+                )
             return "unavailable"
 
         if isinstance(adapter, WorkloadRoutedAdapter):
