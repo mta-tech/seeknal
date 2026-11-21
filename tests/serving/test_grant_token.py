@@ -401,8 +401,14 @@ def test_refuses_non_canonical_header_and_payload(valid_claims):
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     private_key = ec.generate_private_key(ec.SECP256R1())
     public_key = private_key.public_key()
-    token = sign_grant_token(valid_claims, private_key, kid="key-1")
+    kid = "key-1"
+    token = sign_grant_token(valid_claims, private_key, kid=kid)
     header_b64, payload_b64, sig_b64 = token.split(".")
+
+    if len(header_b64) % 4 == 0:
+        kid = "key-12"
+        token = sign_grant_token(valid_claims, private_key, kid=kid)
+        header_b64, payload_b64, sig_b64 = token.split(".")
 
     # Test non-canonical header
     rem_hdr = len(header_b64) % 4
@@ -421,9 +427,17 @@ def test_refuses_non_canonical_header_and_payload(valid_claims):
             pass
     assert non_canonical_hdr is not None, "Failed to find non-canonical header variant"
     with pytest.raises(GrantTokenError):
-        verify_grant_token(f"{non_canonical_hdr}.{payload_b64}.{sig_b64}", {"key-1": public_key})
+        verify_grant_token(f"{non_canonical_hdr}.{payload_b64}.{sig_b64}", {kid: public_key})
 
     # Test non-canonical payload
+    claims_to_test = dict(valid_claims)
+    token = sign_grant_token(claims_to_test, private_key, kid=kid)
+    header_b64, payload_b64, sig_b64 = token.split(".")
+    if len(payload_b64) % 4 == 0:
+        claims_to_test["_pad"] = "x"
+        token = sign_grant_token(claims_to_test, private_key, kid=kid)
+        header_b64, payload_b64, sig_b64 = token.split(".")
+
     rem_pay = len(payload_b64) % 4
     orig_pay_bytes = base64.urlsafe_b64decode(payload_b64 + ("=" * ((4 - rem_pay) % 4)))
     non_canonical_pay = None
@@ -440,7 +454,7 @@ def test_refuses_non_canonical_header_and_payload(valid_claims):
             pass
     assert non_canonical_pay is not None, "Failed to find non-canonical payload variant"
     with pytest.raises(GrantTokenError):
-        verify_grant_token(f"{header_b64}.{non_canonical_pay}.{sig_b64}", {"key-1": public_key})
+        verify_grant_token(f"{header_b64}.{non_canonical_pay}.{sig_b64}", {kid: public_key})
 
 
 
