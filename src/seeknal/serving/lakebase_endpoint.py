@@ -1539,7 +1539,7 @@ class ColdStartConnector:
                 candidate_fns = list(self._account_connect_fns) or [self._connect_fn]
             overall_deadline = time.monotonic() + eff_timeout
             probe_succeeded = False
-            for target_fn in candidate_fns:
+            for cand_idx, target_fn in enumerate(candidate_fns):
                 remaining = overall_deadline - time.monotonic()
                 if remaining <= 0.0:
                     break
@@ -1620,8 +1620,13 @@ class ColdStartConnector:
                     probe_succeeded = True
                     break
                 except (NameError, AttributeError, TypeError) as exc:
-                    logger.error("Programming error during probe_no_wake: %s", exc, exc_info=True)
-                    raise
+                    logger.error(
+                        "Programming error during probe_no_wake for candidate %d: %s",
+                        cand_idx,
+                        exc,
+                        exc_info=True,
+                    )
+                    return "unavailable"
                 except Exception as exc:
                     self.last_probe_error = exc
                     self.last_probe_pgcode = _extract_pgcode(exc)

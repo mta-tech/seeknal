@@ -2026,6 +2026,31 @@ def test_p4_connector_close_shuts_down_probe_executor():
     assert connector._probe_executor._shutdown is True
 
 
+def test_p5_programming_error_logged_and_returns_unavailable(caplog):
+    """P5: NameError/AttributeError/TypeError logs ERROR with candidate index and returns 'unavailable'."""
+    def bad_candidate(**kw: Any) -> Any:
+        raise NameError("undefined local variable")
+
+    connector = ColdStartConnector(
+        bad_candidate,
+        _make_wake_cfg(max_query_wait_seconds=5.0, max_wake_seconds=10.0),
+        engine_name="lb_p5",
+        env={"LB_OPS_PROJECT_TOKEN": "tok-p5"},
+    )
+    with connector._lock:
+        connector._state = "unavailable"
+
+    with caplog.at_level(logging.ERROR):
+        state = connector.probe_no_wake(timeout_seconds=0.5, min_interval_seconds=0.0)
+
+    assert state == "unavailable"
+    assert any(
+        "Programming error during probe_no_wake for candidate 0" in r.message
+        for r in caplog.records
+    )
+
+
+
 
 
 
