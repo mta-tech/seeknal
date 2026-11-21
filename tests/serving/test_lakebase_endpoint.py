@@ -1805,8 +1805,8 @@ def test_l3_probe_connect_timeout_never_above_probe_timeout():
     assert state == "unavailable"
 
 
-def test_l4_bad_timeout_inf_and_nan_do_not_disable_probe_forever():
-    """L4: Bad timeout (inf, nan) raises but does not leave _no_wake_probe_in_flight stuck."""
+def test_l4_bad_timeout_inf_and_nan_do_not_disable_probe_forever(caplog):
+    """L4: Bad timeout (inf, nan) returns 'unavailable', logs warning, and does not leave flag stuck."""
     def conn_fn(**kw: Any) -> Any:
         return FakeDBConnection()
 
@@ -1820,21 +1820,26 @@ def test_l4_bad_timeout_inf_and_nan_do_not_disable_probe_forever():
     with connector._lock:
         connector._state = "unavailable"
 
-    # Test inf: raises OverflowError and does NOT leave flag stuck
-    with pytest.raises(OverflowError):
-        connector.probe_no_wake(timeout_seconds=float("inf"))
+    # Test inf: returns "unavailable", logs warning, does NOT leave flag stuck
+    with caplog.at_level(logging.WARNING):
+        res_inf = connector.probe_no_wake(timeout_seconds=float("inf"))
+    assert res_inf == "unavailable"
     assert connector._no_wake_probe_in_flight is False
+    assert any("Invalid probe timeout_seconds" in r.message for r in caplog.records)
 
     # Probe still works after inf
     state_after_inf = connector.probe_no_wake(timeout_seconds=2.0, min_interval_seconds=0.0)
     assert state_after_inf == "ok"
 
-    # Test nan: raises ValueError and does NOT leave flag stuck
+    # Test nan: returns "unavailable", logs warning, does NOT leave flag stuck
     with connector._lock:
         connector._state = "unavailable"
-    with pytest.raises(ValueError):
-        connector.probe_no_wake(timeout_seconds=float("nan"))
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        res_nan = connector.probe_no_wake(timeout_seconds=float("nan"))
+    assert res_nan == "unavailable"
     assert connector._no_wake_probe_in_flight is False
+    assert any("Invalid probe timeout_seconds" in r.message for r in caplog.records)
 
     # Probe still works after nan
     state_after_nan = connector.probe_no_wake(timeout_seconds=2.0, min_interval_seconds=0.0)

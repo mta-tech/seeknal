@@ -1505,11 +1505,19 @@ class ColdStartConnector:
             self._no_wake_probe_in_flight = True
 
         try:
-            eff_timeout = float(timeout_seconds)
-            if math.isinf(eff_timeout):
-                raise OverflowError("cannot convert float infinity to integer")
-            if math.isnan(eff_timeout):
-                raise ValueError("cannot convert float NaN to integer")
+            try:
+                eff_timeout = float(timeout_seconds)
+                if not math.isfinite(eff_timeout) or eff_timeout <= 0:
+                    raise ValueError(f"Invalid timeout_seconds: {timeout_seconds}")
+            except (ValueError, TypeError, OverflowError) as exc:
+                logger.warning(
+                    "Invalid probe timeout_seconds=%r for engine=%s: %s; reporting unavailable",
+                    timeout_seconds,
+                    self._engine_name,
+                    exc,
+                )
+                return "unavailable"
+
             to_param: int | float = (
                 int(eff_timeout) if eff_timeout >= 1.0 else eff_timeout
             )
