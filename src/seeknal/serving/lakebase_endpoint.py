@@ -1109,6 +1109,9 @@ class ColdStartConnector:
         self._env = env
         self._clock = clock
         self._sleep_fn = sleep_fn
+        if executor is not None:
+            if not callable(executor) and not callable(getattr(executor, "submit", None)):
+                raise TypeError("executor must be callable or have a submit method")
         self._executor = executor
         self._last_wake_worker: threading.Thread | None = None
         self._uses_real_clock = (clock is time.monotonic) and (sleep_fn is time.sleep)
@@ -1620,20 +1623,36 @@ class ColdStartConnector:
             started_new = True
 
         if started_new:
-            if self._executor is not None:
-                if callable(getattr(self._executor, "submit", None)):
-                    self._executor.submit(self._run_wake, op)
-                elif callable(self._executor):
-                    self._executor(self._run_wake, op)
-            else:
-                worker = threading.Thread(
-                    target=self._run_wake,
-                    args=(op,),
-                    daemon=True,
-                    name=f"lakebase-wake-{self._engine_name}",
-                )
-                self._last_wake_worker = worker
-                worker.start()
+            try:
+                if self._executor is not None:
+                    if callable(getattr(self._executor, "submit", None)):
+                        self._executor.submit(self._run_wake, op)
+                    elif callable(self._executor):
+                        self._executor(self._run_wake, op)
+                else:
+                    worker = threading.Thread(
+                        target=self._run_wake,
+                        args=(op,),
+                        daemon=True,
+                        name=f"lakebase-wake-{self._engine_name}",
+                    )
+                    self._last_wake_worker = worker
+                    worker.start()
+            except Exception as exc:
+                finish_now = self._clock()
+                with self._cond:
+                    op.finished_at = finish_now
+                    op.outcome = "error"
+                    op.done = True
+                    self._state = "unavailable"
+                    self._last_no_wake_probe_at = None
+                    self._failed_until = finish_now + self._cold_start.max_wake_seconds
+                    if self._active_wake is op:
+                        self._active_wake = None
+                    self._emit_wake("error")
+                    self._emit_state("unavailable")
+                    self._cond.notify_all()
+                raise EngineError(f"Engine connection failed: {exc}") from exc
         return op
 
     def connect(

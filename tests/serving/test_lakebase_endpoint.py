@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -1672,5 +1673,47 @@ class TestColdStartConnector:
         warm_int_conn = connector.connect(connect_fn=connect_interactive)
         assert warm_int_conn.conn_id == 909
         assert post_calls == 1
+
+
+def test_l1_executor_validation_and_failed_launch_finalises_op():
+    cfg = _make_wake_cfg(max_query_wait_seconds=5.0, max_wake_seconds=10.0)
+
+    # 1. Unusable executor rejected with TypeError
+    with pytest.raises(TypeError, match="executor must be callable or have a submit method"):
+        ColdStartConnector(
+            lambda **kw: None,
+            cfg,
+            executor="not_an_executor",
+            engine_name="lb_l1",
+        )
+
+    # 2. Executor whose submit raises: waiters get a typed error promptly and state is "unavailable"
+    class FailingExecutor:
+        def submit(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("threadpool submission failed")
+
+    def failing_connect(**kw: Any) -> Any:
+        raise ConnectionRefusedError("endpoint asleep")
+
+    clock = FakeClock(initial=100.0)
+    connector = ColdStartConnector(
+        failing_connect,
+        cfg,
+        executor=FailingExecutor(),
+        engine_name="lb_l1",
+        env={"LB_OPS_PROJECT_TOKEN": "tok-l1"},
+        clock=clock,
+        sleep_fn=clock.sleep,
+    )
+
+    t0 = time.monotonic()
+    with pytest.raises(EngineError) as exc_info:
+        connector.connect()
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 1.0
+    assert "threadpool submission failed" in str(exc_info.value)
+    assert connector.state == "unavailable"
+
 
 
