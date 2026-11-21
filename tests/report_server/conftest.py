@@ -16,8 +16,10 @@ from seeknal.report_server.storage import LocalFilesystemStorage
 
 
 @pytest.fixture()
-def test_config(tmp_path: Path) -> ServerConfig:
-    data_dir = Path.cwd() / ".seeknal" / "test-tmp" / tmp_path.name
+def test_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ServerConfig:
+    monkeypatch.setattr("seeknal.report_server.config.is_insecure_path", lambda _p: False)
+    monkeypatch.setattr("seeknal.report_server.storage.is_insecure_path", lambda _p: False)
+    data_dir = tmp_path / "report-server-data"
     shutil.rmtree(data_dir, ignore_errors=True)
     data_dir.mkdir(parents=True, exist_ok=True)
     return ServerConfig(
@@ -34,7 +36,13 @@ def test_engine(test_config: ServerConfig) -> Engine:
 
 @pytest.fixture()
 def test_storage(test_config: ServerConfig) -> LocalFilesystemStorage:
-    return LocalFilesystemStorage(test_config.data_dir / "assets")
+    return LocalFilesystemStorage(
+        test_config.data_dir / "assets",
+        max_tar_members=test_config.max_tar_members,
+        max_unpacked_bytes=test_config.max_unpacked_bytes,
+        max_path_depth=test_config.max_path_depth,
+        max_member_name_length=test_config.max_member_name_length,
+    )
 
 
 @pytest.fixture()
@@ -47,13 +55,13 @@ def test_client(test_app) -> TestClient:
     return TestClient(test_app, raise_server_exceptions=True)
 
 
-def _make_tarball(tmp_path: Path, members: list[tuple]) -> Path:
-    """Build a .tar.gz file at tmp_path/test.tar.gz.
+def _make_tarball(tmp_path: Path, members: list[tuple], filename: str = "test.tar.gz") -> Path:
+    """Build a .tar.gz file at tmp_path/{filename}.
 
     members: list of (arcname, content_bytes, type) where type is
-    'file', 'absolute', 'symlink', or 'hardlink'.
+    'file', 'absolute', 'symlink', 'hardlink', 'chrdev', 'blkdev', or 'fifo'.
     """
-    out = tmp_path / "test.tar.gz"
+    out = tmp_path / filename
     with tarfile.open(out, "w:gz") as tf:
         for item in members:
             arcname, content, kind = item
@@ -63,9 +71,10 @@ def _make_tarball(tmp_path: Path, members: list[tuple]) -> Path:
                 info.size = len(data)
                 tf.addfile(info, io.BytesIO(data))
             elif kind == "absolute":
+                data = content if isinstance(content, bytes) else content.encode()
                 info = tarfile.TarInfo(name=arcname)
-                info.size = len(content)
-                tf.addfile(info, io.BytesIO(content))
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
             elif kind == "symlink":
                 info = tarfile.TarInfo(name=arcname)
                 info.type = tarfile.SYMTYPE
@@ -75,6 +84,22 @@ def _make_tarball(tmp_path: Path, members: list[tuple]) -> Path:
                 info = tarfile.TarInfo(name=arcname)
                 info.type = tarfile.LNKTYPE
                 info.linkname = content.decode() if isinstance(content, bytes) else content
+                tf.addfile(info)
+            elif kind == "chrdev":
+                info = tarfile.TarInfo(name=arcname)
+                info.type = tarfile.CHRTYPE
+                info.devmajor = 1
+                info.devminor = 3
+                tf.addfile(info)
+            elif kind == "blkdev":
+                info = tarfile.TarInfo(name=arcname)
+                info.type = tarfile.BLKTYPE
+                info.devmajor = 8
+                info.devminor = 0
+                tf.addfile(info)
+            elif kind == "fifo":
+                info = tarfile.TarInfo(name=arcname)
+                info.type = tarfile.FIFOTYPE
                 tf.addfile(info)
     return out
 

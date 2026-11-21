@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -23,9 +24,20 @@ def create_app(config: Optional[ServerConfig] = None) -> Starlette:
         config = ServerConfig.from_env()
 
     config.validate()
+    if config.auth_mode == "open":
+        _log.warning(
+            "report_server auth_mode=open: publish and revoke accept unauthenticated requests; "
+            "do not expose this server beyond localhost"
+        )
     config.data_dir.mkdir(parents=True, exist_ok=True)
 
-    storage = LocalFilesystemStorage(config.data_dir)
+    storage = LocalFilesystemStorage(
+        config.data_dir,
+        max_tar_members=config.max_tar_members,
+        max_unpacked_bytes=config.max_unpacked_bytes,
+        max_path_depth=config.max_path_depth,
+        max_member_name_length=config.max_member_name_length,
+    )
     engine = get_engine(config.data_dir)
 
     @asynccontextmanager
@@ -51,6 +63,8 @@ def create_app(config: Optional[ServerConfig] = None) -> Starlette:
     app.state.config = config
     app.state.storage = storage
     app.state.engine = engine
+    app.state.publish_semaphore = asyncio.Semaphore(config.max_concurrent_publishes)
+    app.state.publish_semaphore_capacity = config.max_concurrent_publishes
 
     if config.cors_origins:
         app.add_middleware(

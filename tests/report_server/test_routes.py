@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tarfile
 from pathlib import Path
+from unittest.mock import patch
 
 from starlette.testclient import TestClient
 
@@ -112,6 +114,58 @@ def test_malicious_tarball_rejected(
     assert resp.status_code == 400, (
         f"Malicious tarball must be rejected with 400, got {resp.status_code}: {resp.text}"
     )
+    error_msg = resp.json().get("error", "")
+    assert "Tarball entry" in error_msg
+    assert str(test_client.app.state.config.data_dir) not in error_msg
+
+
+def test_malicious_absolute_tarball_rejected(
+    test_client: TestClient, malicious_tarball_absolute: Path
+) -> None:
+    resp = _publish(test_client, malicious_tarball_absolute)
+    assert resp.status_code == 400
+    error_msg = resp.json().get("error", "")
+    assert error_msg == "Tarball entry has absolute path"
+    assert "/etc/passwd" not in error_msg
+    assert str(test_client.app.state.config.data_dir) not in error_msg
+
+
+def test_corrupt_non_gzip_upload_returns_400(test_client: TestClient) -> None:
+    resp = test_client.post(
+        "/publish",
+        content=b"this is definitely not a valid gzip tarball archive",
+        headers={
+            "Content-Type": "application/gzip",
+            "Authorization": "Bearer test-key-123",
+        },
+    )
+    assert resp.status_code == 400, (
+        f"Corrupt upload must return 400, got {resp.status_code}: {resp.text}"
+    )
+    error_msg = resp.json().get("error", "")
+    assert "corrupt" in error_msg.lower() or "invalid" in error_msg.lower()
+    assert str(test_client.app.state.config.data_dir) not in error_msg
+
+
+def test_filter_error_mapped_to_typed_400_without_server_paths(
+    test_client: TestClient, honest_tarball: Path
+) -> None:
+    filter_err_cls = getattr(tarfile, "OutsideDestinationError", tarfile.TarError)
+
+    def _raise_filter_err(*args, **kwargs):
+        raise filter_err_cls(
+            tarfile.TarInfo(name="../../etc/passwd"),
+            str(test_client.app.state.config.data_dir),
+        )
+
+    with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=_raise_filter_err):
+        resp = _publish(test_client, honest_tarball)
+
+    assert resp.status_code == 400
+    error_msg = resp.json().get("error", "")
+    assert error_msg
+    assert str(test_client.app.state.config.data_dir) not in error_msg
+    assert "/etc/passwd" not in error_msg
 
 
 def test_get_r_path_works_in_api_key_mode_without_bearer(
@@ -125,3 +179,869 @@ def test_get_r_path_works_in_api_key_mode_without_bearer(
     assert serve_resp.status_code == 200, (
         "Viewer must be able to access /r/{slug} without Authorization header"
     )
+
+
+def test_bad_content_length_returns_400(test_client: TestClient) -> None:
+    for bad_cl in ("not-a-number", "-1", "12.34", "+10", ""):
+        resp = test_client.post(
+            "/publish",
+            content=b"abc",
+            headers={
+                "Content-Type": "application/gzip",
+                "Authorization": "Bearer test-key-123",
+                "Content-Length": bad_cl,
+            },
+        )
+        assert resp.status_code == 400, f"Content-Length={bad_cl!r} should return 400, got {resp.status_code}"
+        assert "error" in resp.json()
+
+
+def test_chunked_oversized_body_returns_413_without_reading_all_chunks(
+    test_app,
+) -> None:
+    import asyncio
+    from starlette.requests import Request
+    from seeknal.report_server.routes import publish
+
+    test_app.state.config.max_upload_bytes = 100
+    chunk_size = 40
+    total_chunks = 10
+    chunks_yielded = 0
+
+    async def _run():
+        nonlocal chunks_yielded
+        sent_chunks = 0
+
+        async def receive():
+            nonlocal chunks_yielded, sent_chunks
+            sent_chunks += 1
+            chunks_yielded += 1
+            more = sent_chunks < total_chunks
+            return {
+                "type": "http.request",
+                "body": b"x" * chunk_size,
+                "more_body": more,
+            }
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/publish",
+            "raw_path": b"/publish",
+            "query_string": b"",
+            "headers": [
+                (b"content-type", b"application/gzip"),
+                (b"authorization", b"Bearer test-key-123"),
+                (b"transfer-encoding", b"chunked"),
+            ],
+            "app": test_app,
+        }
+        req = Request(scope, receive)
+        return await publish(req)
+
+    resp = asyncio.run(_run())
+    assert resp.status_code == 413
+    # Cap is 100 bytes, chunk size is 40 bytes -> 3rd chunk reaches 120 bytes > 100 and aborts immediately
+    assert chunks_yielded == 3, f"Expected to read at most 3 chunks (120B <= cap + 1 chunk), read {chunks_yielded}"
+
+
+def test_healthz_responsive_while_extraction_runs(
+    test_app,
+    honest_tarball: Path,
+) -> None:
+    import asyncio
+    import threading
+    import time
+    import httpx
+
+    extraction_started = threading.Event()
+    allow_extraction_finish = threading.Event()
+    orig_extract = test_app.state.storage.extract_tarball
+
+    def _slow_extract(slug, fileobj):
+        extraction_started.set()
+        allow_extraction_finish.wait(timeout=5.0)
+        return orig_extract(slug, fileobj)
+
+    tarball_bytes = honest_tarball.read_bytes()
+
+    async def _run():
+        transport = httpx.ASGITransport(app=test_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            pub_task = asyncio.create_task(
+                client.post(
+                    "/publish",
+                    content=tarball_bytes,
+                    headers={
+                        "Content-Type": "application/gzip",
+                        "Authorization": "Bearer test-key-123",
+                    },
+                )
+            )
+            # Wait for extraction thread to start without blocking the event loop
+            for _ in range(100):
+                if extraction_started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert extraction_started.is_set(), "Extraction did not start in worker thread"
+
+            t0 = time.monotonic()
+            health_resp = await client.get("/healthz")
+            elapsed = time.monotonic() - t0
+            assert health_resp.status_code == 200
+            assert health_resp.json()["status"] == "ok"
+            assert elapsed < 0.5, f"/healthz took {elapsed:.3f}s while extraction was blocked"
+
+            allow_extraction_finish.set()
+            pub_resp = await pub_task
+            assert pub_resp.status_code == 201
+
+    with patch.object(test_app.state.storage, "extract_tarball", side_effect=_slow_extract):
+        asyncio.run(_run())
+
+
+def test_nul_in_pax_path_returns_typed_400_without_paths_in_response_or_logs(
+    test_client: TestClient,
+    tmp_path: Path,
+    caplog,
+) -> None:
+    import io
+    import logging
+
+    nul_tar = tmp_path / "route_pax_nul.tar.gz"
+    with tarfile.open(nul_tar, "w:gz", format=tarfile.PAX_FORMAT) as tf:
+        info = tarfile.TarInfo(name="placeholder.txt")
+        info.pax_headers["path"] = "evil\x00path.txt"
+        data = b"payload"
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    resp = _publish(test_client, nul_tar)
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "Tarball entry name contains a NUL byte"}
+
+    data_dir_str = str(test_client.app.state.config.data_dir)
+    assert data_dir_str not in resp.text
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        assert data_dir_str not in msg
+        assert "evil" not in msg
+        assert "embedded null" not in msg
+
+
+def test_overlong_name_and_file_dir_conflict_return_typed_400_without_paths_in_logs(
+    test_client: TestClient,
+    tmp_path: Path,
+    caplog,
+) -> None:
+    import logging
+    from tests.report_server.conftest import _make_tarball
+
+    data_dir_str = str(test_client.app.state.config.data_dir)
+
+    # 1. Overlong name (> 1024 chars)
+    overlong_name = ("segment_" * 15) + "/" + ("x" * 950)
+    assert len(overlong_name) > 1024
+    overlong_tar = _make_tarball(
+        tmp_path,
+        [(overlong_name, b"data", "file")],
+        filename="overlong_route.tar.gz",
+    )
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    resp_long = _publish(test_client, overlong_tar)
+    assert resp_long.status_code == 400
+    assert resp_long.json() == {"error": "Tarball entry name too long"}
+    assert data_dir_str not in resp_long.text
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        assert data_dir_str not in msg
+        assert "segment_" not in msg
+
+    # 2. File "a" followed by "a/b" (raises OSError during extraction with absolute dest path in exc text)
+    conflict_tar = _make_tarball(
+        tmp_path,
+        [("a", b"file_content", "file"), ("a/b", b"nested_under_file", "file")],
+        filename="file_then_dir_conflict.tar.gz",
+    )
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    resp_conflict = _publish(test_client, conflict_tar)
+    assert resp_conflict.status_code == 400
+    assert resp_conflict.json() == {"error": "Invalid or corrupt tarball archive"}
+    assert data_dir_str not in resp_conflict.text
+    assert any("exc_class=" in rec.getMessage() for rec in caplog.records)
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        assert data_dir_str not in msg
+        assert "/assets/" not in msg
+
+    # 3. Single component over OS NAME_MAX (e.g. 300 chars <= 1024, raises ENAMETOOLONG OSError on extraction)
+    enametoolong_tar = _make_tarball(
+        tmp_path,
+        [("z" * 300, b"too_long_for_fs", "file")],
+        filename="enametoolong.tar.gz",
+    )
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    resp_nametoolong = _publish(test_client, enametoolong_tar)
+    assert resp_nametoolong.status_code == 400
+    assert resp_nametoolong.json() == {"error": "Invalid or corrupt tarball archive"}
+    assert data_dir_str not in resp_nametoolong.text
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        assert data_dir_str not in msg
+        assert "zzzzzzzz" not in msg
+
+
+def test_server_config_defaults_to_api_key(monkeypatch) -> None:
+    from seeknal.report_server.config import ServerConfig
+
+    assert ServerConfig().auth_mode == "api_key"
+    monkeypatch.delenv("SEEKNAL_REPORT_SERVER_AUTH_MODE", raising=False)
+    assert ServerConfig.from_env().auth_mode == "api_key"
+
+
+def test_default_auth_mode_app_rejects_unauthenticated_publish_without_writing_assets(
+    tmp_path: Path,
+    honest_tarball: Path,
+    monkeypatch,
+) -> None:
+    from seeknal.report_server.app import create_app
+    from seeknal.report_server.config import ServerConfig
+
+    monkeypatch.setattr("seeknal.report_server.config.is_insecure_path", lambda _p: False)
+    monkeypatch.setattr("seeknal.report_server.storage.is_insecure_path", lambda _p: False)
+    data_dir = tmp_path / "default-auth-data"
+    cfg = ServerConfig(data_dir=data_dir, api_keys=["k"])
+    assert cfg.auth_mode == "api_key"
+    app = create_app(cfg)
+    client = TestClient(app, raise_server_exceptions=True)
+
+    resp = _publish(client, honest_tarball, auth=False)
+    assert resp.status_code == 401
+    assets_dir = data_dir / "assets"
+    assert list(assets_dir.iterdir()) == []
+
+
+def test_api_key_mode_without_keys_fails_closed_in_validate_and_create_app(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import pytest
+    from seeknal.report_server.app import create_app
+    from seeknal.report_server.config import ServerConfig
+
+    monkeypatch.setattr("seeknal.report_server.config.is_insecure_path", lambda _p: False)
+    monkeypatch.setattr("seeknal.report_server.storage.is_insecure_path", lambda _p: False)
+    cfg = ServerConfig(data_dir=tmp_path / "no-keys-data", api_keys=[])
+    with pytest.raises(ValueError) as exc_info:
+        cfg.validate()
+    err = str(exc_info.value)
+    assert "SEEKNAL_REPORT_SERVER_KEYS" in err
+    assert "SEEKNAL_REPORT_SERVER_AUTH_MODE=open" in err
+
+    with pytest.raises(ValueError) as app_exc_info:
+        create_app(cfg)
+    app_err = str(app_exc_info.value)
+    assert "SEEKNAL_REPORT_SERVER_KEYS" in app_err
+    assert "SEEKNAL_REPORT_SERVER_AUTH_MODE=open" in app_err
+
+
+def test_explicit_open_mode_allows_unauthenticated_publish_and_logs_warning(
+    tmp_path: Path,
+    honest_tarball: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    import logging
+    from seeknal.report_server.app import create_app
+    from seeknal.report_server.config import ServerConfig
+
+    monkeypatch.setattr("seeknal.report_server.config.is_insecure_path", lambda _p: False)
+    monkeypatch.setattr("seeknal.report_server.storage.is_insecure_path", lambda _p: False)
+
+    # 1. Explicit auth_mode="open" emits WARNING on seeknal.report_server and allows unauth publish
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    open_cfg = ServerConfig(data_dir=tmp_path / "open-mode-data", auth_mode="open")
+    open_app = create_app(open_cfg)
+    open_warnings = [
+        rec for rec in caplog.records
+        if rec.name == "seeknal.report_server"
+        and rec.levelno == logging.WARNING
+        and "auth_mode=open" in rec.getMessage()
+    ]
+    assert len(open_warnings) == 1
+
+    open_client = TestClient(open_app, raise_server_exceptions=True)
+    resp = _publish(open_client, honest_tarball, auth=False)
+    assert resp.status_code == 201
+
+    # 2. api_key mode emits no such warning
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    key_cfg = ServerConfig(
+        data_dir=tmp_path / "key-mode-data",
+        auth_mode="api_key",
+        api_keys=["secret-key-not-logged"],
+    )
+    create_app(key_cfg)
+    key_warnings = [
+        rec for rec in caplog.records
+        if rec.name == "seeknal.report_server"
+        and rec.levelno == logging.WARNING
+        and "auth_mode=open" in rec.getMessage()
+    ]
+    assert key_warnings == []
+    for rec in caplog.records:
+        assert "secret-key-not-logged" not in rec.getMessage()
+
+
+def test_serve_asset_blocks_path_traversal_and_unsafe_paths(
+    test_app,
+    test_client: TestClient,
+    honest_tarball: Path,
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    marker = "OUTSIDE_SECRET_MARKER_99182"
+    outside_secret = tmp_path / "secret.txt"
+    outside_secret.write_text(marker, encoding="utf-8")
+    data_dir_secret = test_app.state.config.data_dir / "secret.txt"
+    data_dir_secret.write_text(marker, encoding="utf-8")
+
+    pub_resp = _publish(test_client, honest_tarball)
+    assert pub_resp.status_code == 201
+    slug = pub_resp.json()["slug"]
+
+    # Place a symlink inside the slug directory pointing outside to verify resolved-path containment
+    mount = test_app.state.storage.local_mount_path(slug)
+    assert mount is not None
+    (mount / "escaped_symlink.txt").symlink_to(outside_secret)
+
+    # Honest nested asset and index still return 200
+    honest_nested = test_client.get(f"/r/{slug}/_app/asset.js")
+    assert honest_nested.status_code == 200
+    assert b"console.log('hello');" in honest_nested.content
+
+    # Pre-encoded URLs via TestClient (so the HTTP client does not normalise dot segments)
+    encoded_cases = [
+        f"/r/{slug}/..%2Fsecret.txt",
+        f"/r/{slug}/..%2F..%2Fsecret.txt",
+        f"/r/{slug}/..%2F..%2F..%2Fsecret.txt",
+        f"/r/{slug}/..%2F..%2Fmetadata.db",
+        f"/r/{slug}/%2e%2e/secret.txt",
+        f"/r/{slug}/%2e%2e/%2e%2e/secret.txt",
+        f"/r/{slug}/%2e%2e%2f%2e%2e%2fsecret.txt",
+        f"/r/{slug}/%2F{outside_secret.as_posix().lstrip('/')}",
+        f"/r/{slug}/%2Fetc%2Fpasswd",
+        f"/r/{slug}/index.html%00.txt",
+        f"/r/{slug}/_app%5Casset.js",
+        f"/r/{slug}/..%5C..%5Csecret.txt",
+        f"/r/{slug}/escaped_symlink.txt",
+    ]
+    for url in encoded_cases:
+        resp = test_client.get(url)
+        assert resp.status_code == 404, f"Expected 404 for {url!r}, got {resp.status_code}"
+        assert marker.encode() not in resp.content
+        assert b"SQLite format" not in resp.content
+        assert "secret.txt" not in resp.text
+        assert str(outside_secret) not in resp.text
+
+    # Raw ASGI scope requests (matching uvicorn behaviour without dot-segment normalisation)
+    raw_asgi_paths = [
+        f"/r/{slug}/../../../secret.txt",
+        f"/r/{slug}/../../secret.txt",
+        f"/r/{slug}/../../metadata.db",
+        f"/r/{slug}/_app/../../../secret.txt",
+        f"/r/{slug}//{outside_secret.as_posix().lstrip('/')}",
+        f"/r/{slug}//etc/passwd",
+        f"/r/{slug}/a\x00b.txt",
+        f"/r/{slug}/_app\\asset.js",
+        f"/r/{slug}/..\\..\\secret.txt",
+        f"/r/{slug}/escaped_symlink.txt",
+    ]
+
+    async def _call_raw_asgi(req_path: str) -> tuple[int, bytes]:
+        status_code = 0
+        body_parts: list[bytes] = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            elif message["type"] == "http.response.body":
+                body_parts.append(message.get("body", b""))
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": req_path,
+            "raw_path": req_path.encode("utf-8", errors="surrogateescape"),
+            "query_string": b"",
+            "headers": [],
+            "app": test_app,
+        }
+        await test_app(scope, receive, send)
+        return status_code, b"".join(body_parts)
+
+    for raw_path in raw_asgi_paths:
+        status, body = asyncio.run(_call_raw_asgi(raw_path))
+        assert status == 404, f"Expected 404 for raw ASGI {raw_path!r}, got {status}"
+        assert marker.encode() not in body
+        assert b"SQLite format" not in body
+        assert b"secret.txt" not in body
+
+    # Also verify fallback to storage.open_asset when local_mount_path returns None
+    with patch.object(test_app.state.storage, "local_mount_path", return_value=None):
+        honest_fallback = test_client.get(f"/r/{slug}/_app/asset.js")
+        assert honest_fallback.status_code == 200
+        assert b"console.log('hello');" in honest_fallback.content
+
+        for raw_path in raw_asgi_paths:
+            status, body = asyncio.run(_call_raw_asgi(raw_path))
+            assert status == 404, f"Expected 404 on open_asset branch for {raw_path!r}, got {status}"
+            assert marker.encode() not in body
+            assert b"secret.txt" not in body
+
+
+def test_publish_rejects_huge_gnu_longname_and_pax_headers_with_typed_400_and_bounded_memory(
+    test_client: TestClient,
+    tmp_path: Path,
+) -> None:
+    import tracemalloc
+    from tests.report_server.test_storage import (
+        _build_streamed_huge_gnu_longname_tar_gz,
+        _build_streamed_huge_pax_comment_tar_gz,
+    )
+
+    gnu_tar = _build_streamed_huge_gnu_longname_tar_gz(tmp_path / "route_huge_gnu.tar.gz")
+    pax_tar = _build_streamed_huge_pax_comment_tar_gz(tmp_path / "route_huge_pax.tar.gz")
+    assets_dir = test_client.app.state.config.data_dir / "assets"
+
+    for archive in (gnu_tar, pax_tar):
+        tracemalloc.start()
+        try:
+            resp = _publish(test_client, archive)
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "Tarball entry header too large"}
+        assert peak_bytes < 64 * 1024 * 1024, f"Peak memory {peak_bytes} exceeded 64 MiB"
+        assert list(assets_dir.iterdir()) == []
+
+
+def test_publish_concurrency_cap_returns_503_with_retry_after_and_cleans_spool(
+    test_app,
+    honest_tarball: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import asyncio
+    import tempfile
+    import threading
+    import httpx
+    import seeknal.report_server.routes as routes_mod
+    from tests.report_server.conftest import _make_tarball
+
+    test_app.state.config.max_concurrent_publishes = 1
+    # Force SpooledTemporaryFile to roll over to disk inside data_dir so disk cleanup is verified
+    monkeypatch.setattr(routes_mod, "SPOOL_MAX_SIZE", 1)
+
+    created_spools: list[tempfile.SpooledTemporaryFile] = []
+    orig_spooled = tempfile.SpooledTemporaryFile
+
+    def _tracking_spooled(*args, **kwargs):
+        s = orig_spooled(*args, **kwargs)
+        created_spools.append(s)
+        return s
+
+    monkeypatch.setattr(routes_mod.tempfile, "SpooledTemporaryFile", _tracking_spooled)
+
+    extraction_started = threading.Event()
+    allow_extraction_finish = threading.Event()
+    orig_extract = test_app.state.storage.extract_tarball
+    rolled_during_extract: list[bool] = []
+    open_fds_during_extract: list[int] = []
+
+    def _blocked_extract(slug, fileobj):
+        rolled_during_extract.append(getattr(fileobj, "_rolled", False))
+        open_fds_during_extract.append(fileobj.fileno())
+        extraction_started.set()
+        allow_extraction_finish.wait(timeout=5.0)
+        return orig_extract(slug, fileobj)
+
+    tarball_bytes = honest_tarball.read_bytes()
+
+    async def _run_concurrent():
+        transport = httpx.ASGITransport(app=test_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            first_task = asyncio.create_task(
+                client.post(
+                    "/publish",
+                    content=tarball_bytes,
+                    headers={
+                        "Content-Type": "application/gzip",
+                        "Authorization": "Bearer test-key-123",
+                    },
+                )
+            )
+            for _ in range(100):
+                if extraction_started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert extraction_started.is_set()
+
+            # Second concurrent publish must immediately get 503 with Retry-After: 1
+            second_resp = await client.post(
+                "/publish",
+                content=tarball_bytes,
+                headers={
+                    "Content-Type": "application/gzip",
+                    "Authorization": "Bearer test-key-123",
+                },
+            )
+            assert second_resp.status_code == 503
+            assert second_resp.headers.get("Retry-After") == "1"
+
+            allow_extraction_finish.set()
+            first_resp = await first_task
+            assert first_resp.status_code == 201
+
+    with patch.object(test_app.state.storage, "extract_tarball", side_effect=_blocked_extract):
+        asyncio.run(_run_concurrent())
+
+    assert rolled_during_extract == [True]
+    assert len(created_spools) == 1
+    assert created_spools[0].closed
+    spool_dir = test_app.state.config.data_dir / "tmp"
+    assert list(spool_dir.iterdir()) == []
+
+    # Verify spool file is also closed and removed after a failed publish (400)
+    bad_tar = _make_tarball(
+        tmp_path,
+        [("../../etc/passwd", b"root", "file")],
+        filename="bad_for_spool_test.tar.gz",
+    )
+    bad_bytes = bad_tar.read_bytes()
+    client = TestClient(test_app, raise_server_exceptions=True)
+    fail_resp = client.post(
+        "/publish",
+        content=bad_bytes,
+        headers={
+            "Content-Type": "application/gzip",
+            "Authorization": "Bearer test-key-123",
+        },
+    )
+    assert fail_resp.status_code == 400
+    assert len(created_spools) == 2
+    assert created_spools[1].closed
+    assert list(spool_dir.iterdir()) == []
+
+
+def test_publish_catches_memory_error_and_cleans_up_on_commit_failure(
+    test_client: TestClient,
+    honest_tarball: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    import logging
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import Session
+
+    data_dir_str = str(test_client.app.state.config.data_dir)
+    assets_dir = test_client.app.state.config.data_dir / "assets"
+
+    # 1. MemoryError during extraction returns typed 400 with generic message
+    def _raise_mem_err(*args, **kwargs):
+        raise MemoryError("secret /internal/path allocation failure")
+
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="seeknal.report_server")
+    with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=_raise_mem_err):
+        mem_resp = _publish(test_client, honest_tarball)
+    assert mem_resp.status_code == 400
+    assert mem_resp.json() == {"error": "Tarball uncompressed size exceeds limit"}
+    assert "allocation failure" not in mem_resp.text
+    assert data_dir_str not in mem_resp.text
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        assert "exc_class=MemoryError" in msg
+        assert "allocation failure" not in msg
+
+    # 2. Database commit failure deletes extracted folder and returns typed 500 {"error": "Publish failed"}
+    def _failing_commit(self):
+        raise IntegrityError("INSERT INTO publish", {"slug": "dup"}, Exception("UNIQUE constraint failed"))
+
+    monkeypatch.setattr(Session, "commit", _failing_commit)
+    caplog.clear()
+    caplog.set_level(logging.ERROR, logger="seeknal.report_server")
+    commit_resp = _publish(test_client, honest_tarball)
+    assert commit_resp.status_code == 500
+    assert commit_resp.json() == {"error": "Publish failed"}
+    assert list(assets_dir.iterdir()) == [], "Extracted folder must be deleted when DB commit fails"
+
+    err_records = [
+        rec for rec in caplog.records
+        if rec.name == "seeknal.report_server" and rec.levelno == logging.ERROR
+    ]
+    assert len(err_records) == 1
+    log_msg = err_records[0].getMessage()
+    assert "slug=" in log_msg
+    assert "exc_class=IntegrityError" in log_msg
+    assert "UNIQUE constraint failed" not in log_msg
+    assert data_dir_str not in log_msg
+
+
+def test_publish_rejects_disallowed_headers_and_chains_with_typed_400_and_bounded_memory(
+    test_client: TestClient,
+    tmp_path: Path,
+) -> None:
+    import tracemalloc
+    from tests.report_server.test_storage import (
+        _build_chained_extended_headers_tar_gz,
+        _build_conttype_tar_gz,
+        _build_gnu_longlink_tar_gz,
+        _build_old_gnu_sparse_tar_gz,
+        _build_pax_global_header_tar_gz,
+        _build_pax_gnu_sparse_01_tar_gz,
+        _build_pax_gnu_sparse_10_tar_gz,
+        _build_pax_hdrcharset_tar_gz,
+        _build_pax_linkpath_tar_gz,
+        _build_pax_unknown_key_tar_gz,
+    )
+
+    hdrcharset_tar = _build_pax_hdrcharset_tar_gz(tmp_path / "route_pax_hdrcharset.tar.gz")
+    cases = [
+        (_build_pax_global_header_tar_gz(tmp_path / "route_global_g.tar.gz"), "Tarball entry type not allowed"),
+        (_build_gnu_longlink_tar_gz(tmp_path / "route_longlink_K.tar.gz"), "Tarball entry type not allowed"),
+        (_build_pax_unknown_key_tar_gz(tmp_path / "route_pax_unknown.tar.gz"), "Tarball pax header key not allowed"),
+        (_build_pax_linkpath_tar_gz(tmp_path / "route_pax_linkpath.tar.gz"), "Tarball pax header key not allowed"),
+        (hdrcharset_tar, "Tarball entry has a non-UTF-8 member name"),
+        (_build_pax_gnu_sparse_01_tar_gz(tmp_path / "route_sparse_01.tar.gz"), "Tarball pax header key not allowed"),
+        (_build_old_gnu_sparse_tar_gz(tmp_path / "route_sparse_old.tar.gz"), "Tarball entry type not allowed"),
+        (_build_pax_gnu_sparse_10_tar_gz(tmp_path / "route_sparse_10.tar.gz"), "Tarball pax header key not allowed"),
+        (
+            _build_chained_extended_headers_tar_gz(tmp_path / "route_chain_9.tar.gz", count=9),
+            "Tarball entry header too large",
+        ),
+        (
+            _build_chained_extended_headers_tar_gz(tmp_path / "route_chain_300.tar.gz", count=300),
+            "Tarball entry header too large",
+        ),
+        (_build_conttype_tar_gz(tmp_path / "route_conttype_7.tar.gz"), "Tarball entry type not allowed"),
+    ]
+    assets_dir = test_client.app.state.config.data_dir / "assets"
+
+    for archive, expected_error in cases:
+        tracemalloc.start()
+        try:
+            resp = _publish(test_client, archive)
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert resp.status_code == 400
+        assert resp.json() == {"error": expected_error}
+        assert peak_bytes < 16 * 1024 * 1024, f"{archive.name} peak memory {peak_bytes} exceeded 16 MiB"
+        assert list(assets_dir.iterdir()) == []
+
+    # Chain of 8 extended headers is accepted via /publish
+    ok_chain_8 = _build_chained_extended_headers_tar_gz(tmp_path / "route_chain_8.tar.gz", count=8)
+    ok_resp = _publish(test_client, ok_chain_8)
+    assert ok_resp.status_code == 201
+
+    # Direct RecursionError during extraction is also caught and mapped to typed 400
+    def _raise_recursion(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded in tar header chain")
+
+    with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=_raise_recursion):
+        rec_resp = _publish(test_client, ok_chain_8)
+    assert rec_resp.status_code == 400
+    assert rec_resp.json() == {"error": "Tarball entry header too large"}
+
+
+def test_semaphore_released_when_spool_dir_mkdir_fails(
+    test_app,
+    honest_tarball: Path,
+    monkeypatch,
+) -> None:
+    import pytest
+
+    test_app.state.config.max_concurrent_publishes = 1
+    orig_mkdir = Path.mkdir
+    failed_once = False
+
+    def _fail_mkdir_once(self, *args, **kwargs):
+        nonlocal failed_once
+        if not failed_once and self == test_app.state.config.data_dir / "tmp":
+            failed_once = True
+            raise OSError("simulated spool_dir mkdir failure")
+        return orig_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", _fail_mkdir_once)
+    client = TestClient(test_app, raise_server_exceptions=False)
+
+    first_resp = _publish(client, honest_tarball)
+    assert failed_once
+    assert first_resp.status_code == 500
+
+    # Semaphore slot must have been released so a following honest publish gets 201 (not 503)
+    second_resp = _publish(client, honest_tarball)
+    assert second_resp.status_code == 201
+
+
+def test_semaphore_released_after_mid_upload_413_and_unhandled_error(
+    test_app,
+    honest_tarball: Path,
+) -> None:
+    import asyncio
+    from starlette.requests import Request
+    from seeknal.report_server.routes import publish
+
+    test_app.state.config.max_concurrent_publishes = 1
+    orig_max_upload = test_app.state.config.max_upload_bytes
+
+    # 1. Mid-upload 413 (chunked stream exceeding max_upload_bytes after semaphore.acquire())
+    test_app.state.config.max_upload_bytes = 50
+
+    async def _run_mid_upload_413():
+        sent = 0
+
+        async def receive():
+            nonlocal sent
+            sent += 1
+            return {
+                "type": "http.request",
+                "body": b"x" * 30,
+                "more_body": sent < 3,
+            }
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/publish",
+            "raw_path": b"/publish",
+            "query_string": b"",
+            "headers": [
+                (b"content-type", b"application/gzip"),
+                (b"authorization", b"Bearer test-key-123"),
+                (b"transfer-encoding", b"chunked"),
+            ],
+            "app": test_app,
+        }
+        req = Request(scope, receive)
+        return await publish(req)
+
+    resp_413 = asyncio.run(_run_mid_upload_413())
+    assert resp_413.status_code == 413
+    test_app.state.config.max_upload_bytes = orig_max_upload
+
+    client = TestClient(test_app, raise_server_exceptions=False)
+    after_413_resp = _publish(client, honest_tarball)
+    assert after_413_resp.status_code == 201
+
+    # 2. Unhandled error during extraction (e.g. RuntimeError not in caught tar exception tuple)
+    def _raise_unhandled(*args, **kwargs):
+        raise RuntimeError("simulated unhandled extraction error")
+
+    with patch.object(test_app.state.storage, "extract_tarball", side_effect=_raise_unhandled):
+        unhandled_resp = _publish(client, honest_tarball)
+    assert unhandled_resp.status_code == 500
+
+    # Semaphore must still be released so the next publish succeeds with 201
+    after_unhandled_resp = _publish(client, honest_tarball)
+    assert after_unhandled_resp.status_code == 201
+
+
+def test_overflow_error_mapped_to_typed_400_and_attribute_error_surfaces(
+    test_app,
+    test_client: TestClient,
+    honest_tarball: Path,
+    caplog,
+) -> None:
+    import logging
+    import pytest
+
+    with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=OverflowError("mtime out of range")):
+        resp = _publish(test_client, honest_tarball)
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "Invalid or corrupt tarball archive"}
+
+    # AttributeError is a programming error: it logs at ERROR, surfaces in raising TestClient,
+    # and returns 500 (not 400) when server exceptions are converted to responses.
+    caplog.clear()
+    caplog.set_level(logging.ERROR, logger="seeknal.report_server")
+    with patch.object(test_client.app.state.storage, "extract_tarball", side_effect=AttributeError("programming bug")):
+        with pytest.raises(AttributeError, match="programming bug"):
+            _publish(test_client, honest_tarball)
+
+        non_raising_client = TestClient(test_app, raise_server_exceptions=False)
+        resp_500 = _publish(non_raising_client, honest_tarball)
+        assert resp_500.status_code == 500
+
+    attr_err_logs = [
+        rec for rec in caplog.records
+        if rec.name == "seeknal.report_server"
+        and rec.levelno == logging.ERROR
+        and "exc_class=AttributeError" in rec.getMessage()
+    ]
+    assert len(attr_err_logs) == 2
+
+
+def test_publish_rejects_mid_archive_malformed_pax_header_with_400_and_writes_nothing(
+    test_client: TestClient,
+    tmp_path: Path,
+) -> None:
+    from tests.report_server.test_storage import _build_mid_archive_malformed_pax_tar_gz
+
+    assets_dir = test_client.app.state.config.data_dir / "assets"
+    archive = _build_mid_archive_malformed_pax_tar_gz(tmp_path / "route_mid_bad_pax.tar.gz")
+    resp = _publish(test_client, archive)
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "Tarball pax header malformed"}
+    assert list(assets_dir.iterdir()) == []
+
+
+def test_publish_rejects_invalid_pax_mtimes_with_400_and_accepts_normal_float_mtime(
+    test_client: TestClient,
+    tmp_path: Path,
+) -> None:
+    from tests.report_server.test_storage import _build_pax_mtime_tar_gz
+
+    assets_dir = test_client.app.state.config.data_dir / "assets"
+    for bad_mtime in ("1e400", "1234567890123456789012345678901", "-1", "nan", "inf"):
+        safe_label = bad_mtime.replace("-", "neg_")
+        archive = _build_pax_mtime_tar_gz(tmp_path / f"route_mtime_{safe_label}.tar.gz", bad_mtime)
+        resp = _publish(test_client, archive)
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "Tarball entry has an invalid mtime"}
+    assert list(assets_dir.iterdir()) == []
+
+    ok_archive = _build_pax_mtime_tar_gz(tmp_path / "route_mtime_float_ok.tar.gz", "1700000000.5")
+    ok_resp = _publish(test_client, ok_archive)
+    assert ok_resp.status_code == 201
+
+
+
+
+
+
+
